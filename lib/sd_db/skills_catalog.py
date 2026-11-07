@@ -371,7 +371,7 @@ def record_review_proposals(connection, item, assignment, provider, document):
             json.dumps({**proposal, "assignment": assignment, "provider": provider}, sort_keys=True),
             session="reviewer") for proposal in proposals]
         source["review_result"] = _hash(document)
-        set_item_fields(connection, item, fields={"skill_review": source})
+        set_item_fields(connection, item, fields={**json.loads(state["item"]["fields"] or "{}"), "skill_review": source})
         add_note(connection, item, "comment", f"Reviewer {provider} recorded {len(proposals)} proposals against the checked skill source.", session="runner")
         return workflow.item_state(connection, item)
 
