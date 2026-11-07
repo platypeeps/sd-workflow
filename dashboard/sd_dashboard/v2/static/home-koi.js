@@ -1,6 +1,7 @@
 // Home's Koi view (pack sd:8054): the fish, the pond's care and water tests, and its water changes from Home Assistant.
 // Data: GET /api/home/koi (home_koi.document). A fish is a koi asset and the pond a pond asset (the property map's table):
-// Add fish and a fish's form post /api/home/asset, a measurement or a water test appends to the row's fields. Care tasks
+// Add fish and a fish's form post /api/home/asset (a measurement appends to its log); a water test posts
+// /api/home/koi/test. Care tasks
 // post /api/home/care on the pond. When Home Assistant holds a change the pond's log lacks, the view posts
 // /api/home/koi/water once, which logs it, and reads again.
 (() => {
@@ -61,7 +62,6 @@
   }
   const send = (path, body, done) => window.shell.post(path, body).then(out => { toast(done); return load().then(() => out); }, e => toast(`Not saved: ${e.message}`));
   const pond = () => S.doc.pond;
-  const savePond = fields => { const p = pond(); return send('/api/home/asset', { id: p.id, kind: 'pond', name: p.name, geometry: p.geometry, fields, photo: p.photo }, 'Water test logged'); };
 
   document.addEventListener('click', e => {
     const t = e.target;
@@ -92,9 +92,10 @@
       const c = S.doc.care[Number(fd.get('preset'))];
       send('/api/home/care', { asset: pond().id, title: c.title, due: fd.get('due'), recurrence: c.recurrence }, 'Care task filed');
     } else {
-      const reading = { date: new Date().toISOString().slice(0, 10) };
+      // Only the reading: the server appends it to the pond's current row, so a water change logged meanwhile stays.
+      const reading = {};
       S.doc.tests.forEach(t => { if (fd.get(t) !== '' && fd.get(t) != null) reading[t] = Number(fd.get(t)); });
-      savePond({ ...pond().fields, tests: [...(pond().fields.tests || []), reading] });
+      send('/api/home/koi/test', reading, 'Water test logged');
     }
   });
   document.addEventListener('shell:view', e => { if (e.detail.id === 'koi') load(); });

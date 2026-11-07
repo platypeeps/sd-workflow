@@ -194,3 +194,26 @@ def log_water(payload: dict, *, now: str, environ=None, timeout: float = TIMEOUT
         return {"added": len(added)}
 
     return write
+
+
+def log_test(payload: dict, *, now: str):
+    """`POST /api/home/koi/test {<test>: number, ...}`: append one reading to the pond's current `fields.tests`."""
+    import math
+
+    from sd_db import assets
+
+    if not payload or not set(payload) <= set(TESTS) or not all(
+            type(value) in (int, float) and math.isfinite(value) for value in payload.values()):
+        raise ValueError(f"Send one or more of {', '.join(TESTS)}, each a number.")
+    reading = {"date": now[:10], **{test: payload[test] for test in TESTS if test in payload}}
+
+    def write(connection):
+        pond = _pond(connection)
+        if pond is None:
+            return 409, {"error": "No pond yet: add a pond on the Map first."}
+        tests = list(pond["fields"].get("tests") or []) + [reading]
+        assets.save_asset(connection, asset=pond["id"], kind="pond", name=pond["name"], geometry=pond["geometry"],
+                          photo=pond["photo"], fields={**pond["fields"], "tests": tests}, kinds=assets.ALL_KINDS)
+        return {"tests": len(tests)}
+
+    return write

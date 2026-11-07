@@ -34,6 +34,8 @@ SR = 2232
 PIXEL_FT, HALF = 0.21701388888888898, 200.0
 TIMEOUT = 20.0
 LIMIT = 32 * 1024 * 1024
+#: The fields only the server writes, by kind: `home_koi.log_water` and `log_test` append to the current row.
+SERVER_KEYS = {"pond": ("water_log", "tests")}
 #: The fields the Add form offers a plant or a tree, and a care task's recurrence choices (`sd_db.recurrence`).
 RECUR = ("FREQ=DAILY", "FREQ=WEEKLY", "FREQ=WEEKLY;INTERVAL=2", "FREQ=MONTHLY", "FREQ=YEARLY")
 
@@ -171,6 +173,12 @@ def save(payload: dict):
 
     def write(connection):
         try:
+            if asset is not None and isinstance(values.get("fields"), dict):
+                # The server writes these on the current row (the Koi view); a form's older copy never replaces them.
+                current = assets.get_asset(connection, asset)
+                kept = {key: current["fields"][key] for key in SERVER_KEYS.get(current["kind"], ())
+                        if key in current["fields"]}
+                values["fields"] = {**values["fields"], **kept}
             return assets.save_asset(connection, asset=asset, **values)
         except assets.AssetRefused as refused:
             return 400, {"error": str(refused)}

@@ -89,6 +89,26 @@ class TheKoi(ScreenCase):
         home_map.care({"asset": self.pond["id"], "title": title, "due": "2026-01-01", "recurrence": rule}, "operator")(self.connection)
         self.assertTrue(home_koi.document(self.connection, now=NOW)["pond"]["care"]["overdue"])
 
+    def test_a_water_test_appends_to_the_current_row_and_keeps_the_logged_changes(self):
+        home_koi.log_water({}, now=NOW)(self.connection)
+        out = home_koi.log_test({"ammonia": 0.25, "ph": 7.4}, now=NOW)(self.connection)
+        self.assertEqual(out, {"tests": 1})
+        fields = assets.get_asset(self.connection, self.pond["id"])["fields"]
+        self.assertEqual(len(fields["water_log"]), 2)
+        self.assertEqual(fields["tests"], [{"date": DAY, "ammonia": 0.25, "ph": 7.4}])
+        for bad in ({}, {"chlorine": 1}, {"ph": "7"}, {"ph": float("nan")}, {"ph": True}):
+            with self.assertRaises(ValueError):
+                home_koi.log_test(bad, now=NOW)
+
+    def test_a_stale_pond_save_keeps_the_water_log_and_tests_the_server_wrote(self):
+        stale = dict(self.pond["fields"])
+        home_koi.log_water({}, now=NOW)(self.connection)
+        home_koi.log_test({"ph": 7.4}, now=NOW)(self.connection)
+        home_map.save({"id": self.pond["id"], "kind": "pond", "name": "Pond", "geometry": self.pond["geometry"],
+                       "fields": {**stale, "volume_gal": 2500}, "photo": None})(self.connection)
+        fields = assets.get_asset(self.connection, self.pond["id"])["fields"]
+        self.assertEqual((fields["volume_gal"], len(fields["water_log"]), len(fields["tests"])), (2500, 2, 1))
+
     def test_no_pond_says_to_add_one(self):
         assets.delete_asset(self.connection, self.pond["id"])
         doc = home_koi.document(self.connection, now=NOW)
@@ -99,6 +119,7 @@ class TheKoi(ScreenCase):
     def test_the_routes_are_registered(self):
         self.assertIsNotNone(v2.api("/api/home/koi"))
         self.assertIsNotNone(v2.action("/api/home/koi/water"))
+        self.assertIsNotNone(v2.action("/api/home/koi/test"))
 
 
 class TheKoiScript(unittest.TestCase):
@@ -136,6 +157,28 @@ function run() { OUT.R = R; return JSON.stringify(OUT); }
         self.assertIn("Feed the koi", r["care"])
         self.assertEqual(out["posts"], [["/api/home/koi/water", {}]])
         self.assertEqual(out["gets"], ["/api/home/koi", "/api/home/koi"])
+
+    def test_a_water_test_posts_only_the_reading(self):
+        script = (STAND_IN + MARKUP_JS + f"\nconst DOC = {json.dumps(self.DOC)};\n" + r"""
+DOC.water.unlogged = 0;
+window.shell = { getJSON: p => { OUT.gets.push(p); return Promise.resolve(JSON.parse(JSON.stringify(DOC))); },
+  post: (p, b) => { OUT.posts.push([p, b]); return Promise.resolve({ tests: 1 }); }, toast: m => OUT.toasts.push(m), itemHref: n => '/tasks?row=' + n };
+function FormData(f) { this.get = k => f.values[k]; this.entries = () => Object.entries(f.values); }
+const flush = () => new Promise(r => r()).then(() => null).then(() => null).then(() => null).then(() => null);
+""" + KOI_JS + r"""
+var R = {};
+(async () => { try {
+document.dispatchEvent(new CustomEvent('shell:view', { detail: { id: 'koi' } })); await flush();
+const form = { id: 'koi-test-form', values: { ammonia: '0.25', ph: '' } };
+(DOC_LISTENERS.submit || []).forEach(f => f({ target: form, preventDefault() {} })); await flush();
+} catch (e) { OUT.error = String(e) + ' ' + e.stack; } })();
+function run() { return JSON.stringify(OUT); }
+""")
+        result = subprocess.run([OSASCRIPT, "-l", "JavaScript", "-e", script], capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = json.loads(result.stdout)
+        self.assertIsNone(out["error"])
+        self.assertEqual(out["posts"], [["/api/home/koi/test", {"ammonia": 0.25}]])
 
 
 if __name__ == "__main__":

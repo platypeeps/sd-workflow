@@ -113,7 +113,8 @@ keeps it. A plant or tree with an open care task due before today carries the wa
 Koi (pack sd:8054, `home_koi.py`, `home-koi.js`) shares the Map's assets: the pond is the `pond` asset, placed on
 the Map (`fields.volume_gal` sizes a change in gallons), and each fish a `koi` asset with no place: name, variety,
 photo, acquired, health notes and a log of size and weight. Water tests (ammonia, nitrite, nitrate, pH, KH,
-temperature) are logged on the pond. Feeding, filter cleaning, water tests and treatments are recurring care
+temperature) are logged on the pond through `POST /api/home/koi/test`, which appends the reading to the
+pond's current row. A pond saved from a form keeps the `water_log` and `tests` the server wrote. Feeding, filter cleaning, water tests and treatments are recurring care
 tasks on the pond, filed as the Map files them. Water changes come from Home Assistant: the setting row
 `dashboard.koi_water` names each script that changes the water, one `<entity_id>|<percent>` line, and each run
 in Home Assistant's history (it keeps ten days) is one change of that percent. When the history holds a change
