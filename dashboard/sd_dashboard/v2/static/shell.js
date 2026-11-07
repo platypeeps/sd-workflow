@@ -866,16 +866,19 @@
   function confirmAction({ title, body: text = '', cli = '', ok = 'Confirm', keep = 'Keep it', danger = true, fields = [] }) {
     let from = null;
     const line = v => typeof cli === 'function' ? cli(v) : cli;
+    // sd:8014: a body may follow the fields, as the CLI line does: the bulk Decline names the rows the typed values move.
+    const say = v => typeof text === 'function' ? text(v) : text;
     return new Promise(done => {
       put(confirmDlg, html`<form method="dialog" class="confirm-body">
-        <h2 id="confirm-h">${title}</h2>${CLOSE_X}${text ? html`<p>${text}</p>` : ''}
+        <h2 id="confirm-h">${title}</h2>${CLOSE_X}${say({}) ? html`<p id="confirm-said">${say({})}</p>` : ''}
         ${fields.map(fieldOf)}
         ${line({}) ? html`<div class="cli"><code id="confirm-cli">${line({})}</code></div>` : ''}
         <div class="actions"><button class="btn quiet" value="no" formnovalidate data-cancel>${keep}</button><button class="btn${danger ? ' danger' : ''}" value="yes">${ok}</button></div></form>`);
       const f = confirmDlg.querySelector('form'), yes = f.querySelector('[value="yes"]');
       const values = () => Object.fromEntries(fields.map(x => [x.name, f.elements[x.name].value.trim()]));
       const filled = () => fields.every(x => !x.required || values()[x.name]);
-      const show = () => { const c = f.querySelector('#confirm-cli'); if (c) c.textContent = line(values()); yes.disabled = !filled(); };
+      const show = () => { const c = f.querySelector('#confirm-cli'), b = f.querySelector('#confirm-said');
+        if (c) c.textContent = line(values()); if (b) b.textContent = say(values()); yes.disabled = !filled(); };
       if (fields.length) {
         f.addEventListener('input', show); show();
         f.addEventListener('keydown', e => { if (e.key !== 'Enter' || e.isComposing || e.target.tagName !== 'INPUT') return; e.preventDefault(); if (!yes.disabled) f.requestSubmit(yes); });
@@ -908,7 +911,7 @@
     const fields = c.fields ? c.fields(o) : [];
     if (c.previews || (c.risk !== 'confirm' && !asksFirst(c, o) && !fields.length)) return go();
     const act = actOf(c, o);
-    confirmAction({ title: `${act}: ${o.label}?`, body: c.consequence ? c.consequence(o) : '', cli: v => { const s = cliOf(c, o, v); return noCli(s) ? '' : s; }, ok: act, keep: /^cancel\b/i.test(act) ? 'Keep it' : 'Cancel', danger: c.danger ? !!c.danger(o) : c.risk === 'confirm', fields })
+    confirmAction({ title: `${act}: ${o.label}?`, body: c.consequence ? v => c.consequence(o, v) : '', cli: v => { const s = cliOf(c, o, v); return noCli(s) ? '' : s; }, ok: act, keep: /^cancel\b/i.test(act) ? 'Keep it' : 'Cancel', danger: c.danger ? !!c.danger(o) : c.risk === 'confirm', fields })
       .then(({ yes, from, values }) => { if (!yes) return; go(values); const a = document.activeElement; if (!a || a === body) refocus(from); });
   }
 

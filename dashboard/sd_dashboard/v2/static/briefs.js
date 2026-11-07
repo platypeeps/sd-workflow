@@ -149,7 +149,7 @@ addEventListener('DOMContentLoaded', () => {
       : !recorded.length ? 'No brief records its signal topics yet (pack sd:5798), so signal is not recorded, never quiet.'
       : unrecorded ? `${plural(unrecorded, 'brief')} in range ${unrecorded === 1 ? 'records' : 'record'} no signal topics; ${unrecorded === 1 ? 'it counts' : 'they count'} as not recorded, never as quiet.` : '';
     put(document.getElementById('topic-note'), html`${note}`);
-    shell.view.count('topics', rows.length);
+    shell.view.count('topics', rows.filter(t => t.stage !== 'retired').length);  // sd:8018: open topics only
   }
 
   // ---------- Filters ----------

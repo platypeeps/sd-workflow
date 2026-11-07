@@ -1211,6 +1211,15 @@ class TheFiledView(Script):
         self.assertIn("GitHub sync never", out["R"]["source"])
         self.assertIn("1 Jira ticket: whether you filed it is not synced yet", out["R"]["source"])
 
+    def test_the_filed_tab_counts_open_rows_only(self):
+        """sd:8018: a closed or merged filed row stays listed but leaves the tab's count."""
+        self.filed_doc()
+        self.doc["filed"]["rows"][0]["state"] = "closed"
+        self.doc["filed"]["rows"][1]["state"] = "merged"
+        out = self.run_page("window.shell.view.show('filed'); R.rows = ELS['filed-rows'].html;")
+        self.assertEqual(len(re.findall(r'<tr data-id=', out["R"]["rows"])), 3)
+        self.assertEqual(out["counts"]["filed"], 1, "sd:8018: the tab counted a closed row")
+
     def test_details_show_a_filed_ticket_and_edit_opens_it_in_a_new_tab(self):
         self.filed_doc()
         key = "filed:jira:" + JIRA + "ABC-1"

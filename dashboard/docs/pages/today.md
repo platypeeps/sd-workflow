@@ -14,6 +14,8 @@ A row whose problem reads otherwise shows again before its time.
 Your work lists the items `sd today` lists, from the same `/api/now` document; each row has the same Snooze,
 keyed `today:item:<id>`, and the item shows again early when its status or due date changes (sd:3271).
 `sd today` still lists a snoozed item.
+The decision queues are one queued Needs you line (sd:8013, `now_screen.triage_rows`): how many store rows wait
+in Blog Ideas, Tips, Market Watch and Topics, each a link to the page that decides it. It is apart from Decisions.
 Retry on a failed or interrupted job posts `/api/jobs/<job>/retry` with the job's revision from the same read, as
 Management does (sd:3386); a job that changed since is refused and Now is read again.
 After exit 127, command not found, Retry asks first and names the exit (sd:3392).

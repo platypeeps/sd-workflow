@@ -51,6 +51,11 @@
 /* pack sd:7773: with tiles the vault column has three rows; the tiles took the 1fr row and pushed the ideas down. */
 .col.vault:has(> .idea-areas) { grid-template-rows: auto auto minmax(0, 1fr); }
 .col.vault .idea-areas .fseg { flex-wrap: wrap; }
+/* sd:8014: each vault queue's bulk Decline and its Declined filter, then the declined rows while it is pressed. */
+.col.vault .queue-tools { display: flex; flex-wrap: wrap; gap: var(--space-xs); padding: 0 var(--space-xs) var(--space-xs); }
+.col.vault .declined { margin: 0; padding: 0 var(--space-xs); list-style: none; font-size: var(--text-xs); }
+.col.vault .declined li { padding: 2px 0; border-bottom: var(--rule-hair) solid var(--color-rule); }
+.col.vault .declined + .why { padding: 0 var(--space-xs); font-size: var(--text-2xs); color: var(--color-ink-2); }
 .tag { display: inline-block; padding: 0 4px; border: var(--rule-hair) solid var(--color-rule); border-radius: var(--radius-sm); font: 500 var(--text-2xs)/1.4 var(--font-label); letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-ink-2); }
 
 /* Gate lamps: four fixed positions, D R F A. Glyph carries state; colour reinforces it. */

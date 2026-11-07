@@ -186,6 +186,74 @@ class TheHeartbeat(Bases, ScreenCase):
         self.assertEqual((row["state"], row["facts"]["Kinds"]), ("ok", "blog-idea"))
 
 
+class TheBulkDecline(Bases, ScreenCase):
+    """sd:8014: the bulk Decline moves the stale inbox rows the page showed to declined, by the operator's click alone,
+    and the declined rows stay listed with when and by which control."""
+
+    def seed(self, title, score, created):
+        return create_item(self.connection, kind="idea", title=title, status="planning", source="vault",
+                           external_id=f"blog-idea:{BASE}/{title}.md", path=f"{BASE}/{title}.md", stage="inbox",
+                           fields={"kind": "blog-idea", "score": score, "dateCreated": created}, created_at=created)
+
+    def setUp(self):
+        super().setUp()
+        from datetime import date
+
+        self.low = self.seed("Low and old", "3", "2026-01-02")
+        self.unscored = self.seed("Unscored and old", None, "2026-01-03")
+        self.high = self.seed("High and old", "8", "2026-01-04")
+        self.fresh = self.seed("Low and new", "2", date.today().isoformat())
+
+    def test_the_pool_lists_each_waiting_row_with_its_score_age_and_revision(self):
+        from sd_dashboard import triage
+
+        pool = {row["title"]: row for row in triage.pool(self.connection, "blog-idea", now=NOW)}
+        self.assertEqual(set(pool), {"An idea", "Low and old", "Unscored and old", "High and old", "Low and new"})
+        self.assertEqual((pool["Low and old"]["score"], pool["Low and old"]["age"]), (3.0, 247))
+        self.assertEqual(pool["Low and old"]["revision"], workflow.item_state(self.connection, self.low)["revision"])
+
+    def test_decline_moves_the_matching_rows_refuses_the_rest_and_lists_them_declined(self):
+        from sd_dashboard import triage
+
+        shown = [self.low, self.unscored, self.high, self.fresh]
+        items = [{"item": n, "revision": workflow.item_state(self.connection, n)["revision"]} for n in shown]
+        out = triage.decline({"kind": "blog-idea", "score": 6, "days": 30, "items": items}, "local")(self.connection)
+        self.assertEqual(out["declined"], [self.low, self.unscored])
+        self.assertEqual([row["item"] for row in out["refused"]], [self.high, self.fresh])
+        stages = {n: workflow.item_state(self.connection, n)["item"]["stage"] for n in shown}
+        self.assertEqual(stages, {self.low: "declined", self.unscored: "declined", self.high: "inbox", self.fresh: "inbox"})
+        listed = triage.declined(self.connection, "blog-idea")
+        self.assertEqual({row["item"] for row in listed}, {self.low, self.unscored})
+        self.assertEqual({row["by"] for row in listed}, {"bulk Decline (score below 6, older than 30 days)"})
+        self.assertTrue(all(row["at"] for row in listed))
+
+    def test_a_row_that_moved_since_the_page_read_it_is_refused(self):
+        from sd_dashboard import triage
+
+        out = triage.decline({"kind": "blog-idea", "score": 6, "days": 30, "items": [{"item": self.low, "revision": "0" * 64}]},
+                             "local")(self.connection)
+        self.assertEqual((out["declined"], [row["item"] for row in out["refused"]]), ([], [self.low]))
+        self.assertEqual(workflow.item_state(self.connection, self.low)["item"]["stage"], "inbox")
+
+    def test_a_malformed_post_is_refused_before_any_write(self):
+        from sd_dashboard import triage
+
+        for payload in ({"kind": "topic", "score": 6, "days": 30, "items": [{"item": 1, "revision": "r"}]},
+                        {"kind": "blog-idea", "score": "nan", "days": 30, "items": [{"item": 1, "revision": "r"}]},
+                        {"kind": "blog-idea", "score": 6, "days": 30.5, "items": [{"item": 1, "revision": "r"}]},
+                        {"kind": "blog-idea", "score": 6, "days": 30, "items": []}):
+            with self.assertRaises(ValueError):
+                triage.decline(payload, "local")
+
+    def test_the_route_is_a_writing_page_write(self):
+        from sd_dashboard.v2.pages import writing
+
+        route = next(api for api in writing.PAGE.api if api.path == "/api/triage/decline")
+        items = [{"item": self.low, "revision": workflow.item_state(self.connection, self.low)["revision"]}]
+        out = route.write({"kind": "blog-idea", "score": 6, "days": 30, "items": items}, "local")(self.connection)
+        self.assertEqual(out["declined"], [self.low])
+
+
 class TheScriptForBases(Bases, ScreenCase):
     """tasks.js with a base row: the Base filter, the Stage and Score columns, and the stage select."""
 
