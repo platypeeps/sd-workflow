@@ -60,6 +60,24 @@ BRANCH_FIELDS = frozenset({"branch"})
 #: `sd writing park`, which also moves its file.
 PARK_FIELDS = frozenset({"parked_at"})
 
+#: `area`, an item's own place (pack sd:8010): `home` or `hoa`, kept as
+#: `item.fields.area` rather than a column. The dashboard's `places.area_of`
+#: reads it ahead of the repository rule, so a vault task can sit in Home
+#: alone. `edit_item` sets and clears it; `item_area` reads it.
+AREA_FIELDS = frozenset({"area"})
+AREAS = ("home", "hoa")
+
+
+def item_area(item: Any) -> str | None:
+    """An item row's own area, `fields.area`, or None: no fields, unreadable
+    fields, or a value that is not one of `AREAS` (pack sd:8010)."""
+    try:
+        fields = json.loads(item["fields"] or "{}")
+    except (TypeError, ValueError, RecursionError):
+        return None
+    area = fields.get("area") if isinstance(fields, dict) else None
+    return area if isinstance(area, str) and area in AREAS else None
+
 #: The item kinds a person may set by hand: the four the pack's `sd task add`
 #: files (`ADD_KINDS`, `bin/sd_work.py`), for the reason that list gives. Each
 #: other kind in `item.kind`'s CHECK has a producer -- `report` the job that
@@ -242,7 +260,7 @@ def schema_kinds(connection: sqlite3.Connection) -> tuple[str, ...]:
 def _fields(connection: sqlite3.Connection, changes: dict) -> dict:
     if not isinstance(changes, dict) or any(not isinstance(key, str) for key in changes):
         raise WorkflowError("changes must be an object with named fields")
-    unknown = set(changes) - USER_FIELDS - RECURRENCE_FIELDS - BRANCH_FIELDS - PARK_FIELDS
+    unknown = set(changes) - USER_FIELDS - RECURRENCE_FIELDS - BRANCH_FIELDS - PARK_FIELDS - AREA_FIELDS
     if unknown:
         raise WorkflowError(f"fields cannot be edited here: {', '.join(sorted(unknown))}")
     result = dict(changes)
@@ -255,6 +273,9 @@ def _fields(connection: sqlite3.Connection, changes: dict) -> dict:
             result["parked_at"] = stamp(result["parked_at"])
         except SdDbError as error:
             raise WorkflowError(f"parked_at must be an aware timestamp or null: {error}") from None
+    if "area" in result and result["area"] is not None and (
+            not isinstance(result["area"], str) or result["area"] not in AREAS):
+        raise WorkflowError(f"area must be {' or '.join(AREAS)}, or null")
     if "title" in result:
         result["title"] = _text(result["title"], "title")
     if "body" in result:
@@ -496,6 +517,7 @@ def edit_item(
             raise WorkflowError("a writing piece parks and revives through its own park control, "
                                 "which moves its file")
         values = _park(item, row, values)
+        values = _area(item, row, values)
         if "body" in values and row["kind"] not in ("task", "followup"):
             raise WorkflowError("body text can only be edited here for task and followup items")
         if "repo" in values and row["kind"] == "work" and values["repo"] != row["repo"]:
@@ -520,11 +542,36 @@ def edit_item(
                 lines.append(f"Changed kind {row['kind']} -> {changed['kind']} by {who}")
             if "parked_at" in changed:
                 lines.append(f"{'Unparked' if changed['parked_at'] is None else 'Parked'} by {who}")
-            fields = sorted(set(changed) - {"kind", "parked_at"})
+            # `fields` carries `area` alone here (`_area`), so the note names the area.
+            fields = sorted({"area" if key == "fields" else key for key in changed} - {"kind", "parked_at"})
             if fields:
                 lines.append(f"Updated {', '.join(fields)} by {who}")
             add_note(connection, item, "comment", "\n".join(lines), session=who)
         return item_state(connection, item)
+
+
+def _area(item: int, row: Any, values: dict) -> dict:
+    """`values` with `area` turned into the row's `fields`, that key set or
+    dropped and every other key kept (pack sd:8010); refused on fields that do
+    not read as an object, which a write would lose."""
+    if "area" not in values:
+        return values
+    values = dict(values)
+    area = values.pop("area")
+    try:
+        fields = json.loads(row["fields"] or "{}")
+    except (TypeError, ValueError, RecursionError):
+        fields = None
+    if not isinstance(fields, dict):
+        raise WorkflowError(f"item {item} has unreadable fields; its area cannot be set here")
+    if fields.get("area") == area or (area is None and "area" not in fields):
+        return values  # no change: no write, no note, the revision holds
+    if area is None:
+        del fields["area"]
+    else:
+        fields["area"] = area
+    values["fields"] = json.dumps(fields, sort_keys=True) if fields else None
+    return values
 
 
 def _park(item: int, row: Any, values: dict) -> dict:
@@ -773,8 +820,8 @@ def _next_occurrence(connection: sqlite3.Connection, row: dict, *, who: str) -> 
     Called inside `change_status`'s transaction, after the completion. The
     new row copies what the obligation is -- kind, title, body, priority,
     repository -- and not what one instance of it carried: `branch`, `path`
-    and the producer-owned `fields`. The rule, its anchor and its lead move
-    together (pack sd:5648): the lead is copied as stored, since a read treats
+    and the producer-owned `fields`, all but the area (pack sd:8010). The
+    rule, its anchor and its lead move together (pack sd:5648): the lead is copied as stored, since a read treats
     a value `_fields` would refuse as open rather than hiding the row.
     Clearing the rule on the completed row is what makes a reopen and a
     second completion spawn nothing.
@@ -819,6 +866,9 @@ def _next_occurrence(connection: sqlite3.Connection, row: dict, *, who: str) -> 
     )
     if row["body"] is not None:
         set_item_fields(connection, spawned, body=row["body"])
+    if (area := item_area(row)) is not None:
+        # The area is the operator's, not the producer's: it recurs (pack sd:8010).
+        set_item_fields(connection, spawned, fields={"area": area})
     set_item_fields(connection, row["id"], **CLEARED)
     add_note(connection, row["id"], "comment",
              f"Next occurrence: item {spawned}, due {due} ({rule.text()}, {anchor}-anchored) by {who}",

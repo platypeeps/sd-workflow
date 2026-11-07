@@ -9,7 +9,8 @@ are the same `tasks_screen._rows` (sd:5671).
 **Which rows are an area's.**
 
 - An item is HOA when its repo is the hoa checkout (`hoa_screen.checkout`), and Home when it has no repo: the
-  operator files personal and home items without one. A report is in neither: its family's Reports view holds it.
+  operator files personal and home items without one. An item's own area, `fields.area` (`sd task edit N --area
+  home|hoa`, pack sd:8010), wins: it puts the item in that area alone, out of every realm. A report is in neither: its family's Reports view holds it.
   `area_of` is that rule, and Tasks' rows carry its answer as `area`, so Tasks' HOA and Home realms hold the place
   pages' Tasks rows.
 - A brief is the area's when its repo is the area's checkout, or its series, lower-cased with spaces as hyphens, is a
@@ -149,14 +150,17 @@ def report_realm(job: str | None, basis: str | None, rules: list | None, hoa: st
     return next((family["key"] for family in families if family["key"] in ids and job in family["jobs"]), "personal")
 
 
-def area_of(repo: str | None, kind: str, hoa: str | None) -> str | None:
-    """The area an item belongs to: `hoa` for the hoa checkout's, `home` for one with no repo, else None.
+def area_of(repo: str | None, kind: str, hoa: str | None, own: str | None = None) -> str | None:
+    """The area an item belongs to: its own area `own` (`fields.area`, `workflow.item_area`, pack sd:8010) when it has
+    one, else `hoa` for the hoa checkout's, `home` for one with no repo, else None.
 
     A report is in no area's Tasks: the area's Reports view lists it by its job. Both paths have `~` expanded, as
     `realm_of` expands it, so a row stored as `~/...` against an absolute registered path is still HOA's (sd:7707).
     """
     if kind == "report":
         return None
+    if own:
+        return own
     if not repo:
         return "home"
     return "hoa" if hoa is not None and os.path.expanduser(repo) == os.path.expanduser(hoa) else None
@@ -178,13 +182,14 @@ def _hoa(connection) -> tuple[str | None, str]:
 
 
 def _place(connection, area: str):
-    """`owns(repo, kind)`, whether a row is the place's, or None; why it is None; and whether that is a read that failed.
-    HOA and Home are `area_of`'s; any other area is a realm of `realms`, and owns what `realm_of` gives it."""
+    """`owns(repo, kind, own=None)`, whether a row is the place's, or None; why it is None; and whether that is a read
+    that failed. `own` is an item's own area (pack sd:8010): HOA and Home are `area_of`'s, so it puts the item there
+    alone; any other area is a realm of `realms`, and owns what `realm_of` gives a row with no area of its own."""
     if area == "home":
-        return lambda repo, kind: area_of(repo, kind, None) == "home", "", False
+        return lambda repo, kind, own=None: area_of(repo, kind, None, own) == "home", "", False
     if area == "hoa":
         hoa, why = _hoa(connection)
-        return None if hoa is None else (lambda repo, kind: area_of(repo, kind, hoa) == "hoa"), why, False
+        return None if hoa is None else (lambda repo, kind, own=None: area_of(repo, kind, hoa, own) == "hoa"), why, False
     found = realms(connection)
     if found["state"] == "error":
         return None, f"realms {found['problems'][0]}", True
@@ -194,7 +199,7 @@ def _place(connection, area: str):
         named = "no realms are set" if found["state"] == "missing" else f"{found['source']} names no realm {area}"
         return None, f"not configured: {named}; {line}", False
     hoa = _hoa(connection)[0]
-    return lambda repo, kind: realm_of(repo, kind, found["list"], hoa) == area, "", False
+    return lambda repo, kind, own=None: not own and realm_of(repo, kind, found["list"], hoa) == area, "", False
 
 
 def _family(connection, area: str, config: Path | None) -> tuple[list[str] | None, str, bool]:
@@ -218,17 +223,21 @@ def _unknown(now: str, area: str, reason: str, **more) -> dict:
     return {"read": now, "area": area, "state": "unknown", "reason": reason, "rows": [], **more}
 
 
-def task_rows(connection, owns, *, now: str, repo: str | None = None) -> tuple[list[dict], list[dict]]:
-    """The open rows and the week's done rows `owns(repo, kind)` places, as the Tasks page's rows (`tasks_screen._rows`).
+def task_rows(connection, owns, *, now: str) -> tuple[list[dict], list[dict]]:
+    """The open rows and the week's done rows `owns(repo, kind, own)` places, as the Tasks page's rows
+    (`tasks_screen._rows`); `own` is the row's own area (`workflow.item_area`, pack sd:8010).
 
-    Both are `reads.backlog_items`' unparked rows (`repo` narrows the read), so done is bounded as on Tasks: done within
+    Both are `reads.backlog_items`' unparked rows, every repo's, since an item's own area places it whatever its repo;
+    so done is bounded as on Tasks: done within
     the week. A scheduled occurrence waits until it opens (sd:5670). The caller holds the snapshot. sd:5752: the done
     rows are a place's All view, and a row Done moved there stays a command object, so its Undo finds it.
     """
+    from sd_db.workflow import item_area
+
     from .tasks_screen import _rows, is_scheduled
 
-    found = [row for row in reads.backlog_items(connection, now=now, **({"repo": repo} if repo is not None else {}))
-             if not is_scheduled(row) and owns(row["repo"], row["kind"])]
+    found = [row for row in reads.backlog_items(connection, now=now)
+             if not is_scheduled(row) and owns(row["repo"], row["kind"], item_area(row))]
     rows = _rows(connection, found, realms(connection), now=now)
     return [row for row in rows if row["status"] != "done"], [row for row in rows if row["status"] == "done"]
 

@@ -13,7 +13,8 @@ named, its cells and charts are unknown with that reason, and the other parts
 still answer. The trends carry every row of the export: 7d, 30d, 6m, 1y or All. Mission data is
 caution when the newest row is more than two days old (`STALE_DAYS`). Alarms
 today is unknown until the export holds a row for today. The Tasks cell and the
-Tasks view hold the checkout's open items of every kind but report (sd:4959):
+Tasks view hold the checkout's open items of every kind but report (sd:4959),
+and any item tagged hoa with `sd task edit N --area hoa` (pack sd:8010), less one tagged home:
 overdue is a warning, due within a week is caution (`SOON_DAYS`), the rest are
 queued. Water has no reader: the export holds daily rows, not the pump's state now.
 

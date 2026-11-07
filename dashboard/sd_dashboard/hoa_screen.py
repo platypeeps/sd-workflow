@@ -462,7 +462,8 @@ def _lots(path: Path | None, base: Path | None, features: list[dict]) -> dict:
 
 
 def _items(connection, repo: str | None, now: str, today: date) -> dict:
-    """The checkout's open items of every kind, ranked: overdue, then due within a week, then the rest; priority breaks
+    """The checkout's open items of every kind, and any other whose own area is hoa (pack sd:8010), less any whose
+    own area is home; ranked: overdue, then due within a week, then the rest; priority breaks
     ties. A report is its family's (`places.area_of`), so it is not here (sd:4959). Each is the Tasks page's row
     (`tasks_screen._rows`, read in one snapshot as `places.tasks` reads it), so its Details on HOA are the Tasks page's
     (sd:5671), with its revision, moves, edit capability and issue targets; HOA adds `due_days` and `state`. `done` holds
@@ -473,7 +474,8 @@ def _items(connection, repo: str | None, now: str, today: date) -> dict:
     if repo is None:
         return {"error": "no checkout: no repo named hoa is registered", "rows": [], "done": []}
     with _one_snapshot(connection):
-        rows, done = task_rows(connection, lambda path, kind: area_of(path, kind, repo) == "hoa", now=now, repo=repo)
+        # pack sd:8010: an item of another checkout whose own area is hoa is HOA's too, so every repo's rows are read.
+        rows, done = task_rows(connection, lambda path, kind, own=None: area_of(path, kind, repo, own) == "hoa", now=now)
     for row in rows + done:
         try:
             due = (_day(row["due"]) - today).days if row["due"] else None

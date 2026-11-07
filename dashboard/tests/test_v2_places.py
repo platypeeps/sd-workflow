@@ -126,6 +126,32 @@ class Tasks(Fixture):
         self.assertEqual(hoa, self.ids(places.tasks(self.connection, "hoa", now=NOW)))
         self.assertEqual({r["id"]: r["area"] for r in rows if r["id"] == self.other_item}, {self.other_item: None})
 
+    def tag(self, item, area):
+        workflow.edit_item(self.connection, item, {"area": area}, who="test")
+
+    def test_an_items_own_area_puts_it_on_that_place_alone_whatever_its_repo(self):
+        """pack sd:8010: a vault task tagged home is Home's, not its realm's; one tagged hoa is HOA's, on the HOA page
+        too; an hoa checkout task tagged home leaves HOA; untagged rows keep the repo rule."""
+        vault = self.repo("/repos/vault")
+        upkeep = self.item("Flush the water heater", kind="task", repo=vault)
+        gate = self.item("Paint the gate", kind="task", repo=vault)
+        stays = self.item("Plan the trip", kind="task", repo=vault)
+        self.tag(upkeep, "home")
+        self.tag(gate, "hoa")
+        self.tag(self.hoa_item, "home")
+        self.assertEqual(self.ids(places.tasks(self.connection, "home", now=NOW)),
+                         sorted([self.home_item, upkeep, self.hoa_item]))
+        self.assertEqual(self.ids(places.tasks(self.connection, "hoa", now=NOW)), [gate])
+        hoa = sorted(r["id"] for r in hoa_screen.document(self.connection, now=NOW)["items"]["rows"])
+        self.assertEqual(hoa, [gate])
+        rows = {r["id"]: r for r in tasks_screen.document(self.connection, now=NOW)["rows"]}
+        self.assertEqual([(rows[i]["area"], rows[i]["area_set"]) for i in (upkeep, gate, self.hoa_item, stays, self.home_item)],
+                         [("home", True), ("hoa", True), ("home", True), (None, False), ("home", False)])
+        realms = self.dir / "realms.conf"
+        realms.write_text("realm|acme|Acme|/repos/*\n", encoding="utf-8")
+        with mock.patch.object(places, "REALMS_CONFIG", realms):
+            self.assertEqual(self.ids(places.tasks(self.connection, "acme", now=NOW)), sorted([stays, self.other_item]))
+
     def test_a_places_tasks_rows_are_the_tasks_pages_rows(self):
         # sd:5635: a Tasks row's Details on Home, HOA and a realm place are the Tasks page's own, so the view lists the
         # /api/tasks rows (tasks_screen._rows), with the revision, allowed moves, edit capability and issue targets.
@@ -1241,6 +1267,24 @@ for (const v of ['work', 'hoa', 'home', 'personal']) { await realm(v); R[v] = EL
         self.assertEqual(out["counts"], {"personal": 2, "work": 1, "hoa": 2, "home": 1})
         self.assertEqual(r["urls"], ["view=board"] * 5)
 
+    def test_a_vault_task_with_its_own_home_area_sits_in_home_alone(self):
+        """pack sd:8010: a vault task tagged home (`sd task edit N --area home`) shows under Home and in no Personal or
+        realm tab; an untagged vault task stays in Personal, and the row with no repo stays in Personal and Home."""
+        vault = self.repo("/repos/vault")
+        upkeep = self.item("Flush the water heater", kind="task", repo=vault)
+        self.item("Plan the trip", kind="task", repo=vault)
+        work = self.item("Tag the work task", kind="task", repo=self.other)
+        workflow.edit_item(self.connection, upkeep, {"area": "home"}, who="test")
+        workflow.edit_item(self.connection, work, {"area": "home"}, who="test")
+        self.doc, self.details = self.realm_doc(), {}
+        out = self.run_tasks("for (const v of ['personal', 'work', 'hoa', 'home']) { await realm(v); R[v] = ELS['view-board'].html; }")
+        r, titles = out["R"], ("Flush the water heater", "Plan the trip", "Clean the gutters", "Tag the work task")
+        self.assertEqual([t in r["personal"] for t in titles], [False, True, True, False])
+        self.assertEqual([t in r["work"] for t in titles], [False, False, False, False])
+        self.assertEqual([t in r["hoa"] for t in titles], [False, False, False, False])
+        self.assertEqual([t in r["home"] for t in titles], [True, False, True, True])
+        self.assertEqual(out["counts"], {"personal": 3, "work": 1, "hoa": 2, "home": 3})
+
     def test_an_address_or_an_older_link_lands_on_its_realm(self):
         """Metrics and Today link /tasks?...&realm=all, and a bookmark may hold #view=hoa or #view=home. pack sd:7216: the
         All tab is gone: ?realm=all still lists every realm, and #view=all opens Personal, the address saying #view=personal."""
@@ -1460,6 +1504,15 @@ class TheRule(unittest.TestCase):
         self.assertEqual(places.area_of("~/repos/hoa", "task", home), "hoa")
         self.assertEqual(places.area_of(home, "task", "~/repos/hoa"), "hoa")
         self.assertIsNone(places.area_of("~/repos/hoa-two", "task", home))
+
+    def test_an_items_own_area_wins_over_the_repo_rule_and_a_report_stays_in_none(self):
+        """pack sd:8010: `own` is the item's `fields.area`; it places the row whatever its repo, a report excepted."""
+        self.assertEqual(places.area_of("/repos/vault", "task", "/repos/hoa", "home"), "home")
+        self.assertEqual(places.area_of("/repos/hoa", "task", "/repos/hoa", "home"), "home")
+        self.assertEqual(places.area_of("/repos/vault", "followup", None, "hoa"), "hoa")
+        self.assertEqual(places.area_of(None, "task", None, "hoa"), "hoa")
+        self.assertIsNone(places.area_of("/repos/vault", "report", "/repos/hoa", "home"))
+        self.assertEqual(places.area_of(None, "task", None, None), "home")
 
     def test_a_series_names_a_job_lower_cased_with_hyphens(self):
         self.assertEqual(places.series_job("HOA Morning Digest"), "hoa-morning-digest")

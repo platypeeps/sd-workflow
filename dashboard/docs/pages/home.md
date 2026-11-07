@@ -78,7 +78,9 @@ answer holds none. Good night is such a tile; its entity id is in the tile list.
 Views (`places.js`, `places.py`): Overview is the page above; Tasks, Briefs and
 Reports each read their own document, `GET /api/home/tasks`, `/briefs` and
 `/reports`, only when shown, and the address keeps the view as `#view=<id>`.
-Tasks are the open items with no repo: personal and home items have none; Tasks under Realm Home holds the same rows. A report is in no Tasks realm. A brief is home's when its series, lower-cased with spaces as hyphens,
+Tasks are the open items with no repo: personal and home items have none; and any item tagged home with `sd task edit N
+--area home` (pack sd:8010), whatever its repo, which leaves Personal and its realm tab. Tasks under Realm Home holds
+the same rows. A report is in no Tasks realm. A brief is home's when its series, lower-cased with spaces as hyphens,
 names a job of the `home` family in `dashboard.report_families`; a report
 is home's when its job is in that family. A missing checkout, family or file
 makes the view unknown with the reason and the line to add, never an empty list.

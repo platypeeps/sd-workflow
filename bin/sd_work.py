@@ -249,6 +249,12 @@ def _edit_changes(args: argparse.Namespace) -> dict[str, Any]:
         changes["branch"] = args.branch
     if args.clear_branch:
         changes["branch"] = None
+    # pack sd:8010: the item's own area, which the dashboard's Home or HOA tab
+    # holds alone; `edit_item` keeps it in `fields` and refuses another value.
+    if args.area is not None:
+        changes["area"] = args.area
+    if args.clear_area:
+        changes["area"] = None
     # The field `add` sets and nothing could change afterwards. It is not in
     # the loop above because the flag carries a path and the row carries a
     # checkout; `_belongs_to` is the one step between them, and `edit_item` --
@@ -408,6 +414,16 @@ def _ref(item: Any, repo: Any) -> str:
     return item_ref(item, repo)
 
 
+def _area(row: dict[str, Any]) -> str | None:
+    """The row's own area, `edit --area`'s (pack sd:8010), or None; a row read without `fields` has none."""
+    if not row.get("fields"):
+        return None
+    sd_lib.import_sd_db()
+    from sd_db.workflow import item_area
+
+    return item_area(row)
+
+
 def _print_rows(rows: list[dict[str, Any]], *, moved: bool = False, today: str | None = None) -> None:
     """One line per row, and its checkout, reference and rule; `today` marks a past due date `overdue` (sd:3501)."""
     here = _standing_in(rows)
@@ -421,6 +437,9 @@ def _print_rows(rows: list[dict[str, Any]], *, moved: bool = False, today: str |
             print(line)
         if row.get("ref"):
             print(f"  ref: {row['ref']}")
+        area = _area(row)
+        if area:
+            print(f"  area: {area}")
         if row.get("recurrence"):
             lead = f", shows {row['recurrence_lead']}d early" if row.get("recurrence_lead") else ""
             opens = f" · opens {row['opens_on']}" if row.get("scheduled") else ""
@@ -1604,6 +1623,12 @@ def register(groups: Any, store: Any) -> None:
                               help="record the branch the item lives on; the build records one too")
     branch_group.add_argument("--clear-branch", action="store_true",
                               help="clear a stale branch name; an in_progress item takes --branch instead")
+    area = edit.add_mutually_exclusive_group()
+    area.add_argument("--area", choices=("home", "hoa"),
+                      help="show the item only in the dashboard's Home or HOA tab, whatever its "
+                           "checkout; not in Personal or a realm tab")
+    area.add_argument("--clear-area", action="store_true",
+                      help="drop the item's own area, so its checkout places it again")
     # `--belongs-to` and not `--repo`: see `_belongs_to`. `--no-repo` is the
     # word `add` already uses for the same idea, so the pair reads the same on
     # both verbs.

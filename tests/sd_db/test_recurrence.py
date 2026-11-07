@@ -27,6 +27,7 @@ from sd_db.workflow import (
     item_state,
     next_occurrence_due,
 )
+from sd_db.writes import set_item_fields
 
 
 def engine():
@@ -264,6 +265,20 @@ class RecurringTasks(unittest.TestCase):
         on_completion = self.complete(completion["id"], "2026-01-22")["next_occurrence"]
         self.assertEqual(self.row(on_schedule)["due"], "2026-01-08")
         self.assertEqual(self.row(on_completion)["due"], "2026-01-29")
+
+    def test_the_next_occurrence_keeps_the_area_and_drops_other_fields(self):
+        # pack sd:8010: a recurring Home or HOA task stays in its area; the
+        # producer-owned fields of one instance still stay behind.
+        for area in ("home", "hoa"):
+            with self.subTest(area=area):
+                item = self.capture(recurrence="FREQ=MONTHLY")
+                set_item_fields(self.db, item["id"], fields={"area": area, "score": 3})
+                spawned = self.complete(item["id"], "2026-01-01")["next_occurrence"]
+                self.assertEqual(json.loads(self.row(spawned)["fields"] or "{}"), {"area": area})
+        plain = self.capture(recurrence="FREQ=MONTHLY")
+        set_item_fields(self.db, plain["id"], fields={"score": 3})
+        spawned = self.complete(plain["id"], "2026-01-01")["next_occurrence"]
+        self.assertIsNone(self.row(spawned)["fields"])
 
     def test_a_completion_anchor_restarts_the_series_at_the_completion(self):
         # The PRD's example: `every 10 days`, completed 2026-03-05, next falls

@@ -1130,7 +1130,7 @@ open({port}); await flush(); R.port = ELS.details.html;""")
         self.details[str(plan)]["experiment"] = {"value": "yes", "row": None, "choices": [], "reason": None}
         out = self.run_page(f"open({plan}); await flush(); R.plan = ELS.details.html; open({port}); await flush(); R.port = ELS.details.html;")
         fields = field_help(out["R"]["plan"]) + field_help(out["R"]["port"])
-        self.assertEqual({name for name, _ in fields}, {"Id", "Title", "Status", "Kind", "Priority", "Due", "Repeat", "Lead", "Repo",
+        self.assertEqual({name for name, _ in fields}, {"Id", "Title", "Status", "Kind", "Priority", "Due", "Repeat", "Lead", "Repo", "Area",
                                                         "Urgent", "Quadrant", "Row", "Assignment"})
         self.assertEqual([name for name, helped in fields if not helped], [])
 
@@ -1206,6 +1206,39 @@ change('det-kind', 'work-idea'); await flush(); R.kind = DOC.rows.find(r => r.id
         self.assertIn(f"#{ask} kind followup → task · sd task edit {ask} --kind task", msgs)
         self.assertIn(f"#{plan} kind task → work-idea, repo cleared · sd task edit {plan} --kind work-idea --no-repo", msgs)
         self.assertEqual(out["R"]["kind"], "work-idea")
+
+    # pack sd:8021: the write sets the row's own area as the reread would (`area_set`, pack sd:8010).
+    AREA_ECHO = """(path, body) => { const row = DOC.rows.find(r => path.startsWith('/api/items/' + r.id)); window.WROTE = (window.WROTE || 0) + 1;
+  if ('area' in body) { row.area = body.area; row.area_set = !!body.area; }
+  const item = { id: row.id, status: row.status, priority: row.priority, due: row.due, recurrence: row.recurrence, title: row.title, kind: row.kind, repo: row.repo_path };
+  return [200, { item, notes: [], revision: String(window.WROTE % 10).repeat(64) }]; }"""
+
+    def test_the_area_field_asks_first_then_sets_or_clears_the_items_own_area(self):
+        """pack sd:8021: Task Details' Area select (Home / HOA / none) writes what `sd task edit --area` and
+        `--clear-area` write, each only after a confirm; a declined confirm writes nothing. Its Undo sets the
+        own area back, not the area the repo rule gives."""
+        plan = self.ids["plan"]
+        self.row("plan").update(area=None, area_set=False)
+        out = self.run_page(self.CHANGE + self.ASKED + f"""var YES = [false, true, true, true];
+open({plan}); await flush(); R.html = ELS.details.html;
+change('det-area', 'home'); await flush(); R.declined = OUT.posts.length;
+change('det-area', 'home'); await flush(); R.set = ELS.details.html;
+await lastUndo().undo(); await flush();
+change('det-area', 'hoa'); await flush(); change('det-area', ''); await flush();""", self.AREA_ECHO)
+        self.assertEqual(self.options(out["R"]["html"], "det-area"),
+                         [("", " selected", "None"), ("home", "", "Home"), ("hoa", "", "HOA")])
+        self.assertEqual(out["R"]["declined"], 0, "a declined confirm wrote nothing")
+        self.assertIn(("home", " selected", "Home"), self.options(out["R"]["set"], "det-area"))
+        bodies = [(p[0], {k: v for k, v in p[1].items() if k != "revision"}) for p in out["posts"]]
+        self.assertEqual(bodies, [(f"/api/items/{plan}", {"area": "home"}), (f"/api/items/{plan}", {"area": None}),
+                                  (f"/api/items/{plan}", {"area": "hoa"}), (f"/api/items/{plan}", {"area": None})])
+        self.assertEqual([a[0] for a in out["asked"]], [f"Area → Home: #{plan}?", f"Area → Home: #{plan}?",
+                                                        f"Area → HOA: #{plan}?", f"Area → none: #{plan}?"])
+        self.assertEqual(out["asked"][0][2], f"sd task edit {plan} --area home")
+        self.assertEqual(out["asked"][3][2], f"sd task edit {plan} --clear-area")
+        msgs = [t[0] for t in out["toasts"]]
+        self.assertIn(f"#{plan} area → Home · sd task edit {plan} --area home", msgs)
+        self.assertIn(f"#{plan} area → none · sd task edit {plan} --clear-area", msgs)
 
     def test_the_kind_changes_the_page_sends_are_ones_edit_item_takes(self):
         """sd:6231: the posts above, through `workflow.edit_item`: a followup becomes a task, and a task with a repo becomes
