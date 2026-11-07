@@ -495,8 +495,8 @@ addEventListener('DOMContentLoaded', () => {
       ? ` · repos in no realm: ${REALMS.state === 'missing' ? 'no realm list; set dashboard.realms on Settings' : `${REALMS.source} ${REALMS.problems[0] || 'was not read'}`}` : '';
     // Personal and Work name their sweep's last run and carry Run sweep (sd:5096, sd:5097).
     const w = SWEEP_NAME[place()] && SWEEPS?.[place()];
-    // Each realm tab carries its tasks (sd:5524), so the line under the title counts none.
-    window.PAGE_VIEWS.forEach(v => window.shell.view.count(v.id, listed().filter(t => inPlace(t, v.id)).length));
+    // Each realm tab carries its open tasks (sd:5524, sd:8018): a done row, cancelled ones too, is listed but not counted.
+    window.PAGE_VIEWS.forEach(v => window.shell.view.count(v.id, listed().filter(t => t.status !== 'done' && inPlace(t, v.id)).length));
     // Open counts as the realm tab does: the listed rows, not the scheduled ones.
     const held = tasks.filter(t => t.parked && inPlace(t)).length;
     put(document.getElementById('parked-seg'), window.shell.aside.buttons('parked', 'Parked', PARKED, { open: placed().length, aside: held }));

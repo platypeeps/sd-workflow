@@ -542,6 +542,13 @@ for (const v of R.views) { VIEW = v; document.dispatchEvent(new CustomEvent('she
                               prelude=realms + "SHELL_REALMS.push({ id: 'hoa', label: 'Hoa2' });\n")["R"]["views"]
         self.assertEqual(taken, [["personal", "Personal"], ["brand", "Brand"], ["work", "Work"], ["hoa", "HOA"]])
 
+    def test_a_realm_tab_counts_open_pieces_only(self):
+        """sd:8018: a published or declined piece leaves the tab's count."""
+        closed = ("DOC.pieces.push(Object.assign({}, DOC.pieces[1], { id: 15, title: 'Out Already', stage: 'published' }),"
+                  " Object.assign({}, DOC.pieces[1], { id: 16, title: 'Said No', stage: 'declined' }));\n")
+        out = self.run_page("", prelude=closed)
+        self.assertEqual(out["counts"]["personal"], 4, "sd:8018: the tab counted a closed piece")
+
     def test_personal_shows_with_no_piece_in_it_and_says_where_the_pieces_are(self):
         # sd:5642: Personal is a tab for personal writing, as on Tasks: it stays when every piece's repo is in a realm line,
         # and its empty board says why, not that no piece is registered.

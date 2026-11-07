@@ -478,8 +478,8 @@ addEventListener('DOMContentLoaded', () => {
   function subhead() {
     const sub = document.getElementById('subhead');
     if (!D) { sub.textContent = 'The pieces were not read.'; return; }
-    // Each realm's tab carries its pieces (sd:5524).
-    (window.PAGE_VIEWS || []).forEach(v => window.shell.view?.count(v.id, (D.pieces || []).filter(p => inRealm(p, v.id)).length));
+    // Each realm's tab carries its open pieces (sd:5524, sd:8018): not a published or declined one.
+    (window.PAGE_VIEWS || []).forEach(v => window.shell.view?.count(v.id, (D.pieces || []).filter(p => !['published', 'declined'].includes(p.stage) && inRealm(p, v.id)).length));
     sub.textContent = `Read ${String(D.read).slice(11, 16)} UTC · ` + (view === 'board' ? 'Pieces by stage.' : 'Focused editor: the draft on the left, its evidence on the right.');
   }
   // Board and Editor are the layout menu Tasks uses (shell.viewPick, sd:5641): one icon button; its menu lists the two.

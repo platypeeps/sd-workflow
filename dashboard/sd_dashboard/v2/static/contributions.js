@@ -230,7 +230,8 @@ addEventListener('DOMContentLoaded', () => {
       : { state: 'unknown', attrs: html` data-cell="github"`, label: 'Settled on GitHub', mark: I('circle-dot'),
         val: html`<span class="ph">not recorded</span> · <span class="ph">this sd records no merge or close dates</span>`, sr: 'state unknown' };
     putKeep(document.getElementById('annunciator'), cells([...LANES.map(lamp), settledLamp]));
-    window.shell.view.count('filed', FILED.length);
+    // The Filed tab counts the open rows (sd:8018); the view still lists the closed and merged ones.
+    window.shell.view.count('filed', FILED.filter(r => !['closed', 'merged'].includes(r.state)).length);
     const unknown = tot('unknown');
     put(document.getElementById('source'), html`<span class="g-${unknown ? 'unknown' : 'ok'}" aria-hidden="true">${GLYPH[unknown ? 'unknown' : 'ok']}</span>
       <button class="linkish" type="button" data-collector>Collector</button>

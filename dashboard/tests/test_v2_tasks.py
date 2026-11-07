@@ -932,6 +932,14 @@ pick('p', ''); R.url2 = OUT.urls[OUT.urls.length - 1];""", search="?kind=task,wo
         self.assertIn("A blog idea", out["R"]["board"])
         self.assertNotIn("Port the page", out["R"]["board"])
 
+    def test_a_realm_tab_counts_open_rows_only(self):
+        """sd:8018: a done row (a cancelled one is done too) stays on the board but leaves the tab's count."""
+        row = self.doc["rows"][0]
+        self.doc["rows"] = [*self.doc["rows"], {**row, "id": 903, "key": "903", "title": "Done this week", "status": "done"}]
+        out = self.run_page("R.board = ELS['view-board'].html;", search="?done=1")
+        self.assertIn("Done this week", out["R"]["board"])
+        self.assertEqual(out["counts"]["personal"], 3, "sd:8018: the tab counted a done row")
+
     def test_ideas_leave_the_rows_and_counts_until_kind_picks_them(self):
         """pack sd:6743: an idea kind shows in the Writing and Vault views only; Kind picks it, as the Vault view."""
         self.assertEqual(self.doc["ideas"], ["idea", "work-idea", "personal-idea"])
