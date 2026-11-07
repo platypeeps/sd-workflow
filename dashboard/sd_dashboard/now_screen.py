@@ -653,23 +653,18 @@ def grill_rows(connection: sqlite3.Connection) -> list[dict]:
              "source": "tasks", "at": row["at"]} for row in found]
 
 
-#: The decision queues (sd:8013, once Tasks' Queues fold, pack sd:7527): each store kind, the stage a person decides,
-#: its name and the page that decides it.
-TRIAGE = (("blog-idea", "inbox", "Blog Ideas", "/writing#ideas"), ("tip", "inbox", "Tips", "/writing#tips"),
-          ("market", "candidate", "Market Watch", "/watches?stage=candidate"),
-          ("topic", "candidate", "Topics", "/briefs#view=topics"))
-
-
 def triage_rows(connection: sqlite3.Connection) -> list[dict]:
-    """The decision queues as one queued Needs you row (sd:8013): how many rows wait in each, each linking its home.
+    """The decision queues (`triage.QUEUES`) as one queued Needs you row (sd:8013): how many rows wait in each, each linking its home.
 
     None waiting raises no row; a read that failed is a dark row, never an empty queue. Today's Decisions (question
     notes) are apart: these are store rows waiting on a stage move.
     """
     from sd_db import records
 
+    from .triage import QUEUES
+
     try:
-        links = [{"label": label, "n": n, "href": href} for kind, stage, label, href in TRIAGE
+        links = [{"label": label, "n": n, "href": href} for kind, stage, label, href in QUEUES
                  if (n := len(records.list_rows(connection, kind, stage=stage)))]
     except (SdDbError, sqlite3.Error, ValueError) as failure:
         return [dark_row("queues", str(failure) or "the decision queues could not be read")]

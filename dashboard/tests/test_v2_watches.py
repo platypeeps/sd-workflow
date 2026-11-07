@@ -108,6 +108,14 @@ class TheDocument(ScreenCase):
         for item in ids.values():
             self.assertEqual(rows[item]["revision"], workflow.item_state(self.connection, item)["revision"])
 
+    def test_the_candidates_pool_and_the_declined_rows_are_read(self):
+        """sd:8014: `pool` holds the candidates the bulk Decline may move; `declined` each declined row's when and by."""
+        ids = seed(self.connection)
+        gone = market(self.connection, "Gone Co", "declined")
+        doc = watches_screen.document(self.connection, now=NOW, jobs=self.jobs)
+        self.assertEqual([(r["item"], r["age"]) for r in doc["pool"]], [(ids["candidate"], 243)])
+        self.assertEqual([r["item"] for r in doc["declined"]], [gone])
+
     def test_the_bound_is_stale_days(self):
         days = watches_screen.STALE_DAYS
         market(self.connection, "Edge", "active", profile((date(2026, 9, 6) - timedelta(days=days)).isoformat()))
@@ -351,6 +359,26 @@ class TheScript(ScreenCase):
         self.assertIn("Maybe Co", r["rows"])
         self.assertNotIn("New Agent", r["rows"])
         self.assertIn('data-v="candidate" aria-pressed="true"', r["filters"])
+
+    def test_the_candidates_have_a_bulk_decline_by_age_that_asks_and_posts(self):
+        """sd:8014: a market row has no score, so the candidates' Decline is by age alone; it asks first."""
+        answer = ("(p, b) => p === '/api/watches' ? [200, " + json.dumps(self.doc) + "]"
+                  " : p === '/api/triage/decline' ? [200, { declined: b.items.map(i => i.item), refused: [], by: 'x' }] : [404, {}]")
+        out = self.run_page("R.filters = ELS.filters.html; shellRun(REG.find(c => c.id === 'queue.decline'), C.get('queue:market')); await flush();",
+                            answer=answer)
+        self.assertIn('data-cmd="queue.decline" data-obj="queue:market">Decline 1 older than 30 days</button>', out["R"]["filters"])
+        self.assertEqual(out["confirms"], ["queue.decline"])
+        candidate = self.doc["rows"][[r["id"] for r in self.doc["rows"]].index(self.ids["candidate"])]
+        self.assertEqual([p[:2] for p in out["posts"]], [["/api/triage/decline", {"kind": "market", "score": 6, "days": 30, "items": [
+            {"item": self.ids["candidate"], "revision": candidate["revision"]}]}]])
+
+    def test_a_declined_watch_says_when_and_by_which_control(self):
+        """sd:8014: the Declined filter lists each declined row with when and by what."""
+        self.doc["rows"].append(dict(self.doc["rows"][0], id=990, title="Dropped Co", stage="declined", fresh="idle"))
+        self.doc["declined"] = [{"item": 990, "title": "Dropped Co", "at": "2026-09-02T10:00:00Z",
+                                 "by": "bulk Decline (older than 30 days)"}]
+        r = self.run_page("R.rows = ELS.rows.html;", search="?stage=declined")["R"]
+        self.assertIn('declined <span class="why">2026-09-02 by bulk Decline (older than 30 days)</span>', r["rows"])
 
     def test_clear_filters_in_the_empty_list_clears_the_search_too(self):
         """sd:6285: the empty state's Clear filters cleared the status only, so a search that matched nothing stayed."""

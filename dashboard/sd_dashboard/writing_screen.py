@@ -109,12 +109,18 @@ def _area(value) -> str:
     return ""
 
 
-def _ideas(connection, kind="blog-idea") -> dict:
-    """The inbox blog ideas, or tips (sd:8013), highest score first, or why they were not read."""
+def _ideas(connection, kind="blog-idea", *, now) -> dict:
+    """The inbox blog ideas, or tips (sd:8013), highest score first, or why they were not read. `pool` is every
+    waiting row with its age and revision and `declined` every declined row with when and by what, for the bulk
+    Decline and its Declined filter (sd:8014)."""
+    from . import triage
+
     try:
         got = read_ideas(connection, kind)
+        pool, declined = triage.pool(connection, kind, now=now), triage.declined(connection, kind)
     except Exception as error:  # noqa: BLE001 - a failed read says its cause, never an empty inbox
-        return {"state": "unknown", "reason": str(error) or type(error).__name__, "count": None, "rows": []}
+        return {"state": "unknown", "reason": str(error) or type(error).__name__, "count": None, "rows": [],
+                "pool": [], "declined": []}
     rows = []
     for row in got:
         fields = row["fields"]
@@ -128,7 +134,7 @@ def _ideas(connection, kind="blog-idea") -> dict:
     for area in areas:
         kept.update(id(idea) for idea in [idea for idea in rows if idea["area"] == area][:IDEAS])
     return {"state": "read", "reason": "", "count": len(rows), "top": IDEAS, "areas": areas,
-            "rows": [idea for idea in rows if id(idea) in kept]}
+            "rows": [idea for idea in rows if id(idea) in kept], "pool": pool, "declined": declined}
 
 
 def document(connection, *, now):
@@ -168,8 +174,8 @@ def document(connection, *, now):
             "adversarial": gates.get("companions", {}).get("adversarial"),
             "mirror": _mirror(row, state["parked"], *mirrored),
         })
-    return {"read": now, "stages": list(writing.STAGES), "pieces": pieces, "attention": _attention(pieces), "ideas": _ideas(connection),
-            "tips": _ideas(connection, "tip"),
+    return {"read": now, "stages": list(writing.STAGES), "pieces": pieces, "attention": _attention(pieces), "ideas": _ideas(connection, now=now),
+            "tips": _ideas(connection, "tip", now=now),
             "realms": {key: found[key] for key in ("state", "source", "problems")}}
 
 

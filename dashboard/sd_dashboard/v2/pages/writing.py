@@ -22,13 +22,20 @@ def _report(read):
     return writing_screen.report(read.connection, read.path)
 
 
+def _decline(payload, principal):
+    from ... import triage
+
+    return triage.decline(payload, principal)
+
+
 PAGE = Page(
     section="Writing",
     routes=("/writing",),
     html="writing.html",
     item="sd:2125",
     api=(Api("/api/writing", _read),
-         Api(pattern=REPORT, example="/api/writing/1/research", read=_report)),
+         Api(pattern=REPORT, example="/api/writing/1/research", read=_report),
+         Api("/api/triage/decline", write=_decline)),
     count="/api/writing",
     live=True,
 )

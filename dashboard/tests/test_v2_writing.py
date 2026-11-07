@@ -183,6 +183,9 @@ class TheDocument(Pieces):
                     ("Declined idea", "blog-idea", "declined", "10", ""),
                     ("A tip", "tip", "inbox", "10", ""))}
         ideas = writing_screen.document(self.connection, now=NOW)["ideas"]
+        pool, declined = ideas.pop("pool"), ideas.pop("declined")
+        self.assertEqual(sorted(r["title"] for r in pool), ["High idea", "Low idea", "Unscored idea"])
+        self.assertEqual([r["title"] for r in declined], ["Declined idea"])
         def row(title, score, url, link):
             return {"item": made[title], "title": title, "score": score, "url": url, "href": link, "created": "2026-10-01", "area": ""}
         self.assertEqual(ideas, {"state": "read", "reason": "", "count": 3, "top": 10, "areas": {"": 3}, "rows": [
@@ -279,7 +282,8 @@ class TheDocument(Pieces):
     def test_a_failed_ideas_read_is_unknown_with_its_reason_and_the_pieces_still_read(self):
         with mock.patch.object(writing_screen, "read_ideas", side_effect=sqlite3.OperationalError("no such column: stage")):
             doc = writing_screen.document(self.connection, now=NOW)
-        self.assertEqual(doc["ideas"], {"state": "unknown", "reason": "no such column: stage", "count": None, "rows": []})
+        self.assertEqual(doc["ideas"], {"state": "unknown", "reason": "no such column: stage", "count": None, "rows": [],
+                                       "pool": [], "declined": []})
         self.assertEqual(len(doc["pieces"]), 2)
 
     def test_a_report_reads_one_piece_file_read_only_up_to_a_bound(self):
@@ -466,6 +470,7 @@ COMMANDS = [
     ["piece.apply-answers", "Apply answers", None, "safe", False],
     ["piece.review", "Refresh review", None, "safe", False],
     ["piece.apply-review", "Apply review", None, "safe", False],
+    ["queue.decline", "Decline", None, "confirm", False],
 ]
 
 SHELL_MORE = r"""
@@ -563,6 +568,43 @@ for (const v of R.views) { VIEW = v; document.dispatchEvent(new CustomEvent('she
         self.assertIn('<span class="label">Tips · vault</span><span class="n" title="inbox tips in the vault">33</span>', col)
         self.assertIn("Shell tip", col)
         self.assertIn('<a href="/tasks?base=tip">Tasks</a>', col)
+
+    #: sd:8014: the Blog Ideas inbox's waiting rows with their age, and one row a bulk Decline moved.
+    QUEUED = ("DOC.ideas.pool = ["
+              "{ item: 701, title: 'Stale low', score: 3, age: 90, revision: 'a'.repeat(64) },"
+              "{ item: 702, title: 'Stale unscored', score: null, age: 45, revision: 'b'.repeat(64) },"
+              "{ item: 703, title: 'Stale high', score: 8, age: 90, revision: 'c'.repeat(64) },"
+              "{ item: 704, title: 'Fresh low', score: 2, age: 5, revision: 'd'.repeat(64) }];\n"
+              "DOC.ideas.declined = [{ item: 650, title: 'Gone stale', at: '2026-09-01T10:00:00Z',"
+              " by: 'bulk Decline (score below 6, older than 30 days)' }];\n")
+
+    def test_each_inbox_has_a_bulk_decline_that_asks_and_posts_the_rows_it_names(self):
+        """sd:8014: the button names the rows the defaults move; the press asks first and posts those rows."""
+        answer = ("(path, body) => path === '/api/writing' ? [200, DOC] : path === '/api/triage/decline'"
+                  " ? [200, { declined: body.items.map(i => i.item), refused: [], by: 'x' }] : [404, {}]")
+        out = self.run_page("R.board = ELS['view-board'].html; R.cli = cmd('queue.decline').cli(C.get('queue:blog-idea'), { score: '9', days: '60' });"
+                            " shellRun(cmd('queue.decline'), C.get('queue:blog-idea')); await flush();",
+                            answer=answer, prelude=self.QUEUED)
+        ideas = out["R"]["board"].split('id="ideas"')[1].split('id="tips"')[0]
+        self.assertIn('data-cmd="queue.decline" data-obj="queue:blog-idea">Decline 2 below score 6 older than 30 days</button>',
+                      ideas)
+        self.assertEqual(out["R"]["cli"],
+                         "no sd verb: Decline 2 below score 9 older than 60 days posts /api/triage/decline: #701 Stale low · #703 Stale high")
+        self.assertEqual(out["confirms"], ["queue.decline"])
+        self.assertEqual([p[:2] for p in out["posts"]], [["/api/triage/decline", {"kind": "blog-idea", "score": 6, "days": 30, "items": [
+            {"item": 701, "revision": "a" * 64}, {"item": 702, "revision": "b" * 64}]}]])
+        self.assertIn(["Declined 2 in Blog Ideas inbox", False], out["toasts"])
+
+    def test_the_declined_filter_is_off_until_pressed_and_lists_when_and_by(self):
+        """sd:8014: declined rows stay visible: the Declined filter lists each with when and by which control."""
+        out = self.run_page("""R.off = ELS['view-board'].html;
+ELS['view-board'].listeners.click.forEach(f => f({ target: { closest: s => s === '[data-declined]' ? { dataset: { declined: 'ideas' } } : null } }));
+R.on = ELS['view-board'].html;""", prelude=self.QUEUED)
+        self.assertIn('data-declined="ideas" aria-pressed="false">Declined <span class="n">1</span>', out["R"]["off"])
+        self.assertNotIn("Gone stale", out["R"]["off"])
+        self.assertIn('data-declined="ideas" aria-pressed="true"', out["R"]["on"])
+        self.assertIn("#650 Gone stale", out["R"]["on"])
+        self.assertIn("by bulk Decline (score below 6, older than 30 days)", out["R"]["on"])
 
     def test_a_realm_tab_counts_open_pieces_only(self):
         """sd:8018: a published or declined piece leaves the tab's count."""
@@ -1045,7 +1087,8 @@ DOC.ideas.areas = { Personal: 157, Work: 50 }; window.PAGE_AGAIN.run(); await fl
 
 
 class TheRegistration(Registers, unittest.TestCase):
-    page, section, route, api = "writing", "Writing", "/writing", ("/api/writing", "/api/writing/1/research")
+    page, section, route, api = "writing", "Writing", "/writing", ("/api/writing", "/api/writing/1/research",
+                                                                  "/api/triage/decline")
 
 
 if __name__ == "__main__":

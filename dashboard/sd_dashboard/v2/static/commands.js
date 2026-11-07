@@ -450,5 +450,32 @@
       ${state ? html`<p class="why">${state}</p>` : ''}</section>`;
   }
 
-  window.commands = { answered, fix, dependabotFix, grill, applyReview, retry, runAction, showLog, logLine, printJob, showAssignment, queuedText, build, openPullRequest, syncCollector, adversarialReview, reviewPane, published, PUB_STATE, pubLegend, publishCommands, publishPane };
+  // sd:8014: the bulk Decline of one decision queue, on the queue object `{id, type: 'queue', kind, label, pool}`. `pool`
+  // is the queue's waiting rows from triage.pool, each with its score, age and revision. The button names how many rows
+  // the defaults move; the dialog asks for the score and the age, lists the rows they move, and posts those rows with
+  // their revisions to /api/triage/decline. Only this press declines: nothing declines on a schedule. A market row has
+  // no score, so its Decline is by age alone. The rows move to declined and stay listed under the Declined filter.
+  const DECLINE = { score: 6, days: 30 };
+  const numOr = (v, d) => { const t = String(v ?? '').trim(), n = Number(t); return t && Number.isFinite(n) ? n : d; };
+  function declinePick(o, v) {
+    const s = numOr(v?.score, DECLINE.score), d = Math.max(0, Math.trunc(numOr(v?.days, DECLINE.days)));
+    return { s, d, rows: (o.pool || []).filter(r => r.age != null && r.age > d && (!o.scored || r.score == null || r.score < s)) };
+  }
+  const declineLabel = (o, v) => { const { s, d, rows } = declinePick(o, v); return `Decline ${rows.length}${o.scored ? ` below score ${s}` : ''} older than ${d} days`; };
+  const declineRows = rows => rows.length ? rows.map(r => `#${r.item} ${r.title}`).join(' · ') : 'none';
+  function decline({ post }) {
+    return { id: 'queue.decline', on: 'queue', label: 'Decline', icon: 'archive', risk: 'confirm',
+      does: 'Asks first, then declines the stale rows; Declined still lists them.',
+      fields: o => [...(o.scored ? [{ name: 'score', label: 'Below score', value: String(DECLINE.score) }] : []),
+        { name: 'days', label: 'Older than (days)', value: String(DECLINE.days) }],
+      when: o => declinePick(o).rows.length ? true : 'no row is that old and low',
+      consequence: o => `${declineLabel(o)} in ${o.label}: ${declineRows(declinePick(o).rows)}. They stay listed under Declined; nothing is removed.`,
+      cli: (o, v) => `no sd verb: ${declineLabel(o, v)} posts /api/triage/decline: ${declineRows(declinePick(o, v).rows)}`,
+      run: (o, v) => { const { s, d, rows } = declinePick(o, v);
+        if (!rows.length) return `Nothing declined: no row in ${o.label} is that old and low`;
+        return post('/api/triage/decline', { kind: o.kind, score: s, days: d, items: rows.map(r => ({ item: r.item, revision: r.revision })) })
+          .then(out => `Declined ${out.declined.length} in ${o.label}${out.refused.length ? ` · ${out.refused.length} refused: ${out.refused.map(r => `#${r.item} ${r.reason}`).join('; ')}` : ''}`); } };
+  }
+
+  window.commands = { answered, fix, dependabotFix, grill, applyReview, retry, runAction, showLog, logLine, printJob, showAssignment, queuedText, build, openPullRequest, syncCollector, adversarialReview, reviewPane, published, PUB_STATE, pubLegend, publishCommands, publishPane, decline, declineLabel, declinePick };
 })();
