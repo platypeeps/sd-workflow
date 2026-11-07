@@ -202,7 +202,7 @@ def _text(parser: argparse.ArgumentParser) -> None:
 
 
 def register_votes(groups: Any) -> None:
-    group = groups.add_parser("votes", help="board votes: add, edit, list, show, or import a votes.csv")
+    group = groups.add_parser("votes", help="board votes: add, edit, list, show or import")
     verbs = group.add_subparsers(dest="votes_verb", required=True)
     add = verbs.add_parser("add", help="add one vote by its key, such as CI-1")
     add.add_argument("key")
