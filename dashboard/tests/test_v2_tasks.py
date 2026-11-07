@@ -2305,6 +2305,19 @@ shellRun(cmd('item.email'), C.get('{plan}')); await flush();""", answer)
         self.assertEqual(out["posts"], [[f"/api/items/{plan}/draft-email", {"revision": self.row("plan")["revision"]}, 64]])
         self.assertEqual(out["toasts"], [[f'Draft saved · #{plan} · "The plan is ready" · in Gmail Drafts, not sent', False]])
 
+    def test_a_draft_email_past_the_item_write_bound_still_lands_its_answer(self):
+        # sd:8033 review: the 30 s bound is for the item's status and field writes. Draft email runs a model and Gmail
+        # (email_draft: 120 s plus 30 s), so its post keeps the browser's wait: a 40 s draft still lands its answer.
+        plan = self.ids["plan"]
+        answer = f"""(path, body) => [200, {{ item: {{ id: {plan}, status: 'planning', priority: 2, due: '2026-09-09', recurrence: null }},
+  notes: [], revision: 'd'.repeat(64), draft: {{ subject: 'The plan is ready', id: 'r-1', link: 'https://mail.google.com/mail/#drafts' }} }}]"""
+        prelude = "var AbortSignal = { timeout: ms => ({ timedOut: true }) };\n"
+        out = self.run_page(f"""const F = fetch;
+fetch = (path, o) => o && o.signal && o.signal.timedOut
+  ? Promise.reject(Object.assign(new Error('signal timed out'), {{ name: 'TimeoutError' }})) : F(path, o);
+shellRun(cmd('item.email'), C.get('{plan}')); await flush();""", answer, prelude=prelude)
+        self.assertEqual(out["toasts"], [[f'Draft saved · #{plan} · "The plan is ready" · in Gmail Drafts, not sent', False]])
+
     def test_draft_email_is_off_for_a_kind_it_does_not_fit_and_a_failure_reads_again(self):
         plan, ask, port = self.ids["plan"], self.ids["ask"], self.ids["port"]
         answer = """(path, body) => [504, { error: 'Draft email failed: claude -p gave no answer in 120 s. No Gmail draft was saved.' }]"""
@@ -2667,6 +2680,29 @@ shellRun(cmd('item.complete'), C.get('{plan}')); await flush(); R.listed = !!C.g
         self.assertEqual(out["gets"], ["/api/tasks", "/api/tasks"], "the rows were not read again for the next occurrence")
         self.assertTrue(out["R"]["listed"], "the next occurrence is not listed")
         self.assertEqual(out["toasts"], [[f"#{plan} Ready → Done · next occurrence #99 due Sep 16 · sd task status {plan} done", False]])
+
+    def test_a_completion_the_server_never_answers_says_so_and_frees_the_row(self):
+        # sd:8033: Done → next occurrence was confirmed, and nothing landed or showed. A write the server never answers
+        # stayed pending: no toast, and every later write on the row queued behind it. The write is bounded now: the
+        # page says the outcome is not known, reads the rows again, and the next write on the row is sent.
+        self.repeat_plan()
+        plan = self.ids["plan"]
+        answer = "(path, body) => new Promise(() => {})"
+        prelude = """var BOUNDS = [];
+var AbortSignal = { timeout: ms => { BOUNDS.push(ms); return { timedOut: true }; } };
+"""
+        out = self.run_page(f"""const F = fetch;
+fetch = (path, o) => o && o.signal && o.signal.timedOut ? (OUT.posts.push([path, JSON.parse(o.body), 64]),
+  Promise.reject(Object.assign(new Error('signal timed out'), {{ name: 'TimeoutError' }}))) : F(path, o);
+shellRun(cmd('item.complete'), C.get('{plan}')); await flush();
+R.bounds = BOUNDS.slice(); R.gets = OUT.gets.length;
+shellRun(cmd('item.p1'), C.get('{plan}')); await flush();""", answer, prelude=prelude)
+        self.assertEqual([p[0] for p in out["posts"]], [f"/api/items/{plan}/status", f"/api/items/{plan}"],
+                         "the next write on the row waited behind the unanswered one")
+        self.assertEqual(out["R"]["bounds"], [30000])
+        self.assertIn([f"#{plan} Plan the review: the dashboard did not answer within 30 s, so whether it changed is "
+                       "not known; the rows were read again", False], out["toasts"])
+        self.assertEqual(out["R"]["gets"], 2, "the rows were not read again after the unknown outcome")
 
     def test_a_queued_complete_asks_again_whether_the_task_still_repeats(self):
         # The mirror case: stop repeating is sent (the Details Repeat select, sd:5737), and 5 is confirmed before it answers. As the completion leaves, the task
