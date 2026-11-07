@@ -130,7 +130,7 @@ def save_asset(connection: sqlite3.Connection, *, kind: str, name: str, geometry
 
 
 def delete_asset(connection: sqlite3.Connection, asset: int) -> dict:
-    """Remove one asset; the row it was. Its care items keep their link and read as an asset gone."""
+    """Remove one asset; the row it was. Its care items keep their link and read as an asset gone; ids never return."""
     with transaction(connection):
         found = get_asset(connection, asset)
         connection.execute("DELETE FROM home_asset WHERE id = ?", (asset,))

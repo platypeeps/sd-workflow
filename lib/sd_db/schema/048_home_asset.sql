@@ -6,6 +6,8 @@
 --
 -- A care task is an sd item that names the row in `item.fields.asset`; it
 -- recurs with the item (`workflow._next_occurrence`), so no link table.
+-- AUTOINCREMENT: a deleted asset's id never returns, so its care items read
+-- as an asset gone and never attach to a later one.
 --
 -- A new table, so nothing existing moves. The reverse, run by hand with the
 -- runner, the dashboard and the serve agent stopped, after
@@ -17,7 +19,7 @@
 --   COMMIT;
 
 CREATE TABLE home_asset (
-    id          INTEGER PRIMARY KEY,
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
     kind        TEXT NOT NULL,
     name        TEXT NOT NULL,
     geometry    TEXT,

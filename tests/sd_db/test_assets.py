@@ -69,6 +69,15 @@ class Assets(unittest.TestCase):
         self.assertFalse(found[rose["id"]]["overdue"])
         self.assertEqual(set(found), {oak["id"], rose["id"]})
 
+    def test_a_deleted_assets_id_is_never_reused_so_its_care_does_not_move(self):
+        oak = assets.save_asset(self.db, kind="tree", name="Oak")
+        item = capture_task(self.db, title="Water the oak", due="2026-11-01", who="operator")["item"]["id"]
+        set_item_fields(self.db, item, fields={"area": "home", "asset": oak["id"]})
+        assets.delete_asset(self.db, oak["id"])
+        rose = assets.save_asset(self.db, kind="plant", name="Rose")
+        self.assertNotEqual(rose["id"], oak["id"])
+        self.assertNotIn(rose["id"], assets.care(self.db, today="2026-11-07"))
+
     def test_item_asset_reads_only_a_whole_number(self):
         for text, want in (('{"asset": 3}', 3), ('{"asset": "3"}', None), ('{"asset": true}', None), ("not json", None),
                            (None, None), ("[1]", None)):
