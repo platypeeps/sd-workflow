@@ -148,7 +148,7 @@ addEventListener('DOMContentLoaded', () => {
     const ofWhat = !ideaArea ? `${I.count} inbox ideas` : ideaArea === 'none' ? `${nArea('none')} ideas with no area` : `${nArea(ideaArea)} ${ideaArea} ideas`;
     const idea = i => html`<article class="card idea" aria-label="Idea: ${i.title}"><div class="top"><span class="id">${i.created || ''}</span>${i.area ? html`<span class="area">${i.area}</span>` : ''}<span class="tag">${i.score == null ? 'no score' : `${i.score}/10`}</span></div>
       <div class="t">${i.href ? html`<a class="ext" href="${i.href}" target="_blank" rel="noopener noreferrer">${i.title}</a>` : i.title}</div></article>`;
-    const ideaCol = html`<div class="col vault" data-drop="stage:ideas">
+    const ideaCol = html`<div class="col vault" id="ideas" data-drop="stage:ideas">
       <header><span class="label">Ideas · vault</span>${I.state === 'read' ? html`<span class="n" title="inbox ideas in the vault">${I.count}</span>` : html`<span class="n" title="vault ideas not read">—</span>`}</header>
       ${I.state === 'read' && I.count ? html`<div class="idea-areas">${window.shell.list.fseg('area', 'Area', areaTiles.map(([a, w]) => ({ v: a, pressed: ideaArea === a,
         title: `${w}: ${nArea(a)}`, label: html`${w} <span class="n">${nArea(a)}</span>` })))}</div>` : ''}
@@ -156,7 +156,15 @@ addEventListener('DOMContentLoaded', () => {
         ${I.state === 'read' ? html`${ideasShown.map(idea)}<p class="empty">${I.count ? `Highest ${ideasShown.length} of ${ofWhat}.` : 'No idea in the vault inbox.'} <a href="/tasks?base=blog-idea">Tasks</a> lists them all.</p>`
           : html`<p class="empty">Not read: ${I.reason}</p>`}
       </div></div></div>`;
-    put(document.getElementById('view-board'), html`<div class="board" id="board" role="listbox" aria-label="Pieces by stage">${ideaCol}${STAGES.map(([s, name]) => {
+    // sd:8013: the inbox tips beside the ideas, the home Today's Tips link opens; no piece drops here.
+    const T = D?.tips || { state: 'unknown', reason: 'the read gave no tips', rows: [] };
+    const tipCol = html`<div class="col vault" id="tips">
+      <header><span class="label">Tips · vault</span>${T.state === 'read' ? html`<span class="n" title="inbox tips in the vault">${T.count}</span>` : html`<span class="n" title="vault tips not read">—</span>`}</header>
+      <div><div class="drop">
+        ${T.state === 'read' ? html`${T.rows.slice(0, T.top || T.rows.length).map(idea)}<p class="empty">${T.count ? `Highest ${Math.min(T.count, T.top || T.count)} of ${T.count} inbox tips.` : 'No tip in the vault inbox.'} <a href="/tasks?base=tip">Tasks</a> lists them all.</p>`
+          : html`<p class="empty">Not read: ${T.reason}</p>`}
+      </div></div></div>`;
+    put(document.getElementById('view-board'), html`<div class="board" id="board" role="listbox" aria-label="Pieces by stage">${ideaCol}${tipCol}${STAGES.map(([s, name]) => {
       const rows = v.filter(p => p.stage === s);
       return html`<div class="col" data-drop="stage:${s}">
         <header><span class="label">${name}</span><span class="n">${rows.length}</span></header>

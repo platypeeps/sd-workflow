@@ -78,8 +78,8 @@ IDEAS = 10
 AREAS = ("Personal", "Work", "RWBP")
 
 
-def read_ideas(connection) -> list[dict]:
-    return records.list_rows(connection, "blog-idea", stage="inbox")
+def read_ideas(connection, kind="blog-idea") -> list[dict]:
+    return records.list_rows(connection, kind, stage="inbox")
 
 
 def _score(value) -> float | None:
@@ -109,10 +109,10 @@ def _area(value) -> str:
     return ""
 
 
-def _ideas(connection) -> dict:
-    """The inbox blog ideas, highest score first, or why they were not read."""
+def _ideas(connection, kind="blog-idea") -> dict:
+    """The inbox blog ideas, or tips (sd:8013), highest score first, or why they were not read."""
     try:
-        got = read_ideas(connection)
+        got = read_ideas(connection, kind)
     except Exception as error:  # noqa: BLE001 - a failed read says its cause, never an empty inbox
         return {"state": "unknown", "reason": str(error) or type(error).__name__, "count": None, "rows": []}
     rows = []
@@ -169,6 +169,7 @@ def document(connection, *, now):
             "mirror": _mirror(row, state["parked"], *mirrored),
         })
     return {"read": now, "stages": list(writing.STAGES), "pieces": pieces, "attention": _attention(pieces), "ideas": _ideas(connection),
+            "tips": _ideas(connection, "tip"),
             "realms": {key: found[key] for key in ("state", "source", "problems")}}
 
 

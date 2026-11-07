@@ -3078,56 +3078,21 @@ class TheLinksIntoTasks(unittest.TestCase):
         self.assertEqual(found, {})
 
 
-class TheQueues(ScreenCase):
-    """pack sd:7527: Operations > Resources > Queues is Tasks' folded Decision queues, read the first time it opens."""
+class TheQueuesMoved(unittest.TestCase):
+    """sd:8013: the Decision queues fold left Tasks for one line on Today's Needs you (now_screen.triage_rows)."""
 
-    run_page = TheScript.run_page
-
-    def setUp(self):
-        super().setUp()
-        self.ids = seed(self)
-        self.doc = tasks_screen.document(self.connection, now=NOW)
-        self.details = {}
-
-    QUEUES = {"title": "Queues", "rows": [{"what": "2 in Blog Ideas to decide", "detail": "oldest 9 days · 3 rows in the queue"}],
-              "sections": [{"figures": [["waiting on you", "2"]]},
-                           {"table": {"columns": [["Queue", "text"], ["To decide", "num"]], "search": "",
-                                      "rows": [[{"text": "Blog <Ideas>", "title": "status `inbox` is the one to decide"}, {"text": "2", "num": True}]]}}]}
-
-    def page(self, body, search="", answer=None):
-        write = f"(path) => path === '/api/tasks/queues' ? {json.dumps(answer or [200, self.QUEUES])} : [404, {{ error: 'no answer' }}]"
-        return self.run_page(body, write, search=search)
-
-    def test_the_queues_are_read_only_when_opened_and_drawn_escaped(self):
-        out = self.page("""R.before = OUT.gets.slice(); R.closed = ELS.queues.html;
-const box = ELS['queues-box']; box.open = true; box.listeners.toggle.forEach(f => f()); await flush(); await flush();
-R.html = ELS.queues.html; box.listeners.toggle.forEach(f => f()); await flush(); R.gets = OUT.gets.slice();""")
-        self.assertEqual(out["R"]["before"], ["/api/tasks"])
-        self.assertIsNone(out["R"]["closed"])
-        self.assertEqual(out["R"]["gets"], ["/api/tasks", "/api/tasks/queues"])
-        self.assertIn("<dt>2 in Blog Ideas to decide</dt>", out["R"]["html"])
-        self.assertIn('<td title="status `inbox` is the one to decide">Blog &lt;Ideas&gt;</td><td class="n">2</td>', out["R"]["html"])
+    def test_tasks_has_no_queues_fold_or_route(self):
         page = (V2 / "tasks.html").read_text(encoding="utf-8")
-        self.assertIn('<details class="queues-box" id="queues-box"><summary>Decision queues</summary><div id="queues"></div></details>', page)
-
-    def test_the_address_opens_them_and_a_refused_read_says_why(self):
-        out = self.page("await flush(); await flush(); R.html = ELS.queues.html; R.open = ELS['queues-box'].open;", search="?queues=open",
-                        answer=[503, {"error": "Queues could not be observed: queues: no rows"}])
-        self.assertTrue(out["R"]["open"])
-        self.assertIn("The decision queues were not read: Queues could not be observed: queues: no rows", out["R"]["html"])
-
-    def test_the_route_answers_the_queues_tile(self):
-        page = next(entry for entry in v2.registry.PAGES if entry.section == "Tasks")
-        route = next(api for api in page.api if api.path == "/api/tasks/queues")
-        with patch("sd_dashboard.reports_screen.collect", return_value={"sections": []}) as collect:
-            self.assertEqual(route.read(None), {"sections": []})
-        collect.assert_called_once_with("queues")
+        self.assertNotIn("queues-box", page)
+        self.assertNotIn("/api/tasks/queues", TASKS_JS)
+        entry = next(entry for entry in v2.registry.PAGES if entry.section == "Tasks")
+        self.assertNotIn("/api/tasks/queues", [api.path for api in entry.api])
 
 
 class TheRegistration(Registers, unittest.TestCase):
     page, section, route, api = "tasks", "Tasks", "/tasks", ("/api/tasks", "/api/tasks/start-next", "/api/tasks/start-next/run",
                                                            "/api/tasks/build/plan", "/api/tasks/build", "/api/tasks/1", "/api/tasks/sweep", "/api/tasks/sweep/status",
-                                                           "/api/why", "/api/tasks/queues")
+                                                           "/api/why")
 
 
 class TheDocumentLinks(ScreenCase):

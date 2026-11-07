@@ -295,11 +295,11 @@ class TheScript(ScreenCase):
         jobs.log("market-watch", "Gmail tools unavailable: token expired\n")
         self.doc = watches_screen.document(self.connection, now=NOW, jobs=jobs)
 
-    def run_page(self, body, answer=None):
+    def run_page(self, body, answer=None, search=""):
         answer = answer or ("(p) => p === '/api/watches' ? [200, " + json.dumps(self.doc) + "]"
                             " : p === '/api/actions/run' ? [200, { action: 'x', label: 'Ran', line: 'l', exit: 0, output: 'ok', cut: false }]"
                             " : [200, { request: { status: 'accepted' } }]")
-        script = (STAND_IN + "location.search = ''; location.origin = 'http://dash.example.test';\nvar ROW = null;\n"
+        script = (STAND_IN + f"location.search = {json.dumps(search)}; location.origin = 'http://dash.example.test';\nvar ROW = null;\n"
                   + MARKUP_JS + "\nconst mk = window.markup.html;\n" + SHELL + "\nwindow.shell.row = () => ROW; OUT.opened = []; window.open = (u, t, f) => { OUT.opened.push([u, t, f]); };\n"
                   + READ_SHELL + f"\nANSWER = {answer};\n" + COMMANDS_JS + WATCHES_JS
                   + "\nvar R = {};\n(async () => { try {\n(DOC_LISTENERS.DOMContentLoaded || []).forEach(f => f());\nawait flush();\n"
@@ -344,6 +344,13 @@ class TheScript(ScreenCase):
         # The job's failed run says why.
         self.assertIn("The last run failed", r["job"])
         self.assertIn("exit 1: Gmail tools unavailable: token expired", r["job"])
+
+    def test_a_stage_in_the_address_filters_the_list(self):
+        """sd:8013: Today's Market Watch link opens /watches?stage=candidate on the candidates."""
+        r = self.run_page("R.rows = ELS.rows.html; R.filters = ELS.filters.html;", search="?stage=candidate")["R"]
+        self.assertIn("Maybe Co", r["rows"])
+        self.assertNotIn("New Agent", r["rows"])
+        self.assertIn('data-v="candidate" aria-pressed="true"', r["filters"])
 
     def test_clear_filters_in_the_empty_list_clears_the_search_too(self):
         """sd:6285: the empty state's Clear filters cleared the status only, so a search that matched nothing stayed."""

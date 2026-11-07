@@ -31,11 +31,12 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   const GLYPH = { warning: '■', caution: '▲', queued: '◌', ok: '●', unknown: '▨' };
   // Each source's label, icon, and the page that shows it in full, with that page's name (sd:3402).
   const SRC = { jobs: ['Jobs', 'activity', '/management', 'Management'], prs: ['Pull requests', 'git-pull-request', '/github', 'GitHub'], sessions: ['Sessions', 'bot', '/management#view=sessions', 'Management'], repos: ['Repos', 'hard-drive-download', '/management', 'Management'],
-    lane: ['Lane', 'git-merge', '/today#view=queue', 'Queue'], reports: ['Reports', 'file-text', '/reports', 'Reports'], mail: ['Mail', 'mail', '', ''], tasks: ['Tasks', 'list-checks', '/tasks', 'Tasks'], briefs: ['Briefs', 'book-open', '/briefs', 'Briefs'] };
+    lane: ['Lane', 'git-merge', '/today#view=queue', 'Queue'], reports: ['Reports', 'file-text', '/reports', 'Reports'], mail: ['Mail', 'mail', '', ''], tasks: ['Tasks', 'list-checks', '/tasks', 'Tasks'], briefs: ['Briefs', 'book-open', '/briefs', 'Briefs'],
+    queues: ['Decision queues', 'inbox', '', ''] };
   const TYPE = { job: 'job', pr: 'pull request', ahead: 'repo', dirty: 'repo', pinned: 'repo', worktree: 'sessions', dark: 'collector', item: 'work item',
-    report: 'report', mail: 'mail thread', lane: 'lane entry', brief: 'brief', flaky: 'flaky head', group: 'group' };
+    report: 'report', mail: 'mail thread', lane: 'lane entry', brief: 'brief', flaky: 'flaky head', group: 'group', triage: 'decision queues' };
   const KIND = { job: 'Job', pr: 'Pull request', ahead: 'Repo', dirty: 'Repo', pinned: 'Repo', worktree: 'Sessions', dark: 'Collector', item: 'Work item',
-    report: 'Report', mail: 'Mail', lane: 'Lane entry', brief: 'Brief', flaky: 'Flaky head', group: 'Group' };
+    report: 'Report', mail: 'Mail', lane: 'Lane entry', brief: 'Brief', flaky: 'Flaky head', group: 'Group', triage: 'Decision queues' };
   // A group row's command type: the briefs and the flaky heads (pack sd:7663) have their own acts; the rest are work items.
   const GROUP = { 'group:briefs': 'brief group', 'group:flaky': 'flaky group' };
   // The intents (sd:5921): views over the one list, not tabs. Each says which rows it keeps.
@@ -269,7 +270,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     return html`<tr data-id="${r.id}" data-src="${r.lamp || ''}"${member ? html` class="member" data-in="${member}"` : r.group ? html` class="grp"` : ''}>
       <td class="g g-${s}" title="${s}">${GLYPH[s]}</td>
       <td class="what">${r.group ? html`<button type="button" class="disc" data-toggle="${r.id}" aria-expanded="${String(OPEN.has(r.id))}" aria-label="${OPEN.has(r.id) ? 'Close' : 'Open'} ${r.what}">${I('chevron-right')}</button>` : ''}<button type="button" class="pick">${r.what}</button></td>
-      <td class="detail">${r.detail}</td>
+      <td class="detail">${r.links /* sd:8013: each decision queue links its home */ ? r.links.map((l, i) => html`${i ? ' · ' : ''}<a href="${l.href}">${l.label} ${l.n}</a>`) : r.detail}</td>
       <td class="src">${src ? I(src[1]) : ''}${r.source}</td>
       <td class="num age">${age(r.at)}</td>
       <td class="act">${prOpen(r)}${shell.commands.rowActions(r.id, { icons: r.band === 'broken' || r.kind === 'report' })}</td></tr>`;

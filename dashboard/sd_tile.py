@@ -1,7 +1,7 @@
 """The system dashboard's legacy views, one tab per invocation.
 
 The framework dashboard replaced this one, and six of these views did not go
-with it: Toolbox, Vault, Research, Ports and Queues read the vault, the
+with it: Toolbox, Vault, Research and Ports read the vault, the
 launchd job table and this machine's service map, and all of them stay
 system-owned. So they reached that dashboard through the plugin contract
 instead of being ported into it -- the collectors below are `collectors.py`'s
@@ -9,9 +9,9 @@ own, imported rather than copied, and this file is only the part that turns
 them into a tab. The pack dashboard is no longer served and its plugin loader
 is gone (sd:719). The workflow dashboard in `sd_dashboard/` renders the views
 now: `reports_screen.collect` runs this file as a child for Toolbox
-(Management's Machine view), Research (its Repos filter), Vault (Notes) and
-Queues (Tasks), pack sd:7527, and Health calls `collect_ports` in-process
-(`ports_screen.py`).
+(Management's Machine view), Research (its Repos filter) and Vault (Notes),
+pack sd:7527, and Health calls `collect_ports` in-process (`ports_screen.py`).
+Queues left at sd:8013: Today's Needs you counts the decision queues.
 
 Five when this file was written; Queues joined at 6b-6, and the count is now
 `TABS` rather than a number in a sentence. A new view is a builder and its
@@ -671,86 +671,11 @@ def tab_ports(collectors) -> dict:
     return {"title": "Ports", "sections": [part for part in parts if part], "rows": rows}
 
 
-def tab_queues(collectors) -> dict:
-    """The decision queues' base rows: how much is waiting, and what is oldest.
-
-    **Read-only.** The rows come from the workflow database (`collectors.db_rows`,
-    `sd store list`), their source since pack sd:4627, never the vault notes
-    (sd:5134). A stage moves on Tasks, which offers each base row's moves under
-    its kind's rules, so this table only says which queue is asking.
-
-    One pass per queue, not two: the counts are derived here from the same rows
-    that say what is oldest.
-    """
-    queues, waiting = [], []
-    for key, spec in collectors.DBS.items():
-        rows = collectors.db_rows(key)
-        pending = [row for row in rows if row["status"] == spec["decide"]]
-        counts: dict[str, int] = {}
-        for row in rows:
-            counts[row["status"] or "(none)"] = counts.get(row["status"] or "(none)", 0) + 1
-        oldest = max((row["age"] for row in pending), default=0)
-        queues.append({"key": key, "title": spec["title"], "decide": spec["decide"],
-                       "pending": pending, "counts": counts, "total": len(rows),
-                       "oldest": oldest})
-        waiting += [dict(row, queue=spec["title"]) for row in pending]
-
-    waiting.sort(key=lambda row: (-row["age"], row["queue"], row["stem"]))
-    pending_total = len(waiting)
-    parts = [
-        figures([
-            ("waiting on you", pending_total),
-            ("queues", len(queues)),
-            ("with something to decide", sum(1 for q in queues if q["pending"])),
-            ("rows", sum(q["total"] for q in queues)),
-            ("oldest, days", max((q["oldest"] for q in queues), default=0)),
-        ]),
-        table(
-            [("Queue", "text"), ("To decide", "num"), ("Total", "num"),
-             ("Oldest, days", "num"), ("Breakdown", "none")],
-            [[
-                {"text": q["title"], "title": f"status `{q['decide']}` is the one to decide"},
-                num(len(q["pending"])),
-                num(q["total"]),
-                num(q["oldest"]) if q["pending"] else "",
-                " \u00b7 ".join(f"{name} {count}"
-                                for name, count in sorted(q["counts"].items())),
-            ] for q in queues],
-        ),
-    ]
-    if waiting:
-        parts += [
-            heading("Waiting on a decision, oldest first"),
-            table(
-                [("Title", "text"), ("Queue", "text"), ("Age, days", "num"),
-                 ("Score", "num")],
-                [[row["stem"], row["queue"], num(row["age"]), num(row.get("score") or "")]
-                 for row in waiting[:LIST_ROWS]],
-                search="filter rows",
-            ),
-        ]
-        if pending_total > LIST_ROWS:
-            parts.append(listing([f"{pending_total - LIST_ROWS} more not shown"]))
-
-    # One row per queue rather than one per note: 80 notes waiting is one
-    # decision session, and Now is a list of things asking for attention, not
-    # the queue itself. Rank 3 throughout -- nothing here is broken, and a
-    # queue that has been ignored for a month is still only a queue.
-    rows = [
-        {"rank": 3, "kind": "queue", "id": f"queue:{q['key']}",
-         "what": f"{len(q['pending'])} in {q['title']} to decide",
-         "detail": f"oldest {q['oldest']} days \u00b7 {q['total']} rows in the queue"}
-        for q in queues if q["pending"]
-    ]
-    return {"title": "Queues", "sections": [part for part in parts if part], "rows": rows}
-
-
 TABS = {
     "toolbox": tab_toolbox,
     "vault": tab_vault,
     "research": tab_research,
     "ports": tab_ports,
-    "queues": tab_queues,
 }
 
 

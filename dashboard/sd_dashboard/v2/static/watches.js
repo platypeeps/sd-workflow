@@ -19,7 +19,8 @@
   const COLS = [[null, html`<span class="sr">Freshness</span>`, 'g'], ['title', 'Watch'], ['kind', 'Kind', 'repo'], ['stage', 'Status', 'kind'],
     ['refreshed', 'Last refresh', 'num'], ['host', 'URL', 'mod'], [null, html`<span class="sr">Actions</span>`, 'acts']];
   let DOC = null, ROWS = [], SELECTED = null;
-  const F = { stage: '', q: '' }, L = { sort: 'refreshed', dir: 1, page: 1, size: 50 };
+  // sd:8013: ?stage= opens on one status, as Today's Market Watch link opens the candidates.
+  const F = { stage: STAGES.find(([s]) => s === new URLSearchParams(location.search).get('stage'))?.[0] || '', q: '' }, L = { sort: 'refreshed', dir: 1, page: 1, size: 50 };
   const JOB = () => DOC?.job || {};
   const order = s => { const i = STAGES.findIndex(x => x[0] === s); return i < 0 ? STAGES.length : i; };
   function shown() {

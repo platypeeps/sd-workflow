@@ -2,7 +2,7 @@
 // "build:". The rows are /api/tasks and the Details reading /api/tasks/<id> (tasks_screen.py), never sample data. A command
 // that executes posts to the route v1 already answers, and its toast comes after the write lands, not before.
 // Palette "This page" group. shell.js reads it at start, so it is set before the shell runs.
-const { html, put, plural, tile } = window.markup;
+const { html, put, plural } = window.markup;
 const tasksView = v => () => document.dispatchEvent(new CustomEvent('tasks:view', { detail: v }));
 window.PAGE_COMMANDS = [
   { label: 'Add or find a task', icon: 'plus', run: () => document.getElementById('shift-in').focus() },
@@ -668,18 +668,8 @@ addEventListener('DOMContentLoaded', () => {
     unselect: () => { if (!held(selected)) selected = null; renderDetails(); },
   });
   function load() { return reading.load(); }
-  // ---------- Queues (pack sd:7527): Operations > Resources > Queues, the decision queues' counts and oldest rows ----------
-  // Folded under the board and read the first time it opens (sd_tile.py queues, /api/tasks/queues); ?queues=open opens it.
-  const qbox = document.getElementById('queues-box'), qel = document.getElementById('queues');
-  let queued = false;
-  const readQueues = () => { put(qel, html`<p class="empty">Reading the decision queues…</p>`);
-    return window.shell.getJSON('/api/tasks/queues').then(d => put(qel, tile(d)),
-      e => put(qel, html`<p class="why"><span class="g-unknown" aria-hidden="true">▨</span> The decision queues were not read: ${e.message}</p>`)); };
-  const openQueues = () => { if (!queued) { queued = true; readQueues(); } };
-  qbox.addEventListener('toggle', () => { if (qbox.open) openQueues(); });
-  if (new URLSearchParams(location.search).get('queues') === 'open') { qbox.open = true; openQueues(); }
-  // Read again (sd:5638): the shell's head button reads the tasks again, and the queues once they were opened.
-  window.PAGE_AGAIN = { title: 'Read the tasks again', run: () => Promise.all([load(), queued ? readQueues() : null]) };
+  // Read again (sd:5638): the shell's head button reads the tasks again. The decision queues are Today's (sd:8013).
+  window.PAGE_AGAIN = { title: 'Read the tasks again', run: load };
   // ---------- Run sweep (sd:5096, sd:5097) ----------
   // POST /api/tasks/sweep {realm} starts that realm's sweep in the background (sd_dashboard/sweep.py); a 409 names the run going. It asks
   // first: the run files a brief and followups and saves drafts, and takes up to an hour.

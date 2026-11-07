@@ -119,7 +119,7 @@ class OperationsActions(BrowserSession):
                              # pack sd:7527: each Resources view moved to the page that holds it now.
                              ("resources&resource=toolbox", "/management#view=machine"),
                              ("resources&resource=research", "/management?research=yes#view=repos"),
-                             ("resources&resource=vault", "/notes"), ("resources&resource=queues", "/tasks?queues=open"),
+                             ("resources&resource=vault", "/notes"), ("resources&resource=queues", "/today"),
                              ("resources", "/management#view=machine"), ("resources&resource=ports", "/management#view=machine"),
                              # pack sd:7525: Trackers moved to GitHub's Tracked view.
                              ("trackers", "/github#view=tracked"), ("trackers&view=issues", "/github#view=tracked")):

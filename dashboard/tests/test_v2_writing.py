@@ -266,6 +266,16 @@ class TheDocument(Pieces):
         row = dict(self.connection.execute("SELECT * FROM item WHERE id = ?", (item,)).fetchone())
         self.assertIn("Publication", str(controls.writing_controls(self.connection, row)))
 
+    def test_the_inbox_tips_are_read_beside_the_ideas(self):
+        """sd:8013: Writing holds the Tips queue beside Ideas, so Today's Tips link has a home."""
+        from sd_db import create_item
+
+        for title, stage, score in (("Good tip", "inbox", "7"), ("Used tip", "accepted", "9")):
+            create_item(self.connection, kind="idea", title=title, status="planning", source="vault",
+                        path=f"Tips/{title}.md", stage=stage, fields={"kind": "tip", "score": score})
+        tips = writing_screen.document(self.connection, now=NOW)["tips"]
+        self.assertEqual((tips["state"], tips["count"], [r["title"] for r in tips["rows"]]), ("read", 1, ["Good tip"]))
+
     def test_a_failed_ideas_read_is_unknown_with_its_reason_and_the_pieces_still_read(self):
         with mock.patch.object(writing_screen, "read_ideas", side_effect=sqlite3.OperationalError("no such column: stage")):
             doc = writing_screen.document(self.connection, now=NOW)
@@ -541,6 +551,18 @@ for (const v of R.views) { VIEW = v; document.dispatchEvent(new CustomEvent('she
         taken = self.run_page("R.views = window.PAGE_VIEWS.map(v => [v.id, v.label]);",
                               prelude=realms + "SHELL_REALMS.push({ id: 'hoa', label: 'Hoa2' });\n")["R"]["views"]
         self.assertEqual(taken, [["personal", "Personal"], ["brand", "Brand"], ["work", "Work"], ["hoa", "HOA"]])
+
+    def test_the_board_has_a_tips_column_beside_ideas_and_each_has_its_anchor(self):
+        """sd:8013: Today links /writing#ideas and /writing#tips; the Tips column follows Ideas."""
+        tips = ("DOC.tips = { state: 'read', reason: '', count: 33, top: 10, areas: {}, rows: [{ item: 601, title: 'Shell tip',"
+                " score: 6, url: '', href: null, created: '2026-10-01', area: '' }] };\n")
+        board = self.run_page("", prelude=tips)["html"]["view-board"]
+        self.assertLess(board.index('id="ideas"'), board.index('id="tips"'))
+        self.assertLess(board.index('id="tips"'), board.index('data-drop="stage:accepted"'))
+        col = board.split('id="tips"')[1].split('data-drop="stage:accepted"')[0]
+        self.assertIn('<span class="label">Tips · vault</span><span class="n" title="inbox tips in the vault">33</span>', col)
+        self.assertIn("Shell tip", col)
+        self.assertIn('<a href="/tasks?base=tip">Tasks</a>', col)
 
     def test_a_realm_tab_counts_open_pieces_only(self):
         """sd:8018: a published or declined piece leaves the tab's count."""

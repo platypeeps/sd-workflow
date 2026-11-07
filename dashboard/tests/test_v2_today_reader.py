@@ -171,6 +171,19 @@ R.cleared = window.PAGE_LIST.clear(); R.all = ids(); R.again = window.PAGE_LIST.
                          (True, ["job:nightly-sync:7", "ahead:pushy:1"], False))
 
 
+class TheDecisionQueues(ReaderCase):
+    def test_the_queues_line_links_each_queue_to_its_home(self):
+        """sd:8013: the one Needs you line names each queue's count as a link to the page that decides it."""
+        self.doc["needs"].append({"id": "triage", "kind": "triage", "rank": 4, "band": "queued", "lamp": "",
+                                  "source": "queues", "what": "3 waiting on a decision", "detail": "Blog Ideas 2 · Tips 1",
+                                  "links": [{"label": "Blog Ideas", "n": 2, "href": "/writing#ideas"},
+                                            {"label": "Tips", "n": 1, "href": "/writing#tips"}]})
+        out = self.run_page("R.rows = ELS.rows.html;")
+        line = out["R"]["rows"].split('<tr data-id="triage"')[1].split("</tr>")[0]
+        self.assertIn("3 waiting on a decision", line)
+        self.assertIn('<a href="/writing#ideas">Blog Ideas 2</a> · <a href="/writing#tips">Tips 1</a>', line)
+
+
 class TheList(ReaderCase):
     """sd:5921: one ranked list and no tabs; a group row opens to its first five members, then the rest; a lamp or an
     intent keeps only its rows; ?row= on a member opens its group."""
