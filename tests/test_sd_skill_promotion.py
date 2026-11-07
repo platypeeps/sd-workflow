@@ -206,7 +206,7 @@ class SkillFixture(unittest.TestCase):
         self.assertEqual(rc, 0)
         return json.loads(output.getvalue())
 
-    def reviewed(self, name="sd-kept"):
+    def reviewed(self, name="sd-kept", area=None):
         """A review whose reviewer recorded two proposals and finished.
 
         The reviewer half is the runner's, and a review request queues no
@@ -217,6 +217,10 @@ class SkillFixture(unittest.TestCase):
         """
         state = self.request("review", name)
         item = state["item"]["id"]
+        if area:
+            held = {**json.loads(state["item"]["fields"]), "area": area}
+            self.db.execute("UPDATE item SET fields=? WHERE id=?",
+                            (json.dumps(held), item))
         assignment = runner.enqueue(
             self.db, [item], role="reviewer", scope="skill-review", who="test")[0]["id"]
         registry.seed(self.db, registry.read(connection=self.db))
@@ -325,6 +329,12 @@ class SkillRequests(SkillFixture):
         self.assertEqual(
             self.db.execute("SELECT count(*) FROM assignment").fetchone()[0], 2)
         self.assertEqual(self.git("branch", "--format=%(refname:short)"), "main")
+
+    def test_a_recorded_review_keeps_an_area_the_operator_set(self):
+        """The result owns `skill_review`, not the whole `fields` (sd:8036)."""
+        item, _ = self.reviewed(area="home")
+        row = self.db.execute("SELECT fields FROM item WHERE id=?", (item,)).fetchone()
+        self.assertEqual(json.loads(row[0]).get("area"), "home")
 
     def test_invalid_path_and_changed_source_do_not_file(self):
         with self.assertRaises(sd_skill.SkillRefusal):

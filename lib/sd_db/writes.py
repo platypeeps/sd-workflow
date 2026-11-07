@@ -553,6 +553,16 @@ def upsert_item(
         return item, "inserted"
 
     item = int(found["id"])
+    # A source owns the keys it names, not the row's whole `fields`: a key
+    # set by hand, such as an operator's `area` (pack sd:8010), outlives the
+    # next import (sd:8036).
+    if isinstance(columns.get("fields"), dict):
+        try:
+            held = json.loads(found["fields"] or "{}")
+        except (TypeError, ValueError, RecursionError):
+            held = None
+        if isinstance(held, dict):
+            columns["fields"] = {**held, **columns["fields"]}
     changed = {}
     for key, value in {"kind": kind, "title": title, **columns}.items():
         current = found[key] if key in found.keys() else None
