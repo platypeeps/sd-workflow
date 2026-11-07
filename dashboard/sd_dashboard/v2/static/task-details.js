@@ -339,7 +339,7 @@
         if (t.nextDue === null) return `Completes ${label(t)} and ends the series: its rule (${rule}) gives no next date, so no next occurrence opens. There is no Undo.`;
         return `Completes ${label(t)} and opens the next occurrence${t.nextDue ? `, due ${fmt(t.nextDue)} (${rule}).` : ` (${rule}); sd sets its date.`} A move back would leave two open tasks, so there is no Undo.`; },
       danger: o => ends(T(o)),
-      run: o => { const t = T(o); let from = t.status;
+      run: o => { const t = must(o); let from = t.status;
         const next = v => v?.next_occurrence ? `next occurrence #${v.next_occurrence}${byKey(String(v.next_occurrence))?.due ? ` due ${fmt(byKey(String(v.next_occurrence)).due)}` : ''}`
           : `the series ended: ${v?.next_occurrence_reason || 'no next occurrence was made'}`;
         return landing(moveTo(t.key, 'done', { sent: r => { from = r.status; }, check: completeOn, wait: true }),

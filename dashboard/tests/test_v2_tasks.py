@@ -460,10 +460,11 @@ var FIELD_VALUES = {};
 function shellRun(c, o) {
   var off = c.when ? c.when(o) : true;
   if (off !== true) { OUT.toasts.push({ msg: 'off: ' + off }); return; }
-  if (c.risk === 'confirm' || c.fields || asksFirst(c, o)) OUT.confirms.push(c.id);
+  // ON_CONFIRM(c, o) is what happens while the dialog is open: the shell's confirm resolves later, so the row can be gone.
+  if (c.risk === 'confirm' || c.fields || asksFirst(c, o)) { OUT.confirms.push(c.id); if (typeof ON_CONFIRM === 'function') ON_CONFIRM(c, o); }
   var v = c.fields ? Object.fromEntries(c.fields(o).map(f => [f.name, String((f.name in FIELD_VALUES ? FIELD_VALUES[f.name] : f.value) || '').trim()])) : undefined;
   if (c.fields && c.fields(o).some(f => f.required && !v[f.name])) { OUT.toasts.push({ msg: 'not run: OK is off until ' + c.fields(o).filter(f => f.required && !v[f.name]).map(f => f.label).join(', ') + ' is typed' }); return; }
-  var msg = c.run ? c.run(o, v) : '';
+  var msg = runOne(c, o, v);
   if (thenable(msg)) { settleOne(c, o, msg, { toast: shellToast }); return document.dispatchEvent(new CustomEvent('shell:ran', { detail: { cmd: c.id, obj: o.id } })); }
   if (msg === null) return document.dispatchEvent(new CustomEvent('shell:ran', { detail: { cmd: c.id, obj: o.id, form: true } }));
   OUT.toasts.push({ msg: msg || c.label, undo: c.risk === 'undo' && c.undo ? () => c.undo(o) : null });
@@ -2716,6 +2717,17 @@ change('det-recur', ''); shellRun(cmd('item.complete'), C.get('{plan}')); await 
 HOLD.splice(0).forEach(f => f()); await flush(); HOLD.splice(0).forEach(f => f()); await flush();""", answer, prelude="var HOLD = [];\n")
         self.assertEqual([p[0] for p in out["posts"]], [f"/api/items/{plan}"], "the completion was sent after the series stopped")
         self.assertIn([f"#{plan} Plan the review not changed: the task does not repeat; Status → Done completes it", False], out["toasts"])
+
+    def test_a_row_that_leaves_while_its_done_confirm_is_open_says_why(self):
+        # sd:8035: the shell's confirm resolves later, and run(o) read T(o) with no row: the throw rejected the
+        # confirm's promise, and nothing showed. The run is refused now, and the toast names why.
+        self.repeat_plan()
+        plan = self.ids["plan"]
+        out = self.run_page(f"""shellRun(cmd('item.complete'), C.get('{plan}')); await flush();""",
+                            prelude="var ON_CONFIRM = (c, o) => { o.id = 'gone'; };\n")
+        self.assertEqual(out["confirms"], ["item.complete"])
+        self.assertEqual(out["posts"], [])
+        self.assertIn([f"#{plan} Plan the review not changed: the task is no longer listed", False], out["toasts"])
 
     def repeat_plan(self):
         """Make `plan` weekly in the store, and read the documents again."""
