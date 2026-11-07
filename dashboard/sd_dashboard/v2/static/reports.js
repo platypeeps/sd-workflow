@@ -198,7 +198,8 @@ function renderRows(read) {
   window.PAGE_ATTENTION = DOC.reports && DOC.attention || { state: 'unknown', n: 0, what: 'reports not read' }; window.shell?.attention?.();
   const list = window.shell.list;
   shown = ROWS.filter(matches).sort(order);
-  window.shell.view.count('reports', DOC.reports ? shown.length : null);
+  // The tab counts the open reports the filters show (sd:8018), not the acknowledged ones.
+  window.shell.view.count('reports', DOC.reports ? shown.filter(r => r.open).length : null);
   const slice = list.pageOf(shown, L);
   if (started) writeURL();
   put(byId('rows-head'), list.sortHead(COLS, L));

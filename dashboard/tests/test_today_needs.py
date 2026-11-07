@@ -69,6 +69,34 @@ class TheBadge(ReportsCase):
         self.assertEqual([(row["band"], row["item"], row["what"], row["detail"]) for row in rows],
                          [("queued", grilled, "Grill ready: 3 questions", "say 'grill' in a fresh session")])
 
+    def base_row(self, kind, stage, title):
+        from sd_db import create_item
+
+        return create_item(self.connection, kind="idea", title=title, status="ready", source="vault",
+                           external_id=f"{kind}:{title}", path=f"{kind}/{title}.md", stage=stage, fields={"kind": kind})
+
+    def test_the_decision_queues_are_one_queued_row_that_links_each_home(self):
+        """sd:8013: the Tasks page's Queues fold is one Needs you line, each queue linking to where it is decided."""
+        for title in ("Idea one", "Idea two"):
+            self.base_row("blog-idea", "inbox", title)
+        self.base_row("blog-idea", "accepted", "Taken idea")
+        self.base_row("tip", "inbox", "A tip")
+        self.base_row("market", "candidate", "Example Co")
+        self.base_row("market", "active", "Watched Co")
+        rows = [row for row in self.today()["needs"] if row["id"] == "triage"]
+        self.assertEqual([(row["band"], row["what"], row["detail"]) for row in rows],
+                         [("queued", "4 waiting on a decision", "Blog Ideas 2 · Tips 1 · Market Watch 1")])
+        self.assertEqual(rows[0]["links"], [
+            {"label": "Blog Ideas", "n": 2, "href": "/writing#ideas"},
+            {"label": "Tips", "n": 1, "href": "/writing#tips"},
+            {"label": "Market Watch", "n": 1, "href": "/watches?stage=candidate"}])
+
+    def test_no_decision_waiting_raises_no_row_and_a_failed_read_is_dark(self):
+        self.assertNotIn("triage", [row["id"] for row in self.today()["needs"]])
+        with mock.patch("sd_db.records.list_rows", side_effect=sqlite3.OperationalError("database is locked")):
+            dark = [row for row in self.today()["needs"] if row["id"] == "dark:queues"]
+        self.assertEqual([(row["band"], row["detail"]) for row in dark], [("broken", "database is locked")])
+
     def test_a_grill_read_that_failed_is_a_dark_row(self):
         with mock.patch("sd_db.today.grill", side_effect=sqlite3.OperationalError("database is locked")):
             dark = [row for row in self.today()["needs"] if row["id"] == "dark:grill"]

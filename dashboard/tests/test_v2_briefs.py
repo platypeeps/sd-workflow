@@ -486,7 +486,7 @@ OUT.captures = []; OUT.opened = []; OUT.chat = []; OUT.urls = []; OUT.panes = []
 window.shell.row = () => ROW; window.shell.url = q => OUT.urls.push(q); window.shell.capture = (o, t) => OUT.captures.push([o && o.id, t]);
 window.shell.openChat = () => {}; window.shell.send = t => OUT.chat.push(t); window.shell.openPane = p => OUT.panes.push(p);
 window.open = (u, t, f) => OUT.opened.push([u, t, f]);
-OUT.shown = []; window.shell.view = { show: id => { OUT.shown.push(id); return true; }, current: () => 'list', count() {} };
+OUT.shown = []; window.shell.view = { show: id => { OUT.shown.push(id); return true; }, current: () => 'list', count: (id, n) => { (OUT.counts = OUT.counts || {})[id] = n; } };
 """
 
 
@@ -920,6 +920,15 @@ await flush(); R.lane = OUT.shown.slice(); R.rows = ELS.rows.html;""")
         if found:
             record_topics(self.connection, found)
         return seeded, self.doc(**more)
+
+    def test_the_topics_tab_counts_open_topics_only(self):
+        """sd:8018: a retired topic stays listed but leaves the tab's count."""
+        _, doc = self.topics_page()
+        doc["topics"]["rows"][-1]["stage"] = "retired"
+        out = self.run_page("R.rows = ELS['topic-rows'].html; R.counts = OUT.counts;",
+                            answer=f"() => [200, {json.dumps(doc)}]")
+        self.assertEqual(len(re.findall(r'<tr data-topic=', out["R"]["rows"])), 3)
+        self.assertEqual(out["R"]["counts"]["topics"], 2, "sd:8018: the tab counted a retired topic")
 
     def test_the_topics_view_shows_each_topic_its_last_signal_newest_memory_and_sources(self):
         """system sd:5778: one row per topic row; a topic opens its Details on Tasks, where it is edited."""

@@ -19,7 +19,8 @@
   const COLS = [[null, html`<span class="sr">Freshness</span>`, 'g'], ['title', 'Watch'], ['kind', 'Kind', 'repo'], ['stage', 'Status', 'kind'],
     ['refreshed', 'Last refresh', 'num'], ['host', 'URL', 'mod'], [null, html`<span class="sr">Actions</span>`, 'acts']];
   let DOC = null, ROWS = [], SELECTED = null;
-  const F = { stage: '', q: '' }, L = { sort: 'refreshed', dir: 1, page: 1, size: 50 };
+  // sd:8013: ?stage= opens on one status, as Today's Market Watch link opens the candidates.
+  const F = { stage: STAGES.find(([s]) => s === new URLSearchParams(location.search).get('stage'))?.[0] || '', q: '' }, L = { sort: 'refreshed', dir: 1, page: 1, size: 50 };
   const JOB = () => DOC?.job || {};
   const order = s => { const i = STAGES.findIndex(x => x[0] === s); return i < 0 ? STAGES.length : i; };
   function shown() {
@@ -30,13 +31,18 @@
     return ROWS.filter(r => (!F.stage || r.stage === F.stage) && q.every(w => `${r.title} ${r.kind} ${r.area} ${r.description} ${r.host}`.toLowerCase().includes(w))).sort((a, b) => (key(a) < key(b) ? -1 : key(a) > key(b) ? 1 : 0) * L.dir);
   }
   const age = r => r.refreshed ? `${r.refreshed} · ${r.age === 0 ? 'today' : `${r.age} d ago`}` : '— never';
+  // sd:8014: a declined row says when and by what: the bulk Decline, Remove or a stage move.
+  const declinedBy = r => (DOC?.declined || []).find(d => d.item === r.item);
+  const when = d => d ? `${d.at ? d.at.slice(0, 10) : 'when not recorded'}${d.by ? ` by ${d.by}` : ''}` : '';
+  // The candidates' bulk Decline: by age alone, since a market row has no score.
+  const QUEUE = () => ({ id: 'queue:market', type: 'queue', kind: 'market', label: 'Market Watch candidates', scored: false, pool: DOC?.pool || [] });
   function row(r) {
     const [g, mark, word] = fresh(r);
     return html`<tr data-id="${r.id}" aria-selected="${String(r.id === SELECTED)}">
       <td class="g g-${g}" title="${word}"><span aria-hidden="true">${mark}</span><span class="sr">${word}</span></td>
       <td class="what"><button type="button">${r.title}</button>${r.area ? html`<span class="file">${r.area}</span>` : ''}</td>
       <td class="repo" data-meta="${` · ${r.stage} · ${word}`}">${r.kind || '—'}</td>
-      <td class="kind">${r.stage}</td>
+      <td class="kind">${r.stage}${r.stage === 'declined' && declinedBy(r) ? html` <span class="why">${when(declinedBy(r))}</span>` : ''}</td>
       <td class="num">${age(r)}${r.fresh === 'stale' ? html` <span class="g-caution">stale</span>` : ''}</td>
       <td class="mod">${link(r.url) ? html`<a class="ext" href="${r.url}" target="_blank" rel="noopener noreferrer">${r.host}</a>` : r.url_text || '—'}</td>
       <td class="acts">${window.shell.commands.rowActions(r.id)}</td></tr>`;
@@ -55,13 +61,17 @@
     const asked = j.last_request ? html` · Last request: ${j.last_request.action} ${j.last_request.status}${j.last_request.message ? `, ${j.last_request.message}` : ''}` : '';
     return html`${state}${asked}`;
   }
+  function declineButton() {
+    const o = QUEUE(), none = !window.commands.declinePick(o).rows.length;
+    return html`<button class="btn sm risky" type="button" data-cmd="queue.decline" data-obj="${o.id}"${none ? html` disabled title="no row is that old"` : ''}>${window.commands.declineLabel(o)}</button>`;
+  }
   function draw() {
     const L_ = window.shell.list, list = shown(), slice = L_.pageOf(list, L), n = s => ROWS.filter(r => r.stage === s).length;
     const stale = ROWS.filter(r => r.fresh === 'stale' || r.fresh === 'never').length;
     put($('sub'), html`${DOC ? `${watches(ROWS.length)} · ${n('active')} active${stale ? ` · ${stale} stale or never refreshed` : ''}` : 'The watches were not read'}`);
     put($('job'), jobLine());
     put($('filters'), L_.fbar(html`${L_.fseg('stage', 'Status', STAGES.map(([s, w]) => ({ v: s, pressed: F.stage === s, title: `${w}: ${n(s)}`,
-      label: html`${w} <span class="n">${n(s)}</span>` })))}`, { clear: !!F.stage }));
+      label: html`${w} <span class="n">${n(s)}</span>` })))}${DOC ? declineButton() : ''}`, { clear: !!F.stage }));
     put($('rows-head'), L_.sortHead(COLS, L));
     put($('rows'), html`${slice.map(row)}`);
     const empty = $('empty');
@@ -85,6 +95,7 @@
       <h3>Act</h3><div>${window.shell.commands.bar(r.id)}</div>
       <h3>Facts</h3>
       <dl><dt>Status</dt><dd>${r.stage}</dd>
+        ${r.stage === 'declined' && declinedBy(r) ? html`<dt>Declined</dt><dd>${when(declinedBy(r))}</dd>` : ''}
         <dt>Last refresh</dt><dd>${age(r)} <span class="why">(${word}${r.fresh === 'stale' ? `: older than ${DOC.stale_days} days` : ''})</span></dd>
         ${facts.map(([k, x]) => html`<dt>${k}</dt><dd>${x}</dd>`)}
         <dt>URL</dt><dd>${link(r.url) ? html`<a class="ext" href="${r.url}" target="_blank" rel="noopener noreferrer">${r.url}</a>` : r.url_text ? html`${r.url_text} <span class="why">(not a link that parses)</span>` : '— none in its Sources'}</dd>
@@ -104,7 +115,7 @@
       document.body.dataset.observed = doc.read; // shell time cells count from the reading, not from now
       ROWS = (doc.rows || []).map(r => ({ ...r, id: `watch:${r.id}`, item: r.id, type: 'watch', label: r.title }));
       const job = { ...(doc.job || {}), id: 'job:market-watch', type: 'job', label: 'market-watch', job: 'market-watch' };
-      return { objects: [...ROWS, job, { id: 'watches', type: 'watch list', label: 'Watches' }],
+      return { objects: [...ROWS, job, { id: 'watches', type: 'watch list', label: 'Watches' }, QUEUE()],
         state: ROWS.length ? null : { kind: 'empty', text: 'No market row is in the store yet: Add watch files one.', source: '/api/watches' } };
     },
     clear: () => { DOC = null; ROWS = []; draw(); },
@@ -177,7 +188,8 @@
     { id: 'watch.delete', on: 'watch', label: 'Delete', does: 'Deletes the watch\'s row for good, with its profile and Sources.', key: 'x', risk: 'confirm', executes: true,
       consequence: o => `This deletes ${o.title} (#${o.item}) for good: its profile, its Sources and its notes are lost. A backup and a removal record are made first. Remove keeps them.`,
       cli: o => `sd-db item remove ${o.item} --who dashboard --reason ${shq(`Deleted on the dashboard: sdw.market ${o.title}`)}`, sends: o => `POST /api/actions/run {action: watch.delete, item: ${o.item}}`,
-      run: o => window.commands.runAction(o, 'watch.delete', { item: o.item }).then(said => reader.reread().then(() => said)) });
+      run: o => window.commands.runAction(o, 'watch.delete', { item: o.item }).then(said => reader.reread().then(() => said)) },
+    window.commands.decline({ post: (path, body) => window.shell.post(path, body).then(out => reader.reread().then(() => out), e => { reader.load(); throw e; }) }));
   window.PAGE_LIST = { rows: () => $('rows').querySelectorAll('tr[data-id]'), current: () => SELECTED, select: key => show(key) };
   document.addEventListener('DOMContentLoaded', () => {
     reader = start();

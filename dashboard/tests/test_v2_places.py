@@ -1264,7 +1264,8 @@ for (const v of ['work', 'hoa', 'home', 'personal']) { await realm(v); R[v] = EL
         # Each tab carries its tasks (sd:5524); the shell keeps the tab in #view=, so the query names no realm.
         # The report row is in no realm (places.realm_of), so it sits in Personal too.
         # pack sd:7687: the hoa checkout's open and done rows left Personal for HOA (Personal held 4).
-        self.assertEqual(out["counts"], {"personal": 2, "work": 1, "hoa": 2, "home": 1})
+        # sd:8018: HOA counts its open row only; the done one stays on the board.
+        self.assertEqual(out["counts"], {"personal": 2, "work": 1, "hoa": 1, "home": 1})
         self.assertEqual(r["urls"], ["view=board"] * 5)
 
     def test_a_vault_task_with_its_own_home_area_sits_in_home_alone(self):
@@ -1283,7 +1284,7 @@ for (const v of ['work', 'hoa', 'home', 'personal']) { await realm(v); R[v] = EL
         self.assertEqual([t in r["work"] for t in titles], [False, False, False, False])
         self.assertEqual([t in r["hoa"] for t in titles], [False, False, False, False])
         self.assertEqual([t in r["home"] for t in titles], [True, False, True, True])
-        self.assertEqual(out["counts"], {"personal": 3, "work": 1, "hoa": 2, "home": 3})
+        self.assertEqual(out["counts"], {"personal": 3, "work": 1, "hoa": 1, "home": 3})
 
     def test_an_address_or_an_older_link_lands_on_its_realm(self):
         """Metrics and Today link /tasks?...&realm=all, and a bookmark may hold #view=hoa or #view=home. pack sd:7216: the
