@@ -408,3 +408,30 @@ class TheWaitBudget(BrowserSession):
             status, _, answer = self.post("/api/items", {"title": "held"})
         self.assertEqual((status, answer), (201, {"ok": True}))
         self.assertGreater(self.http_timeout, held)
+
+
+class SettingAnArea(BrowserSession):
+    """pack sd:8021: Task Details' Area select posts `{area}` to the item edit route, as `sd task edit
+    --area` and `--clear-area` do; the Tasks rows then carry the item's own area and `area_set`."""
+
+    def row(self, item):
+        status, _, body = self.request("/api/tasks", headers={"Cookie": self.cookie, "Sec-Fetch-Site": "same-origin"})
+        self.assertEqual(status, 200)
+        return next(r for r in json.loads(body)["rows"] if r["id"] == item)
+
+    def test_the_route_sets_and_clears_the_area_and_the_tasks_row_shows_it(self):
+        item = self.item("Clean the gutters", kind="task")
+        self.connection.commit()
+        self.assertFalse(self.row(item)["area_set"])
+        for area in ("home", "hoa", None):
+            with self.subTest(area=area):
+                state = workflow.item_state(self.connection, item)
+                status, _, result = self.post(f"/api/items/{item}", {"revision": state["revision"], "area": area})
+                self.assertEqual(status, 200, result)
+                row = self.row(item)
+                self.assertEqual(row["area_set"], area is not None)
+                if area:
+                    self.assertEqual(row["area"], area)
+        state = workflow.item_state(self.connection, item)
+        status, _, result = self.post(f"/api/items/{item}", {"revision": state["revision"], "area": "garage"})
+        self.assertEqual(status, 400, result)

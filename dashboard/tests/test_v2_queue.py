@@ -1283,7 +1283,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
            "working": "working: live sessions, build runs and lane gates now running",
            "next": "next: queued in the lane, not started",
            "blocked": "blocked: stopped in the lane, or waiting on a pull request, until someone acts",
-           "suggested": "suggested: up to 6 ready or planned tasks to do next"}
+           "suggested": "suggested: up to 9 ready or planned tasks to do next"}
 
     def test_each_box_says_its_count_and_what_it_counts_on_hover(self):
         # Pack sd:7383: the native title names the count and the meaning; the aria-label stays.
@@ -1350,7 +1350,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                             " R.html = ELS.queue.html; R.filters = ELS['queue-filters'].html;")
         self.assertNotIn("beta:false", out["R"]["before"])
         self.assertIn("beta:false", out["R"]["after"])
-        self.assertEqual(out["R"]["kids"].count("suggested"), 4, "all four, under the cap of six (sd:7869)")
+        self.assertEqual(out["R"]["kids"].count("suggested"), 4, "all four, under the cap of nine (sd:8008)")
         self.assertIn("#60 Ready 60", out["R"]["html"])
         self.assertIn("#63 Ready 63", out["R"]["html"])
         self.assertEqual(out["urls"], [{"show": "suggested"}])
@@ -1373,17 +1373,17 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                 self.assertIn('data-f="qshow" data-v="suggested" aria-pressed="false"', kept["R"]["filters"])
                 self.assertNotIn("beta:false", kept["R"]["repos"])
 
-    def test_a_repo_with_seven_suggested_items_draws_six(self):
-        # sd:7869 (operator 2026-11-06): Suggested keeps at most six items per repo, in sd-next's order.
+    def test_a_repo_with_ten_suggested_items_draws_nine(self):
+        # sd:7869, sd:8008 (operator 2026-11-07): Suggested keeps at most nine items per repo, in sd-next's order.
         self.doc["queues"]["suggested"] = [{"id": n, "repo": "~/repos/example/system", "title": f"Next {n}", "status": "ready",
-                                            "why": "ready", "due": None, "priority": None} for n in range(61, 68)]
+                                            "why": "ready", "due": None, "priority": None} for n in range(61, 71)]
         out = self.run_view("open('system'); R.html = ELS.queue.html;", search="?show=suggested")
         drawn = re.findall(r'<tr class="child" data-type="suggested" data-item="(\d+)"', out["R"]["html"])
-        self.assertEqual(drawn, [str(n) for n in range(61, 67)])
+        self.assertEqual(drawn, [str(n) for n in range(61, 70)])
 
-    def test_suggested_is_sd_nexts_order_less_live_items_six_per_repo_each_with_why(self):
+    def test_suggested_is_sd_nexts_order_less_live_items_nine_per_repo_each_with_why(self):
         # pack sd:7314: Suggested is what sd-next offers next, ranked server-side (sd_db.today.suggested): ready, then
-        # planned, then unscheduled. The view drops a live item and keeps the first six per repo (sd:7869). Each detail says why;
+        # planned, then unscheduled. The view drops a live item and keeps the first nine per repo (sd:8008). Each detail says why;
         # a row that is not ready shows its status and offers no Build.
         def row(n, why, status, priority=None, due=None):
             return {"id": n, "repo": "~/repos/example/system", "title": f"Next {n}", "status": status, "why": why,
@@ -1496,6 +1496,26 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertIn("<b>blocked: PR</b> · on reviewers · waited 2h 1m", rows["44"])
         self.assertEqual(out["R"]["kids"].count("working"), 2, "the lane builders stay; the live item is gone")
         self.assertIn('aria-label="1 merging, 2 working, 2 next, 4 blocked, 0 suggested"', html)
+
+    def test_pr_review_waits_count_split_on_you_and_on_reviewers(self):
+        # pack sd:8005 (operator 2026-11-07): PR waits folded into the blocked box and the tally with lane failures.
+        # The tally and the repo row now count them apart, split by who they wait on; the blocked box keeps them.
+        lanes = queue_screen.document(self.connection, now=NOW)
+        lanes["prs"] = {"error": "", "rows": [
+            {"item": 40, "title": "Live work", "repo": "~/repos/example/system", "url": "https://github.com/example/system/pull/40",
+             "lane": "awaiting_you", "on": "you", "since": "2026-09-06T11:00:00+00:00", "waited": 3600},
+            {"item": 44, "title": "Reviewed", "repo": "~/repos/example/system", "url": "https://github.com/example/system/pull/44",
+             "lane": "awaiting_them", "on": "reviewers", "since": "2026-09-06T10:00:00+00:00", "waited": 7260},
+            {"item": 5, "title": "Prepared only", "repo": "~/repos/example/system", "url": "https://github.com/example/system/pull/5",
+             "lane": "awaiting_them", "on": "reviewers", "since": "2026-09-06T10:00:00+00:00", "waited": 7200}]}
+        out = self.run_view("R.html = ELS.queue.html; R.tally = ELS['queue-tally'].html;", answers={"/api/queue": [200, lanes]})
+        self.assertIn("<span>3 PR review: 1 on you, 2 on reviewers</span>", out["R"]["tally"])
+        system = re.search(r'<tr class="repo" data-repo="system".*?</tr>', out["R"]["html"], re.S).group(0)
+        self.assertIn('<td class="num">3 PR review: 1 on you, 2 on reviewers</td>', system)
+        alpha = re.search(r'<tr class="repo" data-repo="alpha".*?</tr>', out["R"]["html"], re.S).group(0)
+        self.assertIn('<td class="num"></td>', alpha, "a repo with no PR wait says nothing")
+        out = self.run_view("R.tally = ELS['queue-tally'].html;")
+        self.assertNotIn("PR review", out["R"]["tally"], "no PR wait, no count")
 
     def test_a_prepared_entry_whose_pr_waits_on_review_is_one_row_that_leads_with_the_wait(self):
         # pack sd:7859: item 5 stopped prepared in a manual-merge lane; its PR waits on reviewers. One row, Approve kept.

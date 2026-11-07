@@ -398,6 +398,22 @@ def _ahead(connection, host: str) -> int | None:
     return int(-age) if age is not None and age < -STALE_SECONDS else None
 
 
+def _beat_moves(connection, host: str, now: str) -> bool:
+    """Whether the newest beat of `host` was recorded after the hub's own beat `STALE_SECONDS` before `now`.
+
+    A fast clock leaves the stamp no age, so the hub reads the record: rows
+    take ids in the order the hub writes them, and its own beat carries its
+    own clock. With no hub beat that old there is no measure, and the beat
+    counts as moving (pack sd:8001).
+    """
+    cutoff = (datetime.fromisoformat(now) - timedelta(seconds=STALE_SECONDS)).isoformat(timespec="seconds")
+    mark = connection.execute("SELECT MAX(id) FROM state WHERE kind = 'heartbeat' AND key = ? AND timestamp <= ?",
+                              (HEARTBEAT, cutoff)).fetchone()[0]
+    row = connection.execute("SELECT MAX(id) FROM state WHERE kind = 'heartbeat' AND key = ?",
+                             (f"{HEARTBEAT}@{host}",)).fetchone()
+    return mark is None or (row[0] is not None and row[0] > mark)
+
+
 def _beat(connection, host: str):
     return connection.execute("SELECT timestamp, body FROM state WHERE kind = 'heartbeat' AND key = ? "
                               "ORDER BY id DESC LIMIT 1", (f"{HEARTBEAT}@{host}",)).fetchone()
@@ -1389,7 +1405,8 @@ def _strand(connection, hosts: Collection[str | None], *, now: str) -> list[dict
     own clock, so one too far ahead has no age and is no beat (pack
     sd:7970). A dispatcher beat too far ahead (`_ahead`) is a fast clock,
     not a dead dispatcher: that host's ticks still reap its own runs, so
-    the hub leaves them. A missing beat does not prove that host's processes
+    the hub leaves them while `_beat_moves` reads new beats recorded; once
+    they stop, the runs strand as any quiet host's (pack sd:8001). A missing beat does not prove that host's processes
     stopped, so the run keeps its lease: it ends `blocked` with the reason
     (a pending cancel named in it), unreleased, and no Retry or claim takes
     its items until that host's own reap reads its groups gone and releases
@@ -1405,8 +1422,12 @@ def _strand(connection, hosts: Collection[str | None], *, now: str) -> list[dict
         if quiet is not None and quiet < STALE_SECONDS:
             continue
         gone = dispatcher_gone(connection, host)
-        if gone is None or _ahead(connection, host) is not None:
-            continue  # a beat too far ahead is skew: that host's ticks still reap its own runs
+        if gone is None:
+            continue
+        if _ahead(connection, host) is not None:
+            if _beat_moves(connection, host, now):
+                continue  # a beat too far ahead is skew: that host's ticks still reap its own runs
+            gone = f"{gone}, and the hub recorded no beat from it for {STALE_SECONDS} s"
         detail = f"{host}'s dispatcher went quiet ({gone}) and the run sent no beat for {STALE_SECONDS} s"
         if row["cancel_requested"]:
             detail = f"{row['cancel_requested']}, but {detail}"

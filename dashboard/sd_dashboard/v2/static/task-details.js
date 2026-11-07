@@ -147,6 +147,7 @@
       if ('body' in ch) a.push(`--body ${window.shell.shq(ch.body)}`);
       if ('recurrence' in ch) a.push(ch.recurrence ? `--recur ${window.shell.shq(ch.recurrence)}` : '--clear-recur');
       if ('recurrence_lead' in ch) a.push(`--recur-lead ${ch.recurrence_lead ?? 0}`);
+      if ('area' in ch) a.push(ch.area ? `--area ${ch.area}` : '--clear-area');
       return `sd task edit ${t.id} ${a.join(' ')}`;
     }
 
@@ -347,7 +348,8 @@
     // revision the edit answered. A field the row does not carry (the description) takes `before(row)`, read then too.
     // `check` asks as the edit leaves whether it still changes anything: a second one queued
     // behind the first would write nothing, and its Undo would set back what the first one changed (review, PR #46).
-    const FIELD = { anchor: 'recurrence_anchor', lead: 'recurrence_lead', repo_path: 'repo' };
+    // `own` is the row's own area (pack sd:8021): `area` alone may be the repo rule's, which no edit sets back.
+    const FIELD = { anchor: 'recurrence_anchor', lead: 'recurrence_lead', repo_path: 'repo', own: 'area' };
     // `before` holds a field the row does not carry (the description, read with the Details).
     function editRun(t, ch, msg, { check, keep = Object.keys(ch), before = () => ({}) } = {}) {
       let was = {};
@@ -571,6 +573,7 @@
           <dt><label for="det-due">Due</label>${hint('Due', 'The date the work is due; a date within 7 days makes the item urgent.')}</dt><dd><input id="det-due" class="fld" type="date" value="${String(t.due || '')}"${dis}>${t.due || t.overdue ? html` <span class="why">${t.due ? dt : 'overdue · date not recorded'}</span>` : ''}</dd>
           ${repeatFields(t, off)}
           <dt><label for="det-repo">Repo</label>${hint('Repo', 'The checkout this item belongs to; a work item keeps the one its folder is in.')}</dt><dd><select id="det-repo" class="fld"${t.kind === 'work' && !off ? html` disabled title="A work item belongs to the checkout its folder is in."` : dis}>${repoOptions(t, null)}</select></dd>
+          ${areaField(t, dis)}
           <dt>Urgent${hint('Urgent', 'Set by the dashboard from the due date and the item\'s state, not by hand.')}</dt><dd>${urgent(t) ? 'yes' : 'no'} <span class="why">(derived)</span></dd>
           <dt><label for="det-q">Quadrant</label>${hint('Quadrant', 'Where urgency and importance place the item; a move sets its priority or due date.')}</dt><dd>${t.status === 'done' ? 'not placed' : html`<select id="det-q" class="fld"${dis}>${QUADS.map(q => html`<option value="${q[0]}"${q[0] === quadOf(t) ? html` selected` : ''}>${q[1]}</option>`)}</select>`}</dd>
           ${t.assignment ? html`<dt>Assignment${hint('Assignment', 'Whether an agent is working on this task now.')}</dt><dd>${t.assignment}</dd>` : ''}
@@ -607,6 +610,15 @@
       const why = gone ? 'this task was not read again after the change' : KINDS.includes(t.kind) ? '' : `${t.kind} items are owned by their producer; their kind cannot be changed here`;
       return html`<dt><label for="det-kind">Kind</label>${hint('Kind', 'What the item is: a task, a followup or an idea. Idea kinds carry no repo.')}</dt><dd><select id="det-kind" class="fld"${why ? html` disabled title="${why}"` : ''}>${
         (KINDS.includes(t.kind) ? KINDS : [t.kind, ...KINDS]).map(k => html`<option value="${k}"${k === t.kind ? html` selected` : ''}>${k}</option>`)}</select></dd>`;
+    }
+    // pack sd:8021: Area, the item's own place (sd task edit --area, pack sd:8010): Home or HOA shows it in that tab
+    // alone; None lets its repo place it. `area_set` says the row's area is its own, not the repo rule's.
+    const AREAS = [['', 'None'], ['home', 'Home'], ['hoa', 'HOA']];
+    const ownArea = t => t.area_set ? t.area : '';
+    const areaName = v => AREAS.find(a => a[0] === (v || ''))?.[1] || v;
+    function areaField(t, dis) {
+      return html`<dt><label for="det-area">Area</label>${hint('Area', 'Home or HOA shows the item only in that tab, whatever its repo; None lets its repo place it.')}</dt><dd><select id="det-area" class="fld"${dis}>${
+        AREAS.map(([v, name]) => html`<option value="${v}"${v === ownArea(t) ? html` selected` : ''}>${name}</option>`)}</select></dd>`;
     }
     // The repos a task can move to: every registered one (the capture's list) once read, else the ones these rows name.
     function repoOptions(t, list) {
@@ -651,6 +663,14 @@
         window.shell.confirm({ title: `Kind → ${v}: ${label(t)}?`, ok: `Make it ${v}`, keep: 'Cancel', danger: false, cli: cliQuad(t, ch),
           body: `A ${v} item carries no repo, so this also clears its repo (${t.repo}). Undo sets the kind back, not the repo.` })
           .then(yes => { if (yes) go(); });
+        return false; }
+      // pack sd:8021: an area moves the item between tabs, so the change asks first; its Undo sets the own area back.
+      if (id === 'det-area') { const a = v || null; if ((a || '') === ownArea(t) || !AREAS.some(x => x[0] === v)) return false;
+        const ch = { area: a }, to = areaName(v).replace('None', 'none');
+        window.shell.confirm({ title: `Area → ${to}: ${label(t)}?`, ok: a ? `Show in ${to}` : 'Clear the area', keep: 'Cancel', danger: false, cli: cliQuad(t, ch),
+          body: a ? `It shows only in the ${to} tab, not in Personal or its realm tab.` : 'Its repo places it again.' })
+          .then(yes => { if (yes) commitEdit(byKey(t.key) || t, ch, `area → ${to}`, { keep: ['own'], before: r => ({ own: (r.area_set && r.area) || null }),
+            check: r => ((r.area_set && r.area) || null) !== a || `its area is already ${to}` }); });
         return false; }
       if (id === 'det-q') return v !== quadOf(t) && toQuad(t.key, v);
       if (id === 'det-p') { const n = v ? +v : null; if (n === t.p) return false;

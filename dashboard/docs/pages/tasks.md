@@ -13,6 +13,8 @@ quadrant in place (the description saves on leaving it, sd:3467), each change on
 row cannot take is off with the reason. A card's priority and due date are
 dropdowns that make the same writes; Pick a date opens Edit (sd:3440). Status, priority, due, repo and recurrence edits
 carry Undo; resolving a followup note and cancelling an assignment ask first.
+The Area select (pack sd:8021) sets the item's own area, Home or HOA, or clears it with None, as
+`sd task edit N --area home|hoa` and `--clear-area` do; it asks first, and its Undo sets the area back.
 Completing a repeating task asks first and names the outcome (sd:2250): the next
 occurrence's date, or that sd sets it, or, for a rule sd cannot walk, that the
 series ends, on the danger button. `sd work relink` and `sd work cancel` run

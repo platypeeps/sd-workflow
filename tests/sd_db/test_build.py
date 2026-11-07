@@ -1622,6 +1622,24 @@ class Hosts(Case):
         self.assertNotIn("went quiet", self.count("SELECT COALESCE(detail, '') FROM runner_run WHERE id = ?",
                                                   run["id"]))
 
+    def test_the_hub_strands_a_fast_satellites_run_once_its_beat_stops(self):
+        """Pack sd:8001: the skew exemption holds only while the fast beat moves. The hub reads its age by its
+        own record: a satellite beat with no newer row than the hub's own beat `STALE_SECONDS` old has stopped,
+        whatever stamp it carries, so its dead dispatcher's runs strand without waiting for the clock."""
+        run = self.satellite_run()
+        ahead = later(build.clock(), 3600)
+        self.db.execute("UPDATE runner_run SET heartbeat_at = ? WHERE id = ?", (ahead, run["id"]))
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={}, timestamp=ahead)
+        record_state(self.db, "heartbeat", key="build-dispatch", body={}, timestamp=run["created_at"])
+        self.assertEqual(self.strand(run, after=build.STALE_SECONDS - 1), [], "the hub beat is not stale yet")
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={}, timestamp=ahead)
+        self.assertEqual(self.strand(run), [], "a fast beat recorded since still moves")
+        record_state(self.db, "heartbeat", key="build-dispatch", body={}, timestamp=later(run["created_at"], 1))
+        [settled] = self.strand(run)
+        self.assertEqual((settled["run"], settled["outcome"]), (run["id"], "blocked"))
+        self.assertIn("recorded no beat", build.run(self.db, run["id"])["detail"])
+        self.assertTrue(self.lease_held(run))
+
     def test_a_cancel_on_a_quiet_satellite_blocks_and_keeps_the_lease(self):
         run = self.satellite_run()
         lead = run["assignment"]

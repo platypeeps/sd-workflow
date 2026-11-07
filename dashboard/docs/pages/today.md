@@ -43,7 +43,7 @@ on the open repo closes it. The rows, in order:
   a builder's gate in the lane, and the runner's queued and running assignments no run holds
   (`GET /api/queue/runner`, pack sd:7115 and sd:7217);
 - merging, next and blocked: the lane entries of `GET /api/queue` (`queue_screen.document`);
-- suggested: what sd-next offers next, at most six per repo (pack sd:7222, sd:7314): `/api/now`'s
+- suggested: what sd-next offers next, at most nine per repo (pack sd:7222, sd:7314, sd:8008): `/api/now`'s
   `queues.suggested`, ranked by `sd_db.today.suggested` (ready items in the backlog's order, then planned items
   soonest first, then unscheduled ones highest priority first), less any item that is live, in the lane or held by a
   build. Each row says why: `ready`, `planned for <date>` or `unscheduled P<n>`; one that is not ready shows its

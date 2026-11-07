@@ -328,7 +328,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // its child rows under it and closes the row that was open, and a click on the open row closes it. The children, in order:
   // working (the live items of `active`, the build runs of /api/queue/builds, a builder's gate in the lane and the runner's
   // assignments no run holds), merging, next and blocked (the lane entries of /api/queue), suggested (what sd-next offers next,
-  // from `queues.suggested`, at most six, pack sd:7222, sd:7314 and sd:7869), open (All items: its other open tasks, from
+  // from `queues.suggested`, at most nine, pack sd:7222, sd:7314, sd:7869 and sd:8008), open (All items: its other open tasks, from
   // /api/tasks) and ended (ended build runs, and the cancelled
   // and landed lane entries). Each row's marker is its state glyph and its type in words; the parent's glyph is its worst
   // child's. Suggested is on by default (pack sd:7314), All items and Ended builds are off; on, a repo with only those rows
@@ -344,7 +344,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // the merge, which nothing takes back. A build run's Cancel asks first and posts the assignment cancel route; an ended
   // blocked or cancelled bundle's Retry and Send to builder post /api/queue/builds/retry (pack sd:6020). The view reads its
   // three documents when it first shows and on each Today read after; a source that was not read is said under the table.
-  const QTYPES = ['working', 'merging', 'next', 'blocked', 'suggested', 'open', 'ended'], QSHOW = ['suggested', 'open', 'ended'], NEXT = 6;
+  const QTYPES = ['working', 'merging', 'next', 'blocked', 'suggested', 'open', 'ended'], QSHOW = ['suggested', 'open', 'ended'], NEXT = 9;
   const BOXES = ['merging', 'working', 'next', 'blocked', 'suggested']; // a repo row's boxes, left to right (pack sd:7470)
   const QV = { lanes: null, lanesErr: '', built: null, builtErr: '', runner: null, runnerErr: '', tasks: null, tasksErr: '', seen: false, busy: false };
   const QOTHER = new Map(); // the lane entries, selectable as Today's other rows are
@@ -388,7 +388,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     return [type, s, html`<tr class="child" data-type="${type}"${id ? html` data-id="${id}" aria-selected="${String(row() === id)}"` : ''}${r.held ? html` data-held=""` : ''}${p ? html` data-pr="${String(p.item)}"` : ''}>${marker(s, type)}
       <td class="what">${r.state === 'building' ? html`<code>${r.builder}</code>` : html`<a href="${shell.itemHref(r.item)}">#${r.item} ${r.title}</a>`}</td>
       <td class="detail">${p ? html`${prFacts(p)} · ` : ''}${facts}${shots(r)}</td><td class="num">${r.state === 'next' ? `#${r.position}` : p ? dur(p.waited) : ''}</td>
-      <td class="act">${ctl}${p ? prWaitLink(p) : ''}${id ? shell.commands.rowActions(id) : ''}</td></tr>`];
+      <td class="act">${ctl}${p ? prWaitLink(p) : ''}${id ? shell.commands.rowActions(id) : ''}</td></tr>`, p && p.on];
   }
   // A build run's state (pack sd:6095): working; waiting on me (held, or an open question asks); stalled (the log has not
   // grown for 15 min); lost (no supervisor beat for 3 min, which the dispatcher's next reap settles).
@@ -445,7 +445,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     return ['blocked', s, html`<tr class="child" data-type="blocked" data-pr="${String(p.item)}">${marker(s, 'blocked')}
     <td class="what"><a href="${shell.itemHref(p.item)}">#${p.item} ${p.title}</a></td>
     <td class="detail">${prFacts(p)}</td><td class="num">${dur(p.waited)}</td>
-    <td class="act">${prWaitLink(p)}</td></tr>`]; };
+    <td class="act">${prWaitLink(p)}</td></tr>`, p.on]; };
   // A suggested row (pack sd:7271) is a task: a click shows the Tasks page's Details, and its act is Build on a ready one,
   // else its next status, as on Tasks. Its detail says why it is suggested (pack sd:7314): ready, planned for its due
   // date, or unscheduled, with its priority; a row that is not ready shows its status too.
@@ -481,10 +481,10 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   const freshRows = () => [...SROW].filter(([k, t]) => !isItem(k) || (listedTask(k) && listedTask(k).revision !== t.revision)).forEach(([k]) => SROW.delete(k));
   // Each repo's children, from the four reads, each with the rows the filters show; queueView draws a repo that shows one.
   function qGroups() {
-    const G = new Map(), add = (repo, [type, s, tr]) => {
+    const G = new Map(), add = (repo, [type, s, tr, pr]) => {
       const k = repoKey(repo);
       if (!G.has(k)) G.set(k, { key: k, host: '', rows: [] });
-      G.get(k).rows.push({ type, s, tr });
+      G.get(k).rows.push({ type, s, tr, pr });
     };
     const live = new Map(), prs = ((QV.lanes || {}).prs || {}).rows || [], waits = new Set(prs.map(p => Number(p.item)));
     // pack sd:7859: an item waiting on its PR is its PR row alone: no live-session, suggested or open row beside it.
@@ -514,6 +514,9 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     }).sort((a, b) => (a.key === '') - (b.key === '') || busy(a, b) || a.key.localeCompare(b.key));
   }
   const tally = rows => QTYPES.map(t => [t, rows.filter(c => c.type === t).length]).filter(([, n]) => n);
+  // pack sd:8005: the PR waits inside blocked, counted apart and split by who they wait on; '' when there is none.
+  const prTally = rows => { const you = rows.filter(c => c.pr === 'you').length, them = rows.filter(c => c.pr && c.pr !== 'you').length;
+    return you + them ? `${you + them} PR review: ${you} on you, ${them} on reviewers` : ''; };
   // A repo row's five boxes: merging, next and blocked (pack sd:7272, Queue's lane ledger until #1768), with working
   // before them and suggested after (pack sd:7314), counted from all the repo's rows, so a filter hides no count. A box is
   // lit only when its count is not zero; blocked lights the warning lamp; the label says all five in words. A lane that
@@ -546,7 +549,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     if (!groups.some(g => g.key === qOpen)) qOpen = null;
     put($('queue-filters'), shell.list.fseg('qshow', 'Show', [['suggested', 'Suggested'], ['open', 'All items'], ['ended', 'Ended builds']].map(([v, label]) =>
       ({ v, pressed: qShow.has(v), label: html`${label} <span class="n">${String(every.filter(c => c.type === v).length)}</span>` }))));
-    put($('queue-tally'), html`${tally(every.filter(c => !QSHOW.includes(c.type))).map(([t, n]) => html`<span>${n} ${t}</span>`)}`);
+    const prs = prTally(every);
+    put($('queue-tally'), html`${tally(every.filter(c => !QSHOW.includes(c.type))).map(([t, n]) => html`<span>${n} ${t}</span>`)}${prs ? html`<span>${prs}</span>` : ''}`);
     // Auto-pickup (pack sd:6097): its state, and On or Off, bound to the end this read saw.
     const pk = QV.built && QV.built.pickup;
     put($('queue-pickup'), !pk ? html`` : pk.error ? html`Auto-pickup not read: ${pk.error}`
@@ -556,7 +560,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     const parent = g => { const on = qOpen === g.key, name = g.key || 'Unassociated';
       return html`<tr class="repo" data-repo="${g.key}" aria-expanded="${String(on)}">${marker(g.s, 'repo')}
         <td class="what"><button type="button" class="disc" data-open="${g.key}" aria-expanded="${String(on)}" aria-label="${on ? 'Close' : 'Open'} ${name}">${I('chevron-right')}</button><button type="button" class="pick" data-open="${g.key}">${name}</button>${g.host ? html`<small>lane on ${g.host}</small>` : ''}</td>
-        ${pips(g)}<td class="num"></td><td class="act"></td></tr>`; };
+        ${pips(g)}<td class="num">${prTally(g.rows)}</td><td class="act"></td></tr>`; };
     put($('queue'), groups.length ? html`${groups.map(g => html`${parent(g)}${qOpen === g.key ? g.shown.map(c => c.tr) : ''}`)}`
       : html`<tr class="empty"><td colspan="5">${unread.length ? 'No row in what was read; the line under the table names what was not.'
         : `Nothing is working, merging, next or blocked${qShow.size ? ', and no row matches the filters' : ''}.`}</td></tr>`);
