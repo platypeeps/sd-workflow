@@ -1,4 +1,4 @@
-"""Home assets (pack sd:8053): what is on the home lot, one `home_asset` row each.
+"""Home assets (pack sd:8053, sd:8054): what is on the home lot, one `home_asset` row each.
 
 The Home page's property map draws them over the county aerial, and the koi
 dashboard (pack sd:8054) reads its pond and fish from the same rows. A row is
@@ -26,8 +26,11 @@ KINDS = (
     "irrigation-line", "irrigation-valve", "irrigation-zone", "backflow",
     "solar", "powerwall", "inverter", "ev-charger", "hvac",
     "tree", "plant",
-    "light", "drainage", "fence", "easement",
+    "light", "drainage", "fence", "easement", "pond",
 )
+#: The kinds with no place on the map: the pond's fish (pack sd:8054, the Koi view).
+FISH = ("koi",)
+ALL_KINDS = KINDS + FISH
 #: The kinds drawn as a line by default; any kind may hold either shape.
 LINES = frozenset({"gas-line", "water-line", "sewer-line", "electric-line", "comms-line", "irrigation-line",
                    "irrigation-zone", "drainage", "fence", "easement"})
@@ -107,7 +110,7 @@ def get_asset(connection: sqlite3.Connection, asset: int) -> dict:
 
 def save_asset(connection: sqlite3.Connection, *, kind: str, name: str, geometry: Any = None,
                fields: Any = None, photo: Any = None, asset: int | None = None,
-               kinds: tuple[str, ...] = KINDS) -> dict:
+               kinds: tuple[str, ...] = ALL_KINDS) -> dict:
     """Add an asset, or replace asset `asset`'s values; the row as stored."""
     if kind not in kinds:
         raise AssetRefused(f"kind is one of {', '.join(kinds)}")

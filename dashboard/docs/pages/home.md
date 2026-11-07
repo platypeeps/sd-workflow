@@ -109,3 +109,13 @@ point or a line in the same feet, a fields object and a photo address. Add: pres
 planted, sun, water, zone and notes). Drag a point to move it. A row or a mark opens its form: Save, Delete, and
 Add care task, which files a recurring task (area home) naming the asset in `fields.asset`; the next occurrence
 keeps it. A plant or tree with an open care task due before today carries the warning ring.
+
+Koi (pack sd:8054, `home_koi.py`, `home-koi.js`) shares the Map's assets: the pond is the `pond` asset, placed on
+the Map (`fields.volume_gal` sizes a change in gallons), and each fish a `koi` asset with no place: name, variety,
+photo, acquired, health notes and a log of size and weight. Water tests (ammonia, nitrite, nitrate, pH, KH,
+temperature) are logged on the pond. Feeding, filter cleaning, water tests and treatments are recurring care
+tasks on the pond, filed as the Map files them. Water changes come from Home Assistant: the setting row
+`dashboard.koi_water` names each script that changes the water, one `<entity_id>|<percent>` line, and each run
+in Home Assistant's history (it keeps ten days) is one change of that percent. When the history holds a change
+the pond's log lacks, the view posts `POST /api/home/koi/water`, which writes it once. The view shows days since
+the last change, the percent replaced in the last 7 days and the weekly average over 28.

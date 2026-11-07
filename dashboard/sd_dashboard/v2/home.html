@@ -7,6 +7,8 @@
   Edit tiles (sd:3987) posts /api/home/tiles: it writes the tile row.
   Map (home-map.js, pack sd:8053) reads /api/home/map when shown: the assets over the county aerial; Add, move, edit and care post
   /api/home/asset, /api/home/asset/delete and /api/home/care.
+  Koi (home-koi.js, pack sd:8054) reads /api/home/koi when shown; it posts /api/home/asset, /api/home/care and
+  /api/home/koi/water, which logs Home Assistant's water changes on the pond.
   Views (places.js): Overview is the tiles; Tasks, Briefs and Reports each read /api/home/<view> (places.py) when shown.
   A Briefs row shows its Details in the pane, the Briefs page's own (brief-details.js, sd:5620); a Reports row the Reports page's
   (report-details.js, sd:5636); a Tasks row the Tasks page's (task-details.js, sd:5635).
@@ -72,6 +74,17 @@
     <div id="map-form"></div>
     <div id="map-rows"></div>
   </section>
+  <section class="place-view" id="view-koi" data-place-view="koi" data-label="Koi" aria-labelledby="koi-h" hidden>
+    <div class="sec-head"><div><h2 id="koi-h">Koi</h2><p>The fish, the pond's care and water tests, and its water changes from Home Assistant.</p></div></div>
+    <div id="koi-note"></div>
+    <h3>Water changes</h3>
+    <div id="koi-water"></div>
+    <h3>Fish</h3>
+    <div id="koi-fish"></div>
+    <div id="koi-form"></div>
+    <h3>Pond care</h3>
+    <div id="koi-care"></div>
+  </section>
   <section class="place-view" id="view-tasks" data-place-view="tasks" data-label="Tasks" data-api="/api/home/tasks" aria-labelledby="tasks-h" hidden>
     <div class="sec-head"><div><h2 id="tasks-h">Tasks</h2><p>Open items with no repo, and items tagged home (sd task edit N --area home) whatever their repo.</p></div><p class="tally" id="tasks-tally"></p></div>
     <div id="tasks-rows"></div>
@@ -94,6 +107,7 @@
 <script src="/ui/task-details.js"></script>
 <script src="/ui/home.js"></script>
 <script src="/ui/home-map.js"></script>
+<script src="/ui/home-koi.js"></script>
 <script src="/ui/places.js"></script>
 <script src="/ui/shell.js"></script>
 </body>

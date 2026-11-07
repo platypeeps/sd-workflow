@@ -1,7 +1,8 @@
 """Home (sd:2117): the design's Home Assistant tiles, from the setting row or the config folder (sd:3987), with live
 state (sd:3427). Edit tiles posts /api/home/tiles; a tile's Act section posts /api/home/service (sd:4966).
 The Map view (pack sd:8053) reads /api/home/map and its aerial; its Add, move, edit and care post /api/home/asset,
-/api/home/asset/delete and /api/home/care."""
+/api/home/asset/delete and /api/home/care. The Koi view (pack sd:8054) reads /api/home/koi, its fish and pond the
+same assets; /api/home/koi/water logs Home Assistant's water changes on the pond."""
 
 from __future__ import annotations
 
@@ -56,6 +57,20 @@ def _care(payload, principal):
     return home_map.care(payload, principal)
 
 
+def _koi(read):
+    from ... import home_koi
+
+    return home_koi.document(read.connection, now=read.now)
+
+
+def _koi_water(payload, principal):
+    from sd_db.writes import now
+
+    from ... import home_koi
+
+    return home_koi.log_water(payload, now=now())
+
+
 PAGE = Page(
     section="Home",
     routes=("/home",),
@@ -65,5 +80,7 @@ PAGE = Page(
          # The property map (pack sd:8053, home_map).
          Api("/api/home/map", _map), Api("/api/home/map/aerial", _aerial), Api("/api/home/asset", write=_asset),
          Api("/api/home/asset/delete", write=_asset_delete), Api("/api/home/care", write=_care),
+         # The koi pond (pack sd:8054, home_koi).
+         Api("/api/home/koi", _koi), Api("/api/home/koi/water", write=_koi_water),
          *place_views("home")),
 )

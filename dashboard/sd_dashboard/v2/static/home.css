@@ -142,3 +142,9 @@ html[data-kiosk] .headline .what b { font-size: var(--text-xl); }
 .asset-form label { display: grid; gap: var(--space-3xs); color: var(--color-ink-2); }
 #map-rows tr[aria-selected="true"] { background: var(--color-accent-bg); }
 #map-rows tr:focus-visible { outline: 2px solid var(--color-focus); outline-offset: -2px; }
+
+/* ---------- Koi (pack sd:8054) ---------- */
+#view-koi h3 { margin-top: var(--space-md); }
+#koi-fish tr[aria-selected="true"] { background: var(--color-accent-bg); }
+#koi-fish tr:focus-visible { outline: 2px solid var(--color-focus); outline-offset: -2px; }
+#koi-care .st.warning { color: var(--color-warning); }
