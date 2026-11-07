@@ -1,7 +1,7 @@
 # The workflow database: hub, lane host and judgments
 
 `bin/sd-db` runs the workflow database's verbs from this checkout's `lib/`.
-This page covers the hub and its satellites, the refusals, the lane host, `judgments`, the review queue, the item kinds, and renaming a repository by hand.
+This page covers the hub and its satellites, the refusals, the lane host, `judgments`, the review queue, the item kinds, board votes, and renaming a repository by hand.
 The module docstrings under `lib/sd_db/` hold the detail.
 
 ## One hub, many satellites: `serve` and `hub.json`
@@ -641,6 +641,15 @@ The row is the source of truth: no counter or time decides a difference, because
 - A snapshot of a schema newer than this library stops the walk, as it stops the restore: `newer` holds its path and version.
 - `released` lists the runs whose open leases a restore of that snapshot would release.
 - It writes only its temporary copies, so it runs off the hub; `restore_newest` still refuses there.
+
+## `sd votes`: board votes
+
+`sd votes add|edit|list|show|import` keeps a board's votes in the `vote` table, one row per vote, keyed by its checkout and a key such as `CI-1` (pack sd:8050).
+Run it from the checkout, or name one with `--belongs-to PATH`; `list`, `show` and the writes take `--json`.
+`import FILE` loads a CSV with `votes.csv`'s columns in one transaction: a key the checkout holds is updated, and a second run changes nothing.
+`votes` keeps the cell as written; `tally` is each director's answer read from it, or none when the cell does not read whole.
+An outcome starting `pending` makes a vote open unless `--state` says otherwise; `edit --if-revision N` refuses a vote that changed.
+The HOA page's Votes view reads them, open votes first.
 
 ## Renaming a repository
 

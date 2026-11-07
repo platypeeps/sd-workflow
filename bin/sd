@@ -90,6 +90,7 @@ import sd_restore  # noqa: E402
 import sd_shadow  # noqa: E402
 import sd_skill  # noqa: E402
 import sd_suggest  # noqa: E402
+import sd_votes  # noqa: E402
 import sd_work  # noqa: E402
 import sd_writing  # noqa: E402
 
@@ -2945,6 +2946,7 @@ def build_parser() -> argparse.ArgumentParser:
     sd_fleet.register_fleet(groups)
     sd_ci.register_ci(groups)
     sd_notes.register_note_group(groups)
+    sd_votes.register_votes(groups)
     return parser
 
 
