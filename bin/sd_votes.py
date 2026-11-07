@@ -165,9 +165,16 @@ def votes_show(votes, connection, repo: str, args: argparse.Namespace, out) -> i
 def _read_csv(path: str) -> list[dict]:
     try:
         with open(path, encoding="utf-8-sig", newline="") as handle:
-            return list(csv.DictReader(handle))
+            reader = csv.DictReader(handle)
+            header = reader.fieldnames or []
+            rows = list(reader)
     except (OSError, UnicodeError, csv.Error) as error:
         raise WorkRefusal(f"import: cannot read {path}: {error}") from None
+    # DictReader keeps the last of two same-named cells and drops the other, silently.
+    twice = sorted({name for name in header if header.count(name) > 1})
+    if twice:
+        raise WorkRefusal(f"import: {path}: the header names {', '.join(twice)} more than once")
+    return rows
 
 
 def votes_import(votes, connection, repo: str, args: argparse.Namespace, out) -> int:

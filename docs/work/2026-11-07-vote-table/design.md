@@ -33,8 +33,9 @@ Migration 048 adds one table, `vote`: one row per vote or decision.
 
 `sd_db.votes` holds `add`, `edit`, `rows`, `get` and `import_rows`.
 The import takes rows shaped like `votes.csv`: its `id` column is the key.
-It runs in one transaction. A file with a duplicate key, an unknown column or a bad
-row writes nothing and names the row. A key already stored is updated in place,
+It runs in one transaction. A file with a duplicate key, an unknown, missing or
+repeated column, a short row or a bad row writes nothing and names the row.
+A missing column or cell would otherwise blank the stored text on update. A key already stored is updated in place,
 so a second import of the same file changes nothing.
 
 The CLI is one noun, `sd votes add|edit|list|show|import`, with `--json` on reads.
@@ -62,6 +63,7 @@ Rejected: a hash revision, as items have. An integer compared in the `UPDATE`'s
 | import | many rows in one transaction | a bad row late in the file | validate every row first: nothing lands | `test_a_bad_row_late_in_the_file_writes_nothing` |
 | import | many rows in one transaction | a stop between two row writes | one transaction: nothing lands; rerun finishes | `test_a_stop_between_two_row_writes_lands_nothing_and_a_rerun_finishes` |
 | import again | same keys | duplicate rows | upsert by `(repo, key)`; same text is no write | `test_rows_shaped_like_votes_csv_land_and_a_second_import_changes_nothing` |
+| import update | stored text columns | a short row or a header without a column blanks them | refuse the file before any write | `test_a_short_row_refuses_the_file_and_keeps_the_stored_vote`, `test_a_header_missing_a_column_refuses_naming_it_and_keeps_the_stored_vote` |
 | edit | one row, revision + 1 | another write between read and write | `WHERE revision = ?`; refuses stale | `test_a_stale_revision_is_refused` |
 | repo removal | a vote's parent | vote orphaned | removal refuses P7 | `test_a_repo_with_votes_is_refused` |
 | item removal | a vote's link | vote orphaned | removal refuses I11 | `test_an_item_a_vote_links_is_refused` |

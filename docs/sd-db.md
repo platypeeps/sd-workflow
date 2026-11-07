@@ -647,6 +647,7 @@ The row is the source of truth: no counter or time decides a difference, because
 `sd votes add|edit|list|show|import` keeps a board's votes in the `vote` table, one row per vote, keyed by its checkout and a key such as `CI-1` (pack sd:8050).
 Run it from the checkout, or name one with `--belongs-to PATH`; `list`, `show` and the writes take `--json`.
 `import FILE` loads a CSV with `votes.csv`'s columns in one transaction: a key the checkout holds is updated, and a second run changes nothing.
+It refuses the whole file for a header that lacks a column or names one twice, and for a row with fewer cells than the header: either would blank stored text.
 `votes` keeps the cell as written; `tally` is each director's answer read from it, or none when the cell does not read whole.
 An outcome starting `pending` makes a vote open unless `--state` says otherwise; `edit --if-revision N` refuses a vote that changed.
 The HOA page's Votes view reads them, open votes first.

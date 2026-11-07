@@ -8,6 +8,8 @@ synthetic directors and motions; nothing here is a real board's record.
 
 from __future__ import annotations
 
+import csv
+import io
 import random
 import sqlite3
 import tempfile
@@ -35,6 +37,15 @@ CSV_ROW = {
 
 def row(**changes):
     return {**CSV_ROW, **changes}
+
+
+def written(*rows):
+    """`rows` as CSV text, with the first row's keys as the header."""
+    out = io.StringIO()
+    writer = csv.DictWriter(out, fieldnames=list(rows[0]))
+    writer.writeheader()
+    writer.writerows(rows)
+    return out.getvalue()
 
 
 class Store(unittest.TestCase):
@@ -268,6 +279,31 @@ class TheImport(Store):
                 votes.import_rows(self.db, HOA, file)
             self.assertIn(word, str(caught.exception))
         self.assertEqual(self.count(), 0)
+
+    def test_a_short_row_refuses_the_file_and_keeps_the_stored_vote(self):
+        """Lead review of sd:8050: csv.DictReader gives a short row's missing cells as None, which must not
+        become '' and erase the stored votes, outcome and notes, nor flip an open vote to closed."""
+        votes.import_rows(self.db, HOA, [row(outcome="pending: not sent", notes="keep me")])
+        before = self.vote("CI-1")
+        short = ",".join(votes.CSV_COLUMNS) + "\nCI-1,2026-10-02,Replacement topic\n"
+        with self.assertRaises(votes.VoteRefused) as caught:
+            votes.import_rows(self.db, HOA, csv.DictReader(io.StringIO(short)))
+        self.assertIn("row 2 (CI-1): the row has fewer cells than the header", str(caught.exception))
+        self.assertEqual(self.vote("CI-1"), before)
+
+    def test_a_header_missing_a_column_refuses_naming_it_and_keeps_the_stored_vote(self):
+        """Lead review of sd:8050: a header without a votes.csv column would blank that column on update."""
+        votes.import_rows(self.db, HOA, [row(outcome="pending: not sent", notes="keep me")])
+        before = self.vote("CI-1")
+        for text, missing in (("id,motion,votes,outcome,notes\nCI-1,Replacement motion\n",
+                               "date, topic, type, moved, seconded, follow_up, source"),
+                              (written({c: v for c, v in row().items() if c not in ("source", "notes")}),
+                               "source, notes")):
+            with self.subTest(missing=missing):
+                with self.assertRaises(votes.VoteRefused) as caught:
+                    votes.import_rows(self.db, HOA, csv.DictReader(io.StringIO(text)))
+                self.assertIn(f"the header has no {missing} column", str(caught.exception))
+        self.assertEqual(self.vote("CI-1"), before)
 
     def test_extreme_rows_either_land_whole_or_refuse_with_nothing_written(self):
         """A property over extreme cells: empty, very long, unicode, control characters, duplicate keys, cells

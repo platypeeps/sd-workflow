@@ -321,10 +321,16 @@ def import_rows(connection: sqlite3.Connection, repo: str, file: Iterable[Mappin
         if unknown:
             raise VoteRefused(f"{where}: {', '.join(unknown)} is not a votes.csv column; expected "
                               f"{', '.join(CSV_COLUMNS)}")
-        if "id" not in raw:
-            raise VoteRefused(f"{where}: the file has no id column")
+        # Every column, or an update would blank the ones the file left out (lead review of sd:8050).
+        missing = [column for column in CSV_COLUMNS if column not in raw]
+        if missing:
+            raise VoteRefused(f"{where}: the header has no {', '.join(missing)} column; a votes.csv names every one "
+                              f"of {', '.join(CSV_COLUMNS)}")
         key = _key(raw["id"], where)
         where = f"{where} ({key})"
+        # csv.DictReader gives a short row's missing cells as None; read as '' they would erase stored text.
+        if any(value is None for value in raw.values()):
+            raise VoteRefused(f"{where}: the row has fewer cells than the header")
         if key in planned:
             raise VoteRefused(f"{where}: key {key} is also row {planned[key][0]}; one row per key")
         cleaned = _clean({column: value for column, value in raw.items() if column != "id"}, where)

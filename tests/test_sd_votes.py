@@ -95,6 +95,16 @@ class Votes(unittest.TestCase):
         vote = json.loads(self.ok("show", "CI-1", "--json").stdout)
         self.assertEqual((vote["motion"], vote["notes"], len(vote["tally"])), ("Buy it, with a comma", "Ünïcode note", 5))
 
+    def test_import_refuses_a_header_that_names_a_column_twice(self):
+        """Lead review of sd:8050: DictReader keeps the last of two same-named cells, silently."""
+        path = self.home / "votes.csv"
+        path.write_text("id,date,topic,motion,type,moved,seconded,votes,outcome,follow_up,source,notes,notes\n"
+                        "CI-1,,,,,,,,adopted,,,first,second\n", encoding="utf-8")
+        done = self.sd("import", str(path))
+        self.assertEqual(done.returncode, 1, done.stdout)
+        self.assertIn("the header names notes more than once", done.stderr)
+        self.assertEqual(self.db.execute("SELECT count(*) FROM vote").fetchone()[0], 0)
+
     def test_belongs_to_names_the_checkout_from_anywhere(self):
         elsewhere = self.home / "elsewhere"
         elsewhere.mkdir()
