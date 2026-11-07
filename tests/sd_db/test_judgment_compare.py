@@ -147,12 +147,12 @@ class TheMigration(unittest.TestCase):
             path = Path(tmp) / "sd.db"
             initialise(path)
             raw = sqlite3.connect(path, isolation_level=None)
-            # 046, 044, 043, 042, 041, 040, 039, 038, 034 and 026 to 018 came after 017 and are reversed first: their `ADD
+            # 048, 046, 044, 043, 042, 041, 040, 039, 038, 034 and 026 to 018 came after 017 and are reversed first: their `ADD
             # COLUMN` and `CREATE TABLE` do not replay (pack sd:6711, pack sd:6046, pack sd:6093, pack sd:5648, sd:5496, sd:5357,
             # sd:5303, sd:5315, sd:4636, sd:3231, sd:3217, sd:3075, sd:2973, sd:2966, sd:2950, sd:2704, sd:1335,
             # sd:2581).
             # 046 goes first: 032's guard refuses the narrowed kind list (sd:7004).
-            for name in ("046_item_retire_personal_skill_review.sql", "044_shadow_merge_state.sql", "043_note_harness_session.sql", "042_runner_run_build.sql", "041_recurrence_lead.sql", "040_shadow_filed.sql", "039_shadow_updated.sql", "038_shadow_settled.sql", "034_shadow_reason.sql", "026_repo_drop_status_source.sql", "025_repo_drop_satellite_gate.sql", "024_repo_lane_host.sql", "023_judgment_error.sql", "022_judgment_batch_children.sql",
+            for name in ("048_home_asset.sql", "046_item_retire_personal_skill_review.sql", "044_shadow_merge_state.sql", "043_note_harness_session.sql", "042_runner_run_build.sql", "041_recurrence_lead.sql", "040_shadow_filed.sql", "039_shadow_updated.sql", "038_shadow_settled.sql", "034_shadow_reason.sql", "026_repo_drop_status_source.sql", "025_repo_drop_satellite_gate.sql", "024_repo_lane_host.sql", "023_judgment_error.sql", "022_judgment_batch_children.sql",
                          "021_judgment_call_context.sql", "020_repo_satellite_gate.sql",
                          "019_request_outcome.sql",
                          "018_runner_run_repo_nullable.sql", "017_judgment_compare_arms.sql"):

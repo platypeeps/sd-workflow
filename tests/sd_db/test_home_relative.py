@@ -53,6 +53,7 @@ COLUMNS = {
     "cost": {"key": "repo",
              "none": "id call_id timestamp provider bill role assignment pass owner_pid tokens_in "
                      "tokens_out usd window_minutes used_percent source"},
+    "home_asset": {"none": "id kind name geometry fields photo created_at updated_at"},
     "item": {"key": "repo path external_id",
              "history": "fields body title",
              "none": "id kind branch status stage priority due source shipped_at created_at updated_at "
@@ -226,6 +227,8 @@ class TheMigration(AThirteenStore):
             self.assertEqual(after[table], self.before[table], table)
         # 019 adds `request_outcome` after 014, empty.
         self.assertEqual(after.pop("request_outcome"), [])
+        # 048 adds `home_asset` after 014, empty.
+        self.assertEqual(after.pop("home_asset"), [])
         self.assertEqual({table: len(value) for table, value in after.items()},
                          {table: len(value) for table, value in self.before.items()})
         self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
@@ -262,7 +265,8 @@ class TheMigration(AThirteenStore):
         # `status_source` back at `row`, which every row here held, and 025's
         # puts `satellite_gate` back so 020's can drop it. 041's goes first of
         # all: the one later column on `item`, whose rows this compares, after
-        # 044's `shadow` merge columns, 043's `note.harness_session` and 042's build columns on `runner_run`.
+        # 048's `home_asset` table, 044's `shadow` merge columns, 043's `note.harness_session` and 042's build columns on `runner_run`.
+        connection.executescript(reverse_script("048_home_asset.sql"))
         connection.executescript(reverse_script("044_shadow_merge_state.sql"))
         connection.executescript(reverse_script("043_note_harness_session.sql"))
         connection.executescript(reverse_script("042_runner_run_build.sql"))
