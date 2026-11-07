@@ -182,6 +182,19 @@ class TheImport(RegisterCase):
         self.assertEqual(second.counts.inserted, 0)
         self.assertEqual(second.counts.updated, 0)
 
+    def test_a_reimport_keeps_an_area_the_operator_set(self):
+        """The import owns `register_status`, not the whole `fields` (sd:8036)."""
+        run(self.connection, self.reader())
+        row = self.items()["O27"]
+        held = {**json.loads(row["fields"]), "area": "home"}
+        self.connection.execute(
+            "UPDATE item SET fields = ? WHERE id = ?",
+            (json.dumps(held, sort_keys=True), row["id"]),
+        )
+        second = run(self.connection, self.reader())
+        self.assertEqual(second.counts.updated, 0)
+        self.assertEqual(json.loads(self.items()["O27"]["fields"])["area"], "home")
+
 
 class TheCommittedTreeOnOriginMain(RegisterCase):
     """What the checkout has on disk is not what lands; `origin/main` is.

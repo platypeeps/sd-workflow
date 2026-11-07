@@ -718,6 +718,9 @@
   const thenable = v => !!v && typeof v.then === 'function';
   const textOf = (v, fallback) => (typeof v === 'string' && v) || (v && typeof v.text === 'string' && v.text) || fallback;
   const undoOne = (c, o, v) => Promise.resolve().then(() => c.undo(o, v));
+  // A run that throws is refused like a rejected promise, so the shell toasts why: a confirm resolves later, and a row
+  // that left the page meanwhile made run(o) throw inside its then, where the error was lost (sd:8035).
+  const runOne = (c, o, v) => { try { return c.run ? c.run(o, v) : ''; } catch (e) { return Promise.reject(e); } };
   // askFirst is a flag or a test of the object (commands.md): Retry asks only after exit 127 (sd:3392). A safe command that
   // asks confirms first; a function is never itself a yes.
   const asksFirst = (c, o) => typeof c.askFirst === 'function' ? !!c.askFirst(o) : !!c.askFirst;
@@ -889,7 +892,7 @@
   const actOf = (c, o) => /\s/.test(c.label.trim()) ? c.label : `${c.label} ${o.type}`;
   function run(c, o) {
     const go = v => {
-      const msg = c.run ? c.run(o, v) : '';
+      const msg = runOne(c, o, v);
       if (thenable(msg)) { settleOne(c, o, msg, { toast }); return document.dispatchEvent(new CustomEvent('shell:ran', { detail: { cmd: c.id, obj: o.id } })); }
       if (msg === null) return document.dispatchEvent(new CustomEvent('shell:ran', { detail: { cmd: c.id, obj: o.id, form: true } })); // opened a form
       const text = msg || `${c.label} · ${o.label}`;
