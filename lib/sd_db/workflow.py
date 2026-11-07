@@ -16,6 +16,7 @@ from datetime import date
 from typing import Any
 
 from . import repos
+from .assets import item_asset
 from .database import transaction
 from .errors import SdDbError
 from .reads import item_by_id, item_notes
@@ -866,9 +867,12 @@ def _next_occurrence(connection: sqlite3.Connection, row: dict, *, who: str) -> 
     )
     if row["body"] is not None:
         set_item_fields(connection, spawned, body=row["body"])
-    if (area := item_area(row)) is not None:
-        # The area is the operator's, not the producer's: it recurs (pack sd:8010).
-        set_item_fields(connection, spawned, fields={"area": area})
+    # The area (pack sd:8010) and the home asset a care task tends (pack sd:8053) are the operator's, not the
+    # producer's: they recur.
+    kept = {key: value for key, value in (("area", item_area(row)), ("asset", item_asset(row["fields"])))
+            if value is not None}
+    if kept:
+        set_item_fields(connection, spawned, fields=kept)
     set_item_fields(connection, row["id"], **CLEARED)
     add_note(connection, row["id"], "comment",
              f"Next occurrence: item {spawned}, due {due} ({rule.text()}, {anchor}-anchored) by {who}",

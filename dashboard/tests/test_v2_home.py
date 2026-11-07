@@ -370,7 +370,7 @@ class ThePage(BrowserSession):
         self.assertIn("<title>Home · system</title>", body)
         self.assertEqual(Refused(body).found, [])
         scripts = re.findall(r'<script src="/ui/([^"?]+)', body)
-        self.assertEqual(scripts, ["theme.js", "markup.js", "home-kiosk.js", "icons.js", "sections.js", "read.js", "commands.js", "brief-details.js", "report-details.js", "task-details.js", "home.js", "places.js", "shell.js"])
+        self.assertEqual(scripts, ["theme.js", "markup.js", "home-kiosk.js", "icons.js", "sections.js", "read.js", "commands.js", "brief-details.js", "report-details.js", "task-details.js", "home.js", "home-map.js", "places.js", "shell.js"])
         for path in re.findall(r'(?:src|href)="(/ui/[^"]+)"', body):
             self.assertEqual(self.request(path)[0], 200, path)
 
@@ -1222,8 +1222,9 @@ class TheWebTile(TheScript):
 
 
 class TheRegistration(Registers, unittest.TestCase):
-    page, section, route, api = "home", "Home", "/home", ("/api/home", "/api/home/tiles", "/api/home/service", "/api/home/tasks",
-                                                     "/api/home/briefs", "/api/home/reports")
+    page, section, route, api = "home", "Home", "/home", ("/api/home", "/api/home/tiles", "/api/home/service", "/api/home/map",
+                                                     "/api/home/map/aerial", "/api/home/asset", "/api/home/asset/delete",
+                                                     "/api/home/care", "/api/home/tasks", "/api/home/briefs", "/api/home/reports")
 
 
 if __name__ == "__main__":

@@ -95,3 +95,17 @@ acknowledge: a task's Done (or Done → next occurrence for a repeating one), a
 brief's Seen, a report's Acknowledge, each with Undo. Seen is Today's mark,
 the snooze `today:brief:<stem>` held until the brief's text changes, so a
 brief seen here or on Today is seen in both; Not seen clears it.
+
+Map (pack sd:8053, `home_map.py`, `home-map.js`) is the lot's assets over Arapahoe County's 2024 aerial, one
+SVG as HOA's map. The address is the setting row `dashboard.home_map` (Settings), one line; the pack holds none.
+The county's address locator places it in EPSG:2232 (US feet), and the map is the 400 ft square around it. The
+aerial's ImageServer answers one `exportImage` for that square at full resolution (0.217 ft per pixel), cached
+with the geocode under `<state>/system/home-map/`, so the county is asked once per address;
+`GET /api/home/map/aerial` serves it. A failed read names its reason, and the assets still draw on a plain ground.
+
+Assets are rows of the workflow database's `home_asset` table (migration 48, `sd_db.assets`): a kind, a name, a
+point or a line in the same feet, a fields object and a photo address. Add: press Add, pick a kind, click the map
+(a line kind takes a click per point, then Finish line), fill the short form (a plant or tree offers species,
+planted, sun, water, zone and notes). Drag a point to move it. A row or a mark opens its form: Save, Delete, and
+Add care task, which files a recurring task (area home) naming the asset in `fields.asset`; the next occurrence
+keeps it. A plant or tree with an open care task due before today carries the warning ring.

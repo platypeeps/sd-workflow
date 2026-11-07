@@ -134,11 +134,12 @@ def _scalars() -> dict:
 
 def _list(key: str):
     """A list's old file (read at call time, so a test can point it elsewhere) and its parser: text to problems."""
-    from . import health_collectors, hoa_screen, places, reports_screen
+    from . import health_collectors, hoa_screen, home_map, places, reports_screen
 
     return {"dashboard.realms": (places.REALMS_CONFIG, lambda text: places.parse_realms(text)[1]),
             "dashboard.report_families": (reports_screen.FAMILIES_CONFIG, lambda text: reports_screen.parse_families(text)[1]),
             "dashboard.hoa_thresholds": (hoa_screen.THRESHOLDS, hoa_screen.parse_thresholds),
+            "dashboard.home_map": (home_map.state_dir() / "home-map.conf", lambda text: home_map.parse(text)[1]),
             "dashboard.disk_storage": (health_collectors._storage_config(), lambda text: health_collectors.parse_storage(text)[1])}[key]
 
 
