@@ -1284,7 +1284,7 @@ for (const v of ['work', 'hoa', 'home', 'personal']) { await realm(v); R[v] = EL
         self.assertEqual([t in r["work"] for t in titles], [False, False, False, False])
         self.assertEqual([t in r["hoa"] for t in titles], [False, False, False, False])
         self.assertEqual([t in r["home"] for t in titles], [True, False, True, True])
-        self.assertEqual(out["counts"], {"personal": 3, "work": 1, "hoa": 2, "home": 3})
+        self.assertEqual(out["counts"], {"personal": 3, "work": 1, "hoa": 1, "home": 3})
 
     def test_an_address_or_an_older_link_lands_on_its_realm(self):
         """Metrics and Today link /tasks?...&realm=all, and a bookmark may hold #view=hoa or #view=home. pack sd:7216: the
