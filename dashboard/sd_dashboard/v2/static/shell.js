@@ -20,11 +20,12 @@
   // with no status got no answer, so a write's outcome is not known. A page script runs before shell.js, so it calls
   // window.shell.post / shell.getJSON when it acts, not while it loads.
   const csrf = () => document.querySelector('meta[name="sd-csrf"]')?.content || '';
-  // A Blob body (a dropped file, sd:5112) is sent as is, with the caller's extra headers.
-  async function post(path, body, headers) {
+  // A Blob body (a dropped file, sd:5112) is sent as is, with the caller's extra headers. `signal` bounds the wait, for a
+  // write that must say when it got no answer (sd:8033); without one the request waits as long as the browser does.
+  async function post(path, body, headers, signal) {
     const blob = typeof Blob !== 'undefined' && body instanceof Blob;
     const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': blob ? 'application/octet-stream' : 'application/json', 'X-SD-CSRF': csrf(), ...headers },
-      body: blob ? body : JSON.stringify(body) });
+      body: blob ? body : JSON.stringify(body), ...(signal ? { signal } : {}) });
     const out = await r.json().catch(() => ({}));
     if (!r.ok) { const e = new Error(out.error || `HTTP ${r.status}`); e.stale = r.status === 409; e.status = r.status; throw e; }
     return out;
@@ -754,7 +755,7 @@
         e => toast(`${c.label} not undone · ${o.label}: ${whyOf(e)}`)) : null;
       toast(textOf(v, `${c.label} · ${o.label}`), undo);
       return true;
-    }, e => { toast(`${o.label} not changed: ${whyOf(e)}`); return false; });
+    }, e => { toast(`${o.label}${e && e.unknown ? '' : ' not changed'}: ${whyOf(e)}`); return false; }); // unknown: no answer (sd:8033)
   }
   // A bulk run waits for every run, then toasts once: how many landed, which rows the server refused as stale (a 409: the
   // page reads them again), and which did not change, each with its reason (sd:3012). Its Undo reverses only the rows that

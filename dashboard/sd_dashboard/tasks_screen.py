@@ -166,7 +166,10 @@ def _rows(connection, rows, found, *, now: str) -> list[dict]:
             "edit": _edit_capability(row),
             "parked": row["parked_at"],
             # The place Tasks' Realm HOA and Home filter on: the HOA and Home pages' Tasks rule (`places.area_of`).
-            "area": area_of(row["repo"], row["kind"], hoa),
+            # pack sd:8010: an item's own area (`fields.area`) wins, and `area_set` says so: such a row sits in its
+            # area's tab alone, not in Personal or a realm tab.
+            "area": area_of(row["repo"], row["kind"], hoa, own := workflow.item_area(state["item"])),
+            "area_set": bool(own) and row["kind"] != "report",
             # The realm Tasks' Realm filter narrows to: Personal, Work and the others (sd:5064, `places.realm_of`).
             "realm": (report_realm(*_job_basis(state["item"]), rules, hoa, **sources) if row["kind"] == "report"
                       else realm_of(row["repo"], row["kind"], rules, hoa)),

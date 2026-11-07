@@ -27,6 +27,7 @@ from sd_db.workflow import (
     change_status,
     edit_item,
     is_audit_note,
+    item_area,
     item_state,
     resolve_item_note,
     schema_kinds,
@@ -146,6 +147,59 @@ class OrdinaryTasks(WorkflowCase):
         self.assertEqual(observed, state)
         self.assertEqual(item_state(self.db, state["item"]["id"])["item"]["title"],
                          "Concurrent edit")
+
+
+class ItemArea(WorkflowCase):
+    """pack sd:8010: an item's own area, `fields.area`, set and cleared through `edit_item`."""
+
+    def fields(self, item):
+        return json.loads(item_state(self.db, item)["item"]["fields"] or "{}")
+
+    def test_area_sets_home_or_hoa_keeps_other_fields_and_clears(self):
+        state = self.capture()
+        item = state["item"]["id"]
+        set_item_fields(self.db, item, fields={"score": 3})
+        state = item_state(self.db, item)
+        tagged = edit_item(self.db, item, {"area": "home"}, who="operator", expected_revision=state["revision"])
+        self.assertEqual(self.fields(item), {"score": 3, "area": "home"})
+        self.assertEqual(item_area(tagged["item"]), "home")
+        self.assertEqual(tagged["notes"][-1]["body"], "Updated area by operator")
+        self.assertTrue(is_audit_note(tagged["notes"][-1]))
+        self.assertNotEqual(tagged["revision"], state["revision"])
+        moved = edit_item(self.db, item, {"area": "hoa"}, who="operator")
+        self.assertEqual(item_area(moved["item"]), "hoa")
+        cleared = edit_item(self.db, item, {"area": None}, who="operator")
+        self.assertEqual(self.fields(item), {"score": 3})
+        self.assertIsNone(item_area(cleared["item"]))
+        # A clear of no area writes nothing: no note, the same revision.
+        again = edit_item(self.db, item, {"area": None}, who="operator")
+        self.assertEqual(again, cleared)
+
+    def test_an_area_other_than_home_or_hoa_is_refused_and_writes_nothing(self):
+        state = self.capture()
+        for area in ("work", "personal", "Home", "", 1, True):
+            with self.subTest(area=area), self.assertRaisesRegex(WorkflowError, "area must be home or hoa"):
+                edit_item(self.db, state["item"]["id"], {"area": area}, who="operator")
+            self.assertEqual(item_state(self.db, state["item"]["id"]), state)
+
+    def test_a_stale_revision_or_unreadable_fields_refuse_the_area(self):
+        state = self.capture()
+        item = state["item"]["id"]
+        edit_item(self.db, item, {"title": "Moved on"}, who="operator")
+        with self.assertRaises(StaleItem):
+            edit_item(self.db, item, {"area": "home"}, who="operator", expected_revision=state["revision"])
+        set_item_fields(self.db, item, fields="[1, 2]")
+        held = item_state(self.db, item)
+        with self.assertRaisesRegex(WorkflowError, "unreadable fields"):
+            edit_item(self.db, item, {"area": "home"}, who="operator")
+        self.assertEqual(item_state(self.db, item), held)
+
+    def test_item_area_reads_only_a_known_area(self):
+        for fields, area in ((None, None), ("", None), ("{}", None), ('{"area": "home"}', "home"),
+                             ('{"area": "hoa"}', "hoa"), ('{"area": "work"}', None), ("[1]", None),
+                             ("not json", None), ('{"area": ["home"]}', None)):
+            with self.subTest(fields=fields):
+                self.assertEqual(item_area({"fields": fields}), area)
 
 
 class StatusGuards(WorkflowCase):

@@ -752,6 +752,25 @@ class TaskCLI(unittest.TestCase):
         self.assertEqual(set_to["item"]["branch"], "feat/new")
         self.call("task", "edit", item, "--branch", "x", "--clear-branch", code=2)
 
+    def test_edit_area_sets_and_clears_the_items_own_area_and_refuses_another(self):
+        """pack sd:8010. `--area home|hoa` keeps the area in `fields`; `--clear-area` drops it."""
+        state = json.loads(self.call("task", "add", "--priority", "3", "Clean the gutters", "--json").stdout)
+        item = state["item"]["id"]
+        refused = self.call("task", "edit", item, "--area", "work", code=2)
+        self.assertIn("invalid choice: 'work'", refused.stderr)
+        self.call("task", "edit", item, "--area", "home", "--clear-area", code=2)
+        stale = self.call("task", "edit", item, "--title", "Gutters", "--json")
+        self.assertNotEqual(json.loads(stale.stdout)["revision"], state["revision"])
+        refused = self.call("task", "edit", item, "--area", "home", "--if-revision", state["revision"], code=1)
+        self.assertIn("changed", refused.stderr)
+        tagged = json.loads(self.call("task", "edit", item, "--area", "home", "--json").stdout)
+        self.assertEqual(json.loads(tagged["item"]["fields"]), {"area": "home"})
+        self.assertEqual(tagged["notes"][-1]["body"], f"Updated area by {getpass.getuser()}")
+        self.assertIn("  area: home\n", self.call("task", "show", item, "--audit").stdout)
+        cleared = json.loads(self.call("task", "edit", item, "--clear-area", "--json").stdout)
+        self.assertIsNone(cleared["item"]["fields"])
+        self.assertNotIn("area:", self.call("task", "show", item).stdout)
+
     # Stands in for the library's `edit_item` and records what it was handed:
     # the pin may predate the unpark (sd:3007), and the library's own tests
     # cover what it does with `parked_at`.
