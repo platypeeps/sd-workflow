@@ -1,4 +1,4 @@
-// Places: the HOA and Home pages' views (Overview | Tasks | Briefs | Reports; HOA adds Alarms), a realm place's (sd:5663,
+// Places: the HOA and Home pages' views (Overview | Tasks | Briefs | Reports; HOA adds Alarms and Votes), a realm place's (sd:5663,
 // place.js: Overview | Tasks | Briefs | Reports) and Tasks' place views.
 // Data: a place view with data-api reads its own document when it is shown, /api/<place>/<view> (sd_dashboard/places.py).
 // Overview is the page's own read, and so is HOA's Tasks: hoa.js draws it from /api/hoa, which the annunciator and the badge
@@ -10,7 +10,8 @@
 // Open | All (sd:5752): Tasks, Briefs and Reports show their open rows, and each row's primary act is its acknowledge: a
 // task's Done (task-details.js, view 'place'), a brief's Seen (Today's mark, below), a report's Acknowledge (report.ack).
 // All adds the week's done tasks (places.task_rows), the seen briefs or the acknowledged reports. The choice is the URL's
-// ?<view>=all.
+// ?<view>=all. HOA's Votes (pack sd:8050) shows its open votes, and All adds the closed ones; it is read-only, so its rows
+// have no act: `sd votes` writes them.
 //
 // Adapter: viewSwitch(show) is the one place a page meets the shell's view switch (shell.js view:start). The page declares
 // window.PAGE_VIEWS = [{ id, label, key?, api? }] before shell.js; show(id) runs for the view shown, at shell:ready and on
@@ -27,7 +28,7 @@
 
   const GLYPH = { ok: '●', caution: '▲', warning: '■', queued: '◌', unknown: '▨' };
   // sd:5752: the views with Open | All, each a row's open test; SHOW the choice per view, from the URL.
-  const OPEN = { tasks: r => r.status !== 'done', briefs: r => !r.marked, reports: r => r.status !== 'done' };
+  const OPEN = { tasks: r => r.status !== 'done', briefs: r => !r.marked, reports: r => r.status !== 'done', votes: r => r.state === 'open' };
   const SHOW = Object.fromEntries(Object.keys(OPEN).map(v => [v, new URLSearchParams(location.search).get(v) === 'all' ? 'all' : 'open']));
   const act = id => html`<td class="act">${window.shell.commands.rowActions(id)}</td>`, ACT = [html`<span class="sr">Actions</span>`];
   const unknown = why => html`<p class="state-unknown"><b>▨ Not read.</b> ${why}</p>`;
@@ -131,6 +132,22 @@
         rows.length || !doc.rows.length ? `No report from ${doc.jobs.join(', ')} among the newest ${doc.limit}.`
           : `No open report from ${doc.jobs.join(', ')}. All lists the ${plural(doc.rows.length, 'acknowledged report')}.`),
         `${plural(doc.rows.filter(r => r.status !== 'done').length, 'open report')} · ${doc.jobs.length} jobs`];
+    },
+    // pack sd:8050: a vote row, read-only. The tally groups the directors by answer (sd_db.votes.parse_votes); a cell
+    // it could not read shows as written.
+    votes: (doc, rows) => {
+      const glyph = r => r.state === 'open' ? 'queued' : 'ok';
+      const tally = r => r.tally ? ['yes', 'no', 'abstain', 'absent', 'none'].map(a => [a, Object.keys(r.tally).filter(n => r.tally[n] === a)])
+        .filter(([, names]) => names.length).map(([a, names]) => `${a[0].toUpperCase()}${a.slice(1)}: ${names.join(', ')}`).join(' · ') : r.votes || '—';
+      const open = doc.rows.filter(OPEN.votes).length;
+      return [table('votes', [[html`<span class="sr">State</span>`], ['Vote', 'hide-sm'], ['Date'], ['Motion'], ['Type', 'hide-sm'], ['Moved / seconded', 'hide-sm'], ['Votes'], ['Outcome'], ['Source', 'hide-sm']],
+        rows.map(r => html`<tr><td class="g ${glyph(r)}"><span aria-hidden="true">${GLYPH[glyph(r)]}</span><span class="sr">${r.state}</span></td>
+          <td class="ref hide-sm">${r.key}</td><td class="when">${r.date || '—'}</td><td class="what">${r.topic ? html`<b>${r.topic}</b>: ` : ''}${r.motion}</td>
+          <td class="hide-sm">${r.type || '—'}</td><td class="hide-sm">${[r.moved, r.seconded].filter(Boolean).join(' / ') || '—'}</td>
+          <td>${tally(r)}</td><td>${r.outcome || '—'}</td><td class="hide-sm">${r.source || '—'}</td></tr>`),
+        rows.length || !doc.rows.length ? 'No vote is recorded for the hoa checkout.'
+          : `No open vote. All lists the ${plural(doc.rows.length, 'closed vote')}.`),
+        `${plural(open, 'open vote')} · ${doc.rows.length} in all`];
     },
   };
 

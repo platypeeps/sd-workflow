@@ -7,7 +7,7 @@
   (sd:4967, POST /api/hoa/alarm, the workflow database's view state), Acknowledge all on the Alarms toolbar (sd:5621, POST /api/hoa/alarms) and Run sweep on the HOA sweep row (sd:5095, POST /api/hoa/sweep,
   the checkout's tools/sweep.py in the background: Gmail drafts only); email is never sent; the Mission portal is never touched.
   Nothing here is sample data.
-  Views (places.js, left to right as below): Overview is the above; Tasks is hoa.js's table of /api/hoa's items, whose rows show the Tasks page's Details (task-details.js, sd:5671); Briefs and Reports each read /api/hoa/<view> (places.py) when shown; Alarms, right of Reports (sd:5622), is hoa.js's alarm ledger (sd:5286). A Briefs row shows its Details in the pane, the Briefs page's own (brief-details.js, sd:5620); a Reports row the Reports page's (report-details.js, sd:5636).
+  Views (places.js, left to right as below): Overview is the above; Tasks is hoa.js's table of /api/hoa's items, whose rows show the Tasks page's Details (task-details.js, sd:5671); Briefs and Reports each read /api/hoa/<view> (places.py) when shown; Alarms, right of Reports (sd:5622), is hoa.js's alarm ledger (sd:5286). Votes, right of Alarms (pack sd:8050), reads /api/hoa/votes: the board votes, read-only. A Briefs row shows its Details in the pane, the Briefs page's own (brief-details.js, sd:5620); a Reports row the Reports page's (report-details.js, sd:5636).
 -->
 <html lang="en">
 <head>
@@ -117,6 +117,10 @@
       <thead><tr><th scope="col"><span class="sr">State</span></th><th scope="col">Event</th><th scope="col">When</th><th scope="col" class="hide-sm">Kind</th><th scope="col" class="num hide-sm">Min</th><th scope="col" class="hide-sm">Notified</th><th scope="col"><span class="sr">Actions</span></th></tr></thead>
       <tbody id="al-body"></tbody>
     </table>
+  </section>
+  <section class="place-view" id="view-votes" data-place-view="votes" data-label="Votes" data-api="/api/hoa/votes" aria-labelledby="votes-h" hidden>
+    <div class="sec-head"><div><h2 id="votes-h">Board votes</h2><p>The hoa checkout's votes in the workflow database, open first, then newest first. Read-only: <code>sd votes</code> adds and edits them.</p></div><p class="tally" id="votes-tally"></p></div>
+    <div id="votes-rows"></div>
   </section>
 </main>
 

@@ -109,6 +109,11 @@ A brief is hoa's when its series, lower-cased with spaces as hyphens,
 names a job of the `hoa` family in `dashboard.report_families`, or it is filed under the hoa checkout; a report
 is hoa's when its job is in that family. A missing checkout, family or file
 makes the view unknown with the reason and the line to add, never an empty list.
+Votes (pack sd:8050), right of Alarms, reads `GET /api/hoa/votes`: the hoa
+checkout's rows of the `vote` table, open first, then newest first. Each row
+shows the motion, type, mover and seconder, the per-director tally and the
+outcome and source. Open | All keeps `?votes=all`. It is read-only:
+`sd votes` writes the rows. A store without the table makes it an error.
 The views are `window.PAGE_VIEWS`, set from the markup before `shell.js`; the shell's view switch draws
 them in `#viewswitch`, and until that shell lands `places.js` draws a segmented control there (`viewSwitch`).
 

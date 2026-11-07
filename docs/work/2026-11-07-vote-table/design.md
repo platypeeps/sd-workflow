@@ -59,10 +59,14 @@ Rejected: a hash revision, as items have. An integer compared in the `UPDATE`'s
 | --- | --- | --- | --- | --- |
 | 048 migrate | `vote` table, two indexes, version 48 | write fails mid-file | `migrate` wraps the file: 47 stays, rerun | `test_a_failure_in_048_leaves_47_and_no_table` |
 | 048 rollback | pack back at 47, store at 48 | `SchemaTooNew` on open | hand reverse in the 048 header | `test_the_048_reverse_returns_the_47_shape` |
-| import | many rows in one transaction | a bad row, or a stop mid-file | one transaction: nothing lands, rerun | `test_a_bad_row_late_in_the_file_writes_nothing` |
-| import again | same keys | duplicate rows | upsert by `(repo, key)`; same text is no write | `test_a_second_import_changes_nothing` |
+| import | many rows in one transaction | a bad row late in the file | validate every row first: nothing lands | `test_a_bad_row_late_in_the_file_writes_nothing` |
+| import | many rows in one transaction | a stop between two row writes | one transaction: nothing lands; rerun finishes | `test_a_stop_between_two_row_writes_lands_nothing_and_a_rerun_finishes` |
+| import again | same keys | duplicate rows | upsert by `(repo, key)`; same text is no write | `test_rows_shaped_like_votes_csv_land_and_a_second_import_changes_nothing` |
 | edit | one row, revision + 1 | another write between read and write | `WHERE revision = ?`; refuses stale | `test_a_stale_revision_is_refused` |
-| repo or item removal | a vote's parent | vote orphaned | removal refuses P7 and I11 | `test_a_repo_with_votes_is_refused` |
+| repo removal | a vote's parent | vote orphaned | removal refuses P7 | `test_a_repo_with_votes_is_refused` |
+| item removal | a vote's link | vote orphaned | removal refuses I11 | `test_an_item_a_vote_links_is_refused` |
+| older store | none: store at 47 | preview reads a missing table | `_votes` reads no table as no votes | `test_a_removal_preview_reads_a_47_store_with_no_vote_table` |
+| dashboard read | none | store or library without the table | view is `error` with the reason | `test_a_store_or_library_without_the_vote_table_is_an_error_not_an_empty_list` |
 
 ## Acceptance criteria
 

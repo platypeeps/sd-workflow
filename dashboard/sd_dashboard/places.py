@@ -29,6 +29,9 @@ hoa checkout's rows are HOA's before any glob (pack sd:7687). A row with no repo
 `report_realm`'s: its pull repo's for pr-attention, else its family's key when that is a realm (pack sd:7774). Without a readable row a repo row's
 realm is unknown (None), so Personal holds only the rows with no repo and the page says why.
 
+**HOA's Votes (pack sd:8050).** `/api/hoa/votes` is the hoa checkout's rows of the store's `vote` table
+(`sd_db.votes.rows`): open first, then newest first. Read-only: `sd votes` writes them. Only HOA has the view.
+
 **What is not read.** A missing hoa checkout, family or list makes the view `unknown` with the reason and the line to
 add, never an empty list; a family list that did not read makes it `error`. Nothing here writes.
 """
@@ -36,8 +39,10 @@ add, never an empty list; a family list that did not read makes it `error`. Noth
 from __future__ import annotations
 
 import fnmatch
+import importlib
 import os
 import re
+import sqlite3
 from pathlib import Path
 
 from sd_db import reads
@@ -45,7 +50,7 @@ from sd_db import reads
 from .documents import _config_dir, pipe_lines
 
 __all__ = ["AREAS", "area_of", "briefs", "parse_realms", "pull_url", "realm_issues", "realm_of", "realm_places", "realms", "report_realm",
-           "reports", "series_job", "task_rows", "tasks"]
+           "reports", "series_job", "task_rows", "tasks", "votes"]
 
 #: The places, by family key, and their labels.
 AREAS = {"hoa": "HOA", "home": "Home"}
@@ -261,6 +266,23 @@ def tasks(connection, area: str, *, now: str) -> dict:
         lead = _has_lead(connection)
         more = {} if area in AREAS else realm_issues(connection, owns, now=now)
     return {"read": now, "area": area, "state": "read", "reason": "", "rows": rows, "done": done, "lead": lead, **more}
+
+
+def votes(connection, area: str, *, now: str) -> dict:
+    """The hoa checkout's board votes (pack sd:8050), open first, then newest first; `unknown` with the reason when no
+    hoa checkout is registered, and `error` when the store or the library has no vote table: never an empty list."""
+    if area != "hoa":
+        return _unknown(now, area, f"only HOA has votes, not {area}")
+    hoa, why = _hoa(connection)
+    if hoa is None:
+        return _unknown(now, area, why)
+    try:
+        rows = importlib.import_module("sd_db.votes").rows(connection, repo=hoa)
+    except ImportError:
+        return {**_unknown(now, area, "this sd_db has no vote table: update the pack to migration 048"), "state": "error"}
+    except sqlite3.Error as error:
+        return {**_unknown(now, area, f"votes not read: {error}"), "state": "error"}
+    return {"read": now, "area": area, "state": "read", "reason": "", "rows": rows}
 
 
 def realm_issues(connection, owns, *, now: str) -> dict:

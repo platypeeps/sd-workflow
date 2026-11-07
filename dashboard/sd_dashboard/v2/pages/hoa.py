@@ -78,6 +78,6 @@ PAGE = Page(
          Api("/api/hoa/sweep/status", _sweep), Api("/api/hoa/download", write=_download),
          Api("/api/hoa/attachments", _attachments, query=True), Api("/api/hoa/attachments/picture", _picture, query=True),
          Api("/api/hoa/attach", write=_attach),
-         *place_views("hoa", ("briefs", "reports"))),
+         *place_views("hoa", ("briefs", "reports", "votes"))),
     count="/api/hoa",
 )
