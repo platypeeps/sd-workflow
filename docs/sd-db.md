@@ -650,7 +650,7 @@ Otherwise `bin/sd-db backup` stops with "runner row ... differs from the backup 
 
 1. Stop the lanes, the dashboard and `sd-serve`, then run `bin/sd-db backup`.
 2. In one transaction, change the old key (`~/repos/old`) to the new one in `repo.path` and every `repo` column:
-   `item`, `cost`, `repo_protection`, `runner_lease`, `runner_run` (its `detached_from` too) and `shadow`.
+   `item`, `cost`, `repo_protection`, `runner_lease`, `runner_run` (its `detached_from` too), `shadow` and `vote`.
    `SELECT m.name, p.name FROM sqlite_master m, pragma_table_info(m.name) p
    WHERE m.type = 'table' AND p.name LIKE '%repo%'` lists the columns.
 3. Rewrite each file in `runner-journal/` beside `sd.db` whose `record.repo` names the old repository, by its key or its absolute path.
