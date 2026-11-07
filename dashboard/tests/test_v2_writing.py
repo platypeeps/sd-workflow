@@ -583,6 +583,7 @@ for (const v of R.views) { VIEW = v; document.dispatchEvent(new CustomEvent('she
         answer = ("(path, body) => path === '/api/writing' ? [200, DOC] : path === '/api/triage/decline'"
                   " ? [200, { declined: body.items.map(i => i.item), refused: [], by: 'x' }] : [404, {}]")
         out = self.run_page("R.board = ELS['view-board'].html; R.cli = cmd('queue.decline').cli(C.get('queue:blog-idea'), { score: '9', days: '60' });"
+                            " R.said = cmd('queue.decline').consequence(C.get('queue:blog-idea'), { score: '9', days: '60' });"
                             " shellRun(cmd('queue.decline'), C.get('queue:blog-idea')); await flush();",
                             answer=answer, prelude=self.QUEUED)
         ideas = out["R"]["board"].split('id="ideas"')[1].split('id="tips"')[0]
@@ -591,6 +592,8 @@ for (const v of R.views) { VIEW = v; document.dispatchEvent(new CustomEvent('she
         self.assertEqual(out["R"]["cli"],
                          "no sd verb: Decline 2 below score 9 older than 60 days posts /api/triage/decline: #701 Stale low · #703 Stale high")
         self.assertEqual(out["confirms"], ["queue.decline"])
+        self.assertEqual(out["R"]["said"], "Decline 2 below score 9 older than 60 days in Blog Ideas inbox: #701 Stale low"
+                         " · #703 Stale high. They stay listed under Declined; nothing is removed.")
         self.assertEqual([p[:2] for p in out["posts"]], [["/api/triage/decline", {"kind": "blog-idea", "score": 6, "days": 30, "items": [
             {"item": 701, "revision": "a" * 64}, {"item": 702, "revision": "b" * 64}]}]])
         self.assertIn(["Declined 2 in Blog Ideas inbox", False], out["toasts"])

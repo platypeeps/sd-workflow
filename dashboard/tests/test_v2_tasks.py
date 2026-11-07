@@ -677,9 +677,9 @@ class TheConfirmFields(unittest.TestCase):
         script = "var window = globalThis;\n" + MARKUP_JS + r"""
 const { html } = window.markup, put = (el, m) => { el.html = String(m); }, CLOSE_X = '';
 var OUT = { focused: null, result: null, error: null };
-const yes = { disabled: false }, no = {}, line = { textContent: '' }, inputs = { reason: { value: '', tagName: 'INPUT' } }, L = {};
+const yes = { disabled: false }, no = {}, line = { textContent: '' }, said = { textContent: '' }, inputs = { reason: { value: '', tagName: 'INPUT' } }, L = {};
 const form = { elements: inputs, addEventListener: (t, f) => { (L[t] = L[t] || []).push(f); },
-  querySelector: s => s === '[value="yes"]' ? yes : s === '#confirm-cli' ? line : null,
+  querySelector: s => s === '[value="yes"]' ? yes : s === '#confirm-cli' ? line : s === '#confirm-said' ? said : null,
   requestSubmit: b => { confirmDlg.returnValue = b === yes ? 'yes' : 'no'; confirmDlg.onclose(); } };
 var confirmDlg = { html: '', returnValue: '', onclose: null, querySelector: s => s === 'form' ? form : s === '[value="no"]' ? no : null };
 const modal = (d, first) => { OUT.focused = first === inputs.reason ? 'reason' : first === no ? 'keep' : null; return null; };
@@ -723,6 +723,21 @@ close('yes'); OUT.result = await p; OUT.form = confirmDlg.html;""")
         self.assertIn('id="cf-reason" name="reason"', out["form"])
         self.assertIn('required aria-required="true"', out["form"])
         self.assertIn('value="no" formnovalidate', out["form"])
+
+    def test_a_body_of_the_fields_follows_what_is_typed(self):
+        """sd:8014: a consequence that reads the fields (the bulk Decline's rows at a score and age) says what OK will
+        do with the values typed now, not with the defaults the dialog opened on."""
+        out = self.confirm("""const p = confirmAction({ title: 'Decline?', body: v => `Moves ${v.reason || 'the default'} rows.`,
+  fields: [{ name: 'reason', label: 'Reason', value: '' }] });
+OUT.opened = [confirmDlg.html.includes('<p id="confirm-said">Moves the default rows.</p>'), said.textContent];
+type('9'); OUT.typed = said.textContent; close('no'); await p;""")
+        self.assertEqual(out["opened"], [True, "Moves the default rows."])
+        self.assertEqual(out["typed"], "Moves 9 rows.")
+
+    def test_the_shell_gives_a_confirm_the_consequence_of_the_typed_values(self):
+        """sd:8014: run() hands confirmAction the command's consequence as a function of the typed values."""
+        self.assertTrue("body: c.consequence ? v => c.consequence(o, v) : ''" in SHELL_JS,
+                        "run() gives confirmAction the consequence of the defaults only")
 
     def test_a_close_on_ok_with_the_field_empty_runs_nothing_and_enter_is_ok(self):
         out = self.confirm(self.FIELDS + """OUT.enterEmpty = [key('Enter'), confirmDlg.returnValue];

@@ -364,9 +364,11 @@ class TheScript(ScreenCase):
         """sd:8014: a market row has no score, so the candidates' Decline is by age alone; it asks first."""
         answer = ("(p, b) => p === '/api/watches' ? [200, " + json.dumps(self.doc) + "]"
                   " : p === '/api/triage/decline' ? [200, { declined: b.items.map(i => i.item), refused: [], by: 'x' }] : [404, {}]")
-        out = self.run_page("R.filters = ELS.filters.html; shellRun(REG.find(c => c.id === 'queue.decline'), C.get('queue:market')); await flush();",
+        out = self.run_page("R.filters = ELS.filters.html; R.said = REG.find(c => c.id === 'queue.decline').consequence(C.get('queue:market'), { days: '300' });"
+                            " shellRun(REG.find(c => c.id === 'queue.decline'), C.get('queue:market')); await flush();",
                             answer=answer)
         self.assertIn('data-cmd="queue.decline" data-obj="queue:market">Decline 1 older than 30 days</button>', out["R"]["filters"])
+        self.assertTrue(out["R"]["said"].startswith("Decline 0 older than 300 days in Market Watch candidates: none."), out["R"]["said"])
         self.assertEqual(out["confirms"], ["queue.decline"])
         candidate = self.doc["rows"][[r["id"] for r in self.doc["rows"]].index(self.ids["candidate"])]
         self.assertEqual([p[:2] for p in out["posts"]], [["/api/triage/decline", {"kind": "market", "score": 6, "days": 30, "items": [

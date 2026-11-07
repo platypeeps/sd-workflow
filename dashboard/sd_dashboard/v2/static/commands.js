@@ -469,7 +469,8 @@
       fields: o => [...(o.scored ? [{ name: 'score', label: 'Below score', value: String(DECLINE.score) }] : []),
         { name: 'days', label: 'Older than (days)', value: String(DECLINE.days) }],
       when: o => declinePick(o).rows.length ? true : 'no row is that old and low',
-      consequence: o => `${declineLabel(o)} in ${o.label}: ${declineRows(declinePick(o).rows)}. They stay listed under Declined; nothing is removed.`,
+      // The confirm calls it again as the score and age are typed, so it names the rows OK will post (sd:8014 review).
+      consequence: (o, v) => `${declineLabel(o, v)} in ${o.label}: ${declineRows(declinePick(o, v).rows)}. They stay listed under Declined; nothing is removed.`,
       cli: (o, v) => `no sd verb: ${declineLabel(o, v)} posts /api/triage/decline: ${declineRows(declinePick(o, v).rows)}`,
       run: (o, v) => { const { s, d, rows } = declinePick(o, v);
         if (!rows.length) return `Nothing declined: no row in ${o.label} is that old and low`;
