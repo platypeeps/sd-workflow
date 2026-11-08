@@ -1579,7 +1579,7 @@ R.when = ['mission', 'acme'].map(k => c.when(OBJ.get(`source:${k}`)));""", self.
 class TheRegistration(Registers, unittest.TestCase):
     page, section, route, api = "hoa", "HOA", "/hoa", ("/api/hoa", "/api/hoa/alarm", "/api/hoa/alarms", "/api/hoa/sweep",
                                               "/api/hoa/sweep/status", "/api/hoa/download", "/api/hoa/attachments",
-                                              "/api/hoa/attachments/picture", "/api/hoa/attach", "/api/hoa/briefs",
+                                              "/api/hoa/attachments/picture", "/api/hoa/attach", "/api/hoa/vote", "/api/hoa/briefs",
                                               "/api/hoa/reports", "/api/hoa/votes")
 
 

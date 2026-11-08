@@ -650,7 +650,7 @@ Run it from the checkout, or name one with `--belongs-to PATH`; `list`, `show` a
 It refuses the whole file for a header that lacks a column or names one twice, and for a row with fewer cells than the header: either would blank stored text.
 `votes` keeps the cell as written; `tally` is each director's answer read from it, or none when the cell does not read whole.
 An outcome starting `pending` makes a vote open unless `--state` says otherwise; `edit --if-revision N` refuses a vote that changed.
-The HOA page's Votes view reads them, open votes first.
+The HOA page's Votes view reads them, open votes first; its Add vote and Edit write them, Edit at the revision it read (pack sd:8058).
 
 ## Renaming a repository
 
