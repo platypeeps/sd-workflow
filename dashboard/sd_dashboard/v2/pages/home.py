@@ -3,7 +3,8 @@ state (sd:3427). Edit tiles posts /api/home/tiles; a tile's Act section posts /a
 The Map view (pack sd:8053) reads /api/home/map and its aerial; its Add, move, edit and care post /api/home/asset,
 /api/home/asset/delete and /api/home/care. The Koi view (pack sd:8054) reads /api/home/koi, its fish and pond the
 same assets; /api/home/koi/water logs Home Assistant's water changes on the pond
-and /api/home/koi/test a water test."""
+and /api/home/koi/test a water test. An asset's Drive folder (pack sd:8112, hoa_attach.HOME) lists at
+/api/home/attachments, its pictures at /api/home/attachments/picture; Upload and Reference post /api/home/attach."""
 
 from __future__ import annotations
 
@@ -58,6 +59,24 @@ def _care(payload, principal):
     return home_map.care(payload, principal)
 
 
+def _attachments(read):
+    from ... import hoa_attach
+
+    return hoa_attach.listing(read.connection, read.parameters, hoa_attach.HOME)
+
+
+def _picture(read):
+    from ... import hoa_attach
+
+    return hoa_attach.picture(read.connection, read.parameters, hoa_attach.HOME)
+
+
+def _attach(payload, principal):
+    from ... import hoa_attach
+
+    return hoa_attach.request(dict(payload), hoa_attach.HOME)
+
+
 def _koi(read):
     from ... import home_koi
 
@@ -89,6 +108,9 @@ PAGE = Page(
          # The property map (pack sd:8053, home_map).
          Api("/api/home/map", _map), Api("/api/home/map/aerial", _aerial), Api("/api/home/asset", write=_asset),
          Api("/api/home/asset/delete", write=_asset_delete), Api("/api/home/care", write=_care),
+         # An asset's Drive folder (pack sd:8112, hoa_attach.HOME).
+         Api("/api/home/attachments", _attachments, query=True),
+         Api("/api/home/attachments/picture", _picture, query=True), Api("/api/home/attach", write=_attach),
          # The koi pond (pack sd:8054, home_koi).
          Api("/api/home/koi", _koi), Api("/api/home/koi/water", write=_koi_water),
          Api("/api/home/koi/test", write=_koi_test),

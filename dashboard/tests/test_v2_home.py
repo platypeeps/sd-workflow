@@ -1224,7 +1224,8 @@ class TheWebTile(TheScript):
 class TheRegistration(Registers, unittest.TestCase):
     page, section, route, api = "home", "Home", "/home", ("/api/home", "/api/home/tiles", "/api/home/service", "/api/home/map",
                                                      "/api/home/map/aerial", "/api/home/asset", "/api/home/asset/delete",
-                                                     "/api/home/care", "/api/home/koi", "/api/home/koi/water", "/api/home/koi/test",
+                                                     "/api/home/care", "/api/home/attachments", "/api/home/attachments/picture",
+                                                     "/api/home/attach", "/api/home/koi", "/api/home/koi/water", "/api/home/koi/test",
                                                      "/api/home/tasks", "/api/home/briefs", "/api/home/reports")
 
 
