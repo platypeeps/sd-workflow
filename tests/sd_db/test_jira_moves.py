@@ -157,12 +157,12 @@ class TheMoves(unittest.TestCase):
     def linked(self, *keys):
         return [create_item(self.db, kind="task", title=key, source="task-ref", external_id=f"jira:{key}") for key in keys]
 
-    def held_then_moved_once(self, exception):
+    def held_then_moved_once(self, exception=None, *, error=None):
         jira = FakeJira({"ABC-7": "To Do"})
         jira_moves.run(self.db, jira, JIRA_ENV)
         held = jira_moves.read_cursor(self.db)
         transition(self.db, self.item, "done", who="operator")
-        jira.fail = sentence(exception)
+        jira.fail = error or sentence(exception)
         lines = jira_moves.run(self.db, jira, JIRA_ENV)
         self.assertEqual(jira_moves.read_cursor(self.db), held, "a transient failure holds the cursor")
         self.assertEqual(self.notes(self.item), [], "a transient failure writes no note on the item")
@@ -189,6 +189,9 @@ class TheMoves(unittest.TestCase):
 
     def test_a_refused_redirect_holds_the_cursor_and_a_rerun_moves_the_ticket_once(self):
         self.held_then_moved_once(redirected())
+
+    def test_a_200_html_body_holds_the_cursor_and_a_rerun_moves_the_ticket_once(self):
+        self.held_then_moved_once(error=sentence_for_body(b"<html>sign in to the portal</html>"))
 
     def test_an_expired_token_holds_the_cursor_and_a_rerun_moves_the_ticket_once(self):
         self.held_then_moved_once(refused(401, "Unauthorized"))
@@ -244,8 +247,7 @@ class TheMoves(unittest.TestCase):
 
     def test_a_permanent_failure_still_passes_and_notes_once(self):
         for what, error in (("404", sentence(refused(404, "Not Found"))),
-                            ("409", sentence(refused(409, "Conflict"))),
-                            ("a body that does not parse", sentence_for_body(b"<html>not json</html>"))):
+                            ("409", sentence(refused(409, "Conflict")))):
             with self.subTest(what):
                 [item] = self.linked("ABC-8")
                 self.addCleanup(self.db.execute, "DELETE FROM note WHERE item = ?", (item,))
@@ -529,10 +531,18 @@ class TheFailureClasses(unittest.TestCase):
             with self.subTest(repr(exception)):
                 self.assertIs(isinstance(sentence(exception), shadow_jira.Transient), wanted)
 
-    def test_an_answer_that_does_not_parse_is_pinned_on_its_ticket(self):
+    def test_a_body_that_is_not_json_says_nothing_about_one_ticket(self):
         for body in (b"<html>not json</html>", b"\xff\xfe", b"[" * 200000):
             with self.subTest(body[:12]):
-                self.assertNotIsInstance(sentence_for_body(body), shadow_jira.Transient)
+                self.assertIsInstance(sentence_for_body(body), shadow_jira.Transient)
+
+    def test_json_of_the_wrong_shape_is_an_answer_and_not_a_failed_request(self):
+        for body, wanted in ((b"[]", []), (b"7", 7), (b'{"a": 1}', {"a": 1})):
+            with self.subTest(body):
+                opener = MagicMock()
+                opener.open.return_value.__enter__.return_value.read.return_value = body
+                with patch("sd_db.shadow_jira.urllib.request.build_opener", return_value=opener):
+                    self.assertEqual(_http("https://jira.example.test/x", {}, None), (wanted, ""))
 
 
 class TheEmptyAnswer(unittest.TestCase):

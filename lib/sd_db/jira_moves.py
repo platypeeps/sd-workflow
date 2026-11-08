@@ -20,13 +20,13 @@ ticket as it is, and the sync says so. A done item whose stored fields
 cannot be read is unknown, so it fails rather than moves.
 
 A permanent failure, one an answer from Jira pins on that ticket (a
-malformed answer, no matching transition, a 4xx other than 401, 403 or
-429), is one comment note on the item, and the cursor still moves past it, so it is
+JSON answer of the wrong shape, no matching transition, a 4xx other than
+401, 403 or 429), is one comment note on the item, and the cursor still moves past it, so it is
 said once, not every hour. Every field read from a Jira answer is checked,
 so a malformed answer is that item's failure too and the later moves
 continue. Every other failure is transient (`shadow_jira.Transient`: any
-failure of the transport, a refused redirect, a 401, 403, 429 or 5xx) and
-stops the batch with no note: the cursor stays
+failure of the transport, a refused redirect, a 401, 403, 429 or 5xx, a
+body that is not JSON) and stops the batch with no note: the cursor stays
 at the last entry fully handled, the run's lines say so, and the next run
 resumes at the failed entry. Entries run in the order of the note that
 decides them and the cursor is written after each, so neither a stop nor a

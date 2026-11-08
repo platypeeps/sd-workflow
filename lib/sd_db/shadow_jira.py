@@ -340,9 +340,9 @@ class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
 class Transient(str):
     """A failed request's sentence unless an answer from Jira pins the failure on that one request (sd:8117).
 
-    The default: every failure of the transport (any `URLError` or `OSError`, any TLS error, a refused redirect) and
-    a 401, 403, 429, 3xx or 5xx says nothing about one ticket, and a later run may succeed. Only a plain 4xx or a
-    body that does not parse is a plain `str`.
+    The default: every failure of the transport (any `URLError` or `OSError`, any TLS error, a refused redirect), a
+    401, 403, 429, 3xx or 5xx, and a 200 whose body is not JSON say nothing about one ticket, and a later run may
+    succeed. Only a plain 4xx is a plain `str`.
 
     A `str`, so a caller that only says the sentence is unchanged; `jira_moves` asks which kind it holds.
     """
@@ -364,15 +364,9 @@ def _http(url: str, headers: dict[str, str], body: dict | None):
         # nosec B310: `collect` builds `url` from `settings()`, which admits an
         # https base only, and `_RefuseRedirects` keeps it on that URL.
         with opener.open(request, timeout=TIMEOUT_SECONDS) as response:  # nosec B310
-            raw = response.read()
-        try:
             # A transition answers 204 with no body (sd:8117): empty is `{}`, not a failure.
-            data = raw.decode()
+            data = response.read().decode()
             return (json.loads(data) if data.strip() else {}), ""
-        except (ValueError, RecursionError) as error:
-            # Jira answered this request and the answer does not parse: `Transient` does not apply. Type only, as
-            # below: `JSONDecodeError` keeps the document. A body nested too deep for `json` is a `RecursionError`.
-            return None, f"the request to Jira failed: {type(error).__name__}"
     except urllib.error.HTTPError as error:
         error.close()
         if error.code in (401, 403):
@@ -392,7 +386,9 @@ def _http(url: str, headers: dict[str, str], body: dict | None):
     except (http.client.HTTPException, ValueError, RecursionError) as error:
         # Type only: `InvalidURL` and `urllib.parse`'s `ValueError` quote the
         # host, a secret pasted into it included, and `IncompleteRead` quotes
-        # the bytes it did read. Before the `OSError` clause, because
+        # the bytes it did read. A body that is not JSON lands here too: a
+        # login page behind a portal, or one nested too deep for `json`, a
+        # `RecursionError` (sd:8117). Before the `OSError` clause, because
         # `RemoteDisconnected` and `SSLCertVerificationError` are both.
         return None, Transient(f"the request to Jira failed: {type(error).__name__}")
     except (urllib.error.URLError, OSError) as error:
