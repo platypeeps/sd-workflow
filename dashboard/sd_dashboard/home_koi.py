@@ -16,11 +16,12 @@ script's state turns `on` in Home Assistant's history is one change of that perc
 it when Home Assistant holds a change the log does not. Days since the last change and the percent replaced in the
 last 7 days and on average over the last 28 come from the log and the history together.
 
-**Gaps.** Each sync stores the window it covered as `fields.water_synced` `{from, to}`: from the oldest row Home
-Assistant still holds for every script to the sync. When a sync's `from` falls after the last `to`, nobody opened the
-view while Home Assistant purged those days, so their changes are gone; the gap goes to `fields.water_gaps` and a
-total whose window it reaches reads "incomplete since" the gap's start. A read that misses a script covers nothing.
-The view syncs when the log lacks a change or the last window is older than `SYNC_HOURS`; there is no scheduler.
+**Gaps.** A read proves the last `KEEP_DAYS`, the recorder's keep, whatever rows it holds: a script that did not run
+has none. Each sync stores `fields.water_synced` `{since, to}`: `since` is the first sync's proven start, `to` the
+latest sync. When a sync's proven start falls after the last `to`, the days between were purged unread; the gap goes to
+`fields.water_gaps`. A total reads "incomplete since" the first unproven day its window reaches: before `since`, in a
+stored gap, or in the days since the last sync the recorder already purged. The view syncs when the log lacks a change
+or the last sync is older than `SYNC_HOURS`; there is no scheduler.
 """
 
 from __future__ import annotations
@@ -35,6 +36,9 @@ from datetime import date, datetime, timedelta, timezone
 KEY = "dashboard.koi_water"
 #: How far back one history read looks; Home Assistant's recorder keeps ten days by default.
 HISTORY_DAYS = 30
+#: The days a read proves: Home Assistant's default `purge_keep_days`.
+# ponytail: a constant; read the recorder's setting if a machine keeps fewer.
+KEEP_DAYS = 10
 TIMEOUT = 10.0
 #: A stored window older than this makes the view sync on open, so a quiet pond still records its coverage.
 SYNC_HOURS = 24
@@ -118,24 +122,14 @@ def _when(at: str) -> datetime:
     return datetime.fromisoformat(at.replace("Z", "+00:00")).astimezone(timezone.utc)
 
 
-def covered_from(history: list, entities: list[tuple[str, float]], *, now: str) -> str | None:
-    """The oldest moment Home Assistant's history holds for every script, never before the read's start; None when a
-    script has no readable row, so the read attests nothing."""
-    first: dict[str, datetime] = {}
-    for series in history:
-        entity = next((row.get("entity_id") for row in series if isinstance(row, dict) and row.get("entity_id")), None)
-        for row in series:
-            try:
-                at = _when(row["last_changed"]) if isinstance(row, dict) else None
-            except (KeyError, TypeError, ValueError):
-                continue
-            if entity and at:
-                first[entity] = min(first.get(entity, at), at)
-                break
-    if not entities or any(entity not in first for entity, _ in entities):
+def _uncovered(synced, *, now: str) -> dict | None:
+    """The purged days after the last sync `to` that a read at `now` cannot prove, or None."""
+    proven = _when(now) - timedelta(days=KEEP_DAYS)
+    try:
+        last = _when(synced["to"])
+    except (KeyError, TypeError, ValueError, AttributeError):
         return None
-    start = _when(now) - timedelta(days=HISTORY_DAYS)
-    return max(start, *first.values()).isoformat()
+    return {"from": last.isoformat(), "to": proven.isoformat()} if proven > last else None
 
 
 def _gap_age(gap, today: date) -> int | None:
@@ -146,13 +140,21 @@ def _gap_age(gap, today: date) -> int | None:
         return None
 
 
-def incomplete_since(gaps: list, *, today: date) -> dict:
-    """The start date of the oldest gap each total's window reaches, or None: `{week, month}`."""
-    def since(days: int):
+def incomplete_since(gaps: list, since, *, today: date) -> dict:
+    """The first unproven day each total's window reaches, or None: `{week, month}`. No `since` proves nothing."""
+    try:
+        tracked = _day(since)
+    except (TypeError, ValueError, AttributeError):
+        tracked = None
+
+    def first(days: int):
+        start = today - timedelta(days=days - 1)
         hit = [gap["from"][:10] for gap in gaps if (age := _gap_age(gap, today)) is not None and age < days]
+        if tracked is None or tracked > start:
+            hit.append(start.isoformat())
         return min(hit, default=None)
 
-    return {"week": since(7), "month": since(28)}
+    return {"week": first(7), "month": first(28)}
 
 
 def summary(log: list[dict], *, today: date, volume) -> dict:
@@ -218,7 +220,9 @@ def document(connection, *, now: str, environ=None, timeout: float = TIMEOUT) ->
             "pond": {**pond, "care": care.get(pond["id"], {"items": [], "overdue": False})} if pond else None,
             "pond_reason": "" if pond else "No pond yet: add a pond on the Map, then its fish here.",
             "fish": fish, "water": {"log": log, "unlogged": len(unlogged), "sync_due": bool(pond) and due,
-                                    "incomplete_since": incomplete_since(list(held.get("water_gaps") or []), today=today),
+                                    "incomplete_since": incomplete_since(
+                                        list(held.get("water_gaps") or []) + [g for g in [_uncovered(synced, now=now)] if g],
+                                        synced.get("since"), today=today),
                                     **summary(log, today=today, volume=volume)},
             "tests": list(TESTS), "care": [{"title": t, "recurrence": r} for t, r in CARE]}
 
@@ -250,22 +254,18 @@ def log_water(payload: dict, *, now: str, environ=None, timeout: float = TIMEOUT
         added = [row for row in live if row["at"] not in seen]
         if added:
             fields["water_log"] = log + added
-        start = covered_from(history, entities, now=now)
-        if start is not None:
-            # A window that starts after the last one ended leaves days no read covered: their changes are lost.
-            last = fields.get("water_synced") if isinstance(fields.get("water_synced"), dict) else {}
-            gaps = [gap for gap in fields.get("water_gaps") or []
-                    if (age := _gap_age(gap, _when(now).date())) is not None and age < GAP_DAYS]
-            try:
-                if last and _when(start) > _when(last["to"]):
-                    gaps.append({"from": _when(last["to"]).isoformat(), "to": start})
-            except (KeyError, TypeError, ValueError):
-                pass
-            fields["water_synced"] = {"from": start, "to": _when(now).isoformat()}
-            if gaps:
-                fields["water_gaps"] = gaps
-            else:
-                fields.pop("water_gaps", None)
+        last = fields.get("water_synced") if isinstance(fields.get("water_synced"), dict) else {}
+        gaps = [gap for gap in fields.get("water_gaps") or []
+                if (age := _gap_age(gap, _when(now).date())) is not None and age < GAP_DAYS]
+        if gap := _uncovered(last, now=now):
+            gaps.append(gap)
+        since = last.get("since") if isinstance(last.get("since"), str) else None
+        proven = (_when(now) - timedelta(days=KEEP_DAYS)).isoformat()
+        fields["water_synced"] = {"since": since or proven, "to": _when(now).isoformat()}
+        if gaps:
+            fields["water_gaps"] = gaps
+        else:
+            fields.pop("water_gaps", None)
         if fields != pond["fields"]:
             assets.save_asset(connection, asset=pond["id"], kind="pond", name=pond["name"], geometry=pond["geometry"],
                               photo=pond["photo"], fields=fields, kinds=assets.ALL_KINDS)

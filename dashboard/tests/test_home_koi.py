@@ -110,49 +110,55 @@ class TheKoi(ScreenCase):
         self.assertEqual((fields["volume_gal"], len(fields["water_log"]), len(fields["tests"])), (2500, 2, 1))
         self.assertEqual(fields.get("water_synced", {}).get("to"), "2026-09-06T12:00:00+00:00")
 
-    def series(self, first, ran=True):
-        """Both scripts' history, held by Home Assistant from `first`; the small one ran today unless not `ran`."""
-        small = [{"entity_id": "script.pond_change_small", "state": "off", "last_changed": first}]
-        return [small + ([{"state": "on", "last_changed": f"{DAY}T09:00:00+00:00"}] if ran else []),
-                [{"entity_id": "script.pond_change_big", "state": "off", "last_changed": first}]]
+    def synced(self, *days):
+        """Sync on each `2026-MM-DD` at noon UTC; the stored fields after the last."""
+        for day in days:
+            home_koi.log_water({}, now=f"{day}T12:00:00Z")(self.connection)
+        return assets.get_asset(self.connection, self.pond["id"])["fields"]
 
-    def test_each_sync_stores_the_window_it_covered_and_no_gap_when_they_meet(self):
-        # Lane review (pack sd:8054): the first sync and one that overlaps
-        # the last record their window and no gap.
-        self.runs = self.series("2026-08-27T12:00:00+00:00")
-        home_koi.log_water({}, now=NOW)(self.connection)
-        home_koi.log_water({}, now="2026-09-07T12:00:00Z")(self.connection)
-        fields = assets.get_asset(self.connection, self.pond["id"])["fields"]
-        self.assertEqual(fields["water_synced"], {"from": "2026-08-27T12:00:00+00:00", "to": "2026-09-07T12:00:00+00:00"})
-        self.assertEqual(fields.get("water_gaps"), None)
+    def test_the_first_sync_proves_only_the_recorder_days(self):
+        # Lane review (pack sd:8054, round 3): a first sync stored the
+        # history's oldest row as covered and called the 28-day total
+        # complete. A read proves only the recorder's KEEP_DAYS.
+        fields = self.synced(DAY)
+        self.assertEqual(fields["water_synced"], {"since": "2026-08-27T12:00:00+00:00", "to": "2026-09-06T12:00:00+00:00"})
         water = home_koi.document(self.connection, now=NOW)["water"]
-        self.assertEqual((water["incomplete_since"], water["sync_due"]), ({"week": None, "month": None}, False))
+        self.assertEqual((water["incomplete_since"], water["sync_due"]), ({"week": None, "month": "2026-08-10"}, False))
 
-    def test_a_sync_after_the_history_moved_on_marks_the_totals_incomplete(self):
-        # Lane review (pack sd:8054): nobody opened the view for longer than
-        # Home Assistant keeps history, so the changes between the last
-        # covered window and the oldest row it still holds are gone. The gap
-        # is stored and the 28-day total says it is incomplete.
-        self.runs = self.series("2026-08-07T12:00:00+00:00", ran=False)
-        home_koi.log_water({}, now="2026-08-17T12:00:00Z")(self.connection)
-        self.runs = self.series("2026-08-27T12:00:00+00:00")
-        self.assertEqual(home_koi.log_water({}, now=NOW)(self.connection), {"added": 1})
-        fields = assets.get_asset(self.connection, self.pond["id"])["fields"]
+    def test_syncs_closer_than_the_recorder_days_leave_no_gap(self):
+        fields = self.synced("2026-08-01", "2026-08-10", "2026-08-19", "2026-08-28", DAY)
+        self.assertEqual(fields["water_synced"]["since"], "2026-07-22T12:00:00+00:00")
+        self.assertNotIn("water_gaps", fields)
+        water = home_koi.document(self.connection, now=NOW)["water"]
+        self.assertEqual(water["incomplete_since"], {"week": None, "month": None})
+
+    def test_a_sync_after_the_recorder_days_marks_the_gap(self):
+        # Nobody opened the view for longer than Home Assistant keeps
+        # history, so the changes between the last sync and the oldest
+        # day the recorder still keeps are gone.
+        fields = self.synced("2026-08-17", DAY)
         self.assertEqual(fields["water_gaps"], [{"from": "2026-08-17T12:00:00+00:00", "to": "2026-08-27T12:00:00+00:00"}])
         water = home_koi.document(self.connection, now=NOW)["water"]
         self.assertEqual(water["incomplete_since"], {"week": None, "month": "2026-08-17"})
-        # Ten days on the gap reaches into the 7-day window too: 08-27 is 6 days before 09-02.
-        water = home_koi.document(self.connection, now="2026-09-02T12:00:00Z")["water"]
-        self.assertEqual(water["incomplete_since"], {"week": "2026-08-17", "month": "2026-08-17"})
 
-    def test_a_history_without_a_script_covers_nothing(self):
-        # A failed or partial read is unknown: no window is stored, so the
-        # next full read finds the gap from the last known one.
-        self.runs = self.series("2026-08-27T12:00:00+00:00")[:1]
-        home_koi.log_water({}, now=NOW)(self.connection)
-        fields = assets.get_asset(self.connection, self.pond["id"])["fields"]
-        self.assertNotIn("water_synced", fields)
-        self.assertTrue(home_koi.document(self.connection, now=NOW)["water"]["sync_due"])
+    def test_a_script_with_no_rows_still_covers_the_recorder_days(self):
+        # Lane review (pack sd:8054, round 3): a script that ran less often
+        # than the recorder keeps has no rows; that read covered nothing,
+        # so a long absence was never found.
+        self.runs = self.runs[:1]
+        fields = self.synced("2026-08-17", DAY)
+        self.assertEqual(fields["water_gaps"], [{"from": "2026-08-17T12:00:00+00:00", "to": "2026-08-27T12:00:00+00:00"}])
+
+    def test_unread_days_count_before_the_next_sync(self):
+        # A read that fails, or a view nobody opens, leaves the days since
+        # the last sync unproven once they pass the recorder's keep.
+        self.synced("2026-08-17")
+        water = home_koi.document(self.connection, now=NOW)["water"]
+        self.assertEqual((water["incomplete_since"], water["sync_due"]), ({"week": None, "month": "2026-08-17"}, True))
+
+    def test_no_sync_leaves_both_totals_incomplete(self):
+        water = home_koi.document(self.connection, now=NOW)["water"]
+        self.assertEqual(water["incomplete_since"], {"week": "2026-08-31", "month": "2026-08-10"})
 
     def test_a_pond_save_without_fields_keeps_the_water_log_and_tests(self):
         # pack sd:8054 review: `fields` omitted or null fell through to
