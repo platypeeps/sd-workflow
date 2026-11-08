@@ -443,11 +443,13 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // you (changes requested, failing checks, a comment to answer) needs you; on reviewers waits. It counts in the blocked box.
   const prFacts = p => html`<b>blocked: PR</b> · on ${p.on} · waited ${dur(p.waited)} since ${at(p.since)}`;
   const prWaitLink = p => html`<div class="ctl" role="group" aria-label="Pull request of sd:${String(p.item)}"><a class="btn quiet sm" href="${p.url}" target="_blank" rel="noopener noreferrer" aria-label="Open the pull request of sd:${p.item} on GitHub">Open PR</a></div>`;
+  // sd:8142: a PR no item links (`item` null) is keyed and linked by its URL, named `owner/repo#N`.
   const prRow = p => { const s = p.on === 'you' ? 'warning' : 'queued';
-    return ['blocked', s, html`<tr class="child" data-type="blocked" data-pr="${String(p.item)}">${marker(s, 'blocked')}
-    <td class="what"><a href="${shell.itemHref(p.item)}">#${p.item} ${p.title}</a></td>
+    return ['blocked', s, html`<tr class="child" data-type="blocked" data-pr="${p.item == null ? p.url : String(p.item)}">${marker(s, 'blocked')}
+    <td class="what">${p.item == null ? html`<a href="${p.url}" target="_blank" rel="noopener noreferrer">${p.repo}#${p.url.split('/').pop()} ${p.title}</a>`
+      : html`<a href="${shell.itemHref(p.item)}">#${p.item} ${p.title}</a>`}</td>
     <td class="detail">${prFacts(p)}</td><td class="num">${dur(p.waited)}</td>
-    <td class="act">${prWaitLink(p)}</td></tr>`, p.on]; };
+    <td class="act">${p.item == null ? '' : prWaitLink(p)}</td></tr>`, p.on]; };
   // A suggested row (pack sd:7271) is a task: a click shows the Tasks page's Details, and its act is Build on a ready one,
   // else its next status, as on Tasks. Its detail says why it is suggested (pack sd:7314): ready, planned for its due
   // date, or unscheduled, with its priority; a row that is not ready shows its status too.
@@ -489,7 +491,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       if (!G.has(k)) G.set(k, { key: k, host: '', rows: [] });
       G.get(k).rows.push({ type, s, tr, pr });
     };
-    const live = new Map(), prs = ((QV.lanes || {}).prs || {}).rows || [], waits = new Set(prs.map(p => Number(p.item)));
+    const live = new Map(), prs = ((QV.lanes || {}).prs || {}).rows || [], waits = new Set(prs.filter(p => p.item != null).map(p => Number(p.item)));
     // pack sd:7859: an item waiting on its PR is its PR row alone: no live-session, suggested or open row beside it.
     ((ACTIVE || {}).rows || []).filter(r => !waits.has(Number(r.item))).forEach(r => { if (!live.has(r.item)) live.set(r.item, []); live.get(r.item).push(r); });
     live.forEach((rows, item) => add(rows[0].repo, liveRow(item, rows)));

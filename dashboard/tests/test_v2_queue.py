@@ -1618,6 +1618,44 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertIn('href="https://github.com/example/system/pull/5"', rows[0])
         self.assertEqual(out["R"]["html"].count('data-item="5"'), 2, "Retry and Approve, on that one row")
 
+    def observe(self, number, *, author, why, requested=(), repo="example/anvil", state="open"):
+        """An open pull request observed with no item: the operator is `1`, `author` is the writer's id."""
+        from sd_db import contributions
+
+        url = f"https://github.com/{repo}/pull/{number}"
+        observed = {"complete": True, "observed_at": "2026-09-06T11:00:00Z", "operator": {"id": "1", "login": "operator"},
+                    "author": {"id": author, "login": f"user{author}"}, "repo": repo, "title": f"Pull {number}",
+                    "state": state, "head": "a" * 40, "base": "b" * 40, "draft": False, "mergeable": "mergeable",
+                    "ci": "pending", "ci_head": "a" * 40, "ci_ids": [], "why": list(why),
+                    "requested_reviewers": list(requested), "blocking_labels": [], "labels": [], "reviews": [], "events": []}
+        contributions.observe_pull(self.connection, url, observed, expected_revision=contributions.snapshot(
+            self.connection, "github:" + url)["revision"])
+        self.connection.commit()
+        return url
+
+    def test_a_pr_with_no_item_waits_in_its_repos_review_box_in_both_directions(self):
+        # sd:8142 (operator 2026-11-08): every open PR that names the operator counts, not only an item's pull_url.
+        # Mine waits on reviewers; another's that asks my review by name or @mentions me waits on me. A team-only
+        # request, or a closed PR, is no row.
+        mine = self.observe(1, author="1", why=["author"])
+        asked = self.observe(2, author="2", why=["review-requested"], requested=["operator"])
+        named = self.observe(3, author="2", why=["mentioned"])
+        self.observe(4, author="2", why=["review-requested"], requested=[])
+        self.observe(5, author="1", why=["author"], state="closed")
+        rows = queue_screen.pr_rows(self.connection, [], time.time())
+        self.assertEqual(rows["error"], "")
+        found = {r["url"]: (r["item"], r["repo"], r["on"]) for r in rows["rows"]}
+        self.assertEqual(found, {mine: (None, "example/anvil", "reviewers"), asked: (None, "example/anvil", "you"),
+                                 named: (None, "example/anvil", "you")})
+        out = self.run_view("open('anvil'); R.html = ELS.queue.html; R.tally = ELS['queue-tally'].html;")
+        extra, attrs, body = self.repo_detail(out["R"]["html"], "anvil")
+        self.assertEqual(attrs, ' aria-label="0 merging, 3 review, 0 working, 0 next, 0 blocked, 0 suggested"')
+        row = re.search(r'<tr class="child" data-type="blocked" data-pr="' + re.escape(named) + r'">(.*?)</tr>',
+                        out["R"]["html"], re.S).group(1)
+        self.assertIn(f'<a href="{named}" target="_blank" rel="noopener noreferrer">example/anvil#3 Pull 3</a>', row)
+        self.assertIn("<b>blocked: PR</b> · on you", row)
+        self.assertIn("<span>3 PR review: 2 on you, 1 on reviewers</span>", out["R"]["tally"])
+
     def test_an_unmanaged_builds_draft_is_blocked_on_its_pr_and_waits_on_you(self):
         # pack sd:7868 (operator 2026-11-06): a build in an unmanaged repository ends in a draft PR the operator must
         # mark ready. From the real observation, not a written row: the draft reads `awaiting_you`, so Queue draws the
