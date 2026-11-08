@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import copy
+import email.message
 import http.client
 import os
 import socket
 import sqlite3
+import ssl
 import tempfile
 import unittest
 import urllib.error
@@ -27,14 +29,34 @@ from .test_shadow_jira import JIRA_ENV, RawServer, jira_transport
 STATUS = {"To Do": "new", "In Progress": "indeterminate", "Done": "done"}
 
 
-def refused(code: int, reason: str = "Refused") -> urllib.error.HTTPError:
-    return urllib.error.HTTPError("https://jira.example.test/x", code, reason, None, None)  # type: ignore[arg-type]
+def refused(code: int, reason: str = "Refused", headers=None) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("https://jira.example.test/x", code, reason, headers, None)
+
+
+def redirected() -> urllib.error.HTTPError:
+    headers = email.message.Message()
+    headers["Location"] = "https://portal.example.test/login"
+    return refused(302, "Found", headers)
+
+
+def certificate_error() -> ssl.SSLCertVerificationError:
+    return ssl.SSLCertVerificationError(1, "certificate verify failed")
 
 
 def sentence(exception: BaseException) -> str:
     """The error the real transport gives for `exception`: its classification is what these tests rest on."""
     opener = MagicMock()
     opener.open.side_effect = exception
+    with patch("sd_db.shadow_jira.urllib.request.build_opener", return_value=opener):
+        payload, error = _http("https://jira.example.test/rest/api/3/issue/ABC-7", {}, None)
+    assert payload is None and error
+    return error
+
+
+def sentence_for_body(body: bytes) -> str:
+    """The error the real transport gives when Jira answers 200 with `body`."""
+    opener = MagicMock()
+    opener.open.return_value.__enter__.return_value.read.return_value = body
     with patch("sd_db.shadow_jira.urllib.request.build_opener", return_value=opener):
         payload, error = _http("https://jira.example.test/rest/api/3/issue/ABC-7", {}, None)
     assert payload is None and error
@@ -162,6 +184,12 @@ class TheMoves(unittest.TestCase):
     def test_a_dropped_connection_holds_the_cursor_and_a_rerun_moves_the_ticket_once(self):
         self.held_then_moved_once(http.client.RemoteDisconnected("closed"))
 
+    def test_a_certificate_error_holds_the_cursor_and_a_rerun_moves_the_ticket_once(self):
+        self.held_then_moved_once(urllib.error.URLError(certificate_error()))
+
+    def test_a_refused_redirect_holds_the_cursor_and_a_rerun_moves_the_ticket_once(self):
+        self.held_then_moved_once(redirected())
+
     def test_an_expired_token_holds_the_cursor_and_a_rerun_moves_the_ticket_once(self):
         self.held_then_moved_once(refused(401, "Unauthorized"))
 
@@ -217,7 +245,7 @@ class TheMoves(unittest.TestCase):
     def test_a_permanent_failure_still_passes_and_notes_once(self):
         for what, error in (("404", sentence(refused(404, "Not Found"))),
                             ("409", sentence(refused(409, "Conflict"))),
-                            ("a body that does not parse", sentence(ValueError("no json")))):
+                            ("a body that does not parse", sentence_for_body(b"<html>not json</html>"))):
             with self.subTest(what):
                 [item] = self.linked("ABC-8")
                 self.addCleanup(self.db.execute, "DELETE FROM note WHERE item = ?", (item,))
@@ -487,17 +515,24 @@ class ThePropertyOfTheAnswers(unittest.TestCase):
 
 class TheFailureClasses(unittest.TestCase):
     def test_the_transport_marks_what_a_later_run_can_retry(self):
-        transient = [refused(401), refused(403), refused(429), refused(500), refused(502), refused(503), refused(504), TimeoutError("timed out"),
+        transient = [redirected(), refused(300), refused(304), certificate_error(), ssl.SSLError(1, "handshake failed"),
+                     urllib.error.URLError(certificate_error()), urllib.error.URLError(ssl.SSLError(1, "handshake failed")),
+                     http.client.InvalidURL("bad"), urllib.error.URLError(http.client.InvalidURL("bad")),
+                     urllib.error.URLError(ValueError("bad")), ValueError("before any answer"), RecursionError(),
+                     refused(401), refused(403), refused(429), refused(500), refused(502), refused(503), refused(504), TimeoutError("timed out"),
                      socket.gaierror(8, "no such host"), ConnectionResetError(54, "reset"),
                      urllib.error.URLError(ConnectionRefusedError(61, "refused")), urllib.error.URLError("timed out"),
                      http.client.RemoteDisconnected("closed"), http.client.IncompleteRead(b""),
                      http.client.BadStatusLine("x"), urllib.error.URLError(http.client.RemoteDisconnected("closed"))]
-        permanent = [refused(400), refused(404), refused(409), refused(304),
-                     ValueError("no json"), RecursionError(), http.client.InvalidURL("bad"),
-                     urllib.error.URLError(http.client.InvalidURL("bad")), urllib.error.URLError(ValueError("bad"))]
+        permanent = [refused(400), refused(404), refused(409), refused(422)]
         for exception, wanted in [(e, True) for e in transient] + [(e, False) for e in permanent]:
             with self.subTest(repr(exception)):
                 self.assertIs(isinstance(sentence(exception), shadow_jira.Transient), wanted)
+
+    def test_an_answer_that_does_not_parse_is_pinned_on_its_ticket(self):
+        for body in (b"<html>not json</html>", b"\xff\xfe", b"[" * 200000):
+            with self.subTest(body[:12]):
+                self.assertNotIsInstance(sentence_for_body(body), shadow_jira.Transient)
 
 
 class TheEmptyAnswer(unittest.TestCase):

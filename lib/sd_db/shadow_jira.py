@@ -338,18 +338,14 @@ class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
 
 
 class Transient(str):
-    """A failed request's sentence when a later attempt may work (sd:8117).
+    """A failed request's sentence unless an answer from Jira pins the failure on that one request (sd:8117).
 
-    A timeout, a lost connection, a 429, a 5xx, or a 401 or 403: a token renewed later works, and every ticket
-    fails alike until it is.
+    The default: every failure of the transport (any `URLError` or `OSError`, any TLS error, a refused redirect) and
+    a 401, 403, 429, 3xx or 5xx says nothing about one ticket, and a later run may succeed. Only a plain 4xx or a
+    body that does not parse is a plain `str`.
 
     A `str`, so a caller that only says the sentence is unchanged; `jira_moves` asks which kind it holds.
     """
-
-
-def _lost(error: BaseException) -> bool:
-    """Whether an exception caught below is the connection failing, not an answer or a URL that will fail again."""
-    return isinstance(error, http.client.HTTPException) and not isinstance(error, http.client.InvalidURL)
 
 
 def _http(url: str, headers: dict[str, str], body: dict | None):
@@ -368,9 +364,15 @@ def _http(url: str, headers: dict[str, str], body: dict | None):
         # nosec B310: `collect` builds `url` from `settings()`, which admits an
         # https base only, and `_RefuseRedirects` keeps it on that URL.
         with opener.open(request, timeout=TIMEOUT_SECONDS) as response:  # nosec B310
+            raw = response.read()
+        try:
             # A transition answers 204 with no body (sd:8117): empty is `{}`, not a failure.
-            data = response.read().decode()
+            data = raw.decode()
             return (json.loads(data) if data.strip() else {}), ""
+        except (ValueError, RecursionError) as error:
+            # Jira answered this request and the answer does not parse: `Transient` does not apply. Type only, as
+            # below: `JSONDecodeError` keeps the document. A body nested too deep for `json` is a `RecursionError`.
+            return None, f"the request to Jira failed: {type(error).__name__}"
     except urllib.error.HTTPError as error:
         error.close()
         if error.code in (401, 403):
@@ -381,27 +383,24 @@ def _http(url: str, headers: dict[str, str], body: dict | None):
         if error.code in _FOLLOWED and error.headers is not None and (
             "location" in error.headers or "uri" in error.headers
         ):
-            return None, (
+            return None, Transient(
                 f"Jira redirected the request ({error.code} {error.reason}) and redirects "
                 f"are not followed with credentials; set {ENV_BASE} to the URL Jira answers on"
             )
         text = f"Jira returned {error.code} {error.reason}"
-        return None, Transient(text) if error.code == 429 or error.code >= 500 else text
+        return None, text if 400 <= error.code < 500 and error.code != 429 else Transient(text)
     except (http.client.HTTPException, ValueError, RecursionError) as error:
         # Type only: `InvalidURL` and `urllib.parse`'s `ValueError` quote the
         # host, a secret pasted into it included, and `IncompleteRead` quotes
-        # the bytes it did read. A body nested too deep for `json` is a
-        # `RecursionError`, no answer either (sd:8117). Before the `OSError`
-        # clause, because `RemoteDisconnected` is both.
-        text = f"the request to Jira failed: {type(error).__name__}"
-        return None, Transient(text) if _lost(error) else text
+        # the bytes it did read. Before the `OSError` clause, because
+        # `RemoteDisconnected` and `SSLCertVerificationError` are both.
+        return None, Transient(f"the request to Jira failed: {type(error).__name__}")
     except (urllib.error.URLError, OSError) as error:
         # `URLError` quotes its reason, and that can be one of the exceptions
         # above, caught inside `urllib` and wrapped: type only for it too.
         reason = getattr(error, "reason", None)
         if isinstance(reason, (http.client.HTTPException, ValueError)):
-            text = f"the request to Jira failed: {type(reason).__name__}"
-            return None, Transient(text) if _lost(reason) else text
+            return None, Transient(f"the request to Jira failed: {type(reason).__name__}")
         return None, Transient(f"could not reach Jira: {type(error).__name__}: {error}")
 
 
