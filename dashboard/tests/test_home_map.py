@@ -17,6 +17,7 @@ from test_v2_today import OSASCRIPT
 
 STATIC = Path(v2.__file__).resolve().parent / "static"
 MARKUP_JS = (STATIC / "markup.js").read_text(encoding="utf-8")
+ATTACH_JS = (STATIC / "home-attach.js").read_text(encoding="utf-8")
 MAP_JS = (STATIC / "home-map.js").read_text(encoding="utf-8")
 ADDRESS = "1 Example Way, Example Town, CO"
 JPEG = b"\xff\xd8\xff\xe0 synthetic"
@@ -188,6 +189,10 @@ class TheMap(ScreenCase):
             self.assertIsNotNone(v2.api(path), path)
         for path in ("/api/home/asset", "/api/home/asset/delete", "/api/home/care"):
             self.assertIsNotNone(v2.action(path), path)
+        # sd:8112: an asset's Drive folder, through hoa_attach.HOME.
+        for path in ("/api/home/attachments", "/api/home/attachments/picture"):
+            self.assertIsNotNone(v2.api(path), path)
+        self.assertIsNotNone(v2.action("/api/home/attach"), "/api/home/attach")
 
 
 class TheMapScript(unittest.TestCase):
@@ -209,12 +214,12 @@ class TheMapScript(unittest.TestCase):
         script = (STAND_IN + MARKUP_JS + f"\nconst DOC = {json.dumps(self.DOC)};\n" + r"""
 window.shell = { getJSON: p => { OUT.gets.push(p); return Promise.resolve(JSON.parse(JSON.stringify(DOC))); },
   post: (p, b) => { OUT.posts.push([p, b]); return Promise.resolve({ id: 3 }); }, toast: m => OUT.toasts.push(m), confirm: () => Promise.resolve(true),
-  url: q => (OUT.urls = OUT.urls || []).push(String(q)),
+  url: q => (OUT.urls = OUT.urls || []).push(String(q)), itemHref: id => '/item/' + id,
   list: { fseg: (key, name, items) => window.markup.html`<div class="fseg">${items.map(i => window.markup.html`<button type="button" data-f="${key}" data-v="${i.v}" aria-pressed="${String(!!i.pressed)}"${i.off ? window.markup.html` aria-disabled="true"` : ''} title="${i.title}">${i.label}</button>`)}</div>` } };
 globalThis.DOMPoint = function (x, y) { this.matrixTransform = () => ({ x, y }); };
 function FormData(f) { this.get = k => f.values[k]; this.entries = () => Object.entries(f.values); }
 const flush = () => new Promise(r => r()).then(() => null).then(() => null).then(() => null);
-""" + MAP_JS + "\nvar R = {};\n(async () => { try {\n" + body
+""" + ATTACH_JS + MAP_JS + "\nvar R = {};\n(async () => { try {\n" + body
                   + "\n} catch (e) { OUT.error = String(e) + ' ' + e.stack; } })();\nfunction run() { OUT.R = R; return JSON.stringify(OUT); }\n")
         result = subprocess.run([OSASCRIPT, "-l", "JavaScript", "-e", script], capture_output=True, text=True, timeout=60, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -281,6 +286,24 @@ const form = Object.assign(ELS['asset-form'], { id: 'asset-form', values: { name
         self.assertEqual(out["posts"][0], ["/api/home/asset", {"kind": "tree", "name": "Maple",
                                                                 "geometry": {"type": "Point", "coordinates": [50, 60]},
                                                                 "fields": {"species": "Red maple"}, "photo": None}])
+
+    def test_a_selected_asset_lists_its_attachments_with_thumbnails_and_upload(self):
+        """sd:8112: the Details of a selected asset read /api/home/attachments; a picture is a thumbnail through the
+        server, a Reference links its target, and Upload and Reference forms follow."""
+        listed = {"asset": 1, "folder": "https://drive.google.com/drive/folders/OAK", "files": [
+            {"id": "PIC1234567", "name": "oak.jpg", "mime": "image/jpeg", "link": "https://drive.google.com/open?id=PIC1234567", "kind": "picture"},
+            {"id": "LNK1234567", "name": "Plan.url", "mime": "text/plain", "link": "https://drive.google.com/open?id=LNK1234567",
+             "kind": "link", "target": "https://drive.google.com/file/d/TARGET/view"}]}
+        out = self.run_js(self.SHOW + f"const LISTED = {json.dumps(listed)};\n" + r"""
+const was = window.shell.getJSON; window.shell.getJSON = p => p.startsWith('/api/home/attachments?') ? (OUT.gets.push(p), Promise.resolve(LISTED)) : was(p);
+(DOC_LISTENERS.click || []).forEach(f => f({ target: { closest: s => s === '[data-asset]' ? { dataset: { asset: '1' } } : null } }));
+await flush(); await flush(); R.form = ELS['map-form'].html; R.attach = ELS['map-attach'] ? ELS['map-attach'].html : '';""")
+        self.assertIn("/api/home/attachments?asset=1", out["gets"])
+        self.assertIn('<div id="map-attach"', out["R"]["form"])
+        self.assertIn('<img class="thumb" src="/api/home/attachments/picture?id=PIC1234567"', out["R"]["attach"])
+        self.assertIn('href="https://drive.google.com/file/d/TARGET/view" target="_blank" rel="noopener">Plan.url', out["R"]["attach"])
+        self.assertIn('data-attach="upload"', out["R"]["attach"])
+        self.assertIn('data-attach="reference"', out["R"]["attach"])
 
 
 if __name__ == "__main__":

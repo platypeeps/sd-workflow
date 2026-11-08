@@ -1270,12 +1270,12 @@ class Dashboard(BaseHTTPRequestHandler):
                 or not session or not re.fullmatch(r"[a-f0-9]{64}", csrf)
                 or not hmac.compare_digest(csrf, self._csrf(session))):
             return self._json(403, {"error": "Open the dashboard again before saving. The browser session, identity or origin is invalid."})
-        if urlsplit(self.path).path in ("/api/research/intake/file", "/api/hoa/attach/file") and not urlsplit(self.path).query:
+        if urlsplit(self.path).path in ("/api/research/intake/file", "/api/hoa/attach/file", "/api/home/attach/file") and not urlsplit(self.path).query:
             from . import hoa_attach, source_intake
 
-            # sd:6690: HOA's Upload stages the same way, with its own suffixes and cap.
+            # sd:6690, sd:8112: HOA's and Home's Upload stage the same way, with their own suffixes and cap.
             bounds = ({"suffixes": hoa_attach.SUFFIXES, "limit": hoa_attach.UPLOAD_BYTES}
-                      if urlsplit(self.path).path == "/api/hoa/attach/file" else {})
+                      if urlsplit(self.path).path != "/api/research/intake/file" else {})
 
             # sd:5112: a dropped file's raw bytes, past the JSON bound; the intake request names it by its hash.
             if self.headers.get_content_type() != "application/octet-stream" or self.headers.get("Transfer-Encoding"):

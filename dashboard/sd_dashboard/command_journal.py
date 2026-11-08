@@ -135,6 +135,7 @@ COMMANDS = (
     Command(r"/api/tasks/build", "Build", _items),
     Command(r"/api/today/github/copilot-review", "Request Copilot", _key("repo", "number")),
     Command(r"/api/hoa/attach", "Attach", _key("asset", "name")),
+    Command(r"/api/home/attach", "Attach", _key("asset", "name")),
 )
 
 
