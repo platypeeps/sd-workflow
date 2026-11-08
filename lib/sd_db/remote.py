@@ -305,6 +305,23 @@ def build_digest() -> str:
     return _digest
 
 
+def disk_holds(mismatch: BuildMismatch) -> bool:
+    """Whether this package's files on disk now hold the build the hub named in `mismatch` (pack sd:8182).
+
+    The hub names its build in `hub_build`, or, from a hub older than that
+    field, in `hub` when the build itself differed. No digest to compare, or
+    files that did not read (a follow still moving them), is unknown: False,
+    and the caller asks again at its next beat.
+    """
+    hub = mismatch.hub_build or (mismatch.hub if mismatch.field == "build" else None)
+    if hub is None:
+        return False
+    try:
+        return _hash_files() == hub
+    except OSError:
+        return False
+
+
 class HubRestartNeeded(RemoteError):
     """The hub's `sd_db` was installed again after the hub started; it opened nothing.
 

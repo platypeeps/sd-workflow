@@ -461,7 +461,8 @@ def supervise_build(args: argparse.Namespace) -> int:
         raise WorkRefusal(str(error)) from error
     if root is None:
         raise WorkRefusal("sd.bulk_storage_root is unset, so a build run has no log folder")
-    connection = sd_handoff_rows.connect(sd_db, write=True)
+    # A supervisor exec'd across a hub refresh holds a live child: its connection waits for the hub (pack sd:8182).
+    connection = build_run.connect_again(lambda: sd_handoff_rows.connect(sd_db, write=True))
     try:
         scope = connection.execute("SELECT assignment.scope FROM runner_run JOIN assignment "
                                    "ON assignment.id = runner_run.assignment WHERE runner_run.id = ?",
