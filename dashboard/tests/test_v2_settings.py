@@ -269,7 +269,7 @@ class TheDashboardSettings(BrowserSession):
         writes.set_setting(self.connection, "dashboard.hoa_thresholds", "tank|below|12")
         writes.set_setting(self.connection, "adversarial.model", "gpt-fixture")
         held = self.read()
-        self.assertEqual(list(held), list(setting_rows.LISTS) + ["dashboard.home_map_extent", "home.drive_folder", "home.google_account"]
+        self.assertEqual(list(held), list(setting_rows.LISTS) + ["dashboard.home_map_extent", "home.drive_folder", "home.google_account", "contributions.automation_logins"]
                          + list(adversarial.SETTINGS) + list(adversarial.DEEP))
         self.assertEqual((held["dashboard.realms"]["value"], held["dashboard.realms"]["source"]),
                          ("realm|work|Work|/repos/example-work/*\n", "file"))
@@ -367,6 +367,17 @@ class TheDashboardSettings(BrowserSession):
         self.assertEqual(status, 400, answer)
         self.assertIn("from 1 to 16", answer["error"])
 
+
+    def test_the_automation_logins_are_a_row_this_page_sets_and_checks(self):
+        """pack sd:8148, ruling #49297: the list of accounts whose comments are no maintainer comments."""
+        key = "contributions.automation_logins"
+        self.assertEqual(self.read()[key]["source"], "unset")
+        status, _, answer = self.post("/api/settings/row", {"key": key, "value": "scan-account,other-account", "before": None})
+        self.assertEqual((status, answer["was"]), (200, None), answer)
+        self.assertEqual(writes.read_settings(self.connection, [key])[key], "scan-account,other-account")
+        for bad in ("scan account", "scan-account,", "-scan", "a/b"):
+            status, _, answer = self.post("/api/settings/row", {"key": key, "value": bad, "before": "scan-account,other-account"})
+            self.assertEqual(status, 400, (bad, answer))
 
     def test_the_home_drive_keys_are_rows_this_page_sets_and_the_attachments_read(self):
         """Review of sd:8112: no sd config prefix declares home.*, so Settings is where both keys are set."""

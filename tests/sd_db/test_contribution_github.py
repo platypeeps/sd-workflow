@@ -98,6 +98,22 @@ class PullCollection(unittest.TestCase):
         result = api.observation()
         self.assertEqual([row["maintainer"] for row in result["events"]], [False, False, True])
 
+    def test_a_listed_login_is_no_maintainer_on_every_comment_path(self):
+        # pack sd:8148: the issue thread, the review thread and a review's own body all carry the association.
+        api = Api()
+        def row(number, login):
+            return {"id": number, "user": {"id": number, "login": login, "type": "User"}, "body": "Scan passed",
+                    "updated_at": AT, "author_association": "MEMBER"}
+        api.rows[ROOT + "/issues/7/comments?per_page=100"] = [row(5, "scan-account"), row(6, "maintainer")]
+        api.rows[ROOT + "/pulls/7/comments?per_page=100"] = [row(7, "scan-account")]
+        api.rows[ROOT + "/pulls/7/reviews?per_page=100"] = [
+            {**row(8, "scan-account"), "state": "COMMENTED", "submitted_at": AT}]
+        unlisted = api.observation()
+        result = pull(api.client(), URL, OPERATOR, observed_at=AT, automation=frozenset({"scan-account"}))
+        comments = [event for event in result["events"] if event["kind"] == "comment"]
+        self.assertEqual(sorted(event["maintainer"] for event in comments), [False, False, False, True])
+        self.assertEqual([event["maintainer"] for event in unlisted["events"] if event["kind"] == "comment"].count(False), 0)
+
     def test_requested_reviewers_keep_user_logins_not_teams(self):
         # sd:8084: a team request does not name the operator.
         api = Api()
@@ -473,6 +489,15 @@ class IssueApi(Api):
 
 
 class IssueUrls(unittest.TestCase):
+    def test_a_listed_login_is_no_maintainer_on_an_issue(self):
+        api = IssueApi()
+        api.rows[ROOT + "/issues/9/comments?per_page=100"] = [
+            {"id": 5, "user": {"id": 5, "login": "Scan-Account", "type": "User"}, "body": "Scan passed",
+             "updated_at": AT, "author_association": "MEMBER"}]
+        self.assertEqual([event["maintainer"] for event in api.observation()["events"] if event["kind"] == "comment"], [True])
+        result = issue(api.client(), ISSUE_URL, OPERATOR, observed_at=AT, automation=frozenset({"scan-account"}))
+        self.assertEqual([event["maintainer"] for event in result["events"] if event["kind"] == "comment"], [False])
+
     def test_parts_lower_case_the_repository_and_drop_the_trailing_slash(self):
         self.assertEqual(issue_parts("https://github.com/Example/Project/issues/9/"), ("example", "project", 9))
         self.assertEqual(canonical_issue_url("https://github.com/Example/Project/issues/9/"), ISSUE_URL)

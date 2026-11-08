@@ -313,7 +313,7 @@ def refresh(connection, planned, issues, *, client, observed_at, search_complete
     ordered = _order(pending, fresh, _unread_open(connection, issues, fresh),
                      snapshots=snapshots, observed_at=observed_at)
     completed, incomplete, attempted, terminal = [], [], [], set()
-    operator, identified = None, False
+    operator, identified, automation = None, False, frozenset()
     # Pagination is not priced, so the client itself stops at the reserve: an
     # attempt that pages past it fails on the budget and is held, and the
     # collectors that follow keep their requests (sd:1219).
@@ -333,6 +333,9 @@ def refresh(connection, planned, issues, *, client, observed_at, search_complete
             if identify:
                 identified = True
                 try:
+                    # Read first: without the list a service account's comment
+                    # would read as a maintainer's, so no detail read goes on.
+                    automation = github.automation_logins(connection)
                     operator = github.identity(client.get("/user"))
                 except (github.Unavailable, KeyError, TypeError) as error:
                     errors.append(str(error))
@@ -346,7 +349,8 @@ def refresh(connection, planned, issues, *, client, observed_at, search_complete
                         if operator is None:
                             raise github.Unavailable("authenticated GitHub identity unavailable")
                         observation = collect(client, entry["url"], operator, observed_at=observed_at,
-                                              why=entry["why"], blocking_labels=entry["blocking_labels"])
+                                              why=entry["why"], blocking_labels=entry["blocking_labels"],
+                                              automation=automation)
                     except (github.Unavailable, KeyError, TypeError, AttributeError) as error:
                         observation = {"complete": False, "observed_at": observed_at,
                                        "reason": str(error) if isinstance(error, github.Unavailable) else "malformed GitHub contribution response"}
