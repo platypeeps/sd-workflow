@@ -348,7 +348,9 @@ def _http(url: str, headers: dict[str, str], body: dict | None):
         # nosec B310: `collect` builds `url` from `settings()`, which admits an
         # https base only, and `_RefuseRedirects` keeps it on that URL.
         with opener.open(request, timeout=TIMEOUT_SECONDS) as response:  # nosec B310
-            return json.loads(response.read().decode()), ""
+            # A transition answers 204 with no body (sd:8117): empty is `{}`, not a failure.
+            data = response.read().decode()
+            return (json.loads(data) if data.strip() else {}), ""
     except urllib.error.HTTPError as error:
         error.close()
         if error.code in (401, 403):
