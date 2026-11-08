@@ -24,6 +24,8 @@ const BY_TEXT = 'repo, title and reason';
 window.PAGE_FILTER = { open: BY_TEXT, settled: BY_TEXT, filed: 'tickets and issues' };
 window.PAGE_COMMANDS = [
   { label: 'Show the GitHub sync', icon: 'activity', run: () => document.dispatchEvent(new CustomEvent('shell:open', { detail: 'collector' })) },
+  // sd:8146: the head's Refresh from GitHub, which runs Re-run collector's sync.
+  { label: 'Refresh from GitHub', icon: 'rotate-ccw', run: () => document.dispatchEvent(new CustomEvent('contributions:refresh')) },
   ...['all', 'internal', 'external'].map(v => ({ label: `Show ${v} repositories`, icon: 'filter', run: () => document.dispatchEvent(new CustomEvent('contributions:scope', { detail: v })) })),
 ];
 // build: nothing is read yet, so the page claims nothing for the rail until /api/contributions/page answers.
@@ -57,7 +59,7 @@ addEventListener('DOMContentLoaded', () => {
   const settle = r => dated(r.merged_at) ? ['merged', r.merged_at] : dated(r.closed_at) ? ['closed', r.closed_at] : null;
 
   // ---------- Data (build: /api/contributions/page) ----------
-  let DOC = null, ROWS = [], BY = new Map(), selected = null, FAILED = '', STORE = '';
+  let DOC = null, ROWS = [], BY = new Map(), selected = null, FAILED = '', STORE = '', SYNCING = false, SYNC = null;
   // The Filed view (sd:5488): its rows, by key, and whether it is the shown view.
   let FILED = [], FBY = new Map(), FILEDVIEW = false;
   const u0 = new URLSearchParams(location.search);
@@ -185,7 +187,8 @@ addEventListener('DOMContentLoaded', () => {
         cli: o => `open ${shq(o.url)}`,
         run: o => { window.open(o.url, '_blank', 'noopener'); return `Opened in ${TRACKER[o.tracker]} · ${o.ref}`; } },
       // Re-run collector (commands.js); Contributions reads again once the run ends.
-      window.commands.syncCollector({ reread: () => reread(), page: 'Contributions' }),
+      // sd:8146: while the run it follows is live, the head's Refresh from GitHub is off and says Refreshing….
+      SYNC = window.commands.syncCollector({ reread: () => reread(), page: 'Contributions', running: on => { SYNCING = on; if (DOC) renderHead(); } }),
     );
   }
 
@@ -237,6 +240,7 @@ addEventListener('DOMContentLoaded', () => {
       <button class="linkish" type="button" data-collector>Collector</button>
       <span><b>${n(unknown)}</b> of ${n(openN(scope))} open rows unknown freshness</span>
       <span class="g-${st}">GitHub sync ${c.state || 'unknown'}${c.last_success_at ? html`, last success <time class="rel" datetime="${c.last_success_at}"></time>` : ''}</span>
+      <button class="linkish" type="button" data-gh-refresh${SYNCING ? html` disabled` : ''}>${SYNCING ? 'Refreshing…' : 'Refresh from GitHub'}</button>
       <span>${n(tot('linked'))} linked items · ${n(tot('unfiled'))} unfiled</span>`);
   }
 
@@ -503,7 +507,10 @@ addEventListener('DOMContentLoaded', () => {
   };
   document.addEventListener('shell:view', e => onView(e.detail.id));
   onView(window.shell.view?.current?.());
-  document.getElementById('source').addEventListener('click', e => { if (e.target.closest('[data-collector]')) select('collector', true); });
+  const refresh = () => { const o = C.get('collector'); if (!SYNCING && o) C.run(SYNC, o); };
+  document.getElementById('source').addEventListener('click', e => { if (e.target.closest('[data-collector]')) select('collector', true);
+    if (e.target.closest('[data-gh-refresh]')) refresh(); });
+  document.addEventListener('contributions:refresh', refresh);
   [tbody, ftbody].forEach(b => b.addEventListener('click', e => { if (e.target.closest('.rowact') || e.target.closest('a')) return; const tr = e.target.closest('tr[data-id]'); if (tr) select(tr.dataset.id, true); }));
   document.addEventListener('shell:open', e => select(e.detail, true));
   document.addEventListener('shell:filter', e => { if (e.detail.q === q.value) return; q.value = e.detail.q; if (DOC) applyFilter(); });
