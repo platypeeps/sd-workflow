@@ -1387,7 +1387,7 @@ class UnlinkedWaits(ContributionCase):
 
 
 class ReRequestedReview(ContributionCase):
-    """sd:8116 (c), aura#831: changes requested, the author pushes and asks that reviewer again: it waits on them."""
+    """sd:8116 (c): changes requested, the author pushes and asks that reviewer again: it waits on them."""
 
     def test_a_re_request_after_changes_requested_waits_on_reviewers(self):
         reviews = [{"id": "review:1", "actor_id": "2", "state": "CHANGES_REQUESTED", "at": T0}]

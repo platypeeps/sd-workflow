@@ -476,7 +476,7 @@ def _pull_attention(observation: dict, previous: dict, contexts: dict[str, str])
     context = [_event(identifier, why.replace("-", " ").capitalize()) for why, identifier in contexts.items()]
     if str(observation["author"]["id"]) != operator:
         return context, previous.get("ci_baseline")
-    # The author asking for review again answers what came before (sd:8116, aura#831): a reviewer's changes request
+    # The author asking for review again answers what came before (sd:8116): a reviewer's changes request
     # before the author asked that reviewer again, and any comment before the author's newest request.
     asked = [(_moment(event["at"]), str(event.get("reviewer_id"))) for event in observation["events"]
              if event["kind"] == "review_requested" and str(event["actor_id"]) == operator]
