@@ -462,7 +462,10 @@ class TheGateRuns(Fixture):
         lane_run(c, "g7", "merged", "2026-09-01T12:00:00Z", head="5" * 40, item=12)
         self.assertEqual(metrics_screen.flaky(c, NOW)[0], [{"repository": "example/alpha", "item": 9, "title": "Item 9", "head": h,
                                                             "failed": ["2026-09-04T10:00:00Z", "2026-09-04T12:00:00Z"],
-                                                            "passed": "2026-09-04T14:00:00Z", "status": "merged"}])
+                                                            "passed": "2026-09-04T14:00:00Z", "status": "merged",
+                                                            "runs": [{"entry": "f1", "at": "2026-09-04T10:00:00Z", "status": "failed", "log": "", "host": ""},
+                                                                     {"entry": "f2", "at": "2026-09-04T12:00:00Z", "status": "failed", "log": "", "host": ""}],
+                                                            "pass_run": {"entry": "f3", "at": "2026-09-04T14:00:00Z", "status": "merged", "log": "", "host": ""}}])
 
     def test_metrics_carries_no_flaky_head_and_its_badge_counts_none(self):
         """pack sd:7663: the flaky heads moved to Today's Needs you; Metrics keeps CI health alone."""

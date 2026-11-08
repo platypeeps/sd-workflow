@@ -254,6 +254,12 @@ def _ci(connection, now, since=None):
             "repos": sorted(repos.values(), key=lambda r: (-r["gate"], r["repository"]))}
 
 
+def _run(at: str, entry: dict) -> dict:
+    """One lane run as the flaky Fix brief names it: its entry id, end, status and prepare log with the log's host."""
+    return {"entry": entry.get("id"), "at": at, "status": entry["status"], "log": entry.get("prepare_log") or "",
+            "host": entry.get("log_host") or ""}
+
+
 def flaky(connection, now: str) -> tuple[list[dict], int]:
     """The flaky heads of the last `CI_DAYS` (sd:5473), newest pass first, and the count of bodies that are not lane
     entries (`_entries`' `unreadable`); Today lists them (pack sd:7663) and says the count (pack sd:7706).
@@ -272,10 +278,12 @@ def flaky(connection, now: str) -> tuple[list[dict], int]:
             continue
         key = (entry["repository"], head)
         if entry["status"] == "failed" and _failure(entry) == "gate":
-            failed.setdefault(key, []).append(at)
+            failed.setdefault(key, []).append((at, entry))
         elif entry["status"] in PASSED and failed.get(key) and key not in found and at >= since:
+            # pack sd:8113: each run's entry id and prepare log, for the Fix brief that names them.
             found[key] = {"repository": entry["repository"], "item": entry.get("item"), "title": entry.get("title") or "",
-                          "head": head, "failed": failed[key], "passed": at, "status": entry["status"]}
+                          "head": head, "failed": [when for when, _ in failed[key]], "passed": at, "status": entry["status"],
+                          "runs": [_run(when, run) for when, run in failed[key]], "pass_run": _run(at, entry)}
     return sorted(found.values(), key=lambda f: f["passed"], reverse=True), unreadable
 
 
