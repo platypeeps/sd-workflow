@@ -697,7 +697,6 @@ class EveryCheckpointWriter(unittest.TestCase):
         "lib/sd_db/backup.py": ("<backup run id>",),
         "lib/sd_db/contribution_sync.py": ("contribution-refresh-queue",),
         "lib/sd_db/contributions.py": ("contribution:",),
-        "lib/sd_db/jira_moves.py": ("jira-moves",),
         "lib/sd_db/operations.py": ("operations:",),
         "lib/sd_db/provider_controls.py": ("provider-orders:",),
         "lib/sd_db/reporting.py": ("operator-action",),

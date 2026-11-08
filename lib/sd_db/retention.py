@@ -113,7 +113,7 @@ CHECKPOINT_IDLE_AGE = timedelta(days=7)
 NEWEST_ONLY_CHECKPOINTS = (
     "ship:", "ship-review-no-item:", "ship-review-no-item-index:", "ship-adjudication:",
     "ship-adjudication-no-item:", "sd-gate-receipt:", "sd-check-receipt:", "contribution:", "provider-orders:",
-    "review:", "jira-moves",
+    "review:",
 )
 
 #: Checkpoint keys retention never compacts, and why. A backup run id has no

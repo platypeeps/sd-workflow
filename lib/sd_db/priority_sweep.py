@@ -30,8 +30,6 @@ from .errors import SdDbError
 QUEUE = "priority"
 KINDS = ("task", "followup")
 CLOSE_DAYS = 30
-#: How a closure's reason starts: `jira_moves` reads it, because a sweep closure is no finished work.
-CLOSE_REASON = "priority sweep (sd:6726)"
 #: A due date this close proposes P2.
 DUE_SOON_DAYS = 14
 OPTIONS = ["P1", "P2", "P3", "P4"]
@@ -95,7 +93,7 @@ def sweep(connection: sqlite3.Connection, *, who: str, now: datetime) -> dict:
     for item in stale:
         try:
             workflow.change_status(connection, item["id"], "done", who=who,
-                                   reason=f"{CLOSE_REASON}: no priority {CLOSE_DAYS} days after filing; reopen "
+                                   reason=f"priority sweep (sd:6726): no priority {CLOSE_DAYS} days after filing; reopen "
                                           f"with `sd task status {item['id']} planning` and "
                                           f"`sd task edit {item['id']} --priority N`")
         except SdDbError as refused:  # a queued or running build owns the item; the next night tries again
