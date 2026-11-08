@@ -53,7 +53,7 @@ class TheMap(ScreenCase):
     def test_the_address_is_placed_once_and_the_aerial_fetched_once(self):
         writes.set_setting(self.connection, home_map.KEY, ADDRESS)
         doc = home_map.document(self.connection, now=NOW)
-        self.assertEqual(doc["bbox"], [3199800.0, 1649800.0, 3200200.0, 1650200.0])
+        self.assertEqual(doc["bbox"], [3199800.0, 1649800.0, 3200800.0, 1650200.0])  # sd:8085: 800 ft east
         self.assertEqual(doc["aerial"], "/api/home/map/aerial")
         self.assertEqual(home_map.aerial_route(self.connection), (200, JPEG, "image/jpeg"))
         home_map.document(self.connection, now=NOW)
@@ -61,7 +61,7 @@ class TheMap(ScreenCase):
         self.assertEqual(len(self.calls), 2, self.calls)
         self.assertIn("outSR=2232", self.calls[0])
         self.assertIn("bboxSR=2232", self.calls[1])
-        self.assertIn("size=1843%2C1843", self.calls[1])
+        self.assertIn("size=4608%2C1843", self.calls[1])
 
     def test_a_failed_locator_names_its_reason(self):
         writes.set_setting(self.connection, home_map.KEY, ADDRESS)
@@ -155,7 +155,9 @@ class TheMapScript(unittest.TestCase):
     def run_js(self, body):
         script = (STAND_IN + MARKUP_JS + f"\nconst DOC = {json.dumps(self.DOC)};\n" + r"""
 window.shell = { getJSON: p => { OUT.gets.push(p); return Promise.resolve(JSON.parse(JSON.stringify(DOC))); },
-  post: (p, b) => { OUT.posts.push([p, b]); return Promise.resolve({ id: 3 }); }, toast: m => OUT.toasts.push(m), confirm: () => Promise.resolve(true) };
+  post: (p, b) => { OUT.posts.push([p, b]); return Promise.resolve({ id: 3 }); }, toast: m => OUT.toasts.push(m), confirm: () => Promise.resolve(true),
+  url: q => (OUT.urls = OUT.urls || []).push(String(q)),
+  list: { fseg: (key, name, items) => window.markup.html`<div class="fseg">${items.map(i => window.markup.html`<button type="button" data-f="${key}" data-v="${i.v}" aria-pressed="${String(!!i.pressed)}"${i.off ? window.markup.html` aria-disabled="true"` : ''} title="${i.title}">${i.label}</button>`)}</div>` } };
 globalThis.DOMPoint = function (x, y) { this.matrixTransform = () => ({ x, y }); };
 function FormData(f) { this.get = k => f.values[k]; this.entries = () => Object.entries(f.values); }
 const flush = () => new Promise(r => r()).then(() => null).then(() => null).then(() => null);
@@ -180,6 +182,23 @@ const flush = () => new Promise(r => r()).then(() => null).then(() => null).then
         self.assertIn('<circle class="ring"', svg)
         self.assertIn('points="0.00,0.00 10.00,-20.00"', svg)
         self.assertIn("■ overdue", out["R"]["rows"])
+
+    def test_a_group_tile_hides_its_assets_and_keeps_its_count(self):
+        """sd:8085: one tile per kind group; Plants off hides the tree's marker and row, every count stays, the URL
+        keeps the choice, and a group with no assets is dim (aria-disabled), not hidden."""
+        out = self.run_js(self.SHOW + r"""R.before = ELS['map-filters'].html;
+const tile = v => (DOC_LISTENERS.click || []).forEach(f => f({ target: { closest: s => s === '#map-filters [data-f="group"]' ? { dataset: { v } } : null } }));
+tile('plants'); R.svg = ELS['map-svg'].html; R.rows = ELS['map-rows'].html; R.after = ELS['map-filters'].html;""")
+        before, after, svg, rows = (out["R"][k] for k in ("before", "after", "svg", "rows"))
+        self.assertIn('data-v="plants" aria-pressed="true"', before)
+        self.assertIn('data-v="plants" aria-pressed="false"', after)
+        self.assertIn('Plants <span class="n">1</span>', after)
+        self.assertIn('data-v="energy" aria-pressed="true" aria-disabled="true"', after)
+        self.assertNotIn("k-tree", svg)
+        self.assertIn("k-water-line", svg)
+        self.assertNotIn("Oak", rows)
+        self.assertIn("Main", rows)
+        self.assertEqual(out["urls"][-1], "mapoff=plants")
 
     def test_add_places_a_point_where_the_map_is_clicked_and_posts_it(self):
         out = self.run_js(self.SHOW + r"""

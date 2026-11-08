@@ -1,9 +1,11 @@
 // Home's Map view (pack sd:8053): the lot's assets over the county aerial, one SVG as HOA's map.
-// Data: GET /api/home/map (home_map.document): the square (EPSG:2232 feet), the aerial's address, the assets with their care.
-// The SVG's viewBox is the square with y flipped, so an asset's feet are its coordinates. Add: press Add, pick a kind,
+// Data: GET /api/home/map (home_map.document): the box (EPSG:2232 feet, 1,000 by 400 ft), the aerial's address, the assets with their care.
+// The SVG's viewBox is the box with y flipped, so an asset's feet are its coordinates. Add: press Add, pick a kind,
 // click the map (a line kind takes a click per point, then Finish line), fill the short form, Save. Drag a point to move it.
 // A row or a mark opens its form: Save, Delete, and Add care task, a recurring sd item naming the asset (POST /api/home/care).
 // A plant or a tree whose care is overdue carries the warning ring.
+// The tiles (sd:8085): one per kind group with its count; each toggles the group's marks and rows (all on by default,
+// ?mapoff=<group,...> keeps the ones off). A group with no assets is dim; a kind in no group is Other's.
 (() => {
   const { html, put } = window.markup;
   const $ = id => document.getElementById(id);
@@ -11,6 +13,15 @@
   const label = k => k.replace(/-/g, ' ');
   const isLine = k => (S.doc?.lines || []).includes(k);
   const plant = k => k === 'tree' || k === 'plant';
+  const GROUPS = [['gas', 'Gas', ['gas-line', 'gas-shutoff']], ['water', 'Water', ['water-line', 'water-shutoff']],
+    ['sewer', 'Sewer', ['sewer-line', 'sewer-shutoff']], ['electric', 'Electric', ['electric-line', 'electric-shutoff']],
+    ['comms', 'Comms', ['comms-line', 'comms-shutoff']],
+    ['irrigation', 'Irrigation', ['irrigation-line', 'irrigation-valve', 'irrigation-zone', 'backflow']],
+    ['energy', 'Energy', ['solar', 'powerwall', 'inverter', 'ev-charger', 'hvac']], ['plants', 'Plants', ['tree', 'plant']],
+    ['other', 'Other', ['light', 'drainage', 'fence', 'easement', 'pond']]];
+  const group = k => (GROUPS.find(g => g[2].includes(k)) || GROUPS[GROUPS.length - 1])[0];
+  const off = new Set((new URLSearchParams(location.search).get('mapoff') || '').split(',').filter(g => GROUPS.some(x => x[0] === g)));
+  const shown = a => !off.has(group(a.kind));
 
   // The square: the address's, else the assets' extent, else a 400 ft square at 0.
   function box() {
@@ -35,19 +46,22 @@
 
   function draw() {
     const d = S.doc, [x0, y0, x1, y1] = box(), w = x1 - x0, h = y1 - y0, r = w / 120;
-    const placed = d.assets.filter(a => a.geometry), pending = S.points.length ? html`<polyline class="pending" points="${S.points.map(xy).join(' ')}"/>` : '';
+    const placed = d.assets.filter(a => a.geometry && shown(a)), rows = d.assets.filter(shown), pending = S.points.length ? html`<polyline class="pending" points="${S.points.map(xy).join(' ')}"/>` : '';
     put($('map-note'), d.reason ? html`<p class="note">${d.reason}</p>` : html``);
     put($('map-svg'), html`<svg class="map${S.adding ? ' adding' : ''}" id="map-canvas" viewBox="${x0} ${-y1} ${w} ${h}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Property map: ${String(placed.length)} assets">
       ${d.aerial ? html`<image href="${d.aerial}" x="${x0}" y="${-y1}" width="${w}" height="${h}" preserveAspectRatio="none"/>` : html`<rect class="ground" x="${x0}" y="${-y1}" width="${w}" height="${h}"/>`}
       ${placed.map(a => mark(a, r))}${pending}</svg>`);
+    const n = g => d.assets.filter(a => group(a.kind) === g).length;
+    put($('map-filters'), window.shell.list.fseg('group', 'Kinds shown', GROUPS.map(([g, word, kinds]) => ({ v: g, pressed: !off.has(g), off: !n(g),
+      title: `${word}: ${kinds.map(label).join(', ')} · ${n(g)}`, label: html`${word} <span class="n">${String(n(g))}</span>` }))));
     put($('map-tools'), html`<button class="btn sm" type="button" id="map-add" aria-pressed="${String(S.adding)}">${S.adding ? 'Stop adding' : 'Add'}</button>
       ${S.adding ? html`<label class="sr" for="map-kind">Kind</label><select id="map-kind">${d.kinds.map(k => html`<option value="${k}"${k === S.kind ? html` selected` : ''}>${label(k)}</option>`)}</select>
       <span class="why">${isLine(S.kind) ? `Click each point of the ${label(S.kind)}, then Finish line.` : `Click the map where the ${label(S.kind)} is.`}</span>
       ${isLine(S.kind) ? html`<button class="btn sm" type="button" id="map-finish"${S.points.length < 2 ? html` disabled` : ''}>Finish line</button>` : ''}` : ''}`);
     put($('map-rows'), html`<table class="ledger place-rows"><thead><tr><th scope="col">Asset</th><th scope="col">Kind</th><th scope="col">Care</th></tr></thead><tbody>
-      ${d.assets.length ? d.assets.map(a => html`<tr data-asset="${String(a.id)}" tabindex="0" aria-selected="${String(S.sel === a.id)}"><td>${a.name}</td><td>${label(a.kind)}</td>
+      ${rows.length ? rows.map(a => html`<tr data-asset="${String(a.id)}" tabindex="0" aria-selected="${String(S.sel === a.id)}"><td>${a.name}</td><td>${label(a.kind)}</td>
         <td>${a.care.overdue ? html`<span class="st warning">■ overdue</span>` : a.care.items.length ? `next ${a.care.items[0].due || 'undated'}` : '—'}</td></tr>`)
-        : html`<tr class="empty"><td colspan="3">No assets yet: press Add, pick a kind and click the map.</td></tr>`}</tbody></table>`);
+        : html`<tr class="empty"><td colspan="3">${d.assets.length ? 'No assets in the kinds shown: turn a tile on.' : 'No assets yet: press Add, pick a kind and click the map.'}</td></tr>`}</tbody></table>`);
     form();
   }
 
@@ -87,6 +101,15 @@
 
   document.addEventListener('click', e => {
     const t = e.target;
+    const tile = t.closest?.('#map-filters [data-f="group"]');
+    if (tile) {
+      if (tile.getAttribute?.('aria-disabled') === 'true') return;
+      const g = tile.dataset.v;
+      if (off.has(g)) off.delete(g); else off.add(g);
+      const p = new URLSearchParams(location.search);
+      if (off.size) p.set('mapoff', [...off].join(',')); else p.delete('mapoff');
+      window.shell.url(p); draw(); return;
+    }
     if (t.closest?.('#map-add')) { S.adding = !S.adding; S.points = []; S.sel = null; draw(); return; }
     if (t.closest?.('#map-finish')) { const g = { type: 'LineString', coordinates: S.points }; S.points = []; draw(); form(g); return; }
     if (t.closest?.('#asset-cancel')) { S.points = []; form(); return; }

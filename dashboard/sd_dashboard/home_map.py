@@ -2,14 +2,15 @@
 
 **Where.** The address is the workflow database's setting row `dashboard.home_map` (Settings, a dashboard list): one
 line, the street address. Pack code holds no address. The county's address locator (`LOCATOR`) turns it into a point
-in EPSG:2232 (Colorado Central, US feet), and the map is the square `HALF` feet each side of it.
+in EPSG:2232 (Colorado Central, US feet), and the map runs `HALF` feet west, north and south of it and `EAST` feet
+east (sd:8085): 1,000 ft by 400 ft.
 
 **The aerial.** Arapahoe County's 2024 aerial (`AERIAL`, an ArcGIS ImageServer, 0.217 ft = 2.6 in per pixel) answers
-one `exportImage` for that square at full resolution, cached under `<state>/system/home-map/` by the address and the
-square, so the county is asked once per address. `GET /api/home/map/aerial` serves the cached picture.
+one `exportImage` for that box at full resolution, cached under `<state>/system/home-map/` by the address and the
+box, so the county is asked once per address. `GET /api/home/map/aerial` serves the cached picture.
 
 **The assets.** `sd_db.assets` rows, each a point or a line in the same feet, drawn in an SVG whose viewBox is the
-square (y flipped, north up). A plant or a tree whose care is overdue is marked: a care task is an open sd item naming
+box (y flipped, north up). A plant or a tree whose care is overdue is marked: a care task is an open sd item naming
 the asset in `fields.asset` (`assets.care`), filed recurring from the asset's Details (`POST /api/home/care`), so it
 recurs with the item. Add, move, edit and delete post `/api/home/asset` and `/api/home/asset/delete`.
 
@@ -31,8 +32,10 @@ KEY = "dashboard.home_map"
 LOCATOR = "https://gis.arapahoegov.com/arcgis/rest/services/AddressLocator/GeocodeServer/findAddressCandidates"
 AERIAL = "https://gis.arapahoegov.com/arcgis/rest/services/Aerials/ImageServer/exportImage"
 SR = 2232
-#: The aerial's pixel, in feet, and the map's half width: 400 ft across is about 1,843 pixels at full resolution.
+#: The aerial's pixel, in feet; the map's reach west, north and south of the address; and its reach east (sd:8085,
+#: 600 ft more). 1,000 ft by 400 ft is 4,608 by 1,843 pixels at full resolution, under the service's 15000x4100.
 PIXEL_FT, HALF = 0.21701388888888898, 200.0
+EAST = HALF + 600.0
 TIMEOUT = 20.0
 LIMIT = 32 * 1024 * 1024
 #: The fields only the server writes, by kind: `home_koi.log_water` and `log_test` append to the current row.
@@ -66,7 +69,7 @@ def _get(url: str, *, timeout: float) -> bytes:
 
 
 def _cache(address: str) -> Path:
-    return state_dir() / hashlib.sha256(f"{address}|{HALF}".encode()).hexdigest()[:16]
+    return state_dir() / hashlib.sha256(f"{address}|{HALF}|{EAST}".encode()).hexdigest()[:16]
 
 
 def place(address: str, *, timeout: float = TIMEOUT) -> dict:
@@ -109,7 +112,7 @@ def _located(answer) -> dict:
     x, y = (_number(location.get("x")), _number(location.get("y"))) if isinstance(location, dict) else (None, None)
     if x is None or y is None:
         raise LookupError("the county's address locator gave its match no numeric x and y")
-    return {"x": x, "y": y, "bbox": [x - HALF, y - HALF, x + HALF, y + HALF], "match": str(found[0].get("address", ""))}
+    return {"x": x, "y": y, "bbox": [x - HALF, y - HALF, x + EAST, y + HALF], "match": str(found[0].get("address", ""))}
 
 
 def _keep(path: Path, data: bytes) -> None:
@@ -124,7 +127,7 @@ def _keep(path: Path, data: bytes) -> None:
 
 
 def aerial(address: str, *, timeout: float = TIMEOUT) -> bytes:
-    """The aerial for the address's square, from the cache or one `exportImage`; raises `LookupError` with why."""
+    """The aerial for the address's box, from the cache or one `exportImage`; raises `LookupError` with why."""
     where = place(address, timeout=timeout)
     cached = _cache(address) / "aerial.jpg"
     try:
@@ -133,9 +136,9 @@ def aerial(address: str, *, timeout: float = TIMEOUT) -> bytes:
             return held
     except OSError:
         pass
-    side = round(2 * HALF / PIXEL_FT)
+    size = f"{round((HALF + EAST) / PIXEL_FT)},{round(2 * HALF / PIXEL_FT)}"
     query = urllib.parse.urlencode({"bbox": ",".join(f"{n:.3f}" for n in where["bbox"]), "bboxSR": SR, "imageSR": SR,
-                                    "size": f"{side},{side}", "format": "jpg", "f": "image"})
+                                    "size": size, "format": "jpg", "f": "image"})
     try:
         body = _get(f"{AERIAL}?{query}", timeout=timeout)
     except (OSError, ValueError) as error:
