@@ -125,11 +125,18 @@ def _scalars() -> dict:
     """Every single-value row the page edits, by key: `(description, pattern or None)`."""
     from .adversarial import DEEP, PATTERNS
     from .adversarial import SETTINGS as REVIEW
+    from .home_map import EXTENT_KEY
     from .realm_sweep import SETTINGS as SWEEP
 
     return {**{key: (text, None) for key, text in SWEEP.items()}, **{key: (text, PATTERNS[key]) for key, text in REVIEW.items()},
+            EXTENT_KEY: (EXTENT_TEXT, None),
             **{key: (f"The deep review's {DEEP_NAMES.get(key.rsplit('.', 1)[1], key.rsplit('.', 1)[1])}: {wants}. Unset is {default}.", pattern)
                for key, (default, pattern, wants) in DEEP.items()}}
+
+
+#: What Settings says about Home's map area (sd:8110); the Map view's Area control writes the same row.
+EXTENT_TEXT = ("The area Home's Map covers around the address (pack sd:8110): west,east,south,north in feet, each "
+               "50 to 2000. Unset is 200,800,200,200. The Map view's Area control edits it too.")
 
 
 def _list(key: str):
@@ -159,6 +166,7 @@ def rows(connection) -> dict:
     from . import setting_rows
     from .adversarial import DEEP
     from .adversarial import SETTINGS as REVIEW
+    from .home_map import EXTENT_KEY
     from .realm_sweep import SETTINGS as SWEEP
 
     def scalar(key, text, held, pattern=None):
@@ -174,7 +182,7 @@ def rows(connection) -> dict:
     else:
         out.update(sweeps=[scalar(key, text, held) for key, text in SWEEP.items()], sweeps_reason="")
     try:
-        held = writes.read_settings(connection, [*REVIEW, *DEEP])
+        held = writes.read_settings(connection, [*REVIEW, *DEEP, EXTENT_KEY])
         lists = []
         for key, (_, text) in setting_rows.LISTS.items():
             try:
@@ -189,13 +197,15 @@ def rows(connection) -> dict:
         out.update(dashboard=None, dashboard_reason=f"the workflow database did not answer: {failed}")
     else:
         known = _scalars()
-        out.update(dashboard=lists + [scalar(key, text, held) for key, text in REVIEW.items()]
+        out.update(dashboard=lists + [scalar(EXTENT_KEY, EXTENT_TEXT, held)] + [scalar(key, text, held) for key, text in REVIEW.items()]
                    + [scalar(key, known[key][0], held, known[key][1]) for key in DEEP], dashboard_reason="")
     return out
 
 
 def request_row(payload) -> object:
     """`POST /api/settings/row {key, value, before}`: one setting row, `before` the value shown; an empty value unsets."""
+    from . import home_map
+
     known = _scalars()
     key, value, before = payload.get("key"), payload.get("value"), payload.get("before")
     if (set(payload) != {"key", "value", "before"} or key not in known or not isinstance(value, str)
@@ -204,6 +214,8 @@ def request_row(payload) -> object:
     value, pattern = value.strip() or None, known[key][1]
     if value is not None and pattern and not re.fullmatch(pattern, value):
         raise ValueError(f"{key} does not take {value!r}: {known[key][0]}")
+    if value is not None and key == home_map.EXTENT_KEY and home_map.parse_extent(value)[1]:
+        raise ValueError(f"{key} does not take {value!r}: {'; '.join(home_map.parse_extent(value)[1])}.")
     return lambda connection: _set_row(connection, key, value, before)
 
 

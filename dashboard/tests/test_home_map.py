@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from sd_dashboard import home_map, v2
+from sd_dashboard import home_map, settings_screen, v2
 from sd_db import assets, writes
 from support import NOW, ScreenCase
 from test_v2_tasks import STAND_IN
@@ -63,6 +63,55 @@ class TheMap(ScreenCase):
         self.assertIn("bboxSR=2232", self.calls[1])
         self.assertIn("size=4608%2C1843", self.calls[1])
 
+    def test_a_saved_extent_changes_the_box_and_the_export_and_refetches_once(self):
+        """sd:8110: the four edges move the box and the export size; the cache is keyed by them, so a change asks the
+        county for one new aerial and the place is not geocoded again."""
+        writes.set_setting(self.connection, home_map.KEY, ADDRESS)
+        home_map.aerial_route(self.connection)
+        settings_screen.request_row({"key": home_map.EXTENT_KEY, "value": "100,300,150,250", "before": None})(self.connection)
+        doc = home_map.document(self.connection, now=NOW)
+        self.assertEqual(doc["bbox"], [3199900.0, 1649850.0, 3200300.0, 1650250.0])
+        self.assertEqual(doc["extent"]["size"], [1843, 1843])
+        self.assertEqual(doc["extent"]["row"], "100,300,150,250")
+        self.assertEqual(home_map.aerial_route(self.connection)[0], 200)
+        home_map.aerial_route(self.connection)
+        self.assertEqual(len(self.calls), 3, self.calls)
+        self.assertIn("size=1843%2C1843", self.calls[2])
+        self.assertIn("bbox=3199900.000%2C1649850.000%2C3200300.000%2C1650250.000", self.calls[2])
+
+    def test_an_out_of_range_edge_is_refused_naming_the_limit(self):
+        for value, said in (("40,800,200,200", "west is 40; each edge is 50 to 2000 ft"),
+                            ("200,800,200,2500", "north is 2500; each edge is 50 to 2000 ft"),
+                            ("200,800,200", "four numbers")):
+            with self.subTest(value=value), self.assertRaises(ValueError) as raised:
+                settings_screen.request_row({"key": home_map.EXTENT_KEY, "value": value, "before": None})
+            self.assertIn(said, str(raised.exception))
+
+    def test_an_area_past_the_service_maximum_is_fetched_coarser_and_says_so(self):
+        writes.set_setting(self.connection, home_map.KEY, ADDRESS)
+        writes.set_setting(self.connection, home_map.EXTENT_KEY, "2000,2000,2000,2000")
+        doc = home_map.document(self.connection, now=NOW)
+        width, height = doc["extent"]["size"]
+        self.assertLessEqual((width, height), (15000, 4100))
+        self.assertEqual(height, 4100)
+        self.assertIn("fetched at 0.976 ft per pixel", doc["extent"]["coarse"])
+        home_map.aerial_route(self.connection)
+        self.assertIn(f"size={width}%2C4100", self.calls[-1])
+
+    def test_an_asset_outside_the_area_is_listed_off_the_map(self):
+        writes.set_setting(self.connection, home_map.KEY, ADDRESS)
+        assets.save_asset(self.connection, kind="tree", name="Near", geometry={"type": "Point", "coordinates": [3200100, 1650000]})
+        assets.save_asset(self.connection, kind="tree", name="Far", geometry={"type": "Point", "coordinates": [3201500, 1650000]})
+        doc = home_map.document(self.connection, now=NOW)
+        self.assertEqual({a["name"]: a["off_map"] for a in doc["assets"]}, {"Near": False, "Far": True})
+        far = next(a for a in doc["assets"] if a["name"] == "Far")
+        self.assertEqual(far["geometry"]["coordinates"], [3201500.0, 1650000.0])
+
+    def test_settings_shows_the_extent_row(self):
+        writes.set_setting(self.connection, home_map.EXTENT_KEY, "200,800,200,200")
+        rows = {row["key"]: row for row in settings_screen.rows(self.connection)["dashboard"]}
+        self.assertEqual(rows[home_map.EXTENT_KEY]["value"], "200,800,200,200")
+
     def test_a_failed_locator_names_its_reason(self):
         writes.set_setting(self.connection, home_map.KEY, ADDRESS)
         with mock.patch.object(home_map, "_get", side_effect=OSError("down")):
@@ -91,7 +140,7 @@ class TheMap(ScreenCase):
     def test_a_cached_aerial_that_is_not_a_jpeg_is_fetched_again(self):
         writes.set_setting(self.connection, home_map.KEY, ADDRESS)
         home_map.place(ADDRESS)
-        cached = home_map._cache(ADDRESS) / "aerial.jpg"
+        cached = home_map.aerial_file(ADDRESS)
         cached.write_bytes(b"<html>half")
         self.assertEqual(home_map.aerial(ADDRESS), JPEG)
         self.assertEqual(cached.read_bytes(), JPEG)
@@ -108,7 +157,7 @@ class TheMap(ScreenCase):
 
         with mock.patch.object(Path, "write_bytes", cut):
             self.assertEqual(home_map.aerial(ADDRESS), JPEG)
-        self.assertFalse((home_map._cache(ADDRESS) / "aerial.jpg").exists())
+        self.assertFalse((home_map.aerial_file(ADDRESS)).exists())
 
     def test_the_setting_takes_one_line(self):
         self.assertEqual(home_map.parse(f"# home\n{ADDRESS}\n"), (ADDRESS, []))
@@ -154,7 +203,11 @@ class TheMapScript(unittest.TestCase):
            "assets": [{"id": 1, "kind": "tree", "name": "Oak", "geometry": {"type": "Point", "coordinates": [100, 300]},
                        "fields": {}, "photo": None, "care": {"items": [{"id": 9, "title": "Water", "due": "2026-01-01"}], "overdue": True}},
                       {"id": 2, "kind": "water-line", "name": "Main", "geometry": {"type": "LineString", "coordinates": [[0, 0], [10, 20]]},
-                       "fields": {}, "photo": None, "care": {"items": [], "overdue": False}}]}
+                       "fields": {}, "photo": None, "care": {"items": [], "overdue": False}},
+                      {"id": 4, "kind": "gas-shutoff", "name": "Elm", "geometry": {"type": "Point", "coordinates": [900, 300]},
+                       "fields": {}, "photo": None, "care": {"items": [], "overdue": False}, "off_map": True}],
+           "extent": {"edges": {"west": 200, "east": 800, "south": 200, "north": 200}, "row": None,
+                      "key": "dashboard.home_map_extent", "limits": [50, 2000], "size": [4608, 1843], "coarse": "", "problem": ""}}
 
     def run_js(self, body):
         script = (STAND_IN + MARKUP_JS + f"\nconst DOC = {json.dumps(self.DOC)};\n" + r"""
@@ -203,6 +256,17 @@ tile('plants'); R.svg = ELS['map-svg'].html; R.rows = ELS['map-rows'].html; R.af
         self.assertNotIn("Oak", rows)
         self.assertIn("Main", rows)
         self.assertEqual(out["urls"][-1], "mapoff=plants")
+
+    def test_an_asset_off_the_map_is_listed_and_the_area_saves_revision_checked(self):
+        out = self.run_js(self.SHOW + r"""R.rows = ELS['map-rows'].html; R.note = ELS['map-note'].html; R.area = ELS['map-area'].html;
+const form = Object.assign(El('area-form'), { id: 'area-form', values: { west: '100', east: '300', south: '150', north: '250' } });
+(DOC_LISTENERS.submit || []).forEach(f => f({ target: form, preventDefault() {} })); await flush();""")
+        self.assertIn('Elm <span class="off">· off the map</span>', out["R"]["rows"])
+        self.assertIn("1 asset is outside the area", out["R"]["note"])
+        self.assertIn('name="west"', out["R"]["area"])
+        self.assertIn('min="50" max="2000"', out["R"]["area"])
+        self.assertEqual(out["posts"][0], ["/api/settings/row", {"key": "dashboard.home_map_extent",
+                                                                  "value": "100,300,150,250", "before": None}])
 
     def test_add_places_a_point_where_the_map_is_clicked_and_posts_it(self):
         out = self.run_js(self.SHOW + r"""
