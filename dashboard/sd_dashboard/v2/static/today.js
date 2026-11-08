@@ -471,10 +471,11 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     <td class="what"><a href="${shell.itemHref(t.id)}">#${t.id} ${t.title}</a></td>
     <td class="detail">${String(t.status).replace(/_/g, ' ')}${t.p ? ` · P${t.p}` : ''}</td><td class="num">${t.since ? age(t.since) : ''}</td><td class="act">${shell.commands.rowActions(t.key)}</td></tr>`];
   // pack sd:7699: an idea kind (/api/tasks' `ideas`, reads.IDEA_KINDS) is no Queue row; ideas live on Writing.
-  function openItems() {
+  // pack sd:8127: `all` gives them while All items is off too, so its tile counts them; its rows stay hidden.
+  function openItems(all) {
     TASKS = new Map((QV.tasks ? QV.tasks.rows.map(TD.shape) : []).map(t => [t.key, t]));
     const ideas = new Set((QV.tasks && QV.tasks.ideas) || []);
-    return new Map([...TASKS].filter(([k, t]) => qShow.has('open') && t.status !== 'done' && !t.parked && t.repo_path && !ideas.has(t.kind)
+    return new Map([...TASKS].filter(([k, t]) => (all || qShow.has('open')) && t.status !== 'done' && !t.parked && t.repo_path && !ideas.has(t.kind)
       && !(qShow.has('suggested') && SUGG.has(k))));
   }
   // A task's read row (SROW) holds while it is still an item row at the revision its /api/tasks row has (pack sd:7251): a
@@ -549,8 +550,12 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     // pack sd:7251: a filter counts its rows in every repo, before a repo with no row shown is left out.
     const all = qGroups(), every = all.flatMap(g => g.rows), groups = all.filter(g => g.shown.length), active = every.filter(c => !QSHOW.includes(c.type)).length;
     if (!groups.some(g => g.key === qOpen)) qOpen = null;
+    // pack sd:8127: All items counts its open items with the filter off as on, less those waiting on a PR; a failed read counts nothing.
+    const waits = new Set((((QV.lanes || {}).prs || {}).rows || []).map(p => Number(p.item)));
+    const opens = QV.tasks ? [...openItems(true).values()].filter(t => !waits.has(Number(t.id))).length : null;
+    const n = v => v !== 'open' ? every.filter(c => c.type === v).length : opens;
     put($('queue-filters'), shell.list.fseg('qshow', 'Show', [['suggested', 'Suggested'], ['open', 'All items'], ['ended', 'Ended builds']].map(([v, label]) =>
-      ({ v, pressed: qShow.has(v), label: html`${label} <span class="n">${String(every.filter(c => c.type === v).length)}</span>` }))));
+      ({ v, pressed: qShow.has(v), label: n(v) === null ? html`${label}` : html`${label} <span class="n">${String(n(v))}</span>` }))));
     const prs = prTally(every);
     put($('queue-tally'), html`${tally(every.filter(c => !QSHOW.includes(c.type))).map(([t, n]) => html`<span>${n} ${t}</span>`)}${prs ? html`<span>${prs}</span>` : ''}`);
     // Auto-pickup (pack sd:6097): its state, and On or Off, bound to the end this read saw.
@@ -572,9 +577,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   async function loadQueue() {
     QV.seen = true;
     const get = path => shell.getJSON(path).then(doc => [doc, ''], err => [null, err.message]);
-    // All items reads the Tasks page's rows only while it is on (#40961), and Suggested for its rows' tasks (pack sd:7334).
-    const [[l, le], [b, be], [r, re], [t, te]] = await Promise.all(['/api/queue', '/api/queue/builds?show=all', '/api/queue/runner']
-      .map(get).concat(qShow.has('open') || qShow.has('suggested') ? get('/api/tasks') : [[null, '']]));
+    // The Tasks page's rows feed All items' rows and count (pack sd:8127), and Suggested's rows' tasks (pack sd:7334).
+    const [[l, le], [b, be], [r, re], [t, te]] = await Promise.all(['/api/queue', '/api/queue/builds?show=all', '/api/queue/runner', '/api/tasks'].map(get));
     Object.assign(QV, { lanes: l, lanesErr: le, built: b, builtErr: be, runner: r, runnerErr: re, tasks: t, tasksErr: te });
     qAdopt();
   }
