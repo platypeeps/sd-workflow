@@ -346,7 +346,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // blocked or cancelled bundle's Retry and Send to builder post /api/queue/builds/retry (pack sd:6020). The view reads its
   // three documents when it first shows and on each Today read after; a source that was not read is said under the table.
   const QTYPES = ['working', 'merging', 'next', 'blocked', 'suggested', 'open', 'ended'], QSHOW = ['suggested', 'open', 'ended'], NEXT = 9;
-  const BOXES = ['merging', 'working', 'next', 'blocked', 'suggested']; // a repo row's boxes, left to right (pack sd:7470)
+  const BOXES = ['merging', 'working', 'next', 'blocked', 'review', 'suggested']; // a repo row's boxes, left to right (pack sd:7470, sd:8083)
   const QV = { lanes: null, lanesErr: '', built: null, builtErr: '', runner: null, runnerErr: '', tasks: null, tasksErr: '', seen: false, busy: false };
   const QOTHER = new Map(); // the lane entries, selectable as Today's other rows are
   const qShow = new Set();
@@ -510,26 +510,27 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     const busy = (a, b) => BOXES.reduce((d, t) => d || b.n[t] - a.n[t], 0);
     return [...G.values()].map(g => {
       const shown = g.rows.filter(c => !QSHOW.includes(c.type) || qShow.has(c.type)).sort((a, b) => QTYPES.indexOf(a.type) - QTYPES.indexOf(b.type));
-      const n = Object.fromEntries(BOXES.map(t => [t, g.rows.filter(c => c.type === t).length]));
+      // pack sd:8083: a PR wait counts in review, not blocked, so no row counts twice.
+      const n = Object.fromEntries(BOXES.map(t => [t, g.rows.filter(t === 'review' ? c => c.pr : c => c.type === t && !c.pr).length]));
       return { ...g, shown, n, s: shown.reduce((w, c) => RANK[c.s] < RANK[w] ? c.s : w, 'queued') };
     }).sort((a, b) => (a.key === '') - (b.key === '') || busy(a, b) || a.key.localeCompare(b.key));
   }
   const tally = rows => QTYPES.map(t => [t, rows.filter(c => c.type === t).length]).filter(([, n]) => n);
-  // pack sd:8005: the PR waits inside blocked, counted apart and split by who they wait on; '' when there is none.
+  // pack sd:8005: the page's PR waits, split by who they wait on; '' when there is none. Each repo's are its review box.
   const prTally = rows => { const you = rows.filter(c => c.pr === 'you').length, them = rows.filter(c => c.pr && c.pr !== 'you').length;
     return you + them ? `${you + them} PR review: ${you} on you, ${them} on reviewers` : ''; };
-  // A repo row's five boxes: merging, next and blocked (pack sd:7272, Queue's lane ledger until #1768), with working
-  // before them and suggested after (pack sd:7314), counted from all the repo's rows, so a filter hides no count. A box is
-  // lit only when its count is not zero; blocked lights the warning lamp; the label says all five in words. A lane that
-  // was not read counts nothing: the cell says so, not 0.
+  // A repo row's six boxes: merging, next and blocked (pack sd:7272, Queue's lane ledger until #1768), with working
+  // before them, review and suggested after (pack sd:7314, sd:8083), counted from all the repo's rows, so a filter hides
+  // no count. A box is lit only when its count is not zero; blocked lights the warning lamp, review the caution lamp when
+  // a PR waits on you; the label says all six in words. A lane that was not read counts nothing: the cell says so, not 0.
   const pip = (n, on, means) => html`<span class="pip${n ? on : ''}" title="${`${n} ${means}`}">${String(n)}</span>`;
   function pips(g) {
     if (g.key && (!QV.lanes || QV.lanes.problems.some(p => repoKey(p.repo) === g.key)))
       return html`<td class="detail"><span class="g-unknown" aria-hidden="true">${GLYPH.unknown}</span> lane not read</td>`;
     // pack sd:7470: merging is the leftmost box.
-    const { working: w, merging: m, next: n, blocked: b, suggested: s } = g.n;
-    // Each box says its count and what it counts, in its title (pack sd:7383); the label above says all five at once.
-    return html`<td class="detail pipe" aria-label="${m} merging, ${w} working, ${n} next, ${b} blocked, ${s} suggested">${pip(m, ' on', 'merging: claimed by the lane runner, being merged')}${pip(w, ' on', 'working: live sessions, build runs and lane gates now running')}${pip(n, ' on', 'next: queued in the lane, not started')}${pip(b, ' warn', 'blocked: stopped in the lane, or waiting on a pull request, until someone acts')}${pip(s, ' on', `suggested: up to ${NEXT} ready or planned tasks to do next`)}</td>`;
+    const { working: w, merging: m, next: n, blocked: b, review: v, suggested: s } = g.n, you = g.rows.filter(c => c.pr === 'you').length;
+    // Each box says its count and what it counts, in its title (pack sd:7383); the label above says all six at once.
+    return html`<td class="detail pipe" aria-label="${m} merging, ${w} working, ${n} next, ${b} blocked, ${v} review, ${s} suggested">${pip(m, ' on', 'merging: claimed by the lane runner, being merged')}${pip(w, ' on', 'working: live sessions, build runs and lane gates now running')}${pip(n, ' on', 'next: queued in the lane, not started')}${pip(b, ' warn', 'blocked: stopped in the lane until someone acts')}${pip(v, you ? ' caution' : ' on', `review: pull requests waiting on a review, ${you} on you, ${v - you} on reviewers`)}${pip(s, ' on', `suggested: up to ${NEXT} ready or planned tasks to do next`)}</td>`;
   }
   function queueView() {
     const unread = [];
@@ -561,7 +562,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     const parent = g => { const on = qOpen === g.key, name = g.key || 'Unassociated';
       return html`<tr class="repo" data-repo="${g.key}" aria-expanded="${String(on)}">${marker(g.s, 'repo')}
         <td class="what"><button type="button" class="disc" data-open="${g.key}" aria-expanded="${String(on)}" aria-label="${on ? 'Close' : 'Open'} ${name}">${I('chevron-right')}</button><button type="button" class="pick" data-open="${g.key}">${name}</button>${g.host ? html`<small>lane on ${g.host}</small>` : ''}</td>
-        ${pips(g)}<td class="num">${prTally(g.rows)}</td><td class="act"></td></tr>`; };
+        ${pips(g)}<td class="num"></td><td class="act"></td></tr>`; };
     put($('queue'), groups.length ? html`${groups.map(g => html`${parent(g)}${qOpen === g.key ? g.shown.map(c => c.tr) : ''}`)}`
       : html`<tr class="empty"><td colspan="5">${unread.length ? 'No row in what was read; the line under the table names what was not.'
         : `Nothing is working, merging, next or blocked${qShow.size ? ', and no row matches the filters' : ''}.`}</td></tr>`);
