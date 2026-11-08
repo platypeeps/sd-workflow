@@ -38,6 +38,7 @@ MAX_WORKTREES = 24
 #: Directories walked up from one path before giving up.
 MAX_DEPTH = 64
 #: An item number in a branch name: `session-registry-6024`, `build/sd-6024`, `b5106-sessions`.
+BUILD_BRANCH = re.compile(r"build/sd-(\d{1,9})", re.ASCII)
 BRANCH_ITEM = re.compile(r"(?:^|[-_/])(?:sd-?|b)?(\d{1,9})(?=$|[-_/])", re.ASCII)
 #: An absolute or home path in a shell command, for one the shell lexer cannot read (an unclosed quote).
 COMMAND_PATH = re.compile(r"""(?:^|(?<=[\s'"=:(]))(~?/[^\s'";|&()<>`$]+)""")
@@ -83,7 +84,13 @@ def worktree_of(path: str) -> dict | None:
     return None
 
 
-def item_of(branch: str) -> int | None:
+def item_of(branch: str, connection=None) -> int | None:
+    """The item a branch names; build/sd-<n> names its lead assignment n, so its item is that row's (pack sd:8125)."""
+    build = BUILD_BRANCH.fullmatch(branch or "")
+    if build:
+        row = connection.execute("SELECT item FROM assignment WHERE id = ?",
+                                 (int(build[1]),)).fetchone() if connection is not None else None
+        return row[0] if row else None
     found = BRANCH_ITEM.findall(branch or "")
     return int(found[-1]) if found else None
 
@@ -134,13 +141,13 @@ def command_paths(command: str, cwd: object, depth: int = 0) -> list[str]:
     return found[:MAX_COMMAND_PATHS]
 
 
-def worktrees(candidates: list[str]) -> list[dict]:
-    """The distinct linked worktrees the candidate paths lie in, each with its item."""
+def worktrees(candidates: list[str], connection=None) -> list[dict]:
+    """The distinct linked worktrees the candidate paths lie in, each with its item (a build branch's needs `connection`)."""
     found: dict[str, dict] = {}
     for candidate in candidates:
         tree = worktree_of(candidate)
         if tree and tree["path"] not in found:
-            found[tree["path"]] = {**tree, "item": item_of(tree["branch"])}
+            found[tree["path"]] = {**tree, "item": item_of(tree["branch"], connection)}
     return list(found.values())
 
 

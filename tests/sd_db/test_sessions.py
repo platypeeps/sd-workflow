@@ -17,7 +17,7 @@ from pathlib import Path
 
 import sd_db
 from sd_db import retention, sessions
-from sd_db.writes import record_state
+from sd_db.writes import create_item, record_state
 
 from tests.clean_env import clean_environment
 
@@ -74,6 +74,20 @@ class Worktrees(Registry):
         found = sessions.worktrees([str(tree / "lib" / "new-file.py")])
         self.assertEqual(found, [{"path": str(tree), "repo": str(self.repo), "branch": "session-registry-6024",
                                   "item": 6024}])
+
+    def test_a_build_branch_names_its_lead_assignments_item_not_the_assignment(self):
+        """pack sd:8125: build/sd-<n> carries the bundle's lead assignment id, not an item id."""
+        other = [create_item(self.db, kind="task", title=f"Unrelated {n}", status="ready") for n in range(3)][-1]
+        item = create_item(self.db, kind="task", title="Lead item", status="ready")
+        self.db.execute("INSERT INTO assignment (item, role, status, scope) VALUES (?, 'author', 'queued', 'item')",
+                        (item,))
+        lead = self.db.execute("SELECT MAX(id) FROM assignment").fetchone()[0]
+        self.assertNotEqual(lead, item)
+        tree = self.worktree("pack-build", f"build/sd-{lead}")
+        self.assertIsNone(sessions.worktrees([str(tree)])[0]["item"], "no database, no item named")
+        self.assertEqual(sessions.worktrees([str(tree)], self.db)[0]["item"], item)
+        gone = self.worktree("pack-build-gone", f"build/sd-{other + lead + 100}")
+        self.assertIsNone(sessions.worktrees([str(gone)], self.db)[0]["item"], "no assignment, no item named")
 
     def test_a_main_checkout_or_a_plain_folder_holds_nothing(self):
         (self.root / "plain").mkdir()
