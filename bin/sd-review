@@ -2177,7 +2177,7 @@ def review(
         # The result key carries the first binary that ignored the key, else the last measured; each outcome its own.
         measures = [measured for measured, _attempts_made in answers if measured is not None]
         result["codex_skill_suppression"] = next((row for row in measures if row["state"] != SKILLS_SUPPRESSED), measures[-1]) if measures else skills
-        outcomes = [outcome for _measured, attempts in answers for outcome in attempts]
+        outcomes = covered([outcome for _measured, attempts in answers for outcome in attempts])
         finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)])
     finally:
         slot.give_back()  # sd:2523: on every exit; the gate below queues in its own pool
@@ -2316,7 +2316,22 @@ def partial(outcome: Outcome, unread: Sequence[str]) -> Outcome:
         return outcome
     note = f"{outcome.backend} saw {len(unread)} path(s) only as a size and hash: {', '.join(unread)}; coverage is partial"
     return outcome._replace(status=UNAVAILABLE, detail=f"{outcome.detail}; {note}",
-                            diagnostic=dict(outcome.diagnostic or {}, coverage="partial", omitted_paths=list(unread)))
+                            diagnostic=dict(outcome.diagnostic or {}, coverage="partial", omitted_paths=list(unread),
+                                            answered=outcome.status))
+
+
+def covered(outcomes: Sequence[Outcome]) -> list[Outcome]:
+    """sd:8060. A partial answer counts once a reader that opens the repository completed in this run.
+
+    `partial` marks every material reader whenever a path was summarized, so a
+    completed answer that is not partial came from a native reader, which saw
+    those paths. Together the run read every path; without one, nothing changes."""
+    native = next((outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)), None)
+    if native is None:
+        return list(outcomes)
+    return [outcome._replace(status=outcome.diagnostic["answered"], detail=f"{outcome.detail}; {native} read them")
+            if (outcome.diagnostic or {}).get("coverage") == "partial" and outcome.status == UNAVAILABLE else outcome
+            for outcome in outcomes]
 
 
 def finish_review(result: dict[str, Any], outcomes: Sequence[Outcome], reviewed: list[str]) -> dict[str, Any]:
