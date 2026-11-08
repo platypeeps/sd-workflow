@@ -1,0 +1,12 @@
+feat(home): Drive files and pictures on each koi
+
+A saved fish's form gains an Attachments section through
+home-attach.js, the Map's one copy: picture thumbnails from
+/api/home/attachments/picture, other files as links, Upload on
+press, and Reference for a pasted Drive or Docs link. Writes post
+the fish's id, so its folder is Other/<pond> #<id>/<fish> #<id>
+under home.drive_folder (sd:8112), and a rename keeps its files.
+A new unsaved fish shows no section. Unset settings read as on
+the Map. No new setting, route or copy.
+
+Closes: sd:8147
