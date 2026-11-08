@@ -5,7 +5,8 @@ every status writer. This is that job's step: `shadow_sync._sync_jira` runs
 it after the Jira collect, in the hourly `sd shadow sync`, with the same
 `JIRA_*` environment and transport. Nothing else calls it.
 
-It reads the `status_change` notes newer than its cursor, keeps the items
+It reads the `status_change` notes newer than its cursor, less each item's
+opening note (`opened as ...`, which linking writes), keeps the items
 whose ref is `jira:<KEY-N>` (`source = 'task-ref'`), and brings each ticket to
 the status category of the item's current status: planning and ready to
 "To Do", in_progress to "In Progress", done to "Done"; blocked and any other
@@ -61,7 +62,9 @@ def _linked(connection: sqlite3.Connection, after: int) -> tuple[list[dict], int
     rows = connection.execute(
         "SELECT note.id AS note, item.id AS item, item.status AS status, item.external_id AS ref"
         " FROM note JOIN item ON item.id = note.item"
-        " WHERE note.kind = 'status_change' AND note.id > ? ORDER BY note.id", (after,)).fetchall()
+        # An item's opening note is not a change: linking a ticket must not move it (`reads.py`'s test).
+        " WHERE note.kind = 'status_change' AND substr(note.body, 1, 10) IS NOT 'opened as '"
+        " AND note.id > ? ORDER BY note.id", (after,)).fetchall()
     newest = max([after] + [row["note"] for row in rows])
     items: dict[int, dict] = {}
     for row in rows:

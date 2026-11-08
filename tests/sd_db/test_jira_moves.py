@@ -75,6 +75,13 @@ class TheMoves(unittest.TestCase):
         self.assertEqual(jira.posted, [("ABC-7", "Done")])
         self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), [])
 
+    def test_linking_a_ticket_to_a_new_item_moves_nothing(self):
+        jira = FakeJira({"ABC-7": "To Do", "ABC-9": "Done"})
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        create_item(self.db, kind="task", title="filed later", source="task-ref", external_id="jira:ABC-9")
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), [])
+        self.assertEqual(jira.posted, [])
+
     def test_a_ticket_already_there_and_a_blocked_item_move_nothing(self):
         jira = FakeJira({"ABC-7": "In Progress"})
         jira_moves.run(self.db, jira, JIRA_ENV)
