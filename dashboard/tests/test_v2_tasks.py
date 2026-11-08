@@ -562,7 +562,7 @@ const p = settleBulk(c, objs, [Promise.resolve('a1'), Promise.reject(new Error('
 OUT.early = OUT.toasts.length; OUT.result = await p;
 OUT.toasts[0].undo(); await flush();""")
         self.assertEqual(out["early"], 0, "the group toasted before its runs settled")
-        self.assertEqual(out["result"], {"landed": 2, "stale": 0, "failed": 1})
+        self.assertEqual(out["result"], {"landed": 2, "stale": 0, "failed": 1, "unknown": 0})
         self.assertEqual(out["undone"], [["1", "a1"], ["3", "sync"]])
         self.assertEqual(out["toasts"], [["Move · 2 items · 1 of 3 not changed: #2 (stale)", True],
                                          ["Move undone · 2 of 3 reversed · not reversed: #2 (its change did not land)", False]])
@@ -574,7 +574,7 @@ OUT.toasts[0].undo(); await flush();""")
 c.run = o => { if (o.id === '2') throw new Error('the task is no longer listed'); ran.push(o.id); return Promise.resolve(o.id); };
 OUT.result = await settleBulk(c, objs, runEach(c, objs), { toast, plural }); OUT.ran = ran;""")
         self.assertEqual(out["ran"], ["1", "3"])
-        self.assertEqual(out["result"], {"landed": 2, "stale": 0, "failed": 1})
+        self.assertEqual(out["result"], {"landed": 2, "stale": 0, "failed": 1, "unknown": 0})
         self.assertEqual(out["toasts"], [["Move · 2 items · 1 of 3 not changed: #2 (the task is no longer listed)", True]])
 
     def test_thirty_picks_run_three_at_a_time_and_a_reread_waits_for_the_group(self):
@@ -592,7 +592,7 @@ c.undo = () => hold(); most = 0; OUT.toasts[0].undo(); await flush(); OUT.undoFi
 while (held.length) { held.shift()(); await flush(); }
 OUT.undoMost = most; afterBulk('page', () => { OUT.reread += 10; });""")
         self.assertEqual((out["first"], out["most"]), (3, 3))
-        self.assertEqual(out["result"], {"landed": 30, "stale": 0, "failed": 0})
+        self.assertEqual(out["result"], {"landed": 30, "stale": 0, "failed": 0, "unknown": 0})
         self.assertEqual(out["reread"], 11, "one reread after the group, and one at once with no group running")
         self.assertEqual((out["undoFirst"], out["undoMost"]), (3, 3))
         self.assertEqual(out["toasts"], [["Move · 30 items", True], ["Move undone · 30 of 30 reversed", False]])
@@ -607,8 +607,22 @@ OUT.undoMost = most; afterBulk('page', () => { OUT.reread += 10; });""")
         out = self.settle(self.COMMAND + """const stale = Object.assign(new Error('item 2 changed; reload it'), { stale: true });
 OUT.result = await settleBulk(c, [obj(1), obj(2), obj(3), obj(4)],
   [Promise.resolve('a'), Promise.reject(stale), Promise.reject(new Error('a recurring task cannot be cancelled')), Promise.resolve('d')], { toast, plural });""")
-        self.assertEqual(out["result"], {"landed": 2, "stale": 1, "failed": 1})
+        self.assertEqual(out["result"], {"landed": 2, "stale": 1, "failed": 1, "unknown": 0})
         self.assertEqual(out["toasts"], [["Move · 2 items · 1 of 4 refused stale, read again: #2 · 1 of 4 not changed: #3 (a recurring task cannot be cancelled)", True]])
+
+    def test_a_bulk_row_with_no_answer_is_not_known_not_not_changed(self):
+        # sd:8037: a write the server never answered (sd:8033) rejects marked unknown. settleOne says so; the group's
+        # toast said "not changed" and its Undo "did not land", both false for a write that may have landed.
+        out = self.settle(self.COMMAND + """const lost = Object.assign(new Error('no answer within 30 s, so whether it changed is not known'), { unknown: true });
+OUT.result = await settleBulk(c, [obj(1), obj(2), obj(3)],
+  [Promise.resolve('a'), Promise.reject(lost), Promise.reject(new Error('refused'))], { toast, plural });
+OUT.toasts[0].undo(); await flush();""")
+        self.assertEqual(out["result"], {"landed": 1, "stale": 0, "failed": 1, "unknown": 1})
+        self.assertEqual(out["toasts"], [
+            ["Move · 1 item · 1 of 3 not changed: #3 (refused) · 1 of 3 outcome not known: "
+             "#2 (no answer within 30 s, so whether it changed is not known)", True],
+            ["Move undone · 1 of 3 reversed · not reversed: #3 (its change did not land), "
+             "#2 (whether its change landed is not known)", False]])
 
     def test_an_undo_that_had_nothing_to_reverse_is_named(self):
         out = self.settle(self.COMMAND + """await settleBulk(c, [obj(1), obj(2)], [Promise.resolve('gone'), Promise.resolve('b')], { toast, plural });
