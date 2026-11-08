@@ -1551,6 +1551,29 @@ class Hosts(Case):
         self.assertIsNone(self.claim(hosts=HUB))
         self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", lead), "blocked", "a stale beat blocks")
 
+    def test_a_queued_row_blocks_once_its_satellite_claims_nothing_tick_after_tick(self):
+        """sd:8081: a read that fails every tick would leave the row queued with only `unclaimed` to show it."""
+        item = self.item(repo=SAT)
+        lead = build.queue(self.db, [item], who="operator")[0]["id"]
+        for _ in range(build.STUCK_TICKS - 1):
+            record_state(self.db, "heartbeat", key="build-dispatch@work", body={"pid": 1, "why": build.UNREAD[0]})
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", lead), "queued",
+                         "fewer ticks than STUCK_TICKS leave it queued")
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={"pid": 1, "why": build.UNREAD[0]})
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", lead), "blocked")
+        self.assertIn(f"claimed nothing for {build.STUCK_TICKS} ticks: {build.UNREAD[0]}",
+                      self.count("SELECT result FROM assignment WHERE id = ?", lead))
+
+    def test_a_clean_beat_between_unread_ticks_keeps_the_row_queued(self):
+        item = self.item(repo=SAT)
+        lead = build.queue(self.db, [item], who="operator")[0]["id"]
+        for why in [build.UNREAD[0]] * (build.STUCK_TICKS - 1) + ["", build.UNREAD[1]]:
+            record_state(self.db, "heartbeat", key="build-dispatch@work", body={"pid": 1, "why": why})
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", lead), "queued")
+
     def test_a_satellite_that_beats_and_claims_nothing_still_owns_its_runs(self):
         """Its tick reaps before it claims, so the hub leaves its runs: the beat says it is there."""
         run = self.satellite_run()

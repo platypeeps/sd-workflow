@@ -254,17 +254,28 @@ window.PAGE_VIEWS = [{ id: 'spend', label: 'Spend' }, { id: 'providers', label: 
     $('times-note').textContent = [over.length ? `▲ Median wait past 1 h: ${over.join(', ')}. The lane run files the parallel-lanes question.` : '',
       quiet && read.length ? `No entry in ${days} days: ${plural(quiet, 'lane')}.` : ''].filter(Boolean).join(' ');
   }
-  // PR waits (pack sd:7859): the totals row, then the slowest items. On you lights caution on an open one; a wait not
-  // merged says so, never 0.
+  // PR waits (pack sd:7859): the totals row, then one row per repository with its own totals (sd:8084), a disclosure
+  // closed by default as Today > Queue's repo rows are: open, it lists that repository's pull requests, slowest first.
+  // On you lights caution on an open one; a wait not merged says so, never 0. A pull request not known to be the
+  // operator's is named in the note, never counted.
   const merge = s => s == null ? 'not merged' : dur(Math.round(s));
+  const median = g => g.merged ? `median ${merge(g.to_merge)}` : 'none merged';
+  const I = n => html`<svg class="i" aria-hidden="true"><use href="#i-${n}"/></svg>`;
+  let prOpen = null; // the one open repository
   function prWaits() {
     const P = DOC?.prs;
     if (!P || P.error) { put($('prs-body'), html`<tr><td colspan="5">${unknownBlock(P ? P.error : 'the Metrics document did not arrive')}</td></tr>`); $('prs-note').textContent = ''; return; }
-    if (!P.items) { put($('prs-body'), html`<tr><td colspan="5" class="why">No item has a pull-request lane note yet.</td></tr>`); $('prs-note').textContent = ''; return; }
-    const total = html`<tr class="total"><td class="g g-ok">${G.ok}<span class="sr">total</span></td><td class="what">All ${plural(P.items, 'item')}</td><td class="num">${dur(P.on_you)}</td><td class="num">${dur(P.on_reviewers)}</td><td class="num hide-sm">${P.merged ? `median ${merge(P.to_merge)}` : 'none merged'}</td></tr>`;
-    put($('prs-body'), html`${total}${P.slowest.map(w => { const st = w.open && w.on === 'you' ? 'caution' : 'ok';
-      return html`<tr><td class="g g-${st}">${G[st]}<span class="sr">${w.open ? `open, on ${w.on}` : 'ended'}</span></td><td class="what"><a href="${w.url}" target="_blank" rel="noopener noreferrer">sd:${String(w.item)} ${w.title}</a></td><td class="num">${dur(w.on_you)}</td><td class="num">${dur(w.on_reviewers)}</td><td class="num hide-sm">${merge(w.to_merge)}</td></tr>`; })}`);
-    $('prs-note').textContent = `${plural(P.open, 'pull request')} open now; waiting in all: ${dur(P.on_you + P.on_reviewers)}.`;
+    const unknown = P.unknown.length ? `▨ Not counted, not known whether yours: ${P.unknown.join('; ')}.` : '';
+    if (!P.items) { put($('prs-body'), html`<tr><td colspan="5" class="why">No pull request of yours has a lane note yet.</td></tr>`); $('prs-note').textContent = unknown; return; }
+    if (!P.repos.some(g => g.repo === prOpen)) prOpen = null;
+    const total = html`<tr class="total"><td class="g g-ok">${G.ok}<span class="sr">total</span></td><td class="what">All ${plural(P.items, 'item')}</td><td class="num">${dur(P.on_you)}</td><td class="num">${dur(P.on_reviewers)}</td><td class="num hide-sm">${median(P)}</td></tr>`;
+    const parent = g => { const on = prOpen === g.repo, st = g.prs.some(w => w.open && w.on === 'you') ? 'caution' : 'ok';
+      return html`<tr class="repo" data-repo="${g.repo}" aria-expanded="${String(on)}"><td class="g g-${st}">${G[st]}<span class="sr">${st === 'caution' ? 'open on you' : 'normal'}</span></td>
+        <td class="what"><button type="button" class="disc" data-open="${g.repo}" aria-expanded="${String(on)}" aria-label="${on ? 'Close' : 'Open'} ${g.repo}">${I('chevron-right')}</button><button type="button" class="pick" data-open="${g.repo}">${g.repo}</button><small>${plural(g.items, 'pull request')}, ${g.open} open</small></td><td class="num">${dur(g.on_you)}</td><td class="num">${dur(g.on_reviewers)}</td><td class="num hide-sm">${median(g)}</td></tr>`; };
+    const child = w => { const st = w.open && w.on === 'you' ? 'caution' : 'ok';
+      return html`<tr class="member"><td class="g g-${st}">${G[st]}<span class="sr">${w.open ? `open, on ${w.on}` : 'ended'}</span></td><td class="what"><a href="${w.url}" target="_blank" rel="noopener noreferrer">sd:${String(w.item)} ${w.title}</a></td><td class="num">${dur(w.on_you)}</td><td class="num">${dur(w.on_reviewers)}</td><td class="num hide-sm">${merge(w.to_merge)}</td></tr>`; };
+    put($('prs-body'), html`${total}${P.repos.map(g => html`${parent(g)}${prOpen === g.repo ? g.prs.map(child) : ''}`)}`);
+    $('prs-note').textContent = [`${plural(P.open, 'pull request')} open now; waiting in all: ${dur(P.on_you + P.on_reviewers)}.`, unknown].filter(Boolean).join(' ');
   }
   // pack sd:7208: each of the six months by bill. A month with no ledger row says so, never $0; a window bill is not a zero.
   function months() {
@@ -419,6 +430,8 @@ window.PAGE_VIEWS = [{ id: 'spend', label: 'Spend' }, { id: 'providers', label: 
     );
     document.addEventListener('click', e => {
       if (e.target.closest?.('.rowact')) return;
+      const repo = e.target.closest?.('#prs-body tr.repo'); // sd:8084: as Today > Queue's repo rows
+      if (repo && !e.target.closest('a')) { prOpen = prOpen === repo.dataset.repo ? null : repo.dataset.repo; prWaits(); return; }
       const el = e.target.closest?.('[data-ev]'); if (!el) return;
       if (el.dataset.view) S.view.show(el.dataset.view);
       if (el.dataset.ev) show(el.dataset.ev, true);

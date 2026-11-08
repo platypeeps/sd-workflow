@@ -22,7 +22,8 @@ Progress areas made:
   median wait past the 30 min target (pack sd:7412) is `over`: the lane runner files the parallel-lanes question
   then. The range leaves it at 7 days, as it leaves Age.
 - `prs`: pull-request waits from each item's PR lane notes (`_prs`, pack sd:7859): the time on you and on reviewers,
-  the median first PR to merge, and the slowest items. All time, whatever the range.
+  the median first PR to merge, and the same per repository with its pull requests. Only the operator's count:
+  authored or asked to review by name (sd:8084). All time, whatever the range.
 - `controls`: the provider registry as `provider_controls.snapshot` reads it, with its `revision`, and per bill the
   one cap write the route takes (`_writes`, sd:3387).
 - `range`: the page's range, `7d` or `6mo` (`RANGES`, pack sd:7208). With `6mo`, `ranged` holds the parts the range
@@ -458,26 +459,36 @@ def times(connection, remote: str | None, now: float) -> dict:
         return {"error": f"the lane times were not read: {type(error).__name__}: {error}"}
 
 
-#: How many of the slowest pull-request waits the PR waits table lists (pack sd:7859).
-SLOWEST = 5
-
-
 def _prs(connection, now) -> dict:
-    """Pull-request waits (pack sd:7859): the totals on you and on reviewers, first PR to merge, and the slowest items.
+    """Pull-request waits (pack sd:7859): the totals on you and on reviewers and first PR to merge, then the same per
+    repository with its pull requests, slowest first; repositories with the most wait first (sd:8084, note 48655).
 
     Read from each item's PR lane notes (`contributions.pr_waits`), all time: an open one counts to `now`. `to_merge`
-    is the median of the merged ones, or None when none merged.
+    is the median of the merged ones, or None when none merged. Only the operator's pull requests count: authored,
+    or asked to review by name (`contributions.operator_pull`, sd:8084). One not known either way, or an item whose
+    metadata is malformed, is named in `unknown` and not counted.
     """
     from sd_db import contributions
 
-    waits = contributions.pr_waits(connection, now=now)
-    merged = [wait["to_merge"] for wait in waits if wait["to_merge"] is not None]
+    unknown: list[str] = []
+    waits = contributions.pr_waits(connection, now=now, errors=unknown)
+    unknown += [f"sd:{wait['item']}: no reading of its author and requested reviewers" for wait in waits if wait["mine"] is None]
     keys = ("item", "title", "url", "open", "on", "on_you", "on_reviewers", "to_merge")
-    slowest = sorted(waits, key=lambda wait: (-(wait["on_you"] + wait["on_reviewers"]), wait["item"]))[:SLOWEST]
-    return {"error": "", "items": len(waits), "open": sum(1 for wait in waits if wait["open"]),
+    groups: dict[str, list[dict]] = {}
+    for wait in (wait for wait in waits if wait["mine"]):
+        groups.setdefault("/".join(wait["url"].split("/")[3:5]).lower(), []).append(wait)
+    repos = sorted(({"repo": repo, **_wait_totals(rows), "prs": [{key: wait[key] for key in keys} for wait in sorted(
+        rows, key=lambda wait: (-(wait["on_you"] + wait["on_reviewers"]), wait["item"]))]} for repo, rows in groups.items()),
+        key=lambda group: (-(group["on_you"] + group["on_reviewers"]), group["repo"]))
+    return {"error": "", **_wait_totals([wait for rows in groups.values() for wait in rows]), "unknown": unknown,
+            "repos": repos}
+
+
+def _wait_totals(waits: list[dict]) -> dict:
+    merged = [wait["to_merge"] for wait in waits if wait["to_merge"] is not None]
+    return {"items": len(waits), "open": sum(1 for wait in waits if wait["open"]),
             "on_you": sum(wait["on_you"] for wait in waits), "on_reviewers": sum(wait["on_reviewers"] for wait in waits),
-            "merged": len(merged), "to_merge": statistics.median(merged) if merged else None,
-            "slowest": [{key: wait[key] for key in keys} for wait in slowest]}
+            "merged": len(merged), "to_merge": statistics.median(merged) if merged else None}
 
 
 def _lanes(connection, now) -> dict:

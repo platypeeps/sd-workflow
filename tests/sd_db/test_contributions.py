@@ -1438,6 +1438,23 @@ class LaneNoteTests(ContributionCase):
         self.assertEqual(self.lanes(work), [("awaiting_them", "open", False)])
         self.assertEqual([w["item"] for w in c.pr_waits(self.db)], [work])
 
+    def test_a_wait_is_the_operators_when_they_wrote_it_or_were_asked_by_name(self):
+        """sd:8084: a team request names no user, and a pull request by someone else is not the operator's."""
+        other = {"id": "2", "login": "someone"}
+        cases: dict[str, dict] = {"authored": {}, "asked": {"author": other, "requested_reviewers": ["author"]},
+                 "team only": {"author": other, "requested_reviewers": []},
+                 "reviewed": {"author": other, "requested_reviewers": [],
+                              "reviews": [{"id": "review:1", "actor_id": "1", "state": "APPROVED", "at": T0}]},
+                 "unknown": {"author": other}}
+        items = {}
+        for number, (name, changes) in enumerate(cases.items(), start=30):
+            url = f"https://github.com/upstream/project/pull/{number}"
+            items[c.capture(self.db, title=name, changes={"pull_url": url}, who="operator")["item"]["id"]] = name
+            c.observe_pull(self.db, url, self.observation(**changes),
+                           expected_revision=c.snapshot(self.db, "github:" + url)["revision"])
+        self.assertEqual({items[w["item"]]: w["mine"] for w in c.pr_waits(self.db)},
+                         {"authored": True, "asked": True, "team only": False, "reviewed": True, "unknown": None})
+
     def test_an_item_that_names_a_pull_request_or_is_done_keeps_what_it_has(self):
         named = self.item()
         done = self.task("Done")

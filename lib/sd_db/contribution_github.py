@@ -402,8 +402,12 @@ def pull(client, url, operator, *, observed_at, why=(), blocking_labels=()):
     if mergeable is not None and type(mergeable) is not bool:
         raise Unavailable("unknown mergeability state")
     labels = _labels(before)
+    # sd:8084: users asked by name; a team request is in `requested_teams`, which names no one.
+    requested = before.get("requested_reviewers")
+    if not isinstance(requested, list) or any(not isinstance(user, dict) or not isinstance(user.get("login"), str) for user in requested):
+        raise Unavailable("requested reviewers are unavailable")
     return {"complete": True, "observed_at": observed_at, "operator": operator, "author": author,
-            "repo": f"{owner}/{repo}", "title": before.get("title", ""),
+            "repo": f"{owner}/{repo}", "title": before.get("title", ""), "requested_reviewers": [user["login"] for user in requested],
             "state": "merged" if before["merged"] else before["state"], "draft": before["draft"],
             "head": head, "base": base, "mergeable": "unknown" if mergeable is None else "mergeable" if mergeable is True else "conflicting",
             "ci": ci, "ci_head": head, "ci_ids": ci_ids, "why": list(why),

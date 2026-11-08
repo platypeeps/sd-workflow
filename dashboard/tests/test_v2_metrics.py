@@ -255,15 +255,20 @@ TARGET = "the repository gate failed after the review cleared: sd-check fail (ch
 class ThePrWaits(Fixture):
     """pack sd:7859: the PR waits part, from each item's PR lane notes."""
 
-    def pr(self, n, *lanes):
+    def pr(self, n, *lanes, repo="example/system", author="1", requested=(), observed=True):
         from sd_db import contributions
-        from sd_db.writes import add_note
+        from sd_db.writes import add_note, record_state
 
-        url = f"https://github.com/example/system/pull/{n}"
+        url = f"https://github.com/{repo}/pull/{n}"
         item = contributions.capture(self.connection, title=f"PR {n}", changes={"pull_url": url}, who="test")["item"]["id"]
         for at, lane, state in lanes:
             add_note(self.connection, item, "comment", f"PR lane: {lane} · {state} · {url}",
                      session="contribution-observer", timestamp=at)
+        if observed:
+            record_state(self.connection, "checkpoint", key="contribution:github:" + url, body={"observation": {
+                "operator": {"id": "1", "login": "operator"}, "author": {"id": author, "login": "someone"},
+                "requested_reviewers": list(requested), "reviews": []}})
+            self.connection.commit()
         return item
 
     def test_totals_split_on_you_and_on_reviewers_with_the_median_first_pr_to_merge_and_the_slowest(self):
@@ -274,8 +279,33 @@ class ThePrWaits(Fixture):
         self.assertEqual({k: prs[k] for k in ("error", "items", "open", "on_you", "on_reviewers", "merged", "to_merge")},
                          {"error": "", "items": 2, "open": 1, "on_you": 1800 + 7200, "on_reviewers": 3600, "merged": 1,
                           "to_merge": 5400})
-        self.assertEqual([(w["item"], w["on_you"], w["on_reviewers"], w["to_merge"], w["open"], w["on"]) for w in prs["slowest"]],
+        self.assertEqual([(w["item"], w["on_you"], w["on_reviewers"], w["to_merge"], w["open"], w["on"])
+                          for w in prs["repos"][0]["prs"]],
                          [(waiting, 7200, 0, None, True, "you"), (merged, 1800, 3600, 5400, False, None)])
+
+    def test_only_the_operators_pull_requests_count_and_an_unread_one_is_named(self):
+        """sd:8084: authored or asked by name counts; a team-only request, someone else's or an unread one does not."""
+        at = ("2026-09-06T10:00:00Z", "awaiting_them", "open")
+        mine = self.pr(1, at)
+        asked = self.pr(2, at, repo="example/other", author="2", requested=["Operator"])
+        self.pr(3, at, author="2")  # a team request leaves requested_reviewers empty
+        unread = self.pr(4, at, author="2", observed=False)
+        prs = self.doc()["prs"]
+        self.assertEqual(prs["items"], 2)
+        self.assertEqual({r["repo"]: [w["item"] for w in r["prs"]] for r in prs["repos"]},
+                         {"example/system": [mine], "example/other": [asked]})
+        self.assertEqual(prs["unknown"], [f"sd:{unread}: no reading of its author and requested reviewers"])
+
+    def test_repos_carry_their_own_totals_most_wait_first(self):
+        """sd:8084 (note 48655): one group per repository, with its totals, ordered by total wait."""
+        self.pr(1, ("2026-09-06T11:00:00Z", "awaiting_you", "open"))
+        self.pr(2, ("2026-09-06T08:00:00Z", "awaiting_them", "open"), ("2026-09-06T09:00:00Z", "merged", "merged"),
+                repo="example/other")
+        self.pr(3, ("2026-09-06T10:00:00Z", "awaiting_them", "open"), repo="example/other")
+        repos = self.doc()["prs"]["repos"]
+        self.assertEqual([(r["repo"], r["items"], r["open"], r["on_you"], r["on_reviewers"], r["merged"], r["to_merge"])
+                          for r in repos],
+                         [("example/other", 2, 1, 0, 3600 + 7200, 1, 3600), ("example/system", 1, 1, 3600, 0, 0, None)])
 
     def test_a_failed_read_is_the_parts_error(self):
         from sd_db import contributions
@@ -853,32 +883,67 @@ C.run(cmd('bill.cap'), OBJ.get('bill:capped')); await flush();""")
         self.assertIn("<b>▨ Not read.</b> OperationalError: database is locked", out["R"]["body"])
         self.assertIn("lanes: OperationalError: database is locked", out["states"][-1]["text"])
 
-    PRS = {"error": "", "items": 2, "open": 1, "on_you": 9000, "on_reviewers": 3600, "merged": 1, "to_merge": 5400,
-           "slowest": [{"item": 2, "title": "Waiting", "url": "https://github.com/example/system/pull/2", "open": True,
-                        "on": "you", "on_you": 7200, "on_reviewers": 0, "to_merge": None},
-                       {"item": 1, "title": "Landed", "url": "https://github.com/example/system/pull/1", "open": False,
-                        "on": None, "on_you": 1800, "on_reviewers": 3600, "to_merge": 5400}]}
+    PRS = {"error": "", "items": 3, "open": 1, "on_you": 9000, "on_reviewers": 4200, "merged": 1, "to_merge": 5400,
+           "unknown": [], "repos": [
+               {"repo": "example/system", "items": 2, "open": 1, "on_you": 9000, "on_reviewers": 3600, "merged": 1,
+                "to_merge": 5400, "prs": [
+                    {"item": 2, "title": "Waiting", "url": "https://github.com/example/system/pull/2", "open": True,
+                     "on": "you", "on_you": 7200, "on_reviewers": 0, "to_merge": None},
+                    {"item": 1, "title": "Landed", "url": "https://github.com/example/system/pull/1", "open": False,
+                     "on": None, "on_you": 1800, "on_reviewers": 3600, "to_merge": 5400}]},
+               {"repo": "example/other", "items": 1, "open": 0, "on_you": 0, "on_reviewers": 600, "merged": 0,
+                "to_merge": None, "prs": [
+                    {"item": 3, "title": "Closed", "url": "https://github.com/example/other/pull/3", "open": False,
+                     "on": None, "on_you": 0, "on_reviewers": 600, "to_merge": None}]}]}
+    OPEN_SYSTEM = """{ const tr = { dataset: { repo: 'example/system' } };
+DOC_LISTENERS.click.forEach(f => f({ target: { closest: s => s === '#prs-body tr.repo' ? tr : null } })); }
+await flush();"""
 
-    def test_pr_waits_shows_the_totals_then_the_slowest_items(self):
-        """pack sd:7859: the totals row, then each slow item: open on you is caution; one not merged says so, never 0."""
+    def test_pr_waits_shows_the_totals_then_one_closed_row_per_repo(self):
+        """pack sd:7859, sd:8084: the totals row, then each repository's row with its own totals, closed by default."""
         doc = self.doc()
         doc["prs"] = self.PRS
         out = self.run_page("R.body = ELS['prs-body'].html; R.note = ELS['prs-note'].textContent;", doc)
-        body = out["R"]["body"]
-        rows = re.findall(r"<tr[^>]*>(.*?)</tr>", body, re.S)
-        self.assertEqual(len(rows), 3)
-        self.assertIn("All 2 items", rows[0])
-        self.assertEqual(re.findall(r'<td class="num[^"]*">(.*?)</td>', rows[0]), ["2h 30m", "1h 0m", "median 1h 30m"])
-        self.assertIn('<td class="g g-caution">▲<span class="sr">open, on you</span></td>', rows[1])
-        self.assertIn('href="https://github.com/example/system/pull/2"', rows[1])
-        self.assertEqual(re.findall(r'<td class="num[^"]*">(.*?)</td>', rows[1]), ["2h 0m", "0m 0s", "not merged"])
-        self.assertIn('<span class="sr">ended</span>', rows[2])
-        self.assertEqual(out["R"]["note"], "1 pull request open now; waiting in all: 3h 30m.")
+        rows = re.findall(r"<tr[^>]*>(.*?)</tr>", out["R"]["body"], re.S)
+        self.assertEqual(len(rows), 3, "a closed repository shows no pull request rows")
+        self.assertIn("All 3 items", rows[0])
+        self.assertEqual(re.findall(r'<td class="num[^"]*">(.*?)</td>', rows[0]), ["2h 30m", "1h 10m", "median 1h 30m"])
+        self.assertIn('<td class="g g-caution">▲<span class="sr">open on you</span></td>', rows[1])
+        self.assertIn('class="disc" data-open="example/system" aria-expanded="false" aria-label="Open example/system"',
+                      rows[1])
+        self.assertIn("2 pull requests, 1 open", rows[1])
+        self.assertEqual(re.findall(r'<td class="num[^"]*">(.*?)</td>', rows[1]), ["2h 30m", "1h 0m", "median 1h 30m"])
+        self.assertIn('data-open="example/other"', rows[2])
+        self.assertEqual(re.findall(r'<td class="num[^"]*">(.*?)</td>', rows[2]), ["0m 0s", "10m 0s", "none merged"])
+        self.assertEqual(out["R"]["note"], "1 pull request open now; waiting in all: 3h 40m.")
+
+    def test_a_press_on_a_repo_row_opens_its_pull_requests_slowest_first(self):
+        doc = self.doc()
+        doc["prs"] = self.PRS
+        out = self.run_page(self.OPEN_SYSTEM + "\nR.body = ELS['prs-body'].html;", doc)
+        rows = re.findall(r"<tr[^>]*>(.*?)</tr>", out["R"]["body"], re.S)
+        self.assertEqual(len(rows), 5)
+        self.assertIn('aria-expanded="true" aria-label="Close example/system"', rows[1])
+        self.assertIn('<td class="g g-caution">▲<span class="sr">open, on you</span></td>', rows[2])
+        self.assertIn('href="https://github.com/example/system/pull/2"', rows[2])
+        self.assertEqual(re.findall(r'<td class="num[^"]*">(.*?)</td>', rows[2]), ["2h 0m", "0m 0s", "not merged"])
+        self.assertIn('<span class="sr">ended</span>', rows[3])
+        self.assertIn('data-open="example/other"', rows[4])
+        again = self.run_page(self.OPEN_SYSTEM + "\n" + self.OPEN_SYSTEM + "\nR.body = ELS['prs-body'].html;", doc)
+        self.assertEqual(len(re.findall(r"<tr[^>]*>", again["R"]["body"])), 3, "a second press closes it")
+
+    def test_a_pull_request_not_read_is_named_not_counted(self):
+        doc = self.doc()
+        doc["prs"] = {**self.PRS, "unknown": ["sd:9: no reading of its author and requested reviewers"]}
+        note = self.run_page("R.note = ELS['prs-note'].textContent;", doc)["R"]["note"]
+        self.assertIn("▨ Not counted, not known whether yours: sd:9: no reading of its author and requested reviewers.",
+                      note)
 
     def test_pr_waits_with_none_says_so_and_a_failed_read_is_unknown(self):
         doc = self.doc()
-        doc["prs"] = {**self.PRS, "items": 0, "open": 0, "slowest": []}
-        self.assertIn("No item has a pull-request lane note yet.", self.run_page("R.b = ELS['prs-body'].html;", doc)["R"]["b"])
+        doc["prs"] = {**self.PRS, "items": 0, "open": 0, "repos": []}
+        self.assertIn("No pull request of yours has a lane note yet.",
+                      self.run_page("R.b = ELS['prs-body'].html;", doc)["R"]["b"])
         doc["prs"] = {"error": "OperationalError: database is locked"}
         out = self.run_page("R.b = ELS['prs-body'].html;", doc)
         self.assertIn("<b>▨ Not read.</b> OperationalError: database is locked", out["R"]["b"])

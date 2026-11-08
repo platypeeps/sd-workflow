@@ -32,7 +32,7 @@ class Api:
         self.detail = {"user": {"id": 1, "login": "operator"}, "head": {"sha": HEAD},
                        "base": {"sha": BASE}, "state": "open", "merged": False,
                        "draft": False, "title": "Contribution", "updated_at": AT,
-                       "mergeable": True, "labels": []}
+                       "mergeable": True, "labels": [], "requested_reviewers": []}
         self.rows = {
             "/user": {"id": 1, "login": "operator"},
             ROOT + "/pulls/7": self.detail,
@@ -81,6 +81,16 @@ class PullCollection(unittest.TestCase):
         self.assertTrue(result["events"][1]["mentions_operator"])
         self.assertEqual((result["ci"], result["ci_head"], result["ci_ids"]), ("success", HEAD, ["check-run:91"]))
         self.assertEqual([row[0] for row in api.calls].count(ROOT + "/pulls/7"), 2)
+
+    def test_requested_reviewers_keep_user_logins_not_teams(self):
+        # sd:8084: a team request does not name the operator.
+        api = Api()
+        api.detail["requested_reviewers"] = [{"id": 1, "login": "operator"}, {"id": 4, "login": "peer"}]
+        api.detail["requested_teams"] = [{"id": 9, "slug": "core"}]
+        self.assertEqual(api.observation()["requested_reviewers"], ["operator", "peer"])
+        del api.detail["requested_reviewers"]
+        with self.assertRaises(Unavailable):
+            api.observation()
 
     def test_typed_timeline_uses_originator_not_mentioned_actor(self):
         api = Api()

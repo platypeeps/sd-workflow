@@ -43,7 +43,7 @@ def untracked(root: pathlib.Path) -> list[str]:
 # screenshot overruns the limit. UTF-8 (a `-diff` file) and BOM-marked UTF-16 go as text; anything else
 # stays base64, so the size check refuses honestly. Not media: zip, gzip (can carry source), ICO (weak magic).
 BINARY_MARKER = re.compile(r"(?m)^Binary files .* differ\n?")
-SUMMARY = re.compile(r"(?m)^\[(?:binary, not sent\] |renamed\] .*; unchanged lines not sent$)")  # a patch prefixes content lines
+MEDIA, SUMMARY = re.compile(r"(?m)^\[binary, not sent\] "), re.compile(r"(?m)^\[(?:binary, not sent\] |renamed\] .*; unchanged lines not sent$)")  # a patch prefixes content lines
 DELETED = re.compile(r"(?m)^deleted file mode ")  # sd:6088: with -D this header is all a deletion sends
 RENAMED = re.compile(r'(?m)^\[renamed\] ("(?:[^"\\]|\\.)*") -> "(?:[^"\\]|\\.)*"; unchanged lines not sent$')
 MEDIA_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"wOFF", b"wOF2", b"%PDF-")
@@ -110,7 +110,7 @@ def _collect(root: pathlib.Path, subject: Any, drop_deleted: bool, whole: bool) 
         parts.append(part := ("\n" if parts else "") + part)
         inventory.append({"path": name, "bytes": len(part.encode("utf-8")),
                           "boundary": name.split("/", 1)[0] if "/" in name else "repository-root",
-                          **({"summarized": True} if summarized else {})})
+                          **({"summarized": True} if summarized else {}), **({"media": True} if summarized and MEDIA.search(part) else {})})
     return "".join(parts), inventory
 
 
