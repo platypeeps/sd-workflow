@@ -126,6 +126,25 @@ class TheKoi(ScreenCase):
                 self.addCleanup(time.tzset)
         self.assertEqual(assets.get_asset(self.connection, self.pond["id"])["fields"]["tests"][0]["date"], "2026-09-06")
 
+    def test_the_daily_sync_logs_the_changes_with_nobody_on_the_page(self):
+        """sd:8077: `dashboard.sh koi-sync` runs log_water once on the default store, for a daily job."""
+        import contextlib
+        import io
+
+        from sd_db import connect
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("sd_db.connect", lambda: connect(self.path)), contextlib.redirect_stdout(out):
+            self.assertEqual(home_koi.main([]), 0)
+        self.assertEqual(json.loads(out.getvalue()), {"added": 2})
+        self.assertEqual(len(assets.get_asset(self.connection, self.pond["id"])["fields"]["water_log"]), 2)
+        writes.set_setting(self.connection, home_koi.KEY, None)
+        with mock.patch("sd_db.connect", lambda: connect(self.path)), contextlib.redirect_stderr(err):
+            self.assertEqual(home_koi.main([]), 1)
+        self.assertIn("koi-sync: No water-change scripts", err.getvalue())
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(home_koi.main(["extra"]), 2)
+
     def test_a_stale_pond_save_keeps_the_water_log_and_tests_the_server_wrote(self):
         stale = dict(self.pond["fields"])
         home_koi.log_water({}, now=NOW)(self.connection)

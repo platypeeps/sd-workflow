@@ -7,7 +7,7 @@
 # Tasks run sd_tile.py for Toolbox, Research, Vault and Queues (pack sd:7527),
 # and Health's Ports calls `collectors.collect_ports` in-process.
 # `tile` runs one view from a shell.
-# Usage: dashboard.sh tile <tab> | serve | preflight | install | health | shots | pages | test
+# Usage: dashboard.sh tile <tab> | serve | preflight | install | health | shots | koi-sync | pages | test
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
 
@@ -205,6 +205,17 @@ cmd_shots() {
   exec "$runtime_python" -I "$DIR/sd_dashboard/bootstrap.py" shots "$@"
 }
 
+cmd_koi_sync() {
+  # One Koi water-change sync (sd:8077), for the daily job that keeps Home
+  # Assistant's changes past its recorder's ten days: `home_koi.main`.
+  runtime_python="${SD_DASHBOARD_PYTHON:-$RUNTIME_PYTHON_DEFAULT}"
+  if [ ! -x "$runtime_python" ]; then
+    echo "dashboard: missing installed runtime $runtime_python" >&2
+    exit 1
+  fi
+  exec "$runtime_python" -I "$DIR/sd_dashboard/bootstrap.py" home_koi "$@"
+}
+
 cmd_docs() {
   # The design documents: docs/design/*.md rendered into docs/design's sibling
   # docs/dashboard/, which `documents.py` already serves for any checkout that
@@ -240,12 +251,13 @@ case "${1:-}" in
   preflight|install|health) cmd_runtime "$@" ;;
   grants) shift; cmd_grants "$@" ;;
   shots) shift; cmd_shots "$@" ;;
+  koi-sync) shift; cmd_koi_sync "$@" ;;
   docs) shift; cmd_docs "$@" ;;
   pages) shift; cmd_pages "$@" ;;
   test|check) shift; cmd_test "$@" ;;
   -h|--help|help)
     cat <<'HELPEOF'
-usage: dashboard.sh tile <tab> | serve | preflight | install | health | grants | shots | docs | pages | test
+usage: dashboard.sh tile <tab> | serve | preflight | install | health | grants | shots | koi-sync | docs | pages | test
 
   tile <tab>       one tab as JSON on stdout — toolbox, vault, research,
                    ports or queues. The machine and vault views are
@@ -270,6 +282,9 @@ usage: dashboard.sh tile <tab> | serve | preflight | install | health | grants |
                    Prints the commit it serves, and exits 1 when that is not
                    the checkout's HEAD, naming the kickstart line, or when
                    the installed LaunchAgent's PATH no longer finds sd
+  koi-sync         one Koi water-change sync from Home Assistant into the
+                   pond's log, for a daily job; prints {added}, exits 1
+                   naming a refusal
   grants           probe the vault under DASHBOARD_PYTHON and under
                    SD_DASHBOARD_PYTHON, one line per path, naming the one
                    that lacks Full Disk Access. Takes no arguments. Exits 1
@@ -337,7 +352,7 @@ HELPEOF
     exit 0
     ;;
   *)
-    echo "usage: $(basename "$0") tile <tab> | serve | preflight | install | health | grants | shots | docs | pages | test" >&2
+    echo "usage: $(basename "$0") tile <tab> | serve | preflight | install | health | grants | shots | koi-sync | docs | pages | test" >&2
     exit 1
     ;;
 esac
