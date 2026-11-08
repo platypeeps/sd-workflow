@@ -140,6 +140,14 @@ html[data-kiosk] .headline .what b { font-size: var(--text-xl); }
 .home-map .pending { fill: none; stroke: var(--color-accent); stroke-width: 2; stroke-dasharray: 6 4; vector-effect: non-scaling-stroke; }
 .asset-form { display: grid; gap: var(--space-2xs); max-width: 32rem; padding: var(--space-sm) 0; }
 .asset-form label { display: grid; gap: var(--space-3xs); color: var(--color-ink-2); }
+/* The Area control (sd:8110): four edges and Save on one row; two by two on a phone. */
+.map-area fieldset { display: grid; grid-template-columns: repeat(4, minmax(0, 7rem)) max-content; justify-content: start; gap: var(--space-2xs); align-items: end; min-width: 0; border: 0; padding: 0; margin: 0 0 var(--space-2xs); }
+.map-area legend { padding: 0; margin-bottom: var(--space-3xs); color: var(--color-ink-2); }
+.map-area label { display: grid; gap: var(--space-3xs); color: var(--color-ink-2); }
+.map-area input { min-width: 0; font: 400 var(--text-sm)/1.2 var(--font-data); }
+.map-area .why { margin: 0 0 var(--space-xs); color: var(--color-muted); font-size: var(--text-xs); }
+.place-rows .off { color: var(--color-muted); white-space: nowrap; }
+@media (max-width: 40rem) { .map-area fieldset { grid-template-columns: repeat(2, minmax(0, 1fr)); justify-content: stretch; } .map-area fieldset .btn { grid-column: 1 / -1; justify-self: start; } }
 #map-rows tr[aria-selected="true"] { background: var(--color-accent-bg); }
 #map-rows tr:focus-visible { outline: 2px solid var(--color-focus); outline-offset: -2px; }
 

@@ -6,7 +6,7 @@
   (sd:3522). The design's tile states are sample data; nothing here is. A tile's Act section posts /api/home/service (sd:4966): the services its domain allows, the security ones after a typed confirm.
   Edit tiles (sd:3987) posts /api/home/tiles: it writes the tile row.
   Map (home-map.js, pack sd:8053) reads /api/home/map when shown: the assets over the county aerial; Add, move, edit and care post
-  /api/home/asset, /api/home/asset/delete and /api/home/care.
+  /api/home/asset, /api/home/asset/delete and /api/home/care; its Area control posts /api/settings/row (sd:8110).
   Koi (home-koi.js, pack sd:8054) reads /api/home/koi when shown; it posts /api/home/asset, /api/home/care and
   /api/home/koi/water, which logs Home Assistant's water changes on the pond.
   Views (places.js): Overview is the tiles; Tasks, Briefs and Reports each read /api/home/<view> (places.py) when shown.
@@ -70,6 +70,7 @@
   <section class="place-view" id="view-map" data-place-view="map" data-label="Map" aria-labelledby="map-h" hidden>
     <div class="sec-head"><div><h2 id="map-h">Map</h2><p>What is on the lot, over the county's 2024 aerial: lines, shutoffs, irrigation, equipment, plants and trees. Press Add, pick a kind and click the map; drag a point to move it.</p></div><div class="tools" id="map-tools"></div></div>
     <div id="map-note"></div>
+    <div id="map-area"></div>
     <div class="filters toolbar-2" id="map-filters" role="group" aria-label="Filters"></div>
     <div class="home-map" id="map-svg"></div>
     <div id="map-form"></div>

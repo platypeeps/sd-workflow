@@ -2,15 +2,17 @@
 
 **Where.** The address is the workflow database's setting row `dashboard.home_map` (Settings, a dashboard list): one
 line, the street address. Pack code holds no address. The county's address locator (`LOCATOR`) turns it into a point
-in EPSG:2232 (Colorado Central, US feet), and the map runs `HALF` feet west, north and south of it and `EAST` feet
-east (sd:8085): 1,000 ft by 400 ft.
+in EPSG:2232 (Colorado Central, US feet). The map's reach from it is the row `dashboard.home_map_extent`,
+`west,east,south,north` in feet (sd:8110), each 50 to 2000; unset is `DEFAULT`, 200,800,200,200 (sd:8085). The Map
+view's Area control saves it through `/api/settings/row`, revision-checked as Settings.
 
 **The aerial.** Arapahoe County's 2024 aerial (`AERIAL`, an ArcGIS ImageServer, 0.217 ft = 2.6 in per pixel) answers
-one `exportImage` for that box at full resolution, cached under `<state>/system/home-map/` by the address and the
-box, so the county is asked once per address. `GET /api/home/map/aerial` serves the cached picture.
+one `exportImage` for that box, cached under `<state>/system/home-map/` by the address and the four edges, so the
+county is asked once per address and area. A box past the service's `MAX_PX` at full resolution is fetched at the
+coarser pixel that fits, and the page says so. `GET /api/home/map/aerial` serves the cached picture.
 
 **The assets.** `sd_db.assets` rows, each a point or a line in the same feet, drawn in an SVG whose viewBox is the
-box (y flipped, north up). A plant or a tree whose care is overdue is marked: a care task is an open sd item naming
+box (y flipped, north up). An asset wholly outside the box keeps its feet and is listed as off the map. A plant or a tree whose care is overdue is marked: a care task is an open sd item naming
 the asset in `fields.asset` (`assets.care`), filed recurring from the asset's Details (`POST /api/home/care`), so it
 recurs with the item. Add, move, edit and delete post `/api/home/asset` and `/api/home/asset/delete`.
 
@@ -32,10 +34,12 @@ KEY = "dashboard.home_map"
 LOCATOR = "https://gis.arapahoegov.com/arcgis/rest/services/AddressLocator/GeocodeServer/findAddressCandidates"
 AERIAL = "https://gis.arapahoegov.com/arcgis/rest/services/Aerials/ImageServer/exportImage"
 SR = 2232
-#: The aerial's pixel, in feet; the map's reach west, north and south of the address; and its reach east (sd:8085,
-#: 600 ft more). 1,000 ft by 400 ft is 4,608 by 1,843 pixels at full resolution, under the service's 15000x4100.
-PIXEL_FT, HALF = 0.21701388888888898, 200.0
-EAST = HALF + 600.0
+EXTENT_KEY = "dashboard.home_map_extent"
+#: The aerial's full-resolution pixel in feet, and the largest export the service answers (width, height).
+PIXEL_FT, MAX_PX = 0.21701388888888898, (15000, 4100)
+#: The map's reach from the address, west, east, south, north in feet (sd:8085), and each edge's bounds (sd:8110).
+DEFAULT, EDGE = (200.0, 800.0, 200.0, 200.0), (50, 2000)
+EDGES = ("west", "east", "south", "north")
 TIMEOUT = 20.0
 LIMIT = 32 * 1024 * 1024
 #: The fields only the server writes, by kind: `home_koi.log_water` and `log_test` append to the current row.
@@ -59,6 +63,49 @@ def parse(text: str) -> tuple[str | None, list[str]]:
     return lines[0], []
 
 
+def parse_extent(text: str | None) -> tuple[tuple[float, ...], list[str]]:
+    """The row's four edges (`DEFAULT` when unset) and its problems: four numbers, each within `EDGE`."""
+    if not (text or "").strip():
+        return DEFAULT, []
+    parts = [part.strip() for part in text.split(",")]
+    if len(parts) != 4:
+        return DEFAULT, [f"four numbers, {','.join(EDGES)} in feet; found {len(parts)}"]
+    out, problems = [], []
+    for name, part in zip(EDGES, parts, strict=True):
+        try:
+            value = float(part)
+        except ValueError:
+            value = math.nan
+        if not math.isfinite(value) or not EDGE[0] <= value <= EDGE[1]:
+            problems.append(f"{name} is {part or 'empty'}; each edge is {EDGE[0]} to {EDGE[1]} ft")
+        out.append(value)
+    return (DEFAULT, problems) if problems else (tuple(out), [])
+
+
+def extent(connection) -> tuple[tuple[float, ...], str | None, str]:
+    """`(edges, row, problem)`: the area the map covers, the row as held (None unset), and why it fell back."""
+    from sd_db import writes
+
+    try:
+        row = writes.read_settings(connection, [EXTENT_KEY]).get(EXTENT_KEY)
+    except Exception as error:  # an unread row is named, and the map keeps today's area
+        return DEFAULT, None, f"{EXTENT_KEY} not read: {error.__class__.__name__}"
+    edges, problems = parse_extent(row)
+    return edges, row, f"{EXTENT_KEY} is not used ({problems[0]})" if problems else ""
+
+
+def bbox(x: float, y: float, edges) -> list[float]:
+    west, east, south, north = edges
+    return [x - west, y - south, x + east, y + north]
+
+
+def export(edges) -> tuple[int, int, float]:
+    """`(width, height, pixel_ft)` for the area: full resolution, else the coarser pixel `MAX_PX` allows."""
+    west, east, south, north = edges
+    pixel = max(PIXEL_FT, (west + east) / MAX_PX[0], (south + north) / MAX_PX[1])
+    return min(round((west + east) / pixel), MAX_PX[0]), min(round((south + north) / pixel), MAX_PX[1]), pixel
+
+
 def _get(url: str, *, timeout: float) -> bytes:
     request = urllib.request.Request(url, headers={"User-Agent": "sd-dashboard"})
     with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 -- the two fixed https hosts above
@@ -69,11 +116,16 @@ def _get(url: str, *, timeout: float) -> bytes:
 
 
 def _cache(address: str) -> Path:
-    return state_dir() / hashlib.sha256(f"{address}|{HALF}|{EAST}".encode()).hexdigest()[:16]
+    return state_dir() / hashlib.sha256(address.encode()).hexdigest()[:16]
+
+
+def aerial_file(address: str, edges=DEFAULT) -> Path:
+    """The cached aerial for the address and the four edges: a new area is a new file, fetched once."""
+    return _cache(address) / f"aerial-{'-'.join(f'{n:g}' for n in edges)}.jpg"
 
 
 def place(address: str, *, timeout: float = TIMEOUT) -> dict:
-    """`{x, y, bbox, match}` for the address, from the cache or the county's locator; raises `LookupError` with why."""
+    """`{x, y, match}` for the address, from the cache or the county's locator; raises `LookupError` with why."""
     cached = _cache(address) / "place.json"
     try:
         return json.loads(cached.read_text(encoding="utf-8"))
@@ -96,7 +148,7 @@ def _number(value) -> float | None:
 
 
 def _located(answer) -> dict:
-    """`{x, y, bbox, match}` from the locator's JSON, or `LookupError` naming what the reply lacks (sd:8076)."""
+    """`{x, y, match}` from the locator's JSON, or `LookupError` naming what the reply lacks (sd:8076)."""
     if not isinstance(answer, dict):
         raise LookupError("the county's address locator answered with something that is not a JSON object")
     if "error" in answer:
@@ -112,7 +164,7 @@ def _located(answer) -> dict:
     x, y = (_number(location.get("x")), _number(location.get("y"))) if isinstance(location, dict) else (None, None)
     if x is None or y is None:
         raise LookupError("the county's address locator gave its match no numeric x and y")
-    return {"x": x, "y": y, "bbox": [x - HALF, y - HALF, x + EAST, y + HALF], "match": str(found[0].get("address", ""))}
+    return {"x": x, "y": y, "match": str(found[0].get("address", ""))}
 
 
 def _keep(path: Path, data: bytes) -> None:
@@ -126,19 +178,19 @@ def _keep(path: Path, data: bytes) -> None:
         temp.unlink(missing_ok=True)
 
 
-def aerial(address: str, *, timeout: float = TIMEOUT) -> bytes:
-    """The aerial for the address's box, from the cache or one `exportImage`; raises `LookupError` with why."""
+def aerial(address: str, edges=DEFAULT, *, timeout: float = TIMEOUT) -> bytes:
+    """The aerial for the address's area, from the cache or one `exportImage`; raises `LookupError` with why."""
     where = place(address, timeout=timeout)
-    cached = _cache(address) / "aerial.jpg"
+    cached = aerial_file(address, edges)
     try:
         held = cached.read_bytes()
         if held.startswith(b"\xff\xd8"):
             return held
     except OSError:
         pass
-    size = f"{round((HALF + EAST) / PIXEL_FT)},{round(2 * HALF / PIXEL_FT)}"
-    query = urllib.parse.urlencode({"bbox": ",".join(f"{n:.3f}" for n in where["bbox"]), "bboxSR": SR, "imageSR": SR,
-                                    "size": size, "format": "jpg", "f": "image"})
+    width, height, _ = export(edges)
+    query = urllib.parse.urlencode({"bbox": ",".join(f"{n:.3f}" for n in bbox(where["x"], where["y"], edges)), "bboxSR": SR, "imageSR": SR,
+                                    "size": f"{width},{height}", "format": "jpg", "f": "image"})
     try:
         body = _get(f"{AERIAL}?{query}", timeout=timeout)
     except (OSError, ValueError) as error:
@@ -169,19 +221,38 @@ def document(connection, *, now: str, timeout: float = TIMEOUT) -> dict:
     from sd_db import assets
 
     shown, reason = address(connection)
-    where = None
+    edges, row, problem = extent(connection)
+    where = box = None
     if shown is not None:
         try:
             where = place(shown, timeout=timeout)
         except LookupError as error:
             reason = str(error)
+    if where:
+        box = bbox(where["x"], where["y"], edges)
+    width, height, pixel = export(edges)
     care = assets.care(connection, today=now[:10])
-    rows = [{**row, "care": care.get(row["id"], {"items": [], "overdue": False})}
-            for row in assets.list_assets(connection, assets.KINDS)]
-    return {"state": "read" if where else "partial", "reason": reason, "bbox": where["bbox"] if where else None,
-            "aerial": "/api/home/map/aerial" if where else None, "pixel_ft": PIXEL_FT, "assets": rows,
+    rows = [{**one, "care": care.get(one["id"], {"items": [], "overdue": False}), "off_map": _off(one, box)}
+            for one in assets.list_assets(connection, assets.KINDS)]
+    coarse = (f"The area is {round(edges[0] + edges[1])} by {round(edges[2] + edges[3])} ft, past the aerial's "
+              f"{MAX_PX[0]} by {MAX_PX[1]} pixels at {PIXEL_FT:.3f} ft: it is fetched at {pixel:.3f} ft per pixel."
+              if pixel > PIXEL_FT else "")
+    return {"state": "read" if where else "partial", "reason": reason, "bbox": box,
+            "aerial": "/api/home/map/aerial" if where else None, "pixel_ft": pixel, "assets": rows,
+            "extent": {"edges": dict(zip(EDGES, edges, strict=True)), "row": row, "key": EXTENT_KEY, "limits": list(EDGE),
+                       "size": [width, height], "coarse": coarse, "problem": problem},
             "kinds": list(assets.KINDS), "lines": sorted(assets.LINES), "plant_fields": list(assets.PLANT_FIELDS),
             "recur": list(RECUR)}
+
+
+def _off(asset: dict, box) -> bool:
+    """An asset with no point in the box is off the map: it keeps its feet and is listed, not drawn out of sight."""
+    geometry = asset.get("geometry")
+    if not box or not geometry:
+        return False
+    points = [geometry["coordinates"]] if geometry["type"] == "Point" else geometry["coordinates"]
+    # ponytail: point test; a line crossing the box with every point outside counts as off.
+    return not any(box[0] <= x <= box[2] and box[1] <= y <= box[3] for x, y in points)
 
 
 def aerial_route(connection) -> tuple:
@@ -190,7 +261,7 @@ def aerial_route(connection) -> tuple:
     if shown is None:
         return 404, {"error": reason}
     try:
-        return 200, aerial(shown), "image/jpeg"
+        return 200, aerial(shown, extent(connection)[0]), "image/jpeg"
     except LookupError as error:
         return 503, {"error": str(error)}
 
