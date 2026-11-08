@@ -100,6 +100,51 @@ class TheKoi(ScreenCase):
             with self.assertRaises(ValueError):
                 home_koi.log_test(bad, now=NOW)
 
+    def test_a_test_written_during_the_home_assistant_wait_survives_the_water_log(self):
+        """sd:8076: log_water reads the pond again after Home Assistant answers, so a write in the wait is kept."""
+        runs = self.runs
+
+        def slow(*a, **k):
+            home_koi.log_test({"ph": 7.4}, now=NOW)(self.connection)
+            return runs
+
+        with mock.patch.object(home_koi, "_history", slow):
+            self.assertEqual(home_koi.log_water({}, now=NOW)(self.connection), {"added": 2})
+        fields = assets.get_asset(self.connection, self.pond["id"])["fields"]
+        self.assertEqual((len(fields["water_log"]), len(fields["tests"])), (2, 1))
+
+    def test_a_water_test_keeps_the_local_date(self):
+        """sd:8076: 03:00 UTC is still the evening before in a zone west of UTC; the test keeps that local day."""
+        import os
+        import time
+
+        with mock.patch.dict(os.environ, {"TZ": "America/Denver"}):
+            time.tzset()
+            try:
+                home_koi.log_test({"ph": 7.4}, now="2026-09-07T03:00:00Z")(self.connection)
+            finally:
+                self.addCleanup(time.tzset)
+        self.assertEqual(assets.get_asset(self.connection, self.pond["id"])["fields"]["tests"][0]["date"], "2026-09-06")
+
+    def test_the_daily_sync_logs_the_changes_with_nobody_on_the_page(self):
+        """sd:8077: `dashboard.sh koi-sync` runs log_water once on the default store; a scheduler runs it daily."""
+        import contextlib
+        import io
+
+        from sd_db import connect
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch("sd_db.connect", lambda: connect(self.path)), contextlib.redirect_stdout(out):
+            self.assertEqual(home_koi.main([]), 0)
+        self.assertEqual(json.loads(out.getvalue()), {"added": 2})
+        self.assertEqual(len(assets.get_asset(self.connection, self.pond["id"])["fields"]["water_log"]), 2)
+        writes.set_setting(self.connection, home_koi.KEY, None)
+        with mock.patch("sd_db.connect", lambda: connect(self.path)), contextlib.redirect_stderr(err):
+            self.assertEqual(home_koi.main([]), 1)
+        self.assertIn("koi-sync: No water-change scripts", err.getvalue())
+        with contextlib.redirect_stderr(err):
+            self.assertEqual(home_koi.main(["extra"]), 2)
+
     def test_a_stale_pond_save_keeps_the_water_log_and_tests_the_server_wrote(self):
         stale = dict(self.pond["fields"])
         home_koi.log_water({}, now=NOW)(self.connection)

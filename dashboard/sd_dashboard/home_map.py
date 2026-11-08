@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import urllib.error
 import urllib.parse
@@ -77,16 +78,49 @@ def place(address: str, *, timeout: float = TIMEOUT) -> dict:
         pass
     query = urllib.parse.urlencode({"SingleLine": address, "outSR": SR, "maxLocations": 1, "f": "json"})
     try:
-        found = json.loads(_get(f"{LOCATOR}?{query}", timeout=timeout)).get("candidates") or []
-    except (OSError, ValueError, AttributeError) as error:
+        answer = json.loads(_get(f"{LOCATOR}?{query}", timeout=timeout))
+    except (OSError, ValueError) as error:
         raise LookupError(f"the county's address locator did not answer: {error.__class__.__name__}") from None
-    if not found or not isinstance(found[0].get("location"), dict):
-        raise LookupError("the county's address locator found no match for the address on Settings")
-    x, y = float(found[0]["location"]["x"]), float(found[0]["location"]["y"])
-    out = {"x": x, "y": y, "bbox": [x - HALF, y - HALF, x + HALF, y + HALF], "match": str(found[0].get("address", ""))}
-    cached.parent.mkdir(parents=True, exist_ok=True)
-    cached.write_text(json.dumps(out), encoding="utf-8")
+    out = _located(answer)
+    _keep(cached, json.dumps(out).encode())
     return out
+
+
+def _number(value) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    return float(value)
+
+
+def _located(answer) -> dict:
+    """`{x, y, bbox, match}` from the locator's JSON, or `LookupError` naming what the reply lacks (sd:8076)."""
+    if not isinstance(answer, dict):
+        raise LookupError("the county's address locator answered with something that is not a JSON object")
+    if "error" in answer:
+        error = answer["error"] if isinstance(answer["error"], dict) else {}
+        raise LookupError(f"the county's address locator answered an error: {error.get('code', '')} "
+                          f"{error.get('message', '')}".rstrip())
+    found = answer.get("candidates") or []
+    if not isinstance(found, list) or not all(isinstance(one, dict) for one in found):
+        raise LookupError("the county's address locator answered with something that is not a list of candidates")
+    if not found:
+        raise LookupError("the county's address locator found no match for the address on Settings")
+    location = found[0].get("location")
+    x, y = (_number(location.get("x")), _number(location.get("y"))) if isinstance(location, dict) else (None, None)
+    if x is None or y is None:
+        raise LookupError("the county's address locator gave its match no numeric x and y")
+    return {"x": x, "y": y, "bbox": [x - HALF, y - HALF, x + HALF, y + HALF], "match": str(found[0].get("address", ""))}
+
+
+def _keep(path: Path, data: bytes) -> None:
+    """Write the cache file whole or not at all: a temp file beside it, then a rename. A failed write is no cache."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        temp.write_bytes(data)
+        os.replace(temp, path)
+    except OSError:
+        temp.unlink(missing_ok=True)
 
 
 def aerial(address: str, *, timeout: float = TIMEOUT) -> bytes:
@@ -94,7 +128,9 @@ def aerial(address: str, *, timeout: float = TIMEOUT) -> bytes:
     where = place(address, timeout=timeout)
     cached = _cache(address) / "aerial.jpg"
     try:
-        return cached.read_bytes()
+        held = cached.read_bytes()
+        if held.startswith(b"\xff\xd8"):
+            return held
     except OSError:
         pass
     side = round(2 * HALF / PIXEL_FT)
@@ -106,7 +142,7 @@ def aerial(address: str, *, timeout: float = TIMEOUT) -> bytes:
         raise LookupError(f"the county's aerial did not answer: {error.__class__.__name__}") from None
     if not body.startswith(b"\xff\xd8"):
         raise LookupError("the county's aerial answered with something that is not a JPEG")
-    cached.write_bytes(body)
+    _keep(cached, body)
     return body
 
 

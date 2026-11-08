@@ -123,8 +123,10 @@ addEventListener('DOMContentLoaded', () => {
   const IDEA_AREAS = ['Personal', 'Work', 'RWBP'];
   let ideaArea = '';
   // sd:8014: each vault queue's bulk Decline, and its Declined filter, off until pressed: the declined rows with when
-  // and by which control. The sd-writing rules give declined no move out, so a row comes back only by a vault edit.
-  const QUEUE = { ideas: ['blog-idea', 'Blog Ideas inbox'], tips: ['tip', 'Tips inbox'] };
+  // and by which control, each with a Restore that moves it back to the inbox (idea.restore, tip.restore).
+  const QUEUE = { ideas: ['blog-idea', 'Blog Ideas inbox', 'idea.restore'], tips: ['tip', 'Tips inbox', 'tip.restore'] };
+  const declinedObjs = (col, Q) => (Q.declined || []).map(r => ({ id: `declined:${r.item}`, type: 'declined', label: `#${r.item} ${r.title}`,
+    item: r.item, queue: QUEUE[col][1], action: QUEUE[col][2] }));
   const queueObj = (col, Q) => ({ id: `queue:${QUEUE[col][0]}`, type: 'queue', kind: QUEUE[col][0], label: QUEUE[col][1], scored: true, pool: Q.pool || [] });
   const declinedOn = { ideas: false, tips: false };
   function queueTools(col, Q) {
@@ -134,8 +136,7 @@ addEventListener('DOMContentLoaded', () => {
     const label = window.commands.declineLabel(o), tip = none ? `${label}: no row is that old and low` : label;
     return html`<div class="queue-tools"><button class="btn sm risky" type="button" data-cmd="queue.decline" data-obj="${o.id}"${none ? html` disabled` : ''} title="${tip}"><span class="lbl">${label}</span></button>
       <button class="btn quiet sm" type="button" data-declined="${col}" aria-pressed="${String(on)}">Declined <span class="n">${n}</span></button></div>
-      ${on ? html`<ul class="declined" aria-label="Declined ${QUEUE[col][1]}">${(Q.declined || []).map(r => html`<li><span class="t">#${r.item} ${r.title}</span> <span class="why">declined ${r.at ? html`<time datetime="${r.at}">${ago(r.at)}</time>` : 'at a time not recorded'}${r.by ? ` by ${r.by}` : ''}</span></li>`)}${n ? '' : html`<li class="empty">Nothing declined.</li>`}</ul>
-        <p class="why">No Restore here: the vault rules have no move out of declined; edit the row's status in the vault to bring it back.</p>` : ''}`;
+      ${on ? html`<ul class="declined" aria-label="Declined ${QUEUE[col][1]}">${(Q.declined || []).map(r => html`<li><span class="t">#${r.item} ${r.title}</span> <span class="why">declined ${r.at ? html`<time datetime="${r.at}">${ago(r.at)}</time>` : 'at a time not recorded'}${r.by ? ` by ${r.by}` : ''}</span> <button class="btn quiet sm" type="button" data-cmd="queue.restore" data-obj="declined:${r.item}">Restore</button></li>`)}${n ? '' : html`<li class="empty">Nothing declined.</li>`}</ul>` : ''}`;
   }
   const keep = () => { const v = window.shell.aside.param(parked); return v ? { parked: v } : {}; };
   function card(p) {
@@ -398,6 +399,10 @@ addEventListener('DOMContentLoaded', () => {
       ready: o => { const p = P_(o); return !p ? 'not listed' : reviewed(p); },
       post: fixPost, again: fixAgain }),
     window.commands.decline({ post: (path, body) => window.shell.post(path, body).then(out => { reading?.reread(); return out; }, e => { reading?.load(); throw e; }) }),
+    { id: 'queue.restore', on: 'declined', label: 'Restore', does: 'Moves a declined row back to its inbox.', icon: 'archive-restore', risk: 'confirm', executes: true,
+      consequence: o => `This moves ${o.label} from declined back to the ${o.queue}.`,
+      cli: o => `no sd verb: the dashboard moves #${o.item} to inbox, as Tasks moves it`, sends: o => `POST /api/actions/run {action: ${o.action}, item: ${o.item}}`,
+      run: o => window.commands.runAction(o, o.action, { item: o.item }).then(said => { reading?.reread(); return said; }) },
   ];
   // A piece's review that lands rewrites adversarial.md, so the page reads again for its time.
   document.addEventListener('adversarial:run', e => { if (e.detail.run.kind === 'piece' && e.detail.run.filed) reading?.reread(); });
@@ -586,7 +591,8 @@ addEventListener('DOMContentLoaded', () => {
       // Each repo once, with the realm that claims it: "sd-writing under Work".
       const label = id => (window.PAGE_VIEWS || []).find(v => v.id === id)?.label || id;
       const claimed = ps => [...new Map(ps.filter(p => p.realm).map(p => [p.repo, `${p.repo} under ${label(p.realm)}`])).values()].join(', ');
-      const queues = Object.keys(QUEUE).filter(col => doc[col]?.state === 'read').map(col => queueObj(col, doc[col]));
+      const read = Object.keys(QUEUE).filter(col => doc[col]?.state === 'read');
+      const queues = [...read.map(col => queueObj(col, doc[col])), ...read.flatMap(col => declinedObjs(col, doc[col]))];
       return { objects: [...pieces.map(p => ({ id: String(p.id), type: 'piece', label: `#${p.id} ${p.title}` })), ...queues],
         state: pieces.length ? null : REALM === 'personal' && (doc.pieces || []).length
           ? { kind: 'empty', title: 'No personal pieces', source: '/api/writing', text: known
