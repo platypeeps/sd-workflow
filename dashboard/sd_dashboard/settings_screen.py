@@ -11,7 +11,7 @@ the value again. There is no stale-write check: two concurrent manual writes are
 answer carries the value the set replaced, so the page can say when it differs from the one it showed.
 
 The Sweeps section (sd:5109) holds the Work and Personal sweeps' settings, `realm_sweep.SETTINGS`, and the Dashboard
-section the adversarial review's model and effort (`adversarial.SETTINGS`), the Deep review's model, effort, bound and
+section the adversarial review's model and effort (`adversarial.SETTINGS`), Home's Drive keys (`hoa_attach.HOME_SETTINGS`), the Deep review's model, effort, bound and
 sub-agent cap (`adversarial.DEEP`, sd:5784) and the dashboard lists (`setting_rows.LISTS`):
 setting rows read and written on the page's own connection (`sd_db.writes`), as no `sd config` prefix declares them.
 
@@ -125,11 +125,12 @@ def _scalars() -> dict:
     """Every single-value row the page edits, by key: `(description, pattern or None)`."""
     from .adversarial import DEEP, PATTERNS
     from .adversarial import SETTINGS as REVIEW
+    from .hoa_attach import HOME_SETTINGS
     from .home_map import EXTENT_KEY
     from .realm_sweep import SETTINGS as SWEEP
 
     return {**{key: (text, None) for key, text in SWEEP.items()}, **{key: (text, PATTERNS[key]) for key, text in REVIEW.items()},
-            EXTENT_KEY: (EXTENT_TEXT, None),
+            EXTENT_KEY: (EXTENT_TEXT, None), **HOME_SETTINGS,
             **{key: (f"The deep review's {DEEP_NAMES.get(key.rsplit('.', 1)[1], key.rsplit('.', 1)[1])}: {wants}. Unset is {default}.", pattern)
                for key, (default, pattern, wants) in DEEP.items()}}
 
@@ -166,6 +167,7 @@ def rows(connection) -> dict:
     from . import setting_rows
     from .adversarial import DEEP
     from .adversarial import SETTINGS as REVIEW
+    from .hoa_attach import HOME_SETTINGS
     from .home_map import EXTENT_KEY
     from .realm_sweep import SETTINGS as SWEEP
 
@@ -182,7 +184,7 @@ def rows(connection) -> dict:
     else:
         out.update(sweeps=[scalar(key, text, held) for key, text in SWEEP.items()], sweeps_reason="")
     try:
-        held = writes.read_settings(connection, [*REVIEW, *DEEP, EXTENT_KEY])
+        held = writes.read_settings(connection, [*REVIEW, *DEEP, EXTENT_KEY, *HOME_SETTINGS])
         lists = []
         for key, (_, text) in setting_rows.LISTS.items():
             try:
@@ -197,7 +199,8 @@ def rows(connection) -> dict:
         out.update(dashboard=None, dashboard_reason=f"the workflow database did not answer: {failed}")
     else:
         known = _scalars()
-        out.update(dashboard=lists + [scalar(EXTENT_KEY, EXTENT_TEXT, held)] + [scalar(key, text, held) for key, text in REVIEW.items()]
+        out.update(dashboard=lists + [scalar(EXTENT_KEY, EXTENT_TEXT, held)]
+                   + [scalar(key, text, held) for key, (text, _) in HOME_SETTINGS.items()] + [scalar(key, text, held) for key, text in REVIEW.items()]
                    + [scalar(key, known[key][0], held, known[key][1]) for key in DEEP], dashboard_reason="")
     return out
 

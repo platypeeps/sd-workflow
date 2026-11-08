@@ -119,6 +119,9 @@ class TheHomeAttachments(Case):
         status, body = self.upload(self.oak["id"])
         self.assertEqual(status, 503)
         self.assertIn("Nothing was written: home.drive_folder is not set", body["error"])
+        # Review of sd:8112: sd config refuses a home.* key, so the remedy names Settings, where the key is set.
+        self.assertIn("Settings", body["error"])
+        self.assertNotIn("sd config set", body["error"])
         self.assertEqual(self.drive.calls, [], "Drive is not asked")
 
     def test_settings_never_held_list_no_folder_and_an_upload_names_them(self):

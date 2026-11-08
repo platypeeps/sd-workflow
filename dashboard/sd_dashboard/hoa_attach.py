@@ -124,6 +124,8 @@ class Site:
     asset: Callable[[object, object], dict]
     ident: type
     optional: frozenset = frozenset()
+    #: How to set an unset key: `sd config set` takes only declared prefixes, so Home's are set on Settings.
+    remedy: str = "run sd config set {key} <value>"
 
 
 def _account(connection, site: Site) -> str:
@@ -133,11 +135,11 @@ def _account(connection, site: Site) -> str:
 
     account = writes.read_settings(connection, [site.account]).get(site.account)
     if not account:
-        raise LookupError(f"{site.account} is not set: run sd config set {site.account} <value>.")
+        raise LookupError(f"{site.account} is not set: {site.remedy.format(key=site.account)}.")
     return account
 
 
-def _settings(connection, root: str, account_key: str) -> tuple[str, str]:
+def _settings(connection, root: str, account_key: str, remedy: str = "run sd config set {key} <value>") -> tuple[str, str]:
     """`(the root folder id named by setting `root`, the account)`; `LookupError` naming each one unset."""
     from sd_db import writes
 
@@ -145,7 +147,7 @@ def _settings(connection, root: str, account_key: str) -> tuple[str, str]:
     folder, account = held.get(root), held.get(account_key)
     if not folder or not account:
         missing = " and ".join(key for key, value in ((root, folder), (account_key, account)) if not value)
-        raise LookupError(f"{missing} is not set: run sd config set {missing.split(' and ')[0]} <value>.")
+        raise LookupError(f"{missing} is not set: {remedy.format(key=missing.split(' and ')[0])}.")
     return folder, account
 
 
@@ -198,7 +200,7 @@ def _folder(connection, ident: object, site: Site, *, make: bool) -> tuple[dict,
     held = writes.read_settings(connection, sorted(quiet)) if quiet and not make else {}
     if quiet and not make and not all(held.get(name) for name in quiet):
         return asset, "", None
-    folder, account = _settings(connection, key, site.account)
+    folder, account = _settings(connection, key, site.account, site.remedy)
     for sub in existing:
         parent, folder = folder, _one(account, folder, sub)
         if folder is None:
@@ -338,6 +340,13 @@ HOA = Site(roots=ROOTS, account=ACCOUNT_KEY, place=_hoa_place, asset=_asset, ide
 
 HOME_FOLDER_KEY = "home.drive_folder"
 HOME_ACCOUNT_KEY = "home.google_account"
+#: Both keys are Settings rows (settings_screen._scalars): no sd config prefix declares home.*.
+HOME_SETTINGS = {
+    HOME_FOLDER_KEY: ("The Drive folder id that holds Home Map asset folders (pack sd:8112). Unset, the Map and Koi "
+                      "list no folder and Upload refuses.", r"[\w-]{10,200}"),
+    HOME_ACCOUNT_KEY: ("The Google account workspace-mcp reads Home Map attachments as (pack sd:8112).",
+                       r"[^@\s]+@[^@\s]+\.[^@\s]+"),
+}
 #: The Map's kind groups (sd:8085, home-map.js GROUPS); a kind in none is Other's.
 HOME_GROUPS = {"Gas": ("gas-line", "gas-shutoff"), "Water": ("water-line", "water-shutoff"),
                "Sewer": ("sewer-line", "sewer-shutoff"), "Electric": ("electric-line", "electric-shutoff"),
@@ -382,4 +391,5 @@ def _home_asset(connection, ident: object) -> dict:
 
 
 HOME = Site(roots={HOME_FOLDER_KEY: "Home Map"}, account=HOME_ACCOUNT_KEY, place=_home_place, asset=_home_asset, ident=int,
-            optional=frozenset({HOME_FOLDER_KEY, HOME_ACCOUNT_KEY}))
+            optional=frozenset({HOME_FOLDER_KEY, HOME_ACCOUNT_KEY}),
+            remedy="set {key} in Settings, Dashboard section")
