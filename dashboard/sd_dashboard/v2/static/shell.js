@@ -856,14 +856,18 @@
   body.append(confirmDlg); trap(confirmDlg);
   // Confirm: one dialog for every irreversible, force or large bulk action. It names the target and shows the command.
   // confirm:start
-  // fields: [{ name, label, required, placeholder, help, options }], text the command needs from the operator (a reason, a path), as the
+  // fields: [{ name, label, required, placeholder, help, options, multiline }], text the command needs from the operator (a reason, a path), as the
   // design source's shell has them (sd:2200). The line under them follows what is typed (cli(values)). OK stays off while a
   // required field is empty or spaces only, and the close asks again, so no path runs the command without its text. Enter in a
   // field is OK, not the form's first button, which is Keep and would drop what was typed (the design's sd:2369).
   // A field with options ([{ value, label }]) is a choice, not text: a select whose first option is the default (sd:3450),
   // or the option whose value is the field's value (pack sd:7708).
   // A text field's value, when given, is typed in already and can be changed (sd:3523).
-  const fieldOf = f => html`<label class="label" for="cf-${f.name}">${f.label}</label>${f.options
+  // multiline: true is a textarea (pack sd:8058 review): an <input> drops a value's newlines, so stored text with lines
+  // came back changed and a write sent it stripped. Enter in it is a new line; OK stays the button.
+  const fieldOf = f => html`<label class="label" for="cf-${f.name}">${f.label}</label>${f.multiline
+    ? html`<textarea class="cap-in" id="cf-${f.name}" name="${f.name}" rows="3" spellcheck="false"${f.required ? html` required aria-required="true"` : ''}${f.placeholder ? html` placeholder="${f.placeholder}"` : ''}${f.help ? html` aria-describedby="${`cf-${f.name}-help`}"` : ''}>${f.value || ''}</textarea>`
+    : f.options
     ? html`<select class="cap-in" id="cf-${f.name}" name="${f.name}"${f.help ? html` aria-describedby="${`cf-${f.name}-help`}"` : ''}>${f.options.map(x => html`<option value="${x.value}"${x.value === f.value ? html` selected` : ''}>${x.label}</option>`)}</select>`
     : html`<input class="cap-in" id="cf-${f.name}" name="${f.name}" autocomplete="off" spellcheck="false"${f.required ? html` required aria-required="true"` : ''} value="${f.value || ''}" placeholder="${f.placeholder || ''}"${f.help ? html` aria-describedby="${`cf-${f.name}-help`}"` : ''}>`}${f.help ? html`<p id="cf-${f.name}-help">${f.help}</p>` : ''}`;
   function confirmAction({ title, body: text = '', cli = '', ok = 'Confirm', keep = 'Keep it', danger = true, fields = [] }) {

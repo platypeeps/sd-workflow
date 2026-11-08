@@ -775,6 +775,16 @@ OUT.form = confirmDlg.html; OUT.off = yes.disabled; close('yes'); OUT.result = a
         self.assertFalse(out["off"])
         self.assertEqual((out["result"]["yes"], out["result"]["values"]), (True, {"until": "snooze-hour"}))
 
+    def test_a_multiline_field_is_a_textarea_that_keeps_the_stored_lines(self):
+        """pack sd:8058 review: an <input> drops a value's newlines, so a vote's stored motion came back changed and an
+        unrelated edit wrote it back stripped. A field with multiline: true is a textarea holding the text as stored."""
+        out = self.confirm("""inputs.motion = { value: 'Line one\\nLine two', tagName: 'TEXTAREA' };
+const p = confirmAction({ title: 'Edit: CI-1?', fields: [{ name: 'motion', label: 'Motion', multiline: true, value: 'Line one\\nLine <two>' }] });
+OUT.form = confirmDlg.html; close('yes'); OUT.result = await p;""")
+        self.assertIn('<textarea class="cap-in" id="cf-motion" name="motion" rows="3" spellcheck="false">Line one\nLine &lt;two&gt;</textarea>', out["form"])
+        self.assertNotIn('<input class="cap-in" id="cf-motion"', out["form"])
+        self.assertEqual(out["result"]["values"], {"motion": "Line one\nLine two"})
+
     def test_a_confirm_without_fields_is_unchanged(self):
         out = self.confirm("""const p = confirmAction({ title: 'Delete: x?', cli: 'sd x' }); OUT.off = yes.disabled; close('yes'); OUT.result = await p;""")
         self.assertEqual(out["focused"], "keep")

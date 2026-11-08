@@ -248,7 +248,8 @@
       ['type', 'Type', 'meeting or email vote'], ['moved', 'Moved by'], ['seconded', 'Seconded by'], ['votes', 'Votes', 'Ada, Ben Yes; Cy No'],
       ['outcome', 'Outcome', 'adopted, failed, or pending: why'], ['follow_up', 'Follow-up'], ['source', 'Source', 'where the record is'], ['notes', 'Notes']];
     const state = { name: 'state', label: 'State', options: [{ value: '', label: 'From the outcome' }, { value: 'open', label: 'Open' }, { value: 'closed', label: 'Closed' }] };
-    const fields = o => [...TEXT.map(([name, label, placeholder]) => ({ name, label, value: o?.[name] || '', placeholder: placeholder || '' })), state];
+    // Every text column but the date may hold lines (an imported votes.csv cell): a textarea keeps them (multiline).
+    const fields = o => [...TEXT.map(([name, label, placeholder]) => ({ name, label, value: o?.[name] || '', placeholder: placeholder || '', multiline: name !== 'date' })), state];
     const typed = (o, v) => Object.fromEntries(Object.entries(v || {}).filter(([k, x]) => k !== 'key' && (k === 'state' ? x : x !== (o?.[k] || ''))));
     const flags = f => Object.entries(f).map(([k, x]) => ` --${k.replace('_', '-')} ${S.shq(x)}`).join('');
     const send = async (body, said) => {

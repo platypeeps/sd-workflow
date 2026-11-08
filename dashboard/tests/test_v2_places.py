@@ -779,6 +779,23 @@ shellRun(cmd('vote.edit'), C.get('vote:PG-1')); await flush();""", docs)
         self.assertIn("sd votes add 'CI-9' --motion 'Buy the <crime> policy.' --outcome 'adopted' --belongs-to '/repos/hoa'", out["R"]["addCli"])
         self.assertIn("sd votes edit 'PG-1' --if-revision 1 --outcome 'adopted' --state 'closed' --belongs-to '/repos/hoa'", out["R"]["editCli"])
 
+    def test_editing_one_vote_field_leaves_another_fields_stored_lines_alone(self):
+        # pack sd:8058 review: an <input> drops newlines, so a multiline motion read back changed and an outcome edit
+        # posted the motion stripped too. The form shows each text field as the browser would, then Edit posts only the
+        # field typed.
+        sd_votes.add(self.connection, self.hoa, "PG-1", {"motion": "Approve the hours.\nSecond line.", "notes": "a\nb",
+                                                         "outcome": "pending: not sent"})
+        docs = self.docs()
+        docs["/api/hoa/vote"] = [200, {"vote": {}}]
+        out = self.run_page("""await go('#view=votes');
+const c = cmd('vote.edit'), o = C.get('vote:PG-1');
+FIELD_VALUES = Object.fromEntries(c.fields(o).map(f => [f.name, f.multiline ? f.value : String(f.value || '').replace(/[\\r\\n]/g, '')]));
+FIELD_VALUES.outcome = 'adopted';
+R.multi = c.fields(o).filter(f => f.multiline).map(f => f.name);
+shellRun(c, o); await flush();""", docs)
+        self.assertEqual(out["posts"][0][:2], ["/api/hoa/vote", {"key": "PG-1", "revision": 1, "fields": {"outcome": "adopted"}}])
+        self.assertEqual(out["R"]["multi"], ["topic", "motion", "type", "moved", "seconded", "votes", "outcome", "follow_up", "source", "notes"])
+
     def test_no_vote_and_no_open_vote_say_which(self):
         out = self.run_page("await go('#view=votes'); R.none = ELS['votes-rows'].html;", self.docs())
         self.assertIn("No vote is recorded for the hoa checkout.", out["R"]["none"])
