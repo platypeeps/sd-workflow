@@ -182,6 +182,7 @@
 .queue .pip { display: inline-block; min-width: 1.6rem; margin-right: var(--space-3xs); padding: 2px var(--space-3xs); text-align: center; border: var(--rule-hair) solid var(--color-rule-2); border-radius: var(--radius-sm); font: 400 var(--text-xs)/1.2 var(--font-data); font-variant-numeric: tabular-nums; color: var(--color-muted); }
 .queue .pip.on { border-color: var(--color-accent); color: var(--color-ink); }
 .queue .pip.warn { background: var(--color-warning-lamp); border-color: transparent; color: var(--color-warning-ink); }
+.queue .pip.caution { background: var(--color-caution-lamp); border-color: transparent; color: var(--color-caution-lamp-ink); }
 .queue .act { text-align: right; white-space: nowrap; }
 .queue .act .ctl { display: inline-flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-3xs); vertical-align: middle; }
 .queue .act .ctl .btn .i { margin-right: 0; }
