@@ -441,12 +441,17 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   }
   // pack sd:7859: an item whose pull request waits on review (/api/queue's `prs`) is blocked by its PR, not working: on
   // you (changes requested, failing checks, a comment to answer) needs you; on reviewers waits. It counts in the blocked box.
-  const prFacts = p => html`<b>blocked: PR</b> · on ${p.on} · waited ${dur(p.waited)} since ${at(p.since)}`;
-  const prWaitLink = p => html`<div class="ctl" role="group" aria-label="Pull request of sd:${String(p.item)}"><a class="btn quiet sm" href="${p.url}" target="_blank" rel="noopener noreferrer" aria-label="Open the pull request of sd:${p.item} on GitHub">Open PR</a></div>`;
-  const prRow = p => { const s = p.on === 'you' ? 'warning' : 'queued';
-    return ['blocked', s, html`<tr class="child" data-type="blocked" data-pr="${String(p.item)}">${marker(s, 'blocked')}
-    <td class="what"><a href="${shell.itemHref(p.item)}">#${p.item} ${p.title}</a></td>
-    <td class="detail">${prFacts(p)}</td><td class="num">${dur(p.waited)}</td>
+  // sd:8116: a pull request of yours with no item is a row too, its wait approximate (from GitHub's newest event); a
+  // draft says so; a stale one, read over a day ago, waits on no one until the next read.
+  const prTags = p => `${p.draft ? ' · draft' : ''}${p.approximate ? ' · approx.' : ''}`;
+  const prFacts = p => p.stale ? html`<b>PR not read for a day</b> · last wait since ${at(p.since)}${prTags(p)}`
+    : html`<b>blocked: PR</b> · on ${p.on} · waited ${dur(p.waited)} since ${at(p.since)}${prTags(p)}`;
+  const prName = p => p.item == null ? p.url.split('/').slice(3).join('/') : `sd:${p.item}`;
+  const prWaitLink = p => html`<div class="ctl" role="group" aria-label="Pull request of ${prName(p)}"><a class="btn quiet sm" href="${p.url}" target="_blank" rel="noopener noreferrer" aria-label="Open the pull request of ${prName(p)} on GitHub">Open PR</a></div>`;
+  const prRow = p => { const s = p.stale ? 'unknown' : p.on === 'you' ? 'warning' : 'queued';
+    return ['blocked', s, html`<tr class="child" data-type="blocked" data-pr="${String(p.item ?? p.url)}">${marker(s, 'blocked')}
+    <td class="what">${p.item == null ? html`<a href="${p.url}" target="_blank" rel="noopener noreferrer">${p.title}</a>` : html`<a href="${shell.itemHref(p.item)}">#${p.item} ${p.title}</a>`}</td>
+    <td class="detail">${prFacts(p)}</td><td class="num">${p.stale ? '' : dur(p.waited)}</td>
     <td class="act">${prWaitLink(p)}</td></tr>`, p.on]; };
   // A suggested row (pack sd:7271) is a task: a click shows the Tasks page's Details, and its act is Build on a ready one,
   // else its next status, as on Tasks. Its detail says why it is suggested (pack sd:7314): ready, planned for its due
@@ -488,7 +493,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       if (!G.has(k)) G.set(k, { key: k, host: '', rows: [] });
       G.get(k).rows.push({ type, s, tr, pr });
     };
-    const live = new Map(), prs = ((QV.lanes || {}).prs || {}).rows || [], waits = new Set(prs.map(p => Number(p.item)));
+    const live = new Map(), prs = ((QV.lanes || {}).prs || {}).rows || [], waits = new Set(prs.filter(p => p.item != null).map(p => Number(p.item)));
     // pack sd:7859: an item waiting on its PR is its PR row alone: no live-session, suggested or open row beside it.
     ((ACTIVE || {}).rows || []).filter(r => !waits.has(Number(r.item))).forEach(r => { if (!live.has(r.item)) live.set(r.item, []); live.get(r.item).push(r); });
     live.forEach((rows, item) => add(rows[0].repo, liveRow(item, rows)));
@@ -496,7 +501,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     B.runs.forEach(r => { r.items.forEach(m => held.add(m.assignment)); add(r.repo, runRow(r)); });
     ((QV.runner || {}).live || []).filter(a => !held.has(a.id)).forEach(a => add(a.repo, asgRow(a)));
     // A prepared entry and its item's PR wait are one row (pack sd:7859): the lane's, leading with the wait.
-    const waitOf = new Map(prs.map(p => [Number(p.item), p])), drawn = new Set();
+    const waitOf = new Map(prs.filter(p => p.item != null).map(p => [Number(p.item), p])), drawn = new Set();
     (QV.lanes ? QV.lanes.lanes : []).forEach(l => { l.rows.forEach(r => {
       const p = r.state === 'blocked' && r.status === 'prepared' ? waitOf.get(Number(r.item)) : undefined;
       if (p) drawn.add(p);

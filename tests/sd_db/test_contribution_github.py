@@ -102,6 +102,20 @@ class PullCollection(unittest.TestCase):
         self.assertEqual([row["kind"] for row in result["events"]], ["converted_to_draft", "label_added"])
         self.assertEqual(result["blocking_labels"], [])
 
+    def test_a_review_request_names_the_asked_user_and_a_force_push_is_read(self):
+        """sd:8116 (c): the author asking a reviewer again, and a force push, date the pull request's last turn."""
+        api = Api()
+        graphql: dict = api.rows["graphql"]  # type: ignore[assignment]
+        graphql["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"] = [
+            {"__typename": "HeadRefForcePushedEvent", "id": "push:1", "actor": {"databaseId": 1, "login": "operator"}, "createdAt": AT},
+            {"__typename": "ReviewRequestedEvent", "id": "ask:1", "actor": {"databaseId": 1, "login": "operator"}, "createdAt": AT,
+             "requestedReviewer": {"databaseId": 2}},
+            {"__typename": "ReviewRequestedEvent", "id": "ask:2", "actor": {"databaseId": 1, "login": "operator"}, "createdAt": AT,
+             "requestedReviewer": {}}]
+        events = api.observation()["events"]
+        self.assertEqual([(row["kind"], row.get("reviewer_id")) for row in events],
+                         [("pushed", None), ("review_requested", "2"), ("review_requested", None)])
+
     def test_null_actor_refuses_complete_snapshot(self):
         api = Api()
         api.rows[ROOT + "/issues/7/comments?per_page=100"] = [{"id": 5, "user": None, "body": "hello", "updated_at": AT}]

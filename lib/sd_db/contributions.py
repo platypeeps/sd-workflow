@@ -50,9 +50,11 @@ OBSERVED = {"github:": "pull_url", "issue:": "issue_url"}
 # One event vocabulary for both sources. `closed_completed` and
 # `closed_not_planned` carry the close reason GitHub reports as a field; a
 # pull request has no reason and no issue is ever converted to draft.
+# `review_requested` (with the asked user's `reviewer_id`) and `pushed` (a force push) date a pull request's last
+# turn (sd:8116); neither is ever attention.
 EVENTS = frozenset({"comment", "label_added", "label_removed", "converted_to_draft", "ready_for_review",
-                    "closed", "closed_completed", "closed_not_planned", "reopened"})
-ISSUE_EVENTS = EVENTS - {"converted_to_draft", "ready_for_review"}
+                    "closed", "closed_completed", "closed_not_planned", "reopened", "review_requested", "pushed"})
+ISSUE_EVENTS = EVENTS - {"converted_to_draft", "ready_for_review", "review_requested", "pushed"}
 # An issue observation carries none of these; one that does was read as a pull.
 #: The reason an item's open draft pull request reads `awaiting_you` (pack sd:7868).
 DRAFTED = "Draft pull request: mark it ready for review"
@@ -474,10 +476,17 @@ def _pull_attention(observation: dict, previous: dict, contexts: dict[str, str])
     context = [_event(identifier, why.replace("-", " ").capitalize()) for why, identifier in contexts.items()]
     if str(observation["author"]["id"]) != operator:
         return context, previous.get("ci_baseline")
+    # The author asking for review again answers what came before (sd:8116, aura#831): a reviewer's changes request
+    # before the author asked that reviewer again, and any comment before the author's newest request.
+    asked = [(_moment(event["at"]), str(event.get("reviewer_id"))) for event in observation["events"]
+             if event["kind"] == "review_requested" and str(event["actor_id"]) == operator]
+    answered = max((at for at, _ in asked), default=None)
     latest = {}
     for position, review in enumerate(observation["reviews"]):
         actor = str(review["actor_id"])
         if actor == operator or review["state"] not in {"APPROVED", "CHANGES_REQUESTED", "DISMISSED"}:
+            continue
+        if any(at > _moment(review["at"]) and reviewer == actor for at, reviewer in asked):
             continue
         order = (_moment(review["at"]), position)
         if actor not in latest or order > latest[actor][0]:
@@ -502,6 +511,8 @@ def _pull_attention(observation: dict, previous: dict, contexts: dict[str, str])
         if str(event["actor_id"]) == operator:
             continue
         kind = event["kind"]
+        if kind == "comment" and answered and _moment(event["at"]) < answered:
+            continue
         reason = None
         if kind == "comment" and (event.get("maintainer") is True or event.get("mentions_operator") is True):
             reason = "Maintainer comment" if event.get("maintainer") else "Mentioned you"
@@ -1121,33 +1132,84 @@ def pr_waits(connection, *, now=None, errors: list[str] | None = None) -> list[d
     open in a waiting lane, `on` who it waits on (`you`, `reviewers`) and `since` when that lane began. With
     `errors`, an item whose metadata is malformed is said there and skipped (sd:7863); without, it fails the read.
     `mine` is `operator_pull` of the pull request's observation: True, False, or None when not known (sd:8084).
+
+    `stale` is a pull request whose newest reading is older than a day: it is no current wait (`open` False), and its
+    last span ends at that reading. `draft` is the operator's open draft (`_drafted`). An observed pull request of the
+    operator's that no item names is a row too (`_unlinked`, sd:8116): `item` None, `approximate` True.
     """
     end = now or datetime.now(timezone.utc).isoformat(timespec="seconds")
-    found = []
+    found, linked = [], set()
     for row, metadata in _registered(connection, errors):
         url = metadata.get("pull_url")
         if not url:
             continue
+        linked.add(url)
         notes = lane_notes(connection, row["id"], url)
         if not notes:
             continue
+        observation = snapshot(connection, "github:" + url)["observation"] or {}
+        last = notes[-1]
+        stale = last["state"] == "open" and _stale(observation, end)
+        cap = observation["observed_at"] if stale and _moment(observation["observed_at"]) > _moment(last["at"]) \
+            else last["at"] if stale else end
         spans = {"you": 0, "reviewers": 0}
         for note, after in zip(notes, [*notes[1:], None], strict=True):
             who = "you" if note["lane"] in ON_YOU else "reviewers" if note["lane"] in ON_REVIEWERS else None
             if who and note["state"] == "open":  # a closed or merged pull request waits on no one
-                spans[who] += _seconds(note["at"], after["at"] if after else end)
-        last = notes[-1]
+                spans[who] += _seconds(note["at"], after["at"] if after else cap)
         opened = next((index for index, note in enumerate(notes) if note["state"] == "open"), len(notes))
         merged = next((note for note in notes[opened:] if note["lane"] == "merged" or note["state"] == "merged"), None)
-        waiting = last["state"] == "open" and (last["lane"] in ON_YOU or last["lane"] in ON_REVIEWERS)
+        waiting = last["state"] == "open" and (last["lane"] in ON_YOU or last["lane"] in ON_REVIEWERS) and not stale
         found.append({"item": row["id"], "title": row["title"], "repo": row["repo"], "status": row["status"],
                       "url": url, "lane": last["lane"], "state": last["state"], "open": waiting,
                       "on": ("you" if last["lane"] in ON_YOU else "reviewers") if waiting else None,
                       "since": last["at"], "waited": _seconds(last["at"], end) if waiting else None,
                       "on_you": spans["you"], "on_reviewers": spans["reviewers"],
                       "to_merge": _seconds(notes[opened]["at"], merged["at"]) if merged else None,
-                      "mine": operator_pull(snapshot(connection, "github:" + url)["observation"])})
-    return sorted(found, key=lambda value: (value["since"], value["item"]), reverse=True)
+                      "mine": operator_pull(observation), "approximate": False,
+                      "draft": last["state"] == "open" and _drafted(observation), "stale": stale})
+    found += _unlinked(connection, linked, end)
+    return sorted(found, key=lambda value: (value["since"], value["item"] or 0), reverse=True)
+
+
+def _stale(observation: dict, end: str) -> bool:
+    """Whether the newest reading is older than a day at `end`: what it says may have changed since (sd:8116)."""
+    observed = observation.get("observed_at")
+    return bool(observed) and (_moment(end) - _moment(observed)).total_seconds() > STALE_SECONDS
+
+
+def _unlinked(connection, linked: set[str], end: str) -> list[dict]:
+    """The operator's open pull requests (`operator_pull`) observed with no item naming them (sd:8116), as waits.
+
+    No lane note holds their history, so the wait is one span: from the newest event the reading shows (a review, a
+    comment, a review request, a push), else the shadow's `created_at`, else the reading, to `end`: `approximate`.
+    A stale reading's span ends at the reading and is no current wait. No item is made for any.
+    """
+    found = []
+    checkpoints = _latest(connection, "checkpoint", "contribution:github:")
+    for key in checkpoints:
+        source = snapshot(connection, key[len("contribution:"):], checkpoints)
+        url = _observed_url(source["key"])
+        observation = source["observation"] or {}
+        if source.get("moved_to") or url in linked or observation.get("state") != "open" or not operator_pull(observation):
+            continue
+        drafted = _drafted(observation)
+        lane, _ = _lane([source], observation, url, False, source.get("dismissed"), drafted)
+        if lane not in ON_YOU and lane not in ON_REVIEWERS:
+            continue
+        times = [entry["at"] for name in ("reviews", "events") for entry in observation.get(name) or [] if entry.get("at")]
+        since = max(times, key=_moment) if times else _shadow_times(connection, url).get("created_at") \
+            or observation.get("observed_at") or end
+        stale = _stale(observation, end)
+        who = "you" if lane in ON_YOU else "reviewers"
+        span = _seconds(since, observation["observed_at"] if stale else end)
+        found.append({"item": None, "title": observation.get("title") or url, "repo": observation.get("repo"),
+                      "status": None, "url": url, "lane": lane, "state": "open", "open": not stale,
+                      "on": None if stale else who, "since": stamp(since),
+                      "waited": None if stale else span, "on_you": span if who == "you" else 0,
+                      "on_reviewers": span if who == "reviewers" else 0, "to_merge": None, "mine": True,
+                      "approximate": True, "draft": drafted, "stale": stale})
+    return found
 
 
 def operator_pull(observation) -> bool | None:
@@ -1181,8 +1243,9 @@ def _projection_row(heartbeats, row, metadata, sources) -> dict:
     active.sort(key=lambda a: (0 if any(e["kind"] == "newly_unblocked" for s in sources if s["key"] == a["key"] for e in s["attention"]) else 1, a["key"]))
     primary = active[0] if active else {"key": source["key"], "revision": source["revision"], "event_ids": [], "reasons": []}
     waiting = bool(metadata.get("blocked_on") or metadata.get("depends_on"))
-    # An item's open draft the operator wrote waits on them to mark it ready, not on reviewers (pack sd:7868).
-    drafted = bool(row.get("id")) and _drafted(observation)
+    # An open draft the operator wrote waits on them to mark it ready, not on reviewers (pack sd:7868), linked to an
+    # item or not (sd:8116).
+    drafted = _drafted(observation)
     lane, needs_you = _lane(sources, observation, url, waiting, dismissed, drafted)
     try:
         verified = _local_proof(metadata)

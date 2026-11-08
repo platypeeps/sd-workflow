@@ -405,13 +405,15 @@ def runner(connection) -> dict:
 #: left its pull request open, so its wait still shows.
 LANED = ("merging", "next", "blocked", "landed")
 #: What the page reads of each pull-request wait (`contributions.pr_waits`).
-PR_FIELDS = ("item", "title", "repo", "url", "lane", "on", "since", "waited")
+PR_FIELDS = ("item", "title", "repo", "url", "lane", "on", "since", "waited", "approximate", "draft", "stale")
 
 
 def pr_rows(connection, lanes: list[dict], clock: float) -> dict:
     """Pack sd:7859: each item whose linked pull request is open in a waiting lane, `{"rows", "error"}`.
 
-    An item with a lane row in `LANED` keeps its lane state and is left out; so is a `done` one. A
+    A pull request of the operator's with no item is a row too, `item` None (sd:8116); a `stale` one, whose reading is
+    over a day old, is a row that says so and waits on no one. An item with a lane row in `LANED` keeps its lane state
+    and is left out; so is a `done` one. A
     blocked row that stopped `prepared` waits on review: its item is a row here, and the page draws the two as one.
     A read that failed is its `error` and no rows, never an empty answer; an item it skipped is named in `error`
     beside the other rows (sd:7863).
@@ -427,7 +429,8 @@ def pr_rows(connection, lanes: list[dict], clock: float) -> dict:
     except READ_FAILURES as error:
         return {"rows": [], "error": f"pull-request waits were not read: {type(error).__name__}: {error}"}
     return {"rows": [{key: wait[key] for key in PR_FIELDS} for wait in waits
-                     if wait["open"] and wait["status"] != "done" and wait["item"] not in laned],
+                     if (wait["open"] or wait["stale"]) and wait["status"] != "done"
+                     and (wait["item"] is None or wait["item"] not in laned)],
             "error": f"pull-request waits skipped {'; '.join(skipped)}" if skipped else ""}
 
 
