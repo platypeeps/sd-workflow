@@ -761,23 +761,26 @@
     }, e => { toast(`${o.label}${e && e.unknown ? '' : ' not changed'}: ${whyOf(e)}`); return false; }); // unknown: no answer (sd:8033)
   }
   // A bulk run waits for every run, then toasts once: how many landed, which rows the server refused as stale (a 409: the
-  // page reads them again), and which did not change, each with its reason (sd:3012). Its Undo reverses only the rows that
-  // landed, waits for each, and says how many of the group were reversed and which were not.
+  // page reads them again), which did not change, and which got no answer, so whether they changed is not known (an
+  // unknown rejection, sd:8033, sd:8037), each with its reason (sd:3012). Its Undo reverses only the rows that landed,
+  // waits for each, and says how many of the group were reversed and which were not.
   function settleBulk(c, objs, results, { toast, plural }) {
     return Promise.allSettled(results.map(r => Promise.resolve(r))).then(rs => {
-      const landed = [], stale = [], failed = [];
+      const landed = [], stale = [], failed = [], unknown = [];
       rs.forEach((r, i) => r.status === 'fulfilled' ? landed.push({ o: objs[i], v: r.value })
-        : (r.reason && r.reason.stale ? stale : failed).push({ o: objs[i], why: whyOf(r.reason) }));
-      const of = n => `${n} of ${objs.length}`;
+        : (r.reason && r.reason.stale ? stale : r.reason && r.reason.unknown ? unknown : failed).push({ o: objs[i], why: whyOf(r.reason) }));
+      const of = n => `${n} of ${objs.length}`, named = xs => xs.map(x => `${x.o.label} (${x.why})`).join(', ');
       const text = `${c.label} · ${plural(landed.length, c.on)}${stale.length ? ` · ${of(stale.length)} refused stale, read again: ${stale.map(x => x.o.label).join(', ')}` : ''}`
-        + (failed.length ? ` · ${of(failed.length)} not changed: ${failed.map(x => `${x.o.label} (${x.why})`).join(', ')}` : '');
+        + (failed.length ? ` · ${of(failed.length)} not changed: ${named(failed)}` : '')
+        + (unknown.length ? ` · ${of(unknown.length)} outcome not known: ${named(unknown)}` : '');
       const undo = c.risk === 'undo' && c.undo && landed.length ? () => Promise.allSettled(inTurn(landed, x => c.undo(x.o, x.v))).then(us => {
-        const not = stale.concat(failed).map(x => `${x.o.label} (its change did not land)`).concat(us.map((u, i) => u.status === 'rejected' ? `${landed[i].o.label} (${whyOf(u.reason)})`
+        const not = stale.concat(failed).map(x => `${x.o.label} (its change did not land)`)
+          .concat(unknown.map(x => `${x.o.label} (whether its change landed is not known)`)).concat(us.map((u, i) => u.status === 'rejected' ? `${landed[i].o.label} (${whyOf(u.reason)})`
           : u.value === false ? `${landed[i].o.label} (nothing to reverse)` : '').filter(Boolean));
         toast(`${c.label} undone · ${objs.length - not.length} of ${objs.length} reversed${not.length ? ` · not reversed: ${not.join(', ')}` : ''}`);
       }) : null;
       toast(text, undo);
-      return { landed: landed.length, stale: stale.length, failed: failed.length };
+      return { landed: landed.length, stale: stale.length, failed: failed.length, unknown: unknown.length };
     });
   }
   // build (sd:2590): a command with batch(objs, done) takes the whole group in one call.
@@ -853,14 +856,18 @@
   body.append(confirmDlg); trap(confirmDlg);
   // Confirm: one dialog for every irreversible, force or large bulk action. It names the target and shows the command.
   // confirm:start
-  // fields: [{ name, label, required, placeholder, help, options }], text the command needs from the operator (a reason, a path), as the
+  // fields: [{ name, label, required, placeholder, help, options, multiline }], text the command needs from the operator (a reason, a path), as the
   // design source's shell has them (sd:2200). The line under them follows what is typed (cli(values)). OK stays off while a
   // required field is empty or spaces only, and the close asks again, so no path runs the command without its text. Enter in a
   // field is OK, not the form's first button, which is Keep and would drop what was typed (the design's sd:2369).
   // A field with options ([{ value, label }]) is a choice, not text: a select whose first option is the default (sd:3450),
   // or the option whose value is the field's value (pack sd:7708).
   // A text field's value, when given, is typed in already and can be changed (sd:3523).
-  const fieldOf = f => html`<label class="label" for="cf-${f.name}">${f.label}</label>${f.options
+  // multiline: true is a textarea (pack sd:8058 review): an <input> drops a value's newlines, so stored text with lines
+  // came back changed and a write sent it stripped. Enter in it is a new line; OK stays the button.
+  const fieldOf = f => html`<label class="label" for="cf-${f.name}">${f.label}</label>${f.multiline
+    ? html`<textarea class="cap-in" id="cf-${f.name}" name="${f.name}" rows="3" spellcheck="false"${f.required ? html` required aria-required="true"` : ''}${f.placeholder ? html` placeholder="${f.placeholder}"` : ''}${f.help ? html` aria-describedby="${`cf-${f.name}-help`}"` : ''}>${f.value || ''}</textarea>`
+    : f.options
     ? html`<select class="cap-in" id="cf-${f.name}" name="${f.name}"${f.help ? html` aria-describedby="${`cf-${f.name}-help`}"` : ''}>${f.options.map(x => html`<option value="${x.value}"${x.value === f.value ? html` selected` : ''}>${x.label}</option>`)}</select>`
     : html`<input class="cap-in" id="cf-${f.name}" name="${f.name}" autocomplete="off" spellcheck="false"${f.required ? html` required aria-required="true"` : ''} value="${f.value || ''}" placeholder="${f.placeholder || ''}"${f.help ? html` aria-describedby="${`cf-${f.name}-help`}"` : ''}>`}${f.help ? html`<p id="cf-${f.name}-help">${f.help}</p>` : ''}`;
   function confirmAction({ title, body: text = '', cli = '', ok = 'Confirm', keep = 'Keep it', danger = true, fields = [] }) {
