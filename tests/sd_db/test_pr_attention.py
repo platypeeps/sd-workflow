@@ -1,13 +1,15 @@
 """Pull requests that need the operator, filed as report alerts after a shadow sync (sd:6712)."""
 
 import json
+import os
 import re
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
-from sd_db import connect, initialise, pr_attention
+from sd_db import connect, initialise, pr_attention, shadow_jira
 from sd_db.shadow_sync import _sync
 from sd_db.writes import add_note, resolve_note
 
@@ -80,6 +82,12 @@ class Alerts(unittest.TestCase):
         initialise(Path(self.tmp.name) / "sd.db")
         self.db = connect(Path(self.tmp.name) / "sd.db")
         self.addCleanup(self.db.close)
+
+    def test_a_github_sync_with_jira_configured_asks_jira_nothing(self):
+        env = {"JIRA_BASE_URL": "https://jira.example.test", "JIRA_EMAIL": "me@example.test", "JIRA_API_TOKEN": "token"}
+        with mock.patch.dict(os.environ, env), mock.patch.object(shadow_jira, "_http") as http:
+            _sync(self.db, now=NOW, runner=Gh(), alerts=True)
+        http.assert_not_called()
 
     def run_(self, gh, now=NOW):
         found, complete, reason = pr_attention.read(gh, now=now)
@@ -322,13 +330,14 @@ class Alerts(unittest.TestCase):
         result = _sync(self.db, now=NOW, runner=Gh(requested=[pull(7)]), alerts=True)
         self.assertTrue(result.ok, result.reason)
         self.assertIn("shadow sync: pull request alerts: 1 filed, 0 cleared, 1 state(s) open", result.report())
+        self.assertIn("shadow sync: issue alerts: 0 filed, 0 cleared, 0 state(s) open", result.report())
         quiet = _sync(self.db, now=NOW, runner=Gh(requested=[pull(7)]))
         self.assertEqual(quiet.attention, [], "a run that does not ask files nothing")
         self.db.execute("CREATE TRIGGER refuse BEFORE INSERT ON state WHEN NEW.key = 'pr-attention:seen' "
                         "BEGIN SELECT RAISE(ABORT, 'disk full'); END")
         result = _sync(self.db, now=NOW, runner=Gh(requested=[pull(8)]), alerts=True)
         self.assertTrue(result.ok, result.reason)
-        self.assertEqual(result.attention, ["pull request alerts not filed: disk full"])
+        self.assertEqual(result.attention[0], "pull request alerts not filed: disk full")
 
 
 if __name__ == "__main__":

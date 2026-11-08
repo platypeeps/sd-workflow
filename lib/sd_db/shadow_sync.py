@@ -1126,7 +1126,7 @@ def _sync(
 
     _validate_limits(max_requests, max_seconds)
     if tracker == "jira":
-        return _sync_jira(connection, moment, runner, since)
+        return _sync_jira(connection, moment, runner, since, alerts=alerts, max_seconds=max_seconds)
     planned = contribution_sync.plan(connection)
     budget = _SearchBudget(max_requests, time.monotonic() + max_seconds)
     # Existing work must still refresh when a large search consumes its slice.
@@ -1235,7 +1235,8 @@ def _sync(
         )
     contribution_sync.dispatch_pending(connection, notifier=notifier, keys=detail["completed_keys"],
                                        deadline=budget.deadline)
-    attention = _pr_attention(connection, runner, moment, budget) if alerts else []
+    attention = _pr_attention(connection, runner, moment, budget) + _issue_attention(connection, runner, moment, budget) \
+        if alerts else []
     return Synced(
         ok=result.ok,
         reason=result.reason,
@@ -1278,7 +1279,38 @@ def _pr_attention(connection: sqlite3.Connection, runner, moment: datetime, budg
     return lines
 
 
-def _sync_jira(connection: sqlite3.Connection, moment: datetime, transport, since) -> Synced:
+def _issue_attention(connection: sqlite3.Connection, runner, moment: datetime, budget: _SearchBudget) -> list[str]:
+    """`issue_attention` after the sync, as report lines (sd:8142): a side observation, as `_pr_attention` is."""
+    from . import issue_attention
+
+    left = budget.deadline - time.monotonic()
+    if budget.remaining < 1 or left <= 0:
+        return ["issue alerts not read: the sync spent its request or time limit"]
+    budget.remaining -= 1
+    budget.requests += 1
+    try:
+        found, unread, reason = issue_attention.read_github(connection, runner, timeout=min(GH_TIMEOUT_SECONDS, left))
+    except (SdDbError, sqlite3.Error, OSError, ValueError) as error:
+        return [f"issue alerts not filed: {error}"]
+    return _issue_alerts(connection, found, unread, reason, moment)
+
+
+def _issue_alerts(connection: sqlite3.Connection, found: dict, unread: set, reason: str, moment: datetime) -> list[str]:
+    """File what one tracker's read found, as report lines."""
+    from . import issue_attention
+
+    try:
+        done = issue_attention.alert(connection, found, unread, now=moment)
+    except (SdDbError, sqlite3.Error, OSError, ValueError) as error:
+        return [f"issue alerts not filed: {error}"]
+    lines = [f"issue alerts: {len(done['filed'])} filed, {len(done['cleared'])} cleared, {len(found)} state(s) open"]
+    if reason:
+        lines.append(f"issue alerts: read incomplete, those states not cleared: {reason}")
+    return lines + [f"issue alerts: {problem}" for problem in done["problems"]]
+
+
+def _sync_jira(connection: sqlite3.Connection, moment: datetime, transport, since, *, alerts: bool = False,
+               max_seconds: float = MAX_SECONDS) -> Synced:
     """Jira's sync: the GitHub shape with every GitHub-only stage left out.
 
     An unconfigured Jira is not a failure of the run. It writes the heartbeat
@@ -1319,6 +1351,15 @@ def _sync_jira(connection: sqlite3.Connection, moment: datetime, transport, sinc
         moves = jira_moves.run(connection, transport)
     except Exception as error:  # noqa: BLE001 - a side step never fails the sync
         moves = [f"jira moves: not run: {type(error).__name__}: {error}"]
+    if alerts:
+        from . import issue_attention
+
+        try:
+            found, unread, reason = issue_attention.read_jira(connection, transport=transport,
+                                                              deadline=time.monotonic() + max_seconds)
+            moves = moves + _issue_alerts(connection, found, unread, reason, moment)
+        except (SdDbError, sqlite3.Error, OSError, ValueError) as error:
+            moves = moves + [f"issue alerts not filed: {error}"]
     return Synced(
         ok=result.ok,
         reason=result.reason,

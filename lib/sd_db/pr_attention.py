@@ -233,15 +233,15 @@ def read(runner=None, *, timeout: float = 60, now: datetime | None = None) -> tu
     return found, not problems, "; ".join(problems)
 
 
-def _open_alerts(connection: sqlite3.Connection) -> dict[str, int]:
+def _open_alerts(connection: sqlite3.Connection, job: str = JOB) -> dict[str, int]:
     rows = connection.execute("SELECT id, fields FROM item WHERE kind = 'report' AND source = 'cron-report' "
-                              "AND status != 'done' AND external_id > ? AND external_id < ?", (JOB + ":", JOB + ";"))
+                              "AND status != 'done' AND external_id > ? AND external_id < ?", (job + ":", job + ";"))
     return {json.loads(row["fields"])["report"]["attention_basis"]: row["id"] for row in rows}
 
 
-def _seen(connection: sqlite3.Connection) -> set[str]:
+def _seen(connection: sqlite3.Connection, key: str = SEEN_KEY) -> set[str]:
     row = connection.execute("SELECT body FROM state WHERE kind = 'heartbeat' AND key = ? ORDER BY id DESC LIMIT 1",
-                             (SEEN_KEY,)).fetchone()
+                             (key,)).fetchone()
     return set(json.loads(row["body"]).get("seen") or []) if row else set()
 
 
@@ -267,25 +267,32 @@ def _clear(connection: sqlite3.Connection, item: int) -> bool:
     return True
 
 
-def alert(connection: sqlite3.Connection, found: dict[str, dict], complete: bool, *, now: datetime) -> dict:
-    """File a report per state new since the last read; acknowledge each open one that cleared (only on a complete read)."""
+def alert(connection: sqlite3.Connection, found: dict[str, dict], complete: bool, *, now: datetime, job: str = JOB,
+          seen_key: str = SEEN_KEY, labels: dict[str, str] = LABELS, unread=frozenset(), quiet=frozenset()) -> dict:
+    """File a report per state new since the last read; acknowledge each open one that cleared (only on a complete read).
+
+    `job`, `seen_key` and `labels` let `issue_attention` run the same flow (sd:8142). A state named in `unread` was
+    not read, so its alerts stand as a cut read's do. A basis in `quiet` is recorded as seen and files nothing.
+    """
     when = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    seen, filed, cleared, problems = _seen(connection), [], [], []
+    seen, filed, cleared, problems = _seen(connection, seen_key), [], [], []
+    held = {basis for basis in seen if basis.split(" ", 1)[0] in unread}
     for basis, pull in sorted(found.items()):
-        if basis in seen:
+        if basis in seen or basis in quiet:
             continue
-        label = LABELS[pull["state"]]
+        label = labels[pull["state"]]
+        name = pull.get("name") or f"{pull['repo']}#{pull['number']}"
         try:
-            reporting.ingest(connection, job=JOB, run_id=f"{when}:{basis}"[:160], started=when, ended=when, exit_code=0,
-                             text=f"{pull['repo']}#{pull['number']} {pull['title']}: {label}\n{pull['url']}\n",
+            reporting.ingest(connection, job=job, run_id=f"{when}:{basis}"[:160], started=when, ended=when, exit_code=0,
+                             text=f"{name} {pull['title']}: {label}\n{pull['url']}\n",
                              source_path="sd shadow sync", attention=True, attention_basis=basis,
-                             grade=f"{pull['repo']}#{pull['number']}: {label}")
+                             grade=f"{name}: {label}")
             filed.append(basis)
         except (workflow.WorkflowError, sqlite3.Error) as error:
             problems.append(f"{basis}: {error}")
     if complete:
-        for basis, item in _open_alerts(connection).items():
-            if basis in found:
+        for basis, item in _open_alerts(connection, job).items():
+            if basis in found or basis.split(" ", 1)[0] in unread:
                 continue
             try:
                 if _clear(connection, item):
@@ -293,6 +300,6 @@ def alert(connection: sqlite3.Connection, found: dict[str, dict], complete: bool
             except (workflow.WorkflowError, sqlite3.Error) as error:
                 problems.append(f"{basis}: {error}")
     # A cut read keeps what it did not see: a pull it missed is not a pull whose state cleared.
-    kept = (seen if not complete else set()) | {basis for basis in found if basis in seen or basis in filed}
-    record_state(connection, "heartbeat", key=SEEN_KEY, timestamp=when, body={"seen": sorted(kept)})
+    kept = (seen if not complete else held) | {basis for basis in found if basis in seen or basis in filed or basis in quiet}
+    record_state(connection, "heartbeat", key=seen_key, timestamp=when, body={"seen": sorted(kept)})
     return {"filed": filed, "cleared": cleared, "problems": problems}
