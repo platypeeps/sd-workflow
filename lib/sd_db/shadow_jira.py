@@ -365,9 +365,10 @@ def _http(url: str, headers: dict[str, str], body: dict | None):
         # nosec B310: `collect` builds `url` from `settings()`, which admits an
         # https base only, and `_RefuseRedirects` keeps it on that URL.
         with opener.open(request, timeout=TIMEOUT_SECONDS) as response:  # nosec B310
-            # A transition answers 204 with no body (sd:8117): empty is `{}`, not a failure.
+            # A transition answers 204 with no body (sd:8117): only that is `{}`. Any other
+            # empty body fails `json.loads` below, a `Transient` failure, not an answer.
             data = response.read().decode()
-            return (json.loads(data) if data.strip() else {}), ""
+            return ({} if response.status == 204 and body is not None else json.loads(data)), ""
     except urllib.error.HTTPError as error:
         error.close()
         if error.code in (401, 403):

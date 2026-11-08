@@ -594,6 +594,20 @@ class TheEmptyAnswer(unittest.TestCase):
         self.addCleanup(server.close)
         self.assertEqual(_http(server.url + "/rest/api/3/issue/ABC-7/transitions", {}, {"transition": {}}), ({}, ""))
 
+    def test_an_empty_body_where_json_is_required_is_a_transient_failure(self):
+        # Review: only the transition's 204 may be empty; an empty 200 to a read is no answer, so it holds the cursor.
+        cases = [(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", None),
+                 (b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n \r\n", None),
+                 (b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n", None),
+                 (b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n", {"transition": {}})]
+        for reply, body in cases:
+            with self.subTest(reply=reply[:16], post=body is not None):
+                server = RawServer(reply)
+                self.addCleanup(server.close)
+                payload, error = _http(server.url + "/rest/api/3/issue/ABC-7/transitions", {}, body)
+                self.assertIsNone(payload)
+                self.assertIsInstance(error, shadow_jira.Transient)
+
     def test_a_nest_too_deep_to_parse_is_a_failed_request(self):
         deep = b"[" * 200000
         server = RawServer(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(deep) + deep)
