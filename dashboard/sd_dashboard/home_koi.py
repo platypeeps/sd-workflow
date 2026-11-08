@@ -229,16 +229,15 @@ def document(connection, *, now: str, environ=None, timeout: float = TIMEOUT) ->
 
 def log_water(payload: dict, *, now: str, environ=None, timeout: float = TIMEOUT):
     """`POST /api/home/koi/water {}`: write Home Assistant's changes the pond's log lacks; `{added}`."""
-    from sd_db import assets
-
     from . import home_screen
 
     if payload:
         raise ValueError("Send {}: the changes come from Home Assistant.")
 
     def write(connection):
-        pond = _pond(connection)
-        if pond is None:
+        from sd_db.database import transaction
+
+        if _pond(connection) is None:
             return 409, {"error": "No pond yet: add a pond on the Map first."}
         entities, reason = _entities(connection)
         if not entities:
@@ -248,30 +247,43 @@ def log_water(payload: dict, *, now: str, environ=None, timeout: float = TIMEOUT
         except home_screen._Failed as failed:
             return 503, {"error": failed.reason}
         live = changes(history, entities)
-        fields = dict(pond["fields"])
-        log = list(fields.get("water_log") or [])
-        seen = {row.get("at") for row in log}
-        added = [row for row in live if row["at"] not in seen]
-        if added:
-            fields["water_log"] = log + added
-        last = fields.get("water_synced") if isinstance(fields.get("water_synced"), dict) else {}
-        gaps = [gap for gap in fields.get("water_gaps") or []
-                if (age := _gap_age(gap, _when(now).date())) is not None and age < GAP_DAYS]
-        if gap := _uncovered(last, now=now):
-            gaps.append(gap)
-        since = last.get("since") if isinstance(last.get("since"), str) else None
-        proven = (_when(now) - timedelta(days=KEEP_DAYS)).isoformat()
-        fields["water_synced"] = {"since": since or proven, "to": _when(now).isoformat()}
-        if gaps:
-            fields["water_gaps"] = gaps
-        else:
-            fields.pop("water_gaps", None)
-        if fields != pond["fields"]:
-            assets.save_asset(connection, asset=pond["id"], kind="pond", name=pond["name"], geometry=pond["geometry"],
-                              photo=pond["photo"], fields=fields, kinds=assets.ALL_KINDS)
-        return {"added": len(added)}
+        # sd:8076: the pond is read again after Home Assistant's wait, and read and saved in one transaction, so a test
+        # or an edit written while the history was read is kept.
+        with transaction(connection):
+            return _merge(connection, live, now=now)
 
     return write
+
+
+def _merge(connection, live: list[dict], *, now: str):
+    """Write `live`'s changes the pond's log lacks and the sync window, on the pond as it is now; `{added}`."""
+    from sd_db import assets
+
+    pond = _pond(connection)
+    if pond is None:
+        return 409, {"error": "No pond yet: add a pond on the Map first."}
+    fields = dict(pond["fields"])
+    log = list(fields.get("water_log") or [])
+    seen = {row.get("at") for row in log}
+    added = [row for row in live if row["at"] not in seen]
+    if added:
+        fields["water_log"] = log + added
+    last = fields.get("water_synced") if isinstance(fields.get("water_synced"), dict) else {}
+    gaps = [gap for gap in fields.get("water_gaps") or []
+            if (age := _gap_age(gap, _when(now).date())) is not None and age < GAP_DAYS]
+    if gap := _uncovered(last, now=now):
+        gaps.append(gap)
+    since = last.get("since") if isinstance(last.get("since"), str) else None
+    proven = (_when(now) - timedelta(days=KEEP_DAYS)).isoformat()
+    fields["water_synced"] = {"since": since or proven, "to": _when(now).isoformat()}
+    if gaps:
+        fields["water_gaps"] = gaps
+    else:
+        fields.pop("water_gaps", None)
+    if fields != pond["fields"]:
+        assets.save_asset(connection, asset=pond["id"], kind="pond", name=pond["name"], geometry=pond["geometry"],
+                          photo=pond["photo"], fields=fields, kinds=assets.ALL_KINDS)
+    return {"added": len(added)}
 
 
 def log_test(payload: dict, *, now: str):
@@ -283,15 +295,20 @@ def log_test(payload: dict, *, now: str):
     if not payload or not set(payload) <= set(TESTS) or not all(
             type(value) in (int, float) and math.isfinite(value) for value in payload.values()):
         raise ValueError(f"Send one or more of {', '.join(TESTS)}, each a number.")
-    reading = {"date": now[:10], **{test: payload[test] for test in TESTS if test in payload}}
+    # sd:8076: the day the test was taken where the pond is, the machine's zone, not UTC's.
+    day = _when(now).astimezone().date().isoformat()
+    reading = {"date": day, **{test: payload[test] for test in TESTS if test in payload}}
 
     def write(connection):
-        pond = _pond(connection)
-        if pond is None:
-            return 409, {"error": "No pond yet: add a pond on the Map first."}
-        tests = list(pond["fields"].get("tests") or []) + [reading]
-        assets.save_asset(connection, asset=pond["id"], kind="pond", name=pond["name"], geometry=pond["geometry"],
-                          photo=pond["photo"], fields={**pond["fields"], "tests": tests}, kinds=assets.ALL_KINDS)
-        return {"tests": len(tests)}
+        from sd_db.database import transaction
+
+        with transaction(connection):
+            pond = _pond(connection)
+            if pond is None:
+                return 409, {"error": "No pond yet: add a pond on the Map first."}
+            tests = list(pond["fields"].get("tests") or []) + [reading]
+            assets.save_asset(connection, asset=pond["id"], kind="pond", name=pond["name"], geometry=pond["geometry"],
+                              photo=pond["photo"], fields={**pond["fields"], "tests": tests}, kinds=assets.ALL_KINDS)
+            return {"tests": len(tests)}
 
     return write

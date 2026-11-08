@@ -71,6 +71,45 @@ class TheMap(ScreenCase):
         self.assertEqual(doc["state"], "partial")
         self.assertIn("address locator did not answer", doc["reason"])
 
+    def test_a_malformed_locator_answer_names_what_is_wrong(self):
+        """sd:8076: a reply that is not a list of candidates, a location without numbers, or an ArcGIS error is named,
+        not raised and not called no match."""
+        writes.set_setting(self.connection, home_map.KEY, ADDRESS)
+        for answer, said in (({"candidates": ["x"]}, "not a list of candidates"),
+                             ({"candidates": {"address": "x"}}, "not a list of candidates"),
+                             ({"candidates": [{"location": {"x": None, "y": 1}}]}, "no numeric x and y"),
+                             ({"candidates": [{"location": {"x": "a", "y": 1}}]}, "no numeric x and y"),
+                             ({"candidates": [{"location": {"x": True, "y": 1}}]}, "no numeric x and y"),
+                             ({"error": {"code": 498, "message": "Invalid token"}}, "answered an error: 498 Invalid token"),
+                             (["not", "an", "object"], "not a JSON object")):
+            with self.subTest(answer=answer), mock.patch.object(home_map, "_get", return_value=json.dumps(answer).encode()):
+                with self.assertRaises(LookupError) as raised:
+                    home_map.place(ADDRESS)
+                self.assertIn(said, str(raised.exception))
+        self.assertFalse((home_map._cache(ADDRESS) / "place.json").exists())
+
+    def test_a_cached_aerial_that_is_not_a_jpeg_is_fetched_again(self):
+        writes.set_setting(self.connection, home_map.KEY, ADDRESS)
+        home_map.place(ADDRESS)
+        cached = home_map._cache(ADDRESS) / "aerial.jpg"
+        cached.write_bytes(b"<html>half")
+        self.assertEqual(home_map.aerial(ADDRESS), JPEG)
+        self.assertEqual(cached.read_bytes(), JPEG)
+
+    def test_a_failed_cache_write_leaves_no_half_aerial_and_still_answers(self):
+        """sd:8076: the aerial is written to a temp file and renamed, so a cut write never stands as the cache."""
+        writes.set_setting(self.connection, home_map.KEY, ADDRESS)
+        home_map.place(ADDRESS)
+
+        def cut(path, data):
+            with open(path, "wb") as out:
+                out.write(data[:3])
+            raise OSError("disk full")
+
+        with mock.patch.object(Path, "write_bytes", cut):
+            self.assertEqual(home_map.aerial(ADDRESS), JPEG)
+        self.assertFalse((home_map._cache(ADDRESS) / "aerial.jpg").exists())
+
     def test_the_setting_takes_one_line(self):
         self.assertEqual(home_map.parse(f"# home\n{ADDRESS}\n"), (ADDRESS, []))
         self.assertEqual(home_map.parse("a\nb")[0], None)

@@ -3287,10 +3287,6 @@ class TheMergeAndCiPolicyBackfill(SchemaCase):
         self.assertEqual(self.migrate_through(self.VERSION).applied, [self.VERSION])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TheHomeAssetTable(SchemaCase):
     """Migration 49 (pack sd:8053): `home_asset` arrives empty, nothing else
     moves, and the hand-run reverse returns the file to 48."""
@@ -3309,3 +3305,7 @@ class TheHomeAssetTable(SchemaCase):
         raw.executescript(reverse)
         self.assertEqual(schema_version(raw), 48)
         self.assertNotIn("home_asset", tables(raw))
+
+
+if __name__ == "__main__":
+    unittest.main()
