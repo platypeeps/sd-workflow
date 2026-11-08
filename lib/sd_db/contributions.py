@@ -1153,7 +1153,8 @@ def pr_waits(connection, *, now=None, errors: list[str] | None = None) -> list[d
 def unlinked_pr_waits(connection, *, now=None) -> list[dict]:
     """Each open pull request no item links that names the operator (sd:8142), as `pr_waits` rows with `item` None.
 
-    The contribution observations hold every pull the shadow sweeps found, an item's or not. The operator's own
+    The contribution observations hold every pull `contribution_sync.refresh` admits (`OBSERVED_WHY`): the
+    operator's, and another's the review-requested or mentioned sweep found, an item's or not. The operator's own
     waits on them when its lane is `ON_YOU`, else on reviewers. Another's waits on them when it asks their review
     by name (`operator_pull`) or @mentions them (`why` holds `mentioned`); a team-only request is no row. `since`
     is when GitHub opened it, as the shadow read it, else when it was observed.

@@ -272,6 +272,11 @@ def note_lanes(connection) -> list[str]:
     return said
 
 
+#: The sweep buckets whose pulls are observed: the operator's own, and another's that asks their review or
+#: @mentions them, so Queue's PR waits see both directions (sd:8142). Assigned alone is no pull of theirs.
+OBSERVED_WHY = frozenset({"author", "review-requested", "mentioned"})
+
+
 def refresh(connection, planned, issues, *, client, observed_at, search_complete=False, reserve=0,
             reserve_seconds=0):
     """Stage discovered work durably, then collect details until the budget runs out.
@@ -293,7 +298,7 @@ def refresh(connection, planned, issues, *, client, observed_at, search_complete
     additions = [{"key": "github:" + github.canonical_url(row["url"]), "url": github.canonical_url(row["url"]), "why": row.get("why", []),
                   "blocking_labels": [], "explicit": False} for row in issues
                  if row.get("kind") == "pull" and github.PULL.fullmatch(row["url"])
-                 and ("author" in row.get("why", []) or "github:" + github.canonical_url(row["url"]) in known)]
+                 and (OBSERVED_WHY & set(row.get("why", [])) or "github:" + github.canonical_url(row["url"]) in known)]
     for index, row in enumerate(additions):
         current = known.get(row["key"])
         if current is not None:
