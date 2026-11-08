@@ -482,6 +482,25 @@ class BinaryMaterialTests(ReviewFixture):
         self.assertIn("[encoding] old utf-8; new utf-16-le, BOM\n", moved)
         self.assertIn("+new words\n", moved)
 
+    def test_a_native_reader_covers_a_material_readers_screenshot(self):
+        # sd:8060: a lane prepare stopped at 1/2 on every branch with a PNG. codex
+        # read the repository; claude saw the PNG only as a hash and was voided.
+        self.one_reader_per_tier(2)
+        root = self.make_repo()
+        (root / "shot.png").write_bytes(self.SHOT)
+        registry = self.registry_home / ".local/share/sd/providers.yaml"
+        registry.write_text(registry.read_text().replace("roles: [author, reviewer], reader: codex-json",
+                                                         "roles: [author, reviewer], reader: claude-json"))
+        answer = sd_review.Completed(0, json.dumps({"type": "result", "subtype": "success",
+                                                   "structured_output": {"findings": []}}), "")
+        result = sd_review.review(root, namespace(), FakeRunner({"second": answer}),
+                                  self.environment(), self.chatgpt_home())
+        outcomes = {row["backend"]: row for row in result["outcomes"]}
+        self.assertEqual((result["status"], result["completed_reviews"]), ("clean", 2), outcomes)
+        self.assertEqual(outcomes["second"]["diagnostic"]["omitted_paths"], ["shot.png"])
+        self.assertEqual(outcomes["second"]["status"], "clean")
+        self.assertIn("coverage is partial", outcomes["second"]["detail"])
+
     def test_a_native_reader_completes_a_screenshot_review(self):
         root = self.make_repo()
         (root / "shot.png").write_bytes(self.SHOT)

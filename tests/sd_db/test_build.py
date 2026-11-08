@@ -1528,6 +1528,17 @@ class Hosts(Case):
         record_state(self.db, "heartbeat", key="build-dispatch@work", body={"pid": 1, "why": ""})
         self.assertEqual(len(build.queue(self.db, [item], who="operator")), 1, "a beat that claims takes the press")
 
+    def test_a_press_queues_on_a_fresh_beat_whose_count_did_not_read(self):
+        """sd:8055: an unread load or builder count lasts one tick (15 of 265 beats under load), so the press
+        queues and the satellite claims at its next counted beat; the Builds panel names the reason."""
+        for why in build.UNREAD:
+            with self.subTest(why=why):
+                item = self.item(repo=SAT)
+                record_state(self.db, "heartbeat", key="build-dispatch@work", body={"pid": 1, "why": why})
+                lead = build.queue(self.db, [item], who="operator")[0]["id"]
+                self.assertEqual(build.unclaimed(self.db), {str(lead): f"work claims nothing: {why}"})
+                self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (lead,))
+
     def test_a_queued_row_whose_satellite_claims_nothing_stays_queued(self):
         """Review round 5: a `why` may last one tick (an unread load), so the hub's claim blocks only on a stale beat."""
         item = self.item(repo=SAT)
