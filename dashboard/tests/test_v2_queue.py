@@ -312,6 +312,23 @@ class TheRows(Lane, ScreenCase):
                          [(mine, "you", "2026-09-06T11:00:00+00:00", 3600), (theirs, "reviewers", "2026-09-06T10:00:00+00:00", 7200)])
         self.assertEqual(prs["rows"][0]["url"], url)
 
+    def test_an_unlinked_pull_request_says_what_the_wait_rests_on(self):
+        """sd:8116: the wait runs from GitHub's newest event, marked approximate; a linked one is one row."""
+        from sd_db.writes import record_state
+
+        linked, _ = self.pr_item(910, ("2026-09-06T10:00:00Z", "awaiting_them"))
+        url = "https://github.com/example/system/pull/911"
+        record_state(self.connection, "checkpoint", key="contribution:github:" + url, body={"observation": {
+            "operator": {"id": "1", "login": "operator"}, "author": {"id": "1", "login": "someone"},
+            "requested_reviewers": [], "reviews": [], "state": "open", "draft": False, "title": "Unlinked 911",
+            "observed_at": "2026-09-06T11:30:00Z", "repo": "example/system",
+            "events": [{"id": "c", "actor_id": "2", "kind": "comment", "at": "2026-09-06T11:00:00Z"}]}})
+        self.connection.commit()
+        rows = self.doc()["prs"]["rows"]
+        self.assertEqual([(r["item"], r["url"][-3:]) for r in rows], [(linked, "910"), (None, "911")])
+        self.assertEqual((rows[1]["on"], rows[1]["waited"], rows[1]["approximate"], rows[1]["stale"]),
+                         ("reviewers", 3600, True, False))
+
     def test_an_item_in_the_lane_keeps_its_lane_row_not_a_pr_row(self):
         item, _ = self.pr_item(904, ("2026-09-06T10:00:00Z", "awaiting_them"))
         self.list([*self.entries(), {"item": item, "title": "In the lane", "status": "pending", "expected_head": "e" * 40}])
@@ -1242,7 +1259,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
 
     def test_repos_order_by_merging_then_the_other_counts_then_name(self):
         # pack sd:7679 (operator 2026-11-05): the busiest repo first, compared box by box in the boxes' order (merging,
-        # working, next, blocked, suggested), each most first; a tie goes by repo name. A row's state does not order it.
+        # review, working, next, blocked, suggested; pack sd:8137), each most first; a tie goes by repo name. A row's state does not order it.
         def asg(n, repo):
             return {**self.RUNNER["live"][0], "id": n, "item": n, "repo": repo}
         runner = {"live": self.RUNNER["live"] + [asg(n, "/repos/many") for n in (81, 82, 83, 84)]
@@ -1280,17 +1297,17 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         return found.group(1, 2, 3)
 
     BOX = {"merging": "merging: claimed by the lane runner, being merged",
+           "review": "review: pull requests waiting on a review, 0 on you, 0 on reviewers",
            "working": "working: live sessions, build runs and lane gates now running",
            "next": "next: queued in the lane, not started",
            "blocked": "blocked: stopped in the lane until someone acts",
-           "review": "review: pull requests waiting on a review, 0 on you, 0 on reviewers",
            "suggested": "suggested: up to 9 ready or planned tasks to do next"}
 
     def test_each_box_says_its_count_and_what_it_counts_on_hover(self):
         # Pack sd:7383: the native title names the count and the meaning; the aria-label stays.
         out = self.run_view("open('system'); R.html = ELS.queue.html;")
         titles = re.findall(r'<span class="pip[^"]*" title="([^"]*)">', self.repo_detail(out["R"]["html"], "system")[2])
-        self.assertEqual(titles, [f"{n} {self.BOX[k]}" for n, k in zip((1, 3, 2, 2, 0, 4), self.BOX, strict=True)])
+        self.assertEqual(titles, [f"{n} {self.BOX[k]}" for n, k in zip((1, 0, 3, 2, 2, 4), self.BOX, strict=True)])
 
     def test_each_repo_row_counts_working_merging_next_blocked_review_and_suggested_in_six_boxes(self):
         # pack sd:7470: merging is the leftmost box (operator 2026-11-04).
@@ -1303,20 +1320,21 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         out = self.run_view("R.closed = ELS.queue.html; press('ended'); press('suggested'); open('system');"
                             " R.open = ELS.queue.html; R.tally = ELS['queue-tally'].html;")
         # Pack sd:7383: each box also carries its count and meaning in its title.
-        system = ' aria-label="1 merging, 3 working, 2 next, 2 blocked, 0 review, 4 suggested"', \
-            (f'<span class="pip on" title="1 {self.BOX["merging"]}">1</span><span class="pip on" title="3 {self.BOX["working"]}">3</span>'
+        system = ' aria-label="1 merging, 0 review, 3 working, 2 next, 2 blocked, 4 suggested"', \
+            (f'<span class="pip on" title="1 {self.BOX["merging"]}">1</span><span class="pip" title="0 {self.BOX["review"]}">0</span>'
+             f'<span class="pip on" title="3 {self.BOX["working"]}">3</span>'
              f'<span class="pip on" title="2 {self.BOX["next"]}">2</span><span class="pip warn" title="2 {self.BOX["blocked"]}">2</span>'
-             f'<span class="pip" title="0 {self.BOX["review"]}">0</span>'
              f'<span class="pip on" title="4 {self.BOX["suggested"]}">4</span>')
-        alpha = ' aria-label="0 merging, 1 working, 0 next, 0 blocked, 0 review, 0 suggested"', \
-            f'<span class="pip" title="0 {self.BOX["merging"]}">0</span><span class="pip on" title="1 {self.BOX["working"]}">1</span>' + "".join(
-                f'<span class="pip" title="0 {self.BOX[k]}">0</span>' for k in ("next", "blocked", "review", "suggested"))
+        alpha = ' aria-label="0 merging, 0 review, 1 working, 0 next, 0 blocked, 0 suggested"', \
+            (f'<span class="pip" title="0 {self.BOX["merging"]}">0</span><span class="pip" title="0 {self.BOX["review"]}">0</span>'
+             f'<span class="pip on" title="1 {self.BOX["working"]}">1</span>') + "".join(
+                f'<span class="pip" title="0 {self.BOX[k]}">0</span>' for k in ("next", "blocked", "suggested"))
         for html in (out["R"]["closed"], out["R"]["open"]):
             # pack sd:8138: each box sits in its toggle button; the boxes themselves are unchanged.
             for key, want in (("system", system), ("alpha", alpha)):
                 extra, attrs, body = self.repo_detail(html, key)
                 self.assertEqual((extra, attrs, re.sub(r"</?button[^>]*>", "", body)), (" pipe", *want))
-        self.assertEqual(re.sub(r"<[^>]*>", "", self.repo_detail(out["R"]["closed"], "system")[2]), "132204", "the text tally is gone")
+        self.assertEqual(re.sub(r"<[^>]*>", "", self.repo_detail(out["R"]["closed"], "system")[2]), "103224", "the text tally is gone")
         self.assertRegex(out["R"]["tally"], r"<span>\d+ working</span>", "the page's tally stays")
 
     def test_the_boxes_recount_on_the_30_s_read_and_on_a_read_after_a_build_starts(self):
@@ -1336,7 +1354,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
             " refresh(); await flush(); await flush(); await flush(); await flush(); R.reread = label();",
             before="var TICKS = []; setInterval = f => TICKS.push(f);\n")
         self.assertEqual((out["R"]["first"], out["R"]["tick"], out["R"]["reread"]),
-                         tuple(f"0 merging, {n} working, 0 next, 0 blocked, 0 review, 0 suggested" for n in (1, 2, 3)))
+                         tuple(f"0 merging, 0 review, {n} working, 0 next, 0 blocked, 0 suggested" for n in (1, 2, 3)))
 
     def test_a_lane_that_was_not_read_counts_nothing_and_says_so(self):
         # A failed read is not zero (sd:7272): a repo whose lane was not read says so in place of its boxes.
@@ -1402,7 +1420,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                            out["R"]["html"], re.S)
         self.assertEqual(found, [("60", "ready · P1"), ("80", "planned for 2026-09-20 · P2 · planning"),
                                  ("81", "unscheduled P0 · planning"), ("82", "unscheduled · ready")])
-        self.assertIn('aria-label="1 merging, 3 working, 2 next, 2 blocked, 0 review, 4 suggested"', out["R"]["html"])
+        self.assertIn('aria-label="1 merging, 0 review, 3 working, 2 next, 2 blocked, 4 suggested"', out["R"]["html"])
         self.assertEqual(out["R"]["build"], "a build takes a ready task; this one is planning")
 
     def test_suggested_leaves_out_an_item_with_no_repo_so_no_unassociated_group_shows(self):
@@ -1500,7 +1518,35 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertIn('<span class="sr">waiting · </span>blocked', rows["44"])
         self.assertIn("<b>blocked: PR</b> · on reviewers · waited 2h 1m", rows["44"])
         self.assertEqual(out["R"]["kids"].count("working"), 2, "the lane builders stay; the live item is gone")
-        self.assertIn('aria-label="1 merging, 2 working, 2 next, 2 blocked, 2 review, 0 suggested"', html)
+        self.assertIn('aria-label="1 merging, 2 review, 2 working, 2 next, 2 blocked, 0 suggested"', html)
+
+    def test_an_unlinked_pull_request_row_says_approx_and_draft(self):
+        """sd:8116: a draft and an approximate wait say so on the row."""
+        lanes = queue_screen.document(self.connection, now=NOW)
+        lanes["prs"] = {"error": "", "rows": [
+            {"item": None, "title": "Unlinked", "repo": "example/system", "url": "https://github.com/example/system/pull/5",
+             "lane": "awaiting_you", "on": "you", "since": "2026-09-06T11:00:00+00:00", "waited": 3600,
+             "approximate": True, "draft": True, "stale": False}]}
+        out = self.run_view("open('system'); R.html = ELS.queue.html;", answers={"/api/queue": [200, lanes]})
+        row = re.search(r'<tr class="child" data-type="blocked" data-pr="https://github.com/example/system/pull/5">(.*?)</tr>',
+                        out["R"]["html"], re.S)[1]
+        self.assertIn("<b>blocked: PR</b> · on you · waited 1h 0m", row)
+        self.assertIn(" · draft · approx.", row)
+
+    def test_a_stale_pull_request_row_says_so_and_counts_in_no_box(self):
+        """sd:8116 (a): a reading over a day old waits on no one: no review or blocked count and no lamp; the row says so."""
+        lanes = queue_screen.document(self.connection, now=NOW)
+        lanes["prs"] = {"error": "", "rows": [
+            {"item": None, "title": "Old", "repo": "~/repos/example/solo", "url": "https://github.com/example/solo/pull/5",
+             "lane": "awaiting_you", "on": None, "since": "2026-09-01T11:00:00+00:00", "waited": None,
+             "approximate": True, "draft": False, "stale": True}]}
+        out = self.run_view("R.closed = ELS.queue.html; open('solo'); R.open = ELS.queue.html; R.tally = ELS['queue-tally'].html;",
+                            answers={"/api/queue": [200, lanes]})
+        self.assertEqual(self.repo_detail(out["R"]["closed"], "solo")[1],
+                         ' aria-label="0 merging, 0 review, 0 working, 0 next, 0 blocked, 0 suggested"')
+        self.assertIn("<b>PR not read for a day</b>", out["R"]["open"])
+        self.assertNotIn("PR review", out["R"]["tally"])
+        self.assertIn("<span>2 blocked</span>", out["R"]["tally"], "only the fixture's two lane rows count")
 
     def test_pr_review_waits_count_split_on_you_and_on_reviewers(self):
         # pack sd:8005 (operator 2026-11-07): PR waits folded into the blocked box and the tally with lane failures.
@@ -1530,12 +1576,29 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
              "lane": "awaiting_you", "on": "you", "since": "2026-09-06T11:00:00+00:00", "waited": 3600}]}
         out = self.run_view("R.html = ELS.queue.html;", answers={"/api/queue": [200, lanes]})
         extra, attrs, body = self.repo_detail(out["R"]["html"], "solo")
-        self.assertEqual(attrs, ' aria-label="0 merging, 0 working, 0 next, 0 blocked, 1 review, 0 suggested"')
+        self.assertEqual(attrs, ' aria-label="0 merging, 1 review, 0 working, 0 next, 0 blocked, 0 suggested"')
         boxes = re.findall(r'<span class="pip([^"]*)" title="([^"]*)">(\d+)</span>', body)
-        self.assertEqual([(c, n) for c, _, n in boxes], [("", "0"), ("", "0"), ("", "0"), ("", "0"), (" caution", "1"), ("", "0")])
-        self.assertEqual(boxes[4][1], "1 review: pull requests waiting on a review, 1 on you, 0 on reviewers")
+        self.assertEqual([(c, n) for c, _, n in boxes], [("", "0"), (" caution", "1"), ("", "0"), ("", "0"), ("", "0"), ("", "0")])
+        self.assertEqual(boxes[1][1], "1 review: pull requests waiting on a review, 1 on you, 0 on reviewers")
         solo = re.search(r'<tr class="repo" data-repo="solo".*?</tr>', out["R"]["html"], re.S).group(0)
         self.assertIn('<td class="num"></td>', solo, "the box says it; the num cell repeats nothing")
+
+    def test_the_review_box_stands_after_merging_and_before_working(self):
+        # pack sd:8137 (operator 2026-11-08): merging, review, working, next, blocked, suggested, in the boxes and
+        # the label. The review box keeps its caution lamp when a PR waits on you (ruling #49051), and not otherwise.
+        def wait(on):
+            return {"item": 90, "title": "Waits", "repo": "~/repos/example/solo", "url": "https://github.com/example/solo/pull/90",
+                    "lane": "awaiting_you", "on": on, "since": "2026-09-06T11:00:00+00:00", "waited": 3600}
+        for on, lamp in (("you", " caution"), ("reviewers", " on")):
+            with self.subTest(on=on):
+                lanes = queue_screen.document(self.connection, now=NOW)
+                lanes["prs"] = {"error": "", "rows": [wait(on)]}
+                html = self.run_view("R.html = ELS.queue.html;", answers={"/api/queue": [200, lanes]})["R"]["html"]
+                extra, attrs, body = self.repo_detail(html, "solo")
+                self.assertEqual(attrs, ' aria-label="0 merging, 1 review, 0 working, 0 next, 0 blocked, 0 suggested"')
+                boxes = re.findall(r'<span class="pip([^"]*)" title="\d+ (\w+):', body)
+                self.assertEqual(boxes, [("", "merging"), (lamp, "review"), ("", "working"), ("", "next"), ("", "blocked"),
+                                         ("", "suggested")])
 
     # pack sd:8138 (operator 2026-11-08): a repo row's count tiles filter its sub-rows.
     TILE = ("const tile = (repo, t, disabled = false) => ELS.queue.listeners.click[0]({ target: { closest: s =>"
@@ -1566,7 +1629,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         out = self.run_view(self.TILE + " R.before = pressed('system'); tile('system', 'working'); R.working = pressed('system');"
                             " tile('system', 'next'); R.next = pressed('system'); open('system'); R.closed = pressed('system');"
                             " open('system'); R.reopened = kids();")
-        boxes = ["merging", "working", "next", "blocked", "review", "suggested"]
+        boxes = ["merging", "review", "working", "next", "blocked", "suggested"]
         self.assertEqual(out["R"]["before"], [f"{b}:false" for b in boxes])
         self.assertEqual(out["R"]["working"], [f"{b}:{str(b == 'working').lower()}" for b in boxes])
         self.assertEqual(out["R"]["next"], [f"{b}:{str(b == 'next').lower()}" for b in boxes], "another tile switches")
@@ -1624,7 +1687,9 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         from sd_db import contributions
 
         url = f"https://github.com/{repo}/pull/{number}"
-        observed = {"complete": True, "observed_at": "2026-09-06T11:00:00Z", "operator": {"id": "1", "login": "operator"},
+        # sd:8116: `pr_rows` reads the real clock in these tests, and a reading over a day old is no current wait.
+        observed = {"complete": True, "observed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "operator": {"id": "1", "login": "operator"},
                     "author": {"id": author, "login": f"user{author}"}, "repo": repo, "title": f"Pull {number}",
                     "state": state, "head": "a" * 40, "base": "b" * 40, "draft": draft, "mergeable": "mergeable",
                     "ci": "pending", "ci_head": "a" * 40, "ci_ids": [], "why": list(why),
@@ -1655,7 +1720,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                                  named: (None, "example/anvil", "you")})
         out = self.run_view("open('anvil'); R.html = ELS.queue.html; R.tally = ELS['queue-tally'].html;")
         extra, attrs, body = self.repo_detail(out["R"]["html"], "anvil")
-        self.assertEqual(attrs, ' aria-label="0 merging, 0 working, 0 next, 0 blocked, 3 review, 0 suggested"')
+        self.assertEqual(attrs, ' aria-label="0 merging, 3 review, 0 working, 0 next, 0 blocked, 0 suggested"')
         row = re.search(r'<tr class="child" data-type="blocked" data-pr="' + re.escape(named) + r'">(.*?)</tr>',
                         out["R"]["html"], re.S).group(1)
         self.assertIn(f'<a href="{named}" target="_blank" rel="noopener noreferrer">example/anvil#3 Pull 3</a>', row)
@@ -1710,8 +1775,8 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         contributions.observe_pull(self.connection, url, observed, expected_revision=contributions.snapshot(
             self.connection, "github:" + url)["revision"])
         self.connection.commit()
-        out = self.run_view("const names = [...ELS.queue.html.matchAll(/data-repo=\"([^\"]*)\"/g)].map(m => m[1]);"
-                            " for (const n of names) open(n); R.open = ELS.queue.html;")
+        # pack sd:8137: a review box sorts its repo high, so open the one repo, not each in turn.
+        out = self.run_view("open('anvil'); R.open = ELS.queue.html;")
         rows = dict(re.findall(r'<tr class="child" data-type="blocked" data-pr="(\d+)">(.*?)</tr>', out["R"]["open"],
                                re.S))
         self.assertIn(str(item), rows, out["R"]["open"][-3000:])
@@ -1761,7 +1826,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
 
     def test_a_suggested_row_acts_with_build_and_build_reads_the_plan_first(self):
         item, answers = self.suggested()
-        plan = {"read": NOW, "budget_minutes": 60, "refused": [], "room": {"machine": 4, "why": "", "cap": 6, "repo_cap": 3},
+        plan = {"read": NOW, "budget_minutes": 60, "refused": [], "room": {"machine": 4, "why": "", "cap": 6, "repo_cap": 1},
                 "bundles": [{"repo": str(self.checkout), "name": "system", "room": 2, "model": "opus", "branch": "build/sd-1",
                              "items": [{"id": item, "title": "Ship the pickup", "revision": "c" * 64}]}]}
         answers[f"/api/tasks/build/plan?items={item}"] = [200, plan]

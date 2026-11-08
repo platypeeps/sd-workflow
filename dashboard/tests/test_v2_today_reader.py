@@ -824,7 +824,7 @@ R.keys = S.CHOICES.map(c => [c.id, c.label]);""")
     def test_snooze_is_one_command_per_row_that_asks_which_time(self):
         """sd:3450: one Snooze in the row's menu, key z, whose dialog offers the three times; the next 08:00 is the default."""
         out = self.run_page("""ANSWER = (path, body) => path === '/api/now' ? [200, DOC0] : [200, { key: 'k', until: body.until }];
-R.repo = REG.filter(c => c.on === 'repo').map(c => [c.id, c.label, c.key]);
+R.repo = REG.filter(c => c.on === 'repo' && !c.id.startsWith('today.broken.')).map(c => [c.id, c.label, c.key]);
 R.fields = cmd('repo.snooze').fields(C.get('ahead:pushy:1'));
 shellRun(cmd('repo.snooze'), C.get('ahead:pushy:1')); await flush();
 R.until = new Date(OUT.posts[0][1].until); R.at8 = [R.until.getHours(), R.until.getMinutes()];
@@ -1036,6 +1036,11 @@ const DARK = s => ({ rank: 0, kind: 'dark', id: `dark:${s}`, what: `${s} could n
 """
 
 
+# Details' Act bar, as shell.js's bar draws it: a button per live command on the row's type, from the one registry.
+BAR = """C.bar = id => { const o = C.get(id); return mk`<div class="actions">${REG.filter(c => c.on === o.type && (!c.when || c.when(o) === true)).map(c => mk`<button data-cmd="${c.id}">${c.label}</button>`)}</div>`; };
+"""
+
+
 # A row's icon actions, as shell.js's rowActions draws them with { icons: true }: every live command that has an icon.
 ICONS = """const icons = id => { const o = C.get(id); return REG.filter(c => c.on === o.type && (!c.when || c.when(o) === true) && c.icon).map(c => [c.id, c.label, c.icon]); };
 OUT.drawn = {}; C.rowActions = (id, opt) => { OUT.drawn[id] = !!(opt && opt.icons); return mk``; };
@@ -1053,8 +1058,9 @@ class TheNowFix(ReaderCase):
         self.assertEqual({(icon, key) for _, icon, key in out["R"]["fix"]}, {("bot", "f")}, out["R"]["fix"])
 
     def test_a_job_and_a_pull_request_show_their_own_command_not_fix(self):
+        # pack sd:8113: a broken row with no Fix of its own gains review-and-fix; a job's act stays Run now.
         out = self.run_page(ACT + """DOC0.needs.push(PR, DARK('prs')); refresh(); await flush();
-R.fix = REG.filter(c => c.label === 'Fix').map(c => c.on);
+R.fix = REG.filter(c => c.label === 'Fix' && !c.id.startsWith('today.broken.')).map(c => c.on);
 R.acts = ['job:nightly-sync:7', 'pr:example/project#4:4', 'dark:prs', 'ahead:pushy:1'].map(act);""")
         self.assertNotIn("job", out["R"]["fix"])
         self.assertNotIn("pull request", out["R"]["fix"])
@@ -1068,6 +1074,30 @@ R.drawn = OUT.drawn; R.jobs = icons('dark:jobs'); R.prs = icons('dark:prs');""")
         self.assertIn(["collector.fix", "Fix", "bot"], out["R"]["jobs"])
         self.assertNotIn("collector.fix", [c for c, _, _ in out["R"]["prs"]])
         self.assertIn(["collector.sync", "Re-run collector", "rotate-ccw"], out["R"]["prs"])
+
+    def test_a_broken_row_with_no_fix_gains_one_on_the_row_and_in_details(self):
+        """pack sd:8113: a broken row no Fix serves (the pull request collector) shows review-and-fix among its icons and
+        in Details; one with its own Fix (another collector) shows exactly one Fix; Fix files and queues the build."""
+        out = self.run_page(BAR + ICONS + ACT + TheList.CLICK + """DOC0.needs.push(DARK('jobs'), DARK('prs')); refresh(); await flush();
+const pick = id => ROWS_EL.listeners.click[0]({ target: { closest: s => s === 'tr[data-id]' ? { dataset: { id } } : null } });
+R.prs = icons('dark:prs'); R.jobs = icons('dark:jobs').filter(c => c[1] === 'Fix');
+pick('dark:prs'); R.det = ELS.details.html; pick('dark:jobs'); R.jobsDet = ELS.details.html;
+const was = ANSWER; ANSWER = (p, b) => p === '/api/items' ? [201, { item: { id: 52 }, revision: 'a'.repeat(64), existing: false, queued: [{ item: 52 }] }] : was(p, b);
+R.said = await REG.find(c => c.id === 'today.broken.fix.collector').run(C.get('dark:prs'));
+ANSWER = (p, b) => p === '/api/items' ? [201, { item: { id: 52 }, revision: 'a'.repeat(64), existing: true }] : was(p, b);
+R.again = await REG.find(c => c.id === 'today.broken.fix.collector').run(C.get('dark:prs'));
+R.posts = OUT.posts.filter(p => p[0] === '/api/items').map(p => p[1]);""")
+        r = out["R"]
+        self.assertIn(["today.broken.fix.collector", "Fix", "bot"], r["prs"])
+        self.assertIn('data-cmd="today.broken.fix.collector"', r["det"])
+        self.assertEqual(r["jobs"], [["collector.fix", "Fix", "bot"]])
+        self.assertEqual(r["jobsDet"].count(">Fix<"), 1)
+        first = r["posts"][0]
+        self.assertEqual((first["ref"], first["build"], first["title"]), ("broken:dark:prs", True, "Review and fix: prs could not be read"))
+        for words in ("What: prs could not be read", "Detail: no reason", "Source: prs"):
+            self.assertIn(words, first["body"])
+        self.assertEqual(r["said"], "Filed sd:52 and queued its build")
+        self.assertEqual(r["again"], "sd:52 is already open for this row; nothing filed")
 
     def test_after_exit_127_print_stays_the_act(self):
         self.doc["needs"][0]["exit"] = 127
@@ -1137,7 +1167,33 @@ R.cmds = REG.filter(c => c.on === 'flaky head' || c.on === 'flaky group').map(c 
                      "<dt>Head</dt><dd>111111111111</dd>", "<dt>Gate failed</dt><dd>2026-09-04 10:00 UTC</dd>",
                      "<dt>Passed</dt><dd>2026-09-04 14:00 UTC · merged</dd>"):
             self.assertIn(fact, r["details"])
-        self.assertEqual(sorted(r["cmds"]), ["flaky head.snooze", "today.flaky.open", "today.flaky.snooze"])
+        self.assertEqual(sorted(r["cmds"]), ["flaky head.snooze", "today.flaky.fix", "today.flaky.fix-all", "today.flaky.open",
+                                             "today.flaky.snooze"])
+
+    def test_fix_on_a_head_and_fix_all_on_the_group_show_in_details_and_post_the_heads(self):
+        """pack sd:8113: a head's Details offer Fix, first; the group's offer Fix all, which asks first. Fix posts
+        /api/items {fix: [row]}; an open item answers `existing`, opens, and files nothing; Fix all posts every head."""
+        beta = "flaky:example/beta:" + "2" * 40
+        out = self.run_page(BAR + ACT + TheList.CLICK + f"""click('rows', 'toggle', 'group:flaky');
+const pick = id => ROWS_EL.listeners.click[0]({{ target: {{ closest: s => s === 'tr[data-id]' ? {{ dataset: {{ id }} }} : null }} }});
+pick('{self.ALPHA}'); R.head = ELS.details.html; R.row = act('{self.ALPHA}');
+pick('group:flaky'); R.group = ELS.details.html;
+const was = ANSWER; ANSWER = (p, b) => p === '/api/items' ? [201, {{ filed: 0, existing: 1, failed: [], results: [{{ row: b.fix[0], item: 41, existing: true }}] }}] : was(p, b);
+R.one = await REG.find(c => c.id === 'today.flaky.fix').run(C.get('{self.ALPHA}'));
+ANSWER = (p, b) => p === '/api/items' ? [201, {{ filed: 1, existing: 0, failed: [{{ row: b.fix[1], error: 'no longer a flaky head of the last week' }}], results: [] }}] : was(p, b);
+try {{ await REG.find(c => c.id === 'today.flaky.fix-all').run(C.get('group:flaky')); }} catch (e) {{ R.all = e.message; }}
+R.ask = REG.find(c => c.id === 'today.flaky.fix-all').askFirst;
+R.items = OUT.posts.filter(p => p[0] === '/api/items').map(p => p[1]);""")
+        r = out["R"]
+        self.assertIn('data-cmd="today.flaky.fix"', r["head"])
+        self.assertLess(r["head"].index('data-cmd="today.flaky.fix"'), r["head"].index('data-cmd="today.flaky.open"'))
+        self.assertEqual(r["row"], ["today.flaky.fix", "Fix", "bot"])
+        self.assertIn('data-cmd="today.flaky.fix-all"', r["group"])
+        self.assertTrue(r["ask"])
+        self.assertEqual(r["items"], [{"fix": [self.ALPHA]}, {"fix": [self.ALPHA, beta]}])
+        self.assertEqual(r["one"], "sd:41 is already open for this head; nothing filed")
+        self.assertEqual(r["all"], "Fix all · 1 filed, 0 already open, 1 failed: example/beta:" + "2" * 40
+                         + ": no longer a flaky head of the last week")
 
     def test_the_lane_lamp_counts_blocked_entries_apart_from_flaky_heads(self):
         out = self.run_page("""const lane = El('div'), val = El('span'); lane.dataset = { src: 'lane' }; lane.querySelector = () => val;

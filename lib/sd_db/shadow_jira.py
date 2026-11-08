@@ -150,6 +150,11 @@ DEFAULT_JQL = (
     "AND {window} ORDER BY updated DESC"
 )
 
+# The open issues whose comments name the operator, whatever their involvement.
+MENTION_JQL = "comment ~ currentUser() AND statusCategory != Done ORDER BY updated DESC"
+# One comment read per issue, so a bound on the requests a mention read spends.
+MENTION_READS = 50
+
 ENV_BASE = "JIRA_BASE_URL"
 ENV_EMAIL = "JIRA_EMAIL"
 ENV_TOKEN = "JIRA_API_TOKEN"
@@ -559,6 +564,56 @@ def normalize(raw: dict, config: dict[str, str], me: str) -> dict | None:
         # From this issue's own fields, so no failed search can leave it unknown.
         "reason": reason_of(why or ["matched"]),
     }
+
+
+def _names(node, account: str) -> bool:
+    """Whether a comment's document body holds a mention of `account`."""
+    if not isinstance(node, dict):
+        return False
+    if node.get("type") == "mention" and (node.get("attrs") or {}).get("id") == account:
+        return True
+    children = node.get("content")
+    return isinstance(children, list) and any(_names(child, account) for child in children)
+
+
+def mentions(*, transport=None, environ=None, deadline: float | None = None) -> tuple[list[dict], bool, str]:
+    """`(rows, complete, reason)`: open issues with a comment @mention since the operator's last comment (sd:8142).
+
+    Not configured is `([], False, "")`: nothing was read, and nothing is wrong. Any other short read names
+    why, and keeps the rows it reached. A failed search or comment read is never "no mention".
+    """
+    config = settings(environ)
+    if missing(config):
+        return [], False, ""
+    me, error = account_id(config, transport)
+    if error:
+        return [], False, error
+    raw, cut, error = search(MENTION_JQL, config, transport)
+    if error or cut:
+        return [], False, error or "the search was cut"
+    if len(raw) > MENTION_READS:
+        return [], False, f"more than {MENTION_READS} open issues name the operator"
+    rows = []
+    for item in raw:
+        row = normalize(item, config, me)
+        if not row:
+            continue
+        if deadline is not None and time.monotonic() >= deadline:
+            return rows, False, "out of time"
+        url = f"{config['base']}/rest/api/3/issue/{urllib.parse.quote(item['key'])}/comment?orderBy=-created&maxResults=100"
+        payload, error = _request(url, config, None, transport)
+        comments = (payload or {}).get("comments")
+        if error or not isinstance(comments, list):
+            return rows, False, error or "Jira answered with no comment list"
+        for comment in comments:
+            if not isinstance(comment, dict):
+                return rows, False, "Jira answered with a malformed comment"
+            if ((comment.get("author") or {}).get("accountId")) == me:
+                break
+            if _names(comment.get("body"), me):
+                rows.append(row)
+                break
+    return rows, True, ""
 
 
 def collect(watermark: str | None, now: datetime, seam=None, environ=None, *,

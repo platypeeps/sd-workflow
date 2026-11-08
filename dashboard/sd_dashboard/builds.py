@@ -18,6 +18,7 @@ exists, `/api/assignments/<lead>/cancel` (`operations.cancel_assignment`), bound
 
 from __future__ import annotations
 
+import functools
 import os
 import sqlite3
 import subprocess
@@ -31,7 +32,8 @@ from sd_db.database import transaction
 from sd_db.errors import SdDbError
 from sd_db.writes import SettingStale, add_note, set_setting, transition
 
-__all__ = ["ENDED_MAX", "JOB", "QUIET_SECONDS", "answer", "kickstart", "panel", "pickup", "plan", "press", "retry"]
+__all__ = ["ENDED_MAX", "JOB", "QUIET_SECONDS", "answer", "file_and_build", "fix_flaky", "kickstart", "panel", "pickup", "plan",
+           "press", "retry"]
 
 #: The local-cron-jobs job that runs `sd assignments dispatch` (system, build-dispatch.job).
 JOB = "build-dispatch"
@@ -189,6 +191,71 @@ def press(payload: dict, *, start=None):
         return answer(connection, queued, start or kickstart)
 
     return write
+
+
+def file_and_build(connection, capture, *, who: str = "dashboard") -> dict:
+    """Fix's file-then-build (pack sd:8113): `capture()` files the task under its ref or answers the open one
+    (`existing`); a new one goes to ready and its build queues as the Build press queues it. A refused build leaves the
+    item filed, ready, and names why in `build_error`; nothing retries it."""
+    state = capture()
+    if state.get("existing"):
+        return state
+    item = state["item"]["id"]
+    state = workflow.change_status(connection, item, "ready", who=who, expected_revision=state["revision"])
+    try:
+        queued = answer(connection, build.queue(connection, [item], who=who), kickstart)
+    except build.BuildRefused as refusal:
+        return {**workflow.item_state(connection, item), "existing": False, "build_error": str(refusal)}
+    return {**workflow.item_state(connection, item), "existing": False, **queued}
+
+
+#: The ask every flaky Fix brief ends with (pack sd:8113).
+FLAKY_ASK = ("Find the failing test from the logs, reproduce it under load (make test SUITE=<suite>), and fix the cause "
+             "fail-first, or quarantine the test with a reason; never a retry loop.")
+
+
+def _flaky_brief(row: dict) -> tuple[str, str]:
+    """A flaky head's task title and body: each failed lane run with its prepare log, the passing run, the ask."""
+    def run(r):
+        return f"- {r['entry']} {r['status']} at {r['at']}: " + (f"{r['log']} on {r['host'] or 'the lane host'}"
+                                                                   if r["log"] else "no prepare log recorded")
+
+    title = f"Flaky test in {row['repo']} at {row['head'][:12]}: investigate and fix"
+    body = "\n".join([f"The gate failed {len(row['runs'])}x at head {row['head']} in {row['repo']}, then passed at it.",
+                      "", "Failed lane runs:", *map(run, row["runs"]), "", "Passing run:", run(row["pass_run"]), "",
+                      FLAKY_ASK])
+    return title, body
+
+
+def fix_flaky(connection, rows: list[str], *, now: str, capture) -> dict:
+    """`POST /api/items {"fix": [<flaky row id>, ...]}`: one task per head, each filed and built alone, so a failure on
+    one names it and the rest still file. `capture(connection, ref=, title=, body=, repo=)` files or answers the open item.
+    """
+    from sd_db.errors import SdDbError
+
+    from .now_screen import flaky_rows
+
+    heads = {row["id"]: row for row in flaky_rows(connection, now)[0]}
+    results, failed = [], []
+    for ident in rows:
+        try:
+            row = heads.get(ident)
+            if row is None:
+                raise ValueError(f"{ident} is no longer a flaky head of the last week")
+            owner = workflow.item_state(connection, row["item"])["item"] if row.get("item") else None
+            if not owner or not owner.get("repo"):
+                raise ValueError(f"the lane entry at {row['head'][:12]} names no repository through its item")
+            title, body = _flaky_brief(row)
+            with transaction(connection):
+                state = file_and_build(connection, functools.partial(capture, connection, ref=ident, title=title,
+                                                                     body=body, repo=owner["repo"]))
+            if state.get("build_error"):
+                raise ValueError(f"filed sd:{state['item']['id']}, but its build did not queue: {state['build_error']}")
+            results.append({"row": ident, "item": state["item"]["id"], "existing": bool(state.get("existing"))})
+        except (ValueError, SdDbError, build.BuildRefused) as error:
+            failed.append({"row": ident, "error": str(error)})
+    return {"filed": sum(not r["existing"] for r in results), "existing": sum(r["existing"] for r in results),
+            "failed": failed, "results": results}
 
 
 def _waiting(connection, run: dict, items: list[int]) -> str:

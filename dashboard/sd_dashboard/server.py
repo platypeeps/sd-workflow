@@ -227,6 +227,16 @@ GITHUB_REF = re.compile(r"github:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+#[1-9][0-9]{0,9}
 DEPENDABOT_REF = re.compile(r"dependabot:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 #: A Health doctor row's ref (pack sd:6684): `doc:<hash>` as `doctor:<hash>`, filed in the system repo, reused alike.
 DOCTOR_REF = re.compile(r"doctor:[0-9a-f]{12}")
+#: Today's Fix on a flaky head (pack sd:8113): `flaky:<owner>/<repo>:<head>`, reused while its item is open.
+FLAKY_REF = re.compile(r"flaky:[A-Za-z0-9._-]+/[A-Za-z0-9._-]+:[0-9a-f]{7,40}")
+#: Today's Fix on a broken Needs you row with no fix of its own (pack sd:8113): `broken:<row id>`, reused alike.
+BROKEN_REF = re.compile(r"broken:[\w.:/@#-]{1,200}")
+
+
+def _reused(ref) -> bool:
+    """A ref whose open item a second Fix answers instead of filing anew; a done one gives the ref up."""
+    return isinstance(ref, str) and any(pattern.fullmatch(ref) for pattern in (DEPENDABOT_REF, DOCTOR_REF, FLAKY_REF,
+                                                                                BROKEN_REF))
 
 
 def capture_ref(connection, *, ref, who, **values):
@@ -241,12 +251,12 @@ def capture_ref(connection, *, ref, who, **values):
 
     with workflow.transaction(connection):
         filed = writes.item_by_external(connection, "task-ref", ref)
-        if filed is not None and (DEPENDABOT_REF.fullmatch(ref) or DOCTOR_REF.fullmatch(ref)):
+        if filed is not None and _reused(ref):
             # A Dependabot ref names a repository, not one alert, and a doctor ref one finding (pack sd:6684): its open
             # item is reused, and a done one gives the ref up (`<ref>@<id>`), so the next Fix files anew under the
             # unique (source, external_id) index.
             if filed["status"] != "done":
-                return workflow.item_state(connection, filed["id"])
+                return {**workflow.item_state(connection, filed["id"]), "existing": True}
             writes.set_item_fields(connection, filed["id"], external_id=f"{ref}@{filed['id']}")
             filed = None
         if filed is not None:
@@ -615,15 +625,36 @@ def action_route(path, payload, *, principal, operations_backend=None, services_
             return lambda connection: operations.cancel_assignment(connection, int(identifier), **options)
         mutation = operations.retry_job if action == "retry" else operations.cancel_job
         return lambda connection: mutation(connection, identifier, backend=operations_backend, **options)
+    if path == "/api/items" and "fix" in values:
+        from sd_db.writes import now as clock
+
+        from . import builds
+
+        # pack sd:8113: Today's Fix and Fix all on flaky heads; the server writes each brief from its own lane read.
+        rows = values["fix"]
+        if (set(values) != {"fix"} or not isinstance(rows, list) or not rows or len(rows) > 50
+                or not all(isinstance(row, str) and FLAKY_REF.fullmatch(row) for row in rows) or len(set(rows)) != len(rows)):
+            raise ValueError("Fix takes up to 50 distinct flaky row ids, each flaky:<repo>:<head>.")
+        return lambda connection: builds.fix_flaky(connection, rows, now=clock(), capture=lambda c, **kw: capture_ref(
+            c, who="dashboard", **kw))
     if path == "/api/items":
-        if set(values) - {"title", "body", "priority", "due", "repo", "kind", "followup_of", "ref"}:
+        if set(values) - {"title", "body", "priority", "due", "repo", "kind", "followup_of", "ref", "build"}:
             raise ValueError("Unknown task field.")
+        if values.pop("build", False) is not False:
+            from . import builds
+
+            # pack sd:8113: a broken row's Fix files (or answers the open item) under its ref, then queues the build.
+            ref = values.pop("ref", None)
+            if set(values) - {"title", "body", "repo"} or not isinstance(ref, str) or not BROKEN_REF.fullmatch(ref):
+                raise ValueError("Build on capture takes a title, body, repo and a broken:<row id> ref.")
+            return lambda connection: builds.file_and_build(
+                connection, lambda: capture_ref(connection, ref=ref, who="dashboard", **values))
         if "title" not in values:
             raise ValueError("A title is required.")
         kind = values.pop("kind", "task")
         parent = values.pop("followup_of", None)
         ref = values.pop("ref", None)
-        reused = isinstance(ref, str) and bool(DEPENDABOT_REF.fullmatch(ref) or DOCTOR_REF.fullmatch(ref))
+        reused = _reused(ref)
         if ref is not None and (kind != "task" or not isinstance(ref, str)
                                 or not (GITHUB_REF.fullmatch(ref) or reused)):
             raise ValueError("A ref files a task, and names a GitHub issue as github:<owner>/<repo>#<number>,"
@@ -1270,12 +1301,12 @@ class Dashboard(BaseHTTPRequestHandler):
                 or not session or not re.fullmatch(r"[a-f0-9]{64}", csrf)
                 or not hmac.compare_digest(csrf, self._csrf(session))):
             return self._json(403, {"error": "Open the dashboard again before saving. The browser session, identity or origin is invalid."})
-        if urlsplit(self.path).path in ("/api/research/intake/file", "/api/hoa/attach/file") and not urlsplit(self.path).query:
+        if urlsplit(self.path).path in ("/api/research/intake/file", "/api/hoa/attach/file", "/api/home/attach/file") and not urlsplit(self.path).query:
             from . import hoa_attach, source_intake
 
-            # sd:6690: HOA's Upload stages the same way, with its own suffixes and cap.
+            # sd:6690, sd:8112: HOA's and Home's Upload stage the same way, with their own suffixes and cap.
             bounds = ({"suffixes": hoa_attach.SUFFIXES, "limit": hoa_attach.UPLOAD_BYTES}
-                      if urlsplit(self.path).path == "/api/hoa/attach/file" else {})
+                      if urlsplit(self.path).path != "/api/research/intake/file" else {})
 
             # sd:5112: a dropped file's raw bytes, past the JSON bound; the intake request names it by its hash.
             if self.headers.get_content_type() != "application/octet-stream" or self.headers.get("Transfer-Encoding"):

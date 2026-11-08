@@ -254,7 +254,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
              exit: r.exit, revision: r.revision, capability: r.capability, repo: pr ? pr[1] : r.repo, number: pr && +pr[2], seen: r.seen,
              item: r.item, itemKind: r.item_kind, state: r.state, url: r.url, fieldsRead: r.fields_read, until: r.until, login: r.login, claim: r.claim,
              repoPath: r.repo_path, laneRevision: r.lane_revision, head: r.expected_head, runnerMerge: r.runner_merge,
-             members: r.members && r.members.map(m => ({ id: m.id, seen: m.seen, until: m.until, item: m.item })), group: r.id };
+             members: r.members && r.members.map(m => ({ id: m.id, seen: m.seen, until: m.until, item: m.item })), group: r.id,
+             band: r.band, detail: r.detail, source: r.source };
   }
 
   // The selected row, and the picked ones, marked again on the rows a redraw made.
@@ -346,7 +347,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // blocked or cancelled bundle's Retry and Send to builder post /api/queue/builds/retry (pack sd:6020). The view reads its
   // three documents when it first shows and on each Today read after; a source that was not read is said under the table.
   const QTYPES = ['working', 'merging', 'next', 'blocked', 'suggested', 'open', 'ended'], QSHOW = ['suggested', 'open', 'ended'], NEXT = 9;
-  const BOXES = ['merging', 'working', 'next', 'blocked', 'review', 'suggested']; // a repo row's boxes, left to right (pack sd:7470, sd:8083)
+  const BOXES = ['merging', 'review', 'working', 'next', 'blocked', 'suggested']; // a repo row's boxes, left to right (pack sd:7470, sd:8083, sd:8137)
   const QV = { lanes: null, lanesErr: '', built: null, builtErr: '', runner: null, runnerErr: '', tasks: null, tasksErr: '', seen: false, busy: false };
   const QOTHER = new Map(); // the lane entries, selectable as Today's other rows are
   const qShow = new Set();
@@ -441,14 +442,18 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   }
   // pack sd:7859: an item whose pull request waits on review (/api/queue's `prs`) is blocked by its PR, not working: on
   // you (changes requested, failing checks, a comment to answer) needs you; on reviewers waits. It counts in the blocked box.
-  const prFacts = p => html`<b>blocked: PR</b> · on ${p.on} · waited ${dur(p.waited)} since ${at(p.since)}`;
+  // sd:8116: a draft says so, as does a wait that rests on GitHub's newest event; a stale one, read over a day ago,
+  // waits on no one until the next read.
+  const prTags = p => `${p.draft ? ' · draft' : ''}${p.approximate ? ' · approx.' : ''}`;
+  const prFacts = p => p.stale ? html`<b>PR not read for a day</b> · last wait since ${at(p.since)}${prTags(p)}`
+    : html`<b>blocked: PR</b> · on ${p.on} · waited ${dur(p.waited)} since ${at(p.since)}${prTags(p)}`;
   const prWaitLink = p => html`<div class="ctl" role="group" aria-label="Pull request of sd:${String(p.item)}"><a class="btn quiet sm" href="${p.url}" target="_blank" rel="noopener noreferrer" aria-label="Open the pull request of sd:${p.item} on GitHub">Open PR</a></div>`;
   // sd:8142: a PR no item links (`item` null) is keyed and linked by its URL, named `owner/repo#N`.
-  const prRow = p => { const s = p.on === 'you' ? 'warning' : 'queued';
+  const prRow = p => { const s = p.stale ? 'unknown' : p.on === 'you' ? 'warning' : 'queued';
     return ['blocked', s, html`<tr class="child" data-type="blocked" data-pr="${p.item == null ? p.url : String(p.item)}">${marker(s, 'blocked')}
     <td class="what">${p.item == null ? html`<a href="${p.url}" target="_blank" rel="noopener noreferrer">${p.repo}#${p.url.split('/').pop()} ${p.title}</a>`
       : html`<a href="${shell.itemHref(p.item)}">#${p.item} ${p.title}</a>`}</td>
-    <td class="detail">${prFacts(p)}</td><td class="num">${dur(p.waited)}</td>
+    <td class="detail">${prFacts(p)}</td><td class="num">${p.stale ? '' : dur(p.waited)}</td>
     <td class="act">${p.item == null ? '' : prWaitLink(p)}</td></tr>`, p.on]; };
   // A suggested row (pack sd:7271) is a task: a click shows the Tasks page's Details, and its act is Build on a ready one,
   // else its next status, as on Tasks. Its detail says why it is suggested (pack sd:7314): ready, planned for its due
@@ -520,24 +525,25 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     }).sort((a, b) => (a.key === '') - (b.key === '') || busy(a, b) || a.key.localeCompare(b.key));
   }
   // A box's rows: review holds the PR waits, each other box its type less those (pack sd:8083).
-  const inBox = t => t === 'review' ? c => c.pr : c => c.type === t && !c.pr;
-  const tally = rows => QTYPES.map(t => [t, rows.filter(c => c.type === t).length]).filter(([, n]) => n);
+  // sd:8116: a stale PR row (unknown, no one to wait on) shows under its repo and counts in no box.
+  const stalePr = c => c.type === 'blocked' && c.s === 'unknown';
+  const inBox = t => t === 'review' ? c => c.pr : c => c.type === t && !c.pr && !stalePr(c);
+  const tally = rows => QTYPES.map(t => [t, rows.filter(c => c.type === t && !stalePr(c)).length]).filter(([, n]) => n);
   // pack sd:8005: the page's PR waits, split by who they wait on; '' when there is none. Each repo's are its review box.
   const prTally = rows => { const you = rows.filter(c => c.pr === 'you').length, them = rows.filter(c => c.pr && c.pr !== 'you').length;
     return you + them ? `${you + them} PR review: ${you} on you, ${them} on reviewers` : ''; };
-  // A repo row's six boxes: merging, next and blocked (pack sd:7272, Queue's lane ledger until #1768), with working
-  // before them, review and suggested after (pack sd:7314, sd:8083), counted from all the repo's rows, so a filter hides
-  // no count. A box is lit only when its count is not zero; blocked lights the warning lamp, review the caution lamp when
+  // A repo row's six boxes, left to right: merging, review, working, next, blocked and suggested (pack sd:7272, sd:7314,
+  // sd:8083, sd:8137), counted from all the repo's rows, so a filter hides no count. A box is lit only when its count is not zero; blocked lights the warning lamp, review the caution lamp when
   // a PR waits on you; the label says all six in words. A lane that was not read counts nothing: the cell says so, not 0.
   // pack sd:8138: each box is a toggle button that shows only its rows under the repo; a zero box is disabled.
   function pips(g) {
     const pip = (box, n, on, means) => html`<button type="button" class="tile" data-repo="${g.key}" data-tile="${box}" aria-pressed="${String(!!qTile && qTile.repo === g.key && qTile.box === box)}" aria-label="${`Only the ${n} ${box} rows`}"${n ? '' : html` disabled`}><span class="pip${n ? on : ''}" title="${`${n} ${means}`}">${String(n)}</span></button>`;
     if (g.key && (!QV.lanes || QV.lanes.problems.some(p => repoKey(p.repo) === g.key)))
       return html`<td class="detail"><span class="g-unknown" aria-hidden="true">${GLYPH.unknown}</span> lane not read</td>`;
-    // pack sd:7470: merging is the leftmost box.
+    // pack sd:7470: merging is the leftmost box; pack sd:8137: review follows it.
     const { working: w, merging: m, next: n, blocked: b, review: v, suggested: s } = g.n, you = g.rows.filter(c => c.pr === 'you').length;
     // Each box says its count and what it counts, in its title (pack sd:7383); the label above says all six at once.
-    return html`<td class="detail pipe" aria-label="${m} merging, ${w} working, ${n} next, ${b} blocked, ${v} review, ${s} suggested">${pip('merging', m, ' on', 'merging: claimed by the lane runner, being merged')}${pip('working', w, ' on', 'working: live sessions, build runs and lane gates now running')}${pip('next', n, ' on', 'next: queued in the lane, not started')}${pip('blocked', b, ' warn', 'blocked: stopped in the lane until someone acts')}${pip('review', v, you ? ' caution' : ' on', `review: pull requests waiting on a review, ${you} on you, ${v - you} on reviewers`)}${pip('suggested', s, ' on', `suggested: up to ${NEXT} ready or planned tasks to do next`)}</td>`;
+    return html`<td class="detail pipe" aria-label="${m} merging, ${v} review, ${w} working, ${n} next, ${b} blocked, ${s} suggested">${pip('merging', m, ' on', 'merging: claimed by the lane runner, being merged')}${pip('review', v, you ? ' caution' : ' on', `review: pull requests waiting on a review, ${you} on you, ${v - you} on reviewers`)}${pip('working', w, ' on', 'working: live sessions, build runs and lane gates now running')}${pip('next', n, ' on', 'next: queued in the lane, not started')}${pip('blocked', b, ' warn', 'blocked: stopped in the lane until someone acts')}${pip('suggested', s, ' on', `suggested: up to ${NEXT} ready or planned tasks to do next`)}</td>`;
   }
   function queueView() {
     const unread = [];
@@ -963,13 +969,40 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       got: (id, got) => { if (got.row && isItem(String(id))) { const t = TD.shape(got.row); SROW.set(t.key, t); C.put(TD.objectOf(t)); } return false; },
       empty: () => TD.DET.failed[sel()] ? `#${sel()} did not open: ${TD.DET.failed[sel()]}.` : `Reading #${sel()}…`,
       more: t => html`<p class="why"><a href="${shell.itemHref(t.id)}">Open on Tasks</a>: the board, the matrix and every task.</p>` });
+    // The Fix commands Today registers (pack sd:8113): a broken row with none of these live gains review-and-fix below.
+    const FIXES = [session('collector', o => !prs(o) || 'Re-run collector fixes the pull request collector'), session('repo'), session('sessions'),
+      K.fix('work item', { item: o => o.item, report: o => o.itemKind === 'report', post: (o, path) => post(path, { revision: o.revision }) }),
+      { ...K.fix('report', { item: o => o.item, report: () => true, login: o => o.login, post: (o, path) => post(path, { revision: o.revision }),
+        when: o => !!o.login || !o.claim || `${o.claim}: open its session in herdr, or Fix it from Reports` }), primary: o => !!o.login },
+      K.fix('live item', { item: o => o.item, report: o => o.itemKind === 'report', when: o => !!o.revision || 'its revision was not read; Fix it from Tasks',
+        post: (o, path) => post(path, { revision: o.revision }) })];
+    const ownFix = o => FIXES.some(c => c.on === o.type && (!c.when || c.when(o) === true));
+    // Fix and Fix all on flaky heads (pack sd:8113): POST /api/items {fix: [row ids]} files one task per head, each under
+    // --ref flaky:<repo>:<head> with a brief the server writes from its lane read, and queues its build (the Build
+    // button's build.queue). A head whose task is open files nothing: Fix opens that task. Fix all counts each outcome.
+    const fixHeads = ids => window.shell.post('/api/items', { fix: ids }).then(out => reading.reread().then(() => out), err => { load(); throw err; });
+    const failedText = out => out.failed.map(f => `${f.row.replace(/^flaky:/, '')}: ${f.error}`).join('; ');
+    // A broken row with no Fix of its own (pack sd:8113): file a review-and-fix task under --ref broken:<row id> in the
+    // row's repo (none: fleet), naming the row's what, detail and source, then queue its build; an open one opens.
+    // Each takes commands.fix's label, key and icon (sd:6709) and files instead of opening a session, so it asks nothing.
+    const fileFix = on => ({ ...K.fix(on, { item: () => null, report: () => false, post: null }), askFirst: false, primary: () => true, consequence: undefined });
+    const brokenFix = on => ({ ...fileFix(on), id: `today.broken.fix.${on.replace(/\W+/g, '-')}`,
+      does: 'Files a review-and-fix task and queues its build, or opens the open one.',
+      when: o => o.band !== 'broken' ? 'only a broken row files a review-and-fix task' : !ownFix(o) || 'this row has its own Fix',
+      cli: o => `sd task add "Review and fix: ${o.label}" --ref broken:${o.id}${o.repoPath ? ` --belongs-to ${o.repoPath}` : ''}, then sd assignments build <id>`,
+      sends: o => `POST /api/items {ref: broken:${o.id}, build: true}`,
+      run: o => window.shell.post('/api/items', { title: `Review and fix: ${o.label}`.slice(0, 200), ref: `broken:${o.id}`, build: true,
+        ...(o.repoPath ? { repo: o.repoPath } : {}),
+        body: [`What: ${o.label}`, `Detail: ${o.detail || 'none given'}`, `Source: ${o.source || 'not named'}`, '',
+          'Review why Today shows this row as broken, fix the cause fail-first, and say in a note what changed.'].join('\n') })
+        .then(out => reading.reread().then(() => out), err => { load(); throw err; })
+        .then(out => out.existing ? (shell.openItem(out.item.id), `sd:${out.item.id} is already open for this row; nothing filed`)
+          : out.build_error ? `Filed sd:${out.item.id}; its build did not queue: ${out.build_error}` : `Filed sd:${out.item.id} and queued its build`) });
     C.register(
       // Each lane entry is a command object (sd:5064): its menu offers Adversarial review of the worktree the lane recorded.
       K.adversarialReview('entry', { payload: o => ({ kind: 'change', target: o.worktree, item: o.item }),
         when: o => !!o.worktree || 'the lane recorded no worktree for this entry' }),
-      session('collector', o => !prs(o) || 'Re-run collector fixes the pull request collector'),
-      session('repo'),
-      session('sessions'),
+      ...FIXES.slice(0, 3),
       { ...sync, when: o => prs(o) || 'only the pull request collector re-runs from Today' },
       retry,
       // Each row kind's commands from the page that shows it in full (sd:3449).
@@ -977,14 +1010,13 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       K.printJob({ job: o => ({ name: o.job, service: o.service, exit: o.exit }) }),
       open,
       // Fix (sd:3456, commands.js) on a work row, with the revision the read gave; a refused one reads Today again.
-      K.fix('work item', { item: o => o.item, report: o => o.itemKind === 'report', post: (o, path) => post(path, { revision: o.revision }) }),
+      FIXES[3],
       { id: 'today.item.open', on: 'work item', label: 'Open', does: 'Opens the item on Tasks.', key: 'o', icon: 'arrow-up-right', risk: 'safe', executes: false, primary: () => true,
         cli: o => `sd task show ${o.item}`, run: o => shell.openItem(o.item) },
       // A problem report whose output shows an expired login (sd:6964): Fix opens its Credentials row, ahead of Acknowledge.
       // Any other report's Fix is the Reports page's debug session, posted with the read's revision (pack sd:7683); one
       // another session took names who has it instead, so a second session does not start on it.
-      { ...K.fix('report', { item: o => o.item, report: () => true, login: o => o.login, post: (o, path) => post(path, { revision: o.revision }),
-        when: o => !!o.login || !o.claim || `${o.claim}: open its session in herdr, or Fix it from Reports` }), primary: o => !!o.login },
+      FIXES[4],
       // A problem report (sd:5921): Acknowledge posts the Reports page's route with the revision the read gave.
       { id: 'today.report.ack', on: 'report', label: 'Acknowledge', does: 'Closes the report, not the fault: the next failure opens a new one.', key: 'a', icon: 'check', risk: 'safe', bulk: true, primary: o => !o.login,
         when: o => o.fieldsRead || `its fields cannot be read: sd reports acknowledge ${o.item}`,
@@ -1022,7 +1054,22 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
         askFirst: o => o.members.length > BULK, consequence: o => `Writes ${o.members.length} snoozes, one per member; each member comes back on its own after a week or by Unsnooze.`,
         cli: () => 'no sd verb: the dashboard writes one snooze per member (POST /api/snooze)',
         run: o => each(o, m => ({ page: 'today', row: m.id, until: week(), seen: m.seen })).then(() => `Snoozed ${o.members.length} for a week · ${o.label}`) },
-      // A flaky head (pack sd:7663): Open item, and Snooze below; its group snoozes every head for a week.
+      // A flaky head (pack sd:7663): Fix (pack sd:8113), Open item, and Snooze below; its group fixes or snoozes every head.
+      { ...fileFix('flaky head'), id: 'today.flaky.fix', does: 'Files a fix task and queues its build, or opens the open one.',
+        cli: o => `sd task add "Flaky test in ..." --ref ${o.id}, then sd assignments build <id>`, sends: o => `POST /api/items {fix: ["${o.id}"]}`,
+        run: o => fixHeads([o.id]).then(out => {
+          if (out.failed.length) throw new Error(failedText(out));
+          const r = out.results[0];
+          if (r.existing) { shell.openItem(r.item); return `sd:${r.item} is already open for this head; nothing filed`; }
+          return `Filed sd:${r.item} and queued its build`; }) },
+      { id: 'today.flaky.fix-all', on: 'flaky group', label: 'Fix all', does: 'Asks first, then files a task per flaky head and queues each build.',
+        key: 'f', icon: 'bot', risk: 'safe', executes: true, primary: () => true, askFirst: true,
+        consequence: o => `Files one task per flaky head and queues up to ${o.members.length} builds, one each. A head whose task is open files nothing.`,
+        cli: () => 'sd task add --ref flaky:<repo>:<head> per head, then sd assignments build <ids>', sends: o => `POST /api/items {fix: [${o.members.length} row ids]}`,
+        run: o => fixHeads(o.members.map(m => m.id)).then(out => {
+          const text = `Fix all · ${out.filed} filed, ${out.existing} already open, ${out.failed.length} failed`;
+          if (out.failed.length) throw new Error(`${text}: ${failedText(out)}`);
+          return text; }) },
       { id: 'today.flaky.open', on: 'flaky head', label: 'Open item', does: 'Opens the item whose head the gate failed, then passed.', key: 'o', icon: 'arrow-up-right', risk: 'safe', executes: false, primary: () => true,
         when: o => !!o.item || 'the lane entry named no item', cli: o => `sd task show ${o.item}`, run: o => shell.openItem(o.item) },
       { id: 'today.flaky.snooze', on: 'flaky group', label: 'Snooze all 1w', does: 'Hides every flaky head for a week, one snooze each.', key: 'z', icon: 'clock', risk: 'safe', primary: () => true,
@@ -1035,8 +1082,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
         cli: o => `sd task show ${o.item}`, run: o => shell.openItem(o.item) },
       { ...K.showAssignment({ primary: () => false, run: o => { select(`run:${o.run}`, true); return `Assignment #${o.n} shown in Details`; } }),
         id: 'today.live.assignment', on: 'live item', key: 'a', does: 'Shows the builder run that holds the item, with its assignment, in Details.', when: o => !!o.n || 'no build run holds this item' },
-      K.fix('live item', { item: o => o.item, report: o => o.itemKind === 'report', when: o => !!o.revision || 'its revision was not read; Fix it from Tasks',
-        post: (o, path) => post(path, { revision: o.revision }) }),
+      FIXES[5],
       { id: 'today.landed.open', on: 'delivered item', label: 'Open item', does: 'Opens the item on Tasks.', key: 'o', icon: 'arrow-up-right', risk: 'safe', executes: false, primary: () => true,
         cli: o => `sd task show ${o.item}`, run: o => shell.openItem(o.item) },
       { id: 'today.group.read', on: 'brief group', label: 'Read', does: 'Opens Briefs.', key: 'o', icon: 'book-open', risk: 'safe', executes: false, primary: () => true,
@@ -1046,6 +1092,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
         cli: () => 'no sd verb: the dashboard writes one snooze per brief (POST /api/snooze)',
         run: o => each(o, m => ({ page: 'today', row: m.id, until: m.until, seen: m.seen })).then(() => `Seen · ${o.members.length} briefs`) },
     );
+    C.register(...[...new Set([...Object.values(TYPE), 'item group'])].filter(t => t !== 'flaky head').map(brokenFix));
     // Snooze (sd:1896) on every row type that ends by time: the row leaves Today until then, and Unsnooze brings it back.
     window.snooze.register(C, { page: 'today', types: ['job', 'pull request', 'repo', 'sessions', 'collector', 'work item', 'report', 'mail thread', 'flaky head'], reread: () => load() });
 

@@ -8,6 +8,8 @@
 // A plant or a tree whose care is overdue carries the warning ring.
 // The tiles (sd:8085): one per kind group with its count; each toggles the group's marks and rows (all on by default,
 // ?mapoff=<group,...> keeps the ones off). A group with no assets is dim; a kind in no group is Other's.
+// Attachments (sd:8112): a selected asset's Drive folder, <group>/<name> #<id> under home.drive_folder, drawn by
+// home-attach.js: pictures as thumbnails, Upload and Reference (a .url file) write there on the operator's press only.
 (() => {
   const { html, put } = window.markup;
   const $ = id => document.getElementById(id);
@@ -90,9 +92,13 @@
       <label>Task <input name="title" required value="Water the ${a.name}"></label>
       <label>First due <input name="due" type="date" required></label>
       <label>Repeats <select name="recurrence">${S.doc.recur.map(r => html`<option>${r}</option>`)}</select></label>
-      <div class="ed-act"><button class="btn" type="submit">Add care task</button></div></form>` : ''}`);
+      <div class="ed-act"><button class="btn" type="submit">Add care task</button></div></form>
+      <section class="asset-form" aria-label="Attachments"><h3>Attachments</h3><div id="map-attach" class="attach"></div></section>` : ''}`);
     $('asset-form').dataset.geometry = geometry ? JSON.stringify(geometry) : '';
+    if (a) attachments(a);
   }
+
+  const attachments = a => window.homeAttach.show('map-attach', a.id, () => S.sel === a.id);
 
   const toast = m => window.shell?.toast ? window.shell.toast(m) : null;
   async function load() {
@@ -140,6 +146,7 @@
   document.addEventListener('change', e => { if (e.target.id === 'map-kind') { S.kind = e.target.value; S.points = []; draw(); } });
   document.addEventListener('keydown', e => { const row = e.target.closest?.('[data-asset]'); if (row && e.key === 'Enter') { S.sel = Number(row.dataset.asset); draw(); } });
   document.addEventListener('submit', e => {
+    if (e.target.closest?.('#map-attach') && e.target.dataset.attach) { e.preventDefault(); const id = S.sel; window.homeAttach.send(e.target, 'map-attach', id, () => S.sel === id); return; }
     if (e.target.id === 'asset-form') {
       e.preventDefault();
       const fd = new FormData(e.target), a = S.doc.assets.find(x => x.id === S.sel), kind = a ? a.kind : S.kind;
@@ -181,5 +188,5 @@
   });
 
   document.addEventListener('shell:view', e => { if (e.detail.id === 'map') load(); });
-  window.homeMap = { load, state: S, draw, form };
+  window.homeMap = { load, state: S, draw, form, attachments };
 })();

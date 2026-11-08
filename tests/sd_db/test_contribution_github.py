@@ -4,6 +4,7 @@ import copy
 import json
 import time
 import unittest
+from typing import Any
 from unittest.mock import patch
 
 from sd_db.contribution_github import (
@@ -33,7 +34,7 @@ class Api:
                        "base": {"sha": BASE}, "state": "open", "merged": False,
                        "draft": False, "title": "Contribution", "updated_at": AT,
                        "mergeable": True, "labels": [], "requested_reviewers": []}
-        self.rows = {
+        self.rows: dict[str, Any] = {
             "/user": {"id": 1, "login": "operator"},
             ROOT + "/pulls/7": self.detail,
             ROOT + "/pulls/7/reviews?per_page=100": [],
@@ -82,6 +83,37 @@ class PullCollection(unittest.TestCase):
         self.assertEqual((result["ci"], result["ci_head"], result["ci_ids"]), ("success", HEAD, ["check-run:91"]))
         self.assertEqual([row[0] for row in api.calls].count(ROOT + "/pulls/7"), 2)
 
+    def test_bot_comment_is_never_a_maintainer_comment(self):
+        # sd:8148: a MEMBER bot's status comment is no maintainer ask.
+        api = Api()
+        comments: list[dict] = [
+            {"id": 5, "user": {"id": 3, "login": "scanner[bot]", "type": "Bot"},
+             "body": "scan passed", "updated_at": AT, "author_association": "MEMBER"},
+            {"id": 6, "user": {"id": 4, "login": "scanner-app", "type": "User"},
+             "body": "scan passed", "updated_at": AT, "author_association": "MEMBER",
+             "performed_via_github_app": {"id": 9, "slug": "scanner"}},
+            {"id": 7, "user": {"id": 2, "login": "maintainer", "type": "User"},
+             "body": "Please rebase", "updated_at": AT, "author_association": "MEMBER"}]
+        api.rows[ROOT + "/issues/7/comments?per_page=100"] = comments
+        result = api.observation()
+        self.assertEqual([row["maintainer"] for row in result["events"]], [False, False, True])
+
+    def test_a_listed_login_is_no_maintainer_on_every_comment_path(self):
+        # pack sd:8148: the issue thread, the review thread and a review's own body all carry the association.
+        api = Api()
+        def row(number, login):
+            return {"id": number, "user": {"id": number, "login": login, "type": "User"}, "body": "Scan passed",
+                    "updated_at": AT, "author_association": "MEMBER"}
+        api.rows[ROOT + "/issues/7/comments?per_page=100"] = [row(5, "scan-account"), row(6, "maintainer")]
+        api.rows[ROOT + "/pulls/7/comments?per_page=100"] = [row(7, "scan-account")]
+        api.rows[ROOT + "/pulls/7/reviews?per_page=100"] = [
+            {**row(8, "scan-account"), "state": "COMMENTED", "submitted_at": AT}]
+        unlisted = api.observation()
+        result = pull(api.client(), URL, OPERATOR, observed_at=AT, automation=frozenset({"scan-account"}))
+        comments = [event for event in result["events"] if event["kind"] == "comment"]
+        self.assertEqual(sorted(event["maintainer"] for event in comments), [False, False, False, True])
+        self.assertEqual([event["maintainer"] for event in unlisted["events"] if event["kind"] == "comment"].count(False), 0)
+
     def test_requested_reviewers_keep_user_logins_not_teams(self):
         # sd:8084: a team request does not name the operator.
         api = Api()
@@ -101,6 +133,20 @@ class PullCollection(unittest.TestCase):
         result = api.observation()
         self.assertEqual([row["kind"] for row in result["events"]], ["converted_to_draft", "label_added"])
         self.assertEqual(result["blocking_labels"], [])
+
+    def test_a_review_request_names_the_asked_user_and_a_force_push_is_read(self):
+        """sd:8116 (c): the author asking a reviewer again, and a force push, date the pull request's last turn."""
+        api = Api()
+        graphql: dict = api.rows["graphql"]  # type: ignore[assignment]
+        graphql["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"] = [
+            {"__typename": "HeadRefForcePushedEvent", "id": "push:1", "actor": {"databaseId": 1, "login": "operator"}, "createdAt": AT},
+            {"__typename": "ReviewRequestedEvent", "id": "ask:1", "actor": {"databaseId": 1, "login": "operator"}, "createdAt": AT,
+             "requestedReviewer": {"databaseId": 2}},
+            {"__typename": "ReviewRequestedEvent", "id": "ask:2", "actor": {"databaseId": 1, "login": "operator"}, "createdAt": AT,
+             "requestedReviewer": {}}]
+        events = api.observation()["events"]
+        self.assertEqual([(row["kind"], row.get("reviewer_id")) for row in events],
+                         [("pushed", None), ("review_requested", "2"), ("review_requested", None)])
 
     def test_null_actor_refuses_complete_snapshot(self):
         api = Api()
@@ -457,6 +503,15 @@ class IssueApi(Api):
 
 
 class IssueUrls(unittest.TestCase):
+    def test_a_listed_login_is_no_maintainer_on_an_issue(self):
+        api = IssueApi()
+        api.rows[ROOT + "/issues/9/comments?per_page=100"] = [
+            {"id": 5, "user": {"id": 5, "login": "Scan-Account", "type": "User"}, "body": "Scan passed",
+             "updated_at": AT, "author_association": "MEMBER"}]
+        self.assertEqual([event["maintainer"] for event in api.observation()["events"] if event["kind"] == "comment"], [True])
+        result = issue(api.client(), ISSUE_URL, OPERATOR, observed_at=AT, automation=frozenset({"scan-account"}))
+        self.assertEqual([event["maintainer"] for event in result["events"] if event["kind"] == "comment"], [False])
+
     def test_parts_lower_case_the_repository_and_drop_the_trailing_slash(self):
         self.assertEqual(issue_parts("https://github.com/Example/Project/issues/9/"), ("example", "project", 9))
         self.assertEqual(canonical_issue_url("https://github.com/Example/Project/issues/9/"), ISSUE_URL)

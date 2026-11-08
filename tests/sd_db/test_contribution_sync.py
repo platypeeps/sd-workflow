@@ -10,7 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from sd_db import connect, initialise, protection, upsert_repo
+from sd_db import connect, initialise, protection, upsert_repo, writes
 from sd_db import contribution_sync as adapter
 from sd_db import contributions as core
 from sd_db.contribution_github import Client
@@ -379,10 +379,10 @@ class ContributionSync(SyncCase):
         self.assertTrue(first.watermark_moved)
         self.assertEqual(len(core.projection(self.db)), 4)
         saved = adapter._queue(self.db)
-        # All eight are open and never read, so they go first in queue order
-        # (pack sd:7844, ahead of sd:7840's newest-first slots): 7 to 10 are
-        # read and 11 heads the queue.
-        self.assertEqual(saved["pending"][0]["url"], urls[4])
+        # All eight are open and never read, so they go first, the newest
+        # queued first (pack sd:7844, sd:8116): 14 to 11 are read and 7 heads
+        # the queue.
+        self.assertEqual(saved["pending"][0]["url"], urls[0])
         self.assertLessEqual(first.requests, 40)
         second = self.run_sync(max_requests=40)
         self.assertEqual(second.queued, 4)
@@ -528,8 +528,8 @@ class ContributionSync(SyncCase):
         snapshots["github:fresh"] = {"observation": {"state": "open", "observed_at": "2026-10-18T07:00:00+00:00"}}
         snapshots["github:stale"] = {"observation": {"state": "open", "observed_at": "2026-10-15T08:00:00+00:00"}}
         ordered = [row["key"] for row in adapter._order(pending, snapshots=snapshots, observed_at=now)]
-        self.assertEqual(ordered[2], "github:stale")
-        self.assertGreater(ordered.index("github:fresh"), ordered.index("github:backlog/7"))
+        # sd:8116 (a): every row last read open is read each run, the oldest reading first, not only a day-old one.
+        self.assertEqual(ordered[2:4], ["github:stale", "github:fresh"])
         self.assertEqual(sorted(ordered), sorted(keys))
 
     def stale_rows(self, count):
@@ -538,20 +538,25 @@ class ContributionSync(SyncCase):
         old = {"observation": {"state": "open", "observed_at": "2026-10-15T08:00:00+00:00"}}
         return rows, {row["key"]: old for row in rows}
 
-    def test_failing_stale_pulls_take_a_few_slots_and_the_backlog_keeps_its_turn(self):
+    def test_failing_stale_pulls_rotate_and_the_backlog_keeps_its_turn(self):
         # Review of sd:7864: a pull whose reads keep failing leaves only a
-        # heartbeat, so its observation stays stale; uncapped, enough of them
-        # went ahead of the whole backlog every run.
-        slots = 10
-        stale, snapshots = self.stale_rows(slots + 2)
+        # heartbeat, so its observation stays stale; ahead of the rest, enough
+        # of them went ahead of the whole backlog every run. A held one rotates.
+        stale, snapshots = self.stale_rows(12)
         backlog = [{"key": f"github:backlog/{n}", "explicit": False} for n in range(4)]
+        held = {row["key"] for row in stale[10:]}
         keys = [row["key"] for row in adapter._order(
-            [*backlog, *stale], snapshots=snapshots, observed_at="2026-10-18T08:00:00+00:00")]
-        # The two head slots, then the capped stale tier, then queue order.
-        self.assertEqual(keys[2:2 + slots], [row["key"] for row in stale[:slots]])
-        self.assertEqual(keys[2 + slots:], ["github:backlog/2", "github:backlog/3",
-                                            *(row["key"] for row in stale[slots:])])
-        self.assertEqual(adapter.STALE_SLOTS, slots)
+            [*backlog, *stale], snapshots=snapshots, observed_at="2026-10-18T08:00:00+00:00", held=held)]
+        # The two head slots, then every open pull whose last read held, then queue order.
+        self.assertEqual(keys[2:12], [row["key"] for row in stale[:10]])
+        self.assertEqual(keys[12:], ["github:backlog/2", "github:backlog/3", *(row["key"] for row in stale[10:])])
+
+    def test_unread_open_pulls_are_read_newest_queued_first(self):
+        """sd:8116 (b): an authored pull opened today sat behind 60 older unread open ones and no run reached it."""
+        pending = [{"key": f"github:open/{n}", "explicit": False} for n in range(60)]
+        unread = {row["key"] for row in pending}
+        keys = [row["key"] for row in adapter._order(pending, unread=unread)]
+        self.assertEqual(keys[:adapter.UNREAD_SLOTS], [f"github:open/{n}" for n in range(59, 49, -1)])
 
     def test_explicit_work_past_the_first_three_stays_ahead_of_stale_pulls(self):
         # Review of sd:7864: explicit rows past the first three, `item:`
@@ -899,6 +904,55 @@ class IssueSync(SyncCase):
         with self.assertRaisesRegex(ValueError, "unpriced dependency kind"):
             adapter._cost({"key": "item:1", "depends_on": [{"kind": "merge", "url": URL}, {"kind": "closed", "url": URL}]})
         self.assertEqual(set(adapter.DEPENDENCY_REQUESTS), {"item", "merge", "release", "issue"})
+
+
+class AutomationLogins(SyncCase):
+    """pack sd:8148, ruling #49297: a service account posts as a plain MEMBER, so only a list can name it."""
+
+    KEY = "contributions.automation_logins"
+
+    def observed(self, login):
+        self.api.rows[ROOT + "/issues/7/comments?per_page=100"] = [
+            {"id": 19, "user": {"id": 2, "login": login, "type": "User"}, "body": "Scan passed",
+             "author_association": "MEMBER", "updated_at": AT}]
+        result = self.run_sync([URL])
+        state = core.snapshot(self.db, "github:" + URL)
+        rows = core.projection(self.db)
+        return result, [event["reason"] for event in state["attention"]], rows[0]["lane"] if rows else None
+
+    def test_a_listed_login_gives_no_maintainer_reason_and_no_wait_on_you(self):
+        writes.set_setting(self.db, self.KEY, "scan-account,other-account")
+        _, reasons, lane = self.observed("scan-account")
+        self.assertEqual(reasons, [])
+        self.assertNotEqual(lane, "awaiting_you")
+
+    def test_a_listed_login_matches_in_any_case(self):
+        writes.set_setting(self.db, self.KEY, "Scan-Account")
+        self.assertEqual(self.observed("scan-ACCOUNT")[1], [])
+
+    def test_an_unlisted_member_still_gives_a_maintainer_reason(self):
+        writes.set_setting(self.db, self.KEY, "scan-account")
+        _, reasons, lane = self.observed("maintainer")
+        self.assertEqual(reasons, ["Maintainer comment"])
+        self.assertEqual(lane, "awaiting_you")
+
+    def test_an_unset_or_cleared_key_behaves_as_before(self):
+        self.assertEqual(self.observed("scan-account")[1], ["Maintainer comment"])
+        writes.set_setting(self.db, self.KEY, None)
+        self.assertEqual(self.observed("scan-account")[1], ["Maintainer comment"])
+
+    def test_listing_a_login_clears_a_comment_already_observed(self):
+        self.assertEqual(self.observed("scan-account")[1], ["Maintainer comment"])
+        writes.set_setting(self.db, self.KEY, "scan-account")
+        self.assertEqual(self.observed("scan-account")[1], [])
+
+    def test_a_row_that_does_not_read_is_unknown_and_flags_no_comment(self):
+        writes.record_state(self.db, "setting", key=self.KEY, body={"not": "a value"})
+        self.db.commit()
+        result, reasons, _ = self.observed("scan-account")
+        self.assertFalse(result.ok)
+        self.assertIn(self.KEY, result.reason)
+        self.assertEqual(reasons, [])
 
 
 class LaneNotePass(SyncCase):

@@ -622,7 +622,8 @@ def flaky_rows(connection: sqlite3.Connection, now: str) -> tuple[list[dict], in
              "detail": f"the gate failed {len(found['failed'])}× at this head, then passed at it",
              "source": "lane", "at": found["passed"], "item": found.get("item"), "title": found["title"],
              "repo": found["repository"], "head": found["head"], "failed": found["failed"], "passed": found["passed"],
-             "status": found["status"], "problem": [found["repository"], found["head"], found["failed"]]}
+             "status": found["status"], "runs": found["runs"], "pass_run": found["pass_run"],
+             "problem": [found["repository"], found["head"], found["failed"]]}
             for found in heads], unreadable
 
 

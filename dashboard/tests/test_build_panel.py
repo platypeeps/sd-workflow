@@ -105,7 +105,7 @@ class BuildRoutes(Fixture):
         self.assertEqual([[row["id"] for row in bundle["items"]] for bundle in out["bundles"]], [items[:3], items[3:]])
         self.assertEqual({bundle["model"] for bundle in out["bundles"]}, {"opus"})
         self.assertEqual([row["id"] for row in out["refused"]], [planning])
-        self.assertEqual((out["room"]["machine"], out["room"]["why"], out["bundles"][0]["room"]), (6, "", 3))
+        self.assertEqual((out["room"]["machine"], out["room"]["why"], out["bundles"][0]["room"]), (6, "", build.REPO_CAP))
 
     def test_the_plan_names_the_satellite_that_runs_a_bundle(self):
         """Pack sd:7933: a satellite lane's bundle names its host and none of the hub's room."""
@@ -125,7 +125,7 @@ class BuildRoutes(Fixture):
         out = plan()
         self.assertEqual(out["refused"], [])
         self.assertEqual([(bundle["name"], bundle["host"], bundle["room"], bundle["beat"])
-                          for bundle in out["bundles"]], [("alpha", "", 3, None), ("sat", "work", 0, 42)])
+                          for bundle in out["bundles"]], [("alpha", "", build.REPO_CAP, None), ("sat", "work", 0, 42)])
 
     def test_the_plan_shows_no_room_when_the_load_was_not_read(self):
         out = builds.plan(self.connection, [self.ready()], now=NOW,
@@ -201,7 +201,7 @@ class BuildsPanel(Fixture):
             out = builds.plan(self.connection, [own], now=NOW,
                               sessions=lambda connection, *, now: {"sessions": [], "builders": {"running": 0, "why": ""}},
                               gate=lambda: {"load": [1.0, 1.0, 1.0], "load_max": 40.0})
-            self.assertEqual((out["refused"], [(b["host"], b["room"]) for b in out["bundles"]]), ([], [("", 3)]))
+            self.assertEqual((out["refused"], [(b["host"], b["room"]) for b in out["bundles"]]), ([], [("", build.REPO_CAP)]))
             status, _, body = self.post("/api/tasks/build", {"items": [own], "revisions": {str(own): self.revision(own)}})
             self.assertEqual((status, [row["host"] for row in body["queued"]], len(self.kicks)), (200, [""], 1), body)
             run = self.claimed([self.ready()])

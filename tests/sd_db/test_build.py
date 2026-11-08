@@ -235,9 +235,19 @@ class Claim(Case):
         first = self.claim()
         self.assertEqual((first["repo"], len(first["members"])), (A, 3))
         second = self.claim()
-        self.assertEqual((second["repo"], len(second["members"])), (A, 1), "the fourth of A still ranks first")
+        self.assertEqual((second["repo"], len(second["members"])), (B, 1), "A's fourth waits for its running bundle")
+        self.assertIsNone(self.claim())
+        build.end(self.db, first["id"], "cancelled", "the operator cancelled it")
         third = self.claim()
-        self.assertEqual((third["repo"], len(third["members"])), (B, 1))
+        self.assertEqual((third["repo"], len(third["members"])), (A, 1), "the next bundle takes the fourth")
+
+    def test_one_running_bundle_fills_its_repository_not_another(self):
+        """sd:8158: one bundle per repository at a time, so later items wait for it and the next bundle takes them."""
+        build.queue(self.db, [self.item()], who="operator")
+        self.claim()
+        available = build.room(self.db, **IDLE)
+        self.assertEqual(build.room_for(available, A), 0)
+        self.assertEqual(build.room_for(available, B), 1)
 
     def test_claim_race_respects_repo_cap(self):
         """Failure table, Claim: `BEGIN IMMEDIATE` serializes claims; the later ones see the earlier leases."""
@@ -266,7 +276,8 @@ class Claim(Case):
         self.assertEqual(self.count("SELECT COUNT(*) FROM runner_lease WHERE released_at IS NULL"), build.REPO_CAP)
         members = [member["item"] for run in runs for member in run["members"]]
         self.assertEqual(len(members), len(set(members)))
-        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE status = 'running'"), 9)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE status = 'running'"),
+                         build.REPO_CAP * build.BUNDLE_MAX)
 
     def test_claim_rolls_back_moved_item(self):
         """Failure table, Claim: an item moved after the press fails the re-check; nothing else changes."""
@@ -321,7 +332,8 @@ class Claim(Case):
         for row in reversed(queued):
             state = runner.queue_state(self.db, row["id"])
             runner.requeue(self.db, row["id"], expected_revision=state["revision"], who="operator")
-        runs = [self.claim(), self.claim()]
+        with mock.patch.object(build, "REPO_CAP", 2):  # two bundles at once: their leads are this test's subject
+            runs = [self.claim(), self.claim()]
         self.assertEqual([len(run["members"]) if run else 0 for run in runs].count(0), 0, "two bundles, not one")
         claims = {run["assignment"]: run for run in runs}
         again = claims.pop(lead)
@@ -439,15 +451,16 @@ class Claim(Case):
 
     def test_interactive_builders_count_against_their_repository_and_the_machine(self):
         build.queue(self.db, [self.item()], who="operator")
-        busy = [{"repo": A, "session_id": f"s{n}"} for n in range(3)]
+        busy = [{"repo": A, "session_id": f"s{n}"} for n in range(build.REPO_CAP)]
         self.assertIsNone(self.claim(interactive=busy))
         elsewhere = [{"repo": None, "session_id": f"s{n}"} for n in range(6)]
         self.assertIsNone(self.claim(interactive=elsewhere))
         self.assertIn("6 builders run already", build.room(self.db, **{**IDLE, "interactive": elsewhere})["why"])
-        run = self.claim(interactive=busy[:2])
+        run = self.claim(interactive=busy[:build.REPO_CAP - 1])
         build.write(self.db, run["id"], session_id="headless")
         available = build.room(self.db, **{**IDLE, "interactive": [{"repo": A, "session_id": "headless"}]})
-        self.assertEqual(build.room_for(available, A), 2, "a headless run's own session counts once")
+        self.assertEqual(available["used"], {A: 1}, "a headless run's own session counts once")
+        self.assertEqual(build.room_for(available, A), build.REPO_CAP - 1)
 
 
 class Writes(Case):
@@ -479,6 +492,56 @@ class Writes(Case):
         self.assertEqual((row["step"], row["outcome"], row["released_at"]), ("enqueued", None, None),
                          "the run stays open for steps 7 and 8")
         self.assertFalse(build.enqueued(self.db, self.bundle["id"]), "enqueued once")
+
+    def test_an_enqueued_bundle_keeps_its_repository_slot_until_the_run_ends(self):
+        """Pack sd:8158: the lease goes at `enqueued`, but its pull request is open; a second bundle is a second PR."""
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        build.enqueued(self.db, self.bundle["id"])
+        build.queue(self.db, [self.item(), self.item(B)], who="operator")
+        available = build.room(self.db, **IDLE)
+        self.assertEqual(build.room_for(available, A), 0, "the open pull request holds A's one bundle")
+        self.assertGreater(build.room_for(available, B), 0, "another repo still has room")
+        self.assertEqual(available["machine"], build.MACHINE_CAP, "no builder runs: the machine slot is free")
+        self.assertEqual(self.claim()["repo"], B)
+        self.assertIsNone(self.claim(), "A's item waits for the next bundle")
+        build.end(self.db, self.bundle["id"], "done", "merged")
+        self.assertEqual(self.claim()["repo"], A, "the slot frees once the run ends")
+
+    def enqueue_draft(self):
+        url = "https://github.com/example/project/pull/5"
+        build.write(self.db, self.bundle["id"], step="enqueuing", detail=build.DRAFT_PULL + url)
+        self.assertTrue(build.enqueued(self.db, self.bundle["id"], held_by=build.DRAFT_PULL + url))
+
+    def test_an_unmanaged_draft_pull_request_frees_its_repository_slot(self):
+        """Pack sd:8158, blocker #49312: its owners may leave the draft open for weeks; no reap or cancel ends the run."""
+        self.enqueue_draft()
+        build.queue(self.db, [self.item()], who="operator")
+        available = build.room(self.db, **IDLE)
+        self.assertEqual(build.room_for(available, A), 1, "an open upstream draft stops no later build")
+        self.assertNotIn(A, available["used"])
+        self.assertEqual(self.claim()["repo"], A)
+
+    def test_an_ended_run_at_a_lane_step_holds_no_slot(self):
+        """Pack sd:8158, class pass: a reaped run stays unreleased until its groups read gone, which may be never."""
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        build.enqueued(self.db, self.bundle["id"])
+        self.db.execute("UPDATE runner_run SET step = 'cleaning', outcome = 'blocked' WHERE id = ?", (self.bundle["id"],))
+        self.assertEqual(build.room_for(build.room(self.db, **IDLE), A), 1)
+
+    def test_a_managed_run_keeps_its_slot_at_every_lane_step(self):
+        """Pack sd:8158: only a draft pull request frees the slot early; `reap` bounds the two supervised steps."""
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        build.enqueued(self.db, self.bundle["id"])
+        for step in build.LANE_STEPS:
+            with self.subTest(step=step):
+                self.db.execute("UPDATE runner_run SET step = ? WHERE id = ?", (step, self.bundle["id"]))
+                self.assertEqual(build.room_for(build.room(self.db, **IDLE), A), 0)
+
+    def test_a_draft_run_past_enqueued_holds_its_slot_until_it_cleans_up(self):
+        """Pack sd:8158: after the owners merge, `cleaning` runs under a supervisor in that worktree, so it counts."""
+        self.enqueue_draft()
+        self.db.execute("UPDATE runner_run SET step = 'cleaning' WHERE id = ?", (self.bundle["id"],))
+        self.assertEqual(build.room_for(build.room(self.db, **IDLE), A), 0)
 
     def test_reap_skips_enqueued_run(self):
         """Failure table, Enqueued: no supervisor while the run waits on the lane; reap leaves it open."""
@@ -770,7 +833,8 @@ class Reap(Case):
             self.db.execute("UPDATE assignment SET scope = 'build', queued_at = ? WHERE id = ?",
                             (self.bundle["created_at"], ident))
             queued.append(ident)
-        self.assertIsNone(self.claim())
+        with mock.patch.object(build, "REPO_CAP", 2):  # room beside the held run, so the claim reaches the hold
+            self.assertIsNone(self.claim())
         rows = self.db.execute(f"SELECT status, result FROM assignment WHERE id IN ({queued[0]}, {queued[1]})")
         for row in rows:
             self.assertEqual(row["status"], "blocked")
@@ -1216,11 +1280,12 @@ class Pickup(Case):
         self.item(status="planning", priority=0)
         self.assertEqual(build.pickup(self.db, self.room(), now=self.NOW), [], "off picks nothing")
         self.on()
-        self.assertEqual(build.pickup(self.db, self.room(), now=self.NOW), [*a, b])
+        self.assertEqual(build.pickup(self.db, self.room(), now=self.NOW), [*a[:build.BUNDLE_MAX], b],
+                         "one bundle a repository: A's fourth waits for the next")
         self.assertTrue(all(build.picked(self.db, row["id"]) for row in
                             self.db.execute("SELECT id FROM assignment WHERE scope = 'build'")))
         self.assertEqual(build.pickup(self.db, self.room(), now=self.NOW), [], "a queued build is claimed first")
-        self.assertEqual([len(build.run(self.db, self.claim()["id"])["members"]) for _ in range(3)], [3, 1, 1])
+        self.assertEqual([len(build.run(self.db, self.claim()["id"])["members"]) for _ in range(2)], [3, 1])
 
     def test_pickup_keeps_to_the_room(self):
         items = [self.item(priority=n) for n in range(5)]
@@ -1229,6 +1294,16 @@ class Pickup(Case):
         self.assertEqual(build.pickup(self.db, self.room(interactive=[{"repo": B, "session_id": None}] * 5),
                                       now=self.NOW), items[:3], "one slot left: one bundle")
         self.assertFalse(build.picked(self.db, build.queue(self.db, [items[3]], who="operator")[0]["id"]))
+
+    def test_a_press_waiting_on_a_full_repository_holds_no_other_repository(self):
+        """Pack sd:8158: at one bundle per repo a press can wait for a whole bundle; only a press with room holds."""
+        build.queue(self.db, [self.item()], who="operator")
+        b = self.item(repo=B)
+        self.on()
+        busy = self.room(interactive=[{"repo": A, "session_id": "s1"}])
+        self.assertEqual(build.room_for(busy, A), 0)
+        self.assertEqual(build.pickup(self.db, busy, now=self.NOW), [b], "A's waiting press holds nothing in B")
+        self.assertEqual(build.pickup(self.db, self.room(), now=self.NOW), [], "a press with room is claimed first")
 
     def end(self, status):
         item = self.item()

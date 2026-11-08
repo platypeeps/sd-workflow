@@ -18,6 +18,7 @@ from test_v2_today import OSASCRIPT
 
 STATIC = Path(v2.__file__).resolve().parent / "static"
 MARKUP_JS = (STATIC / "markup.js").read_text(encoding="utf-8")
+ATTACH_JS = (STATIC / "home-attach.js").read_text(encoding="utf-8")
 KOI_JS = (STATIC / "home-koi.js").read_text(encoding="utf-8")
 SCRIPTS = "script.pond_change_small|25\nscript.pond_change_big|50\n"
 DAY = NOW[:10]
@@ -292,6 +293,65 @@ function run() { return JSON.stringify(OUT); }
         out = json.loads(result.stdout)
         self.assertIsNone(out["error"])
         self.assertEqual(out["posts"], [["/api/home/koi/test", {"ammonia": 0.25}]])
+
+    LISTED = {"asset": 2, "folder": "https://drive.google.com/drive/folders/GOL", "files": [
+        {"id": "PIC1234567", "name": "scales.jpg", "mime": "image/jpeg", "link": "https://drive.google.com/open?id=PIC1234567",
+         "kind": "picture"},
+        {"id": "DOC1234567", "name": "receipt.pdf", "mime": "application/pdf", "link": "https://drive.google.com/open?id=DOC1234567",
+         "kind": "document"}]}
+
+    def attach_js(self, body):
+        """sd:8147: the Koi view with home-attach.js, a fish's folder answering LISTED and an upload staging."""
+        script = (STAND_IN + MARKUP_JS + f"\nconst DOC = {json.dumps(self.DOC)};\nconst LISTED = {json.dumps(self.LISTED)};\n" + r"""
+DOC.water.unlogged = 0;
+window.shell = { getJSON: p => { OUT.gets.push(p); return Promise.resolve(JSON.parse(JSON.stringify(p.startsWith('/api/home/attachments?') ? LISTED : DOC))); },
+  post: (p, b) => { OUT.posts.push([p, p === '/api/home/attach/file' ? { name: b.name } : b]); return Promise.resolve({ sha256: 'a'.repeat(64) }); },
+  toast: m => OUT.toasts.push(m), itemHref: n => '/tasks?row=' + n };
+const flush = () => new Promise(r => r()).then(() => null).then(() => null).then(() => null).then(() => null);
+const click = sel => (DOC_LISTENERS.click || []).forEach(f => f({ target: { closest: s => s === sel ? { dataset: { fish: '2' } } : null } }));
+""" + ATTACH_JS + KOI_JS + r"""
+var R = {};
+(async () => { try {
+document.dispatchEvent(new CustomEvent('shell:view', { detail: { id: 'koi' } })); await flush();
+""" + body + r"""
+} catch (e) { OUT.error = String(e) + ' ' + e.stack; } })();
+function run() { OUT.R = R; return JSON.stringify(OUT); }
+""")
+        result = subprocess.run([OSASCRIPT, "-l", "JavaScript", "-e", script], capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = json.loads(result.stdout)
+        self.assertIsNone(out["error"])
+        return out
+
+    SELECT = "click('[data-fish]'); await flush(); await flush(); R.form = ELS['koi-form'].html; R.attach = (ELS['koi-attach'] || {}).html || '';"
+
+    def test_a_selected_fish_lists_its_files(self):
+        out = self.attach_js(self.SELECT)
+        self.assertIn("/api/home/attachments?asset=2", out["gets"])
+        self.assertIn('<div id="koi-attach"', out["R"]["form"])
+        self.assertIn('href="https://drive.google.com/open?id=DOC1234567" target="_blank" rel="noopener">receipt.pdf', out["R"]["attach"])
+        self.assertIn('data-attach="upload"', out["R"]["attach"])
+        self.assertIn('data-attach="reference"', out["R"]["attach"])
+
+    def test_a_picture_renders_as_an_image_from_picture(self):
+        out = self.attach_js(self.SELECT)
+        self.assertIn('<img class="thumb" src="/api/home/attachments/picture?id=PIC1234567" alt="scales.jpg"', out["R"]["attach"])
+
+    def test_upload_posts_that_fishs_id(self):
+        out = self.attach_js(self.SELECT + r"""
+const button = { setAttribute() {}, removeAttribute() {} };
+const form = { dataset: { attach: 'upload' }, elements: { file: { files: [{ name: 'scales.jpg' }] } }, querySelector: () => button,
+  closest: s => s === '#koi-attach' ? ELS['koi-attach'] : null };
+(DOC_LISTENERS.submit || []).forEach(f => f({ target: form, preventDefault() {} })); await flush(); await flush();""")
+        self.assertEqual(out["posts"], [["/api/home/attach/file", {"name": "scales.jpg"}],
+                                        ["/api/home/attach", {"asset": 2, "sha256": "a" * 64, "name": "scales.jpg"}]])
+
+    def test_a_new_fish_shows_no_section(self):
+        out = self.attach_js("click('#koi-add'); await flush(); R.form = ELS['koi-form'].html;")
+        self.assertIn("New fish", out["R"]["form"])
+        self.assertNotIn("koi-attach", out["R"]["form"])
+        self.assertNotIn("Attachments", out["R"]["form"])
+        self.assertFalse([g for g in out["gets"] if g.startswith("/api/home/attachments")])
 
     def draw_water(self, water):
         script = (STAND_IN + MARKUP_JS + f"\nconst DOC = {json.dumps(self.DOC)};\n" + f"Object.assign(DOC.water, {json.dumps(water)});" + r"""

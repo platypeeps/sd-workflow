@@ -19,6 +19,11 @@ No new store: an asset's attachments are its Drive folder's listing. The design 
   (operator ruling, note #36048): workspace-mcp cannot make a Drive shortcut.
 
 Every Drive call goes through workspace-mcp (`research_slides._call`), so the dashboard holds no Google token.
+
+**Home** (pack sd:8112) runs the same code as a second `Site`, `HOME`: `home.drive_folder` holds the root folder id
+and `home.google_account` the account; an asset's folder is `<kind group>/<asset name> #<id>` (a koi's is under its
+pond's, `Other/<pond> #<id>/<koi> #<id>`), each folder made on the first attachment and found by its ` #<id>`.
+Unset, an asset lists no folder and an upload names the setting. Its routes are `/api/home/attachments`, `/api/home/attachments/picture` and `/api/home/attach`.
 """
 
 from __future__ import annotations
@@ -30,11 +35,13 @@ import re
 import threading
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
+from typing import Callable
 
 from . import hoa_screen, notes_screen, research_slides, source_intake
 
-__all__ = ["ACCOUNT_KEY", "FOLDER_KEY", "LIGHT_KEY", "PICTURE_BYTES", "SUFFIXES", "UPLOAD_BYTES", "listing", "picture", "place",
-           "request"]
+__all__ = ["ACCOUNT_KEY", "FOLDER_KEY", "HOA", "HOME", "LIGHT_KEY", "PICTURE_BYTES", "SUFFIXES", "UPLOAD_BYTES", "Site",
+           "listing", "picture", "place", "request"]
 
 FOLDER_KEY = "hoa.water_system_folder"
 #: sd:7667: the street lights' folders sit under their own Light System folder, not under Water System.
@@ -104,26 +111,43 @@ def _write(tool: str, arguments: dict, what: str) -> str:
     return made[1]
 
 
-def _account(connection) -> str:
+@dataclass(frozen=True)
+class Site:
+    """One map's attachments: its root settings by label, its account setting, where an asset files and how one is found.
+
+    `place(asset)` is `(root setting, folders that must exist, folders made on the first attachment)`. `optional` are
+    the settings whose absence lists an asset with no folder, Drive not asked; an upload still names them."""
+
+    roots: dict
+    account: str
+    place: Callable[[dict], tuple[str, list, list]]
+    asset: Callable[[object, object], dict]
+    ident: type
+    optional: frozenset = frozenset()
+    #: How to set an unset key: `sd config set` takes only declared prefixes, so Home's are set on Settings.
+    remedy: str = "run sd config set {key} <value>"
+
+
+def _account(connection, site: Site) -> str:
     """The account alone (sd:7680): a picture is named by its file id, so no folder setting gates it; `LookupError`
     when unset."""
     from sd_db import writes
 
-    account = writes.read_settings(connection, [ACCOUNT_KEY]).get(ACCOUNT_KEY)
+    account = writes.read_settings(connection, [site.account]).get(site.account)
     if not account:
-        raise LookupError(f"{ACCOUNT_KEY} is not set: run sd config set {ACCOUNT_KEY} <value>.")
+        raise LookupError(f"{site.account} is not set: {site.remedy.format(key=site.account)}.")
     return account
 
 
-def _settings(connection, root: str) -> tuple[str, str]:
+def _settings(connection, root: str, account_key: str, remedy: str = "run sd config set {key} <value>") -> tuple[str, str]:
     """`(the root folder id named by setting `root`, the account)`; `LookupError` naming each one unset."""
     from sd_db import writes
 
-    held = writes.read_settings(connection, [root, ACCOUNT_KEY])
-    folder, account = held.get(root), held.get(ACCOUNT_KEY)
+    held = writes.read_settings(connection, [root, account_key])
+    folder, account = held.get(root), held.get(account_key)
     if not folder or not account:
-        missing = " and ".join(key for key, value in ((root, folder), (ACCOUNT_KEY, account)) if not value)
-        raise LookupError(f"{missing} is not set: run sd config set {missing.split(' and ')[0]} <value>.")
+        missing = " and ".join(key for key, value in ((root, folder), (account_key, account)) if not value)
+        raise LookupError(f"{missing} is not set: {remedy.format(key=missing.split(' and ')[0])}.")
     return folder, account
 
 
@@ -153,35 +177,42 @@ def _children(account: str, folder: str) -> list[dict]:
     return rows
 
 
-def _one(account: str, parent: str, name: str) -> str | None:
-    """The id of the one folder named `name` in `parent`; None for none, `LookupError` for two."""
-    found = [row["id"] for row in _children(account, parent) if row["mime"] == FOLDER_MIME and row["name"] == name]
+def _one(account: str, parent: str, name: str | tuple[str, str]) -> str | None:
+    """The id of the one folder named `name` in `parent`; None for none, `LookupError` for two. A `(name, suffix)`
+    pair matches by its suffix alone (sd:8112: ` #<asset id>`), so a renamed asset keeps its folder."""
+    name, suffix = name if isinstance(name, tuple) else (name, None)
+    found = [row["id"] for row in _children(account, parent) if row["mime"] == FOLDER_MIME
+             and (row["name"].endswith(suffix) if suffix else row["name"] == name)]
     if len(found) > 1:
         raise LookupError(f"Drive holds {len(found)} folders named {name}: {', '.join(found)}. Merge them in Drive.")
     return found[0] if found else None
 
 
-def _folder(connection, ident: object, *, make: bool) -> tuple[dict, str, str | None]:
+def _folder(connection, ident: object, site: Site, *, make: bool) -> tuple[dict, str, str | None]:
     """`(asset, account, folder id)`: the asset's folder, made when `make` and missing; None when missing."""
-    asset = _asset(connection, ident)
-    key, sub, own = place(asset)
-    if key == LIGHT_KEY and not make:
-        from sd_db import writes
+    from sd_db import writes
 
-        # sd:7667: the pack can land before hoa declares the light key and before it is set. Unset, a pole has no
-        # folder yet: an empty listing, Drive not asked; an upload still refuses below, naming the setting.
-        if not writes.read_settings(connection, [LIGHT_KEY]).get(LIGHT_KEY):
-            return asset, "", None
-    root, account = _settings(connection, key)
-    parent = _one(account, root, sub)
-    if parent is None:
-        raise LookupError(f"The {ROOTS[key]} folder has no folder named {sub}.")
-    if own is None:
-        return asset, account, parent
-    folder = _one(account, parent, own)
-    if folder is None and make:
-        folder = _write("create_drive_folder", {"user_google_email": account, "folder_name": own,
-                                                "parent_folder_id": parent}, "the folder")
+    asset = site.asset(connection, ident)
+    key, existing, made = site.place(asset)
+    quiet = site.optional & {key, site.account}
+    # sd:7667, sd:8112: an unset optional setting is no folder yet: an empty listing, Drive not asked; an upload
+    # still refuses below, naming the setting. A key never held has no row, so it is absent from the answer.
+    held = writes.read_settings(connection, sorted(quiet)) if quiet and not make else {}
+    if quiet and not make and not all(held.get(name) for name in quiet):
+        return asset, "", None
+    folder, account = _settings(connection, key, site.account, site.remedy)
+    for sub in existing:
+        parent, folder = folder, _one(account, folder, sub)
+        if folder is None:
+            raise LookupError(f"The {site.roots[key]} folder has no folder named {sub}.")
+    for own in made:
+        parent, folder = folder, _one(account, folder, own)
+        if folder is None:
+            if not make:
+                return asset, account, None
+            folder = _write("create_drive_folder", {"user_google_email": account,
+                                                    "folder_name": own if isinstance(own, str) else "".join(own),
+                                                    "parent_folder_id": parent}, "the folder")
     return asset, account, folder
 
 
@@ -193,10 +224,10 @@ def _kind(row: dict) -> str:
     return "picture" if row["mime"].startswith("image/") else "document"
 
 
-def listing(connection, parameters: dict):
+def listing(connection, parameters: dict, site: Site | None = None):
     """`GET /api/hoa/attachments?asset=<id>`: `{"asset", "folder", "files"}`, or `(status, {"error"})`."""
     try:
-        asset, account, folder = _folder(connection, _first(parameters, "asset"), make=False)
+        asset, account, folder = _folder(connection, _first(parameters, "asset"), site or HOA, make=False)
         files = []
         for row in _children(account, folder) if folder else []:
             entry = {**row, "kind": _kind(row)}
@@ -221,13 +252,13 @@ def _fetch(url: str) -> bytes:
     return data
 
 
-def picture(connection, parameters: dict):
+def picture(connection, parameters: dict, site: Site | None = None):
     """`GET /api/hoa/attachments/picture?id=<file id>`: `(200, bytes, mime)` for a picture, else `(status, {"error"})`."""
     ident = _first(parameters, "id")
     if not isinstance(ident, str) or not ID.fullmatch(ident):
         return 400, {"error": "Name the picture by its Drive file id."}
     try:
-        account = _account(connection)
+        account = _account(connection, site or HOA)
         said = _call("get_drive_file_download_url", {"user_google_email": account, "file_id": ident}, "the download")
         found, mime = re.search(r"Download URL:\s*(http\S+)", said), re.search(r"MIME Type:\s*(image/[\w.+-]+)", said)
         if not mime:
@@ -241,7 +272,7 @@ def picture(connection, parameters: dict):
         return 503, {"error": f"The picture was not read: {error}"}
 
 
-def _upload(connection, values: dict) -> dict:
+def _upload(connection, values: dict, site: Site) -> dict:
     sha, name = values.get("sha256"), values.get("name")
     if not isinstance(sha, str) or not source_intake.SHA.fullmatch(sha) or not isinstance(name, str):
         raise ValueError("Upload names a staged file by its sha256 and its name.")
@@ -255,7 +286,7 @@ def _upload(connection, values: dict) -> dict:
     stored = source_intake._name(name, SUFFIXES)
     mime = mimetypes.guess_type(stored)[0] or "application/octet-stream"
     with ATTACHING:
-        asset, account, folder = _folder(connection, values.get("asset"), make=True)
+        asset, account, folder = _folder(connection, values.get("asset"), site, make=True)
         made = _write("create_drive_file", {"user_google_email": account, "file_name": stored, "folder_id": folder,
                                            "base64_content": base64.b64encode(data).decode("ascii"), "base64_sha256": sha,
                                            "content_mime_type": mime, "mime_type": mime}, "the upload")
@@ -263,7 +294,7 @@ def _upload(connection, values: dict) -> dict:
     return {"asset": asset["id"], "name": stored, "id": made}
 
 
-def _reference(connection, values: dict) -> dict:
+def _reference(connection, values: dict, site: Site) -> dict:
     link, name = values.get("link"), values.get("name") or "Drive link"
     if not isinstance(link, str) or not LINK.fullmatch(link.strip()):
         raise ValueError("Reference takes a drive.google.com or docs.google.com link.")
@@ -271,24 +302,26 @@ def _reference(connection, values: dict) -> dict:
         raise ValueError("A Reference's name is text.")
     stored = re.sub(r"[^A-Za-z0-9._ -]+", "-", name).strip(" -._")[:100] or "Drive link"
     with ATTACHING:
-        asset, account, folder = _folder(connection, values.get("asset"), make=True)
+        asset, account, folder = _folder(connection, values.get("asset"), site, make=True)
         made = _write("create_drive_file", {"user_google_email": account, "file_name": f"{stored}.url",
                                            "folder_id": folder, "content": f"[InternetShortcut]\nURL={link.strip()}\n",
                                            "mime_type": "text/plain"}, "the reference")
     return {"asset": asset["id"], "name": f"{stored}.url", "id": made}
 
 
-def request(values: dict):
+def request(values: dict, site: Site | None = None):
     """`POST /api/hoa/attach`'s checks; the write runs on the operator's press only."""
-    if set(values) - {"asset", "sha256", "name", "link"} or not isinstance(values.get("asset"), str):
-        raise ValueError('Send {"asset", "sha256", "name"} to upload or {"asset", "link", "name"} to reference.')
+    site = site or HOA
+    asset = values.get("asset")
+    if set(values) - {"asset", "sha256", "name", "link"} or not isinstance(asset, site.ident) or isinstance(asset, bool):
+        raise ValueError('Name the asset by its id. Send {"asset", "sha256", "name"} to upload or {"asset", "link", "name"} to reference.')
     if ("sha256" in values) == ("link" in values):
         raise ValueError("Attach either a staged file (sha256) or a link, not both.")
     act = _upload if "sha256" in values else _reference
 
     def write(connection):
         try:
-            return 200, act(connection, values)
+            return 200, act(connection, values, site)
         except Unknown as error:
             return 504, {"error": f"Whether Drive holds the file is not known ({error}). Look in the asset's folder "
                                   "before you press again."}
@@ -296,3 +329,67 @@ def request(values: dict):
             return 503, {"error": f"Nothing was written: {error}"}
 
     return write
+
+
+def _hoa_place(asset: dict) -> tuple[str, list, list]:
+    key, sub, own = place(asset)
+    return key, [sub], [own] if own else []
+
+
+HOA = Site(roots=ROOTS, account=ACCOUNT_KEY, place=_hoa_place, asset=_asset, ident=str, optional=frozenset({LIGHT_KEY}))
+
+HOME_FOLDER_KEY = "home.drive_folder"
+HOME_ACCOUNT_KEY = "home.google_account"
+#: Both keys are Settings rows (settings_screen._scalars): no sd config prefix declares home.*.
+HOME_SETTINGS = {
+    HOME_FOLDER_KEY: ("The Drive folder id that holds Home Map asset folders (pack sd:8112). Unset, the Map and Koi "
+                      "list no folder and Upload refuses.", r"[\w-]{10,200}"),
+    HOME_ACCOUNT_KEY: ("The Google account workspace-mcp reads Home Map attachments as (pack sd:8112).",
+                       r"[^@\s]+@[^@\s]+\.[^@\s]+"),
+}
+#: The Map's kind groups (sd:8085, home-map.js GROUPS); a kind in none is Other's.
+HOME_GROUPS = {"Gas": ("gas-line", "gas-shutoff"), "Water": ("water-line", "water-shutoff"),
+               "Sewer": ("sewer-line", "sewer-shutoff"), "Electric": ("electric-line", "electric-shutoff"),
+               "Comms": ("comms-line", "comms-shutoff"),
+               "Irrigation": ("irrigation-line", "irrigation-valve", "irrigation-zone", "backflow"),
+               "Energy": ("solar", "powerwall", "inverter", "ev-charger", "hvac"), "Plants": ("tree", "plant")}
+
+
+def _own(asset: dict) -> tuple[str, str]:
+    """`(name, " #<id>")`: names repeat and change, so the folder is found by its id suffix (decision #49151); a
+    renamed asset keeps its old folder name."""
+    return asset["name"].strip(), f" #{asset['id']}"
+
+
+def _home_place(asset: dict) -> tuple[str, list, list]:
+    """`Other/<pond> #<id>/<koi> #<id>` for a fish, else `<kind group>/<name> #<id>`; every folder is made on the
+    first attachment."""
+    if asset["kind"] == "koi":
+        return HOME_FOLDER_KEY, [], ["Other", _own(asset["pond"]), _own(asset)]
+    group = next((word for word, kinds in HOME_GROUPS.items() if asset["kind"] in kinds), "Other")
+    return HOME_FOLDER_KEY, [], [group, _own(asset)]
+
+
+def _home_asset(connection, ident: object) -> dict:
+    from sd_db import assets
+
+    if isinstance(ident, str) and ident.isdigit():
+        ident = int(ident)
+    if type(ident) is not int:
+        raise ValueError("Name the asset by its id.")
+    try:
+        asset = assets.get_asset(connection, ident)
+    except assets.AssetRefused as refused:
+        raise ValueError(f"No asset {ident} on the map: {refused}.") from None
+    if asset["kind"] == "koi":
+        # ponytail: the Koi view's one pond (home_koi._pond); a fish names no pond of its own.
+        ponds = assets.list_assets(connection, ("pond",))
+        if not ponds:
+            raise ValueError("A koi files under its pond's folder: add the pond first.")
+        asset = {**asset, "pond": ponds[0]}
+    return asset
+
+
+HOME = Site(roots={HOME_FOLDER_KEY: "Home Map"}, account=HOME_ACCOUNT_KEY, place=_home_place, asset=_home_asset, ident=int,
+            optional=frozenset({HOME_FOLDER_KEY, HOME_ACCOUNT_KEY}),
+            remedy="set {key} in Settings, Dashboard section")

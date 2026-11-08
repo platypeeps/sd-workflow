@@ -9,19 +9,27 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import time
 from dataclasses import dataclass
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
 from urllib.request import urlopen
 
+from .errors import SdDbError
 from .shadow_sync import GH_TIMEOUT_SECONDS, MAX_PAGES, PAGE_SIZE, _run, parse_iso
+from .writes import read_settings
 
 MAX_BYTES = 8 * 1024 * 1024
 SHA = re.compile(r"[0-9a-f]{40}")
 PULL = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/pull/([1-9][0-9]*)/?")
 ISSUE = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/issues/([1-9][0-9]*)/?")
 MAINTAINERS = {"OWNER", "MEMBER", "COLLABORATOR"}
+AUTOMATION_KEY = "contributions.automation_logins"
+AUTOMATION_PATTERN = r"[A-Za-z0-9](-?[A-Za-z0-9])*(,[A-Za-z0-9](-?[A-Za-z0-9])*)*"
+AUTOMATION_SETTINGS = {AUTOMATION_KEY: (
+    "GitHub logins, comma-separated, of service accounts: their comments are no maintainer comments.",
+    AUTOMATION_PATTERN)}
 ACTOR = "actor { login ... on User { databaseId } ... on Bot { databaseId } }"
 TIMELINE = """query($owner:String!,$repo:String!,$number:Int!,$after:String) {
   repository(owner:$owner,name:$repo) { pullRequest(number:$number) {
@@ -33,6 +41,8 @@ TIMELINE = """query($owner:String!,$repo:String!,$number:Int!,$after:String) {
       ... on ReadyForReviewEvent { id createdAt ACTOR }
       ... on ClosedEvent { id createdAt ACTOR }
       ... on ReopenedEvent { id createdAt ACTOR }
+      ... on ReviewRequestedEvent { id createdAt ACTOR requestedReviewer { ... on User { databaseId } } }
+      ... on HeadRefForcePushedEvent { id createdAt ACTOR }
     } }
   } }
 }""".replace("ACTOR", ACTOR)
@@ -325,13 +335,25 @@ def _ci(client, prefix, head):
     return state, sorted(ids)
 
 
-def _comment(row, kind, url, operator, *, at):
+def automation_logins(connection):
+    """The lower-cased logins of `AUTOMATION_KEY`; a row that does not read is unknown, not none (sd:8148)."""
+    try:
+        value = read_settings(connection, [AUTOMATION_KEY]).get(AUTOMATION_KEY)
+    except (SdDbError, sqlite3.Error) as error:
+        raise Unavailable(f"{AUTOMATION_KEY}: {error}") from error
+    return frozenset(login.strip().lower() for login in (value or "").split(",") if login.strip())
+
+
+def _comment(row, kind, url, operator, *, at, automation=frozenset()):
     actor = identity(row.get("user"))
+    # A bot or app post carries its owner's association, not a human ask (sd:8148).
+    automated = row["user"].get("type") == "Bot" or actor["login"].endswith("[bot]") \
+        or bool(row.get("performed_via_github_app")) or actor["login"].lower() in automation
     body = row.get("body")
     if not isinstance(body, str):
         raise Unavailable("comment body is unavailable")
     return {"id": f"{kind}:{row['id']}:{at}", "actor_id": actor["id"], "kind": "comment", "at": _at(at),
-            "maintainer": row.get("author_association") in MAINTAINERS,
+            "maintainer": not automated and row.get("author_association") in MAINTAINERS,
             "mentions_operator": bool(re.search(r"(?<![\w@])@" + re.escape(operator["login"]) + r"(?![\w-])", body, re.I)),
             "url": row.get("html_url", url)}
 
@@ -366,7 +388,7 @@ def _labels(detail):
     return [label["name"] for label in labels]
 
 
-def pull(client, url, operator, *, observed_at, why=(), blocking_labels=()):
+def pull(client, url, operator, *, observed_at, why=(), blocking_labels=(), automation=frozenset()):
     owner, repo, number = pull_parts(url)
     prefix = f"/repos/{owner}/{repo}"
     path = f"{prefix}/pulls/{number}"
@@ -383,14 +405,19 @@ def pull(client, url, operator, *, observed_at, why=(), blocking_labels=()):
         reviews.append({"id": f"review:{row['id']}", "actor_id": identity(row.get("user"))["id"],
                         "state": state, "at": _at(row.get("submitted_at"))})
         if row.get("body"):
-            events.append(_comment(row, "review-comment", url, operator, at=row.get("submitted_at")))
+            events.append(_comment(row, "review-comment", url, operator, at=row.get("submitted_at"), automation=automation))
     for endpoint, kind in ((f"{prefix}/issues/{number}/comments", "comment"), (path + "/comments", "inline")):
         for row in client.pages(endpoint):
-            events.append(_comment(row, kind, url, operator, at=row.get("updated_at")))
+            events.append(_comment(row, kind, url, operator, at=row.get("updated_at"), automation=automation))
     kinds = {"LabeledEvent": "label_added", "UnlabeledEvent": "label_removed",
              "ConvertToDraftEvent": "converted_to_draft", "ReadyForReviewEvent": "ready_for_review",
-             "ClosedEvent": "closed", "ReopenedEvent": "reopened"}
-    for event, _ in _timeline_events(client.timeline(owner, repo, number), kinds, url):
+             "ClosedEvent": "closed", "ReopenedEvent": "reopened",
+             "ReviewRequestedEvent": "review_requested", "HeadRefForcePushedEvent": "pushed"}
+    for event, row in _timeline_events(client.timeline(owner, repo, number), kinds, url):
+        if event["kind"] == "review_requested":
+            # A team request names no user: no reviewer, so it answers no one's changes request.
+            reviewer = (row.get("requestedReviewer") or {}).get("databaseId")
+            event["reviewer_id"] = str(reviewer) if reviewer is not None else None
         events.append(event)
     ci, ci_ids = _ci(client, prefix, head)
     after = client.get(path)
@@ -432,14 +459,14 @@ def _issue_detail(client, path):
     return detail
 
 
-def issue(client, url, operator, *, observed_at, why=(), blocking_labels=()):
+def issue(client, url, operator, *, observed_at, why=(), blocking_labels=(), automation=frozenset()):
     owner, repo, number = issue_parts(url)
     path = f"/repos/{owner}/{repo}/issues/{number}"
     before = _issue_detail(client, path)
     author = identity(before.get("user"))
     events = []
     for row in client.pages(path + "/comments"):
-        events.append(_comment(row, "comment", url, operator, at=row.get("updated_at")))
+        events.append(_comment(row, "comment", url, operator, at=row.get("updated_at"), automation=automation))
     kinds = {"LabeledEvent": "label_added", "UnlabeledEvent": "label_removed",
              "ClosedEvent": "closed", "ReopenedEvent": "reopened"}
     for event, row in _timeline_events(client.timeline(owner, repo, number, kind="issue"), kinds, url):

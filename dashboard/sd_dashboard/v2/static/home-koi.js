@@ -5,6 +5,7 @@
 // post /api/home/care on the pond. When Home Assistant holds a change the pond's log lacks, the view posts
 // /api/home/koi/water once, which logs it, and reads again; it also posts when the pond's last synced window is
 // stale (water.sync_due). A total whose window a gap reaches reads "incomplete since <date>" (water.incomplete_since).
+// A saved fish's form shows its Drive folder (pack sd:8147) through home-attach.js, the Map's: a koi asset's folder.
 (() => {
   const { html, put } = window.markup;
   const $ = id => document.getElementById(id);
@@ -51,7 +52,9 @@
       <label>Health notes <textarea name="health" rows="2">${v.health || ''}</textarea></label>
       <label>Photo address <input name="photo" type="url" value="${f?.photo || ''}"></label>
       <fieldset><legend>Measurement</legend><label>Date <input name="m-date" type="date"></label><label>Size (in) <input name="m-size" inputmode="decimal"></label><label>Weight (lb) <input name="m-weight" inputmode="decimal"></label></fieldset>
-      <div class="ed-act"><button class="btn" type="submit">Save</button>${f ? html`<button class="btn quiet" type="button" id="koi-delete">Delete</button>` : ''}</div></form>`);
+      <div class="ed-act"><button class="btn" type="submit">Save</button>${f ? html`<button class="btn quiet" type="button" id="koi-delete">Delete</button>` : ''}</div></form>
+      ${f ? html`<section class="asset-form" aria-label="Attachments"><h3>Attachments</h3><div id="koi-attach" class="attach"></div></section>` : ''}`);
+    if (f) window.homeAttach.show('koi-attach', f.id, () => S.sel === f.id);
   }
 
   const toast = m => window.shell?.toast ? window.shell.toast(m) : null;
@@ -78,6 +81,9 @@
     if (row) { S.sel = Number(row.dataset.fish); draw(); }
   });
   document.addEventListener('submit', e => {
+    if (e.target.closest?.('#koi-attach') && e.target.dataset.attach) {
+      e.preventDefault(); const fish = S.sel; window.homeAttach.send(e.target, 'koi-attach', fish, () => S.sel === fish); return;
+    }
     const id = e.target.id;
     if (!['koi-fish-form', 'koi-care-form', 'koi-test-form'].includes(id)) return;
     e.preventDefault();

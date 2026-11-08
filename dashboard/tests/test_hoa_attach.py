@@ -222,6 +222,15 @@ class TheOtherSystems(Case):
         self.assertIsInstance(hoa_attach.listing(self.connection, {"asset": ["TANK-01"]}), dict,
                               "an unset light setting leaves the water assets read")
 
+    def test_a_light_setting_never_held_is_no_folder_yet(self):
+        # Review of sd:8112: a key with no row is absent from read_settings, not None; the pack lands before
+        # hoa declares the key, so a never-held key is the case the quiet listing exists for.
+        self.connection.execute("DELETE FROM state WHERE kind = 'setting' AND key = ?", (hoa_attach.LIGHT_KEY,))
+        self.connection.commit()
+        self.assertEqual(hoa_attach.listing(self.connection, {"asset": ["LGT-1"]}),
+                         {"asset": "LGT-1", "folder": "", "files": []})
+        self.assertEqual(self.drive.calls, [], "a never-held light setting asks Drive nothing")
+
     def test_a_light_pole_with_no_folder_is_named_and_never_made(self):
         writes.set_setting(self.connection, hoa_attach.LIGHT_KEY, "LIGHTS")
         self.drive.items["LIGHTS"] = [("LGT-2", "L2", FOLDER)]

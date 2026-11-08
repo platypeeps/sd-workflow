@@ -59,9 +59,10 @@ from .writes import now as clock
 SCOPE = "build"
 #: The scope of a draft run (`sd_db.draft`): it counts against the machine cap only, as it holds no branch.
 DRAFT = "draft"
-#: Code-writing builders per machine and per repository: the operator's standing rule.
+#: Code-writing builders per machine, the operator's standing rule, and bundles per repository at once.
+#: One: each bundle becomes its own pull request, so later items wait and the next bundle takes them (sd:8158).
 MACHINE_CAP = 6
-REPO_CAP = 3
+REPO_CAP = 1
 #: Items per bundle, so a bundle fits one 60-minute run (lead, note #29482).
 BUNDLE_MAX = 3
 BUDGET_MINUTES = 60
@@ -530,17 +531,20 @@ def pickup(connection, available: dict, *, now: str | None = None) -> list[int]:
     """One tick of auto-pickup while it is on: queue `eligible` items, as `PICKUP`, to fill the room; the items.
 
     The press queue goes first: while any build of this host's lanes is
-    queued, nothing is picked and the claim drains it. Each free builder
-    slot takes one bundle of up to `BUNDLE_MAX` items of one repository,
-    each repository at most its `room_for`. No room, or no item, queues
-    nothing.
+    queued in a repository with room, nothing is picked and the claim
+    drains it. A press waiting on a full repository holds no other one: at
+    one bundle per repository it may wait a whole bundle (pack sd:8158).
+    Each free builder slot takes one bundle of up to `BUNDLE_MAX` items of
+    one repository, each repository at most its `room_for`. No room, or no
+    item, queues nothing.
     """
     if available["why"] or not pickup_state(connection, now=now)["on"]:
         return []
     # Only this host's presses hold it: the hub never claims a satellite's.
     hosts = lane_hosts(connection)
-    if any(lane_of(connection, row["lane_host"]) in hosts for row in connection.execute(
-            "SELECT repo.lane_host FROM assignment JOIN item ON item.id = assignment.item "
+    if any(lane_of(connection, row["lane_host"]) in hosts and room_for(available, row["repo"]) > 0
+           for row in connection.execute(
+            "SELECT item.repo, repo.lane_host FROM assignment JOIN item ON item.id = assignment.item "
             "LEFT JOIN repo ON repo.path = item.repo WHERE assignment.status = 'queued' AND assignment.scope = ?",
             (SCOPE,))):
         return []
@@ -662,9 +666,19 @@ def room(connection, *, load: float | None, load_cap: float | None, interactive:
         "SELECT runner_run.session_id, runner_run.owner FROM runner_run JOIN assignment "
         "ON assignment.id = runner_run.assignment WHERE runner_run.released_at IS NULL AND assignment.scope = ?",
         (DRAFT,)).fetchall() if mine(row, hosts)]
-    headless = {row["session_id"] for row in [*builds, *drafts] if row["session_id"]}
+    # A run at a lane step released its lease, but its pull request is open: it keeps its repository's slot
+    # until it ends, or the next bundle opens a second pull request (pack sd:8158). It holds no machine slot.
+    # Not an ended run, nor a draft pull request: nothing here ends those, and its owners may never merge it.
+    marks = ", ".join("?" for _ in LANE_STEPS)
+    lane = [row for row in connection.execute(
+        f"SELECT runner_run.repo, runner_run.session_id, runner_run.owner, runner_run.step, runner_run.detail, "
+        f"runner_run.outcome FROM runner_run JOIN assignment "
+        f"ON assignment.id = runner_run.assignment WHERE runner_run.released_at IS NULL "
+        f"AND runner_run.outcome IS NULL AND assignment.scope = ? AND runner_run.step IN ({marks})",
+        (SCOPE, *LANE_STEPS)).fetchall() if mine(row, hosts) and draft_pull(dict(row)) is None]
+    headless = {row["session_id"] for row in [*builds, *drafts, *lane] if row["session_id"]}
     used: dict[str, int] = {}
-    for row in builds:
+    for row in [*builds, *lane]:
         used[row["repo"]] = used.get(row["repo"], 0) + 1
     others = [entry for entry in interactive or [] if not (entry.get("session_id") and entry["session_id"] in headless)]
     for entry in others:
