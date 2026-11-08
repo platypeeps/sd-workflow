@@ -237,6 +237,19 @@ class TheMoves(unittest.TestCase):
         self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: already Done"])
         self.assertEqual(jira.posted, [("ABC-7", "Done")])
 
+    def test_a_failed_note_write_holds_the_cursor_and_the_next_run_says_it(self):
+        jira = FakeJira({"ABC-7": "To Do"})
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        held = jira_moves.read_cursor(self.db)
+        jira.fail = "Jira returned 500 Server Error"
+        transition(self.db, self.item, "done", who="operator")
+        with patch.object(workflow, "add_item_note", side_effect=sqlite3.OperationalError("database is locked")):
+            with self.assertRaises(sqlite3.OperationalError):
+                jira_moves.run(self.db, jira, JIRA_ENV)
+        self.assertEqual(jira_moves.read_cursor(self.db), held)
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        self.assertEqual(len(self.notes(self.item)), 1)
+
 
 #: Every shape a JSON value can take, at its extremes, and a Python nest deeper than any answer.
 JUNK: list[Any] = [None, True, False, 0, -1, 2**70, 1e308, float("inf"), float("nan"), 5e-324, "", "x", [], [1], [[]],
