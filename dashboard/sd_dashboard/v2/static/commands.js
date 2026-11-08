@@ -241,8 +241,9 @@
   // Re-run collector (sd:2207, sd:2894): the server runs sd shadow sync in a thread, bounded to 120 s, one run at a time; a
   // second start is refused while one is live. The page asks how it went every 5 s and calls reread() once it ends. Success
   // is quiet: the reread shows it. A failed tracker or a run that broke stays as a toast with its first reason. `page`
-  // names who reads again. sd:8146: a 409 is a sync already running (the lock `sd shadow sync` exits 4 on), so the page
-  // follows it as its own. `running(bool)` hears when the followed run starts and ends, for a page's button.
+  // names who reads again. sd:8146: a 409 is a sync already running (the lock `sd shadow sync` exits 4 on). Only the
+  // dashboard's own run can be followed: /api/shadow/state reads that run alone, so a 409 whose state reads idle is a
+  // terminal or nightly sync, said with no promise to read again. `running(bool)` hears a followed run start and end.
   const SYNC_POLL = 5000;
   function syncCollector({ reread, page, running = () => {} }) {
     const wait = () => setTimeout(() => window.shell.getJSON('/api/shadow/state').then(s => {
@@ -255,7 +256,9 @@
     return { id: 'collector.sync', on: 'collector', label: 'Re-run collector', does: 'Gets the latest from GitHub now, up to 2 minutes, then refreshes.', key: 'r', icon: 'rotate-ccw', risk: 'safe', primary: () => true,
       cli: () => 'sd shadow sync --max-seconds 120',
       run: () => window.shell.post('/api/shadow/sync', {}).then(() => follow('Shadow sync started'),
-        e => { if (e.status === 409) return follow('A shadow sync is already running'); throw e; }) };
+        e => { if (e.status !== 409) throw e;
+          return window.shell.getJSON('/api/shadow/state').then(s => s.running ? follow('A shadow sync is already running')
+            : `A shadow sync outside the dashboard is running: ${e.message} · try again after it ends`); }) };
   }
 
   // Adversarial review (sd:5064): POST /api/adversarial starts a codex review of the row in the background (adversarial.py).

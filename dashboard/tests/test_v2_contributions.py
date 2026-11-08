@@ -879,14 +879,29 @@ shellRun(cmd('collector.sync'), C.get('collector')); await flush();""", answer=s
         self.assertEqual(out["posts"], [["/api/shadow/sync", {}, 64]])
         self.assertEqual(out["gets"][-1], "/api/contributions/page")
 
-    def test_a_sync_already_running_is_followed_not_an_error(self):
-        # `sd shadow sync` exit 4: the lock is held, the route answers 409. sd:8146 reverses the old toast-only refusal:
-        # the page waits on the live run and reads again.
-        busy = "[409, { error: 'another shadow sync holds the lock' }]"
+    def test_a_dashboard_sync_already_running_is_followed_not_an_error(self):
+        # sd:8146: the 409 for the dashboard's own live run (its state reads running): the page waits on it and reads again.
+        busy = "[409, { error: 'A shadow sync started at 2026-10-06T15:00:00Z is still running. Wait for it to finish.' }]"
         out = self.run_page(self.CLICK_REFRESH, answer=self.refresh_answer(busy))
         self.assertEqual([t[0] for t in out["toasts"]], ["A shadow sync is already running · Contributions reads again when it ends"])
         self.assertIn("/api/shadow/state", out["gets"])
         self.assertEqual(out["gets"][-1], "/api/contributions/page")
+
+    def test_a_sync_held_outside_the_dashboard_is_said_not_followed(self):
+        # `sd shadow sync` (a terminal, the nightly job) holds the lock: the route answers 409, but /api/shadow/state is
+        # the dashboard's run only and reads idle, here with an older run's failure. The page promises no reread it cannot
+        # keep, toasts no stale failure, and leaves Refresh on.
+        busy = "[409, { error: 'another shadow sync is already running against this database; wait for it to finish' }]"
+        idle = """(() => { OUT.during = []; return (path, body) => path === '/api/contributions/page' ? [200, DOC]
+          : path === '/api/shadow/sync' ? %s
+          : path === '/api/shadow/state' ? (OUT.during.push(ELS.source.html), [200, { running: false, error: 'OperationalError: old run', trackers: [] }])
+          : [404, { error: 'no answer' }]; })()""" % busy
+        out = self.run_page(self.CLICK_REFRESH + " R.after = ELS.source.html;", answer=idle)
+        self.assertEqual([t[0] for t in out["toasts"]], [
+            "A shadow sync outside the dashboard is running: another shadow sync is already running against this database;"
+            " wait for it to finish · try again after it ends"])
+        self.assertEqual(out["gets"], ["/api/contributions/page", "/api/shadow/state"], "the page reread before the sync ended")
+        self.assertIn("data-gh-refresh>Refresh from GitHub</button>", out["R"]["after"])
 
     def test_off_commands_name_their_reason(self):
         out = self.run_page("""const w = (id, key) => cmd(id).when(C.get(key));
