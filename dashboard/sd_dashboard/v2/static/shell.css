@@ -877,3 +877,12 @@ ul.listing { margin: 0 0 var(--space-sm); padding-left: var(--space-md); font: 4
 .tile-attention dl { margin: 0; display: grid; gap: var(--space-2xs); }
 .tile-attention dt { font-size: var(--text-sm); color: var(--color-ink); overflow-wrap: anywhere; }
 .tile-attention dd { margin: 0; font: 400 var(--text-xs)/1.3 var(--font-data); color: var(--color-ink-2); overflow-wrap: anywhere; }
+/* A group row's disclosure chevron (Today's Needs you, Queue, pulls and categories; Metrics' PR waits, sd:8084): one
+ * rule set, so a page with group rows reuses it. :is() keeps the class-list specificity the page rules had. */
+:is(.needs, .queue, .pulls, .cats, .pr-waits) .what .disc { all: unset; float: left; display: grid; place-items: center; width: 1.25rem; height: 1.25rem; margin-right: var(--space-3xs); cursor: pointer; color: var(--color-muted); vertical-align: -0.2em; }
+:is(.needs, .queue, .pulls, .cats, .pr-waits) .what .disc + .pick { display: flow-root; } /* beside the floated chevron, wrapping in its own box */
+:is(.needs, .queue, .pulls, .cats, .pr-waits) .what .disc .i { transition: transform var(--dur-fast) var(--ease-out); }
+:is(.needs, .queue, .pulls, .cats, .pr-waits) .what .disc[aria-expanded="true"] .i { transform: rotate(90deg); }
+:is(.needs, .queue, .pulls, .cats, .pr-waits) .what .disc:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; border-radius: var(--radius-sm); }
+@media (pointer: coarse) { :is(.needs, .queue, .pulls, .cats, .pr-waits) .what .disc { width: var(--row-touch); height: var(--row-touch); } }
+@media (prefers-reduced-motion: reduce) { :is(.needs, .queue, .pulls, .cats, .pr-waits) .what .disc .i { transition: none; } }

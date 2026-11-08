@@ -118,11 +118,6 @@
 .intents .chip:disabled { opacity: 0.5; cursor: default; }
 .needs tr.band th { padding: var(--space-sm) var(--space-xs) var(--space-2xs); text-align: left; font: 600 var(--text-2xs)/1 var(--font-label); letter-spacing: 0.09em; text-transform: uppercase; color: var(--color-muted); border-bottom: var(--rule-hair) solid var(--color-rule); }
 .needs .what { min-width: 0; overflow-wrap: anywhere; }
-.needs .what .disc, .queue .what .disc, .pulls .what .disc, .cats .what .disc { all: unset; float: left; display: grid; place-items: center; width: 1.25rem; height: 1.25rem; margin-right: var(--space-3xs); cursor: pointer; color: var(--color-muted); vertical-align: -0.2em; }
-.needs .what .disc + .pick, .queue .what .disc + .pick, .pulls .what .disc + .pick, .cats .what .disc + .pick { display: flow-root; } /* beside the floated chevron, wrapping in its own box */
-.needs .what .disc .i, .queue .what .disc .i, .pulls .what .disc .i, .cats .what .disc .i { transition: transform var(--dur-fast) var(--ease-out); }
-.needs .what .disc[aria-expanded="true"] .i, .queue .what .disc[aria-expanded="true"] .i, .pulls .what .disc[aria-expanded="true"] .i, .cats .what .disc[aria-expanded="true"] .i { transform: rotate(90deg); }
-.needs .what .disc:focus-visible, .queue .what .disc:focus-visible, .pulls .what .disc:focus-visible, .cats .what .disc:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; border-radius: var(--radius-sm); }
 .needs tr.member .what { padding-left: var(--space-lg); font-weight: 400; }
 .needs tr.more td { padding-block: var(--space-2xs); font-size: var(--text-xs); color: var(--color-muted); }
 .needs .age, .ledger.active .num { white-space: nowrap; font: 400 var(--text-xs)/1 var(--font-data); font-variant-numeric: tabular-nums; color: var(--color-ink-2); }
@@ -131,8 +126,7 @@
 .foot a { color: var(--color-ink-2); }
 .foot a:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
 @media (pointer: coarse) { .active .what a { display: flex; align-items: center; min-height: var(--row-touch); } }
-@media (pointer: coarse) { .needs .what .disc, .queue .what .disc, .pulls .what .disc, .cats .what .disc { width: var(--row-touch); height: var(--row-touch); } .needs tr.more .linkbtn, .foot a { display: inline-flex; align-items: center; min-height: var(--row-touch); } }
-@media (prefers-reduced-motion: reduce) { .needs .what .disc .i, .queue .what .disc .i, .pulls .what .disc .i, .cats .what .disc .i { transition: none; } }
+@media (pointer: coarse) { .needs tr.more .linkbtn, .foot a { display: inline-flex; align-items: center; min-height: var(--row-touch); } }
 @media (max-width: 899px) {
   .needs tbody tr { grid-template-columns: 2rem minmax(0, 1fr) auto; grid-template-areas: "g what age" ". detail detail" ". src act"; }
   .needs tbody tr.band, .needs tbody tr.more { display: block; }
@@ -182,6 +176,7 @@
 .queue .pip { display: inline-block; min-width: 1.6rem; margin-right: var(--space-3xs); padding: 2px var(--space-3xs); text-align: center; border: var(--rule-hair) solid var(--color-rule-2); border-radius: var(--radius-sm); font: 400 var(--text-xs)/1.2 var(--font-data); font-variant-numeric: tabular-nums; color: var(--color-muted); }
 .queue .pip.on { border-color: var(--color-accent); color: var(--color-ink); }
 .queue .pip.warn { background: var(--color-warning-lamp); border-color: transparent; color: var(--color-warning-ink); }
+.queue .pip.caution { background: var(--color-caution-lamp); border-color: transparent; color: var(--color-caution-lamp-ink); }
 .queue .act { text-align: right; white-space: nowrap; }
 .queue .act .ctl { display: inline-flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-3xs); vertical-align: middle; }
 .queue .act .ctl .btn .i { margin-right: 0; }

@@ -586,7 +586,7 @@ def observe_pull(connection, url, observation, *, expected_revision) -> dict:
             raise WorkflowError("CI observation does not describe the current pull-request head")
         if value["ci"] in {"success", "failure"} and not value["ci_ids"]:
             raise WorkflowError("conclusive CI needs check-run or status identities")
-        for name in ("why", "blocking_labels", "labels"):
+        for name in ("why", "blocking_labels", "labels", "requested_reviewers"):
             _strings(value.get(name, []), name)
         _text(value.get("title"), "title")
         if not isinstance(value.get("repo"), str) or value["repo"].lower() != "/".join(url.split("/")[3:5]):
@@ -686,7 +686,7 @@ def observe_issue(connection, url, observation, *, expected_revision) -> dict:
             raise WorkflowError("issue observation carries pull-request fields")
         if value.get("state") not in {"open", "closed"} or value.get("state_reason") not in {None, "completed", "not_planned"}:
             raise WorkflowError("invalid issue lifecycle observation")
-        for name in ("why", "blocking_labels", "labels"):
+        for name in ("why", "blocking_labels", "labels", "requested_reviewers"):
             _strings(value.get(name, []), name)
         _text(value.get("title"), "title")
         if not isinstance(value.get("repo"), str) or value["repo"].lower() != "/".join(url.split("/")[3:5]):
@@ -1120,6 +1120,7 @@ def pr_waits(connection, *, now=None, errors: list[str] | None = None) -> list[d
     after it, or None: a pull request first seen merged has no time to merge (sd:7908). `open` is a pull request still
     open in a waiting lane, `on` who it waits on (`you`, `reviewers`) and `since` when that lane began. With
     `errors`, an item whose metadata is malformed is said there and skipped (sd:7863); without, it fails the read.
+    `mine` is `operator_pull` of the pull request's observation: True, False, or None when not known (sd:8084).
     """
     end = now or datetime.now(timezone.utc).isoformat(timespec="seconds")
     found = []
@@ -1144,8 +1145,29 @@ def pr_waits(connection, *, now=None, errors: list[str] | None = None) -> list[d
                       "on": ("you" if last["lane"] in ON_YOU else "reviewers") if waiting else None,
                       "since": last["at"], "waited": _seconds(last["at"], end) if waiting else None,
                       "on_you": spans["you"], "on_reviewers": spans["reviewers"],
-                      "to_merge": _seconds(notes[opened]["at"], merged["at"]) if merged else None})
+                      "to_merge": _seconds(notes[opened]["at"], merged["at"]) if merged else None,
+                      "mine": operator_pull(snapshot(connection, "github:" + url)["observation"])})
     return sorted(found, key=lambda value: (value["since"], value["item"]), reverse=True)
+
+
+def operator_pull(observation) -> bool | None:
+    """Whether the operator wrote the pull request or was asked to review it by name (sd:8084), or None when its
+    observation says neither: none, or one read before `requested_reviewers` was kept.
+
+    GitHub drops a reviewer from `requested_reviewers` once they review, so a review by the operator counts too. A
+    team request names no user, so it does not count.
+    """
+    observation = observation or {}
+    operator = observation.get("operator") or {}
+    if not operator.get("id") or not (observation.get("author") or {}).get("id"):
+        return None
+    if str(observation["author"]["id"]) == str(operator["id"]) \
+            or any(str(review.get("actor_id")) == str(operator["id"]) for review in observation.get("reviews") or []):
+        return True
+    requested = observation.get("requested_reviewers")
+    if requested is None:
+        return None
+    return str(operator.get("login") or "").lower() in {login.lower() for login in requested}
 
 
 def _projection_row(heartbeats, row, metadata, sources) -> dict:
