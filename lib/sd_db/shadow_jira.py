@@ -366,11 +366,12 @@ def _http(url: str, headers: dict[str, str], body: dict | None):
                 f"are not followed with credentials; set {ENV_BASE} to the URL Jira answers on"
             )
         return None, f"Jira returned {error.code} {error.reason}"
-    except (http.client.HTTPException, ValueError) as error:
+    except (http.client.HTTPException, ValueError, RecursionError) as error:
         # Type only: `InvalidURL` and `urllib.parse`'s `ValueError` quote the
         # host, a secret pasted into it included, and `IncompleteRead` quotes
-        # the bytes it did read. Before the `OSError` clause, because
-        # `RemoteDisconnected` is both.
+        # the bytes it did read. A body nested too deep for `json` is a
+        # `RecursionError`, no answer either (sd:8117). Before the `OSError`
+        # clause, because `RemoteDisconnected` is both.
         return None, f"the request to Jira failed: {type(error).__name__}"
     except (urllib.error.URLError, OSError) as error:
         # `URLError` quotes its reason, and that can be one of the exceptions

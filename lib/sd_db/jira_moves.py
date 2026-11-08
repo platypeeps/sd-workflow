@@ -14,14 +14,21 @@ status move nothing. A ticket already in that category is left alone. The
 transition is the first the ticket offers into that category, one named
 like the category first.
 
+`done` is also how sd records work nobody did: `progress.cancel_work` and
+the priority sweep's closure. Neither is finished work, so each leaves the
+ticket as it is, and the sync says so. A done item whose stored fields
+cannot be read is unknown, so it fails rather than moves.
+
 A failure is one comment note on the item, and the cursor still moves past
-it, so a failure is said once, not every hour. A Jira that is not configured
-moves nothing and holds the cursor.
+it, so a failure is said once, not every hour. Every field read from a Jira
+answer is checked, so a malformed answer is that item's failure too and the
+later moves continue. A Jira that is not configured moves nothing and holds
+the cursor.
 
 The first run has no cursor. It checks the token by listing the transitions
 of the newest linked ticket, read-only, and starts the cursor at the newest
-note: history is not replayed. A failed check holds the cursor, so the next
-run checks again.
+note: history is not replayed. A failed check, a malformed answer included,
+holds the cursor, so the next run checks again; no move waits on it.
 """
 
 from __future__ import annotations
@@ -60,7 +67,8 @@ def _write_cursor(connection: sqlite3.Connection, note: int) -> None:
 def _linked(connection: sqlite3.Connection, after: int) -> tuple[list[dict], int]:
     """The linked items with a status change after note `after`, one row each, and the newest note id read."""
     rows = connection.execute(
-        "SELECT note.id AS note, item.id AS item, item.status AS status, item.external_id AS ref"
+        "SELECT note.id AS note, note.body AS body, item.id AS item, item.status AS status,"
+        " item.external_id AS ref, item.fields AS fields"
         " FROM note JOIN item ON item.id = note.item"
         # An item's opening note is not a change: linking a ticket must not move it (`reads.py`'s test).
         " WHERE note.kind = 'status_change' AND substr(note.body, 1, 10) IS NOT 'opened as '"
@@ -70,12 +78,65 @@ def _linked(connection: sqlite3.Connection, after: int) -> tuple[list[dict], int
     for row in rows:
         found = KEY.fullmatch(row["ref"] or "")
         if found:
-            items[row["item"]] = {"item": row["item"], "status": row["status"], "key": found[1]}
+            # The newest note in the window wins: it is the one that set the item's status.
+            items[row["item"]] = {"item": row["item"], "status": row["status"], "key": found[1],
+                                  "body": row["body"], "fields": row["fields"]}
     return list(items.values()), newest
 
 
 def _issue(config: dict, key: str) -> str:
     return f"{config['base']}/rest/api/3/issue/{urllib.parse.quote(key)}"
+
+
+def _object(value: object, what: str) -> dict:
+    """`value` when it is a JSON object; otherwise that item's failure, never an error that stops the batch."""
+    if not isinstance(value, dict):
+        raise ValueError(f"Jira's answer has no {what} object")
+    return value
+
+
+def _text(value: object, what: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Jira's answer has no {what}")
+    return value
+
+
+def _state(value: object) -> tuple[str, str]:
+    """The name and the category key of a Jira status object."""
+    state = _object(value, "status")
+    category = _object(state.get("statusCategory"), "status category")
+    return _text(state.get("name"), "status name"), _text(category.get("key"), "status category key")
+
+
+def _transitions(payload: object) -> list[tuple[str, str, str]]:
+    """Each transition offered, as (id, target name, target category key); a malformed one raises `ValueError`."""
+    listed = _object(payload, "transition list").get("transitions")
+    if not isinstance(listed, list):
+        raise ValueError("Jira's answer has no list of transitions")
+    offers = []
+    for entry in listed:
+        offer = _object(entry, "transition")
+        name, category = _state(offer.get("to"))
+        offers.append((_text(offer.get("id"), "transition id"), name, category))
+    return offers
+
+
+def _nobody_did(entry: dict) -> str:
+    """Why this item's `done` is not finished work, or "": said on the sync's line, and the ticket stays."""
+    from .priority_sweep import CLOSE_REASON
+
+    if entry["status"] != "done":
+        return ""
+    if f": {CLOSE_REASON}" in entry["body"]:
+        return "closed by the priority sweep"
+    try:
+        fields = json.loads(entry["fields"] or "{}")
+    except (TypeError, ValueError, RecursionError):
+        fields = None
+    if not isinstance(fields, dict):
+        raise ValueError("its stored fields cannot be read")
+    completion = fields.get("completion")
+    return "cancelled" if isinstance(completion, dict) and completion.get("outcome") == "cancelled" else ""
 
 
 def move(config: dict, key: str, status: str, transport=None) -> str:
@@ -86,22 +147,21 @@ def move(config: dict, key: str, status: str, transport=None) -> str:
     payload, error = shadow_jira._request(_issue(config, key) + "?fields=status", config, None, transport)
     if error:
         raise ValueError(error)
-    current = (((payload or {}).get("fields") or {}).get("status") or {})
-    if (current.get("statusCategory") or {}).get("key") == category:
-        return f"{key}: already {current.get('name')}"
+    current, current_category = _state(_object(_object(payload, "issue").get("fields"), "fields").get("status"))
+    if current_category == category:
+        return f"{key}: already {current}"
     payload, error = shadow_jira._request(_issue(config, key) + "/transitions", config, None, transport)
     if error:
         raise ValueError(error)
-    offered = [t for t in (payload or {}).get("transitions") or []
-               if isinstance(t, dict) and ((t.get("to") or {}).get("statusCategory") or {}).get("key") == category]
+    offered = [offer for offer in _transitions(payload) if offer[2] == category]
     if not offered:
-        raise ValueError(f"no transition into {name} is offered from {current.get('name') or 'its status'}")
-    chosen = next((t for t in offered if (t.get("to") or {}).get("name", "").lower() == name.lower()), offered[0])
+        raise ValueError(f"no transition into {name} is offered from {current}")
+    chosen = next((offer for offer in offered if offer[1].lower() == name.lower()), offered[0])
     _, error = shadow_jira._request(_issue(config, key) + "/transitions", config,
-                                    {"transition": {"id": str(chosen.get("id"))}}, transport)
+                                    {"transition": {"id": chosen[0]}}, transport)
     if error:
         raise ValueError(error)
-    return f"{key}: moved to {(chosen.get('to') or {}).get('name') or name}"
+    return f"{key}: moved to {chosen[1]}"
 
 
 def run(connection: sqlite3.Connection, transport=None, environ=None) -> list[str]:
@@ -120,7 +180,12 @@ def run(connection: sqlite3.Connection, transport=None, environ=None) -> list[st
         found = KEY.fullmatch(last[0]) if last is not None else None
         if found:
             key = found[1]
-            _, error = shadow_jira._request(_issue(config, key) + "/transitions", config, None, transport)
+            payload, error = shadow_jira._request(_issue(config, key) + "/transitions", config, None, transport)
+            if not error:
+                try:
+                    _transitions(payload)
+                except ValueError as malformed:
+                    error = str(malformed)
             if error:
                 return [f"jira moves: token check on {key} failed, cursor held: {error}"]
             _write_cursor(connection, newest)
@@ -131,7 +196,10 @@ def run(connection: sqlite3.Connection, transport=None, environ=None) -> list[st
     lines = []
     for entry in items:
         try:
-            lines.append("jira moves: " + move(config, entry["key"], entry["status"], transport))
+            why = _nobody_did(entry)
+            said = f"{entry['key']}: {why}; ticket left as it is" if why else move(
+                config, entry["key"], entry["status"], transport)
+            lines.append("jira moves: " + said)
         except ValueError as error:
             text = f"Jira ticket {entry['key']} was not moved to match {entry['status']}: {error}"
             workflow.add_item_note(connection, entry["item"], kind="comment", body=text, who=WHO)

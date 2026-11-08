@@ -2,16 +2,20 @@
 
 from __future__ import annotations
 
+import copy
 import os
+import sqlite3
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from collections.abc import Iterator
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
-from sd_db import connect, jira_moves
+from sd_db import connect, jira_moves, priority_sweep, progress, workflow
 from sd_db.migrate import initialise
-from sd_db.shadow_jira import _http
+from sd_db.shadow_jira import _http, settings
 from sd_db.shadow_sync import sync
 from sd_db.writes import create_item, transition
 
@@ -23,15 +27,20 @@ STATUS = {"To Do": "new", "In Progress": "indeterminate", "Done": "done"}
 class FakeJira:
     """A Jira of tickets by key: answers the status read, the transition list and the transition."""
 
-    def __init__(self, tickets: dict[str, str], *, fail=None):
+    def __init__(self, tickets: dict[str, str], *, fail=None, malformed: dict[tuple[str, str], Any] | None = None):
         self.tickets = dict(tickets)
         self.fail = fail
+        #: (key, "status" or "transitions") -> the answer that replaces Jira's own.
+        self.malformed = malformed or {}
         self.posted: list[tuple[str, str]] = []
 
     def __call__(self, url, headers, body):
         key = url.split("/issue/")[1].split("/")[0].split("?")[0]
         if self.fail:
             return None, self.fail
+        which = "status" if url.endswith("?fields=status") else "transitions" if body is None else ""
+        if (key, which) in self.malformed:
+            return self.malformed[key, which], ""
         if url.endswith("?fields=status"):
             name = self.tickets[key]
             return {"fields": {"status": {"name": name, "statusCategory": {"key": STATUS[name]}}}}, ""
@@ -127,11 +136,188 @@ class TheMoves(unittest.TestCase):
         self.assertIn("shadow sync: jira moves: ABC-7: moved to Done", result.report())
 
 
+    def test_a_cancelled_item_leaves_its_ticket_alone(self):
+        jira = FakeJira({"ABC-7": "To Do"})
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        progress.cancel_work(self.db, self.item, reason="nobody needs it", who="operator", guard=progress.task_guard)
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: cancelled; ticket left as it is"])
+        self.assertEqual(jira.posted, [])
+
+    def test_a_priority_sweep_closure_leaves_its_ticket_alone(self):
+        jira = FakeJira({"ABC-7": "To Do"})
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        now = datetime(2026, 11, 8, tzinfo=timezone.utc)
+        self.db.execute("UPDATE item SET created_at = ? WHERE id = ?",
+                        ((now - timedelta(days=priority_sweep.CLOSE_DAYS + 1)).isoformat(), self.item))
+        self.db.commit()
+        priority_sweep.sweep(self.db, who="sweep", now=now)
+        self.assertEqual(self.db.execute("SELECT status FROM item WHERE id = ?", (self.item,)).fetchone()[0], "done")
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV),
+                         ["jira moves: ABC-7: closed by the priority sweep; ticket left as it is"])
+        self.assertEqual(jira.posted, [])
+
+    def test_a_reopened_cancel_moves_again_when_finished(self):
+        jira = FakeJira({"ABC-7": "To Do"})
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        progress.cancel_work(self.db, self.item, reason="nobody needs it", who="operator", guard=progress.task_guard)
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        workflow.change_status(self.db, self.item, "in_progress", who="operator")
+        workflow.change_status(self.db, self.item, "done", who="operator")
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: moved to Done"])
+
+    def test_a_done_item_whose_fields_cannot_be_read_moves_nothing(self):
+        for raw in ("{not json", "[1]", "[" * 200000):
+            with self.subTest(raw=raw[:9]):
+                jira = FakeJira({"ABC-7": "To Do"})
+                self.db.execute("DELETE FROM state WHERE key = ?", (jira_moves.CURSOR,))
+                self.db.execute("DELETE FROM note WHERE item = ? AND kind = 'comment'", (self.item,))
+                self.db.execute("UPDATE item SET status = 'planning', fields = NULL WHERE id = ?", (self.item,))
+                self.db.commit()
+                jira_moves.run(self.db, jira, JIRA_ENV)
+                transition(self.db, self.item, "done", who="operator")
+                self.db.execute("UPDATE item SET fields = ? WHERE id = ?", (raw, self.item))
+                self.db.commit()
+                self.assertIn("its stored fields cannot be read", jira_moves.run(self.db, jira, JIRA_ENV)[0])
+                self.assertEqual(jira.posted, [])
+                self.assertEqual(len(self.notes(self.item)), 1)
+
+    def test_a_malformed_answer_fails_that_item_and_the_next_still_moves(self):
+        ticket = {"name": "To Do", "statusCategory": {"key": "new"}}
+        moved = {"id": "31", "to": {"name": "Done", "statusCategory": {"key": "done"}}}
+        cases: list[tuple[str, Any]] = [
+            ("status", [1]), ("status", None), ("status", {}), ("status", {"fields": [1]}), ("status", {"fields": "x"}),
+            ("status", {"fields": {}}), ("status", {"fields": {"status": [1]}}),
+            ("status", {"fields": {"status": {**ticket, "statusCategory": [1]}}}),
+            ("status", {"fields": {"status": {**ticket, "statusCategory": {"key": 3}}}}),
+            ("status", {"fields": {"status": {**ticket, "statusCategory": {"key": ""}}}}),
+            ("status", {"fields": {"status": {"statusCategory": {"key": "new"}}}}),
+            ("transitions", [1]), ("transitions", None), ("transitions", {}), ("transitions", {"transitions": 5}),
+            ("transitions", {"transitions": "abc"}), ("transitions", {"transitions": [1]}),
+            ("transitions", {"transitions": [{"id": "31"}]}), ("transitions", {"transitions": [{"id": "31", "to": 1}]}),
+            ("transitions", {"transitions": [{"id": "31", "to": {"name": "Done", "statusCategory": [1]}}]}),
+            ("transitions", {"transitions": [{"id": "31", "to": {"name": None, "statusCategory": {"key": "done"}}}]}),
+            ("transitions", {"transitions": [{"to": moved["to"]}]}),
+            ("transitions", {"transitions": [{"id": None, "to": moved["to"]}]}),
+            ("transitions", {"transitions": [moved, 1]}),
+        ]
+        healthy = create_item(self.db, kind="task", title="linked too", source="task-ref", external_id="jira:ABC-8")
+        for which, answer in cases:
+            with self.subTest(which=which, answer=answer):
+                jira = FakeJira({"ABC-7": "To Do", "ABC-8": "To Do"}, malformed={("ABC-7", which): answer})
+                self.db.execute("DELETE FROM state WHERE key = ?", (jira_moves.CURSOR,))
+                self.db.execute("DELETE FROM note WHERE item = ? AND kind = 'comment'", (self.item,))
+                self.db.execute("UPDATE item SET status = 'planning' WHERE id IN (?, ?)", (self.item, healthy))
+                self.db.commit()
+                jira_moves.run(self.db, jira, JIRA_ENV)
+                held = jira_moves.read_cursor(self.db)
+                transition(self.db, self.item, "done", who="operator")
+                transition(self.db, healthy, "done", who="operator")
+                lines = jira_moves.run(self.db, jira, JIRA_ENV)
+                self.assertEqual(jira.posted, [("ABC-8", "Done")])
+                self.assertEqual(lines[-1], "jira moves: ABC-8: moved to Done")
+                self.assertEqual(len(self.notes(self.item)), 1)
+                self.assertGreater(jira_moves.read_cursor(self.db), held)
+
+    def test_a_malformed_token_check_holds_the_cursor(self):
+        for answer in ([1], None, {}, {"transitions": 5}, {"transitions": [1]}):
+            with self.subTest(answer=answer):
+                jira = FakeJira({"ABC-7": "To Do"}, malformed={("ABC-7", "transitions"): answer})
+                lines = jira_moves.run(self.db, jira, JIRA_ENV)
+                self.assertIn("token check on ABC-7 failed, cursor held", lines[0])
+                self.assertIsNone(jira_moves.read_cursor(self.db))
+
+    def test_a_crash_before_the_cursor_write_moves_no_ticket_twice(self):
+        jira = FakeJira({"ABC-7": "To Do"})
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        transition(self.db, self.item, "done", who="operator")
+        with patch.object(jira_moves, "_write_cursor", side_effect=sqlite3.OperationalError("disk I/O error")):
+            with self.assertRaises(sqlite3.OperationalError):
+                jira_moves.run(self.db, jira, JIRA_ENV)
+        self.assertEqual(jira.posted, [("ABC-7", "Done")])
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: already Done"])
+        self.assertEqual(jira.posted, [("ABC-7", "Done")])
+
+
+#: Every shape a JSON value can take, at its extremes, and a Python nest deeper than any answer.
+JUNK: list[Any] = [None, True, False, 0, -1, 2**70, 1e308, float("inf"), float("nan"), 5e-324, "", "x", [], [1], [[]],
+                   {}, {"a": 1}, {"statusCategory": 1}, {"key": []}]
+DEEP: list[Any] = []
+for _ in range(200):
+    DEEP = [DEEP]
+JUNK.append(DEEP)
+STATUS_ANSWER: dict[str, Any] = {"fields": {"status": {"name": "To Do", "statusCategory": {"key": "new"}}}}
+TRANSITIONS_ANSWER: dict[str, Any] = {"transitions": [
+    {"id": "11", "to": {"name": "To Do", "statusCategory": {"key": "new"}}},
+    {"id": "31", "to": {"name": "Done", "statusCategory": {"key": "done"}}}]}
+
+
+def paths(node: Any, at: tuple = ()) -> Iterator[tuple]:
+    """Every position in a JSON tree, the root included."""
+    yield at
+    if isinstance(node, dict):
+        for key, value in node.items():
+            yield from paths(value, (*at, key))
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            yield from paths(value, (*at, index))
+
+
+def replaced(tree: Any, at: tuple, value: Any) -> Any:
+    if not at:
+        return value
+    tree = copy.deepcopy(tree)
+    node = tree
+    for step in at[:-1]:
+        node = node[step]
+    node[at[-1]] = value
+    return tree
+
+
+def scripted(answers: dict[str, Any], posted: list[dict]):
+    """A transport that gives `answers` and records each transition body it is sent."""
+
+    def transport(url, headers, body):
+        if body is not None:
+            posted.append(body)
+            return {}, ""
+        return answers["status" if url.endswith("?fields=status") else "transitions"], ""
+
+    return transport
+
+
+class ThePropertyOfTheAnswers(unittest.TestCase):
+    def test_junk_at_any_position_is_a_result_or_a_value_error(self):
+        config = settings(JIRA_ENV)
+        for status in ("done", "planning", "in_progress"):
+            for which, tree in (("status", STATUS_ANSWER), ("transitions", TRANSITIONS_ANSWER)):
+                for at in paths(tree):
+                    for junk in JUNK:
+                        answers = {"status": STATUS_ANSWER, "transitions": TRANSITIONS_ANSWER, which: replaced(tree, at, junk)}
+                        posted: list[dict] = []
+                        transport = scripted(answers, posted)
+                        with self.subTest(status=status, which=which, at=at, junk=repr(junk)[:20]):
+                            try:
+                                said = jira_moves.move(config, "ABC-7", status, transport)
+                            except ValueError:
+                                self.assertEqual(posted, [])
+                            else:
+                                self.assertIsInstance(said, str)
+                                for body in posted:
+                                    self.assertRegex(body["transition"]["id"], r"\S")
+
+
 class TheEmptyAnswer(unittest.TestCase):
     def test_a_204_with_no_body_is_an_empty_payload(self):
         server = RawServer(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
         self.addCleanup(server.close)
         self.assertEqual(_http(server.url + "/rest/api/3/issue/ABC-7/transitions", {}, {"transition": {}}), ({}, ""))
+
+    def test_a_nest_too_deep_to_parse_is_a_failed_request(self):
+        deep = b"[" * 200000
+        server = RawServer(b"HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n" % len(deep) + deep)
+        self.addCleanup(server.close)
+        self.assertEqual(_http(server.url + "/rest/api/3/issue/ABC-7", {}, None),
+                         (None, "the request to Jira failed: RecursionError"))
 
 
 if __name__ == "__main__":
