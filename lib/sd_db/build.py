@@ -59,9 +59,10 @@ from .writes import now as clock
 SCOPE = "build"
 #: The scope of a draft run (`sd_db.draft`): it counts against the machine cap only, as it holds no branch.
 DRAFT = "draft"
-#: Code-writing builders per machine and per repository: the operator's standing rule.
+#: Code-writing builders per machine, the operator's standing rule, and bundles per repository at once.
+#: One: each bundle becomes its own pull request, so later items wait and the next bundle takes them (sd:8158).
 MACHINE_CAP = 6
-REPO_CAP = 3
+REPO_CAP = 1
 #: Items per bundle, so a bundle fits one 60-minute run (lead, note #29482).
 BUNDLE_MAX = 3
 BUDGET_MINUTES = 60

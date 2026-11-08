@@ -1640,7 +1640,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
 
     def test_a_suggested_row_acts_with_build_and_build_reads_the_plan_first(self):
         item, answers = self.suggested()
-        plan = {"read": NOW, "budget_minutes": 60, "refused": [], "room": {"machine": 4, "why": "", "cap": 6, "repo_cap": 3},
+        plan = {"read": NOW, "budget_minutes": 60, "refused": [], "room": {"machine": 4, "why": "", "cap": 6, "repo_cap": 1},
                 "bundles": [{"repo": str(self.checkout), "name": "system", "room": 2, "model": "opus", "branch": "build/sd-1",
                              "items": [{"id": item, "title": "Ship the pickup", "revision": "c" * 64}]}]}
         answers[f"/api/tasks/build/plan?items={item}"] = [200, plan]

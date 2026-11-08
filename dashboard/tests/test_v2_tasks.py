@@ -2287,7 +2287,7 @@ R.shown = D.html; R.before = OUT.posts.length; D.returnValue = 'start'; D.onclos
     # Build (pack sd:6095): the plan builds.plan answers for one ready item, read before anything is written.
     def build_plan(self, item, refused=()):
         return {"read": NOW, "budget_minutes": 60, "refused": list(refused),
-                "room": {"machine": 4, "why": "", "cap": 6, "repo_cap": 3},
+                "room": {"machine": 4, "why": "", "cap": 6, "repo_cap": 1},
                 "bundles": [] if refused else [{"repo": "/r/alpha", "name": "alpha", "room": 2, "model": "opus",
                                                  "branch": "build/sd-<lead assignment>",
                                                  "items": [{"id": item, "title": "Plan <the> review", "revision": "c" * 64}]}]}

@@ -370,8 +370,9 @@ Four roles share the work:
 
 Workers:
 
-- **Run at most 6 code-writing builders per machine, and at most 3 per repository.** More starve the gates and reviews they wait on,
+- **Run at most 6 code-writing builders per machine, and one build bundle per repository at a time.** More starve the gates and reviews they wait on,
   and one serial lane lands about 3 at a time: the rest only queue and go stale against main (sd:5617).
+  A repository's later items wait, and the next bundle takes them (sd:8158).
 - **Start no builder while load5 is above 40.**
 - **A writer runs alone in its checkout.** Any agent or session that changes files works in its own git worktree or clone.
   Never start a second writer in a checkout that already has one.
