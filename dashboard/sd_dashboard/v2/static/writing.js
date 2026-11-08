@@ -130,7 +130,9 @@ addEventListener('DOMContentLoaded', () => {
   function queueTools(col, Q) {
     if (Q.state !== 'read') return '';
     const o = queueObj(col, Q), n = (Q.declined || []).length, on = declinedOn[col], none = !window.commands.declinePick(o).rows.length;
-    return html`<div class="queue-tools"><button class="btn sm risky" type="button" data-cmd="queue.decline" data-obj="${o.id}"${none ? html` disabled title="no row is that old and low"` : ''}>${window.commands.declineLabel(o)}</button>
+    // pack sd:8070: the label cuts with an ellipsis in a narrow column; the title keeps it whole.
+    const label = window.commands.declineLabel(o), tip = none ? `${label}: no row is that old and low` : label;
+    return html`<div class="queue-tools"><button class="btn sm risky" type="button" data-cmd="queue.decline" data-obj="${o.id}"${none ? html` disabled` : ''} title="${tip}"><span class="lbl">${label}</span></button>
       <button class="btn quiet sm" type="button" data-declined="${col}" aria-pressed="${String(on)}">Declined <span class="n">${n}</span></button></div>
       ${on ? html`<ul class="declined" aria-label="Declined ${QUEUE[col][1]}">${(Q.declined || []).map(r => html`<li><span class="t">#${r.item} ${r.title}</span> <span class="why">declined ${r.at ? html`<time datetime="${r.at}">${ago(r.at)}</time>` : 'at a time not recorded'}${r.by ? ` by ${r.by}` : ''}</span></li>`)}${n ? '' : html`<li class="empty">Nothing declined.</li>`}</ul>
         <p class="why">No Restore here: the vault rules have no move out of declined; edit the row's status in the vault to bring it back.</p>` : ''}`;

@@ -912,13 +912,13 @@ def one_migration_back(database):
     """
     raw = sqlite3.connect(database, isolation_level=None)
     try:
-        # The reverse of 048_vote.sql, which its header carries as `--   ` lines: the `vote` table goes,
-        # and the version goes to 47. The helper is rewritten with every migration: a migration that adds
-        # a table or a column would be refused if left in place.
-        text = (SCHEMA_DIR / "048_vote.sql").read_text()
+        # The reverse of 049_home_asset.sql, which its header carries as `--   ` lines: the
+        # `home_asset` table goes, and the version goes to 48. The helper is rewritten with every
+        # migration: a migration that adds a table or a column would be refused if left in place.
+        text = (SCHEMA_DIR / "049_home_asset.sql").read_text()
         script = "\n".join(line[4:] for line in text.splitlines() if line.startswith("--   "))
-        assert "PRAGMA user_version = 47" in script, \
-            "048's reverse is not where this helper expects it"
+        assert "PRAGMA user_version = 48" in script, \
+            "049's reverse is not where this helper expects it"
         raw.executescript(script)
         assert raw.execute("PRAGMA user_version").fetchone()[0] == SCHEMA_VERSION - 1
     finally:

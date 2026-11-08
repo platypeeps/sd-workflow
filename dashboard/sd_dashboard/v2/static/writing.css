@@ -15,16 +15,18 @@
 
 /* Board */
 .board { display: grid; grid-auto-flow: column; grid-auto-columns: minmax(15rem, 1fr); gap: var(--space-sm); overflow-x: auto; overscroll-behavior-x: contain; padding-bottom: var(--space-xs); }
-.col { display: grid; grid-template-rows: auto minmax(0, 1fr); min-width: 0; border-radius: var(--radius-md); background: var(--color-well); border: var(--rule-hair) solid transparent; }
+/* pack sd:8070: each grid from a column down to a tile caps its track at the column; an implicit auto track grew to
+ * the vault column's nowrap Decline button, and every tile under it ran into the next column. */
+.col { display: grid; grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); min-width: 0; border-radius: var(--radius-md); background: var(--color-well); border: var(--rule-hair) solid transparent; }
 .col header { display: flex; align-items: center; gap: var(--space-xs); padding: var(--space-xs) var(--space-sm); border-bottom: var(--rule-hair) solid var(--color-rule-2); min-height: 2.5rem; }
 .col header .n { margin-left: auto; font: 500 var(--text-xs)/1 var(--font-data); color: var(--color-muted); }
 .col.vault header { border-bottom-style: dashed; }
-.drop { display: grid; align-content: start; gap: var(--space-xs); padding: var(--space-xs); min-height: 8rem; }
+.drop { display: grid; grid-template-columns: minmax(0, 1fr); align-content: start; gap: var(--space-xs); padding: var(--space-xs); min-height: 8rem; }
 .empty { margin: 0; padding: var(--space-xs); font-size: var(--text-xs); color: var(--color-muted); }
 .refusal { display: none; margin: var(--space-xs) var(--space-xs) 0; padding: var(--space-xs) var(--space-sm); border-radius: var(--radius-sm); background: var(--color-panel); font-size: var(--text-xs); line-height: 1.4; color: var(--color-ink-2); }
 .refusal b { color: var(--color-warning); font-weight: 600; }
 .card {
-  position: relative; display: grid; gap: var(--space-2xs); padding: var(--space-xs) var(--space-xs) var(--space-xs) var(--space-sm);
+  position: relative; display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-2xs); padding: var(--space-xs) var(--space-xs) var(--space-xs) var(--space-sm);
   border: var(--rule-hair) solid var(--color-rule-2); border-radius: var(--radius-sm); background: var(--color-panel);
   cursor: grab; user-select: none; -webkit-user-select: none; touch-action: manipulation; text-align: left; color: inherit; font: inherit;
 }
@@ -35,7 +37,7 @@
 .card[aria-selected="true"][data-state] { box-shadow: inset var(--rule-lamp) 0 0 var(--color-accent); }
 .card.parked { background-image: repeating-linear-gradient(135deg, var(--color-hatch) 0 1px, transparent 1px 8px); }
 .card.lifted { opacity: 0.35; }
-.card .top { display: flex; align-items: center; gap: var(--space-xs); min-height: 1.5rem; }
+.card .top { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-xs); min-height: 1.5rem; }
 .card .id { font: 500 var(--text-xs)/1 var(--font-data); color: var(--color-ink-2); }
 .card .t { font-size: var(--text-sm); line-height: 1.35; color: var(--color-ink); overflow-wrap: anywhere; }
 .card .meta { display: flex; flex-wrap: wrap; gap: var(--space-2xs) var(--space-xs); font: 400 var(--text-2xs)/1.3 var(--font-data); color: var(--color-muted); }
@@ -51,6 +53,9 @@
 /* pack sd:7773: with tiles the vault column has three rows; the tiles took the 1fr row and pushed the ideas down. */
 .col.vault:has(> .idea-areas) { grid-template-rows: auto auto minmax(0, 1fr); }
 .col.vault .idea-areas .fseg { flex-wrap: wrap; }
+/* A button stays one line (sd:5729) and shrinks to its column; its label cuts with an ellipsis. */
+.col .btn { max-width: 100%; }
+.col .btn > .lbl { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 /* sd:8014: each vault queue's bulk Decline and its Declined filter, then the declined rows while it is pressed. */
 .col.vault .queue-tools { display: flex; flex-wrap: wrap; gap: var(--space-xs); padding: 0 var(--space-xs) var(--space-xs); }
 .col.vault .declined { margin: 0; padding: 0 var(--space-xs); list-style: none; font-size: var(--text-xs); }

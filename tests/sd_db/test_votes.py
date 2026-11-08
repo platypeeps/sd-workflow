@@ -104,7 +104,8 @@ class TheMigration(MigrationStore):
                                    "revision", "created_at", "updated_at"])
         self.assertEqual(raw.execute("SELECT count(*) FROM vote").fetchone()[0], 0)
         self.assertIn("vote", schema_module.TABLES)
-        self.assertEqual(sorted(tables(raw)), sorted(schema_module.TABLES))
+        # 049 adds `home_asset` (pack sd:8053) after 048.
+        self.assertEqual(sorted(tables(raw)), sorted(set(schema_module.TABLES) - {"home_asset"}))
         self.assertEqual(self.dump(), before)
 
     def test_a_failure_in_048_leaves_47_and_no_table(self):
