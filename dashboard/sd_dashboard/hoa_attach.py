@@ -191,8 +191,9 @@ def _folder(connection, ident: object, site: Site, *, make: bool) -> tuple[dict,
     key, existing, made = site.place(asset)
     quiet = site.optional & {key, site.account}
     # sd:7667, sd:8112: an unset optional setting is no folder yet: an empty listing, Drive not asked; an upload
-    # still refuses below, naming the setting.
-    if quiet and not make and not all(writes.read_settings(connection, sorted(quiet)).values()):
+    # still refuses below, naming the setting. A key never held has no row, so it is absent from the answer.
+    held = writes.read_settings(connection, sorted(quiet)) if quiet and not make else {}
+    if quiet and not make and not all(held.get(name) for name in quiet):
         return asset, "", None
     folder, account = _settings(connection, key, site.account)
     for sub in existing:

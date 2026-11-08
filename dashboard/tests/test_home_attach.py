@@ -88,6 +88,18 @@ class TheHomeAttachments(Case):
         self.assertIn("Nothing was written: home.drive_folder is not set", body["error"])
         self.assertEqual(self.drive.calls, [], "Drive is not asked")
 
+    def test_settings_never_held_list_no_folder_and_an_upload_names_them(self):
+        """Review of sd:8112: on a fresh install neither key has a row; read_settings omits both, not None."""
+        self.connection.execute("DELETE FROM state WHERE kind = 'setting' AND key IN (?, ?)",
+                                ("home.drive_folder", "home.google_account"))
+        self.connection.commit()
+        listed = hoa_attach.listing(self.connection, {"asset": [str(self.oak["id"])]}, site=HOME)
+        self.assertEqual((listed["folder"], listed["files"]), ("", []))
+        status, body = self.upload(self.oak["id"])
+        self.assertEqual(status, 503)
+        self.assertIn("is not set", body["error"])
+        self.assertEqual(self.drive.calls, [], "Drive is not asked")
+
     def test_an_unknown_asset_is_named(self):
         with self.assertRaisesRegex(ValueError, "Name the asset"):
             hoa_attach.request({"asset": "Oak", "link": "https://drive.google.com/x"}, site=HOME)
