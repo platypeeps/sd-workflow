@@ -424,10 +424,13 @@ def pr_rows(connection, lanes: list[dict], clock: float) -> dict:
     try:
         waits = contributions.pr_waits(connection, now=time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(clock)),
                                        errors=skipped)
+        # sd:8142: and every open pull no item links that names the operator, either way.
+        loose = contributions.unlinked_pr_waits(connection, now=time.strftime("%Y-%m-%dT%H:%M:%S+00:00",
+                                                                             time.gmtime(clock)))
     except READ_FAILURES as error:
         return {"rows": [], "error": f"pull-request waits were not read: {type(error).__name__}: {error}"}
     return {"rows": [{key: wait[key] for key in PR_FIELDS} for wait in waits
-                     if wait["open"] and wait["status"] != "done" and wait["item"] not in laned],
+                     if wait["open"] and wait["status"] != "done" and wait["item"] not in laned] + loose,
             "error": f"pull-request waits skipped {'; '.join(skipped)}" if skipped else ""}
 
 

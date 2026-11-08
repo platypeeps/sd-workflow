@@ -55,11 +55,12 @@ class SyncCase(unittest.TestCase):
         self.sent.append(claim)
         return "sent"
 
-    def search(self, urls=(), *, contexts=()):
+    def search(self, urls=(), *, contexts=(), only=False):
+        """`only`: the urls answer the `contexts` buckets alone, not `author:@me` (another's pull)."""
         def runner(argv):
             if argv == ["gh", "auth", "status"]:
                 return 0, "", ""
-            author_bucket = any(value.startswith("q=author:@me ") for value in argv)
+            author_bucket = not only and any(value.startswith("q=author:@me ") for value in argv)
             context_bucket = any(value.startswith(f"q={context} ") for value in argv for context in contexts)
             rows = [{"__typename": "PullRequest", "url": url, "number": int(url.rsplit("/", 1)[1]),
                      "title": "Contribution", "state": "OPEN", "updatedAt": self.now.isoformat(),
@@ -68,8 +69,8 @@ class SyncCase(unittest.TestCase):
                                                        "pageInfo": {"hasNextPage": False, "endCursor": None}}}}), ""
         return runner
 
-    def run_sync(self, urls=(), *, contexts=(), **options):
-        runner = self.search(urls, contexts=contexts) if contexts else self.search(urls)
+    def run_sync(self, urls=(), *, contexts=(), only=False, **options):
+        runner = self.search(urls, contexts=contexts, only=only) if contexts else self.search(urls)
         result = sync(self.db, now=self.now, runner=runner, contribution_client=self.api.client(),
                       notifier=self.notify, **options)
         self.now += timedelta(minutes=1)
@@ -135,6 +136,21 @@ class ContributionSync(SyncCase):
         self.assertEqual(len(self.sent), 2)
         self.assertEqual(len(event_ids), 2)
         self.assertNotEqual(event_ids[0], event_ids[1])
+
+    def test_anothers_pull_that_asks_or_mentions_the_operator_is_observed_and_waits_on_them(self):
+        # sd:8142 review: refresh queued only `author` pulls, so another's pull found by the review-requested or
+        # mentioned sweep was never observed and never waited on the operator. Found by those buckets alone, it
+        # is read, and Queue's unlinked PR waits name it on you.
+        self.api.detail["user"] = {"id": 2, "login": "maintainer"}
+        self.api.detail["requested_reviewers"] = [{"login": "operator"}]
+        for bucket, why in (("review-requested:@me", "review-requested"), ("mentioned", "mentioned")):
+            with self.subTest(why=why):
+                qualifier = "mentions:@me" if why == "mentioned" else bucket
+                self.assertTrue(self.run_sync([URL], contexts=(qualifier,), only=True).ok)
+                current = core.snapshot(self.db, "github:" + URL)
+                self.assertIn(why, current["observation"]["why"])
+                waits = {row["url"]: row["on"] for row in core.unlinked_pr_waits(self.db, now=self.now.isoformat())}
+                self.assertEqual(waits, {URL: "you"})
 
     def test_projected_observation_restores_context_without_a_queue_entry(self):
         self.api.detail["user"] = {"id": 2, "login": "maintainer"}

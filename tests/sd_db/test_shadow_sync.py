@@ -1052,8 +1052,8 @@ class TheSettleDates(SyncCase):
                        url="https://github.com/example-org/benchmark/pull/2"),
                 "mergedAt": "2026-09-05T09:00:00Z", "closedAt": "2026-09-05T09:00:00Z"}
         closed = {**node(3, state="CLOSED"), "closedAt": "2026-09-05T08:00:00+00:00"}
-        # Not the author bucket: an authored pull would also start a contribution detail read.
-        runner = QueryGh(lambda query: [{**node(1), "closedAt": None}, pull, closed] if "mentions:@me" in query else [])
+        # The assigned bucket: an authored, asked or mentioning pull starts a detail read (sd:8142).
+        runner = QueryGh(lambda query: [{**node(1), "closedAt": None}, pull, closed] if "assignee:@me" in query else [])
         result = sync(self.connection, now=self.now, runner=runner)
         self.assertTrue(result.ok, result.reason)
         self.assertEqual(self.dates(), {"1": ("open", None, None),
@@ -1112,8 +1112,8 @@ class TheLinks(SyncCase):
         pulls = [self.pull(10, branch="fix/two-issues", closes=closes),
                  self.pull(11, branch="feature/LOG-12-retry"),
                  self.pull(12, branch="ABC-9-nothing", title="Handle UTF-8 names")]
-        # Not the author bucket: an authored pull would also start a contribution detail read.
-        runner = QueryGh(lambda query: pulls if "mentions:@me" in query else [])
+        # The assigned bucket: an authored, asked or mentioning pull starts a detail read (sd:8142).
+        runner = QueryGh(lambda query: pulls if "assignee:@me" in query else [])
         result = sync(self.connection, now=self.now, runner=runner)
         self.assertTrue(result.ok, result.reason)
         self.assertEqual(len(runner.queries), 4)
@@ -1152,13 +1152,13 @@ class TheLinks(SyncCase):
     def test_an_unreadable_field_is_unknown_and_keeps_the_stored_value(self):
         later = self.now + timedelta(hours=1)
         first = self.pull(10, branch="fix/one", closes=(f"{self.BASE}/issues/1",))
-        sync(self.connection, now=self.now, runner=QueryGh(lambda query: [first] if "mentions:@me" in query else []))
+        sync(self.connection, now=self.now, runner=QueryGh(lambda query: [first] if "assignee:@me" in query else []))
         broken: tuple[object, ...] = (None, [], {"nodes": None}, {"nodes": [{"url": ""}]}, {"nodes": [7]}, "x")
         for value in broken:
             with self.subTest(value=value):
                 again = {**first, "closingIssuesReferences": value, "headRefName": None, "updatedAt": iso(later)}
                 result = sync(self.connection, now=later,
-                              runner=QueryGh(lambda query, again=again: [again] if "mentions:@me" in query else []))
+                              runner=QueryGh(lambda query, again=again: [again] if "assignee:@me" in query else []))
                 self.assertTrue(result.ok, result.reason)
                 self.assertEqual(self.links()["10"], ("fix/one", json.dumps([f"{self.BASE}/issues/1"])))
 
@@ -1173,7 +1173,7 @@ class TheLinks(SyncCase):
                  {**self.pull(11, branch="b"), "reviewDecision": None, "mergeable": "CONFLICTING",
                   "commits": {"nodes": [{"commit": {"statusCheckRollup": None}}]}},
                  self.pull(12, branch="c")]
-        runner = QueryGh(lambda query: pulls if "mentions:@me" in query else [])
+        runner = QueryGh(lambda query: pulls if "assignee:@me" in query else [])
         result = sync(self.connection, now=self.now, runner=runner)
         self.assertTrue(result.ok, result.reason)
         query = next(value for argv in runner.calls for value in argv if value.startswith("query="))
@@ -1768,7 +1768,7 @@ class TheRevisit(SyncCase):
         self.stored(6, repo=self.OLD)
         new = f"https://github.com/{self.NEW}/pull/6"
         found = {**node(6, url=new, kind="PullRequest"), "repository": {"nameWithOwner": self.NEW}}
-        runner = QueryGh(lambda query: [found] if "mentions:@me" in query else [],
+        runner = QueryGh(lambda query: [found] if "assignee:@me" in query else [],
                          read=lambda path: pull(6, url=new.replace("example-org", "Example-Org")))
         result = sync(self.connection, now=self.now, runner=runner)
         self.assertTrue(result.ok, result.reason)
