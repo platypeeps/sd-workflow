@@ -558,6 +558,23 @@ class DeletedMaterialTests(ReviewFixture):
         self.assertEqual(native["partial_providers"], [])
         self.assertEqual(native["status"], "within_limit")
 
+    def test_a_native_reader_does_not_cover_a_summarized_text_deletion(self):
+        # sd:8081: only media omissions count once another reader completes; a
+        # deleted text file sent as its header was read by one reader alone.
+        self.one_reader_per_tier(2)
+        root, base = self.deleting_branch()
+        registry = self.registry_home / ".local/share/sd/providers.yaml"
+        registry.write_text(registry.read_text().replace("roles: [author, reviewer], reader: codex-json",
+                                                         "roles: [author, reviewer], reader: claude-json"))
+        answer = sd_review.Completed(0, json.dumps({"type": "result", "subtype": "success",
+                                                   "structured_output": {"findings": []}}), "")
+        result = sd_review.review(root, namespace(scope="branch", base=base), FakeRunner({"second": answer}),
+                                  self.environment(), self.chatgpt_home())
+        outcomes = {row["backend"]: row for row in result["outcomes"]}
+        self.assertEqual(outcomes["second"]["diagnostic"]["omitted_paths"], ["big/blob.bin", "big/notes.txt"])
+        self.assertEqual(outcomes["second"]["status"], "unavailable", outcomes)
+        self.assertEqual(result["completed_reviews"], 1, outcomes)
+
     def test_deletion_within_the_limit_is_sent_whole_and_not_omitted(self):
         root = self.make_repo()
         (root / "old.py").write_text("gone = 1\n")
