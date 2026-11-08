@@ -1312,8 +1312,10 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
             f'<span class="pip" title="0 {self.BOX["merging"]}">0</span><span class="pip on" title="1 {self.BOX["working"]}">1</span>' + "".join(
                 f'<span class="pip" title="0 {self.BOX[k]}">0</span>' for k in ("next", "blocked", "review", "suggested"))
         for html in (out["R"]["closed"], out["R"]["open"]):
-            self.assertEqual(self.repo_detail(html, "system"), (" pipe", *system))
-            self.assertEqual(self.repo_detail(html, "alpha"), (" pipe", *alpha))
+            # pack sd:8138: each box sits in its toggle button; the boxes themselves are unchanged.
+            for key, want in (("system", system), ("alpha", alpha)):
+                extra, attrs, body = self.repo_detail(html, key)
+                self.assertEqual((extra, attrs, re.sub(r"</?button[^>]*>", "", body)), (" pipe", *want))
         self.assertEqual(re.sub(r"<[^>]*>", "", self.repo_detail(out["R"]["closed"], "system")[2]), "132204", "the text tally is gone")
         self.assertRegex(out["R"]["tally"], r"<span>\d+ working</span>", "the page's tally stays")
 
@@ -1534,6 +1536,72 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertEqual(boxes[4][1], "1 review: pull requests waiting on a review, 1 on you, 0 on reviewers")
         solo = re.search(r'<tr class="repo" data-repo="solo".*?</tr>', out["R"]["html"], re.S).group(0)
         self.assertIn('<td class="num"></td>', solo, "the box says it; the num cell repeats nothing")
+
+    # pack sd:8138 (operator 2026-11-08): a repo row's count tiles filter its sub-rows.
+    TILE = ("const tile = (repo, t, disabled = false) => ELS.queue.listeners.click[0]({ target: { closest: s =>"
+            " s === 'button[data-tile]' ? { disabled, dataset: { repo, tile: t } } : null } });"
+            " const showAll = repo => ELS.queue.listeners.click[0]({ target: { closest: s =>"
+            " s === 'button[data-tile-clear]' ? { dataset: { tileClear: repo } } : null } });"
+            " const pressed = repo => [...(ELS.queue.html.split(`data-repo=\"${repo}\" aria-expanded`)[1] || '').split('</tr>')[0]"
+            ".matchAll(/data-tile=\"(\\w+)\" aria-pressed=\"(true|false)\"/g)].map(m => m[1] + ':' + m[2]);")
+
+    def test_a_tile_click_opens_its_repo_and_shows_only_that_tiles_rows(self):
+        out = self.run_view(self.TILE + " tile('system', 'next'); R.repos = repos(); R.kids = kids(); R.html = ELS.queue.html;")
+        self.assertIn("system:true", out["R"]["repos"])
+        self.assertEqual(out["R"]["kids"], ["next", "next"])
+        self.assertRegex(out["R"]["html"], r'<button type="button" class="linkbtn" data-tile-clear="system">'
+                                           r'Showing next: 2 of \d+ · Show all</button>')
+
+    def test_a_second_click_on_the_tile_or_show_all_restores_every_row(self):
+        out = self.run_view(self.TILE + " open('system'); R.all = kids(); tile('system', 'next'); tile('system', 'next');"
+                            " R.again = kids(); R.repos = repos(); tile('system', 'blocked'); R.blocked = kids();"
+                            " showAll('system'); R.shown = kids(); R.html = ELS.queue.html;")
+        self.assertEqual(out["R"]["again"], out["R"]["all"])
+        self.assertIn("system:true", out["R"]["repos"], "the second click clears the filter, not the repo")
+        self.assertEqual(out["R"]["blocked"], ["blocked", "blocked"])
+        self.assertEqual(out["R"]["shown"], out["R"]["all"])
+        self.assertNotIn("data-tile-clear", out["R"]["html"])
+
+    def test_aria_pressed_follows_the_one_tile_that_filters(self):
+        out = self.run_view(self.TILE + " R.before = pressed('system'); tile('system', 'working'); R.working = pressed('system');"
+                            " tile('system', 'next'); R.next = pressed('system'); open('system'); R.closed = pressed('system');"
+                            " open('system'); R.reopened = kids();")
+        boxes = ["merging", "working", "next", "blocked", "review", "suggested"]
+        self.assertEqual(out["R"]["before"], [f"{b}:false" for b in boxes])
+        self.assertEqual(out["R"]["working"], [f"{b}:{str(b == 'working').lower()}" for b in boxes])
+        self.assertEqual(out["R"]["next"], [f"{b}:{str(b == 'next').lower()}" for b in boxes], "another tile switches")
+        self.assertEqual(out["R"]["closed"], [f"{b}:false" for b in boxes], "closing the repo clears its tile")
+        self.assertEqual(out["R"]["reopened"].count("working"), 3)
+
+    def test_a_zero_tile_is_disabled_and_does_nothing(self):
+        out = self.run_view(self.TILE + " R.before = ELS.queue.html; tile('alpha', 'next', true); R.after = ELS.queue.html;"
+                            " R.repos = repos();")
+        self.assertEqual(out["R"]["after"], out["R"]["before"])
+        self.assertIn("alpha:false", out["R"]["repos"])
+        self.assertRegex(out["R"]["before"], r'data-repo="alpha" data-tile="next" aria-pressed="false"[^>]* disabled>')
+        self.assertNotRegex(out["R"]["before"], r'data-repo="alpha" data-tile="working" aria-pressed="false"[^>]* disabled>')
+
+    def test_the_suggested_tile_shows_suggested_rows_with_the_suggested_filter_off(self):
+        out = self.run_view(self.TILE + " tile('system', 'suggested'); R.kids = kids(); R.filters = ELS['queue-filters'].html;")
+        self.assertIn('data-v="suggested" aria-pressed="false"', out["R"]["filters"])
+        self.assertEqual(out["R"]["kids"], ["suggested"] * 4)
+
+    def test_a_pressed_review_tile_keeps_its_caution_lamp_and_gets_the_ring(self):
+        # Rulings #49024 and #49052: a ring around the tile, no fill change; the review tile stays caution.
+        lanes = queue_screen.document(self.connection, now=NOW)
+        lanes["prs"] = {"error": "", "rows": [
+            {"item": 90, "title": "Waits", "repo": "~/repos/example/solo", "url": "https://github.com/example/solo/pull/90",
+             "lane": "awaiting_you", "on": "you", "since": "2026-09-06T11:00:00+00:00", "waited": 3600}]}
+        out = self.run_view(self.TILE + " tile('solo', 'review'); R.html = ELS.queue.html; R.kids = kids();",
+                            answers={"/api/queue": [200, lanes]})
+        self.assertRegex(out["R"]["html"], r'data-repo="solo" data-tile="review" aria-pressed="true"[^>]*>'
+                                           r'<span class="pip caution" title="1 review:')
+        self.assertEqual(out["R"]["kids"], ["blocked"])
+        css = (Path(__file__).resolve().parents[1] / "sd_dashboard/v2/static/today.css").read_text()
+        self.assertIn('.queue .tile[aria-pressed="true"] .pip { box-shadow: 0 0 0 2px var(--color-ink); }', css)
+        self.assertRegex(css, r'@media \(forced-colors: active\) \{[^}]*\.queue \.tile\[aria-pressed="true"\] \.pip '
+                              r'\{ outline: 2px solid Highlight;')
+        self.assertIn(".queue .tile:focus-visible { outline: 2px solid var(--color-focus);", css)
 
     def test_a_prepared_entry_whose_pr_waits_on_review_is_one_row_that_leads_with_the_wait(self):
         # pack sd:7859: item 5 stopped prepared in a manual-merge lane; its PR waits on reviewers. One row, Approve kept.

@@ -351,6 +351,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   const QOTHER = new Map(); // the lane entries, selectable as Today's other rows are
   const qShow = new Set();
   let qOpen = null, qSaid = null; // the one open repo; the last write's result
+  let qTile = null; // pack sd:8138: the open repo's pressed box, { repo, box }; it holds only while that repo is open
   // ponytail: the repo's folder name keys its row; two checkouts of one name share a row.
   const repoKey = p => p ? String(p).replace(/\/+$/, '').split('/').pop() : '';
   const HM = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
@@ -512,10 +513,12 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     return [...G.values()].map(g => {
       const shown = g.rows.filter(c => !QSHOW.includes(c.type) || qShow.has(c.type)).sort((a, b) => QTYPES.indexOf(a.type) - QTYPES.indexOf(b.type));
       // pack sd:8083: a PR wait counts in review, not blocked, so no row counts twice.
-      const n = Object.fromEntries(BOXES.map(t => [t, g.rows.filter(t === 'review' ? c => c.pr : c => c.type === t && !c.pr).length]));
+      const n = Object.fromEntries(BOXES.map(t => [t, g.rows.filter(inBox(t)).length]));
       return { ...g, shown, n, s: shown.reduce((w, c) => RANK[c.s] < RANK[w] ? c.s : w, 'queued') };
     }).sort((a, b) => (a.key === '') - (b.key === '') || busy(a, b) || a.key.localeCompare(b.key));
   }
+  // A box's rows: review holds the PR waits, each other box its type less those (pack sd:8083).
+  const inBox = t => t === 'review' ? c => c.pr : c => c.type === t && !c.pr;
   const tally = rows => QTYPES.map(t => [t, rows.filter(c => c.type === t).length]).filter(([, n]) => n);
   // pack sd:8005: the page's PR waits, split by who they wait on; '' when there is none. Each repo's are its review box.
   const prTally = rows => { const you = rows.filter(c => c.pr === 'you').length, them = rows.filter(c => c.pr && c.pr !== 'you').length;
@@ -524,14 +527,15 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // before them, review and suggested after (pack sd:7314, sd:8083), counted from all the repo's rows, so a filter hides
   // no count. A box is lit only when its count is not zero; blocked lights the warning lamp, review the caution lamp when
   // a PR waits on you; the label says all six in words. A lane that was not read counts nothing: the cell says so, not 0.
-  const pip = (n, on, means) => html`<span class="pip${n ? on : ''}" title="${`${n} ${means}`}">${String(n)}</span>`;
+  // pack sd:8138: each box is a toggle button that shows only its rows under the repo; a zero box is disabled.
   function pips(g) {
+    const pip = (box, n, on, means) => html`<button type="button" class="tile" data-repo="${g.key}" data-tile="${box}" aria-pressed="${String(!!qTile && qTile.repo === g.key && qTile.box === box)}" aria-label="${`Only the ${n} ${box} rows`}"${n ? '' : html` disabled`}><span class="pip${n ? on : ''}" title="${`${n} ${means}`}">${String(n)}</span></button>`;
     if (g.key && (!QV.lanes || QV.lanes.problems.some(p => repoKey(p.repo) === g.key)))
       return html`<td class="detail"><span class="g-unknown" aria-hidden="true">${GLYPH.unknown}</span> lane not read</td>`;
     // pack sd:7470: merging is the leftmost box.
     const { working: w, merging: m, next: n, blocked: b, review: v, suggested: s } = g.n, you = g.rows.filter(c => c.pr === 'you').length;
     // Each box says its count and what it counts, in its title (pack sd:7383); the label above says all six at once.
-    return html`<td class="detail pipe" aria-label="${m} merging, ${w} working, ${n} next, ${b} blocked, ${v} review, ${s} suggested">${pip(m, ' on', 'merging: claimed by the lane runner, being merged')}${pip(w, ' on', 'working: live sessions, build runs and lane gates now running')}${pip(n, ' on', 'next: queued in the lane, not started')}${pip(b, ' warn', 'blocked: stopped in the lane until someone acts')}${pip(v, you ? ' caution' : ' on', `review: pull requests waiting on a review, ${you} on you, ${v - you} on reviewers`)}${pip(s, ' on', `suggested: up to ${NEXT} ready or planned tasks to do next`)}</td>`;
+    return html`<td class="detail pipe" aria-label="${m} merging, ${w} working, ${n} next, ${b} blocked, ${v} review, ${s} suggested">${pip('merging', m, ' on', 'merging: claimed by the lane runner, being merged')}${pip('working', w, ' on', 'working: live sessions, build runs and lane gates now running')}${pip('next', n, ' on', 'next: queued in the lane, not started')}${pip('blocked', b, ' warn', 'blocked: stopped in the lane until someone acts')}${pip('review', v, you ? ' caution' : ' on', `review: pull requests waiting on a review, ${you} on you, ${v - you} on reviewers`)}${pip('suggested', s, ' on', `suggested: up to ${NEXT} ready or planned tasks to do next`)}</td>`;
   }
   function queueView() {
     const unread = [];
@@ -550,6 +554,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     // pack sd:7251: a filter counts its rows in every repo, before a repo with no row shown is left out.
     const all = qGroups(), every = all.flatMap(g => g.rows), groups = all.filter(g => g.shown.length), active = every.filter(c => !QSHOW.includes(c.type)).length;
     if (!groups.some(g => g.key === qOpen)) qOpen = null;
+    if (qTile && qTile.repo !== qOpen) qTile = null;
     // pack sd:8127: All items counts its open items with the filter off as on, less those waiting on a PR; a failed read counts nothing.
     const waits = new Set((((QV.lanes || {}).prs || {}).rows || []).map(p => Number(p.item)));
     const opens = QV.tasks ? [...openItems(true).values()].filter(t => !waits.has(Number(t.id))).length : null;
@@ -568,7 +573,11 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       return html`<tr class="repo" data-repo="${g.key}" aria-expanded="${String(on)}">${marker(g.s, 'repo')}
         <td class="what"><button type="button" class="disc" data-open="${g.key}" aria-expanded="${String(on)}" aria-label="${on ? 'Close' : 'Open'} ${name}">${I('chevron-right')}</button><button type="button" class="pick" data-open="${g.key}">${name}</button>${g.host ? html`<small>lane on ${g.host}</small>` : ''}</td>
         ${pips(g)}<td class="num"></td><td class="act"></td></tr>`; };
-    put($('queue'), groups.length ? html`${groups.map(g => html`${parent(g)}${qOpen === g.key ? g.shown.map(c => c.tr) : ''}`)}`
+    // pack sd:8138: a pressed box shows its rows, hidden by a Show filter or not, under a line that clears it.
+    const kids = g => { if (!qTile) return g.shown.map(c => c.tr);
+      const rows = g.rows.filter(inBox(qTile.box)).sort((a, b) => QTYPES.indexOf(a.type) - QTYPES.indexOf(b.type));
+      return [html`<tr class="child tiled"><td colspan="5"><button type="button" class="linkbtn" data-tile-clear="${g.key}">Showing ${qTile.box}: ${String(rows.length)} of ${String(g.rows.length)} · Show all</button></td></tr>`, ...rows.map(c => c.tr)]; };
+    put($('queue'), groups.length ? html`${groups.map(g => html`${parent(g)}${qOpen === g.key ? kids(g) : ''}`)}`
       : html`<tr class="empty"><td colspan="5">${unread.length ? 'No row in what was read; the line under the table names what was not.'
         : `Nothing is working, merging, next or blocked${qShow.size ? ', and no row matches the filters' : ''}.`}</td></tr>`);
     const note = $('queue-note'); note.hidden = !unread.length; note.textContent = unread.map(u => `▨ ${u}`).join(' · ');
@@ -1051,6 +1060,11 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       if (e.target.closest('.rowact')) return;
       const w = e.target.closest('button[data-act]'); if (w) { if (!w.disabled) laneAct(w); return; }
       const b = e.target.closest('button[data-build]'); if (b) { if (!b.disabled) buildAct(b); return; }
+      // pack sd:8138: a box opens its repo filtered to its rows; a second press clears, another switches. No disclosure toggle.
+      const t = e.target.closest('button[data-tile]');
+      if (t) { if (t.disabled) return; const { repo, tile: box } = t.dataset, same = qOpen === repo && qTile && qTile.box === box;
+        qOpen = repo; qTile = same ? null : { repo, box }; return queueView(); }
+      const c = e.target.closest('button[data-tile-clear]'); if (c) { qTile = null; return queueView(); }
       const p = e.target.closest('tr.repo'); if (p && !e.target.closest('a, [data-copy]')) { qOpen = qOpen === p.dataset.repo ? null : p.dataset.repo; return queueView(); }
       pickRow('tr[data-id]')(e);
     });
