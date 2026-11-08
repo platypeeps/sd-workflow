@@ -341,8 +341,9 @@ class Transient(str):
     """A failed request's sentence unless an answer from Jira pins the failure on that one request (sd:8117).
 
     The default: every failure of the transport (any `URLError` or `OSError`, any TLS error, a refused redirect), a
-    401, 403, 429, 3xx or 5xx, and a 200 whose body is not JSON say nothing about one ticket, and a later run may
-    succeed. Only a plain 4xx is a plain `str`.
+    401, 403, 404, 429, 3xx or 5xx, and a 200 whose body is not JSON say nothing about one ticket, and a later run may
+    succeed. A 404 is both "no such ticket" and "this token may not see it", and access can come back. Only another
+    plain 4xx is a plain `str`.
 
     A `str`, so a caller that only says the sentence is unchanged; `jira_moves` asks which kind it holds.
     """
@@ -382,7 +383,7 @@ def _http(url: str, headers: dict[str, str], body: dict | None):
                 f"are not followed with credentials; set {ENV_BASE} to the URL Jira answers on"
             )
         text = f"Jira returned {error.code} {error.reason}"
-        return None, text if 400 <= error.code < 500 and error.code != 429 else Transient(text)
+        return None, text if 400 <= error.code < 500 and error.code not in (404, 429) else Transient(text)
     except (http.client.HTTPException, ValueError, RecursionError) as error:
         # Type only: `InvalidURL` and `urllib.parse`'s `ValueError` quote the
         # host, a secret pasted into it included, and `IncompleteRead` quotes

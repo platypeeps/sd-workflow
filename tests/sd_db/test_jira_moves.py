@@ -74,13 +74,10 @@ class FakeJira:
         self.posted: list[tuple[str, str]] = []
         #: key -> the error every request about that ticket gets.
         self.down: dict[str, str] = {}
-        #: What `/myself`, the account check, answers: an error sentence, or the payload.
-        self.account_error: str = ""
-        self.account: Any = {"accountId": "acct-1"}
 
     def __call__(self, url, headers, body):
         if url.endswith("/rest/api/3/myself"):
-            return (None, self.account_error) if self.account_error else (self.account, "")
+            return {"accountId": "acct-1"}, ""
         key = url.split("/issue/")[1].split("/")[0].split("?")[0]
         if key in self.down:
             return None, self.down[key]
@@ -251,7 +248,7 @@ class TheMoves(unittest.TestCase):
         self.assertEqual(jira.posted, [("ABC-7", "Done")])
 
     def test_a_permanent_failure_still_passes_and_notes_once(self):
-        for what, error in (("404", sentence(refused(404, "Not Found"))),
+        for what, error in (("400", sentence(refused(400, "Bad Request"))),
                             ("409", sentence(refused(409, "Conflict")))):
             with self.subTest(what):
                 [item] = self.linked("ABC-8")
@@ -285,7 +282,7 @@ class TheMoves(unittest.TestCase):
         [eight] = self.linked("ABC-8")
         transition(self.db, self.item, "done", who="operator")
         transition(self.db, eight, "done", who="operator")
-        jira.down.update({"ABC-7": sentence(refused(404, "Not Found")), "ABC-8": sentence(refused(503))})
+        jira.down.update({"ABC-7": sentence(refused(400, "Bad Request")), "ABC-8": sentence(refused(503))})
         jira_moves.run(self.db, jira, JIRA_ENV)
         self.assertEqual(len(self.notes(self.item)), 1)
         del jira.down["ABC-8"]
@@ -337,29 +334,25 @@ class TheMoves(unittest.TestCase):
         self.assertIn("shadow sync: jira moves: ABC-7: moved to Done", result.report())
 
 
-    def test_a_404_with_a_failed_account_check_holds_the_cursor(self):
-        # A 404 on every request (a wrong base, a token that sees no project) is no fact about one ticket.
+    def test_a_404_with_a_passing_account_check_holds_the_cursor(self):
+        # Review: `/myself` proves the account, not access to a project; a 404 there may clear later.
         jira = FakeJira({"ABC-7": "To Do"})
         jira_moves.run(self.db, jira, JIRA_ENV)
         held = jira_moves.read_cursor(self.db)
         transition(self.db, self.item, "done", who="operator")
-        jira.fail = jira.account_error = "Jira returned 404 Not Found"
+        jira.down["ABC-7"] = sentence(refused(404, "Not Found"))
         lines = jira_moves.run(self.db, jira, JIRA_ENV)
-        self.assertEqual(lines, ["jira moves: account check failed, cursor held for the next run: "
+        self.assertEqual(lines, ["jira moves: ABC-7: not moved, cursor held for the next run: "
                                  "Jira returned 404 Not Found"])
         self.assertEqual((jira_moves.read_cursor(self.db), self.notes(self.item)), (held, []))
-        jira.fail = jira.account_error = ""
+        del jira.down["ABC-7"]
         self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: moved to Done"])
 
-    def test_a_malformed_account_answer_holds_the_cursor(self):
-        jira = FakeJira({"ABC-7": "To Do"})
-        jira_moves.run(self.db, jira, JIRA_ENV)
-        held = jira_moves.read_cursor(self.db)
-        transition(self.db, self.item, "done", who="operator")
-        jira.account = [1]
-        lines = jira_moves.run(self.db, jira, JIRA_ENV)
-        self.assertIn("account check failed, cursor held", lines[0])
-        self.assertEqual((jira_moves.read_cursor(self.db), jira.posted), (held, []))
+    def test_a_malformed_account_answer_is_an_error_not_a_crash(self):
+        for payload in ([1], 7, {"accountId": 3}):
+            with self.subTest(payload):
+                self.assertEqual(shadow_jira.account_id(settings(JIRA_ENV), lambda *a, answer=payload: (answer, "")),
+                                 ("", "Jira accepted the request but named no account"))
 
     def test_a_failed_collect_runs_no_moves(self):
         jira = FakeJira({"ABC-7": "To Do"})
@@ -571,12 +564,12 @@ class TheFailureClasses(unittest.TestCase):
                      urllib.error.URLError(certificate_error()), urllib.error.URLError(ssl.SSLError(1, "handshake failed")),
                      http.client.InvalidURL("bad"), urllib.error.URLError(http.client.InvalidURL("bad")),
                      urllib.error.URLError(ValueError("bad")), ValueError("before any answer"), RecursionError(),
-                     refused(401), refused(403), refused(429), refused(500), refused(502), refused(503), refused(504), TimeoutError("timed out"),
+                     refused(401), refused(403), refused(429), refused(500), refused(502), refused(503), refused(504), refused(404), TimeoutError("timed out"),
                      socket.gaierror(8, "no such host"), ConnectionResetError(54, "reset"),
                      urllib.error.URLError(ConnectionRefusedError(61, "refused")), urllib.error.URLError("timed out"),
                      http.client.RemoteDisconnected("closed"), http.client.IncompleteRead(b""),
                      http.client.BadStatusLine("x"), urllib.error.URLError(http.client.RemoteDisconnected("closed"))]
-        permanent = [refused(400), refused(404), refused(409), refused(422)]
+        permanent = [refused(400), refused(409), refused(422)]
         for exception, wanted in [(e, True) for e in transient] + [(e, False) for e in permanent]:
             with self.subTest(repr(exception)):
                 self.assertIs(isinstance(sentence(exception), shadow_jira.Transient), wanted)

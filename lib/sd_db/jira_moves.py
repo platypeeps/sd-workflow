@@ -19,19 +19,17 @@ the priority sweep's closure. Neither is finished work, so each leaves the
 ticket as it is, and the sync says so. A done item whose stored fields
 cannot be read is unknown, so it fails rather than moves.
 
-Before the first ticket request of a run it reads `/myself`, the
-collect's own availability check: a failure there holds the cursor with
-no note, so a 4xx on every ticket (a wrong base, a token that sees no
-project) is never a note on each item. `shadow_sync` skips the step
-when the collect failed.
+A 404 is transient too: Jira answers it both for a missing ticket and
+for one the token may not see, and access can come back. `shadow_sync`
+skips the step when the collect failed.
 
 A permanent failure, one an answer from Jira pins on that ticket (a
 JSON answer of the wrong shape, no matching transition, a 4xx other than
-401, 403 or 429), is one comment note on the item, and the cursor still moves past it, so it is
+401, 403, 404 or 429), is one comment note on the item, and the cursor still moves past it, so it is
 said once, not every hour. Every field read from a Jira answer is checked,
 so a malformed answer is that item's failure too and the later moves
 continue. Every other failure is transient (`shadow_jira.Transient`: any
-failure of the transport, a refused redirect, a 401, 403, 429 or 5xx, a
+failure of the transport, a refused redirect, a 401, 403, 404, 429 or 5xx, a
 body that is not JSON) and stops the batch with no note: the cursor stays
 at the last entry fully handled, the run's lines say so, and the next run
 resumes at the failed entry. Entries run in the order of the note that
@@ -220,12 +218,6 @@ def run(connection: sqlite3.Connection, transport=None, environ=None) -> list[st
         _write_cursor(connection, newest)
         return [f"jira moves: no linked ticket; cursor starts at note {newest}"]
     items, newest = _linked(connection, cursor)
-    if items:
-        # A plain 4xx is a fact about one ticket only once the base and the token answer (sd:8117):
-        # a wrong base or a token that sees no project 404s on every ticket.
-        _, error = shadow_jira.account_id(config, transport)
-        if error:
-            return [f"jira moves: account check failed, cursor held for the next run: {error}"]
     lines: list[str] = []
     at = cursor
     for entry in items:
