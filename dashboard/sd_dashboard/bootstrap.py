@@ -13,6 +13,6 @@ from sd_dashboard import pack_library  # noqa: E402 - needs the path above
 
 sys.path.insert(0, str(pack_library()))
 module = sys.argv.pop(1)
-if module not in ("server", "runtime", "shots"):
+if module not in ("server", "runtime", "shots", "home_koi"):
     raise SystemExit("unknown dashboard module")
 runpy.run_module(f"sd_dashboard.{module}", run_name="__main__")
