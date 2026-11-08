@@ -1,5 +1,7 @@
 // Home's Map view (pack sd:8053): the lot's assets over the county aerial, one SVG as HOA's map.
-// Data: GET /api/home/map (home_map.document): the box (EPSG:2232 feet, 1,000 by 400 ft), the aerial's address, the assets with their care.
+// Data: GET /api/home/map (home_map.document): the box (EPSG:2232 feet), the aerial's address, the assets with their care.
+// Area (sd:8110): four edges in feet from the address; Save posts dashboard.home_map_extent to /api/settings/row with the
+// row shown as `before`, so a row changed since the read refuses. An asset with no point in the box is listed as off the map.
 // The SVG's viewBox is the box with y flipped, so an asset's feet are its coordinates. Add: press Add, pick a kind,
 // click the map (a line kind takes a click per point, then Finish line), fill the short form, Save. Drag a point to move it.
 // A row or a mark opens its form: Save, Delete, and Add care task, a recurring sd item naming the asset (POST /api/home/care).
@@ -47,7 +49,13 @@
   function draw() {
     const d = S.doc, [x0, y0, x1, y1] = box(), w = x1 - x0, h = y1 - y0, r = w / 120;
     const placed = d.assets.filter(a => a.geometry && shown(a)), rows = d.assets.filter(shown), pending = S.points.length ? html`<polyline class="pending" points="${S.points.map(xy).join(' ')}"/>` : '';
-    put($('map-note'), d.reason ? html`<p class="note">${d.reason}</p>` : html``);
+    const away = d.assets.filter(a => a.off_map).length, x = d.extent || {};
+    put($('map-note'), html`${d.reason ? html`<p class="note">${d.reason}</p>` : ''}${x.problem ? html`<p class="note">${x.problem}</p>` : ''}${x.coarse ? html`<p class="note">${x.coarse}</p>` : ''}${away ? html`<p class="note">${String(away)} ${away === 1 ? 'asset is' : 'assets are'} outside the area: listed below as off the map.</p>` : ''}`);
+    if (x.edges) put($('map-area'), html`<form class="map-area" id="area-form" aria-label="Area the map covers"><fieldset><legend>Area, ft from the address</legend>
+      ${['west', 'east', 'south', 'north'].map(k => html`<label>${k} <input name="${k}" type="number" inputmode="numeric" required min="${String(x.limits[0])}" max="${String(x.limits[1])}" step="1" value="${String(Math.round(x.edges[k]))}"></label>`)}
+      <button class="btn sm" type="submit">Save</button></fieldset>
+      <p class="why">Each edge ${String(x.limits[0])} to ${String(x.limits[1])} ft · aerial ${String(x.size[0])} × ${String(x.size[1])} px</p></form>`);
+    $('map-svg').style.aspectRatio = `${w} / ${h}`;
     put($('map-svg'), html`<svg class="map${S.adding ? ' adding' : ''}" id="map-canvas" viewBox="${x0} ${-y1} ${w} ${h}" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Property map: ${String(placed.length)} assets">
       ${d.aerial ? html`<image href="${d.aerial}" x="${x0}" y="${-y1}" width="${w}" height="${h}" preserveAspectRatio="none"/>` : html`<rect class="ground" x="${x0}" y="${-y1}" width="${w}" height="${h}"/>`}
       ${placed.map(a => mark(a, r))}${pending}</svg>`);
@@ -59,7 +67,7 @@
       <span class="why">${isLine(S.kind) ? `Click each point of the ${label(S.kind)}, then Finish line.` : `Click the map where the ${label(S.kind)} is.`}</span>
       ${isLine(S.kind) ? html`<button class="btn sm" type="button" id="map-finish"${S.points.length < 2 ? html` disabled` : ''}>Finish line</button>` : ''}` : ''}`);
     put($('map-rows'), html`<table class="ledger place-rows"><thead><tr><th scope="col">Asset</th><th scope="col">Kind</th><th scope="col">Care</th></tr></thead><tbody>
-      ${rows.length ? rows.map(a => html`<tr data-asset="${String(a.id)}" tabindex="0" aria-selected="${String(S.sel === a.id)}"><td>${a.name}</td><td>${label(a.kind)}</td>
+      ${rows.length ? rows.map(a => html`<tr data-asset="${String(a.id)}" tabindex="0" aria-selected="${String(S.sel === a.id)}"><td>${a.name}${a.off_map ? html` <span class="off">· off the map</span>` : ''}</td><td>${label(a.kind)}</td>
         <td>${a.care.overdue ? html`<span class="st warning">■ overdue</span>` : a.care.items.length ? `next ${a.care.items[0].due || 'undated'}` : '—'}</td></tr>`)
         : html`<tr class="empty"><td colspan="3">${d.assets.length ? 'No assets in the kinds shown: turn a tile on.' : 'No assets yet: press Add, pick a kind and click the map.'}</td></tr>`}</tbody></table>`);
     form();
@@ -140,6 +148,12 @@
       const geometry = e.target.dataset.geometry ? JSON.parse(e.target.dataset.geometry) : a ? a.geometry : null;
       const body = { kind, name: fd.get('name'), geometry, fields, photo: fd.get('photo') || null, ...(a ? { id: a.id } : {}) };
       send('/api/home/asset', body, `${body.name} saved`).then(out => { if (out?.id) { S.sel = out.id; S.adding = false; draw(); } });
+    } else if (e.target.id === 'area-form') {
+      e.preventDefault();
+      const fd = new FormData(e.target), x = S.doc.extent;
+      const value = ['west', 'east', 'south', 'north'].map(k => String(fd.get(k)).trim()).join(',');
+      window.shell.post('/api/settings/row', { key: x.key, value, before: x.row }).then(() => { toast('Area saved'); return load(); },
+        err => { toast(`Not saved: ${err.message}`); return load(); });
     } else if (e.target.id === 'care-form') {
       e.preventDefault();
       const fd = new FormData(e.target);

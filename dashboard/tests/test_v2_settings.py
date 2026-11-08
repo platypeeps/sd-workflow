@@ -269,7 +269,7 @@ class TheDashboardSettings(BrowserSession):
         writes.set_setting(self.connection, "dashboard.hoa_thresholds", "tank|below|12")
         writes.set_setting(self.connection, "adversarial.model", "gpt-fixture")
         held = self.read()
-        self.assertEqual(list(held), list(setting_rows.LISTS) + list(adversarial.SETTINGS) + list(adversarial.DEEP))
+        self.assertEqual(list(held), list(setting_rows.LISTS) + ["dashboard.home_map_extent"] + list(adversarial.SETTINGS) + list(adversarial.DEEP))
         self.assertEqual((held["dashboard.realms"]["value"], held["dashboard.realms"]["source"]),
                          ("realm|work|Work|/repos/example-work/*\n", "file"))
         self.assertEqual((held["dashboard.hoa_thresholds"]["source"], held["dashboard.report_families"]["source"]), ("database", "unset"))
