@@ -531,17 +531,20 @@ def pickup(connection, available: dict, *, now: str | None = None) -> list[int]:
     """One tick of auto-pickup while it is on: queue `eligible` items, as `PICKUP`, to fill the room; the items.
 
     The press queue goes first: while any build of this host's lanes is
-    queued, nothing is picked and the claim drains it. Each free builder
-    slot takes one bundle of up to `BUNDLE_MAX` items of one repository,
-    each repository at most its `room_for`. No room, or no item, queues
-    nothing.
+    queued in a repository with room, nothing is picked and the claim
+    drains it. A press waiting on a full repository holds no other one: at
+    one bundle per repository it may wait a whole bundle (pack sd:8158).
+    Each free builder slot takes one bundle of up to `BUNDLE_MAX` items of
+    one repository, each repository at most its `room_for`. No room, or no
+    item, queues nothing.
     """
     if available["why"] or not pickup_state(connection, now=now)["on"]:
         return []
     # Only this host's presses hold it: the hub never claims a satellite's.
     hosts = lane_hosts(connection)
-    if any(lane_of(connection, row["lane_host"]) in hosts for row in connection.execute(
-            "SELECT repo.lane_host FROM assignment JOIN item ON item.id = assignment.item "
+    if any(lane_of(connection, row["lane_host"]) in hosts and room_for(available, row["repo"]) > 0
+           for row in connection.execute(
+            "SELECT item.repo, repo.lane_host FROM assignment JOIN item ON item.id = assignment.item "
             "LEFT JOIN repo ON repo.path = item.repo WHERE assignment.status = 'queued' AND assignment.scope = ?",
             (SCOPE,))):
         return []

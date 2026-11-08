@@ -1259,6 +1259,16 @@ class Pickup(Case):
                                       now=self.NOW), items[:3], "one slot left: one bundle")
         self.assertFalse(build.picked(self.db, build.queue(self.db, [items[3]], who="operator")[0]["id"]))
 
+    def test_a_press_waiting_on_a_full_repository_holds_no_other_repository(self):
+        """Pack sd:8158: at one bundle per repo a press can wait for a whole bundle; only a press with room holds."""
+        build.queue(self.db, [self.item()], who="operator")
+        b = self.item(repo=B)
+        self.on()
+        busy = self.room(interactive=[{"repo": A, "session_id": "s1"}])
+        self.assertEqual(build.room_for(busy, A), 0)
+        self.assertEqual(build.pickup(self.db, busy, now=self.NOW), [b], "A's waiting press holds nothing in B")
+        self.assertEqual(build.pickup(self.db, self.room(), now=self.NOW), [], "a press with room is claimed first")
+
     def end(self, status):
         item = self.item()
         lead = build.queue(self.db, [item], who=build.PICKUP)[0]["id"]
