@@ -756,6 +756,29 @@ seg('votes', 'all'); await flush(); R.all = ELS['votes-rows'].html;""", self.doc
         self.assertIn('<table class="ledger place-rows" data-toolbar="votes-filters">', r["all"])
         self.assertIn("1 open vote", r["tally"])
 
+    def test_add_and_edit_vote_post_the_fields_and_the_revision_read_and_read_the_view_again(self):
+        # pack sd:8058: Add vote posts every field typed with no revision; Edit posts only the fields changed, with the
+        # revision the view read, as `sd votes edit --if-revision`. Each reads the view again; a stale edit does too.
+        sd_votes.add(self.connection, self.hoa, "PG-1", {"motion": "Approve the hours.", "outcome": "pending: not sent"})
+        docs = self.docs()
+        docs["/api/hoa/vote"] = [200, {"vote": {}}]
+        out = self.run_page(self.ACTS + """await go('#view=votes'); R.rows = ELS['votes-rows'].html;
+FIELD_VALUES = { key: 'CI-9', motion: 'Buy the <crime> policy.', outcome: 'adopted', state: '' };
+shellRun(cmd('vote.add'), C.get('votes')); await flush(); R.addCli = cmd('vote.add').cli(C.get('votes'), FIELD_VALUES);
+FIELD_VALUES = { outcome: 'adopted', state: 'closed' };
+shellRun(cmd('vote.edit'), C.get('vote:PG-1')); await flush(); R.editCli = cmd('vote.edit').cli(C.get('vote:PG-1'), FIELD_VALUES);
+ANSWER = path => path === '/api/hoa/vote' ? [409, { error: 'vote PG-1 is at revision 2, not 1; read it again' }] : DOCS[path];
+shellRun(cmd('vote.edit'), C.get('vote:PG-1')); await flush();""", docs)
+        self.assertRegex(out["R"]["rows"], r'(?s)<tr>.*PG-1.*<i data-act="vote.edit"></i></td></tr>')
+        self.assertEqual(out["posts"][0][:2], ["/api/hoa/vote", {"key": "CI-9", "revision": None,
+                                                                  "fields": {"motion": "Buy the <crime> policy.", "outcome": "adopted"}}])
+        self.assertEqual(out["posts"][1][:2], ["/api/hoa/vote", {"key": "PG-1", "revision": 1, "fields": {"outcome": "adopted", "state": "closed"}}])
+        self.assertEqual(out["gets"].count("/api/hoa/votes"), 4, "each write did not read the view again")
+        self.assertEqual([t["msg"] for t in out["toasts"]][:2], ["Vote added · CI-9", "Vote edited · PG-1"])
+        self.assertEqual(out["toasts"][2]["msg"], "PG-1 not changed: vote PG-1 is at revision 2, not 1; read it again")
+        self.assertIn("sd votes add 'CI-9' --motion 'Buy the <crime> policy.' --outcome 'adopted' --belongs-to '/repos/hoa'", out["R"]["addCli"])
+        self.assertIn("sd votes edit 'PG-1' --if-revision 1 --outcome 'adopted' --state 'closed' --belongs-to '/repos/hoa'", out["R"]["editCli"])
+
     def test_no_vote_and_no_open_vote_say_which(self):
         out = self.run_page("await go('#view=votes'); R.none = ELS['votes-rows'].html;", self.docs())
         self.assertIn("No vote is recorded for the hoa checkout.", out["R"]["none"])
@@ -1585,6 +1608,32 @@ class Votes(Fixture):
             doc = places.votes(self.connection, "hoa", now=NOW)
         self.assertEqual(doc["state"], "error")
         self.assertIn("migration 048", doc["reason"])
+
+
+    # pack sd:8058: Add and Edit post /api/hoa/vote; an edit names the revision it read, as `sd votes edit --if-revision`.
+    def test_a_vote_write_adds_then_edits_at_the_revision_read(self):
+        added = places.write_vote({"key": "CI-2", "revision": None, "fields": {"motion": "Buy it.", "outcome": "pending: not sent"}})(self.connection)
+        self.assertEqual((added["vote"]["revision"], added["vote"]["state"], added["vote"]["repo"]), (1, "open", self.hoa))
+        edited = places.write_vote({"key": "CI-2", "revision": 1, "fields": {"outcome": "adopted"}})(self.connection)
+        self.assertEqual((edited["vote"]["revision"], edited["vote"]["state"], edited["vote"]["motion"]), (2, "closed", "Buy it."))
+        closed = places.write_vote({"key": "CI-2", "revision": 2, "fields": {"state": "open"}})(self.connection)
+        self.assertEqual((closed["vote"]["revision"], closed["vote"]["state"]), (3, "open"))
+
+    def test_a_stale_vote_edit_is_refused_as_stale_and_writes_nothing(self):
+        self.add("CI-3", motion="Buy it.")
+        sd_votes.edit(self.connection, self.hoa, "CI-3", {"notes": "moved"})
+        with self.assertRaises(workflow.StaleItem):
+            places.write_vote({"key": "CI-3", "revision": 1, "fields": {"outcome": "adopted"}})(self.connection)
+        self.assertEqual(sd_votes.get(self.connection, self.hoa, "CI-3")["revision"], 2)
+        with self.assertRaises(sd_votes.VoteRefused):
+            places.write_vote({"key": "CI-3", "revision": None, "fields": {"motion": "again"}})(self.connection)
+
+    def test_a_malformed_vote_write_is_refused_before_it_runs(self):
+        for payload in ({"key": "A", "fields": {}}, {"key": 1, "revision": None, "fields": {}},
+                        {"key": "A", "revision": True, "fields": {}}, {"key": "A", "revision": None, "fields": {"motion": 3}},
+                        {"key": "A", "revision": None, "fields": []}, {"key": "A", "revision": None, "fields": {}, "x": 1}):
+            with self.subTest(payload=payload), self.assertRaises(ValueError):
+                places.write_vote(payload)
 
 
 class TheRule(unittest.TestCase):

@@ -10,8 +10,8 @@
 // Open | All (sd:5752): Tasks, Briefs and Reports show their open rows, and each row's primary act is its acknowledge: a
 // task's Done (task-details.js, view 'place'), a brief's Seen (Today's mark, below), a report's Acknowledge (report.ack).
 // All adds the week's done tasks (places.task_rows), the seen briefs or the acknowledged reports. The choice is the URL's
-// ?<view>=all. HOA's Votes (pack sd:8050) shows its open votes, and All adds the closed ones; it is read-only, so its rows
-// have no act: `sd votes` writes them.
+// ?<view>=all. HOA's Votes (pack sd:8050) shows its open votes, and All adds the closed ones. Add vote and each row's Edit
+// (pack sd:8058) post /api/hoa/vote, as `sd votes add` and `sd votes edit --if-revision` write.
 //
 // Adapter: viewSwitch(show) is the one place a page meets the shell's view switch (shell.js view:start). The page declares
 // window.PAGE_VIEWS = [{ id, label, key?, api? }] before shell.js; show(id) runs for the view shown, at shell:ready and on
@@ -133,18 +133,20 @@
           : `No open report from ${doc.jobs.join(', ')}. All lists the ${plural(doc.rows.length, 'acknowledged report')}.`),
         `${plural(doc.rows.filter(r => r.status !== 'done').length, 'open report')} · ${doc.jobs.length} jobs`];
     },
-    // pack sd:8050: a vote row, read-only. The tally groups the directors by answer (sd_db.votes.parse_votes); a cell
+    // pack sd:8050: a vote row; its act is Edit (pack sd:8058). The tally groups the directors by answer (sd_db.votes.parse_votes); a cell
     // it could not read shows as written.
     votes: (doc, rows) => {
       const glyph = r => r.state === 'open' ? 'queued' : 'ok';
       const tally = r => r.tally ? ['yes', 'no', 'abstain', 'absent', 'none'].map(a => [a, Object.keys(r.tally).filter(n => r.tally[n] === a)])
         .filter(([, names]) => names.length).map(([a, names]) => `${a[0].toUpperCase()}${a.slice(1)}: ${names.join(', ')}`).join(' · ') : r.votes || '—';
       const open = doc.rows.filter(OPEN.votes).length;
-      return [table('votes', [[html`<span class="sr">State</span>`], ['Vote', 'hide-sm'], ['Date'], ['Motion'], ['Type', 'hide-sm'], ['Moved / seconded', 'hide-sm'], ['Votes'], ['Outcome'], ['Source', 'hide-sm']],
+      doc.rows.forEach(r => window.shell.commands.put({ ...r, id: `vote:${r.key}`, type: 'vote', label: r.key, belongs: doc.repo }));
+      window.shell.commands.put({ id: 'votes', type: 'vote list', label: 'Board votes', belongs: doc.repo });
+      return [table('votes', [[html`<span class="sr">State</span>`], ['Vote', 'hide-sm'], ['Date'], ['Motion'], ['Type', 'hide-sm'], ['Moved / seconded', 'hide-sm'], ['Votes'], ['Outcome'], ['Source', 'hide-sm'], ACT],
         rows.map(r => html`<tr><td class="g ${glyph(r)}"><span aria-hidden="true">${GLYPH[glyph(r)]}</span><span class="sr">${r.state}</span></td>
           <td class="ref hide-sm">${r.key}</td><td class="when">${r.date || '—'}</td><td class="what">${r.topic ? html`<b>${r.topic}</b>: ` : ''}${r.motion}</td>
           <td class="hide-sm">${r.type || '—'}</td><td class="hide-sm">${[r.moved, r.seconded].filter(Boolean).join(' / ') || '—'}</td>
-          <td>${tally(r)}</td><td>${r.outcome || '—'}</td><td class="hide-sm">${r.source || '—'}</td></tr>`),
+          <td>${tally(r)}</td><td>${r.outcome || '—'}</td><td class="hide-sm">${r.source || '—'}</td>${act(`vote:${r.key}`)}</tr>`),
         rows.length || !doc.rows.length ? 'No vote is recorded for the hoa checkout.'
           : `No open vote. All lists the ${plural(doc.rows.length, 'closed vote')}.`),
         `${plural(open, 'open vote')} · ${doc.rows.length} in all`];
@@ -237,6 +239,34 @@
     return { key: t => t.key, rows: doc => { T = [...doc.rows || [], ...doc.done || []].map(TD.shape); d.adopt(T); return T; }, objects: rows => rows.map(d.objectOf),
       show: t => { window.shell.commands.select(t.key); d.readDet(t.id); d.renderDetails(); }, forget: () => {} };
   }
+  // pack sd:8058: Add vote and Edit, one form each (the shell's confirm fields), posting /api/hoa/vote (places.write_vote).
+  // Add sends the fields typed; Edit sends only the fields changed, with the revision the view read, so a vote changed
+  // since is refused as stale (409) with nothing written. State "from the outcome" sends none: the outcome sets it.
+  // Each write reads the view again, a refused stale one too.
+  function votes() {
+    const S = window.shell, TEXT = [['date', 'Date', 'YYYY-MM-DD'], ['topic', 'Topic', 'the subject, a few words'], ['motion', 'Motion', 'as worded'],
+      ['type', 'Type', 'meeting or email vote'], ['moved', 'Moved by'], ['seconded', 'Seconded by'], ['votes', 'Votes', 'Ada, Ben Yes; Cy No'],
+      ['outcome', 'Outcome', 'adopted, failed, or pending: why'], ['follow_up', 'Follow-up'], ['source', 'Source', 'where the record is'], ['notes', 'Notes']];
+    const state = { name: 'state', label: 'State', options: [{ value: '', label: 'From the outcome' }, { value: 'open', label: 'Open' }, { value: 'closed', label: 'Closed' }] };
+    const fields = o => [...TEXT.map(([name, label, placeholder]) => ({ name, label, value: o?.[name] || '', placeholder: placeholder || '' })), state];
+    const typed = (o, v) => Object.fromEntries(Object.entries(v || {}).filter(([k, x]) => k !== 'key' && (k === 'state' ? x : x !== (o?.[k] || ''))));
+    const flags = f => Object.entries(f).map(([k, x]) => ` --${k.replace('_', '-')} ${S.shq(x)}`).join('');
+    const send = async (body, said) => {
+      try { await S.post('/api/hoa/vote', body); } catch (err) { if (err.stale) await window.places.reread('votes'); throw err; }
+      await window.places.reread('votes');
+      return said;
+    };
+    S.commands.register(
+      { id: 'vote.add', on: 'vote list', label: 'Add vote', icon: 'plus', does: 'Adds a board vote to the workflow database.', risk: 'safe', executes: true, sends: () => 'POST /api/hoa/vote',
+        fields: () => [{ name: 'key', label: 'Key', required: true, placeholder: 'such as CI-2' }, ...fields(null)],
+        cli: (o, v) => `sd votes add ${S.shq(v?.key || 'KEY')}${flags(typed(null, v))} --belongs-to ${S.shq(o.belongs || 'PATH')}`,
+        run: (o, v) => send({ key: v.key, revision: null, fields: typed(null, v) }, `Vote added · ${v.key}`) },
+      { id: 'vote.edit', on: 'vote', label: 'Edit', icon: 'pen-line', does: 'Changes the vote\'s fields; refused if it changed since this read.', risk: 'safe', executes: true, primary: () => true,
+        sends: () => 'POST /api/hoa/vote', fields,
+        cli: (o, v) => `sd votes edit ${S.shq(o.key)} --if-revision ${o.revision}${flags(typed(o, v))} --belongs-to ${S.shq(o.belongs || 'PATH')}`,
+        run: (o, v) => { const f = typed(o, v); return Object.keys(f).length ? send({ key: o.key, revision: o.revision, fields: f }, `Vote edited · ${o.key}`) : `Nothing changed · ${o.key}`; } });
+    S.commands.put({ id: 'votes', type: 'vote list', label: 'Board votes' });
+  }
   // The shell's picked rows, so a retired row's pick is dropped first, as read.js retires: the shell refuses to toggle a
   // pick on a type no bulk command is on, and the bulk bar would run on the retired object.
   let picks = [];
@@ -323,6 +353,7 @@
     if (blocks.some(b => b.dataset.placeView === 'reports')) DETAILS.reports = reports('reports');
     // HOA's Tasks is hoa.js's table from /api/hoa, which attaches task-details.js itself (sd:5671): only a Tasks view that reads its rows.
     if (blocks.some(b => b.dataset.placeView === 'tasks' && b.dataset.api)) DETAILS.tasks = tasks('tasks');
+    if (blocks.some(b => b.dataset.placeView === 'votes')) votes();
     Object.keys(DETAILS).forEach(v => { if (!DETAILS[v]) delete DETAILS[v]; });
     list();
     viewSwitch(id => {

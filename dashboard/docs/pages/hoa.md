@@ -112,8 +112,12 @@ makes the view unknown with the reason and the line to add, never an empty list.
 Votes (pack sd:8050), right of Alarms, reads `GET /api/hoa/votes`: the hoa
 checkout's rows of the `vote` table, open first, then newest first. Each row
 shows the motion, type, mover and seconder, the per-director tally and the
-outcome and source. Open | All keeps `?votes=all`. It is read-only:
-`sd votes` writes the rows. A store without the table makes it an error.
+outcome and source. Open | All keeps `?votes=all`. Add vote and a row's
+Edit (pack sd:8058) post `/api/hoa/vote`, as `sd votes add` and
+`sd votes edit --if-revision` write: Edit sends only the fields changed,
+with the revision the view read, and a vote changed since is refused with
+nothing written. Each write reads the view again. A store without the
+table makes it an error.
 The views are `window.PAGE_VIEWS`, set from the markup before `shell.js`; the shell's view switch draws
 them in `#viewswitch`, and until that shell lands `places.js` draws a segmented control there (`viewSwitch`).
 
