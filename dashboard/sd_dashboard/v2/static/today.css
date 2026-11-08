@@ -177,6 +177,13 @@
 .queue .pip.on { border-color: var(--color-accent); color: var(--color-ink); }
 .queue .pip.warn { background: var(--color-warning-lamp); border-color: transparent; color: var(--color-warning-ink); }
 .queue .pip.caution { background: var(--color-caution-lamp); border-color: transparent; color: var(--color-caution-lamp-ink); }
+/* pack sd:8138: each box is a toggle; pressed is a 2px ink ring, so the lamp fill stays (rulings #49024, #49052). */
+.queue .tile { padding: 0; margin: 0; border: 0; background: none; font: inherit; cursor: pointer; border-radius: var(--radius-sm); }
+.queue .tile:disabled { cursor: default; }
+.queue .tile:not(:disabled):hover .pip { border-color: var(--color-ink); }
+.queue .tile:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
+.queue .tile[aria-pressed="true"] .pip { box-shadow: 0 0 0 2px var(--color-ink); }
+@media (forced-colors: active) { .queue .tile[aria-pressed="true"] .pip { outline: 2px solid Highlight; outline-offset: 0; } }
 .queue .act { text-align: right; white-space: nowrap; }
 .queue .act .ctl { display: inline-flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-3xs); vertical-align: middle; }
 .queue .act .ctl .btn .i { margin-right: 0; }

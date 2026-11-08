@@ -523,8 +523,9 @@ class TheShadowSync(SuggestCase):
         self.environment(GH_SEARCH=json.dumps(TWO_OPEN_ISSUES))
         self.run_verb(sd_shadow.shadow_sync, strict=True)
         searches = [call for call in self.gh_calls() if "graphql" in call]
-        # The four buckets, then the two pull request alert searches (sd:6712).
-        self.assertEqual(6, len(searches))
+        # The four buckets, then the three pull request alert searches: author and requested (sd:6712), and
+        # mentioned (sd:8142).
+        self.assertEqual(7, len(searches))
         self.assertEqual(2, len(self.shadow_rows()))
 
     def test_a_second_run_updates_the_rows_rather_than_duplicating_them(self):

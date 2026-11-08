@@ -1,13 +1,15 @@
 """Open pull requests that need the operator, as one report alert per pull and state (sd:6712).
 
-After a GitHub shadow sync, two unwindowed searches read every open pull the
-operator authored and every one with a review requested of them by name
-(`user-review-requested`, so a team request is not theirs). Each pull's
-attention states:
+After a GitHub shadow sync, three unwindowed searches read every open pull the
+operator authored, every one with a review requested of them by name
+(`user-review-requested`, so a team request is not theirs), and every other
+one that @mentions them (sd:8142). Each pull's attention states:
 
 | state             | whose pull | read from                                  |
 | ----------------- | ---------- | ------------------------------------------ |
 | review requested  | another's  | the `user-review-requested:@me` search     |
+| mentioned         | another's  | `mentions:@me`, not asked, not reviewed    |
+| waiting on review | yours      | not draft, no review 24 h after it opened  |
 | changes requested | yours      | `reviewDecision` CHANGES_REQUESTED         |
 | checks failing    | yours      | red rollup unless every red is optional    |
 | merge conflict    | yours      | `mergeable` CONFLICTING                    |
@@ -52,7 +54,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 
 from . import reporting, workflow
 from .database import transaction
@@ -63,7 +65,8 @@ SEEN_KEY = "pr-attention:seen"
 #: One page per search: more open pulls than this is a cut read.
 PAGE = 100
 QUERY = """query($q: String!, $n: Int!) { search(query: $q, type: ISSUE, first: $n) { issueCount nodes {
-  ... on PullRequest { url number title repository { nameWithOwner } reviewDecision mergeable
+  ... on PullRequest { url number title repository { nameWithOwner } reviewDecision mergeable isDraft createdAt
+    reviews(first: 1) { totalCount }
     commits(last: 1) { nodes { commit { statusCheckRollup { state } } } } } } } }"""
 #: One red rollup's head contexts and which are required, per pull: aliased `p<i>` in one query.
 CHECKS = """p{i}: repository(owner: {owner}, name: {name}) {{ pullRequest(number: {n}) {{ commits(last: 1) {{ nodes {{
@@ -72,10 +75,15 @@ CHECKS = """p{i}: repository(owner: {owner}, name: {name}) {{ pullRequest(number
     ... on StatusContext {{ state isRequired(pullRequestNumber: {n}) }} }} }} }} }} }} }} }} }}"""
 #: A check run's conclusion or a status's state that fails the check.
 RED = frozenset({"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"})
+#: `requested` reads before `mentioned`, so a pull that asks the operator's review alerts once, as that (sd:8142).
 SEARCHES = (("author", "is:pr is:open archived:false author:@me"),
-            ("requested", "is:pr is:open archived:false user-review-requested:@me"))
+            ("requested", "is:pr is:open archived:false user-review-requested:@me"),
+            ("mentioned", "is:pr is:open archived:false mentions:@me -author:@me -reviewed-by:@me"))
 LABELS = {"review_requested": "review requested of you", "changes_requested": "changes requested",
-          "checks_failing": "checks failing", "conflict": "merge conflict", "ready": "approved, ready to merge"}
+          "checks_failing": "checks failing", "conflict": "merge conflict", "ready": "approved, ready to merge",
+          "mentioned": "you are mentioned", "waiting_on_reviewers": "waiting on reviewers, no review in 24 h"}
+#: How long the operator's open pull may go without a review before it is an alert (sd:8142).
+REVIEW_WAIT = timedelta(hours=24)
 
 
 def _rollup(pull: dict) -> str | None:
@@ -83,13 +91,16 @@ def _rollup(pull: dict) -> str | None:
     return (((nodes[-1] or {}).get("commit") or {}).get("statusCheckRollup") or {}).get("state")
 
 
-def states(pull: dict, why: str, optional_red: bool = False) -> list[str]:
+def states(pull: dict, why: str, optional_red: bool = False, now: datetime | None = None) -> list[str]:
     """The attention states of one search node, from `LABELS`.
 
     `optional_red`, from `_optional_red`: every red check on the head is optional, so the red rollup blocks nothing.
+    `now` dates the review wait; without it no pull waits on reviewers.
     """
     if why == "requested":
         return ["review_requested"]
+    if why == "mentioned":
+        return ["mentioned"]
     rollup = _rollup(pull)
     decision, mergeable = pull.get("reviewDecision"), pull.get("mergeable")
     found = []
@@ -101,6 +112,9 @@ def states(pull: dict, why: str, optional_red: bool = False) -> list[str]:
         found.append("conflict")
     if decision == "APPROVED" and mergeable == "MERGEABLE" and rollup in ("SUCCESS", None):
         found.append("ready")
+    if now is not None and pull.get("isDraft") is False and (pull.get("reviews") or {}).get("totalCount") == 0 \
+            and now - datetime.fromisoformat(pull["createdAt"].replace("Z", "+00:00")) >= REVIEW_WAIT:
+        found.append("waiting_on_reviewers")
     return found
 
 
@@ -119,6 +133,8 @@ def _well_formed(node) -> bool:
     if not (_has(node, "url", str) and node["url"] and _has(node, "number", int) and _has(node, "title", str)
             and _has(node, "reviewDecision", str, null=True) and _has(node, "mergeable", str)
             and _has(node, "repository", dict) and _has(node["repository"], "nameWithOwner", str)
+            and isinstance(node.get("isDraft"), bool) and _has(node, "createdAt", str) and _moment(node["createdAt"])
+            and _has(node, "reviews", dict) and _has(node["reviews"], "totalCount", int)
             and _has(node, "commits", dict) and _has(node["commits"], "nodes", list) and node["commits"]["nodes"]):
         return False
     tip = node["commits"]["nodes"][-1]
@@ -126,6 +142,14 @@ def _well_formed(node) -> bool:
         return False
     rollup = tip["commit"]["statusCheckRollup"]
     return rollup is None or _has(rollup, "state", str)
+
+
+def _moment(value: str) -> bool:
+    """Whether `value` is an ISO instant with a zone, as GitHub's `createdAt` is."""
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).tzinfo is not None
+    except ValueError:
+        return False
 
 
 def _verdict(answer) -> bool | None:
@@ -171,10 +195,11 @@ def _optional_red(pulls: list[dict], runner, timeout: float) -> set[str]:
     return {pull["url"] for i, pull in enumerate(pulls) if _verdict(data.get(f"p{i}")) is False}
 
 
-def read(runner=None, *, timeout: float = 60) -> tuple[dict[str, dict], bool, str]:
-    """`({basis: pull}, complete, reason)`: every open pull's states, keyed `<state> <url>`."""
+def read(runner=None, *, timeout: float = 60, now: datetime | None = None) -> tuple[dict[str, dict], bool, str]:
+    """`({basis: pull}, complete, reason)`: every open pull's states, keyed `<state> <url>`. `now` dates review waits."""
     from .shadow_sync import _run
 
+    now = now or datetime.now(timezone.utc)
     found: dict[str, dict] = {}
     problems = []
     for why, query in SEARCHES:
@@ -199,7 +224,9 @@ def read(runner=None, *, timeout: float = 60) -> tuple[dict[str, dict], bool, st
         optional = _optional_red([node for node in nodes if _rollup(node) in ("FAILURE", "ERROR")],
                                  runner, timeout) if why == "author" else set()
         for node in nodes:
-            for state in states(node, why, node["url"] in optional):
+            if why == "mentioned" and f"review_requested {node['url']}" in found:
+                continue  # one alert per pull: the review request says it
+            for state in states(node, why, node["url"] in optional, now):
                 found[f"{state} {node['url']}"] = {"state": state, "url": node["url"], "number": node.get("number"),
                                                     "title": node.get("title") or "",
                                                     "repo": (node.get("repository") or {}).get("nameWithOwner") or ""}
