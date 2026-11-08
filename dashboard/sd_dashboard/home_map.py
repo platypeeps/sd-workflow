@@ -165,6 +165,7 @@ def _id(value, what: str = "asset") -> int:
 def save(payload: dict):
     """`POST /api/home/asset {id?, kind, name, geometry, fields, photo}`: add or replace one asset."""
     from sd_db import assets
+    from sd_db.database import transaction
 
     values = dict(payload)
     if not set(values) <= {"id", "kind", "name", "geometry", "fields", "photo"} or not {"kind", "name"} <= set(values):
@@ -173,13 +174,18 @@ def save(payload: dict):
 
     def write(connection):
         try:
-            if asset is not None and isinstance(values.get("fields"), dict):
-                # The server writes these on the current row (the Koi view); a form's older copy never replaces them.
-                current = assets.get_asset(connection, asset)
-                kept = {key: current["fields"][key] for key in SERVER_KEYS.get(current["kind"], ())
-                        if key in current["fields"]}
-                values["fields"] = {**values["fields"], **kept}
-            return assets.save_asset(connection, asset=asset, **values)
+            # One transaction: a log the Koi view appends between the read and the write is not lost.
+            with transaction(connection):
+                if asset is not None:
+                    # The server writes these on the current row (the Koi view); a form's older copy, or no
+                    # `fields` at all (omitted or null, which save_asset reads as empty), never replaces them.
+                    current = assets.get_asset(connection, asset)
+                    kept = {key: current["fields"][key] for key in SERVER_KEYS.get(current["kind"], ())
+                            if key in current["fields"]}
+                    sent = values.get("fields")
+                    if kept and (sent is None or isinstance(sent, dict)):
+                        values["fields"] = {**(sent or {}), **kept}
+                return assets.save_asset(connection, asset=asset, **values)
         except assets.AssetRefused as refused:
             return 400, {"error": str(refused)}
 

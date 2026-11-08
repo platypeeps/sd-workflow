@@ -109,6 +109,23 @@ class TheKoi(ScreenCase):
         fields = assets.get_asset(self.connection, self.pond["id"])["fields"]
         self.assertEqual((fields["volume_gal"], len(fields["water_log"]), len(fields["tests"])), (2500, 2, 1))
 
+    def test_a_pond_save_without_fields_keeps_the_water_log_and_tests(self):
+        # pack sd:8054 review: `fields` omitted or null fell through to
+        # save_asset's empty default and cleared the server's logs.
+        home_koi.log_water({}, now=NOW)(self.connection)
+        home_koi.log_test({"ph": 7.4}, now=NOW)(self.connection)
+        logged = assets.get_asset(self.connection, self.pond["id"])["fields"]
+        base = {"id": self.pond["id"], "kind": "pond", "name": "Pond", "geometry": self.pond["geometry"]}
+        for case, payload in (("omitted", base), ("null", {**base, "fields": None})):
+            with self.subTest(case):
+                # Each case starts from the logged row, so one case's loss
+                # cannot hide the other's.
+                assets.save_asset(self.connection, asset=self.pond["id"], kind="pond", name="Pond",
+                                  geometry=self.pond["geometry"], fields=logged)
+                home_map.save(dict(payload))(self.connection)
+                fields = assets.get_asset(self.connection, self.pond["id"])["fields"]
+                self.assertEqual((len(fields.get("water_log", [])), len(fields.get("tests", []))), (2, 1))
+
     def test_no_pond_says_to_add_one(self):
         assets.delete_asset(self.connection, self.pond["id"])
         doc = home_koi.document(self.connection, now=NOW)
