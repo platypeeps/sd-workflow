@@ -8,7 +8,7 @@ one that @mentions them (sd:8142). Each pull's attention states:
 | state             | whose pull | read from                                  |
 | ----------------- | ---------- | ------------------------------------------ |
 | review requested  | another's  | the `user-review-requested:@me` search     |
-| mentioned         | another's  | `mentions:@me`, unless a review is asked   |
+| mentioned         | another's  | `mentions:@me`, not asked, not reviewed    |
 | waiting on review | yours      | not draft, no review 24 h after it opened  |
 | changes requested | yours      | `reviewDecision` CHANGES_REQUESTED         |
 | checks failing    | yours      | red rollup unless every red is optional    |
@@ -78,7 +78,7 @@ RED = frozenset({"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED"
 #: `requested` reads before `mentioned`, so a pull that asks the operator's review alerts once, as that (sd:8142).
 SEARCHES = (("author", "is:pr is:open archived:false author:@me"),
             ("requested", "is:pr is:open archived:false user-review-requested:@me"),
-            ("mentioned", "is:pr is:open archived:false mentions:@me -author:@me"))
+            ("mentioned", "is:pr is:open archived:false mentions:@me -author:@me -reviewed-by:@me"))
 LABELS = {"review_requested": "review requested of you", "changes_requested": "changes requested",
           "checks_failing": "checks failing", "conflict": "merge conflict", "ready": "approved, ready to merge",
           "mentioned": "you are mentioned", "waiting_on_reviewers": "waiting on reviewers, no review in 24 h"}

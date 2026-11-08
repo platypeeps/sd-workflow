@@ -35,9 +35,9 @@ class Gh:
     """
 
     def __init__(self, author=(), requested=(), fail=None, count=None, contexts=None, checks_fail=None,
-                 checks_code=0, mentioned=()):
+                 checks_code=0, mentioned=(), reviewed=()):
         self.author, self.requested, self.fail, self.count = list(author), list(requested), fail, count
-        self.mentioned = list(mentioned)
+        self.mentioned, self.reviewed = list(mentioned), set(reviewed)
         self.contexts, self.checks_fail, self.checks_code, self.checks_asked = contexts or {}, checks_fail, \
             checks_code, 0
 
@@ -52,6 +52,8 @@ class Gh:
             self.requested if "user-review-requested:@me" in query else []
         if self.fail and nodes is self.requested:
             return 1, "", self.fail
+        if "-reviewed-by:@me" in query:  # GitHub leaves out the pulls the operator reviewed
+            nodes = [node for node in nodes if node["number"] not in self.reviewed]
         block = {"issueCount": self.count or len(nodes), "pageInfo": {"hasNextPage": False, "endCursor": None},
                  "nodes": nodes}
         return 0, json.dumps({"data": {"search": block}}), ""
@@ -294,6 +296,14 @@ class Alerts(unittest.TestCase):
                       self.reports())
         done, _ = self.run_(Gh(requested=[pull(10, repo="example/other")]))
         self.assertEqual(done["cleared"], [f"mentioned {other}"])
+
+    def test_a_mention_you_answered_with_a_review_clears(self):
+        # sd:8142 class pass (#49159): `mentions:@me` holds for a pull's life, so a review must end the alert.
+        url = "https://github.com/example/other/pull/9"
+        done, _ = self.run_(Gh(mentioned=[pull(9, repo="example/other")]))
+        self.assertEqual(done["filed"], [f"mentioned {url}"])
+        done, reason = self.run_(Gh(mentioned=[pull(9, repo="example/other")], reviewed=[9]))
+        self.assertEqual((done["cleared"], reason), ([f"mentioned {url}"], ""))
 
     def test_your_pull_with_no_review_after_24_hours_waits_on_reviewers(self):
         # sd:8142: your open, non-draft pull with no review 24 h after it opened is one alert; a review clears it.

@@ -1618,14 +1618,15 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertIn('href="https://github.com/example/system/pull/5"', rows[0])
         self.assertEqual(out["R"]["html"].count('data-item="5"'), 2, "Retry and Approve, on that one row")
 
-    def observe(self, number, *, author, why, requested=(), repo="example/anvil", state="open", reviews=()):
+    def observe(self, number, *, author, why, requested=(), repo="example/anvil", state="open", reviews=(),
+                draft=False):
         """An open pull request observed with no item: the operator is `1`, `author` is the writer's id."""
         from sd_db import contributions
 
         url = f"https://github.com/{repo}/pull/{number}"
         observed = {"complete": True, "observed_at": "2026-09-06T11:00:00Z", "operator": {"id": "1", "login": "operator"},
                     "author": {"id": author, "login": f"user{author}"}, "repo": repo, "title": f"Pull {number}",
-                    "state": state, "head": "a" * 40, "base": "b" * 40, "draft": False, "mergeable": "mergeable",
+                    "state": state, "head": "a" * 40, "base": "b" * 40, "draft": draft, "mergeable": "mergeable",
                     "ci": "pending", "ci_head": "a" * 40, "ci_ids": [], "why": list(why),
                     "requested_reviewers": list(requested), "blocking_labels": [], "labels": [], "events": [],
                     "reviews": [{"id": f"review:{n}", "actor_id": "1", "state": state_, "at": "2026-09-06T10:00:00Z"}
@@ -1654,12 +1655,39 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                                  named: (None, "example/anvil", "you")})
         out = self.run_view("open('anvil'); R.html = ELS.queue.html; R.tally = ELS['queue-tally'].html;")
         extra, attrs, body = self.repo_detail(out["R"]["html"], "anvil")
-        self.assertEqual(attrs, ' aria-label="0 merging, 3 review, 0 working, 0 next, 0 blocked, 0 suggested"')
+        self.assertEqual(attrs, ' aria-label="0 merging, 0 working, 0 next, 0 blocked, 3 review, 0 suggested"')
         row = re.search(r'<tr class="child" data-type="blocked" data-pr="' + re.escape(named) + r'">(.*?)</tr>',
                         out["R"]["html"], re.S).group(1)
         self.assertIn(f'<a href="{named}" target="_blank" rel="noopener noreferrer">example/anvil#3 Pull 3</a>', row)
         self.assertIn("<b>blocked: PR</b> · on you", row)
         self.assertIn("<span>3 PR review: 2 on you, 1 on reviewers</span>", out["R"]["tally"])
+
+    def test_a_pr_the_operator_already_answered_no_longer_waits_on_them(self):
+        # sd:8142 class pass (#49159): each `why` against reviewed or not. A review answers another's PR whether it
+        # asked by name or @mentioned the operator (`mentions:@me` stays true for the PR's life); a request made
+        # again after the review asks anew. The operator's own PR is not answered by their own review.
+        table = (  # (why, author, requested, reviews, draft, on)
+            (["review-requested"], "2", ["operator"], (), False, "you"),
+            (["review-requested"], "2", [], ["APPROVED"], False, None),
+            (["review-requested"], "2", ["operator"], ["COMMENTED"], False, "you"),
+            (["mentioned"], "2", [], (), False, "you"),
+            (["mentioned"], "2", [], ["APPROVED"], False, None),
+            (["mentioned"], "2", [], ["COMMENTED"], False, None),
+            (["mentioned", "review-requested"], "2", ["operator"], ["CHANGES_REQUESTED"], False, "you"),
+            (["author"], "1", [], (), False, "reviewers"),
+            (["author"], "1", [], ["COMMENTED"], False, "reviewers"),
+            (["author"], "1", [], (), True, "you"),
+            (["author"], "1", [], ["COMMENTED"], True, "you"),
+        )
+        want = {}
+        for number, (why, author, requested, reviews, draft, on) in enumerate(table, start=10):
+            url = self.observe(number, author=author, why=why, requested=requested, reviews=reviews, draft=draft)
+            want[url] = on
+        rows = queue_screen.pr_rows(self.connection, [], time.time())
+        found = {r["url"]: r["on"] for r in rows["rows"]}
+        for (why, _author, requested, reviews, draft, _on), url in zip(table, want, strict=True):
+            with self.subTest(why=why, requested=requested, reviews=reviews, draft=draft):
+                self.assertEqual(found.get(url), want[url])
 
     def test_an_unmanaged_builds_draft_is_blocked_on_its_pr_and_waits_on_you(self):
         # pack sd:7868 (operator 2026-11-06): a build in an unmanaged repository ends in a draft PR the operator must

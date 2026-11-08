@@ -1156,8 +1156,8 @@ def unlinked_pr_waits(connection, *, now=None) -> list[dict]:
     The contribution observations hold every pull `contribution_sync.refresh` admits (`OBSERVED_WHY`): the
     operator's, and another's the review-requested or mentioned sweep found, an item's or not. The operator's own
     waits on them when its lane is `ON_YOU`, else on reviewers. Another's waits on them when it asks their review
-    by name now (`_asked_by_name`) or @mentions them (`why` holds `mentioned`); a team-only request, or one they
-    already answered with a review, is no row. `since`
+    by name now (`_asked_by_name`) or @mentions them (`why` holds `mentioned`) and they have not reviewed it; a
+    team-only request, or one they already answered with a review, is no row. `since`
     is when GitHub opened it, as the shadow read it, else when it was observed.
     """
     end = now or datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -1176,7 +1176,8 @@ def unlinked_pr_waits(connection, *, now=None) -> list[dict]:
         if operator and str((observation.get("author") or {}).get("id") or "") == operator:
             lane, _needs = _lane([source], observation, url, False, None, _drafted(observation))
             on = "you" if lane in ON_YOU else "reviewers"
-        elif _asked_by_name(observation) or "mentioned" in (observation.get("why") or []):
+        elif _asked_by_name(observation) or ("mentioned" in (observation.get("why") or [])
+                                              and not _reviewed_by(observation, operator)):
             on = "you"
         else:
             continue
@@ -1185,6 +1186,11 @@ def unlinked_pr_waits(connection, *, now=None) -> list[dict]:
                       "url": url, "lane": "awaiting_you" if on == "you" else "awaiting_them", "on": on,
                       "since": since, "waited": _seconds(since, end)})
     return sorted(found, key=lambda value: (value["since"], value["url"]), reverse=True)
+
+
+def _reviewed_by(observation: dict, operator: str) -> bool:
+    """Whether `operator` has reviewed the pull: that answers an @mention, which GitHub keeps for the pull's life."""
+    return bool(operator) and any(str(review.get("actor_id")) == operator for review in observation.get("reviews") or [])
 
 
 def _asked_by_name(observation: dict) -> bool:
