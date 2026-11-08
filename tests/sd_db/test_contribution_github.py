@@ -4,6 +4,7 @@ import copy
 import json
 import time
 import unittest
+from typing import Any
 from unittest.mock import patch
 
 from sd_db.contribution_github import (
@@ -33,7 +34,7 @@ class Api:
                        "base": {"sha": BASE}, "state": "open", "merged": False,
                        "draft": False, "title": "Contribution", "updated_at": AT,
                        "mergeable": True, "labels": [], "requested_reviewers": []}
-        self.rows = {
+        self.rows: dict[str, Any] = {
             "/user": {"id": 1, "login": "operator"},
             ROOT + "/pulls/7": self.detail,
             ROOT + "/pulls/7/reviews?per_page=100": [],
@@ -81,6 +82,21 @@ class PullCollection(unittest.TestCase):
         self.assertTrue(result["events"][1]["mentions_operator"])
         self.assertEqual((result["ci"], result["ci_head"], result["ci_ids"]), ("success", HEAD, ["check-run:91"]))
         self.assertEqual([row[0] for row in api.calls].count(ROOT + "/pulls/7"), 2)
+
+    def test_bot_comment_is_never_a_maintainer_comment(self):
+        # sd:8148: a MEMBER bot's status comment is no maintainer ask.
+        api = Api()
+        comments: list[dict] = [
+            {"id": 5, "user": {"id": 3, "login": "scanner[bot]", "type": "Bot"},
+             "body": "scan passed", "updated_at": AT, "author_association": "MEMBER"},
+            {"id": 6, "user": {"id": 4, "login": "scanner-app", "type": "User"},
+             "body": "scan passed", "updated_at": AT, "author_association": "MEMBER",
+             "performed_via_github_app": {"id": 9, "slug": "scanner"}},
+            {"id": 7, "user": {"id": 2, "login": "maintainer", "type": "User"},
+             "body": "Please rebase", "updated_at": AT, "author_association": "MEMBER"}]
+        api.rows[ROOT + "/issues/7/comments?per_page=100"] = comments
+        result = api.observation()
+        self.assertEqual([row["maintainer"] for row in result["events"]], [False, False, True])
 
     def test_requested_reviewers_keep_user_logins_not_teams(self):
         # sd:8084: a team request does not name the operator.

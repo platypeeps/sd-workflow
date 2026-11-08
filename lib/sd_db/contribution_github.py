@@ -327,11 +327,14 @@ def _ci(client, prefix, head):
 
 def _comment(row, kind, url, operator, *, at):
     actor = identity(row.get("user"))
+    # A bot or app post carries its owner's association, not a human ask (sd:8148).
+    automated = row["user"].get("type") == "Bot" or actor["login"].endswith("[bot]") \
+        or bool(row.get("performed_via_github_app"))
     body = row.get("body")
     if not isinstance(body, str):
         raise Unavailable("comment body is unavailable")
     return {"id": f"{kind}:{row['id']}:{at}", "actor_id": actor["id"], "kind": "comment", "at": _at(at),
-            "maintainer": row.get("author_association") in MAINTAINERS,
+            "maintainer": not automated and row.get("author_association") in MAINTAINERS,
             "mentions_operator": bool(re.search(r"(?<![\w@])@" + re.escape(operator["login"]) + r"(?![\w-])", body, re.I)),
             "url": row.get("html_url", url)}
 
