@@ -30,7 +30,7 @@ Jira tickets are shadowed the way GitHub issues are. The second module is
 over its own JQL window. `sync`'s `tracker` chooses the collector: `github`
 runs the four buckets here, the intake sweep of `policy.issues`
 repositories, their contribution details and the protection sweep; `jira`
-runs `shadow_jira` with none of that, and any other name is a `ValueError`. `sync` stays one tracker per call; the caller -- the pack's
+runs `shadow_jira` with none of that, then `jira_moves`, and any other name is a `ValueError`. `sync` stays one tracker per call; the caller -- the pack's
 `sd shadow sync` -- iterates `TRACKERS` and reports each tracker on its own.
 """
 
@@ -1004,7 +1004,8 @@ class Synced:
     #: not a failure, since the next run repeats each sweep whole.
     intake_incomplete: list[str] = field(default_factory=list)
     #: What `pr_attention` and `issue_attention` filed and cleared after the
-    #: sync (sd:6712, sd:8142); never a failure of the sync.
+    #: sync (sd:6712, sd:8142), and on Jira the ticket moves (`jira_moves`,
+    #: sd:8117); never a failure of the sync.
     attention: list[str] = field(default_factory=list)
     #: What the pull-request lane pass could not link or note (sd:7859); a side observation, never a failure.
     lanes: list[str] = field(default_factory=list)
@@ -1111,8 +1112,9 @@ def _sync(
     operator, a queue checkpoint that moved) still fail the run.
 
     `tracker` chooses the collector, from `TRACKERS`. `jira` is collect,
-    store, watermark on success, heartbeat, the issue alerts when `alerts`
-    asks for them (sd:8142), and nothing else: `runner` is its
+    store, watermark on success, heartbeat, the linked-ticket moves
+    (`jira_moves`, sd:8117), the issue alerts when `alerts` asks for
+    them (sd:8142), and nothing else: `runner` is its
     HTTP transport seam rather than a `gh` runner, `max_requests` and
     `max_seconds` are validated and otherwise unused because Jira's ceiling
     is `shadow_jira.MAX_PAGES`, and `since` is refused because the recovery
@@ -1344,16 +1346,27 @@ def _sync_jira(connection: sqlite3.Connection, moment: datetime, transport, sinc
                   "windowed": windowed, "requests": result.requests, "coverage": result.coverage,
                   "queued": 0, "incomplete": []},
         )
-    attention: list[str] = []
+    # Ticket moves (sd:8117) are a side step, as the lane notes are: said, never a failed sync.
+    # A failed collect says Jira did not answer this run, so no move reads a failure as a ticket's own.
+    moves: list[str] = []
+    if configured and not result.ok:
+        moves = ["jira moves: not run, the collect failed; cursor held"]
+    elif configured:
+        try:
+            from . import jira_moves
+
+            moves = jira_moves.run(connection, transport)
+        except Exception as error:  # noqa: BLE001 - a side step never fails the sync
+            moves = [f"jira moves: not run: {type(error).__name__}: {error}"]
     if alerts:
         from . import issue_attention
 
         try:
             found, unread, reason = issue_attention.read_jira(connection, transport=transport,
                                                               deadline=time.monotonic() + max_seconds)
-            attention = _issue_alerts(connection, found, unread, reason, moment)
+            moves = moves + _issue_alerts(connection, found, unread, reason, moment)
         except (SdDbError, sqlite3.Error, OSError, ValueError) as error:
-            attention = [f"issue alerts not filed: {error}"]
+            moves = moves + [f"issue alerts not filed: {error}"]
     return Synced(
         ok=result.ok,
         reason=result.reason,
@@ -1365,5 +1378,5 @@ def _sync_jira(connection: sqlite3.Connection, moment: datetime, transport, sinc
         requests=result.requests,
         coverage=result.coverage,
         configured=configured,
-        attention=attention,
+        attention=moves,
     )
