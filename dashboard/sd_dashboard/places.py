@@ -10,7 +10,7 @@ are the same `tasks_screen._rows` (sd:5671).
 
 - An item is HOA when its repo is the hoa checkout (`hoa_screen.checkout`), and Home when it has no repo: the
   operator files personal and home items without one. An item's own area, `fields.area` (`sd task edit N --area
-  home|hoa`, pack sd:8010), wins: it puts the item in that area alone, out of every realm. A report is in neither: its family's Reports view holds it.
+  home|hoa|personal|<realm>`, pack sd:8010, sd:8062), wins: it puts the item in that area or realm alone. A report is in neither: its family's Reports view holds it.
   `area_of` is that rule, and Tasks' rows carry its answer as `area`, so Tasks' HOA and Home realms hold the place
   pages' Tasks rows.
 - A brief is the area's when its repo is the area's checkout, or its series, lower-cased with spaces as hyphens, is a
@@ -184,7 +184,8 @@ def _hoa(connection) -> tuple[str | None, str]:
 def _place(connection, area: str):
     """`owns(repo, kind, own=None)`, whether a row is the place's, or None; why it is None; and whether that is a read
     that failed. `own` is an item's own area (pack sd:8010): HOA and Home are `area_of`'s, so it puts the item there
-    alone; any other area is a realm of `realms`, and owns what `realm_of` gives a row with no area of its own."""
+    alone; any other area is a realm of `realms`, and owns a row whose own area is that realm, or, with none, what
+    `realm_of` gives it (pack sd:8062)."""
     if area == "home":
         return lambda repo, kind, own=None: area_of(repo, kind, None, own) == "home", "", False
     if area == "hoa":
@@ -199,7 +200,8 @@ def _place(connection, area: str):
         named = "no realms are set" if found["state"] == "missing" else f"{found['source']} names no realm {area}"
         return None, f"not configured: {named}; {line}", False
     hoa = _hoa(connection)[0]
-    return lambda repo, kind, own=None: not own and realm_of(repo, kind, found["list"], hoa) == area, "", False
+    # pack sd:8062: an item's own area may be a realm id; it wins over the repo rule here too.
+    return lambda repo, kind, own=None: (own or realm_of(repo, kind, found["list"], hoa)) == area, "", False
 
 
 def _family(connection, area: str, config: Path | None) -> tuple[list[str] | None, str, bool]:
