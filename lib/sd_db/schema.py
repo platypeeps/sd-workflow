@@ -15,7 +15,7 @@ SCHEMA_DIR = Path(__file__).resolve().parent / "schema"
 
 #: The version this build of the library was written against. Bumped in the
 #: same commit that adds a migration file, and nowhere else.
-SCHEMA_VERSION = 48
+SCHEMA_VERSION = 49
 
 #: The storage tables. `report` is an `item.kind`
 #: value. The tuple is the document requirement 1 points at: a record kind
@@ -39,6 +39,7 @@ TABLES = (
     "judgment",
     "request_outcome",
     "vote",
+    "home_asset",
 )
 
 #: The version is `PRAGMA user_version`, not a bookkeeping table.

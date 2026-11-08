@@ -32,6 +32,10 @@ LISTS = {
     "dashboard.hoa_thresholds": ("hoa-thresholds.conf", "The problem lines on HOA's trend charts. One "
                                  "<series>|below|<number> or <series>|above|<number> line each; series is tank, runtime "
                                  "or aquifer."),
+    "dashboard.home_map": ("home-map.conf", "The street address Home's Map centres on (pack sd:8053): one line. The "
+                           "county's address locator places it, and the map is the 400 ft square around it."),
+    "dashboard.koi_water": ("koi-water.conf", "The Home Assistant scripts that change the koi pond's water (pack "
+                            "sd:8054): one <entity_id>|<percent> line each, the percent of the pond one run replaces."),
     "dashboard.disk_storage": ("disk.conf", "The storage folders Health's Disk view sizes, "
                                "folder by folder: the place for large uncommitted data. One storage|<path> line each "
                                "(~ and $HOME expand)."),

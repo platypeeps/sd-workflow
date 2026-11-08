@@ -587,7 +587,8 @@ for (const v of R.views) { VIEW = v; document.dispatchEvent(new CustomEvent('she
                             " shellRun(cmd('queue.decline'), C.get('queue:blog-idea')); await flush();",
                             answer=answer, prelude=self.QUEUED)
         ideas = out["R"]["board"].split('id="ideas"')[1].split('id="tips"')[0]
-        self.assertIn('data-cmd="queue.decline" data-obj="queue:blog-idea">Decline 2 below score 6 older than 30 days</button>',
+        label = "Decline 2 below score 6 older than 30 days"
+        self.assertIn(f'data-cmd="queue.decline" data-obj="queue:blog-idea" title="{label}"><span class="lbl">{label}</span></button>',
                       ideas)
         self.assertEqual(out["R"]["cli"],
                          "no sd verb: Decline 2 below score 9 older than 60 days posts /api/triage/decline: #701 Stale low · #703 Stale high")
@@ -921,6 +922,31 @@ R.all = ELS['view-board'].html; press('Work'); R.work = ELS['view-board'].html; 
             rows = rows_for(kids)
             self.assertEqual(len(rows), len(kids), (rows, kids))
             self.assertEqual([r for r in rows if "1fr" in r], [rows[-1]], rows)
+
+    def test_no_tile_or_control_is_wider_than_its_column(self):
+        """pack sd:8070: the vault column's Decline button, nowrap, was wider than its 15rem column. `.col` is a grid
+        with an implicit auto track, so the track grew to the button and every tile under it ran into the next column
+        (headless Chrome, 1024 to 1440 wide). Each grid from the column down to a tile caps its track at the column,
+        a tile's top row (id, tags, four lamps) wraps, and a button in a column stays one line (sd:5729) but shrinks
+        to the column and cuts its label with an ellipsis; the title keeps the whole label."""
+        css = re.sub(r"/\*.*?\*/", "", WRITING_CSS, flags=re.S)
+
+        def body(selector):
+            return " ".join(b for sels, b in re.findall(r"([^{}]+)\{([^{}]*)\}", css)
+                            if selector in (s.strip() for s in sels.split(",")))
+
+        board = self.run_page("")["html"]["view-board"]
+        # The chain the markup draws: column > body > drop > tile > top row, and the Decline button in a column.
+        for cls in ("col", "drop", "card", "top", "queue-tools", "btn", "lbl"):
+            self.assertRegex(board, rf'class="(?:[^"]* )?{cls}[ "]', cls)
+        for grid in (".col", ".drop", ".card"):
+            self.assertIn("display: grid", body(grid), grid)
+            self.assertRegex(body(grid), r"grid-template-columns:\s*minmax\(0, 1fr\)", grid)
+        self.assertRegex(body(".col .btn"), r"max-width:\s*100%", "a nowrap button widens its column")
+        for rule in (r"min-width:\s*0", r"overflow:\s*hidden", r"text-overflow:\s*ellipsis"):
+            self.assertRegex(body(".col .btn > .lbl"), rule, "a button's label runs past its column")
+        self.assertRegex(board, r'data-cmd="queue\.decline"[^>]*title="Decline [^"]+"><span class="lbl">Decline ')
+        self.assertRegex(body(".card .top"), r"flex-wrap:\s*wrap", "a tile's lamps run past the tile")
 
     def test_a_pressed_no_area_tile_that_vanishes_on_a_read_again_clears(self):
         """pack sd:7695: No area pressed, then a read again in which every idea has an area: the tile is gone, so the
