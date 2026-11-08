@@ -2177,7 +2177,8 @@ def review(
         # The result key carries the first binary that ignored the key, else the last measured; each outcome its own.
         measures = [measured for measured, _attempts_made in answers if measured is not None]
         result["codex_skill_suppression"] = next((row for row in measures if row["state"] != SKILLS_SUPPRESSED), measures[-1]) if measures else skills
-        outcomes = covered([outcome for _measured, attempts in answers for outcome in attempts])
+        outcomes = [outcome for _measured, attempts in answers for outcome in attempts]
+        outcomes = [row._replace(status=FINDINGS if row.findings else CLEAN) if (row.diagnostic or {}).get("coverage") == "partial" and any(other.status in (CLEAN, FINDINGS) for other in outcomes) else row for row in outcomes]
         finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)])
     finally:
         slot.give_back()  # sd:2523: on every exit; the gate below queues in its own pool
@@ -2311,27 +2312,12 @@ def partial(outcome: Outcome, unread: Sequence[str]) -> Outcome:
     """sd:2181. A reader that saw a path only as a size-and-hash line did not review it.
 
     The answer keeps its findings but does not count toward depth, so the chain
-    falls through to a reviewer that reads the repository itself."""
+    falls through to a reviewer that reads the repository itself: once one completes, it counts (sd:8060)."""
     if not unread or outcome.status not in (CLEAN, FINDINGS):
         return outcome
     note = f"{outcome.backend} saw {len(unread)} path(s) only as a size and hash: {', '.join(unread)}; coverage is partial"
     return outcome._replace(status=UNAVAILABLE, detail=f"{outcome.detail}; {note}",
-                            diagnostic=dict(outcome.diagnostic or {}, coverage="partial", omitted_paths=list(unread),
-                                            answered=outcome.status))
-
-
-def covered(outcomes: Sequence[Outcome]) -> list[Outcome]:
-    """sd:8060. A partial answer counts once a reader that opens the repository completed in this run.
-
-    `partial` marks every material reader whenever a path was summarized, so a
-    completed answer that is not partial came from a native reader, which saw
-    those paths. Together the run read every path; without one, nothing changes."""
-    native = next((outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)), None)
-    if native is None:
-        return list(outcomes)
-    return [outcome._replace(status=(outcome.diagnostic or {})["answered"], detail=f"{outcome.detail}; {native} read them")
-            if (outcome.diagnostic or {}).get("coverage") == "partial" and outcome.status == UNAVAILABLE else outcome
-            for outcome in outcomes]
+                            diagnostic=dict(outcome.diagnostic or {}, coverage="partial", omitted_paths=list(unread)))
 
 
 def finish_review(result: dict[str, Any], outcomes: Sequence[Outcome], reviewed: list[str]) -> dict[str, Any]:

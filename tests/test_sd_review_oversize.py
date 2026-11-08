@@ -498,7 +498,8 @@ class BinaryMaterialTests(ReviewFixture):
         outcomes = {row["backend"]: row for row in result["outcomes"]}
         self.assertEqual((result["status"], result["completed_reviews"]), ("clean", 2), outcomes)
         self.assertEqual(outcomes["second"]["diagnostic"]["omitted_paths"], ["shot.png"])
-        self.assertIn("codex read them", outcomes["second"]["detail"])
+        self.assertEqual(outcomes["second"]["status"], "clean")
+        self.assertIn("coverage is partial", outcomes["second"]["detail"])
 
     def test_a_native_reader_completes_a_screenshot_review(self):
         root = self.make_repo()
