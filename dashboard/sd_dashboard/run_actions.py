@@ -29,6 +29,8 @@ mounted volume, a port number, a Home Assistant tile, a registered repo row, a c
 | watch.remove       | a market row not declined                    | `records.edit_row`, stage declined            |
 | watch.restore      | a declined market row                        | `records.edit_row`, stage candidate           |
 | watch.delete       | a market row                                 | `sd-db item remove <id>`, preview then apply  |
+| idea.restore       | a declined blog-idea row                     | `records.edit_row`, stage inbox               |
+| tip.restore        | a declined tip row                           | `records.edit_row`, stage inbox               |
 | topic.add          | a topic title                                | `sd store add sdw.topic <title> ...`          |
 | topic.remove       | a topic row not retired                      | `records.edit_row`, stage retired             |
 | topic.restore      | a retired topic row                          | `records.edit_row`, stage candidate           |
@@ -754,7 +756,7 @@ def learning_add(connection, values, jobs=None) -> Step:
 
 #: The stage Remove moves a row to: the one its routine skips. market-watch refreshes active watches and the brief
 #: routines read active topics, so a removed row keeps its body, Memory and Sources and gets no new run.
-RETIRED = {"market": "declined", "topic": "retired"}
+RETIRED = {"market": "declined", "topic": "retired", "blog-idea": "declined", "tip": "declined"}
 
 
 def _store_row(connection, values, kind: str) -> dict:
@@ -771,16 +773,18 @@ def _store_row(connection, values, kind: str) -> dict:
 
 
 def _move(kind: str, restore: bool = False):
-    """Remove: the row's stage moves to `RETIRED[kind]`; Restore moves it from there back to candidate (sd-writing
-    sd:6828 added that move). Both go through `records.edit_row`, as Tasks moves a base row. The dashboard is the
+    """Remove: the row's stage moves to `RETIRED[kind]`; Restore moves it from there back to the stage its queue waits
+    in (`triage.QUEUES`): candidate (sd-writing sd:6828 added that move), inbox for a declined idea or tip (sd:8014). Both go through `records.edit_row`, as Tasks moves a base row. The dashboard is the
     operator, so the plugin's `human-only` stage is its to set; `sd store set` refuses it to agents."""
 
     def check(connection, values, jobs=None) -> Step:
         from sd_db import records, workflow
 
+        from . import triage
+
         row = _store_row(connection, values, kind)
         current = row.get("stage") or ""
-        stage = "candidate" if restore else RETIRED[kind]
+        stage = dict((k, s) for k, s, _, _ in triage.QUEUES)[kind] if restore else RETIRED[kind]
         if restore and current != RETIRED[kind]:
             raise ValueError(f"{row['title']} is {current}, not {RETIRED[kind]}; nothing ran.")
         if current == stage:
@@ -796,7 +800,7 @@ def _move(kind: str, restore: bool = False):
             except workflow.WorkflowError as error:
                 return 1, str(error)
             return 0, f"{row['title']}: stage {current} -> {stage}. Its body stays; " + (
-                "Activate it in Tasks." if restore else "Restore brings it back, Delete removes the row.")
+                f"it waits in its {stage} again." if restore else "Restore brings it back, Delete removes the row.")
 
         return Step(line=f"stage {current} -> {stage} on #{row['id']} (records.edit_row, as Tasks moves it)", call=call)
 
@@ -869,6 +873,8 @@ ACTIONS = {
     "watch.remove": ("Remove watch", _move("market")),
     "watch.restore": ("Restore watch", _move("market", restore=True)),
     "watch.delete": ("Delete watch", _delete("market")),
+    "idea.restore": ("Restore idea", _move("blog-idea", restore=True)),
+    "tip.restore": ("Restore tip", _move("tip", restore=True)),
     "topic.add": ("Add topic", topic_add),
     "topic.remove": ("Remove topic", _move("topic")),
     "topic.restore": ("Restore topic", _move("topic", restore=True)),

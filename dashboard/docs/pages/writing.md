@@ -41,8 +41,9 @@ than 30 days". It asks first, takes another score and age, and posts the
 rows it names, with their revisions, to `/api/triage/decline`
 (`triage.decline`). Only the press declines; no job does. The Declined
 filter, off until pressed, lists each declined row with when and by
-which control. Declined rows have no Restore yet: the vault rules give
-declined no move out.
+which control, and a Restore that asks, then moves the row back to the
+inbox (`idea.restore`, `tip.restore` on `/api/actions/run`). Restore
+refuses while the sd-writing rules give declined no move to inbox.
 
 The Ideas column (pack sd:7244) is `ideas` in the same read: the
 `sdw.blog-idea` rows at stage inbox, read with `records.list_rows`, highest

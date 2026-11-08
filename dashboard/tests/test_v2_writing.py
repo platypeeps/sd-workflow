@@ -25,10 +25,12 @@ from unittest import mock
 from sd_dashboard import hoa_screen, places, server, v2, writing_screen
 from sd_dashboard.v2.pages import writing as writing_page
 from sd_db import upsert_repo, writing
+from test_run_actions import Run
 from test_v2_read import READ_SHELL
 from test_v2_registry import Registers
 from test_v2_tasks import COMMANDS_JS, SHELL, STAND_IN
 from test_v2_today import OSASCRIPT, Refused
+from test_v2_watches import plugin
 from test_workflow_actions import BrowserSession
 
 V2 = Path(v2.__file__).resolve().parent
@@ -471,6 +473,7 @@ COMMANDS = [
     ["piece.review", "Refresh review", None, "safe", False],
     ["piece.apply-review", "Apply review", None, "safe", False],
     ["queue.decline", "Decline", None, "confirm", False],
+    ["queue.restore", "Restore", None, "confirm", False],
 ]
 
 SHELL_MORE = r"""
@@ -609,6 +612,17 @@ R.on = ELS['view-board'].html;""", prelude=self.QUEUED)
         self.assertIn('data-declined="ideas" aria-pressed="true"', out["R"]["on"])
         self.assertIn("#650 Gone stale", out["R"]["on"])
         self.assertIn("by bulk Decline (score below 6, older than 30 days)", out["R"]["on"])
+
+    def test_a_declined_row_offers_restore_that_asks_and_posts_its_action(self):
+        """sd:8014: each row the Declined filter lists has a Restore; it asks first and posts idea.restore for an idea."""
+        out = self.run_page("""ELS['view-board'].listeners.click.forEach(f => f({ target: { closest: s => s === '[data-declined]' ? { dataset: { declined: 'ideas' } } : null } }));
+R.on = ELS['view-board'].html; R.said = cmd('queue.restore').consequence(C.get('declined:650'));
+shellRun(cmd('queue.restore'), C.get('declined:650')); await flush();""", prelude=self.QUEUED)
+        self.assertIn('data-cmd="queue.restore" data-obj="declined:650"', out["R"]["on"])
+        self.assertNotIn("No Restore here", out["R"]["on"])
+        self.assertEqual(out["R"]["said"], "This moves #650 Gone stale from declined back to the Blog Ideas inbox.")
+        self.assertEqual(out["confirms"], ["queue.restore"])
+        self.assertEqual([p[:2] for p in out["posts"]], [["/api/actions/run", {"action": "idea.restore", "item": 650}]])
 
     def test_a_realm_tab_counts_open_pieces_only(self):
         """sd:8018: a published or declined piece leaves the tab's count."""
@@ -1113,6 +1127,48 @@ DOC.ideas.areas = { Personal: 157, Work: 50 }; window.PAGE_AGAIN.run(); await fl
         self.assertNotIn("mockup", PAGE_JS)
         self.assertNotIn("contenteditable", PAGE_JS.replace('[contenteditable="true"]', ""))
         self.assertIn("window.shell.read({", PAGE_JS)
+
+
+class TheRestore(Run):
+    """sd:8014: Restore brings a declined idea or tip back to the inbox through `/api/actions/run`, as watch.restore
+    brings a declined watch back to candidate; the plugin's rules decide whether that move exists."""
+
+    INBOX = {"inbox": ["accepted", "declined"], "accepted": ["declined"], "declined": ["inbox"]}
+
+    def row(self, kind, title, stage):
+        from sd_db import create_item
+
+        item = create_item(self.connection, kind="idea", title=title, status="done" if stage == "declined" else "planning",
+                           source="vault", path=f"Inbox/{title}.md", stage=stage,
+                           fields={"kind": kind, "score": "3", "dateCreated": "2026-08-01"}, body={"markdown": "kept body"})
+        self.connection.commit()
+        return item
+
+    def rules(self, kind, transitions):
+        return mock.patch("sd_db.records.plugin_entries", return_value=[plugin(
+            kind, "Inbox", {"inbox": "planning", "accepted": "ready", "declined": "done"}, transitions, {"decline": "declined"})])
+
+    def test_restore_brings_a_declined_idea_or_tip_back_to_the_inbox(self):
+        for kind, action, label in (("blog-idea", "idea.restore", "Restore idea"), ("tip", "tip.restore", "Restore tip")):
+            with self.subTest(kind=kind), self.rules(kind, self.INBOX):
+                item = self.row(kind, f"Gone {kind}", "declined")
+                status, body = self.run_(action, item=item)
+                self.assertEqual((status, body["exit"], body["label"]), (200, 0, label), body)
+                stage, kept = self.connection.execute("SELECT stage, body FROM item WHERE id=?", (item,)).fetchone()
+                self.assertEqual(stage, "inbox")
+                self.assertIn("kept body", kept)
+                self.assertIn("stage declined -> inbox", body["output"])
+                status, body = self.run_(action, item=item)
+                self.assertEqual(status, 400)
+                self.assertIn("is inbox, not declined; nothing ran", body["error"])
+
+    def test_restore_refuses_while_the_plugin_has_no_move_out_of_declined(self):
+        item = self.row("tip", "Stuck tip", "declined")
+        with self.rules("tip", {k: v for k, v in self.INBOX.items() if k != "declined"}):
+            status, body = self.run_("tip.restore", item=item)
+        self.assertEqual(status, 400)
+        self.assertIn("its plugin allows no move to inbox; nothing ran", body["error"])
+        self.assertEqual(self.connection.execute("SELECT stage FROM item WHERE id=?", (item,)).fetchone()[0], "declined")
 
 
 class TheRegistration(Registers, unittest.TestCase):
