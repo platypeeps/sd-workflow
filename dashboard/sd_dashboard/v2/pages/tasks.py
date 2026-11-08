@@ -6,7 +6,7 @@ Start next (sd:5107) reads its plan at `/api/tasks/start-next` and posts the ite
 `/api/tasks/start-next/run` (`start_next`). The palette's why search (pack sd:6019) reads `/api/why?q=`: a path or a
 rule's text, to the items whose pages say why (`why_search`). Build (pack sd:6095) reads its dialog's plan at
 `/api/tasks/build/plan?items=1,2` and posts the items it showed, with their revisions, to `/api/tasks/build` (`builds`).
-Queues (pack sd:7527) is the view Operations > Resources showed: `/api/tasks/queues`, `sd_tile.py queues`."""
+The decision queues (pack sd:7527) are one line on Today's Needs you now (sd:8013, `now_screen.triage_rows`)."""
 
 from __future__ import annotations
 
@@ -68,12 +68,6 @@ def _why(read):
     return why_search.search(read.connection, asked[0])
 
 
-def _queues(read):
-    from ... import reports_screen
-
-    return reports_screen.view("queues")
-
-
 def _sweeps(read):
     from ... import sweep
 
@@ -95,7 +89,7 @@ PAGE = Page(
          Api("/api/tasks/build/plan", _build_plan, query=True), Api("/api/tasks/build", write=_build),
          Api(pattern=r"/api/tasks/[1-9][0-9]{0,18}", example="/api/tasks/1", read=_details),
          Api("/api/tasks/sweep", write=_run_sweep), Api("/api/tasks/sweep/status", _sweeps),
-         Api("/api/why", _why, query=True), Api("/api/tasks/queues", _queues)),
+         Api("/api/why", _why, query=True)),
     count="/api/tasks",
     live=True,
 )

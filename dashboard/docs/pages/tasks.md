@@ -47,7 +47,7 @@ Tasks filters on. v1's screen and its run selection were deleted in sd:2622;
 `/classic/backlog` is a 404.
 
 Realm sub tabs (sd:6263; sd:5753 had made Realm a filter) narrow every layout to the rows of one realm or place:
-Personal (the first tab), each realm `dashboard.realms` names, HOA or Home, and each tab carries its count. The filters
+Personal (the first tab), each realm `dashboard.realms` names, HOA or Home, and each tab carries its count of open rows (a done or cancelled row is listed, not counted, sd:8018). The filters
 apply inside each tab. Each row carries `realm` from `places.realm_of` and `area` from `places.area_of`, the rule the HOA
 and Home pages' Tasks views use: the hoa checkout's items, or items with no repo. A report is in neither. An item's own
 area, set with `sd task edit N --area <area>` and cleared with `--clear-area` (pack sd:8010), wins over that rule: the

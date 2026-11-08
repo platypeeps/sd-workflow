@@ -39,8 +39,8 @@ for the whole table.
 
 Five seconds on a whole tile process was the retired plugin contract's outer
 limit. The pack's loader enforced it for every tab; a Resources view's `Budget`
-enforces it now for the four tabs it runs (`reports_screen.VIEWS`,
-`VIEW_SECONDS`), which hold Toolbox, Vault, Research and Queues, and
+enforces it now for the three tabs it runs (`reports_screen.VIEWS`,
+`VIEW_SECONDS`), which hold Toolbox, Vault and Research, and
 kills the tile's process group there. Ports is not among them: no Resources
 view runs the ports tile, and the Ports page calls `collect_ports` in-process.
 `sd_tile.py` holds every tab a second earlier than five, so the collector
@@ -142,41 +142,6 @@ VAULT = system_tools_config.obsidian_vault()
 REPO_ROOT = pathlib.Path(os.environ.get("REPO_ROOT", os.path.expanduser("~/repos")))
 #: launchd label prefix shared by every system job and service.
 LABEL_PREFIX = system_tools_config.label_prefix()
-
-
-TODAY = datetime.date.today
-
-
-# ---------------------------------------------------------------- decision queues
-
-# key -> definition: `title` names it, `kind` is the base kind whose rows
-# `db_rows` reads from the workflow database, `decide` is the stage that means
-# nobody has ruled yet, and `columns` is what it lifts out of each row's
-# fields. The rows have been the source since pack sd:4627; the vault's
-# `System/Databases` notes were their mirror and are read here no more
-# (sd:5134). Nothing here writes a stage: Tasks moves it.
-DBS = {
-    "blog": dict(
-        title="Blog Ideas", kind="sdw.blog-idea",
-        decide="inbox",
-        columns=["score", "my-rating", "topics", "description"],
-    ),
-    "tip": dict(
-        title="Tips and Tricks", kind="sdw.tip",
-        decide="inbox",
-        columns=["score", "my-rating", "topics", "description"],
-    ),
-    "topic": dict(
-        title="Topics", kind="sdw.topic",
-        decide="candidate",
-        columns=["slug", "description"],
-    ),
-    "watch": dict(
-        title="Market Watch", kind="sdw.market",
-        decide="candidate",
-        columns=["slug", "description"],
-    ),
-}
 
 
 # The vault's area folders are its top-level `* Home` directories, found on
@@ -526,13 +491,6 @@ class Budget:
         return subprocess.CompletedProcess(argv, proc.returncode, out.decode("utf-8", "replace"), text)
 
 
-def age_days(iso):
-    try:
-        return (TODAY() - datetime.date.fromisoformat(iso[:10])).days
-    except (ValueError, TypeError):
-        return None
-
-
 # macOS gates ~/Documents behind TCC, and a launchd job has nobody to click the
 # prompt: on 2026-08-28 an unanswered one held collect_areas for 1605 seconds
 # with the page stuck on "collecting…". Probing in a child bounds that to
@@ -721,43 +679,7 @@ def obsidian_url(rel):
         urllib.parse.quote(VAULT.name), urllib.parse.quote(rel))
 
 
-def as_float(v):
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return None
-
-
 # ------------------------------------------------------------- db read/write
-
-
-def db_rows(key):
-    """One queue's base rows, highest score first, read with `sd store list <kind> --json`.
-
-    An answer that is not a JSON list of rows raises -- no answer, a command
-    that could not start, a timeout's cut: an empty list would read as an
-    empty queue, a negative nobody observed. `run` caps the call at the
-    tile's deadline.
-    """
-    d = DBS[key]
-    out = run(["sd", "store", "list", d["kind"], "--json"], timeout=10)
-    try:
-        listed = json.loads(out)
-    except ValueError:
-        listed = None
-    if not isinstance(listed, list) or not all(isinstance(entry, dict) for entry in listed):
-        raise RuntimeError(f"`sd store list {d['kind']} --json` gave no rows to read")
-    rows = []
-    for entry in listed:
-        def text(name, *, entry=entry):
-            return "" if entry.get(name) is None else str(entry[name])
-        row = {"stem": text("title"), "status": text("status"), "created": text("dateCreated")[:10]}
-        row["age"] = age_days(row["created"])
-        for c in d["columns"]:
-            row[c] = text(c)
-        rows.append(row)
-    rows.sort(key=lambda r: (-(as_float(r.get("score")) or 0), r["created"] or ""), reverse=False)
-    return rows
 
 
 # ---------------------------------------------------------------- git facts

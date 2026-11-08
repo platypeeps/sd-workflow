@@ -42,7 +42,7 @@ class TheTables(SchemaCase):
         connection = connect(self.path)
         self.addCleanup(connection.close)
         self.assertEqual(sorted(tables(connection)), sorted(TABLES))
-        self.assertEqual(len(TABLES), 17)
+        self.assertEqual(len(TABLES), 18)
 
     def test_report_is_an_item_kind_not_a_table_and_dep_is_neither(self):
         initialise(self.path)
@@ -970,7 +970,8 @@ class TheRequestOutcome(SchemaCase):
                           connection.execute("PRAGMA table_info(request_outcome)")],
                          [("id", "TEXT", 1, 1), ("committed_at", "TEXT", 1, 0)])
         self.assertEqual(connection.execute("SELECT count(*) FROM request_outcome").fetchone()[0], 0)
-        self.assertEqual(sorted(tables(connection)), sorted(TABLES))
+        # 48 adds `vote` after 19 (pack sd:8050).
+        self.assertEqual(sorted(tables(connection)), sorted(set(TABLES) - {"vote"}))
         self.assertEqual(self._dump(), before)
         connection.execute("INSERT INTO request_outcome VALUES ('01J0000000000000000000000A', 't')")
         for row in (("01J0000000000000000000000A", "t"), (None, "t"), ("01J0000000000000000000000B", None)):

@@ -653,6 +653,28 @@ def grill_rows(connection: sqlite3.Connection) -> list[dict]:
              "source": "tasks", "at": row["at"]} for row in found]
 
 
+def triage_rows(connection: sqlite3.Connection) -> list[dict]:
+    """The decision queues (`triage.QUEUES`) as one queued Needs you row (sd:8013): how many rows wait in each, each linking its home.
+
+    None waiting raises no row; a read that failed is a dark row, never an empty queue. Today's Decisions (question
+    notes) are apart: these are store rows waiting on a stage move.
+    """
+    from sd_db import records
+
+    from .triage import QUEUES
+
+    try:
+        links = [{"label": label, "n": n, "href": href} for kind, stage, label, href in QUEUES
+                 if (n := len(records.list_rows(connection, kind, stage=stage)))]
+    except (SdDbError, sqlite3.Error, ValueError) as failure:
+        return [dark_row("queues", str(failure) or "the decision queues could not be read")]
+    if not links:
+        return []
+    return [{"id": "triage", "kind": "triage", "rank": QUIET, "source": "queues", "links": links,
+             "what": f"{sum(link['n'] for link in links)} waiting on a decision",
+             "detail": " \u00b7 ".join(f"{link['label']} {link['n']}" for link in links)}]
+
+
 def needs(rows: list[dict], *, work: list[dict], live: set[int], today: str, lanes: list[dict],
           briefs: list[dict]) -> list[dict]:
     """Needs you (sd:5921): every fact that asks the operator to act, ranked in the bands, as one list.
@@ -1045,8 +1067,8 @@ def document(connection: sqlite3.Connection, *, now: str, fleet=None, jobs=None,
     held = [{**row, "lamp": LAMP.get(row["source"], "")} if row["kind"] == "dark" else row
             for row in snoozed + dark_snoozed + work_snoozed + reports_snoozed + mail_snoozed + grill_snoozed
             + flaky_snoozed]
-    listed = needs([*shown, *dark, *reports, *threads, *grills, *flaky_needs(flakes)], work=work, live=live,
-                   today=now[:10], lanes=queue.get("lanes") or [], briefs=reported["briefs"])
+    listed = needs([*shown, *dark, *reports, *threads, *grills, *flaky_needs(flakes), *triage_rows(connection)],
+                   work=work, live=live, today=now[:10], lanes=queue.get("lanes") or [], briefs=reported["briefs"])
     summary = lane_summary(queue)
     motion(connection, active, queue.get("lanes") or [])
     return {"now": now, "sources": sources, "observed": observed, "rows": shown, "active": active,

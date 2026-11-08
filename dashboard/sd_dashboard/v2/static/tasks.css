@@ -206,5 +206,3 @@
 .issue-link:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 1px; }
 
 /* Queues (pack sd:7527): the decision queues under the board, folded until opened, drawn by markup.tile. */
-.queues-box { margin-top: var(--space-lg); min-width: 0; }
-.queues-box > summary { cursor: pointer; font-size: var(--text-sm); font-weight: 500; color: var(--color-ink); min-height: var(--row-touch); display: flex; align-items: center; }

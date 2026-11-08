@@ -1023,7 +1023,8 @@ press('all'); R.all = ELS['al-body'].html;""", self.acked_doc())
         self.assertNotIn('id="al-table"', overview)
         views = re.findall(r'data-place-view="([a-z]+)"', page)
         # sd:5622: the switch and its arrow keys follow this order (places.js builds PAGE_VIEWS from the blocks).
-        self.assertEqual(views, ["overview", "tasks", "briefs", "reports", "alarms"])
+        # pack sd:8050: Votes, right of Alarms.
+        self.assertEqual(views, ["overview", "tasks", "briefs", "reports", "alarms", "votes"])
         self.assertRegex(page, r'<table class="ledger" id="al-table" aria-labelledby="al-h" data-toolbar="al-toolbar">')
 
     def test_every_event_acknowledged_says_so_instead_of_an_empty_table(self):
@@ -1579,7 +1580,7 @@ class TheRegistration(Registers, unittest.TestCase):
     page, section, route, api = "hoa", "HOA", "/hoa", ("/api/hoa", "/api/hoa/alarm", "/api/hoa/alarms", "/api/hoa/sweep",
                                               "/api/hoa/sweep/status", "/api/hoa/download", "/api/hoa/attachments",
                                               "/api/hoa/attachments/picture", "/api/hoa/attach", "/api/hoa/briefs",
-                                              "/api/hoa/reports")
+                                              "/api/hoa/reports", "/api/hoa/votes")
 
 
 if __name__ == "__main__":

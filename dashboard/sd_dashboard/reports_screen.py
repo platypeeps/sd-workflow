@@ -1,7 +1,8 @@
 """Database reports, and the bounded, read-only machine and vault views other pages show.
 
 The views (`VIEWS`) are `sd_tile.py` tabs, each run as a child under its budget by `collect` and served by `view`:
-Toolbox as Management's Machine view, Research as its Repos filter, Vault on Notes and Queues on Tasks (pack sd:7527).
+Toolbox as Management's Machine view, Research as its Repos filter and Vault on Notes (pack sd:7527); Queues left
+for Today's Needs you (sd:8013).
 They were Operations > Resources until then.
 
 Since sd:2121 it also builds the documents behind the default UI's Reports
@@ -37,15 +38,7 @@ from .documents import _config_dir, pipe_lines
 from .management_screen import log_tail, unreadable
 from .markup import join, tag
 
-# Queues joined this tuple rather than taking a screen of its own (sd:719 step
-# 2). `collectors.py` has no `collect_queues` to call, but `sd_tile.py queues`
-# already turns `DBS` and `db_rows` into the same document the other four
-# return, so the view needed a name here and nothing else: the same budget,
-# the same markup filter, and the same refusal on the page when the vault
-# cannot be read. A screen of its own would have imported the collectors
-# in-process, as Ports does, and read the vault inside the server process
-# rather than in a child that the budget can kill.
-VIEWS = (("toolbox", "Toolbox"), ("vault", "Vault"), ("research", "Research"), ("queues", "Queues"))
+VIEWS = (("toolbox", "Toolbox"), ("vault", "Vault"), ("research", "Research"))
 # The child each view runs: one plugin tile, owned by this dashboard checkout
 # and never supplied by a page.
 TILE = Path(__file__).resolve().parents[1] / "sd_tile.py"
@@ -54,16 +47,14 @@ TILE = Path(__file__).resolve().parents[1] / "sd_tile.py"
 # retired plugin contract's figure, and these tabs were built for it
 # (`sd_tile.py`, `TILE_SECONDS`).
 # Measured on 2026-09-13 through this interpreter at load average ~14, ten runs
-# each: toolbox, briefs and vault 0.08s worst, research 0.53s worst. Queues,
-# measured when it joined through `python3 -I sd_tile.py queues` at load
-# average ~4, five runs: 0.13s worst and 6,242 bytes. Read those as the quiet
-# case: on 2026-09-14, with this machine at load average 11 to 45, Toolbox,
-# Vault, Research and Queues were each seen refused at this ceiling, and Briefs
+# each: toolbox, briefs and vault 0.08s worst, research 0.53s worst. Read those
+# as the quiet case: on 2026-09-14, with this machine at load average 11 to 45,
+# Toolbox, Vault and Research were each seen refused at this ceiling, and Briefs
 # and Vault answered in 0.19-0.50s a few minutes later at load 42. The scan did
 # not grow; the machine was busy. A view that outgrows its ceiling is
 # refused with the reason, not waited on; file it as sd:756 was filed for Ports
 # rather than raise the number here.
-VIEW_SECONDS = {"toolbox": 5.0, "vault": 5.0, "research": 5.0, "queues": 5.0}
+VIEW_SECONDS = {"toolbox": 5.0, "vault": 5.0, "research": 5.0}
 
 
 def _collectors():

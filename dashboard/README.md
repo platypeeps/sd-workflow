@@ -666,7 +666,6 @@ command from `../sd-plugin.json` and ran one of these commands per tab per load.
 | **Vault** | One card per `* Home` area with its note count, plus Inbox pressure | vault frontmatter |
 | **Research** | Every checkout carrying a `research.conf.py`, its documents, and whether the rendered HTML is **fresh**, **stale** or **not built** | the conf itself, plus the built page's mtime in `docs/dashboard/` (or the older `build/`) |
 | **Ports** | Each service's effective ports, and which of them clash with another candidate or are already held — read from `machine-setup.sh`'s own conflict lines, which the collector could not see until 6b-9 | `machine-setup.sh candidates service` |
-| **Queues** | The four decision queues: how many base rows are waiting, and the oldest undecided ones across all of them | the workflow database's base rows, through `sd store list <kind> --json` (sd:5134) |
 
 A cron job's last exit code says the last run was fine; it cannot say the job
 has quietly stopped firing. The **next run** column is computed from each job's

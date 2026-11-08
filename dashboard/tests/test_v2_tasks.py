@@ -678,9 +678,9 @@ class TheConfirmFields(unittest.TestCase):
         script = "var window = globalThis;\n" + MARKUP_JS + r"""
 const { html } = window.markup, put = (el, m) => { el.html = String(m); }, CLOSE_X = '';
 var OUT = { focused: null, result: null, error: null };
-const yes = { disabled: false }, no = {}, line = { textContent: '' }, inputs = { reason: { value: '', tagName: 'INPUT' } }, L = {};
+const yes = { disabled: false }, no = {}, line = { textContent: '' }, said = { textContent: '' }, inputs = { reason: { value: '', tagName: 'INPUT' } }, L = {};
 const form = { elements: inputs, addEventListener: (t, f) => { (L[t] = L[t] || []).push(f); },
-  querySelector: s => s === '[value="yes"]' ? yes : s === '#confirm-cli' ? line : null,
+  querySelector: s => s === '[value="yes"]' ? yes : s === '#confirm-cli' ? line : s === '#confirm-said' ? said : null,
   requestSubmit: b => { confirmDlg.returnValue = b === yes ? 'yes' : 'no'; confirmDlg.onclose(); } };
 var confirmDlg = { html: '', returnValue: '', onclose: null, querySelector: s => s === 'form' ? form : s === '[value="no"]' ? no : null };
 const modal = (d, first) => { OUT.focused = first === inputs.reason ? 'reason' : first === no ? 'keep' : null; return null; };
@@ -724,6 +724,21 @@ close('yes'); OUT.result = await p; OUT.form = confirmDlg.html;""")
         self.assertIn('id="cf-reason" name="reason"', out["form"])
         self.assertIn('required aria-required="true"', out["form"])
         self.assertIn('value="no" formnovalidate', out["form"])
+
+    def test_a_body_of_the_fields_follows_what_is_typed(self):
+        """sd:8014: a consequence that reads the fields (the bulk Decline's rows at a score and age) says what OK will
+        do with the values typed now, not with the defaults the dialog opened on."""
+        out = self.confirm("""const p = confirmAction({ title: 'Decline?', body: v => `Moves ${v.reason || 'the default'} rows.`,
+  fields: [{ name: 'reason', label: 'Reason', value: '' }] });
+OUT.opened = [confirmDlg.html.includes('<p id="confirm-said">Moves the default rows.</p>'), said.textContent];
+type('9'); OUT.typed = said.textContent; close('no'); await p;""")
+        self.assertEqual(out["opened"], [True, "Moves the default rows."])
+        self.assertEqual(out["typed"], "Moves 9 rows.")
+
+    def test_the_shell_gives_a_confirm_the_consequence_of_the_typed_values(self):
+        """sd:8014: run() hands confirmAction the command's consequence as a function of the typed values."""
+        self.assertTrue("body: c.consequence ? v => c.consequence(o, v) : ''" in SHELL_JS,
+                        "run() gives confirmAction the consequence of the defaults only")
 
     def test_a_close_on_ok_with_the_field_empty_runs_nothing_and_enter_is_ok(self):
         out = self.confirm(self.FIELDS + """OUT.enterEmpty = [key('Enter'), confirmDlg.returnValue];
@@ -932,6 +947,14 @@ pick('p', ''); R.url2 = OUT.urls[OUT.urls.length - 1];""", search="?kind=task,wo
         self.assertIn('<option value="base:blog-idea" selected>blog-idea (plugin kind)</option></select>', filters)
         self.assertIn("A blog idea", out["R"]["board"])
         self.assertNotIn("Port the page", out["R"]["board"])
+
+    def test_a_realm_tab_counts_open_rows_only(self):
+        """sd:8018: a done row (a cancelled one is done too) stays on the board but leaves the tab's count."""
+        row = self.doc["rows"][0]
+        self.doc["rows"] = [*self.doc["rows"], {**row, "id": 903, "key": "903", "title": "Done this week", "status": "done"}]
+        out = self.run_page("R.board = ELS['view-board'].html;", search="?done=1")
+        self.assertIn("Done this week", out["R"]["board"])
+        self.assertEqual(out["counts"]["personal"], 3, "sd:8018: the tab counted a done row")
 
     def test_ideas_leave_the_rows_and_counts_until_kind_picks_them(self):
         """pack sd:6743: an idea kind shows in the Writing and Vault views only; Kind picks it, as the Vault view."""
@@ -3166,56 +3189,21 @@ class TheLinksIntoTasks(unittest.TestCase):
         self.assertEqual(found, {})
 
 
-class TheQueues(ScreenCase):
-    """pack sd:7527: Operations > Resources > Queues is Tasks' folded Decision queues, read the first time it opens."""
+class TheQueuesMoved(unittest.TestCase):
+    """sd:8013: the Decision queues fold left Tasks for one line on Today's Needs you (now_screen.triage_rows)."""
 
-    run_page = TheScript.run_page
-
-    def setUp(self):
-        super().setUp()
-        self.ids = seed(self)
-        self.doc = tasks_screen.document(self.connection, now=NOW)
-        self.details = {}
-
-    QUEUES = {"title": "Queues", "rows": [{"what": "2 in Blog Ideas to decide", "detail": "oldest 9 days · 3 rows in the queue"}],
-              "sections": [{"figures": [["waiting on you", "2"]]},
-                           {"table": {"columns": [["Queue", "text"], ["To decide", "num"]], "search": "",
-                                      "rows": [[{"text": "Blog <Ideas>", "title": "status `inbox` is the one to decide"}, {"text": "2", "num": True}]]}}]}
-
-    def page(self, body, search="", answer=None):
-        write = f"(path) => path === '/api/tasks/queues' ? {json.dumps(answer or [200, self.QUEUES])} : [404, {{ error: 'no answer' }}]"
-        return self.run_page(body, write, search=search)
-
-    def test_the_queues_are_read_only_when_opened_and_drawn_escaped(self):
-        out = self.page("""R.before = OUT.gets.slice(); R.closed = ELS.queues.html;
-const box = ELS['queues-box']; box.open = true; box.listeners.toggle.forEach(f => f()); await flush(); await flush();
-R.html = ELS.queues.html; box.listeners.toggle.forEach(f => f()); await flush(); R.gets = OUT.gets.slice();""")
-        self.assertEqual(out["R"]["before"], ["/api/tasks"])
-        self.assertIsNone(out["R"]["closed"])
-        self.assertEqual(out["R"]["gets"], ["/api/tasks", "/api/tasks/queues"])
-        self.assertIn("<dt>2 in Blog Ideas to decide</dt>", out["R"]["html"])
-        self.assertIn('<td title="status `inbox` is the one to decide">Blog &lt;Ideas&gt;</td><td class="n">2</td>', out["R"]["html"])
+    def test_tasks_has_no_queues_fold_or_route(self):
         page = (V2 / "tasks.html").read_text(encoding="utf-8")
-        self.assertIn('<details class="queues-box" id="queues-box"><summary>Decision queues</summary><div id="queues"></div></details>', page)
-
-    def test_the_address_opens_them_and_a_refused_read_says_why(self):
-        out = self.page("await flush(); await flush(); R.html = ELS.queues.html; R.open = ELS['queues-box'].open;", search="?queues=open",
-                        answer=[503, {"error": "Queues could not be observed: queues: no rows"}])
-        self.assertTrue(out["R"]["open"])
-        self.assertIn("The decision queues were not read: Queues could not be observed: queues: no rows", out["R"]["html"])
-
-    def test_the_route_answers_the_queues_tile(self):
-        page = next(entry for entry in v2.registry.PAGES if entry.section == "Tasks")
-        route = next(api for api in page.api if api.path == "/api/tasks/queues")
-        with patch("sd_dashboard.reports_screen.collect", return_value={"sections": []}) as collect:
-            self.assertEqual(route.read(None), {"sections": []})
-        collect.assert_called_once_with("queues")
+        self.assertNotIn("queues-box", page)
+        self.assertNotIn("/api/tasks/queues", TASKS_JS)
+        entry = next(entry for entry in v2.registry.PAGES if entry.section == "Tasks")
+        self.assertNotIn("/api/tasks/queues", [api.path for api in entry.api])
 
 
 class TheRegistration(Registers, unittest.TestCase):
     page, section, route, api = "tasks", "Tasks", "/tasks", ("/api/tasks", "/api/tasks/start-next", "/api/tasks/start-next/run",
                                                            "/api/tasks/build/plan", "/api/tasks/build", "/api/tasks/1", "/api/tasks/sweep", "/api/tasks/sweep/status",
-                                                           "/api/why", "/api/tasks/queues")
+                                                           "/api/why")
 
 
 class TheDocumentLinks(ScreenCase):
