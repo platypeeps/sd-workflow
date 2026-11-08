@@ -2288,9 +2288,8 @@ class Hosts(Case):
 
     def test_a_tick_that_cannot_claim_says_why_in_its_beat(self):
         """Review round 4: a satellite whose tick claims nothing beats with the reason, and the hub refuses its
-        presses with it, rather than read the beat as a dispatcher that would claim."""
-        sat = create_item(self.db, kind="task", title="Satellite", repo=str(self.satellite), status="ready")
-
+        presses with it, rather than read the beat as a dispatcher that would claim. An unread input lasts one
+        tick, so its press queues (sd:8055)."""
         def beat():
             row = self.db.execute("SELECT body FROM state WHERE kind = 'heartbeat' AND key = 'build-dispatch@work' "
                                   "ORDER BY id DESC LIMIT 1").fetchone()
@@ -2299,11 +2298,12 @@ class Hosts(Case):
         for inputs, why in (({"why": unset}, unset), ({"load": None}, build.UNREAD[0]),
                             ({"interactive": None}, build.UNREAD[1]), ({}, "")):
             with self.subTest(inputs=inputs):
+                sat = create_item(self.db, kind="task", title="Satellite", repo=str(self.satellite), status="ready")
                 with self.on("work"):
                     self.assertEqual(self.tick(**inputs)["why"], why)
                 self.assertEqual(beat(), why)
                 with self.on("hub"):
-                    if why:
+                    if why and why not in build.UNREAD:
                         with self.assertRaisesRegex(build.BuildRefused, f"build-dispatch@work claims nothing: {why}"):
                             build.queue(self.db, [sat], who="operator")
                     else:
