@@ -30,10 +30,11 @@ hoa checkout's rows are HOA's before any glob (pack sd:7687). A row with no repo
 realm is unknown (None), so Personal holds only the rows with no repo and the page says why.
 
 **HOA's Votes (pack sd:8050).** `/api/hoa/votes` is the hoa checkout's rows of the store's `vote` table
-(`sd_db.votes.rows`): open first, then newest first. Read-only: `sd votes` writes them. Only HOA has the view.
+(`sd_db.votes.rows`): open first, then newest first. Only HOA has the view. Add and Edit post `/api/hoa/vote`
+(`write_vote`, pack sd:8058), `sd votes add` and `sd votes edit --if-revision`'s writes: a stale revision is a 409.
 
 **What is not read.** A missing hoa checkout, family or list makes the view `unknown` with the reason and the line to
-add, never an empty list; a family list that did not read makes it `error`. Nothing here writes.
+add, never an empty list; a family list that did not read makes it `error`. Only `write_vote` writes.
 """
 
 from __future__ import annotations
@@ -45,12 +46,12 @@ import re
 import sqlite3
 from pathlib import Path
 
-from sd_db import reads
+from sd_db import reads, workflow
 
 from .documents import _config_dir, pipe_lines
 
 __all__ = ["AREAS", "area_of", "briefs", "parse_realms", "pull_url", "realm_issues", "realm_of", "realm_places", "realms", "report_realm",
-           "reports", "series_job", "task_rows", "tasks", "votes"]
+           "reports", "series_job", "task_rows", "tasks", "votes", "write_vote"]
 
 #: The places, by family key, and their labels.
 AREAS = {"hoa": "HOA", "home": "Home"}
@@ -284,7 +285,40 @@ def votes(connection, area: str, *, now: str) -> dict:
         return {**_unknown(now, area, "this sd_db has no vote table: update the pack to migration 048"), "state": "error"}
     except sqlite3.Error as error:
         return {**_unknown(now, area, f"votes not read: {error}"), "state": "error"}
-    return {"read": now, "area": area, "state": "read", "reason": "", "rows": rows}
+    return {"read": now, "area": area, "state": "read", "reason": "", "rows": rows, "repo": hoa}
+
+
+def write_vote(payload: dict):
+    """`POST /api/hoa/vote` (pack sd:8058): `{"key", "revision", "fields"}`, the write as `action_route` returns one.
+
+    `revision` null adds the vote (`sd votes add`); a number edits it at that revision (`sd votes edit --if-revision`),
+    and a vote at another one is refused as stale (409) with nothing written. `fields` are the text columns to set and an
+    optional `state`; an empty state is none given, so the outcome sets it. `sd_db.votes` checks the columns.
+    """
+    key, revision, fields = payload.get("key"), payload.get("revision"), payload.get("fields")
+    if set(payload) != {"key", "revision", "fields"} or not isinstance(key, str) or not isinstance(fields, dict) \
+            or (revision is not None and (isinstance(revision, bool) or not isinstance(revision, int))) \
+            or not all(isinstance(name, str) and isinstance(value, str) for name, value in fields.items()):
+        raise ValueError("Send the vote's key, the revision read (null to add) and its fields as text.")
+
+    def write(connection):
+        try:
+            votes = importlib.import_module("sd_db.votes")
+        except ImportError:
+            raise ValueError("this sd_db has no vote table: update the pack to migration 048") from None
+        hoa, why = _hoa(connection)
+        if hoa is None:
+            raise ValueError(f"No vote written: {why}.")
+        text = {name: value for name, value in fields.items() if name != "state"}
+        state = fields.get("state") or None
+        try:
+            if revision is None:
+                return {"vote": votes.add(connection, hoa, key, text, state=state)}
+            return {"vote": votes.edit(connection, hoa, key, {**text, **({"state": state} if state else {})}, expected_revision=revision)}
+        except votes.StaleVote as stale:
+            raise workflow.StaleItem(str(stale)) from None
+
+    return write
 
 
 def realm_issues(connection, owns, *, now: str) -> dict:

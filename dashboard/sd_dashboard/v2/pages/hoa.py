@@ -6,7 +6,8 @@ checkout's tools/sweep.py in the background; GET /api/hoa/sweep/status reads its
 /api/hoa/download (sd:5626), which opens the source's portal in a Claude Chrome session, waits for the operator's login,
 then runs the checkout's download; /api/hoa's `downloads` part reads each source's last run. An asset's attachments
 (sd:6690) are its Drive folder's listing, GET /api/hoa/attachments; its pictures come through
-/api/hoa/attachments/picture; Upload and Reference post /api/hoa/attach (`hoa_attach`)."""
+/api/hoa/attachments/picture; Upload and Reference post /api/hoa/attach (`hoa_attach`). The
+Votes view's Add and Edit post /api/hoa/vote (`places.write_vote`, pack sd:8058)."""
 
 from __future__ import annotations
 
@@ -55,6 +56,12 @@ def _attach(payload, principal):
     return hoa_attach.request(dict(payload))
 
 
+def _vote(payload, principal):
+    from ... import places
+
+    return places.write_vote(payload)
+
+
 def _ack(payload, principal):
     from ... import hoa_screen
 
@@ -77,7 +84,7 @@ PAGE = Page(
          Api("/api/hoa/sweep", write=_run_sweep),
          Api("/api/hoa/sweep/status", _sweep), Api("/api/hoa/download", write=_download),
          Api("/api/hoa/attachments", _attachments, query=True), Api("/api/hoa/attachments/picture", _picture, query=True),
-         Api("/api/hoa/attach", write=_attach),
+         Api("/api/hoa/attach", write=_attach), Api("/api/hoa/vote", write=_vote),
          *place_views("hoa", ("briefs", "reports", "votes"))),
     count="/api/hoa",
 )
