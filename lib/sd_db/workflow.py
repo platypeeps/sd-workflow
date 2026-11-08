@@ -33,6 +33,7 @@ from .writes import (
     TransitionRefused,
     add_note,
     create_item,
+    read_settings,
     refuse_base_status,
     resolve_note,
     set_item_fields,
@@ -61,23 +62,46 @@ BRANCH_FIELDS = frozenset({"branch"})
 #: `sd writing park`, which also moves its file.
 PARK_FIELDS = frozenset({"parked_at"})
 
-#: `area`, an item's own place (pack sd:8010): `home` or `hoa`, kept as
+#: `area`, an item's own place (pack sd:8010): `home`, `hoa`, `personal` or a
+#: realm id of the `dashboard.realms` setting row (pack sd:8062), kept as
 #: `item.fields.area` rather than a column. The dashboard's `places.area_of`
 #: reads it ahead of the repository rule, so a vault task can sit in Home
-#: alone. `edit_item` sets and clears it; `item_area` reads it.
+#: alone. `edit_item` sets and clears it against `areas`; `item_area` reads it.
 AREA_FIELDS = frozenset({"area"})
-AREAS = ("home", "hoa")
+AREAS = ("home", "hoa", "personal")
+#: A realm id, as the dashboard's `places.parse_realms` takes one.
+AREA_ID = re.compile(r"[a-z0-9][a-z0-9-]*")
+REALMS_KEY = "dashboard.realms"
+
+
+def areas(connection: sqlite3.Connection) -> tuple[str, ...]:
+    """`AREAS` and then each realm id the `dashboard.realms` row names, in
+    line order (pack sd:8062): its `realm|<id>|<label>|<glob>` lines, less
+    ids that are `AREAS` or `all`. A row never held, cleared or unreadable
+    names no realm. The pre-row `realms.conf` file is the dashboard's alone."""
+    try:
+        text = read_settings(connection, [REALMS_KEY]).get(REALMS_KEY) or ""
+    except SdDbError:
+        text = ""
+    found = dict.fromkeys(AREAS)
+    for line in text.splitlines():
+        fields = [field.strip() for field in line.split("|")]
+        if (len(fields) == 4 and fields[0] == "realm" and all(fields[1:]) and AREA_ID.fullmatch(fields[1])
+                and fields[1] != "all"):
+            found.setdefault(fields[1])
+    return tuple(found)
 
 
 def item_area(item: Any) -> str | None:
     """An item row's own area, `fields.area`, or None: no fields, unreadable
-    fields, or a value that is not one of `AREAS` (pack sd:8010)."""
+    fields, or a value that is not an area id (pack sd:8010, sd:8062). A
+    realm the setting no longer names still reads; the page places it."""
     try:
         fields = json.loads(item["fields"] or "{}")
     except (TypeError, ValueError, RecursionError):
         return None
     area = fields.get("area") if isinstance(fields, dict) else None
-    return area if isinstance(area, str) and area in AREAS else None
+    return area if isinstance(area, str) and AREA_ID.fullmatch(area) else None
 
 #: The item kinds a person may set by hand: the four the pack's `sd task add`
 #: files (`ADD_KINDS`, `bin/sd_work.py`), for the reason that list gives. Each
@@ -274,9 +298,10 @@ def _fields(connection: sqlite3.Connection, changes: dict) -> dict:
             result["parked_at"] = stamp(result["parked_at"])
         except SdDbError as error:
             raise WorkflowError(f"parked_at must be an aware timestamp or null: {error}") from None
-    if "area" in result and result["area"] is not None and (
-            not isinstance(result["area"], str) or result["area"] not in AREAS):
-        raise WorkflowError(f"area must be {' or '.join(AREAS)}, or null")
+    if "area" in result and result["area"] is not None:
+        known = areas(connection)
+        if not isinstance(result["area"], str) or result["area"] not in known:
+            raise WorkflowError(f"area must be one of {', '.join(known)}, or null")
     if "title" in result:
         result["title"] = _text(result["title"], "title")
     if "body" in result:

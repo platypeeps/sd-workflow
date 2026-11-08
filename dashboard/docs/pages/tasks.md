@@ -13,8 +13,9 @@ quadrant in place (the description saves on leaving it, sd:3467), each change on
 row cannot take is off with the reason. A card's priority and due date are
 dropdowns that make the same writes; Pick a date opens Edit (sd:3440). Status, priority, due, repo and recurrence edits
 carry Undo; resolving a followup note and cancelling an assignment ask first.
-The Area select (pack sd:8021) sets the item's own area, Home or HOA, or clears it with None, as
-`sd task edit N --area home|hoa` and `--clear-area` do; it asks first, and its Undo sets the area back.
+The Area select (pack sd:8021) sets the item's own area, Home, HOA, Personal or a realm (pack sd:8062), or
+clears it with None, as `sd task edit N --area <area>` and `--clear-area` do; it asks first, and its Undo sets the
+area back.
 Completing a repeating task asks first and names the outcome (sd:2250): the next
 occurrence's date, or that sd sets it, or, for a rule sd cannot walk, that the
 series ends, on the danger button. `sd work relink` and `sd work cancel` run
@@ -49,8 +50,10 @@ Realm sub tabs (sd:6263; sd:5753 had made Realm a filter) narrow every layout to
 Personal (the first tab), each realm `dashboard.realms` names, HOA or Home, and each tab carries its count of open rows (a done or cancelled row is listed, not counted, sd:8018). The filters
 apply inside each tab. Each row carries `realm` from `places.realm_of` and `area` from `places.area_of`, the rule the HOA
 and Home pages' Tasks views use: the hoa checkout's items, or items with no repo. A report is in neither. An item's own
-area, set with `sd task edit N --area home|hoa` and cleared with `--clear-area` (pack sd:8010), wins over that rule: the
-row carries `area_set` and sits in that area's tab alone, never in Personal or a realm tab. A row whose realm
+area, set with `sd task edit N --area <area>` and cleared with `--clear-area` (pack sd:8010), wins over that rule: the
+row carries `area_set` and sits in that area's tab alone. The areas are home, hoa, personal and each `dashboard.realms`
+id, read when the edit runs (pack sd:8062), so a Work repo's task tagged personal sits in Personal alone; a tag whose
+realm has no tab falls back to the repo rule. A row whose realm
 has no tab, a report or a row read without a realm list, sits in Personal, so pack sd:7216 dropped the All tab. The shell
 keeps the tab as `#view=<id>`; a `?realm=<id>` link shows that tab, and an old `#view=all` opens Personal.
 Today's and Metrics' drilldowns count every realm and link `?realm=all`: the list holds every realm's rows, no tab is

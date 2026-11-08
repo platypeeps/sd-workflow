@@ -97,8 +97,9 @@ addEventListener('DOMContentLoaded', () => {
     : `sweep ${w.last.state}${w.last.exit != null ? `, exit ${w.last.exit}` : ''}${w.last.reason ? `: ${w.last.reason}` : ''}`;
   // A row's realm tab: its realm when that has a tab, else Personal (no realm list read, or a realm with no tab: pack sd:7216).
   // pack sd:7687: the hoa checkout's rows are realm hoa (places.realm_of), so they sit in HOA, not Personal too.
-  // pack sd:8010: a row with its own area (area_set, sd task edit --area) sits in that area's tab alone.
-  const tabOf = t => t.area_set ? t.area : t.realm !== 'home' && window.PAGE_VIEWS.some(v => v.id === t.realm) ? t.realm : 'personal';
+  // pack sd:8010: a row with its own area (area_set, sd task edit --area) sits in that area's tab alone. pack sd:8062:
+  // the area may be personal or a realm id; one with no tab (a realm since dropped) falls back to the repo rule.
+  const tabOf = t => t.area_set && window.PAGE_VIEWS.some(v => v.id === t.area) ? t.area : t.realm !== 'home' && window.PAGE_VIEWS.some(v => v.id === t.realm) ? t.realm : 'personal';
   const inPlace = (t, p = place()) => p === 'all' || (p === 'hoa' || p === 'home' ? t.area === p : tabOf(t) === p);
   const placed = () => listed().filter(t => inPlace(t));
 

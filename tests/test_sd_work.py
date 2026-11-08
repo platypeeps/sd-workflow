@@ -753,11 +753,11 @@ class TaskCLI(unittest.TestCase):
         self.call("task", "edit", item, "--branch", "x", "--clear-branch", code=2)
 
     def test_edit_area_sets_and_clears_the_items_own_area_and_refuses_another(self):
-        """pack sd:8010. `--area home|hoa` keeps the area in `fields`; `--clear-area` drops it."""
+        """pack sd:8010. `--area home` keeps the area in `fields`; `--clear-area` drops it."""
         state = json.loads(self.call("task", "add", "--priority", "3", "Clean the gutters", "--json").stdout)
         item = state["item"]["id"]
-        refused = self.call("task", "edit", item, "--area", "work", code=2)
-        self.assertIn("invalid choice: 'work'", refused.stderr)
+        refused = self.call("task", "edit", item, "--area", "work", code=1)
+        self.assertIn("area must be one of home, hoa, personal, or null", refused.stderr)
         self.call("task", "edit", item, "--area", "home", "--clear-area", code=2)
         stale = self.call("task", "edit", item, "--title", "Gutters", "--json")
         self.assertNotEqual(json.loads(stale.stdout)["revision"], state["revision"])
@@ -770,6 +770,20 @@ class TaskCLI(unittest.TestCase):
         cleared = json.loads(self.call("task", "edit", item, "--clear-area", "--json").stdout)
         self.assertIsNone(cleared["item"]["fields"])
         self.assertNotIn("area:", self.call("task", "show", item).stdout)
+
+    def test_edit_area_takes_personal_and_the_realm_ids_the_setting_names(self):
+        """pack sd:8062. `--area` takes home, hoa, personal and each
+        dashboard.realms id, checked when the edit runs."""
+        item = json.loads(self.call("task", "add", "--priority", "3", "Plan the trip", "--json").stdout)["item"]["id"]
+        tagged = json.loads(self.call("task", "edit", item, "--area", "personal", "--json").stdout)
+        self.assertEqual(json.loads(tagged["item"]["fields"]), {"area": "personal"})
+        with database(sd_db.default_path(self.home), write=True) as connection:
+            sd_db.writes.set_setting(connection, "dashboard.realms", "realm|work|Work|/repos/*\n")
+        tagged = json.loads(self.call("task", "edit", item, "--area", "work", "--json").stdout)
+        self.assertEqual(json.loads(tagged["item"]["fields"]), {"area": "work"})
+        self.assertIn("  area: work\n", self.call("task", "show", item).stdout)
+        refused = self.call("task", "edit", item, "--area", "acme", code=1)
+        self.assertIn("area must be one of home, hoa, personal, work, or null", refused.stderr)
 
     # Stands in for the library's `edit_item` and records what it was handed:
     # the pin may predate the unpark (sd:3007), and the library's own tests

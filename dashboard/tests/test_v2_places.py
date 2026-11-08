@@ -153,6 +153,19 @@ class Tasks(Fixture):
         with mock.patch.object(places, "REALMS_CONFIG", realms):
             self.assertEqual(self.ids(places.tasks(self.connection, "acme", now=NOW)), sorted([stays, self.other_item]))
 
+    def test_an_item_tagged_personal_or_a_realm_sits_in_that_place_alone(self):
+        """pack sd:8062: an item's own area may be personal or a dashboard.realms id: a Work repo's task tagged
+        personal leaves Work; a task with no repo tagged acme leaves Home for Acme."""
+        writes.set_setting(self.connection, "dashboard.realms", "realm|acme|Acme|/repos/sys*\n")
+        errand = self.item("Buy stamps", kind="task")
+        self.tag(self.other_item, "personal")
+        self.tag(errand, "acme")
+        self.assertEqual(self.ids(places.tasks(self.connection, "acme", now=NOW)), [errand])
+        self.assertEqual(self.ids(places.tasks(self.connection, "home", now=NOW)), [self.home_item])
+        rows = {r["id"]: r for r in tasks_screen.document(self.connection, now=NOW)["rows"]}
+        self.assertEqual([(rows[i]["area"], rows[i]["area_set"]) for i in (self.other_item, errand, self.home_item)],
+                         [("personal", True), ("acme", True), ("home", False)])
+
     def test_a_places_tasks_rows_are_the_tasks_pages_rows(self):
         # sd:5635: a Tasks row's Details on Home, HOA and a realm place are the Tasks page's own, so the view lists the
         # /api/tasks rows (tasks_screen._rows), with the revision, allowed moves, edit capability and issue targets.
@@ -1317,6 +1330,23 @@ for (const v of ['work', 'hoa', 'home', 'personal']) { await realm(v); R[v] = EL
         self.assertEqual([t in r["hoa"] for t in titles], [False, False, False, False])
         self.assertEqual([t in r["home"] for t in titles], [True, False, True, True])
         self.assertEqual(out["counts"], {"personal": 3, "work": 1, "hoa": 1, "home": 3})
+
+    def test_a_task_tagged_personal_or_a_realm_sits_in_that_tab_alone(self):
+        """pack sd:8062: the Work repo's task tagged personal sits in Personal, not Work; a task with no repo tagged
+        work sits in Work, not Personal or Home; a tag naming a realm with no tab falls back to the repo rule."""
+        writes.set_setting(self.connection, "dashboard.realms", "realm|work|Work|/repos/sys*\n")
+        errand = self.item("Buy stamps", kind="task")
+        workflow.edit_item(self.connection, self.other_item, {"area": "personal"}, who="test")
+        workflow.edit_item(self.connection, errand, {"area": "work"}, who="test")
+        self.doc, self.details = self.realm_doc(), {}
+        stale = self.item("Water the ferns", kind="task", repo=self.other)
+        self.doc["rows"] += [{**next(r for r in self.doc["rows"] if r["id"] == self.other_item), "id": stale,
+                              "title": "Water the ferns", "area": "gone", "area_set": True, "realm": "work"}]
+        out = self.run_tasks("for (const v of ['personal', 'work', 'home']) { await realm(v); R[v] = ELS['view-board'].html; }")
+        r, titles = out["R"], ("Tune the gate", "Buy stamps", "Clean the gutters", "Water the ferns")
+        self.assertEqual([t in r["personal"] for t in titles], [True, False, True, False])
+        self.assertEqual([t in r["work"] for t in titles], [False, True, False, True])
+        self.assertEqual([t in r["home"] for t in titles], [False, False, True, False])
 
     def test_an_address_or_an_older_link_lands_on_its_realm(self):
         """Metrics and Today link /tasks?...&realm=all, and a bookmark may hold #view=hoa or #view=home. pack sd:7216: the
