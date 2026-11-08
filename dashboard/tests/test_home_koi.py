@@ -108,6 +108,51 @@ class TheKoi(ScreenCase):
                        "fields": {**stale, "volume_gal": 2500}, "photo": None})(self.connection)
         fields = assets.get_asset(self.connection, self.pond["id"])["fields"]
         self.assertEqual((fields["volume_gal"], len(fields["water_log"]), len(fields["tests"])), (2500, 2, 1))
+        self.assertEqual(fields.get("water_synced", {}).get("to"), "2026-09-06T12:00:00+00:00")
+
+    def series(self, first, ran=True):
+        """Both scripts' history, held by Home Assistant from `first`; the small one ran today unless not `ran`."""
+        small = [{"entity_id": "script.pond_change_small", "state": "off", "last_changed": first}]
+        return [small + ([{"state": "on", "last_changed": f"{DAY}T09:00:00+00:00"}] if ran else []),
+                [{"entity_id": "script.pond_change_big", "state": "off", "last_changed": first}]]
+
+    def test_each_sync_stores_the_window_it_covered_and_no_gap_when_they_meet(self):
+        # Lane review (pack sd:8054): the first sync and one that overlaps
+        # the last record their window and no gap.
+        self.runs = self.series("2026-08-27T12:00:00+00:00")
+        home_koi.log_water({}, now=NOW)(self.connection)
+        home_koi.log_water({}, now="2026-09-07T12:00:00Z")(self.connection)
+        fields = assets.get_asset(self.connection, self.pond["id"])["fields"]
+        self.assertEqual(fields["water_synced"], {"from": "2026-08-27T12:00:00+00:00", "to": "2026-09-07T12:00:00+00:00"})
+        self.assertEqual(fields.get("water_gaps"), None)
+        water = home_koi.document(self.connection, now=NOW)["water"]
+        self.assertEqual((water["incomplete_since"], water["sync_due"]), ({"week": None, "month": None}, False))
+
+    def test_a_sync_after_the_history_moved_on_marks_the_totals_incomplete(self):
+        # Lane review (pack sd:8054): nobody opened the view for longer than
+        # Home Assistant keeps history, so the changes between the last
+        # covered window and the oldest row it still holds are gone. The gap
+        # is stored and the 28-day total says it is incomplete.
+        self.runs = self.series("2026-08-07T12:00:00+00:00", ran=False)
+        home_koi.log_water({}, now="2026-08-17T12:00:00Z")(self.connection)
+        self.runs = self.series("2026-08-27T12:00:00+00:00")
+        self.assertEqual(home_koi.log_water({}, now=NOW)(self.connection), {"added": 1})
+        fields = assets.get_asset(self.connection, self.pond["id"])["fields"]
+        self.assertEqual(fields["water_gaps"], [{"from": "2026-08-17T12:00:00+00:00", "to": "2026-08-27T12:00:00+00:00"}])
+        water = home_koi.document(self.connection, now=NOW)["water"]
+        self.assertEqual(water["incomplete_since"], {"week": None, "month": "2026-08-17"})
+        # Ten days on the gap reaches into the 7-day window too: 08-27 is 6 days before 09-02.
+        water = home_koi.document(self.connection, now="2026-09-02T12:00:00Z")["water"]
+        self.assertEqual(water["incomplete_since"], {"week": "2026-08-17", "month": "2026-08-17"})
+
+    def test_a_history_without_a_script_covers_nothing(self):
+        # A failed or partial read is unknown: no window is stored, so the
+        # next full read finds the gap from the last known one.
+        self.runs = self.series("2026-08-27T12:00:00+00:00")[:1]
+        home_koi.log_water({}, now=NOW)(self.connection)
+        fields = assets.get_asset(self.connection, self.pond["id"])["fields"]
+        self.assertNotIn("water_synced", fields)
+        self.assertTrue(home_koi.document(self.connection, now=NOW)["water"]["sync_due"])
 
     def test_a_pond_save_without_fields_keeps_the_water_log_and_tests(self):
         # pack sd:8054 review: `fields` omitted or null fell through to
@@ -196,6 +241,40 @@ function run() { return JSON.stringify(OUT); }
         out = json.loads(result.stdout)
         self.assertIsNone(out["error"])
         self.assertEqual(out["posts"], [["/api/home/koi/test", {"ammonia": 0.25}]])
+
+    def draw_water(self, water):
+        script = (STAND_IN + MARKUP_JS + f"\nconst DOC = {json.dumps(self.DOC)};\n" + f"Object.assign(DOC.water, {json.dumps(water)});" + r"""
+window.shell = { getJSON: p => { OUT.gets.push(p); return Promise.resolve(JSON.parse(JSON.stringify(DOC))); },
+  post: (p, b) => { OUT.posts.push([p, b]); return Promise.resolve({ added: 0 }); }, toast: m => OUT.toasts.push(m), itemHref: n => '/tasks?row=' + n };
+const flush = () => new Promise(r => r()).then(() => null).then(() => null).then(() => null).then(() => null);
+""" + KOI_JS + r"""
+var R = {};
+(async () => { try {
+document.dispatchEvent(new CustomEvent('shell:view', { detail: { id: 'koi' } })); await flush(); await flush();
+R.water = ELS['koi-water'].html;
+} catch (e) { OUT.error = String(e) + ' ' + e.stack; } })();
+function run() { OUT.R = R; return JSON.stringify(OUT); }
+""")
+        result = subprocess.run([OSASCRIPT, "-l", "JavaScript", "-e", script], capture_output=True, text=True, timeout=60, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        out = json.loads(result.stdout)
+        self.assertIsNone(out["error"])
+        return out
+
+    def test_a_gap_marks_the_totals_it_reaches_incomplete(self):
+        # Lane review (pack sd:8054): a total with a gap in its window is
+        # not shown as the whole record.
+        out = self.draw_water({"unlogged": 0, "sync_due": False, "incomplete_since": {"week": None, "month": "2026-08-17"}})
+        figures = out["R"]["water"].split("Weekly average")
+        self.assertNotIn("incomplete", figures[0])
+        self.assertIn("incomplete since 2026-08-17", figures[1])
+        self.assertEqual(out["posts"], [])
+
+    def test_a_due_sync_posts_once_with_nothing_unlogged(self):
+        # The view syncs when the stored window is stale, so a quiet pond
+        # still records what Home Assistant covered.
+        out = self.draw_water({"unlogged": 0, "sync_due": True, "incomplete_since": {"week": None, "month": None}})
+        self.assertEqual(out["posts"], [["/api/home/koi/water", {}]])
 
 
 if __name__ == "__main__":

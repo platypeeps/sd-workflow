@@ -35,7 +35,7 @@ PIXEL_FT, HALF = 0.21701388888888898, 200.0
 TIMEOUT = 20.0
 LIMIT = 32 * 1024 * 1024
 #: The fields only the server writes, by kind: `home_koi.log_water` and `log_test` append to the current row.
-SERVER_KEYS = {"pond": ("water_log", "tests")}
+SERVER_KEYS = {"pond": ("water_log", "tests", "water_synced", "water_gaps")}
 #: The fields the Add form offers a plant or a tree, and a care task's recurrence choices (`sd_db.recurrence`).
 RECUR = ("FREQ=DAILY", "FREQ=WEEKLY", "FREQ=WEEKLY;INTERVAL=2", "FREQ=MONTHLY", "FREQ=YEARLY")
 

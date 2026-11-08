@@ -3,7 +3,8 @@
 // Add fish and a fish's form post /api/home/asset (a measurement appends to its log); a water test posts
 // /api/home/koi/test. Care tasks
 // post /api/home/care on the pond. When Home Assistant holds a change the pond's log lacks, the view posts
-// /api/home/koi/water once, which logs it, and reads again.
+// /api/home/koi/water once, which logs it, and reads again; it also posts when the pond's last synced window is
+// stale (water.sync_due). A total whose window a gap reaches reads "incomplete since <date>" (water.incomplete_since).
 (() => {
   const { html, put } = window.markup;
   const $ = id => document.getElementById(id);
@@ -11,14 +12,15 @@
   const num = v => v === '' || v == null ? null : Number(v);
   const last = f => (f.fields.log || []).slice(-1)[0] || {};
   const pct = n => `${Math.round(n * 10) / 10} %`;
+  const gap = d => d ? html` <small class="st warning">incomplete since ${d}</small>` : '';
 
   function draw() {
     const d = S.doc, w = d.water, pond = d.pond;
     put($('koi-note'), html`${d.reason ? html`<p class="note">${d.reason}</p>` : ''}${d.pond_reason ? html`<p class="note">${d.pond_reason}</p>` : ''}`);
     put($('koi-water'), html`<dl class="figures">
       <div><dt>Since the last change</dt><dd>${w.days_since == null ? '—' : `${w.days_since} d`}</dd></div>
-      <div><dt>Replaced, last 7 days</dt><dd>${pct(w.week_percent)}${w.week_gallons ? ` · ${Math.round(w.week_gallons)} gal` : ''}</dd></div>
-      <div><dt>Weekly average, 28 days</dt><dd>${pct(w.average_week_percent)}</dd></div></dl>
+      <div><dt>Replaced, last 7 days</dt><dd>${pct(w.week_percent)}${w.week_gallons ? ` · ${Math.round(w.week_gallons)} gal` : ''}${gap(w.incomplete_since?.week)}</dd></div>
+      <div><dt>Weekly average, 28 days</dt><dd>${pct(w.average_week_percent)}${gap(w.incomplete_since?.month)}</dd></div></dl>
       <table class="ledger"><thead><tr><th scope="col">Changed</th><th scope="col">Percent</th><th scope="col">Script</th></tr></thead><tbody>
       ${w.log.length ? w.log.slice(0, 12).map(r => html`<tr><td><time datetime="${r.at}">${r.at.slice(0, 16).replace('T', ' ')}</time></td><td>${pct(r.percent)}</td><td>${r.entity}</td></tr>`)
         : html`<tr class="empty"><td colspan="3">No water change logged yet.</td></tr>`}</tbody></table>`);
@@ -56,8 +58,8 @@
   async function load() {
     try {
       S.doc = await window.shell.getJSON('/api/home/koi'); draw();
-      // Home Assistant keeps ten days: log what it holds that the pond's log lacks, once per view.
-      if (S.doc.water.unlogged && S.doc.pond && !S.synced) { S.synced = true; await window.shell.post('/api/home/koi/water', {}).then(load, e => toast(`Water changes not logged: ${e.message}`)); }
+      // Home Assistant keeps ten days: log what it holds that the pond's log lacks, and the window it covered, once per view.
+      if ((S.doc.water.unlogged || S.doc.water.sync_due) && S.doc.pond && !S.synced) { S.synced = true; await window.shell.post('/api/home/koi/water', {}).then(load, e => toast(`Water changes not logged: ${e.message}`)); }
     } catch (e) { put($('koi-note'), html`<p class="state-unknown"><b>▨ Not read.</b> ${e.message}</p>`); }
   }
   const send = (path, body, done) => window.shell.post(path, body).then(out => { toast(done); return load().then(() => out); }, e => toast(`Not saved: ${e.message}`));

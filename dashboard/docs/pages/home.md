@@ -120,3 +120,6 @@ tasks on the pond, filed as the Map files them. Water changes come from Home Ass
 in Home Assistant's history (it keeps ten days) is one change of that percent. When the history holds a change
 the pond's log lacks, the view posts `POST /api/home/koi/water`, which writes it once. The view shows days since
 the last change, the percent replaced in the last 7 days and the weekly average over 28.
+Each sync stores the window it covered on the pond. Changes are kept only while the view is opened within Home
+Assistant's ten days, and there is no scheduled collector: a sync whose window starts after the last one ended
+records the gap, and a total whose window it reaches reads "incomplete since" the gap's start date.
