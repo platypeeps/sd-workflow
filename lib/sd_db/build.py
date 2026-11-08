@@ -71,6 +71,9 @@ STALE_SECONDS = 600
 #: The `heartbeat` state row each build-dispatch tick writes first: this key on the hub, `<key>@<host>` on a
 #: satellite (pack sd:7933).
 HEARTBEAT = "build-dispatch"
+#: Consecutive satellite beats naming a `why` after which the hub's claim blocks that lane's queued rows: one
+#: unread tick passes, a read that fails every tick does not (sd:8081).
+STUCK_TICKS = 3
 #: Lost runs one bundle may retry before it blocks.
 RETRIES = 1
 # The note on an item a blocked run parked (pack sd:6132).
@@ -240,6 +243,20 @@ def dispatcher_refusal(connection, host: str) -> str | None:
     return f"{HEARTBEAT}@{host} claims nothing: {why}" if why and why not in UNREAD else None
 
 
+def dispatcher_stuck(connection, host: str) -> str | None:
+    """Why `host`'s tick claimed nothing for its last `STUCK_TICKS` beats, or None when one of them named no `why`.
+
+    Retention keeps one beat per key, so a compaction restarts the count:
+    it delays the block by a few ticks, never blocks early (sd:8081).
+    """
+    rows = connection.execute("SELECT body FROM state WHERE kind = 'heartbeat' AND key = ? ORDER BY id DESC LIMIT ?",
+                              (f"{HEARTBEAT}@{host}", STUCK_TICKS)).fetchall()
+    whys = [_why(row) for row in rows]
+    if len(whys) < STUCK_TICKS or not all(whys):
+        return None
+    return f"{HEARTBEAT}@{host} claimed nothing for {STUCK_TICKS} ticks: {whys[0]}"
+
+
 def item_host(connection, item: int) -> str | None:
     """`lane_of` the lane of `item`'s repository: the other machine whose dispatcher claims its build, or None."""
     row = connection.execute(_REPO, (item,)).fetchone()
@@ -266,12 +283,16 @@ def dispatcher_why(connection, host: str) -> str | None:
     """The reason the newest beat of `host`'s tick names for claiming nothing, or None when it names none.
 
     A reason may last one tick (an unread load), so the hub's claim leaves a
-    queued row queued on it and blocks only on `dispatcher_gone`; the Builds
-    panel shows it on the row (review round 5).
+    queued row queued on it and blocks only on `dispatcher_gone` or
+    `dispatcher_stuck`; the Builds panel shows it on the row (review round 5).
     """
     row = _beat(connection, host)
+    return _why(row) if row else None
+
+
+def _why(row) -> str | None:
     try:
-        why = json.loads(row["body"]).get("why") if row else None
+        why = json.loads(row["body"]).get("why")
     except (TypeError, ValueError, AttributeError):
         why = None
     return why if isinstance(why, str) and why else None
@@ -756,10 +777,12 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
         if None in hosts:
             # The hub blocks another host's row once that host's dispatcher went quiet: a lane moved after the
             # press, or a dispatcher that died after it, would leave the item locked with no word. A fresh beat
-            # that names a `why` leaves the row queued, as that reason may last one tick (review round 5).
+            # that names a `why` leaves the row queued, as that reason may last one tick (review round 5), until
+            # `STUCK_TICKS` beats in a row name one (sd:8081).
             for row in queued:
                 away = lanes[row["id"]]
-                gone = dispatcher_gone(connection, away) if away is not None and away not in hosts else None
+                gone = (dispatcher_gone(connection, away) or dispatcher_stuck(connection, away)
+                        if away is not None and away not in hosts else None)
                 if gone:
                     _refuse(connection, row, f"item {row['item']}'s lane runs on {away}, and {gone}")
         available = room(connection, load=load, load_cap=load_cap, interactive=interactive, hosts=hosts)
