@@ -346,7 +346,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // blocked or cancelled bundle's Retry and Send to builder post /api/queue/builds/retry (pack sd:6020). The view reads its
   // three documents when it first shows and on each Today read after; a source that was not read is said under the table.
   const QTYPES = ['working', 'merging', 'next', 'blocked', 'suggested', 'open', 'ended'], QSHOW = ['suggested', 'open', 'ended'], NEXT = 9;
-  const BOXES = ['merging', 'working', 'next', 'blocked', 'review', 'suggested']; // a repo row's boxes, left to right (pack sd:7470, sd:8083)
+  const BOXES = ['merging', 'review', 'working', 'next', 'blocked', 'suggested']; // a repo row's boxes, left to right (pack sd:7470, sd:8083, sd:8137)
   const QV = { lanes: null, lanesErr: '', built: null, builtErr: '', runner: null, runnerErr: '', tasks: null, tasksErr: '', seen: false, busy: false };
   const QOTHER = new Map(); // the lane entries, selectable as Today's other rows are
   const qShow = new Set();
@@ -520,18 +520,17 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // pack sd:8005: the page's PR waits, split by who they wait on; '' when there is none. Each repo's are its review box.
   const prTally = rows => { const you = rows.filter(c => c.pr === 'you').length, them = rows.filter(c => c.pr && c.pr !== 'you').length;
     return you + them ? `${you + them} PR review: ${you} on you, ${them} on reviewers` : ''; };
-  // A repo row's six boxes: merging, next and blocked (pack sd:7272, Queue's lane ledger until #1768), with working
-  // before them, review and suggested after (pack sd:7314, sd:8083), counted from all the repo's rows, so a filter hides
-  // no count. A box is lit only when its count is not zero; blocked lights the warning lamp, review the caution lamp when
+  // A repo row's six boxes, left to right: merging, review, working, next, blocked and suggested (pack sd:7272, sd:7314,
+  // sd:8083, sd:8137), counted from all the repo's rows, so a filter hides no count. A box is lit only when its count is not zero; blocked lights the warning lamp, review the caution lamp when
   // a PR waits on you; the label says all six in words. A lane that was not read counts nothing: the cell says so, not 0.
   const pip = (n, on, means) => html`<span class="pip${n ? on : ''}" title="${`${n} ${means}`}">${String(n)}</span>`;
   function pips(g) {
     if (g.key && (!QV.lanes || QV.lanes.problems.some(p => repoKey(p.repo) === g.key)))
       return html`<td class="detail"><span class="g-unknown" aria-hidden="true">${GLYPH.unknown}</span> lane not read</td>`;
-    // pack sd:7470: merging is the leftmost box.
+    // pack sd:7470: merging is the leftmost box; pack sd:8137: review follows it.
     const { working: w, merging: m, next: n, blocked: b, review: v, suggested: s } = g.n, you = g.rows.filter(c => c.pr === 'you').length;
     // Each box says its count and what it counts, in its title (pack sd:7383); the label above says all six at once.
-    return html`<td class="detail pipe" aria-label="${m} merging, ${w} working, ${n} next, ${b} blocked, ${v} review, ${s} suggested">${pip(m, ' on', 'merging: claimed by the lane runner, being merged')}${pip(w, ' on', 'working: live sessions, build runs and lane gates now running')}${pip(n, ' on', 'next: queued in the lane, not started')}${pip(b, ' warn', 'blocked: stopped in the lane until someone acts')}${pip(v, you ? ' caution' : ' on', `review: pull requests waiting on a review, ${you} on you, ${v - you} on reviewers`)}${pip(s, ' on', `suggested: up to ${NEXT} ready or planned tasks to do next`)}</td>`;
+    return html`<td class="detail pipe" aria-label="${m} merging, ${v} review, ${w} working, ${n} next, ${b} blocked, ${s} suggested">${pip(m, ' on', 'merging: claimed by the lane runner, being merged')}${pip(v, you ? ' caution' : ' on', `review: pull requests waiting on a review, ${you} on you, ${v - you} on reviewers`)}${pip(w, ' on', 'working: live sessions, build runs and lane gates now running')}${pip(n, ' on', 'next: queued in the lane, not started')}${pip(b, ' warn', 'blocked: stopped in the lane until someone acts')}${pip(s, ' on', `suggested: up to ${NEXT} ready or planned tasks to do next`)}</td>`;
   }
   function queueView() {
     const unread = [];
