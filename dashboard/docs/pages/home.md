@@ -95,3 +95,31 @@ acknowledge: a task's Done (or Done → next occurrence for a repeating one), a
 brief's Seen, a report's Acknowledge, each with Undo. Seen is Today's mark,
 the snooze `today:brief:<stem>` held until the brief's text changes, so a
 brief seen here or on Today is seen in both; Not seen clears it.
+
+Map (pack sd:8053, `home_map.py`, `home-map.js`) is the lot's assets over Arapahoe County's 2024 aerial, one
+SVG as HOA's map. The address is the setting row `dashboard.home_map` (Settings), one line; the pack holds none.
+The county's address locator places it in EPSG:2232 (US feet), and the map is the 400 ft square around it. The
+aerial's ImageServer answers one `exportImage` for that square at full resolution (0.217 ft per pixel), cached
+with the geocode under `<state>/system/home-map/`, so the county is asked once per address;
+`GET /api/home/map/aerial` serves it. A failed read names its reason, and the assets still draw on a plain ground.
+
+Assets are rows of the workflow database's `home_asset` table (migration 49, `sd_db.assets`): a kind, a name, a
+point or a line in the same feet, a fields object and a photo address. Add: press Add, pick a kind, click the map
+(a line kind takes a click per point, then Finish line), fill the short form (a plant or tree offers species,
+planted, sun, water, zone and notes). Drag a point to move it. A row or a mark opens its form: Save, Delete, and
+Add care task, which files a recurring task (area home) naming the asset in `fields.asset`; the next occurrence
+keeps it. A plant or tree with an open care task due before today carries the warning ring.
+
+Koi (pack sd:8054, `home_koi.py`, `home-koi.js`) shares the Map's assets: the pond is the `pond` asset, placed on
+the Map (`fields.volume_gal` sizes a change in gallons), and each fish a `koi` asset with no place: name, variety,
+photo, acquired, health notes and a log of size and weight. Water tests (ammonia, nitrite, nitrate, pH, KH,
+temperature) are logged on the pond through `POST /api/home/koi/test`, which appends the reading to the
+pond's current row. A pond saved from a form keeps the `water_log` and `tests` the server wrote. Feeding, filter cleaning, water tests and treatments are recurring care
+tasks on the pond, filed as the Map files them. Water changes come from Home Assistant: the setting row
+`dashboard.koi_water` names each script that changes the water, one `<entity_id>|<percent>` line, and each run
+in Home Assistant's history (it keeps ten days) is one change of that percent. When the history holds a change
+the pond's log lacks, the view posts `POST /api/home/koi/water`, which writes it once. The view shows days since
+the last change, the percent replaced in the last 7 days and the weekly average over 28.
+Each sync stores the window it covered on the pond. Changes are kept only while the view is opened within Home
+Assistant's ten days, and there is no scheduled collector: a sync whose window starts after the last one ended
+records the gap, and a total whose window it reaches reads "incomplete since" the gap's start date.

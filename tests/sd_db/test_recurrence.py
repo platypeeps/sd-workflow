@@ -280,6 +280,15 @@ class RecurringTasks(unittest.TestCase):
         spawned = self.complete(plain["id"], "2026-01-01")["next_occurrence"]
         self.assertIsNone(self.row(spawned)["fields"])
 
+    def test_the_next_occurrence_keeps_the_home_asset_it_tends(self):
+        # pack sd:8053: a plant's care task names its asset in fields.asset;
+        # the next occurrence tends the same asset, so the map's overdue mark
+        # follows the series.
+        item = self.capture(recurrence="FREQ=WEEKLY")
+        set_item_fields(self.db, item["id"], fields={"area": "home", "asset": 7, "score": 3})
+        spawned = self.complete(item["id"], "2026-01-01")["next_occurrence"]
+        self.assertEqual(json.loads(self.row(spawned)["fields"] or "{}"), {"area": "home", "asset": 7})
+
     def test_a_completion_anchor_restarts_the_series_at_the_completion(self):
         # The PRD's example: `every 10 days`, completed 2026-03-05, next falls
         # due 2026-03-15 whatever the due date was. Drifts by design.
