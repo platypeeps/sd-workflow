@@ -3,17 +3,20 @@
 from __future__ import annotations
 
 import copy
+import http.client
 import os
+import socket
 import sqlite3
 import tempfile
 import unittest
+import urllib.error
 from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
-from sd_db import connect, jira_moves, priority_sweep, progress, workflow
+from sd_db import connect, jira_moves, priority_sweep, progress, shadow_jira, workflow
 from sd_db.migrate import initialise
 from sd_db.shadow_jira import _http, settings
 from sd_db.shadow_sync import sync
@@ -22,6 +25,20 @@ from sd_db.writes import create_item, transition
 from .test_shadow_jira import JIRA_ENV, RawServer, jira_transport
 
 STATUS = {"To Do": "new", "In Progress": "indeterminate", "Done": "done"}
+
+
+def refused(code: int, reason: str = "Refused") -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("https://jira.example.test/x", code, reason, None, None)  # type: ignore[arg-type]
+
+
+def sentence(exception: BaseException) -> str:
+    """The error the real transport gives for `exception`: its classification is what these tests rest on."""
+    opener = MagicMock()
+    opener.open.side_effect = exception
+    with patch("sd_db.shadow_jira.urllib.request.build_opener", return_value=opener):
+        payload, error = _http("https://jira.example.test/rest/api/3/issue/ABC-7", {}, None)
+    assert payload is None and error
+    return error
 
 
 class FakeJira:
@@ -33,9 +50,13 @@ class FakeJira:
         #: (key, "status" or "transitions") -> the answer that replaces Jira's own.
         self.malformed = malformed or {}
         self.posted: list[tuple[str, str]] = []
+        #: key -> the error every request about that ticket gets.
+        self.down: dict[str, str] = {}
 
     def __call__(self, url, headers, body):
         key = url.split("/issue/")[1].split("/")[0].split("?")[0]
+        if key in self.down:
+            return None, self.down[key]
         if self.fail:
             return None, self.fail
         which = "status" if url.endswith("?fields=status") else "transitions" if body is None else ""
@@ -103,13 +124,152 @@ class TheMoves(unittest.TestCase):
     def test_a_failure_is_one_note_on_the_item_and_the_cursor_moves_on(self):
         jira = FakeJira({"ABC-7": "To Do"})
         jira_moves.run(self.db, jira, JIRA_ENV)
-        jira.fail = "Jira returned 500 Server Error"
+        jira.fail = "Jira returned 400 Bad Request"
         transition(self.db, self.item, "done", who="operator")
         jira_moves.run(self.db, jira, JIRA_ENV)
         self.assertEqual(self.notes(self.item),
-                         ["Jira ticket ABC-7 was not moved to match done: Jira returned 500 Server Error"])
+                         ["Jira ticket ABC-7 was not moved to match done: Jira returned 400 Bad Request"])
         jira_moves.run(self.db, jira, JIRA_ENV)
         self.assertEqual(len(self.notes(self.item)), 1)
+
+    def linked(self, *keys):
+        return [create_item(self.db, kind="task", title=key, source="task-ref", external_id=f"jira:{key}") for key in keys]
+
+    def held_then_moved_once(self, exception):
+        jira = FakeJira({"ABC-7": "To Do"})
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        held = jira_moves.read_cursor(self.db)
+        transition(self.db, self.item, "done", who="operator")
+        jira.fail = sentence(exception)
+        lines = jira_moves.run(self.db, jira, JIRA_ENV)
+        self.assertEqual(jira_moves.read_cursor(self.db), held, "a transient failure holds the cursor")
+        self.assertEqual(self.notes(self.item), [], "a transient failure writes no note on the item")
+        self.assertEqual(lines, [f"jira moves: ABC-7: not moved, cursor held for the next run: {jira.fail}"])
+        jira.fail = None
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: moved to Done"])
+        self.assertEqual(jira.posted, [("ABC-7", "Done")])
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), [])
+
+    def test_a_503_holds_the_cursor_and_a_rerun_moves_the_ticket_once(self):
+        self.held_then_moved_once(refused(503, "Service Unavailable"))
+
+    def test_a_timeout_holds_the_cursor_and_a_rerun_moves_the_ticket_once(self):
+        self.held_then_moved_once(TimeoutError("timed out"))
+
+    def test_a_refused_connection_holds_the_cursor_and_a_rerun_moves_the_ticket_once(self):
+        self.held_then_moved_once(urllib.error.URLError(ConnectionRefusedError(61, "Connection refused")))
+
+    def test_a_dropped_connection_holds_the_cursor_and_a_rerun_moves_the_ticket_once(self):
+        self.held_then_moved_once(http.client.RemoteDisconnected("closed"))
+
+    def test_a_429_midway_keeps_the_earlier_move_and_resumes_at_the_failed_entry(self):
+        jira = FakeJira({"ABC-7": "To Do", "ABC-8": "To Do", "ABC-9": "To Do"})
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        eight, nine = self.linked("ABC-8", "ABC-9")
+        for item in (self.item, eight, nine):
+            transition(self.db, item, "done", who="operator")
+        limit = sentence(refused(429, "Too Many Requests"))
+        jira.down["ABC-8"] = limit
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV),
+                         ["jira moves: ABC-7: moved to Done",
+                          f"jira moves: ABC-8: not moved, cursor held for the next run: {limit}"])
+        self.assertEqual(jira.posted, [("ABC-7", "Done")], "the batch stops at the failure")
+        jira.down.clear()
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV),
+                         ["jira moves: ABC-8: moved to Done", "jira moves: ABC-9: moved to Done"])
+        self.assertEqual(jira.posted, [("ABC-7", "Done"), ("ABC-8", "Done"), ("ABC-9", "Done")])
+
+    def test_an_item_changed_on_both_sides_of_another_item_is_handled_once(self):
+        jira = FakeJira({"ABC-7": "To Do", "ABC-8": "To Do"})
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        [eight] = self.linked("ABC-8")
+        transition(self.db, self.item, "in_progress", who="operator")
+        transition(self.db, eight, "done", who="operator")
+        transition(self.db, self.item, "done", who="operator")
+        jira.down["ABC-7"] = sentence(refused(503))
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        self.assertEqual(jira.posted, [("ABC-8", "Done")], "entries run in the order of the note that decides them")
+        jira.down.clear()
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: moved to Done"])
+        self.assertEqual(jira.posted, [("ABC-8", "Done"), ("ABC-7", "Done")])
+
+    def test_a_timed_out_transition_that_landed_is_not_posted_again(self):
+        jira = FakeJira({"ABC-7": "To Do"})
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        transition(self.db, self.item, "done", who="operator")
+        timeout = sentence(TimeoutError("timed out"))
+
+        def landed(url, headers, body):
+            answer = jira(url, headers, body)
+            return (None, timeout) if body is not None else answer
+
+        jira_moves.run(self.db, landed, JIRA_ENV)
+        self.assertEqual(jira.posted, [("ABC-7", "Done")])
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: already Done"])
+        self.assertEqual(jira.posted, [("ABC-7", "Done")])
+
+    def test_a_permanent_failure_still_passes_and_notes_once(self):
+        for what, error in (("404", sentence(refused(404, "Not Found"))),
+                            ("409", sentence(refused(409, "Conflict"))),
+                            ("a body that does not parse", sentence(ValueError("no json")))):
+            with self.subTest(what):
+                [item] = self.linked("ABC-8")
+                self.addCleanup(self.db.execute, "DELETE FROM note WHERE item = ?", (item,))
+                jira = FakeJira({"ABC-7": "To Do", "ABC-8": "To Do"})
+                jira_moves.run(self.db, jira, JIRA_ENV)
+                jira.down["ABC-8"] = error
+                transition(self.db, item, "done", who="operator")
+                jira_moves.run(self.db, jira, JIRA_ENV)
+                self.assertEqual(self.notes(item), [f"Jira ticket ABC-8 was not moved to match done: {error}"])
+                self.assertEqual(jira_moves.read_cursor(self.db),
+                                 self.db.execute("SELECT MAX(id) FROM note").fetchone()[0] - 1,
+                                 "the cursor passes the failure, up to the status note before this comment")
+                jira_moves.run(self.db, jira, JIRA_ENV)
+                self.assertEqual(len(self.notes(item)), 1)
+                self.db.execute("UPDATE item SET external_id = 'jira:ABC-0' || id WHERE id = ?", (item,))
+
+    def test_no_matching_transition_still_passes_and_notes(self):
+        jira = FakeJira({"ABC-7": "To Do"}, malformed={("ABC-7", "transitions"): {"transitions": []}})
+        jira_moves.run(self.db, FakeJira({"ABC-7": "To Do"}), JIRA_ENV)
+        transition(self.db, self.item, "done", who="operator")
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        self.assertEqual(self.notes(self.item),
+                         ["Jira ticket ABC-7 was not moved to match done: no transition into Done is offered from To Do"])
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        self.assertEqual(len(self.notes(self.item)), 1)
+
+    def test_a_transient_failure_repeats_no_note_written_before_it(self):
+        jira = FakeJira({"ABC-7": "To Do", "ABC-8": "To Do"})
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        [eight] = self.linked("ABC-8")
+        transition(self.db, self.item, "done", who="operator")
+        transition(self.db, eight, "done", who="operator")
+        jira.down.update({"ABC-7": sentence(refused(404, "Not Found")), "ABC-8": sentence(refused(503))})
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        self.assertEqual(len(self.notes(self.item)), 1)
+        del jira.down["ABC-8"]
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-8: moved to Done"])
+        self.assertEqual(len(self.notes(self.item)), 1, "the note before the held cursor is not written again")
+
+    def test_a_crash_midway_repeats_no_note_written_before_it(self):
+        jira = FakeJira({"ABC-7": "To Do", "ABC-8": "To Do"})
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        [eight] = self.linked("ABC-8")
+        transition(self.db, self.item, "done", who="operator")
+        transition(self.db, eight, "done", who="operator")
+        jira.fail = "Jira returned 400 Bad Request"
+        real = workflow.add_item_note
+
+        def fails_on_the_second(connection, item, **options):
+            if item == eight:
+                raise sqlite3.OperationalError("database is locked")
+            return real(connection, item, **options)
+
+        with patch.object(workflow, "add_item_note", side_effect=fails_on_the_second):
+            with self.assertRaises(sqlite3.OperationalError):
+                jira_moves.run(self.db, jira, JIRA_ENV)
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        self.assertEqual((len(self.notes(self.item)), len(self.notes(eight))), (1, 1))
 
     def test_a_failed_token_check_holds_the_cursor(self):
         jira = FakeJira({"ABC-7": "To Do"}, fail="Jira rejected the credentials (401 Unauthorized)")
@@ -241,7 +401,7 @@ class TheMoves(unittest.TestCase):
         jira = FakeJira({"ABC-7": "To Do"})
         jira_moves.run(self.db, jira, JIRA_ENV)
         held = jira_moves.read_cursor(self.db)
-        jira.fail = "Jira returned 500 Server Error"
+        jira.fail = "Jira returned 400 Bad Request"
         transition(self.db, self.item, "done", who="operator")
         with patch.object(workflow, "add_item_note", side_effect=sqlite3.OperationalError("database is locked")):
             with self.assertRaises(sqlite3.OperationalError):
@@ -317,6 +477,21 @@ class ThePropertyOfTheAnswers(unittest.TestCase):
                                 self.assertIsInstance(said, str)
                                 for body in posted:
                                     self.assertRegex(body["transition"]["id"], r"\S")
+
+
+class TheFailureClasses(unittest.TestCase):
+    def test_the_transport_marks_what_a_later_run_can_retry(self):
+        transient = [refused(429), refused(500), refused(502), refused(503), refused(504), TimeoutError("timed out"),
+                     socket.gaierror(8, "no such host"), ConnectionResetError(54, "reset"),
+                     urllib.error.URLError(ConnectionRefusedError(61, "refused")), urllib.error.URLError("timed out"),
+                     http.client.RemoteDisconnected("closed"), http.client.IncompleteRead(b""),
+                     http.client.BadStatusLine("x"), urllib.error.URLError(http.client.RemoteDisconnected("closed"))]
+        permanent = [refused(400), refused(401), refused(403), refused(404), refused(409), refused(304),
+                     ValueError("no json"), RecursionError(), http.client.InvalidURL("bad"),
+                     urllib.error.URLError(http.client.InvalidURL("bad")), urllib.error.URLError(ValueError("bad"))]
+        for exception, wanted in [(e, True) for e in transient] + [(e, False) for e in permanent]:
+            with self.subTest(repr(exception)):
+                self.assertIs(isinstance(sentence(exception), shadow_jira.Transient), wanted)
 
 
 class TheEmptyAnswer(unittest.TestCase):

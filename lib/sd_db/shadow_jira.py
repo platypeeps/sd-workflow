@@ -337,6 +337,18 @@ class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class Transient(str):
+    """A failed request's sentence when a later attempt may work: a timeout, a lost connection, a 429 or a 5xx (sd:8117).
+
+    A `str`, so a caller that only says the sentence is unchanged; `jira_moves` asks which kind it holds.
+    """
+
+
+def _lost(error: BaseException) -> bool:
+    """Whether an exception caught below is the connection failing, not an answer or a URL that will fail again."""
+    return isinstance(error, http.client.HTTPException) and not isinstance(error, http.client.InvalidURL)
+
+
 def _http(url: str, headers: dict[str, str], body: dict | None):
     """The real transport: the seam's signature, over `urllib`."""
     try:
@@ -370,21 +382,24 @@ def _http(url: str, headers: dict[str, str], body: dict | None):
                 f"Jira redirected the request ({error.code} {error.reason}) and redirects "
                 f"are not followed with credentials; set {ENV_BASE} to the URL Jira answers on"
             )
-        return None, f"Jira returned {error.code} {error.reason}"
+        text = f"Jira returned {error.code} {error.reason}"
+        return None, Transient(text) if error.code == 429 or error.code >= 500 else text
     except (http.client.HTTPException, ValueError, RecursionError) as error:
         # Type only: `InvalidURL` and `urllib.parse`'s `ValueError` quote the
         # host, a secret pasted into it included, and `IncompleteRead` quotes
         # the bytes it did read. A body nested too deep for `json` is a
         # `RecursionError`, no answer either (sd:8117). Before the `OSError`
         # clause, because `RemoteDisconnected` is both.
-        return None, f"the request to Jira failed: {type(error).__name__}"
+        text = f"the request to Jira failed: {type(error).__name__}"
+        return None, Transient(text) if _lost(error) else text
     except (urllib.error.URLError, OSError) as error:
         # `URLError` quotes its reason, and that can be one of the exceptions
         # above, caught inside `urllib` and wrapped: type only for it too.
         reason = getattr(error, "reason", None)
         if isinstance(reason, (http.client.HTTPException, ValueError)):
-            return None, f"the request to Jira failed: {type(reason).__name__}"
-        return None, f"could not reach Jira: {type(error).__name__}: {error}"
+            text = f"the request to Jira failed: {type(reason).__name__}"
+            return None, Transient(text) if _lost(reason) else text
+        return None, Transient(f"could not reach Jira: {type(error).__name__}: {error}")
 
 
 def account_id(config: dict[str, str], transport=None) -> tuple[str, str]:

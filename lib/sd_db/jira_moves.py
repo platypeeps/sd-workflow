@@ -19,11 +19,18 @@ the priority sweep's closure. Neither is finished work, so each leaves the
 ticket as it is, and the sync says so. A done item whose stored fields
 cannot be read is unknown, so it fails rather than moves.
 
-A failure is one comment note on the item, and the cursor still moves past
-it, so a failure is said once, not every hour. Every field read from a Jira
-answer is checked, so a malformed answer is that item's failure too and the
-later moves continue. A Jira that is not configured moves nothing and holds
-the cursor.
+A permanent failure (a malformed answer, no matching transition, a 4xx) is
+one comment note on the item, and the cursor still moves past it, so it is
+said once, not every hour. Every field read from a Jira answer is checked,
+so a malformed answer is that item's failure too and the later moves
+continue. A transient failure (`shadow_jira.Transient`: a timeout, a lost
+connection, a 429 or a 5xx) stops the batch with no note: the cursor stays
+at the last entry fully handled, the run's lines say so, and the next run
+resumes at the failed entry. Entries run in the order of the note that
+decides them and the cursor is written after each, so neither a stop nor a
+crash repeats an earlier move or note. A ticket stuck on a transient error
+holds the later ones until it clears, and says so every hour. A Jira that
+is not configured moves nothing and holds the cursor.
 
 The first run has no cursor. It checks the token by listing the transitions
 of the newest linked ticket, read-only, and starts the cursor at the newest
@@ -40,6 +47,11 @@ import urllib.parse
 
 from . import shadow_jira
 from .writes import record_state, resolve_state
+
+
+class _Retry(Exception):
+    """A transient failure of one request: not a `ValueError`, so no per-item handler takes it."""
+
 
 #: The `checkpoint` key the cursor lives under: `{"note": <last note id read>}`.
 CURSOR = "jira-moves"
@@ -65,7 +77,7 @@ def _write_cursor(connection: sqlite3.Connection, note: int) -> None:
 
 
 def _linked(connection: sqlite3.Connection, after: int) -> tuple[list[dict], int]:
-    """The linked items with a status change after note `after`, one row each, and the newest note id read."""
+    """The linked items with a status change after note `after`, oldest deciding note first, and the newest note id read."""
     rows = connection.execute(
         "SELECT note.id AS note, note.body AS body, item.id AS item, item.status AS status,"
         " item.external_id AS ref, item.fields AS fields"
@@ -80,8 +92,14 @@ def _linked(connection: sqlite3.Connection, after: int) -> tuple[list[dict], int
         if found:
             # The newest note in the window wins: it is the one that set the item's status.
             items[row["item"]] = {"item": row["item"], "status": row["status"], "key": found[1],
-                                  "body": row["body"], "fields": row["fields"]}
-    return list(items.values()), newest
+                                  "body": row["body"], "fields": row["fields"], "note": row["note"]}
+    return sorted(items.values(), key=lambda entry: entry["note"]), newest
+
+
+def _stop(error: str) -> None:
+    """Raise for a failed request: `_Retry` for a transient one, `ValueError` for the rest; nothing for no error."""
+    if error:
+        raise _Retry(error) if isinstance(error, shadow_jira.Transient) else ValueError(error)
 
 
 def _issue(config: dict, key: str) -> str:
@@ -140,27 +158,28 @@ def _nobody_did(entry: dict) -> str:
 
 
 def move(config: dict, key: str, status: str, transport=None) -> str:
-    """Bring ticket `key` to the category of sd `status`: what was done, as a sentence; raises `ValueError`."""
+    """Bring ticket `key` to the category of sd `status`: what was done, as a sentence.
+
+    Raises `ValueError` for a permanent failure and `_Retry` for a transient one. A retry after a transition that
+    timed out but landed reads the ticket as already there and posts nothing.
+    """
     if status not in TARGET:
         return f"{key}: {status} moves nothing"
     category, name = TARGET[status]
     payload, error = shadow_jira._request(_issue(config, key) + "?fields=status", config, None, transport)
-    if error:
-        raise ValueError(error)
+    _stop(error)
     current, current_category = _state(_object(_object(payload, "issue").get("fields"), "fields").get("status"))
     if current_category == category:
         return f"{key}: already {current}"
     payload, error = shadow_jira._request(_issue(config, key) + "/transitions", config, None, transport)
-    if error:
-        raise ValueError(error)
+    _stop(error)
     offered = [offer for offer in _transitions(payload) if offer[2] == category]
     if not offered:
         raise ValueError(f"no transition into {name} is offered from {current}")
     chosen = next((offer for offer in offered if offer[1].lower() == name.lower()), offered[0])
     _, error = shadow_jira._request(_issue(config, key) + "/transitions", config,
                                     {"transition": {"id": chosen[0]}}, transport)
-    if error:
-        raise ValueError(error)
+    _stop(error)
     return f"{key}: moved to {chosen[1]}"
 
 
@@ -193,17 +212,24 @@ def run(connection: sqlite3.Connection, transport=None, environ=None) -> list[st
         _write_cursor(connection, newest)
         return [f"jira moves: no linked ticket; cursor starts at note {newest}"]
     items, newest = _linked(connection, cursor)
-    lines = []
+    lines: list[str] = []
+    at = cursor
     for entry in items:
         try:
             why = _nobody_did(entry)
             said = f"{entry['key']}: {why}; ticket left as it is" if why else move(
                 config, entry["key"], entry["status"], transport)
             lines.append("jira moves: " + said)
+        except _Retry as error:
+            lines.append(f"jira moves: {entry['key']}: not moved, cursor held for the next run: {error}")
+            return lines
         except ValueError as error:
             text = f"Jira ticket {entry['key']} was not moved to match {entry['status']}: {error}"
             workflow.add_item_note(connection, entry["item"], kind="comment", body=text, who=WHO)
             lines.append(f"jira moves: item {entry['item']}: {text}")
-    if newest != cursor:
+        # This entry is done for good: a stop or a crash at a later one repeats neither its move nor its note.
+        at = entry["note"]
+        _write_cursor(connection, at)
+    if newest != at:
         _write_cursor(connection, newest)
     return lines
