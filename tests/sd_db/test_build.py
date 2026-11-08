@@ -493,6 +493,20 @@ class Writes(Case):
                          "the run stays open for steps 7 and 8")
         self.assertFalse(build.enqueued(self.db, self.bundle["id"]), "enqueued once")
 
+    def test_an_enqueued_bundle_keeps_its_repository_slot_until_the_run_ends(self):
+        """Pack sd:8158: the lease goes at `enqueued`, but its pull request is open; a second bundle is a second PR."""
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        build.enqueued(self.db, self.bundle["id"])
+        build.queue(self.db, [self.item(), self.item(B)], who="operator")
+        available = build.room(self.db, **IDLE)
+        self.assertEqual(build.room_for(available, A), 0, "the open pull request holds A's one bundle")
+        self.assertGreater(build.room_for(available, B), 0, "another repo still has room")
+        self.assertEqual(available["machine"], build.MACHINE_CAP, "no builder runs: the machine slot is free")
+        self.assertEqual(self.claim()["repo"], B)
+        self.assertIsNone(self.claim(), "A's item waits for the next bundle")
+        build.end(self.db, self.bundle["id"], "done", "merged")
+        self.assertEqual(self.claim()["repo"], A, "the slot frees once the run ends")
+
     def test_reap_skips_enqueued_run(self):
         """Failure table, Enqueued: no supervisor while the run waits on the lane; reap leaves it open."""
         build.write(self.db, self.bundle["id"], step="enqueuing", supervisor_pid=4242, supervisor_start=START)
