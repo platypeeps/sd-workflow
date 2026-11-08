@@ -507,6 +507,42 @@ class Writes(Case):
         build.end(self.db, self.bundle["id"], "done", "merged")
         self.assertEqual(self.claim()["repo"], A, "the slot frees once the run ends")
 
+    def enqueue_draft(self):
+        url = "https://github.com/example/project/pull/5"
+        build.write(self.db, self.bundle["id"], step="enqueuing", detail=build.DRAFT_PULL + url)
+        self.assertTrue(build.enqueued(self.db, self.bundle["id"], held_by=build.DRAFT_PULL + url))
+
+    def test_an_unmanaged_draft_pull_request_frees_its_repository_slot(self):
+        """Pack sd:8158, blocker #49312: its owners may leave the draft open for weeks; no reap or cancel ends the run."""
+        self.enqueue_draft()
+        build.queue(self.db, [self.item()], who="operator")
+        available = build.room(self.db, **IDLE)
+        self.assertEqual(build.room_for(available, A), 1, "an open upstream draft stops no later build")
+        self.assertNotIn(A, available["used"])
+        self.assertEqual(self.claim()["repo"], A)
+
+    def test_an_ended_run_at_a_lane_step_holds_no_slot(self):
+        """Pack sd:8158, class pass: a reaped run stays unreleased until its groups read gone, which may be never."""
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        build.enqueued(self.db, self.bundle["id"])
+        self.db.execute("UPDATE runner_run SET step = 'cleaning', outcome = 'blocked' WHERE id = ?", (self.bundle["id"],))
+        self.assertEqual(build.room_for(build.room(self.db, **IDLE), A), 1)
+
+    def test_a_managed_run_keeps_its_slot_at_every_lane_step(self):
+        """Pack sd:8158: only a draft pull request frees the slot early; `reap` bounds the two supervised steps."""
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        build.enqueued(self.db, self.bundle["id"])
+        for step in build.LANE_STEPS:
+            with self.subTest(step=step):
+                self.db.execute("UPDATE runner_run SET step = ? WHERE id = ?", (step, self.bundle["id"]))
+                self.assertEqual(build.room_for(build.room(self.db, **IDLE), A), 0)
+
+    def test_a_draft_run_past_enqueued_holds_its_slot_until_it_cleans_up(self):
+        """Pack sd:8158: after the owners merge, `cleaning` runs under a supervisor in that worktree, so it counts."""
+        self.enqueue_draft()
+        self.db.execute("UPDATE runner_run SET step = 'cleaning' WHERE id = ?", (self.bundle["id"],))
+        self.assertEqual(build.room_for(build.room(self.db, **IDLE), A), 0)
+
     def test_reap_skips_enqueued_run(self):
         """Failure table, Enqueued: no supervisor while the run waits on the lane; reap leaves it open."""
         build.write(self.db, self.bundle["id"], step="enqueuing", supervisor_pid=4242, supervisor_start=START)

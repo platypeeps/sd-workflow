@@ -668,12 +668,14 @@ def room(connection, *, load: float | None, load_cap: float | None, interactive:
         (DRAFT,)).fetchall() if mine(row, hosts)]
     # A run at a lane step released its lease, but its pull request is open: it keeps its repository's slot
     # until it ends, or the next bundle opens a second pull request (pack sd:8158). It holds no machine slot.
+    # Not an ended run, nor a draft pull request: nothing here ends those, and its owners may never merge it.
     marks = ", ".join("?" for _ in LANE_STEPS)
     lane = [row for row in connection.execute(
-        f"SELECT runner_run.repo, runner_run.session_id, runner_run.owner FROM runner_run JOIN assignment "
+        f"SELECT runner_run.repo, runner_run.session_id, runner_run.owner, runner_run.step, runner_run.detail, "
+        f"runner_run.outcome FROM runner_run JOIN assignment "
         f"ON assignment.id = runner_run.assignment WHERE runner_run.released_at IS NULL "
-        f"AND assignment.scope = ? AND runner_run.step IN ({marks})",
-        (SCOPE, *LANE_STEPS)).fetchall() if mine(row, hosts)]
+        f"AND runner_run.outcome IS NULL AND assignment.scope = ? AND runner_run.step IN ({marks})",
+        (SCOPE, *LANE_STEPS)).fetchall() if mine(row, hosts) and draft_pull(dict(row)) is None]
     headless = {row["session_id"] for row in [*builds, *drafts, *lane] if row["session_id"]}
     used: dict[str, int] = {}
     for row in [*builds, *lane]:
