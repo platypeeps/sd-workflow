@@ -162,6 +162,12 @@ class TheMoves(unittest.TestCase):
     def test_a_dropped_connection_holds_the_cursor_and_a_rerun_moves_the_ticket_once(self):
         self.held_then_moved_once(http.client.RemoteDisconnected("closed"))
 
+    def test_an_expired_token_holds_the_cursor_and_a_rerun_moves_the_ticket_once(self):
+        self.held_then_moved_once(refused(401, "Unauthorized"))
+
+    def test_a_forbidden_token_holds_the_cursor_and_a_rerun_moves_the_ticket_once(self):
+        self.held_then_moved_once(refused(403, "Forbidden"))
+
     def test_a_429_midway_keeps_the_earlier_move_and_resumes_at_the_failed_entry(self):
         jira = FakeJira({"ABC-7": "To Do", "ABC-8": "To Do", "ABC-9": "To Do"})
         jira_moves.run(self.db, jira, JIRA_ENV)
@@ -481,12 +487,12 @@ class ThePropertyOfTheAnswers(unittest.TestCase):
 
 class TheFailureClasses(unittest.TestCase):
     def test_the_transport_marks_what_a_later_run_can_retry(self):
-        transient = [refused(429), refused(500), refused(502), refused(503), refused(504), TimeoutError("timed out"),
+        transient = [refused(401), refused(403), refused(429), refused(500), refused(502), refused(503), refused(504), TimeoutError("timed out"),
                      socket.gaierror(8, "no such host"), ConnectionResetError(54, "reset"),
                      urllib.error.URLError(ConnectionRefusedError(61, "refused")), urllib.error.URLError("timed out"),
                      http.client.RemoteDisconnected("closed"), http.client.IncompleteRead(b""),
                      http.client.BadStatusLine("x"), urllib.error.URLError(http.client.RemoteDisconnected("closed"))]
-        permanent = [refused(400), refused(401), refused(403), refused(404), refused(409), refused(304),
+        permanent = [refused(400), refused(404), refused(409), refused(304),
                      ValueError("no json"), RecursionError(), http.client.InvalidURL("bad"),
                      urllib.error.URLError(http.client.InvalidURL("bad")), urllib.error.URLError(ValueError("bad"))]
         for exception, wanted in [(e, True) for e in transient] + [(e, False) for e in permanent]:

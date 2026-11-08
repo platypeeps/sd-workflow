@@ -338,7 +338,10 @@ class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
 
 
 class Transient(str):
-    """A failed request's sentence when a later attempt may work: a timeout, a lost connection, a 429 or a 5xx (sd:8117).
+    """A failed request's sentence when a later attempt may work (sd:8117).
+
+    A timeout, a lost connection, a 429, a 5xx, or a 401 or 403: a token renewed later works, and every ticket
+    fails alike until it is.
 
     A `str`, so a caller that only says the sentence is unchanged; `jira_moves` asks which kind it holds.
     """
@@ -371,7 +374,7 @@ def _http(url: str, headers: dict[str, str], body: dict | None):
     except urllib.error.HTTPError as error:
         error.close()
         if error.code in (401, 403):
-            return None, (
+            return None, Transient(
                 f"Jira rejected the credentials ({error.code} {error.reason}); "
                 f"check {ENV_EMAIL} and {ENV_TOKEN}"
             )
