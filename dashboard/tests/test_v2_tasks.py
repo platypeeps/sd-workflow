@@ -1250,7 +1250,7 @@ change('det-area', 'home'); await flush(); R.set = ELS.details.html;
 await lastUndo().undo(); await flush();
 change('det-area', 'hoa'); await flush(); change('det-area', ''); await flush();""", self.AREA_ECHO)
         self.assertEqual(self.options(out["R"]["html"], "det-area"),
-                         [("", " selected", "None"), ("home", "", "Home"), ("hoa", "", "HOA")])
+                         [("", " selected", "None"), ("home", "", "Home"), ("hoa", "", "HOA"), ("personal", "", "Personal")])
         self.assertEqual(out["R"]["declined"], 0, "a declined confirm wrote nothing")
         self.assertIn(("home", " selected", "Home"), self.options(out["R"]["set"], "det-area"))
         bodies = [(p[0], {k: v for k, v in p[1].items() if k != "revision"}) for p in out["posts"]]
@@ -1263,6 +1263,21 @@ change('det-area', 'hoa'); await flush(); change('det-area', ''); await flush();
         msgs = [t[0] for t in out["toasts"]]
         self.assertIn(f"#{plan} area → Home · sd task edit {plan} --area home", msgs)
         self.assertIn(f"#{plan} area → none · sd task edit {plan} --clear-area", msgs)
+
+    def test_the_area_field_lists_personal_and_each_realm(self):
+        """pack sd:8062: Area offers None, Home, HOA, Personal and each dashboard.realms realm (SHELL_REALMS), and
+        a realm pick writes `sd task edit --area <id>`."""
+        plan = self.ids["plan"]
+        self.row("plan").update(area=None, area_set=False)
+        out = self.run_page(self.CHANGE + self.ASKED + f"""var YES = [true];
+open({plan}); await flush(); R.html = ELS.details.html;
+change('det-area', 'lab'); await flush();""", self.AREA_ECHO,
+                            prelude="globalThis.SHELL_REALMS = [{ id: 'work', label: 'Work' }, { id: 'lab', label: 'Lab' }];\n")
+        self.assertEqual(self.options(out["R"]["html"], "det-area"),
+                         [("", " selected", "None"), ("home", "", "Home"), ("hoa", "", "HOA"), ("personal", "", "Personal"),
+                          ("work", "", "Work"), ("lab", "", "Lab")])
+        self.assertEqual([p[1]["area"] for p in out["posts"]], ["lab"])
+        self.assertEqual(out["asked"][0][:3:2], [f"Area → Lab: #{plan}?", f"sd task edit {plan} --area lab"])
 
     def test_the_kind_changes_the_page_sends_are_ones_edit_item_takes(self):
         """sd:6231: the posts above, through `workflow.edit_item`: a followup becomes a task, and a task with a repo becomes

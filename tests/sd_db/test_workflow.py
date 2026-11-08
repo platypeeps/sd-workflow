@@ -23,6 +23,7 @@ from sd_db.workflow import (
     WorkflowError,
     add_item_note,
     allowed_statuses,
+    areas,
     capture_task,
     change_status,
     edit_item,
@@ -32,7 +33,13 @@ from sd_db.workflow import (
     resolve_item_note,
     schema_kinds,
 )
-from sd_db.writes import TransitionRefused, add_note, set_item_fields, transition
+from sd_db.writes import (
+    TransitionRefused,
+    add_note,
+    set_item_fields,
+    set_setting,
+    transition,
+)
 
 
 class WorkflowCase(unittest.TestCase):
@@ -175,12 +182,26 @@ class ItemArea(WorkflowCase):
         again = edit_item(self.db, item, {"area": None}, who="operator")
         self.assertEqual(again, cleared)
 
-    def test_an_area_other_than_home_or_hoa_is_refused_and_writes_nothing(self):
+    def test_an_area_other_than_home_hoa_personal_or_a_realm_is_refused_and_writes_nothing(self):
         state = self.capture()
-        for area in ("work", "personal", "Home", "", 1, True):
-            with self.subTest(area=area), self.assertRaisesRegex(WorkflowError, "area must be home or hoa"):
+        for area in ("work", "acme", "all", "Home", "", 1, True):
+            with self.subTest(area=area), self.assertRaisesRegex(
+                    WorkflowError, "area must be one of home, hoa, personal, or null"):
                 edit_item(self.db, state["item"]["id"], {"area": area}, who="operator")
             self.assertEqual(item_state(self.db, state["item"]["id"]), state)
+
+    def test_a_realm_id_of_the_dashboard_realms_setting_is_an_area(self):
+        """pack sd:8062: the areas are home, hoa, personal and the realm ids the
+        dashboard.realms row names, read when the edit runs, never a fixed list."""
+        self.assertEqual(areas(self.db), ("home", "hoa", "personal"))
+        set_setting(self.db, "dashboard.realms", "realm|work|Work|/repos/*\nrealm|work|Work|/w/*\n"
+                    "realm|lab|Lab|/lab\nrealm|hoa|Clash|/x\nnot a line\n")
+        self.assertEqual(areas(self.db), ("home", "hoa", "personal", "work", "lab"))
+        item = self.capture()["item"]["id"]
+        for area in ("work", "lab", "personal"):
+            self.assertEqual(item_area(edit_item(self.db, item, {"area": area}, who="operator")["item"]), area)
+        with self.assertRaisesRegex(WorkflowError, "area must be one of home, hoa, personal, work, lab, or null"):
+            edit_item(self.db, item, {"area": "acme"}, who="operator")
 
     def test_a_stale_revision_or_unreadable_fields_refuse_the_area(self):
         state = self.capture()
@@ -196,7 +217,8 @@ class ItemArea(WorkflowCase):
 
     def test_item_area_reads_only_a_known_area(self):
         for fields, area in ((None, None), ("", None), ("{}", None), ('{"area": "home"}', "home"),
-                             ('{"area": "hoa"}', "hoa"), ('{"area": "work"}', None), ("[1]", None),
+                             ('{"area": "hoa"}', "hoa"), ('{"area": "work"}', "work"),
+                             ('{"area": "Work"}', None), ('{"area": ""}', None), ("[1]", None),
                              ("not json", None), ('{"area": ["home"]}', None)):
             with self.subTest(fields=fields):
                 self.assertEqual(item_area({"fields": fields}), area)

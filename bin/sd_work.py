@@ -249,7 +249,7 @@ def _edit_changes(args: argparse.Namespace) -> dict[str, Any]:
         changes["branch"] = args.branch
     if args.clear_branch:
         changes["branch"] = None
-    # pack sd:8010: the item's own area, which the dashboard's Home or HOA tab
+    # pack sd:8010, sd:8062: the item's own area, which that dashboard tab
     # holds alone; `edit_item` keeps it in `fields` and refuses another value.
     if args.area is not None:
         changes["area"] = args.area
@@ -1624,9 +1624,11 @@ def register(groups: Any, store: Any) -> None:
     branch_group.add_argument("--clear-branch", action="store_true",
                               help="clear a stale branch name; an in_progress item takes --branch instead")
     area = edit.add_mutually_exclusive_group()
-    area.add_argument("--area", choices=("home", "hoa"),
-                      help="show the item only in the dashboard's Home or HOA tab, whatever its "
-                           "checkout; not in Personal or a realm tab")
+    # pack sd:8062: the areas are home, hoa, personal and the dashboard.realms
+    # ids, so `edit_item` checks the value when the edit runs, not argparse.
+    area.add_argument("--area", metavar="AREA",
+                      help="show the item only in that dashboard Tasks tab, whatever its checkout: "
+                           "home, hoa, personal or a dashboard.realms id")
     area.add_argument("--clear-area", action="store_true",
                       help="drop the item's own area, so its checkout places it again")
     # `--belongs-to` and not `--repo`: see `_belongs_to`. `--no-repo` is the
