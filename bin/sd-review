@@ -2329,7 +2329,7 @@ def covered(outcomes: Sequence[Outcome]) -> list[Outcome]:
     native = next((outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)), None)
     if native is None:
         return list(outcomes)
-    return [outcome._replace(status=outcome.diagnostic["answered"], detail=f"{outcome.detail}; {native} read them")
+    return [outcome._replace(status=(outcome.diagnostic or {})["answered"], detail=f"{outcome.detail}; {native} read them")
             if (outcome.diagnostic or {}).get("coverage") == "partial" and outcome.status == UNAVAILABLE else outcome
             for outcome in outcomes]
 
