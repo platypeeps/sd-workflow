@@ -14,9 +14,11 @@ from sd_db.writes import add_note, resolve_note
 NOW = datetime(2026, 10, 29, 15, 0, tzinfo=timezone.utc)
 
 
-def pull(number, *, decision=None, mergeable="MERGEABLE", rollup="SUCCESS", repo="example/widget"):
+def pull(number, *, decision=None, mergeable="MERGEABLE", rollup="SUCCESS", repo="example/widget", draft=False,
+         created="2026-10-29T14:00:00Z", reviews=0):
     return {"url": f"https://github.com/{repo}/pull/{number}", "number": number, "title": f"Pull {number}",
             "repository": {"nameWithOwner": repo}, "reviewDecision": decision, "mergeable": mergeable,
+            "isDraft": draft, "createdAt": created, "reviews": {"totalCount": reviews},
             "commits": {"nodes": [{"commit": {"statusCheckRollup": {"state": rollup} if rollup else None}}]}}
 
 
@@ -33,8 +35,9 @@ class Gh:
     """
 
     def __init__(self, author=(), requested=(), fail=None, count=None, contexts=None, checks_fail=None,
-                 checks_code=0):
+                 checks_code=0, mentioned=()):
         self.author, self.requested, self.fail, self.count = list(author), list(requested), fail, count
+        self.mentioned = list(mentioned)
         self.contexts, self.checks_fail, self.checks_code, self.checks_asked = contexts or {}, checks_fail, \
             checks_code, 0
 
@@ -44,7 +47,8 @@ class Gh:
         query = next((value[2:] for value in argv if value.startswith("q=")), None)
         if query is None:
             return self.checks(next(value[6:] for value in argv if value.startswith("query=")))
-        nodes = self.author if "author:@me" in query and "is:pr is:open" in query else \
+        nodes = self.mentioned if "mentions:@me" in query else \
+            self.author if "author:@me" in query and "is:pr is:open" in query else \
             self.requested if "user-review-requested:@me" in query else []
         if self.fail and nodes is self.requested:
             return 1, "", self.fail
@@ -76,7 +80,7 @@ class Alerts(unittest.TestCase):
         self.addCleanup(self.db.close)
 
     def run_(self, gh, now=NOW):
-        found, complete, reason = pr_attention.read(gh)
+        found, complete, reason = pr_attention.read(gh, now=now)
         return pr_attention.alert(self.db, found, complete, now=now), reason
 
     def reports(self):
@@ -161,7 +165,7 @@ class Alerts(unittest.TestCase):
         for contexts in ([optional], [optional, {"state": "SUCCESS", "isRequired": True}]):
             with self.subTest(contexts=contexts):
                 found, complete, reason = pr_attention.read(
-                    Gh(author=[pull(7, decision="APPROVED", rollup="FAILURE")], contexts={7: contexts}))
+                    Gh(author=[pull(7, decision="APPROVED", rollup="FAILURE")], contexts={7: contexts}), now=NOW)
                 self.assertEqual((found, complete, reason), ({}, True, ""))
 
     def test_a_red_required_check_still_raises_checks_failing(self):
@@ -170,7 +174,7 @@ class Alerts(unittest.TestCase):
             with self.subTest(red=red):
                 gh = Gh(author=[pull(7, rollup="FAILURE")],
                         contexts={7: [{"conclusion": "FAILURE", "isRequired": False}, red]})
-                found, complete, reason = pr_attention.read(gh)
+                found, complete, reason = pr_attention.read(gh, now=NOW)
                 self.assertEqual((sorted(found), complete, reason), ([f"checks_failing {url}"], True, ""))
 
     def test_an_alert_for_an_optional_red_check_clears(self):
@@ -198,11 +202,11 @@ class Alerts(unittest.TestCase):
                 with self.subTest(contexts=contexts, code=code):
                     found, complete, reason = pr_attention.read(Gh(
                         author=[pull(7, decision="APPROVED", rollup="FAILURE"), pull(8, rollup="FAILURE")],
-                        contexts={7: contexts, 8: optional}, checks_code=code))
+                        contexts={7: contexts, 8: optional}, checks_code=code), now=NOW)
                     self.assertEqual((sorted(found), complete, reason), ([f"checks_failing {seven}"], True, ""),
                                      "pull 8's verdict still holds")
         found, complete, reason = pr_attention.read(Gh(author=[pull(7, rollup="FAILURE"), pull(8, rollup="FAILURE")],
-                                                       contexts={8: optional}, checks_fail="HTTP 502"))
+                                                       contexts={8: optional}, checks_fail="HTTP 502"), now=NOW)
         self.assertEqual((sorted(found), complete, reason),
                          ([f"checks_failing {seven}", f"checks_failing {eight}"], True, ""))
 
@@ -227,7 +231,7 @@ class Alerts(unittest.TestCase):
 
     def test_a_pull_with_no_red_rollup_asks_no_checks_query(self):
         gh = Gh(author=[pull(1), pull(2, rollup="PENDING"), pull(3, rollup=None)], requested=[pull(4, rollup="FAILURE")])
-        pr_attention.read(gh)
+        pr_attention.read(gh, now=NOW)
         self.assertEqual(gh.checks_asked, 0, "the extra call is made only for an authored pull with a red rollup")
 
     def test_a_failed_or_cut_read_files_what_it_read_and_clears_nothing(self):
@@ -277,6 +281,32 @@ class Alerts(unittest.TestCase):
         done, reason = self.run_(Gh(author=[pull(7, rollup=None)]))
         self.assertEqual((sorted(done["cleared"]), reason), ([f"checks_failing {url}", f"conflict {url}"], ""),
                          "a present commit with no rollup is a read: its checks cleared")
+
+    def test_anothers_pull_that_mentions_you_alerts_once_and_a_review_request_wins(self):
+        # sd:8142 (operator 2026-11-08): another's open pull naming you by @mention is an alert; one per pull, so a
+        # pull that also asks your review files only that.
+        other = "https://github.com/example/other/pull/9"
+        both = "https://github.com/example/other/pull/10"
+        done, reason = self.run_(Gh(mentioned=[pull(9, repo="example/other"), pull(10, repo="example/other")],
+                                    requested=[pull(10, repo="example/other")]))
+        self.assertEqual((sorted(done["filed"]), reason), (sorted([f"mentioned {other}", f"review_requested {both}"]), ""))
+        self.assertIn(("pr-attention: example/other#9: you are mentioned", "planning", f"mentioned {other}"),
+                      self.reports())
+        done, _ = self.run_(Gh(requested=[pull(10, repo="example/other")]))
+        self.assertEqual(done["cleared"], [f"mentioned {other}"])
+
+    def test_your_pull_with_no_review_after_24_hours_waits_on_reviewers(self):
+        # sd:8142: your open, non-draft pull with no review 24 h after it opened is one alert; a review clears it.
+        url = "https://github.com/example/widget/pull/5"
+        day = "2026-10-28T15:00:00Z"
+        quiet = [pull(5, created="2026-10-28T15:00:01Z"), pull(6, created=day, draft=True), pull(7, created=day, reviews=1)]
+        done, _ = self.run_(Gh(author=quiet))
+        self.assertEqual(done["filed"], [], "under 24 h, a draft, or a reviewed pull waits on no one yet")
+        done, _ = self.run_(Gh(author=[pull(5, created=day)]))
+        self.assertEqual(done["filed"], [f"waiting_on_reviewers {url}"])
+        self.assertEqual(self.reports()[-1][0], "pr-attention: example/widget#5: waiting on reviewers, no review in 24 h")
+        done, _ = self.run_(Gh(author=[pull(5, created=day, reviews=1)]))
+        self.assertEqual(done["cleared"], [f"waiting_on_reviewers {url}"])
 
     def test_the_sync_reports_its_alerts_and_an_alert_failure_never_fails_it(self):
         result = _sync(self.db, now=NOW, runner=Gh(requested=[pull(7)]), alerts=True)

@@ -1264,7 +1264,7 @@ def _pr_attention(connection: sqlite3.Connection, runner, moment: datetime, budg
     budget.remaining -= len(pr_attention.SEARCHES)
     budget.requests += len(pr_attention.SEARCHES)
     try:
-        found, complete, reason = pr_attention.read(runner, timeout=min(GH_TIMEOUT_SECONDS, left))
+        found, complete, reason = pr_attention.read(runner, timeout=min(GH_TIMEOUT_SECONDS, left), now=moment)
         done = pr_attention.alert(connection, found, complete, now=moment)
     except (SdDbError, sqlite3.Error, OSError, ValueError) as error:
         return [f"pull request alerts not filed: {error}"]
