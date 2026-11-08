@@ -78,7 +78,7 @@ def beat_session(payload: dict, environ: dict[str, str]) -> None:
         if payload.get("hook_event_name") == "SessionEnd":
             sessions.end(connection, session)
             return
-        found = sessions.worktrees(sessions.touched(payload))
+        found = sessions.worktrees(sessions.touched(payload), connection)
         sessions.beat(connection, session, machine=this_host(), cwd=payload.get("cwd"), found=found)
     finally:
         connection.close()

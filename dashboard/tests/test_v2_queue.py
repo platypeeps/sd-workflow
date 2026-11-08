@@ -1238,7 +1238,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertEqual(out["R"]["open"][0], ["system:true", "alpha:false", "sd:false"])
         self.assertEqual(out["R"]["open"][1], ["working"] * 3 + ["merging", "next", "next", "blocked", "blocked"])
         self.assertEqual(out["R"]["again"], [["system:false", "alpha:false", "sd:false"], []])
-        self.assertEqual(out["gets"], ["/api/now", "/api/queue", "/api/queue/builds?show=all", "/api/queue/runner"])
+        self.assertEqual(out["gets"], ["/api/now", "/api/queue", "/api/queue/builds?show=all", "/api/queue/runner", "/api/tasks"])
 
     def test_repos_order_by_merging_then_the_other_counts_then_name(self):
         # pack sd:7679 (operator 2026-11-05): the busiest repo first, compared box by box in the boxes' order (merging,
@@ -1681,14 +1681,13 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         # Turned on from off, Suggested reads the tasks; a tasks read that failed is said, not taken as no task.
         on = self.run_view("R.before = OUT.gets.slice(); press('suggested'); await flush(); await flush(); await flush();"
                            f" R.ready = cmd('item.status.ready').when({{ id: '{loose}' }});", answers=answers)
-        self.assertNotIn("/api/tasks", on["R"]["before"], "off, the view reads no tasks")
-        self.assertIn("/api/tasks", on["gets"])
+        self.assertIn("/api/tasks", on["R"]["before"], "off, the view reads tasks for All items' count (pack sd:8127)")
         self.assertEqual(on["R"]["ready"], True)
         failed = self.run_view("R.note = ELS['queue-note'].textContent;", search="?show=suggested",
                                answers={"/api/tasks": [500, {"error": "tasks down"}]})
         self.assertIn("Suggested items' tasks not read", failed["R"]["note"])
 
-    # pack sd:7271 (#40961): All items adds the repo's other open items, read from /api/tasks only while it is on. Each
+    # pack sd:7271 (#40961): All items adds the repo's other open items, read from /api/tasks (always, pack sd:8127). Each
     # is an item row as a suggested one is, and its act is the one Tasks' list row offers: the move to its next status.
     def open_items(self):
         from sd_dashboard import tasks_screen
@@ -1702,12 +1701,11 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
             answers[f"/api/tasks/{n}"] = [200, tasks_screen.details(self.connection, n, now=NOW)]
         return made, answers
 
-    def test_all_items_adds_the_repos_other_open_items_read_from_tasks_only_while_on(self):
+    def test_all_items_adds_the_repos_other_open_items_read_from_tasks(self):
         made, answers = self.open_items()
         out = self.run_view("R.before = OUT.gets.slice(); press('open'); await flush(); await flush(); open('system');"
                             " R.kids = kids(); R.html = ELS.queue.html; R.filters = ELS['queue-filters'].html;", answers=answers)
-        self.assertNotIn("/api/tasks", out["R"]["before"], "off, the view reads no tasks")
-        self.assertIn("/api/tasks", out["gets"])
+        self.assertIn("/api/tasks", out["R"]["before"], "off, the view reads tasks for the count (pack sd:8127)")
         self.assertEqual(out["urls"], [{"show": "open"}])
         self.assertIn('data-f="qshow" data-v="open" aria-pressed="true"', out["R"]["filters"])
         self.assertIn("All items", out["R"]["filters"])
@@ -1765,9 +1763,22 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
 
     # pack sd:7251: a filter's count counts its rows in every repo, also a repo that shows only while the filter is on.
     def test_each_filter_counts_the_rows_of_repos_it_would_add(self):
-        out = self.run_view("R.filters = ELS['queue-filters'].html;")
+        from sd_dashboard import tasks_screen
+        out = self.run_view("R.filters = ELS['queue-filters'].html;",
+                            answers={"/api/tasks": [200, tasks_screen.document(self.connection, now=NOW)]})
         counts = dict(re.findall(r'data-v="(\w+)" aria-pressed="false">[^<]+<span class="n">(\d+)</span>', out["R"]["filters"]))
         self.assertEqual(counts, {"suggested": "5", "open": "0", "ended": "3"})
+
+    # pack sd:8127: with All items off, its tile still counts the open items it would show; its rows stay hidden, and a
+    # failed tasks read shows no count rather than 0.
+    def test_all_items_off_counts_its_open_items_on_the_tile(self):
+        made, answers = self.open_items()
+        out = self.run_view("open('system'); R.kids = kids(); R.filters = ELS['queue-filters'].html;", answers=answers)
+        counts = dict(re.findall(r'data-v="(\w+)" aria-pressed="false">[^<]+<span class="n">(\d+)</span>', out["R"]["filters"]))
+        self.assertEqual(counts.get("open"), "2", "blocked and in progress count; done does not")
+        self.assertNotIn("open", out["R"]["kids"])
+        failed = self.run_view("R.filters = ELS['queue-filters'].html;", answers={"/api/tasks": [500, {"error": "tasks down"}]})
+        self.assertRegex(failed["R"]["filters"], r'data-v="open" aria-pressed="false">All items</button>')
 
     # pack sd:7251 (#41066): with Suggested off, All items shows the ready items Suggested would; on, each shows once.
     def test_all_items_alone_shows_the_ready_items_suggested_holds(self):
