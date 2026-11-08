@@ -206,8 +206,8 @@ cmd_shots() {
 }
 
 cmd_koi_sync() {
-  # One Koi water-change sync (sd:8077), for the daily job that keeps Home
-  # Assistant's changes past its recorder's ten days: `home_koi.main`.
+  # One Koi water-change sync (sd:8077): `home_koi.main`. Nothing here
+  # schedules it; a daily local-cron-jobs job on the hub does (system sd:8080).
   runtime_python="${SD_DASHBOARD_PYTHON:-$RUNTIME_PYTHON_DEFAULT}"
   if [ ! -x "$runtime_python" ]; then
     echo "dashboard: missing installed runtime $runtime_python" >&2
@@ -283,8 +283,8 @@ usage: dashboard.sh tile <tab> | serve | preflight | install | health | grants |
                    the checkout's HEAD, naming the kickstart line, or when
                    the installed LaunchAgent's PATH no longer finds sd
   koi-sync         one Koi water-change sync from Home Assistant into the
-                   pond's log, for a daily job; prints {added}, exits 1
-                   naming a refusal
+                   pond's log; prints {added}, exits 1 naming a refusal.
+                   Not scheduled here: run it from a daily cron job
   grants           probe the vault under DASHBOARD_PYTHON and under
                    SD_DASHBOARD_PYTHON, one line per path, naming the one
                    that lacks Full Disk Access. Takes no arguments. Exits 1

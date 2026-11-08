@@ -21,8 +21,9 @@ has none. Each sync stores `fields.water_synced` `{since, to}`: `since` is the f
 latest sync. When a sync's proven start falls after the last `to`, the days between were purged unread; the gap goes to
 `fields.water_gaps`. A total reads "incomplete since" the first unproven day its window reaches: before `since`, in a
 stored gap, or in the days since the last sync the recorder already purged. The view syncs when the log lacks a change
-or the last sync is older than `SYNC_HOURS`. A daily job runs the same sync with nobody on the page (sd:8077):
-`dashboard.sh koi-sync`, `main` here.
+or the last sync is older than `SYNC_HOURS`. `dashboard.sh koi-sync` (`main` here, sd:8077) runs the same sync
+from a shell. The pack schedules nothing: a daily `local-cron-jobs` job on the hub runs it (system sd:8080); until
+one does, a change is kept only if the view or a hand run syncs within the recorder's days.
 """
 
 from __future__ import annotations
@@ -316,8 +317,8 @@ def log_test(payload: dict, *, now: str):
 
 
 def main(argv=None) -> int:
-    """`dashboard.sh koi-sync` (sd:8077): one `log_water` on the default store, for a daily job, so Home Assistant's
-    changes are kept even when nobody opens the Koi view within the recorder's `KEEP_DAYS`. 0 with `{added}` on
+    """`dashboard.sh koi-sync` (sd:8077): one `log_water` on the default store. Run daily by a scheduler (the pack
+    ships none; system sd:8080 adds the job), it keeps Home Assistant's changes past the recorder's `KEEP_DAYS`. 0 with `{added}` on
     stdout; 1 with the refusal on stderr (no pond, no scripts, Home Assistant down); 2 for an argument."""
     import sys
 

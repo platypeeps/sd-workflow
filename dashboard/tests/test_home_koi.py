@@ -127,7 +127,7 @@ class TheKoi(ScreenCase):
         self.assertEqual(assets.get_asset(self.connection, self.pond["id"])["fields"]["tests"][0]["date"], "2026-09-06")
 
     def test_the_daily_sync_logs_the_changes_with_nobody_on_the_page(self):
-        """sd:8077: `dashboard.sh koi-sync` runs log_water once on the default store, for a daily job."""
+        """sd:8077: `dashboard.sh koi-sync` runs log_water once on the default store; a scheduler runs it daily."""
         import contextlib
         import io
 
