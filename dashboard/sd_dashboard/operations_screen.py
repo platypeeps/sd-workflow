@@ -24,12 +24,12 @@ MOVED = {"services": ("/management#view=deploys", "Services: Management, Deploys
          "sessions": ("/management#view=sessions", "Sessions: Management, Sessions"),
          "usage": ("/metrics#view=spend", "Usage: Metrics, Spend"),
          "resources": ("/management#view=machine", "Resources: Management, Machine; research, vault and queues on "
-                                                   "Repos, Notes and Tasks"),
+                                                   "Repos, Notes and Today"),
          "trackers": ("/github#view=tracked", "Trackers: GitHub, Tracked")}
 #: Resources' views and the page that holds each now (pack sd:7527): `?area=resources&resource=<view>` answers 301
 #: there, and a bare or unknown one to Toolbox's, the view Resources opened on.
 MOVED_RESOURCES = {"toolbox": "/management#view=machine", "research": "/management?research=yes#view=repos",
-                   "vault": "/notes", "queues": "/tasks?queues=open"}
+                   "vault": "/notes", "queues": "/today"}
 
 
 def assignment_cancel(connection, identity: int):

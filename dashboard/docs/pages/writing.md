@@ -35,6 +35,15 @@ button per option or a box for words; each answer posts
 is answered, posts Fix with `{"grill": "apply"}`: claude edits the draft to
 follow each ruling and leaves the edit uncommitted.
 
+Bulk Decline (sd:8014) sits on the Ideas and Tips columns. Its
+button names what the defaults move: "Decline N below score 6 older
+than 30 days". It asks first, takes another score and age, and posts the
+rows it names, with their revisions, to `/api/triage/decline`
+(`triage.decline`). Only the press declines; no job does. The Declined
+filter, off until pressed, lists each declined row with when and by
+which control. Declined rows have no Restore yet: the vault rules give
+declined no move out.
+
 The Ideas column (pack sd:7244) is `ideas` in the same read: the
 `sdw.blog-idea` rows at stage inbox, read with `records.list_rows`, highest
 score first. It shows `IDEAS` of them with the inbox count in its header and

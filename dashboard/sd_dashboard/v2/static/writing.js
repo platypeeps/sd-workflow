@@ -122,6 +122,19 @@ addEventListener('DOMContentLoaded', () => {
   // pack sd:7670: the Ideas column's Area tile, '' for none pressed; writing_screen.AREAS.
   const IDEA_AREAS = ['Personal', 'Work', 'RWBP'];
   let ideaArea = '';
+  // sd:8014: each vault queue's bulk Decline, and its Declined filter, off until pressed: the declined rows with when
+  // and by which control. The sd-writing rules give declined no move out, so a row comes back only by a vault edit.
+  const QUEUE = { ideas: ['blog-idea', 'Blog Ideas inbox'], tips: ['tip', 'Tips inbox'] };
+  const queueObj = (col, Q) => ({ id: `queue:${QUEUE[col][0]}`, type: 'queue', kind: QUEUE[col][0], label: QUEUE[col][1], scored: true, pool: Q.pool || [] });
+  const declinedOn = { ideas: false, tips: false };
+  function queueTools(col, Q) {
+    if (Q.state !== 'read') return '';
+    const o = queueObj(col, Q), n = (Q.declined || []).length, on = declinedOn[col], none = !window.commands.declinePick(o).rows.length;
+    return html`<div class="queue-tools"><button class="btn sm risky" type="button" data-cmd="queue.decline" data-obj="${o.id}"${none ? html` disabled title="no row is that old and low"` : ''}>${window.commands.declineLabel(o)}</button>
+      <button class="btn quiet sm" type="button" data-declined="${col}" aria-pressed="${String(on)}">Declined <span class="n">${n}</span></button></div>
+      ${on ? html`<ul class="declined" aria-label="Declined ${QUEUE[col][1]}">${(Q.declined || []).map(r => html`<li><span class="t">#${r.item} ${r.title}</span> <span class="why">declined ${r.at ? html`<time datetime="${r.at}">${ago(r.at)}</time>` : 'at a time not recorded'}${r.by ? ` by ${r.by}` : ''}</span></li>`)}${n ? '' : html`<li class="empty">Nothing declined.</li>`}</ul>
+        <p class="why">No Restore here: the vault rules have no move out of declined; edit the row's status in the vault to bring it back.</p>` : ''}`;
+  }
   const keep = () => { const v = window.shell.aside.param(parked); return v ? { parked: v } : {}; };
   function card(p) {
     const L = gates(p), st = worst(L);
@@ -148,15 +161,23 @@ addEventListener('DOMContentLoaded', () => {
     const ofWhat = !ideaArea ? `${I.count} inbox ideas` : ideaArea === 'none' ? `${nArea('none')} ideas with no area` : `${nArea(ideaArea)} ${ideaArea} ideas`;
     const idea = i => html`<article class="card idea" aria-label="Idea: ${i.title}"><div class="top"><span class="id">${i.created || ''}</span>${i.area ? html`<span class="area">${i.area}</span>` : ''}<span class="tag">${i.score == null ? 'no score' : `${i.score}/10`}</span></div>
       <div class="t">${i.href ? html`<a class="ext" href="${i.href}" target="_blank" rel="noopener noreferrer">${i.title}</a>` : i.title}</div></article>`;
-    const ideaCol = html`<div class="col vault" data-drop="stage:ideas">
+    const ideaCol = html`<div class="col vault" id="ideas" data-drop="stage:ideas">
       <header><span class="label">Ideas · vault</span>${I.state === 'read' ? html`<span class="n" title="inbox ideas in the vault">${I.count}</span>` : html`<span class="n" title="vault ideas not read">—</span>`}</header>
       ${I.state === 'read' && I.count ? html`<div class="idea-areas">${window.shell.list.fseg('area', 'Area', areaTiles.map(([a, w]) => ({ v: a, pressed: ideaArea === a,
         title: `${w}: ${nArea(a)}`, label: html`${w} <span class="n">${nArea(a)}</span>` })))}</div>` : ''}
-      <div><p class="refusal" role="note"></p><div class="drop">
+      <div>${queueTools('ideas', I)}<p class="refusal" role="note"></p><div class="drop">
         ${I.state === 'read' ? html`${ideasShown.map(idea)}<p class="empty">${I.count ? `Highest ${ideasShown.length} of ${ofWhat}.` : 'No idea in the vault inbox.'} <a href="/tasks?base=blog-idea">Tasks</a> lists them all.</p>`
           : html`<p class="empty">Not read: ${I.reason}</p>`}
       </div></div></div>`;
-    put(document.getElementById('view-board'), html`<div class="board" id="board" role="listbox" aria-label="Pieces by stage">${ideaCol}${STAGES.map(([s, name]) => {
+    // sd:8013: the inbox tips beside the ideas, the home Today's Tips link opens; no piece drops here.
+    const T = D?.tips || { state: 'unknown', reason: 'the read gave no tips', rows: [] };
+    const tipCol = html`<div class="col vault" id="tips">
+      <header><span class="label">Tips · vault</span>${T.state === 'read' ? html`<span class="n" title="inbox tips in the vault">${T.count}</span>` : html`<span class="n" title="vault tips not read">—</span>`}</header>
+      <div>${queueTools('tips', T)}<div class="drop">
+        ${T.state === 'read' ? html`${T.rows.slice(0, T.top || T.rows.length).map(idea)}<p class="empty">${T.count ? `Highest ${Math.min(T.count, T.top || T.count)} of ${T.count} inbox tips.` : 'No tip in the vault inbox.'} <a href="/tasks?base=tip">Tasks</a> lists them all.</p>`
+          : html`<p class="empty">Not read: ${T.reason}</p>`}
+      </div></div></div>`;
+    put(document.getElementById('view-board'), html`<div class="board" id="board" role="listbox" aria-label="Pieces by stage">${ideaCol}${tipCol}${STAGES.map(([s, name]) => {
       const rows = v.filter(p => p.stage === s);
       return html`<div class="col" data-drop="stage:${s}">
         <header><span class="label">${name}</span><span class="n">${rows.length}</span></header>
@@ -374,6 +395,7 @@ addEventListener('DOMContentLoaded', () => {
     window.commands.applyReview('piece', { item: o => P_(o).id,
       ready: o => { const p = P_(o); return !p ? 'not listed' : reviewed(p); },
       post: fixPost, again: fixAgain }),
+    window.commands.decline({ post: (path, body) => window.shell.post(path, body).then(out => { reading?.reread(); return out; }, e => { reading?.load(); throw e; }) }),
   ];
   // A piece's review that lands rewrites adversarial.md, so the page reads again for its time.
   document.addEventListener('adversarial:run', e => { if (e.detail.run.kind === 'piece' && e.detail.run.filed) reading?.reread(); });
@@ -424,6 +446,8 @@ addEventListener('DOMContentLoaded', () => {
   document.addEventListener('shell:open', e => { if (byId(e.detail)) select(e.detail, true); });
   document.addEventListener('shell:picked', e => document.querySelectorAll('.card[data-id]').forEach(c => c.toggleAttribute('data-picked', e.detail.includes(c.dataset.id))));
   document.getElementById('view-board').addEventListener('click', e => {
+    const q = e.target.closest?.('[data-declined]');
+    if (q) { declinedOn[q.dataset.declined] = !declinedOn[q.dataset.declined]; renderBoard(); return; }
     const c = e.target.closest?.('[data-f="area"]'); if (!c) return;
     ideaArea = ideaArea === c.dataset.v ? '' : c.dataset.v;
     renderBoard();
@@ -478,8 +502,8 @@ addEventListener('DOMContentLoaded', () => {
   function subhead() {
     const sub = document.getElementById('subhead');
     if (!D) { sub.textContent = 'The pieces were not read.'; return; }
-    // Each realm's tab carries its pieces (sd:5524).
-    (window.PAGE_VIEWS || []).forEach(v => window.shell.view?.count(v.id, (D.pieces || []).filter(p => inRealm(p, v.id)).length));
+    // Each realm's tab carries its open pieces (sd:5524, sd:8018): not a published or declined one.
+    (window.PAGE_VIEWS || []).forEach(v => window.shell.view?.count(v.id, (D.pieces || []).filter(p => !['published', 'declined'].includes(p.stage) && inRealm(p, v.id)).length));
     sub.textContent = `Read ${String(D.read).slice(11, 16)} UTC · ` + (view === 'board' ? 'Pieces by stage.' : 'Focused editor: the draft on the left, its evidence on the right.');
   }
   // Board and Editor are the layout menu Tasks uses (shell.viewPick, sd:5641): one icon button; its menu lists the two.
@@ -560,7 +584,8 @@ addEventListener('DOMContentLoaded', () => {
       // Each repo once, with the realm that claims it: "sd-writing under Work".
       const label = id => (window.PAGE_VIEWS || []).find(v => v.id === id)?.label || id;
       const claimed = ps => [...new Map(ps.filter(p => p.realm).map(p => [p.repo, `${p.repo} under ${label(p.realm)}`])).values()].join(', ');
-      return { objects: pieces.map(p => ({ id: String(p.id), type: 'piece', label: `#${p.id} ${p.title}` })),
+      const queues = Object.keys(QUEUE).filter(col => doc[col]?.state === 'read').map(col => queueObj(col, doc[col]));
+      return { objects: [...pieces.map(p => ({ id: String(p.id), type: 'piece', label: `#${p.id} ${p.title}` })), ...queues],
         state: pieces.length ? null : REALM === 'personal' && (doc.pieces || []).length
           ? { kind: 'empty', title: 'No personal pieces', source: '/api/writing', text: known
             ? `Pieces from a repo a realm claims show in that realm: ${claimed(doc.pieces)}. dashboard.realms on Settings decides which repos each realm claims.`

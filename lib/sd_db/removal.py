@@ -116,6 +116,8 @@ REFERENCES = {
     ("cost", "assignment"): "I4: refused",
     ("runner_run", "assignment"): "I6: released runs removed",
     ("runner_lease", "run"): "I6: released leases removed",
+    ("vote", "repo"): "P7: refused while a vote names the repo (pack sd:8050)",
+    ("vote", "item"): "I11: refused while a vote links the item (pack sd:8050)",
 }
 
 #: The one record-marker predicate, shared with sd:755 (C-19). It tests that
@@ -365,6 +367,8 @@ def _item(connection, item, *, queue, pending):
                 f" AND (after IN ({_marks(ids)}) OR parent IN ({_marks(ids)})) ORDER BY id", (item, *ids, *ids)):
             refusals.append(_refusal("I5", "assignment", child["id"],
                                      f"assignment {child['id']} on another item waits on or was spawned by this item's work"))
+    for vote in _votes(connection, "SELECT key, repo FROM vote WHERE item=? ORDER BY repo, key", (item,)):
+        refusals.append(_refusal("I11", "vote", vote["key"], f"vote {vote['key']} in {_quoted(vote['repo'])} links item {item}"))
     for note in notes:
         if note["kind"] in ("followup", "question") and note["resolved_at"] is None:
             refusals.append(_refusal("I7", "note", note["id"], f"note {note['id']} is an unresolved {note['kind']}"))
@@ -398,6 +402,13 @@ def _item(connection, item, *, queue, pending):
             refusals.append(_refusal("I10", "state", queue,
                                      f"the {QUEUE} checkpoint has a pending entry {_quoted(entry.get('key'))} naming item {item}"))
     return {"item": [row], "note": notes, "assignment": assignments}, refusals
+
+
+def _votes(connection, sql, arguments):
+    """`vote` rows, or none on a store before migration 048, which a preview may read (pack sd:8050)."""
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='vote'").fetchone() is None:
+        return []
+    return connection.execute(sql, arguments).fetchall()
 
 
 def _runs(connection, assignments):
@@ -734,6 +745,8 @@ def _plan_repo(connection, path, *, with_items, home):
         refusals.append(_refusal("P2", "repo", path, f"repo {_quoted(path)} has pieces_source retiring"))
     tables = {"repo": [row], "repo_protection": _rows(connection, "SELECT * FROM repo_protection WHERE repo=?", (path,)),
               "item": [], "note": [], "assignment": []}
+    refusals += [_refusal("P7", "vote", key, f"vote {key} names repo {_quoted(path)}; a vote has no other copy")
+                 for (key,) in _votes(connection, "SELECT key FROM vote WHERE repo=? ORDER BY key", (path,))]
     items = [ident for (ident,) in connection.execute("SELECT id FROM item WHERE repo=? ORDER BY id", (path,))]
     malformed = []
     if items and not with_items:

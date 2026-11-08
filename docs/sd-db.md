@@ -1,7 +1,7 @@
 # The workflow database: hub, lane host and judgments
 
 `bin/sd-db` runs the workflow database's verbs from this checkout's `lib/`.
-This page covers the hub and its satellites, the refusals, the lane host, `judgments`, the review queue, the item kinds, and renaming a repository by hand.
+This page covers the hub and its satellites, the refusals, the lane host, `judgments`, the review queue, the item kinds, board votes, and renaming a repository by hand.
 The module docstrings under `lib/sd_db/` hold the detail.
 
 ## One hub, many satellites: `serve` and `hub.json`
@@ -642,6 +642,16 @@ The row is the source of truth: no counter or time decides a difference, because
 - `released` lists the runs whose open leases a restore of that snapshot would release.
 - It writes only its temporary copies, so it runs off the hub; `restore_newest` still refuses there.
 
+## `sd votes`: board votes
+
+`sd votes add|edit|list|show|import` keeps a board's votes in the `vote` table, one row per vote, keyed by its checkout and a key such as `CI-1` (pack sd:8050).
+Run it from the checkout, or name one with `--belongs-to PATH`; `list`, `show` and the writes take `--json`.
+`import FILE` loads a CSV with `votes.csv`'s columns in one transaction: a key the checkout holds is updated, and a second run changes nothing.
+It refuses the whole file for a header that lacks a column or names one twice, and for a row with fewer cells than the header: either would blank stored text.
+`votes` keeps the cell as written; `tally` is each director's answer read from it, or none when the cell does not read whole.
+An outcome starting `pending` makes a vote open unless `--state` says otherwise; `edit --if-revision N` refuses a vote that changed.
+The HOA page's Votes view reads them, open votes first.
+
 ## Renaming a repository
 
 There is no rename verb (sd:3172).
@@ -650,7 +660,7 @@ Otherwise `bin/sd-db backup` stops with "runner row ... differs from the backup 
 
 1. Stop the lanes, the dashboard and `sd-serve`, then run `bin/sd-db backup`.
 2. In one transaction, change the old key (`~/repos/old`) to the new one in `repo.path` and every `repo` column:
-   `item`, `cost`, `repo_protection`, `runner_lease`, `runner_run` (its `detached_from` too) and `shadow`.
+   `item`, `cost`, `repo_protection`, `runner_lease`, `runner_run` (its `detached_from` too), `shadow` and `vote`.
    `SELECT m.name, p.name FROM sqlite_master m, pragma_table_info(m.name) p
    WHERE m.type = 'table' AND p.name LIKE '%repo%'` lists the columns.
 3. Rewrite each file in `runner-journal/` beside `sd.db` whose `record.repo` names the old repository, by its key or its absolute path.

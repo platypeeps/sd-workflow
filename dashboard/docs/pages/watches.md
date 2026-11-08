@@ -13,6 +13,11 @@ a date as fresh past that bound. The document also carries the job's
 launchd state, its last run's stamp and the last line the run printed, so a
 failed run says why.
 
+Bulk Decline (sd:8014) on the candidates moves those older than 30 days
+(a market row has no score) to declined, after it asks. A declined row
+says when and by which control, from its stage note; Restore brings one
+back.
+
 Refresh all is Run now on the job: it posts `/api/jobs/market-watch/retry`
 with the job's revision, as Management and HOA run a job. Refresh, on one
 active watch, runs `watch.refresh` through `/api/actions/run`: claude starts

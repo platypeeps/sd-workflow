@@ -820,6 +820,12 @@ TB.querySelector = () => TB.querySelectorAll()[0] || null;"""
         for heading in ("Acknowledge clean reports", "Also on the classic Resources screen"):
             self.assertNotIn(heading, page)
 
+    def test_the_reports_tab_counts_open_reports_only(self):
+        """sd:8018: an acknowledged report stays on the list but leaves the tab's count."""
+        out = self.run_page("R.counts = OUT.counts; R.shown = shown.length; R.open = shown.filter(r => r.open).length;")
+        self.assertGreater(out["R"]["shown"], out["R"]["open"], "the fixture needs an acknowledged report")
+        self.assertEqual(out["R"]["counts"]["reports"], out["R"]["open"], "sd:8018: the tab counted an acknowledged report")
+
     def test_a_job_with_a_report_that_needs_action_stays_in_the_short_cadence_table(self):
         """A job whose log shows no gap is still listed while its newest report needs action (the rows key byJob by job)."""
         doc = json.loads(json.dumps(self.doc))
@@ -1018,7 +1024,7 @@ R.p = ['job:weekly-scan', 'job:nightly-sync'].map(id => [C.get(id).failed, !!c.p
                             + " R.st2 = F.status; R.bar3 = ELS.filters.html;"
                             + "ELS.filters.listeners.click[0]({ target: { closest: s => s === '[data-fclear]' ? {} : null } });"
                             + " R.bar4 = ELS.filters.html; R.url4 = String(OUT.urls[OUT.urls.length - 1]); R.tally4 = OUT.counts.reports;"
-                            + " R.F = [F.job, F.status, F.q, (OUT.shift ?? null)]; R.n = shown.length; R.all = ROWS.length;",
+                            + " R.F = [F.job, F.status, F.q, (OUT.shift ?? null)]; R.n = shown.length; R.all = ROWS.length; R.open = ROWS.filter(r => r.open).length;",
                             prelude="location.search = '?job=nightly-sync&act=1&q=sync';")
         R, all_ = out["R"], out["R"]["all"]
         bar = R["bar"]
@@ -1039,7 +1045,7 @@ R.p = ['job:weekly-scan', 'job:nightly-sync'].map(id => [C.get(id).failed, !!c.p
         self.assertNotIn('data-fclear', R["bar4"])
         self.assertTrue(R["bar4"].endswith('<div class="fsum"></div></div>'))
         self.assertEqual(R["url4"], "")
-        self.assertEqual(R["tally4"], all_)
+        self.assertEqual(R["tally4"], R["open"], "sd:8018: the tab counts the open rows shown")
         self.assertEqual(R["F"], ["", "", "", ""])
         self.assertEqual(R["n"], all_)
 

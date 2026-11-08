@@ -94,11 +94,15 @@ def _job(connection, backend) -> dict:
 
 
 def document(connection, *, now: str, jobs=None) -> dict:
-    """`/api/watches`: the market rows in the store's order, the page sorts them, and the market-watch job."""
+    """`/api/watches`: the market rows in the store's order, the page sorts them, and the market-watch job. `pool` and
+    `declined` are the candidates' bulk Decline and each declined row's when and by (sd:8014)."""
     from sd_db import reads, records
+
+    from . import triage
 
     today = datetime.fromisoformat(now.replace("Z", "+00:00")).date()
     rows = records.list_rows(connection, "market")
     revisions = reads.revisions(connection, [row["id"] for row in rows]) if rows else {}
     return {"read": now, "today": today.isoformat(), "stale_days": STALE_DAYS,
-            "rows": [_row(row, today, revisions[row["id"]]) for row in rows], "job": _job(connection, jobs)}
+            "rows": [_row(row, today, revisions[row["id"]]) for row in rows], "job": _job(connection, jobs),
+            "pool": triage.pool(connection, "market", now=now), "declined": triage.declined(connection, "market")}

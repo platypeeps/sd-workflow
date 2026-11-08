@@ -22,8 +22,8 @@ document for it.
 ## When to use
 
 Use when the source meaning is settled and the user wants a Slack message or
-canvas, Notion page, internal memo, announcement, briefing, YouTube outline, or a
-short personal-blog version of a published article.
+canvas, Notion page, Google Doc or Sheet, internal memo, announcement, briefing,
+YouTube outline, or a short personal-blog version of a published article.
 The output is a destination-specific draft, adaptation ledger, safety review,
 preview, and connector-ready handoff.
 
@@ -39,7 +39,7 @@ identify them before reading sources, profile content, or workspace artifacts.
 
 - `input=` — approved source artifact or bounded approved source set;
 - `audience=` — intended readers and their assumed context;
-- `destination=slack-message|slack-canvas|notion-page|memo|announcement|briefing|youtube-outline|blog-short`;
+- `destination=slack-message|slack-canvas|notion-page|google-doc|google-sheet|memo|announcement|briefing|youtube-outline|blog-short`;
 - `objective=` — what the destination draft should enable;
 - `tone=` — explicit voice guidance; never invent a personal or corporate voice;
 - `constraints=` — length, required sections, links, confidentiality,
@@ -77,6 +77,14 @@ identify them before reading sources, profile content, or workspace artifacts.
      only when supplied, links, and update status;
    - **Notion page** — descriptive title, structured sections, source metadata,
      durable links, and navigation-friendly headings;
+   - **Google Doc** — a native Doc, never pasted Markdown or HTML: descriptive
+     title, heading styles for structure, source metadata, and durable links.
+     The handoff names the Drive folder only when supplied; per the publication
+     contract, Drive receives only a document designated for it;
+   - **Google Sheet** — a native Sheet, for tabular content only: one header
+     row with units, one record per row, values not formulas for sourced facts,
+     no merged cells, and a source column of ledger IDs on every row. Prose that
+     does not fit rows goes to a companion Google Doc or the handoff, not a cell;
    - **Memo** — decision context, evidence, implications, recommendation or
      request when present in the source, and explicit limitations;
    - **Announcement** — audience relevance, what changed, effective timing only

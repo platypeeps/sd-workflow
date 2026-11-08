@@ -15,7 +15,7 @@
 --
 --   BEGIN;
 --   DROP TABLE home_asset;
---   PRAGMA user_version = 47;
+--   PRAGMA user_version = 48;
 --   COMMIT;
 
 CREATE TABLE home_asset (

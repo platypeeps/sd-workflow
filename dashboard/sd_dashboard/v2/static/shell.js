@@ -718,6 +718,9 @@
   const thenable = v => !!v && typeof v.then === 'function';
   const textOf = (v, fallback) => (typeof v === 'string' && v) || (v && typeof v.text === 'string' && v.text) || fallback;
   const undoOne = (c, o, v) => Promise.resolve().then(() => c.undo(o, v));
+  // A run that throws is refused like a rejected promise, so the shell toasts why: a confirm resolves later, and a row
+  // that left the page meanwhile made run(o) throw inside its then, where the error was lost (sd:8035).
+  const runOne = (c, o, v) => { try { return c.run ? c.run(o, v) : ''; } catch (e) { return Promise.reject(e); } };
   // askFirst is a flag or a test of the object (commands.md): Retry asks only after exit 127 (sd:3392). A safe command that
   // asks confirms first; a function is never itself a yes.
   const asksFirst = (c, o) => typeof c.askFirst === 'function' ? !!c.askFirst(o) : !!c.askFirst;
@@ -863,16 +866,19 @@
   function confirmAction({ title, body: text = '', cli = '', ok = 'Confirm', keep = 'Keep it', danger = true, fields = [] }) {
     let from = null;
     const line = v => typeof cli === 'function' ? cli(v) : cli;
+    // sd:8014: a body may follow the fields, as the CLI line does: the bulk Decline names the rows the typed values move.
+    const say = v => typeof text === 'function' ? text(v) : text;
     return new Promise(done => {
       put(confirmDlg, html`<form method="dialog" class="confirm-body">
-        <h2 id="confirm-h">${title}</h2>${CLOSE_X}${text ? html`<p>${text}</p>` : ''}
+        <h2 id="confirm-h">${title}</h2>${CLOSE_X}${say({}) ? html`<p id="confirm-said">${say({})}</p>` : ''}
         ${fields.map(fieldOf)}
         ${line({}) ? html`<div class="cli"><code id="confirm-cli">${line({})}</code></div>` : ''}
         <div class="actions"><button class="btn quiet" value="no" formnovalidate data-cancel>${keep}</button><button class="btn${danger ? ' danger' : ''}" value="yes">${ok}</button></div></form>`);
       const f = confirmDlg.querySelector('form'), yes = f.querySelector('[value="yes"]');
       const values = () => Object.fromEntries(fields.map(x => [x.name, f.elements[x.name].value.trim()]));
       const filled = () => fields.every(x => !x.required || values()[x.name]);
-      const show = () => { const c = f.querySelector('#confirm-cli'); if (c) c.textContent = line(values()); yes.disabled = !filled(); };
+      const show = () => { const c = f.querySelector('#confirm-cli'), b = f.querySelector('#confirm-said');
+        if (c) c.textContent = line(values()); if (b) b.textContent = say(values()); yes.disabled = !filled(); };
       if (fields.length) {
         f.addEventListener('input', show); show();
         f.addEventListener('keydown', e => { if (e.key !== 'Enter' || e.isComposing || e.target.tagName !== 'INPUT') return; e.preventDefault(); if (!yes.disabled) f.requestSubmit(yes); });
@@ -889,7 +895,7 @@
   const actOf = (c, o) => /\s/.test(c.label.trim()) ? c.label : `${c.label} ${o.type}`;
   function run(c, o) {
     const go = v => {
-      const msg = c.run ? c.run(o, v) : '';
+      const msg = runOne(c, o, v);
       if (thenable(msg)) { settleOne(c, o, msg, { toast }); return document.dispatchEvent(new CustomEvent('shell:ran', { detail: { cmd: c.id, obj: o.id } })); }
       if (msg === null) return document.dispatchEvent(new CustomEvent('shell:ran', { detail: { cmd: c.id, obj: o.id, form: true } })); // opened a form
       const text = msg || `${c.label} · ${o.label}`;
@@ -905,7 +911,7 @@
     const fields = c.fields ? c.fields(o) : [];
     if (c.previews || (c.risk !== 'confirm' && !asksFirst(c, o) && !fields.length)) return go();
     const act = actOf(c, o);
-    confirmAction({ title: `${act}: ${o.label}?`, body: c.consequence ? c.consequence(o) : '', cli: v => { const s = cliOf(c, o, v); return noCli(s) ? '' : s; }, ok: act, keep: /^cancel\b/i.test(act) ? 'Keep it' : 'Cancel', danger: c.danger ? !!c.danger(o) : c.risk === 'confirm', fields })
+    confirmAction({ title: `${act}: ${o.label}?`, body: c.consequence ? v => c.consequence(o, v) : '', cli: v => { const s = cliOf(c, o, v); return noCli(s) ? '' : s; }, ok: act, keep: /^cancel\b/i.test(act) ? 'Keep it' : 'Cancel', danger: c.danger ? !!c.danger(o) : c.risk === 'confirm', fields })
       .then(({ yes, from, values }) => { if (!yes) return; go(values); const a = document.activeElement; if (!a || a === body) refocus(from); });
   }
 

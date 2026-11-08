@@ -88,6 +88,9 @@ COLUMNS = {
     "skill_use": {"key": "cwd", "none": "id timestamp skill surface mode"},
     "state": {"key": "key", "history": "body", "none": "id kind timestamp resolved_at"},
     "trial": {"none": "id skill started expires"},
+    # pack sd:8050: a vote's text is the board's record, kept as written.
+    "vote": {"key": "repo", "history": "topic motion type moved seconded votes tally outcome follow_up source notes",
+             "none": "id key date state item revision created_at updated_at"},
 }
 
 
@@ -225,9 +228,10 @@ class TheMigration(AThirteenStore):
                 self.assertEqual(under, [], f"{table}.{column}")
         for table in ("note", "assignment", "judgment", "publication_claim"):
             self.assertEqual(after[table], self.before[table], table)
-        # 019 adds `request_outcome` after 014, empty.
+        # 019 adds `request_outcome` after 014, empty, and 048 `vote`.
         self.assertEqual(after.pop("request_outcome"), [])
-        # 048 adds `home_asset` after 014, empty.
+        self.assertEqual(after.pop("vote"), [])
+        # 049 adds `home_asset` after 014, empty.
         self.assertEqual(after.pop("home_asset"), [])
         self.assertEqual({table: len(value) for table, value in after.items()},
                          {table: len(value) for table, value in self.before.items()})
@@ -265,8 +269,10 @@ class TheMigration(AThirteenStore):
         # `status_source` back at `row`, which every row here held, and 025's
         # puts `satellite_gate` back so 020's can drop it. 041's goes first of
         # all: the one later column on `item`, whose rows this compares, after
-        # 048's `home_asset` table, 044's `shadow` merge columns, 043's `note.harness_session` and 042's build columns on `runner_run`.
-        connection.executescript(reverse_script("048_home_asset.sql"))
+        # 049's `home_asset` table, 048's `vote` table, 044's `shadow` merge columns,
+        # 043's `note.harness_session` and 042's build columns on `runner_run`.
+        connection.executescript(reverse_script("049_home_asset.sql"))
+        connection.executescript(reverse_script("048_vote.sql"))
         connection.executescript(reverse_script("044_shadow_merge_state.sql"))
         connection.executescript(reverse_script("043_note_harness_session.sql"))
         connection.executescript(reverse_script("042_runner_run_build.sql"))
@@ -512,10 +518,12 @@ EQUALITY_LOOKUPS = {
                  "write the row path "
                  "they read through `paths.keys` in the same transaction; `seed_clones` the path `row_for` or `add` gave; "
                  "`mine_issues` and `intake_issues` match `shadow.repo`, a slug"),
-    "removal.py": (7, "`_plan_repo` rebinds `path` to the row `row_for` found; `_detach` reads it off the plan"),
+    "removal.py": (8, "`_plan_repo` rebinds `path` to the row `row_for` found, and P7's vote lookup binds it; "
+                   "`_detach` reads it off the plan"),
     "runner.py": (6, "every argument is an item or run row's `repo`"),
     "runner_exec.py": (1, "the item row's `repo`"),
     "ship.py": (1, "the item row's `repo`"),
+    "votes.py": (2, "`_get` and `rows` bind the row path `_stored` read through `repos.row_for`"),
     "writes.py": (3, "`upsert_repo`, whose guard refuses an unconverted path, writes and reads back its row "
                   "(pack sd:7366); `settle_shadow` "
                   "sets `shadow.repo`, a slug, and looks nothing up by it"),

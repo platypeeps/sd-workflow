@@ -103,7 +103,7 @@ aerial's ImageServer answers one `exportImage` for that square at full resolutio
 with the geocode under `<state>/system/home-map/`, so the county is asked once per address;
 `GET /api/home/map/aerial` serves it. A failed read names its reason, and the assets still draw on a plain ground.
 
-Assets are rows of the workflow database's `home_asset` table (migration 48, `sd_db.assets`): a kind, a name, a
+Assets are rows of the workflow database's `home_asset` table (migration 49, `sd_db.assets`): a kind, a name, a
 point or a line in the same feet, a fields object and a photo address. Add: press Add, pick a kind, click the map
 (a line kind takes a click per point, then Finish line), fill the short form (a plant or tree offers species,
 planted, sun, water, zone and notes). Drag a point to move it. A row or a mark opens its form: Save, Delete, and

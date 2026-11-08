@@ -38,6 +38,7 @@ from sd_db import (
     workflow,
     writes,
 )
+from sd_db import votes as sd_votes
 from support import NOW, ScreenCase, before_5648
 from test_now_screen import JobsBackend
 from test_v2_tasks import SHELL, STAND_IN
@@ -667,7 +668,7 @@ class TheRoutes(BrowserSession):
             # HOA's Tasks view is /api/hoa's items, so HOA has no tasks read of its own.
             self.assertEqual(self.request("/api/hoa/tasks", headers={"Cookie": self.cookie})[0], 404)
             for area in places.AREAS:
-                for view in ("tasks", "briefs", "reports") if area == "home" else ("briefs", "reports"):
+                for view in ("tasks", "briefs", "reports") if area == "home" else ("briefs", "reports", "votes"):
                     path = f"/api/{area}/{view}"
                     self.assertEqual(self.request(path)[0], 403, path)
                     status, _, body = self.request(path, headers={"Cookie": self.cookie})
@@ -684,7 +685,8 @@ class ThePlaceScript(Fixture):
     """places.js on the HOA and Home pages: the switch, and each view reading its own document only when shown."""
 
     #: The views each page's markup declares: [id, label, api]. HOA's Tasks is drawn by hoa.js, so it reads nothing here.
-    VIEWS = {"hoa": [["overview", "Overview", None], ["tasks", "Tasks", None], ["briefs", "Briefs", "/api/hoa/briefs"], ["reports", "Reports", "/api/hoa/reports"]],
+    VIEWS = {"hoa": [["overview", "Overview", None], ["tasks", "Tasks", None], ["briefs", "Briefs", "/api/hoa/briefs"], ["reports", "Reports", "/api/hoa/reports"],
+                     ["votes", "Votes", "/api/hoa/votes"]],
              "home": [["overview", "Overview", None], ["tasks", "Tasks", "/api/home/tasks"], ["briefs", "Briefs", "/api/home/briefs"], ["reports", "Reports", "/api/home/reports"]],
              # A realm place (place.html, sd:6162): every view reads its own document, the Overview too.
              "acme": [[v, v.title(), f"/api/place/acme/{v}"] for v in ("overview", "tasks", "briefs", "reports")]}
@@ -714,9 +716,39 @@ const go = async hash => { VIEW = hash.replace('#view=', ''); document.dispatchE
         return out
 
     def docs(self, area="hoa"):
-        more = {"tasks": {}, "briefs": {"config": self.config}, "reports": {"config": self.config, "jobs": self.jobs}}
+        more = {"tasks": {}, "briefs": {"config": self.config}, "reports": {"config": self.config, "jobs": self.jobs}, "votes": {}}
         return {f"/api/{area}/{view}": [200, getattr(places, view)(self.connection, area, now=NOW, **more[view])]
-                for view in ("tasks", "briefs", "reports")}
+                for view in ("tasks", "briefs", "reports", *(("votes",) if area == "hoa" else ()))}
+
+
+    # pack sd:8050: HOA's Votes view: Open | All, open votes first, read-only.
+    def test_the_votes_view_shows_open_votes_and_all_adds_the_closed_ones_with_each_column(self):
+        sd_votes.add(self.connection, self.hoa, "CI-1", {"date": "2026-10-02", "topic": "Crime policy",
+                     "motion": "Buy the <crime> policy.", "type": "email vote", "moved": "Ada", "seconded": "Ben",
+                     "votes": "Ada, Ben Yes; Cy No", "outcome": "adopted", "source": "mail 1"})
+        sd_votes.add(self.connection, self.hoa, "PG-1", {"date": "2026-09-29", "topic": "Inventory hours",
+                     "motion": "Approve the hours.", "votes": "not recorded", "outcome": "pending: not sent"})
+        out = self.run_page(self.ACTS + """await go('#view=votes'); R.open = ELS['votes-rows'].html; R.tally = ELS['votes-tally'].html;
+seg('votes', 'all'); await flush(); R.all = ELS['votes-rows'].html;""", self.docs())
+        r = out["R"]
+        self.assertEqual(out["gets"], ["/api/hoa/votes"])
+        self.assertIn("PG-1", r["open"])
+        self.assertNotIn("CI-1", r["open"])
+        self.assertIn('Open <span class="n">1</span>', r["open"])
+        self.assertIn('All <span class="n">2</span>', r["open"])
+        self.assertLess(r["all"].index("PG-1"), r["all"].index("CI-1"))
+        for part in ("Crime policy", "Buy the &lt;crime&gt; policy.", "email vote", "Ada / Ben", "Yes: Ada, Ben", "No: Cy",
+                     "adopted", "mail 1", "not recorded", "2026-10-02"):
+            self.assertIn(part, r["all"], part)
+        self.assertIn('<table class="ledger place-rows" data-toolbar="votes-filters">', r["all"])
+        self.assertIn("1 open vote", r["tally"])
+
+    def test_no_vote_and_no_open_vote_say_which(self):
+        out = self.run_page("await go('#view=votes'); R.none = ELS['votes-rows'].html;", self.docs())
+        self.assertIn("No vote is recorded for the hoa checkout.", out["R"]["none"])
+        sd_votes.add(self.connection, self.hoa, "CI-1", {"outcome": "adopted"})
+        out = self.run_page("await go('#view=votes'); R.closed = ELS['votes-rows'].html;", self.docs())
+        self.assertIn("No open vote. All lists the 1 closed vote.", out["R"]["closed"])
 
     def test_a_click_on_a_row_opens_what_its_link_opens(self):
         # sd:5481: a row opens its page with its Details; a click on the link itself or with a modifier is the browser's.
@@ -1264,7 +1296,8 @@ for (const v of ['work', 'hoa', 'home', 'personal']) { await realm(v); R[v] = EL
         # Each tab carries its tasks (sd:5524); the shell keeps the tab in #view=, so the query names no realm.
         # The report row is in no realm (places.realm_of), so it sits in Personal too.
         # pack sd:7687: the hoa checkout's open and done rows left Personal for HOA (Personal held 4).
-        self.assertEqual(out["counts"], {"personal": 2, "work": 1, "hoa": 2, "home": 1})
+        # sd:8018: HOA counts its open row only; the done one stays on the board.
+        self.assertEqual(out["counts"], {"personal": 2, "work": 1, "hoa": 1, "home": 1})
         self.assertEqual(r["urls"], ["view=board"] * 5)
 
     def test_a_vault_task_with_its_own_home_area_sits_in_home_alone(self):
@@ -1283,7 +1316,7 @@ for (const v of ['work', 'hoa', 'home', 'personal']) { await realm(v); R[v] = EL
         self.assertEqual([t in r["work"] for t in titles], [False, False, False, False])
         self.assertEqual([t in r["hoa"] for t in titles], [False, False, False, False])
         self.assertEqual([t in r["home"] for t in titles], [True, False, True, True])
-        self.assertEqual(out["counts"], {"personal": 3, "work": 1, "hoa": 2, "home": 3})
+        self.assertEqual(out["counts"], {"personal": 3, "work": 1, "hoa": 1, "home": 3})
 
     def test_an_address_or_an_older_link_lands_on_its_realm(self):
         """Metrics and Today link /tasks?...&realm=all, and a bookmark may hold #view=hoa or #view=home. pack sd:7216: the
@@ -1487,6 +1520,41 @@ class ThePages(unittest.TestCase):
             overview, state, other = (text.index(mark) for mark in ('data-place-view="overview"', 'id="state"', 'data-place-view="tasks"'))
             self.assertLess(overview, state, page)
             self.assertLess(state, other, page)
+
+
+class Votes(Fixture):
+    """pack sd:8050: HOA's Votes view is the hoa checkout's `vote` rows, open first, then newest first. Read-only."""
+
+    def add(self, key, **fields):
+        return sd_votes.add(self.connection, self.hoa, key, fields)
+
+    def test_hoa_votes_are_the_checkouts_open_first_then_newest(self):
+        self.add("OLD", date="2025-03-01", outcome="adopted")
+        self.add("NEW", date="2026-03-01", outcome="failed")
+        self.add("OPEN", date="2024-01-01", outcome="pending: not voted")
+        sd_votes.add(self.connection, self.other, "ELSE", {"outcome": "pending"})
+        doc = places.votes(self.connection, "hoa", now=NOW)
+        self.assertEqual((doc["state"], [r["key"] for r in doc["rows"]]), ("read", ["OPEN", "NEW", "OLD"]))
+
+    def test_without_a_registered_hoa_checkout_votes_are_unknown_with_the_reason(self):
+        bare = ScreenCase()
+        bare.setUp()
+        self.addCleanup(bare.doCleanups)
+        doc = places.votes(bare.connection, "hoa", now=NOW)
+        self.assertEqual((doc["state"], doc["rows"]), ("unknown", []))
+        self.assertIn("no repo named hoa", doc["reason"])
+        self.assertEqual(places.votes(self.connection, "home", now=NOW)["state"], "unknown")
+
+    def test_a_store_or_library_without_the_vote_table_is_an_error_not_an_empty_list(self):
+        """Older state: a dashboard on an sd_db before 048, or a store not yet migrated."""
+        with mock.patch.object(sd_votes, "rows", side_effect=sqlite3.OperationalError("no such table: vote")):
+            doc = places.votes(self.connection, "hoa", now=NOW)
+        self.assertEqual((doc["state"], doc["rows"]), ("error", []))
+        self.assertIn("no such table: vote", doc["reason"])
+        with mock.patch.dict("sys.modules", {"sd_db.votes": None}):
+            doc = places.votes(self.connection, "hoa", now=NOW)
+        self.assertEqual(doc["state"], "error")
+        self.assertIn("migration 048", doc["reason"])
 
 
 class TheRule(unittest.TestCase):

@@ -42,7 +42,7 @@ class TheTables(SchemaCase):
         connection = connect(self.path)
         self.addCleanup(connection.close)
         self.assertEqual(sorted(tables(connection)), sorted(TABLES))
-        self.assertEqual(len(TABLES), 18)
+        self.assertEqual(len(TABLES), 19)
 
     def test_report_is_an_item_kind_not_a_table_and_dep_is_neither(self):
         initialise(self.path)
@@ -970,8 +970,9 @@ class TheRequestOutcome(SchemaCase):
                           connection.execute("PRAGMA table_info(request_outcome)")],
                          [("id", "TEXT", 1, 1), ("committed_at", "TEXT", 1, 0)])
         self.assertEqual(connection.execute("SELECT count(*) FROM request_outcome").fetchone()[0], 0)
-        # 48 adds `home_asset` (pack sd:8053); this file stops at 19.
-        self.assertEqual(sorted(tables(connection)), sorted(set(TABLES) - {"home_asset"}))
+        # 48 adds `vote` (pack sd:8050) and 49 `home_asset` (pack sd:8053)
+        # after 19.
+        self.assertEqual(sorted(tables(connection)), sorted(set(TABLES) - {"vote", "home_asset"}))
         self.assertEqual(self._dump(), before)
         connection.execute("INSERT INTO request_outcome VALUES ('01J0000000000000000000000A', 't')")
         for row in (("01J0000000000000000000000A", "t"), (None, "t"), ("01J0000000000000000000000B", None)):
@@ -3291,20 +3292,20 @@ if __name__ == "__main__":
 
 
 class TheHomeAssetTable(SchemaCase):
-    """Migration 48 (pack sd:8053): `home_asset` arrives empty, nothing else
-    moves, and the hand-run reverse returns the file to 47."""
+    """Migration 49 (pack sd:8053): `home_asset` arrives empty, nothing else
+    moves, and the hand-run reverse returns the file to 48."""
 
     def test_the_table_arrives_empty_and_the_reverse_drops_it(self):
-        self.migrate_through(47)
-        result = self.migrate_through(48)
-        self.assertEqual((result.before, result.applied), (47, [48]))
+        self.migrate_through(48)
+        result = self.migrate_through(49)
+        self.assertEqual((result.before, result.applied), (48, [49]))
         raw = sqlite3.connect(self.path, isolation_level=None)
         self.addCleanup(raw.close)
         self.assertEqual([row[1] for row in raw.execute("PRAGMA table_info(home_asset)")],
                          ["id", "kind", "name", "geometry", "fields", "photo", "created_at", "updated_at"])
         self.assertEqual(raw.execute("SELECT count(*) FROM home_asset").fetchone()[0], 0)
-        text = dict(schema_module.migrations())[48].read_text(encoding="utf-8")
+        text = dict(schema_module.migrations())[49].read_text(encoding="utf-8")
         reverse = "\n".join(line[len("--   "):] for line in text.splitlines() if line.startswith("--   "))
         raw.executescript(reverse)
-        self.assertEqual(schema_version(raw), 47)
+        self.assertEqual(schema_version(raw), 48)
         self.assertNotIn("home_asset", tables(raw))
