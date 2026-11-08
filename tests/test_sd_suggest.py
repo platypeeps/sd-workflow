@@ -524,8 +524,8 @@ class TheShadowSync(SuggestCase):
         self.run_verb(sd_shadow.shadow_sync, strict=True)
         searches = [call for call in self.gh_calls() if "graphql" in call]
         # The four buckets, then the three pull request alert searches: author and requested (sd:6712), and
-        # mentioned (sd:8142).
-        self.assertEqual(7, len(searches))
+        # mentioned (sd:8142), then the issue mention search (sd:8142).
+        self.assertEqual(8, len(searches))
         self.assertEqual(2, len(self.shadow_rows()))
 
     def test_a_second_run_updates_the_rows_rather_than_duplicating_them(self):
@@ -799,8 +799,9 @@ class TheShadowRecoveryWindow(SuggestCase):
         self.assertEqual(0, code)
         # One call per tracker the library names, in its order, carrying the
         # tracker and nothing else: the limits stay the library's defaults.
-        # GitHub's scheduled run also files the pull request alerts (sd:6712).
-        self.assertEqual([{"tracker": name, **({"alerts": True} if name == "github" else {})} for name in sd_db.TRACKERS],
+        # A scheduled run also files alerts: GitHub's pull request and issue alerts (sd:6712), Jira's issue
+        # alerts (sd:8142).
+        self.assertEqual([{"tracker": name, "alerts": True} for name in sd_db.TRACKERS],
                          [call.kwargs for call in sync.call_args_list])
         self.assertEqual(2, len(self.shadow_rows()))
 
@@ -826,8 +827,7 @@ class TheShadowRecoveryWindow(SuggestCase):
         with patch.object(sd_db, "sync_shadow", wraps=sd_db.sync_shadow) as sync:
             code, _ = self.command_sync("--strict", "--max-requests", "4")
         self.assertEqual(0, code)
-        self.assertEqual([{"tracker": name, "max_requests": 4, **({"alerts": True} if name == "github" else {})}
-                          for name in sd_db.TRACKERS],
+        self.assertEqual([{"tracker": name, "max_requests": 4, "alerts": True} for name in sd_db.TRACKERS],
                          [call.kwargs for call in sync.call_args_list])
 
     def synced(self, **fields):
