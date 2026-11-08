@@ -1618,7 +1618,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertIn('href="https://github.com/example/system/pull/5"', rows[0])
         self.assertEqual(out["R"]["html"].count('data-item="5"'), 2, "Retry and Approve, on that one row")
 
-    def observe(self, number, *, author, why, requested=(), repo="example/anvil", state="open"):
+    def observe(self, number, *, author, why, requested=(), repo="example/anvil", state="open", reviews=()):
         """An open pull request observed with no item: the operator is `1`, `author` is the writer's id."""
         from sd_db import contributions
 
@@ -1627,7 +1627,9 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                     "author": {"id": author, "login": f"user{author}"}, "repo": repo, "title": f"Pull {number}",
                     "state": state, "head": "a" * 40, "base": "b" * 40, "draft": False, "mergeable": "mergeable",
                     "ci": "pending", "ci_head": "a" * 40, "ci_ids": [], "why": list(why),
-                    "requested_reviewers": list(requested), "blocking_labels": [], "labels": [], "reviews": [], "events": []}
+                    "requested_reviewers": list(requested), "blocking_labels": [], "labels": [], "events": [],
+                    "reviews": [{"id": f"review:{n}", "actor_id": "1", "state": state_, "at": "2026-09-06T10:00:00Z"}
+                                for n, state_ in enumerate(reviews)]}
         contributions.observe_pull(self.connection, url, observed, expected_revision=contributions.snapshot(
             self.connection, "github:" + url)["revision"])
         self.connection.commit()
@@ -1642,6 +1644,9 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         named = self.observe(3, author="2", why=["mentioned"])
         self.observe(4, author="2", why=["review-requested"], requested=[])
         self.observe(5, author="1", why=["author"], state="closed")
+        # A PR the operator already reviewed waits on its author: GitHub drops them from requested_reviewers.
+        self.observe(6, author="2", why=["review-requested"], requested=[], reviews=["APPROVED"])
+        self.observe(7, author="2", why=["review-requested"], requested=["someone"], reviews=["CHANGES_REQUESTED"])
         rows = queue_screen.pr_rows(self.connection, [], time.time())
         self.assertEqual(rows["error"], "")
         found = {r["url"]: (r["item"], r["repo"], r["on"]) for r in rows["rows"]}
