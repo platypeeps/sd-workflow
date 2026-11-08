@@ -229,13 +229,15 @@ def dispatcher_refusal(connection, host: str) -> str | None:
     the `why` its newest beat names (review round 4). The press asks it.
 
     A tick beats before it claims, so a beat alone does not say it can: one
-    with no log folder, an unread load or a restore pending claims nothing.
+    with no log folder or a restore pending claims nothing. An `UNREAD` why
+    lasts one tick, so it refuses no press: the next counted beat claims, and
+    the Builds panel names it meanwhile (`unclaimed`, pack sd:8055).
     """
     gone = dispatcher_gone(connection, host)
     if gone:
         return gone
     why = dispatcher_why(connection, host)
-    return f"{HEARTBEAT}@{host} claims nothing: {why}" if why else None
+    return f"{HEARTBEAT}@{host} claims nothing: {why}" if why and why not in UNREAD else None
 
 
 def item_host(connection, item: int) -> str | None:

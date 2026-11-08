@@ -70,7 +70,7 @@ def state_of(outcome: str | None) -> str:
 def parse_votes(text: str | None) -> dict[str, str] | None:
     """Each director's answer in a votes cell, or None when the cell names none or is not read whole.
 
-    A cell is `;`-separated segments, each a list of names (`,` or `and`)
+    A cell is `;`-separated segments, each a list of names (`,` or `and`, any case)
     then a verdict word: `Ada, Ben Yes; Cy No`. A `N-M:` or `unanimous:`
     head may come first; then the first segment may list names alone, which
     read yes when the head is unanimous or `N-0`, and a `N-M` head must
@@ -98,8 +98,9 @@ def parse_votes(text: str | None) -> dict[str, str] | None:
             names_text, verdict = segment, "yes"
         else:
             return None
-        names = [name.strip() for name in re.split(r",|\band\b", names_text)]
-        if any(not NAME.fullmatch(name) for name in names):
+        names = [name.strip() for name in re.split(r",|\band\b", names_text, flags=re.IGNORECASE)]
+        # A name holding a verdict word is no director's: `Ada Yes, Ben No` used `,` for `;` (sd:8063).
+        if any(not NAME.fullmatch(name) or VERDICTS.keys() & set(name.lower().split()) for name in names):
             return None
         for name in names:
             if name in tally:

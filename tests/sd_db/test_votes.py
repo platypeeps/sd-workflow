@@ -69,7 +69,9 @@ class Store(unittest.TestCase):
         return found
 
 
-class TheMigration(unittest.TestCase):
+class MigrationStore(unittest.TestCase):
+    """A store migrated to a chosen version; no tests of its own, so a subclass reruns none (sd:8063)."""
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
@@ -87,6 +89,8 @@ class TheMigration(unittest.TestCase):
         finally:
             raw.close()
 
+
+class TheMigration(MigrationStore):
     def test_048_adds_an_empty_vote_table_and_moves_nothing_else(self):
         self.through(VERSION - 1)
         before = self.dump()
@@ -145,6 +149,9 @@ class TheTally(unittest.TestCase):
             "Ada, Ben Yes; Cy agreed; Dee agreed (9/29)": {"Ada": "yes", "Ben": "yes", "Cy": "yes", "Dee": "yes"},
             "Ada and Ben agreed": {"Ada": "yes", "Ben": "yes"},
             "Ada abstained; Ben Yes": {"Ada": "abstain", "Ben": "yes"},
+            # sd:8063: `and` splits names in any case, never joins them into one.
+            "Ada And Ben agreed": {"Ada": "yes", "Ben": "yes"},
+            "Ada AND Ben Yes; Cy No": {"Ada": "yes", "Ben": "yes", "Cy": "no"},
         }
         for text, want in cases.items():
             with self.subTest(text=text):
@@ -153,7 +160,9 @@ class TheTally(unittest.TestCase):
     def test_a_cell_without_names_or_with_one_unread_segment_has_no_tally(self):
         for text in ("", "unanimous", "5-0", "not recorded", "majority; tally not recorded", "none",
                      "Ada Yes; only some directors replied", "Ada Yes; Ada No", "3-0: Ada, Ben Yes",
-                     "Ada and Ben agreed by text", "Ada Yes;", "see motion", "x" * 5000):
+                     "Ada and Ben agreed by text", "Ada Yes;", "see motion", "x" * 5000,
+                     # sd:8063: a name holding a verdict word is no director's: a `,` for a `;`.
+                     "Ada Yes, Ben No", "Ada, Ben No Yes"):
             with self.subTest(text=text[:40]):
                 self.assertIsNone(votes.parse_votes(text))
 
@@ -353,7 +362,7 @@ class TheRemoval(Store):
         self.assertEqual([r["key"] for r in plan["refusals"] if r["code"] == "I11"], ["CI-1"])
 
 
-class TheOlderStore(TheMigration):
+class TheOlderStore(MigrationStore):
     def test_a_removal_preview_reads_a_47_store_with_no_vote_table(self):
         """Older state: `sd-db repo remove` without --apply reads the store, which may predate 048."""
         self.through(VERSION - 1)
