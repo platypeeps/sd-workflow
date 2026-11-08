@@ -474,19 +474,22 @@ def _prs(connection, now) -> dict:
     Read from each item's PR lane notes (`contributions.pr_waits`), all time: an open one counts to `now`. `to_merge`
     is the median of the merged ones, or None when none merged. Only the operator's pull requests count: authored,
     or asked to review by name (`contributions.operator_pull`, sd:8084). One not known either way, or an item whose
-    metadata is malformed, is named in `unknown` and not counted.
+    metadata is malformed, is named in `unknown` and not counted. A pull request of the operator's with no item counts
+    too, `approximate` (sd:8116); a `stale` one counts its span to its last reading and is not open.
     """
     from sd_db import contributions
 
     unknown: list[str] = []
     waits = contributions.pr_waits(connection, now=now, errors=unknown)
     unknown += [f"sd:{wait['item']}: no reading of its author and requested reviewers" for wait in waits if wait["mine"] is None]
-    keys = ("item", "title", "url", "open", "on", "on_you", "on_reviewers", "to_merge")
+    waits += [wait for wait in contributions.unlinked_pr_waits(connection, now=now) if wait["mine"]]
+    keys = ("item", "title", "url", "open", "on", "on_you", "on_reviewers", "to_merge", "approximate", "draft", "stale")
     groups: dict[str, list[dict]] = {}
     for wait in (wait for wait in waits if wait["mine"]):
         groups.setdefault("/".join(wait["url"].split("/")[3:5]).lower(), []).append(wait)
     repos = sorted(({"repo": repo, **_wait_totals(rows), "prs": [{key: wait[key] for key in keys} for wait in sorted(
-        rows, key=lambda wait: (-(wait["on_you"] + wait["on_reviewers"]), wait["item"]))]} for repo, rows in groups.items()),
+        rows, key=lambda wait: (-(wait["on_you"] + wait["on_reviewers"]), wait["item"] or 0, wait["url"]))]}
+        for repo, rows in groups.items()),
         key=lambda group: (-(group["on_you"] + group["on_reviewers"]), group["repo"]))
     return {"error": "", **_wait_totals([wait for rows in groups.values() for wait in rows]), "unknown": unknown,
             "repos": repos}

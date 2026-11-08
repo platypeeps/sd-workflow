@@ -442,14 +442,18 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   }
   // pack sd:7859: an item whose pull request waits on review (/api/queue's `prs`) is blocked by its PR, not working: on
   // you (changes requested, failing checks, a comment to answer) needs you; on reviewers waits. It counts in the blocked box.
-  const prFacts = p => html`<b>blocked: PR</b> · on ${p.on} · waited ${dur(p.waited)} since ${at(p.since)}`;
+  // sd:8116: a draft says so, as does a wait that rests on GitHub's newest event; a stale one, read over a day ago,
+  // waits on no one until the next read.
+  const prTags = p => `${p.draft ? ' · draft' : ''}${p.approximate ? ' · approx.' : ''}`;
+  const prFacts = p => p.stale ? html`<b>PR not read for a day</b> · last wait since ${at(p.since)}${prTags(p)}`
+    : html`<b>blocked: PR</b> · on ${p.on} · waited ${dur(p.waited)} since ${at(p.since)}${prTags(p)}`;
   const prWaitLink = p => html`<div class="ctl" role="group" aria-label="Pull request of sd:${String(p.item)}"><a class="btn quiet sm" href="${p.url}" target="_blank" rel="noopener noreferrer" aria-label="Open the pull request of sd:${p.item} on GitHub">Open PR</a></div>`;
   // sd:8142: a PR no item links (`item` null) is keyed and linked by its URL, named `owner/repo#N`.
-  const prRow = p => { const s = p.on === 'you' ? 'warning' : 'queued';
+  const prRow = p => { const s = p.stale ? 'unknown' : p.on === 'you' ? 'warning' : 'queued';
     return ['blocked', s, html`<tr class="child" data-type="blocked" data-pr="${p.item == null ? p.url : String(p.item)}">${marker(s, 'blocked')}
     <td class="what">${p.item == null ? html`<a href="${p.url}" target="_blank" rel="noopener noreferrer">${p.repo}#${p.url.split('/').pop()} ${p.title}</a>`
       : html`<a href="${shell.itemHref(p.item)}">#${p.item} ${p.title}</a>`}</td>
-    <td class="detail">${prFacts(p)}</td><td class="num">${dur(p.waited)}</td>
+    <td class="detail">${prFacts(p)}</td><td class="num">${p.stale ? '' : dur(p.waited)}</td>
     <td class="act">${p.item == null ? '' : prWaitLink(p)}</td></tr>`, p.on]; };
   // A suggested row (pack sd:7271) is a task: a click shows the Tasks page's Details, and its act is Build on a ready one,
   // else its next status, as on Tasks. Its detail says why it is suggested (pack sd:7314): ready, planned for its due
@@ -521,8 +525,10 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     }).sort((a, b) => (a.key === '') - (b.key === '') || busy(a, b) || a.key.localeCompare(b.key));
   }
   // A box's rows: review holds the PR waits, each other box its type less those (pack sd:8083).
-  const inBox = t => t === 'review' ? c => c.pr : c => c.type === t && !c.pr;
-  const tally = rows => QTYPES.map(t => [t, rows.filter(c => c.type === t).length]).filter(([, n]) => n);
+  // sd:8116: a stale PR row (unknown, no one to wait on) shows under its repo and counts in no box.
+  const stalePr = c => c.type === 'blocked' && c.s === 'unknown';
+  const inBox = t => t === 'review' ? c => c.pr : c => c.type === t && !c.pr && !stalePr(c);
+  const tally = rows => QTYPES.map(t => [t, rows.filter(c => c.type === t && !stalePr(c)).length]).filter(([, n]) => n);
   // pack sd:8005: the page's PR waits, split by who they wait on; '' when there is none. Each repo's are its review box.
   const prTally = rows => { const you = rows.filter(c => c.pr === 'you').length, them = rows.filter(c => c.pr && c.pr !== 'you').length;
     return you + them ? `${you + them} PR review: ${you} on you, ${them} on reviewers` : ''; };

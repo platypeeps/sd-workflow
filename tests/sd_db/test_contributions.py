@@ -1299,10 +1299,12 @@ class DraftWaitsOnYou(ContributionCase):
         self.assertEqual((row["lane"], row["needs_you"]), ("awaiting_them", False))
         self.assertNotIn(c.DRAFTED, row["reasons"])
 
-    def test_a_draft_with_no_item_or_by_another_author_keeps_its_lane(self):
-        """No item: an observed draft is not the operator's work item; another author's draft waits on them."""
+    def test_a_draft_with_no_item_waits_on_you_and_another_authors_keeps_its_lane(self):
+        """sd:8116 (d): the operator's open draft waits on them, linked or not; another author's waits on them."""
         self.observe(draft=True)
-        self.assertEqual(self.lane()["lane"], "awaiting_them")
+        row = self.lane()
+        self.assertEqual((row["item_id"], row["lane"]), (None, "awaiting_you"))
+        self.assertIn(c.DRAFTED, row["reasons"])
         self.linked()
         self.observe(draft=True, observed_at=T1, author={"id": "2", "login": "other"})
         self.assertEqual(self.lane()["lane"], "awaiting_them")
@@ -1318,6 +1320,107 @@ class DraftWaitsOnYou(ContributionCase):
         self.observe(draft=True)
         c.record_lane(self.db, item)
         self.assertEqual([note["lane"] for note in c.lane_notes(self.db, item)][-1:], ["awaiting_you"])
+
+
+class UnlinkedWaits(ContributionCase):
+    """sd:8116: the operator's observed pull requests with no item are waits too, read from their reading alone."""
+
+    NOW = "2026-09-10T06:00:00+00:00"
+
+    def pull(self, number, **changes):
+        url = f"https://github.com/upstream/project/pull/{number}"
+        c.observe_pull(self.db, url, self.observation(**changes),
+                       expected_revision=c.snapshot(self.db, "github:" + url)["revision"])
+        return url
+
+    def waits(self, now=None):
+        now = now or self.NOW
+        return {w["url"]: w for w in [*c.pr_waits(self.db, now=now), *c.unlinked_pr_waits(self.db, now=now)]}
+
+    def test_an_unlinked_authored_pull_waits_from_its_newest_event_and_a_strangers_does_not(self):
+        other = {"id": "2", "login": "someone"}
+        mine = self.pull(40, observed_at=T3, events=[self.event(id="e1", at=T1, maintainer=False), self.event(
+            id="e2", at=T2, actor_id="1")], reviews=[{"id": "review:1", "actor_id": "2", "state": "COMMENTED", "at": T0}])
+        asked = self.pull(41, observed_at=T3, author=other, requested_reviewers=["author"])
+        self.pull(42, observed_at=T3, author=other, requested_reviewers=[])
+        self.pull(43, observed_at=T3, state="merged")
+        waits = self.waits()
+        self.assertEqual(sorted(waits), [mine, asked])
+        wait = waits[mine]
+        self.assertEqual({k: wait[k] for k in ("item", "repo", "open", "on", "since", "approximate", "stale", "draft", "mine")},
+                         {"item": None, "repo": "upstream/project", "open": True, "on": "reviewers", "since": T2,
+                          "approximate": True, "stale": False, "draft": False, "mine": True})
+        self.assertEqual((wait["on_reviewers"], wait["on_you"], wait["waited"]), (21480, 0, 21480))
+
+    def test_with_no_event_the_wait_starts_at_created_at(self):
+        url = self.pull(44, observed_at=T3)
+        upsert_shadow(self.db, tracker="github", url=url, repo="upstream/project", number=44, kind="pull",
+                      title="Contribution", state="open", created_at=T1)
+        self.db.commit()
+        self.assertEqual(self.waits()[url]["since"], T1)
+
+    def test_a_force_push_or_review_request_dates_the_wait(self):
+        url = self.pull(48, observed_at=T3, events=[self.event("pushed", id="p", at=T2, actor_id="1", maintainer=None)])
+        self.assertEqual(self.waits()[url]["since"], T2)
+
+    def test_an_unlinked_operator_draft_waits_on_you_marked_draft(self):
+        url = self.pull(46, observed_at=T3, draft=True)
+        wait = self.waits()[url]
+        self.assertEqual((wait["on"], wait["draft"], wait["lane"]), ("you", True, "awaiting_you"))
+
+    def test_a_stale_reading_is_no_current_wait_and_says_so(self):
+        """sd:8116 (a): a pull request last read two days ago may have merged since; it is not counted as waiting."""
+        url = self.pull(47, observed_at=T3)
+        item = c.capture(self.db, title="Linked", changes={"pull_url": URL}, who="operator")["item"]["id"]
+        self.observe(observed_at=T3)
+        later = "2026-09-12T00:03:00+00:00"
+        waits = self.waits(later)
+        for key in (url, URL):
+            self.assertEqual((waits[key]["stale"], waits[key]["open"], waits[key]["on"], waits[key]["waited"]),
+                             (True, False, None, None), key)
+        self.assertEqual(waits[URL]["item"], item)
+        self.assertEqual(waits[URL]["on_reviewers"], 0, "its span ends at the reading, not two days on")
+        self.assertEqual(waits[url]["on_reviewers"], 0, "an unlinked one's span ends at the reading too")
+
+    def test_a_reading_that_does_not_parse_reads_stale_and_fails_no_row(self):
+        """sd:8116 (a), class Failures: a bad time is an unknown reading, not a current wait and not a failed read."""
+        self.assertTrue(c._stale({"observed_at": "not a time"}, self.NOW))
+        self.assertFalse(c._stale({}, self.NOW), "no reading at all says nothing about its age")
+
+
+class ReRequestedReview(ContributionCase):
+    """sd:8116 (c): changes requested, the author pushes and asks that reviewer again: it waits on them."""
+
+    def test_a_re_request_after_changes_requested_waits_on_reviewers(self):
+        reviews = [{"id": "review:1", "actor_id": "2", "state": "CHANGES_REQUESTED", "at": T0}]
+        events = [self.event(id="comment:1", at=T0), self.event(id="comment:2", at=T1, actor_id="1"),
+                  self.event("pushed", id="push:1", at=T1, actor_id="1", maintainer=None),
+                  self.event("review_requested", id="ask:1", at=T2, actor_id="1", reviewer_id="2", maintainer=None)]
+        result = self.observe(observed_at=T3, head="c" * 40, ci_head="c" * 40, reviews=reviews, events=events)
+        self.assertEqual(result["attention"], [])
+        self.assertEqual(c.projection(self.db)[0]["lane"], "awaiting_them")
+
+    def test_a_request_to_another_reviewer_leaves_the_changes_request_on_you(self):
+        reviews = [{"id": "review:1", "actor_id": "2", "state": "CHANGES_REQUESTED", "at": T0}]
+        events = [self.event("review_requested", id="ask:1", at=T2, actor_id="1", reviewer_id="3", maintainer=None)]
+        result = self.observe(observed_at=T3, reviews=reviews, events=events)
+        self.assertEqual([a["reason"] for a in result["attention"]], ["Changes requested"])
+
+    def test_a_team_request_answers_no_reviewer(self):
+        reviews = [{"id": "review:1", "actor_id": "2", "state": "CHANGES_REQUESTED", "at": T0}]
+        events = [self.event("review_requested", id="ask:1", at=T2, actor_id="1", reviewer_id=None, maintainer=None)]
+        result = self.observe(observed_at=T3, reviews=reviews, events=events)
+        self.assertEqual([a["reason"] for a in result["attention"]], ["Changes requested"])
+
+    def test_the_authors_own_comment_is_never_a_maintainer_comment(self):
+        result = self.observe(events=[self.event(id="comment:1", actor_id="1", maintainer=True)])
+        self.assertEqual(result["attention"], [])
+
+    def test_a_comment_after_the_re_request_is_still_on_you(self):
+        events = [self.event("review_requested", id="ask:1", at=T1, actor_id="1", reviewer_id="2", maintainer=None),
+                  self.event(id="comment:9", at=T2)]
+        result = self.observe(observed_at=T3, events=events)
+        self.assertEqual([a["reason"] for a in result["attention"]], ["Maintainer comment"])
 
 
 class LaneNoteTests(ContributionCase):
@@ -1427,7 +1530,7 @@ class LaneNoteTests(ContributionCase):
         self.assertEqual(c.link_shipped(self.db), (sorted([made["work"], made["followup"], made["task"]]), []))
         self.assertIsNone(c._metadata(item_state(self.db, made["idea"])["item"]))
         self.assertEqual(self.lanes(made["work"]), [("awaiting_them", "open", False)])
-        self.assertEqual([(w["item"], w["on"]) for w in c.pr_waits(self.db)], [(made["work"], "reviewers")])
+        self.assertEqual([(w["item"], w["on"]) for w in c.pr_waits(self.db, now=T3)], [(made["work"], "reviewers")])
         self.assertEqual(c.link_shipped(self.db), ([], []), "a rerun links nothing")
         self.assertEqual(set(c.KINDS), set(delivering), "contributions take what the lane delivers")
 
@@ -1606,7 +1709,7 @@ class LaneNoteTests(ContributionCase):
         item = self.item()
         self.observe()
         self.assertEqual(self.lanes(item), [("awaiting_them", "open", False)])
-        self.assertTrue(c.pr_waits(self.db)[0]["open"])
+        self.assertTrue(c.pr_waits(self.db, now=T3)[0]["open"])
 
     def test_a_bundles_pull_request_goes_to_the_lowest_item_number(self):
         # sd:7863: receipts sorted by str(item), so item 10 took the bundle's pull request before item 9.

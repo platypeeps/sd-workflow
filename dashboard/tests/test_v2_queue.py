@@ -312,6 +312,23 @@ class TheRows(Lane, ScreenCase):
                          [(mine, "you", "2026-09-06T11:00:00+00:00", 3600), (theirs, "reviewers", "2026-09-06T10:00:00+00:00", 7200)])
         self.assertEqual(prs["rows"][0]["url"], url)
 
+    def test_an_unlinked_pull_request_says_what_the_wait_rests_on(self):
+        """sd:8116: the wait runs from GitHub's newest event, marked approximate; a linked one is one row."""
+        from sd_db.writes import record_state
+
+        linked, _ = self.pr_item(910, ("2026-09-06T10:00:00Z", "awaiting_them"))
+        url = "https://github.com/example/system/pull/911"
+        record_state(self.connection, "checkpoint", key="contribution:github:" + url, body={"observation": {
+            "operator": {"id": "1", "login": "operator"}, "author": {"id": "1", "login": "someone"},
+            "requested_reviewers": [], "reviews": [], "state": "open", "draft": False, "title": "Unlinked 911",
+            "observed_at": "2026-09-06T11:30:00Z", "repo": "example/system",
+            "events": [{"id": "c", "actor_id": "2", "kind": "comment", "at": "2026-09-06T11:00:00Z"}]}})
+        self.connection.commit()
+        rows = self.doc()["prs"]["rows"]
+        self.assertEqual([(r["item"], r["url"][-3:]) for r in rows], [(linked, "910"), (None, "911")])
+        self.assertEqual((rows[1]["on"], rows[1]["waited"], rows[1]["approximate"], rows[1]["stale"]),
+                         ("reviewers", 3600, True, False))
+
     def test_an_item_in_the_lane_keeps_its_lane_row_not_a_pr_row(self):
         item, _ = self.pr_item(904, ("2026-09-06T10:00:00Z", "awaiting_them"))
         self.list([*self.entries(), {"item": item, "title": "In the lane", "status": "pending", "expected_head": "e" * 40}])
@@ -1503,6 +1520,34 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertEqual(out["R"]["kids"].count("working"), 2, "the lane builders stay; the live item is gone")
         self.assertIn('aria-label="1 merging, 2 review, 2 working, 2 next, 2 blocked, 0 suggested"', html)
 
+    def test_an_unlinked_pull_request_row_says_approx_and_draft(self):
+        """sd:8116: a draft and an approximate wait say so on the row."""
+        lanes = queue_screen.document(self.connection, now=NOW)
+        lanes["prs"] = {"error": "", "rows": [
+            {"item": None, "title": "Unlinked", "repo": "example/system", "url": "https://github.com/example/system/pull/5",
+             "lane": "awaiting_you", "on": "you", "since": "2026-09-06T11:00:00+00:00", "waited": 3600,
+             "approximate": True, "draft": True, "stale": False}]}
+        out = self.run_view("open('system'); R.html = ELS.queue.html;", answers={"/api/queue": [200, lanes]})
+        row = re.search(r'<tr class="child" data-type="blocked" data-pr="https://github.com/example/system/pull/5">(.*?)</tr>',
+                        out["R"]["html"], re.S)[1]
+        self.assertIn("<b>blocked: PR</b> · on you · waited 1h 0m", row)
+        self.assertIn(" · draft · approx.", row)
+
+    def test_a_stale_pull_request_row_says_so_and_counts_in_no_box(self):
+        """sd:8116 (a): a reading over a day old waits on no one: no review or blocked count and no lamp; the row says so."""
+        lanes = queue_screen.document(self.connection, now=NOW)
+        lanes["prs"] = {"error": "", "rows": [
+            {"item": None, "title": "Old", "repo": "~/repos/example/solo", "url": "https://github.com/example/solo/pull/5",
+             "lane": "awaiting_you", "on": None, "since": "2026-09-01T11:00:00+00:00", "waited": None,
+             "approximate": True, "draft": False, "stale": True}]}
+        out = self.run_view("R.closed = ELS.queue.html; open('solo'); R.open = ELS.queue.html; R.tally = ELS['queue-tally'].html;",
+                            answers={"/api/queue": [200, lanes]})
+        self.assertEqual(self.repo_detail(out["R"]["closed"], "solo")[1],
+                         ' aria-label="0 merging, 0 review, 0 working, 0 next, 0 blocked, 0 suggested"')
+        self.assertIn("<b>PR not read for a day</b>", out["R"]["open"])
+        self.assertNotIn("PR review", out["R"]["tally"])
+        self.assertIn("<span>2 blocked</span>", out["R"]["tally"], "only the fixture's two lane rows count")
+
     def test_pr_review_waits_count_split_on_you_and_on_reviewers(self):
         # pack sd:8005 (operator 2026-11-07): PR waits folded into the blocked box and the tally with lane failures.
         # The tally counts them apart, split by who they wait on; pack sd:8083 moves each repo's to its review box.
@@ -1642,7 +1687,9 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         from sd_db import contributions
 
         url = f"https://github.com/{repo}/pull/{number}"
-        observed = {"complete": True, "observed_at": "2026-09-06T11:00:00Z", "operator": {"id": "1", "login": "operator"},
+        # sd:8116: `pr_rows` reads the real clock in these tests, and a reading over a day old is no current wait.
+        observed = {"complete": True, "observed_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "operator": {"id": "1", "login": "operator"},
                     "author": {"id": author, "login": f"user{author}"}, "repo": repo, "title": f"Pull {number}",
                     "state": state, "head": "a" * 40, "base": "b" * 40, "draft": draft, "mergeable": "mergeable",
                     "ci": "pending", "ci_head": "a" * 40, "ci_ids": [], "why": list(why),

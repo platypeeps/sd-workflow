@@ -405,7 +405,7 @@ def runner(connection) -> dict:
 #: left its pull request open, so its wait still shows.
 LANED = ("merging", "next", "blocked", "landed")
 #: What the page reads of each pull-request wait (`contributions.pr_waits`).
-PR_FIELDS = ("item", "title", "repo", "url", "lane", "on", "since", "waited")
+PR_FIELDS = ("item", "title", "repo", "url", "lane", "on", "since", "waited", "approximate", "draft", "stale")
 
 
 def pr_rows(connection, lanes: list[dict], clock: float) -> dict:
@@ -430,7 +430,8 @@ def pr_rows(connection, lanes: list[dict], clock: float) -> dict:
     except READ_FAILURES as error:
         return {"rows": [], "error": f"pull-request waits were not read: {type(error).__name__}: {error}"}
     return {"rows": [{key: wait[key] for key in PR_FIELDS} for wait in waits
-                     if wait["open"] and wait["status"] != "done" and wait["item"] not in laned] + loose,
+                     if (wait["open"] or wait["stale"]) and wait["status"] != "done" and wait["item"] not in laned]
+                    + [{key: wait[key] for key in PR_FIELDS} for wait in loose],
             "error": f"pull-request waits skipped {'; '.join(skipped)}" if skipped else ""}
 
 

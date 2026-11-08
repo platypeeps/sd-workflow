@@ -272,8 +272,11 @@ window.PAGE_VIEWS = [{ id: 'spend', label: 'Spend' }, { id: 'providers', label: 
     const parent = g => { const on = prOpen === g.repo, st = g.prs.some(w => w.open && w.on === 'you') ? 'caution' : 'ok';
       return html`<tr class="repo" data-repo="${g.repo}" aria-expanded="${String(on)}"><td class="g g-${st}">${G[st]}<span class="sr">${st === 'caution' ? 'open on you' : 'normal'}</span></td>
         <td class="what"><button type="button" class="disc" data-open="${g.repo}" aria-expanded="${String(on)}" aria-label="${on ? 'Close' : 'Open'} ${g.repo}">${I('chevron-right')}</button><button type="button" class="pick" data-open="${g.repo}">${g.repo}</button><small>${plural(g.items, 'pull request')}, ${g.open} open</small></td><td class="num">${dur(g.on_you)}</td><td class="num">${dur(g.on_reviewers)}</td><td class="num hide-sm">${median(g)}</td></tr>`; };
+    // sd:8116: a pull request with no item has an approximate wait; a draft says so; a stale reading is not open.
+    const tags = w => { const t = [w.draft && 'draft', w.approximate && 'approx.', w.stale && 'not read for a day'].filter(Boolean);
+      return t.length ? html`<small>${t.join(' · ')}</small>` : ''; };
     const child = w => { const st = w.open && w.on === 'you' ? 'caution' : 'ok';
-      return html`<tr class="member"><td class="g g-${st}">${G[st]}<span class="sr">${w.open ? `open, on ${w.on}` : 'ended'}</span></td><td class="what"><a href="${w.url}" target="_blank" rel="noopener noreferrer">sd:${String(w.item)} ${w.title}</a></td><td class="num">${dur(w.on_you)}</td><td class="num">${dur(w.on_reviewers)}</td><td class="num hide-sm">${merge(w.to_merge)}</td></tr>`; };
+      return html`<tr class="member"><td class="g g-${st}">${G[st]}<span class="sr">${w.open ? `open, on ${w.on}` : w.stale ? 'not read for a day' : 'ended'}</span></td><td class="what"><a href="${w.url}" target="_blank" rel="noopener noreferrer">${w.item == null ? w.title : `sd:${String(w.item)} ${w.title}`}</a>${tags(w)}</td><td class="num">${dur(w.on_you)}</td><td class="num">${dur(w.on_reviewers)}</td><td class="num hide-sm">${merge(w.to_merge)}</td></tr>`; };
     put($('prs-body'), html`${total}${P.repos.map(g => html`${parent(g)}${prOpen === g.repo ? g.prs.map(child) : ''}`)}`);
     $('prs-note').textContent = [`${plural(P.open, 'pull request')} open now; waiting in all: ${dur(P.on_you + P.on_reviewers)}.`, unknown].filter(Boolean).join(' ');
   }

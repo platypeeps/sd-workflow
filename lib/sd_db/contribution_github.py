@@ -41,6 +41,8 @@ TIMELINE = """query($owner:String!,$repo:String!,$number:Int!,$after:String) {
       ... on ReadyForReviewEvent { id createdAt ACTOR }
       ... on ClosedEvent { id createdAt ACTOR }
       ... on ReopenedEvent { id createdAt ACTOR }
+      ... on ReviewRequestedEvent { id createdAt ACTOR requestedReviewer { ... on User { databaseId } } }
+      ... on HeadRefForcePushedEvent { id createdAt ACTOR }
     } }
   } }
 }""".replace("ACTOR", ACTOR)
@@ -409,8 +411,13 @@ def pull(client, url, operator, *, observed_at, why=(), blocking_labels=(), auto
             events.append(_comment(row, kind, url, operator, at=row.get("updated_at"), automation=automation))
     kinds = {"LabeledEvent": "label_added", "UnlabeledEvent": "label_removed",
              "ConvertToDraftEvent": "converted_to_draft", "ReadyForReviewEvent": "ready_for_review",
-             "ClosedEvent": "closed", "ReopenedEvent": "reopened"}
-    for event, _ in _timeline_events(client.timeline(owner, repo, number), kinds, url):
+             "ClosedEvent": "closed", "ReopenedEvent": "reopened",
+             "ReviewRequestedEvent": "review_requested", "HeadRefForcePushedEvent": "pushed"}
+    for event, row in _timeline_events(client.timeline(owner, repo, number), kinds, url):
+        if event["kind"] == "review_requested":
+            # A team request names no user: no reviewer, so it answers no one's changes request.
+            reviewer = (row.get("requestedReviewer") or {}).get("databaseId")
+            event["reviewer_id"] = str(reviewer) if reviewer is not None else None
         events.append(event)
     ci, ci_ids = _ci(client, prefix, head)
     after = client.get(path)

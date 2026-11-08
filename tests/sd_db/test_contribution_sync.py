@@ -379,10 +379,10 @@ class ContributionSync(SyncCase):
         self.assertTrue(first.watermark_moved)
         self.assertEqual(len(core.projection(self.db)), 4)
         saved = adapter._queue(self.db)
-        # All eight are open and never read, so they go first in queue order
-        # (pack sd:7844, ahead of sd:7840's newest-first slots): 7 to 10 are
-        # read and 11 heads the queue.
-        self.assertEqual(saved["pending"][0]["url"], urls[4])
+        # All eight are open and never read, so they go first, the newest
+        # queued first (pack sd:7844, sd:8116): 14 to 11 are read and 7 heads
+        # the queue.
+        self.assertEqual(saved["pending"][0]["url"], urls[0])
         self.assertLessEqual(first.requests, 40)
         second = self.run_sync(max_requests=40)
         self.assertEqual(second.queued, 4)
@@ -528,8 +528,8 @@ class ContributionSync(SyncCase):
         snapshots["github:fresh"] = {"observation": {"state": "open", "observed_at": "2026-10-18T07:00:00+00:00"}}
         snapshots["github:stale"] = {"observation": {"state": "open", "observed_at": "2026-10-15T08:00:00+00:00"}}
         ordered = [row["key"] for row in adapter._order(pending, snapshots=snapshots, observed_at=now)]
-        self.assertEqual(ordered[2], "github:stale")
-        self.assertGreater(ordered.index("github:fresh"), ordered.index("github:backlog/7"))
+        # sd:8116 (a): every row last read open is read each run, the oldest reading first, not only a day-old one.
+        self.assertEqual(ordered[2:4], ["github:stale", "github:fresh"])
         self.assertEqual(sorted(ordered), sorted(keys))
 
     def stale_rows(self, count):
@@ -538,20 +538,25 @@ class ContributionSync(SyncCase):
         old = {"observation": {"state": "open", "observed_at": "2026-10-15T08:00:00+00:00"}}
         return rows, {row["key"]: old for row in rows}
 
-    def test_failing_stale_pulls_take_a_few_slots_and_the_backlog_keeps_its_turn(self):
+    def test_failing_stale_pulls_rotate_and_the_backlog_keeps_its_turn(self):
         # Review of sd:7864: a pull whose reads keep failing leaves only a
-        # heartbeat, so its observation stays stale; uncapped, enough of them
-        # went ahead of the whole backlog every run.
-        slots = 10
-        stale, snapshots = self.stale_rows(slots + 2)
+        # heartbeat, so its observation stays stale; ahead of the rest, enough
+        # of them went ahead of the whole backlog every run. A held one rotates.
+        stale, snapshots = self.stale_rows(12)
         backlog = [{"key": f"github:backlog/{n}", "explicit": False} for n in range(4)]
+        held = {row["key"] for row in stale[10:]}
         keys = [row["key"] for row in adapter._order(
-            [*backlog, *stale], snapshots=snapshots, observed_at="2026-10-18T08:00:00+00:00")]
-        # The two head slots, then the capped stale tier, then queue order.
-        self.assertEqual(keys[2:2 + slots], [row["key"] for row in stale[:slots]])
-        self.assertEqual(keys[2 + slots:], ["github:backlog/2", "github:backlog/3",
-                                            *(row["key"] for row in stale[slots:])])
-        self.assertEqual(adapter.STALE_SLOTS, slots)
+            [*backlog, *stale], snapshots=snapshots, observed_at="2026-10-18T08:00:00+00:00", held=held)]
+        # The two head slots, then every open pull whose last read held, then queue order.
+        self.assertEqual(keys[2:12], [row["key"] for row in stale[:10]])
+        self.assertEqual(keys[12:], ["github:backlog/2", "github:backlog/3", *(row["key"] for row in stale[10:])])
+
+    def test_unread_open_pulls_are_read_newest_queued_first(self):
+        """sd:8116 (b): an authored pull opened today sat behind 60 older unread open ones and no run reached it."""
+        pending = [{"key": f"github:open/{n}", "explicit": False} for n in range(60)]
+        unread = {row["key"] for row in pending}
+        keys = [row["key"] for row in adapter._order(pending, unread=unread)]
+        self.assertEqual(keys[:adapter.UNREAD_SLOTS], [f"github:open/{n}" for n in range(59, 49, -1)])
 
     def test_explicit_work_past_the_first_three_stays_ahead_of_stale_pulls(self):
         # Review of sd:7864: explicit rows past the first three, `item:`

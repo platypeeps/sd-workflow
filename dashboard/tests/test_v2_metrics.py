@@ -307,6 +307,35 @@ class ThePrWaits(Fixture):
                           for r in repos],
                          [("example/other", 2, 1, 0, 3600 + 7200, 1, 3600), ("example/system", 1, 1, 3600, 0, 0, None)])
 
+    def unlinked(self, n, *, author="1", requested=(), draft=False, events=(), why=()):
+        """sd:8116: a pull request observed with no item naming it."""
+        from sd_db.writes import record_state
+
+        url = f"https://github.com/example/system/pull/{n}"
+        record_state(self.connection, "checkpoint", key="contribution:github:" + url, body={"observation": {
+            "operator": {"id": "1", "login": "operator"}, "author": {"id": author, "login": "someone"},
+            "requested_reviewers": list(requested), "reviews": [], "state": "open", "draft": draft,
+            "title": f"Unlinked {n}", "repo": "example/system", "events": list(events), "why": list(why)}})
+        self.connection.commit()
+        return url
+
+    def test_an_unlinked_pull_of_yours_counts_once_and_a_strangers_does_not(self):
+        """sd:8116: authored or asked by name with no item counts, approximate; a linked one is counted once."""
+        linked = self.pr(1, ("2026-09-06T10:00:00Z", "awaiting_them", "open"))
+        mine = self.unlinked(5, events=[{"id": "c1", "actor_id": "1", "kind": "comment", "at": "2026-09-06T11:00:00Z"}])
+        self.unlinked(6, author="2")
+        self.unlinked(8, author="2", why=["mentioned"])
+        draft = self.unlinked(7, draft=True, events=[{"id": "c2", "actor_id": "1", "kind": "comment",
+                                                      "at": "2026-09-06T11:30:00Z"}])
+        prs = self.doc()["prs"]
+        rows = {w["url"]: w for w in prs["repos"][0]["prs"]}
+        self.assertEqual(prs["items"], 3)
+        self.assertEqual(prs["unknown"], [], "a row the operator is only mentioned on is left out, not unknown")
+        self.assertEqual(sorted(rows), sorted([mine, draft, "https://github.com/example/system/pull/1"]))
+        self.assertEqual((rows[mine]["item"], rows[mine]["approximate"], rows[mine]["on_reviewers"]), (None, True, 3600))
+        self.assertEqual((rows[draft]["draft"], rows[draft]["on_you"]), (True, 1800))
+        self.assertEqual(rows["https://github.com/example/system/pull/1"]["item"], linked)
+
     def test_a_failed_read_is_the_parts_error(self):
         from sd_db import contributions
 
@@ -941,6 +970,20 @@ await flush();"""
         note = self.run_page("R.note = ELS['prs-note'].textContent;", doc)["R"]["note"]
         self.assertIn("▨ Not counted, not known whether yours: sd:9: no reading of its author and requested reviewers.",
                       note)
+
+    def test_an_unlinked_pull_request_shows_no_item_and_its_tags(self):
+        """sd:8116: no sd: name for a pull request with no item; draft and approx. say what the row is."""
+        doc = self.doc()
+        system = self.PRS["repos"][0]
+        extra = {"item": None, "title": "Unlinked", "url": "https://github.com/example/system/pull/5", "open": True,
+                 "on": "you", "on_you": 60, "on_reviewers": 0, "to_merge": None, "approximate": True, "draft": True,
+                 "stale": False}
+        doc["prs"] = {**self.PRS, "repos": [{**system, "prs": [extra, *system["prs"]]}, *self.PRS["repos"][1:]]}
+        out = self.run_page(self.OPEN_SYSTEM + "\nR.body = ELS['prs-body'].html;", doc)
+        rows = re.findall(r"<tr[^>]*>(.*?)</tr>", out["R"]["body"], re.S)
+        self.assertIn('href="https://github.com/example/system/pull/5" target="_blank" rel="noopener noreferrer">Unlinked</a>'
+                      "<small>draft · approx.</small>", rows[2])
+        self.assertNotIn("sd:null", out["R"]["body"])
 
     def test_pr_waits_with_none_says_so_and_a_failed_read_is_unknown(self):
         doc = self.doc()
