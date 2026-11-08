@@ -70,6 +70,7 @@
 .tbl .what button:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
 .tbl .what small { display: block; font: 400 var(--text-xs)/1.35 var(--font-data); color: var(--color-ink-2); }
 .scroll-x { overflow-x: auto; }
+.pr-waits tr.member .what { padding-left: var(--space-lg); } /* a repository's pull requests, under its row (sd:8084) */
 
 .state-unknown { background: repeating-linear-gradient(135deg, var(--color-panel) 0 6px, var(--color-well) 6px 7px); border: var(--rule-hair) solid var(--color-rule); border-radius: var(--radius-md); padding: var(--space-sm) var(--space-md); font-size: var(--text-sm); color: var(--color-ink-2); }
 .state-unknown b { color: var(--color-ink); }

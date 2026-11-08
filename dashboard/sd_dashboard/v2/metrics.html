@@ -107,9 +107,9 @@
       <p class="foot-note" id="times-note"></p>
     </section>
     <section class="panel" id="prs" aria-labelledby="prs-h">
-      <div class="panel-head"><div><h2 id="prs-h">PR waits <button class="help" type="button" aria-label="Help: PR waits" data-help="<b>How long items waited on their pull requests, all time.</b> Read from each item's PR lane notes: on you is changes requested, failing checks or a comment to answer; on reviewers is open and waiting on others. First PR to merge runs from the first lane note to the merge. An open pull request counts to now."><svg class="i" aria-hidden="true"><use href="#i-circle-help"/></svg></button></h2>
-        <p>Time on you and on reviewers, first PR to merge, and the slowest items.</p></div></div>
-      <div class="scroll-x"><table class="tbl" id="prs-table" aria-labelledby="prs-h"><thead><tr><th scope="col" class="g"><span class="sr">State</span></th><th scope="col">Item</th><th scope="col" class="num">On you</th><th scope="col" class="num">On reviewers</th><th scope="col" class="num hide-sm">First PR to merge</th></tr></thead><tbody id="prs-body"></tbody></table></div>
+      <div class="panel-head"><div><h2 id="prs-h">PR waits <button class="help" type="button" aria-label="Help: PR waits" data-help="<b>How long items waited on their pull requests, all time.</b> Only your pull requests count: ones you wrote, or ones you were asked to review by name; a team request does not count, and a review you gave keeps one counted. A pull request not read yet is named below, not counted. Each repository row opens to its pull requests, slowest first. Read from each item's PR lane notes: on you is changes requested, failing checks or a comment to answer; on reviewers is open and waiting on others. First PR to merge runs from the first lane note to the merge. An open pull request counts to now."><svg class="i" aria-hidden="true"><use href="#i-circle-help"/></svg></button></h2>
+        <p>Time on you and on reviewers and first PR to merge, by repository, for pull requests you wrote or were asked to review.</p></div></div>
+      <div class="scroll-x"><table class="tbl pr-waits" id="prs-table" aria-labelledby="prs-h"><thead><tr><th scope="col" class="g"><span class="sr">State</span></th><th scope="col">Item</th><th scope="col" class="num">On you</th><th scope="col" class="num">On reviewers</th><th scope="col" class="num hide-sm">First PR to merge</th></tr></thead><tbody id="prs-body"></tbody></table></div>
       <p class="foot-note" id="prs-note"></p>
     </section>
   </div>
