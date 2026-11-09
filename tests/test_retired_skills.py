@@ -1,13 +1,14 @@
 """sd-presentation and sd-publish are retired; nothing names them (sd:8286)."""
 
-import re
+import subprocess
 import unittest
 from pathlib import Path
 
+from tests.clean_env import clean_environment
+
 ROOT = Path(__file__).resolve().parents[1]
-RETIRED = re.compile(r"\bsd-(presentation|publish)\b(?![-_\w])")
-#: History records the skills as they were; a live page must not.
-SKIP = ("docs/work/", "tests/test_retired_skills.py")
+#: Either name, not followed by more of a name (`sd-publish-drive` is a live skill).
+RETIRED = r"(^|[^-_[:alnum:]])sd-(presentation|publish)([^-_[:alnum:]]|$)"
 
 
 class RetiredSkills(unittest.TestCase):
@@ -16,21 +17,13 @@ class RetiredSkills(unittest.TestCase):
             self.assertFalse((ROOT / "skills" / name).exists(), name)
 
     def test_no_live_file_names_them(self):
-        hits = []
-        for top in ("skills", "contrib", "tests", "bin", "lib", "docs"):
-            for path in (ROOT / top).rglob("*"):
-                rel = path.relative_to(ROOT).as_posix()
-                if not path.is_file() or rel.startswith(SKIP):
-                    continue
-                try:
-                    text = path.read_text(encoding="utf-8")
-                except (UnicodeDecodeError, OSError):
-                    continue
-                hits += [rel for line in text.splitlines() if RETIRED.search(line)]
-        for top in ROOT.glob("*.md"):
-            text = top.read_text(encoding="utf-8")
-            hits += [top.name for line in text.splitlines() if RETIRED.search(line)]
-        self.assertEqual([], sorted(set(hits)))
+        # Tracked files only; history in docs/work records the skills as they were.
+        found = subprocess.run(
+            ["git", "-C", str(ROOT), "grep", "-n", "-I", "-E", RETIRED, "--", ".",
+             ":(exclude)docs/work", ":(exclude)tests/test_retired_skills.py"],
+            capture_output=True, text=True, check=False, env=clean_environment())
+        self.assertIn(found.returncode, (0, 1), found.stderr)
+        self.assertEqual("", found.stdout)
 
 
 if __name__ == "__main__":
