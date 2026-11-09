@@ -2235,6 +2235,56 @@ class Archive(Case):
                     supervisor = self.supervisor(log_root=build_run.resume_root(ident, self.logs))
                 self.assertEqual(supervisor.log, build_run.log_dir(root, str(self.repo)) / f"{ident}.jsonl")
 
+    def ended(self, name: str) -> tuple[Path, Path]:
+        """An ended, released run with one quiet local file `name`; (that file, where the archive puts it)."""
+        self.press()
+        local = self.root / "local"
+        folder = build_run.log_dir(local, str(self.repo))
+        folder.mkdir(parents=True)
+        path = folder / name.format(run=self.bundle["id"])
+        path.write_text("x")
+        os.utime(path, (0, 0))
+        self.db.execute("UPDATE runner_run SET outcome = 'blocked', released_at = ?, log_path = ?, detail = ? "
+                        "WHERE id = ?", (build_run.now(), str(path), f"refused; log {path}", self.bundle["id"]))
+        self.db.commit()
+        return path, build_run.log_dir(self.logs, str(self.repo)) / path.name
+
+    def test_notes_and_end_messages_name_the_archived_log(self):
+        """sd:8275: the move rewrote only `log_path`; a note or end message still named the local file it removed."""
+        path, target = self.ended("{run}.jsonl")
+        item = self.items[0]
+        add_note(self.db, item, "followup", f"Build blocked: refused; log {path}. Look at the log.")
+        self.db.execute("UPDATE assignment SET result = ? WHERE id = ?", (f"refused; log {path}",
+                                                                           self.bundle["assignment"]))
+        self.db.commit()
+        self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs), [str(target)])
+        bodies = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (item,))]
+        self.assertNotIn(str(path), "\n".join(bodies))
+        self.assertIn(f"Build blocked: refused; log {target}. Look at the log.", bodies)
+        for sql in ("SELECT detail FROM runner_run WHERE id = ?", "SELECT result FROM assignment WHERE id = ?"):
+            key = self.bundle["id"] if "runner_run" in sql else self.bundle["assignment"]
+            self.assertEqual(self.db.execute(sql, (key,)).fetchone()[0], f"refused; log {target}")
+
+    def test_a_hung_bulk_root_does_not_stall_the_tick(self):
+        """sd:8275: the copy ran on the tick's thread, so a hung network mount held dispatch past its timer."""
+        path, target = self.ended("{run}.jsonl")
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def hung(*_args, **_kwargs):
+            release.wait(30)
+            raise OSError("the mount came back too late")
+
+        with mock.patch.object(build_run.shutil, "copy2", side_effect=hung):
+            started = time.monotonic()
+            self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs, deadline=0.3), [])
+            self.assertLess(time.monotonic() - started, 5)
+        self.assertTrue(path.exists(), "a copy that did not finish leaves the local file")
+        self.assertEqual(self.db.execute("SELECT log_path FROM runner_run WHERE id = ?",
+                                         (self.bundle["id"],)).fetchone()[0], str(path))
+        release.set()
+        self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs), [str(target)])
+
     def test_an_unwritable_bulk_root_leaves_the_files_for_the_next_tick(self):
         self.press()
         local = self.root / "local"

@@ -48,6 +48,7 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Collection
 from dataclasses import dataclass, field
@@ -654,15 +655,24 @@ def resume_root(ident: str, bulk: Path) -> Path:
 ARCHIVE_SETTLE_SECONDS = 60
 
 
-def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETTLE_SECONDS) -> list[str]:
+#: How long one tick waits on the bulk root's copies: a hung network mount must not hold dispatch.
+ARCHIVE_DEADLINE_SECONDS = 20
+
+
+def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETTLE_SECONDS,
+            deadline: float = ARCHIVE_DEADLINE_SECONDS) -> list[str]:
     """Move each file of an ended run from `local` to the same place under `bulk`; the new paths.
 
     `sd-<assignment>.title` and `.body.md` move once every run of that assignment ended and was released,
     the rest once the run their name starts with was: an outcome alone leaves a blocked or abandoned run's
-    groups alive until the reap releases it, and they may still write. A file no run owns, one written in the last `settle` seconds or one
-    whose copy fails stays for a later tick. The row's `log_path` names the copy before the local file goes.
+    groups alive until the reap releases it, and they may still write. A file no run owns, one written in the
+    last `settle` seconds or one whose copy fails stays for a later tick.
+
+    The copies run on a daemon thread the tick waits on for `deadline` seconds at most (sd:8275): a copy not
+    done by then is left for a later tick. The rows then name the copy, in `log_path` and in every note body,
+    run detail and assignment result that named the local file, before the local file goes.
     """
-    moved, cutoff = [], time.time() - settle
+    pending, cutoff = [], time.time() - settle
     for path in sorted(local.glob("*/build/*")):
         owner = re.fullmatch(r"sd-(\d+)\.(?:title|body\.md)", path.name)
         ended = "SELECT outcome IS NOT NULL AND released_at IS NOT NULL FROM runner_run WHERE "
@@ -671,22 +681,41 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
         released = [row[0] for row in rows]
         if not released or not all(released):
             continue
-        target = bulk / path.relative_to(local)
         try:
             if path.stat().st_mtime > cutoff:
                 continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, target)
         except OSError:
             continue
-        # The local file goes only after the row names the copy: a failed write leaves it for the next tick.
+        pending.append((path, bulk / path.relative_to(local)))
+    copied: list[tuple[Path, Path]] = []
+
+    def copy() -> None:
+        for path, target in pending:
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, target)
+            except OSError:
+                continue
+            copied.append((path, target))
+
+    worker = threading.Thread(target=copy, name="sd-build-archive", daemon=True)
+    worker.start()
+    worker.join(deadline)
+    moved = []
+    # A copy still running past the deadline is not in this snapshot; the next tick copies it again.
+    for path, target in list(copied):
+        old, new = str(path), str(target)
+        # The local file goes only after the rows name the copy: a failed write leaves it for the next tick.
         with transaction(connection):
-            connection.execute("UPDATE runner_run SET log_path = ? WHERE log_path = ?", (str(target), str(path)))
+            connection.execute("UPDATE runner_run SET log_path = ? WHERE log_path = ?", (new, old))
+            for table, column in (("note", "body"), ("runner_run", "detail"), ("assignment", "result")):
+                connection.execute(f"UPDATE {table} SET {column} = replace({column}, ?, ?) "
+                                   f"WHERE instr({column}, ?) > 0", (old, new, old))
         try:
             path.unlink()
         except OSError:
-            continue  # the row names the copy; the next tick copies again and removes it
-        moved.append(str(target))
+            continue  # the rows name the copy; the next tick copies again and removes it
+        moved.append(new)
     return moved
 
 
