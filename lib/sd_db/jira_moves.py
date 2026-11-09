@@ -25,7 +25,8 @@ Before it posts a transition, an unassigned ticket is assigned to the
 sync's own account (`/myself`), since a workflow may require an assignee
 on it (ruling #50708); a ticket with an assignee keeps it. A refused
 assignment is a failed move, and every 4xx line carries Jira's own
-`errorMessages` and `errors` text.
+`errorMessages` and `errors` text. A failed `/myself` lookup there says
+nothing about the ticket, so it is transient, whatever Jira answered.
 
 `done` is also how sd records work nobody did: `progress.cancel_work` and
 the priority sweep's closure. Neither is finished work, so each leaves the
@@ -255,11 +256,16 @@ def _assign(config: dict, key: str, transport=None) -> str:
     existing assignee is never changed. A refusal is a failed move.
     """
     me, error = shadow_jira.account_id(config, transport)
-    _stop(error, config, transport)
+    if error:
+        # The lookup says nothing about this ticket: any failure, a malformed answer or a 4xx included, holds the
+        # cursor, as the first run's account check does (sd:8293 lane round 2).
+        raise _Retry(f"assigning it to the sync's account: the account check failed: {error}")
     _, error = shadow_jira._request(_issue(config, key) + "/assignee", config, {"accountId": me},
                                     transport, method="PUT")
     try:
         _stop(error, config, transport)
+    except _Retry as failed:
+        raise _Retry(f"assigning it to the sync's account: {failed}") from None
     except ValueError as refused:
         raise ValueError(f"assigning it to the sync's account failed: {refused}") from None
     return "assigned to the sync's account, "

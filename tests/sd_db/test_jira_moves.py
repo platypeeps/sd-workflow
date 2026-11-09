@@ -234,6 +234,58 @@ class TheMoves(unittest.TestCase):
             "Jira returned 400 Bad Request: User cannot be assigned issues."])
         self.assertEqual(jira.posted, [])
 
+    def held_by_the_account_lookup(self, *answers):
+        """sd:8293 lane round 2: the assignment's `/myself` lookup says nothing about the ticket, so every
+        failure of it holds the cursor, names the assignment step, and the next run moves the ticket."""
+        jira = FakeJira({"ABC-7": "To Do"})
+        jira.assignees["ABC-7"] = None
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        held = jira_moves.read_cursor(self.db)
+        transition(self.db, self.item, "done", who="operator")
+        queue = list(answers)
+
+        def transport(url, headers, body, method=None):
+            if url.endswith("/rest/api/3/myself") and queue:
+                return queue.pop(0)
+            return jira(url, headers, body, method)
+
+        lines = jira_moves.run(self.db, transport, JIRA_ENV)
+        self.assertEqual((jira_moves.read_cursor(self.db), self.notes(self.item)), (held, []))
+        self.assertEqual(len(lines), 1, lines)
+        self.assertTrue(lines[0].startswith("jira moves: ABC-7: not moved, cursor held for the next run: "
+                                            "assigning it to the sync's account: the account check failed: "),
+                        lines[0])
+        self.assertEqual((jira.assigned, jira.posted), ([], []))
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV),
+                         ["jira moves: ABC-7: assigned to the sync's account, moved to Done"])
+
+    def test_a_malformed_account_answer_holds_an_assignment(self):
+        self.held_by_the_account_lookup(({"accountId": 3}, ""))
+
+    def test_a_400_from_the_account_check_holds_an_assignment(self):
+        self.held_by_the_account_lookup((None, sentence(refused(400, "Bad Request"))))
+
+    def test_a_404_from_the_account_check_holds_an_assignment_though_a_reprobe_passes(self):
+        self.held_by_the_account_lookup((None, sentence(refused(404, "Not Found"))))
+
+    def test_a_503_from_the_account_check_names_the_assignment_step(self):
+        self.held_by_the_account_lookup((None, sentence(refused(503, "Service Unavailable"))))
+
+    def test_a_503_on_the_assignment_holds_the_cursor_and_names_the_step(self):
+        jira = FakeJira({"ABC-7": "To Do"})
+        jira.assignees["ABC-7"] = None
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        held = jira_moves.read_cursor(self.db)
+        transition(self.db, self.item, "done", who="operator")
+        jira.refuse_assign = sentence(refused(503, "Service Unavailable"))
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), [
+            "jira moves: ABC-7: not moved, cursor held for the next run: assigning it to the sync's account: "
+            "Jira returned 503 Service Unavailable"])
+        self.assertEqual((jira_moves.read_cursor(self.db), self.notes(self.item), jira.posted), (held, [], []))
+        jira.refuse_assign = ""
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV),
+                         ["jira moves: ABC-7: assigned to the sync's account, moved to Done"])
+
     def linked(self, *keys):
         return [create_item(self.db, kind="task", title=key, source="task-ref", external_id=f"jira:{key}") for key in keys]
 
@@ -497,9 +549,11 @@ class TheMoves(unittest.TestCase):
         held = jira_moves.read_cursor(self.db)
         transition(self.db, self.item, "done", who="operator")
         jira.down["ABC-7"] = sentence(refused(404, "Not Found"))
-        for probe in (sentence(refused(503, "Service Unavailable")), sentence(refused(404, "Not Found"))):
+        malformed = "Jira accepted the request but named no account"
+        for answer, probe in ((None, sentence(refused(503, "Service Unavailable"))),
+                              (None, sentence(refused(404, "Not Found"))), ({"accountId": 3}, malformed)):
             with self.subTest(probe):
-                jira.myself = (None, probe)
+                jira.myself = (answer, "" if answer else probe)
                 lines = jira_moves.run(self.db, jira, JIRA_ENV)
                 self.assertEqual(lines, ["jira moves: ABC-7: not moved, cursor held for the next run: "
                                          f"Jira returned 404 Not Found; the account check failed: {probe}"])
@@ -690,7 +744,11 @@ def replaced(tree: Any, at: tuple, value: Any) -> Any:
 def scripted(answers: dict[str, Any], posted: list[dict]):
     """A transport that gives `answers` and records each transition body it is sent."""
 
-    def transport(url, headers, body):
+    def transport(url, headers, body, method=None):
+        if url.endswith("/rest/api/3/myself"):
+            return {"accountId": "acct-1"}, ""
+        if url.endswith("/assignee"):
+            return {}, ""
         if body is not None:
             posted.append(body)
             return {}, ""
