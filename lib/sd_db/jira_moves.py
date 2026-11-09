@@ -21,6 +21,12 @@ offered into it, unless that is a done name that says the work was not
 done (`NOT_DONE`). Any other offer list is that item's failure, a note
 naming the offers, and the ticket stays.
 
+Before it posts a transition, an unassigned ticket is assigned to the
+sync's own account (`/myself`), since a workflow may require an assignee
+on it (ruling #50708); a ticket with an assignee keeps it. A refused
+assignment is a failed move, and every 4xx line carries Jira's own
+`errorMessages` and `errors` text.
+
 `done` is also how sd records work nobody did: `progress.cancel_work` and
 the priority sweep's closure. Neither is finished work, so each leaves the
 ticket as it is, and the sync says so. A done item whose stored fields
@@ -207,9 +213,10 @@ def move(config: dict, key: str, status: str, transport=None) -> str:
     if status not in TARGET:
         return f"{key}: {status} moves nothing"
     category, name = TARGET[status]
-    payload, error = shadow_jira._request(_issue(config, key) + "?fields=status", config, None, transport)
+    payload, error = shadow_jira._request(_issue(config, key) + "?fields=status,assignee", config, None, transport)
     _stop(error, config, transport)
-    current, current_category = _state(_object(_object(payload, "issue").get("fields"), "fields").get("status"))
+    fields = _object(_object(payload, "issue").get("fields"), "fields")
+    current, current_category = _state(fields.get("status"))
     if current_category == category:
         return f"{key}: already {current}, left as it is"
     if category == "done" and _folded(current) in RELEASE:
@@ -225,10 +232,37 @@ def move(config: dict, key: str, status: str, transport=None) -> str:
     if chosen is None:
         raise ValueError(f"no transition named {name} is offered from {current}, and the "
                          f"{name.lower()} offers are {', '.join(offer[1] for offer in offered)}")
+    assigned = "" if _assigned(fields) else _assign(config, key, transport)
     _, error = shadow_jira._request(_issue(config, key) + "/transitions", config,
                                     {"transition": {"id": chosen[0]}}, transport)
     _stop(error, config, transport)
-    return f"{key}: moved to {chosen[1]}"
+    return f"{key}: {assigned}moved to {chosen[1]}"
+
+
+def _assigned(fields: dict) -> bool:
+    """Whether the ticket has an assignee; a malformed one is that item's failure."""
+    who = fields.get("assignee")
+    if who is None:
+        return False
+    _text(_object(who, "assignee").get("accountId"), "assignee account id")
+    return True
+
+
+def _assign(config: dict, key: str, transport=None) -> str:
+    """Assign an unassigned ticket to the sync's own account before it moves (ruling #50708).
+
+    Some workflows require an assignee on a transition, such as Done. An
+    existing assignee is never changed. A refusal is a failed move.
+    """
+    me, error = shadow_jira.account_id(config, transport)
+    _stop(error, config, transport)
+    _, error = shadow_jira._request(_issue(config, key) + "/assignee", config, {"accountId": me},
+                                    transport, method="PUT")
+    try:
+        _stop(error, config, transport)
+    except ValueError as refused:
+        raise ValueError(f"assigning it to the sync's account failed: {refused}") from None
+    return "assigned to the sync's account, "
 
 
 def run(connection: sqlite3.Connection, transport=None, environ=None) -> list[str]:

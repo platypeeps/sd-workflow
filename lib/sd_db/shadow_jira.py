@@ -305,11 +305,13 @@ def window_minutes(start: datetime, now: datetime) -> int:
     return int(math.ceil(seconds / 60.0))
 
 
-def _request(url: str, config: dict[str, str], body: dict | None, transport=None):
+def _request(url: str, config: dict[str, str], body: dict | None, transport=None, method: str | None = None):
     """One authenticated call. Returns (payload, error-sentence).
 
     `transport` is the test seam: a callable taking (url, headers, body) and
-    returning a payload dict, so nothing in the suite opens a socket.
+    returning a payload dict, so nothing in the suite opens a socket. A
+    `method` other than urllib's default (GET, or POST with a body) is passed
+    as a keyword, so a transport that never sees one need not take it.
     """
     auth = base64.b64encode(
         f"{config['email']}:{config['token']}".encode()
@@ -317,7 +319,8 @@ def _request(url: str, config: dict[str, str], body: dict | None, transport=None
     headers = {"Authorization": "Basic " + auth, "Accept": "application/json"}
     if body is not None:
         headers["Content-Type"] = "application/json"
-    return (transport if transport is not None else _http)(url, headers, body)
+    send = transport if transport is not None else _http
+    return send(url, headers, body, method=method) if method else send(url, headers, body)
 
 
 # The codes `urllib`'s redirect handler follows. Any other 3xx (300, 304, 305)
@@ -355,7 +358,27 @@ class NotFound(Transient):
     """A 404: transient alone, but `jira_moves` pins it on the ticket when the account check passes (sd:8117)."""
 
 
-def _http(url: str, headers: dict[str, str], body: dict | None):
+def _jira_says(error: urllib.error.HTTPError) -> str:
+    """Jira's own reason from an error body: its `errorMessages` and `errors` texts, or "" (sd:8293).
+
+    A 400 on a transition says only "Bad Request"; the body says why, such as
+    "Field Assignee is required". Anything else in the body is dropped.
+    """
+    try:
+        payload = json.loads(error.read(65536).decode())
+    except (OSError, ValueError, RecursionError, http.client.HTTPException):
+        return ""
+    if not isinstance(payload, dict):
+        return ""
+    messages = payload.get("errorMessages")
+    errors = payload.get("errors")
+    said = [m for m in messages if isinstance(m, str)] if isinstance(messages, list) else []
+    said += [m for m in errors.values() if isinstance(m, str)] if isinstance(errors, dict) else []
+    said = [" ".join(m.split()) for m in said if m.strip()]
+    return "; ".join(said)[:300]
+
+
+def _http(url: str, headers: dict[str, str], body: dict | None, method: str | None = None):
     """The real transport: the seam's signature, over `urllib`."""
     try:
         # Inside the `try`: `Request` splits the URL, and `urllib.parse`
@@ -364,6 +387,7 @@ def _http(url: str, headers: dict[str, str], body: dict | None):
             url,
             data=json.dumps(body).encode() if body is not None else None,
             headers=headers,
+            method=method,
         )
         # Built per call, as `urlopen` builds its default, so proxy settings
         # come from the environment at request time rather than at import.
@@ -376,6 +400,7 @@ def _http(url: str, headers: dict[str, str], body: dict | None):
             data = response.read().decode()
             return ({} if response.status == 204 and body is not None else json.loads(data)), ""
     except urllib.error.HTTPError as error:
+        says = _jira_says(error) if 400 <= error.code < 500 and error.code not in (401, 403) else ""
         error.close()
         if error.code in (401, 403):
             return None, Transient(
@@ -389,7 +414,7 @@ def _http(url: str, headers: dict[str, str], body: dict | None):
                 f"Jira redirected the request ({error.code} {error.reason}) and redirects "
                 f"are not followed with credentials; set {ENV_BASE} to the URL Jira answers on"
             )
-        text = f"Jira returned {error.code} {error.reason}"
+        text = f"Jira returned {error.code} {error.reason}" + (f": {says}" if says else "")
         if error.code == 404:
             return None, NotFound(text)
         return None, text if 400 <= error.code < 500 and error.code != 429 else Transient(text)
