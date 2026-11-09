@@ -3097,6 +3097,20 @@ class LineLimits(SharedQueue):
         entry = sd_lane.enqueue_entry(tree, 1, "fix: " + "t" * 58, self.body, self.environ, claim="deliver")
         self.assertEqual((entry["status"], self.remote_tip("topic")), ("pending", entry["expected_head"]))
 
+    DEPENDABOT = "build(deps): bump example from 1.0 to 1.1\n\n" + "r" * 140
+
+    def test_a_dependabot_commit_is_exempt(self) -> None:
+        """sd:8191: a Dependabot body runs to 140 and the branch cannot be rewritten."""
+        tree = self.worktree("topic")
+        git(tree, "commit", "-q", "--allow-empty", "-m", self.DEPENDABOT,
+            "--author", "dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>")
+        entry = sd_lane.enqueue_entry(tree, 1, "chore: bump example", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["status"], "pending")
+
+    def test_the_same_lines_from_another_author_are_refused(self) -> None:
+        tree, [head] = self.committed("topic", self.DEPENDABOT)
+        self.assertIn(f"commit {head[:12]} line 3 is 140 characters", str(self.refused(tree, "t")))
+
     def test_a_merge_commit_is_a_branch_commit_too(self) -> None:
         """Codex review: `--no-merges` let a 90-character merge subject through; only two exemptions exist."""
         tree, _ = self.committed("topic", "fine")
