@@ -251,7 +251,7 @@ def shadow_sync(args) -> int:
                 continue
             # sd:6712: a scheduled GitHub run files the pull request alerts; a library without them is not asked.
             # sd:8142: a Jira run files the issue alerts it read.
-            alerts = {"alerts": True} if not recovery and importlib.util.find_spec("sd_db.pr_attention") else {}
+            alerts: dict[str, bool | int] = {"alerts": True} if not recovery and importlib.util.find_spec("sd_db.pr_attention") else {}
             days = mention_days() if alerts and name == "jira" else None
             if days:
                 alerts["mention_days"] = days
