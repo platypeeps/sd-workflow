@@ -424,8 +424,8 @@ class Case(unittest.TestCase):
     def supervisor(self, ident=None, **options):
         options = {"beat_seconds": 0.2, "timeout": 30, "grace": 0.5, **options}
         options = {"cited": ADAPTER.cited, "environ": self.env, **options}
-        return build_run.Supervisor(self.db, ident or self.bundle["id"], tools=self.tools, log_root=self.logs,
-                                    **options)
+        options.setdefault("log_root", self.logs)
+        return build_run.Supervisor(self.db, ident or self.bundle["id"], tools=self.tools, **options)
 
     def write_pr(self, title="feat(fixture): build the fixture", body="## Summary\n\nx\n\n## Test plan\n\ny\n"):
         logs = build_run.log_dir(self.logs, self.bundle["repo"])
@@ -2160,6 +2160,94 @@ class Sweep(Case):
         support.git(self.repo, "worktree", "lock", str(work))
         self.assertEqual(build_run.sweep(self.db), [])
         self.assertTrue(work.is_dir())
+
+
+class Archive(Case):
+    """pack sd:8246: a run writes its logs to a local folder; the tick moves an ended run's files to the bulk root."""
+
+    def test_the_default_local_root_is_the_state_folder(self):
+        self.assertEqual(build_run.local_root({"HOME": "/home/operator"}),
+                         Path("/home/operator/.local/state/sd/builds"))
+        self.assertEqual(build_run.local_root({"XDG_STATE_HOME": "/state"}), Path("/state/sd/builds"))
+
+    def test_an_ended_runs_quiet_files_move_and_the_row_names_the_new_log(self):
+        self.press()
+        ident, lead = self.bundle["id"], self.bundle["assignment"]
+        local = self.root / "local"
+        folder = build_run.log_dir(local, str(self.repo))
+        folder.mkdir(parents=True)
+        names = [f"{ident}.jsonl", f"{ident}.supervisor.log", f"sd-{lead}.title", f"sd-{lead}.body.md"]
+        for name in [*names, "stray.log"]:
+            (folder / name).write_text("x")
+            os.utime(folder / name, (0, 0))
+        self.db.execute("UPDATE runner_run SET log_path = ? WHERE id = ?", (str(folder / names[0]), ident))
+        self.db.commit()
+        self.assertEqual(build_run.archive(self.db, local, self.logs), [], "an open run's files stay")
+        self.db.execute("UPDATE runner_run SET outcome = 'blocked' WHERE id = ?", (ident,))
+        self.db.commit()
+        # Review round 2: a blocked run holds its lease, and maybe live groups, until the reap releases it.
+        self.assertEqual(build_run.archive(self.db, local, self.logs), [], "an unreleased run's files stay")
+        self.db.execute("UPDATE runner_run SET released_at = ? WHERE id = ?", (build_run.now(), ident))
+        self.db.commit()
+        (folder / names[1]).touch()  # written just now: the supervisor may still be printing
+        target = build_run.log_dir(self.logs, str(self.repo))
+        moved = build_run.archive(self.db, local, self.logs)
+        self.assertEqual(sorted(moved), sorted(str(target / name) for name in names if name != names[1]))
+        self.assertEqual(sorted(path.name for path in folder.iterdir()), sorted([names[1], "stray.log"]))
+        log = self.db.execute("SELECT log_path FROM runner_run WHERE id = ?", (ident,)).fetchone()[0]
+        self.assertEqual(log, str(target / names[0]))
+
+    def test_a_failed_row_update_keeps_the_local_log_for_the_next_tick(self):
+        """Review round 1: the move deleted the local file before `log_path` changed, so a failed write left
+        the row naming a file no later tick could find."""
+        self.press()
+        ident, local = self.bundle["id"], self.root / "local"
+        folder = build_run.log_dir(local, str(self.repo))
+        folder.mkdir(parents=True)
+        log = folder / f"{ident}.jsonl"
+        log.write_text("x")
+        os.utime(log, (0, 0))
+        self.db.execute("UPDATE runner_run SET outcome = 'done', released_at = ?, log_path = ? WHERE id = ?",
+                        (build_run.now(), str(log), ident))
+        self.db.commit()
+        with mock.patch.object(build_run, "transaction", side_effect=sqlite3.OperationalError("database is locked")):
+            with self.assertRaises(sqlite3.OperationalError):
+                build_run.archive(self.db, local, self.logs)
+        self.assertTrue(log.exists(), "the local log stays until the row names the moved one")
+        target = build_run.log_dir(self.logs, str(self.repo)) / log.name
+        self.assertEqual(build_run.archive(self.db, local, self.logs), [str(target)])
+        self.assertFalse(log.exists())
+        self.assertEqual(self.db.execute("SELECT log_path FROM runner_run WHERE id = ?", (ident,)).fetchone()[0],
+                         str(target))
+
+    def test_a_resumed_supervisor_keeps_the_log_root_it_started_with(self):
+        """Review round 2: a supervisor that execs in place keeps its child, which writes to the first image's
+        files; the new image must read the same ones, and one from before pack sd:8246 used the bulk root."""
+        self.press()
+        ident, local = self.bundle["id"], self.root / "local"
+        self.assertEqual(self.supervisor().state()["root"], str(self.logs))
+        with mock.patch.object(build_run, "local_root", return_value=local):
+            self.assertEqual(build_run.resume_root(ident, self.logs), local, "a fresh start logs locally")
+            for handed, root in ((resume_state(ident), self.logs), ({**resume_state(ident), "root": "/kept"},
+                                                                     Path("/kept"))):
+                with mock.patch.dict(os.environ, {build_run.RESUME_ENV: json.dumps(handed)}):
+                    self.assertEqual(build_run.resume_root(ident, self.logs), root)
+                    supervisor = self.supervisor(log_root=build_run.resume_root(ident, self.logs))
+                self.assertEqual(supervisor.log, build_run.log_dir(root, str(self.repo)) / f"{ident}.jsonl")
+
+    def test_an_unwritable_bulk_root_leaves_the_files_for_the_next_tick(self):
+        self.press()
+        local = self.root / "local"
+        folder = build_run.log_dir(local, str(self.repo))
+        folder.mkdir(parents=True)
+        log = folder / f"{self.bundle['id']}.jsonl"
+        log.write_text("x")
+        os.utime(log, (0, 0))
+        self.db.execute("UPDATE runner_run SET outcome = 'done', released_at = ?", (build_run.now(),))
+        self.db.commit()
+        self.logs.write_text("a file, not a folder")
+        self.assertEqual(build_run.archive(self.db, local, self.logs), [])
+        self.assertTrue(log.exists())
 
 
 class Drafts(Case):

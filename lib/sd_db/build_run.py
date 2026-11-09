@@ -41,7 +41,9 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shlex
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -55,7 +57,7 @@ from typing import Any, Callable
 from . import build, contributions, draft, paths, remote, sessions
 from .build import Probe
 from .config import system_checkout
-from .database import Patient
+from .database import Patient, transaction
 from .errors import SchemaTooNew
 from .ship import this_host
 from .workflow import WorkflowError
@@ -627,8 +629,65 @@ def spawn(argv: list[str], *, log: Path) -> int:
 
 
 def log_dir(log_root: Path, repo: str) -> Path:
-    """`<bulk root>/<repository>/build/`, the design's log folder."""
+    """`<root>/<repository>/build/`, the design's log folder, under the local or the bulk root."""
     return log_root / paths.expand(repo).name / "build"
+
+
+def local_root(environ: dict | None = None) -> Path:
+    """Where a live run writes its logs, `$XDG_STATE_HOME/sd/builds` on the system disk: the bulk root
+    may be a network volume (pack sd:8246). `archive` moves an ended run's files to the bulk root."""
+    env = os.environ if environ is None else environ
+    state = env.get("XDG_STATE_HOME") or os.path.join(env.get("HOME") or os.path.expanduser("~"), ".local/state")
+    return Path(state) / "sd" / "builds"
+
+
+def resume_root(ident: str, bulk: Path) -> Path:
+    """The log root for run `ident`'s supervisor: the one an earlier image of this process handed over, whose
+    kept child still writes there; `bulk` for an image from before pack sd:8246, which named none; else local."""
+    state = resume_state(ident)
+    if state is None:
+        return local_root()
+    return Path(state["root"]) if state.get("root") else bulk
+
+
+#: A file written this recently stays local: the supervisor may still print its last line.
+ARCHIVE_SETTLE_SECONDS = 60
+
+
+def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETTLE_SECONDS) -> list[str]:
+    """Move each file of an ended run from `local` to the same place under `bulk`; the new paths.
+
+    `sd-<assignment>.title` and `.body.md` move once every run of that assignment ended and was released,
+    the rest once the run their name starts with was: an outcome alone leaves a blocked or abandoned run's
+    groups alive until the reap releases it, and they may still write. A file no run owns, one written in the last `settle` seconds or one
+    whose copy fails stays for a later tick. The row's `log_path` names the copy before the local file goes.
+    """
+    moved, cutoff = [], time.time() - settle
+    for path in sorted(local.glob("*/build/*")):
+        owner = re.fullmatch(r"sd-(\d+)\.(?:title|body\.md)", path.name)
+        ended = "SELECT outcome IS NOT NULL AND released_at IS NOT NULL FROM runner_run WHERE "
+        rows = connection.execute(ended + "assignment = ?", (int(owner[1]),)) if owner \
+            else connection.execute(ended + "id = ?", (path.name.split(".", 1)[0],))
+        released = [row[0] for row in rows]
+        if not released or not all(released):
+            continue
+        target = bulk / path.relative_to(local)
+        try:
+            if path.stat().st_mtime > cutoff:
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, target)
+        except OSError:
+            continue
+        # The local file goes only after the row names the copy: a failed write leaves it for the next tick.
+        with transaction(connection):
+            connection.execute("UPDATE runner_run SET log_path = ? WHERE log_path = ?", (str(target), str(path)))
+        try:
+            path.unlink()
+        except OSError:
+            continue  # the row names the copy; the next tick copies again and removes it
+        moved.append(str(target))
+    return moved
 
 
 def _environ(environ: dict | None) -> dict:
@@ -663,7 +722,7 @@ class Supervisor:
         self.checks = checks
         self.beat_seconds, self.timeout, self.grace = beat_seconds, timeout, grace
         self.row = build.run(self.db, ident)
-        self.logs = log_dir(log_root, self.row["repo"])
+        self.log_root, self.logs = log_root, log_dir(log_root, self.row["repo"])
         self.work = Path(self.row["work_path"])
         self.repo = paths.expand(self.row["repo"])
         self.lead, self.others = _lead_item(self.db, ident)
@@ -721,7 +780,7 @@ class Supervisor:
         if last is not None and last["exit"] is None:
             last["left"] = max(self.deadline - time.monotonic(), 0.0)
         return {"run": self.ident, "pid": os.getpid(), "child": last, "groups": self.groups, "reviewed": self.reviewed,
-                "ending": self.ending, "marks": sorted(self.marks), "unknown": self.unknown}
+                "ending": self.ending, "marks": sorted(self.marks), "unknown": self.unknown, "root": str(self.log_root)}
 
     def fault_seen(self, fault: Exception) -> None:
         if not self.hub_down:
@@ -1705,7 +1764,7 @@ class DraftSupervisor(Supervisor):
         self.db, self.ident, self.tools, self.probe = Patient(connection), ident, tools, probe
         self.beat_seconds, self.timeout, self.grace = beat_seconds, timeout, grace
         self.row = build.run(self.db, ident)
-        self.logs = log_dir(log_root, self.row["repo"])
+        self.log_root, self.logs = log_root, log_dir(log_root, self.row["repo"])
         self.repo = self.work = paths.expand(self.row["repo"])
         self.log = self.logs / f"{ident}.jsonl"
         self.item = self.db.execute("SELECT item FROM assignment WHERE id = ?",

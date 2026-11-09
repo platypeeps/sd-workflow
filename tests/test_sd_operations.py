@@ -188,6 +188,8 @@ class OperationsCLI(unittest.TestCase):
         run.now = Mock(return_value="2026-10-25T09:00:00+00:00")
         run.paths = types.SimpleNamespace(key=lambda value: value, expand=Path)
         run.Tools = lambda **tools: types.SimpleNamespace(**tools)
+        run.local_root = Mock(return_value=Path("/local"))
+        run.archive = Mock(return_value=[])
         for patcher in (patch.dict(sys.modules, {"sd_db.build": build, "sd_db.build_run": run}),
                         patch.object(sd_db, "build", build, create=True),
                         patch.object(sd_db, "build_run", run, create=True),
@@ -208,6 +210,7 @@ class OperationsCLI(unittest.TestCase):
         kwargs = run.dispatch.call_args.kwargs
         self.assertEqual((kwargs["load"], kwargs["load_cap"], kwargs["interactive"]), (None, None, []))
         self.assertIn("bulk_storage_root is unset", kwargs["why"])
+        run.archive.assert_not_called()  # no bulk root: an ended run's logs stay local
         self.assertIn("claimed 1, drafted 0, spawned 1", output)
         self.connect.assert_called_with(sd_db, write=True)
         self.connection.close.assert_called_once()
@@ -222,13 +225,16 @@ class OperationsCLI(unittest.TestCase):
             "reaped": [], "moved": [], "swept": [], "claimed": [], "drafted": [], "spawned": ["r1"], "why": ""})[1]
         with patch.object(cli, "gate_load", return_value=(1.0, 0.0)), \
                 patch.object(cli, "interactive_builders", return_value=[]), \
-                patch.object(cli, "log_root", return_value=Path("/bulk")):
+                patch.object(cli, "log_root", return_value=Path("/bulk")), \
+                patch.object(cli, "writable", return_value=True):
             self.call("assignments", "dispatch")
         argv = run.spawn.call_args.args[0]
         self.assertEqual(Path(argv[1]), ROOT / "bin" / "sd")
         arguments = self.parser.parse_args(argv[2:])
         self.assertEqual((arguments.handler, arguments.run, arguments.sessions), (cli.build_dispatcher, "r1", False))
-        self.assertEqual(run.spawn.call_args.kwargs["log"], Path("/bulk/r1.supervisor.log"))
+        # pack sd:8246: a live run logs to the local folder; the tick moves an ended run's files to the bulk root.
+        self.assertEqual(run.spawn.call_args.kwargs["log"], Path("/local/r1.supervisor.log"))
+        run.archive.assert_called_once_with(self.connection, Path("/local"), Path("/bulk"))
 
     def tick(self, run):
         with patch.object(cli, "gate_load", return_value=(1.0, 40.0)), \
