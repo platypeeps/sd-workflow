@@ -445,7 +445,7 @@ def tick(sd_db: Any, build: Any, build_run: Any, root: Path | None, why: str, un
                                     spawn=spawn, lane=lane, why=why)
         result["pushed"] = push_failures(connection)
         if root is not None and not why:  # the bulk root answered the probe
-            result["archived"] = build_run.archive(connection, build_run.local_root(), root)
+            result["logs_moved"] = build_run.archive(connection, build_run.local_root(), root)
     except (sd_db.SdDbError, ValueError, OSError) as error:
         raise WorkRefusal(str(error)) from error
     finally:
