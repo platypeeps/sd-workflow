@@ -513,8 +513,10 @@ def suggested(connection: sqlite3.Connection, *, repos: Iterable[str | None] | N
     taken = {row["id"] for row in queued if row["queue"] in ("build", "lane")}
     ready = [row for row in queued if row["queue"] == "ready"]
     fields = {row["id"]: row for row in connection.execute(
-        f"SELECT id, due, priority FROM item WHERE id IN ({', '.join('?' for _ in ready)})",
+        f"SELECT id, due, priority, kind FROM item WHERE id IN ({', '.join('?' for _ in ready)})",
         [row["id"] for row in ready])} if ready else {}
+    # A ready idea or report is a vault reference note, not work (sd:8281).
+    ready = [row for row in ready if fields[row["id"]]["kind"] not in _UNSCHEDULED_SKIPS]
     due = [row for row in work(connection, repos=repos, now=now)
            if row["due"] is not None and row["kind"] not in _UNSCHEDULED_SKIPS]
     found = []
