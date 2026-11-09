@@ -303,6 +303,12 @@ class Sessions(ScreenCase):
         doc = self.read([agent("*")])
         self.assertEqual(doc["sessions"][0]["safe"]["state"], "unknown")
 
+    def test_an_observer_session_with_no_transcript_leaves_the_builder_count_known(self):
+        # pack sd:8266: claude-mem's observers keep no transcript and build nothing; two stopped the dispatcher.
+        cwd = "/home/op/.claude-mem/observer-sessions/49303"
+        doc = self.read([agent(OTHER, status="busy", cwd=cwd, name="49303-f1")])
+        self.assertEqual(counted(doc["builders"]), {"running": 0, "why": ""})
+
 
 class Ending(unittest.TestCase):
     """sd:5126: End session signals only the pid that claude agents and ps still tie to the posted session."""
