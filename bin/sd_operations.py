@@ -465,7 +465,7 @@ def supervise_build(args: argparse.Namespace) -> int:
         raise WorkRefusal(str(error)) from error
     if root is None:
         raise WorkRefusal("sd.bulk_storage_root is unset, so a build run has no log folder")
-    local = build_run.local_root()
+    local = build_run.resume_root(args.run, root)  # a resumed image keeps its child's files
 
     def start() -> tuple[Any, Any]:
         # `sd_db.connect`, not the wrapper that turns every error into one refusal: a mismatch must keep its type.
