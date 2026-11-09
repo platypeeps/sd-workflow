@@ -14,6 +14,7 @@ import importlib
 import io
 import json
 import os
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -2302,7 +2303,67 @@ class Archive(Case):
         self.assertEqual(self.db.execute("SELECT log_path FROM runner_run WHERE id = ?",
                                          (self.bundle["id"],)).fetchone()[0], str(path))
         release.set()
+        self.join_archive_workers()
         self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs), [str(target)])
+
+    @staticmethod
+    def join_archive_workers():
+        for worker in threading.enumerate():
+            if worker.name == "sd-build-archive":
+                worker.join(5)
+
+    def test_a_tick_starts_no_copy_while_an_earlier_one_runs(self):
+        """sd:8275 lane round 1: a copy past the deadline kept running, and the next tick started a second
+        copy of the same file to the same destination: two writers, each opening it with truncation."""
+        path, target = self.ended("{run}.jsonl")
+        release = threading.Event()
+        self.addCleanup(release.set)
+        calls = []
+
+        def hung(source, destination, *_args, **_kwargs):
+            calls.append(destination)
+            release.wait(30)
+            raise OSError("the mount came back too late")
+
+        with mock.patch.object(build_run.shutil, "copy2", side_effect=hung):
+            self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs, deadline=0.3), [])
+            self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs, deadline=0.3), [])
+            self.assertEqual(len(calls), 1, "a tick that finds a copy in flight starts no other")
+            release.set()
+            self.join_archive_workers()
+        self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs), [str(target)])
+        self.assertEqual(target.read_text(), "x")
+        self.assertFalse(path.exists())
+
+    def test_a_failed_copy_never_truncates_the_archived_log(self):
+        """sd:8275 lane round 1: a copy opened the archive itself with truncation, so a late or failed copy
+        could empty the one complete log after the rows named it and the local file went."""
+        path, target = self.ended("{run}.jsonl")
+        target.parent.mkdir(parents=True)
+        target.write_text("the complete log")
+
+        def broken(source, destination, *_args, **_kwargs):
+            Path(destination).write_text("")  # opened with truncation, then the mount fails
+            raise OSError("the mount went away")
+
+        with mock.patch.object(build_run.shutil, "copy2", side_effect=broken):
+            self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs), [])
+        self.assertEqual(target.read_text(), "the complete log")
+        self.assertTrue(path.exists())
+        self.assertEqual(sorted(entry.name for entry in target.parent.iterdir()), [target.name],
+                         "a failed copy leaves no partial file beside the archive")
+
+    def test_a_copy_an_earlier_tick_finished_is_collected_not_copied_again(self):
+        """sd:8275 lane round 1: a copy done after its tick ended was copied again by every later tick; a slow
+        mount then never caught up, and each copy reopened the archive."""
+        path, target = self.ended("{run}.jsonl")
+        target.parent.mkdir(parents=True)
+        shutil.copy2(path, target)
+        with mock.patch.object(build_run.shutil, "copy2", side_effect=OSError("no copy expected")):
+            self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs), [str(target)])
+        self.assertFalse(path.exists())
+        self.assertEqual(self.db.execute("SELECT log_path FROM runner_run WHERE id = ?",
+                                         (self.bundle["id"],)).fetchone()[0], str(target))
 
     def test_an_unwritable_bulk_root_leaves_the_files_for_the_next_tick(self):
         self.press()

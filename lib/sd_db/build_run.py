@@ -39,6 +39,8 @@ The hub's tick and each satellite's act only on their own lanes' runs
 
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import os
 import re
@@ -659,6 +661,20 @@ ARCHIVE_SETTLE_SECONDS = 60
 ARCHIVE_DEADLINE_SECONDS = 20
 
 
+#: The lock file under the local root that the one archive copier holds.
+ARCHIVE_LOCK = ".archive.lock"
+
+
+def _same_copy(path: Path, target: Path) -> bool:
+    """Whether `target` is a finished copy of `path`: a copy lands only by rename, and `copy2` keeps the
+    size and mtime; two seconds of slack for a volume that stores coarse times."""
+    try:
+        source, copy = path.stat(), target.stat()
+    except FileNotFoundError:
+        return False
+    return copy.st_size == source.st_size and abs(copy.st_mtime - source.st_mtime) <= 2
+
+
 def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETTLE_SECONDS,
             deadline: float = ARCHIVE_DEADLINE_SECONDS) -> list[str]:
     """Move each file of an ended run from `local` to the same place under `bulk`; the new paths.
@@ -671,6 +687,11 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
     The copies run on a daemon thread the tick waits on for `deadline` seconds at most (sd:8275): a copy not
     done by then is left for a later tick. The rows then name the copy, in `log_path` and in every note body,
     run detail and assignment result that named the local file, before the local file goes.
+
+    One copier at a time (sd:8275 lane round 1): the thread holds `ARCHIVE_LOCK` under `local` until it ends,
+    and a tick that finds it held copies nothing, as a tick in another process does while an earlier one's
+    copy still hangs. A copy goes to a name of its own and is renamed into place, so a late or failed copy
+    never opens the archive itself; a copy an earlier tick finished is collected, not made again.
     """
     pending, cutoff = [], time.time() - settle
     for path in sorted(local.glob("*/build/*")):
@@ -687,22 +708,42 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
         except OSError:
             continue
         pending.append((path, bulk / path.relative_to(local)))
+    if not pending:
+        return []
+    lock = os.open(local / ARCHIVE_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(lock)
+        return []  # an earlier copier still runs: it may hold any of these files open
     copied: list[tuple[Path, Path]] = []
 
     def copy() -> None:
-        for path, target in pending:
-            try:
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(path, target)
-            except OSError:
-                continue
-            copied.append((path, target))
+        try:
+            for path, target in pending:
+                part = target.with_name(f".{target.name}.{os.getpid()}.part")
+                try:
+                    if _same_copy(path, target):
+                        copied.append((path, target))
+                        continue
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    for stale in target.parent.glob(f".{target.name}.*.part"):
+                        stale.unlink(missing_ok=True)  # a killed copier's; the lock says none runs
+                    shutil.copy2(path, part)
+                    os.replace(part, target)
+                except OSError:
+                    with contextlib.suppress(OSError):
+                        part.unlink(missing_ok=True)
+                    continue
+                copied.append((path, target))
+        finally:
+            os.close(lock)
 
     worker = threading.Thread(target=copy, name="sd-build-archive", daemon=True)
     worker.start()
     worker.join(deadline)
     moved = []
-    # A copy still running past the deadline is not in this snapshot; the next tick copies it again.
+    # A copy still running past the deadline is not in this snapshot; a later tick collects it.
     for path, target in list(copied):
         old, new = str(path), str(target)
         # The local file goes only after the rows name the copy: a failed write leaves it for the next tick.
