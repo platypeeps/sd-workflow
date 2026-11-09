@@ -51,6 +51,8 @@ from .active_sessions import BRANCH_ITEM, Unread, _item_id, _reason, elapsed
 
 __all__ = ["builders", "document", "end", "list_agents", "list_processes", "read_work"]
 
+#: Where claude-mem runs its observer sessions.
+OBSERVER_CWD = "/.claude-mem/observer-sessions/"
 #: One `claude agents --json`, `ps` or git call's bound; no answer within it is unknown, not empty.
 CLAUDE_SECONDS = 10
 GIT_SECONDS = 10
@@ -386,8 +388,10 @@ def builders(sessions: list[dict] | None, why: str) -> dict:
     """How many builders run on this Mac: running builder subagents and busy or waiting Fix sessions; None when not known."""
     if sessions is None:
         return {"running": None, "why": why or "no session was listed", "holders": []}
+    # claude-mem's observers keep no transcript and build nothing, so one leaves the count known (pack sd:8266).
     blind = [row["name"] or row["id"] for row in sessions
-             if any(reason.startswith(("no transcript", "its transcript")) for reason in row["safe"]["why"])]
+             if OBSERVER_CWD not in (row["cwd"] or "")
+             and any(reason.startswith(("no transcript", "its transcript")) for reason in row["safe"]["why"])]
     if blind:
         return {"running": None, "why": f"the transcripts of {', '.join(blind)} were not read", "holders": []}
     # Unknown holds its slot: only a finished answer or an idle session frees it (sd:5106 round 1). A stalled agent
