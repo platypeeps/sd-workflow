@@ -63,8 +63,6 @@ WRITER_SKILLS = (
 #: here is held to the predicate: the day its page stops matching, the entry
 #: is stale and the derivation test says so.
 NOT_WRITERS = {
-    "sd-presentation": "matches the negation `It does not create or edit "
-                       "slide files`; the skill declares itself read-only",
     "sd-research-repo": "matches `Write or edit through the file tools`; the "
                         "files it writes are another repository's, its own "
                         "`CLAUDE.md` among them, not this tree's",

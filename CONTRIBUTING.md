@@ -241,8 +241,8 @@ SHA-256 of a stable identifier.
 - `sd-docs-lint`: `sd-docs-lint:<16 hex>` over the batch's sorted origins
   (`<item>/<file> `<citation>``), one per line; the weak-reading note names
   each origin, so an outcome recomputes the key from it.
-- `sd-fact-check`, `sd-publish` and the prose scores: the skill pages show the
-  key and the run id the agent sets.
+- `sd-fact-check` and the prose scores: the skill pages show the key and
+  the run id the agent sets.
 
 ### Permissions
 

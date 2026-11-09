@@ -35,9 +35,7 @@
     "act": {
       "summary": "brief to draft to send",
       "skills": [
-        "sd-humanizer",
-        "sd-presentation",
-        "sd-publish"
+        "sd-humanizer"
       ]
     }
   }

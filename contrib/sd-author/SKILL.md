@@ -35,8 +35,8 @@ before selecting either workflow.
 
 Do not use for research-paper methodology (`sd-paper`), isolated open research
 (`sd-research`), claim-only auditing (`sd-fact-check`), source distillation
-(`sd-digest target=...`), final technical editing (`sd-technical-editor`), or publishing
-(`sd-publish`). These are capability handoffs, not required runtime dependencies.
+(`sd-digest target=...`), or final technical editing (`sd-technical-editor`).
+These are capability handoffs, not required runtime dependencies.
 
 ## Arguments
 
@@ -160,8 +160,7 @@ stop and identify them before reading sources or workspace artifacts.
       claim. A review that names no revision cannot be reconciled; re-run it.
 11. Package the approved article, title and deck options, short summary,
     evidence state and unresolved gaps, visual/adaptation suggestions, and
-    follow-up topics. Handoff to `sd-publish` only through a separate explicit
-    request. Never claim that an unavailable supporting skill ran.
+    follow-up topics. Publishing is a separate explicit request. Never claim that an unavailable supporting skill ran.
 
 ## Safety rules
 
@@ -206,4 +205,4 @@ stop and identify them before reading sources or workspace artifacts.
 - **Integrity and confidentiality** — unsupported claims, originality limits,
   sensitive material, and withheld or placeholder content; and
 - **Publication handoff** — explicit not-published status and the smallest
-  separate `sd-publish`, specialist-review, or evidence step still needed.
+  separate publishing, specialist-review, or evidence step still needed.
