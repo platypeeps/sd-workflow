@@ -2353,6 +2353,16 @@ class Archive(Case):
         self.assertEqual(sorted(entry.name for entry in target.parent.iterdir()), [target.name],
                          "a failed copy leaves no partial file beside the archive")
 
+    def test_a_killed_copiers_partial_file_goes(self):
+        """sd:8275 lane round 1: a tick that exits at its deadline kills its copier mid-copy; its part file
+        must not pile up beside the archive."""
+        path, target = self.ended("{run}.jsonl")
+        target.parent.mkdir(parents=True)
+        stale = target.with_name(f".{target.name}.1.part")
+        stale.write_text("half")
+        self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs), [str(target)])
+        self.assertEqual(sorted(entry.name for entry in target.parent.iterdir()), [target.name])
+
     def test_a_copy_an_earlier_tick_finished_is_collected_not_copied_again(self):
         """sd:8275 lane round 1: a copy done after its tick ended was copied again by every later tick; a slow
         mount then never caught up, and each copy reopened the archive."""
