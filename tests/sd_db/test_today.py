@@ -211,6 +211,12 @@ class TheSections(TodayCase):
         self.assertEqual({k: rows[1][k] for k in ("repo", "status", "due")},
                          {"repo": APP, "status": "planning", "due": "2026-09-01"})
 
+    def test_suggested_leaves_out_ready_ideas(self):
+        """Sd:8281: a ready vault reference note (kind idea) is not work; a ready task still is."""
+        task = self.item("Ready task", repo=APP, status="ready")
+        self.item("Ready idea", repo=APP, status="ready", kind="idea")
+        self.assertEqual([row["id"] for row in today.suggested(self.connection, now=NOW)], [task])
+
     def test_blocked_says_why_from_the_status_change_or_a_waiting_note(self):
         vendor = self.item("Vendor")
         transition(self.connection, vendor, "blocked", who="operator", reason="Waits on the vendor\nmore detail")
