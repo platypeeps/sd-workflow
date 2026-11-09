@@ -650,7 +650,7 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
 
     `sd-<assignment>.title` and `.body.md` move once every run of that assignment ended, the rest once the
     run their name starts with ended. A file no run owns, one written in the last `settle` seconds or one
-    whose move fails stays for a later tick. A moved run log is the row's `log_path` from then on.
+    whose copy fails stays for a later tick. The row's `log_path` names the copy before the local file goes.
     """
     moved, cutoff = [], time.time() - settle
     for path in sorted(local.glob("*/build/*")):
@@ -665,11 +665,16 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
             if path.stat().st_mtime > cutoff:
                 continue
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(path, target)
+            shutil.copy2(path, target)
         except OSError:
             continue
+        # The local file goes only after the row names the copy: a failed write leaves it for the next tick.
         with transaction(connection):
             connection.execute("UPDATE runner_run SET log_path = ? WHERE log_path = ?", (str(target), str(path)))
+        try:
+            path.unlink()
+        except OSError:
+            continue  # the row names the copy; the next tick copies again and removes it
         moved.append(str(target))
     return moved
 

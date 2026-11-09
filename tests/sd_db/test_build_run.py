@@ -2193,6 +2193,28 @@ class Archive(Case):
         log = self.db.execute("SELECT log_path FROM runner_run WHERE id = ?", (ident,)).fetchone()[0]
         self.assertEqual(log, str(target / names[0]))
 
+    def test_a_failed_row_update_keeps_the_local_log_for_the_next_tick(self):
+        """Review round 1: the move deleted the local file before `log_path` changed, so a failed write left
+        the row naming a file no later tick could find."""
+        self.press()
+        ident, local = self.bundle["id"], self.root / "local"
+        folder = build_run.log_dir(local, str(self.repo))
+        folder.mkdir(parents=True)
+        log = folder / f"{ident}.jsonl"
+        log.write_text("x")
+        os.utime(log, (0, 0))
+        self.db.execute("UPDATE runner_run SET outcome = 'done', log_path = ? WHERE id = ?", (str(log), ident))
+        self.db.commit()
+        with mock.patch.object(build_run, "transaction", side_effect=sqlite3.OperationalError("database is locked")):
+            with self.assertRaises(sqlite3.OperationalError):
+                build_run.archive(self.db, local, self.logs)
+        self.assertTrue(log.exists(), "the local log stays until the row names the moved one")
+        target = build_run.log_dir(self.logs, str(self.repo)) / log.name
+        self.assertEqual(build_run.archive(self.db, local, self.logs), [str(target)])
+        self.assertFalse(log.exists())
+        self.assertEqual(self.db.execute("SELECT log_path FROM runner_run WHERE id = ?", (ident,)).fetchone()[0],
+                         str(target))
+
     def test_an_unwritable_bulk_root_leaves_the_files_for_the_next_tick(self):
         self.press()
         local = self.root / "local"
