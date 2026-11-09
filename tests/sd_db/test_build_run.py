@@ -2888,11 +2888,36 @@ class HubFaults(Case):
         output = self.root / "review.out"
         output.write_text("answer")
         supervisor.held = {"name": "review", "argv": ["x"], "exit": 0}
-        supervisor.empty(output)
+        supervisor.empty(output, "review")
         self.assertEqual(output.read_text(), "answer", "a replay keeps the answer it needs")
         supervisor.held = None
-        supervisor.empty(output)
+        supervisor.empty(output, "review")
         self.assertEqual(output.read_text(), "", "a fresh child starts with an empty file")
+
+    def test_a_held_child_keeps_only_the_output_of_a_child_that_will_replay(self):
+        """sd:8194: a new review after a held builder appended to the old JSON, and a second review ran."""
+        supervisor = self.supervisor()
+        output = self.root / "review.out"
+        for held, name, kept in (({"name": "claude", "argv": [], "exit": 0, "as": "building"}, "review", False),
+                                 ({"name": "review", "argv": ["x"], "exit": 0}, "lint", False),
+                                 ({"name": "checks", "argv": ["x"], "exit": 0}, "review", True),
+                                 ({"name": "enqueue", "argv": ["x"], "exit": 0}, "lint", True)):
+            with self.subTest(held=held["name"], name=name):
+                output.write_text("old answer")
+                supervisor.held = held
+                supervisor.empty(output, name)
+                self.assertEqual(output.read_text(), "old answer" if kept else "")
+
+    def test_a_held_claude_of_another_role_gives_no_offset(self):
+        """sd:8194: a new fix was judged from the held builder's lines, so its cost and report repeated."""
+        self.plan(claude=["pass"], sd_review=["clean"])
+        logs = build_run.log_dir(self.logs, self.bundle["repo"])
+        logs.mkdir(parents=True, exist_ok=True)
+        (logs / f"{self.bundle['id']}.jsonl").write_text("12345678")
+        supervisor = self.supervisor()
+        supervisor.held = {"name": "claude", "argv": [], "exit": 0, "offset": 5, "as": "building"}
+        self.assertEqual(supervisor.start_offset("fix:0"), 8)
+        self.assertEqual(supervisor.start_offset("building"), 5)
 
     def test_a_held_claude_reads_its_own_log_lines(self):
         self.plan(claude=["pass"], sd_review=["clean"])
@@ -2900,10 +2925,10 @@ class HubFaults(Case):
         logs.mkdir(parents=True, exist_ok=True)
         supervisor = self.supervisor()
         supervisor.held = {"name": "claude", "argv": [], "exit": 0, "offset": 5}
-        self.assertEqual(supervisor.start_offset(), 5)
+        self.assertEqual(supervisor.start_offset(None), 5)
         supervisor.held = None
         (logs / f"{self.bundle['id']}.jsonl").write_text("12345678")
-        self.assertEqual(supervisor.start_offset(), 8)
+        self.assertEqual(supervisor.start_offset(None), 8)
 
     def test_a_walk_after_a_fault_starts_at_the_row_step_not_the_read_one(self):
         """A walk again in this process: the row moved past what `__init__` read."""

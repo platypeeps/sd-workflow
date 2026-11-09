@@ -43,8 +43,12 @@ def plain(text="plain"):
     return {"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": text}]}]}
 
 
+#: When a fixture comment was written, unless it names its own: inside the window.
+TODAY = "2026-11-08T10:00:00.000+0000"
+
+
 def jira(issues, *, search_error=None, comment_error=None):
-    """Jira's three calls. `issues` is `{key: [(account, body), ...]}`, comments newest first."""
+    """Jira's three calls. `issues` is `{key: [(account, body[, created]), ...]}`, comments newest first."""
     asked = []
 
     def transport(url, headers, body):
@@ -59,7 +63,8 @@ def jira(issues, *, search_error=None, comment_error=None):
         if comment_error:
             return None, comment_error
         key = url.split("/issue/")[1].split("/")[0]
-        return {"comments": [{"author": {"accountId": who}, "body": text} for who, text in issues[key]]}, ""
+        return {"comments": [{"author": {"accountId": who}, "body": text, "created": (created or [TODAY])[0]}
+                             for who, text, *created in issues[key]]}, ""
     transport.asked = asked
     return transport
 
@@ -85,7 +90,7 @@ class Base(unittest.TestCase):
         found_g, unread_g, reason_g = issue_attention.read_github(self.connection, runner or gh(*nodes))
         done_g = issue_attention.alert(self.connection, found_g, unread_g, now=now)
         found_j, unread_j, reason_j = issue_attention.read_jira(
-            self.connection, transport=transport or jira({}), environ=ENV if environ is None else environ)
+            self.connection, transport=transport or jira({}), environ=ENV if environ is None else environ, now=now)
         done_j = issue_attention.alert(self.connection, found_j, unread_j, now=now)
         done = {key: done_g[key] + done_j[key] for key in done_g}
         return done, {**found_g, **found_j}, (unread_g - {"jira_mentioned"}) | (unread_j - {"mentioned"}), reason_g or reason_j
@@ -201,6 +206,22 @@ class JiraMentions(Base):
         done, _, unread, reason = self.run_once(now=LATER, transport=transport, environ={"PATH": "/usr/bin"})
         self.assertEqual((transport.asked, unread, reason, done["cleared"]), ([], {"jira_mentioned"}, "", []))
 
+    def test_a_mention_older_than_the_window_files_nothing(self):
+        """sd:8200: six alerts for mentions from 2021-2022; none needed action."""
+        old = jira({"OPS-1": [("other", mention(ACCOUNT), "2021-03-04T10:00:00.000+0000")]})
+        done, found, unread, _ = self.run_once(transport=old)
+        self.assertEqual((found, done["filed"], unread), ({}, [], set()))
+        done = self.run_once(now=LATER, transport=jira({"OPS-1": [("other", mention(ACCOUNT))]}))[0]
+        self.assertEqual(done["filed"], [f"jira_mentioned {self.KEY}"])
+
+    def test_the_window_is_the_days_asked_for(self):
+        ten_days = jira({"OPS-1": [("other", mention(ACCOUNT), "2026-10-29T10:00:00.000+0000")]})
+        for days, found in ((30, [f"jira_mentioned {self.KEY}"]), (7, [])):
+            with self.subTest(days=days):
+                rows = issue_attention.read_jira(self.connection, transport=ten_days, environ=ENV, now=NOW,
+                                                 days=days)[0]
+                self.assertEqual(list(rows), found)
+
     def test_more_issues_than_the_read_cap_is_a_cut_read(self):
         many = {f"OPS-{n}": [("other", plain())] for n in range(issue_attention.shadow_jira.MENTION_READS + 1)}
         _, _, unread, reason = self.run_once(transport=jira(many))
@@ -214,6 +235,12 @@ class Wiring(Base):
             result = _sync(self.connection, now=NOW, tracker="jira", alerts=True,
                            runner=jira({"OPS-1": [("other", mention(ACCOUNT))]}))
         self.assertIn("shadow sync: issue alerts: 1 filed, 0 cleared, 1 state(s) open", result.report())
+
+    def test_a_jira_sync_reads_mentions_inside_the_days_it_is_given(self):
+        with mock.patch.dict(os.environ, ENV):
+            result = _sync(self.connection, now=NOW, tracker="jira", alerts=True, mention_days=7,
+                           runner=jira({"OPS-1": [("other", mention(ACCOUNT), "2026-10-29T10:00:00.000+0000")]}))
+        self.assertIn("shadow sync: issue alerts: 0 filed, 0 cleared, 0 state(s) open", result.report())
 
     def test_a_jira_sync_that_does_not_ask_files_nothing(self):
         with mock.patch.dict(os.environ, ENV):

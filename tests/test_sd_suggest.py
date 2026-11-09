@@ -496,6 +496,30 @@ class TheDedupRead(SuggestCase):
         self.assertIn(f"From proposal note {note}.", body)
 
 
+class TheMentionWindow(unittest.TestCase):
+    """sd:8200: a Jira run reads mentions inside `sd.jira_recent_days`; unset is the library's 30."""
+
+    def test_the_jira_run_is_given_the_configured_days(self):
+        with tempfile.TemporaryDirectory() as home:
+            path = Path(home) / "sd-ai-command-pack" / "config.json"
+            path.parent.mkdir(parents=True)
+            asked = []
+            library = MagicMock(TRACKERS=("github", "jira"))
+            library.sync_shadow.side_effect = lambda _connection, **options: asked.append(options)
+            rows = MagicMock(library=lambda: library)
+            for written, days in (({"jira_recent_days": "7"}, 7), ({}, "absent")):
+                with self.subTest(days=days), patch.dict(os.environ, {"XDG_CONFIG_HOME": home}), \
+                        patch.object(sd_shadow, "_rows", return_value=rows), \
+                        patch.object(sd_shadow, "report_sync", return_value=0), \
+                        patch.object(sd_shadow.importlib.util, "find_spec", return_value=True):
+                    path.write_text(json.dumps({"config": {"sd": written}}), encoding="utf-8")
+                    asked.clear()
+                    sd_shadow.shadow_sync(MagicMock(since=None, until=None, max_requests=None,
+                                                    max_seconds=None, strict=False))
+                    self.assertEqual([options.get("mention_days", "absent") for options in asked],
+                                     ["absent", days])
+
+
 class TheShadowSync(SuggestCase):
     """The verb over `sd_db.sync_shadow`: what it reports and what it returns."""
 

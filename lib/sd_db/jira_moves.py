@@ -11,7 +11,10 @@ whose ref is `jira:<KEY-N>` (`source = 'task-ref'`), and brings each ticket to
 the status category of the item's current status: planning and ready to
 "To Do", in_progress to "In Progress", done to "Done"; blocked and any other
 status move nothing. A ticket already in that category is left alone, and
-the line names its status. A status category is no outcome (ruling
+the line names its status. A done item leaves a ticket in a release status
+(`RELEASE`: Awaiting Release, Released to STAGE, Ready for Prod Release)
+where it is, so the team's release step still runs (sd:8215); the line
+names the status, no note is written, and the cursor moves on. A status category is no outcome (ruling
 #49630): the transition is the one offered into the category whose
 destination has the target's name, folded (`_folded`); else the only one
 offered into it, unless that is a done name that says the work was not
@@ -80,6 +83,8 @@ TARGET = {"planning": ("new", "To Do"), "ready": ("new", "To Do"),
           "in_progress": ("indeterminate", "In Progress"), "done": ("done", "Done")}
 #: Done-category names that say the work was not done: never a stand-in for Done (ruling #49630).
 NOT_DONE = {"won't do", "cancelled", "canceled", "rejected", "declined", "duplicate"}
+#: Statuses where the team's release step still runs: a done item leaves the ticket there (sd:8215).
+RELEASE = {"awaiting release", "released to stage", "ready for prod release"}
 #: Apostrophe look-alikes a Jira admin may type into a status name.
 _APOSTROPHES = str.maketrans({"\u2019": "'", "\u2018": "'", "\u02bc": "'", "`": "'", "\u00b4": "'"})
 
@@ -207,6 +212,8 @@ def move(config: dict, key: str, status: str, transport=None) -> str:
     current, current_category = _state(_object(_object(payload, "issue").get("fields"), "fields").get("status"))
     if current_category == category:
         return f"{key}: already {current}, left as it is"
+    if category == "done" and _folded(current) in RELEASE:
+        return f"{key}: in {current}, a release status, left as it is"
     payload, error = shadow_jira._request(_issue(config, key) + "/transitions", config, None, transport)
     _stop(error, config, transport)
     offered = [offer for offer in _transitions(payload) if offer[2] == category]

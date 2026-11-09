@@ -789,15 +789,28 @@ class Supervisor:
         self.held = None
         return None
 
-    def empty(self, path: Path) -> None:
-        """Empty a child's output before it runs; a replay keeps what the child it replays already wrote."""
-        if self.held is None:
+    def will_replay(self, name: str, role: str | None = None) -> bool:
+        """Whether the walk's next `name` child answers from the held record (`replayed`), not by running.
+
+        Asked before a child's output is emptied or its offset taken (pack sd:8194): a held child of another name
+        or role is not the one starting, so its output and lines are not this child's.
+        """
+        held = self.held
+        if held is None:
+            return False
+        if held["name"] == name:
+            return name != "claude" or held.get("as") == role
+        return name in PRECEDES.get(held["name"], ())
+
+    def empty(self, path: Path, name: str) -> None:
+        """Empty a `name` child's output before it runs; a replay keeps what the child it replays already wrote."""
+        if not self.will_replay(name):
             path.write_bytes(b"")
 
-    def start_offset(self) -> int:
-        """Where this child's stream lines start: a replayed child's own offset, else the log's end now."""
+    def start_offset(self, role: str | None) -> int:
+        """Where this claude child's stream lines start: a replayed child's own offset, else the log's end now."""
         held = self.held
-        if held is not None and held["name"] == "claude" and held.get("offset") is not None:
+        if self.will_replay("claude", role) and held is not None and held.get("offset") is not None:
             return held["offset"]
         return self.log.stat().st_size if self.log.exists() else 0
 
@@ -939,7 +952,7 @@ class Supervisor:
         answer: dict | None = None
         for _attempt in range(2):
             out = self.out("review")
-            self.empty(out)
+            self.empty(out, "review")
             self.child([*self.tools.review, "-C", str(self.work), "--scope", "branch", "--json"], cwd=self.work,
                        name="review")
             answer = self.review_answer(out, head)
@@ -980,7 +993,7 @@ class Supervisor:
         for argv in commands:
             said = shlex.join(argv)
             for name in ("checks", "checks.err"):
-                self.empty(self.out(name))
+                self.empty(self.out(name), "checks")
             code = self.child([*self.tools.gate, "--label", f"build {self.row['branch']} checks", "--", *argv],
                               cwd=self.work, name="checks", descendants=True)
             if code == 125 and self.refused():  # the gate started nothing: unknown, never a failure of the code
@@ -1092,7 +1105,7 @@ class Supervisor:
             return self.finish("blocked", f"the title at {self.title} is missing, not UTF-8 text, or over "
                                           f"{TITLE_MAX} characters")
         errors = self.out("lint.err")
-        self.empty(errors)
+        self.empty(errors, "lint")
         # A foreign repository's docs tree follows none of this pack's rules: only the body is linted there.
         only = ["--body-only"] if unmanaged else []
         if self.child([*self.tools.lint, "--pr-body", str(self.body), *only], cwd=self.work, name="lint") != 0:
@@ -1107,7 +1120,7 @@ class Supervisor:
         if unmanaged:
             return self.publish(head, title, delivered)
         out = self.out("enqueue")
-        self.empty(out)
+        self.empty(out, "enqueue")
         items = [arg for item in delivered for arg in ("--item", str(item))]
         # The run is each delivered item's whole delivery, so it is the last pull request: `--deliver`.
         self.child([*self.tools.ship, "-C", str(self.work), "lane", "enqueue", *items, "--deliver", "--title", title,
@@ -1274,7 +1287,7 @@ class Supervisor:
                 raise Unread(f"{url} reads head {own[0].get('headRefOid')!r}, not the pushed {head[:12]}")
             return url
         out = self.out("pull")
-        self.empty(out)
+        self.empty(out, "pull")
         if self.child([*self.tools.gh, "pr", "create", "--repo", repository, "--draft", "--head", branch,
                        "--base", self.base().removeprefix("origin/"), "--title", title, "--body-file", str(self.body)],
                       cwd=self.work, name="pull") != 0:
@@ -1360,7 +1373,7 @@ class Supervisor:
                 "--model", self.row["model"] or build.OPUS]
         if session:
             argv += ["--resume", session]
-        offset = self.start_offset()
+        offset = self.start_offset(role)
         self.child(argv, cwd=self.work, name="claude", out=self.log, session=session is None, offset=offset, role=role)
         with open(self.log, "rb") as handle:
             handle.seek(offset)
@@ -1733,7 +1746,7 @@ class DraftSupervisor(Supervisor):
                            log_path=str(self.log)):
             raise Lost
         self.last_beat = time.monotonic()
-        offset = self.start_offset()
+        offset = self.start_offset(None)
         self.child(self.argv(), cwd=self.repo, name="claude", out=self.log, session=True, offset=offset)
         with open(self.log, "rb") as handle:
             handle.seek(offset)

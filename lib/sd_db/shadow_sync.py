@@ -1090,6 +1090,7 @@ def _sync(
     contribution_client=None,
     notifier=None,
     alerts: bool = False,
+    mention_days: int | None = None,
 ) -> Synced:
     """Collect, write the rows, and advance the cursor only on success.
 
@@ -1114,7 +1115,8 @@ def _sync(
     `tracker` chooses the collector, from `TRACKERS`. `jira` is collect,
     store, watermark on success, heartbeat, the linked-ticket moves
     (`jira_moves`, sd:8117), the issue alerts when `alerts` asks for
-    them (sd:8142), and nothing else: `runner` is its
+    them (sd:8142), reading mentions from the last `mention_days` (`sd.jira_recent_days`, sd:8200),
+    and nothing else: `runner` is its
     HTTP transport seam rather than a `gh` runner, `max_requests` and
     `max_seconds` are validated and otherwise unused because Jira's ceiling
     is `shadow_jira.MAX_PAGES`, and `since` is refused because the recovery
@@ -1128,7 +1130,8 @@ def _sync(
 
     _validate_limits(max_requests, max_seconds)
     if tracker == "jira":
-        return _sync_jira(connection, moment, runner, since, alerts=alerts, max_seconds=max_seconds)
+        return _sync_jira(connection, moment, runner, since, alerts=alerts, max_seconds=max_seconds,
+                          mention_days=mention_days)
     planned = contribution_sync.plan(connection)
     budget = _SearchBudget(max_requests, time.monotonic() + max_seconds)
     # Existing work must still refresh when a large search consumes its slice.
@@ -1312,7 +1315,7 @@ def _issue_alerts(connection: sqlite3.Connection, found: dict, unread: set, reas
 
 
 def _sync_jira(connection: sqlite3.Connection, moment: datetime, transport, since, *, alerts: bool = False,
-               max_seconds: float = MAX_SECONDS) -> Synced:
+               max_seconds: float = MAX_SECONDS, mention_days: int | None = None) -> Synced:
     """Jira's sync: the GitHub shape with every GitHub-only stage left out.
 
     An unconfigured Jira is not a failure of the run. It writes the heartbeat
@@ -1362,8 +1365,9 @@ def _sync_jira(connection: sqlite3.Connection, moment: datetime, transport, sinc
         from . import issue_attention
 
         try:
-            found, unread, reason = issue_attention.read_jira(connection, transport=transport,
-                                                              deadline=time.monotonic() + max_seconds)
+            found, unread, reason = issue_attention.read_jira(
+                connection, transport=transport, deadline=time.monotonic() + max_seconds, now=moment,
+                days=mention_days or issue_attention.shadow_jira.MENTION_DAYS)
             moves = moves + _issue_alerts(connection, found, unread, reason, moment)
         except (SdDbError, sqlite3.Error, OSError, ValueError) as error:
             moves = moves + [f"issue alerts not filed: {error}"]
