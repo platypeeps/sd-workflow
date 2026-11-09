@@ -461,20 +461,31 @@ def supervise_build(args: argparse.Namespace) -> int:
         raise WorkRefusal(str(error)) from error
     if root is None:
         raise WorkRefusal("sd.bulk_storage_root is unset, so a build run has no log folder")
-    connection = sd_handoff_rows.connect(sd_db, write=True)
+    def start() -> tuple[Any, Any]:
+        # `sd_db.connect`, not the wrapper that turns every error into one refusal: a mismatch must keep its type.
+        connection = sd_db.connect(write=True)
+        try:
+            scope = connection.execute("SELECT assignment.scope FROM runner_run JOIN assignment "
+                                       "ON assignment.id = runner_run.assignment WHERE runner_run.id = ?",
+                                       (args.run,)).fetchone()
+            if scope is not None and scope[0] == build_run.draft.SCOPE:
+                drafter = build_run.DraftSupervisor(connection, args.run, tools=tools(build_run), log_root=root)
+                return connection, drafter
+            return connection, build_run.Supervisor(connection, args.run, tools=tools(build_run), log_root=root,
+                                                    cited=cited, checked=enqueue_refusals, checks=own_checks)
+        except BaseException:
+            connection.close()
+            raise
+
     try:
-        scope = connection.execute("SELECT assignment.scope FROM runner_run JOIN assignment "
-                                   "ON assignment.id = runner_run.assignment WHERE runner_run.id = ?",
-                                   (args.run,)).fetchone()
-        if scope is not None and scope[0] == build_run.draft.SCOPE:
-            result = build_run.DraftSupervisor(connection, args.run, tools=tools(build_run), log_root=root).run()
-        else:
-            result = build_run.Supervisor(connection, args.run, tools=tools(build_run), log_root=root,
-                                          cited=cited, checked=enqueue_refusals, checks=own_checks).run()
+        # A supervisor exec'd across a hub refresh holds a live child: every read before `run()` waits (pack sd:8182).
+        connection, supervisor = build_run.start_again(args.run, start)
+        try:
+            result = supervisor.run()
+        finally:
+            connection.close()
     except (sd_db.SdDbError, ValueError) as error:
         raise WorkRefusal(str(error)) from error
-    finally:
-        connection.close()
     print(json.dumps(result, ensure_ascii=False))
     return 0
 

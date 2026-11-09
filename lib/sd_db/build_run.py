@@ -12,7 +12,10 @@ so neither the job's timeout nor launchd's exit cleanup reaches it.
 `Supervisor` walks one run's steps from its `step` column, each written
 before it starts: `worktree`, `building`, `reviewing` and `fixing`,
 `enqueuing`, then `enqueued`, where it exits and the lane holds the run; a
-fresh supervisor does `cleaning` after the merge. Every child runs in its own
+fresh supervisor does `cleaning` after the merge. A hub fault (`HUB_FAULTS`)
+is no loss: the child keeps running, the beat tries again, and a build the
+hub refuses for life is replaced in place by the pack on disk, the pid and
+the child kept (pack sd:8182). Every child runs in its own
 process group, recorded in `builder_pgid` and `builder_start` before the
 child runs: the child waits on a pipe and execs only once that write landed,
 so a supervisor lost between the spawn and the write leaves nothing running.
@@ -49,10 +52,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import build, contributions, draft, paths, sessions
+from . import build, contributions, draft, paths, remote, sessions
 from .build import Probe
 from .config import system_checkout
 from .database import Patient
+from .errors import SchemaTooNew
 from .ship import this_host
 from .workflow import WorkflowError
 from .writes import add_note, now, record_cost, record_state
@@ -83,6 +87,20 @@ ALLOWED = ("Bash(git commit -m:*)", "Bash(git commit -F:*)")
 
 #: `sd_gate_slots.NOT_STARTED`: the gate's last stderr line when it started nothing; a check's own 125 lacks it.
 GATE_NOT_STARTED = "sd gate run: the command did not start (exit 125)"
+
+#: What a hub session can raise, or the hub's configuration refuse: gone, restarting, fenced, refusing this
+#: process's build, serving a database newer than it, or a write whose answer was lost. None says the run moved,
+#: so a supervisor keeps its child, then walks on (pack sd:8182). One that never clears stops at the child's
+#: budget and `settle_seconds`. A write whose answer was lost is the hub's to say (`once`); the compare-and-sets
+#: find the rest, as a retried run's do.
+HUB_FAULTS = (remote.RemoteError, SchemaTooNew)
+#: How a supervisor hands its state to the image it execs: the child it keeps, and what the next walk needs.
+RESUME_ENV = "SD_BUILD_RESUME"
+#: The once-only writes that belong to one child; every other mark lasts the run.
+CHILD_MARKS = ("cost", "report")
+#: On a replay, the children that ran and passed before a held one in the same step, by name: they are not run again.
+PRECEDES = {"worktree": {"worktree"}, "checking-health": {"checking-sync"}, "checks": {"review", "checks"},
+            "enqueue": {"lint"}, "push": {"lint"}, "pull": {"lint", "push"}}
 
 #: The child waits for one byte on its pipe, written once its group is recorded, then execs the command.
 GATE = ("import os, sys\n"
@@ -165,6 +183,100 @@ is none.>
 RESUME = """Your run was interrupted. Continue the brief in {worktree}: finish the items, commit, write the
 title to {title} and the body to {body}, and leave the worktree clean. Your final message is your report.
 {denied}"""
+
+
+def exec_in_place(state: dict) -> None:
+    """Replace this process with the pack now on disk, handing it `state` (pack sd:8182); return if it cannot.
+
+    The hub refuses the build this process loaded for the rest of its life, and no retry inside it can pass
+    (`follow`, sd:3359). `exec` keeps the pid and the process start `build.alive` reads, and the child stays this
+    process's child. A new image that does not load would strand that child, so a child process proves the
+    entrypoint loads first; one that fails leaves this image waiting for its next beat.
+    """
+    try:
+        probe = subprocess.run([sys.executable, sys.argv[0], "assignments", "dispatch", "--help"], check=False,
+                               capture_output=True, stdin=subprocess.DEVNULL, timeout=READ_SECONDS)
+    except (OSError, subprocess.SubprocessError):
+        return
+    if probe.returncode != 0:
+        return
+    sys.stdout.flush()
+    sys.stderr.flush()
+    try:
+        os.execve(sys.executable, [sys.executable, *sys.argv], {**os.environ, RESUME_ENV: json.dumps(state)})
+    except OSError:
+        return
+
+
+def resume_state(ident: str) -> dict | None:
+    """What an earlier image of this process handed over for run `ident`; None for anything else (pack sd:8182)."""
+    raw = os.environ.get(RESUME_ENV)
+    try:
+        state = json.loads(raw) if raw else None
+    except ValueError:
+        return None
+    if not isinstance(state, dict) or state.get("run") != ident or state.get("pid") != os.getpid():
+        return None
+    return state
+
+
+def start_again(ident: str, start: Callable[[], Any], *, bound: float = build.STALE_SECONDS) -> Any:
+    """`start()`, tried until `bound` while this process holds a child an earlier image kept (pack sd:8182).
+
+    `start` is every hub read from the connection to the supervisor; `run()`'s own loop takes over from there.
+    Without a handed-over state it is one try. A mismatch this image cannot pass follows the build. The wait
+    comes off the child's budget. Past `bound` the kept child is ended, so none outlives its supervisor, and
+    the failure stands: the reap owns the run.
+    """
+    state = resume_state(ident)
+    if state is None:
+        return start()
+    child = state.get("child") or {}
+    begun, budget = time.monotonic(), child.get("left")
+    while True:
+        if budget is not None:
+            child["left"] = max(budget - (time.monotonic() - begun), 0.0)
+            os.environ[RESUME_ENV] = json.dumps(state)
+        try:
+            return start()
+        except Exception as fault:
+            if isinstance(fault, remote.BuildMismatch) and remote.disk_holds(fault):
+                exec_in_place(state)
+            if time.monotonic() - begun < bound:
+                time.sleep(5.0)
+                continue
+            if child.get("pid") and child.get("exit") is None:
+                build.kill_group(child["pid"])
+            raise
+
+
+class Adopted:
+    """`subprocess.Popen`'s wait and poll for a child an earlier image of this process started."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid: int = pid
+        self.returncode: int | None = None
+
+    def poll(self) -> int | None:
+        if self.returncode is None:
+            try:
+                reaped, status = os.waitpid(self.pid, os.WNOHANG)
+            except ChildProcessError:
+                self.returncode = -1  # no longer a child of this process: a read's unknown, not a pass
+            else:
+                if reaped:
+                    self.returncode = os.waitstatus_to_exitcode(status)
+        return self.returncode
+
+    def wait(self, timeout: float | None = None) -> int:
+        stop = None if timeout is None else time.monotonic() + timeout
+        while self.poll() is None:
+            if stop is not None and time.monotonic() >= stop:
+                raise subprocess.TimeoutExpired(str(self.pid), timeout or 0.0)
+            time.sleep(0.05)
+        code = self.returncode
+        assert code is not None
+        return code
 
 
 class Unread(Exception):
@@ -539,7 +651,8 @@ class Supervisor:
                  cited: Callable[[Path, str, str, str], Collection[int] | None], environ: dict | None = None,
                  beat_seconds: float = BEAT_SECONDS, timeout: float = TIMEOUT_SECONDS, grace: float = GRACE_SECONDS,
                  probe=Probe, checked: Callable[[Path, str, str, str, str], list[str]] | None = None,
-                 checks: Callable[[Path], list[list[str]]] | None = None):
+                 checks: Callable[[Path], list[list[str]]] | None = None,
+                 settle_seconds: float = build.STALE_SECONDS):
         """`cited(worktree, base, head, body)` is the items the lane reads the branch as delivering, None when unread:
         the lane's own reader, which lives beside it in `bin/`. `checked(worktree, base, head, title, body)` is
         what enqueue and its push would refuse, the line check and the leak guard (pack sd:6926); None checks
@@ -567,17 +680,176 @@ class Supervisor:
         self.env["OTEL_RESOURCE_ATTRIBUTES"] = ",".join(filter(None, (
             self.env.get("OTEL_RESOURCE_ATTRIBUTES"), f"sd.build_run={ident}",
             "sd.items=" + ";".join(str(item) for item in (self.lead, *self.others)))))
+        self.take_resume(settle_seconds)
+
+    # ----------------------------------------------------------- recovery (pack sd:8182)
+
+    def take_resume(self, settle_seconds: float) -> None:
+        """What an earlier image of this process handed over, off the environment so no child inherits it.
+
+        Only this run's state, in this process, counts: anything else is ignored, so the run registers as it
+        would. `last` is the last child and what it left; `held` is that record while a replay reaches it;
+        `ending` is an end not yet written; `marks` are the once-only writes done since `last` started.
+        """
+        self.settle_seconds = settle_seconds
+        self.last: dict | None = None
+        self.held: dict | None = None
+        self.ending: tuple | None = None
+        self.marks: set[str] = set()
+        self.unknown: dict[str, str] = {}
+        self.hub_down = False
+        self.down_since: float | None = None
+        self.deadline = 0.0
+        self.resumed = False
+        state = resume_state(self.ident)
+        os.environ.pop(RESUME_ENV, None)
+        self.env.pop(RESUME_ENV, None)
+        if state is None:
+            return
+        self.resumed = True
+        self.last = self.held = state.get("child")
+        self.reviewed = state.get("reviewed")
+        self.ending = tuple(state["ending"]) if state.get("ending") else None
+        self.marks = set(state.get("marks") or ())
+        self.unknown = dict(state.get("unknown") or {})
+        groups = state.get("groups")
+        self.groups = None if groups is None else {int(group): start for group, start in groups.items()}
+
+    def state(self) -> dict:
+        """What the next image needs, in JSON: the child kept, and what this image holds only in memory."""
+        last = self.last
+        if last is not None and last["exit"] is None:
+            last["left"] = max(self.deadline - time.monotonic(), 0.0)
+        return {"run": self.ident, "pid": os.getpid(), "child": last, "groups": self.groups, "reviewed": self.reviewed,
+                "ending": self.ending, "marks": sorted(self.marks), "unknown": self.unknown}
+
+    def fault_seen(self, fault: Exception) -> None:
+        if not self.hub_down:
+            self.hub_down = True
+            print(f"sd: build run {self.ident}: {fault}; keeping its child and asking again", file=sys.stderr, flush=True)
+
+    def follow_build(self, fault: Exception) -> None:
+        """Exec in place once the disk holds the build the hub refused this process for; else ask again later."""
+        if isinstance(fault, remote.BuildMismatch) and remote.disk_holds(fault):
+            exec_in_place(self.state())
+
+    def outage(self, fault: Exception) -> dict | None:
+        """A hub fault with no child left to keep: wait for the hub, then walk again; the run's end when it stays gone.
+
+        The walk restarts from the step on the row, each child that already ran answering from its record, so a
+        result in the window is judged once. `settle_seconds` counts from the first fault since the walk last got
+        anywhere (a child started, a beat landed), so a statement that fails every time still ends: the
+        supervisor exits, the row stays open for the reap, and no process waits on a hub that never comes back.
+        """
+        self.fault_seen(fault)
+        last = self.last
+        self.held = last if last is not None and last["exit"] is not None else None
+        if self.down_since is None:
+            self.down_since = time.monotonic()
+        stop = self.down_since + self.settle_seconds
+        while True:
+            self.follow_build(fault)
+            if time.monotonic() >= stop:
+                return {"run": self.ident, "outcome": None,
+                        "why": f"no answer from the hub for {self.settle_seconds:g} s: {fault}"}
+            time.sleep(min(self.beat_seconds, 5.0))
+            try:
+                self.db.execute("SELECT 1").fetchone()
+            except HUB_FAULTS as again:
+                fault = again
+            else:
+                self.hub_down = False
+                return None
+
+    def adopt(self) -> None:
+        """Wait out the child an earlier image kept; it still runs as this process's child."""
+        held = self.held
+        if held is None or held["exit"] is not None:
+            return
+        self.last = held
+        held["exit"] = self.waited(Adopted(held["pid"]), held["name"], session=held["session"],
+                                   deadline=time.monotonic() + held["left"])
+
+    def replayed(self, argv: list[str], name: str, role: str | None) -> int | None:
+        """A held child's exit code when the walk reaches it, 0 for one before it; None to start the child.
+
+        The walk re-runs each step from its top, so a child that already ran must not run again. A claude child
+        matches by the `role` it started as, not its prompt, which reads the session the first image wrote: a
+        fault starting a fix leaves the builder held, and it must not answer for the fix. A child outside the
+        held one's path means the walk took another way, so nothing is skipped from there on.
+        """
+        held = self.held
+        if held is None:
+            return None
+        if held["name"] == name and (held.get("as") == role if name == "claude" else held["argv"] == argv):
+            self.held, self.last = None, held
+            return held["exit"]
+        if name in PRECEDES.get(held["name"], ()):
+            return 0
+        self.held = None
+        return None
+
+    def empty(self, path: Path) -> None:
+        """Empty a child's output before it runs; a replay keeps what the child it replays already wrote."""
+        if self.held is None:
+            path.write_bytes(b"")
+
+    def start_offset(self) -> int:
+        """Where this child's stream lines start: a replayed child's own offset, else the log's end now."""
+        held = self.held
+        if held is not None and held["name"] == "claude" and held.get("offset") is not None:
+            return held["offset"]
+        return self.log.stat().st_size if self.log.exists() else 0
+
+    def once(self, mark: str, write: Callable[[], Any]) -> None:
+        """Run `write` unless a replay already did: a cost, a note and a round's count are not idempotent.
+
+        A write whose answer was lost (`UnknownOutcome`) may have committed, so its request id waits here: the
+        hub's answer decides on the replay. A hub that cannot say yet is one more fault, under `outage`'s bound.
+        """
+        if mark in self.marks:
+            return
+        rid = self.unknown.get(mark)
+        if rid is not None:
+            answer = self.db.outcome(rid)
+            if answer == remote.RECORDED:
+                self.marks.add(mark)
+                del self.unknown[mark]
+                return
+            if answer != remote.ABSENT:
+                raise remote.UnknownOutcome(rid, f"the hub answers {answer} for it")
+            del self.unknown[mark]
+        try:
+            write()
+        except remote.UnknownOutcome as fault:
+            self.unknown[mark] = fault.rid
+            raise
+        self.marks.add(mark)
+
+    def note(self, item: int, body: str) -> None:
+        """A comment the walk can reach again on a replay; a comment after the walk's last step needs no guard."""
+        self.once(f"note:{body}", lambda: add_note(self.db, item, "comment", body))
 
     # ----------------------------------------------------------- the walk
 
     def run(self) -> dict:
         pid = os.getpid()
-        if not build.register(self.db, self.ident, pid=pid, pgid=os.getpgrp(), start=self.probe.started(pid)):
-            return {"run": self.ident, "outcome": None, "why": "another supervisor holds the run, or it ended"}
+        if not self.resumed:
+            if not build.register(self.db, self.ident, pid=pid, pgid=os.getpgrp(), start=self.probe.started(pid)):
+                return {"run": self.ident, "outcome": None, "why": "another supervisor holds the run, or it ended"}
+            self.last_beat = time.monotonic()
         self.logs.mkdir(parents=True, exist_ok=True)
-        self.last_beat = time.monotonic()
+        while True:
+            try:
+                return self.ended()
+            except HUB_FAULTS as fault:
+                gone = self.outage(fault)
+                if gone is not None:
+                    return gone
+
+    def ended(self) -> dict:
         try:
-            return self.walk()
+            return self.walked()
         except Lost:
             return {"run": self.ident, "outcome": None, "why": "the run ended or moved under this supervisor"}
         except Cancelled:
@@ -590,11 +862,21 @@ class Supervisor:
             # An unknown result: no write, so the reap finds the run lost and retries it once.
             return {"run": self.ident, "outcome": None, "why": str(unread)}
 
+    def walked(self) -> dict:
+        """The child an earlier image kept, an end waiting to be written, then the walk."""
+        self.adopt()
+        if self.ending is not None:
+            outcome, detail, question = self.ending
+            return self.finish(outcome, detail, question=question)
+        return self.walk()
+
     def walk(self) -> dict:
-        step = self.row["step"]
+        step = self.fresh()["step"]  # read now: a walk after a hub fault starts where the row is
         steps = {"claimed": self.worktree, "worktree": self.worktree, "building": self.building,
                  "reviewing": self.reviewing, "fixing": self.reviewing, "enqueuing": self.enqueuing,
                  "checking": self.checking, "cleaning": self.cleaning}
+        if self.held is not None and self.held["name"] == "claude" and self.held.get("as") == self.fix_role():
+            steps["fixing"] = self.fix  # a kept builder is the fix itself, not the review after it
         while step in steps:
             ended = steps[step]()
             if isinstance(ended, dict):
@@ -605,6 +887,7 @@ class Supervisor:
         return self.finish("blocked", f"no supervisor step for {step}")
 
     def finish(self, outcome: str, detail: str, *, question: str | None = None) -> dict:
+        self.ending = (outcome, detail, question)  # kept: a hub fault here must not lose how the run ended
         ended = build.end(self.db, self.ident, outcome, detail, question=question)
         return ended or {"run": self.ident, "outcome": None, "why": "the run ended or moved before its last write"}
 
@@ -644,7 +927,7 @@ class Supervisor:
         self.enter("building", log_path=str(self.log))
         session = self.fresh()["session_id"]
         prompt = (RESUME if session else BRIEF).format(**self.brief())
-        return self.claude(prompt, session=session, then="reviewing")
+        return self.claude(prompt, session=session, then="reviewing", role="building")
 
     def reviewing(self) -> str | dict:
         self.enter("reviewing")
@@ -656,7 +939,7 @@ class Supervisor:
         answer: dict | None = None
         for _attempt in range(2):
             out = self.out("review")
-            out.write_bytes(b"")
+            self.empty(out)
             self.child([*self.tools.review, "-C", str(self.work), "--scope", "branch", "--json"], cwd=self.work,
                        name="review")
             answer = self.review_answer(out, head)
@@ -690,14 +973,14 @@ class Supervisor:
             return self.finish("blocked", f"the repository's check entrypoints did not read, a configuration "
                                           f"fault no fix round can mend: {error}")
         if not commands:
-            add_note(self.db, self.lead, "comment",
-                     f"Build run {self.ident}: no check entrypoint found in the repository; no tests ran at {head[:12]}")
+            self.note(self.lead, f"Build run {self.ident}: no check entrypoint found in the repository; "
+                                 f"no tests ran at {head[:12]}")
             return []
         passed = []
         for argv in commands:
             said = shlex.join(argv)
             for name in ("checks", "checks.err"):
-                self.out(name).write_bytes(b"")
+                self.empty(self.out(name))
             code = self.child([*self.tools.gate, "--label", f"build {self.row['branch']} checks", "--", *argv],
                               cwd=self.work, name="checks", descendants=True)
             if code == 125 and self.refused():  # the gate started nothing: unknown, never a failure of the code
@@ -714,7 +997,7 @@ class Supervisor:
                 return [{"path": said, "line": "-", "summary": f"exit 0, but it changed tracked files: {paths}; "
                          "commit or undo them, so the checked tree is the pushed head"}]
             passed.append(f"`{said}`")
-        add_note(self.db, self.lead, "comment", f"Build run {self.ident}: {', '.join(passed)} passed at {head[:12]}")
+        self.note(self.lead, f"Build run {self.ident}: {', '.join(passed)} passed at {head[:12]}")
         return []
 
     def refused(self) -> bool:
@@ -732,13 +1015,21 @@ class Supervisor:
         return self.checked(self.work, self.base(), head, title.strip(), body)
 
     def blocked_round(self, blockers: list[dict]) -> str | dict:
-        rounds = (self.fresh()["review_round"] or 0) + 1
-        if not build.write(self.db, self.ident, review_round=rounds):
-            raise Lost
         self.blockers = blockers
+        # Once per child that blocked: a fault after this write re-walks the held review, which is the same review.
+        self.once(f"round:{(self.last or {}).get('pid')}", self.count_round)
+        rounds = self.fresh()["review_round"] or 0
         if rounds >= REVIEW_ROUNDS:
             return self.finish("blocked", f"{rounds} review rounds left blockers: {self.summary(self.blockers)}")
         return self.fix()
+
+    def count_round(self) -> None:
+        if not build.write(self.db, self.ident, review_round=(self.fresh()["review_round"] or 0) + 1):
+            raise Lost
+
+    def fix_role(self) -> str:
+        """What this round's fix child starts as: a round's count moves only between two fixes."""
+        return f"fix:{self.fresh()['review_round'] or 0}"
 
     def fix(self) -> str | dict:
         self.enter("fixing")
@@ -746,7 +1037,7 @@ class Supervisor:
         if not session:
             return self.finish("blocked", "no builder session recorded to resume for the fix")
         prompt = FIX.format(blockers=self.summary(self.blockers, limit=None), **self.brief())
-        return self.claude(prompt, session=session, then="reviewing")
+        return self.claude(prompt, session=session, then="reviewing", role=self.fix_role())
 
     def enqueuing(self) -> str | dict:
         if not build.enqueuing(self.db, self.ident):
@@ -801,7 +1092,7 @@ class Supervisor:
             return self.finish("blocked", f"the title at {self.title} is missing, not UTF-8 text, or over "
                                           f"{TITLE_MAX} characters")
         errors = self.out("lint.err")
-        errors.write_bytes(b"")
+        self.empty(errors)
         # A foreign repository's docs tree follows none of this pack's rules: only the body is linted there.
         only = ["--body-only"] if unmanaged else []
         if self.child([*self.tools.lint, "--pr-body", str(self.body), *only], cwd=self.work, name="lint") != 0:
@@ -816,7 +1107,7 @@ class Supervisor:
         if unmanaged:
             return self.publish(head, title, delivered)
         out = self.out("enqueue")
-        out.write_bytes(b"")
+        self.empty(out)
         items = [arg for item in delivered for arg in ("--item", str(item))]
         # The run is each delivered item's whole delivery, so it is the last pull request: `--deliver`.
         self.child([*self.tools.ship, "-C", str(self.work), "lane", "enqueue", *items, "--deliver", "--title", title,
@@ -857,8 +1148,8 @@ class Supervisor:
         # The owners of a private repository already see work names; a public one, or one whose visibility did
         # not read, is scanned first, as machine-setup guards only public clones (operator ruling, pack sd:7868).
         if self.private(repository):
-            add_note(self.db, self.lead, "comment", f"Build run {self.ident}: {repository} is private, so the "
-                                                    f"privacy-pattern scan before the push was skipped")
+            self.note(self.lead, f"Build run {self.ident}: {repository} is private, so the "
+                                 f"privacy-pattern scan before the push was skipped")
         else:
             leaked = self.leaks(head, title)
             if leaked:
@@ -983,7 +1274,7 @@ class Supervisor:
                 raise Unread(f"{url} reads head {own[0].get('headRefOid')!r}, not the pushed {head[:12]}")
             return url
         out = self.out("pull")
-        out.write_bytes(b"")
+        self.empty(out)
         if self.child([*self.tools.gh, "pr", "create", "--repo", repository, "--draft", "--head", branch,
                        "--base", self.base().removeprefix("origin/"), "--title", title, "--body-file", str(self.body)],
                       cwd=self.work, name="pull") != 0:
@@ -1019,20 +1310,19 @@ class Supervisor:
         except Unread as unread:
             dirty = f"unread: {unread}"
         if dirty:
-            add_note(self.db, self.lead, "comment",
-                     f"Build run {self.ident} kept worktree {self.work}: it is not clean ({dirty.splitlines()[0]})")
+            self.note(self.lead, f"Build run {self.ident} kept worktree {self.work}: it is not clean "
+                                 f"({dirty.splitlines()[0]})")
             return self.finish("done", f"worktree {self.work} kept: not clean")
         # A session other than this run's builder works in it (pack sd:6024): it stays.
         own = self.fresh()["session_id"]
         held = sessions.describe(sessions.holders(self.db, str(self.work), machine=this_host(),
                                                   exclude=(own,) if own else ()))
         if held:
-            add_note(self.db, self.lead, "comment", f"Build run {self.ident} kept worktree {self.work}: {held}")
+            self.note(self.lead, f"Build run {self.ident} kept worktree {self.work}: {held}")
             return self.finish("done", f"worktree {self.work} kept: {held}")
         if self.child([*self.tools.git, "-C", str(self.repo), "worktree", "remove", str(self.work)], cwd=self.repo,
                       name="cleaning") != 0:
-            add_note(self.db, self.lead, "comment",
-                     f"Build run {self.ident} kept worktree {self.work}: git worktree remove failed")
+            self.note(self.lead, f"Build run {self.ident} kept worktree {self.work}: git worktree remove failed")
             return self.finish("done", f"worktree {self.work} kept: removal failed")
         return self.finish("done", f"worktree {self.work} removed")
 
@@ -1064,14 +1354,14 @@ class Supervisor:
                 f"The operator sent these findings to the branch, oldest first. Fix each one the branch does not\n"
                 f"fix yet, fail-first, as a new commit:\n{sent}\n")
 
-    def claude(self, prompt: str, *, session: str | None, then: str) -> str | dict:
+    def claude(self, prompt: str, *, session: str | None, then: str, role: str) -> str | dict:
         argv = [*self.tools.claude, "-p", prompt, "--output-format", "stream-json", "--verbose",
                 "--allowedTools", *ALLOWED, "--permission-mode", "auto", "--max-turns", str(MAX_TURNS),
                 "--model", self.row["model"] or build.OPUS]
         if session:
             argv += ["--resume", session]
-        offset = self.log.stat().st_size if self.log.exists() else 0
-        self.child(argv, cwd=self.work, name="claude", out=self.log, session=session is None)
+        offset = self.start_offset()
+        self.child(argv, cwd=self.work, name="claude", out=self.log, session=session is None, offset=offset, role=role)
         with open(self.log, "rb") as handle:
             handle.seek(offset)
             lines = handle.read().decode("utf-8", "replace").splitlines()
@@ -1083,10 +1373,11 @@ class Supervisor:
                 fields["session_id"] = verdict["session_id"]
             if not build.write(self.db, self.ident, **fields):
                 raise Lost
-            self.cost(final)
+            self.once("cost", lambda: self.cost(final))
         if verdict["state"] == "pass":
             if isinstance(final, dict) and isinstance(final.get("result"), str) and final["result"].strip():
-                add_note(self.db, self.lead, "comment", f"Build run {self.ident} report:\n{final['result'][:8000]}")
+                self.once("report", lambda: add_note(self.db, self.lead, "comment",
+                                                     f"Build run {self.ident} report:\n{final['result'][:8000]}"))
             problem = self.unfinished()
             return self.finish("blocked", problem) if problem else then
         if verdict["state"] == "denied":
@@ -1204,7 +1495,7 @@ class Supervisor:
     # -------------------------------------------------------------- children
 
     def child(self, argv: list[str], *, cwd: Path, name: str, out: Path | None = None, session: bool = False,
-              descendants: bool = False) -> int:
+              descendants: bool = False, offset: int = 0, role: str | None = None) -> int:
         """Run one child in its own process group, recorded before it runs; its exit code.
 
         The child waits on a pipe until `builder_pgid` and `builder_start`
@@ -1215,8 +1506,11 @@ class Supervisor:
         The groups its descendants run in (`sd gate run` puts its command in
         one) are ended with it and must read gone too. With `descendants`,
         each is also recorded while it runs, so one that outlives its parent
-        is still ended (`ours`).
+        is still ended (`ours`). On a replay a child that already ran answers from its record (`replayed`).
         """
+        replayed = self.replayed(argv, name, role)
+        if replayed is not None:
+            return replayed
         target = out or self.out(name)
         read, gate = os.pipe()
         try:
@@ -1230,17 +1524,35 @@ class Supervisor:
         finally:
             os.close(read)
         try:
-            recorded = build.write(self.db, self.ident, builder_pgid=process.pid,
-                                   builder_start=self.probe.started(process.pid))
-            if recorded:
-                os.write(gate, b"1")
-        finally:
-            os.close(gate)
+            try:
+                recorded = build.write(self.db, self.ident, builder_pgid=process.pid,
+                                       builder_start=self.probe.started(process.pid))
+                if recorded:
+                    os.write(gate, b"1")
+            finally:
+                os.close(gate)
+        except HUB_FAULTS:
+            process.wait()  # its gate closed unwritten: it exits unrun, and the walk starts it again
+            raise
         if not recorded:
             process.wait()
             raise Lost
-        deadline = time.monotonic() + self.timeout
+        self.last = {"name": name, "argv": argv, "pid": process.pid, "exit": None, "session": session, "offset": offset,
+                     "as": role}
+        for mark in CHILD_MARKS:
+            self.marks.discard(mark)
+            self.unknown.pop(mark, None)
+        self.down_since = None
         self.groups = {} if descendants else None
+        return self.waited(process, name, session=session, deadline=time.monotonic() + self.timeout)
+
+    def waited(self, process, name: str, *, session: bool, deadline: float) -> int:
+        """Wait out one recorded child, beating; its exit code once its group is gone.
+
+        A hub fault leaves the child running: the beat is skipped, as at a held lock, and the next one tries
+        again (pack sd:8182). One beat landing clears the outage and reads the run again.
+        """
+        self.deadline = deadline
         while True:
             try:
                 code = process.wait(timeout=min(1.0, self.beat_seconds))
@@ -1254,22 +1566,27 @@ class Supervisor:
                 # give its number to an unrelated group whose EPERM read as a Survivor (sd:7909).
                 self.groups = {group: start for group, start in self.groups.items() if self.ours(group, start)}
             try:
-                if session:
+                if session and not self.hub_down:
                     self.watch_session()
                 self.beat(process)
             except Lost:
                 # No write lands any more: the group goes before the supervisor does.
                 self.end_group(process.pid, process)
                 raise
+            except HUB_FAULTS as fault:
+                self.fault_seen(fault)
+                self.follow_build(fault)  # a build the hub refuses: this image cannot beat, so replace it
             if time.monotonic() >= deadline:
                 if not self.end_group(process.pid, process):
                     raise Survivor(f"process group {process.pid} ({name}) still had a process after SIGKILL")
                 raise TimedOut
+        if self.last is not None:
+            self.last["exit"] = code
         if not self.end_group(process.pid, process):
             raise Survivor(f"process group {process.pid} ({name}) still had a process after SIGKILL")
         return code
 
-    def beat(self, process: subprocess.Popen) -> None:
+    def beat(self, process: Any) -> None:
         """Beat when one is due; stop the child's group at a lost run or a requested cancel."""
         if time.monotonic() - self.last_beat < self.beat_seconds:
             return
@@ -1284,6 +1601,7 @@ class Supervisor:
             return
         if not beaten:
             raise Lost
+        self.hub_down, self.down_since = False, None
         row = self.fresh()
         if row["cancel_requested"] and row["step"] in build.CANCELLABLE:
             if not self.end_group(process.pid, process):
@@ -1306,7 +1624,7 @@ class Supervisor:
                         raise Lost
                     return
 
-    def end_group(self, pgid: int, process: subprocess.Popen | None = None) -> bool:
+    def end_group(self, pgid: int, process: Any = None) -> bool:
         """TERM the group and the groups below it, `grace` seconds, then SIGKILL; True once ESRCH answers on each.
 
         The groups below are read live before each signal (`build.descendant_groups`), so each is one this
@@ -1324,9 +1642,10 @@ class Supervisor:
             groups.update(group for group, start in (self.groups or {}).items() if self.ours(group, start))
 
         def gone() -> bool:
+            ended = all(self.probe.group(group) is False for group in groups)
             if process is not None:
-                process.poll()
-            return all(self.probe.group(group) is False for group in groups)
+                process.poll()  # after the read: a leader that died before it reads gone, and is ours to reap
+            return ended
 
         for sent, wait in ((signal.SIGTERM, self.grace), (signal.SIGKILL, 5.0)):
             widen()
@@ -1369,7 +1688,7 @@ class DraftSupervisor(Supervisor):
 
     def __init__(self, connection, ident: str, *, tools: Tools, log_root: Path, environ: dict | None = None,
                  beat_seconds: float = BEAT_SECONDS, timeout: float = draft.BUDGET_MINUTES * 60,
-                 grace: float = GRACE_SECONDS, probe=Probe):
+                 grace: float = GRACE_SECONDS, probe=Probe, settle_seconds: float = build.STALE_SECONDS):
         self.db, self.ident, self.tools, self.probe = Patient(connection), ident, tools, probe
         self.beat_seconds, self.timeout, self.grace = beat_seconds, timeout, grace
         self.row = build.run(self.db, ident)
@@ -1380,15 +1699,15 @@ class DraftSupervisor(Supervisor):
                                        (self.row["assignment"],)).fetchone()["item"]
         self.last_beat = 0.0
         self.env = _environ(environ)
+        self.reviewed: str | None = None
+        self.take_resume(settle_seconds)
 
-    def run(self) -> dict:
-        pid = os.getpid()
-        if not build.register(self.db, self.ident, pid=pid, pgid=os.getpgrp(), start=self.probe.started(pid)):
-            return {"run": self.ident, "outcome": None, "why": "another supervisor holds the run, or it ended"}
-        self.logs.mkdir(parents=True, exist_ok=True)
-        self.last_beat = time.monotonic()
+    def walk(self) -> dict:
+        return self.drafting()
+
+    def ended(self) -> dict:
         try:
-            return self.drafting()
+            return self.walked()
         except (Lost, Cancelled):
             return {"run": self.ident, "outcome": None, "why": "the run ended or moved under this supervisor"}
         except TimedOut:
@@ -1397,6 +1716,7 @@ class DraftSupervisor(Supervisor):
             return self.finish("blocked", str(survivor))
 
     def finish(self, outcome: str, detail: str, *, question: str | None = None) -> dict:
+        self.ending = (outcome, detail, question)
         ended = draft.end(self.db, self.ident, outcome, detail)
         return ended or {"run": self.ident, "outcome": None, "why": "the run ended or moved before its last write"}
 
@@ -1413,8 +1733,8 @@ class DraftSupervisor(Supervisor):
                            log_path=str(self.log)):
             raise Lost
         self.last_beat = time.monotonic()
-        offset = self.log.stat().st_size if self.log.exists() else 0
-        self.child(self.argv(), cwd=self.repo, name="claude", out=self.log, session=True)
+        offset = self.start_offset()
+        self.child(self.argv(), cwd=self.repo, name="claude", out=self.log, session=True, offset=offset)
         with open(self.log, "rb") as handle:
             handle.seek(offset)
             lines = handle.read().decode("utf-8", "replace").splitlines()
@@ -1426,7 +1746,7 @@ class DraftSupervisor(Supervisor):
                 fields["session_id"] = verdict["session_id"]
             if not build.write(self.db, self.ident, **fields):
                 raise Lost
-            self.cost(final)
+            self.once("cost", lambda: self.cost(final))
         if verdict["state"] != "pass":
             # A turn limit is no loss here: a fresh run has no session to resume, so it blocks as any other end.
             return self.finish("blocked", f"{verdict['why']}; nothing was written; log {self.log}")

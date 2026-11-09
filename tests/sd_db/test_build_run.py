@@ -11,6 +11,7 @@ refuse fails here too.
 import contextlib
 import dataclasses
 import importlib
+import io
 import json
 import os
 import signal
@@ -32,8 +33,10 @@ from sd_db import (
     build_run,
     database,
     draft,
+    follow,
     hub,
     operations,
+    remote,
     runner,
     sessions,
     writes,
@@ -285,6 +288,35 @@ def end(process):
     process.wait()
 
 
+class Refuses:
+    """A connection whose `at`th statement raises `fault`; `seen` lists every statement, so a new read is covered."""
+
+    def __init__(self, real, at, fault, seen):
+        self.real, self.at, self.fault, self.seen = real, at, fault, seen
+
+    def execute(self, *args):
+        self.seen.append(args[0])
+        if len(self.seen) == self.at:
+            raise self.fault
+        return self.real.execute(*args)
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+
+def resume_state(run, child=424242):
+    """What an earlier image of this process hands over while `child` still runs."""
+    return {"run": run, "pid": os.getpid(), "reviewed": None, "ending": None, "marks": [], "groups": None,
+            "child": {"name": "claude", "argv": [], "pid": child, "exit": None, "session": False, "offset": 0,
+                      "left": 30.0}}
+
+
+def moving_clock():
+    """`time.monotonic`, five seconds further on at every read: a bound passes without a real wait."""
+    clock = iter(range(0, 10 ** 9, 5))
+    return mock.patch("time.monotonic", side_effect=lambda: next(clock))
+
+
 def group_gone(pgid):
     try:
         os.killpg(pgid, 0)
@@ -355,11 +387,45 @@ class Case(unittest.TestCase):
         self.bundle = bundle
         return bundle
 
+    def assert_start_recovers(self, run):
+        """Every statement from the connection to `run()`, failing once: the start retries and keeps the child."""
+        state, statements = resume_state(run), []
+
+        def supervise(at, fault, seen):
+            attempts, resumed = [], []
+
+            def opened(write=False):
+                attempts.append(write)
+                return Refuses(connect(self.database), at if len(attempts) == 1 else 0, fault, seen)
+
+            def reached(supervisor):
+                resumed.append(supervisor.resumed)
+                return {"run": run}
+
+            with mock.patch.dict(os.environ, {"SD_BUILD_RESUME": json.dumps(state)}), \
+                    mock.patch("sd_db.connect", opened), mock.patch("time.sleep"), \
+                    mock.patch("sys.path", [str(BIN), *sys.path]), \
+                    mock.patch.object(ADAPTER, "log_root", return_value=self.logs), \
+                    mock.patch.object(build_run.Supervisor, "run", reached), \
+                    mock.patch.object(build, "kill_group") as kill, mock.patch("builtins.print"):
+                ADAPTER.supervise_build(mock.Mock(run=run))
+            return attempts, resumed, kill
+
+        supervise(0, None, statements)
+        self.assertGreaterEqual(len(statements), 4, statements)
+        for at in range(1, len(statements) + 1):
+            for fault in (HubFaults.UNREACHABLE, HubFaults.MISMATCH):
+                with self.subTest(statement=statements[at - 1], fault=type(fault).__name__):
+                    attempts, resumed, kill = supervise(at, fault, [])
+                    self.assertEqual(len(attempts), 2, "the failed start was tried again")
+                    self.assertEqual(resumed, [True], "the supervisor took the child over")
+                    kill.assert_not_called()
+
     def supervisor(self, ident=None, **options):
         options = {"beat_seconds": 0.2, "timeout": 30, "grace": 0.5, **options}
-        options = {"cited": ADAPTER.cited, **options}
+        options = {"cited": ADAPTER.cited, "environ": self.env, **options}
         return build_run.Supervisor(self.db, ident or self.bundle["id"], tools=self.tools, log_root=self.logs,
-                                    environ=self.env, **options)
+                                    **options)
 
     def write_pr(self, title="feat(fixture): build the fixture", body="## Summary\n\nx\n\n## Test plan\n\ny\n"):
         logs = build_run.log_dir(self.logs, self.bundle["repo"])
@@ -555,6 +621,28 @@ class Supervise(Case):
             time.sleep(0.05)
         self.assertIs(build.Probe.group(leader.pid), False)
         self.assertTrue(self.supervisor().end_group(leader.pid))
+
+    def test_a_leader_that_dies_between_the_poll_and_the_read_is_reaped(self):
+        """Gate at e97e9f626: a leader dead after the poll read gone as a zombie, and stayed unreaped."""
+        self.press()
+        leader = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        self.addCleanup(end, leader)
+
+        class DiesAtTheRead(build.Probe):
+            @staticmethod
+            def group(pgid):
+                os.kill(pgid, signal.SIGKILL)
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    state = subprocess.run(["ps", "-o", "stat=", "-p", str(pgid)], capture_output=True, text=True)
+                    if state.stdout.strip().startswith("Z"):
+                        return False
+                    time.sleep(0.02)
+                raise AssertionError("the leader never became a zombie")
+
+        self.assertTrue(self.supervisor(probe=DiesAtTheRead).end_group(leader.pid, leader))
+        self.assertIsNotNone(leader.returncode, "the supervisor reaps the leader it read as gone")
+        self.assertTrue(group_gone(leader.pid))
 
     def test_an_unread_ps_does_not_fail_an_end_once_the_group_is_gone(self):
         """Review of b34af431e: an unread `ps` set a flag no later read cleared, so a run whose group read
@@ -2168,6 +2256,23 @@ class Drafts(Case):
         self.assertIn("Draft blocked:", followups[0])
         self.assertEqual(draft.open_runs(self.db), [])
 
+    def test_a_draft_run_keeps_its_child_through_a_hub_fault(self):
+        """pack sd:8182: the draft supervisor shares the child and the beat, so it shares the fault."""
+        run = self.claimed()
+        self.plan(claude=["draft"])
+        fired: list[str] = []
+        real = build.beat
+
+        def beat(connection, ident):
+            if not fired:
+                fired.append(ident)
+                raise remote.HubUnreachable("hub.example.test", 8769, "timed out")
+            return real(connection, ident)
+
+        with mock.patch.object(build, "beat", beat):
+            ended = self.drafter(run["id"], beat_seconds=0.01).run()
+        self.assertEqual(ended["outcome"], "done")
+
     def test_a_tick_claims_and_spawns_one_draft(self):
         self.queue()
         spawned: list[str] = []
@@ -2177,6 +2282,10 @@ class Drafts(Case):
         self.assertEqual((result["claimed"], len(result["drafted"]), spawned), ([], 1, result["drafted"]))
         self.assertEqual(build_run.dispatch(self.db, **tick)["drafted"], [], "one draft at a time")
         self.assertEqual(build_run.dispatch(self.db, **{**tick, "load": None})["drafted"], [])
+
+    def test_every_hub_read_before_the_draft_run_loop_is_retried_with_the_child_kept(self):
+        """Round 2: `DraftSupervisor` has its own constructor and its own reads."""
+        self.assert_start_recovers(self.claimed()["id"])
 
     def test_supervise_routes_a_draft_run_to_the_draft_supervisor(self):
         run = self.claimed()
@@ -2192,7 +2301,7 @@ class Drafts(Case):
         args = mock.Mock(run=run["id"])
         with mock.patch("sys.path", [str(BIN), *sys.path]), \
                 mock.patch.object(ADAPTER, "log_root", return_value=self.logs), \
-                mock.patch.object(ADAPTER.sd_handoff_rows, "connect", return_value=connect(self.database)), \
+                mock.patch("sd_db.connect", return_value=connect(self.database)), \
                 mock.patch.object(build_run, "DraftSupervisor", Fake), \
                 mock.patch("builtins.print"):
             ADAPTER.supervise_build(args)
@@ -2380,6 +2489,676 @@ class Hosts(Case):
         with self.on("work"):
             self.assertEqual(ADAPTER.push_failures(self.db, environ), [])
         self.assertEqual(ADAPTER.push_failures(self.db, environ), [f"build:{run['id']}"])
+
+
+#: A process replaced in place: the first image runs this script, is refused at a beat, and execs itself; the
+#: second image holds the same pid and the same child (pack sd:8182). `--help` is the exec's preflight.
+EXEC_DRIVER = textwrap.dedent('''
+    import json, os, sys
+    from pathlib import Path
+    from unittest import mock
+    if "--help" in sys.argv:
+        sys.exit(0)
+    from sd_db import build, build_run, remote
+    from sd_db.database import connect
+    plan = json.loads(Path(sys.argv[1]).read_text())
+    with open(plan["pids"], "a") as out:
+        out.write(f"{os.getpid()}\\n")
+    db = connect(plan["database"])
+    first = os.environ.get("SD_BUILD_RESUME") is None
+    patches = [mock.patch.object(build, "this_host", return_value="hub"),
+               mock.patch("sd_db.hub.configured", return_value=False)]
+    if first:
+        def refused(connection, ident):
+            raise remote.BuildMismatch("build", "old", "new", hub_build="new")
+        patches += [mock.patch.object(build, "beat", refused), mock.patch.object(remote, "disk_holds", return_value=True)]
+    for patch in patches:
+        patch.start()
+    tools = build_run.Tools(**plan["tools"])
+    ended = build_run.Supervisor(db, plan["run"], tools=tools, log_root=Path(plan["logs"]), environ=plan["env"],
+                                 cited=lambda *_: set(plan["items"]), beat_seconds=0.2, timeout=60, grace=0.5).run()
+    Path(plan["result"]).write_text(json.dumps(ended))
+''')
+
+
+class Replaced(BaseException):
+    """What the fake `exec_in_place` raises in place of replacing the test's process."""
+
+    def __init__(self, state):
+        super().__init__(state)
+        self.state = state
+
+
+def replaced(state):
+    raise Replaced(state)
+
+
+class HubFaults(Case):
+    """Pack sd:8182: a hub refresh drops the session, then refuses the build this process loaded.
+
+    Each `HUB` raised from the beat, a step's write or the last write used to end the supervisor beside
+    its live child. The mismatch cannot clear in this process, so it ends in `exec_in_place`.
+    """
+
+    MISMATCH = remote.BuildMismatch("build", "old-digest", "hub-digest", hub_build="hub-digest")
+    UNREACHABLE = remote.HubUnreachable("hub.example.test", 8769, "timed out")
+
+    def setUp(self):
+        super().setUp()
+        self.press()
+        self.write_pr()
+
+    def row(self):
+        return build.run(self.db, self.bundle["id"])
+
+    def faults_once(self, name, fault, fields=None, after=0, where=None):
+        """`build.<name>` raising `fault` once, on the call after `after` that writes one of `fields`, when named."""
+        real, fired, passed = getattr(build, name), [], []
+
+        def faulty(*args, **kwargs):
+            if not fired and (fields is None or set(fields) & set(kwargs)) and (where is None or where(kwargs)):
+                if len(passed) == after:
+                    fired.append(name)
+                    raise fault
+                passed.append(1)
+            return real(*args, **kwargs)
+
+        return mock.patch.object(build, name, faulty), fired
+
+    def test_a_hub_gone_at_a_beat_keeps_the_child_and_beats_again(self):
+        """The 3fb55b02 death: `hub ... is unreachable: timed out` at a beat ended the supervisor."""
+        build.write(self.db, self.bundle["id"], step="reviewing")
+        self.plan(claude=["slow"])
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        real, calls = build.beat, []
+
+        def beat(connection, ident):
+            calls.append(ident)
+            if len(calls) == 1:
+                raise self.UNREACHABLE
+            return real(connection, ident)
+
+        before = self.row()["heartbeat_at"]
+        with mock.patch.object(build, "beat", beat):
+            code = supervisor.child([*self.tools.claude, "-p", "x"], cwd=self.root, name="gone")
+        self.assertEqual(code, 0)
+        self.assertGreater(len(calls), 1, "the next beat came")
+        row = self.row()
+        self.assertEqual((row["step"], row["outcome"]), ("reviewing", None))
+        self.assertGreaterEqual(row["heartbeat_at"], before or "")
+
+    def test_a_mismatch_at_a_beat_hands_the_child_to_the_followed_build(self):
+        """The b671669f death: the hub refuses this build for life, so the process replaces itself."""
+        self.plan(claude=["slow"], sd_review=["clean"])
+        held = [False, True]
+
+        def beat(connection, ident):
+            raise self.MISMATCH
+
+        state = None
+        with (mock.patch.object(build, "beat", beat),
+              mock.patch.object(remote, "disk_holds", side_effect=lambda _: held.pop(0) if held else True, create=True),
+              mock.patch.object(build_run, "exec_in_place", replaced, create=True)):
+            try:
+                self.supervisor().run()
+            except Replaced as image:
+                state = image.state
+                kept = image  # its traceback holds the old image's Popen, as a real exec keeps the child
+        self.assertIsNotNone(state, "the process replaced itself once the disk held the hub's build")
+        self.assertIsNone(state["child"]["exit"], "the child still ran at the exec")
+        self.assertEqual(state["run"], self.bundle["id"])
+        self.assertEqual(self.row()["builder_pgid"], state["child"]["pid"])
+        with mock.patch.dict(os.environ, {"SD_BUILD_RESUME": json.dumps(state)}):
+            ended = self.supervisor().run()
+        del kept
+        self.assertEqual(ended["step"], "enqueued")
+        self.assertEqual(len(self.calls("claude")), 1, "the live child was kept, not run again")
+        row = self.row()
+        self.assertIsNotNone(row["final"], "its result was judged from its own log lines")
+        self.assertTrue(group_gone(state["child"]["pid"]))
+        self.assertIsNone(row["outcome"])
+
+    def test_a_real_exec_keeps_the_pid_and_the_child(self):
+        """Exec, not its fake: the same pid and its child live on, and the second image finishes the run."""
+        self.plan(claude=["slow"], sd_review=["clean"])
+        (self.root / "driver.py").write_text(EXEC_DRIVER, encoding="utf-8")
+        plan = {"database": str(self.database), "run": self.bundle["id"], "logs": str(self.logs),
+                "tools": dataclasses.asdict(self.tools), "items": self.items, "env": self.env,
+                "pids": str(self.root / "pids"), "result": str(self.root / "result.json")}
+        (self.root / "plan.json").write_text(json.dumps(plan), encoding="utf-8")
+        env = {**os.environ, "PYTHONPATH": os.pathsep.join([str(BIN.parent / "lib"), str(BIN)])}
+        done = subprocess.run([sys.executable, str(self.root / "driver.py"), str(self.root / "plan.json")],
+                              capture_output=True, text=True, timeout=120, env=env, check=False)
+        self.assertEqual(done.returncode, 0, done.stderr)
+        pids = (self.root / "pids").read_text().split()
+        self.assertEqual(len(pids), 2, "the driver ran twice under one pid")
+        self.assertEqual(pids[0], pids[1])
+        self.assertEqual(json.loads((self.root / "result.json").read_text())["step"], "enqueued")
+        self.assertEqual(len(self.calls("claude")), 1)
+        self.assertEqual(self.row()["supervisor_pid"], int(pids[0]))
+
+    def test_a_mismatch_that_never_clears_ends_the_group_and_the_run_cleanly(self):
+        """No follow comes: the budget ends the child, nothing hangs, and the reap owns the row."""
+        self.plan(claude=["hang"])
+
+        def beat(connection, ident):
+            raise self.MISMATCH
+
+        supervisor = self.supervisor(timeout=1.0)
+        supervisor.settle_seconds = 0.3
+        with (mock.patch.object(build, "beat", beat),
+              mock.patch.object(remote, "disk_holds", return_value=False, create=True),
+              mock.patch.object(build, "end", side_effect=self.MISMATCH),
+              mock.patch.object(build_run, "exec_in_place", replaced, create=True)):
+            ended = supervisor.run()
+        self.assertIsNone(ended["outcome"])
+        self.assertIn("build mismatch", ended["why"])
+        self.assertTrue(group_gone(self.row()["builder_pgid"]), "no child outlives the supervisor")
+        self.assertIsNone(self.row()["outcome"], "nothing was written: the row is the reap's")
+
+    def test_a_result_written_in_the_window_is_not_lost(self):
+        """b671669f's result: the child ended, then its first write met the fault; no second child runs."""
+        self.plan(claude=["pass"], sd_review=["clean"])
+        patch, fired = self.faults_once("write", self.UNREACHABLE, fields=("final",))
+        with patch:
+            ended = self.supervisor().run()
+        self.assertEqual((fired, ended["step"]), (["write"], "enqueued"))
+        self.assertEqual(len(self.calls("claude")), 1, "the result was not paid for twice")
+        self.assertIsNotNone(self.row()["final"])
+
+    def test_a_mismatch_after_the_child_replays_its_result_in_the_new_image(self):
+        self.plan(claude=["pass"], sd_review=["clean"])
+        patch, fired = self.faults_once("write", self.MISMATCH, fields=("final",))
+        state = None
+        with (patch, mock.patch.object(remote, "disk_holds", return_value=True, create=True),
+              mock.patch.object(build_run, "exec_in_place", replaced, create=True)):
+            try:
+                self.supervisor().run()
+            except Replaced as image:
+                state = image.state
+        self.assertEqual(fired, ["write"])
+        self.assertEqual(state["child"]["exit"], 0)
+        with mock.patch.dict(os.environ, {"SD_BUILD_RESUME": json.dumps(state)}):
+            self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        self.assertEqual(len(self.calls("claude")), 1)
+
+    def test_a_group_write_in_the_window_runs_the_child_after_it(self):
+        """A failed group write closes the gate: the child exits unrun, and the walk starts it again."""
+        self.plan(claude=["pass"], sd_review=["clean"])
+        patch, fired = self.faults_once("write", self.UNREACHABLE, fields=("builder_pgid",))
+        with patch:
+            ended = self.supervisor().run()
+        self.assertEqual((fired, ended["step"]), (["write"], "enqueued"))
+        self.assertEqual(len(self.calls("claude")), 1, "the gated child never ran")
+
+    def test_a_step_write_in_the_window_is_written_after_it(self):
+        self.plan(claude=["pass"], sd_review=["clean"])
+        patch, fired = self.faults_once("write", self.UNREACHABLE, fields=("step",))
+        with patch:
+            ended = self.supervisor().run()
+        self.assertEqual((fired, ended["step"]), (["write"], "enqueued"))
+
+    def test_the_last_write_in_the_window_is_written_after_it(self):
+        """The run blocked while the hub restarted: its end lands once the hub answers."""
+        self.plan(claude=["silent"])
+        patch, fired = self.faults_once("end", self.UNREACHABLE)
+        with patch:
+            ended = self.supervisor().run()
+        self.assertEqual((fired, ended["outcome"]), (["end"], "blocked"))
+        self.assertEqual(self.row()["outcome"], "blocked")
+
+    def test_a_cost_and_a_report_are_not_written_twice_on_a_replay(self):
+        self.plan(claude=["pass"], sd_review=["clean"])
+        real, faults = add_note, []
+
+        def note(connection, item, kind, body, *args, **kwargs):
+            if "report:" in body and not faults:
+                faults.append(body)  # the cost of this child was written before the note
+                raise self.UNREACHABLE
+            return real(connection, item, kind, body, *args, **kwargs)
+
+        with mock.patch.object(build_run, "add_note", note):
+            self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        reports = self.db.execute("SELECT COUNT(*) FROM note WHERE item = ? AND body LIKE '%report:%'",
+                                  (self.items[0],)).fetchone()[0]
+        self.assertEqual(reports, 1)
+        costs = self.db.execute("SELECT COUNT(*) FROM cost WHERE pass = ?", (self.bundle["id"],)).fetchone()[0]
+        self.assertEqual(costs, 1)
+
+    def run_with_lost_answer(self, target, answers, *, committed):
+        """The first `build_run.<target>` loses its answer, after its commit when `committed`; what `outcome` said."""
+        self.plan(claude=["pass"], sd_review=["clean"])
+        real, faults, asked = getattr(build_run, target), [], []
+        lost = remote.UnknownOutcome("r" * 26, "the answer to COMMIT was lost")
+
+        def write(*args, **kwargs):
+            if faults:
+                return real(*args, **kwargs)
+            faults.append(target)
+            if committed:
+                real(*args, **kwargs)
+            raise lost
+
+        def outcome(rid):
+            asked.append(rid)
+            return answers.pop(0)
+
+        supervisor = self.supervisor()
+        supervisor.db.outcome = outcome
+        with mock.patch.object(build_run, target, write), mock.patch("time.sleep"):
+            self.assertEqual(supervisor.run()["step"], "enqueued")
+        return asked
+
+    def costs(self):
+        return self.db.execute("SELECT COUNT(*) FROM cost WHERE pass = ?", (self.bundle["id"],)).fetchone()[0]
+
+    def test_a_committed_cost_whose_answer_was_lost_is_not_written_again(self):
+        """`UnknownOutcome`: the transaction may have committed; the hub says, then the walk goes on."""
+        self.assertEqual(self.run_with_lost_answer("record_cost", ["recorded"], committed=True), ["r" * 26])
+        self.assertEqual(self.costs(), 1)
+
+    def test_an_absent_cost_whose_answer_was_lost_is_written_on_the_replay(self):
+        self.run_with_lost_answer("record_cost", ["absent"], committed=False)
+        self.assertEqual(self.costs(), 1)
+
+    def test_a_write_still_in_flight_is_asked_again(self):
+        """A live session still owns it: no replay yet, whichever way it ends."""
+        asked = self.run_with_lost_answer("record_cost", ["in_flight", "recorded"], committed=True)
+        self.assertEqual(len(asked), 2)
+        self.assertEqual(self.costs(), 1)
+
+    def test_a_committed_report_whose_answer_was_lost_is_not_written_again(self):
+        self.run_with_lost_answer("add_note", ["recorded"], committed=True)
+        reports = self.db.execute("SELECT COUNT(*) FROM note WHERE item = ? AND body LIKE '%report:%'",
+                                  (self.items[0],)).fetchone()[0]
+        self.assertEqual(reports, 1)
+
+    def test_a_lost_answer_is_handed_over_to_the_next_image(self):
+        """The rid travels with the marks, so the new image asks the hub and does not write again."""
+        supervisor = self.supervisor()
+        supervisor.last = {"name": "claude", "argv": [], "pid": 1, "exit": 0, "session": False, "offset": 0}
+        lost = remote.UnknownOutcome("r" * 26, "lost")
+        with self.assertRaises(remote.UnknownOutcome):
+            supervisor.once("cost", mock.Mock(side_effect=lost))
+        write = mock.Mock()
+        with mock.patch.dict(os.environ, {"SD_BUILD_RESUME": json.dumps(supervisor.state())}):
+            image = self.supervisor()
+        image.db.outcome = mock.Mock(return_value="recorded")
+        image.once("cost", write)
+        write.assert_not_called()
+        self.assertIn("cost", image.marks)
+
+    def test_a_note_whose_answer_was_lost_is_not_written_again(self):
+        """Each note the walk reaches again: `own_checks`' here, the rest go through the same call."""
+        real, faults = add_note, []
+
+        def note(*args, **kwargs):
+            real(*args, **kwargs)
+            if not faults:
+                faults.append(1)
+                raise remote.UnknownOutcome("r" * 26, "lost")
+
+        supervisor = self.supervisor(checks=lambda _: [])
+        supervisor.db.outcome = mock.Mock(return_value="recorded")
+        with mock.patch.object(build_run, "add_note", note):
+            with self.assertRaises(remote.UnknownOutcome):
+                supervisor.own_checks("a" * 40)
+            supervisor.own_checks("a" * 40)
+        said = self.db.execute("SELECT COUNT(*) FROM note WHERE item = ? AND body LIKE '%no check entrypoint%'",
+                               (self.items[0],)).fetchone()[0]
+        self.assertEqual(said, 1)
+
+    def test_a_note_after_the_step_moved_is_not_written_again(self):
+        """`enqueued` landed before its note: the replay reads the step and stops, so no second note."""
+        real, faults = add_note, []
+
+        def note(connection, item, kind, body, *args, **kwargs):
+            real(connection, item, kind, body, *args, **kwargs)
+            if "in the lane" in body and not faults:
+                faults.append(body)
+                raise remote.UnknownOutcome("r" * 26, "lost")
+
+        self.plan(claude=["pass"], sd_review=["clean"])
+        with mock.patch.object(build_run, "add_note", note):
+            ended = self.supervisor().run()
+        self.assertEqual((len(faults), ended["step"]), (1, "enqueued"))
+        said = self.db.execute("SELECT COUNT(*) FROM note WHERE item = ? AND body LIKE '%in the lane%'",
+                               (self.items[0],)).fetchone()[0]
+        self.assertEqual(said, 1)
+
+    def test_a_replayed_review_counts_one_round_and_keeps_its_blockers(self):
+        """A fault after the round's write re-walked the held review: one review counted as two."""
+        self.plan(claude=["pass", "pass"], sd_review=["blocking", "clean"])
+        patch, fired = self.faults_once("write", self.UNREACHABLE, fields=("step",),
+                                        where=lambda fields: fields.get("step") == "fixing")
+        with patch:
+            ended = self.supervisor().run()
+        self.assertEqual((fired, ended["step"]), (["write"], "enqueued"))
+        self.assertEqual(self.row()["review_round"], 1)
+        self.assertEqual(len(self.calls("sd-review")), 2, "the held review answered; only the fix's review ran")
+        fix = self.calls("claude")[1]["argv"]
+        self.assertIn("a blocker", fix[fix.index("-p") + 1])
+
+    def test_a_fix_whose_start_faulted_is_not_answered_by_the_builder(self):
+        """The prechecked path: a fault on the fix's group write left the builder as `last`, and it stood in."""
+        self.plan(claude=["pass", "pass"], sd_review=["clean"])
+        patch, fired = self.faults_once("write", self.UNREACHABLE, fields=("builder_pgid",), after=3)  # fetch, add, builder
+        with patch:
+            ended = self.supervisor(checked=lambda *_: [] if len(self.calls("claude")) >= 2 else ["not ready"]).run()
+        self.assertEqual((fired, ended.get("step")), (["write"], "enqueued"), ended)
+        self.assertEqual(len(self.calls("claude")), 2, "the fix ran")
+        self.assertEqual(self.row()["review_round"], 1, "the builder did not answer for the fix")
+
+    def test_a_second_fix_whose_start_faulted_is_not_answered_by_the_first(self):
+        """Two fixes in a row at the same step: the first must not stand in for the second."""
+        self.plan(claude=["pass", "pass", "pass"], sd_review=["clean"])
+        patch, fired = self.faults_once("write", self.UNREACHABLE, fields=("builder_pgid",), after=4)  # fetch, add, builder, fix
+        with patch:
+            ended = self.supervisor(checked=lambda *_: [] if len(self.calls("claude")) >= 3 else ["not ready"]).run()
+        self.assertEqual((fired, ended.get("step")), (["write"], "enqueued"), ended)
+        self.assertEqual(len(self.calls("claude")), 3, "both fixes ran")
+        self.assertEqual(self.row()["review_round"], 2, "the first fix did not answer for the second")
+
+    def test_a_replay_skips_earlier_children_and_runs_the_next(self):
+        """A held second check: the first is not run again, the second answers from its record, then a child runs."""
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        build.write(self.db, self.bundle["id"], step="reviewing")
+        first, second, third = [[sys.executable, "-c", f"print({n})"] for n in (1, 2, 3)]
+        supervisor.held = {"name": "checks", "argv": second, "exit": 7}
+        self.assertEqual(supervisor.child(first, cwd=self.root, name="checks"), 0)
+        self.assertEqual(supervisor.child(second, cwd=self.root, name="checks"), 7)
+        self.assertIsNone(supervisor.held)
+        self.assertEqual(supervisor.child(third, cwd=self.root, name="checks"), 0)
+        self.assertEqual(self.row()["builder_pgid"], supervisor.last["pid"], "the third child ran")
+
+    def test_a_replay_that_leaves_the_held_childs_path_starts_its_child(self):
+        """The walk took another way: nothing is skipped as passed, the child runs."""
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        build.write(self.db, self.bundle["id"], step="reviewing")
+        supervisor.held = {"name": "review", "argv": ["old"], "exit": 0}
+        self.assertEqual(supervisor.child([sys.executable, "-c", "print(1)"], cwd=self.root, name="lint"), 0)
+        self.assertIsNone(supervisor.held)
+        self.assertEqual(self.row()["builder_pgid"], supervisor.last["pid"], "the child ran")
+
+    def test_a_replay_keeps_the_output_of_a_child_that_ran(self):
+        supervisor = self.supervisor()
+        output = self.root / "review.out"
+        output.write_text("answer")
+        supervisor.held = {"name": "review", "argv": ["x"], "exit": 0}
+        supervisor.empty(output)
+        self.assertEqual(output.read_text(), "answer", "a replay keeps the answer it needs")
+        supervisor.held = None
+        supervisor.empty(output)
+        self.assertEqual(output.read_text(), "", "a fresh child starts with an empty file")
+
+    def test_a_held_claude_reads_its_own_log_lines(self):
+        self.plan(claude=["pass"], sd_review=["clean"])
+        logs = build_run.log_dir(self.logs, self.bundle["repo"])
+        logs.mkdir(parents=True, exist_ok=True)
+        supervisor = self.supervisor()
+        supervisor.held = {"name": "claude", "argv": [], "exit": 0, "offset": 5}
+        self.assertEqual(supervisor.start_offset(), 5)
+        supervisor.held = None
+        (logs / f"{self.bundle['id']}.jsonl").write_text("12345678")
+        self.assertEqual(supervisor.start_offset(), 8)
+
+    def test_a_walk_after_a_fault_starts_at_the_row_step_not_the_read_one(self):
+        """A walk again in this process: the row moved past what `__init__` read."""
+        self.plan(claude=["pass"], sd_review=["clean"])
+        supervisor = self.supervisor()
+        build.write(self.db, self.bundle["id"], step="enqueued")
+        self.assertEqual(supervisor.walk(), {"run": self.bundle["id"], "outcome": None, "step": "enqueued"})
+
+    def test_a_fix_interrupted_at_its_builder_resumes_at_the_fix(self):
+        """The `fixing` step normally resumes at its review; a held builder is the fix's own continuation."""
+        self.plan(claude=["pass"], sd_review=["clean"])
+        supervisor = self.supervisor()
+        build.write(self.db, self.bundle["id"], step="fixing", session_id="session-fixture")
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        supervisor.held = {"name": "claude", "argv": [], "exit": 0, "offset": 0, "session": False,
+                           "descendants": False, "pid": 1, "as": "fix:0"}
+        with mock.patch.object(supervisor, "fix", return_value={"run": "r"}) as fix:
+            self.assertEqual(supervisor.walk(), {"run": "r"})
+        fix.assert_called_once_with()
+
+    def test_state_for_another_run_or_process_is_ignored(self):
+        """Evidence: a handed-over state is this run's in this process, or nothing."""
+        build.register(self.db, self.bundle["id"], pid=4242, pgid=4242, start="x")
+        for state in ({"run": "other", "pid": os.getpid()}, {"run": self.bundle["id"], "pid": 4242}):
+            with mock.patch.dict(os.environ, {"SD_BUILD_RESUME": json.dumps(state)}):
+                ended = self.supervisor().run()
+            self.assertIn("another supervisor", ended["why"])
+
+    def test_no_child_inherits_the_handed_over_state(self):
+        state = {"run": self.bundle["id"], "pid": os.getpid(), "child": None, "groups": None, "reviewed": None,
+                 "ending": None, "marks": []}
+        with mock.patch.dict(os.environ, {"SD_BUILD_RESUME": json.dumps(state)}):
+            supervisor = self.supervisor(environ=None)
+            self.assertNotIn("SD_BUILD_RESUME", os.environ)
+        self.assertNotIn("SD_BUILD_RESUME", supervisor.env)
+
+    def test_every_hub_fault_at_a_beat_keeps_the_child(self):
+        """Each way the hub can refuse, the real types: `Fenced` and `HubConfigError` used to end the supervisor."""
+        rid = "r" * 26
+        faults = (self.UNREACHABLE, self.MISMATCH, remote.HubRestartNeeded("a", "b"), remote.UnknownOutcome(rid, "lost"),
+                  remote.TransactionLost(rid), build_run.SchemaTooNew(9, 8), hub.Fenced("not the hub"),
+                  hub.HubConfigError("no token"), remote.HubOnly("migrate", "hub.example.test:8769"),
+                  hub.HubConflict(Path("/x/hub.json"), Path("/x/db"), "hub.example.test"))
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        build.write(self.db, self.bundle["id"], step="reviewing")
+        short = [sys.executable, "-c", "import time; time.sleep(0.5)"]
+        for fault in faults:
+            with self.subTest(kind=type(fault).__name__), \
+                    mock.patch.object(build, "beat", side_effect=fault), \
+                    mock.patch.object(remote, "disk_holds", return_value=False, create=True):
+                self.assertEqual(supervisor.child(short, cwd=self.root, name=type(fault).__name__), 0)
+
+    def test_a_refusal_that_never_clears_stops_at_the_bounds(self):
+        """A permanent refusal: the budget ends the child, `settle_seconds` ends the supervisor, the row is the reap's."""
+        self.plan(claude=["hang"])
+        refused = hub.Fenced("not the hub")
+
+        supervisor = self.supervisor(timeout=1.0)
+        supervisor.settle_seconds = 0.3
+        with mock.patch.object(build, "beat", side_effect=refused), mock.patch.object(build, "end", side_effect=refused):
+            ended = supervisor.run()
+        self.assertIsNone(ended["outcome"])
+        self.assertIn("no answer from the hub", ended["why"])
+        self.assertTrue(group_gone(self.row()["builder_pgid"]))
+        self.assertIsNone(self.row()["outcome"])
+
+    def test_a_reaped_run_ends_the_kept_child_at_the_first_beat(self):
+        """The new image finds the run moved: nothing else writes, and the kept child goes with it."""
+        kept = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        self.addCleanup(end, kept)
+        build.write(self.db, self.bundle["id"], step="building", builder_pgid=kept.pid, builder_start="x",
+                    session_id="session-fixture")
+        build.register(self.db, self.bundle["id"], pid=os.getpid(), pgid=os.getpgrp(), start="x")
+        build.end(self.db, self.bundle["id"], "interrupted", "reaped while the image changed")
+        state = {"run": self.bundle["id"], "pid": os.getpid(), "reviewed": None, "ending": None, "marks": [],
+                 "groups": None, "child": {"name": "claude", "argv": [], "pid": kept.pid, "exit": None,
+                                           "session": False, "offset": 0, "left": 30.0}}
+        with mock.patch.dict(os.environ, {"SD_BUILD_RESUME": json.dumps(state)}):
+            ended = self.supervisor().run()
+        self.assertIn("ended or moved", ended["why"])
+        self.assertTrue(group_gone(kept.pid))
+
+    def test_the_budget_survives_the_exec(self):
+        """The new image keeps what was left of the child's budget, so a refresh cannot extend it."""
+        kept = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        self.addCleanup(end, kept)
+        build.write(self.db, self.bundle["id"], step="building", builder_pgid=kept.pid, builder_start="x",
+                    session_id="session-fixture", log_path="x")
+        build.register(self.db, self.bundle["id"], pid=os.getpid(), pgid=os.getpgrp(), start="x")
+        state = {"run": self.bundle["id"], "pid": os.getpid(), "reviewed": None, "ending": None, "marks": [],
+                 "groups": None, "child": {"name": "claude", "argv": [], "pid": kept.pid, "exit": None,
+                                           "session": False, "offset": 0, "left": 0.3}}
+        with mock.patch.dict(os.environ, {"SD_BUILD_RESUME": json.dumps(state)}):
+            ended = self.supervisor(timeout=500).run()
+        self.assertEqual(ended["outcome"], "timed_out")
+        self.assertTrue(group_gone(kept.pid))
+
+    def test_an_unwarranted_disk_build_is_no_match(self):
+        """A failed read or an older hub's mismatch is unknown: no exec."""
+        current = remote.tree_digest(Path(remote.__file__).resolve().parent)
+        self.assertTrue(remote.disk_holds(remote.BuildMismatch("build", "x", current, hub_build=current)))
+        self.assertTrue(remote.disk_holds(remote.BuildMismatch("build", "x", current)))
+        self.assertFalse(remote.disk_holds(remote.BuildMismatch("schema", 1, 2)))
+        self.assertFalse(remote.disk_holds(remote.BuildMismatch("build", "x", "another")))
+        with mock.patch.object(remote, "_hash_files", side_effect=OSError("moving")):
+            self.assertFalse(remote.disk_holds(remote.BuildMismatch("build", "x", current, hub_build=current)))
+
+    def test_the_exec_stays_put_when_the_new_image_does_not_load(self):
+        with mock.patch("subprocess.run", return_value=subprocess.CompletedProcess([], 1)), \
+                mock.patch("os.execve") as execve:
+            build_run.exec_in_place({"run": "r"})
+        execve.assert_not_called()
+
+    def test_a_connect_after_the_exec_waits_for_the_hub(self):
+        state = {"run": "r", "pid": os.getpid(), "child": {"pid": 999999, "exit": None}}
+        tries = []
+
+        def connect_once():
+            tries.append(1)
+            if len(tries) == 1:
+                raise OSError("no hub")
+            return "session"
+
+        with mock.patch.dict(os.environ, {"SD_BUILD_RESUME": json.dumps(state)}), \
+                mock.patch("time.sleep"):
+            self.assertEqual(build_run.start_again("r", connect_once), "session")
+        self.assertEqual(len(tries), 2)
+
+    def test_every_hub_read_before_the_run_loop_is_retried_with_the_child_kept(self):
+        """Round 2: only the connect was covered; a fault in a later read exited beside the live child."""
+        self.assert_start_recovers(self.bundle["id"])
+
+    def supervise_faulting(self, opened, *, state=None, **patches):
+        state = resume_state(self.bundle["id"]) if state is None else state
+        raw = state if isinstance(state, str) else json.dumps(state)
+        with mock.patch.dict(os.environ, {"SD_BUILD_RESUME": raw}), mock.patch("sd_db.connect", opened), \
+                mock.patch("time.sleep"), mock.patch("sys.path", [str(BIN), *sys.path]), \
+                mock.patch.object(ADAPTER, "log_root", return_value=self.logs), \
+                mock.patch.object(build, "kill_group") as kill, mock.patch("builtins.print"), moving_clock():
+            with mock.patch.multiple(remote, **patches) if patches else contextlib.nullcontext():
+                try:
+                    ADAPTER.supervise_build(mock.Mock(run=self.bundle["id"]))
+                except ADAPTER.WorkRefusal as refusal:
+                    return refusal, kill
+        return None, kill
+
+    def test_a_start_that_never_succeeds_ends_the_kept_child(self):
+        """Past the bound the child goes too: none outlives its supervisor, and the row stays the reap's."""
+        closed, seen = [], []
+
+        def opened(write=False):
+            real = connect(self.database)
+            refusing = Refuses(real, 1, self.UNREACHABLE, [])
+            refusing.close = lambda: (closed.append(1), real.close())
+            seen.append(refusing)
+            return refusing
+
+        refusal, kill = self.supervise_faulting(opened)
+        self.assertIsNotNone(refusal, "the failure stands")
+        kill.assert_called_once_with(424242)
+        self.assertEqual(len(closed), len(seen), "each failed start closed its connection")
+
+    def test_a_mismatch_in_the_start_follows_the_build(self):
+        """The hub refuses this image for life: a retry cannot pass, at the connect or at a read after it."""
+        def at_connect(write=False):
+            raise self.MISMATCH
+
+        def at_a_read(write=False):
+            return Refuses(connect(self.database), 1, self.MISMATCH, [])
+
+        for name, opened in (("connect", at_connect), ("read", at_a_read)):
+            with self.subTest(name), mock.patch.object(build_run, "exec_in_place", replaced, create=True):
+                with self.assertRaises(Replaced) as image:
+                    self.supervise_faulting(opened, disk_holds=lambda _: True)
+                self.assertEqual(image.exception.state["child"]["pid"], 424242)
+                self.assertEqual(image.exception.state["run"], self.bundle["id"])
+
+    def test_a_wait_in_the_start_spends_the_childs_budget(self):
+        """A hub outage at the start must not give the child its budget again."""
+        lefts = []
+
+        def opened(write=False):
+            lefts.append(json.loads(os.environ["SD_BUILD_RESUME"])["child"]["left"])
+            if len(lefts) == 1:
+                raise self.UNREACHABLE
+            return connect(self.database)
+
+        with mock.patch.object(build_run.Supervisor, "run", return_value={"run": "r"}):
+            self.supervise_faulting(opened)
+        self.assertLess(lefts[1], lefts[0])
+
+    def test_a_state_of_another_process_or_run_is_no_held_child(self):
+        """Only this process's state for this run names a child to wait for or end; anything else is one try."""
+        other = resume_state(self.bundle["id"])
+        other["pid"] = os.getpid() + 1
+        for state in (other, resume_state("another-run"), "{not json"):
+            with self.subTest(state=str(state)[:24]):
+                opened = mock.Mock(side_effect=self.UNREACHABLE)
+                refusal, kill = self.supervise_faulting(opened, state=state)
+                self.assertIsNotNone(refusal)
+                self.assertEqual(opened.call_count, 1)
+                kill.assert_not_called()
+
+    def test_the_connects_follow_keeps_the_handed_over_state(self):
+        """`bin/sd`'s hook follows at a connect's mismatch, then execs: the pid and this state go with it."""
+        reruns = []
+        with mock.patch.object(follow, "script", return_value=Path("/x/repo-sync.sh")), \
+                mock.patch.object(follow, "_run_follow", return_value=(0, "", False)), \
+                mock.patch.object(follow, "stdin_consumed", return_value=""), \
+                mock.patch.object(remote, "sessions_opened", return_value=0):
+            follow.attempt(self.MISMATCH, [], environ={"SD_BUILD_RESUME": "state"}, argv=["sd"], out=io.StringIO(),
+                           rerun=lambda _, env: reruns.append(env))
+        self.assertEqual(reruns[0]["SD_BUILD_RESUME"], "state")
+
+    def test_a_resumed_supervisor_registers_nothing(self):
+        """The one hub call `run()` makes outside its loop is the registration, which a resumed run skips."""
+        state = resume_state(self.bundle["id"])
+        with mock.patch.dict(os.environ, {"SD_BUILD_RESUME": json.dumps(state)}), \
+                mock.patch.object(build, "register") as register, \
+                mock.patch.object(build_run.Supervisor, "ended", return_value={"run": self.bundle["id"]}):
+            self.supervisor().run()
+        register.assert_not_called()
+
+    def test_a_fault_at_the_first_beat_of_a_kept_child_keeps_it(self):
+        """The first hub call inside `run()`'s loop for an adopted child: the child stays until its budget."""
+        kept = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        self.addCleanup(end, kept)
+        build.write(self.db, self.bundle["id"], step="building", builder_pgid=kept.pid, builder_start="x",
+                    session_id="session-fixture", log_path="x")
+        build.register(self.db, self.bundle["id"], pid=os.getpid(), pgid=os.getpgrp(), start="x")
+        state = resume_state(self.bundle["id"], kept.pid)
+        state["child"]["left"] = 1.0
+        patch, fired = self.faults_once("beat", self.UNREACHABLE)
+        with patch, mock.patch.dict(os.environ, {"SD_BUILD_RESUME": json.dumps(state)}):
+            ended = self.supervisor(timeout=500).run()
+        self.assertEqual(fired, ["beat"])
+        self.assertEqual(ended["outcome"], "timed_out")
+        self.assertTrue(group_gone(kept.pid))
+
+    def test_a_connect_that_never_returns_ends_the_kept_child(self):
+        state = {"run": "r", "pid": os.getpid(), "child": {"pid": 424242, "exit": None}}
+        with mock.patch.dict(os.environ, {"SD_BUILD_RESUME": json.dumps(state)}), \
+                mock.patch("time.sleep"), mock.patch.object(build, "kill_group") as kill:
+            with self.assertRaises(OSError):
+                build_run.start_again("r", mock.Mock(side_effect=OSError("no hub")), bound=0)
+        kill.assert_called_once_with(424242)
+
+    def test_a_connect_with_no_handed_over_state_is_one_try(self):
+        connect = mock.Mock(side_effect=OSError("no hub"))
+        with mock.patch.dict(os.environ, clear=False):
+            os.environ.pop("SD_BUILD_RESUME", None)
+            with self.assertRaises(OSError):
+                build_run.start_again("r", connect)
+        connect.assert_called_once_with()
 
 
 if __name__ == "__main__":
