@@ -26,7 +26,7 @@ from sd_db.writes import create_item, transition
 
 from .test_shadow_jira import JIRA_ENV, RawServer, jira_transport
 
-STATUS = {"To Do": "new", "In Progress": "indeterminate", "Done": "done"}
+STATUS = {"To Do": "new", "In Progress": "indeterminate", "Done": "done", "Won't Do": "done"}
 
 
 def refused(code: int, reason: str = "Refused", headers=None) -> urllib.error.HTTPError:
@@ -97,7 +97,12 @@ class FakeJira:
                 {"id": "21", "to": {"name": "In Progress", "statusCategory": {"key": "indeterminate"}}},
                 {"id": "41", "to": {"name": "Won't Do", "statusCategory": {"key": "done"}}},
                 {"id": "31", "to": {"name": "Done", "statusCategory": {"key": "done"}}}]}, ""
-        name = {"11": "To Do", "21": "In Progress", "31": "Done", "41": "Won't Do"}[body["transition"]["id"]]
+        names = {"11": "To Do", "21": "In Progress", "31": "Done", "41": "Won't Do"}
+        listed = self.malformed.get((key, "transitions"))
+        if isinstance(listed, dict) and isinstance(listed.get("transitions"), list):
+            names.update({offer["id"]: offer["to"]["name"] for offer in listed["transitions"]
+                          if isinstance(offer, dict) and isinstance(offer.get("to"), dict)})
+        name = names[body["transition"]["id"]]
         self.posted.append((key, name))
         self.tickets[key] = name
         return {}, ""
@@ -142,7 +147,7 @@ class TheMoves(unittest.TestCase):
         jira = FakeJira({"ABC-7": "In Progress"})
         jira_moves.run(self.db, jira, JIRA_ENV)
         transition(self.db, self.item, "in_progress", who="operator")
-        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: already In Progress"])
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: already In Progress, left as it is"])
         transition(self.db, self.item, "blocked", who="operator")
         self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: blocked moves nothing"])
         self.assertEqual(jira.posted, [])
@@ -246,7 +251,7 @@ class TheMoves(unittest.TestCase):
 
         jira_moves.run(self.db, landed, JIRA_ENV)
         self.assertEqual(jira.posted, [("ABC-7", "Done")])
-        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: already Done"])
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: already Done, left as it is"])
         self.assertEqual(jira.posted, [("ABC-7", "Done")])
 
     def test_a_permanent_failure_still_passes_and_notes_once(self):
@@ -277,6 +282,51 @@ class TheMoves(unittest.TestCase):
                          ["Jira ticket ABC-7 was not moved to match done: no transition into Done is offered from To Do"])
         jira_moves.run(self.db, jira, JIRA_ENV)
         self.assertEqual(len(self.notes(self.item)), 1)
+
+    def offering(self, *names: str) -> FakeJira:
+        """A Jira whose ABC-7, in To Do, offers only these done-category destinations, ids 51 on."""
+        offers = [{"id": str(51 + n), "to": {"name": name, "statusCategory": {"key": "done"}}}
+                  for n, name in enumerate(names)]
+        jira = FakeJira({"ABC-7": "To Do"}, malformed={("ABC-7", "transitions"): {"transitions": offers}})
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        transition(self.db, self.item, "done", who="operator")
+        return jira
+
+    def test_wont_do_then_closed_moves_nothing_and_notes_the_offers(self):
+        """Round 6 (#49630): a status category is no outcome; Won't Do must not stand in for Done."""
+        jira = self.offering("Won't Do", "Closed")
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        self.assertEqual(jira.posted, [])
+        self.assertEqual(self.notes(self.item), [
+            "Jira ticket ABC-7 was not moved to match done: no transition named Done is offered "
+            "from To Do, and the done offers are Won't Do, Closed"])
+
+    def test_a_lone_wont_do_moves_nothing(self):
+        for name in ("Won't Do", "cancelled", "Canceled", "Rejected", "Declined", "Duplicate"):
+            with self.subTest(name):
+                self.db.execute("DELETE FROM state WHERE key = ?", (jira_moves.CURSOR,))
+                self.db.execute("DELETE FROM note WHERE item = ? AND kind = 'comment'", (self.item,))
+                transition(self.db, self.item, "ready", who="operator")
+                jira = self.offering(name)
+                jira_moves.run(self.db, jira, JIRA_ENV)
+                self.assertEqual(jira.posted, [])
+                self.assertEqual(len(self.notes(self.item)), 1)
+
+    def test_a_lone_completion_destination_is_chosen(self):
+        jira = self.offering("Closed")
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: moved to Closed"])
+
+    def test_done_among_the_offers_is_chosen(self):
+        jira = self.offering("Won't Do", "Closed", "DONE")
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: moved to DONE"])
+
+    def test_a_ticket_already_wont_do_is_left_and_never_said_moved(self):
+        jira = FakeJira({"ABC-7": "Won't Do"})
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        transition(self.db, self.item, "done", who="operator")
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV),
+                         ["jira moves: ABC-7: already Won't Do, left as it is"])
+        self.assertEqual(jira.posted, [])
 
     def test_a_transient_failure_repeats_no_note_written_before_it(self):
         jira = FakeJira({"ABC-7": "To Do", "ABC-8": "To Do"})
@@ -494,7 +544,7 @@ class TheMoves(unittest.TestCase):
             with self.assertRaises(sqlite3.OperationalError):
                 jira_moves.run(self.db, jira, JIRA_ENV)
         self.assertEqual(jira.posted, [("ABC-7", "Done")])
-        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: already Done"])
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: already Done, left as it is"])
         self.assertEqual(jira.posted, [("ABC-7", "Done")])
 
     def test_a_failed_note_write_holds_the_cursor_and_the_next_run_says_it(self):

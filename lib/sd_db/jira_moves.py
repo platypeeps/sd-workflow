@@ -10,9 +10,13 @@ opening note (`opened as ...`, which linking writes), keeps the items
 whose ref is `jira:<KEY-N>` (`source = 'task-ref'`), and brings each ticket to
 the status category of the item's current status: planning and ready to
 "To Do", in_progress to "In Progress", done to "Done"; blocked and any other
-status move nothing. A ticket already in that category is left alone. The
-transition is the first the ticket offers into that category, one named
-like the category first.
+status move nothing. A ticket already in that category is left alone, and
+the line names its status. A status category is no outcome (ruling
+#49630): the transition is the one offered into the category whose
+destination has the target's name, case folded; else the only one
+offered into it, unless that is a done name that says the work was not
+done (`NOT_DONE`). Any other offer list is that item's failure, a note
+naming the offers, and the ticket stays.
 
 `done` is also how sd records work nobody did: `progress.cancel_work` and
 the priority sweep's closure. Neither is finished work, so each leaves the
@@ -70,6 +74,8 @@ KEY = re.compile(r"jira:([A-Z][A-Z0-9_]*-[1-9][0-9]*)")
 #: sd status -> Jira status category key, and the name preferred inside it.
 TARGET = {"planning": ("new", "To Do"), "ready": ("new", "To Do"),
           "in_progress": ("indeterminate", "In Progress"), "done": ("done", "Done")}
+#: Done-category names that say the work was not done: never a stand-in for Done (ruling #49630).
+NOT_DONE = {"won't do", "cancelled", "canceled", "rejected", "declined", "duplicate"}
 
 
 def read_cursor(connection: sqlite3.Connection) -> int | None:
@@ -189,13 +195,18 @@ def move(config: dict, key: str, status: str, transport=None) -> str:
     _stop(error, config, transport)
     current, current_category = _state(_object(_object(payload, "issue").get("fields"), "fields").get("status"))
     if current_category == category:
-        return f"{key}: already {current}"
+        return f"{key}: already {current}, left as it is"
     payload, error = shadow_jira._request(_issue(config, key) + "/transitions", config, None, transport)
     _stop(error, config, transport)
     offered = [offer for offer in _transitions(payload) if offer[2] == category]
     if not offered:
         raise ValueError(f"no transition into {name} is offered from {current}")
-    chosen = next((offer for offer in offered if offer[1].lower() == name.lower()), offered[0])
+    chosen = next((offer for offer in offered if offer[1].lower() == name.lower()), None)
+    if chosen is None and len(offered) == 1 and not (category == "done" and offered[0][1].lower() in NOT_DONE):
+        chosen = offered[0]
+    if chosen is None:
+        raise ValueError(f"no transition named {name} is offered from {current}, and the "
+                         f"{name.lower()} offers are {', '.join(offer[1] for offer in offered)}")
     _, error = shadow_jira._request(_issue(config, key) + "/transitions", config,
                                     {"transition": {"id": chosen[0]}}, transport)
     _stop(error, config, transport)
