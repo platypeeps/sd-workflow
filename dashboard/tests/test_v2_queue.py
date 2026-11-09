@@ -1666,6 +1666,13 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                               r'\{ outline: 2px solid Highlight;')
         self.assertIn(".queue .tile:focus-visible { outline: 2px solid var(--color-focus);", css)
 
+    def test_the_count_tiles_stay_in_one_row_on_a_touch_screen(self):
+        # sd:8189: shell.css makes a td's direct button a grid block on touch; the tiles must stay inline.
+        static = Path(__file__).resolve().parents[1] / "sd_dashboard/v2/static"
+        self.assertIn("td > button:not(.btn, .icon-btn, .chip, .help)", (static / "shell.css").read_text())
+        css = (static / "today.css").read_text()
+        self.assertRegex(css, r"@media \(pointer: coarse\) \{ \.queue \.pipe > \.tile \{ display: inline-grid; \} \}")
+
     def test_a_prepared_entry_whose_pr_waits_on_review_is_one_row_that_leads_with_the_wait(self):
         # pack sd:7859: item 5 stopped prepared in a manual-merge lane; its PR waits on reviewers. One row, Approve kept.
         lanes = queue_screen.document(self.connection, now=NOW)
