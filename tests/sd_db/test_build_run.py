@@ -2162,6 +2162,52 @@ class Sweep(Case):
         self.assertTrue(work.is_dir())
 
 
+class Archive(Case):
+    """pack sd:8246: a run writes its logs to a local folder; the tick moves an ended run's files to the bulk root."""
+
+    def test_the_default_local_root_is_the_state_folder(self):
+        self.assertEqual(build_run.local_root({"HOME": "/home/operator"}),
+                         Path("/home/operator/.local/state/sd/builds"))
+        self.assertEqual(build_run.local_root({"XDG_STATE_HOME": "/state"}), Path("/state/sd/builds"))
+
+    def test_an_ended_runs_quiet_files_move_and_the_row_names_the_new_log(self):
+        self.press()
+        ident, lead = self.bundle["id"], self.bundle["assignment"]
+        local = self.root / "local"
+        folder = build_run.log_dir(local, str(self.repo))
+        folder.mkdir(parents=True)
+        names = [f"{ident}.jsonl", f"{ident}.supervisor.log", f"sd-{lead}.title", f"sd-{lead}.body.md"]
+        for name in [*names, "stray.log"]:
+            (folder / name).write_text("x")
+            os.utime(folder / name, (0, 0))
+        self.db.execute("UPDATE runner_run SET log_path = ? WHERE id = ?", (str(folder / names[0]), ident))
+        self.db.commit()
+        self.assertEqual(build_run.archive(self.db, local, self.logs), [], "an open run's files stay")
+        self.db.execute("UPDATE runner_run SET outcome = 'blocked' WHERE id = ?", (ident,))
+        self.db.commit()
+        (folder / names[1]).touch()  # written just now: the supervisor may still be printing
+        target = build_run.log_dir(self.logs, str(self.repo))
+        moved = build_run.archive(self.db, local, self.logs)
+        self.assertEqual(sorted(moved), sorted(str(target / name) for name in names if name != names[1]))
+        self.assertEqual(sorted(path.name for path in folder.iterdir()), sorted([names[1], "stray.log"]))
+        log = self.db.execute("SELECT log_path FROM runner_run WHERE id = ?", (ident,)).fetchone()[0]
+        self.assertEqual(log, str(target / names[0]))
+
+    def test_an_unwritable_bulk_root_leaves_the_files_for_the_next_tick(self):
+        self.press()
+        local = self.root / "local"
+        folder = build_run.log_dir(local, str(self.repo))
+        folder.mkdir(parents=True)
+        log = folder / f"{self.bundle['id']}.jsonl"
+        log.write_text("x")
+        os.utime(log, (0, 0))
+        self.db.execute("UPDATE runner_run SET outcome = 'done'")
+        self.db.commit()
+        self.logs.write_text("a file, not a folder")
+        self.assertEqual(build_run.archive(self.db, local, self.logs), [])
+        self.assertTrue(log.exists())
+
+
 class Drafts(Case):
     """The draft supervisor and the tick's draft claim (pack sd:6361), with the fake `claude`."""
 

@@ -200,7 +200,9 @@ def build_modules() -> tuple[Any, Any, Any]:
 
 
 def log_root() -> Path | None:
-    """`sd.bulk_storage_root`, where each run's logs go as `<root>/<repository>/build/`; None when unset."""
+    """`sd.bulk_storage_root`, where an ended run's logs go as `<root>/<repository>/build/`; None when unset.
+
+    A live run writes them under `build_run.local_root()` (pack sd:8246)."""
     import sd_lib
     value = sd_lib.core_setting("bulk_storage_root")
     return Path(os.path.expanduser(value)) if value else None
@@ -431,7 +433,7 @@ def tick(sd_db: Any, build: Any, build_run: Any, root: Path | None, why: str, un
             repo = build.run(connection, ident)["repo"]
             try:
                 build_run.spawn([sys.executable, str(BIN / "sd"), "assignments", "dispatch", "--supervise", ident],
-                                log=build_run.log_dir(root, repo) / f"{ident}.supervisor.log")
+                                log=build_run.log_dir(build_run.local_root(), repo) / f"{ident}.supervisor.log")
             except OSError as error:
                 unstarted[ident] = f"cannot start {ident}'s supervisor: {error}"
 
@@ -442,6 +444,8 @@ def tick(sd_db: Any, build: Any, build_run: Any, root: Path | None, why: str, un
                                     interactive=interactive_builders(connection, build_run.now(), build_run.paths.key),
                                     spawn=spawn, lane=lane, why=why)
         result["pushed"] = push_failures(connection)
+        if root is not None and not why:  # the bulk root answered the probe
+            result["archived"] = build_run.archive(connection, build_run.local_root(), root)
     except (sd_db.SdDbError, ValueError, OSError) as error:
         raise WorkRefusal(str(error)) from error
     finally:
@@ -461,6 +465,8 @@ def supervise_build(args: argparse.Namespace) -> int:
         raise WorkRefusal(str(error)) from error
     if root is None:
         raise WorkRefusal("sd.bulk_storage_root is unset, so a build run has no log folder")
+    local = build_run.local_root()
+
     def start() -> tuple[Any, Any]:
         # `sd_db.connect`, not the wrapper that turns every error into one refusal: a mismatch must keep its type.
         connection = sd_db.connect(write=True)
@@ -469,9 +475,9 @@ def supervise_build(args: argparse.Namespace) -> int:
                                        "ON assignment.id = runner_run.assignment WHERE runner_run.id = ?",
                                        (args.run,)).fetchone()
             if scope is not None and scope[0] == build_run.draft.SCOPE:
-                drafter = build_run.DraftSupervisor(connection, args.run, tools=tools(build_run), log_root=root)
+                drafter = build_run.DraftSupervisor(connection, args.run, tools=tools(build_run), log_root=local)
                 return connection, drafter
-            return connection, build_run.Supervisor(connection, args.run, tools=tools(build_run), log_root=root,
+            return connection, build_run.Supervisor(connection, args.run, tools=tools(build_run), log_root=local,
                                                     cited=cited, checked=enqueue_refusals, checks=own_checks)
         except BaseException:
             connection.close()
