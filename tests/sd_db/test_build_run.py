@@ -557,6 +557,28 @@ class Supervise(Case):
         self.assertIs(build.Probe.group(leader.pid), False)
         self.assertTrue(self.supervisor().end_group(leader.pid))
 
+    def test_a_leader_that_dies_between_the_poll_and_the_read_is_reaped(self):
+        """Gate at e97e9f626: a leader dead after the poll read gone as a zombie, and stayed unreaped."""
+        self.press()
+        leader = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        self.addCleanup(end, leader)
+
+        class DiesAtTheRead(build.Probe):
+            @staticmethod
+            def group(pgid):
+                os.kill(pgid, signal.SIGKILL)
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    state = subprocess.run(["ps", "-o", "stat=", "-p", str(pgid)], capture_output=True, text=True)
+                    if state.stdout.strip().startswith("Z"):
+                        return False
+                    time.sleep(0.02)
+                raise AssertionError("the leader never became a zombie")
+
+        self.assertTrue(self.supervisor(probe=DiesAtTheRead).end_group(leader.pid, leader))
+        self.assertIsNotNone(leader.returncode, "the supervisor reaps the leader it read as gone")
+        self.assertTrue(group_gone(leader.pid))
+
     def test_an_unread_ps_does_not_fail_an_end_once_the_group_is_gone(self):
         """Review of b34af431e: an unread `ps` set a flag no later read cleared, so a run whose group read
         ESRCH ended a survivor, managed builds too. Its known groups' ESRCH is True, as `kill_group` reads it."""

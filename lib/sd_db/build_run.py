@@ -1588,9 +1588,10 @@ class Supervisor:
             groups.update(group for group, start in (self.groups or {}).items() if self.ours(group, start))
 
         def gone() -> bool:
+            ended = all(self.probe.group(group) is False for group in groups)
             if process is not None:
-                process.poll()
-            return all(self.probe.group(group) is False for group in groups)
+                process.poll()  # after the read: a leader that died before it reads gone, and is ours to reap
+            return ended
 
         for sent, wait in ((signal.SIGTERM, self.grace), (signal.SIGKILL, 5.0)):
             widen()
