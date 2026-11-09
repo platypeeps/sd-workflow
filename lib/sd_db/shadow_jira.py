@@ -337,6 +337,22 @@ class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class Transient(str):
+    """A failed request's sentence unless an answer from Jira pins the failure on that one request (sd:8117).
+
+    The default: every failure of the transport (any `URLError` or `OSError`, any TLS error, a refused redirect), a
+    401, 403, 404, 429, 3xx or 5xx, and a 200 whose body is not JSON say nothing about one ticket, and a later run may
+    succeed. A 404 is `NotFound`: alone it says nothing about one ticket, and `jira_moves` asks the account check
+    before it pins one there. Only another plain 4xx is a plain `str`.
+
+    A `str`, so a caller that only says the sentence is unchanged; `jira_moves` asks which kind it holds.
+    """
+
+
+class NotFound(Transient):
+    """A 404: transient alone, but `jira_moves` pins it on the ticket when the account check passes (sd:8117)."""
+
+
 def _http(url: str, headers: dict[str, str], body: dict | None):
     """The real transport: the seam's signature, over `urllib`."""
     try:
@@ -353,35 +369,43 @@ def _http(url: str, headers: dict[str, str], body: dict | None):
         # nosec B310: `collect` builds `url` from `settings()`, which admits an
         # https base only, and `_RefuseRedirects` keeps it on that URL.
         with opener.open(request, timeout=TIMEOUT_SECONDS) as response:  # nosec B310
-            return json.loads(response.read().decode()), ""
+            # A transition answers 204 with no body (sd:8117): only that is `{}`. Any other
+            # empty body fails `json.loads` below, a `Transient` failure, not an answer.
+            data = response.read().decode()
+            return ({} if response.status == 204 and body is not None else json.loads(data)), ""
     except urllib.error.HTTPError as error:
         error.close()
         if error.code in (401, 403):
-            return None, (
+            return None, Transient(
                 f"Jira rejected the credentials ({error.code} {error.reason}); "
                 f"check {ENV_EMAIL} and {ENV_TOKEN}"
             )
         if error.code in _FOLLOWED and error.headers is not None and (
             "location" in error.headers or "uri" in error.headers
         ):
-            return None, (
+            return None, Transient(
                 f"Jira redirected the request ({error.code} {error.reason}) and redirects "
                 f"are not followed with credentials; set {ENV_BASE} to the URL Jira answers on"
             )
-        return None, f"Jira returned {error.code} {error.reason}"
-    except (http.client.HTTPException, ValueError) as error:
+        text = f"Jira returned {error.code} {error.reason}"
+        if error.code == 404:
+            return None, NotFound(text)
+        return None, text if 400 <= error.code < 500 and error.code != 429 else Transient(text)
+    except (http.client.HTTPException, ValueError, RecursionError) as error:
         # Type only: `InvalidURL` and `urllib.parse`'s `ValueError` quote the
         # host, a secret pasted into it included, and `IncompleteRead` quotes
-        # the bytes it did read. Before the `OSError` clause, because
-        # `RemoteDisconnected` is both.
-        return None, f"the request to Jira failed: {type(error).__name__}"
+        # the bytes it did read. A body that is not JSON lands here too: a
+        # login page behind a portal, or one nested too deep for `json`, a
+        # `RecursionError` (sd:8117). Before the `OSError` clause, because
+        # `RemoteDisconnected` and `SSLCertVerificationError` are both.
+        return None, Transient(f"the request to Jira failed: {type(error).__name__}")
     except (urllib.error.URLError, OSError) as error:
         # `URLError` quotes its reason, and that can be one of the exceptions
         # above, caught inside `urllib` and wrapped: type only for it too.
         reason = getattr(error, "reason", None)
         if isinstance(reason, (http.client.HTTPException, ValueError)):
-            return None, f"the request to Jira failed: {type(reason).__name__}"
-        return None, f"could not reach Jira: {type(error).__name__}: {error}"
+            return None, Transient(f"the request to Jira failed: {type(reason).__name__}")
+        return None, Transient(f"could not reach Jira: {type(error).__name__}: {error}")
 
 
 def account_id(config: dict[str, str], transport=None) -> tuple[str, str]:
@@ -389,7 +413,8 @@ def account_id(config: dict[str, str], transport=None) -> tuple[str, str]:
     payload, error = _request(config["base"] + "/rest/api/3/myself", config, None, transport)
     if error:
         return "", error
-    found = (payload or {}).get("accountId") or ""
+    found = payload.get("accountId") if isinstance(payload, dict) else ""
+    found = found if isinstance(found, str) else ""
     return found, "" if found else "Jira accepted the request but named no account"
 
 

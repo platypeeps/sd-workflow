@@ -869,11 +869,18 @@ def check_lines(worktree: pathlib.Path, title: str, body: str, base: str, head: 
     The commits are those `head` adds to `origin/<base>`, merges included:
     only a fenced line or a bare URL is exempt. Only enqueue checks; an
     entry already queued is not checked again (`retry`). A failed read is
-    an unknown answer, not a pass: nothing is queued.
+    an unknown answer, not a pass: nothing is queued. A commit Dependabot
+    authored is exempt: its body runs to 140 and the branch cannot be
+    rewritten without a force-push (sd:8191).
     """
     import sd_ship_body  # noqa: PLC0415
     from sd_ship_remote import Refusal  # noqa: PLC0415
-    commits = branch_commits(worktree, base, head)
+    authors = lane_git(worktree, "log", "--format=%H %an", f"refs/remotes/origin/{base}..{head}")
+    if authors is None:
+        raise LaneError(f"Cannot read the commits {head} adds to origin/{base}; fetch origin, then enqueue "
+                        "again. Nothing was queued or pushed.", code=PUBLISH_UNKNOWN)
+    bots = {line.split(" ", 1)[0] for line in authors.splitlines() if line.endswith(" dependabot[bot]")}
+    commits = [(sha, message) for sha, message in branch_commits(worktree, base, head) if sha not in bots]
     try:
         sd_ship_body.refuse_long_lines(title, body, commits)
         sd_ship_body.refuse_unconventional_title(title)

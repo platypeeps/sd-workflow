@@ -87,8 +87,10 @@ class TheRun(ScreenCase):
             with patch.object(shadow_run.time, "monotonic", lambda: 1119.0):
                 self.assertEqual(transport("https://jira.example.test/x", {}, None), ({"ok": 1}, ""))
             with patch.object(shadow_run.time, "monotonic", lambda: 1120.0):
-                self.assertEqual(transport("https://jira.example.test/x", {}, None),
-                                 (None, "the dashboard's 120-second sync budget ran out"))
+                payload, error = transport("https://jira.example.test/x", {}, None)
+                self.assertEqual((payload, error), (None, "the dashboard's 120-second sync budget ran out"))
+                # A spent budget says nothing about one ticket: `jira_moves` holds its cursor (sd:8117).
+                self.assertIsInstance(error, sd_db.shadow_jira.Transient)
 
     def test_a_start_answers_running_even_when_the_run_ends_at_once(self):
         # Review round 1: the answer was read after the thread started, so a fast run answered its start "finished".

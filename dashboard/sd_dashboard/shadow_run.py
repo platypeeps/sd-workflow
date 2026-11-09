@@ -103,7 +103,8 @@ def _until(deadline: float):
 
     def transport(url, headers, body):
         if time.monotonic() >= deadline:
-            return None, f"the dashboard's {MAX_SECONDS}-second sync budget ran out"
+            # Transient: a spent budget says nothing about one ticket, so `jira_moves` holds its cursor (sd:8117).
+            return None, shadow_jira.Transient(f"the dashboard's {MAX_SECONDS}-second sync budget ran out")
         return shadow_jira._http(url, headers, body)  # the library's own transport; it has no public name
 
     return transport
