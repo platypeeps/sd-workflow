@@ -3161,5 +3161,11 @@ class HubFaults(Case):
         connect.assert_called_once_with()
 
 
+class Budget(unittest.TestCase):
+    def test_a_build_child_gets_two_hours(self):
+        """25 of 263 runs died at 3600 s, 13 building and 12 reviewing (sd:8204)."""
+        self.assertEqual(build_run.TIMEOUT_SECONDS, 7200)
+
+
 if __name__ == "__main__":
     unittest.main()

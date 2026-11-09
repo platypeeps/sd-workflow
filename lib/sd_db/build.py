@@ -63,11 +63,11 @@ DRAFT = "draft"
 #: One: each bundle becomes its own pull request, so later items wait and the next bundle takes them (sd:8158).
 MACHINE_CAP = 6
 REPO_CAP = 1
-#: Items per bundle, so a bundle fits one 60-minute run (lead, note #29482).
+#: Items per bundle, so a bundle fits one 120-minute run (lead, note #29482).
 BUNDLE_MAX = 3
-BUDGET_MINUTES = 60
+BUDGET_MINUTES = 120
 #: A supervisor beats every 30 s; one silent this long, or unspawned this long after its claim, is lost.
-#: 600, not 180: a beat a held lock skips no longer ends a 60-minute build (pack sd:6741).
+#: 600, not 180: a beat a held lock skips no longer ends a long build (pack sd:6741).
 STALE_SECONDS = 600
 #: The `heartbeat` state row each build-dispatch tick writes first: this key on the hub, `<key>@<host>` on a
 #: satellite (pack sd:7933).
