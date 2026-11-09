@@ -309,6 +309,17 @@ class Sessions(ScreenCase):
         doc = self.read([agent(OTHER, status="busy", cwd=cwd, name="49303-f1")])
         self.assertEqual(counted(doc["builders"]), {"running": 0, "why": ""})
 
+    def test_a_no_persistence_session_with_no_transcript_leaves_the_builder_count_known(self):
+        # pack sd:8296: sd-review's `claude -p --no-session-persistence` writes no transcript and builds nothing.
+        self.transcript()
+        ps = [(100, 1, "claude -n system"), (200, 1, "claude -p --no-session-persistence --model x")]
+        doc = self.read([agent(), agent(OTHER, pid=200, status="busy", name="review")], processes=lambda: ps)
+        self.assertEqual(counted(doc["builders"]), {"running": 0, "why": ""})
+        # Any other session with no transcript still leaves the count unknown.
+        ps = [(100, 1, "claude -n system"), (200, 1, "claude -p --model x")]
+        doc = self.read([agent(), agent(OTHER, pid=200, status="busy", name="review")], processes=lambda: ps)
+        self.assertIsNone(doc["builders"]["running"])
+
 
 class Ending(unittest.TestCase):
     """sd:5126: End session signals only the pid that claude agents and ps still tie to the posted session."""
