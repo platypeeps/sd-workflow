@@ -88,14 +88,16 @@ ALLOWED = ("Bash(git commit -m:*)", "Bash(git commit -F:*)")
 #: `sd_gate_slots.NOT_STARTED`: the gate's last stderr line when it started nothing; a check's own 125 lacks it.
 GATE_NOT_STARTED = "sd gate run: the command did not start (exit 125)"
 
-#: What a hub session can raise when the hub restarts or moves to a new pack: gone, restarting, refusing this
+#: What a hub session can raise, or the hub's configuration refuse: gone, restarting, fenced, refusing this
 #: process's build, serving a database newer than it, or a write whose answer was lost. None says the run moved,
-#: so a supervisor keeps its child, then walks on (pack sd:8182). The transaction either rolled back or is in
-#: the hub's hands: the walk's compare-and-sets find which, as a retried run's do.
-HUB_FAULTS = (remote.HubUnreachable, remote.BuildMismatch, remote.HubRestartNeeded, remote.UnknownOutcome,
-              remote.TransactionLost, SchemaTooNew)
+#: so a supervisor keeps its child, then walks on (pack sd:8182). One that never clears stops at the child's
+#: budget and `settle_seconds`. A write whose answer was lost is the hub's to say (`once`); the compare-and-sets
+#: find the rest, as a retried run's do.
+HUB_FAULTS = (remote.RemoteError, SchemaTooNew)
 #: How a supervisor hands its state to the image it execs: the child it keeps, and what the next walk needs.
 RESUME_ENV = "SD_BUILD_RESUME"
+#: The once-only writes that belong to one child; every other mark lasts the run.
+CHILD_MARKS = ("cost", "report")
 #: On a replay, the children that ran and passed before a held one in the same step, by name: they are not run again.
 PRECEDES = {"worktree": {"worktree"}, "checking-health": {"checking-sync"}, "checks": {"review", "checks"},
             "enqueue": {"lint"}, "push": {"lint"}, "pull": {"lint", "push"}}
@@ -694,6 +696,7 @@ class Supervisor:
         self.held: dict | None = None
         self.ending: tuple | None = None
         self.marks: set[str] = set()
+        self.unknown: dict[str, str] = {}
         self.hub_down = False
         self.down_since: float | None = None
         self.deadline = 0.0
@@ -708,6 +711,7 @@ class Supervisor:
         self.reviewed = state.get("reviewed")
         self.ending = tuple(state["ending"]) if state.get("ending") else None
         self.marks = set(state.get("marks") or ())
+        self.unknown = dict(state.get("unknown") or {})
         groups = state.get("groups")
         self.groups = None if groups is None else {int(group): start for group, start in groups.items()}
 
@@ -717,7 +721,7 @@ class Supervisor:
         if last is not None and last["exit"] is None:
             last["left"] = max(self.deadline - time.monotonic(), 0.0)
         return {"run": self.ident, "pid": os.getpid(), "child": last, "groups": self.groups, "reviewed": self.reviewed,
-                "ending": self.ending, "marks": sorted(self.marks)}
+                "ending": self.ending, "marks": sorted(self.marks), "unknown": self.unknown}
 
     def fault_seen(self, fault: Exception) -> None:
         if not self.hub_down:
@@ -766,17 +770,18 @@ class Supervisor:
         held["exit"] = self.waited(Adopted(held["pid"]), held["name"], session=held["session"],
                                    deadline=time.monotonic() + held["left"])
 
-    def replayed(self, argv: list[str], name: str) -> int | None:
+    def replayed(self, argv: list[str], name: str, role: str | None) -> int | None:
         """A held child's exit code when the walk reaches it, 0 for one before it; None to start the child.
 
-        The walk re-runs each step from its top, so a child that already ran must not run again. The claude
-        child matches by name alone: its prompt reads the session the first image wrote. A child outside the
+        The walk re-runs each step from its top, so a child that already ran must not run again. A claude child
+        matches by the `role` it started as, not its prompt, which reads the session the first image wrote: a
+        fault starting a fix leaves the builder held, and it must not answer for the fix. A child outside the
         held one's path means the walk took another way, so nothing is skipped from there on.
         """
         held = self.held
         if held is None:
             return None
-        if held["name"] == name and (name == "claude" or held["argv"] == argv):
+        if held["name"] == name and (held.get("as") == role if name == "claude" else held["argv"] == argv):
             self.held, self.last = None, held
             return held["exit"]
         if name in PRECEDES.get(held["name"], ()):
@@ -797,10 +802,33 @@ class Supervisor:
         return self.log.stat().st_size if self.log.exists() else 0
 
     def once(self, mark: str, write: Callable[[], Any]) -> None:
-        """Run `write` unless a replay of the same child already did: a cost and a report are not idempotent."""
-        if mark not in self.marks:
+        """Run `write` unless a replay already did: a cost, a note and a round's count are not idempotent.
+
+        A write whose answer was lost (`UnknownOutcome`) may have committed, so its request id waits here: the
+        hub's answer decides on the replay. A hub that cannot say yet is one more fault, under `outage`'s bound.
+        """
+        if mark in self.marks:
+            return
+        rid = self.unknown.get(mark)
+        if rid is not None:
+            answer = self.db.outcome(rid)
+            if answer == remote.RECORDED:
+                self.marks.add(mark)
+                del self.unknown[mark]
+                return
+            if answer != remote.ABSENT:
+                raise remote.UnknownOutcome(rid, f"the hub answers {answer} for it")
+            del self.unknown[mark]
+        try:
             write()
-            self.marks.add(mark)
+        except remote.UnknownOutcome as fault:
+            self.unknown[mark] = fault.rid
+            raise
+        self.marks.add(mark)
+
+    def note(self, item: int, body: str) -> None:
+        """A comment the walk can reach again on a replay; a comment after the walk's last step needs no guard."""
+        self.once(f"note:{body}", lambda: add_note(self.db, item, "comment", body))
 
     # ----------------------------------------------------------- the walk
 
@@ -847,7 +875,7 @@ class Supervisor:
         steps = {"claimed": self.worktree, "worktree": self.worktree, "building": self.building,
                  "reviewing": self.reviewing, "fixing": self.reviewing, "enqueuing": self.enqueuing,
                  "checking": self.checking, "cleaning": self.cleaning}
-        if self.held is not None and self.held["name"] == "claude":
+        if self.held is not None and self.held["name"] == "claude" and self.held.get("as") == self.fix_role():
             steps["fixing"] = self.fix  # a kept builder is the fix itself, not the review after it
         while step in steps:
             ended = steps[step]()
@@ -899,7 +927,7 @@ class Supervisor:
         self.enter("building", log_path=str(self.log))
         session = self.fresh()["session_id"]
         prompt = (RESUME if session else BRIEF).format(**self.brief())
-        return self.claude(prompt, session=session, then="reviewing")
+        return self.claude(prompt, session=session, then="reviewing", role="building")
 
     def reviewing(self) -> str | dict:
         self.enter("reviewing")
@@ -945,8 +973,8 @@ class Supervisor:
             return self.finish("blocked", f"the repository's check entrypoints did not read, a configuration "
                                           f"fault no fix round can mend: {error}")
         if not commands:
-            add_note(self.db, self.lead, "comment",
-                     f"Build run {self.ident}: no check entrypoint found in the repository; no tests ran at {head[:12]}")
+            self.note(self.lead, f"Build run {self.ident}: no check entrypoint found in the repository; "
+                                 f"no tests ran at {head[:12]}")
             return []
         passed = []
         for argv in commands:
@@ -969,7 +997,7 @@ class Supervisor:
                 return [{"path": said, "line": "-", "summary": f"exit 0, but it changed tracked files: {paths}; "
                          "commit or undo them, so the checked tree is the pushed head"}]
             passed.append(f"`{said}`")
-        add_note(self.db, self.lead, "comment", f"Build run {self.ident}: {', '.join(passed)} passed at {head[:12]}")
+        self.note(self.lead, f"Build run {self.ident}: {', '.join(passed)} passed at {head[:12]}")
         return []
 
     def refused(self) -> bool:
@@ -987,13 +1015,21 @@ class Supervisor:
         return self.checked(self.work, self.base(), head, title.strip(), body)
 
     def blocked_round(self, blockers: list[dict]) -> str | dict:
-        rounds = (self.fresh()["review_round"] or 0) + 1
-        if not build.write(self.db, self.ident, review_round=rounds):
-            raise Lost
         self.blockers = blockers
+        # Once per child that blocked: a fault after this write re-walks the held review, which is the same review.
+        self.once(f"round:{(self.last or {}).get('pid')}", self.count_round)
+        rounds = self.fresh()["review_round"] or 0
         if rounds >= REVIEW_ROUNDS:
             return self.finish("blocked", f"{rounds} review rounds left blockers: {self.summary(self.blockers)}")
         return self.fix()
+
+    def count_round(self) -> None:
+        if not build.write(self.db, self.ident, review_round=(self.fresh()["review_round"] or 0) + 1):
+            raise Lost
+
+    def fix_role(self) -> str:
+        """What this round's fix child starts as: a round's count moves only between two fixes."""
+        return f"fix:{self.fresh()['review_round'] or 0}"
 
     def fix(self) -> str | dict:
         self.enter("fixing")
@@ -1001,7 +1037,7 @@ class Supervisor:
         if not session:
             return self.finish("blocked", "no builder session recorded to resume for the fix")
         prompt = FIX.format(blockers=self.summary(self.blockers, limit=None), **self.brief())
-        return self.claude(prompt, session=session, then="reviewing")
+        return self.claude(prompt, session=session, then="reviewing", role=self.fix_role())
 
     def enqueuing(self) -> str | dict:
         if not build.enqueuing(self.db, self.ident):
@@ -1112,8 +1148,8 @@ class Supervisor:
         # The owners of a private repository already see work names; a public one, or one whose visibility did
         # not read, is scanned first, as machine-setup guards only public clones (operator ruling, pack sd:7868).
         if self.private(repository):
-            add_note(self.db, self.lead, "comment", f"Build run {self.ident}: {repository} is private, so the "
-                                                    f"privacy-pattern scan before the push was skipped")
+            self.note(self.lead, f"Build run {self.ident}: {repository} is private, so the "
+                                 f"privacy-pattern scan before the push was skipped")
         else:
             leaked = self.leaks(head, title)
             if leaked:
@@ -1274,20 +1310,19 @@ class Supervisor:
         except Unread as unread:
             dirty = f"unread: {unread}"
         if dirty:
-            add_note(self.db, self.lead, "comment",
-                     f"Build run {self.ident} kept worktree {self.work}: it is not clean ({dirty.splitlines()[0]})")
+            self.note(self.lead, f"Build run {self.ident} kept worktree {self.work}: it is not clean "
+                                 f"({dirty.splitlines()[0]})")
             return self.finish("done", f"worktree {self.work} kept: not clean")
         # A session other than this run's builder works in it (pack sd:6024): it stays.
         own = self.fresh()["session_id"]
         held = sessions.describe(sessions.holders(self.db, str(self.work), machine=this_host(),
                                                   exclude=(own,) if own else ()))
         if held:
-            add_note(self.db, self.lead, "comment", f"Build run {self.ident} kept worktree {self.work}: {held}")
+            self.note(self.lead, f"Build run {self.ident} kept worktree {self.work}: {held}")
             return self.finish("done", f"worktree {self.work} kept: {held}")
         if self.child([*self.tools.git, "-C", str(self.repo), "worktree", "remove", str(self.work)], cwd=self.repo,
                       name="cleaning") != 0:
-            add_note(self.db, self.lead, "comment",
-                     f"Build run {self.ident} kept worktree {self.work}: git worktree remove failed")
+            self.note(self.lead, f"Build run {self.ident} kept worktree {self.work}: git worktree remove failed")
             return self.finish("done", f"worktree {self.work} kept: removal failed")
         return self.finish("done", f"worktree {self.work} removed")
 
@@ -1319,14 +1354,14 @@ class Supervisor:
                 f"The operator sent these findings to the branch, oldest first. Fix each one the branch does not\n"
                 f"fix yet, fail-first, as a new commit:\n{sent}\n")
 
-    def claude(self, prompt: str, *, session: str | None, then: str) -> str | dict:
+    def claude(self, prompt: str, *, session: str | None, then: str, role: str) -> str | dict:
         argv = [*self.tools.claude, "-p", prompt, "--output-format", "stream-json", "--verbose",
                 "--allowedTools", *ALLOWED, "--permission-mode", "auto", "--max-turns", str(MAX_TURNS),
                 "--model", self.row["model"] or build.OPUS]
         if session:
             argv += ["--resume", session]
         offset = self.start_offset()
-        self.child(argv, cwd=self.work, name="claude", out=self.log, session=session is None, offset=offset)
+        self.child(argv, cwd=self.work, name="claude", out=self.log, session=session is None, offset=offset, role=role)
         with open(self.log, "rb") as handle:
             handle.seek(offset)
             lines = handle.read().decode("utf-8", "replace").splitlines()
@@ -1460,7 +1495,7 @@ class Supervisor:
     # -------------------------------------------------------------- children
 
     def child(self, argv: list[str], *, cwd: Path, name: str, out: Path | None = None, session: bool = False,
-              descendants: bool = False, offset: int = 0) -> int:
+              descendants: bool = False, offset: int = 0, role: str | None = None) -> int:
         """Run one child in its own process group, recorded before it runs; its exit code.
 
         The child waits on a pipe until `builder_pgid` and `builder_start`
@@ -1473,7 +1508,7 @@ class Supervisor:
         each is also recorded while it runs, so one that outlives its parent
         is still ended (`ours`). On a replay a child that already ran answers from its record (`replayed`).
         """
-        replayed = self.replayed(argv, name)
+        replayed = self.replayed(argv, name, role)
         if replayed is not None:
             return replayed
         target = out or self.out(name)
@@ -1502,8 +1537,11 @@ class Supervisor:
         if not recorded:
             process.wait()
             raise Lost
-        self.last = {"name": name, "argv": argv, "pid": process.pid, "exit": None, "session": session, "offset": offset}
-        self.marks = set()
+        self.last = {"name": name, "argv": argv, "pid": process.pid, "exit": None, "session": session, "offset": offset,
+                     "as": role}
+        for mark in CHILD_MARKS:
+            self.marks.discard(mark)
+            self.unknown.pop(mark, None)
         self.down_since = None
         self.groups = {} if descendants else None
         return self.waited(process, name, session=session, deadline=time.monotonic() + self.timeout)

@@ -2551,14 +2551,16 @@ class HubFaults(Case):
     def row(self):
         return build.run(self.db, self.bundle["id"])
 
-    def faults_once(self, name, fault, fields=None):
-        """`build.<name>` raising `fault` once, on the first call that writes one of `fields` when named."""
-        real, fired = getattr(build, name), []
+    def faults_once(self, name, fault, fields=None, after=0, where=None):
+        """`build.<name>` raising `fault` once, on the call after `after` that writes one of `fields`, when named."""
+        real, fired, passed = getattr(build, name), [], []
 
         def faulty(*args, **kwargs):
-            if not fired and (fields is None or set(fields) & set(kwargs)):
-                fired.append(name)
-                raise fault
+            if not fired and (fields is None or set(fields) & set(kwargs)) and (where is None or where(kwargs)):
+                if len(passed) == after:
+                    fired.append(name)
+                    raise fault
+                passed.append(1)
             return real(*args, **kwargs)
 
         return mock.patch.object(build, name, faulty), fired
@@ -2724,6 +2726,140 @@ class HubFaults(Case):
         costs = self.db.execute("SELECT COUNT(*) FROM cost WHERE pass = ?", (self.bundle["id"],)).fetchone()[0]
         self.assertEqual(costs, 1)
 
+    def run_with_lost_answer(self, target, answers, *, committed):
+        """The first `build_run.<target>` loses its answer, after its commit when `committed`; what `outcome` said."""
+        self.plan(claude=["pass"], sd_review=["clean"])
+        real, faults, asked = getattr(build_run, target), [], []
+        lost = remote.UnknownOutcome("r" * 26, "the answer to COMMIT was lost")
+
+        def write(*args, **kwargs):
+            if faults:
+                return real(*args, **kwargs)
+            faults.append(target)
+            if committed:
+                real(*args, **kwargs)
+            raise lost
+
+        def outcome(rid):
+            asked.append(rid)
+            return answers.pop(0)
+
+        supervisor = self.supervisor()
+        supervisor.db.outcome = outcome
+        with mock.patch.object(build_run, target, write), mock.patch("time.sleep"):
+            self.assertEqual(supervisor.run()["step"], "enqueued")
+        return asked
+
+    def costs(self):
+        return self.db.execute("SELECT COUNT(*) FROM cost WHERE pass = ?", (self.bundle["id"],)).fetchone()[0]
+
+    def test_a_committed_cost_whose_answer_was_lost_is_not_written_again(self):
+        """`UnknownOutcome`: the transaction may have committed; the hub says, then the walk goes on."""
+        self.assertEqual(self.run_with_lost_answer("record_cost", ["recorded"], committed=True), ["r" * 26])
+        self.assertEqual(self.costs(), 1)
+
+    def test_an_absent_cost_whose_answer_was_lost_is_written_on_the_replay(self):
+        self.run_with_lost_answer("record_cost", ["absent"], committed=False)
+        self.assertEqual(self.costs(), 1)
+
+    def test_a_write_still_in_flight_is_asked_again(self):
+        """A live session still owns it: no replay yet, whichever way it ends."""
+        asked = self.run_with_lost_answer("record_cost", ["in_flight", "recorded"], committed=True)
+        self.assertEqual(len(asked), 2)
+        self.assertEqual(self.costs(), 1)
+
+    def test_a_committed_report_whose_answer_was_lost_is_not_written_again(self):
+        self.run_with_lost_answer("add_note", ["recorded"], committed=True)
+        reports = self.db.execute("SELECT COUNT(*) FROM note WHERE item = ? AND body LIKE '%report:%'",
+                                  (self.items[0],)).fetchone()[0]
+        self.assertEqual(reports, 1)
+
+    def test_a_lost_answer_is_handed_over_to_the_next_image(self):
+        """The rid travels with the marks, so the new image asks the hub and does not write again."""
+        supervisor = self.supervisor()
+        supervisor.last = {"name": "claude", "argv": [], "pid": 1, "exit": 0, "session": False, "offset": 0}
+        lost = remote.UnknownOutcome("r" * 26, "lost")
+        with self.assertRaises(remote.UnknownOutcome):
+            supervisor.once("cost", mock.Mock(side_effect=lost))
+        write = mock.Mock()
+        with mock.patch.dict(os.environ, {"SD_BUILD_RESUME": json.dumps(supervisor.state())}):
+            image = self.supervisor()
+        image.db.outcome = mock.Mock(return_value="recorded")
+        image.once("cost", write)
+        write.assert_not_called()
+        self.assertIn("cost", image.marks)
+
+    def test_a_note_whose_answer_was_lost_is_not_written_again(self):
+        """Each note the walk reaches again: `own_checks`' here, the rest go through the same call."""
+        real, faults = add_note, []
+
+        def note(*args, **kwargs):
+            real(*args, **kwargs)
+            if not faults:
+                faults.append(1)
+                raise remote.UnknownOutcome("r" * 26, "lost")
+
+        supervisor = self.supervisor(checks=lambda _: [])
+        supervisor.db.outcome = mock.Mock(return_value="recorded")
+        with mock.patch.object(build_run, "add_note", note):
+            with self.assertRaises(remote.UnknownOutcome):
+                supervisor.own_checks("a" * 40)
+            supervisor.own_checks("a" * 40)
+        said = self.db.execute("SELECT COUNT(*) FROM note WHERE item = ? AND body LIKE '%no check entrypoint%'",
+                               (self.items[0],)).fetchone()[0]
+        self.assertEqual(said, 1)
+
+    def test_a_note_after_the_step_moved_is_not_written_again(self):
+        """`enqueued` landed before its note: the replay reads the step and stops, so no second note."""
+        real, faults = add_note, []
+
+        def note(connection, item, kind, body, *args, **kwargs):
+            real(connection, item, kind, body, *args, **kwargs)
+            if "in the lane" in body and not faults:
+                faults.append(body)
+                raise remote.UnknownOutcome("r" * 26, "lost")
+
+        self.plan(claude=["pass"], sd_review=["clean"])
+        with mock.patch.object(build_run, "add_note", note):
+            ended = self.supervisor().run()
+        self.assertEqual((len(faults), ended["step"]), (1, "enqueued"))
+        said = self.db.execute("SELECT COUNT(*) FROM note WHERE item = ? AND body LIKE '%in the lane%'",
+                               (self.items[0],)).fetchone()[0]
+        self.assertEqual(said, 1)
+
+    def test_a_replayed_review_counts_one_round_and_keeps_its_blockers(self):
+        """A fault after the round's write re-walked the held review: one review counted as two."""
+        self.plan(claude=["pass", "pass"], sd_review=["blocking", "clean"])
+        patch, fired = self.faults_once("write", self.UNREACHABLE, fields=("step",),
+                                        where=lambda fields: fields.get("step") == "fixing")
+        with patch:
+            ended = self.supervisor().run()
+        self.assertEqual((fired, ended["step"]), (["write"], "enqueued"))
+        self.assertEqual(self.row()["review_round"], 1)
+        self.assertEqual(len(self.calls("sd-review")), 2, "the held review answered; only the fix's review ran")
+        fix = self.calls("claude")[1]["argv"]
+        self.assertIn("a blocker", fix[fix.index("-p") + 1])
+
+    def test_a_fix_whose_start_faulted_is_not_answered_by_the_builder(self):
+        """The prechecked path: a fault on the fix's group write left the builder as `last`, and it stood in."""
+        self.plan(claude=["pass", "pass"], sd_review=["clean"])
+        patch, fired = self.faults_once("write", self.UNREACHABLE, fields=("builder_pgid",), after=3)  # fetch, add, builder
+        with patch:
+            ended = self.supervisor(checked=lambda *_: [] if len(self.calls("claude")) >= 2 else ["not ready"]).run()
+        self.assertEqual((fired, ended.get("step")), (["write"], "enqueued"), ended)
+        self.assertEqual(len(self.calls("claude")), 2, "the fix ran")
+        self.assertEqual(self.row()["review_round"], 1, "the builder did not answer for the fix")
+
+    def test_a_second_fix_whose_start_faulted_is_not_answered_by_the_first(self):
+        """Two fixes in a row at the same step: the first must not stand in for the second."""
+        self.plan(claude=["pass", "pass", "pass"], sd_review=["clean"])
+        patch, fired = self.faults_once("write", self.UNREACHABLE, fields=("builder_pgid",), after=4)  # fetch, add, builder, fix
+        with patch:
+            ended = self.supervisor(checked=lambda *_: [] if len(self.calls("claude")) >= 3 else ["not ready"]).run()
+        self.assertEqual((fired, ended.get("step")), (["write"], "enqueued"), ended)
+        self.assertEqual(len(self.calls("claude")), 3, "both fixes ran")
+        self.assertEqual(self.row()["review_round"], 2, "the first fix did not answer for the second")
+
     def test_a_replay_skips_earlier_children_and_runs_the_next(self):
         """A held second check: the first is not run again, the second answers from its record, then a child runs."""
         supervisor = self.supervisor()
@@ -2783,7 +2919,7 @@ class HubFaults(Case):
         build.write(self.db, self.bundle["id"], step="fixing", session_id="session-fixture")
         supervisor.logs.mkdir(parents=True, exist_ok=True)
         supervisor.held = {"name": "claude", "argv": [], "exit": 0, "offset": 0, "session": False,
-                           "descendants": False, "pid": 1}
+                           "descendants": False, "pid": 1, "as": "fix:0"}
         with mock.patch.object(supervisor, "fix", return_value={"run": "r"}) as fix:
             self.assertEqual(supervisor.walk(), {"run": "r"})
         fix.assert_called_once_with()
@@ -2805,23 +2941,35 @@ class HubFaults(Case):
         self.assertNotIn("SD_BUILD_RESUME", supervisor.env)
 
     def test_every_hub_fault_at_a_beat_keeps_the_child(self):
-        """Each way the hub can be away, enumerated from `HUB_FAULTS`, leaves the child alone."""
-        faults = {remote.HubUnreachable: self.UNREACHABLE,
-                  remote.BuildMismatch: self.MISMATCH,
-                  remote.HubRestartNeeded: remote.HubRestartNeeded("a", "b"),
-                  remote.UnknownOutcome: remote.UnknownOutcome("r" * 26, "the answer was lost"),
-                  remote.TransactionLost: remote.TransactionLost("r" * 26),
-                  build_run.SchemaTooNew: build_run.SchemaTooNew(9, 8)}
-        self.assertEqual(set(faults), set(build_run.HUB_FAULTS), "every fault the supervisor names is covered")
+        """Each way the hub can refuse, the real types: `Fenced` and `HubConfigError` used to end the supervisor."""
+        rid = "r" * 26
+        faults = (self.UNREACHABLE, self.MISMATCH, remote.HubRestartNeeded("a", "b"), remote.UnknownOutcome(rid, "lost"),
+                  remote.TransactionLost(rid), build_run.SchemaTooNew(9, 8), hub.Fenced("not the hub"),
+                  hub.HubConfigError("no token"), remote.HubOnly("migrate", "hub.example.test:8769"),
+                  hub.HubConflict(Path("/x/hub.json"), Path("/x/db"), "hub.example.test"))
         supervisor = self.supervisor()
         supervisor.logs.mkdir(parents=True, exist_ok=True)
         build.write(self.db, self.bundle["id"], step="reviewing")
         short = [sys.executable, "-c", "import time; time.sleep(0.5)"]
-        for kind, fault in faults.items():
-            with self.subTest(kind=kind.__name__), \
+        for fault in faults:
+            with self.subTest(kind=type(fault).__name__), \
                     mock.patch.object(build, "beat", side_effect=fault), \
                     mock.patch.object(remote, "disk_holds", return_value=False, create=True):
-                self.assertEqual(supervisor.child(short, cwd=self.root, name=kind.__name__), 0)
+                self.assertEqual(supervisor.child(short, cwd=self.root, name=type(fault).__name__), 0)
+
+    def test_a_refusal_that_never_clears_stops_at_the_bounds(self):
+        """A permanent refusal: the budget ends the child, `settle_seconds` ends the supervisor, the row is the reap's."""
+        self.plan(claude=["hang"])
+        refused = hub.Fenced("not the hub")
+
+        supervisor = self.supervisor(timeout=1.0)
+        supervisor.settle_seconds = 0.3
+        with mock.patch.object(build, "beat", side_effect=refused), mock.patch.object(build, "end", side_effect=refused):
+            ended = supervisor.run()
+        self.assertIsNone(ended["outcome"])
+        self.assertIn("no answer from the hub", ended["why"])
+        self.assertTrue(group_gone(self.row()["builder_pgid"]))
+        self.assertIsNone(self.row()["outcome"])
 
     def test_a_reaped_run_ends_the_kept_child_at_the_first_beat(self):
         """The new image finds the run moved: nothing else writes, and the kept child goes with it."""
