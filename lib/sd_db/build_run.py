@@ -675,6 +675,20 @@ def _same_copy(path: Path, target: Path) -> bool:
     return copy.st_size == source.st_size and abs(copy.st_mtime - source.st_mtime) <= 2
 
 
+#: The copier the last `archive` in this process started; `archive_wait` gives it the rest of the tick.
+_copier: threading.Thread | None = None
+
+
+def archive_wait(seconds: float) -> None:
+    """Wait up to `seconds` for this process's copier, once the tick closed its connection (sd:8339).
+
+    The tick process kills the daemon copier when it exits, so without this wait a copy longer than
+    `ARCHIVE_DEADLINE_SECONDS` never landed. A copy done in the wait is collected by the next tick.
+    """
+    if _copier is not None and seconds > 0:
+        _copier.join(seconds)
+
+
 def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETTLE_SECONDS,
             deadline: float = ARCHIVE_DEADLINE_SECONDS) -> list[str]:
     """Move each file of an ended run from `local` to the same place under `bulk`; the new paths.
@@ -691,7 +705,8 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
     One copier at a time (sd:8275 lane round 1): the thread holds `ARCHIVE_LOCK` under `local` until it ends,
     and a tick that finds it held copies nothing, as a tick in another process does while an earlier one's
     copy still hangs. A copy goes to a name of its own and is renamed into place, so a late or failed copy
-    never opens the archive itself; a copy an earlier tick finished is collected, not made again.
+    never opens the archive itself; a copy an earlier tick finished is collected, not made again. A file
+    with a killed copier's part file is copied after the others, so one too slow for any tick holds none.
     """
     pending, cutoff = [], time.time() - settle
     for path in sorted(local.glob("*/build/*")):
@@ -720,12 +735,20 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
 
     def copy() -> None:
         try:
+            fresh, killed = [], []
             for path, target in pending:
-                part = target.with_name(f".{target.name}.{os.getpid()}.part")
                 try:
                     if _same_copy(path, target):
                         copied.append((path, target))
-                        continue
+                    elif any(target.parent.glob(f".{target.name}.*.part")):
+                        killed.append((path, target))  # outlasted a tick: the others go first (sd:8339)
+                    else:
+                        fresh.append((path, target))
+                except OSError:
+                    continue
+            for path, target in fresh + killed:
+                part = target.with_name(f".{target.name}.{os.getpid()}.part")
+                try:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     for stale in target.parent.glob(f".{target.name}.*.part"):
                         stale.unlink(missing_ok=True)  # a killed copier's; the lock says none runs
@@ -739,7 +762,8 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
         finally:
             os.close(lock)
 
-    worker = threading.Thread(target=copy, name="sd-build-archive", daemon=True)
+    global _copier
+    worker = _copier = threading.Thread(target=copy, name="sd-build-archive", daemon=True)
     worker.start()
     worker.join(deadline)
     moved = []

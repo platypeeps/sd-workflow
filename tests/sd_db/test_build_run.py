@@ -2335,6 +2335,48 @@ class Archive(Case):
         self.assertEqual(target.read_text(), "x")
         self.assertFalse(path.exists())
 
+    def test_a_copy_past_the_deadline_lands_while_the_tick_waits(self):
+        """sd:8339: the tick exited at the 20 s deadline and killed its copier, so a longer copy never landed.
+        `archive_wait` gives it the rest of the tick; the next tick collects the copy."""
+        path, target = self.ended("{run}.jsonl")
+        real = shutil.copy2
+
+        def slow(source, destination, *args, **kwargs):
+            time.sleep(0.6)
+            return real(source, destination, *args, **kwargs)
+
+        with mock.patch.object(build_run.shutil, "copy2", side_effect=slow):
+            self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs, deadline=0.1), [])
+            build_run.archive_wait(5)
+        self.assertEqual(target.read_text(), "x")
+        with mock.patch.object(build_run.shutil, "copy2", side_effect=OSError("no copy expected")):
+            self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs), [str(target)])
+        self.assertFalse(path.exists())
+
+    def test_a_file_a_killed_copier_left_goes_after_the_others(self):
+        """sd:8339: a file whose copy outlasts every tick restarted first each time and held the files after it."""
+        path, target = self.ended("{run}.jsonl")
+        later = path.with_name(f"{self.bundle['id']}.supervisor.log")
+        later.write_text("y")
+        os.utime(later, (0, 0))
+        target.parent.mkdir(parents=True)
+        target.with_name(f".{target.name}.1.part").write_text("half")
+        release = threading.Event()
+        self.addCleanup(release.set)
+        real = shutil.copy2
+
+        def stuck(source, destination, *args, **kwargs):
+            if Path(source) == path:
+                release.wait(30)
+                raise OSError("still too slow")
+            return real(source, destination, *args, **kwargs)
+
+        with mock.patch.object(build_run.shutil, "copy2", side_effect=stuck):
+            moved = build_run.archive(self.db, self.root / "local", self.logs, deadline=0.5)
+            release.set()
+            self.join_archive_workers()
+        self.assertEqual(moved, [str(target.with_name(later.name))])
+
     def test_a_failed_copy_never_truncates_the_archived_log(self):
         """sd:8275 lane round 1: a copy opened the archive itself with truncation, so a late or failed copy
         could empty the one complete log after the rows named it and the local file went."""

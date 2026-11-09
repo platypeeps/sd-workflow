@@ -14,6 +14,7 @@ import sqlite3
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -397,6 +398,7 @@ def dispatch_builds(args: argparse.Namespace) -> int:
         raise Overdue
     # One bound for the whole tick, the waits on a lock and the lane list too; a skip exits 0 (pack sd:6494).
     signal.signal(signal.SIGALRM, overdue)
+    armed = time.monotonic()
     signal.setitimer(signal.ITIMER_REAL, TICK_SECONDS)
     unstarted: dict[str, str] = {}
     try:
@@ -411,6 +413,8 @@ def dispatch_builds(args: argparse.Namespace) -> int:
         print(f"skipped: {error}")
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
+        # The copier dies with this process: it keeps the rest of the tick's budget, as before sd:8275 (sd:8339).
+        build_run.archive_wait(TICK_SECONDS - (time.monotonic() - armed))
     if result is None:
         return 0
     if unstarted:  # an unwritable run log skips that run's supervisor, not the tick
