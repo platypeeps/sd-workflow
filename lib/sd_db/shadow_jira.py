@@ -114,7 +114,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from .shadow_sync import Collected, iso, parse_iso, reason_of
 
@@ -154,6 +154,8 @@ DEFAULT_JQL = (
 MENTION_JQL = "comment ~ currentUser() AND statusCategory != Done ORDER BY updated DESC"
 # One comment read per issue, so a bound on the requests a mention read spends.
 MENTION_READS = 50
+#: How far back a mention is a live wait when `sd.jira_recent_days` is unset (sd:8200): its unset value.
+MENTION_DAYS = 30
 
 ENV_BASE = "JIRA_BASE_URL"
 ENV_EMAIL = "JIRA_EMAIL"
@@ -601,8 +603,11 @@ def _names(node, account: str) -> bool:
     return isinstance(children, list) and any(_names(child, account) for child in children)
 
 
-def mentions(*, transport=None, environ=None, deadline: float | None = None) -> tuple[list[dict], bool, str]:
+def mentions(*, transport=None, environ=None, deadline: float | None = None, now: datetime | None = None,
+             days: int = MENTION_DAYS) -> tuple[list[dict], bool, str]:
     """`(rows, complete, reason)`: open issues with a comment @mention since the operator's last comment (sd:8142).
+
+    A mention written more than `days` before `now`, or never dated, is no live wait and files nothing (sd:8200).
 
     Not configured is `([], False, "")`: nothing was read, and nothing is wrong. Any other short read names
     why, and keeps the rows it reached. A failed search or comment read is never "no mention".
@@ -618,6 +623,7 @@ def mentions(*, transport=None, environ=None, deadline: float | None = None) -> 
         return [], False, error or "the search was cut"
     if len(raw) > MENTION_READS:
         return [], False, f"more than {MENTION_READS} open issues name the operator"
+    cutoff = (now or datetime.now(timezone.utc)) - timedelta(days=days)
     rows = []
     for item in raw:
         row = normalize(item, config, me)
@@ -636,9 +642,19 @@ def mentions(*, transport=None, environ=None, deadline: float | None = None) -> 
             if ((comment.get("author") or {}).get("accountId")) == me:
                 break
             if _names(comment.get("body"), me):
-                rows.append(row)
+                if _created(comment) >= cutoff:
+                    rows.append(row)
                 break
     return rows, True, ""
+
+
+def _created(comment: dict) -> datetime:
+    """When a comment was written, in UTC; `datetime.min` for one with no readable date."""
+    try:
+        moment = datetime.fromisoformat(comment.get("created"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
 
 
 def collect(watermark: str | None, now: datetime, seam=None, environ=None, *,

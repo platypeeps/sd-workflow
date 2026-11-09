@@ -6,7 +6,8 @@ persists files once, a state that clears acknowledges its alert. `read` finds th
     state            means                                          read from
     assigned         an open issue assigned to the operator         the `shadow` rows, GitHub and Jira, every repo
     mentioned        a GitHub @mention since the operator's reply   a `mentions:@me` search, issue body and comments
-    jira_mentioned   a Jira comment @mention since their reply      `shadow_jira.mentions`
+    jira_mentioned   a Jira comment @mention since their reply,     `shadow_jira.mentions`
+                     written inside `sd.jira_recent_days` (sd:8200)
 
 A shadow row's `reason` holds assigned, filed or watched and no mention, so mentions read live. A team mention and a
 watcher-only row match neither read. An assignment already open at the first read is not new: it is recorded and
@@ -106,11 +107,15 @@ def read_github(connection: sqlite3.Connection, runner=None, *, timeout: float =
     return found, {"jira_mentioned", "mentioned"} if short else {"jira_mentioned"}, f"GitHub mentions: {short}" if short else ""
 
 
-def read_jira(connection: sqlite3.Connection, *, deadline: float | None = None, transport=None,
-              environ=None) -> tuple[dict[str, dict], set[str], str]:
-    """`({basis: issue}, unread states, reason)` for a Jira sync, whose `transport` seam keeps tests off the network."""
+def read_jira(connection: sqlite3.Connection, *, deadline: float | None = None, transport=None, environ=None,
+              now: datetime | None = None, days: int = shadow_jira.MENTION_DAYS) -> tuple[dict[str, dict], set[str], str]:
+    """`({basis: issue}, unread states, reason)` for a Jira sync, whose `transport` seam keeps tests off the network.
+
+    A mention more than `days` before `now` is not read as a wait (sd:8200).
+    """
     found = _assigned(connection)
-    rows, complete, short = shadow_jira.mentions(transport=transport, environ=environ, deadline=deadline)
+    rows, complete, short = shadow_jira.mentions(transport=transport, environ=environ, deadline=deadline, now=now,
+                                                 days=days)
     for row in rows:
         _add(found, "jira_mentioned", row)
     return found, {"mentioned"} if complete else {"mentioned", "jira_mentioned"}, f"Jira mentions: {short}" if short else ""
