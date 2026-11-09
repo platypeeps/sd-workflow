@@ -206,24 +206,43 @@ def exec_in_place(state: dict) -> None:
         return
 
 
-def connect_again(connect: Callable[[], Any], *, bound: float = build.STALE_SECONDS) -> Any:
-    """`connect()`, retried past a failure when this process was exec'd with a live child (pack sd:8182).
-
-    A second refresh can refuse the new image too. Past `bound` the kept child is ended, so none outlives its
-    supervisor, and the failure stands: the reap owns the run. Without a handed-over state this is one try.
-    """
+def resume_state(ident: str) -> dict | None:
+    """What an earlier image of this process handed over for run `ident`; None for anything else (pack sd:8182)."""
     raw = os.environ.get(RESUME_ENV)
-    if raw is None:
-        return connect()
-    stop = time.monotonic() + bound
+    try:
+        state = json.loads(raw) if raw else None
+    except ValueError:
+        return None
+    if not isinstance(state, dict) or state.get("run") != ident or state.get("pid") != os.getpid():
+        return None
+    return state
+
+
+def start_again(ident: str, start: Callable[[], Any], *, bound: float = build.STALE_SECONDS) -> Any:
+    """`start()`, tried until `bound` while this process holds a child an earlier image kept (pack sd:8182).
+
+    `start` is every hub read from the connection to the supervisor; `run()`'s own loop takes over from there.
+    Without a handed-over state it is one try. A mismatch this image cannot pass follows the build. The wait
+    comes off the child's budget. Past `bound` the kept child is ended, so none outlives its supervisor, and
+    the failure stands: the reap owns the run.
+    """
+    state = resume_state(ident)
+    if state is None:
+        return start()
+    child = state.get("child") or {}
+    begun, budget = time.monotonic(), child.get("left")
     while True:
+        if budget is not None:
+            child["left"] = max(budget - (time.monotonic() - begun), 0.0)
+            os.environ[RESUME_ENV] = json.dumps(state)
         try:
-            return connect()
-        except Exception:
-            if time.monotonic() < stop:
+            return start()
+        except Exception as fault:
+            if isinstance(fault, remote.BuildMismatch) and remote.disk_holds(fault):
+                exec_in_place(state)
+            if time.monotonic() - begun < bound:
                 time.sleep(5.0)
                 continue
-            child = json.loads(raw).get("child") or {}
             if child.get("pid") and child.get("exit") is None:
                 build.kill_group(child["pid"])
             raise
@@ -679,13 +698,10 @@ class Supervisor:
         self.down_since: float | None = None
         self.deadline = 0.0
         self.resumed = False
-        raw = os.environ.pop(RESUME_ENV, None)
+        state = resume_state(self.ident)
+        os.environ.pop(RESUME_ENV, None)
         self.env.pop(RESUME_ENV, None)
-        try:
-            state = json.loads(raw) if raw else None
-        except ValueError:
-            state = None
-        if not isinstance(state, dict) or state.get("run") != self.ident or state.get("pid") != os.getpid():
+        if state is None:
             return
         self.resumed = True
         self.last = self.held = state.get("child")

@@ -11,6 +11,7 @@ refuse fails here too.
 import contextlib
 import dataclasses
 import importlib
+import io
 import json
 import os
 import signal
@@ -32,6 +33,7 @@ from sd_db import (
     build_run,
     database,
     draft,
+    follow,
     hub,
     operations,
     remote,
@@ -286,6 +288,35 @@ def end(process):
     process.wait()
 
 
+class Refuses:
+    """A connection whose `at`th statement raises `fault`; `seen` lists every statement, so a new read is covered."""
+
+    def __init__(self, real, at, fault, seen):
+        self.real, self.at, self.fault, self.seen = real, at, fault, seen
+
+    def execute(self, *args):
+        self.seen.append(args[0])
+        if len(self.seen) == self.at:
+            raise self.fault
+        return self.real.execute(*args)
+
+    def __getattr__(self, name):
+        return getattr(self.real, name)
+
+
+def resume_state(run, child=424242):
+    """What an earlier image of this process hands over while `child` still runs."""
+    return {"run": run, "pid": os.getpid(), "reviewed": None, "ending": None, "marks": [], "groups": None,
+            "child": {"name": "claude", "argv": [], "pid": child, "exit": None, "session": False, "offset": 0,
+                      "left": 30.0}}
+
+
+def moving_clock():
+    """`time.monotonic`, five seconds further on at every read: a bound passes without a real wait."""
+    clock = iter(range(0, 10 ** 9, 5))
+    return mock.patch("time.monotonic", side_effect=lambda: next(clock))
+
+
 def group_gone(pgid):
     try:
         os.killpg(pgid, 0)
@@ -355,6 +386,40 @@ class Case(unittest.TestCase):
         assert bundle is not None
         self.bundle = bundle
         return bundle
+
+    def assert_start_recovers(self, run):
+        """Every statement from the connection to `run()`, failing once: the start retries and keeps the child."""
+        state, statements = resume_state(run), []
+
+        def supervise(at, fault, seen):
+            attempts, resumed = [], []
+
+            def opened(write=False):
+                attempts.append(write)
+                return Refuses(connect(self.database), at if len(attempts) == 1 else 0, fault, seen)
+
+            def reached(supervisor):
+                resumed.append(supervisor.resumed)
+                return {"run": run}
+
+            with mock.patch.dict(os.environ, {"SD_BUILD_RESUME": json.dumps(state)}), \
+                    mock.patch("sd_db.connect", opened), mock.patch("time.sleep"), \
+                    mock.patch("sys.path", [str(BIN), *sys.path]), \
+                    mock.patch.object(ADAPTER, "log_root", return_value=self.logs), \
+                    mock.patch.object(build_run.Supervisor, "run", reached), \
+                    mock.patch.object(build, "kill_group") as kill, mock.patch("builtins.print"):
+                ADAPTER.supervise_build(mock.Mock(run=run))
+            return attempts, resumed, kill
+
+        supervise(0, None, statements)
+        self.assertGreaterEqual(len(statements), 4, statements)
+        for at in range(1, len(statements) + 1):
+            for fault in (HubFaults.UNREACHABLE, HubFaults.MISMATCH):
+                with self.subTest(statement=statements[at - 1], fault=type(fault).__name__):
+                    attempts, resumed, kill = supervise(at, fault, [])
+                    self.assertEqual(len(attempts), 2, "the failed start was tried again")
+                    self.assertEqual(resumed, [True], "the supervisor took the child over")
+                    kill.assert_not_called()
 
     def supervisor(self, ident=None, **options):
         options = {"beat_seconds": 0.2, "timeout": 30, "grace": 0.5, **options}
@@ -2218,6 +2283,10 @@ class Drafts(Case):
         self.assertEqual(build_run.dispatch(self.db, **tick)["drafted"], [], "one draft at a time")
         self.assertEqual(build_run.dispatch(self.db, **{**tick, "load": None})["drafted"], [])
 
+    def test_every_hub_read_before_the_draft_run_loop_is_retried_with_the_child_kept(self):
+        """Round 2: `DraftSupervisor` has its own constructor and its own reads."""
+        self.assert_start_recovers(self.claimed()["id"])
+
     def test_supervise_routes_a_draft_run_to_the_draft_supervisor(self):
         run = self.claimed()
         seen = []
@@ -2232,7 +2301,7 @@ class Drafts(Case):
         args = mock.Mock(run=run["id"])
         with mock.patch("sys.path", [str(BIN), *sys.path]), \
                 mock.patch.object(ADAPTER, "log_root", return_value=self.logs), \
-                mock.patch.object(ADAPTER.sd_handoff_rows, "connect", return_value=connect(self.database)), \
+                mock.patch("sd_db.connect", return_value=connect(self.database)), \
                 mock.patch.object(build_run, "DraftSupervisor", Fake), \
                 mock.patch("builtins.print"):
             ADAPTER.supervise_build(args)
@@ -2802,7 +2871,7 @@ class HubFaults(Case):
         execve.assert_not_called()
 
     def test_a_connect_after_the_exec_waits_for_the_hub(self):
-        state = {"run": "r", "pid": 1, "child": {"pid": 999999, "exit": None}}
+        state = {"run": "r", "pid": os.getpid(), "child": {"pid": 999999, "exit": None}}
         tries = []
 
         def connect_once():
@@ -2813,15 +2882,126 @@ class HubFaults(Case):
 
         with mock.patch.dict(os.environ, {"SD_BUILD_RESUME": json.dumps(state)}), \
                 mock.patch("time.sleep"):
-            self.assertEqual(build_run.connect_again(connect_once), "session")
+            self.assertEqual(build_run.start_again("r", connect_once), "session")
         self.assertEqual(len(tries), 2)
 
+    def test_every_hub_read_before_the_run_loop_is_retried_with_the_child_kept(self):
+        """Round 2: only the connect was covered; a fault in a later read exited beside the live child."""
+        self.assert_start_recovers(self.bundle["id"])
+
+    def supervise_faulting(self, opened, *, state=None, **patches):
+        state = resume_state(self.bundle["id"]) if state is None else state
+        raw = state if isinstance(state, str) else json.dumps(state)
+        with mock.patch.dict(os.environ, {"SD_BUILD_RESUME": raw}), mock.patch("sd_db.connect", opened), \
+                mock.patch("time.sleep"), mock.patch("sys.path", [str(BIN), *sys.path]), \
+                mock.patch.object(ADAPTER, "log_root", return_value=self.logs), \
+                mock.patch.object(build, "kill_group") as kill, mock.patch("builtins.print"), moving_clock():
+            with mock.patch.multiple(remote, **patches) if patches else contextlib.nullcontext():
+                try:
+                    ADAPTER.supervise_build(mock.Mock(run=self.bundle["id"]))
+                except ADAPTER.WorkRefusal as refusal:
+                    return refusal, kill
+        return None, kill
+
+    def test_a_start_that_never_succeeds_ends_the_kept_child(self):
+        """Past the bound the child goes too: none outlives its supervisor, and the row stays the reap's."""
+        closed, seen = [], []
+
+        def opened(write=False):
+            real = connect(self.database)
+            refusing = Refuses(real, 1, self.UNREACHABLE, [])
+            refusing.close = lambda: (closed.append(1), real.close())
+            seen.append(refusing)
+            return refusing
+
+        refusal, kill = self.supervise_faulting(opened)
+        self.assertIsNotNone(refusal, "the failure stands")
+        kill.assert_called_once_with(424242)
+        self.assertEqual(len(closed), len(seen), "each failed start closed its connection")
+
+    def test_a_mismatch_in_the_start_follows_the_build(self):
+        """The hub refuses this image for life: a retry cannot pass, at the connect or at a read after it."""
+        def at_connect(write=False):
+            raise self.MISMATCH
+
+        def at_a_read(write=False):
+            return Refuses(connect(self.database), 1, self.MISMATCH, [])
+
+        for name, opened in (("connect", at_connect), ("read", at_a_read)):
+            with self.subTest(name), mock.patch.object(build_run, "exec_in_place", replaced, create=True):
+                with self.assertRaises(Replaced) as image:
+                    self.supervise_faulting(opened, disk_holds=lambda _: True)
+                self.assertEqual(image.exception.state["child"]["pid"], 424242)
+                self.assertEqual(image.exception.state["run"], self.bundle["id"])
+
+    def test_a_wait_in_the_start_spends_the_childs_budget(self):
+        """A hub outage at the start must not give the child its budget again."""
+        lefts = []
+
+        def opened(write=False):
+            lefts.append(json.loads(os.environ["SD_BUILD_RESUME"])["child"]["left"])
+            if len(lefts) == 1:
+                raise self.UNREACHABLE
+            return connect(self.database)
+
+        with mock.patch.object(build_run.Supervisor, "run", return_value={"run": "r"}):
+            self.supervise_faulting(opened)
+        self.assertLess(lefts[1], lefts[0])
+
+    def test_a_state_of_another_process_or_run_is_no_held_child(self):
+        """Only this process's state for this run names a child to wait for or end; anything else is one try."""
+        other = resume_state(self.bundle["id"])
+        other["pid"] = os.getpid() + 1
+        for state in (other, resume_state("another-run"), "{not json"):
+            with self.subTest(state=str(state)[:24]):
+                opened = mock.Mock(side_effect=self.UNREACHABLE)
+                refusal, kill = self.supervise_faulting(opened, state=state)
+                self.assertIsNotNone(refusal)
+                self.assertEqual(opened.call_count, 1)
+                kill.assert_not_called()
+
+    def test_the_connects_follow_keeps_the_handed_over_state(self):
+        """`bin/sd`'s hook follows at a connect's mismatch, then execs: the pid and this state go with it."""
+        reruns = []
+        with mock.patch.object(follow, "script", return_value=Path("/x/repo-sync.sh")), \
+                mock.patch.object(follow, "_run_follow", return_value=(0, "", False)), \
+                mock.patch.object(follow, "stdin_consumed", return_value=""), \
+                mock.patch.object(remote, "sessions_opened", return_value=0):
+            follow.attempt(self.MISMATCH, [], environ={"SD_BUILD_RESUME": "state"}, argv=["sd"], out=io.StringIO(),
+                           rerun=lambda _, env: reruns.append(env))
+        self.assertEqual(reruns[0]["SD_BUILD_RESUME"], "state")
+
+    def test_a_resumed_supervisor_registers_nothing(self):
+        """The one hub call `run()` makes outside its loop is the registration, which a resumed run skips."""
+        state = resume_state(self.bundle["id"])
+        with mock.patch.dict(os.environ, {"SD_BUILD_RESUME": json.dumps(state)}), \
+                mock.patch.object(build, "register") as register, \
+                mock.patch.object(build_run.Supervisor, "ended", return_value={"run": self.bundle["id"]}):
+            self.supervisor().run()
+        register.assert_not_called()
+
+    def test_a_fault_at_the_first_beat_of_a_kept_child_keeps_it(self):
+        """The first hub call inside `run()`'s loop for an adopted child: the child stays until its budget."""
+        kept = subprocess.Popen(["sleep", "30"], start_new_session=True)
+        self.addCleanup(end, kept)
+        build.write(self.db, self.bundle["id"], step="building", builder_pgid=kept.pid, builder_start="x",
+                    session_id="session-fixture", log_path="x")
+        build.register(self.db, self.bundle["id"], pid=os.getpid(), pgid=os.getpgrp(), start="x")
+        state = resume_state(self.bundle["id"], kept.pid)
+        state["child"]["left"] = 1.0
+        patch, fired = self.faults_once("beat", self.UNREACHABLE)
+        with patch, mock.patch.dict(os.environ, {"SD_BUILD_RESUME": json.dumps(state)}):
+            ended = self.supervisor(timeout=500).run()
+        self.assertEqual(fired, ["beat"])
+        self.assertEqual(ended["outcome"], "timed_out")
+        self.assertTrue(group_gone(kept.pid))
+
     def test_a_connect_that_never_returns_ends_the_kept_child(self):
-        state = {"run": "r", "pid": 1, "child": {"pid": 424242, "exit": None}}
+        state = {"run": "r", "pid": os.getpid(), "child": {"pid": 424242, "exit": None}}
         with mock.patch.dict(os.environ, {"SD_BUILD_RESUME": json.dumps(state)}), \
                 mock.patch("time.sleep"), mock.patch.object(build, "kill_group") as kill:
             with self.assertRaises(OSError):
-                build_run.connect_again(mock.Mock(side_effect=OSError("no hub")), bound=0)
+                build_run.start_again("r", mock.Mock(side_effect=OSError("no hub")), bound=0)
         kill.assert_called_once_with(424242)
 
     def test_a_connect_with_no_handed_over_state_is_one_try(self):
@@ -2829,7 +3009,7 @@ class HubFaults(Case):
         with mock.patch.dict(os.environ, clear=False):
             os.environ.pop("SD_BUILD_RESUME", None)
             with self.assertRaises(OSError):
-                build_run.connect_again(connect)
+                build_run.start_again("r", connect)
         connect.assert_called_once_with()
 
 
