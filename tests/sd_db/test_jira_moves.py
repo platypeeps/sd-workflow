@@ -26,7 +26,9 @@ from sd_db.writes import create_item, transition
 
 from .test_shadow_jira import JIRA_ENV, RawServer, jira_transport
 
-STATUS = {"To Do": "new", "In Progress": "indeterminate", "Done": "done", "Won't Do": "done"}
+STATUS = {"To Do": "new", "In Progress": "indeterminate", "Done": "done", "Won't Do": "done",
+          "Awaiting Release": "indeterminate", "Released to STAGE": "indeterminate",
+          "Ready for Prod Release": "indeterminate"}
 
 
 def refused(code: int, reason: str = "Refused", headers=None) -> urllib.error.HTTPError:
@@ -151,6 +153,27 @@ class TheMoves(unittest.TestCase):
         transition(self.db, self.item, "blocked", who="operator")
         self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: blocked moves nothing"])
         self.assertEqual(jira.posted, [])
+
+    def test_a_ticket_in_a_release_status_is_left_when_its_item_goes_done(self):
+        """sd:8215: Awaiting Release went to Done, skipping the team's release step."""
+        for number, name in enumerate(("Awaiting Release", "Released to STAGE", "Ready for Prod Release"), 20):
+            with self.subTest(name):
+                key = f"ABC-{number}"
+                item = create_item(self.db, kind="task", title=name, source="task-ref", external_id=f"jira:{key}")
+                jira = FakeJira({key: name})
+                self.db.execute("DELETE FROM state WHERE key = ?", (jira_moves.CURSOR,))
+                jira_moves.run(self.db, jira, JIRA_ENV)
+                transition(self.db, item, "done", who="operator")
+                self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV),
+                                 [f"jira moves: {key}: in {name}, a release status, left as it is"])
+                self.assertEqual(jira.posted, [])
+                self.assertEqual(self.notes(item), [])
+
+    def test_a_ticket_in_progress_still_moves_to_done(self):
+        jira = FakeJira({"ABC-7": "In Progress"})
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        transition(self.db, self.item, "done", who="operator")
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: moved to Done"])
 
     def test_a_failure_is_one_note_on_the_item_and_the_cursor_moves_on(self):
         jira = FakeJira({"ABC-7": "To Do"})
