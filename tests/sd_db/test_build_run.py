@@ -191,6 +191,11 @@ FAKE = textwrap.dedent('''
                                   {"command": ["make", "check"], "exit_code": 2, "failed_steps": ["make target audit"],
                                    "failure": "audit: a long line"}]}}))
             sys.exit(0)
+        if mode in ("skip_route", "skip_other"):  # pack sd:8291: a docs-only change the router skips, or not
+            print(json.dumps({"status": "skipped", "completed_reviews": 0, "findings": [],
+                              "route": {"tier": "skip" if mode == "skip_route" else "cheap", "category": "docs"},
+                              "subject": {"head": git("-C", work, "rev-parse", "HEAD")}}))
+            sys.exit(0)
         print(json.dumps({"status": "blocking" if mode == "blocking" else "clean",
                           "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                           "findings": findings if mode == "blocking" else []}))
@@ -787,6 +792,20 @@ class Supervise(Case):
         self.assertEqual(len(self.calls("sd-review")), 2)
         fix = [call["argv"] for call in self.calls("claude")][1]
         self.assertIn("make target audit", fix[fix.index("-p") + 1], "the fix names the failed gate step")
+
+    def test_a_review_the_router_skips_passes(self):
+        """pack sd:8291: a README-only build ended blocked on a deliberate route skip."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["skip_route", "skip_route"])
+        self.assertEqual(self.supervisor().run().get("step"), "enqueued", self.latest()["detail"])
+        self.assertEqual(len(self.calls("sd-review")), 1)
+
+    def test_a_skip_for_another_reason_still_blocks(self):
+        self.press()
+        self.plan(claude=["pass"], sd_review=["skip_other", "skip_other"])
+        self.assertEqual(self.supervisor().run()["outcome"], "blocked")
+        self.assertIn("the review gave no answer twice", self.latest()["detail"])
 
     def test_an_unknown_review_is_retried_once(self):
         self.press()

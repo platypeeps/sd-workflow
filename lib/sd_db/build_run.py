@@ -1019,7 +1019,7 @@ class Supervisor:
                 break
         if answer is None:
             return self.finish("blocked", f"the review gave no answer twice at {head[:12]}; see {self.out('review')}")
-        if answer["status"] in ("clean", "advisory"):
+        if answer["status"] in ("clean", "advisory", "skipped"):
             # `sd-review` runs no gate in an unmanaged checkout (sd:5953): the repository's own checks run here.
             failed = self.own_checks(head) if build.unmanaged(self.db, self.row["repo"]) else []
             if isinstance(failed, dict):
@@ -1540,7 +1540,8 @@ class Supervisor:
         status = answer.get("status")
         findings = answer.get("findings")
         findings = findings if isinstance(findings, list) else []
-        if status in ("clean", "advisory"):
+        # A route skip (a docs-only change) is the router's deliberate answer; any other skip stays unknown (pack sd:8291).
+        if status in ("clean", "advisory") or status == "skipped" and (answer.get("route") or {}).get("tier") == "skip":
             return {"status": status, "blockers": []}
         if status == "blocking":
             return {"status": status, "blockers": [row for row in findings

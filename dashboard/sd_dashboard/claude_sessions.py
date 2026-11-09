@@ -474,7 +474,10 @@ def document(connection, *, now: str, fleet=None, agents=None, processes=None, w
                         for task in row["tasks"] if titles is None or task["item"] in titles]
     rank = {"waiting": 0, "unknown": 1, "busy": 2, "idle": 3}
     sessions.sort(key=lambda row: (rank[row["status"]], row["age"] if row["age"] is not None else 1 << 62, row["id"]))
-    return {"read": now, "sessions": sessions, "sources": sources, "builders": builders(sessions, "")}
+    # A `--no-session-persistence` session (sd-review's reviewers) keeps no transcript and builds nothing (pack sd:8296).
+    transient = {pid for pid, _, command in procs if "--no-session-persistence" in command.split()}
+    return {"read": now, "sessions": sessions, "sources": sources,
+            "builders": builders([row for row in sessions if row["pid"] not in transient], "")}
 
 
 def _runs_claude(command: str) -> bool:
