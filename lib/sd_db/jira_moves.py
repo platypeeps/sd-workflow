@@ -46,10 +46,14 @@ crash repeats an earlier move or note. A ticket stuck on a transient error
 holds the later ones until it clears, and says so every hour. A Jira that
 is not configured moves nothing and holds the cursor.
 
-The first run has no cursor. It checks the token by listing the transitions
-of the newest linked ticket, read-only, and starts the cursor at the newest
-note: history is not replayed. A failed check, a malformed answer included,
-holds the cursor, so the next run checks again; no move waits on it.
+The first run has no cursor. It checks the token with the account check,
+`/myself`, never a ticket (ruling #49745), and starts the cursor at the
+newest note: history is not replayed. A failed check, a malformed answer
+included, holds the cursor, so the next run checks again; no move waits on
+it. So no single ticket can hold the cursor: a ticket's 404 passes when
+the account check passes, and every failure that holds is one no ticket
+owns (an account check that fails, a 401, 403, 429 or 5xx, a transport
+failure, a spent budget, a body that is not JSON).
 """
 
 from __future__ import annotations
@@ -230,24 +234,12 @@ def run(connection: sqlite3.Connection, transport=None, environ=None) -> list[st
     cursor = read_cursor(connection)
     if cursor is None:
         newest = connection.execute("SELECT COALESCE(MAX(id), 0) FROM note").fetchone()[0]
-        last = connection.execute(
-            "SELECT external_id FROM item WHERE source = 'task-ref' AND external_id LIKE 'jira:%'"
-            " ORDER BY id DESC LIMIT 1").fetchone()
-        found = KEY.fullmatch(last[0]) if last is not None else None
-        if found:
-            key = found[1]
-            payload, error = shadow_jira._request(_issue(config, key) + "/transitions", config, None, transport)
-            if not error:
-                try:
-                    _transitions(payload)
-                except ValueError as malformed:
-                    error = str(malformed)
-            if error:
-                return [f"jira moves: token check on {key} failed, cursor held: {error}"]
-            _write_cursor(connection, newest)
-            return [f"jira moves: token check on {key} passed; cursor starts at note {newest}"]
+        # The account check, not a ticket: no one ticket may hold the first run (ruling #49745).
+        _, error = shadow_jira.account_id(config, transport)
+        if error:
+            return [f"jira moves: account check failed, cursor held: {error}"]
         _write_cursor(connection, newest)
-        return [f"jira moves: no linked ticket; cursor starts at note {newest}"]
+        return [f"jira moves: account check passed; cursor starts at note {newest}"]
     items, newest = _linked(connection, cursor)
     lines: list[str] = []
     at = cursor

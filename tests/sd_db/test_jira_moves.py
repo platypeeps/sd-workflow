@@ -126,7 +126,7 @@ class TheMoves(unittest.TestCase):
     def test_a_status_change_moves_the_linked_ticket_once(self):
         jira = FakeJira({"ABC-7": "To Do"})
         first = jira_moves.run(self.db, jira, JIRA_ENV)
-        self.assertIn("token check on ABC-7 passed", first[0])
+        self.assertIn("account check passed", first[0])
         self.assertEqual(jira.posted, [])
         transition(self.db, self.item, "in_progress", who="operator")
         transition(self.db, self.other, "in_progress", who="operator")
@@ -367,11 +367,23 @@ class TheMoves(unittest.TestCase):
         jira_moves.run(self.db, jira, JIRA_ENV)
         self.assertEqual((len(self.notes(self.item)), len(self.notes(eight))), (1, 1))
 
-    def test_a_failed_token_check_holds_the_cursor(self):
-        jira = FakeJira({"ABC-7": "To Do"}, fail="Jira rejected the credentials (401 Unauthorized)")
+    def test_a_failed_account_check_holds_the_first_run(self):
+        jira = FakeJira({"ABC-7": "To Do"})
+        jira.myself = (None, "Jira rejected the credentials (401 Unauthorized)")
         lines = jira_moves.run(self.db, jira, JIRA_ENV)
-        self.assertIn("token check on ABC-7 failed, cursor held", lines[0])
+        self.assertIn("account check failed, cursor held", lines[0])
         self.assertIsNone(jira_moves.read_cursor(self.db))
+
+    def test_a_deleted_newest_ticket_does_not_hold_the_first_run(self):
+        # Ruling #49745: the first run asks `/myself`, not one ticket, so a 404 there decides nothing.
+        healthy = create_item(self.db, kind="task", title="old", source="task-ref", external_id="jira:ABC-8")
+        create_item(self.db, kind="task", title="gone", source="task-ref", external_id="jira:ABC-9")
+        jira = FakeJira({"ABC-7": "To Do", "ABC-8": "To Do"})
+        jira.down["ABC-9"] = sentence(refused(404, "Not Found"))
+        self.assertIn("account check passed", jira_moves.run(self.db, jira, JIRA_ENV)[0])
+        self.assertIsNotNone(jira_moves.read_cursor(self.db))
+        transition(self.db, healthy, "done", who="operator")
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-8: moved to Done"])
 
     def test_an_unconfigured_jira_moves_nothing(self):
         self.assertEqual(jira_moves.run(self.db, FakeJira({}), {}), [])
@@ -534,12 +546,13 @@ class TheMoves(unittest.TestCase):
                 self.assertEqual(len(self.notes(self.item)), 1)
                 self.assertGreater(jira_moves.read_cursor(self.db), held)
 
-    def test_a_malformed_token_check_holds_the_cursor(self):
-        for answer in ([1], None, {}, {"transitions": 5}, {"transitions": [1]}):
+    def test_a_malformed_account_answer_holds_the_first_run(self):
+        for answer in ([1], None, {}, {"accountId": 3}, {"accountId": ""}):
             with self.subTest(answer=answer):
-                jira = FakeJira({"ABC-7": "To Do"}, malformed={("ABC-7", "transitions"): answer})
+                jira = FakeJira({"ABC-7": "To Do"})
+                jira.myself = (answer, "")
                 lines = jira_moves.run(self.db, jira, JIRA_ENV)
-                self.assertIn("token check on ABC-7 failed, cursor held", lines[0])
+                self.assertIn("account check failed, cursor held", lines[0])
                 self.assertIsNone(jira_moves.read_cursor(self.db))
 
     def test_a_crash_before_the_cursor_write_moves_no_ticket_twice(self):
