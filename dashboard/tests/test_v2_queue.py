@@ -1404,6 +1404,15 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         drawn = re.findall(r'<tr class="child" data-type="suggested" data-item="(\d+)"', out["R"]["html"])
         self.assertEqual(drawn, [str(n) for n in range(61, 70)])
 
+    def test_a_suggested_item_due_today_or_overdue_says_due_and_its_status(self):
+        # pack sd:8238: an open item due today or before is suggested as `due`; its detail names the date, not ready.
+        self.doc["queues"]["suggested"] = [{"id": 90, "repo": "~/repos/example/system", "title": "Overdue",
+                                            "status": "planning", "why": "due", "due": "2026-09-01", "priority": 2}]
+        out = self.run_view("open('system'); R.html = ELS.queue.html;", search="?show=suggested")
+        found = re.findall(r'<tr class="child" data-type="suggested" data-item="(\d+)".*?<td class="detail">(.*?)</td>',
+                           out["R"]["html"], re.S)
+        self.assertEqual(found, [("90", "due 2026-09-01 · P2 · planning")])
+
     def test_suggested_is_sd_nexts_order_less_live_items_nine_per_repo_each_with_why(self):
         # pack sd:7314: Suggested is what sd-next offers next, ranked server-side (sd_db.today.suggested): ready, then
         # planned, then unscheduled. The view drops a live item and keeps the first nine per repo (sd:8008). Each detail says why;

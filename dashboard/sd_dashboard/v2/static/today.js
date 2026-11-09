@@ -456,14 +456,14 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     <td class="detail">${prFacts(p)}</td><td class="num">${p.stale ? '' : dur(p.waited)}</td>
     <td class="act">${p.item == null ? '' : prWaitLink(p)}</td></tr>`, p.on]; };
   // A suggested row (pack sd:7271) is a task: a click shows the Tasks page's Details, and its act is Build on a ready one,
-  // else its next status, as on Tasks. Its detail says why it is suggested (pack sd:7314): ready, planned for its due
-  // date, or unscheduled, with its priority; a row that is not ready shows its status too.
+  // else its next status, as on Tasks. Its detail says why it is suggested (pack sd:7314): ready, due today or before
+  // (pack sd:8238), planned for its due date, or unscheduled, with its priority; a row not ready shows its status too.
   const P = r => r.priority == null ? '' : `P${r.priority}`;
-  const WHY = { ready: r => ['ready', P(r)], planned: r => [`planned for ${r.due}`, P(r), r.status], unscheduled: r => [`unscheduled ${P(r)}`.trim(), r.status] };
+  const WHY = { ready: r => ['ready', P(r)], due: r => [`due ${r.due}`, P(r), r.status], planned: r => [`planned for ${r.due}`, P(r), r.status], unscheduled: r => [`unscheduled ${P(r)}`.trim(), r.status] };
   const suggestRow = r => ['suggested', 'queued', html`<tr class="child" data-type="suggested" data-item="${r.id}" data-id="${String(r.id)}" aria-selected="${String(row() === String(r.id))}">${marker('queued', 'suggested')}
     <td class="what"><a href="${shell.itemHref(r.id)}">#${r.id} ${r.title}</a></td>
     <td class="detail">${(WHY[r.why] || WHY.ready)(r).filter(Boolean).join(' · ')}</td><td class="num">${r.since ? age(r.since) : ''}</td><td class="act">${shell.commands.rowActions(String(r.id))}</td></tr>`];
-  // What sd-next offers next (pack sd:7314): the read's `queues.suggested`, ranked by sd_db.today.suggested (ready, then
+  // What sd-next offers next (pack sd:7314): the read's `queues.suggested`, ranked by sd_db.today.suggested (ready, due,
   // planned, then unscheduled), less the items live now, at most NEXT per repo, in that order. An item with no repo is
   // no row (pack sd:7731): Suggested draws no Unassociated group; Tasks still lists it.
   function suggested(doc) {
