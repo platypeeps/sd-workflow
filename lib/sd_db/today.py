@@ -500,9 +500,10 @@ def unscheduled(connection: sqlite3.Connection, *, repos: Iterable[str | None] |
 
 def suggested(connection: sqlite3.Connection, *, repos: Iterable[str | None] | None = None, now: str | None = None,
               queued: list[dict] | None = None) -> list[dict]:
-    """What sd-next offers next (pack sd:7314), in its order: `queues`' ready items, then `planned` soonest first,
-    then `unscheduled` highest priority first. Each row is `id`, `repo`, `title`, `status`, `why` (`ready`,
-    `planned` or `unscheduled`), `due` and `priority`.
+    """What sd-next offers next (pack sd:7314), in its order: `queues`' ready items, then `work`'s open items due
+    today or before, oldest due first (pack sd:8238), then `planned` soonest first, then `unscheduled` highest
+    priority first. Each row is `id`, `repo`, `title`, `status`, `why` (`ready`, `due`, `planned` or
+    `unscheduled`), `due` and `priority`.
 
     An item counts once, under its first reason. One with a lane entry or a build assignment is left out: the
     Queue view shows it as a merging, next, blocked or working row. `queued` is `queues`' rows when the caller
@@ -514,8 +515,11 @@ def suggested(connection: sqlite3.Connection, *, repos: Iterable[str | None] | N
     fields = {row["id"]: row for row in connection.execute(
         f"SELECT id, due, priority FROM item WHERE id IN ({', '.join('?' for _ in ready)})",
         [row["id"] for row in ready])} if ready else {}
+    due = [row for row in work(connection, repos=repos, now=now)
+           if row["due"] is not None and row["kind"] not in _UNSCHEDULED_SKIPS]
     found = []
     for why, rows in (("ready", [{**row, **dict(fields[row["id"]])} for row in ready]),
+                      ("due", due),
                       ("planned", planned(connection, repos=repos, now=now)),
                       ("unscheduled", unscheduled(connection, repos=repos))):
         for row in rows:

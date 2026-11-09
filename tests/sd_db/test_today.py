@@ -195,6 +195,22 @@ class TheSections(TodayCase):
         queued = today.queues(self.connection, now=NOW)
         self.assertEqual(today.suggested(self.connection, now=NOW, queued=queued), rows, "a read's queues are reused")
 
+    def test_suggested_offers_open_items_due_today_or_overdue_after_ready(self):
+        """Pack sd:8238: an open item due today or before is suggested, oldest due first, after the ready ones and
+        before the planned ones. An idea or a report is not; neither is a done item."""
+        ready = self.item("Ready", repo=APP, status="ready")
+        overdue = self.item("Overdue", repo=APP, due="2026-09-01")
+        due_today = self.item("Due today", repo=LIB, due="2026-09-06", status="in_progress")
+        later = self.item("Later", repo=APP, due="2026-09-30")
+        self.item("Done", repo=APP, due="2026-09-01", status="done")
+        self.item("An idea", repo=APP, kind="idea", due="2026-09-01")
+        self.item("Alert", repo=APP, kind="report", due="2026-09-01")
+        rows = today.suggested(self.connection, now=NOW)
+        self.assertEqual([(row["id"], row["why"]) for row in rows],
+                         [(ready, "ready"), (overdue, "due"), (due_today, "due"), (later, "planned")])
+        self.assertEqual({k: rows[1][k] for k in ("repo", "status", "due")},
+                         {"repo": APP, "status": "planning", "due": "2026-09-01"})
+
     def test_blocked_says_why_from_the_status_change_or_a_waiting_note(self):
         vendor = self.item("Vendor")
         transition(self.connection, vendor, "blocked", who="operator", reason="Waits on the vendor\nmore detail")
