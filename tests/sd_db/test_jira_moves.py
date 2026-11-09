@@ -302,7 +302,9 @@ class TheMoves(unittest.TestCase):
             "from To Do, and the done offers are Won't Do, Closed"])
 
     def test_a_lone_wont_do_moves_nothing(self):
-        for name in ("Won't Do", "cancelled", "Canceled", "Rejected", "Declined", "Duplicate"):
+        for name in ("Won't Do", "cancelled", "Canceled", "Rejected", "Declined", "Duplicate",
+                     # Review of 525472a69: a curly apostrophe or stray spaces slipped past `lower()`.
+                     "Won\u2019t Do", "Won't Do ", "  won\u2018t\u00a0 DO", "Won`t Do", " Duplicate\t"):
             with self.subTest(name):
                 self.db.execute("DELETE FROM state WHERE key = ?", (jira_moves.CURSOR,))
                 self.db.execute("DELETE FROM note WHERE item = ? AND kind = 'comment'", (self.item,))
@@ -319,6 +321,10 @@ class TheMoves(unittest.TestCase):
     def test_done_among_the_offers_is_chosen(self):
         jira = self.offering("Won't Do", "Closed", "DONE")
         self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: moved to DONE"])
+
+    def test_a_target_name_with_stray_spaces_is_still_the_target(self):
+        jira = self.offering("Won\u2019t Do", " done ")
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: moved to  done "])
 
     def test_a_ticket_already_wont_do_is_left_and_never_said_moved(self):
         jira = FakeJira({"ABC-7": "Won't Do"})

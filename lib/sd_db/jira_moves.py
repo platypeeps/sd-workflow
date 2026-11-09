@@ -13,7 +13,7 @@ the status category of the item's current status: planning and ready to
 status move nothing. A ticket already in that category is left alone, and
 the line names its status. A status category is no outcome (ruling
 #49630): the transition is the one offered into the category whose
-destination has the target's name, case folded; else the only one
+destination has the target's name, folded (`_folded`); else the only one
 offered into it, unless that is a done name that says the work was not
 done (`NOT_DONE`). Any other offer list is that item's failure, a note
 naming the offers, and the ticket stays.
@@ -76,6 +76,13 @@ TARGET = {"planning": ("new", "To Do"), "ready": ("new", "To Do"),
           "in_progress": ("indeterminate", "In Progress"), "done": ("done", "Done")}
 #: Done-category names that say the work was not done: never a stand-in for Done (ruling #49630).
 NOT_DONE = {"won't do", "cancelled", "canceled", "rejected", "declined", "duplicate"}
+#: Apostrophe look-alikes a Jira admin may type into a status name.
+_APOSTROPHES = str.maketrans({"\u2019": "'", "\u2018": "'", "\u02bc": "'", "`": "'", "\u00b4": "'"})
+
+
+def _folded(name: str) -> str:
+    """A status name as compared: apostrophe look-alikes made `'`, whitespace runs one space, trimmed, case folded."""
+    return " ".join(name.translate(_APOSTROPHES).split()).casefold()
 
 
 def read_cursor(connection: sqlite3.Connection) -> int | None:
@@ -201,8 +208,8 @@ def move(config: dict, key: str, status: str, transport=None) -> str:
     offered = [offer for offer in _transitions(payload) if offer[2] == category]
     if not offered:
         raise ValueError(f"no transition into {name} is offered from {current}")
-    chosen = next((offer for offer in offered if offer[1].lower() == name.lower()), None)
-    if chosen is None and len(offered) == 1 and not (category == "done" and offered[0][1].lower() in NOT_DONE):
+    chosen = next((offer for offer in offered if _folded(offer[1]) == _folded(name)), None)
+    if chosen is None and len(offered) == 1 and not (category == "done" and _folded(offered[0][1]) in NOT_DONE):
         chosen = offered[0]
     if chosen is None:
         raise ValueError(f"no transition named {name} is offered from {current}, and the "
