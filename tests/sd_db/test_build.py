@@ -176,7 +176,7 @@ class Queue(Case):
                              expected_revisions={item: item_state(self.db, item)["revision"] for item in items})
         self.assertEqual([(row["item"], row["status"], row["role"], row["lane"], row["scope"], row["budget_minutes"])
                           for row in queued],
-                         [(item, "queued", "author", "parallel", "build", 60) for item in items])
+                         [(item, "queued", "author", "parallel", "build", build.BUDGET_MINUTES) for item in items])
         with self.assertRaisesRegex(workflow.TransitionRefused, f"cancel queued assignment {queued[0]['id']} first"):
             workflow.change_status(self.db, items[0], "blocked", who="operator")
 
