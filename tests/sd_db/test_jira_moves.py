@@ -74,10 +74,12 @@ class FakeJira:
         self.posted: list[tuple[str, str]] = []
         #: key -> the error every request about that ticket gets.
         self.down: dict[str, str] = {}
+        #: The answer to `/myself`, the account check a 404 asks for.
+        self.myself: tuple[Any, str] = ({"accountId": "acct-1"}, "")
 
     def __call__(self, url, headers, body):
         if url.endswith("/rest/api/3/myself"):
-            return {"accountId": "acct-1"}, ""
+            return self.myself
         key = url.split("/issue/")[1].split("/")[0].split("?")[0]
         if key in self.down:
             return None, self.down[key]
@@ -334,18 +336,37 @@ class TheMoves(unittest.TestCase):
         self.assertIn("shadow sync: jira moves: ABC-7: moved to Done", result.report())
 
 
-    def test_a_404_with_a_passing_account_check_holds_the_cursor(self):
-        # Review: `/myself` proves the account, not access to a project; a 404 there may clear later.
+    def test_a_deleted_ticket_with_a_working_token_notes_once_and_later_tickets_move(self):
+        # Ruling #49587: a 404 while `/myself` answers is that one ticket's; it must not hold the rest.
+        healthy, = self.linked("ABC-8")
+        jira = FakeJira({"ABC-7": "To Do", "ABC-8": "To Do"})
+        jira_moves.run(self.db, jira, JIRA_ENV)
+        transition(self.db, self.item, "done", who="operator")
+        transition(self.db, healthy, "done", who="operator")
+        jira.down["ABC-7"] = sentence(refused(404, "Not Found"))
+        lines = jira_moves.run(self.db, jira, JIRA_ENV)
+        self.assertEqual(lines, [f"jira moves: item {self.item}: Jira ticket ABC-7 was not moved to match done: "
+                                 "Jira returned 404 Not Found", "jira moves: ABC-8: moved to Done"])
+        self.assertEqual(jira.posted, [("ABC-8", "Done")])
+        self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), [])
+        self.assertEqual(self.notes(self.item),
+                         ["Jira ticket ABC-7 was not moved to match done: Jira returned 404 Not Found"])
+
+    def test_a_404_with_a_failing_account_check_holds_the_cursor(self):
         jira = FakeJira({"ABC-7": "To Do"})
         jira_moves.run(self.db, jira, JIRA_ENV)
         held = jira_moves.read_cursor(self.db)
         transition(self.db, self.item, "done", who="operator")
         jira.down["ABC-7"] = sentence(refused(404, "Not Found"))
-        lines = jira_moves.run(self.db, jira, JIRA_ENV)
-        self.assertEqual(lines, ["jira moves: ABC-7: not moved, cursor held for the next run: "
-                                 "Jira returned 404 Not Found"])
-        self.assertEqual((jira_moves.read_cursor(self.db), self.notes(self.item)), (held, []))
+        for probe in (sentence(refused(503, "Service Unavailable")), sentence(refused(404, "Not Found"))):
+            with self.subTest(probe):
+                jira.myself = (None, probe)
+                lines = jira_moves.run(self.db, jira, JIRA_ENV)
+                self.assertEqual(lines, ["jira moves: ABC-7: not moved, cursor held for the next run: "
+                                         f"Jira returned 404 Not Found; the account check failed: {probe}"])
+                self.assertEqual((jira_moves.read_cursor(self.db), self.notes(self.item)), (held, []))
         del jira.down["ABC-7"]
+        jira.myself = ({"accountId": "acct-1"}, "")
         self.assertEqual(jira_moves.run(self.db, jira, JIRA_ENV), ["jira moves: ABC-7: moved to Done"])
 
     def test_a_malformed_account_answer_is_an_error_not_a_crash(self):
@@ -573,6 +594,13 @@ class TheFailureClasses(unittest.TestCase):
         for exception, wanted in [(e, True) for e in transient] + [(e, False) for e in permanent]:
             with self.subTest(repr(exception)):
                 self.assertIs(isinstance(sentence(exception), shadow_jira.Transient), wanted)
+
+    def test_a_404_is_marked_as_not_found(self):
+        # `jira_moves` asks for the account check on this mark alone, never on the text.
+        self.assertIsInstance(sentence(refused(404, "Not Found")), shadow_jira.NotFound)
+        for exception in (refused(403), refused(429), refused(503)):
+            with self.subTest(repr(exception)):
+                self.assertNotIsInstance(sentence(exception), shadow_jira.NotFound)
 
     def test_a_body_that_is_not_json_says_nothing_about_one_ticket(self):
         for body in (b"<html>not json</html>", b"\xff\xfe", b"[" * 200000):

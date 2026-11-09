@@ -19,18 +19,22 @@ the priority sweep's closure. Neither is finished work, so each leaves the
 ticket as it is, and the sync says so. A done item whose stored fields
 cannot be read is unknown, so it fails rather than moves.
 
-A 404 is transient too: Jira answers it both for a missing ticket and
-for one the token may not see, and access can come back. `shadow_sync`
-skips the step when the collect failed.
+A 404 (`shadow_jira.NotFound`) asks the account check, `/myself`, with
+the same config and transport (ruling #49587). When it passes, Jira and
+the token work, so the 404 is that ticket's: a deleted one, or one the
+token may not see; it is a permanent failure. When it fails, the 404 is
+transient. `shadow_sync` skips the step when the collect failed.
 
 A permanent failure, one an answer from Jira pins on that ticket (a
-JSON answer of the wrong shape, no matching transition, a 4xx other than
-401, 403, 404 or 429), is one comment note on the item, and the cursor still moves past it, so it is
+JSON answer of the wrong shape, no matching transition, a 404 with a
+passing account check, a 4xx other than 401, 403, 404 or 429), is one
+comment note on the item, and the cursor still moves past it, so it is
 said once, not every hour. Every field read from a Jira answer is checked,
 so a malformed answer is that item's failure too and the later moves
 continue. Every other failure is transient (`shadow_jira.Transient`: any
-failure of the transport, a refused redirect, a 401, 403, 404, 429 or 5xx, a
-body that is not JSON) and stops the batch with no note: the cursor stays
+failure of the transport, a refused redirect, a 401, 403, 429 or 5xx, a
+spent dashboard budget, a 404 with a failing account check, a body that
+is not JSON) and stops the batch with no note: the cursor stays
 at the last entry fully handled, the run's lines say so, and the next run
 resumes at the failed entry. Entries run in the order of the note that
 decides them and the cursor is written after each, so neither a stop nor a
@@ -102,10 +106,19 @@ def _linked(connection: sqlite3.Connection, after: int) -> tuple[list[dict], int
     return sorted(items.values(), key=lambda entry: entry["note"]), newest
 
 
-def _stop(error: str) -> None:
-    """Raise for a failed request: `_Retry` for a transient one, `ValueError` for the rest; nothing for no error."""
-    if error:
-        raise _Retry(error) if isinstance(error, shadow_jira.Transient) else ValueError(error)
+def _stop(error: str, config: dict, transport=None) -> None:
+    """Raise for a failed request: `_Retry` for a transient one, `ValueError` for the rest; nothing for no error.
+
+    A 404 asks `/myself` first: when the account check passes, Jira and the token work, so the 404 is that ticket's.
+    """
+    if not error:
+        return
+    if isinstance(error, shadow_jira.NotFound):
+        _, probe = shadow_jira.account_id(config, transport)
+        if probe:
+            raise _Retry(f"{error}; the account check failed: {probe}")
+        raise ValueError(error)
+    raise _Retry(error) if isinstance(error, shadow_jira.Transient) else ValueError(error)
 
 
 def _issue(config: dict, key: str) -> str:
@@ -173,19 +186,19 @@ def move(config: dict, key: str, status: str, transport=None) -> str:
         return f"{key}: {status} moves nothing"
     category, name = TARGET[status]
     payload, error = shadow_jira._request(_issue(config, key) + "?fields=status", config, None, transport)
-    _stop(error)
+    _stop(error, config, transport)
     current, current_category = _state(_object(_object(payload, "issue").get("fields"), "fields").get("status"))
     if current_category == category:
         return f"{key}: already {current}"
     payload, error = shadow_jira._request(_issue(config, key) + "/transitions", config, None, transport)
-    _stop(error)
+    _stop(error, config, transport)
     offered = [offer for offer in _transitions(payload) if offer[2] == category]
     if not offered:
         raise ValueError(f"no transition into {name} is offered from {current}")
     chosen = next((offer for offer in offered if offer[1].lower() == name.lower()), offered[0])
     _, error = shadow_jira._request(_issue(config, key) + "/transitions", config,
                                     {"transition": {"id": chosen[0]}}, transport)
-    _stop(error)
+    _stop(error, config, transport)
     return f"{key}: moved to {chosen[1]}"
 
 
