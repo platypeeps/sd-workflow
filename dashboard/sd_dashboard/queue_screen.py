@@ -61,10 +61,10 @@ revision and an entry that finished are each refused as `stale_claim`, which the
 reaches the page for this; the pending order is not what Release acts on, so it passes no `--expected-revision`.
 
 Read again on the Queue view (sd:8375) first posts `/api/queue/prs/check` `{items}`, the items its pull-request rows
-show, none or more (`check_prs`), plus each open item whose pull request is already recorded merged: a close that
-failed keeps it eligible. Each open item whose contribution `pull_url` names a pull request is read on GitHub
+show (`check_prs`). Each open item whose contribution `pull_url` names a pull request is read on GitHub
 (`contribution_github.pull`) and recorded as the collector records it (`contributions.observe_pull`); one GitHub merged
-moves its item to done with `PR <url> merged at <merge commit>`. A closed, unmerged one only records. At most
+moves its item to done with `PR <url> merged at <merge commit>`, then records; a close that fails records nothing,
+so the PR row stays for the next Read again. A closed, unmerged one only records. At most
 `PR_CHECK_ITEMS` items, `PR_CHECK_SECONDS` seconds; a pull not read, or an item the move refuses, stays open and is
 named in `unread`, which the page shows under the table.
 """
@@ -553,18 +553,18 @@ def move(payload: dict):
 def check_prs(payload: dict):
     """`POST /api/queue/prs/check` `{items}` (sd:8375): check the page's request, then return `pr_check`'s write."""
     items = payload.get("items") if set(payload) == {"items"} else None
-    if (not isinstance(items, list) or len(items) > PR_CHECK_ITEMS
+    if (not isinstance(items, list) or not 1 <= len(items) <= PR_CHECK_ITEMS
             or any(type(item) is not int or not 1 <= item <= 9223372036854775807 for item in items)):
-        raise ValueError(f"Name 0 to {PR_CHECK_ITEMS} items.")
+        raise ValueError(f"Name 1 to {PR_CHECK_ITEMS} items.")
     return lambda connection: pr_check(connection, list(dict.fromkeys(items)))
 
 
 def pr_check(connection, items: list[int], *, client=None) -> dict:
     """Read on GitHub the pull request each open item in `items` links; close the item whose pull request merged.
 
-    An open item whose pull request is already recorded merged is checked too, named or not: its merge is recorded
-    before its close, so a close that failed (a GitHub read, the budget, a refused move) left it with no PR row for
-    the page to name, and only this keeps it eligible until it closes. Named items go first, up to `PR_CHECK_ITEMS`.
+    Only named items are read: an open item whose merge was recorded before may be one the operator reopened or kept
+    open. A merge is recorded only once its item closed, so a close that failed (a GitHub read, the budget, a refused
+    move) leaves the pull request recorded open, its PR row stays, and the next Read again names it again.
 
     `{"checked", "closed", "unread"}`: the items read, those moved to done, and one line per item left open unread or
     unmoved. Nothing here runs inside a transaction: each record and each move is its own.
@@ -575,11 +575,8 @@ def pr_check(connection, items: list[int], *, client=None) -> dict:
     from sd_db import contributions, workflow
 
     wanted = set(items)
-    rows = [row for row in contributions.projection(connection)
-            if row["item_id"] and row["local_status"] != "done" and github.PULL.fullmatch(row["url"] or "")
-            and (row["item_id"] in wanted or row["external_state"] == "merged")]
-    rows.sort(key=lambda row: row["item_id"] not in wanted)
-    linked = [(row["item_id"], row["url"]) for row in rows[:PR_CHECK_ITEMS]]
+    linked = [(row["item_id"], row["url"]) for row in contributions.projection(connection)
+              if row["item_id"] in wanted and row["local_status"] != "done" and github.PULL.fullmatch(row["url"] or "")]
     found: dict = {"checked": [], "closed": [], "unread": []}
     if not linked:
         return found
@@ -601,16 +598,18 @@ def pr_check(connection, items: list[int], *, client=None) -> dict:
             previous = before["observation"] or {}
             observation = github.pull(client, url, operator, observed_at=observed_at, why=previous.get("why", []),
                                       blocking_labels=previous.get("blocking_labels", []), automation=automation)
+            if observation["state"] == "merged":
+                # Close first: a merge recorded before a close that fails would drop the PR row, and with it the
+                # item from every later check.
+                owner, name, number = github.pull_parts(url)
+                commit = client.get(f"/repos/{owner}/{name}/pulls/{number}").get("merge_commit_sha")
+                if not isinstance(commit, str) or not commit:
+                    raise github.Unavailable("GitHub named no merge commit")
+                workflow.change_status(connection, item, "done", who="dashboard", reason=f"PR {url} merged at {commit}")
+                found["closed"].append(item)
             contributions.observe_pull(connection, url, observation, expected_revision=before["revision"])
             found["checked"].append(item)
-            if observation["state"] != "merged":
-                continue
-            owner, name, number = github.pull_parts(url)
-            commit = client.get(f"/repos/{owner}/{name}/pulls/{number}").get("merge_commit_sha")
-            if not isinstance(commit, str) or not commit:
-                raise github.Unavailable("GitHub named no merge commit")
-            workflow.change_status(connection, item, "done", who="dashboard", reason=f"PR {url} merged at {commit}")
-            found["closed"].append(item)
         except (ValueError, KeyError, TypeError, SdDbError) as error:
-            found["unread"].append(f"sd:{item} left open: {url}: {error}")
+            said = "closed, not recorded" if item in found["closed"] else "left open"
+            found["unread"].append(f"sd:{item} {said}: {url}: {error}")
     return found
