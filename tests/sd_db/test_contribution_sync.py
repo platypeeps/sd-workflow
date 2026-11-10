@@ -103,6 +103,7 @@ class ContributionSync(SyncCase):
 
     def test_projected_context_survives_quiet_and_matching_search_refreshes(self):
         contexts = ("assignee:@me", "user-review-requested:@me")
+        self.api.detail["requested_reviewers"] = [{"login": "operator"}]
         self.assertTrue(self.run_sync([URL], contexts=contexts).ok)
         key = "github:" + URL
         first = core.snapshot(self.db, key)
@@ -154,6 +155,7 @@ class ContributionSync(SyncCase):
 
     def test_projected_observation_restores_context_without_a_queue_entry(self):
         self.api.detail["user"] = {"id": 2, "login": "maintainer"}
+        self.api.detail["requested_reviewers"] = [{"login": "operator"}]
         observation = self.api.observation()
         observation["why"] = ["review-requested"]
         key = "github:" + URL
@@ -162,6 +164,23 @@ class ContributionSync(SyncCase):
         self.assertEqual(adapter.plan(self.db)["pending"][0]["why"], ["review-requested"])
         self.assertTrue(self.run_sync().ok)
         self.assertEqual(core.snapshot(self.db, key)["attention"], before["attention"])
+
+    def test_a_stored_team_only_request_loses_its_context_on_the_next_read(self):
+        # sd:8360: a pull stored from a team-only request keeps its why in the
+        # queue, and no windowed search returns it to replace that; the read
+        # of the pull drops the context when no one asks the operator by name.
+        self.api.detail["user"] = {"id": 2, "login": "maintainer"}
+        observation = self.api.observation()
+        observation["why"] = ["review-requested"]
+        key = "github:" + URL
+        before = core.observe_pull(self.db, URL, observation, expected_revision=core.snapshot(self.db, key)["revision"])
+        self.assertEqual([event["id"] for event in before["attention"]], ["context:review-requested"])
+        self.api.detail["requested_teams"] = [{"id": 9, "slug": "core"}]
+        self.api.detail["updated_at"] = "2026-09-10T02:00:00Z"
+        self.assertTrue(self.run_sync().ok)
+        current = core.snapshot(self.db, key)
+        self.assertEqual(current["observation"]["why"], [])
+        self.assertEqual(current["attention"], [])
 
     def test_incomplete_detail_preserves_new_search_context_for_retry(self):
         self.assertTrue(self.run_sync([URL]).ok)

@@ -124,6 +124,20 @@ class PullCollection(unittest.TestCase):
         with self.assertRaises(Unavailable):
             api.observation()
 
+    def test_review_requested_why_needs_the_operator_asked_by_name(self):
+        # sd:8360: a pull stored from a team-only request, or one the operator
+        # has reviewed, keeps its search why; the read drops it.
+        api = Api()
+        why = ["mentioned", "review-requested"]
+        api.detail["requested_teams"] = [{"id": 9, "slug": "core"}]
+
+        def observe():
+            return pull(api.client(), URL, OPERATOR, observed_at=AT, why=why)["why"]
+
+        self.assertEqual(observe(), ["mentioned"])
+        api.detail["requested_reviewers"] = [{"id": 1, "login": "Operator"}]
+        self.assertEqual(observe(), why)
+
     def test_typed_timeline_uses_originator_not_mentioned_actor(self):
         api = Api()
         api.rows["graphql"]["data"]["repository"]["pullRequest"]["timelineItems"]["nodes"] = [
