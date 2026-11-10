@@ -1489,6 +1489,10 @@ def projection(connection, *, repo=None) -> list[dict]:
             if filters is None or value["repo"] in filters:
                 result.append(value)
         _with_shadow(result, connection)
+        # A pull on an `automation/` head branch with no item is a job's: the job that opened it merges it, so no
+        # person waits on it (sd:8379). The GitHub page still lists it from the shadow.
+        result = [value for value in result
+                  if value["item_id"] or not (value.get("branch") or "").startswith("automation/")]
         return sorted(result, key=lambda value: (LANES[value["lane"]], value["key"]))
     finally:
         connection.execute("RELEASE contribution_projection")
