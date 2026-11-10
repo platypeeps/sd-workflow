@@ -17,7 +17,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import paths, shadow_sync, teammate
+from . import build, paths, shadow_sync, teammate
 from .database import transaction
 from .errors import SdDbError
 from .runner import OWNING
@@ -678,7 +678,7 @@ def _merge_close_refusal(connection, row: dict, metadata: dict, url: str, merged
     """Why the merge of `url` does not close item `row`, or None when it may (sd:8375).
 
     The one guard every close from a recorded merge passes. A merge is not proof the item is done: an operator
-    blocker, an unmet dependency, a run holding the item, a reopen after the merge, a kind that needs delivery
+    blocker, an unmet dependency, a run or lane entry holding the item, a reopen after the merge, a kind that needs delivery
     evidence or a status outside `MERGE_CLOSES_FROM` each keeps it open.
     """
     item = row["id"]
@@ -694,6 +694,11 @@ def _merge_close_refusal(connection, row: dict, metadata: dict, url: str, merged
     run = teammate.holding(connection, item)
     if run is not None:
         return f"teammate run {run['id']} holds it"
+    # The holding guards a teammate start checks (`teammate.start`): an unreleased build run, bundle members too,
+    # and a lane entry that delivers the item, whose close `sd-ship` owns.
+    retained = build._held(connection, item) or teammate.lane_holding(connection, item)
+    if retained:
+        return retained
     if row["kind"] == "work":
         return "a work item closes only with delivery evidence"
     if "done" not in allowed_statuses(connection, item):

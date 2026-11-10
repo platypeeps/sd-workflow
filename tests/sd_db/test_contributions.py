@@ -2037,6 +2037,47 @@ class CloseOnMerge(ContributionCase):
                 self.assertEqual(self.status(item), "planning")
                 self.refused(item, f"assignment {held} holds it")
 
+    def test_an_item_a_retained_build_run_holds_stays_open(self):
+        """Round 7 class pass: `build._held`, the third holding guard a teammate start checks, keeps a merged item
+        open while an unreleased build run holds it, as lead or bundle member, though its assignment is blocked."""
+        from sd_db.writes import create_assignment, upsert_repo
+
+        for role in ("lead", "member"):
+            with self.subTest(role=role):
+                self.setUp()
+                upsert_repo(self.db, "/example/repo", managed=1)
+                linked, other = self.item(), self.prerequisite()
+                lead_item, member_item = (linked, other) if role == "lead" else (other, linked)
+                lead = create_assignment(self.db, item=lead_item, role="author", status="blocked")
+                member = create_assignment(self.db, item=member_item, role="author", status="blocked", parent=lead)
+                self.db.execute("UPDATE assignment SET scope = 'build' WHERE id IN (?, ?)", (lead, member))
+                self.db.execute(
+                    "INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, "
+                    "start_step, step, outcome, created_at, updated_at) VALUES ('kept', ?, 1, '/example/repo', "
+                    "'build/sd-1', 'fixture', '/w/b', '/w/b', 'claimed', 'building', 'interrupted', ?, ?)",
+                    (lead, T1, T1))
+                self.db.commit()
+                self.observe(state="merged", merge_commit=self.MERGE)
+                self.assertEqual(self.status(linked), "planning")
+                self.refused(linked, f"item {linked} is held by build run kept")
+
+    def test_an_item_a_lane_entry_owes_its_close_stays_open(self):
+        """Round 7: a lane entry that delivers the item owns its close (`sd-ship`'s close_task), even when the sync
+        records the merge first; `teammate.lane_holding` names it, as a teammate start checks."""
+        for status in ("pending", "running", "prepared", "merged"):
+            with self.subTest(status=status):
+                self.setUp()
+                item = self.item()
+                entry = {"id": "e1", "item": item, "status": status, "claim": "deliver", "closes": [],
+                         "merge_commit": self.MERGE}
+                self.db.execute("INSERT INTO state (kind, key, timestamp, body) VALUES ('checkpoint', ?, ?, ?)",
+                                ("lane:v1:example/repo:e1", T1, json.dumps(entry)))
+                self.db.commit()
+                self.observe(state="merged", merge_commit=self.MERGE)
+                self.assertEqual(self.status(item), "planning")
+                self.refused(item, f"item {item} ")
+                self.assertIn("lane entry e1", "\n".join(self.notes(item)))
+
     def test_an_item_reopened_after_the_merge_stays_open(self):
         item = self.item()
         transition(self.db, item, "done", who="operator", reason="finished by hand")
