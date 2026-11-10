@@ -1043,3 +1043,19 @@ class LaneNotePass(SyncCase):
         self.assertTrue(self.tracker_heartbeat()["ok"])
         self.assertEqual(len(result.lanes), 2)
         self.assertIn("shadow sync: pull-request lanes: " + "; ".join(result.lanes), result.report())
+
+
+class MergeNotes(SyncCase):
+    """sd:8375: the sync that records an item's pull merged notes the item once and changes no status."""
+
+    def test_a_sync_that_records_the_linked_pull_merged_notes_its_item_once(self):
+        item = core.capture(self.db, title="Filed", changes={"pull_url": URL}, who="operator")["item"]["id"]
+        self.assertTrue(self.run_sync([URL]).ok)
+        self.api.detail.update(state="closed", merged=True, merge_commit_sha="c" * 40, updated_at="2026-09-10T02:00:00Z")
+        self.assertTrue(self.run_sync([URL]).ok)
+        self.api.detail.update(updated_at="2026-09-10T03:00:00Z")
+        self.assertTrue(self.run_sync([URL]).ok)
+        status = self.db.execute("SELECT status FROM item WHERE id = ?", (item,)).fetchone()[0]
+        notes = [row[0] for row in self.db.execute(
+            "SELECT body FROM note WHERE item = ? AND kind = 'comment' AND body LIKE 'PR http%merged%'", (item,))]
+        self.assertEqual((status, notes), ("planning", [f"PR {URL} merged at {'c' * 40}"]))

@@ -381,4 +381,5 @@ JSON.stringify({
 class TheRegistration(Registers, unittest.TestCase):
     page, section, route = "today", "Today", "/today"
     # pack sd:7234: the Queue view's lane, build and runner routes.
-    api = ("/api/queue", "/api/queue/move", "/api/queue/builds", "/api/queue/builds/retry", "/api/queue/builds/pickup", "/api/queue/runner")
+    api = ("/api/queue", "/api/queue/move", "/api/queue/builds", "/api/queue/builds/retry", "/api/queue/builds/pickup", "/api/queue/runner",
+           "/api/queue/prs/check")

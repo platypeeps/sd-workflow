@@ -59,6 +59,13 @@ claim the row showed, in the verb's transaction (pack sd:3330). At prepare the e
 fails, since a merge may have landed. A token is made per claim, so a step that moved on, a claim taken again at the same
 revision and an entry that finished are each refused as `stale_claim`, which the page reads as a 409. The holder token
 reaches the page for this; the pending order is not what Release acts on, so it passes no `--expected-revision`.
+
+Read again on the Queue view (sd:8375) first posts `/api/queue/prs/check` `{items}`, the items its pull-request rows
+show (`check_prs`). Each open item whose contribution `pull_url` names a pull request is read on GitHub
+(`contribution_github.pull`) and recorded as the collector records it (`contributions.observe_pull`). The read that
+first records a pull request merged writes `PR <url> merged at <merge commit>` on each open item linking it and
+changes no status: the operator closes the item. At most `PR_CHECK_ITEMS` items, `PR_CHECK_SECONDS` seconds; a pull
+not read, or a merged pull whose item is still open, is named in `unread`, which the page shows under the table.
 """
 
 from __future__ import annotations
@@ -100,6 +107,11 @@ WHO = {("prepared", None): "operator", ("skipped", None): "builder", ("failed", 
 #: Not `hub_unavailable` (a write may have landed) or `publish_unknown` (origin may have moved): those are unknown.
 REFUSED = ("stale_revision", "stale_head", "stale_claim", "holder_alive", "head_gone", "branch_diverged", "default_branch",
            "head_moved", "superseded", "already_merged")
+#: Read again's pull-request check (sd:8375): how many items, how long, and the requests one pull read may spend
+#: (its detail twice, reviews, two comment lists, the timeline and two CI reads, with paging room).
+PR_CHECK_ITEMS = 20
+PR_CHECK_SECONDS = 30
+PR_CHECK_REQUESTS = 15
 EDITS = "Edits take effect at the next item boundary: the runner reads the queue again before each item, never mid-merge."
 
 
@@ -535,3 +547,56 @@ def move(payload: dict):
             raise ValueError(answer.get("error") or "sd-ship lane refused the change.")
         return {"ok": True, "action": action, "item": values["item"], "pending": answer.get("pending"), "edits": EDITS}
     return write
+
+
+def check_prs(payload: dict):
+    """`POST /api/queue/prs/check` `{items}` (sd:8375): check the page's request, then return `pr_check`'s write."""
+    items = payload.get("items") if set(payload) == {"items"} else None
+    if (not isinstance(items, list) or not 1 <= len(items) <= PR_CHECK_ITEMS
+            or any(type(item) is not int or not 1 <= item <= 9223372036854775807 for item in items)):
+        raise ValueError(f"Name 1 to {PR_CHECK_ITEMS} items.")
+    return lambda connection: pr_check(connection, list(dict.fromkeys(items)))
+
+
+def pr_check(connection, items: list[int], *, client=None) -> dict:
+    """Read on GitHub the pull request each open item in `items` links and record it as the collector does.
+
+    `{"checked", "unread"}`: the items read, and one line per item whose pull was not read or merged while the item
+    stays open (`observe_pull` notes a merge and changes no status). Each record is its own transaction.
+    """
+    from types import SimpleNamespace
+
+    from sd_db import contribution_github as github
+    from sd_db import contributions
+
+    wanted = set(items)
+    linked = [(row["item_id"], row["url"]) for row in contributions.projection(connection)
+              if row["item_id"] in wanted and row["local_status"] != "done" and github.PULL.fullmatch(row["url"] or "")]
+    found: dict = {"checked": [], "unread": []}
+    if not linked:
+        return found
+    if client is None:
+        budget = SimpleNamespace(remaining=PR_CHECK_REQUESTS * len(linked) + 1, requests=0,
+                                 deadline=time.monotonic() + PR_CHECK_SECONDS)
+        client = github.Client(budget)
+    observed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    try:
+        operator = github.identity(client.get("/user"))
+        automation = github.automation_logins(connection)
+    except (ValueError, KeyError, TypeError, SdDbError) as error:
+        found["unread"] = [f"sd:{item} left open: {url} not read: {error}" for item, url in linked]
+        return found
+    for item, url in linked:
+        try:
+            url = github.canonical_url(url)
+            before = contributions.snapshot(connection, "github:" + url)
+            previous = before["observation"] or {}
+            observation = github.pull(client, url, operator, observed_at=observed_at, why=previous.get("why", []),
+                                      blocking_labels=previous.get("blocking_labels", []), automation=automation)
+            contributions.observe_pull(connection, url, observation, expected_revision=before["revision"])
+            found["checked"].append(item)
+            if observation["state"] == "merged":
+                found["unread"].append(f"sd:{item} open: {url} merged at {observation['merge_commit']}; close it")
+        except (ValueError, KeyError, TypeError, SdDbError) as error:
+            found["unread"].append(f"sd:{item} left open: {url}: {error}")
+    return found

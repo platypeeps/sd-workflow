@@ -574,6 +574,11 @@ def _undismiss(state, value) -> None:
 
 
 def observe_pull(connection, url, observation, *, expected_revision) -> dict:
+    """Record one complete pull-request read.
+
+    The read that first records the pull merged writes `PR <url> merged at <sha>` on each open item linking it and
+    changes no status (sd:8375): a merge is not proof the item is done, so the operator closes it.
+    """
     url = _url(url)
     with transaction(connection):
         state = _checked(connection, "github:" + url, expected_revision)
@@ -587,6 +592,8 @@ def observe_pull(connection, url, observation, *, expected_revision) -> dict:
                 return _hold(connection, state, "GitHub actor identity is unknown")
         for name in ("head", "base"):
             _sha(value.get(name), name)
+        if value.get("merge_commit") is not None:
+            _sha(value["merge_commit"], "merge_commit")
         if value.get("state") not in {"open", "closed", "merged"} or type(value.get("draft")) is not bool:
             raise WorkflowError("invalid pull-request lifecycle observation")
         if value.get("mergeable") not in {"mergeable", "conflicting", "unknown"} \
@@ -618,6 +625,11 @@ def observe_pull(connection, url, observation, *, expected_revision) -> dict:
         item = registered[0]["id"] if registered else None
         if registered and value.get("blocking_labels", []) != registered[1].get("blocking_labels", []):
             raise StaleItem("blocking-label policy changed; recollect with the current configuration")
+        if value["state"] == "merged" and (state["observation"] or {}).get("state") != "merged":
+            merged = f"PR {url} merged" + (f" at {value['merge_commit']}" if value.get("merge_commit") else "")
+            for row, metadata in _registered(connection, []):
+                if metadata.get("pull_url") == url and row["status"] != "done":
+                    add_note(connection, row["id"], "comment", merged, session=OBSERVER)
         contexts = _context_ids(value, state)
         attention, baseline = _pull_attention(value, state, contexts)
         state["context_events"] = contexts
