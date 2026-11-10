@@ -1103,14 +1103,17 @@ def end(connection, ident: str, outcome: str, detail: str, *, question: str | No
 
 def merged(connection, read: dict) -> bool:
     """The tick moves an `enqueued` run whose lane entry merged to `cleaning`, or to `checking` when auto-pickup
-    queued it (`picked`), with a fresh beat and no supervisor.
+    queued it (`picked`) on the hub's lane, with a fresh beat and no supervisor. `checking` runs the hub's
+    refresh and dashboard health; a satellite's run cleans, as a failed check there would turn auto-pickup off
+    for every host (review of sd:8393).
 
     The compare-and-set matches the row read, at `enqueued` and open; the
     process columns of the supervisor that enqueued it are cleared, so the
     tick spawns a fresh one and the reap judges it as any step.
     """
     with transaction(connection):
-        return _after_merge(connection, read, "checking" if picked(connection, read["assignment"]) else "cleaning")
+        check = run_host(read["owner"]) is None and picked(connection, read["assignment"])
+        return _after_merge(connection, read, "checking" if check else "cleaning")
 
 
 def _after_merge(connection, read: dict, step: str) -> bool:

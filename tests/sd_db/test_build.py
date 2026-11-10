@@ -1446,8 +1446,14 @@ class Hosts(Case):
                 mock.patch.object(build, "served_by", return_value="hub.example.test:7000"):
             self.assertEqual([row["id"] for row in build.eligible(self.db)], [satellite])
             self.assertEqual(build.pickup(self.db, build.room(self.db, **IDLE), now=Pickup.NOW), [satellite])
-        self.assertEqual(self.claim(hosts=WORK)["repo"], SAT, "the satellite claims its pick")
+        run = self.claim(hosts=WORK)
+        self.assertEqual(run["repo"], SAT, "the satellite claims its pick")
         self.assertEqual(self.count("SELECT status FROM item WHERE id = ?", hub), "ready", "the hub's waits")
+        build.write(self.db, run["id"], step="enqueuing")
+        build.enqueued(self.db, run["id"])
+        self.assertTrue(build.merged(self.db, build.run(self.db, run["id"])))
+        self.assertEqual(build.run(self.db, run["id"])["step"], "cleaning",
+                         "the health check after a merge is the hub's: a satellite's pick cleans")
 
     def test_the_hub_never_signals_or_reaps_a_satellite_run(self):
         """The hazard: the hub would probe pid 4242 here and kill group 777, which name a satellite's processes."""
