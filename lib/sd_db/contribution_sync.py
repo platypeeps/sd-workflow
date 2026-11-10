@@ -78,9 +78,14 @@ def _merge(pending, additions):
 
 #: The never-read keys a run reads ahead of the rotation, newest first (sd:7840).
 FRESH_SLOTS = 5
+#: Rows last read open that the shadow store shows merged or closed, read
+#: ahead of the rest, held ones too (sd:8456). Capped so a pull whose read
+#: keeps failing cannot take the whole budget every run.
+ENDED_SLOTS = 5
 
 
-def _order(pending, fresh=frozenset(), unread=frozenset(), *, snapshots=None, observed_at=None, held=frozenset()):
+def _order(pending, fresh=frozenset(), unread=frozenset(), *, snapshots=None, observed_at=None, held=frozenset(),
+           ended=frozenset()):
     # Explicit local work gets priority, while ordinary authored work has two
     # guaranteed slots before the rest follow in queue order. The budget, not a
     # count, decides how far down the list a run gets; rotation in `refresh`
@@ -104,6 +109,9 @@ def _order(pending, fresh=frozenset(), unread=frozenset(), *, snapshots=None, ob
     # last read failed, keeps its old reading and would lead every run, so
     # it rotates instead. The unread tier takes the newest queued first
     # (sd:8116): an open pull found today sat behind older unread ones.
+    # `ended` keys, last read open but merged or closed in the shadow store,
+    # lead after the explicit head, held or not (sd:8456): a held merged
+    # pull rotated behind thousands of keys and read open for days.
     from . import contributions as core
 
     snapshots = snapshots or {}
@@ -119,16 +127,20 @@ def _order(pending, fresh=frozenset(), unread=frozenset(), *, snapshots=None, ob
             return datetime.min.replace(tzinfo=timezone.utc)
 
     explicit = [row for row in pending if row.get("explicit")]
-    first = [row for row in reversed(pending) if not row.get("explicit") and row["key"] in unread][:UNREAD_SLOTS]
-    taken = {row["key"] for row in first}
+    head = explicit[:3]
+    head += [row for row in pending if row["key"] in ended and row not in head][:ENDED_SLOTS]
+    taken = {row["key"] for row in head}
+    first = [row for row in reversed(pending) if row["key"] not in taken and not row.get("explicit")
+             and row["key"] in unread][:UNREAD_SLOTS]
+    taken |= {row["key"] for row in first}
     ordinary = [row for row in pending if not row.get("explicit") and row["key"] not in taken]
-    ordered = explicit[:3] + first + ordinary[:2]
+    ordered = head + first + ordinary[:2]
     taken = {row["key"] for row in ordered}
     ordered += [row for row in reversed(pending) if row["key"] in fresh and row["key"] not in taken][:FRESH_SLOTS]
     taken = {row["key"] for row in ordered}
     # Every tier past the first skips the keys already taken: the fresh tier
     # can hold explicit rows, and a key read twice fails its revision check.
-    ordered += [row for row in explicit[3:] if row["key"] not in taken]
+    ordered += [row for row in explicit if row["key"] not in taken]
     taken = {row["key"] for row in ordered}
     opened = [(when, n, row) for n, row in enumerate(pending)
               if row["key"] not in taken and (when := reading(row)) is not None]
@@ -316,8 +328,11 @@ def refresh(connection, planned, issues, *, client, observed_at, search_complete
     snapshots = dict(planned["snapshots"])
     fresh = _fresh(connection, pending, snapshots)
     opened = [row["key"] for row in pending if ((snapshots.get(row["key"]) or {}).get("observation") or {}).get("state") == "open"]
+    facts = core._shadow_facts(connection, [key.split(":", 1)[1] for key in opened])
+    ended = {key for key in opened if any((facts.get(key.split(":", 1)[1]) or {}).get(name)
+                                          for name in ("merged_at", "closed_at"))}
     ordered = _order(pending, fresh, _unread_open(connection, issues, fresh), snapshots=snapshots,
-                     observed_at=observed_at, held={key for key in opened if _held(connection, key)})
+                     observed_at=observed_at, held={key for key in opened if _held(connection, key)}, ended=ended)
     completed, incomplete, attempted, terminal = [], [], [], set()
     operator, identified, automation = None, False, frozenset()
     # Pagination is not priced, so the client itself stops at the reserve: an

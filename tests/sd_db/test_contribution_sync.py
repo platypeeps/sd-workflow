@@ -668,6 +668,27 @@ class ContributionSync(SyncCase):
         ordered = adapter._order(planned["pending"], fresh)
         self.assertEqual([row["url"] for row in ordered], [old[2], old[3], old[0], old[1], URL, old[4]])
 
+    def test_a_held_open_pull_the_shadow_shows_merged_is_read_ahead(self):
+        # sd:8456: a read that failed mid-collection held a pull last read
+        # open; it rotated behind thousands of queued keys and stayed open
+        # after GitHub merged it, though the shadow store had its merge.
+        self.assertTrue(self.run_sync([URL]).ok)
+        detail = self.api.rows[ROOT + "/pulls/7"]
+        self.api.rows[ROOT + "/pulls/7"] = Response(503, {}, "")
+        self.run_sync()
+        self.assertTrue(adapter._held(self.db, "github:" + URL))
+        self.api.rows[ROOT + "/pulls/7"] = detail
+        self.backlog(range(8, 20))
+        self.db.execute("UPDATE shadow SET state = 'merged', merged_at = ? WHERE url = ?", (AT, URL))
+        self.db.commit()
+        self.api.detail.update(state="closed", merged=True, merge_commit_sha="c" * 40,
+                               updated_at="2026-09-10T02:00:00Z")
+        client = self.api.client(requests=1 + adapter.PULL_REQUESTS)
+        result = adapter.refresh(self.db, adapter.plan(self.db), [], client=client,
+                                 observed_at=self.now.isoformat())
+        self.assertEqual(result["completed_keys"], ["github:" + URL])
+        self.assertEqual(core.snapshot(self.db, "github:" + URL)["observation"]["state"], "merged")
+
     def test_a_never_read_backlog_takes_a_few_slots_and_observed_work_keeps_its_turn(self):
         # Review of sd:7840: every never-read key went ahead of the rotation,
         # the ~4,900 backlog included, so explicit work past the first three
