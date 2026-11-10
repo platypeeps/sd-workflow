@@ -71,6 +71,9 @@ CHECKOUT = system_checkout()
 SECONDS = 30
 #: The most of a step's output an answer carries: the tail, where a failure says why.
 OUTPUT_CHARS = 64 * 1024
+#: Folders a step's PATH gains ahead of the server's: launchd's PATH has no keg-only tool, so a Studio Check's
+#: `make` found no `cargo` from Homebrew's rustup (sd:8343).
+TOOL_DIRS = ("/opt/homebrew/opt/rustup/bin",)
 #: The lines of a job's log Show log prints.
 LOG_LINES = 200
 #: The entries Show biggest lists.
@@ -892,6 +895,13 @@ def _studio():
 _studio()
 
 
+def _tool_env() -> dict:
+    """The server's environment, its PATH led by `TOOL_DIRS` it does not already hold."""
+    path = os.environ.get("PATH", "")
+    extra = [folder for folder in TOOL_DIRS if folder not in path.split(":")]
+    return {**os.environ, "PATH": ":".join([*extra, path] if path else extra)}
+
+
 def run(name: str, step: Step) -> tuple[int, dict]:
     """The step, bounded: 200 with its exit and output tail, or 504 when it ran past its bound."""
     answer = {"action": name, "label": ACTIONS[name][0], "line": step.line}
@@ -902,7 +912,7 @@ def run(name: str, step: Step) -> tuple[int, dict]:
     else:
         try:
             done = subprocess.run(list(step.argv), cwd=step.cwd, input=step.stdin if step.stdin is not None else "",
-                                  capture_output=True, text=True, timeout=step.seconds, check=False, env=step.env)
+                                  capture_output=True, text=True, timeout=step.seconds, check=False, env=step.env if step.env is not None else _tool_env())
             code, output = done.returncode, (done.stdout + (("\n" if done.stdout and done.stderr else "") + done.stderr))
         except subprocess.TimeoutExpired:
             code, output = None, f"It gave no answer in {step.seconds} s; its process was stopped."
