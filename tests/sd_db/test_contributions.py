@@ -1911,6 +1911,11 @@ class CloseOnMerge(ContributionCase):
     def status(self, item):
         return self.db.execute("SELECT status FROM item WHERE id = ?", (item,)).fetchone()["status"]
 
+    def prerequisite(self):
+        from sd_db.workflow import capture_task
+
+        return capture_task(self.db, title="Prerequisite", priority=3, who="operator")["item"]["id"]
+
     def notes(self, item):
         return [row["body"] for row in self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id", (item,))]
 
@@ -1933,8 +1938,41 @@ class CloseOnMerge(ContributionCase):
         c.observe_pull(self.db, DEPENDENCY, other, expected_revision=c.snapshot(self.db, "github:" + DEPENDENCY)["revision"])
         self.observe(state="merged", merge_commit=self.MERGE)
         self.assertEqual(self.status(item), "planning")
-        self.assertIn(f"PR {URL} merged at {self.MERGE}; left open: {DEPENDENCY} is not merged",
+        self.assertIn(f"PR {URL} merged at {self.MERGE}; left open: merge dependency {DEPENDENCY} is not satisfied",
                       "\n".join(self.notes(item)))
+
+    def test_an_item_with_an_unmet_item_issue_or_release_dependency_stays_open(self):
+        release = {"kind": "release", "repo": "upstream/project", "tag": "v1.0.0", "contains_pull": URL}
+        for dependency in ({"kind": "item"}, {"kind": "issue", "url": ISSUE}, release):
+            with self.subTest(kind=dependency["kind"]):
+                self.setUp()
+                if dependency["kind"] == "item":
+                    dependency = {"kind": "item", "item": self.prerequisite()}
+                item = self.item(depends_on=[dependency])
+                self.observe(state="merged", merge_commit=self.MERGE)
+                self.assertEqual(self.status(item), "planning")
+                self.assertIn(f"PR {URL} merged at {self.MERGE}; left open: {dependency['kind']} dependency",
+                              "\n".join(self.notes(item)))
+
+    def test_an_item_whose_dependencies_are_recorded_satisfied_closes(self):
+        prerequisite = self.prerequisite()
+        dependency = {"kind": "item", "item": prerequisite}
+        item = self.item(depends_on=[dependency])
+        transition(self.db, prerequisite, "done", who="operator", reason="finished")
+        self.db.commit()
+        self.observe(state="merged", merge_commit=self.MERGE)
+        self.assertEqual(self.status(item), "done")
+
+    def test_a_merged_item_closes_when_its_dependencies_are_first_satisfied(self):
+        release = {"kind": "release", "repo": "upstream/project", "tag": "v1.0.0", "contains_pull": URL}
+        item = self.item(depends_on=[release])
+        self.observe(state="merged", merge_commit=self.MERGE)
+        self.assertEqual(self.status(item), "planning", "the release is not out yet")
+        proof = {"repo": "upstream/project", "tag": "v1.0.0", "contains_pull": URL, "published": True, "merged": True,
+                 "ancestor": True, "merge_commit_sha": self.MERGE, "tag_commit": "e" * 40}
+        c.observe_dependencies(self.db, item, [{"dependency": release, "state": "satisfied", "proof": proof}],
+                               observed_at=T1, expected_revision=c.snapshot(self.db, f"item:{item}")["revision"])
+        self.assertEqual(self.status(item), "done")
 
     def test_a_reopened_item_stays_open_when_the_merge_is_recorded_again(self):
         item = self.item()
