@@ -959,8 +959,12 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     kept = []
     for index, (sha, message) in enumerate(commits):
         if "Closes:" in message and any(REVERT_SUBJECT.match(later) for _, later in commits[:index]):
-            files = lane_git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-r", sha)
-            if files and lane_git(worktree, "diff", "--name-only", f"{sha}^", head, "--", *files.split("\n")) == "":
+            # NUL-separated and literal: git quotes a name with a tab or non-ASCII byte otherwise.
+            files = publish_git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-z", "-r", sha)
+            names = [name for name in files.stdout.split("\0") if name] if files and files.returncode == 0 else []
+            same = names and publish_git(worktree, "--literal-pathspecs", "diff", "--quiet", f"{sha}^", head,
+                                         "--", *names)
+            if same and same.returncode == 0:
                 continue
         kept.append((sha, message))
     return kept

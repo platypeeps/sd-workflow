@@ -3022,6 +3022,23 @@ class CitedCloses(SharedQueue):
         entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
         self.assertEqual(entry["closes"], [b])
 
+    def test_a_revert_of_other_work_keeps_a_close_on_a_quoted_filename(self) -> None:
+        """sd:8373 review: git quotes a name with a tab or non-ASCII byte; a quoted pathspec matched nothing."""
+        a, b, *_ = self.open
+        tree, _ = self.committed("topic-quoted-name")
+        name = " naïve\tname.txt"
+        (tree / name).write_text("work\n", encoding="utf-8")
+        git(tree, "add", "--", name)
+        git(tree, "commit", "-q", "-m", f"feat: implement\n\nCloses: sd:{a}")
+        (tree / "other.txt").write_text("other\n", encoding="utf-8")
+        git(tree, "add", "other.txt")
+        git(tree, "commit", "-q", "-m", f"fix: other\n\nCloses: sd:{b}")
+        git(tree, "rm", "-q", "other.txt")
+        git(tree, "commit", "-q", "-m", "revert: hold the other fix")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [a])
+
     def test_a_later_change_that_is_no_revert_keeps_the_close(self) -> None:
         """sd:8373: only a revert subject undoes a cited commit; a later fix that empties the file does not."""
         a, *_ = self.open
