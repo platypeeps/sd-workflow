@@ -67,6 +67,7 @@ The view reads its three documents when it first shows, on each Today read after
 A source that was not read is named under the table.
 Read again on this view first posts `/api/queue/prs/check` with the items its PR rows show, at most 20 (sd:8375):
 the server reads each linked pull request on GitHub, records it, and closes an item whose pull request merged.
+An open item whose pull request is recorded merged is checked again on each Read again until it closes.
 A pull request it could not read, or an item it could not close, stays open and is named under the table.
 The 30 s poll reads only the database.
 

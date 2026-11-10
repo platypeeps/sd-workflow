@@ -905,7 +905,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // server closes an item whose PR merged. What it could not read or close stays open and is named under the table.
   async function prCheck() {
     const items = [...new Set((((QV.lanes || {}).prs || {}).rows || []).filter(p => p.item != null).map(p => Number(p.item)))].slice(0, 20);
-    if (!items.length) { QV.prCheck = null; return; }
+    // Posted with no items too: the server also checks an open item whose PR it recorded merged but did not close.
     try { QV.prCheck = (await shell.post('/api/queue/prs/check', { items })).unread || []; }
     catch (e) { QV.prCheck = [`Pull requests not checked on GitHub: ${e.message}`]; }
   }

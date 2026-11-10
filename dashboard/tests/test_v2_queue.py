@@ -866,13 +866,19 @@ class ThePrCheck(BrowserSession):
         states = {21: ("merged", "9" * 40), 22: ("closed", None), 23: ("open", None)}
         self.read = []
 
+        self.merge_fails = False
+        test = self
+
         class Client:
             def __init__(self, budget):
                 pass
 
             def get(self, path):
-                return {"id": 1, "login": "operator"} if path == "/user" \
-                    else {"merge_commit_sha": states[int(path.rsplit("/", 1)[1])][1]}
+                if path == "/user":
+                    return {"id": 1, "login": "operator"}
+                if test.merge_fails:
+                    raise contribution_github.Exhausted("contribution collection budget exhausted")
+                return {"merge_commit_sha": states[int(path.rsplit("/", 1)[1])][1]}
 
         def pull(client, url, operator, **_):
             n = int(url.rsplit("/", 1)[1])
@@ -906,10 +912,19 @@ class ThePrCheck(BrowserSession):
         closed = self.contributions.snapshot(self.connection, "github:https://github.com/example/system/pull/22")
         self.assertEqual(closed["observation"]["state"], "closed")
 
+    def test_a_merged_pull_whose_close_failed_is_closed_by_a_later_check_that_does_not_name_it(self):
+        """The merged observation is recorded before the close, so the PR row is gone; the next check still closes it."""
+        self.merge_fails = True
+        status, _, answer = self.post("/api/queue/prs/check", {"items": [self.items[21]]})
+        self.assertEqual((status, answer["closed"], self.status(21)), (200, [], "planning"), answer)
+        self.merge_fails = False
+        status, _, answer = self.post("/api/queue/prs/check", {"items": []})
+        self.assertEqual((status, answer["closed"], self.status(21)), (200, [self.items[21]], "done"), answer)
+
     def test_only_the_named_items_are_read_and_the_request_is_bounded(self):
         status, _, _ = self.post("/api/queue/prs/check", {"items": [self.items[22]]})
         self.assertEqual((status, self.read), (200, [22]))
-        for payload in ({"items": []}, {"items": ["1"]}, {"items": list(range(1, queue_screen.PR_CHECK_ITEMS + 2))},
+        for payload in ({"items": ["1"]}, {"items": list(range(1, queue_screen.PR_CHECK_ITEMS + 2))},
                         {"items": [1], "extra": 1}):
             status, _, _ = self.post("/api/queue/prs/check", payload)
             self.assertEqual(status, 400, payload)
@@ -1333,6 +1348,14 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertEqual(out["at"], out["R"]["before"], "the page read again before the check answered")
         self.assertIn("/api/queue", out["gets"][out["at"]:])
         self.assertIn("sd:902 left open: not read", out["R"]["note"])
+
+    def test_read_again_on_queue_with_no_pr_row_still_checks(self):
+        """A merged PR whose close failed has no PR row; the server finds it, so the page posts with none."""
+        answers = self.pr_answers()
+        answers["/api/queue"][1]["prs"] = {"rows": [], "error": ""}
+        out = self.run_view("window.shell.view.current = () => 'queue'; await window.PAGE_AGAIN.run(); await flush();",
+                            answers=answers)
+        self.assertEqual([p[:2] for p in out["posts"]], [["/api/queue/prs/check", {"items": []}]])
 
     def test_read_again_off_queue_or_a_failed_check_still_reads(self):
         out = self.run_view("await window.PAGE_AGAIN.run(); await flush();", answers=self.pr_answers())
