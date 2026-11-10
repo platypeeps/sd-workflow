@@ -278,7 +278,7 @@ def cited(worktree: Path, base: str, head: str, body: str) -> set[int] | None:
     import sd_ship_body
     branch = base.removeprefix("origin/")
     try:
-        commits = sd_lane.branch_commits(worktree, branch, head)
+        commits = sd_lane.unreverted(worktree, head, sd_lane.branch_commits(worktree, branch, head))
         parents = sd_lane.branch_parents(worktree, branch, head)
     except sd_lane.LaneError:
         return None

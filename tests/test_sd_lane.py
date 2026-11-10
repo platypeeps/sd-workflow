@@ -3004,6 +3004,37 @@ class CitedCloses(SharedQueue):
         entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
         self.assertEqual(entry["closes"], [a])
 
+    def test_a_hand_written_revert_closes_nothing_it_undid(self) -> None:
+        """sd:8373: a `revert:` commit naming no sha undid a cited commit and its fixes; the item closed."""
+        a, b, *_ = self.open
+        tree, _ = self.committed("topic-hand-revert")
+        (tree / "kept.txt").write_text("kept\n", encoding="utf-8")
+        git(tree, "add", "kept.txt")
+        git(tree, "commit", "-q", "-m", f"fix: kept\n\nCloses: sd:{b}")
+        (tree / "work.txt").write_text("work\n", encoding="utf-8")
+        git(tree, "add", "work.txt")
+        git(tree, "commit", "-q", "-m", f"feat: implement\n\nCloses: sd:{a}")
+        (tree / "work.txt").write_text("work, fixed\n", encoding="utf-8")
+        git(tree, "commit", "-q", "-am", "fix: the work")
+        git(tree, "rm", "-q", "work.txt")
+        git(tree, "commit", "-q", "-m", "revert: hold the work for a redesign\n\nThe operator split it out.")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [b])
+
+    def test_a_later_change_that_is_no_revert_keeps_the_close(self) -> None:
+        """sd:8373: only a revert subject undoes a cited commit; a later fix that empties the file does not."""
+        a, *_ = self.open
+        tree, _ = self.committed("topic-later-fix")
+        (tree / "work.txt").write_text("work\n", encoding="utf-8")
+        git(tree, "add", "work.txt")
+        git(tree, "commit", "-q", "-m", f"feat: implement\n\nCloses: sd:{a}")
+        git(tree, "rm", "-q", "work.txt")
+        git(tree, "commit", "-q", "-m", "refactor: fold the work into the caller")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [a])
+
     def test_an_associate_only_claim_closes_nothing_it_cites(self) -> None:
         entry = self.enqueue("Words.\n", f"fix: the slice\n\nCloses: sd:{self.open[0]}", claim="associate-only")
         self.assertEqual(entry["closes"], [])
