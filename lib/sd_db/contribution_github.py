@@ -442,7 +442,9 @@ def pull(client, url, operator, *, observed_at, why=(), blocking_labels=(), auto
             "head": head, "base": base, "mergeable": "unknown" if mergeable is None else "mergeable" if mergeable is True else "conflicting",
             "ci": ci, "ci_head": head, "ci_ids": ci_ids, "why": list(why),
             "blocking_labels": list(blocking_labels), "labels": labels,
-            "reviews": reviews, "events": events}
+            "reviews": reviews, "events": events,
+            # sd:8375: the merge commit closes the linked item's note with it.
+            **({"merge_commit": before.get("merge_commit_sha")} if before["merged"] else {})}
 
 
 # GitHub's REST `state_reason` and the timeline's `stateReason` name the same
