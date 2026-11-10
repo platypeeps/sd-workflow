@@ -778,8 +778,8 @@ class ContributionSync(SyncCase):
         self.assertEqual(len(self.sent), 1)
         self.assertTrue(self.run_sync().ok)
         self.assertEqual(len(self.sent), 1)
-        # sd:8375: its own pull request merged, so the sync that recorded that closed it.
-        self.assertEqual(core.projection(self.db)[0]["local_status"], "done")
+        # sd:8375: its release was unmet when the merge was recorded, and a later proof closes nothing.
+        self.assertEqual(core.projection(self.db)[0]["local_status"], "planning")
 
     def test_queue_revision_conflict_does_not_overwrite_pending_work(self):
         self.run_sync([URL])

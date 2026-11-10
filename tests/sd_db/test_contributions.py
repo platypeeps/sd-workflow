@@ -1938,7 +1938,7 @@ class CloseOnMerge(ContributionCase):
         c.observe_pull(self.db, DEPENDENCY, other, expected_revision=c.snapshot(self.db, "github:" + DEPENDENCY)["revision"])
         self.observe(state="merged", merge_commit=self.MERGE)
         self.assertEqual(self.status(item), "planning")
-        self.assertIn(f"PR {URL} merged at {self.MERGE}; left open: merge dependency {DEPENDENCY} is not satisfied",
+        self.assertIn(f"PR {URL} merged at {self.MERGE}; not closed: merge dependency {DEPENDENCY} is not satisfied",
                       "\n".join(self.notes(item)))
 
     def test_an_item_with_an_unmet_item_issue_or_release_dependency_stays_open(self):
@@ -1951,7 +1951,7 @@ class CloseOnMerge(ContributionCase):
                 item = self.item(depends_on=[dependency])
                 self.observe(state="merged", merge_commit=self.MERGE)
                 self.assertEqual(self.status(item), "planning")
-                self.assertIn(f"PR {URL} merged at {self.MERGE}; left open: {dependency['kind']} dependency",
+                self.assertIn(f"PR {URL} merged at {self.MERGE}; not closed: {dependency['kind']} dependency",
                               "\n".join(self.notes(item)))
 
     def test_an_item_whose_dependencies_are_recorded_satisfied_closes(self):
@@ -1963,16 +1963,29 @@ class CloseOnMerge(ContributionCase):
         self.observe(state="merged", merge_commit=self.MERGE)
         self.assertEqual(self.status(item), "done")
 
-    def test_a_merged_item_closes_when_its_dependencies_are_first_satisfied(self):
-        release = {"kind": "release", "repo": "upstream/project", "tag": "v1.0.0", "contains_pull": URL}
-        item = self.item(depends_on=[release])
-        self.observe(state="merged", merge_commit=self.MERGE)
-        self.assertEqual(self.status(item), "planning", "the release is not out yet")
+    def satisfy(self, item, release):
         proof = {"repo": "upstream/project", "tag": "v1.0.0", "contains_pull": URL, "published": True, "merged": True,
                  "ancestor": True, "merge_commit_sha": self.MERGE, "tag_commit": "e" * 40}
         c.observe_dependencies(self.db, item, [{"dependency": release, "state": "satisfied", "proof": proof}],
                                observed_at=T1, expected_revision=c.snapshot(self.db, f"item:{item}")["revision"])
-        self.assertEqual(self.status(item), "done")
+
+    def test_a_merge_refused_for_a_dependency_is_not_retried_when_it_is_satisfied(self):
+        release = {"kind": "release", "repo": "upstream/project", "tag": "v1.0.0", "contains_pull": URL}
+        item = self.item(depends_on=[release])
+        self.observe(state="merged", merge_commit=self.MERGE)
+        self.assertEqual(self.status(item), "planning", "the release is not out yet")
+        self.satisfy(item, release)
+        self.assertEqual(self.status(item), "planning", "only the open -> merged record closes")
+
+    def test_a_reopened_item_stays_open_when_a_dependency_is_then_satisfied(self):
+        release = {"kind": "release", "repo": "upstream/project", "tag": "v1.0.0", "contains_pull": URL}
+        item = self.item(depends_on=[release])
+        self.observe(state="merged", merge_commit=self.MERGE)
+        transition(self.db, item, "done", who="operator", reason="finished by hand")
+        transition(self.db, item, "in_progress", who="operator", reason="not finished")
+        self.db.commit()
+        self.satisfy(item, release)
+        self.assertEqual(self.status(item), "in_progress")
 
     def test_a_reopened_item_stays_open_when_the_merge_is_recorded_again(self):
         item = self.item()
@@ -1989,4 +2002,4 @@ class CloseOnMerge(ContributionCase):
         result = self.observe(state="merged", merge_commit=self.MERGE)
         self.assertEqual(result["observation"]["state"], "merged", "the merge is recorded all the same")
         self.assertEqual(self.status(item), "in_progress")
-        self.assertIn(f"PR {URL} merged at {self.MERGE}; left open: ", "\n".join(self.notes(item)))
+        self.assertIn(f"PR {URL} merged at {self.MERGE}; not closed: ", "\n".join(self.notes(item)))

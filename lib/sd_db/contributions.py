@@ -646,24 +646,24 @@ def observe_pull(connection, url, observation, *, expected_revision) -> dict:
         return result
 
 
-def _close_merged(connection, url: str, commit, only: int | None = None) -> None:
+def _close_merged(connection, url: str, commit) -> None:
     """Close each open item linking pull request `url`, on the observation that first records it merged (sd:8375).
 
-    Whoever records the merge closes, the nightly sync or a Read again, so no surface has to see it first. Only the
-    transition closes: an item reopened after a recorded merge stays open. An item with a dependency not met
-    (`_refuse_unmet`) stays open, and `observe_dependencies` closes it with `only` when they are first all
-    satisfied after the merge was recorded. An item the move refuses (a `work` item needs delivery evidence, a queued or
-    running assignment), stays open with a note that names the merge and why; the merge is recorded all the same.
+    Whoever records the merge closes, the nightly sync or a Read again, so no surface has to see it first. Only that
+    open -> merged transition closes, and it is never retried: an item reopened after a recorded merge stays open, and
+    a dependency satisfied later closes nothing. An item with a dependency not met (`_refuse_unmet`) or one the move
+    refuses (a `work` item needs delivery evidence, a queued or running assignment) stays open with a note that names
+    the merge and why; the merge is recorded all the same.
     """
     said = f"PR {url} merged" + (f" at {commit}" if isinstance(commit, str) and SHA.fullmatch(commit) else "")
     for row, metadata in _registered(connection, []):
-        if metadata.get("pull_url") != url or row["status"] == "done" or only not in (None, row["id"]):
+        if metadata.get("pull_url") != url or row["status"] == "done":
             continue
         try:
             _refuse_unmet(connection, row["id"], url, metadata.get("depends_on", []))
             change_status(connection, row["id"], "done", who="contribution-observer", reason=said)
         except (WorkflowError, TransitionRefused) as error:
-            add_note(connection, row["id"], "comment", f"{said}; left open: {error}", session="contribution-observer")
+            add_note(connection, row["id"], "comment", f"{said}; not closed: {error}", session="contribution-observer")
 
 
 def _refuse_unmet(connection, item: int, url: str, dependencies: list) -> None:
@@ -876,11 +876,6 @@ def observe_dependencies(connection, item, observations, *, observed_at, expecte
         state["observation"] = {"observed_at": observed_at, "configured": dependencies, "dependencies": verified, "satisfied": satisfied}
         _publish_attention(connection, state, attention, item)
         result = _save(connection, state)
-        if satisfied and previous.get("satisfied") is not True and metadata.get("pull_url"):
-            # sd:8375: a merge recorded while a dependency was unmet left the item open; this is its close.
-            pulled = snapshot(connection, "github:" + metadata["pull_url"])["observation"] or {}
-            if pulled.get("state") == "merged":
-                _close_merged(connection, metadata["pull_url"], pulled.get("merge_commit"), only=item)
         record_state(connection, "heartbeat", key="contribution-observe:" + state["key"], body={"ok": True})
         _note_lane(connection, item)
         return result
