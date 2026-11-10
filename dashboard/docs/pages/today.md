@@ -65,6 +65,10 @@ shows too. `?show=` keeps the choice: no key is the default, and an empty `show=
 All items lists no idea kind (pack sd:7699): ideas live on Writing.
 The view reads its three documents when it first shows, on each Today read after, and every 30 s while it shows.
 A source that was not read is named under the table.
+Read again on this view first posts `/api/queue/prs/check` with the items its PR rows show, at most 20 (sd:8375):
+the server reads each linked pull request on GitHub, records it, and closes an item whose pull request merged.
+A pull request it could not read, or an item it could not close, stays open and is named under the table.
+The 30 s poll reads only the database.
 
 A live row's click shows its Details with Open item, Show assignment and Fix (sd:6714).
 Up, down, top, hold, release and cancel, a blocked row's Retry and Approve, a cancelled row's Re-queue and a running
