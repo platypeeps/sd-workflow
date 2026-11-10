@@ -10,7 +10,7 @@ Ship one `ready` piece: final gates, one approved tip, one confirmed push to the
 Run from the root of the writing content repository. `pack` below means `python3 scripts/pack.py`.
 Read `references/publication.md` in full before a claim or push: it owns the claim, the connector actions, the readback and the recovery.
 The repository's `CLAUDE.md` names the primary blog that reads the publishing folder, and its `--target` name, written `<primary>` below.
-A second, shorter version for a personal blog is `sd-publish` work, after the live URL exists.
+A second, shorter version for a personal blog is separate work, after the live URL exists.
 
 It has no `bin/` command: the steps below are the procedure, and `scripts/pack.py` dispatches each connector action.
 
@@ -40,7 +40,7 @@ The primary blog publishes from the Drive doc on its own schedule. When the user
 1. `pack pieces set-published-url --piece <year>/<slug> --target <primary> --url "<live URL>"`.
 2. With a tip: `sd store set sdw.tip "<tip title>" --field status=published --field url="<live URL>" --field used-by=<year>/<slug>`.
 3. With `obsidian_source`: `sd store set sdw.blog-idea "<idea title>" --field status=published --field url="<live URL>"`. The idea must be at `drafting`. Set the note's `url` to the live primary URL, not the Drive doc.
-4. Only now may `sd-publish` write a personal-blog version that links to it.
+4. Only now may a separate step write a personal-blog version that links to it.
 
 Never guess or build the live URL from a title or slug. A plausible 404 reads as done; a null reads as not live yet.
 

@@ -83,7 +83,7 @@ class TheRun(ScreenCase):
             self.start(shadow_run.Run(), stub)
         self.assertEqual([call[2] for call in stub.calls], [120, 20])
         transport = stub.calls[1][4]
-        with patch("sd_db.shadow_jira._http", lambda *a: ({"ok": 1}, "")) as _:
+        with patch("sd_db.shadow_jira._http", lambda *a, **k: ({"ok": 1}, "")) as _:
             with patch.object(shadow_run.time, "monotonic", lambda: 1119.0):
                 self.assertEqual(transport("https://jira.example.test/x", {}, None), ({"ok": 1}, ""))
             with patch.object(shadow_run.time, "monotonic", lambda: 1120.0):
@@ -206,3 +206,18 @@ class TheLibraryLock(ScreenCase):
 if __name__ == "__main__":
     unittest.main()
 
+
+
+class TheJiraTransport(unittest.TestCase):
+    """sd:8293 review: `jira_moves` assigns a ticket with a PUT, so the dashboard's transport takes a method."""
+
+    def test_the_transport_forwards_a_method_to_the_library(self):
+        import time
+
+        transport = shadow_run._until(time.monotonic() + 60)
+        with patch("sd_db.shadow_jira._http", return_value=({}, "")) as http:
+            self.assertEqual(transport("https://jira.example.test/x", {}, {"accountId": "a"}, method="PUT"),
+                             ({}, ""))
+            transport("https://jira.example.test/y", {}, None)
+        self.assertEqual(http.call_args_list[0].kwargs, {"method": "PUT"})
+        self.assertEqual(http.call_args_list[1].kwargs, {"method": None})

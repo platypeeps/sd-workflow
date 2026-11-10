@@ -190,6 +190,7 @@ class OperationsCLI(unittest.TestCase):
         run.Tools = lambda **tools: types.SimpleNamespace(**tools)
         run.local_root = Mock(return_value=Path("/local"))
         run.archive = Mock(return_value=[])
+        run.archive_wait = Mock()
         for patcher in (patch.dict(sys.modules, {"sd_db.build": build, "sd_db.build_run": run}),
                         patch.object(sd_db, "build", build, create=True),
                         patch.object(sd_db, "build_run", run, create=True),
@@ -235,6 +236,22 @@ class OperationsCLI(unittest.TestCase):
         # pack sd:8246: a live run logs to the local folder; the tick moves an ended run's files to the bulk root.
         self.assertEqual(run.spawn.call_args.kwargs["log"], Path("/local/r1.supervisor.log"))
         run.archive.assert_called_once_with(self.connection, Path("/local"), Path("/bulk"))
+
+    def test_the_tick_gives_the_archive_copier_the_rest_of_its_budget(self):
+        """sd:8339: the tick exited after `archive`'s 20 s wait and killed its copier, so a copy that took longer
+        never landed; before sd:8275 it had the tick's whole budget. It waits once the connection is closed."""
+        run = self.builds()
+        run.archive_wait.side_effect = lambda seconds: self.connection.close.assert_called_once()
+        with patch.object(cli, "gate_load", return_value=(1.0, 40.0)), \
+                patch.object(cli, "interactive_builders", return_value=[]), \
+                patch.object(cli, "log_root", return_value=Path("/bulk")), \
+                patch.object(cli, "writable", return_value=True), \
+                patch.object(cli, "TICK_SECONDS", 30, create=True):
+            code, _ = self.call("assignments", "dispatch")
+        self.assertEqual(code, 0)
+        run.archive.assert_called_once()
+        (seconds,), _ = run.archive_wait.call_args
+        self.assertTrue(25 < seconds <= 30, seconds)
 
     def tick(self, run):
         with patch.object(cli, "gate_load", return_value=(1.0, 40.0)), \
