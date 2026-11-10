@@ -40,7 +40,6 @@ The hub's tick and each satellite's act only on their own lanes' runs
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
 import re
@@ -57,7 +56,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import build, contributions, draft, paths, remote, sessions
+from . import build, contributions, draft, paths, remote, runner_journal, sessions
 from .build import Probe
 from .config import system_checkout
 from .database import Patient, transaction
@@ -675,6 +674,10 @@ def _same_copy(path: Path, target: Path) -> bool:
     return copy.st_size == source.st_size and abs(copy.st_mtime - source.st_mtime) <= 2
 
 
+class _ArchiveLocked(Exception):
+    """`runner_journal.lock` refused the archive lock: held by a live copier when its cause is BlockingIOError."""
+
+
 #: The copier the last `archive` in this process started; `archive_wait` gives it the rest of the tick.
 _copier: threading.Thread | None = None
 
@@ -725,12 +728,14 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
         pending.append((path, bulk / path.relative_to(local)))
     if not pending:
         return []
-    lock = os.open(local / ARCHIVE_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+    held = contextlib.ExitStack()  # the copier thread closes it: the lock lasts as long as the copier
     try:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        os.close(lock)
-        return []  # an earlier copier still runs: it may hold any of these files open
+        held.enter_context(runner_journal.lock(local / ARCHIVE_LOCK, blocking=False, noun="build archive",
+                                               error=_ArchiveLocked))
+    except _ArchiveLocked as refused:
+        if isinstance(refused.__cause__, BlockingIOError):
+            return []  # an earlier copier still runs: it may hold any of these files open
+        raise OSError(str(refused)) from refused
     copied: list[tuple[Path, Path]] = []
 
     def copy() -> None:
@@ -760,7 +765,7 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
                     continue
                 copied.append((path, target))
         finally:
-            os.close(lock)
+            held.close()
 
     global _copier
     worker = _copier = threading.Thread(target=copy, name="sd-build-archive", daemon=True)
