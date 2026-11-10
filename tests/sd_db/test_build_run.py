@@ -2708,14 +2708,32 @@ class Hosts(Case):
         with self.on("work"):
             self.assertEqual(self.tick()["moved"], [{"run": run["id"], "step": "cleaning"}])
 
-    def test_a_satellite_tick_runs_no_draft_or_pickup(self):
+    def test_a_satellite_pick_that_merges_cleans_and_leaves_pickup_on(self):
+        """Review of sd:8393: `checking` runs the hub's refresh and dashboard health; on a satellite they fail
+        and would turn auto-pickup off for every host. A satellite's merged pick goes to `cleaning`."""
+        build.set_pickup(self.db, True)
+        sat = create_item(self.db, kind="task", title="Satellite", repo=str(self.satellite), status="ready")
+        with self.on("work"):
+            result = self.tick()
+        self.assertEqual(result["picked"], [sat])
+        run = build.run(self.db, result["claimed"][0])
+        build.write(self.db, run["id"], step="enqueuing")
+        self.assertTrue(build.enqueued(self.db, run["id"]))
+        self.entries[sat] = {"id": "e1", "status": "merged"}
+        with self.on("work"):
+            self.assertEqual(self.tick()["moved"], [{"run": run["id"], "step": "cleaning"}])
+        self.assertTrue(build.pickup_state(self.db)["on"])
+
+    def test_a_satellite_tick_picks_its_own_lanes_and_drafts_nothing(self):
+        """Sd:8393: a satellite's tick picks and claims its own lane's ready item; drafts stay the hub's."""
         build.set_pickup(self.db, True)
         ready = create_item(self.db, kind="task", title="Ready", repo=str(self.repo), status="ready")
+        mine = create_item(self.db, kind="task", title="Mine", repo=str(self.satellite), status="ready")
         planned = create_item(self.db, kind="task", title="Draft", repo=str(self.repo), status="planning")
         self.assertIsNotNone(draft.queue_if_eligible(self.db, planned, who="dashboard"))
         with self.on("work"):
             result = self.tick()
-        self.assertEqual((result["picked"], result["drafted"], result["claimed"]), ([], [], []))
+        self.assertEqual((result["picked"], result["drafted"], len(result["claimed"])), ([mine], [], 1))
         self.assertEqual(item_state(self.db, ready)["item"]["status"], "ready")
         self.assertIsNone(draft.queue_if_eligible(
             self.db, create_item(self.db, kind="task", title="Sat", repo=str(self.satellite), status="planning"),

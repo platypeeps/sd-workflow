@@ -1434,11 +1434,26 @@ class Hosts(Case):
                 room = build.room(self.db, **IDLE, hosts=hosts)
                 self.assertEqual((room["machine"], room["used"]), (build.MACHINE_CAP - 1, {repo: 1}))
 
-    def test_auto_pickup_skips_a_satellite_lane(self):
+    def test_auto_pickup_runs_on_each_lane_host_for_its_own_lanes(self):
+        """Sd:8393: a satellite lane's ready item got no build while pickup ran on the hub only; each host's
+        dispatcher picks for its own lanes, under its own caps, and its claim takes the row."""
         hub, satellite = self.item(), self.item(repo=SAT)
-        self.assertEqual([row["id"] for row in build.eligible(self.db)], [hub])
-        with self.assertRaisesRegex(build.BuildRefused, "auto-pickup and drafts run on the hub only"):
-            build._item(self.db, satellite, hub_only=True)
+        self.assertEqual([row["id"] for row in build.eligible(self.db)], [hub], "the hub picks the hub's lanes")
+        build.set_pickup(self.db, True, now=Pickup.NOW)
+        with mock.patch.object(build, "this_host", return_value="work"), \
+                mock.patch("sd_db.hub.configured", return_value=True), \
+                mock.patch.object(build, "hub_host", return_value="hub"), \
+                mock.patch.object(build, "served_by", return_value="hub.example.test:7000"):
+            self.assertEqual([row["id"] for row in build.eligible(self.db)], [satellite])
+            self.assertEqual(build.pickup(self.db, build.room(self.db, **IDLE), now=Pickup.NOW), [satellite])
+        run = self.claim(hosts=WORK)
+        self.assertEqual(run["repo"], SAT, "the satellite claims its pick")
+        self.assertEqual(self.count("SELECT status FROM item WHERE id = ?", hub), "ready", "the hub's waits")
+        build.write(self.db, run["id"], step="enqueuing")
+        build.enqueued(self.db, run["id"])
+        self.assertTrue(build.merged(self.db, build.run(self.db, run["id"])))
+        self.assertEqual(build.run(self.db, run["id"])["step"], "cleaning",
+                         "the health check after a merge is the hub's: a satellite's pick cleans")
 
     def test_the_hub_never_signals_or_reaps_a_satellite_run(self):
         """The hazard: the hub would probe pid 4242 here and kill group 777, which name a satellite's processes."""
