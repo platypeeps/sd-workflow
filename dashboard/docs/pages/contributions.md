@@ -26,7 +26,8 @@ checkouts with one folder name stay two bars. Draft nudge is copy only; Open on
 GitHub opens the row on GitHub in a new tab (sd:5628). Re-run collector, the
 collector's command, heads the Open view after its tally (sd:7211), as
 Clean all safe heads Health's Checkouts; it posts `/api/shadow/sync` and
-reads again when the sync ends. Hide and Unhide (sd:5486) post
+reads again when the sync ends. Read again runs that same sync (sd:8380);
+while one runs, or before the collector row exists, it only reads. Hide and Unhide (sd:5486) post
 `/api/contributions/view`, `{"key", "hidden"}`, which writes the view store
 Designs' Hide writes, keyed `contribution:<key>`; each offers Undo. A key the
 projection no longer lists is refused with 409. A hidden open row stays in the

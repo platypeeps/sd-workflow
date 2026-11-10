@@ -827,12 +827,12 @@ shellRun(cmd('collector.sync'), C.get('collector')); await flush();""", answer=s
         self.assertEqual([t[0] for t in out["toasts"]], ["Shadow sync started · Contributions reads again when it ends"])
 
     def test_the_toolbar_has_no_refresh_and_re_run_collector_still_syncs(self):
-        """sd:5750: the operator ruled out the toolbar's Refresh (sd:5630). Read again reads; Re-run collector syncs."""
+        """sd:5750: the operator ruled out the toolbar's Refresh (sd:5630). Read again and Re-run collector sync (sd:8380)."""
         page = (V2 / "contributions.html").read_text(encoding="utf-8")
         self.assertNotIn('id="contrib-refresh"', page)
         self.assertNotIn("contrib-refresh", PAGE_JS)
         out = self.run_page("R.title = window.PAGE_AGAIN.title; R.sync = cmd('collector.sync').label;")
-        self.assertEqual(out["R"]["title"], "Refresh contributions")
+        self.assertEqual(out["R"]["title"], "Sync with GitHub and read again")
         self.assertEqual(out["R"]["sync"], "Re-run collector")
 
     def test_a_sync_that_ends_with_a_failed_tracker_or_a_broken_run_says_why(self):
@@ -844,9 +844,8 @@ shellRun(cmd('collector.sync'), C.get('collector')); await flush();""", answer=s
         out = self.run_page("shellRun(cmd('collector.sync'), C.get('collector')); await flush();", answer=self.sync_answer(broken))
         self.assertEqual(out["toasts"][-1][0], "Shadow sync ended with a problem: OperationalError: database is locked")
 
-    # sd:8146: Refresh from GitHub in the head, beside the GitHub sync line, runs Re-run collector's sync.
-    CLICK_REFRESH = ("ELS.source.listeners.click.forEach(f => f({ target: { closest: s => s === '[data-gh-refresh]' ? {} : null } }));"
-                     " await flush();")
+    # sd:8380: Read again is the page's one refresh: it runs Re-run collector's sync; no head Refresh from GitHub.
+    READ_AGAIN = "await window.PAGE_AGAIN.run(); await flush();"
 
     def refresh_answer(self, start="[202, { running: true }]"):
         """A sync that reads running once, then ends; the second page read carries a newer last success."""
@@ -854,35 +853,33 @@ shellRun(cmd('collector.sync'), C.get('collector')); await flush();""", answer=s
           const newer = JSON.parse(JSON.stringify(DOC)); newer.collector = { ...(newer.collector || {}), state: 'fresh', last_success_at: '2026-09-06T01:00:00Z' };
           return (path, body) => path === '/api/contributions/page' ? [200, reads++ ? newer : DOC]
           : path === '/api/shadow/sync' ? %s
-          : path === '/api/shadow/state' ? (OUT.during.push(ELS.source.html), n++ ? [200, { running: false, error: null, trackers: [] }] : [200, { running: true }])
+          : path === '/api/shadow/state' ? (OUT.during.push(1), n++ ? [200, { running: false, error: null, trackers: [] }] : [200, { running: true }])
           : [404, { error: 'no answer' }]; })()""" % start)
 
-    def test_refresh_from_github_posts_the_sync_once_and_rereads_when_it_ends(self):
-        out = self.run_page("R.before = ELS.source.html; R.page = window.PAGE_COMMANDS.map(c => c.label);" + self.CLICK_REFRESH
+    def test_read_again_posts_the_sync_once_and_rereads_when_it_ends(self):
+        out = self.run_page("R.before = ELS.source.html; R.page = window.PAGE_COMMANDS.map(c => c.label);" + self.READ_AGAIN
                             + " R.after = ELS.source.html;", answer=self.refresh_answer())
-        self.assertIn("Refresh from GitHub", out["R"]["page"])
-        self.assertRegex(out["R"]["before"], r'GitHub sync [^<]*(<time[^>]*></time>)?</span>\s*<button class="linkish" type="button" data-gh-refresh>Refresh from GitHub</button>')
+        self.assertNotIn("Refresh from GitHub", out["R"]["page"])
+        self.assertNotIn("data-gh-refresh", out["R"]["before"])
         self.assertEqual(out["posts"], [["/api/shadow/sync", {}, 64]])
         self.assertEqual(out["gets"][-1], "/api/contributions/page", "the page did not read again when the sync ended")
         self.assertIn('last success <time class="rel" datetime="2026-09-06T01:00:00Z">', out["R"]["after"])
 
-    def test_refresh_from_github_is_off_and_says_refreshing_while_the_sync_runs(self):
-        out = self.run_page(self.CLICK_REFRESH + " R.after = ELS.source.html;", answer=self.refresh_answer())
-        self.assertTrue(out["during"])
-        for seen in out["during"]:
-            self.assertIn('data-gh-refresh disabled>Refreshing…</button>', seen)
-        self.assertIn("data-gh-refresh>Refresh from GitHub</button>", out["R"]["after"])
-
-    def test_the_palette_refresh_from_github_runs_the_same_sync(self):
-        out = self.run_page("window.PAGE_COMMANDS.find(c => c.label === 'Refresh from GitHub').run(); await flush();",
-                            answer=self.refresh_answer())
-        self.assertEqual(out["posts"], [["/api/shadow/sync", {}, 64]])
-        self.assertEqual(out["gets"][-1], "/api/contributions/page")
+    def test_read_again_while_the_sync_runs_only_reads(self):
+        # The first state read, while the sync runs, presses Read again a second time.
+        running = """(() => { let n = 0; return (path, body) => path === '/api/contributions/page' ? [200, DOC]
+          : path === '/api/shadow/sync' ? [202, { running: true }]
+          : path === '/api/shadow/state' ? (n++ ? [200, { running: false, error: null, trackers: [] }]
+                                                : (window.PAGE_AGAIN.run(), [200, { running: true }]))
+          : [404, { error: 'no answer' }]; })()"""
+        out = self.run_page(self.READ_AGAIN, answer=running)
+        self.assertEqual(out["posts"], [["/api/shadow/sync", {}, 64]], "a second Read again during the sync posted again")
+        self.assertEqual(out["gets"].count("/api/contributions/page"), 3)
 
     def test_a_dashboard_sync_already_running_is_followed_not_an_error(self):
         # sd:8146: the 409 for the dashboard's own live run (its state reads running): the page waits on it and reads again.
         busy = "[409, { error: 'A shadow sync started at 2026-10-06T15:00:00Z is still running. Wait for it to finish.' }]"
-        out = self.run_page(self.CLICK_REFRESH, answer=self.refresh_answer(busy))
+        out = self.run_page(self.READ_AGAIN, answer=self.refresh_answer(busy))
         self.assertEqual([t[0] for t in out["toasts"]], ["A shadow sync is already running · Contributions reads again when it ends"])
         self.assertIn("/api/shadow/state", out["gets"])
         self.assertEqual(out["gets"][-1], "/api/contributions/page")
@@ -890,18 +887,17 @@ shellRun(cmd('collector.sync'), C.get('collector')); await flush();""", answer=s
     def test_a_sync_held_outside_the_dashboard_is_said_not_followed(self):
         # `sd shadow sync` (a terminal, the nightly job) holds the lock: the route answers 409, but /api/shadow/state is
         # the dashboard's run only and reads idle, here with an older run's failure. The page promises no reread it cannot
-        # keep, toasts no stale failure, and leaves Refresh on.
+        # keep and toasts no stale failure.
         busy = "[409, { error: 'another shadow sync is already running against this database; wait for it to finish' }]"
-        idle = """(() => { OUT.during = []; return (path, body) => path === '/api/contributions/page' ? [200, DOC]
+        idle = """(() => (path, body) => path === '/api/contributions/page' ? [200, DOC]
           : path === '/api/shadow/sync' ? %s
-          : path === '/api/shadow/state' ? (OUT.during.push(ELS.source.html), [200, { running: false, error: 'OperationalError: old run', trackers: [] }])
-          : [404, { error: 'no answer' }]; })()""" % busy
-        out = self.run_page(self.CLICK_REFRESH + " R.after = ELS.source.html;", answer=idle)
+          : path === '/api/shadow/state' ? [200, { running: false, error: 'OperationalError: old run', trackers: [] }]
+          : [404, { error: 'no answer' }])()""" % busy
+        out = self.run_page(self.READ_AGAIN, answer=idle)
         self.assertEqual([t[0] for t in out["toasts"]], [
             "A shadow sync outside the dashboard is running: another shadow sync is already running against this database;"
             " wait for it to finish · try again after it ends"])
         self.assertEqual(out["gets"], ["/api/contributions/page", "/api/shadow/state"], "the page reread before the sync ended")
-        self.assertIn("data-gh-refresh>Refresh from GitHub</button>", out["R"]["after"])
 
     def test_off_commands_name_their_reason(self):
         out = self.run_page("""const w = (id, key) => cmd(id).when(C.get(key));

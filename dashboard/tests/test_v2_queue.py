@@ -849,6 +849,83 @@ print(sd_lane.this_host())
 """
 
 
+class ThePrCheck(BrowserSession):
+    """sd:8375: Read again on Queue reads each shown item's pull request on GitHub; a merged one closes its item."""
+
+    def setUp(self):
+        super().setUp()
+        from sd_db import contribution_github, contributions
+
+        self.contributions = contributions
+        self.items = {}
+        for n in (21, 22, 23):
+            url = f"https://github.com/example/system/pull/{n}"
+            self.items[n] = contributions.capture(self.connection, title=f"PR {n}", changes={"pull_url": url},
+                                                  who="test")["item"]["id"]
+        self.connection.commit()
+        states = {21: ("merged", "9" * 40), 22: ("closed", None), 23: ("open", None)}
+        self.read = []
+
+        test = self
+
+        class Client:
+            def __init__(self, budget):
+                pass
+
+            def get(self, path):
+                test.assertEqual(path, "/user")
+                return {"id": 1, "login": "operator"}
+
+        def pull(client, url, operator, **_):
+            n = int(url.rsplit("/", 1)[1])
+            self.read.append(n)
+            if n == 23:
+                raise contribution_github.Unavailable("GitHub request unavailable (exit 1)")
+            return {"complete": True, "observed_at": "2026-09-06T12:00:00Z", "operator": operator, "author": operator,
+                    "repo": "example/system", "title": f"PR {n}", "state": states[n][0], "head": "a" * 40,
+                    "base": "b" * 40, "merge_commit": states[n][1], "draft": False, "mergeable": "unknown", "ci": "success", "ci_head": "a" * 40,
+                    "ci_ids": ["check:1"], "why": ["author"], "blocking_labels": [], "labels": [], "reviews": [], "events": [],
+                    "requested_reviewers": []}
+
+        for patch in (mock.patch.object(contribution_github, "Client", Client),
+                      mock.patch.object(contribution_github, "pull", pull)):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def status(self, n):
+        return self.connection.execute("SELECT status FROM item WHERE id = ?", (self.items[n],)).fetchone()[0]
+
+    def notes(self, n):
+        return [row[0] for row in self.connection.execute(
+            "SELECT body FROM note WHERE item = ? AND kind = 'comment' AND body LIKE 'PR http%merged%'", (self.items[n],))]
+
+    def test_a_merged_pull_notes_its_item_and_changes_no_status(self):
+        status, _, answer = self.post("/api/queue/prs/check", {"items": list(self.items.values())})
+        self.assertEqual(status, 200, answer)
+        self.assertEqual(answer["checked"], [self.items[21], self.items[22]])
+        pull = "https://github.com/example/system/pull/"
+        self.assertEqual(answer["unread"], [f"sd:{self.items[21]} open: {pull}21 merged at {'9' * 40}; close it",
+                                            f"sd:{self.items[23]} left open: {pull}23: GitHub request unavailable (exit 1)"])
+        self.assertEqual([self.status(n) for n in (21, 22, 23)], ["planning", "planning", "planning"])
+        self.assertEqual((self.notes(21), self.notes(22)), ([f"PR {pull}21 merged at {'9' * 40}"], []))
+        closed = self.contributions.snapshot(self.connection, f"github:{pull}22")
+        self.assertEqual(closed["observation"]["state"], "closed")
+
+    def test_a_second_check_adds_no_second_note(self):
+        for _ in range(2):
+            status, _, answer = self.post("/api/queue/prs/check", {"items": [self.items[21]]})
+            self.assertEqual(status, 200, answer)
+        self.assertEqual((len(self.notes(21)), self.status(21)), (1, "planning"))
+
+    def test_only_the_named_items_are_read_and_the_request_is_bounded(self):
+        status, _, _ = self.post("/api/queue/prs/check", {"items": [self.items[22]]})
+        self.assertEqual((status, self.read), (200, [22]))
+        for payload in ({"items": []}, {"items": ["1"]}, {"items": list(range(1, queue_screen.PR_CHECK_ITEMS + 2))},
+                        {"items": [1], "extra": 1}):
+            status, _, _ = self.post("/api/queue/prs/check", payload)
+            self.assertEqual(status, 400, payload)
+
+
 class RealLane(BrowserSession):
     """The pinned pack's `sd-ship lane` on a temporary lane root, seeded with `seeds()`.
 
@@ -1247,6 +1324,43 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         start = ("document.dispatchEvent(new CustomEvent('shell:view', { detail: { id: 'queue', first: true } }));\n"
                  "await flush(); await flush(); await flush();\n")
         return self.run_page(self.JS + start + body, search=search, after=after)
+
+    def pr_answers(self, check=(200, {"checked": [901], "unread": ["sd:902 left open: not read"]})):
+        doc = queue_screen.document(self.connection, now=NOW)
+        row = {"title": "PR", "repo": "system", "url": "https://github.com/example/system/pull/1", "lane": "awaiting_them",
+               "on": "reviewers", "since": NOW, "waited": 60, "approximate": False, "draft": False, "stale": False}
+        doc["prs"] = {"rows": [{**row, "item": 901}, {**row, "item": 902}, {**row, "item": 901}, {**row, "item": None}],
+                      "error": ""}
+        return {"/api/queue": [200, doc], "/api/queue/prs/check": list(check)}
+
+    # sd:8375: the post is counted against the reads so far: the page reads Queue again after it, not before.
+    AT = "const A0 = ANSWER; ANSWER = (p, b) => { if (p === '/api/queue/prs/check') OUT.at = OUT.gets.length; return A0(p, b); };\n"
+
+    def test_read_again_on_queue_checks_the_shown_prs_once_then_reads_again(self):
+        out = self.run_view("window.shell.view.current = () => 'queue'; R.before = OUT.gets.length;"
+                            " await window.PAGE_AGAIN.run(); await flush(); await flush(); R.note = ELS['queue-note'].textContent;",
+                            answers=self.pr_answers(), before=self.AT)
+        self.assertEqual([p[:2] for p in out["posts"]], [["/api/queue/prs/check", {"items": [901, 902]}]])
+        self.assertEqual(out["at"], out["R"]["before"], "the page read again before the check answered")
+        self.assertIn("/api/queue", out["gets"][out["at"]:])
+        self.assertIn("sd:902 left open: not read", out["R"]["note"])
+
+    def test_read_again_on_queue_with_no_pr_row_checks_nothing_and_reads(self):
+        answers = self.pr_answers()
+        answers["/api/queue"][1]["prs"] = {"rows": [], "error": ""}
+        out = self.run_view("window.shell.view.current = () => 'queue'; await window.PAGE_AGAIN.run(); await flush();",
+                            answers=answers)
+        self.assertEqual(out["posts"], [])
+        self.assertEqual(out["gets"].count("/api/queue"), 2)
+
+    def test_read_again_off_queue_or_a_failed_check_still_reads(self):
+        out = self.run_view("await window.PAGE_AGAIN.run(); await flush();", answers=self.pr_answers())
+        self.assertEqual(out["posts"], [])
+        out = self.run_view("window.shell.view.current = () => 'queue'; await window.PAGE_AGAIN.run(); await flush(); await flush();"
+                            " R.note = ELS['queue-note'].textContent;",
+                            answers=self.pr_answers((502, {"error": "gh failed"})))
+        self.assertIn("Pull requests not checked on GitHub: gh failed", out["R"]["note"])
+        self.assertEqual(out["gets"].count("/api/queue"), 2)
 
     def test_each_repo_is_one_closed_row_that_a_click_opens_and_a_second_click_closes(self):
         out = self.run_view("R.closed = [repos(), kids()]; open('system'); R.open = [repos(), kids()];"
@@ -2151,7 +2265,8 @@ class TheRegistration(unittest.TestCase):
         pages = {page.name: page for page in registry().PAGES}
         self.assertNotIn("queue", pages)
         self.assertEqual(tuple(api_paths(pages["today"])), ("/api/queue", "/api/queue/move", "/api/queue/builds",
-                                                            "/api/queue/builds/retry", "/api/queue/builds/pickup", "/api/queue/runner"))
+                                                            "/api/queue/builds/retry", "/api/queue/builds/pickup", "/api/queue/runner",
+                                                            "/api/queue/prs/check"))
         self.assertNotIn("Queue", v2.SECTIONS)
         self.assertNotIn("'Queue'", GROUP_BLOCK)
         for gone in ("queue.html", "static/queue.js", "static/queue.css", "pages/queue.py"):

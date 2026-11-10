@@ -588,6 +588,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     put($('queue'), groups.length ? html`${groups.map(g => html`${parent(g)}${qOpen === g.key ? kids(g) : ''}`)}`
       : html`<tr class="empty"><td colspan="5">${unread.length ? 'No row in what was read; the line under the table names what was not.'
         : `Nothing is working, merging, next or blocked${qShow.size ? ', and no row matches the filters' : ''}.`}</td></tr>`);
+    if (QV.prCheck) unread.push(...QV.prCheck);
     const note = $('queue-note'); note.hidden = !unread.length; note.textContent = unread.map(u => `▨ ${u}`).join(' · ');
     shell.view.count('queue', active);
   }
@@ -900,7 +901,15 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   window.PAGE_REPO = o => o && o.type === 'repo' ? o.id.split(':')[1] : (o && o.repo) || null;
 
   // Read again (sd:5638): the shell's head button reads Today again; sd:6697 dropped the Observed lamp.
-  window.PAGE_AGAIN = { title: 'Read Today again', run: load };
+  // sd:8375: on the Queue view it first asks GitHub about the pull request of each item a PR row shows, at most 20: the
+  // server notes a merge on its item. A pull not read, or merged with its item open, is named under the table.
+  async function prCheck() {
+    const items = [...new Set((((QV.lanes || {}).prs || {}).rows || []).filter(p => p.item != null).map(p => Number(p.item)))].slice(0, 20);
+    if (!items.length) { QV.prCheck = null; return; }
+    try { QV.prCheck = (await shell.post('/api/queue/prs/check', { items })).unread || []; }
+    catch (e) { QV.prCheck = [`Pull requests not checked on GitHub: ${e.message}`]; }
+  }
+  window.PAGE_AGAIN = { title: 'Read Today again', run: () => shell.view.current() === 'queue' ? prCheck().then(load) : load() };
 
   window.PAGE_COMMANDS = [
     { label: 'Clear the filter', icon: 'filter', run: clearSource },

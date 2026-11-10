@@ -381,7 +381,15 @@ class PullCollection(unittest.TestCase):
         api.detail["state"] = "closed"
         self.assertEqual(api.observation()["state"], "closed")
         api.detail["merged"] = True
-        self.assertEqual(api.observation()["state"], "merged")
+        api.detail["merge_commit_sha"] = "c" * 40
+        self.assertEqual((api.observation()["state"], api.observation()["merge_commit"]), ("merged", "c" * 40))
+
+    def test_a_merged_pull_with_no_merge_commit_is_not_a_complete_read(self):
+        # sd:8375: the read that records a merge closes its item with the merge commit as the reason.
+        api = Api()
+        api.detail.update(state="closed", merged=True)
+        with self.assertRaises(Unavailable):
+            api.observation()
 
 
 class BoundedTransport(unittest.TestCase):

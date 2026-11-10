@@ -428,6 +428,9 @@ def pull(client, url, operator, *, observed_at, why=(), blocking_labels=(), auto
     mergeable = after.get("mergeable")
     if mergeable is not None and type(mergeable) is not bool:
         raise Unavailable("unknown mergeability state")
+    commit = before.get("merge_commit_sha") if before["merged"] else None
+    if before["merged"] and not (isinstance(commit, str) and commit):
+        raise Unavailable("merged pull names no merge commit")
     labels = _labels(before)
     # sd:8084: users asked by name; a team request is in `requested_teams`, which names no one.
     requested = before.get("requested_reviewers")
@@ -438,7 +441,7 @@ def pull(client, url, operator, *, observed_at, why=(), blocking_labels=(), auto
     why = [reason for reason in why if reason != "review-requested" or asked]
     return {"complete": True, "observed_at": observed_at, "operator": operator, "author": author,
             "repo": f"{owner}/{repo}", "title": before.get("title", ""), "requested_reviewers": [user["login"] for user in requested],
-            "state": "merged" if before["merged"] else before["state"], "draft": before["draft"],
+            "state": "merged" if before["merged"] else before["state"], "merge_commit": commit, "draft": before["draft"],
             "head": head, "base": base, "mergeable": "unknown" if mergeable is None else "mergeable" if mergeable is True else "conflicting",
             "ci": ci, "ci_head": head, "ci_ids": ci_ids, "why": list(why),
             "blocking_labels": list(blocking_labels), "labels": labels,
