@@ -433,6 +433,9 @@ def pull(client, url, operator, *, observed_at, why=(), blocking_labels=(), auto
     requested = before.get("requested_reviewers")
     if not isinstance(requested, list) or any(not isinstance(user, dict) or not isinstance(user.get("login"), str) for user in requested):
         raise Unavailable("requested reviewers are unavailable")
+    # sd:8360: the search's why outlives the request; keep it only while the operator is asked by name.
+    asked = operator["login"].lower() in {user["login"].lower() for user in requested}
+    why = [reason for reason in why if reason != "review-requested" or asked]
     return {"complete": True, "observed_at": observed_at, "operator": operator, "author": author,
             "repo": f"{owner}/{repo}", "title": before.get("title", ""), "requested_reviewers": [user["login"] for user in requested],
             "state": "merged" if before["merged"] else before["state"], "draft": before["draft"],
