@@ -64,9 +64,10 @@ since the tick reaps before it claims.
 3. Room: counts only this host's build and draft runs against `MACHINE_CAP`
    and `REPO_CAP` (ruling Q3). The interactive builders are this machine's already.
 4. Dispatch, reap, held release, watch, sweep and the spawn loop act only on mine.
-5. Drafts and auto-pickup stay on the hub (ruling Q2): `eligible` and `draft`
-   refuse a satellite lane; a satellite tick runs no pickup, no draft claim or reap,
-   and no stop-on-blocks.
+5. Drafts stay on the hub (ruling Q2): `draft` refuses a satellite lane, and a
+   satellite tick runs no draft claim or reap and no stop-on-blocks. Auto-pickup
+   runs on each lane host for its own lanes (sd:8393): `eligible` keeps this
+   host's lanes, and the host's own room caps what it queues.
 6. The failure push runs on the hub only, over every host's runs:
    one pusher sends each failure once, and the hub holds the notifier.
 7. The tick's heartbeat key is `build-dispatch` on the hub and
@@ -80,7 +81,7 @@ travels with every retry (`_settle`, `_health_unknown` copy it).
 
 ## Non-goals
 
-- Auto-pickup and drafts for satellite lanes (ruling Q2).
+- Drafts for satellite lanes (ruling Q2).
 - The system half: the job on the work satellite, its `SD_HUB_ONLY_AGENTS` entry,
   its log root (ruling Q4). That lands in the system repository after this.
 - Live log reads of a satellite run from the hub.

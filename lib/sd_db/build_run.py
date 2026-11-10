@@ -574,8 +574,8 @@ def dispatch(connection, *, owner: str, load: float | None, load_cap: float | No
     it, as it names a reason the caller found (such as an unwritable log folder).
 
     Each step takes only this machine's runs and lanes (`build.lane_hosts`,
-    pack sd:7933). Auto-pickup, its stop on blocks and the drafts run on the
-    hub only: a satellite's tick reaps, watches, sweeps, claims and spawns.
+    pack sd:7933). Auto-pickup picks this host's lanes (sd:8393); its stop
+    on blocks and the drafts run on the hub only.
     """
     hosts = build.lane_hosts(connection)
     hub = None in hosts
@@ -592,7 +592,7 @@ def dispatch(connection, *, owner: str, load: float | None, load_cap: float | No
     swept = sweep(connection, hosts=hosts)
     stopped = build.stop_on_blocks(connection) if hub else None
     picked: list[int] = []
-    if not why and hub:
+    if not why:
         picked = build.pickup(connection, build.room(connection, load=load, load_cap=load_cap,
                                                      interactive=interactive, hosts=hosts))
     claimed: list[str] = []

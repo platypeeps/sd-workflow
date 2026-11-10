@@ -137,9 +137,9 @@ def _repo_refusal(row, connection=None, *, hub_only: bool = False) -> str | None
 
     `row` carries the item's `id` and `repo`, and the repository's `repo_path`,
     `managed`, `remote` and `lane_host` (`_REPO`'s columns). A build runs on
-    its lane host (pack sd:7933); `hub_only`, for auto-pickup and drafts,
-    refuses a lane on a satellite (`lane_of`, which reads `connection`), as
-    they run on the hub only.
+    its lane host (pack sd:7933); `hub_only`, for drafts, refuses a lane on
+    a satellite (`lane_of`, which reads `connection`), as they run on the
+    hub only.
     """
     item = row["id"]
     if row["repo_path"] is None:
@@ -167,7 +167,7 @@ def _repo_refusal(row, connection=None, *, hub_only: bool = False) -> str | None
     if not row["remote"]:
         return f"item {item}'s repository {row['repo']} has no remote"
     if hub_only and lane_of(connection, row["lane_host"]) is not None:
-        return f"item {item}'s lane runs on {row['lane_host']}; auto-pickup and drafts run on the hub only"
+        return f"item {item}'s lane runs on {row['lane_host']}; drafts run on the hub only"
     return None
 
 
@@ -346,8 +346,8 @@ _REPO = ("SELECT item.*, repo.path AS repo_path, repo.remote, repo.managed, repo
          "FROM item LEFT JOIN repo ON repo.path = item.repo WHERE item.id = ?")
 
 
-def _item(connection, item: int, *, hub_only: bool = False) -> dict:
-    """The item a build may take, or the refusal that names why not; `hub_only` as `_repo_refusal`."""
+def _item(connection, item: int) -> dict:
+    """The item a build may take, or the refusal that names why not."""
     row = connection.execute(_REPO, (item,)).fetchone()
     if row is None:
         raise BuildRefused(f"no item {item}")
@@ -356,7 +356,7 @@ def _item(connection, item: int, *, hub_only: bool = False) -> dict:
                            f"{', '.join(RUNNABLE_KINDS[:-1])} and {RUNNABLE_KINDS[-1]} items")
     if row["status"] != "ready":
         raise BuildRefused(f"item {item} is {row['status']}; a build takes a ready item")
-    refused = _repo_refusal(row, connection, hub_only=hub_only)
+    refused = _repo_refusal(row, connection)
     if refused:
         raise BuildRefused(refused)
     away = lane_of(connection, row["lane_host"])
@@ -477,16 +477,19 @@ def eligible(connection, *, now: str | None = None) -> list[dict]:
     """The ready items a build may take, highest priority first: auto-pickup's selection.
 
     `reads.backlog_items` gives the unparked rows in priority order; a
-    scheduled occurrence, every row `queue` would refuse and a satellite's
-    lane (auto-pickup runs on the hub only, pack sd:7933) are left out.
+    scheduled occurrence, every row `queue` would refuse and another host's
+    lane are left out: each lane host's dispatcher picks for its own lanes,
+    under its own caps, and its claim takes the row (sd:8393, pack sd:7933).
     """
-    found = []
+    hosts, found = lane_hosts(connection), []
     for row in reads.backlog_items(connection, status="ready", now=now):
         if row["scheduled"]:
             continue
         try:
-            _item(connection, row["id"], hub_only=True)
+            taken = _item(connection, row["id"])
         except BuildRefused:
+            continue
+        if lane_of(connection, taken["lane_host"]) not in hosts:
             continue
         found.append({"id": row["id"], "title": row["title"], "repo": row["repo"], "priority": row["priority"]})
     return found
