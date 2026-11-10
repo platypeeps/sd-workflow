@@ -2013,3 +2013,58 @@ class CloseOnMerge(ContributionCase):
         self.assertEqual(result["observation"]["state"], "merged", "the merge is recorded all the same")
         self.assertEqual(self.status(item), "in_progress")
         self.assertIn(f"PR {URL} merged at {self.MERGE}; not closed: ", "\n".join(self.notes(item)))
+
+    # Round 6: a merge is not proof the item is done; one guard keeps each such item open with a note.
+    def refused(self, item, why):
+        self.assertIn(f"PR {URL} merged at {self.MERGE}; not closed: {why}", "\n".join(self.notes(item)))
+
+    def test_an_item_blocked_on_something_stays_open(self):
+        item = self.item(blocked_on="production validation")
+        self.observe(state="merged", merge_commit=self.MERGE)
+        self.assertEqual(self.status(item), "planning")
+        self.refused(item, "it is blocked on: production validation")
+
+    def test_an_item_a_build_or_teammate_run_holds_stays_open(self):
+        from sd_db.writes import create_assignment
+
+        for status in ("queued", "running", "ending", "in_session"):
+            with self.subTest(status=status):
+                self.setUp()
+                item = self.item()
+                held = create_assignment(self.db, role="builder", status=status, item=item)
+                self.db.commit()
+                self.observe(state="merged", merge_commit=self.MERGE)
+                self.assertEqual(self.status(item), "planning")
+                self.refused(item, f"assignment {held} holds it")
+
+    def test_an_item_reopened_after_the_merge_stays_open(self):
+        item = self.item()
+        transition(self.db, item, "done", who="operator", reason="finished by hand")
+        transition(self.db, item, "in_progress", who="operator", reason="not finished")
+        self.db.commit()
+        self.observe(state="merged", merge_commit=self.MERGE, merged_at="2000-01-01T00:00:00Z")
+        self.assertEqual(self.status(item), "in_progress")
+        self.refused(item, "it was reopened after the merge")
+
+    def test_an_item_reopened_before_the_merge_closes(self):
+        item = self.item()
+        transition(self.db, item, "done", who="operator", reason="finished by hand")
+        transition(self.db, item, "in_progress", who="operator", reason="not finished")
+        self.db.commit()
+        self.observe(state="merged", merge_commit=self.MERGE, merged_at="2999-01-01T00:00:00Z")
+        self.assertEqual(self.status(item), "done")
+
+    def test_an_item_waiting_outside_the_open_statuses_stays_open(self):
+        item = self.item()
+        transition(self.db, item, "blocked", who="operator", reason="waiting on a vendor")
+        self.db.commit()
+        self.observe(state="merged", merge_commit=self.MERGE)
+        self.assertEqual(self.status(item), "blocked")
+        self.refused(item, "its status is blocked")
+
+    def test_a_work_item_names_the_delivery_evidence_it_needs(self):
+        item = create_item(self.db, kind="work", title="Work", status="in_progress")
+        c.configure(self.db, item, {"pull_url": URL}, who="operator")
+        self.observe(state="merged", merge_commit=self.MERGE)
+        self.assertEqual(self.status(item), "in_progress")
+        self.refused(item, "a work item closes only with delivery evidence")

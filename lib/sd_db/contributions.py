@@ -17,14 +17,16 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import paths, shadow_sync
+from . import paths, shadow_sync, teammate
 from .database import transaction
 from .errors import SdDbError
+from .runner import OWNING
 from .workflow import (
     StaleItem,
     WorkflowError,
     _checked_state,
     _text,
+    allowed_statuses,
     capture_task,
     change_status,
     item_state,
@@ -640,30 +642,77 @@ def observe_pull(connection, url, observation, *, expected_revision) -> dict:
         result = _save(connection, state)
         record_state(connection, "heartbeat", key="contribution-observe:" + state["key"], body={"ok": True})
         if merged_now:
-            _close_merged(connection, url, value.get("merge_commit"))
+            _close_merged(connection, url, value.get("merge_commit"), value.get("merged_at"))
         if item is not None:
             _note_lane(connection, item)
         return result
 
 
-def _close_merged(connection, url: str, commit) -> None:
+def _close_merged(connection, url: str, commit, merged_at) -> None:
     """Close each open item linking pull request `url`, on the observation that first records it merged (sd:8375).
 
     Whoever records the merge closes, the nightly sync or a Read again, so no surface has to see it first. Only that
-    open -> merged transition closes, and it is never retried: an item reopened after a recorded merge stays open, and
-    a dependency satisfied later closes nothing. An item with a dependency not met (`_refuse_unmet`) or one the move
-    refuses (a `work` item needs delivery evidence, a queued or running assignment) stays open with a note that names
-    the merge and why; the merge is recorded all the same.
+    open -> merged transition closes, and it is never retried. A merge is not proof the item is done, so each item
+    passes `_merge_close_refusal` first; one it refuses, or one the move refuses, stays as it is with a note that
+    names the merge and why. The merge is recorded all the same.
     """
     said = f"PR {url} merged" + (f" at {commit}" if isinstance(commit, str) and SHA.fullmatch(commit) else "")
     for row, metadata in _registered(connection, []):
         if metadata.get("pull_url") != url or row["status"] == "done":
             continue
         try:
-            _refuse_unmet(connection, row["id"], url, metadata.get("depends_on", []))
-            change_status(connection, row["id"], "done", who="contribution-observer", reason=said)
+            why = _merge_close_refusal(connection, row, metadata, url, merged_at)
+            if why is None:
+                change_status(connection, row["id"], "done", who="contribution-observer", reason=said)
+                continue
         except (WorkflowError, TransitionRefused) as error:
-            add_note(connection, row["id"], "comment", f"{said}; not closed: {error}", session="contribution-observer")
+            why = str(error)
+        add_note(connection, row["id"], "comment", f"{said}; not closed: {why}", session="contribution-observer")
+
+
+#: The statuses a merge may close from; `blocked` and `ready_to_send` wait on something a merge does not give.
+MERGE_CLOSES_FROM = ("planning", "ready", "in_progress")
+
+
+def _merge_close_refusal(connection, row: dict, metadata: dict, url: str, merged_at) -> str | None:
+    """Why the merge of `url` does not close item `row`, or None when it may (sd:8375).
+
+    The one guard every close from a recorded merge passes. A merge is not proof the item is done: an operator
+    blocker, an unmet dependency, a run holding the item, a reopen after the merge, a kind that needs delivery
+    evidence or a status outside `MERGE_CLOSES_FROM` each keeps it open.
+    """
+    item = row["id"]
+    if row["status"] not in MERGE_CLOSES_FROM:
+        return f"its status is {row['status']}"
+    if (metadata.get("blocked_on") or "").strip():
+        return f"it is blocked on: {metadata['blocked_on'].strip()}"
+    marks = ",".join("?" * len(OWNING))
+    held = connection.execute(f"SELECT id FROM assignment WHERE item = ? AND status IN ({marks}) LIMIT 1",
+                              (item, *OWNING)).fetchone()
+    if held is not None:
+        return f"assignment {held['id']} holds it"
+    run = teammate.holding(connection, item)
+    if run is not None:
+        return f"teammate run {run['id']} holds it"
+    if row["kind"] == "work":
+        return "a work item closes only with delivery evidence"
+    if "done" not in allowed_statuses(connection, item):
+        return f"a {row['kind']} item does not move to done through task controls"
+    if _reopened_since(connection, item, merged_at):
+        return "it was reopened after the merge"
+    _refuse_unmet(connection, item, url, metadata.get("depends_on", []))
+    return None
+
+
+def _reopened_since(connection, item: int, merged_at) -> bool:
+    """Whether a status note moved `item` out of done at or after `merged_at`; any reopen when that is unknown."""
+    try:
+        since = stamp(merged_at)
+    except SdDbError:
+        since = ""
+    return connection.execute(
+        "SELECT 1 FROM note WHERE item = ? AND kind = 'status_change' AND body LIKE 'done -> %' AND timestamp >= ? "
+        "LIMIT 1", (item, since)).fetchone() is not None
 
 
 def _refuse_unmet(connection, item: int, url: str, dependencies: list) -> None:

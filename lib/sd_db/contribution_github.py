@@ -443,8 +443,10 @@ def pull(client, url, operator, *, observed_at, why=(), blocking_labels=(), auto
             "ci": ci, "ci_head": head, "ci_ids": ci_ids, "why": list(why),
             "blocking_labels": list(blocking_labels), "labels": labels,
             "reviews": reviews, "events": events,
-            # sd:8375: the merge commit closes the linked item's note with it.
-            **({"merge_commit": before.get("merge_commit_sha")} if before["merged"] else {})}
+            # sd:8375: the merge commit closes the linked item's note with it; the merge time
+            # tells a reopen after the merge from one before it.
+            **({"merge_commit": before.get("merge_commit_sha"), "merged_at": before.get("merged_at")}
+               if before["merged"] else {})}
 
 
 # GitHub's REST `state_reason` and the timeline's `stateReason` name the same
