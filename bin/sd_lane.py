@@ -797,7 +797,8 @@ def enqueue_entry(worktree: pathlib.Path, item: int, title: str, body_file: path
         check_convention(worktree, title, base, head, queue.environ)
         check_docs(worktree, body, base)
         if claim == "deliver":  # an associate-only claim closes nothing (sd:3365)
-            commits, parents = branch_commits(worktree, base, head), branch_parents(worktree, base, head)
+            commits = unreverted(worktree, head, branch_commits(worktree, base, head))
+            parents = branch_parents(worktree, base, head)
             cited, repo = on_hub(queue, lambda connection: cited_closes(connection, item, body, commits, closes,
                                                                         parents))
             entry["closes"] = [*closes, *(row["item"] for row in cited)]
@@ -940,6 +941,33 @@ def branch_commits(worktree: pathlib.Path, base: str, head: str) -> list[tuple[s
                         "again. Nothing was queued or pushed.", code=PUBLISH_UNKNOWN)
     return [(sha.strip(), message) for sha, _, message in
             (chunk.strip("\n").partition("\x1f") for chunk in raw.split("\x1e")) if sha.strip()]
+
+
+#: A revert's subject: `git revert`'s `Revert "..."`, or a Conventional `revert:` (sd:8373).
+REVERT_SUBJECT = re.compile(r"^(?:Revert\b|revert(?:\([^)]*\))?!?:)", re.IGNORECASE)
+
+
+def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """`commits` (newest first) less each cited one a later hand-written revert undid (sd:8373).
+
+    A `revert:` commit that names no sha escapes `sd_ship_body.kept_commits`:
+    system sd:8242 closed though the branch undid its commit and fixes. A
+    commit with a `Closes:` line counts as undone when a later commit's
+    subject is a revert and the files it changed read at `head` as before
+    it. A read that fails keeps the commit, as before this check.
+    """
+    kept = []
+    for index, (sha, message) in enumerate(commits):
+        if "Closes:" in message and any(REVERT_SUBJECT.match(later) for _, later in commits[:index]):
+            # NUL-separated and literal: git quotes a name with a tab or non-ASCII byte otherwise.
+            files = publish_git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-z", "-r", sha)
+            names = [name for name in files.stdout.split("\0") if name] if files and files.returncode == 0 else []
+            same = names and publish_git(worktree, "--literal-pathspecs", "diff", "--quiet", f"{sha}^", head,
+                                         "--", *names)
+            if same and same.returncode == 0:
+                continue
+        kept.append((sha, message))
+    return kept
 
 
 def branch_parents(worktree: pathlib.Path, base: str, head: str) -> dict[str, tuple[str, ...]]:
