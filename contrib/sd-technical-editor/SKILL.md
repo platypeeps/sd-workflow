@@ -24,8 +24,8 @@ authorized revision after the report.
 
 Do not use for topic discovery (`sd-topic-radar`), original article development
 (`sd-author`), primary research (`sd-research`), claim-only auditing
-(`sd-fact-check`), adversarial premise review (`sd-red-team`), or publication
-(`sd-publish`). These are separate capability handoffs, not prerequisites.
+(`sd-fact-check`), or adversarial premise review (`sd-red-team`). These are
+separate capability handoffs, not prerequisites.
 
 The `voice-consistency` pass here measures the draft against its own
 representative language. Conformance to an external, stated brand or house voice
@@ -184,5 +184,5 @@ reading, searching, or editing.
   approval-to-change mapping, re-check results, and remaining findings when edit
   mode was authorized; and
 - **Handoffs and limits** — explicitly not-published status plus any separate
-  `sd-fact-check`, `sd-research`, `sd-red-team`, `sd-author`, or `sd-publish`
+  `sd-fact-check`, `sd-research`, `sd-red-team`, or `sd-author`
   work that remains not run.

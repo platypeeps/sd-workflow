@@ -39,6 +39,7 @@ The hub's tick and each satellite's act only on their own lanes' runs
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -48,13 +49,14 @@ import signal
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
-from . import build, contributions, draft, paths, remote, sessions
+from . import build, contributions, draft, paths, remote, runner_journal, sessions
 from .build import Probe
 from .config import system_checkout
 from .database import Patient, transaction
@@ -654,15 +656,62 @@ def resume_root(ident: str, bulk: Path) -> Path:
 ARCHIVE_SETTLE_SECONDS = 60
 
 
-def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETTLE_SECONDS) -> list[str]:
+#: How long one tick waits on the bulk root's copies: a hung network mount must not hold dispatch.
+ARCHIVE_DEADLINE_SECONDS = 20
+
+
+#: The lock file under the local root that the one archive copier holds.
+ARCHIVE_LOCK = ".archive.lock"
+
+
+def _same_copy(path: Path, target: Path) -> bool:
+    """Whether `target` is a finished copy of `path`: a copy lands only by rename, and `copy2` keeps the
+    size and mtime; two seconds of slack for a volume that stores coarse times."""
+    try:
+        source, copy = path.stat(), target.stat()
+    except FileNotFoundError:
+        return False
+    return copy.st_size == source.st_size and abs(copy.st_mtime - source.st_mtime) <= 2
+
+
+class _ArchiveLocked(Exception):
+    """`runner_journal.lock` refused the archive lock: held by a live copier when its cause is BlockingIOError."""
+
+
+#: The copier the last `archive` in this process started; `archive_wait` gives it the rest of the tick.
+_copier: threading.Thread | None = None
+
+
+def archive_wait(seconds: float) -> None:
+    """Wait up to `seconds` for this process's copier, once the tick closed its connection (sd:8339).
+
+    The tick process kills the daemon copier when it exits, so without this wait a copy longer than
+    `ARCHIVE_DEADLINE_SECONDS` never landed. A copy done in the wait is collected by the next tick.
+    """
+    if _copier is not None and seconds > 0:
+        _copier.join(seconds)
+
+
+def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETTLE_SECONDS,
+            deadline: float = ARCHIVE_DEADLINE_SECONDS) -> list[str]:
     """Move each file of an ended run from `local` to the same place under `bulk`; the new paths.
 
     `sd-<assignment>.title` and `.body.md` move once every run of that assignment ended and was released,
     the rest once the run their name starts with was: an outcome alone leaves a blocked or abandoned run's
-    groups alive until the reap releases it, and they may still write. A file no run owns, one written in the last `settle` seconds or one
-    whose copy fails stays for a later tick. The row's `log_path` names the copy before the local file goes.
+    groups alive until the reap releases it, and they may still write. A file no run owns, one written in the
+    last `settle` seconds or one whose copy fails stays for a later tick.
+
+    The copies run on a daemon thread the tick waits on for `deadline` seconds at most (sd:8275): a copy not
+    done by then is left for a later tick. The rows then name the copy, in `log_path` and in every note body,
+    run detail and assignment result that named the local file, before the local file goes.
+
+    One copier at a time (sd:8275 lane round 1): the thread holds `ARCHIVE_LOCK` under `local` until it ends,
+    and a tick that finds it held copies nothing, as a tick in another process does while an earlier one's
+    copy still hangs. A copy goes to a name of its own and is renamed into place, so a late or failed copy
+    never opens the archive itself; a copy an earlier tick finished is collected, not made again. A file
+    with a killed copier's part file is copied after the others, so one too slow for any tick holds none.
     """
-    moved, cutoff = [], time.time() - settle
+    pending, cutoff = [], time.time() - settle
     for path in sorted(local.glob("*/build/*")):
         owner = re.fullmatch(r"sd-(\d+)\.(?:title|body\.md)", path.name)
         ended = "SELECT outcome IS NOT NULL AND released_at IS NOT NULL FROM runner_run WHERE "
@@ -671,22 +720,72 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
         released = [row[0] for row in rows]
         if not released or not all(released):
             continue
-        target = bulk / path.relative_to(local)
         try:
             if path.stat().st_mtime > cutoff:
                 continue
-            target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(path, target)
         except OSError:
             continue
-        # The local file goes only after the row names the copy: a failed write leaves it for the next tick.
+        pending.append((path, bulk / path.relative_to(local)))
+    if not pending:
+        return []
+    held = contextlib.ExitStack()  # the copier thread closes it: the lock lasts as long as the copier
+    try:
+        held.enter_context(runner_journal.lock(local / ARCHIVE_LOCK, blocking=False, noun="build archive",
+                                               error=_ArchiveLocked))
+    except _ArchiveLocked as refused:
+        if isinstance(refused.__cause__, BlockingIOError):
+            return []  # an earlier copier still runs: it may hold any of these files open
+        raise OSError(str(refused)) from refused
+    copied: list[tuple[Path, Path]] = []
+
+    def copy() -> None:
+        try:
+            fresh, killed = [], []
+            for path, target in pending:
+                try:
+                    if _same_copy(path, target):
+                        copied.append((path, target))
+                    elif any(target.parent.glob(f".{target.name}.*.part")):
+                        killed.append((path, target))  # outlasted a tick: the others go first (sd:8339)
+                    else:
+                        fresh.append((path, target))
+                except OSError:
+                    continue
+            for path, target in fresh + killed:
+                part = target.with_name(f".{target.name}.{os.getpid()}.part")
+                try:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    for stale in target.parent.glob(f".{target.name}.*.part"):
+                        stale.unlink(missing_ok=True)  # a killed copier's; the lock says none runs
+                    shutil.copy2(path, part)
+                    os.replace(part, target)
+                except OSError:
+                    with contextlib.suppress(OSError):
+                        part.unlink(missing_ok=True)
+                    continue
+                copied.append((path, target))
+        finally:
+            held.close()
+
+    global _copier
+    worker = _copier = threading.Thread(target=copy, name="sd-build-archive", daemon=True)
+    worker.start()
+    worker.join(deadline)
+    moved = []
+    # A copy still running past the deadline is not in this snapshot; a later tick collects it.
+    for path, target in list(copied):
+        old, new = str(path), str(target)
+        # The local file goes only after the rows name the copy: a failed write leaves it for the next tick.
         with transaction(connection):
-            connection.execute("UPDATE runner_run SET log_path = ? WHERE log_path = ?", (str(target), str(path)))
+            connection.execute("UPDATE runner_run SET log_path = ? WHERE log_path = ?", (new, old))
+            for table, column in (("note", "body"), ("runner_run", "detail"), ("assignment", "result")):
+                connection.execute(f"UPDATE {table} SET {column} = replace({column}, ?, ?) "
+                                   f"WHERE instr({column}, ?) > 0", (old, new, old))
         try:
             path.unlink()
         except OSError:
-            continue  # the row names the copy; the next tick copies again and removes it
-        moved.append(str(target))
+            continue  # the rows name the copy; the next tick copies again and removes it
+        moved.append(new)
     return moved
 
 

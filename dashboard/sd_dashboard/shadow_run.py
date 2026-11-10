@@ -101,11 +101,12 @@ def _until(deadline: float):
     """Jira's real transport, refusing each request once `deadline` has passed; the refusal is a failed collect."""
     from sd_db import shadow_jira
 
-    def transport(url, headers, body):
+    def transport(url, headers, body, method=None):
         if time.monotonic() >= deadline:
             # Transient: a spent budget says nothing about one ticket, so `jira_moves` holds its cursor (sd:8117).
             return None, shadow_jira.Transient(f"the dashboard's {MAX_SECONDS}-second sync budget ran out")
-        return shadow_jira._http(url, headers, body)  # the library's own transport; it has no public name
+        # The library's own transport; it has no public name. `method` is the assignment's PUT (sd:8293).
+        return shadow_jira._http(url, headers, body, method=method)
 
     return transport
 
