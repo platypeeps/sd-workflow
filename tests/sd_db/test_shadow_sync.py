@@ -216,6 +216,14 @@ class TheSync(SyncCase):
         expected = f"updated:{iso(self.now - FIRST_RUN_WINDOW)}..{iso(self.now)}"
         self.assertTrue(all(expected in one for one in runner.queries))
 
+    def test_a_review_asked_of_a_team_is_not_the_operators(self):
+        """`review-requested:@me` also matches a request to a team the operator is in (sd:8358)."""
+        runner = Gh(nodes=[])
+        sync(self.connection, now=self.now, runner=runner)
+        asked = [one for one in runner.queries if "review-requested:@me" in one]
+        self.assertEqual(len(asked), 1)
+        self.assertRegex(asked[0], r"(^|\s)user-review-requested:@me(\s|$)")
+
     def test_a_second_sync_updates_the_row_rather_than_adding_one(self):
         sync(self.connection, now=self.now, runner=Gh(nodes=[node(11)]))
         result = sync(
@@ -816,7 +824,7 @@ class TheReason(SyncCase):
 
     def test_github_rows_store_the_strongest_bucket(self):
         runner = BucketGh({"assignee:@me": [node(1), node(4)], "author:@me": [node(2), node(4)],
-                           "mentions:@me": [node(3)], "review-requested:@me": [node(5)]})
+                           "mentions:@me": [node(3)], "user-review-requested:@me": [node(5)]})
         result = sync(self.connection, now=self.now, runner=runner)
         self.assertTrue(result.ok, result.reason)
         self.assertEqual(self.reasons(), {"1": "assigned", "2": "filed", "3": "watched", "4": "assigned",
