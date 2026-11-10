@@ -566,7 +566,7 @@ def pr_check(connection, items: list[int]) -> dict:
     from types import SimpleNamespace
 
     from sd_db import contribution_github as github
-    from sd_db import contributions
+    from sd_db import contributions, workflow
 
     wanted = set(items)
     linked = [(row["item_id"], row["url"]) for row in contributions.projection(connection)
@@ -592,8 +592,7 @@ def pr_check(connection, items: list[int]) -> dict:
                                       blocking_labels=previous.get("blocking_labels", []), automation=automation)
             contributions.observe_pull(connection, url, observation, expected_revision=before["revision"])
             found["checked"].append(item)
-            done = connection.execute("SELECT status FROM item WHERE id = ?", (item,)).fetchone()[0] == "done"
-            if done:
+            if workflow.item_state(connection, item)["item"]["status"] == "done":
                 found["closed"].append(item)
             elif observation["state"] == "merged":
                 found["unread"].append(f"sd:{item} left open: {url} merged; its notes say why")
