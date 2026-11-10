@@ -691,6 +691,16 @@ class ProjectionTests(ContributionCase):
         local = rows[URL.replace("12", "14")]
         self.assertEqual((local["branch"], local["linked"]), ("ABC-9", []))
 
+    def test_an_automation_pull_with_no_item_is_left_out(self):
+        """sd:8379. A job opened it and a job merges it, so no person waits on it; an item's pull stays."""
+        self.observe()
+        tracked = URL.replace("12", "14")
+        c.capture(self.db, title="Tracked", changes={"pull_url": tracked}, who="operator")
+        for url in (URL, tracked):
+            upsert_shadow(self.db, tracker="github", url=url, kind="pull", state="open",
+                          branch="automation/vault-cleanup/f8e3")
+        self.assertEqual([row["url"] for row in c.projection(self.db)], [tracked])
+
     def test_a_store_before_38_reads_no_settle_date(self):
         """Older state: the new library over a store not yet migrated reads its rows, each with no date."""
         old = self.root / "old.db"
