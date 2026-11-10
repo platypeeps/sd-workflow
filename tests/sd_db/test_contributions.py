@@ -1387,6 +1387,22 @@ class UnlinkedWaits(ContributionCase):
         self.assertTrue(c._stale({"observed_at": "not a time"}, self.NOW))
         self.assertFalse(c._stale({}, self.NOW), "no reading at all says nothing about its age")
 
+    def test_a_pull_left_with_no_context_leaves_the_projection(self):
+        """sd:8377: a team-only request read before sd:8360 kept a row with no reason, item or authorship."""
+        other = {"id": "2", "login": "someone"}
+        team = self.pull(50, author=other, requested_reviewers=[], why=["review-requested"])
+        quiet = self.pull(51, author=other, requested_reviewers=[], why=[])
+        kept = {self.pull(52, author=other, requested_reviewers=[], why=["mentioned"]),
+                self.pull(53, author=other, requested_reviewers=["Author"], why=["review-requested"]),
+                self.pull(54, author=other, requested_reviewers=[], why=[],
+                          reviews=[{"id": "review:1", "actor_id": "1", "state": "APPROVED", "at": T0}]),
+                self.pull(55, why=[]), self.pull(56, author=other, why=[])}
+        listed = {row["url"] for row in c.projection(self.db)}
+        self.assertEqual(listed & {team, quiet}, set())
+        self.assertEqual(kept - listed, set(), "a mention, a named request, a review, authorship or an old read stays")
+        item = c.capture(self.db, title="Tracked", changes={"pull_url": quiet}, who="operator")["item"]["id"]
+        self.assertIn(item, {row["item_id"] for row in c.projection(self.db)}, "an item's pull stays listed")
+
 
 class ReRequestedReview(ContributionCase):
     """sd:8116 (c): changes requested, the author pushes and asks that reviewer again: it waits on them."""

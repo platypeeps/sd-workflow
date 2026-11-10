@@ -177,6 +177,9 @@ class ContributionSync(SyncCase):
         self.assertEqual([event["id"] for event in before["attention"]], ["context:review-requested"])
         self.api.detail["requested_teams"] = [{"id": 9, "slug": "core"}]
         self.api.detail["updated_at"] = "2026-09-10T02:00:00Z"
+        # sd:8377: the projection no longer lists it, so its queue entry is what reads it again.
+        adapter._save_queue(self.db, [{"key": key, "url": URL, "why": ["review-requested"], "blocking_labels": [],
+                                       "explicit": False}], adapter._queue(self.db)["revision"])
         self.assertTrue(self.run_sync().ok)
         current = core.snapshot(self.db, key)
         self.assertEqual(current["observation"]["why"], [])

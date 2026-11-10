@@ -1422,6 +1422,10 @@ def projection(connection, *, repo=None) -> list[dict]:
             source = snapshot(connection, key, checkpoints)
             if source.get("moved_to"):
                 continue  # `fold` moved it; its new key is the row (sd:6091)
+            observation = source.get("observation") or {}
+            if key.startswith("github:") and operator_pull(observation) is False \
+                    and "mentioned" not in (observation.get("why") or []):
+                continue  # sd:8377: no item, authorship, review, named request or mention leaves no context
             value = _projection_row(heartbeats, {}, {}, [source])
             if filters is None or value["repo"] in filters:
                 result.append(value)
