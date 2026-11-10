@@ -778,7 +778,8 @@ class ContributionSync(SyncCase):
         self.assertEqual(len(self.sent), 1)
         self.assertTrue(self.run_sync().ok)
         self.assertEqual(len(self.sent), 1)
-        self.assertEqual(core.projection(self.db)[0]["local_status"], "planning")
+        # sd:8375: its own pull request merged, so the sync that recorded that closed it.
+        self.assertEqual(core.projection(self.db)[0]["local_status"], "done")
 
     def test_queue_revision_conflict_does_not_overwrite_pending_work(self):
         self.run_sync([URL])
@@ -1043,3 +1044,18 @@ class LaneNotePass(SyncCase):
         self.assertTrue(self.tracker_heartbeat()["ok"])
         self.assertEqual(len(result.lanes), 2)
         self.assertIn("shadow sync: pull-request lanes: " + "; ".join(result.lanes), result.report())
+
+
+class CloseOnMergeSync(SyncCase):
+    """sd:8375: a sync that first records an item's pull request merged closes the item, the nightly one too."""
+
+    def test_the_sync_that_records_the_merge_closes_the_item(self):
+        item = core.capture(self.db, title="Shipped", changes={"pull_url": URL}, who="operator")["item"]["id"]
+        self.assertTrue(self.run_sync([URL]).ok)
+        def status():
+            return self.db.execute("SELECT status FROM item WHERE id = ?", (item,)).fetchone()
+
+        self.assertEqual(status()["status"], "planning")
+        self.api.detail.update(state="closed", merged=True, merge_commit_sha="d" * 40, updated_at=AT)
+        self.assertTrue(self.run_sync([URL]).ok)
+        self.assertEqual(status()["status"], "done")

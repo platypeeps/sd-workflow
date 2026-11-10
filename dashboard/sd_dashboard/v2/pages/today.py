@@ -9,7 +9,8 @@ else. The build runs read /api/queue/builds (`builds.panel`), with ?show=all the
 or cancelled run's Retry posts /api/queue/builds/retry, and its Send to builder posts the same route with a `finding`
 (pack sd:6020); a running build's Cancel posts the assignment cancel route that exists. Auto-pickup's On and Off post
 /api/queue/builds/pickup (`builds.pickup`, pack sd:6097). The runner assignments (pack
-sd:7115, sd:7217) read /api/queue/runner (`queue_screen.runner`)."""
+sd:7115, sd:7217) read /api/queue/runner (`queue_screen.runner`). Read again on the Queue view posts
+/api/queue/prs/check first (`queue_screen.check_prs`, sd:8375): a pull request GitHub merged closes its item."""
 
 from __future__ import annotations
 
@@ -60,6 +61,12 @@ def _pickup(payload, principal):
     return builds.pickup(payload)
 
 
+def _check_prs(payload, principal):
+    from ... import queue_screen
+
+    return queue_screen.check_prs(payload)
+
+
 def _move(payload, principal):
     from ... import queue_screen
 
@@ -73,7 +80,7 @@ PAGE = Page(
     item="sd:2110",
     api=(Api("/api/queue", _read), Api("/api/queue/move", write=_move), Api("/api/queue/builds", _builds, query=True),
          Api("/api/queue/builds/retry", write=_retry), Api("/api/queue/builds/pickup", write=_pickup),
-         Api("/api/queue/runner", _runner)),
+         Api("/api/queue/runner", _runner), Api("/api/queue/prs/check", write=_check_prs)),
     # server.py serves /api/now and keeps each read's badge for the rail (sd:3446).
     count="/api/now",
 )

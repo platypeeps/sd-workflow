@@ -26,9 +26,18 @@ from .workflow import (
     _checked_state,
     _text,
     capture_task,
+    change_status,
     item_state,
 )
-from .writes import add_note, now, record_state, resolve_note, set_item_fields, stamp
+from .writes import (
+    TransitionRefused,
+    add_note,
+    now,
+    record_state,
+    resolve_note,
+    set_item_fields,
+    stamp,
+)
 
 FIELDS = frozenset({"local_clone", "local_branch", "tested_commit", "pull_url", "evidence",
                     "blocked_on", "depends_on", "blocking_labels",
@@ -622,6 +631,7 @@ def observe_pull(connection, url, observation, *, expected_revision) -> dict:
         attention, baseline = _pull_attention(value, state, contexts)
         state["context_events"] = contexts
         _undismiss(state, value)
+        merged_now = value["state"] == "merged" and (state["observation"] or {}).get("state") != "merged"
         state["observation"] = value
         state["ci_baseline"] = baseline
         if value["mergeable"] != "unknown":
@@ -629,9 +639,58 @@ def observe_pull(connection, url, observation, *, expected_revision) -> dict:
         _publish_attention(connection, state, attention, item)
         result = _save(connection, state)
         record_state(connection, "heartbeat", key="contribution-observe:" + state["key"], body={"ok": True})
+        if merged_now:
+            _close_merged(connection, url, value.get("merge_commit"))
         if item is not None:
             _note_lane(connection, item)
         return result
+
+
+def _close_merged(connection, url: str, commit, only: int | None = None) -> None:
+    """Close each open item linking pull request `url`, on the observation that first records it merged (sd:8375).
+
+    Whoever records the merge closes, the nightly sync or a Read again, so no surface has to see it first. Only the
+    transition closes: an item reopened after a recorded merge stays open. An item with a dependency not met
+    (`_refuse_unmet`) stays open, and `observe_dependencies` closes it with `only` when they are first all
+    satisfied after the merge was recorded. An item the move refuses (a `work` item needs delivery evidence, a queued or
+    running assignment), stays open with a note that names the merge and why; the merge is recorded all the same.
+    """
+    said = f"PR {url} merged" + (f" at {commit}" if isinstance(commit, str) and SHA.fullmatch(commit) else "")
+    for row, metadata in _registered(connection, []):
+        if metadata.get("pull_url") != url or row["status"] == "done" or only not in (None, row["id"]):
+            continue
+        try:
+            _refuse_unmet(connection, row["id"], url, metadata.get("depends_on", []))
+            change_status(connection, row["id"], "done", who="contribution-observer", reason=said)
+        except (WorkflowError, TransitionRefused) as error:
+            add_note(connection, row["id"], "comment", f"{said}; left open: {error}", session="contribution-observer")
+
+
+def _refuse_unmet(connection, item: int, url: str, dependencies: list) -> None:
+    """Raise unless each of `item`'s dependencies is met, so its pull request's merge alone does not close it.
+
+    A `merge` on `url` is met by the merge being recorded; one on another pull request by that one recorded merged;
+    an `item` by that item being done. An `issue` or `release` needs the item's dependency observation, taken for
+    the configuration it has now, to say it is satisfied.
+    """
+    recorded = snapshot(connection, f"item:{item}")["observation"] or {}
+    proven = {_digest(row["dependency"]) for row in recorded.get("dependencies", [])
+              if recorded.get("configured") == dependencies and isinstance(row, dict)
+              and row.get("state") == "satisfied" and isinstance(row.get("dependency"), dict)}
+    for dependency in dependencies:
+        kind = dependency["kind"]
+        if kind == "merge" and dependency["url"] == url:
+            continue
+        if kind == "merge" and (snapshot(connection, "github:" + dependency["url"])["observation"] or {}).get("state") == "merged":
+            continue
+        if kind == "item":
+            row = connection.execute("SELECT status FROM item WHERE id = ?", (dependency["item"],)).fetchone()
+            if row is not None and row["status"] == "done":
+                continue
+        elif _digest(dependency) in proven:
+            continue
+        name = dependency.get("url") or dependency.get("contains_pull") or f"sd:{dependency.get('item')}"
+        raise WorkflowError(f"{kind} dependency {name} is not satisfied")
 
 
 def _issue_attention(observation: dict, previous: dict) -> list[dict]:
@@ -817,6 +876,11 @@ def observe_dependencies(connection, item, observations, *, observed_at, expecte
         state["observation"] = {"observed_at": observed_at, "configured": dependencies, "dependencies": verified, "satisfied": satisfied}
         _publish_attention(connection, state, attention, item)
         result = _save(connection, state)
+        if satisfied and previous.get("satisfied") is not True and metadata.get("pull_url"):
+            # sd:8375: a merge recorded while a dependency was unmet left the item open; this is its close.
+            pulled = snapshot(connection, "github:" + metadata["pull_url"])["observation"] or {}
+            if pulled.get("state") == "merged":
+                _close_merged(connection, metadata["pull_url"], pulled.get("merge_commit"), only=item)
         record_state(connection, "heartbeat", key="contribution-observe:" + state["key"], body={"ok": True})
         _note_lane(connection, item)
         return result
