@@ -96,11 +96,13 @@ FIRST_RUN_WINDOW = timedelta(days=90)
 #: `(why, search qualifier)`. `involves:@me` would collapse these into one
 #: call and lose *why* an issue reached you, which is the whole value:
 #: "three people requested your review" and "you opened three issues" are the
-#: same count and completely different mornings.
+#: same count and completely different mornings. `user-review-requested`
+#: lists a request made to the operator by name; `review-requested` also
+#: matches one made to a team they belong to (sd:8358).
 BUCKETS = (
     ("assigned", "assignee:@me"),
     ("mentioned", "mentions:@me"),
-    ("review-requested", "review-requested:@me"),
+    ("review-requested", "user-review-requested:@me"),
     ("author", "author:@me"),
 )
 

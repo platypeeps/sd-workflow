@@ -102,7 +102,7 @@ class ContributionSync(SyncCase):
         self.assertEqual(self.db.execute("SELECT count(*) FROM item").fetchone()[0], 0)
 
     def test_projected_context_survives_quiet_and_matching_search_refreshes(self):
-        contexts = ("assignee:@me", "review-requested:@me")
+        contexts = ("assignee:@me", "user-review-requested:@me")
         self.api.detail["requested_reviewers"] = [{"login": "operator"}]
         self.assertTrue(self.run_sync([URL], contexts=contexts).ok)
         key = "github:" + URL
@@ -144,7 +144,7 @@ class ContributionSync(SyncCase):
         # is read, and Queue's unlinked PR waits name it on you.
         self.api.detail["user"] = {"id": 2, "login": "maintainer"}
         self.api.detail["requested_reviewers"] = [{"login": "operator"}]
-        for bucket, why in (("review-requested:@me", "review-requested"), ("mentioned", "mentioned")):
+        for bucket, why in (("user-review-requested:@me", "review-requested"), ("mentioned", "mentioned")):
             with self.subTest(why=why):
                 qualifier = "mentions:@me" if why == "mentioned" else bucket
                 self.assertTrue(self.run_sync([URL], contexts=(qualifier,), only=True).ok)
