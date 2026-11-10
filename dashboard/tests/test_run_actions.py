@@ -272,6 +272,17 @@ class TheBounds(Run):
         self.assertEqual((status, body["cut"], len(body["output"])), (200, True, run_actions.OUTPUT_CHARS))
         self.assertTrue(body["output"].endswith("the end"))
 
+    def test_a_step_finds_cargo_in_keg_only_rustup(self):
+        """sd:8343: launchd's PATH lacks Homebrew's keg-only rustup, so a Studio Check's `make` found no cargo."""
+        keg = Path(self.tmp.name).resolve() / "keg"
+        keg.mkdir()
+        (keg / "cargo").write_text("#!/bin/sh\necho cargo ran\n")
+        (keg / "cargo").chmod(0o755)
+        self.stub("make", "cargo")
+        with patch.object(run_actions, "TOOL_DIRS", (str(keg),)):
+            status, body = run_actions.run("job.log", run_actions.Step(line="make", argv=("make",)))
+        self.assertEqual((status, body["exit"], body["output"]), (200, 0, "cargo ran"))
+
     def test_a_program_that_does_not_start_is_503_and_ran_nothing(self):
         status, body = run_actions.run("job.log", run_actions.Step(line="gone", argv=(str(self.bin / "gone"),)))
         self.assertEqual(status, 503)
