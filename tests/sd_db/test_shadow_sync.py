@@ -212,7 +212,10 @@ class TheSync(SyncCase):
         runner = Gh(nodes=[])
         sync(self.connection, now=self.now, runner=runner)
         self.assertEqual(len(runner.queries), 4)
-        self.assertTrue(any("review-requested:@me" in one for one in runner.queries))
+        # sd:8358: `review-requested` also matches a team's request; only a request by name is yours.
+        terms = [term for one in runner.queries for term in one.split()]
+        self.assertIn("user-review-requested:@me", terms)
+        self.assertNotIn("review-requested:@me", terms)
         expected = f"updated:{iso(self.now - FIRST_RUN_WINDOW)}..{iso(self.now)}"
         self.assertTrue(all(expected in one for one in runner.queries))
 
@@ -816,7 +819,7 @@ class TheReason(SyncCase):
 
     def test_github_rows_store_the_strongest_bucket(self):
         runner = BucketGh({"assignee:@me": [node(1), node(4)], "author:@me": [node(2), node(4)],
-                           "mentions:@me": [node(3)], "review-requested:@me": [node(5)]})
+                           "mentions:@me": [node(3)], "user-review-requested:@me": [node(5)]})
         result = sync(self.connection, now=self.now, runner=runner)
         self.assertTrue(result.ok, result.reason)
         self.assertEqual(self.reasons(), {"1": "assigned", "2": "filed", "3": "watched", "4": "assigned",

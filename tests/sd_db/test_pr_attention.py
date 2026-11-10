@@ -51,7 +51,7 @@ class Gh:
             return self.checks(next(value[6:] for value in argv if value.startswith("query=")))
         nodes = self.mentioned if "mentions:@me" in query else \
             self.author if "author:@me" in query and "is:pr is:open" in query else \
-            self.requested if "user-review-requested:@me" in query else []
+            self.requested if "user-review-requested:@me" in query and "is:pr is:open" in query else []
         if self.fail and nodes is self.requested:
             return 1, "", self.fail
         if "-reviewed-by:@me" in query:  # GitHub leaves out the pulls the operator reviewed

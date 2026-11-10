@@ -220,8 +220,9 @@ operator. If Notion does not answer, or answers from a workspace that is not the
 Jira. Search issues within jira_scope, updated after its Since time, that are assigned to the operator, mention them, or
 that they watch: (assignee = currentUser() OR watcher = currentUser() OR text ~ currentUser()).
 
-GitHub. Within github_scope, find open pull requests that request the operator's review (review-requested:@me),
-reviews on their own open pull requests (author:@me), and mentions (mentions:@me), updated after its Since time.
+GitHub. Within github_scope, find open pull requests that request the operator's review by name
+(user-review-requested:@me), reviews on their own open pull requests (author:@me), and mentions (mentions:@me),
+updated after its Since time.
 """,
 }
 
