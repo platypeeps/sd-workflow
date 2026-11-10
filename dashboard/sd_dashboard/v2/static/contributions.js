@@ -3,7 +3,7 @@
 // /classic/contributions renders, never sample data. The dashboard makes no GitHub call: the "Settled on GitHub" lamp, each
 // row's settle date and the settled-per-day chart read the dates the shadow collector records (sd:5301). Acknowledge, Make task and
 // Dismiss run through dashboard routes and ask first: none has a verb that reverses it. Open on GitHub opens a tab (sd:5628);
-// Re-run collector asks the server to run sd shadow sync (sd:2207).
+// Re-run collector, and Read again (sd:8380), ask the server to run sd shadow sync (sd:2207).
 // build (sd:5486): Hide and Unhide post /api/contributions/view, the view state Designs' Hide writes, each with Undo. A hidden
 // row leaves the Open rows, the lamps, the tallies and the badge; Hidden, in the Open table's Open | Hidden, lists it with Unhide.
 // Hide persists until Unhide, where Dismiss ends on new activity. An unread store hides nothing and turns both commands off.
@@ -24,8 +24,6 @@ const BY_TEXT = 'repo, title and reason';
 window.PAGE_FILTER = { open: BY_TEXT, settled: BY_TEXT, filed: 'tickets and issues' };
 window.PAGE_COMMANDS = [
   { label: 'Show the GitHub sync', icon: 'activity', run: () => document.dispatchEvent(new CustomEvent('shell:open', { detail: 'collector' })) },
-  // sd:8146: the head's Refresh from GitHub, which runs Re-run collector's sync.
-  { label: 'Refresh from GitHub', icon: 'rotate-ccw', run: () => document.dispatchEvent(new CustomEvent('contributions:refresh')) },
   ...['all', 'internal', 'external'].map(v => ({ label: `Show ${v} repositories`, icon: 'filter', run: () => document.dispatchEvent(new CustomEvent('contributions:scope', { detail: v })) })),
 ];
 // build: nothing is read yet, so the page claims nothing for the rail until /api/contributions/page answers.
@@ -187,8 +185,8 @@ addEventListener('DOMContentLoaded', () => {
         cli: o => `open ${shq(o.url)}`,
         run: o => { window.open(o.url, '_blank', 'noopener'); return `Opened in ${TRACKER[o.tracker]} · ${o.ref}`; } },
       // Re-run collector (commands.js); Contributions reads again once the run ends.
-      // sd:8146: while the run it follows is live, the head's Refresh from GitHub is off and says Refreshing….
-      SYNC = window.commands.syncCollector({ reread: () => reread(), page: 'Contributions', running: on => { SYNCING = on; if (DOC) renderHead(); } }),
+      // sd:8380: while the run it follows is live, Read again only reads.
+      SYNC = window.commands.syncCollector({ reread: () => reread(), page: 'Contributions', running: on => { SYNCING = on; } }),
     );
   }
 
@@ -240,7 +238,6 @@ addEventListener('DOMContentLoaded', () => {
       <button class="linkish" type="button" data-collector>Collector</button>
       <span><b>${n(unknown)}</b> of ${n(openN(scope))} open rows unknown freshness</span>
       <span class="g-${st}">GitHub sync ${c.state || 'unknown'}${c.last_success_at ? html`, last success <time class="rel" datetime="${c.last_success_at}"></time>` : ''}</span>
-      <button class="linkish" type="button" data-gh-refresh${SYNCING ? html` disabled` : ''}>${SYNCING ? 'Refreshing…' : 'Refresh from GitHub'}</button>
       <span>${n(tot('linked'))} linked items · ${n(tot('unfiled'))} unfiled</span>`);
   }
 
@@ -507,10 +504,7 @@ addEventListener('DOMContentLoaded', () => {
   };
   document.addEventListener('shell:view', e => onView(e.detail.id));
   onView(window.shell.view?.current?.());
-  const refresh = () => { const o = C.get('collector'); if (!SYNCING && o) C.run(SYNC, o); };
-  document.getElementById('source').addEventListener('click', e => { if (e.target.closest('[data-collector]')) select('collector', true);
-    if (e.target.closest('[data-gh-refresh]')) refresh(); });
-  document.addEventListener('contributions:refresh', refresh);
+  document.getElementById('source').addEventListener('click', e => { if (e.target.closest('[data-collector]')) select('collector', true); });
   [tbody, ftbody].forEach(b => b.addEventListener('click', e => { if (e.target.closest('.rowact') || e.target.closest('a')) return; const tr = e.target.closest('tr[data-id]'); if (tr) select(tr.dataset.id, true); }));
   document.addEventListener('shell:open', e => select(e.detail, true));
   document.addEventListener('shell:filter', e => { if (e.detail.q === q.value) return; q.value = e.detail.q; if (DOC) applyFilter(); });
@@ -558,9 +552,10 @@ addEventListener('DOMContentLoaded', () => {
     unselect: nothing,
   });
   const load = () => reading.load(), reread = () => reading.reread();
-  // Read again (sd:5638): the shell's head button reads the table again. The sync is the collector's Re-run collector
-  // (sd:5750 took out the toolbar's Refresh, a second way to it).
-  window.PAGE_AGAIN = { title: 'Refresh contributions', run: load };
+  // Read again (sd:5638) is the page's one refresh (sd:8380): it runs Re-run collector's sync, which reads the page again
+  // when the run ends. While a sync runs, or before the collector row exists, it only reads.
+  const again = () => { const o = C.get('collector'); if (SYNCING || !o) return load(); C.run(SYNC, o); };
+  window.PAGE_AGAIN = { title: 'Sync with GitHub and read again', run: again };
   registerCommands();
   load();
 });
