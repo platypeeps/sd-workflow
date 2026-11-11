@@ -675,7 +675,7 @@ def _close_merged(connection, row: dict, metadata: dict, value: dict, merged: st
         add_note(connection, item, "comment", merged, session=OBSERVER)
         return
     try:
-        why = _merge_close_refusal(connection, row, metadata, value.get("opened_at"))
+        why = _merge_close_refusal(connection, row, metadata, metadata["pull_url"], value.get("opened_at"))
         if why is None:
             change_status(connection, item, "done", who=OBSERVER, reason=f"{merged}; its commit says Closes: sd:{item}")
             return
@@ -684,12 +684,13 @@ def _close_merged(connection, row: dict, metadata: dict, value: dict, merged: st
     add_note(connection, item, "comment", f"{merged}; not closed: {why}", session=OBSERVER)
 
 
-def _merge_close_refusal(connection, row: dict, metadata: dict, opened_at) -> str | None:
+def _merge_close_refusal(connection, row: dict, metadata: dict, url: str, opened_at) -> str | None:
     """Why a merge whose commit closes item `row` does not close it, or None when it may (sd:8455).
 
     Each check is a blocker an sd:8375 review round found: a status a merge does not end, an operator's
     `blocked_on`, an open followup (done would resolve it), a reopen since the pull opened, an assignment, run or
-    lane entry holding the item, and a kind that closes only with delivery evidence.
+    lane entry holding the item, a kind that closes only with delivery evidence, and an unmet dependency (round 3,
+    and the sd:8455 review).
     """
     item = row["id"]
     if row["status"] not in MERGE_CLOSES_FROM:
@@ -723,6 +724,34 @@ def _merge_close_refusal(connection, row: dict, metadata: dict, opened_at) -> st
         return "a work item closes only with delivery evidence"
     if "done" not in allowed_statuses(connection, item):
         return f"a {row['kind']} item does not move to done through task controls"
+    return _unmet(connection, item, url, metadata.get("depends_on") or [])
+
+
+def _unmet(connection, item: int, url: str, dependencies: list) -> str | None:
+    """The first of `item`'s dependencies that is not met, said, or None; its own pull request's merge alone does not
+    close it (sd:8455).
+
+    A `merge` on `url` is met by this merge; one on another pull request by that one recorded merged; an `item` by
+    that item being done now. An `issue` or `release` needs the item's dependency observation, taken for the
+    configuration it has now, to say it is satisfied: unread is unmet.
+    """
+    recorded = snapshot(connection, f"item:{item}")["observation"] or {}
+    proven = {_digest(row["dependency"]) for row in recorded.get("dependencies", [])
+              if recorded.get("configured") == dependencies and isinstance(row, dict)
+              and row.get("state") == "satisfied" and isinstance(row.get("dependency"), dict)}
+    for dependency in dependencies:
+        kind = dependency["kind"]
+        if kind == "merge" and (dependency["url"] == url or (
+                snapshot(connection, "github:" + dependency["url"])["observation"] or {}).get("state") == "merged"):
+            continue
+        if kind == "item":
+            row = connection.execute("SELECT status FROM item WHERE id = ?", (dependency["item"],)).fetchone()
+            if row is not None and row["status"] == "done":
+                continue
+        elif kind != "merge" and _digest(dependency) in proven:
+            continue
+        name = dependency.get("url") or dependency.get("contains_pull") or f"sd:{dependency.get('item')}"
+        return f"{kind} dependency {name} is not satisfied"
     return None
 
 

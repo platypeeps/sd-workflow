@@ -16,7 +16,7 @@ from sd_db import contributions as core
 from sd_db.contribution_github import Client
 from sd_db.database import transaction
 from sd_db.shadow_sync import _SearchBudget, read_watermark, sync
-from sd_db.workflow import change_status
+from sd_db.workflow import capture_task, change_status
 
 from . import test_contribution_github as fixtures
 from .test_contribution_github import (
@@ -1091,8 +1091,8 @@ class MergeCloses(SyncCase):
 
     MERGE = "c" * 40
 
-    def item(self, **changes):
-        return core.capture(self.db, title="Filed", changes={"pull_url": URL, **changes}, who="operator")["item"]["id"]
+    def item(self, url=URL, **changes):
+        return core.capture(self.db, title="Filed", changes={"pull_url": url, **changes}, who="operator")["item"]["id"]
 
     def merge(self, item, message=None):
         """Read the pull open, then merged at `MERGE` whose message is `message` (default: closes `item`)."""
@@ -1172,3 +1172,35 @@ class MergeCloses(SyncCase):
         self.db.execute("UPDATE item SET kind = 'work' WHERE id = ?", (item,))
         self.db.commit()
         self.assertIn("delivery evidence", self.kept(item))
+
+    def test_an_unmet_dependency_keeps_it_open(self):
+        # Review of sd:8455: blocked_on was checked and depends_on was not.
+        prerequisite = capture_task(self.db, title="First", priority=3, who="operator")["item"]["id"]
+        item = self.item(depends_on=[{"kind": "item", "item": prerequisite}])
+        self.assertIn(f"item dependency sd:{prerequisite} is not satisfied", self.kept(item))
+
+    def test_an_unmerged_or_unread_dependency_refuses_and_a_met_one_does_not(self):
+        other = URL.rsplit("/", 1)[0] + "/8"
+        prerequisite = capture_task(self.db, title="First", priority=3, who="operator")["item"]["id"]
+        change_status(self.db, prerequisite, "done", who="operator")
+        for number, dependencies, refused in (
+                (9, [{"kind": "merge", "url": other}], f"merge dependency {other} is not satisfied"),
+                (10, [{"kind": "merge", "url": URL.rsplit("/", 1)[0] + "/10"}, {"kind": "item", "item": prerequisite}],
+                 None)):
+            with self.subTest(dependencies=dependencies):
+                url = URL.rsplit("/", 1)[0] + f"/{number}"
+                item = self.item(url, depends_on=dependencies)
+                row = dict(self.db.execute("SELECT * FROM item WHERE id = ?", (item,)).fetchone())
+                metadata = core._metadata(row)
+                self.assertEqual(core._merge_close_refusal(self.db, row, metadata, url, None), refused)
+
+    def test_a_met_item_dependency_still_closes(self):
+        prerequisite = capture_task(self.db, title="First", priority=3, who="operator")["item"]["id"]
+        change_status(self.db, prerequisite, "done", who="operator")
+        item = self.item(depends_on=[{"kind": "item", "item": prerequisite}])
+        self.assertTrue(self.run_sync([URL]).ok)
+        # The observer's own unblock followup holds the item like any open followup until it is resolved.
+        for (note,) in self.db.execute("SELECT id FROM note WHERE item = ? AND kind = 'followup'", (item,)).fetchall():
+            writes.resolve_note(self.db, note)
+        self.db.commit()
+        self.assertEqual(self.merge(item)[0], "done")
