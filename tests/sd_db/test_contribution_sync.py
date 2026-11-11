@@ -1191,7 +1191,7 @@ class MergeCloses(SyncCase):
                 url = URL.rsplit("/", 1)[0] + f"/{number}"
                 item = self.item(url, depends_on=dependencies)
                 row = dict(self.db.execute("SELECT * FROM item WHERE id = ?", (item,)).fetchone())
-                metadata = core._metadata(row)
+                metadata = core._metadata(row) or {}
                 self.assertEqual(core._merge_close_refusal(self.db, row, metadata, url, None), refused)
 
     def test_a_met_item_dependency_still_closes(self):
