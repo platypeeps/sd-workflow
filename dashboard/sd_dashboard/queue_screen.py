@@ -64,7 +64,7 @@ Read again on the Queue view (sd:8375) first posts `/api/queue/prs/check` `{item
 show (`check_prs`). Each open item whose contribution `pull_url` names a pull request is read on GitHub
 (`contribution_github.pull`) and recorded as the collector records it (`contributions.observe_pull`). The read that
 first records a pull request merged writes `PR <url> merged at <merge commit>` on each open item linking it and
-changes no status: the operator closes the item. At most `PR_CHECK_ITEMS` items, `PR_CHECK_SECONDS` seconds; a pull
+changes no status, unless its commit says `Closes: sd:<item>` (sd:8455). At most `PR_CHECK_ITEMS` items, `PR_CHECK_SECONDS` seconds; a pull
 not read, or a merged pull whose item is still open, is named in `unread`, which the page shows under the table.
 """
 
@@ -562,7 +562,7 @@ def pr_check(connection, items: list[int], *, client=None) -> dict:
     """Read on GitHub the pull request each open item in `items` links and record it as the collector does.
 
     `{"checked", "unread"}`: the items read, and one line per item whose pull was not read or merged while the item
-    stays open (`observe_pull` notes a merge and changes no status). Each record is its own transaction.
+    stays open (`observe_pull` notes a merge; it closes only on a `Closes:` trailer). Each record is its own transaction.
     """
     from types import SimpleNamespace
 

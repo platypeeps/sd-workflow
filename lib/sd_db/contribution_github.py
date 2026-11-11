@@ -388,6 +388,31 @@ def _labels(detail):
     return [label["name"] for label in labels]
 
 
+#: A trailer block line and the item a `Closes:` trailer names, as `bin/sd_lib.trailer_block` reads them.
+_TRAILER = re.compile(r"[A-Za-z0-9-]+[ \t]*:.*|[ \t]+\S.*")
+_CLOSES = re.compile(r"Closes:[ \t]*sd:([1-9][0-9]*)[ \t]*")
+
+
+def _closes(client, prefix, commit):
+    """The items the merge commit's trailer block closes, or None when GitHub has no message for it (sd:8455).
+
+    Only the last paragraph, and only when every line of it is a trailer: a quoted `Closes:` in prose closes
+    nothing. A commit GitHub answers 404 or 410 for, or a message that does not parse, is unknown, not "none",
+    and the merge is still recorded; any other failure, the budget's too, fails the whole read, which a later
+    run retries, since only the read that first records the merge may close.
+    """
+    try:
+        message = (client.get(f"{prefix}/commits/{commit}", missing=True) or {})["commit"]["message"]
+    except (Gone, KeyError, TypeError):
+        return None
+    if not isinstance(message, str):
+        return None
+    block = re.split(r"\n[ \t]*\r?\n", message.rstrip())[-1].splitlines()
+    if not block or not all(_TRAILER.fullmatch(line) for line in block) or block[0][:1] in " \t":
+        return []
+    return sorted({int(match[1]) for line in block if (match := _CLOSES.fullmatch(line))})
+
+
 def pull(client, url, operator, *, observed_at, why=(), blocking_labels=(), automation=frozenset()):
     owner, repo, number = pull_parts(url)
     prefix = f"/repos/{owner}/{repo}"
@@ -431,6 +456,7 @@ def pull(client, url, operator, *, observed_at, why=(), blocking_labels=(), auto
     commit = before.get("merge_commit_sha") if before["merged"] else None
     if before["merged"] and not (isinstance(commit, str) and commit):
         raise Unavailable("merged pull names no merge commit")
+    closes = _closes(client, prefix, commit) if commit else []
     labels = _labels(before)
     # sd:8084: users asked by name; a team request is in `requested_teams`, which names no one.
     requested = before.get("requested_reviewers")
@@ -441,7 +467,8 @@ def pull(client, url, operator, *, observed_at, why=(), blocking_labels=(), auto
     why = [reason for reason in why if reason != "review-requested" or asked]
     return {"complete": True, "observed_at": observed_at, "operator": operator, "author": author,
             "repo": f"{owner}/{repo}", "title": before.get("title", ""), "requested_reviewers": [user["login"] for user in requested],
-            "state": "merged" if before["merged"] else before["state"], "merge_commit": commit, "draft": before["draft"],
+            "state": "merged" if before["merged"] else before["state"], "merge_commit": commit, "closes": closes,
+            "opened_at": before.get("created_at"), "draft": before["draft"],
             "head": head, "base": base, "mergeable": "unknown" if mergeable is None else "mergeable" if mergeable is True else "conflicting",
             "ci": ci, "ci_head": head, "ci_ids": ci_ids, "why": list(why),
             "blocking_labels": list(blocking_labels), "labels": labels,

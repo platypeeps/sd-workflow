@@ -16,6 +16,7 @@ from sd_db import contributions as core
 from sd_db.contribution_github import Client
 from sd_db.database import transaction
 from sd_db.shadow_sync import _SearchBudget, read_watermark, sync
+from sd_db.workflow import change_status
 
 from . import test_contribution_github as fixtures
 from .test_contribution_github import (
@@ -1080,3 +1081,94 @@ class MergeNotes(SyncCase):
         notes = [row[0] for row in self.db.execute(
             "SELECT body FROM note WHERE item = ? AND kind = 'comment' AND body LIKE 'PR http%merged%'", (item,))]
         self.assertEqual((status, notes), ("planning", [f"PR {URL} merged at {'c' * 40}"]))
+
+
+class MergeCloses(SyncCase):
+    """sd:8455: a pull merged outside sd-ship closes its item only when the merge commit says `Closes: sd:N`.
+
+    Every other case keeps the sd:8375 note; the refusals are the cases the eight sd:8375 rounds found.
+    """
+
+    MERGE = "c" * 40
+
+    def item(self, **changes):
+        return core.capture(self.db, title="Filed", changes={"pull_url": URL, **changes}, who="operator")["item"]["id"]
+
+    def merge(self, item, message=None):
+        """Read the pull open, then merged at `MERGE` whose message is `message` (default: closes `item`)."""
+        self.assertTrue(self.run_sync([URL]).ok)
+        if message is not False:
+            self.api.rows[ROOT + "/commits/" + self.MERGE] = {
+                "sha": self.MERGE, "commit": {"message": message or f"fix: work\n\nBody.\n\nCloses: sd:{item}\n"}}
+        self.api.detail.update(state="closed", merged=True, merge_commit_sha=self.MERGE,
+                               updated_at="2026-09-10T02:00:00Z")
+        self.assertTrue(self.run_sync([URL]).ok)
+        status = self.db.execute("SELECT status FROM item WHERE id = ?", (item,)).fetchone()[0]
+        notes = [row[0] for row in self.db.execute(
+            "SELECT body FROM note WHERE item = ? AND kind IN ('comment', 'status_change') AND body LIKE '%PR http%merged at%'",
+            (item,))]
+        return status, notes
+
+    def test_a_closes_trailer_for_the_item_closes_it(self):
+        item = self.item()
+        status, notes = self.merge(item)
+        self.assertEqual(status, "done")
+        self.assertTrue(any(f"PR {URL} merged at {self.MERGE}" in note for note in notes), notes)
+
+    def test_a_later_sync_does_not_close_an_item_reopened_after_the_close(self):
+        item = self.item()
+        self.assertEqual(self.merge(item)[0], "done")
+        change_status(self.db, item, "in_progress", who="operator")
+        self.api.detail.update(updated_at="2026-09-10T03:00:00Z")
+        self.assertTrue(self.run_sync([URL]).ok)
+        self.assertEqual(self.db.execute("SELECT status FROM item WHERE id = ?", (item,)).fetchone()[0], "in_progress")
+
+    def kept(self, item, message=None):
+        status, notes = self.merge(item, message)
+        self.assertNotEqual(status, "done")
+        self.assertEqual(len(notes), 1, notes)
+        self.assertTrue(notes[0].startswith(f"PR {URL} merged at {self.MERGE}"), notes)
+        return notes[0]
+
+    def test_no_trailer_keeps_the_note_only(self):
+        self.assertEqual(self.kept(self.item(), "fix: work\n\nNo trailer here.\n"), f"PR {URL} merged at {self.MERGE}")
+
+    def test_a_trailer_for_another_item_keeps_the_note_only(self):
+        item = self.item()
+        self.kept(item, f"fix: work\n\nCloses: sd:{item + 1}\n")
+
+    def test_a_closes_line_in_prose_is_no_trailer(self):
+        item = self.item()
+        self.kept(item, f"fix: work\n\nCloses: sd:{item} was quoted here\nin prose.\n\nRef: x\n")
+
+    def test_an_unreadable_merge_commit_keeps_the_note_only(self):
+        self.kept(self.item(), False)
+
+    def test_blocked_on_keeps_it_open(self):
+        self.assertIn("blocked on", self.kept(self.item(blocked_on="production validation")))
+
+    def test_an_open_followup_keeps_it_open_and_unresolved(self):
+        item = self.item()
+        note = writes.add_note(self.db, item, "followup", "Check the rollout", session="operator")
+        self.assertIn(f"open followup #{note}", self.kept(item))
+        self.assertIsNone(self.db.execute("SELECT resolved_at FROM note WHERE id = ?", (note,)).fetchone()[0])
+
+    def test_a_reopen_since_the_pull_opened_keeps_it_open(self):
+        item = self.item()
+        change_status(self.db, item, "done", who="operator")
+        change_status(self.db, item, "in_progress", who="operator")
+        self.assertIn("reopened", self.kept(item))
+
+    def test_a_lane_entry_or_build_run_holding_it_keeps_it_open(self):
+        for target in ("sd_db.teammate.lane_holding", "sd_db.build._held"):
+            with self.subTest(target=target):
+                self.setUp()
+                item = self.item()
+                with patch(target, return_value="a lane entry delivers it"):
+                    self.assertIn("a lane entry delivers it", self.kept(item))
+
+    def test_a_work_item_keeps_it_open(self):
+        item = self.item()
+        self.db.execute("UPDATE item SET kind = 'work' WHERE id = ?", (item,))
+        self.db.commit()
+        self.assertIn("delivery evidence", self.kept(item))

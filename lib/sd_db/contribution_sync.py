@@ -20,7 +20,7 @@ MAX_NOTIFICATIONS = 5
 #: stops before an attempt that cannot finish. A pull reads itself, its
 #: reviews, comments, inline comments, timeline, check runs and statuses,
 #: then itself again, plus its head's workflow runs when its check names
-#: repeat (sd:1776); an issue reads itself, its comments and its timeline,
+#: repeat (sd:1776), or a merged one's merge commit (sd:8455); an issue reads itself, its comments and its timeline,
 #: then itself again. A merge dependency reads its pull, a release one adds the release,
 #: the tag ref, one peel, the comparison, PyPI and the ref again, and an
 #: issue one reads the issue and, unless that is closed as completed, one

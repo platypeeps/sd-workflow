@@ -17,18 +17,29 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import paths, shadow_sync
+from . import build, paths, shadow_sync, teammate
 from .database import transaction
 from .errors import SdDbError
+from .runner import OWNING
 from .workflow import (
     StaleItem,
     WorkflowError,
     _checked_state,
     _text,
+    allowed_statuses,
     capture_task,
+    change_status,
     item_state,
 )
-from .writes import add_note, now, record_state, resolve_note, set_item_fields, stamp
+from .writes import (
+    TransitionRefused,
+    add_note,
+    now,
+    record_state,
+    resolve_note,
+    set_item_fields,
+    stamp,
+)
 
 FIELDS = frozenset({"local_clone", "local_branch", "tested_commit", "pull_url", "evidence",
                     "blocked_on", "depends_on", "blocking_labels",
@@ -577,7 +588,8 @@ def observe_pull(connection, url, observation, *, expected_revision) -> dict:
     """Record one complete pull-request read.
 
     The read that first records the pull merged writes `PR <url> merged at <sha>` on each open item linking it and
-    changes no status (sd:8375): a merge is not proof the item is done, so the operator closes it.
+    changes no status (sd:8375): a merge is not proof the item is done, so the operator closes it. The one
+    exception is `_close_merged`'s (sd:8455).
     """
     url = _url(url)
     with transaction(connection):
@@ -629,7 +641,7 @@ def observe_pull(connection, url, observation, *, expected_revision) -> dict:
             merged = f"PR {url} merged" + (f" at {value['merge_commit']}" if value.get("merge_commit") else "")
             for row, metadata in _registered(connection, []):
                 if metadata.get("pull_url") == url and row["status"] != "done":
-                    add_note(connection, row["id"], "comment", merged, session=OBSERVER)
+                    _close_merged(connection, row, metadata, value, merged)
         contexts = _context_ids(value, state)
         attention, baseline = _pull_attention(value, state, contexts)
         state["context_events"] = contexts
@@ -644,6 +656,74 @@ def observe_pull(connection, url, observation, *, expected_revision) -> dict:
         if item is not None:
             _note_lane(connection, item)
         return result
+
+
+#: The statuses a merge may close from; `blocked` and `ready_to_send` wait on something a merge does not give.
+MERGE_CLOSES_FROM = ("planning", "ready", "in_progress")
+
+
+def _close_merged(connection, row: dict, metadata: dict, value: dict, merged: str) -> None:
+    """Close item `row` on the read that first records its pull merged, or note the merge (sd:8455, sd:8375).
+
+    It closes only when the merge commit's trailer block says `Closes: sd:<item>`, the author's word that the
+    item is done, as `sd-ship` reads it, and `_merge_close_refusal` finds nothing holding it; else it writes the
+    sd:8375 note, with the refusal when the trailer asked for a close. Never retried: a later read sees the
+    merge recorded and does nothing, so a reopen stands.
+    """
+    item = row["id"]
+    if item not in (value.get("closes") or []):
+        add_note(connection, item, "comment", merged, session=OBSERVER)
+        return
+    try:
+        why = _merge_close_refusal(connection, row, metadata, value.get("opened_at"))
+        if why is None:
+            change_status(connection, item, "done", who=OBSERVER, reason=f"{merged}; its commit says Closes: sd:{item}")
+            return
+    except (WorkflowError, TransitionRefused) as error:
+        why = str(error)
+    add_note(connection, item, "comment", f"{merged}; not closed: {why}", session=OBSERVER)
+
+
+def _merge_close_refusal(connection, row: dict, metadata: dict, opened_at) -> str | None:
+    """Why a merge whose commit closes item `row` does not close it, or None when it may (sd:8455).
+
+    Each check is a blocker an sd:8375 review round found: a status a merge does not end, an operator's
+    `blocked_on`, an open followup (done would resolve it), a reopen since the pull opened, an assignment, run or
+    lane entry holding the item, and a kind that closes only with delivery evidence.
+    """
+    item = row["id"]
+    if row["status"] not in MERGE_CLOSES_FROM:
+        return f"its status is {row['status']}"
+    if (metadata.get("blocked_on") or "").strip():
+        return f"it is blocked on: {metadata['blocked_on'].strip()}"
+    followup = connection.execute("SELECT id FROM note WHERE item = ? AND kind = 'followup' AND resolved_at IS NULL "
+                                  "ORDER BY id LIMIT 1", (item,)).fetchone()
+    if followup is not None:
+        return f"open followup #{followup['id']}"
+    try:
+        since = stamp(opened_at)
+    except SdDbError:
+        since = ""  # an unknown opening: any reopen counts
+    if connection.execute("SELECT 1 FROM note WHERE item = ? AND kind = 'status_change' AND body LIKE 'done -> %' "
+                          "AND timestamp >= ? LIMIT 1", (item, since)).fetchone() is not None:
+        return "it was reopened since the pull request opened"
+    marks = ",".join("?" * len(OWNING))
+    held = connection.execute(f"SELECT id FROM assignment WHERE item = ? AND status IN ({marks}) LIMIT 1",
+                              (item, *OWNING)).fetchone()
+    if held is not None:
+        return f"assignment {held['id']} holds it"
+    run = teammate.holding(connection, item)
+    if run is not None:
+        return f"teammate run {run['id']} holds it"
+    # The guards a teammate start checks: an unreleased build run, and a lane entry whose close `sd-ship` owns.
+    retained = build._held(connection, item) or teammate.lane_holding(connection, item)
+    if retained:
+        return retained
+    if row["kind"] == "work":
+        return "a work item closes only with delivery evidence"
+    if "done" not in allowed_statuses(connection, item):
+        return f"a {row['kind']} item does not move to done through task controls"
+    return None
 
 
 def _issue_attention(observation: dict, previous: dict) -> list[dict]:
