@@ -3480,5 +3480,18 @@ class Budget(unittest.TestCase):
         self.assertEqual(build_run.TIMEOUT_SECONDS, 7200)
 
 
+class ChildEnvironment(unittest.TestCase):
+    """A build child gets GITHUB_TOKEN from the operator's PAT (sd:8506)."""
+
+    def test_a_child_gets_github_token_from_the_pat(self) -> None:
+        env = build_run._environ({"GITHUB_PERSONAL_ACCESS_TOKEN": "example-pat"})
+        self.assertEqual(env.get("GITHUB_TOKEN"), "example-pat")
+
+    def test_a_set_github_token_wins(self) -> None:
+        env = build_run._environ({"GITHUB_PERSONAL_ACCESS_TOKEN": "example-pat",
+                                  "GITHUB_TOKEN": "example-own"})
+        self.assertEqual(env["GITHUB_TOKEN"], "example-own")
+
+
 if __name__ == "__main__":
     unittest.main()

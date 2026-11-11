@@ -794,6 +794,9 @@ def _environ(environ: dict | None) -> dict:
     # The token reaches the child's environment only: no row or log holds it.
     if env.get("CUSTOM_CLAUDE_CODE_OAUTH_TOKEN"):
         env["CLAUDE_CODE_OAUTH_TOKEN"] = env["CUSTOM_CLAUDE_CODE_OAUTH_TOKEN"]
+    # A repo's own checks may fetch private release assets with GITHUB_TOKEN (sd:8506).
+    if not env.get("GITHUB_TOKEN") and env.get("GITHUB_PERSONAL_ACCESS_TOKEN"):
+        env["GITHUB_TOKEN"] = env["GITHUB_PERSONAL_ACCESS_TOKEN"]
     return env
 
 
