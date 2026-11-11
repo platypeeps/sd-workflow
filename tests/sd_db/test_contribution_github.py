@@ -2,6 +2,7 @@
 
 import copy
 import json
+import re
 import time
 import unittest
 from typing import Any
@@ -49,6 +50,8 @@ class Api:
 
     def __call__(self, path, fields, timeout):
         self.calls.append((path, fields, timeout))
+        if path not in self.rows and re.search(r"/commits/[0-9a-f]{40}$", path):
+            return Response(404, {}, "")  # a merge commit no test serves (sd:8455)
         value = self.rows[path]
         if callable(value):
             value = value()

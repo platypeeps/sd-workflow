@@ -68,7 +68,7 @@ A source that was not read is named under the table.
 Read again on this view first posts `/api/queue/prs/check` with the items its PR rows show, at most 20 (sd:8375):
 the server reads each linked pull request on GitHub and records it as the nightly sync does.
 The read that first records a merge writes `PR <url> merged at <sha>` on each open item linking it, here or in the sync.
-It changes no status: the operator closes the item.
+It changes no status, unless the merge commit's trailer block says `Closes: sd:<item>` and nothing holds the item (sd:8455).
 A pull request it could not read, or one merged while its item is open, is named under the table.
 The 30 s poll reads only the database.
 
