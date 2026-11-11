@@ -122,6 +122,9 @@ class FakeJira:
             names.update({offer["id"]: offer["to"]["name"] for offer in listed["transitions"]
                           if isinstance(offer, dict) and isinstance(offer.get("to"), dict)})
         name = names[body["transition"]["id"]]
+        if STATUS.get(name) == "done" and self.assignees.get(key, "acct-person") is None:
+            # Jira refuses Done on an unassigned ticket (sd:8473: LOG-25093, LOG-25094).
+            return None, "Jira returned 400 Bad Request"
         self.posted.append((key, name))
         self.tickets[key] = name
         return {}, ""
