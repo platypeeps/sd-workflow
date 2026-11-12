@@ -241,7 +241,7 @@ def dispatcher_refusal(connection, host: str) -> str | None:
     if gone:
         return gone
     why = dispatcher_why(connection, host)
-    return f"{HEARTBEAT}@{host} claims nothing: {why}" if why and why not in UNREAD else None
+    return f"{HEARTBEAT}@{host} claims nothing: {why}" if why and not why.startswith(UNREAD) else None
 
 
 def dispatcher_stuck(connection, host: str) -> str | None:
@@ -622,7 +622,8 @@ def _key(repo: str | None) -> str | None:
     return paths.key(repo) if isinstance(repo, str) and repo.startswith("/") else repo
 
 
-#: `room`'s answers for an input it did not read: the tick claims nothing and says which.
+#: `room`'s answers for an input it did not read: the tick claims nothing and says which; the tick's beat may add
+#: the reason after the constant (pack sd:8606).
 UNREAD = ("the load was not read", "the interactive builders were not counted")
 #: Why nothing claims while a restore reimport is pending: the press, the claim and the tick's beat say it.
 RESTORING = "database restore reimport is incomplete; builds are held"

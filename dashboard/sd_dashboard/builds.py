@@ -75,27 +75,26 @@ def _seconds(since: str | None, now: str) -> int | None:
 
 
 def interactive(connection, *, now: str, sessions=None) -> list[dict] | None:
-    """One `{repo, session_id}` per interactive builder, as `sd assignments dispatch` counts them; None when unread.
+    """One `{repo, session_id}` per slot `claude_sessions.builders` holds, as `sd assignments dispatch` counts them;
+    None when unread.
 
     `sessions` is `claude_sessions.document`, the seam a test fills. A cwd in a linked worktree counts against its
-    main checkout (`sd_lib.main_worktree_root`, pack sd:6112).
+    main checkout (`sd_lib.main_worktree_root`, pack sd:6112). The holders are the one rule (pack sd:8606).
     """
     from . import claude_sessions, pack_module
 
     try:
-        document = (sessions or claude_sessions.document)(connection, now=now)
-        if document["builders"]["running"] is None:
+        counted = (sessions or claude_sessions.document)(connection, now=now)["builders"]
+        if counted["running"] is None:
             return None
         root = pack_module("sd_lib").main_worktree_root
         repos = [row["path"] for row in sd_repos.registered(connection)]
         found = []
-        for session in document["sessions"] or []:
-            count = sum(1 for agent in session.get("agents") or [] if agent["builder"] and agent["state"] != "idle")
-            count += 1 if session.get("builder") and session.get("status") != "idle" else 0
-            cwd = str(root(Path(session["cwd"]).resolve())) if session.get("cwd") else ""
+        for holder in counted.get("holders") or []:
+            cwd = str(root(Path(holder["cwd"]).resolve())) if holder.get("cwd") else ""
             key = build.paths.key(cwd) if cwd else ""
             repo = next((path for path in repos if key and (key == path or key.startswith(path.rstrip("/") + "/"))), None)
-            found += [{"repo": repo, "session_id": session.get("id")}] * count
+            found.append({"repo": repo, "session_id": holder.get("session_id")})
         return found
     except Exception:  # noqa: BLE001 -- any failure is "not counted", which shows no room
         return None

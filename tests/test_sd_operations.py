@@ -204,7 +204,7 @@ class OperationsCLI(unittest.TestCase):
         """pack sd:6094: an unread load is None, never room; an unset bulk root is a reason for no claim."""
         run = self.builds()
         with patch.object(cli, "gate_load", return_value=(None, None)), \
-                patch.object(cli, "interactive_builders", return_value=[]), \
+                patch.object(cli, "interactive_builders", return_value=([], "")), \
                 patch.object(cli, "log_root", return_value=None):
             code, output = self.call("assignments", "dispatch")
         self.assertEqual(code, 0)
@@ -225,7 +225,7 @@ class OperationsCLI(unittest.TestCase):
         run.dispatch.side_effect = lambda connection, **kwargs: (kwargs["spawn"]("r1"), {
             "reaped": [], "moved": [], "swept": [], "claimed": [], "drafted": [], "spawned": ["r1"], "why": ""})[1]
         with patch.object(cli, "gate_load", return_value=(1.0, 0.0)), \
-                patch.object(cli, "interactive_builders", return_value=[]), \
+                patch.object(cli, "interactive_builders", return_value=([], "")), \
                 patch.object(cli, "log_root", return_value=Path("/bulk")), \
                 patch.object(cli, "writable", return_value=True):
             self.call("assignments", "dispatch")
@@ -243,7 +243,7 @@ class OperationsCLI(unittest.TestCase):
         run = self.builds()
         run.archive_wait.side_effect = lambda seconds: self.connection.close.assert_called_once()
         with patch.object(cli, "gate_load", return_value=(1.0, 40.0)), \
-                patch.object(cli, "interactive_builders", return_value=[]), \
+                patch.object(cli, "interactive_builders", return_value=([], "")), \
                 patch.object(cli, "log_root", return_value=Path("/bulk")), \
                 patch.object(cli, "writable", return_value=True), \
                 patch.object(cli, "TICK_SECONDS", 30, create=True):
@@ -255,7 +255,7 @@ class OperationsCLI(unittest.TestCase):
 
     def tick(self, run):
         with patch.object(cli, "gate_load", return_value=(1.0, 40.0)), \
-                patch.object(cli, "interactive_builders", return_value=[]), \
+                patch.object(cli, "interactive_builders", return_value=([], "")), \
                 patch.object(cli, "log_root", return_value=Path("/bulk")):
             return self.call("assignments", "dispatch")
 
@@ -321,10 +321,43 @@ class OperationsCLI(unittest.TestCase):
         connection.execute("CREATE TABLE repo (path TEXT)")
         connection.execute("INSERT INTO repo VALUES ('/repos/a')")
         with patch.object(sessions_module, "document", return_value=document):
-            found = cli.interactive_builders(connection, "2026-10-25T09:00:00+00:00", lambda path: path)
-        self.assertEqual(len(found), document["builders"]["running"])
+            found, why = cli.interactive_builders(connection, "2026-10-25T09:00:00+00:00", lambda path: path)
+        self.assertEqual((len(found), why), (document["builders"]["running"], ""))
         # pack sd:6400: s1's stalled builder holds no slot.
         self.assertEqual([row["repo"] for row in found if row["session_id"] == "s1"], ["/repos/a"] * 2)
+
+    def test_an_unread_session_is_one_slot_and_an_uncounted_machine_says_why(self):
+        """pack sd:8606: a session whose transcript was not read made the whole count None, and the tick said only
+        "the interactive builders were not counted", so a satellite claimed nothing for days with no reason on the
+        hub. The count reads `builders`' holders, so an unread session is one slot against its repository; an
+        uncounted machine names the reason in the tick's `why`."""
+        with patch.object(sys, "path", [str(ROOT / "dashboard"), *sys.path]):
+            sessions_module = importlib.import_module("sd_dashboard.claude_sessions")
+        blind = {"id": "s9", "name": "s9", "cwd": "/repos/a/src", "status": "busy", "builder": False, "age": None,
+                 "quiet": 60, "agents": [],
+                 "safe": {"state": "unknown", "why": ["no transcript was found, so its last action and builders were not read"]}}
+        document = {"sessions": [blind], "builders": sessions_module.builders([blind], "")}
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute("CREATE TABLE repo (path TEXT)")
+        connection.execute("INSERT INTO repo VALUES ('/repos/a')")
+        with patch.object(sessions_module, "document", return_value=document):
+            found = cli.interactive_builders(connection, "2026-10-25T09:00:00+00:00", lambda path: path)
+        self.assertEqual(found, ([{"repo": "/repos/a", "session_id": "s9"}], ""))
+        unread = {"sessions": None, "builders": sessions_module.builders(None, "claude agents --json gave no answer in 10 s")}
+        with patch.object(sessions_module, "document", return_value=unread):
+            found = cli.interactive_builders(connection, "2026-10-25T09:00:00+00:00", lambda path: path)
+        self.assertEqual(found, (None, "claude agents --json gave no answer in 10 s"))
+        run = self.builds()
+        sys.modules["sd_db.build"].UNREAD = ("the load was not read", "the interactive builders were not counted")
+        with patch.object(cli, "gate_load", return_value=(1.0, 40.0)), \
+                patch.object(cli, "interactive_builders", return_value=found), \
+                patch.object(cli, "log_root", return_value=Path("/bulk")), \
+                patch.object(cli, "writable", return_value=True):
+            self.call("assignments", "dispatch")
+        kwargs = run.dispatch.call_args.kwargs
+        self.assertEqual((kwargs["interactive"], kwargs["why"]),
+                         (None, "the interactive builders were not counted: claude agents --json gave no answer in 10 s"))
 
     def test_a_builder_in_a_linked_worktree_counts_against_its_repository(self):
         """pack sd:6112: a cwd in a worktree outside the checkout is its registered repository, by git's common dir."""
@@ -360,7 +393,7 @@ class OperationsCLI(unittest.TestCase):
             connection.execute("CREATE TABLE repo (path TEXT)")
             connection.execute("INSERT INTO repo VALUES (?)", (str(checkout),))
             with patch.object(sessions_module, "document", return_value=document):
-                found = cli.interactive_builders(connection, "2026-10-25T09:00:00+00:00", lambda path: path)
+                found, _ = cli.interactive_builders(connection, "2026-10-25T09:00:00+00:00", lambda path: path)
         self.assertEqual([(row["session_id"], row["repo"]) for row in found],
                          [("s1", str(checkout)), ("s2", str(checkout)), ("s3", None)])
 
@@ -376,7 +409,7 @@ class OperationsCLI(unittest.TestCase):
                 config.write_text(json.dumps({"config": {"sd": {"bulk_storage_root": "relative/path"}}}))
                 run = self.builds()
                 with patch.object(cli, "gate_load", return_value=(1.0, 0.0)), \
-                        patch.object(cli, "interactive_builders", return_value=[]):
+                        patch.object(cli, "interactive_builders", return_value=([], "")):
                     code, _ = self.call("assignments", "dispatch")
         self.assertEqual(code, 0)
         self.assertIn("sd.bulk_storage_root", run.dispatch.call_args.kwargs["why"])

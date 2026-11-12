@@ -134,6 +134,23 @@ class BuildRoutes(Fixture):
         self.assertEqual((out["room"]["machine"], out["room"]["why"], out["bundles"][0]["room"]),
                          (0, "the load was not read", 0))
 
+    def test_the_room_counts_the_slots_the_session_count_holds(self):
+        """pack sd:8606: the Build dialog counted a stalled builder that `claude_sessions.builders` frees (pack
+        sd:6400), and an unread session made its whole room unread. Both read `builders`' holders now: one slot per
+        holder, against the repository its cwd lies in."""
+        from sd_dashboard import claude_sessions
+
+        def session(ident, status, agents, why=()):
+            return {"id": ident, "name": ident, "cwd": f"{REPO}/src", "status": status, "builder": False, "age": 5,
+                    "quiet": 5, "safe": {"state": "unknown", "why": list(why)},
+                    "agents": [{"name": f"{ident}-b", "builder": True, "state": state, "age": 5} for state in agents]}
+
+        listed = [session("s1", "busy", ["stalled"]),
+                  session("s2", "busy", [], why=["no transcript was found, so its last action and builders were not read"])]
+        document = {"sessions": listed, "builders": claude_sessions.builders(listed, "")}
+        found = builds.interactive(self.connection, now=NOW, sessions=lambda connection, *, now: document)
+        self.assertEqual(found, [{"repo": REPO, "session_id": "s2"}])
+
     def test_the_plan_route_reads_its_items(self):
         item = self.ready()
         with patch.object(builds, "_room", lambda connection, **_: {"machine": 6, "used": {}, "held": [], "why": ""}):

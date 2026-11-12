@@ -23,8 +23,9 @@ runs under it, and no checkout above holds unpushed work; a fact that could not 
 the reason, never `yes`. Sessions on other machines are not listed: `claude agents` lists this Mac's.
 
 `builders` counts the builders running on this Mac, for Tasks' Start next (sd:5107): every builder subagent that is
-running or unknown (not idle or stalled, pack sd:6400) and every Fix session that `claude agents` does not call idle. A source that
-could not be read makes it None with the reason.
+running or unknown (not idle or stalled, pack sd:6400) and every Fix session that `claude agents` does not call idle. A
+session whose transcript was not read holds one unknown slot until it is not busy and quiet for `STALL` (pack sd:8606).
+A session list that could not be read makes it None with the reason.
 
 `end` is Management's End session (sd:5126): it reads `claude agents --json` and `ps` again and sends SIGTERM only
 when the posted session id still holds the posted pid and that process runs claude. A subagent runs inside its
@@ -371,11 +372,13 @@ def _session(raw: dict, *, root: Path, clock: float, procs, procs_error: str, tr
             no.append(f"{path} holds {' and '.join(held)}")
     safe = "no" if no else "unknown" if unknown else "yes"
     age = int(clock - last) if last is not None else None
+    # How long nothing was written: from the last write, or from the start when no write was read (pack sd:8606).
+    quiet = age if age is not None else int(clock - started) if started is not None else None
     return {"id": session, "name": str(raw.get("name") or ""), "kind": str(raw.get("kind") or ""), "pid": pid, "cwd": cwd,
             "started": _iso(started), "status": status,
             "waiting": None if status == "unknown" else status == "waiting",
             "waiting_for": raw.get("waitingFor") if isinstance(raw.get("waitingFor"), str) else "",
-            "last_action": _iso(last), "age": age, "age_text": elapsed(age) if age is not None else "",
+            "last_action": _iso(last), "age": age, "age_text": elapsed(age) if age is not None else "", "quiet": quiet,
             "builder": builder, "tasks": tasks,
             "agents": [{key: agent[key] for key in ("name", "builder", "state", "items", "description")}
                        | {"last": _iso(agent["last"]), "age": int(clock - agent["last"])}
@@ -388,18 +391,22 @@ def builders(sessions: list[dict] | None, why: str) -> dict:
     """How many builders run on this Mac: running builder subagents and busy or waiting Fix sessions; None when not known."""
     if sessions is None:
         return {"running": None, "why": why or "no session was listed", "holders": []}
-    # claude-mem's observers keep no transcript and build nothing, so one leaves the count known (pack sd:8266).
-    blind = [row["name"] or row["id"] for row in sessions
-             if OBSERVER_CWD not in (row["cwd"] or "")
-             and any(reason.startswith(("no transcript", "its transcript")) for reason in row["safe"]["why"])]
-    if blind:
-        return {"running": None, "why": f"the transcripts of {', '.join(blind)} were not read", "holders": []}
     # Unknown holds its slot: only a finished answer or an idle session frees it (sd:5106 round 1). A stalled agent
     # does not (operator, pack sd:6400): the load cap guards the machine, and finished builders that never wrote a
-    # final answer filled the cap. `holders` names each slot, unknown first.
+    # final answer filled the cap. `holders` names each slot, unknown first, with the session's id and cwd.
     holders = []
     for row in sessions:
-        where = {"session": row["name"] or row["id"][:8], "repo": Path(row["cwd"]).name if row["cwd"] else row["name"]}
+        where = {"session": row["name"] or row["id"][:8], "repo": Path(row["cwd"]).name if row["cwd"] else row["name"],
+                 "session_id": row["id"], "cwd": row["cwd"]}
+        # A session whose transcript was not read holds one unknown slot, never the whole count: two stale ones on a
+        # satellite stopped its dispatcher for days (pack sd:8606). One not busy and quiet for `STALL` holds none, as
+        # a stalled agent holds none. claude-mem's observers keep no transcript and build nothing (pack sd:8266).
+        if (OBSERVER_CWD not in (row["cwd"] or "")
+                and any(reason.startswith(("no transcript", "its transcript")) for reason in row["safe"]["why"])):
+            quiet = row.get("quiet")
+            if row["status"] == "busy" or not isinstance(quiet, int) or quiet < STALL:
+                holders.append(where | {"agent": "", "state": "unknown", "age": quiet})
+            continue
         holders += [where | {"agent": agent["name"], "state": agent["state"], "age": agent["age"]}
                     for agent in row["agents"] if agent["builder"] and agent["state"] not in ("idle", "stalled")]
         if row["builder"] and row["status"] != "idle":

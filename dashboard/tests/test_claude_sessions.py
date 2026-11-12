@@ -206,7 +206,8 @@ class Sessions(ScreenCase):
             "claude agents gave no cwd, so its checkout was not read",
             f"no live worktree names #{item}, and the item is not done, so its builder's work was not read"])
         self.assertEqual(counted(doc["builders"]), {"running": 1, "why": ""})
-        self.assertEqual(doc["builders"]["holders"], [{"session": "system", "repo": "system", "agent": "", "state": "unknown", "age": 60}])
+        self.assertEqual(doc["builders"]["holders"], [{"session": "system", "repo": "system", "session_id": LEAD, "cwd": "",
+                                                       "agent": "", "state": "unknown", "age": 60}])
 
     def test_a_first_prompt_past_the_head_is_still_read_and_one_never_found_is_unread(self):
         item = self.item("Long head")
@@ -215,7 +216,8 @@ class Sessions(ScreenCase):
         self.assertEqual(counted(self.read([agent(status="busy")])["builders"]), {"running": 1, "why": ""})
         self.transcript(records=[{"type": "summary", "summary": "x" * (claude_sessions.TAIL_MAX + 10)}])
         doc = self.read([agent(status="busy")])
-        self.assertIsNone(doc["builders"]["running"])
+        # pack sd:8606: an unread transcript holds one unknown slot; it no longer voids the count.
+        self.assertEqual(counted(doc["builders"]), {"running": 1, "why": ""})
         self.assertIn("its transcript could not be read: no first prompt in its first 4 MiB", doc["sessions"][0]["safe"]["why"])
 
     def test_the_turn_reads_the_last_record_even_past_the_tail_and_a_question_is_still_a_turn(self):
@@ -287,10 +289,10 @@ class Sessions(ScreenCase):
         self.assertEqual(row["safe"], {"state": "unknown", "why": ["the process table was not read: ps gave no answer in 10 s"]})
         row = self.read([agent()], work=broken)["sessions"][0]
         self.assertEqual(row["safe"]["state"], "unknown")
-        # No transcript: its builders are not known, so neither is the machine's builder count.
+        # No transcript: its builders are not known, so it holds one slot while busy (pack sd:8606).
         doc = self.read([agent(OTHER)])
         self.assertEqual(doc["sessions"][0]["safe"]["state"], "unknown")
-        self.assertIsNone(doc["builders"]["running"])
+        self.assertEqual(counted(self.read([agent(OTHER, status="busy")])["builders"]), {"running": 1, "why": ""})
         # claude itself not answering: no session list, which is not an empty one.
         doc = claude_sessions.document(None, now=NOW, agents=broken, fleet=lambda area: {"worktrees": []}, root=self.home)
         self.assertIsNone(doc["sessions"])
@@ -309,16 +311,45 @@ class Sessions(ScreenCase):
         doc = self.read([agent(OTHER, status="busy", cwd=cwd, name="49303-f1")])
         self.assertEqual(counted(doc["builders"]), {"running": 0, "why": ""})
 
+    def test_an_unread_session_holds_one_slot_until_it_goes_quiet_and_never_voids_the_count(self):
+        """pack sd:8606: two stale sessions on a satellite whose transcripts were not read made the count None, so its
+        dispatcher claimed nothing for days. Each unread session holds one `unknown` slot of its own, as unknown holds
+        its slot (sd:5106); one that is not busy and wrote nothing for `STALL` holds none, as a stalled builder holds
+        none (pack sd:6400). The count stays known either way."""
+        self.transcript()
+        stale = claude_sessions.STALL + 60
+        third, fourth = "33333333-3333-4333-8333-333333333333", "44444444-4444-4444-8444-444444444444"
+        old = agent(OTHER, pid=200, status="idle", cwd="/work/hoa", name="hoa")
+        old["startedAt"] = int((CLOCK - stale) * 1000)
+        fresh = agent(third, pid=300, status="idle", cwd="/work/hoa", name="fresh")
+        fresh["startedAt"] = int((CLOCK - 60) * 1000)
+        busy = agent(fourth, pid=400, status="busy", cwd="/work/x", name="busy")
+        busy["startedAt"] = int((CLOCK - stale) * 1000)
+        doc = self.read([agent(), old, fresh, busy])
+        self.assertEqual(counted(doc["builders"]), {"running": 2, "why": ""})
+        self.assertEqual(sorted((h["session_id"], h["cwd"], h["state"], h["age"]) for h in doc["builders"]["holders"]),
+                         [(third, "/work/hoa", "unknown", 60), (fourth, "/work/x", "unknown", stale)])
+        # A transcript that was found but not read ages from its last write, not from the session's start.
+        unreadable = [{"type": "summary", "summary": "x" * (claude_sessions.TAIL_MAX + 10)}]
+        self.transcript(OTHER, records=unreadable, age=stale)
+        old["startedAt"] = int((CLOCK - 60) * 1000)
+        doc = self.read([old])
+        self.assertIn("its transcript could not be read: no first prompt in its first 4 MiB",
+                      doc["sessions"][0]["safe"]["why"])
+        self.assertEqual(counted(doc["builders"]), {"running": 0, "why": ""})
+        self.transcript(OTHER, records=unreadable, age=60)
+        self.assertEqual(counted(self.read([old])["builders"]), {"running": 1, "why": ""})
+
     def test_a_no_persistence_session_with_no_transcript_leaves_the_builder_count_known(self):
         # pack sd:8296: sd-review's `claude -p --no-session-persistence` writes no transcript and builds nothing.
         self.transcript()
         ps = [(100, 1, "claude -n system"), (200, 1, "claude -p --no-session-persistence --model x")]
         doc = self.read([agent(), agent(OTHER, pid=200, status="busy", name="review")], processes=lambda: ps)
         self.assertEqual(counted(doc["builders"]), {"running": 0, "why": ""})
-        # Any other session with no transcript still leaves the count unknown.
+        # Any other busy session with no transcript holds one unknown slot (pack sd:8606).
         ps = [(100, 1, "claude -n system"), (200, 1, "claude -p --model x")]
         doc = self.read([agent(), agent(OTHER, pid=200, status="busy", name="review")], processes=lambda: ps)
-        self.assertIsNone(doc["builders"]["running"])
+        self.assertEqual(counted(doc["builders"]), {"running": 1, "why": ""})
 
 
 class Ending(unittest.TestCase):
