@@ -8,6 +8,7 @@ and the receipt keeps the registry's order whatever order the answers came in.
 from __future__ import annotations
 
 import _thread
+import datetime
 import io
 import json
 import os
@@ -240,6 +241,46 @@ class ClaudeGetsTheRankedPrompt(ParallelFixture):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, read[0])
                 self.assertNotIn(phrase, sessions[0]["stdin"])
+
+
+
+class EachReaderReportsItsTimeAndCost(ParallelFixture):
+    """pack sd:8503: a rule such as "drop the Claude reader past 5 min or $3"
+    needs each reader's wall time and cost in its own outcome."""
+
+    def test_each_outcome_carries_its_wall_time_and_the_claude_cost(self) -> None:
+        root = self.prepare(CLAUDE_AND_CODEX, "codex@codex, claude@claude")
+        envelope = {"type": "result", "subtype": "success", "structured_output": {"findings": []},
+                    "total_cost_usd": 1.25, "usage": {"input_tokens": 10, "cache_creation_input_tokens": 200,
+                                                     "cache_read_input_tokens": 3000, "output_tokens": 40}}
+
+        def claude(argv: Any, env: Any, cwd: Any, timeout: int) -> Any:
+            time.sleep(0.2)
+            return sd_review.Completed(0, json.dumps(envelope), "")
+
+        result = self.review(root, FakeRunner({"claude": claude}))
+        self.assertEqual(result["reviewed_by"], ["codex", "claude"], result["outcomes"])
+        rows = {row["backend"]: row for row in result["outcomes"]}
+        for name, row in rows.items():
+            with self.subTest(reader=name):
+                started = datetime.datetime.fromisoformat(row["started"])
+                finished = datetime.datetime.fromisoformat(row["finished"])
+                self.assertIsNotNone(started.tzinfo)
+                self.assertLessEqual(started, finished)
+                self.assertGreaterEqual(row["wall_seconds"], 0)
+        self.assertGreaterEqual(rows["claude"]["wall_seconds"], 0.2)
+        self.assertEqual(rows["claude"]["cost"], {"usd": 1.25, "input_tokens": 3210, "output_tokens": 40})
+        self.assertIsNone(rows["codex"]["cost"])
+
+    def test_a_claude_envelope_without_cost_reports_none(self) -> None:
+        odd = ('{"total_cost_usd": NaN}', '{"total_cost_usd": Infinity}', '{"total_cost_usd": -1}',
+               '{"total_cost_usd": true}', '{"total_cost_usd": 1e400}', '{"total_cost_usd": null}')
+        for stdout in ("", "not json", json.dumps({"type": "result", "total_cost_usd": "1"}), json.dumps([1]), *odd):
+            with self.subTest(stdout=stdout):
+                self.assertIsNone(sd_review.reader_cost("claude-json", stdout))
+        self.assertIsNone(sd_review.reader_cost("codex-json", json.dumps({"total_cost_usd": 1.0})))
+        self.assertEqual(sd_review.reader_cost("claude-json", json.dumps({"total_cost_usd": 0, "usage": {
+            "input_tokens": 10**13, "output_tokens": -1}})), {"usd": 0, "input_tokens": None, "output_tokens": None})
 
 
 DRIVER = textwrap.dedent("""

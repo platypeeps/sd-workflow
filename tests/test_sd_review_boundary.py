@@ -969,11 +969,14 @@ class LineBudgetTests(unittest.TestCase):
         # `blocker_checklist` (+42 in `bin/sd-review`) gives the reviewer the
         # blocker classes the repository's ship receipts hold, read-only, and
         # anchors the read at the base so a replayed request stays the same.
+        # 4899 -> 4937 is pack sd:8503, the operator raising the 4900
+        # ceiling (2026-11-12): each reader's wall clock and reported cost
+        # (+38 in `bin/sd-review`), so a report shows what each reader took.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4899,
+            4937,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

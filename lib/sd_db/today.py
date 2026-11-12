@@ -462,7 +462,7 @@ def planned(connection: sqlite3.Connection, *, repos: Iterable[str | None] | Non
     """
     where, values = repo_in("item.repo", _keep(repos))
     return [{"id": row["id"], "repo": row["repo"], "status": row["status"], "title": row["title"],
-             "due": row["due"], "priority": row["priority"]} for row in connection.execute(
+             "due": row["due"], "priority": row["priority"], "kind": row["kind"]} for row in connection.execute(
         f"""
         SELECT item.* FROM item
          WHERE item.status != 'done' AND item.due > ? AND {WORK_KIND} AND {_unparked_clause(connection)}
@@ -494,7 +494,7 @@ def unscheduled(connection: sqlite3.Connection, *, repos: Iterable[str | None] |
         (*_UNSCHEDULED_SKIPS, *values, *OWNING),
     ).fetchall()
     return [{"id": row["id"], "repo": row["repo"], "status": row["status"], "title": row["title"],
-             "priority": row["priority"], "created_at": row["created_at"]}
+             "priority": row["priority"], "created_at": row["created_at"], "kind": row["kind"]}
             for row in rows if row["id"] not in laned]
 
 
@@ -503,7 +503,7 @@ def suggested(connection: sqlite3.Connection, *, repos: Iterable[str | None] | N
     """What sd-next offers next (pack sd:7314), in its order: `queues`' ready items, then `work`'s open items due
     today or before, oldest due first (pack sd:8238), then `planned` soonest first, then `unscheduled` highest
     priority first. Each row is `id`, `repo`, `title`, `status`, `why` (`ready`, `due`, `planned` or
-    `unscheduled`), `due` and `priority`.
+    `unscheduled`), `due`, `priority` and `kind` (the Queue's Build reads it, pack sd:8532).
 
     An item counts once, under its first reason. One with a lane entry or a build assignment is left out: the
     Queue view shows it as a merging, next, blocked or working row. `queued` is `queues`' rows when the caller
@@ -528,7 +528,7 @@ def suggested(connection: sqlite3.Connection, *, repos: Iterable[str | None] | N
             if row["id"] not in taken:
                 taken.add(row["id"])
                 found.append({"id": row["id"], "repo": row["repo"], "title": row["title"], "status": row["status"],
-                              "why": why, "due": row.get("due"), "priority": row.get("priority")})
+                              "why": why, "due": row.get("due"), "priority": row.get("priority"), "kind": row["kind"]})
     return found
 
 

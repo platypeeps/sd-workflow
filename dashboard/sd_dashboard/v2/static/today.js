@@ -1033,7 +1033,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     // build holding it. Build registers ahead of TD's commands, so it is the act wherever it is on; elsewhere the act is
     // the move to the next status, as on Tasks' list (view 'list').
     const sel = () => isItem(row()) ? row() : null;
-    const found = o => taskOf(o.id) || (SUGG.has(o.id) ? { id: SUGG.get(o.id).id, status: SUGG.get(o.id).status, repo: SUGG.get(o.id).repo, repo_path: SUGG.get(o.id).repo, assignment: null } : null);
+    const found = o => taskOf(o.id) || (SUGG.has(o.id) ? { id: SUGG.get(o.id).id, status: SUGG.get(o.id).status, repo: SUGG.get(o.id).repo, repo_path: SUGG.get(o.id).repo, kind: SUGG.get(o.id).kind, assignment: null } : null);
     // sd:8565: a live assignment the queue read holds the row as a Tasks row's does, and the press is said on the queue's line.
     const ready = o => { const t = found(o), a = t && runFor(t.id); return t && a && !t.assignment ? { ...t, assignment: a.status } : t; };
     C.register(K.build({ row: ready, reread: () => reading.reread(), primary: () => true,

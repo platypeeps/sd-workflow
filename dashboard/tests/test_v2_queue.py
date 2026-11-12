@@ -2108,6 +2108,28 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         off = self.run_view(f"R.off = cmd('item.build').when({{ id: '{item}' }});", search="?show=suggested", answers=answers)
         self.assertEqual(off["R"]["off"], "the task is no longer listed")
 
+    def test_build_is_off_for_a_suggested_followup_and_names_the_edit(self):
+        """Pack sd:8532. The operator's case: Build on a ready followup in the Queue was offered, then refused by
+        build._item. The suggested row carries its kind, so Build is off before and after Details read it."""
+        from sd_dashboard import tasks_screen
+        from sd_db import today, workflow
+        item = self.item("Answer the vendor", kind="followup", priority=2, repo=str(self.checkout))
+        workflow.change_status(self.connection, item, "ready", who="test")
+        row = next(r for r in today.suggested(self.connection, now=NOW) if r["id"] == item)
+        self.assertEqual(row["kind"], "followup")
+        self.doc["queues"]["rows"] = [{"queue": "ready", "id": item, "repo": "~/repos/example/system", "title": "Answer the vendor",
+                                       "status": "ready", "detail": "P2", "since": NOW}] + self.READY
+        self.doc["queues"]["suggested"] = [{**r, "kind": "followup" if r["id"] == item else "task"}
+                                           for r in as_suggested(self.doc["queues"]["rows"])]
+        answers = {f"/api/tasks/{item}": [200, tasks_screen.details(self.connection, item, now=NOW)]}
+        why = ("a build takes a work, task or report item; this one's kind is followup."
+               f" Make it a task first: sd task edit {item} --kind task")
+        unread = self.run_view(f"R.off = cmd('item.build').when({{ id: '{item}' }});", search="?show=suggested", answers=answers)
+        self.assertEqual(unread["R"]["off"], why)
+        read = self.run_view(self.PICK.replace("ID", str(item)) + f" R.off = cmd('item.build').when(C.get('{item}'));",
+                             search="?show=suggested", answers=answers)
+        self.assertEqual(read["R"]["off"], why)
+
     # pack sd:7334: a planned or an unscheduled suggested row offers its next status before its Details are read, as a
     # Tasks list row does: its task is the /api/tasks row, read while Suggested shows, not only once Details open.
     def test_a_planned_and_an_unscheduled_suggestion_offer_their_next_status_unopened(self):
