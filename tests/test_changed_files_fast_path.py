@@ -200,6 +200,18 @@ class TheSelection(TreeCase):
     def test_a_changed_test_module_selects_itself(self) -> None:
         self.assertEqual(self.select("tests/test_zeta.py"), sorted(self.always | {"tests.test_zeta"}))
 
+    def test_a_changed_sd_db_test_module_selects_itself(self) -> None:
+        """`tests/sd_db/` holds the library's suite (sd:5987); the runner
+        shards its modules, so a change there narrows like any other
+        (sd:8553). A helper beside them is not a module: full run."""
+        (self.root / "tests/sd_db").mkdir()
+        (self.root / "tests/sd_db/test_kappa.py").write_text(FIXTURE_TEST)
+        (self.root / "tests/sd_db/support.py").write_text("VALUE = 4\n")
+
+        self.assertEqual(self.select("tests/sd_db/test_kappa.py"),
+                         sorted(self.always | {"tests.sd_db.test_kappa"}))
+        self.assertIsNone(self.select("tests/sd_db/support.py"))
+
     def test_a_module_importing_the_change_brings_its_tests(self) -> None:
         self.assertEqual(self.select("bin/sd_beta.py"),
                          sorted(self.always | {"tests.test_beta", "tests.test_epsilon"}))
