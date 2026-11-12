@@ -178,7 +178,8 @@
   // a bundle when there is room; until then each row shows its assignment as queued. Tasks and Today's suggested Queue
   // rows (pack sd:7271) register it: `row(o)` is the item's { id, status, repo, assignment }, or nothing once the page no
   // longer lists it; `reread()` reads the page again after the press.
-  function build({ row, reread, primary = () => false }) {
+  // `said(text, ok)`, when a page gives it, also puts the press's outcome on a line of its own that stays (sd:8565).
+  function build({ row, reread, primary = () => false, said = () => {} }) {
     const { html, put, plural } = window.markup;
     const toast = m => window.shell.toast(m);
     const dlg = document.createElement('dialog');
@@ -209,10 +210,12 @@
         if (dlg.returnValue !== 'build' || !ok) return;
         const revisions = Object.fromEntries(items.map(r => [String(r.id), r.revision]));
         window.shell.post('/api/tasks/build', { items: items.map(r => r.id), revisions }).then(out => {
-          toast(queuedText(out)); done?.(); reread();
+          const text = queuedText(out);
+          toast(text); said(text, true); done?.(); reread();
         }, err => {
           // A 409 is a refused press that changed nothing; no status is no answer, so whether it queued is not known.
-          toast(err.status === 409 ? err.message : err.status ? `Nothing queued: ${err.message}` : `Build got no answer, so what queued is not known: read the tasks again (${err.message})`);
+          const text = err.status === 409 ? err.message : err.status ? `Nothing queued: ${err.message}` : `Build got no answer, so what queued is not known: read the tasks again (${err.message})`;
+          toast(text); said(text, false);
           reread();
         });
       };
