@@ -1181,27 +1181,58 @@ def _rebuild(connection, read: dict, reason: str, stamp: str, base: str) -> None
     next builder merges main into the same branch (pack sd:6940). Each member still `in_progress` goes back to
     `ready`; one the operator moved stays out. A lead moved or left out of delivery, or past `CONFLICT_REBUILDS`
     on the lead's item, queues nothing: the run stays `lane_failed` for the operator."""
-    lead = read["assignment"]
-    members = [member for member in _members(connection, lead, "done")
-               if connection.execute("SELECT status FROM item WHERE id = ?",
-                                     (member["item"],)).fetchone()["status"] == "in_progress"]
-    if not members or members[0]["id"] != lead:
-        return  # without its lead the claim would pick a child's branch and worktree: the operator's call
+    members = _sent_back(connection, read)
+    if not members:
+        return
     done = connection.execute("SELECT COUNT(*) FROM note WHERE item = ? AND body LIKE ?",
                               (members[0]["item"], REBUILD + "%")).fetchone()[0]
     if done >= CONFLICT_REBUILDS:
         return
     finding = (f"{REBUILD}{base} conflicted. Merge {base} into {read['branch']}, resolve each conflict, run the tests the "
                f"conflict touched, and commit the merge; the lane said: {reason}"[:2000])
+    _send_back(connection, members, finding, stamp, who="build",
+               why=f"build run {read['id']}: the lane's merge of {base} conflicted", result=reason,
+               said=f"rebuild {done + 1} of {CONFLICT_REBUILDS} after the lane's merge of {base} conflicted")
+
+
+def _sent_back(connection, read: dict) -> list[dict]:
+    """The members of `read`'s bundle a send-back queues again: each `done` one whose item is still `in_progress`,
+    the lead first; none without the lead, since the claim would then pick a child's branch and worktree."""
+    lead = read["assignment"]
+    members = [member for member in _members(connection, lead, "done")
+               if connection.execute("SELECT status FROM item WHERE id = ?",
+                                     (member["item"],)).fetchone()["status"] == "in_progress"]
+    return members if members and members[0]["id"] == lead else []
+
+
+def _send_back(connection, members: list[dict], finding: str, stamp: str, *, who: str, why: str, result: str,
+               said: str) -> None:
+    """Each member's item to `ready` with `finding` as its note, and its assignment queued again, as Send to builder
+    does: the next builder resumes the same branch and worktree, and its brief quotes the finding (pack sd:6020)."""
     for member in members:
-        transition(connection, member["item"], "ready", who="build",
-                   reason=f"build run {read['id']}: the lane's merge of {base} conflicted")
+        transition(connection, member["item"], "ready", who=who, reason=why)
         add_note(connection, member["item"], "comment", finding)
         connection.execute("UPDATE assignment SET status = 'queued', queued_at = ?, started = NULL, ended = NULL, "
-                           "result = ? WHERE id = ?", (stamp, f"requeued by build: {reason}"[:600], member["id"]))
-        add_note(connection, member["item"], "comment",
-                 f"Build assignment {member['id']} queued again by build: rebuild {done + 1} of "
-                 f"{CONFLICT_REBUILDS} after the lane's merge of {base} conflicted")
+                           "result = ? WHERE id = ?", (stamp, f"requeued by {who}: {result}"[:600], member["id"]))
+        add_note(connection, member["item"], "comment", f"Build assignment {member['id']} queued again by {who}: {said}")
+
+
+def lane_fix(connection, run: str, finding: str, *, who: str) -> list[int]:
+    """Fix on a failed lane entry (pack sd:8584): the bundle whose run ended `lane_failed` goes back to its builder
+    with `finding` as a Send to builder note, as a conflict's rebuild does; the items queued again. The caller holds
+    the transaction and checked the lead's revision. A run that is not its lead's latest released `lane_failed` one,
+    or a bundle with no member left to send back, is `BuildRefused` and writes nothing."""
+    read = connection.execute("SELECT * FROM runner_run WHERE id = ?", (run,)).fetchone()
+    latest = read and connection.execute("SELECT id FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
+                                         (read["assignment"],)).fetchone()
+    if read is None or read["outcome"] != "lane_failed" or read["released_at"] is None or latest["id"] != run:
+        raise BuildRefused(f"build run {run} is not its bundle's latest lane_failed run")
+    members = _sent_back(connection, dict(read))
+    if not members:
+        raise BuildRefused(f"build run {run}'s lead item moved on since the lane failed; build it from Tasks")
+    said = f"Fix of build run {run}'s failed lane entry"
+    _send_back(connection, members, FINDING + finding, clock(), who=who, why=said, result=said, said=said)
+    return [member["item"] for member in members]
 
 
 class Probe:

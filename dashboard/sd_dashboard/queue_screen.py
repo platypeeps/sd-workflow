@@ -18,7 +18,9 @@ The six states, from each entry's `status`:
   building  a builder gate log in the lane folder, changed in the last `BUILDING_HOURS`: empty while its gate runs.
   blocked   the newest entry of an item that `failed`, was `skipped` or stopped `prepared`, in the last `BLOCKED_DAYS`,
             with the first line of its reason. An item that is `done` in the database (cancel closes as `done`) is not
-            blocked, whatever its lane entry says: it closed after the lane stopped (sd:5847).
+            blocked, whatever its lane entry says: it closed after the lane stopped (sd:5847). A failed one also says
+            whether its worktree still holds the head it failed at (`unchanged`), what a failed prepare answered
+            (`failure`, from its log) and whether Fix may send it back to the build run that enqueued it (`fix`).
   cancelled the newest entry of an item that was `cancelled`, in the last `BLOCKED_DAYS`, with its head.
   landed    `merged` today, in this machine's zone, with the merge commit and the pull request its subject names.
 
@@ -46,6 +48,11 @@ the body copy the lane kept (pack sd:3254); Approve adds `--manual`, the merge g
 `runner_merge` is manual takes it. Both carry the head the row showed as `--expected-head`, which the verb checks under
 the queue's lock (pack sd:3268), so neither acts on an entry that ended at another head after the page read it. The
 page offers both only when `sd-ship lane retry --help` names `--expected-head`: an older pack cannot check the head.
+
+Retry on a failed row whose worktree still holds the head it failed at repeats the failure unless it was transient
+(pack sd:8584): `unchanged` is `sd_lane.at_head`, the check `lane retry` makes, so the page asks first and names the
+blocker's code, whether the lane marks it retryable, and its next action; None is a worktree not read here. Fix sends
+the finding to the build run that enqueued the branch (`builds.lane_fix_state`), through Send to builder's route.
 
 Re-queue acts on a cancelled row (sd:3398): `lane retry <item> --expected-head <head>` queues the cancelled entry
 again, last, at the head the row showed (pack sd:3389). The page checks first that the item's newest entry is still that
@@ -289,6 +296,63 @@ def _pr(path: str, commit: str) -> str | None:
     return found[1] if found else None
 
 
+#: The most of a prepare log the page reads for prepare's answer, which comes before its stderr (pack sd:8584).
+PREPARE_LOG_BYTES = 1 << 20
+
+
+def _failure(entry: dict, lane: Path) -> dict:
+    """pack sd:8584: a failed prepare's answer from its log in the lane's `logs/`: the blocker's `code`, whether the
+    lane marks it `retryable`, and its `next_action`. `{}` for a failure at another step or a log not read here: a log
+    on another host, outside `logs/`, cut short or with no answer."""
+    log = Path(str(entry.get("prepare_log") or ""))
+    if entry.get("step") != "prepare" or log.parent != lane / "logs":
+        return {}
+    try:
+        with log.open("rb") as handle:
+            text = handle.read(PREPARE_LOG_BYTES).decode("utf-8", errors="replace")
+        # `sd_lane.ship_process` writes `$ <argv>`, the answer, then `--- stderr ---`; JSON escapes its own newlines.
+        answer = json.loads(text.partition("\n")[2].partition("\n--- stderr ---\n")[0])
+    except (OSError, ValueError):
+        return {}
+    workflow = answer.get("workflow") if isinstance(answer, dict) else None
+    blocker = workflow.get("blocker") if isinstance(workflow, dict) else None
+    if not isinstance(blocker, dict):
+        return {}
+    return {"code": blocker.get("code"), "retryable": blocker.get("retryable"), "next_action": workflow.get("next_action")}
+
+
+def _git(tree: Path, *args: str) -> str | None:
+    """`git <args>` in `tree`, bounded by `GIT_SECONDS`; its stdout stripped, or None when git did not answer."""
+    try:
+        done = subprocess.run(["git", "-C", str(tree), *args], capture_output=True, text=True, timeout=GIT_SECONDS,
+                              check=False)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return done.stdout.strip() if done.returncode == 0 else None
+
+
+def _unchanged(entry: dict) -> bool | None:
+    """pack sd:8584: whether the entry's worktree still holds the head it ended at, or prepare's catch-up of it: the
+    check `lane retry` makes. A merge at HEAD asks `sd_lane.at_head` whether it is that catch-up. None when not read
+    here: another host's worktree, one gone or on another branch, a pack without the check, or git that did not answer."""
+    from sd_db.ship import this_host
+
+    head, branch, tree = entry.get("expected_head"), entry.get("branch"), Path(str(entry.get("worktree") or ""))
+    if not (head and branch and entry.get("worktree") and entry.get("enqueued_on") == this_host() and tree.is_dir()):
+        return None
+    if _git(tree, "branch", "--show-current") != branch:
+        return None
+    found = _git(tree, "rev-list", "--parents", "-n", "1", "HEAD")
+    if not found:
+        return None
+    if found.split()[0] == head or len(found.split()) != 3:
+        return found.split()[0] == head  # one parent: a commit of its own, never a catch-up
+    try:
+        return bool(pack_module("sd_lane").at_head(tree, str(head)))
+    except (ImportError, AttributeError, OSError, RuntimeError):  # `sd_lane.LaneError` is a RuntimeError
+        return None
+
+
 def _building(lane: Path, now: float) -> list[dict]:
     """Each builder gate log changed in the last `BUILDING_HOURS`, newest first."""
     rows = []
@@ -371,9 +435,11 @@ def rows(entries: list[dict], *, path: str, lane: Path, now: float, done: frozen
                 who = WHO.get((status, entry.get("step"))) or WHO.get((status, None), "lane")
                 reason = (str(entry.get("reason") or "").strip().splitlines() or [status])[0]
                 head = str(entry.get("expected_head") or "")
+                failed = {"branch": entry.get("branch"), "unchanged": _unchanged(entry), "failure": _failure(entry, lane),
+                          "prepare_log": str(entry.get("prepare_log") or "") or None} if status == "failed" else {}
                 blocked.append({**base, "state": "blocked", "status": status, "step": entry.get("step"),
                                 "reason": reason, "who": who, "finished": entry.get("finished_at"),
-                                "head": head[:12], "expected_head": head})
+                                "head": head[:12], "expected_head": head, **failed})
         elif status == "cancelled" and latest.get(item) is entry:
             finished = _when(entry.get("finished_at"))
             if finished and now - finished <= BLOCKED_DAYS * 86400:
@@ -451,6 +517,7 @@ def document(connection, *, now: str = "") -> dict:
     """The page's document: the header readings and one section per repository lane."""
     from sd_db import repos
 
+    from .builds import lane_fix_state
     from .hoa_screen import checkout
     from .places import realm_of, realms
 
@@ -478,10 +545,14 @@ def document(connection, *, now: str = "") -> dict:
         root = root or lane.parent.parent
         entries = answer.get("entries") or []
         # pack sd:6016: the realm tab that lists the lane, its checkout's realm (None: the realm list was not read).
+        shown = rows(entries, path=path, lane=lane, now=clock, done=closed(connection, entries))
+        for row in shown:
+            if row["state"] == "blocked" and row["status"] == "failed":
+                row["fix"] = lane_fix_state(connection, row["branch"])
         lanes.append({"repo": Path(path).name, "path": path, "realm": realm_of(path, "lane", rules, hoa), "lane": str(lane),
                       "revision": revision(entries),
                       "runner_merge": repos.policy_merge(managed[path]["declarations"]), "host": managed[path]["lane_host"] or "hub",
-                      "rows": rows(entries, path=path, lane=lane, now=clock, done=closed(connection, entries))})
+                      "rows": shown})
     return {"read": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock)), "load": _load(), "gates": gates,
             "lanes": lanes, "problems": problems, "root": str(root) if root else None, "edits": EDITS,
             "managed": len(managed), "prs": pr_rows(connection, lanes, clock),

@@ -12,7 +12,7 @@ from sd_dashboard import builds
 from sd_db import build, runner, ship, upsert_repo
 from sd_db.workflow import item_state
 from sd_db.writes import now as clock
-from sd_db.writes import record_state
+from sd_db.writes import record_state, transition
 from support import NOW
 from test_workflow_actions import BrowserSession
 
@@ -425,6 +425,76 @@ class SendToBuilder(Fixture):
             "SELECT COUNT(*) FROM assignment WHERE scope = 'build' AND status = 'queued'").fetchone()[0], 0)
         self.assertEqual(self.connection.execute(
             "SELECT COUNT(*) FROM note WHERE body LIKE 'Send to builder:%'").fetchone()[0], 0)
+
+
+class LaneFix(Fixture):
+    """pack sd:8584: Fix on a failed lane entry sends the build run that enqueued it back to its builder with the
+    lane's finding, through Send to builder's route; a Retry with no finding still refuses that run."""
+
+    claimed = BuildsPanel.claimed
+
+    def lane_failed(self, items):
+        run = self.claimed(items)
+        build.write(self.connection, run["id"], step="enqueuing")
+        self.assertTrue(build.enqueued(self.connection, run["id"]))
+        self.assertTrue(build.lane_failed(self.connection, build.run(self.connection, run["id"]),
+                                          "local review blocking: 1/1 completed"))
+        return run
+
+    def queued(self):
+        return self.connection.execute("SELECT COUNT(*) FROM assignment WHERE scope = 'build' AND status = 'queued'"
+                                       ).fetchone()[0]
+
+    def test_fix_sends_a_lane_failed_bundle_back_to_its_builder_with_the_finding(self):
+        items = [self.ready(), self.ready()]
+        run = self.lane_failed(items)
+        fix = builds.lane_fix_state(self.connection, run["branch"])
+        self.assertEqual((fix["allowed"], fix["assignment"]), (True, run["assignment"]), fix)
+        status, _, body = self.post("/api/queue/builds/retry", {"assignment": fix["assignment"], "revision": fix["revision"],
+                                                               "finding": "The lane's review blocked a.py:1"})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(sorted(row["item"] for row in body["queued"]), items)
+        self.assertEqual([item_state(self.connection, i)["item"]["status"] for i in items], ["ready", "ready"])
+        for item in items:
+            notes = [row["body"] for row in self.connection.execute("SELECT body FROM note WHERE item = ?", (item,))]
+            self.assertIn("Send to builder: The lane's review blocked a.py:1", notes)
+        self.assertEqual(len(self.kicks), 1)
+        again = build.claim(self.connection, owner="fixture", root=self.path.parent / "worktrees", **IDLE)
+        self.assertEqual((again["assignment"], again["branch"], again["work_path"]),
+                         (run["assignment"], run["branch"], run["work_path"]))
+        # The brief quotes the finding: the note is inside the window the next run reads (`build_run.findings`).
+        first = self.connection.execute("SELECT MIN(created_at) FROM runner_run WHERE assignment = ?",
+                                        (run["assignment"],)).fetchone()[0]
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM note WHERE body LIKE 'Send to builder:%' AND timestamp >= ? AND timestamp <= ?",
+            (first, again["created_at"])).fetchone()[0], 2)
+        status, _, body = self.post("/api/queue/builds/retry", {"assignment": fix["assignment"], "revision": fix["revision"],
+                                                               "finding": "again"})
+        self.assertEqual(status, 409, body)
+
+    def test_retry_without_a_finding_still_refuses_a_lane_failed_run_and_writes_nothing(self):
+        run = self.lane_failed([self.ready()])
+        fix = builds.lane_fix_state(self.connection, run["branch"])
+        status, _, body = self.post("/api/queue/builds/retry", {"assignment": fix["assignment"], "revision": fix["revision"]})
+        self.assertEqual(status, 400, body)
+        self.assertIn("Retry takes a blocked or cancelled one", body["error"])
+        self.assertEqual(self.queued(), 0)
+
+    def test_fix_is_off_for_a_branch_no_build_run_holds_and_for_a_lead_that_moved_on(self):
+        self.assertEqual(builds.lane_fix_state(self.connection, "build/night"),
+                         {"allowed": False, "reason": "no build run holds branch build/night; send the finding to the "
+                                                      "session that enqueued it"})
+        items = [self.ready()]
+        run = self.lane_failed(items)
+        transition(self.connection, items[0], "planning", who="operator", reason="moved on")
+        fix = builds.lane_fix_state(self.connection, run["branch"])
+        self.assertEqual((fix["allowed"], fix["reason"]),
+                         (False, "its lead item moved on since the lane failed; build it from Tasks"))
+        status, _, body = self.post("/api/queue/builds/retry", {"assignment": fix["assignment"], "revision": fix["revision"],
+                                                               "finding": "fix it"})
+        self.assertEqual(status, 400, body)
+        self.assertEqual((self.queued(), self.connection.execute(
+            "SELECT COUNT(*) FROM note WHERE body LIKE 'Send to builder:%'").fetchone()[0]), (0, 0))
 
 
 class AutoPickup(Fixture):

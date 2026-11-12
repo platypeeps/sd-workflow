@@ -491,7 +491,8 @@ def lane_rows(lanes: list[dict]) -> list[dict]:
     """Each lane's blocked entries as Needs you rows (sd:5921): broken, and keyed on the head the entry ended at.
 
     The row carries what Queue's Retry and Approve post (`/api/queue/move`): the repo path, the item, the lane's
-    revision and the full head, so Today's Retry acts on the entry the read showed and nothing newer.
+    revision and the full head, so Today's Retry acts on the entry the read showed and nothing newer; and, from a failed
+    entry, whether its head is `unchanged` since and prepare's `failure`, which Retry names before it asks (pack sd:8584).
     """
     out = []
     for lane in lanes:
@@ -504,7 +505,8 @@ def lane_rows(lanes: list[dict]) -> list[dict]:
                         "detail": f"{row.get('who') or 'lane'}: {row.get('reason') or row.get('status')}",
                         "source": "lane", "at": row.get("finished"), "item": row["item"], "title": row.get("title") or "",
                         "repo": lane["repo"], "repo_path": lane["path"], "lane_revision": lane["revision"],
-                        "expected_head": row.get("expected_head") or "", "runner_merge": lane.get("runner_merge")})
+                        "expected_head": row.get("expected_head") or "", "runner_merge": lane.get("runner_merge"),
+                        "unchanged": row.get("unchanged"), "failure": row.get("failure") or {}})
     return out
 
 

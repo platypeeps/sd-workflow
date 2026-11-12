@@ -36,7 +36,7 @@ from pathlib import Path
 from unittest import mock
 
 from sd_dashboard import hoa_screen, now_screen, pack_bin, places, queue_screen, v2
-from sd_db import upsert_repo
+from sd_db import ship, upsert_repo
 from sd_db.writes import create_item
 from support import NOW, ScreenCase
 from test_v2_registry import GROUP_BLOCK
@@ -140,6 +140,23 @@ class Lane:
 
     def calls(self):
         return [line.split() for line in self.log.read_text().splitlines()]
+
+    def failed(self, answer=None, **extra):
+        """pack sd:8584: item 14 failed prepare at the checkout's head, enqueued here, its log in the lane's logs;
+        `answer` is the log's stdout in place of prepare's JSON answer."""
+        log = self.lane / "logs" / "prepare-14-20260906T100000.log"
+        prepared = json.dumps({"ok": False, "error": "local review blocking: 1/1 completed", "workflow": {
+            "blocker": {"code": "review_blocking", "retryable": False},
+            "next_action": "Run `sd-ship adjudicate --item 14` to print each blocking finding in full; fix them."}},
+            indent=2)
+        log.write_text(f"$ sd-ship -C /w prepare --item 14 --json\n{prepared if answer is None else answer}\n--- stderr ---\n"
+                       "{\"not\": \"the answer\"}\n")
+        entry = {"item": 14, "title": "Review blocked", "status": "failed", "step": "prepare",
+                 "reason": "local review blocking: 1/1 completed\nhigh a.py:1 wrong", "finished_at": "2026-09-06T10:00:00Z",
+                 "expected_head": self.merged, "branch": "main", "worktree": str(self.checkout),
+                 "enqueued_on": ship.this_host(), "prepare_log": str(log), **extra}
+        self.list(self.entries() + [entry])
+        return next(row for row in queue_screen.document(self.connection, now=NOW)["lanes"][0]["rows"] if row.get("item") == 14)
 
     def shot_entries(self):
         """sd:6728: item 5 carries two PNGs the lane drew and one outside its logs; item 4 the warning of none."""
@@ -545,6 +562,49 @@ class TheRows(Lane, ScreenCase):
         self.fixture.write_text("not json")
         doc = self.doc()
         self.assertEqual((doc["lanes"], [p["repo"] for p in doc["problems"]]), ([], [str(self.checkout)]))
+
+    def test_a_failed_prepare_names_the_lanes_code_next_action_and_whether_it_retries(self):
+        row = self.failed()
+        self.assertEqual(row["failure"], {"code": "review_blocking", "retryable": False, "next_action":
+                                          "Run `sd-ship adjudicate --item 14` to print each blocking finding in full; fix them."})
+        # A log outside the lane's logs, or one that holds no answer, is not read: no failure, never a guess.
+        self.assertEqual(self.failed(answer="")["failure"], {})
+        self.assertEqual(self.failed(answer='{"ok": false, "error": "cut sh')["failure"], {})
+        self.assertEqual(self.failed(prepare_log="/elsewhere/prepare-14.log")["failure"], {})
+
+    def test_a_failed_entry_says_whether_its_worktree_still_holds_the_head_it_failed_at(self):
+        self.assertIs(self.failed()["unchanged"], True)
+        # Another host's worktree is not read here: unknown, not unchanged.
+        self.assertIsNone(self.failed(enqueued_on="elsewhere")["unchanged"])
+        self.assertIsNone(self.failed(worktree=str(self.checkout / "gone"))["unchanged"])
+        git(self.checkout, "-c", "user.name=t", "-c", "user.email=t@example.test", "commit", "-q", "--allow-empty",
+            "-m", "the builder's fix")
+        self.assertIs(self.failed()["unchanged"], False)
+
+    def test_a_merge_at_head_is_unchanged_only_when_the_lane_reads_it_as_prepares_catch_up(self):
+        def commit(*args):
+            git(self.checkout, "-c", "user.name=t", "-c", "user.email=t@example.test", *args)
+        commit("checkout", "-q", "-b", "side")
+        commit("commit", "-q", "--allow-empty", "-m", "base moved")
+        commit("checkout", "-q", "main")
+        commit("merge", "-q", "--no-ff", "-m", "catch up", "side")
+        asked = []
+
+        class Lane:
+            @staticmethod
+            def at_head(tree, head):
+                asked.append((str(tree), head))
+                return answer
+        for answer, said in ((True, True), (False, False)):
+            with self.subTest(answer=answer), mock.patch.object(queue_screen, "pack_module", return_value=Lane):
+                self.assertIs(self.failed()["unchanged"], said)
+        self.assertEqual(asked[-1], (str(self.checkout), self.merged))
+        # The pinned pack's own check, with no origin to read the base from, is unknown, never unchanged.
+        self.assertIsNone(self.failed()["unchanged"])
+
+    def test_a_blocked_entry_no_build_run_holds_offers_no_fix_and_says_why(self):
+        self.assertEqual(self.failed()["fix"], {"allowed": False, "reason": "no build run holds branch main; send the "
+                                                                            "finding to the session that enqueued it"})
 
 
 class TheMove(Lane, BrowserSession):
@@ -2283,6 +2343,55 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertEqual([p[:2] for p in out["posts"]], [["/api/assignments/7/cancel", {"revision": "a" * 64}],
                                                          ["/api/queue/builds/retry", {"assignment": 5, "revision": "b" * 64,
                                                                                       "finding": "Fix the label"}]])
+
+    NEXT = "Run `sd-ship adjudicate --item 14` to print each blocking finding in full; fix them."
+
+    def test_a_failed_entry_at_an_unchanged_head_says_retry_repeats_it_and_retry_asks_first(self):
+        """pack sd:8584: Retry on a head no commit moved repeated a review block silently; the row and the press say so."""
+        self.failed()
+        out = self.run_view("open('system'); R.html = ELS.queue.html;")
+        self.assertIn("head unchanged since this failure: Retry repeats it unless the failure was transient", out["R"]["html"])
+        self.assertIn(f"review_blocking, not retryable · next: {self.NEXT}", out["R"]["html"])
+        kept = self.confirmed("retry", 14, False, head=self.merged)
+        self.assertEqual(kept["posts"], [])
+        self.assertEqual(kept["asked"]["ok"], "Retry anyway")
+        self.assertIn("No commit moved the head since this failure", kept["asked"]["body"])
+        self.assertIn("The lane marks review_blocking as not retryable", kept["asked"]["body"])
+        self.assertIn(self.NEXT, kept["asked"]["body"])
+        done = self.confirmed("retry", 14, True, head=self.merged)
+        self.assertEqual((done["posts"][0][1]["action"], done["posts"][0][1]["head"]), ("retry", self.merged))
+
+    def test_a_failed_entry_whose_worktree_moved_says_retry_is_refused(self):
+        self.failed()
+        git(self.checkout, "-c", "user.name=t", "-c", "user.email=t@example.test", "commit", "-q", "--allow-empty",
+            "-m", "the builder's fix")
+        out = self.run_view("open('system'); R.html = ELS.queue.html;")
+        self.assertIn("the worktree moved past this head: enqueue the new head; Retry is refused", out["R"]["html"])
+
+    def fix_doc(self, fix):
+        self.failed()
+        doc = queue_screen.document(self.connection, now=NOW)
+        next(row for row in doc["lanes"][0]["rows"] if row.get("item") == 14)["fix"] = fix
+        return doc
+
+    def test_fix_on_a_failed_entry_asks_with_the_lanes_finding_and_sends_it_to_the_builder(self):
+        doc = self.fix_doc({"allowed": True, "reason": "", "assignment": 832, "revision": "c" * 64})
+        out = self.run_view("window.shell.ask = a => { OUT.ask = a; return Promise.resolve({ yes: true, values: { finding: a.fields[0].value } }); };"
+                            f"open('system'); act('button[data-act]', {{ repo: {json.dumps(str(self.checkout))}, item: '14', act: 'fix' }});"
+                            " await flush(); await flush(); R.said = ELS['queue-said'].textContent;",
+                            answers={"/api/queue": [200, doc], "/api/queue/builds/retry": [200, {"run": "r9", "queued": []}]})
+        finding = out["ask"]["fields"][0]["value"]
+        self.assertEqual(finding, f"The lane's prepare failed at head {self.merged[:12]}: local review blocking: 1/1 completed. "
+                                  f"The lane says next: {self.NEXT} Prepare log: {self.lane}/logs/prepare-14-20260906T100000.log")
+        self.assertEqual([p[:2] for p in out["posts"]], [["/api/queue/builds/retry", {"assignment": 832, "revision": "c" * 64,
+                                                                                      "finding": finding}]])
+        self.assertIn("system: sd:14 sent to its builder with the lane's finding", out["R"]["said"])
+
+    def test_fix_is_off_with_its_reason_when_no_build_run_holds_the_branch(self):
+        self.failed()
+        out = self.run_view("open('system'); R.html = ELS.queue.html;")
+        self.assertRegex(out["R"]["html"], r'data-act="fix" data-item="14"[^>]*disabled title="no build run holds branch main; '
+                                           r'send the finding to the session that enqueued it"')
 
     def test_a_row_links_its_screenshots_and_an_entry_offers_adversarial_review(self):
         self.shot_entries()
