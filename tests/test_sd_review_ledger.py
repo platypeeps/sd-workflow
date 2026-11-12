@@ -126,6 +126,9 @@ class TheCostRows(LedgerFixture):
         self.assertGreater(receipt["bound_usd"], 0.2)
         self.assertEqual(result["capped_bills"], {})
         self.assertEqual(result["ledger_fault"], "")
+        # pack sd:8503: the outcome itself names what the call cost, and when it ran.
+        self.assertEqual(result["outcomes"][0]["cost"], {"usd": receipt["usd"], "input_tokens": 1000, "output_tokens": 2000})
+        self.assertIsInstance(result["outcomes"][0]["wall_seconds"], float)
 
     def test_cost_rows_at_the_cap_are_passed_over_by_fallthrough_naming_the_months_total(self) -> None:
         self.seed()

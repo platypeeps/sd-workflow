@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime
 import hashlib
 import json
 import os
@@ -1164,10 +1165,15 @@ class Outcome(NamedTuple):
     argv: tuple[str, ...]
     scrubbed: tuple[str, ...]
     diagnostic: dict[str, Any] | None = None
+    #: pack sd:8503: `started`, `finished` and `wall_seconds` of the attempt, set by `_attempts`.
+    clock: dict[str, Any] | None = None
+    #: pack sd:8503: what the reader reported it cost (`reader_cost`), or None.
+    cost: dict[str, Any] | None = None
 
     def outcome_report(self, *, environment: bool = True) -> dict[str, Any]:
         row = {"backend": self.backend, "status": self.status, "detail": self.detail,
-               "findings": len(self.findings), "diagnostic": self.diagnostic}
+               "findings": len(self.findings), "diagnostic": self.diagnostic,
+               "started": None, "finished": None, "wall_seconds": None, **(self.clock or {}), "cost": self.cost}
         if environment:
             row["scrubbed_env_names"] = list(self.scrubbed)
         return row
@@ -1175,6 +1181,31 @@ class Outcome(NamedTuple):
 
 def _outcome(backend: str, status: str, detail: str, argv: Sequence[str] = (), scrubbed: Sequence[str] = ()) -> Outcome:
     return Outcome(backend, status, (), detail, tuple(argv), tuple(scrubbed))
+
+
+def _token_count(value: Any) -> int | None:
+    return value if type(value) is int and 0 <= value <= 10**12 else None
+
+
+def reader_cost(reader: str | None, stdout: str) -> dict[str, Any] | None:
+    """pack sd:8503: the API-equivalent cost a reader reported, or None.
+
+    Only Claude's result envelope names one (`total_cost_usd`, priced at API
+    rates on a subscription too); its input tokens count cache writes and reads.
+    Codex, agy and opencode report no cost here, so they read None, not zero."""
+    if reader != "claude-json":
+        return None
+    try:
+        value = json.loads(stdout)
+    except (ValueError, RecursionError):
+        return None
+    usd = value.get("total_cost_usd") if isinstance(value, dict) else None
+    if not isinstance(usd, (int, float)) or isinstance(usd, bool) or not 0 <= usd < 10**6:
+        return None  # also NaN, inf and a negative
+    usage = value.get("usage") if isinstance(value.get("usage"), dict) else {}
+    parts = [_token_count(usage.get(key)) for key in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")]
+    return {"usd": usd, "input_tokens": sum(part or 0 for part in parts) if any(part is not None for part in parts) else None,
+            "output_tokens": _token_count(usage.get("output_tokens"))}
 
 
 def _answer(
@@ -1316,12 +1347,25 @@ def _free(provider: sd_registry.Provider) -> bool:
 def _attempts(provider: sd_registry.Provider, run: Callable[[], Outcome]) -> list[Outcome]:
     """sd:1821: a free entry (both prices zero) runs once more after a schema
     failure, not falling through to a reviewer that may bill. The failed
-    attempt is returned too, so its recovered blockers stay, as a fallback's do."""
-    outcome = run()
+    attempt is returned too, so its recovered blockers stay, as a fallback's do.
+    Each attempt carries its own wall clock (pack sd:8503)."""
+    outcome = _timed(run)
     if (outcome.status not in (CLEAN, FINDINGS) and _free(provider)
             and (outcome.diagnostic or {}).get("failure_stage") == "schema"):
-        return [outcome, run()]
+        return [outcome, _timed(run)]
     return [outcome]
+
+
+def _timed(run: Callable[[], Outcome]) -> Outcome:
+    started, began = time.time(), time.monotonic()
+    outcome = run()
+    elapsed = time.monotonic() - began
+    return outcome._replace(clock={"started": _utc(started), "finished": _utc(started + elapsed),
+                                   "wall_seconds": round(elapsed, 3)})
+
+
+def _utc(seconds: float) -> str:
+    return datetime.datetime.fromtimestamp(seconds, datetime.timezone.utc).isoformat(timespec="milliseconds")
 
 
 def _request_record(provider: sd_registry.Provider, subject: Subject, request_prompt: str) -> dict[str, Any]:
@@ -1375,7 +1419,12 @@ def _url_attempt(provider: sd_registry.Provider, subject: Subject, request_promp
     # Model content is not transport evidence, even when parsing failed.
     outcome = _answer(provider.name, result._replace(stdout=""), parsed)
     diagnostic["failure_stage"] = _failure_stage(result, diagnostic, text, parsed)
-    return outcome._replace(diagnostic=diagnostic, detail=sd_registry.stop_detail(provider, diagnostic, outcome.detail))
+    usage = diagnostic["sanitized_response"].get("usage", {})
+    usd = (receipt or {}).get("usd")
+    cost = {"usd": usd if type(usd) in (int, float) else None, "input_tokens": usage.get("prompt_tokens"),
+            "output_tokens": usage.get("completion_tokens")}
+    return outcome._replace(diagnostic=diagnostic, detail=sd_registry.stop_detail(provider, diagnostic, outcome.detail),
+                            cost=cost if any(value is not None for value in cost.values()) else None)
 
 
 def run_provider(
@@ -1506,7 +1555,7 @@ def run_provider(
             result, parsed = sd_opencode.opencode_answer(result, parse=parse_findings, oversized=oversized_findings, limit=MAX_OUTPUT_BYTES)
         else:
             result, parsed = claude_answer(result)
-    return _answer(provider.name, result, parsed, argv, removed)._replace(diagnostic=(
+    return _answer(provider.name, result, parsed, argv, removed)._replace(cost=reader_cost(provider.reader, result.stdout), diagnostic=(
         {"prompt_transport": "stdin", "prompt_bytes": len(prompt.encode()),
          "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
          "skill_suppression": dict(skills) if skills is not None else None} if codex else
