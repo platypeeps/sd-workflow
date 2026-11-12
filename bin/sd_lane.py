@@ -338,6 +338,9 @@ class BuildRefused(LaneError):
 STALE_REVISION = "stale_revision"
 #: The refusal code of a retry whose `--expected-head` is not the head of the item's last entry (sd:3268).
 STALE_HEAD = "stale_head"
+#: A last entry the dashboard's Fix (`sd_db.build.lane_fix`, pack sd:8584) cancelled and handed to a builder: its
+#: worktree is the builder's, so `retry` refuses it.
+HANDED_BACK = "handed_back"
 #: The refusal code of a cancel whose `--expected-claim` no longer holds the item's running entry (sd:3330).
 STALE_CLAIM = "stale_claim"
 #: The refusals of a cancelled entry's retry (sd:3389): its item has a newer entry, or merged at its head.
@@ -1636,7 +1639,8 @@ def retry(root: pathlib.Path, item: int, environ: dict[str, str], *, manual: boo
     showed: a last entry at another head is refused with `STALE_HEAD`
     (sd:3268). None checks nothing. In the write's transaction the read
     is made again: another head refuses `STALE_HEAD`, a newer entry
-    `SUPERSEDED` (`check_successor`).
+    `SUPERSEDED` (`check_successor`). An entry Fix handed back to its
+    builder (`HANDED_BACK`, pack sd:8584) is refused at both reads.
 
     What enqueue refuses as a moved head (sd:5989), retry refuses too, before
     the publish (sd:6057): a worktree here that moved past the head
@@ -1655,6 +1659,10 @@ def retry(root: pathlib.Path, item: int, environ: dict[str, str], *, manual: boo
         if expected_head is not None and latest.get("expected_head") != expected_head:
             raise LaneError(f"sd:{item}'s last entry is at {latest.get('expected_head')}, not the expected head "
                             f"{expected_head}; read it again with `sd-ship lane list`", code=STALE_HEAD)
+        if latest.get("handed_back"):
+            handed = latest["handed_back"] if isinstance(latest["handed_back"], dict) else {}
+            raise LaneError(f"sd:{item}'s last entry was handed back to its builder by Fix (build run "
+                            f"{handed.get('run')}); the builder enqueues its new head", code=HANDED_BACK)
         return latest
 
     def still_newest(connection: Any) -> None:

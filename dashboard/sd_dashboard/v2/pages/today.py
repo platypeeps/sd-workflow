@@ -40,16 +40,19 @@ def _retry(payload, principal):
     from ... import builds
 
     finding = payload.get("finding", "")
-    if (set(payload) - {"finding"} != {"assignment", "revision"} or type(payload["assignment"]) is not int
+    if (set(payload) - {"finding", "run"} != {"assignment", "revision"} or type(payload["assignment"]) is not int
             or not 1 <= payload["assignment"] <= 9223372036854775807 or not isinstance(payload["revision"], str)):
         raise ValueError("Retry takes the lead assignment and the revision the panel read.")
     if "finding" in payload and (not isinstance(finding, str) or not finding.strip()
                                  or len(finding) > builds.FINDING_MAX):
         raise ValueError(f"Send to builder takes a finding of 1 to {builds.FINDING_MAX} characters.")
+    # pack sd:8584: Fix names the lane_failed run it read, and sends a finding.
+    if "run" in payload and (not isinstance(payload["run"], str) or not payload["run"] or "finding" not in payload):
+        raise ValueError("Fix takes the build run the page read and a finding.")
 
     def write(connection):
         out = builds.retry(connection, payload["assignment"], expected_revision=payload["revision"], who="dashboard",
-                           finding=finding.strip())
+                           finding=finding.strip(), run=payload.get("run"))
         return {**out, "kickstart": builds.kickstart()}
 
     return write

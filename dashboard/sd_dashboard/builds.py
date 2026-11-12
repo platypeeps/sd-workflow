@@ -14,6 +14,10 @@ its assignment is queued again (`runner.requeue`), in one transaction. With a `f
 sd:6020): the finding is a `build.FINDING` note on each item first, and the claim keeps the bundle under its lead, so
 the next builder resumes the same worktree and its brief names the finding. Cancel on a running build is the route that
 exists, `/api/assignments/<lead>/cancel` (`operations.cancel_assignment`), bound to the revision this panel read.
+
+Fix on a failed lane entry (pack sd:8584) is Send to builder on the build run that enqueued the entry's branch
+(`lane_fix_state`), named by the press: `build.lane_fix` hands the entry back to the builder and queues its bundle again
+under its lead, or refuses. Retry and a plain Send to builder still refuse a `lane_failed` run.
 """
 
 from __future__ import annotations
@@ -32,8 +36,8 @@ from sd_db.database import transaction
 from sd_db.errors import SdDbError
 from sd_db.writes import SettingStale, add_note, set_setting, transition
 
-__all__ = ["ENDED_MAX", "JOB", "QUIET_SECONDS", "answer", "file_and_build", "fix_flaky", "kickstart", "panel", "pickup", "plan",
-           "press", "retry"]
+__all__ = ["ENDED_MAX", "JOB", "QUIET_SECONDS", "answer", "file_and_build", "fix_flaky", "kickstart", "lane_fix_state", "panel",
+           "pickup", "plan", "press", "retry"]
 
 #: The local-cron-jobs job that runs `sd assignments dispatch` (system, build-dispatch.job).
 JOB = "build-dispatch"
@@ -363,6 +367,29 @@ def _retry_state(connection, run: dict) -> dict:
             "bundle": current["status"]}
 
 
+def lane_fix_state(connection, branch: str | None) -> dict:
+    """Fix on a failed lane entry (pack sd:8584): the newest build run holding `branch`, with the lead's revision, and
+    whether Fix takes it: `build.lane_fix_check`, the check its press makes. Off with the reason in every other state:
+    the entry names no branch, no build run holds it (a session enqueued it), the check refuses, or a read failed."""
+    if not branch:
+        return {"allowed": False, "reason": "the lane entry names no branch"}
+    try:
+        run = build.branch_run(connection, branch)
+        if run is None:
+            return {"allowed": False, "reason": f"no build run holds branch {branch}; send the finding to the session "
+                                                "that enqueued it"}
+        revision = runner.queue_state(connection, run["assignment"])["revision"]
+        reason = ""
+        try:
+            build.lane_fix_check(connection, run["id"])
+        except build.BuildRefused as refusal:
+            reason = str(refusal)
+    except (SdDbError, sqlite3.Error) as failure:
+        return {"allowed": False, "reason": f"the build runs were not read: {failure}"}
+    return {"allowed": not reason, "reason": reason, "assignment": run["assignment"], "revision": revision,
+            "run": run["id"]}
+
+
 def panel(connection, *, now: str, show: str = "active") -> dict:
     """Queue's Builds panel: `runs`, each open build run, then each open teammate run (`_teammate_row`); `recent`, under `show` "all" only, the ended runs, newest
     first, up to `ENDED_MAX` (pack sd:6834).
@@ -423,12 +450,16 @@ def pickup(payload: dict):
     return write
 
 
-def retry(connection, assignment: int, *, expected_revision: str, who: str, finding: str = "") -> dict:
+def retry(connection, assignment: int, *, expected_revision: str, who: str, finding: str = "",
+          run: str | None = None) -> dict:
     """Retry a blocked or cancelled build: each such member's item to `ready`, a `finding` note on it when one is
     sent (Send to builder), then its assignment queued again, in one transaction.
 
     The lead's revision is the one the panel read; a moved run is `StaleItem` (a 409). Each item must pass the
     press's own check once it is ready, so a retried bundle is one the next claim can take.
+
+    `run` is Fix on a failed lane entry (pack sd:8584): the lane_failed run the page read, which must be the lead's
+    latest; `build.lane_fix` hands the entry back and queues the bundle, or refuses. It never falls back to Retry.
     """
     with transaction(connection):
         current = runner.queue_state(connection, assignment)
@@ -436,6 +467,16 @@ def retry(connection, assignment: int, *, expected_revision: str, who: str, find
             raise workflow.WorkflowError(f"assignment {assignment} is not a build")
         if current["revision"] != expected_revision:
             raise workflow.StaleItem(f"build assignment {assignment} changed; read the Builds panel again")
+        if run is not None:
+            try:
+                if (current["run"] or {}).get("id") != run:
+                    raise build.BuildRefused(f"build run {run} is not assignment {assignment}'s latest run")
+                items = build.lane_fix(connection, run, finding, who=who)
+            except build.BuildRefused as refusal:
+                raise workflow.WorkflowError(f"Fix refused: {refusal}") from None
+            return {"run": run, "queued": [{"id": member["id"], "item": member["item"], "status": "queued"}
+                                           for member in build._members(connection, assignment, "queued")
+                                           if member["item"] in items]}
         run = current["run"]
         state = _retry_state(connection, run) if run else {"allowed": False, "reason": "it never ran"}
         if not state["allowed"]:
