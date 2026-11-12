@@ -247,8 +247,10 @@ class TheConfirms(ReaderCase):
         super().setUp()
         late = [work(n, due="2026-08-01", recurring=True) for n in range(1, 32)]
         briefs = [{"id": f"b{n}", "subj": f"Brief {n}", "src": "hoa", "words": 90, "day": NOW[:10], "seen": "x"} for n in (1, 2)]
-        self.doc["needs"] = now_screen.needs(self.doc["needs"], work=late, live=set(), today=NOW[:10], briefs=briefs,
-                                             lanes=[{**lane(rows=[blocked(5780)]), "runner_merge": "manual"}])
+        self.needs = lambda *rows: now_screen.needs(self.base, work=late, live=set(), today=NOW[:10], briefs=briefs,
+                                                    lanes=[{**lane(rows=rows), "runner_merge": "manual"}])
+        self.base = self.doc["needs"]
+        self.doc["needs"] = self.needs(blocked(5780))
 
     DECLINE = """const cmd = id => REG.find(c => c.id === id);
 function decline(c, o) {
@@ -270,6 +272,18 @@ decline(cmd('today.lane.approve'), o); await flush(); R.said = (cmd('today.lane.
         out = self.run_page(self.DECLINE + f"decline(cmd('today.lane.retry'), C.get('{self.ENTRY}')); await flush();")
         self.assertEqual(out["confirms"], [])
         self.assertEqual([(path, body["action"]) for path, body, _ in out["posts"]], [("/api/queue/move", "retry")])
+
+    def test_retry_at_a_head_no_commit_moved_asks_first_and_names_the_lanes_next_action(self):
+        """pack sd:8584: Retry on Needs you repeated a code failure silently, as Queue's did; it asks there too."""
+        failure = {"code": "merge_conflict", "retryable": False,
+                   "next_action": "Run git merge origin/main, resolve the conflict, commit, then run prepare again."}
+        self.doc["needs"] = self.needs({**blocked(5780), "unchanged": True, "failure": failure})
+        out = self.run_page(self.DECLINE + f"""const o = C.get('{self.ENTRY}');
+decline(cmd('today.lane.retry'), o); await flush(); R.said = cmd('today.lane.retry').consequence(o);""")
+        self.assertEqual((out["confirms"], out["posts"]), (["today.lane.retry"], []))
+        self.assertEqual(out["R"]["said"], "No commit moved the head since this failure, so Retry repeats it unless the failure"
+                                           " was transient. The lane marks merge_conflict as not retryable. The lane says next:"
+                                           f" {failure['next_action']}")
 
     STALE = "The queue changed since the page read it. Read it again, then retry."
 

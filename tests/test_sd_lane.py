@@ -4770,6 +4770,35 @@ class RetryCancelled(SharedQueue):
         self.assertEqual((self.entries()[-1]["status"], self.entries()[-1]["code"], self.calls),
                          ("skipped", sd_lane.HEAD_MOVED, []))
 
+    def test_an_entry_fix_handed_back_to_its_builder_is_not_retried(self) -> None:
+        """pack sd:8584 round 1: Fix cancels a failed entry and hands its worktree to a builder (`handed_back`).
+
+        A Retry or Re-queue from a page read before the Fix would put that worktree back in the lane while the
+        builder edits it; it is refused at the read and again in the write's transaction, and queues nothing.
+        """
+        _, head = self.cancelled()
+
+        def hand_back(rows: list[dict[str, Any]]) -> None:
+            for row in rows:
+                if row["item"] == 1:
+                    row["handed_back"] = {"run": "run-1"}
+        real = sd_lane.require_published
+
+        def fix_lands_first(*args: Any) -> None:
+            real(*args)
+            sd_lane.update(self.store(), hand_back)
+        before = self.rows()
+        with mock.patch.object(sd_lane, "require_published", fix_lands_first), \
+                self.assertRaises(sd_lane.LaneError) as refused:
+            sd_lane.retry(self.repo, 1, self.environ, expected_head=head)
+        self.assertEqual(refused.exception.code, "handed_back")
+        self.assertEqual(len(self.rows()), len(before) + 1, "only the hand-back's own row was written")
+        with self.assertRaises(sd_lane.LaneError) as refused:
+            sd_lane.retry(self.repo, 1, self.environ, expected_head=head)
+        self.assertEqual(refused.exception.code, "handed_back")
+        self.assertIn("handed back to its builder", str(refused.exception))
+        self.assertEqual([row["status"] for row in self.entries() if row["item"] == 1], ["cancelled"])
+
     def test_a_successor_moved_above_a_cancelled_entry_is_the_one_retried(self) -> None:
         """Failure table, read: a newer entry of the item ended at a position above the cancelled one.
 

@@ -253,7 +253,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
              failed: r.kind === 'job' && !!r.retry, retry: r.retry, job: job && job[1], service: r.service,
              exit: r.exit, revision: r.revision, capability: r.capability, repo: pr ? pr[1] : r.repo, number: pr && +pr[2], seen: r.seen,
              item: r.item, itemKind: r.item_kind, state: r.state, url: r.url, fieldsRead: r.fields_read, until: r.until, login: r.login, claim: r.claim,
-             repoPath: r.repo_path, laneRevision: r.lane_revision, head: r.expected_head, runnerMerge: r.runner_merge,
+             repoPath: r.repo_path, laneRevision: r.lane_revision, head: r.expected_head, runnerMerge: r.runner_merge, unchanged: r.unchanged, failure: r.failure,
              members: r.members && r.members.map(m => ({ id: m.id, seen: m.seen, until: m.until, item: m.item })), group: r.id,
              band: r.band, detail: r.detail, source: r.source };
   }
@@ -365,7 +365,24 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     const off = on => on ? html` disabled` : '';
     return html`<div class="ctl" role="group" aria-label="Order of sd:${String(r.item)}">${sb('up', r, I('arrow-up'), `Move up sd:${r.item}`, off(r.position === 1))}${sb('down', r, I('arrow-down'), `Move down sd:${r.item}`, off(r.position === last))}${sb('top', r, 'Top', `Move sd:${r.item} to the top`, off(r.position === 1))}${sb(r.held ? 'release' : 'hold', r, r.held ? 'Release' : 'Hold', `${r.held ? 'Release' : 'Hold'} sd:${r.item}`)}${sb('cancel', r, 'Cancel…', `Cancel sd:${r.item} in this lane`)}</div>`;
   }
-  const again = (r, manual) => !QV.lanes.retry ? '' : html`<div class="ctl" role="group" aria-label="Unblock sd:${String(r.item)}">${sb('retry', r, 'Retry', `Retry sd:${r.item}: queue it again at the same head`, html` data-head="${r.expected_head}"`)}${manual ? sb('approve', r, 'Approve…', `Approve sd:${r.item}: queue it again with the merge granted`, html` data-head="${r.expected_head}"`) : ''}</div>`;
+  const again = (r, manual) => !QV.lanes.retry ? '' : html`<div class="ctl" role="group" aria-label="Unblock sd:${String(r.item)}">${sb('retry', r, r.unchanged === true ? 'Retry…' : 'Retry', `Retry sd:${r.item}: queue it again at the same head`, html` data-head="${r.expected_head}"`)}${manual ? sb('approve', r, 'Approve…', `Approve sd:${r.item}: queue it again with the merge granted`, html` data-head="${r.expected_head}"`) : ''}</div>`;
+  // pack sd:8584: a failed entry's Fix sends the lane's finding to the build run that enqueued its branch; off says why.
+  const mendBtn = r => !r.fix ? '' : html`<div class="ctl" role="group" aria-label="Fix sd:${String(r.item)}">${sb('fix', r, 'Fix…', `Fix sd:${r.item}: send the lane's finding to its builder`, r.fix.allowed ? '' : html` disabled title="${r.fix.reason}"`)}</div>`;
+  // pack sd:8584: what a failed entry's facts add: whether a commit moved its head since, and what prepare answered.
+  const moved = r => r.unchanged === true ? ' · head unchanged since this failure: Retry repeats it unless the failure was transient'
+    : r.unchanged === false ? ' · the worktree moved past this head: enqueue the new head; Retry is refused' : '';
+  const answered = f => !f || !f.code ? '' : ` · ${f.code}${f.retryable === false ? ', not retryable' : f.retryable === true ? ', retryable' : ''}${f.next_action ? ` · next: ${f.next_action}` : ''}`;
+  // Retry at a head no commit moved repeats the failure (pack sd:8584): what it asks, on Queue and on Needs you.
+  const repeats = r => {
+    const f = r.failure || {};
+    return ['No commit moved the head since this failure, so Retry repeats it unless the failure was transient.',
+      f.code && f.retryable === false ? `The lane marks ${f.code} as not retryable.` : '',
+      f.next_action ? `The lane says next: ${f.next_action}` : ''].filter(Boolean).join(' ');
+  };
+  // Fix's finding, which the operator may edit: the failure, the lane's next action and the log the builder reads.
+  const finding = r => [`The lane's ${r.step || 'run'} failed at head ${r.head}: ${String(r.reason || r.status).replace(/[.\s]*$/, '.')}`,
+    (r.failure || {}).next_action ? `The lane says next: ${r.failure.next_action}` : '', r.prepare_log ? `Prepare log: ${r.prepare_log}` : '']
+    .filter(Boolean).join(' ').slice(0, 4000);
   const back = r => !QV.lanes.requeue ? '' : html`<div class="ctl" role="group" aria-label="Cancel of sd:${String(r.item)}">${sb('requeue', r, 'Re-queue', `Re-queue sd:${r.item} at head ${r.head}`, html` data-head="${r.expected_head}"`)}</div>`;
   const free = r => !r.claim ? '' : html`<div class="ctl" role="group" aria-label="Claim of sd:${String(r.item)}">${sb('reclaim', r, 'Release…', `Release sd:${r.item} from ${r.host || 'its holder'}`, html` data-claim="${r.claim}"`)}</div>`;
   // Each lane state's glyph, type and fact line. A cancelled or landed entry is an ended row.
@@ -373,7 +390,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     merging: r => [r.lease_passed ? 'caution' : 'ok', 'merging', html`<b>${r.step || 'step not recorded'}</b> on <b>${r.host || 'host not recorded'}</b> · claimed ${r.claim_age == null ? 'at a time not recorded' : `${dur(r.claim_age)} ago`} · ${r.lease_until ? `lease ${r.lease_passed ? 'passed' : 'to'} ${at(r.lease_until)}` : 'lease not recorded'} · head ${r.head || 'not recorded'}`],
     next: r => [r.held ? 'caution' : 'queued', 'next', html`${r.held ? 'held' : 'position'} ${r.position} · gate <b>${r.gate}</b>${r.gate_summary ? ` (${r.gate_summary})` : ''} · head ${r.head || 'not recorded'}${r.held ? ' · skipped until released' : ''}`],
     building: r => [{ running: 'ok', pass: 'ok', fail: 'warning' }[r.gate] || 'unknown', 'working', html`gate <b>${r.gate}</b>${r.summary ? ` · ${r.summary}` : ''}${r.head ? ` · head ${r.head}` : ''} · log changed ${at(new Date(r.changed * 1000).toISOString())}`],
-    blocked: r => ['warning', 'blocked', html`<b>${r.who} acts</b> · ${r.status}${r.step ? ` at ${r.step}` : ''} · ${r.reason} · head ${r.head || 'not recorded'}`],
+    blocked: r => ['warning', 'blocked', html`<b>${r.who} acts</b> · ${r.status}${r.step ? ` at ${r.step}` : ''} · ${r.reason} · head ${r.head || 'not recorded'}${moved(r)}${answered(r.failure)}`],
     cancelled: r => ['queued', 'ended', html`cancelled at ${at(r.finished)} · head ${r.head || 'not recorded'}${QV.lanes.requeue ? '' : ` · Re-queue off: ${QV.lanes.requeue_off || 'not known whether the pack takes it'}`}`],
     landed: r => ['ok', 'ended', html`landed · ${r.pr ? `PR #${r.pr}` : 'PR not named'} · merge ${r.commit || 'not recorded'} · ${at(r.finished)}`],
   };
@@ -386,7 +403,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   function entryRow(l, r, p) {
     const [s0, type, facts] = ENTRY[r.state](r), last = l.rows.filter(x => x.state === 'next').length, e = { ...r, lane: l.path };
     const s = p ? (p.on === 'you' ? 'warning' : 'queued') : s0;
-    const ctl = r.state === 'next' ? controls(e, last) : r.state === 'blocked' ? again(e, l.runner_merge === 'manual') : r.state === 'cancelled' ? back(e) : r.state === 'merging' ? free(e) : '';
+    const ctl = r.state === 'next' ? controls(e, last) : r.state === 'blocked' ? html`${again(e, l.runner_merge === 'manual')}${mendBtn(e)}` : r.state === 'cancelled' ? back(e) : r.state === 'merging' ? free(e) : '';
     const id = r.state === 'building' ? null : entryId(l, r);
     return [type, s, html`<tr class="child" data-type="${type}"${id ? html` data-id="${id}" aria-selected="${String(row() === id)}"` : ''}${r.held ? html` data-held=""` : ''}${p ? html` data-pr="${String(p.item)}"` : ''}>${marker(s, type)}
       <td class="what">${r.state === 'building' ? html`<code>${r.builder}</code>` : html`<a href="${shell.itemHref(r.item)}">#${r.item} ${r.title}</a>`}</td>
@@ -692,10 +709,39 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       body: `${host} claimed it ${ago}, at ${r.step || 'a step not recorded'}. ${outcome} The holder's next queue write is refused. If the entry moved on since this read, nothing is released. sd-ship refuses the release when the holder runs alive on this machine.`,
       cli: `sd-ship -C ${shell.shq(l.path)} lane cancel ${item} --expected-claim ${shell.shq(claim)}`, ok: 'Release entry', keep: 'Keep it running' });
   }
+  // Retry asks first only when no commit moved the head since the failure (pack sd:8584); it then names what the lane said.
+  function anyway(l, item, head) {
+    const r = l.rows.find(x => x.state === 'blocked' && x.item === item);
+    if (!r || r.unchanged !== true) return Promise.resolve(true);
+    return shell.confirm({ title: `Retry sd:${item}${r.title ? ` · ${r.title}` : ''} in ${l.repo}?`, body: repeats(r), danger: false,
+      cli: `sd-ship -C ${shell.shq(l.path)} lane retry ${item} --expected-head ${head}`, ok: 'Retry anyway', keep: 'Leave it blocked' });
+  }
+  // Fix (pack sd:8584): Send to builder on the build run that enqueued the entry, its finding the lane's, edited first.
+  async function mend(l, item) {
+    const r = l.rows.find(x => x.state === 'blocked' && x.item === item);
+    if (!r || !r.fix || !r.fix.allowed) return;
+    const { yes, values } = await shell.ask({ title: `Fix sd:${item}${r.title ? ` · ${r.title}` : ''} in ${l.repo}?`, ok: 'Send to builder', keep: 'Cancel', danger: false,
+      body: `The finding goes on the item as a note, and build run ${r.fix.run}'s bundle queues again. Its next builder resumes ${r.worktree || 'the same worktree'} on ${r.branch}, fixes the finding first and enqueues the new head.`,
+      fields: [{ name: 'finding', label: 'Finding', required: true, multiline: true, value: finding(r) }] });
+    const text = (values && values.finding || '').trim();
+    if (!yes || !text) return;
+    QV.busy = true; queueView();
+    try {
+      await shell.post('/api/queue/builds/retry', { assignment: r.fix.assignment, revision: r.fix.revision, finding: text, run: r.fix.run });
+      qSaid = { ok: true, text: `${l.repo}: sd:${item} sent to its builder with the lane's finding; its build queues again.` };
+    } catch (err) {
+      qSaid = { ok: false, text: err.status >= 400 && err.status < 500 ? `${l.repo}: sd:${item} not sent to its builder: ${err.message}`
+        : `${l.repo}: not known whether sd:${item} was sent to its builder: ${err.message} Read the view before you act again.` };
+    }
+    QV.busy = false;
+    await loadQueue();
+  }
   async function laneAct(b) {
     const l = QV.lanes && QV.lanes.lanes.find(x => x.path === b.dataset.repo);
     if (!l || QV.busy) return;
     const item = Number(b.dataset.item), action = b.dataset.act, head = b.dataset.head || '', claim = b.dataset.claim || '';
+    if (action === 'fix') return mend(l, item);
+    if (action === 'retry' && !(await anyway(l, item, head))) return;
     if (action === 'cancel' && !(await sure(l, item))) return;
     if (action === 'reclaim' && !(await letGo(l, item, claim))) return;
     if (action === 'approve' && !(await grant(l, item, head))) return;
@@ -1056,7 +1102,9 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       { id: 'today.mail.open', on: 'mail thread', label: 'Open thread', does: 'Opens the thread in Gmail in a new tab.', key: 'o', icon: 'mail', risk: 'safe', executes: false, primary: () => true,
         cli: () => 'no CLI: the thread is in Gmail', run: o => { window.open(o.url, '_blank', 'noopener'); return `${o.label} opens in Gmail`; } },
       // A blocked lane entry (sd:5921): Queue's Retry and Approve, posted with the lane's revision and the head the read showed.
+      // pack sd:8584: at a head no commit moved since the failure it asks first, naming what the lane said.
       { id: 'today.lane.retry', on: 'lane entry', label: 'Retry', does: 'Queues the entry again at the head it ended at.', key: 'r', icon: 'rotate-ccw', risk: 'safe', primary: () => true,
+        askFirst: o => o.unchanged === true, consequence: o => o.unchanged === true ? repeats(o) : '',
         cli: o => `sd-ship -C ${o.repoPath} lane retry ${o.item} --expected-head ${o.head}`, sends: () => 'POST /api/queue/move {action: retry}',
         when: o => !!o.head || 'the entry recorded no head; retry it from Queue', run: o => lane('retry')(o).then(() => `Queued again · sd:${o.item}`) },
       // Approve grants the merge, which nothing takes back, so it asks first as Queue's does; Retry runs at once there too.

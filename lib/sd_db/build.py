@@ -1182,27 +1182,121 @@ def _rebuild(connection, read: dict, reason: str, stamp: str, base: str) -> None
     next builder merges main into the same branch (pack sd:6940). Each member still `in_progress` goes back to
     `ready`; one the operator moved stays out. A lead moved or left out of delivery, or past `CONFLICT_REBUILDS`
     on the lead's item, queues nothing: the run stays `lane_failed` for the operator."""
-    lead = read["assignment"]
-    members = [member for member in _members(connection, lead, "done")
-               if connection.execute("SELECT status FROM item WHERE id = ?",
-                                     (member["item"],)).fetchone()["status"] == "in_progress"]
-    if not members or members[0]["id"] != lead:
-        return  # without its lead the claim would pick a child's branch and worktree: the operator's call
+    members = _sent_back(connection, read)
+    if not members:
+        return
     done = connection.execute("SELECT COUNT(*) FROM note WHERE item = ? AND body LIKE ?",
                               (members[0]["item"], REBUILD + "%")).fetchone()[0]
     if done >= CONFLICT_REBUILDS:
         return
     finding = (f"{REBUILD}{base} conflicted. Merge {base} into {read['branch']}, resolve each conflict, run the tests the "
                f"conflict touched, and commit the merge; the lane said: {reason}"[:2000])
+    _send_back(connection, members, finding, stamp, who="build",
+               why=f"build run {read['id']}: the lane's merge of {base} conflicted", result=reason,
+               said=f"rebuild {done + 1} of {CONFLICT_REBUILDS} after the lane's merge of {base} conflicted")
+
+
+def _sent_back(connection, read: dict) -> list[dict]:
+    """The members of `read`'s bundle a send-back queues again: each `done` one whose item is still `in_progress`,
+    the lead first; none without the lead, since the claim would then pick a child's branch and worktree."""
+    lead = read["assignment"]
+    members = [member for member in _members(connection, lead, "done")
+               if connection.execute("SELECT status FROM item WHERE id = ?",
+                                     (member["item"],)).fetchone()["status"] == "in_progress"]
+    return members if members and members[0]["id"] == lead else []
+
+
+def _send_back(connection, members: list[dict], finding: str, stamp: str, *, who: str, why: str, result: str,
+               said: str) -> None:
+    """Each member's item to `ready` with `finding` as its note, and its assignment queued again, as Send to builder
+    does: the next builder resumes the same branch and worktree, and its brief quotes the finding (pack sd:6020)."""
     for member in members:
-        transition(connection, member["item"], "ready", who="build",
-                   reason=f"build run {read['id']}: the lane's merge of {base} conflicted")
+        transition(connection, member["item"], "ready", who=who, reason=why)
         add_note(connection, member["item"], "comment", finding)
         connection.execute("UPDATE assignment SET status = 'queued', queued_at = ?, started = NULL, ended = NULL, "
-                           "result = ? WHERE id = ?", (stamp, f"requeued by build: {reason}"[:600], member["id"]))
-        add_note(connection, member["item"], "comment",
-                 f"Build assignment {member['id']} queued again by build: rebuild {done + 1} of "
-                 f"{CONFLICT_REBUILDS} after the lane's merge of {base} conflicted")
+                           "result = ? WHERE id = ?", (stamp, f"requeued by {who}: {result}"[:600], member["id"]))
+        add_note(connection, member["item"], "comment", f"Build assignment {member['id']} queued again by {who}: {said}")
+
+
+def branch_run(connection, branch: str) -> dict | None:
+    """The newest build run on `branch`, or None: the run that enqueued a lane entry on it (pack sd:8584)."""
+    found = connection.execute(
+        "SELECT runner_run.* FROM runner_run JOIN assignment ON assignment.id = runner_run.assignment "
+        "WHERE runner_run.branch = ? AND assignment.scope = ? ORDER BY runner_run.created_at DESC, runner_run.run DESC "
+        "LIMIT 1", (branch, SCOPE)).fetchone()
+    return dict(found) if found else None
+
+
+def lane_fix_check(connection, run: str) -> tuple[list[dict], str, dict]:
+    """Whether Fix on a failed lane entry (pack sd:8584) takes build run `run`: its bundle's members to send back, and
+    the lane entry's key and body to hand back. Fix's state on the page and its press both read this one check.
+
+    Only one state passes: `run` is its lead's latest run, released, ended `lane_failed`; the lead assignment is
+    `done`; a member is still `in_progress`; and the branch's newest lane entry failed (`_lane_entry`). Every other
+    state is `BuildRefused` with its reason, so a blocked or cancelled rebuild is never a plain Send to builder."""
+    read = connection.execute("SELECT * FROM runner_run WHERE id = ?", (run,)).fetchone()
+    if read is None:
+        raise BuildRefused(f"no build run {run}")
+    latest = connection.execute("SELECT id FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
+                                (read["assignment"],)).fetchone()
+    status = connection.execute("SELECT status FROM assignment WHERE id = ?", (read["assignment"],)).fetchone()
+    if latest["id"] != run:
+        raise BuildRefused(f"build run {latest['id']} is newer than {run}")
+    if read["released_at"] is None:
+        raise BuildRefused(f"build run {run} still holds its lease")
+    if read["outcome"] != "lane_failed":
+        raise BuildRefused(f"build run {run} ended {read['outcome'] or 'nothing yet'}, not lane_failed; Fix sends "
+                           "back only a bundle whose lane entry failed")
+    if status is None or status[0] != "done":
+        raise BuildRefused(f"the bundle is {status[0] if status else 'gone'} again")
+    members = _sent_back(connection, dict(read))
+    if not members:
+        raise BuildRefused("its lead item moved on since the lane failed; build it from Tasks")
+    return members, *_lane_entry(connection, read["branch"])
+
+
+def lane_fix(connection, run: str, finding: str, *, who: str) -> list[int]:
+    """Fix on a failed lane entry (pack sd:8584): the bundle whose run ended `lane_failed` goes back to its builder
+    with `finding` as a Send to builder note, as a conflict's rebuild does; the items queued again. The lane entry is
+    handed back to the builder first. The caller holds the transaction and checked the lead's revision. A state
+    `lane_fix_check` refuses is `BuildRefused` and writes nothing."""
+    members, key, entry = lane_fix_check(connection, run)
+    stamp = clock()
+    # The builder now owns the worktree: the entry is cancelled, and `sd_lane.retry` refuses one `handed_back`.
+    entry.update(status="cancelled", finished_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                 handed_back={"run": run, "by": who, "at": stamp},
+                 reason=f"handed back to its builder by Fix (build run {run}); it was {entry['status']}: "
+                        f"{entry.get('reason') or 'no reason kept'}"[:2000])
+    connection.execute("INSERT INTO state(kind, key, timestamp, body) VALUES ('checkpoint', ?, ?, ?)",
+                       (key, stamp, json.dumps(entry, sort_keys=True)))
+    said = f"Fix of build run {run}'s failed lane entry"
+    _send_back(connection, members, FINDING + finding, stamp, who=who, why=said, result=said, said=said)
+    return [member["item"] for member in members]
+
+
+def _lane_entry(connection, branch: str) -> tuple[str, dict]:
+    """The newest lane entry on `branch`, by the order the hub took them (`sd_lane.enqueue_order`), and its key, when
+    it ended `failed` or `skipped`. Any other end is `BuildRefused`: pending or running is the lane's again (a Retry),
+    and none read or one unreadable is unknown, never a failure to hand back (round 1 of pack sd:8584)."""
+    found = []
+    for row in connection.execute(
+            "SELECT state.key, state.body, keys.first FROM state JOIN (SELECT key, MIN(id) AS first, MAX(id) AS last "
+            "FROM state WHERE kind = 'checkpoint' AND key >= ? AND key < ? GROUP BY key) AS keys ON state.id = keys.last",
+            reads.LANE_KEYS):
+        try:
+            entry = json.loads(row["body"])
+        except (TypeError, ValueError):
+            raise BuildRefused(f"lane entry {row['key']} was not read; Fix waits for a readable lane") from None
+        if isinstance(entry, dict) and entry.get("branch") == branch:
+            found.append((row["first"], row["key"], entry))
+    if not found:
+        raise BuildRefused(f"no lane entry holds branch {branch}; the lane's state is unknown, so Fix writes nothing")
+    _, key, entry = max(found, key=lambda each: each[0])
+    if entry.get("status") in ("pending", "running"):
+        raise BuildRefused(f"the lane holds branch {branch} again ({entry['status']}); Fix waits until it ends")
+    if entry.get("status") not in ("failed", "skipped"):
+        raise BuildRefused(f"branch {branch}'s newest lane entry is {entry.get('status')}; Fix takes a failed one")
+    return key, entry
 
 
 class Probe:
