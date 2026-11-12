@@ -444,6 +444,17 @@ class TheRows(Lane, ScreenCase):
         self.assertEqual((cancelled["item"], cancelled["head"], cancelled["expected_head"], cancelled["finished"]),
                          (1, "1" * 12, "1" * 40, "2026-09-06T07:00:00Z"))
 
+    def test_a_cancelled_entry_names_why_only_when_it_was_handed_back(self):
+        """pack sd:8601: a row Fix or a conflict rebuild handed back says so; an operator's cancel names nothing."""
+        why = "handed back to its builder by Fix (build run r9); it was failed: a blocking finding"
+        self.list([{**e, "handed_back": {"run": "r9", "by": "build"}, "reason": why} if e["item"] == 1 else e
+                   for e in self.entries()])
+        rows = [row for row in self.doc()["lanes"][0]["rows"] if row["state"] == "cancelled"]
+        self.assertEqual([(row["item"], row["reason"]) for row in rows], [(1, why)])
+        self.list(self.entries())
+        rows = [row for row in self.doc()["lanes"][0]["rows"] if row["state"] == "cancelled"]
+        self.assertEqual([(row["item"], row["reason"]) for row in rows], [(1, None)])
+
     def test_a_cancelled_entry_that_is_not_its_items_newest_or_is_old_has_no_row(self):
         later = {"item": 1, "title": "Cancelled", "status": "pending", "expected_head": "1" * 40}
         old = {"item": 16, "title": "Cancelled last week", "status": "cancelled", "expected_head": "6" * 40,
@@ -571,6 +582,13 @@ class TheRows(Lane, ScreenCase):
         self.assertEqual(self.failed(answer="")["failure"], {})
         self.assertEqual(self.failed(answer='{"ok": false, "error": "cut sh')["failure"], {})
         self.assertEqual(self.failed(prepare_log="/elsewhere/prepare-14.log")["failure"], {})
+
+    def test_a_failed_entry_names_the_log_of_the_step_that_failed(self):
+        """pack sd:8601: a merge failure's log is its merge log; Fix sent the prepare log of a prepare that passed."""
+        self.assertEqual(self.failed()["log"], f"{self.lane}/logs/prepare-14-20260906T100000.log")
+        merge = self.failed(step="merge", merge_log=f"{self.lane}/logs/merge-14.log")
+        self.assertEqual((merge["log"], merge["failure"]), (f"{self.lane}/logs/merge-14.log", {}))
+        self.assertIsNone(self.failed(step="merge")["log"])
 
     def test_a_failed_entry_says_whether_its_worktree_still_holds_the_head_it_failed_at(self):
         self.assertIs(self.failed()["unchanged"], True)
@@ -792,6 +810,13 @@ class TheMove(Lane, BrowserSession):
             self.assertEqual((code, status), (code, want), answer)
             if code != "stale_head":
                 self.assertEqual(answer["error"], f"refused {code}; nothing was queued")
+
+    def test_a_requeue_of_an_entry_handed_back_to_its_builder_is_refused_not_unknown(self):
+        """pack sd:8601: `lane retry` refuses a handed-back entry before any write (pack sd:8584, exit 3)."""
+        refusal = "sd:1's last entry was handed back to its builder (build run r9); the builder enqueues its new head"
+        with mock.patch.dict(os.environ, {"QUEUE_REFUSE": refusal, "QUEUE_CODE": "handed_back"}):
+            status, _, answer = self.move("requeue", item=1, head="1" * 40)
+        self.assertEqual((status, answer), (400, {"error": refusal}))
 
     def test_a_requeue_whose_publish_is_unknown_is_an_unknown_outcome(self):
         # `publish_unknown` also follows a push that may have landed on origin; the page cannot tell which.
@@ -2422,6 +2447,27 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertEqual([p[:2] for p in out["posts"]], [["/api/queue/builds/retry", {"assignment": 832, "revision": "c" * 64,
                                                                                       "finding": finding, "run": "r9"}]])
         self.assertIn("system: sd:14 sent to its builder with the lane's finding", out["R"]["said"])
+
+    def test_fix_on_a_merge_failure_sends_the_merge_log(self):
+        """pack sd:8601: the finding names the log of the step that failed, never a prepare log that passed."""
+        self.failed(step="merge", merge_log=f"{self.lane}/logs/merge-14.log")
+        doc = queue_screen.document(self.connection, now=NOW)
+        next(row for row in doc["lanes"][0]["rows"] if row.get("item") == 14)["fix"] = {
+            "allowed": True, "reason": "", "assignment": 832, "revision": "c" * 64, "run": "r9"}
+        out = self.run_view("window.shell.ask = a => { OUT.ask = a; return Promise.resolve({ yes: false }); };"
+                            f"open('system'); act('button[data-act]', {{ repo: {json.dumps(str(self.checkout))}, item: '14', act: 'fix' }});"
+                            " await flush(); await flush();", answers={"/api/queue": [200, doc]})
+        finding = out["ask"]["fields"][0]["value"]
+        self.assertTrue(finding.endswith(f"Merge log: {self.lane}/logs/merge-14.log"), finding)
+        self.assertNotIn("Prepare log", finding)
+
+    def test_a_handed_back_row_names_why_it_ended(self):
+        why = "handed back to its builder by a conflict rebuild (build run r9); it was failed: conflict"
+        self.list([{**e, "handed_back": {"run": "r9", "by": "build"}, "reason": why} if e["item"] == 1 else e
+                   for e in self.entries()])
+        out = self.run_view("open('system'); R.html = ELS.queue.html;", search="?show=ended")
+        self.assertIn(f"head 111111111111 · {why}", out["R"]["html"])
+        self.assertNotIn('data-act="requeue" data-item="1"', out["R"]["html"])
 
     def test_fix_is_off_with_its_reason_when_no_build_run_holds_the_branch(self):
         self.failed()

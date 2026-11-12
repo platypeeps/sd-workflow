@@ -1157,11 +1157,12 @@ def pull_merged(connection, read: dict, url: str) -> bool:
         return True
 
 
-def lane_failed(connection, read: dict, reason: str) -> bool:
+def lane_failed(connection, read: dict, reason: str, *, entry: str | None = None) -> bool:
     """The tick ends an `enqueued` run whose lane entry failed or was skipped: `lane_failed`, released, in one write.
 
     The worktree stays for Retry; the lane's own note names the step.
-    A failure that is only prepare's merge of origin/main conflicting queues the bundle again (`_rebuild`).
+    A failure that is only prepare's merge of origin/main conflicting queues the bundle again (`_rebuild`), and hands
+    the lane entry the watch read, `entry` by id, back to the builder (pack sd:8601).
     """
     with transaction(connection):
         stamp = clock()
@@ -1173,15 +1174,19 @@ def lane_failed(connection, read: dict, reason: str) -> bool:
         connection.execute("UPDATE runner_lease SET released_at = ? WHERE run = ? AND released_at IS NULL",
                            (stamp, read["id"]))
         if conflict := CONFLICT.search(reason):
-            _rebuild(connection, read, reason, stamp, conflict.group(1))
+            _rebuild(connection, read, reason, stamp, conflict.group(1), entry)
         return True
 
 
-def _rebuild(connection, read: dict, reason: str, stamp: str, base: str) -> None:
+def _rebuild(connection, read: dict, reason: str, stamp: str, base: str, entry: str | None = None) -> None:
     """Queue a bundle whose lane entry conflicted with main again under its lead, as Send to builder does, so the
     next builder merges main into the same branch (pack sd:6940). Each member still `in_progress` goes back to
     `ready`; one the operator moved stays out. A lead moved or left out of delivery, or past `CONFLICT_REBUILDS`
-    on the lead's item, queues nothing: the run stays `lane_failed` for the operator."""
+    on the lead's item, queues nothing: the run stays `lane_failed` for the operator.
+
+    The branch's newest lane entry, the one the watch read (`entry`), is handed back to the builder as Fix hands
+    it, so `lane retry` refuses it while the builder holds the worktree (pack sd:8601). One not read, another
+    entry since, or none: no rebuild, and a note on the lead's item says why."""
     members = _sent_back(connection, read)
     if not members:
         return
@@ -1191,6 +1196,16 @@ def _rebuild(connection, read: dict, reason: str, stamp: str, base: str) -> None
         return
     finding = (f"{REBUILD}{base} conflicted. Merge {base} into {read['branch']}, resolve each conflict, run the tests the "
                f"conflict touched, and commit the merge; the lane said: {reason}"[:2000])
+    try:
+        key, found = _lane_entry(connection, read["branch"])
+        if entry is not None and found.get("id") != entry:
+            raise BuildRefused(f"branch {read['branch']}'s newest lane entry is {found.get('id')}, not {entry}")
+    except BuildRefused as refusal:
+        add_note(connection, members[0]["item"], "comment",
+                 f"Build run {read['id']}: no rebuild after the lane's merge of {base} conflicted, since the lane "
+                 f"entry was not handed back: {refusal}. Retry or Fix it on Queue.")
+        return
+    _hand_back(connection, key, found, read["id"], who="build", by="a conflict rebuild", stamp=stamp)
     _send_back(connection, members, finding, stamp, who="build",
                why=f"build run {read['id']}: the lane's merge of {base} conflicted", result=reason,
                said=f"rebuild {done + 1} of {CONFLICT_REBUILDS} after the lane's merge of {base} conflicted")
@@ -1262,16 +1277,21 @@ def lane_fix(connection, run: str, finding: str, *, who: str) -> list[int]:
     `lane_fix_check` refuses is `BuildRefused` and writes nothing."""
     members, key, entry = lane_fix_check(connection, run)
     stamp = clock()
-    # The builder now owns the worktree: the entry is cancelled, and `sd_lane.retry` refuses one `handed_back`.
-    entry.update(status="cancelled", finished_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                 handed_back={"run": run, "by": who, "at": stamp},
-                 reason=f"handed back to its builder by Fix (build run {run}); it was {entry['status']}: "
-                        f"{entry.get('reason') or 'no reason kept'}"[:2000])
-    connection.execute("INSERT INTO state(kind, key, timestamp, body) VALUES ('checkpoint', ?, ?, ?)",
-                       (key, stamp, json.dumps(entry, sort_keys=True)))
+    _hand_back(connection, key, entry, run, who=who, by="Fix", stamp=stamp)
     said = f"Fix of build run {run}'s failed lane entry"
     _send_back(connection, members, FINDING + finding, stamp, who=who, why=said, result=said, said=said)
     return [member["item"] for member in members]
+
+
+def _hand_back(connection, key: str, entry: dict, run: str, *, who: str, by: str, stamp: str) -> None:
+    """The builder now owns the worktree: the lane entry at `key` is cancelled and `handed_back`, a new checkpoint
+    row of its key, so `sd_lane.retry` refuses it (pack sd:8584). Fix and a conflict rebuild both write it."""
+    entry.update(status="cancelled", finished_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                 handed_back={"run": run, "by": who, "at": stamp},
+                 reason=f"handed back to its builder by {by} (build run {run}); it was {entry['status']}: "
+                        f"{entry.get('reason') or 'no reason kept'}"[:2000])
+    connection.execute("INSERT INTO state(kind, key, timestamp, body) VALUES ('checkpoint', ?, ?, ?)",
+                       (key, stamp, json.dumps(entry, sort_keys=True)))
 
 
 def _lane_entry(connection, branch: str) -> tuple[str, dict]:

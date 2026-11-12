@@ -114,7 +114,7 @@ WHO = {("prepared", None): "operator", ("skipped", None): "builder", ("failed", 
 #: The refusal codes of the verbs the page runs that wrote nothing: a stale check, or a definite answer before the write.
 #: Not `hub_unavailable` (a write may have landed) or `publish_unknown` (origin may have moved): those are unknown.
 REFUSED = ("stale_revision", "stale_head", "stale_claim", "holder_alive", "head_gone", "branch_diverged", "default_branch",
-           "head_moved", "superseded", "already_merged")
+           "head_moved", "superseded", "already_merged", "handed_back")
 #: Read again's pull-request check (sd:8375): how many items, how long, and the requests one pull read may spend
 #: (its detail twice, reviews, two comment lists, the timeline and two CI reads, with paging room).
 PR_CHECK_ITEMS = 20
@@ -445,8 +445,10 @@ def rows(entries: list[dict], *, path: str, lane: Path, now: float, done: frozen
                 who = WHO.get((status, entry.get("step"))) or WHO.get((status, None), "lane")
                 reason = (str(entry.get("reason") or "").strip().splitlines() or [status])[0]
                 head = str(entry.get("expected_head") or "")
+                # The log of the step that failed: a merge failure's prepare log is of a prepare that passed (sd:8601).
+                log = entry.get("merge_log" if entry.get("step") == "merge" else "prepare_log")
                 failed = {"branch": entry.get("branch"), "unchanged": _unchanged(entry), "failure": _failure(entry, lane),
-                          "prepare_log": str(entry.get("prepare_log") or "") or None} if status == "failed" else {}
+                          "log": str(log or "") or None} if status == "failed" else {}
                 blocked.append({**base, "state": "blocked", "status": status, "step": entry.get("step"),
                                 "reason": reason, "who": who, "finished": entry.get("finished_at"),
                                 "head": head[:12], "expected_head": head, **failed})
@@ -454,8 +456,10 @@ def rows(entries: list[dict], *, path: str, lane: Path, now: float, done: frozen
             finished = _when(entry.get("finished_at"))
             if finished and now - finished <= BLOCKED_DAYS * 86400:
                 head = str(entry.get("expected_head") or "")
+                # A hand-back to a builder names why, and `lane retry` refuses it (pack sd:8584, sd:8601).
+                why = (str(entry.get("reason") or "").strip() or "handed back to its builder") if entry.get("handed_back") else None
                 cancelled.append({**base, "state": "cancelled", "finished": entry.get("finished_at"),
-                                  "head": head[:12], "expected_head": head})
+                                  "head": head[:12], "expected_head": head, "reason": why})
         elif status == "merged":
             finished = _when(entry.get("finished_at"))
             if finished and time.strftime("%Y-%m-%d", time.localtime(finished)) == today:

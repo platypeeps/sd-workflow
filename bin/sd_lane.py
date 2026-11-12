@@ -1661,7 +1661,7 @@ def retry(root: pathlib.Path, item: int, environ: dict[str, str], *, manual: boo
                             f"{expected_head}; read it again with `sd-ship lane list`", code=STALE_HEAD)
         if latest.get("handed_back"):
             handed = latest["handed_back"] if isinstance(latest["handed_back"], dict) else {}
-            raise LaneError(f"sd:{item}'s last entry was handed back to its builder by Fix (build run "
+            raise LaneError(f"sd:{item}'s last entry was handed back to its builder (build run "
                             f"{handed.get('run')}); the builder enqueues its new head", code=HANDED_BACK)
         return latest
 

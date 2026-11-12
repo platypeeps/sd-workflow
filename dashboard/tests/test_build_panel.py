@@ -517,8 +517,8 @@ class LaneFix(Fixture):
 
     def test_fix_is_off_and_refused_when_a_rebuilt_bundle_ended_blocked_or_cancelled(self):
         """Round 2, rows 6 and 7: a conflict rebuild queued the bundle, its next run ended blocked or cancelled, and
-        run 1's failed entry is still a Queue row. Fix there is off, and its press is refused: a plain Send to
-        builder would leave that entry retryable."""
+        run 1's entry is still a Queue row. Fix there is off, and its press is refused. The rebuild handed that
+        entry back itself (pack sd:8601), so it is not retryable."""
         for outcome in ("blocked", "cancelled"):
             with self.subTest(outcome=outcome):
                 items = [self.ready()]
@@ -537,7 +537,8 @@ class LaneFix(Fixture):
                     status, _, body = self.fix(fix, run=run)
                     self.assertEqual(status, 400, body)
                     self.assertIn("Fix refused", body["error"])
-                self.assertEqual((self.queued(), self.lane_entry(f"e-{outcome}")["status"]), (0, "failed"))
+                handed = self.lane_entry(f"e-{outcome}")
+                self.assertEqual((self.queued(), handed["status"], handed["handed_back"]["by"]), (0, "cancelled", "build"))
 
     def test_fix_refuses_while_the_lane_holds_the_branch_again_or_holds_no_entry_and_writes_nothing(self):
         """Round 1: a Retry from another page put the branch back in the lane; Fix would hand its worktree to a

@@ -479,7 +479,7 @@ def watch(connection, *, lane: Callable[[dict, list[int]], dict | None], probe=P
         elif (entry is not None and status in LANE_ENDED
               and build.verdict(row, probe=probe)[0] == build.GONE):  # a rebuild must not share a live worktree
             reason = f"lane entry {entry.get('id')} {status}: {entry.get('reason') or entry.get('code') or 'no reason'}"
-            if build.lane_failed(connection, row, reason):
+            if build.lane_failed(connection, row, reason, entry=entry.get("id")):
                 moved.append({"run": row["id"], "outcome": "lane_failed"})
     return moved
 
