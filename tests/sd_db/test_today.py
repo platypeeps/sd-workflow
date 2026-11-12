@@ -217,6 +217,14 @@ class TheSections(TodayCase):
         self.item("Ready idea", repo=APP, status="ready", kind="idea")
         self.assertEqual([row["id"] for row in today.suggested(self.connection, now=NOW)], [task])
 
+    def test_suggested_rows_carry_their_kind(self):
+        """Pack sd:8532: the Queue's Build reads the kind to grey out one build._item would refuse."""
+        followup = self.item("Ready followup", repo=APP, status="ready", kind="followup")
+        planned = self.item("Planned", repo=APP, due="2026-09-30", kind="task")
+        loose = self.item("Loose", repo=LIB, kind="followup")
+        rows = {row["id"]: row["kind"] for row in today.suggested(self.connection, now=NOW)}
+        self.assertEqual(rows, {followup: "followup", planned: "task", loose: "followup"})
+
     def test_blocked_says_why_from_the_status_change_or_a_waiting_note(self):
         vendor = self.item("Vendor")
         transition(self.connection, vendor, "blocked", who="operator", reason="Waits on the vendor\nmore detail")

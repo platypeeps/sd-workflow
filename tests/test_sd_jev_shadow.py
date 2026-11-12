@@ -113,6 +113,10 @@ class TriageTests(ReviewFixture):
                                       self.codex_home)
         # A slot wait is load, not Jev: it differs between two runs on a busy machine (sd:6344).
         result["review_slot"].pop("waited_seconds", None)
+        # A reader's wall clock is time, not Jev, too (pack sd:8503).
+        for outcome in result["outcomes"]:
+            for key in ("started", "finished", "wall_seconds"):
+                outcome.pop(key, None)
         return json.dumps(result, sort_keys=True), noise.getvalue()
 
     def test_a_review_with_findings_records_a_triage_and_changes_nothing(self):
