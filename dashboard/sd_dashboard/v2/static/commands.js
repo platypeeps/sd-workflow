@@ -181,7 +181,8 @@
   // build: sd_db.runner.RUNNABLE_KINDS, the kinds build._item takes; test_v2_tasks holds it to the library (pack sd:8532).
   const BUILD_KINDS = ['work', 'task', 'report'];
   const buildKinds = `${BUILD_KINDS.slice(0, -1).join(', ')} or ${BUILD_KINDS.at(-1)}`;
-  function build({ row, reread, primary = () => false }) {
+  // `said(text, ok)`, when a page gives it, also puts the press's outcome on a line of its own that stays (sd:8565).
+  function build({ row, reread, primary = () => false, said = () => {} }) {
     const { html, put, plural } = window.markup;
     const toast = m => window.shell.toast(m);
     const dlg = document.createElement('dialog');
@@ -212,10 +213,12 @@
         if (dlg.returnValue !== 'build' || !ok) return;
         const revisions = Object.fromEntries(items.map(r => [String(r.id), r.revision]));
         window.shell.post('/api/tasks/build', { items: items.map(r => r.id), revisions }).then(out => {
-          toast(queuedText(out)); done?.(); reread();
+          const text = queuedText(out);
+          toast(text); said(text, true); done?.(); reread();
         }, err => {
           // A 409 is a refused press that changed nothing; no status is no answer, so whether it queued is not known.
-          toast(err.status === 409 ? err.message : err.status ? `Nothing queued: ${err.message}` : `Build got no answer, so what queued is not known: read the tasks again (${err.message})`);
+          const text = err.status === 409 ? err.message : err.status ? `Nothing queued: ${err.message}` : `Build got no answer, so what queued is not known: read the tasks again (${err.message})`;
+          toast(text); said(text, false);
           reread();
         });
       };

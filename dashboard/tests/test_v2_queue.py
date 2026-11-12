@@ -1736,7 +1736,20 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertIn("system:true", out["R"]["repos"])
         self.assertEqual(out["R"]["kids"], ["next", "next"])
         self.assertRegex(out["R"]["html"], r'<button type="button" class="linkbtn" data-tile-clear="system">'
-                                           r'Showing next: 2 of \d+ · Show all</button>')
+                                           r'2 next \(\d+ rows\) · Show all</button>')
+
+    def test_each_tiles_line_counts_its_own_rows_beside_the_repos(self):
+        """sd:8565 fault 5 (#53336): 'Showing blocked: 0 of 180' read as 180 blocked; every tile says '<n> <box> (<N> rows)'."""
+        boxes = ["merging", "review", "working", "next", "blocked", "suggested"]
+        out = self.run_view(self.TILE + " R.lines = {}; for (const b of " + json.dumps(boxes) + ") { tile('system', b);"
+                            " const m = ELS.queue.html.match(/data-tile-clear=\"system\">([^<]*)</); R.lines[b] = m ? m[1] : null;"
+                            " tile('system', b); }", search="?show=suggested")
+        for box in boxes:
+            line = out["R"]["lines"][box]
+            if line is None:
+                continue  # a zero box is disabled in the page, but the stand-in click still presses it
+            self.assertRegex(line, rf"^\d+ {box} \(\d+ rows?\) · Show all$", box)
+        self.assertTrue(any(out["R"]["lines"].values()))
 
     def test_a_second_click_on_the_tile_or_show_all_restores_every_row(self):
         out = self.run_view(self.TILE + " open('system'); R.all = kids(); tile('system', 'next'); tile('system', 'next');"
@@ -1966,7 +1979,8 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                             " R.live = on.map(c => c.id); R.primary = (on.find(c => c.primary && c.primary(o)) || {}).id;"
                             " shellRun(cmd('item.build'), o); await flush();"
                             " const D = MADE.find(e => /id=\"build-h\"/.test(e.html || '')); R.shown = D ? D.html : null; R.before = OUT.posts.length;"
-                            " if (D) { D.returnValue = 'build'; D.onclose(); await flush(); }",
+                            " if (D) { D.returnValue = 'build'; D.onclose(); await flush(); await flush(); await flush(); }"
+                            " R.said = ELS['queue-said'].textContent;",
                             search="?show=suggested", answers=answers)
         self.assertIn(f'<i data-acts="{item}"></i>', out["R"]["html"], "the row's act cell draws its commands")
         self.assertIn("item.build", out["R"]["live"])
@@ -1974,6 +1988,55 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertIn(f"<code>#{item}</code> Ship the pickup", out["R"]["shown"])
         self.assertEqual(out["R"]["before"], 0, "Build posts nothing before the dialog's Build")
         self.assertEqual([p[:2] for p in out["posts"]], [["/api/tasks/build", {"items": [item], "revisions": {str(item): "c" * 64}}]])
+        # sd:8565 fault 1: the press says what it queued in a toast and on the queue's own line, which stays.
+        self.assertIn(f"Queued #{item} for build", [t["msg"].split(" · ")[0] for t in out["toasts"]])
+        self.assertTrue(out["R"]["said"].startswith(f"Queued #{item} for build"), out["R"]["said"])
+
+    def test_a_suggested_row_with_a_queued_build_says_so_and_offers_no_build(self):
+        """sd:8565 fault 1: after a press the row changed nothing; its live assignment now shows on it."""
+        item, answers = self.suggested()
+        runner = {"live": self.RUNNER["live"] + [{**self.RUNNER["live"][1], "id": 836, "item": item, "role": "author",
+                                                  "repo": "~/repos/example/system"}]}
+        answers["/api/queue/runner"] = [200, runner]
+        out = self.run_view(f"open('system'); R.html = ELS.queue.html; R.on = cmd('item.build').when({{ id: '{item}' }});",
+                            search="?show=suggested", answers=answers)
+        row = re.search(rf'<tr class="child" data-type="suggested" data-item="{item}".*?</tr>', out["R"]["html"], re.S)
+        self.assertIn("build queued · assignment 836", row.group(0))
+        self.assertEqual(out["R"]["on"], "an agent run is queued for it")
+
+    def test_the_queue_says_it_is_reading_until_today_answers(self):
+        """sd:8565 fault 2: before /api/now answered, the view said 'The queue could not be read: .'"""
+        out = self.run_view("R.html = ELS.queue.html;",
+                            before="const A1 = ANSWER; ANSWER = (p, b) => p === '/api/now' ? new Promise(() => {}) : A1(p, b);\n")
+        self.assertNotIn("could not be read", out["R"]["html"])
+        self.assertIn("Reading the queue", out["R"]["html"])
+
+    def test_a_row_link_to_a_queue_row_holds_until_the_queue_is_read(self):
+        """sd:8565 fault 3: ?row= naming a lane entry gave way to Needs you's top row, read before the queue."""
+        entry = f"entry:{self.checkout}:12"
+        out = self.run_view("R.row = new URLSearchParams(location.search).get('row'); R.details = ELS.details.html;",
+                            search="?show=&row=" + entry.replace(":", "%3A").replace("/", "%2F"))
+        self.assertEqual(out["R"]["row"], entry)
+        self.assertIn("Lane entry", out["R"]["details"])
+
+    def test_a_row_link_the_queue_does_not_list_falls_back_to_the_first_row(self):
+        out = self.run_view("R.row = new URLSearchParams(location.search).get('row');", search="?show=&row=entry%3Agone%3A1")
+        self.assertNotEqual(out["R"]["row"], "entry:gone:1")
+        self.assertIsNotNone(out["R"]["row"])
+
+    def test_the_filter_matches_a_queue_row_by_its_item_number(self):
+        """sd:8565 fault 4: the filter text left the Queue view unchanged; it now keeps the rows that carry it."""
+        out = self.run_view("document.dispatchEvent(new CustomEvent('shell:filter', { detail: { q: '#12', view: 'queue' } }));"
+                            " R.repos = repos(); R.kids = kids(); R.html = ELS.queue.html;")
+        self.assertEqual(out["R"]["kids"], ["next"])
+        self.assertIn("#12 Queue page", out["R"]["html"])
+        self.assertNotIn("#3 Merge the slice", out["R"]["html"])
+
+    def test_an_ended_build_that_stopped_says_stopped_not_blocked(self):
+        """sd:8565 fault 5: an ended run read 'blocked', the word the blocked tile counts lane entries by."""
+        out = self.run_view("open('gamma'); R.html = ELS.queue.html;", search="?show=ended")
+        row = re.search(r'<tr class="child" data-type="ended" data-run="r0">.*?</tr>', out["R"]["html"], re.S)
+        self.assertIn("<b>stopped</b> · build r0", row.group(0))
 
     def test_build_on_an_unread_suggested_row_reads_the_queue_rows_repository(self):
         """Pack sd:7275. Before Details load, Build reads the queue row: its repo path allows. A null one is no

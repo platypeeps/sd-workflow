@@ -794,10 +794,15 @@ def _environ(environ: dict | None) -> dict:
     # The token reaches the child's environment only: no row or log holds it.
     if env.get("CUSTOM_CLAUDE_CODE_OAUTH_TOKEN"):
         env["CLAUDE_CODE_OAUTH_TOKEN"] = env["CUSTOM_CLAUDE_CODE_OAUTH_TOKEN"]
-    # A repo's own checks may fetch private release assets with GITHUB_TOKEN (sd:8506).
-    if not env.get("GITHUB_TOKEN") and env.get("GITHUB_PERSONAL_ACCESS_TOKEN"):
-        env["GITHUB_TOKEN"] = env["GITHUB_PERSONAL_ACCESS_TOKEN"]
     return env
+
+
+def _checks_environ(env: dict) -> dict:
+    """A repo's own checks may fetch private release assets with GITHUB_TOKEN (sd:8506). Only they get it
+    from the PAT: elsewhere gh and its credential helper would act as the PAT, not the gh login (sd:8515)."""
+    if env.get("GITHUB_TOKEN") or not env.get("GITHUB_PERSONAL_ACCESS_TOKEN"):
+        return env
+    return {**env, "GITHUB_TOKEN": env["GITHUB_PERSONAL_ACCESS_TOKEN"]}
 
 
 class Supervisor:
@@ -1156,7 +1161,7 @@ class Supervisor:
             for name in ("checks", "checks.err"):
                 self.empty(self.out(name), "checks")
             code = self.child([*self.tools.gate, "--label", f"build {self.row['branch']} checks", "--", *argv],
-                              cwd=self.work, name="checks", descendants=True)
+                              cwd=self.work, name="checks", descendants=True, env=_checks_environ(self.env))
             if code == 125 and self.refused():  # the gate started nothing: unknown, never a failure of the code
                 raise Unread(f"sd gate run did not start `{said}`; see {self.out('checks.err')}")
             if code != 0:
@@ -1670,7 +1675,7 @@ class Supervisor:
     # -------------------------------------------------------------- children
 
     def child(self, argv: list[str], *, cwd: Path, name: str, out: Path | None = None, session: bool = False,
-              descendants: bool = False, offset: int = 0, role: str | None = None) -> int:
+              descendants: bool = False, offset: int = 0, role: str | None = None, env: dict | None = None) -> int:
         """Run one child in its own process group, recorded before it runs; its exit code.
 
         The child waits on a pipe until `builder_pgid` and `builder_start`
@@ -1691,8 +1696,8 @@ class Supervisor:
         try:
             with open(target, "ab") as sink, open(self.out(name + ".err"), "ab") as errors:
                 process = subprocess.Popen([sys.executable, "-c", GATE, str(read), *argv], cwd=cwd,
-                                           stdin=subprocess.DEVNULL, stdout=sink, stderr=errors, env=self.env,
-                                           pass_fds=(read,), start_new_session=True)
+                                           stdin=subprocess.DEVNULL, stdout=sink, stderr=errors,
+                                           env=self.env if env is None else env, pass_fds=(read,), start_new_session=True)
         except OSError:
             os.close(gate)
             raise

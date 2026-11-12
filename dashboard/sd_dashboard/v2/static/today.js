@@ -420,7 +420,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     const s = r.outcome === 'done' ? 'ok' : r.retry.bundle === 'blocked' ? 'warning' : 'queued', off = r.retry.allowed ? '' : r.retry.reason;
     return ['ended', s, html`<tr class="child" data-type="ended" data-run="${r.run}">${marker(s, 'ended')}
       <td class="what">${names(r)}</td>
-      <td class="detail"><b>${r.retry.bundle === 'blocked' ? 'blocked' : r.outcome || 'ended'}</b> · build ${r.run} at ${r.step} · ended ${at(r.ended)} · ${usd(r.usd || 0)}${hostFacts(r)}${r.detail ? ` · ${r.detail}` : ''}</td>
+      <td class="detail"><b>${r.retry.bundle === 'blocked' ? 'stopped' : r.outcome || 'ended'}</b> · build ${r.run} at ${r.step} · ended ${at(r.ended)} · ${usd(r.usd || 0)}${hostFacts(r)}${r.detail ? ` · ${r.detail}` : ''}</td>
       <td class="num"></td>
       <td class="act"><div class="ctl" role="group" aria-label="Run ${r.run}">${['blocked', 'cancelled'].includes(r.retry.bundle) ? html`${bb('retry', r, 'Retry', `Retry build run ${r.run}: queue its items again`, off)}${bb('send', r, 'Send to builder…', `Send a finding to the builder of run ${r.run}`, off)}` : ''}${asgBtn(r.assignment)}${prLink(r)}${logBtn(r)}</div></td></tr>`];
   }
@@ -460,9 +460,12 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // (pack sd:8238), planned for its due date, or unscheduled, with its priority; a row not ready shows its status too.
   const P = r => r.priority == null ? '' : `P${r.priority}`;
   const WHY = { ready: r => ['ready', P(r)], due: r => [`due ${r.due}`, P(r), r.status], planned: r => [`planned for ${r.due}`, P(r), r.status], unscheduled: r => [`unscheduled ${P(r)}`.trim(), r.status] };
+  // sd:8565: a row whose item has a live assignment (a Build press queued one) says so.
+  const runFor = id => (((QV.runner || {}).live) || []).find(a => Number(a.item) === Number(id));
+  const runNote = id => { const a = runFor(id); return a ? ` · build ${a.status} · assignment ${a.id}` : ''; };
   const suggestRow = r => ['suggested', 'queued', html`<tr class="child" data-type="suggested" data-item="${r.id}" data-id="${String(r.id)}" aria-selected="${String(row() === String(r.id))}">${marker('queued', 'suggested')}
     <td class="what"><a href="${shell.itemHref(r.id)}">#${r.id} ${r.title}</a></td>
-    <td class="detail">${(WHY[r.why] || WHY.ready)(r).filter(Boolean).join(' · ')}</td><td class="num">${r.since ? age(r.since) : ''}</td><td class="act">${shell.commands.rowActions(String(r.id))}</td></tr>`];
+    <td class="detail">${(WHY[r.why] || WHY.ready)(r).filter(Boolean).join(' · ')}${runNote(r.id)}</td><td class="num">${r.since ? age(r.since) : ''}</td><td class="act">${shell.commands.rowActions(String(r.id))}</td></tr>`];
   // What sd-next offers next (pack sd:7314): the read's `queues.suggested`, ranked by sd_db.today.suggested (ready, due,
   // planned, then unscheduled), less the items live now, at most NEXT per repo, in that order. An item with no repo is
   // no row (pack sd:7731): Suggested draws no Unassociated group; Tasks still lists it.
@@ -477,7 +480,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   const OPENS = { blocked: 'caution', in_progress: 'ok' }; // a blocked task is a look, not a lane's needs-you
   const openRow = t => ['open', OPENS[t.status] || 'queued', html`<tr class="child" data-type="open" data-item="${t.key}" data-id="${t.key}" aria-selected="${String(row() === t.key)}">${marker(OPENS[t.status] || 'queued', 'open')}
     <td class="what"><a href="${shell.itemHref(t.id)}">#${t.id} ${t.title}</a></td>
-    <td class="detail">${String(t.status).replace(/_/g, ' ')}${t.p ? ` · P${t.p}` : ''}</td><td class="num">${t.since ? age(t.since) : ''}</td><td class="act">${shell.commands.rowActions(t.key)}</td></tr>`];
+    <td class="detail">${String(t.status).replace(/_/g, ' ')}${t.p ? ` · P${t.p}` : ''}${runNote(t.id)}</td><td class="num">${t.since ? age(t.since) : ''}</td><td class="act">${shell.commands.rowActions(t.key)}</td></tr>`];
   // pack sd:7699: an idea kind (/api/tasks' `ideas`, reads.IDEA_KINDS) is no Queue row; ideas live on Writing.
   // pack sd:8127: `all` gives them while All items is off too, so its tile counts them; its rows stay hidden.
   function openItems(all) {
@@ -518,7 +521,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     // pack sd:7679: the busiest repo first, box by box in the boxes' order, each most first; then the name. Unassociated last.
     const busy = (a, b) => BOXES.reduce((d, t) => d || b.n[t] - a.n[t], 0);
     return [...G.values()].map(g => {
-      const shown = g.rows.filter(c => !QSHOW.includes(c.type) || qShow.has(c.type)).sort((a, b) => QTYPES.indexOf(a.type) - QTYPES.indexOf(b.type));
+      const shown = g.rows.filter(c => (!QSHOW.includes(c.type) || qShow.has(c.type)) && qMatch(c)).sort((a, b) => QTYPES.indexOf(a.type) - QTYPES.indexOf(b.type));
       // pack sd:8083: a PR wait counts in review, not blocked, so no row counts twice.
       const n = Object.fromEntries(BOXES.map(t => [t, g.rows.filter(inBox(t)).length]));
       return { ...g, shown, n, s: shown.reduce((w, c) => RANK[c.s] < RANK[w] ? c.s : w, 'queued') };
@@ -527,6 +530,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // A box's rows: review holds the PR waits, each other box its type less those (pack sd:8083).
   // sd:8116: a stale PR row (unknown, no one to wait on) shows under its repo and counts in no box.
   const stalePr = c => c.type === 'blocked' && c.s === 'unknown';
+  // sd:8565: the filter text keeps the rows whose words carry it, an item's #number among them.
+  const qMatch = c => !query || low(c.tr.text.replace(/<[^>]*>/g, ' ')).includes(query);
   const inBox = t => t === 'review' ? c => c.pr : c => c.type === t && !c.pr && !stalePr(c);
   const tally = rows => QTYPES.map(t => [t, rows.filter(c => c.type === t && !stalePr(c)).length]).filter(([, n]) => n);
   // pack sd:8005: the page's PR waits, split by who they wait on; '' when there is none. Each repo's are its review box.
@@ -548,7 +553,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   function queueView() {
     const unread = [];
     if (!QV.seen) return;
-    if (!DOC) { put($('queue'), html`<tr class="empty"><td colspan="5">The queue could not be read: ${failed}. Read again tries again.</td></tr>`); return; }
+    // sd:8565: before Today's first answer the view is reading, not failed with an empty reason.
+    if (!DOC) { put($('queue'), html`<tr class="empty"><td colspan="5">${failed ? `The queue could not be read: ${failed}. Read again tries again.` : 'Reading the queue…'}</td></tr>`); return; }
     if (!QV.lanes) unread.push(`Lanes not read: ${QV.lanesErr || 'no answer yet'}`);
     else QV.lanes.problems.forEach(p => unread.push(`${p.repo}: lane not read. ${p.error}`));
     if (QV.lanes && QV.lanes.prs && QV.lanes.prs.error) unread.push(QV.lanes.prs.error);
@@ -583,10 +589,12 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
         ${pips(g)}<td class="num"></td><td class="act"></td></tr>`; };
     // pack sd:8138: a pressed box shows its rows, hidden by a Show filter or not, under a line that clears it.
     const kids = g => { if (!qTile) return g.shown.map(c => c.tr);
-      const rows = g.rows.filter(inBox(qTile.box)).sort((a, b) => QTYPES.indexOf(a.type) - QTYPES.indexOf(b.type));
-      return [html`<tr class="child tiled"><td colspan="5"><button type="button" class="linkbtn" data-tile-clear="${g.key}">Showing ${qTile.box}: ${String(rows.length)} of ${String(g.rows.length)} · Show all</button></td></tr>`, ...rows.map(c => c.tr)]; };
-    put($('queue'), groups.length ? html`${groups.map(g => html`${parent(g)}${qOpen === g.key ? kids(g) : ''}`)}`
+      const rows = g.rows.filter(inBox(qTile.box)).filter(qMatch).sort((a, b) => QTYPES.indexOf(a.type) - QTYPES.indexOf(b.type));
+      return [html`<tr class="child tiled"><td colspan="5"><button type="button" class="linkbtn" data-tile-clear="${g.key}">${String(rows.length)} ${qTile.box} (${plural(g.rows.length, 'row')}) · Show all</button></td></tr>`, ...rows.map(c => c.tr)]; };
+    // A filter shows each repo's matching rows, open or not.
+    put($('queue'), groups.length ? html`${groups.map(g => html`${parent(g)}${qOpen === g.key || query ? kids(g) : ''}`)}`
       : html`<tr class="empty"><td colspan="5">${unread.length ? 'No row in what was read; the line under the table names what was not.'
+        : query ? `No row matches “${query}”. Esc clears it.`
         : `Nothing is working, merging, next or blocked${qShow.size ? ', and no row matches the filters' : ''}.`}</td></tr>`);
     if (QV.prCheck) unread.push(...QV.prCheck);
     const note = $('queue-note'); note.hidden = !unread.length; note.textContent = unread.map(u => `▨ ${u}`).join(' · ');
@@ -599,6 +607,15 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     const [[l, le], [b, be], [r, re], [t, te]] = await Promise.all(['/api/queue', '/api/queue/builds?show=all', '/api/queue/runner', '/api/tasks'].map(get));
     Object.assign(QV, { lanes: l, lanesErr: le, built: b, builtErr: be, runner: r, runnerErr: re, tasks: t, tasksErr: te });
     qAdopt();
+    QV.read = true; restore();
+  }
+  // sd:8565: Today's first read answers before the queue's, so a ?row= that only the queue lists gave way to the first
+  // row for good. Once both have answered, that row is selected, unless the selection moved off the first-read one.
+  let wanted = null, landed = null;
+  function restore() {
+    if (!wanted || landed === null || !QV.read) return;
+    const id = wanted; wanted = null;
+    if (row() === landed && row() !== id && listed(id)) select(id, false);
   }
   // The view's rows from what QV holds: the open items and lane entries become command objects, and one put before that
   // no read lists now retires (pack sd:7251), as the reader retires a Needs you row: its pick drops, and it is 'not listed'.
@@ -970,8 +987,11 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     // build holding it. Build registers ahead of TD's commands, so it is the act wherever it is on; elsewhere the act is
     // the move to the next status, as on Tasks' list (view 'list').
     const sel = () => isItem(row()) ? row() : null;
-    const ready = o => taskOf(o.id) || (SUGG.has(o.id) ? { id: SUGG.get(o.id).id, status: SUGG.get(o.id).status, repo: SUGG.get(o.id).repo, repo_path: SUGG.get(o.id).repo, kind: SUGG.get(o.id).kind, assignment: null } : null);
-    C.register(K.build({ row: ready, reread: () => reading.reread(), primary: () => true }));
+    const found = o => taskOf(o.id) || (SUGG.has(o.id) ? { id: SUGG.get(o.id).id, status: SUGG.get(o.id).status, repo: SUGG.get(o.id).repo, repo_path: SUGG.get(o.id).repo, kind: SUGG.get(o.id).kind, assignment: null } : null);
+    // sd:8565: a live assignment the queue read holds the row as a Tasks row's does, and the press is said on the queue's line.
+    const ready = o => { const t = found(o), a = t && runFor(t.id); return t && a && !t.assignment ? { ...t, assignment: a.status } : t; };
+    C.register(K.build({ row: ready, reread: () => reading.reread(), primary: () => true,
+      said: (text, ok) => { qSaid = { ok, text }; queueView(); } }));
     TD = window.taskDetails.attach({ details: $('details'), rows: () => [...new Map([...OPENI, ...SROW]).values()], byKey: taskOf, selected: sel,
       read: () => DOC && DOC.now, view: () => 'list', render: () => { if (sel()) TD.renderDetails(); }, reread: () => reading.reread(),
       load: () => load().then(() => !!DOC, () => false), select: (key, open) => select(key, open),
@@ -1187,7 +1207,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     put($('rows-head'), COLS); // drawn before the read, so a failed one keeps the columns
 
     // The shell's Shapeshift bar (sd:5539) filters Needs you through shell:filter.
-    document.addEventListener('shell:filter', e => { query = e.detail.q.toLowerCase(); if (DOC) applyFilter(); });
+    document.addEventListener('shell:filter', e => { query = e.detail.q.toLowerCase(); if (DOC) { applyFilter(); queueView(); } });
     // The shell walks the rows on j / k, and Esc clears the lamp and intent through clear() (sd:3525).
     window.PAGE_LIST = { rows: () => $('rows').querySelectorAll('tr[data-id]'), select: id => select(id, false),
       clear: () => !!(srcFilter || intent) && (clearSource(), true) };
@@ -1205,6 +1225,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       },
       unselect,
     });
-    load();
+    wanted = row();
+    load().then(() => { landed = row() || ''; restore(); });
   });
 })();

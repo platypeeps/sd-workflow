@@ -1498,6 +1498,18 @@ class Unmanaged(Case):
         fix = self.calls("claude")[1]["argv"]
         self.assertIn("exit 125", fix[fix.index("-p") + 1])
 
+    def test_only_the_check_gets_github_token_from_the_pat(self):
+        """sd:8515: the check sees GITHUB_TOKEN; the supervisor env, which gh and git push read, does not."""
+        self.env["GITHUB_PERSONAL_ACCESS_TOKEN"] = "example-pat"
+        self.env.pop("GITHUB_TOKEN", None)
+        token = [sys.executable, "-c", "import os, sys; sys.exit(os.environ.get('GITHUB_TOKEN') != 'example-pat')"]
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        supervisor = self.supervisor(checks=lambda work: [token])
+        self.assertIsNone(supervisor.env.get("GITHUB_TOKEN"))  # not assertNotIn: it would print the env
+        self.assertEqual(supervisor.run()["step"], "enqueued")
+
     def test_no_check_entrypoint_runs_none_and_says_so(self):
         self.press()
         self.write_pr()
@@ -3481,15 +3493,20 @@ class Budget(unittest.TestCase):
 
 
 class ChildEnvironment(unittest.TestCase):
-    """A build child gets GITHUB_TOKEN from the operator's PAT (sd:8506)."""
+    """Only a repository's own checks get GITHUB_TOKEN from the operator's PAT (sd:8506, sd:8515)."""
 
-    def test_a_child_gets_github_token_from_the_pat(self) -> None:
+    def test_the_supervisor_env_holds_no_github_token_from_the_pat(self) -> None:
+        """sd:8515: gh and its credential helper would act as the PAT, not the gh login."""
         env = build_run._environ({"GITHUB_PERSONAL_ACCESS_TOKEN": "example-pat"})
+        self.assertIsNone(env.get("GITHUB_TOKEN"))
+
+    def test_a_check_gets_github_token_from_the_pat(self) -> None:
+        env = build_run._checks_environ({"GITHUB_PERSONAL_ACCESS_TOKEN": "example-pat"})
         self.assertEqual(env.get("GITHUB_TOKEN"), "example-pat")
 
     def test_a_set_github_token_wins(self) -> None:
-        env = build_run._environ({"GITHUB_PERSONAL_ACCESS_TOKEN": "example-pat",
-                                  "GITHUB_TOKEN": "example-own"})
+        env = build_run._checks_environ({"GITHUB_PERSONAL_ACCESS_TOKEN": "example-pat",
+                                         "GITHUB_TOKEN": "example-own"})
         self.assertEqual(env["GITHUB_TOKEN"], "example-own")
 
 
