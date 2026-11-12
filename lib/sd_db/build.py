@@ -1230,9 +1230,43 @@ def lane_fix(connection, run: str, finding: str, *, who: str) -> list[int]:
     members = _sent_back(connection, dict(read))
     if not members:
         raise BuildRefused(f"build run {run}'s lead item moved on since the lane failed; build it from Tasks")
+    key, entry = _lane_entry(connection, read["branch"])
+    stamp = clock()
+    # The builder now owns the worktree: the entry is cancelled, and `sd_lane.retry` refuses one `handed_back`.
+    entry.update(status="cancelled", finished_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                 handed_back={"run": run, "by": who, "at": stamp},
+                 reason=f"handed back to its builder by Fix (build run {run}); it was {entry['status']}: "
+                        f"{entry.get('reason') or 'no reason kept'}"[:2000])
+    connection.execute("INSERT INTO state(kind, key, timestamp, body) VALUES ('checkpoint', ?, ?, ?)",
+                       (key, stamp, json.dumps(entry, sort_keys=True)))
     said = f"Fix of build run {run}'s failed lane entry"
-    _send_back(connection, members, FINDING + finding, clock(), who=who, why=said, result=said, said=said)
+    _send_back(connection, members, FINDING + finding, stamp, who=who, why=said, result=said, said=said)
     return [member["item"] for member in members]
+
+
+def _lane_entry(connection, branch: str) -> tuple[str, dict]:
+    """The newest lane entry on `branch`, by the order the hub took them (`sd_lane.enqueue_order`), and its key, when
+    it ended `failed` or `skipped`. Any other end is `BuildRefused`: pending or running is the lane's again (a Retry),
+    and none read or one unreadable is unknown, never a failure to hand back (round 1 of pack sd:8584)."""
+    found = []
+    for row in connection.execute(
+            "SELECT state.key, state.body, keys.first FROM state JOIN (SELECT key, MIN(id) AS first, MAX(id) AS last "
+            "FROM state WHERE kind = 'checkpoint' AND key >= ? AND key < ? GROUP BY key) AS keys ON state.id = keys.last",
+            reads.LANE_KEYS):
+        try:
+            entry = json.loads(row["body"])
+        except (TypeError, ValueError):
+            raise BuildRefused(f"lane entry {row['key']} was not read; Fix waits for a readable lane") from None
+        if isinstance(entry, dict) and entry.get("branch") == branch:
+            found.append((row["first"], row["key"], entry))
+    if not found:
+        raise BuildRefused(f"no lane entry holds branch {branch}; the lane's state is unknown, so Fix writes nothing")
+    _, key, entry = max(found, key=lambda each: each[0])
+    if entry.get("status") in ("pending", "running"):
+        raise BuildRefused(f"the lane holds branch {branch} again ({entry['status']}); Fix waits until it ends")
+    if entry.get("status") not in ("failed", "skipped"):
+        raise BuildRefused(f"branch {branch}'s newest lane entry is {entry.get('status')}; Fix takes a failed one")
+    return key, entry
 
 
 class Probe:

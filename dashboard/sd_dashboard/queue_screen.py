@@ -50,9 +50,10 @@ the queue's lock (pack sd:3268), so neither acts on an entry that ended at anoth
 page offers both only when `sd-ship lane retry --help` names `--expected-head`: an older pack cannot check the head.
 
 Retry on a failed row whose worktree still holds the head it failed at repeats the failure unless it was transient
-(pack sd:8584): `unchanged` is `sd_lane.at_head`, the check `lane retry` makes, so the page asks first and names the
-blocker's code, whether the lane marks it retryable, and its next action; None is a worktree not read here. Fix sends
-the finding to the build run that enqueued the branch (`builds.lane_fix_state`), through Send to builder's route.
+(pack sd:8584): `unchanged` (`_unchanged`, one local git read) says so, the page asks first and names the blocker's
+code, whether the lane marks it retryable, and its next action; None is a worktree not read here. Fix sends the
+finding to the build run that enqueued the branch (`builds.lane_fix_state`), through Send to builder's route, and
+hands the failed entry back to that builder (`build.lane_fix`): `lane retry` then refuses it.
 
 Re-queue acts on a cancelled row (sd:3398): `lane retry <item> --expected-head <head>` queues the cancelled entry
 again, last, at the head the row showed (pack sd:3389). The page checks first that the item's newest entry is still that
@@ -331,10 +332,18 @@ def _git(tree: Path, *args: str) -> str | None:
     return done.stdout.strip() if done.returncode == 0 else None
 
 
+#: The most merges prepare's catch-ups stack on a head: `sd_lane.CATCH_UPS`, twice, as `sd_lane.catch_up_of` walks.
+CATCH_UP_LINKS = 14
+
+
 def _unchanged(entry: dict) -> bool | None:
-    """pack sd:8584: whether the entry's worktree still holds the head it ended at, or prepare's catch-up of it: the
-    check `lane retry` makes. A merge at HEAD asks `sd_lane.at_head` whether it is that catch-up. None when not read
-    here: another host's worktree, one gone or on another branch, a pack without the check, or git that did not answer."""
+    """pack sd:8584: whether the entry's worktree still holds the head it ended at, or a chain of merges on it, the
+    shape of prepare's catch-up. None when not read here: another host's worktree, one gone or on another branch,
+    or git that did not answer.
+
+    One local git read under `GIT_SECONDS`: rows() runs on every page read. It never asks `sd_lane.at_head`, which
+    reads origin and writes merge objects into the worktree (round 1). So a merge that is not a clean catch-up reads
+    as unchanged here; `lane retry` makes the full check and refuses it `HEAD_MOVED`."""
     from sd_db.ship import this_host
 
     head, branch, tree = entry.get("expected_head"), entry.get("branch"), Path(str(entry.get("worktree") or ""))
@@ -342,15 +351,16 @@ def _unchanged(entry: dict) -> bool | None:
         return None
     if _git(tree, "branch", "--show-current") != branch:
         return None
-    found = _git(tree, "rev-list", "--parents", "-n", "1", "HEAD")
+    found = _git(tree, "rev-list", "--first-parent", "--parents", "-n", str(CATCH_UP_LINKS + 1), "HEAD")
     if not found:
         return None
-    if found.split()[0] == head or len(found.split()) != 3:
-        return found.split()[0] == head  # one parent: a commit of its own, never a catch-up
-    try:
-        return bool(pack_module("sd_lane").at_head(tree, str(head)))
-    except (ImportError, AttributeError, OSError, RuntimeError):  # `sd_lane.LaneError` is a RuntimeError
-        return None
+    for line in found.splitlines():
+        commit, *parents = line.split()
+        if commit == head:
+            return True
+        if len(parents) != 2:  # a commit of its own, not a catch-up merge
+            return False
+    return False if len(found.splitlines()) <= CATCH_UP_LINKS else None
 
 
 def _building(lane: Path, now: float) -> list[dict]:

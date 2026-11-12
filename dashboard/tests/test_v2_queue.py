@@ -581,26 +581,39 @@ class TheRows(Lane, ScreenCase):
             "-m", "the builder's fix")
         self.assertIs(self.failed()["unchanged"], False)
 
-    def test_a_merge_at_head_is_unchanged_only_when_the_lane_reads_it_as_prepares_catch_up(self):
+    def test_a_merge_at_head_is_read_locally_bounded_and_read_only(self):
+        """Round 1 of pack sd:8584: rows() runs on every page read, so `_unchanged` reads local git under GIT_SECONDS.
+        It never asks the pack's `at_head`, whose catch-up check runs ls-remote, fetch and merge-tree."""
         def commit(*args):
             git(self.checkout, "-c", "user.name=t", "-c", "user.email=t@example.test", *args)
         commit("checkout", "-q", "-b", "side")
         commit("commit", "-q", "--allow-empty", "-m", "base moved")
         commit("checkout", "-q", "main")
         commit("merge", "-q", "--no-ff", "-m", "catch up", "side")
-        asked = []
+        ran, real = [], subprocess.run
 
-        class Lane:
-            @staticmethod
-            def at_head(tree, head):
-                asked.append((str(tree), head))
-                return answer
-        for answer, said in ((True, True), (False, False)):
-            with self.subTest(answer=answer), mock.patch.object(queue_screen, "pack_module", return_value=Lane):
-                self.assertIs(self.failed()["unchanged"], said)
-        self.assertEqual(asked[-1], (str(self.checkout), self.merged))
-        # The pinned pack's own check, with no origin to read the base from, is unknown, never unchanged.
-        self.assertIsNone(self.failed()["unchanged"])
+        def watched(argv, *args, **kwargs):
+            ran.append((list(argv), kwargs.get("timeout")))
+            return real(argv, *args, **kwargs)
+        lane = mock.Mock(side_effect=AssertionError("the page asked the pack's lane module"))
+
+        def unchanged():
+            with mock.patch.object(queue_screen, "pack_module", lane), \
+                    mock.patch.object(queue_screen.subprocess, "run", watched):
+                return self.failed()["unchanged"]
+        self.assertIs(unchanged(), True)  # a catch-up merge whose first parent is the head
+        commit("commit", "-q", "--allow-empty", "-m", "the builder's fix")
+        commit("checkout", "-q", "side")
+        commit("commit", "-q", "--allow-empty", "-m", "base moved again")
+        commit("checkout", "-q", "main")
+        commit("merge", "-q", "--no-ff", "-m", "catch up again", "side")
+        self.assertIs(unchanged(), False)  # a merge on top of the builder's own commit
+        git_calls = [(argv, timeout) for argv, timeout in ran if argv[0] == "git" and str(self.checkout) in argv]
+        self.assertTrue(git_calls)
+        for argv, timeout in git_calls:
+            self.assertFalse({"ls-remote", "fetch", "merge-tree", "merge", "push"} & set(argv), argv)
+            self.assertEqual(timeout, queue_screen.GIT_SECONDS, argv)
+        lane.assert_not_called()
 
     def test_a_blocked_entry_no_build_run_holds_offers_no_fix_and_says_why(self):
         self.assertEqual(self.failed()["fix"], {"allowed": False, "reason": "no build run holds branch main; send the "

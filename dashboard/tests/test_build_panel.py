@@ -437,9 +437,24 @@ class LaneFix(Fixture):
         run = self.claimed(items)
         build.write(self.connection, run["id"], step="enqueuing")
         self.assertTrue(build.enqueued(self.connection, run["id"]))
+        self.entry(run, "failed", items[0], "e-failed")
         self.assertTrue(build.lane_failed(self.connection, build.run(self.connection, run["id"]),
                                           "local review blocking: 1/1 completed"))
         return run
+
+    def entry(self, run, status, item, ident):
+        """A lane entry on `run`'s branch as `sd_lane.store` writes it: a new `checkpoint` row of its key."""
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO state(kind, key, timestamp, body) VALUES ('checkpoint', ?, ?, ?)",
+                (f"lane:v1:example/repo:{ident}", clock(), json.dumps(
+                    {"id": ident, "item": item, "branch": run["branch"], "status": status, "expected_head": "a" * 40,
+                     "reason": "local review blocking: 1/1 completed"})))
+
+    def lane_entry(self, ident):
+        found = self.connection.execute("SELECT body FROM state WHERE key = ? ORDER BY id DESC LIMIT 1",
+                                        (f"lane:v1:example/repo:{ident}",)).fetchone()
+        return json.loads(found[0])
 
     def queued(self):
         return self.connection.execute("SELECT COUNT(*) FROM assignment WHERE scope = 'build' AND status = 'queued'"
@@ -471,6 +486,32 @@ class LaneFix(Fixture):
         status, _, body = self.post("/api/queue/builds/retry", {"assignment": fix["assignment"], "revision": fix["revision"],
                                                                "finding": "again"})
         self.assertEqual(status, 409, body)
+        # The failed entry is handed back to the builder: cancelled, so the lane runs it no more (round 1).
+        handed = self.lane_entry("e-failed")
+        self.assertEqual((handed["status"], handed["handed_back"]["run"]), ("cancelled", run["id"]), handed)
+
+    def test_fix_refuses_while_the_lane_holds_the_branch_again_or_holds_no_entry_and_writes_nothing(self):
+        """Round 1: a Retry from another page put the branch back in the lane; Fix would hand its worktree to a
+        builder while the lane prepares or merges it. No entry read is unknown, not failed."""
+        items = [self.ready()]
+        run = self.lane_failed(items)
+        fix = builds.lane_fix_state(self.connection, run["branch"])
+        for status in ("pending", "running"):
+            with self.subTest(status=status):
+                self.entry(run, status, items[0], "e-retried")
+                status_code, _, body = self.post("/api/queue/builds/retry", {
+                    "assignment": fix["assignment"], "revision": fix["revision"], "finding": "fix it"})
+                self.assertEqual(status_code, 400, body)
+                self.assertIn(f"the lane holds branch {run['branch']} again ({status})", body["error"])
+                self.assertEqual((self.queued(), self.lane_entry("e-failed")["status"]), (0, "failed"))
+        with self.connection:
+            self.connection.execute("DELETE FROM state WHERE key LIKE 'lane:v1:%'")
+        status_code, _, body = self.post("/api/queue/builds/retry", {
+            "assignment": fix["assignment"], "revision": fix["revision"], "finding": "fix it"})
+        self.assertEqual(status_code, 400, body)
+        self.assertIn(f"no lane entry holds branch {run['branch']}", body["error"])
+        self.assertEqual((self.queued(), self.connection.execute(
+            "SELECT COUNT(*) FROM note WHERE body LIKE 'Send to builder:%'").fetchone()[0]), (0, 0))
 
     def test_retry_without_a_finding_still_refuses_a_lane_failed_run_and_writes_nothing(self):
         run = self.lane_failed([self.ready()])
