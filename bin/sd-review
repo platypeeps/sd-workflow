@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import argparse
 import contextlib
-import datetime
 import hashlib
 import json
 import os
@@ -1165,10 +1164,8 @@ class Outcome(NamedTuple):
     argv: tuple[str, ...]
     scrubbed: tuple[str, ...]
     diagnostic: dict[str, Any] | None = None
-    #: pack sd:8503: `started`, `finished` and `wall_seconds` of the attempt, set by `_attempts`.
-    clock: dict[str, Any] | None = None
-    #: pack sd:8503: what the reader reported it cost (`reader_cost`), or None.
-    cost: dict[str, Any] | None = None
+    clock: dict[str, Any] | None = None  # pack sd:8503: the attempt's wall clock, set by `_timed`.
+    cost: dict[str, Any] | None = None  # pack sd:8503: `reader_cost`, or None.
 
     def outcome_report(self, *, environment: bool = True) -> dict[str, Any]:
         row = {"backend": self.backend, "status": self.status, "detail": self.detail,
@@ -1188,11 +1185,7 @@ def _token_count(value: Any) -> int | None:
 
 
 def reader_cost(reader: str | None, stdout: str) -> dict[str, Any] | None:
-    """pack sd:8503: the API-equivalent cost a reader reported, or None.
-
-    Only Claude's result envelope names one (`total_cost_usd`, priced at API
-    rates on a subscription too); its input tokens count cache writes and reads.
-    Codex, agy and opencode report no cost here, so they read None, not zero."""
+    """pack sd:8503: Claude's `total_cost_usd` (API rates) and tokens, cache included; other readers read None, not zero."""
     if reader != "claude-json":
         return None
     try:
@@ -1360,12 +1353,8 @@ def _timed(run: Callable[[], Outcome]) -> Outcome:
     started, began = time.time(), time.monotonic()
     outcome = run()
     elapsed = time.monotonic() - began
-    return outcome._replace(clock={"started": _utc(started), "finished": _utc(started + elapsed),
-                                   "wall_seconds": round(elapsed, 3)})
-
-
-def _utc(seconds: float) -> str:
-    return datetime.datetime.fromtimestamp(seconds, datetime.timezone.utc).isoformat(timespec="milliseconds")
+    utc = lambda s: time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(s)) + f".{int(s % 1 * 1000):03d}+00:00"  # noqa: E731
+    return outcome._replace(clock={"started": utc(started), "finished": utc(started + elapsed), "wall_seconds": round(elapsed, 3)})
 
 
 def _request_record(provider: sd_registry.Provider, subject: Subject, request_prompt: str) -> dict[str, Any]:
