@@ -727,7 +727,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     if (!yes || !text) return;
     QV.busy = true; queueView();
     try {
-      await shell.post('/api/queue/builds/retry', { assignment: r.fix.assignment, revision: r.fix.revision, finding: text });
+      await shell.post('/api/queue/builds/retry', { assignment: r.fix.assignment, revision: r.fix.revision, finding: text, run: r.fix.run });
       qSaid = { ok: true, text: `${l.repo}: sd:${item} sent to its builder with the lane's finding; its build queues again.` };
     } catch (err) {
       qSaid = { ok: false, text: err.status >= 400 && err.status < 500 ? `${l.repo}: sd:${item} not sent to its builder: ${err.message}`

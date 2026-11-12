@@ -16,8 +16,8 @@ the next builder resumes the same worktree and its brief names the finding. Canc
 exists, `/api/assignments/<lead>/cancel` (`operations.cancel_assignment`), bound to the revision this panel read.
 
 Fix on a failed lane entry (pack sd:8584) is Send to builder on the build run that enqueued the entry's branch
-(`lane_fix_state`): a run that ended `lane_failed` takes a finding too, and `build.lane_fix` queues its bundle again
-under its lead. Retry with no finding still refuses that run: the same head would fail the same way.
+(`lane_fix_state`), named by the press: `build.lane_fix` hands the entry back to the builder and queues its bundle again
+under its lead, or refuses. Retry and a plain Send to builder still refuse a `lane_failed` run.
 """
 
 from __future__ import annotations
@@ -347,14 +347,12 @@ def _teammate_row(connection, run: dict, now: str) -> dict:
                        "reason": f"its lead ends it: sd assignments beat {first} --end"}}
 
 
-def _retry_state(connection, run: dict, *, fix: bool = False) -> dict:
+def _retry_state(connection, run: dict) -> dict:
     """Retry on an ended run: only the lead's latest run, released, whose bundle ended blocked or cancelled.
 
     A bundle blocks on a `blocked` outcome and on a second loss at one step, whose run keeps the loss as its
     outcome (`build.LOSSES`); the lead assignment's `blocked` status covers both.
-    A cancelled bundle keeps its worktree too, so Send to builder may resume it (pack sd:6020). With `fix`, a
-    finding to send, a run that ended `lane_failed` is taken too while its lead item still waits on the lane
-    (pack sd:8584).
+    A cancelled bundle keeps its worktree too, so Send to builder may resume it (pack sd:6020).
     """
     current = runner.queue_state(connection, run["assignment"])
     latest = current["run"]
@@ -363,11 +361,6 @@ def _retry_state(connection, run: dict, *, fix: bool = False) -> dict:
         reason = f"run {latest['id']} is newer"
     elif latest["released_at"] is None:
         reason = "the run still holds its lease"
-    elif fix and latest["outcome"] == "lane_failed" and current["status"] not in AGAIN:
-        if current["status"] != "done":
-            reason = f"the bundle is {current['status']} again"
-        elif not build._sent_back(connection, latest):
-            reason = "its lead item moved on since the lane failed; build it from Tasks"
     elif current["status"] not in AGAIN:
         reason = f"the bundle ended {current['status']}; Retry takes a blocked or cancelled one"
     return {"assignment": run["assignment"], "revision": current["revision"], "allowed": not reason, "reason": reason,
@@ -375,9 +368,9 @@ def _retry_state(connection, run: dict, *, fix: bool = False) -> dict:
 
 
 def lane_fix_state(connection, branch: str | None) -> dict:
-    """Fix on a failed lane entry (pack sd:8584): the build run that enqueued `branch`, the newest one holding it, with
-    the lead's revision and whether Send to builder takes it (`_retry_state` with `fix`). Off with the reason when the
-    entry names no branch, no build run holds it (a session enqueued it), or the read failed."""
+    """Fix on a failed lane entry (pack sd:8584): the newest build run holding `branch`, with the lead's revision, and
+    whether Fix takes it: `build.lane_fix_check`, the check its press makes. Off with the reason in every other state:
+    the entry names no branch, no build run holds it (a session enqueued it), the check refuses, or a read failed."""
     if not branch:
         return {"allowed": False, "reason": "the lane entry names no branch"}
     try:
@@ -388,11 +381,16 @@ def lane_fix_state(connection, branch: str | None) -> dict:
         if run is None:
             return {"allowed": False, "reason": f"no build run holds branch {branch}; send the finding to the session "
                                                 "that enqueued it"}
-        state = _retry_state(connection, dict(run), fix=True)
+        revision = runner.queue_state(connection, run["assignment"])["revision"]
+        reason = ""
+        try:
+            build.lane_fix_check(connection, run["id"])
+        except build.BuildRefused as refusal:
+            reason = str(refusal)
     except (SdDbError, sqlite3.Error) as failure:
         return {"allowed": False, "reason": f"the build runs were not read: {failure}"}
-    return {"allowed": state["allowed"], "reason": state["reason"], "assignment": state["assignment"],
-            "revision": state["revision"], "run": run["id"]}
+    return {"allowed": not reason, "reason": reason, "assignment": run["assignment"], "revision": revision,
+            "run": run["id"]}
 
 
 def panel(connection, *, now: str, show: str = "active") -> dict:
@@ -455,13 +453,16 @@ def pickup(payload: dict):
     return write
 
 
-def retry(connection, assignment: int, *, expected_revision: str, who: str, finding: str = "") -> dict:
+def retry(connection, assignment: int, *, expected_revision: str, who: str, finding: str = "",
+          run: str | None = None) -> dict:
     """Retry a blocked or cancelled build: each such member's item to `ready`, a `finding` note on it when one is
     sent (Send to builder), then its assignment queued again, in one transaction.
 
     The lead's revision is the one the panel read; a moved run is `StaleItem` (a 409). Each item must pass the
-    press's own check once it is ready, so a retried bundle is one the next claim can take. A finding sent to a run
-    that ended `lane_failed` is Fix on its lane entry (pack sd:8584): `build.lane_fix` queues it again.
+    press's own check once it is ready, so a retried bundle is one the next claim can take.
+
+    `run` is Fix on a failed lane entry (pack sd:8584): the lane_failed run the page read, which must be the lead's
+    latest; `build.lane_fix` hands the entry back and queues the bundle, or refuses. It never falls back to Retry.
     """
     with transaction(connection):
         current = runner.queue_state(connection, assignment)
@@ -469,18 +470,20 @@ def retry(connection, assignment: int, *, expected_revision: str, who: str, find
             raise workflow.WorkflowError(f"assignment {assignment} is not a build")
         if current["revision"] != expected_revision:
             raise workflow.StaleItem(f"build assignment {assignment} changed; read the Builds panel again")
-        run = current["run"]
-        state = _retry_state(connection, run, fix=bool(finding)) if run else {"allowed": False, "reason": "it never ran"}
-        if not state["allowed"]:
-            raise workflow.WorkflowError(f"Retry refused: {state['reason']}")
-        if current["status"] not in AGAIN:  # a lane_failed run that `_retry_state` took with the finding
+        if run is not None:
             try:
-                items = build.lane_fix(connection, run["id"], finding, who=who)
+                if (current["run"] or {}).get("id") != run:
+                    raise build.BuildRefused(f"build run {run} is not assignment {assignment}'s latest run")
+                items = build.lane_fix(connection, run, finding, who=who)
             except build.BuildRefused as refusal:
                 raise workflow.WorkflowError(f"Fix refused: {refusal}") from None
-            return {"run": run["id"], "queued": [{"id": member["id"], "item": member["item"], "status": "queued"}
-                                                 for member in build._members(connection, assignment, "queued")
-                                                 if member["item"] in items]}
+            return {"run": run, "queued": [{"id": member["id"], "item": member["item"], "status": "queued"}
+                                           for member in build._members(connection, assignment, "queued")
+                                           if member["item"] in items]}
+        run = current["run"]
+        state = _retry_state(connection, run) if run else {"allowed": False, "reason": "it never ran"}
+        if not state["allowed"]:
+            raise workflow.WorkflowError(f"Retry refused: {state['reason']}")
         members = build._members(connection, assignment, current["status"])
         if not members:
             raise workflow.WorkflowError(f"Retry refused: build run {run['id']} has no {current['status']} member")

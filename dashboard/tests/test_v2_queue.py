@@ -2410,7 +2410,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         return doc
 
     def test_fix_on_a_failed_entry_asks_with_the_lanes_finding_and_sends_it_to_the_builder(self):
-        doc = self.fix_doc({"allowed": True, "reason": "", "assignment": 832, "revision": "c" * 64})
+        doc = self.fix_doc({"allowed": True, "reason": "", "assignment": 832, "revision": "c" * 64, "run": "r9"})
         out = self.run_view("window.shell.ask = a => { OUT.ask = a; return Promise.resolve({ yes: true, values: { finding: a.fields[0].value } }); };"
                             f"open('system'); act('button[data-act]', {{ repo: {json.dumps(str(self.checkout))}, item: '14', act: 'fix' }});"
                             " await flush(); await flush(); R.said = ELS['queue-said'].textContent;",
@@ -2418,8 +2418,9 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         finding = out["ask"]["fields"][0]["value"]
         self.assertEqual(finding, f"The lane's prepare failed at head {self.merged[:12]}: local review blocking: 1/1 completed. "
                                   f"The lane says next: {self.NEXT} Prepare log: {self.lane}/logs/prepare-14-20260906T100000.log")
+        # Round 2: the press names the lane_failed run it read, so the server takes Fix's path or refuses.
         self.assertEqual([p[:2] for p in out["posts"]], [["/api/queue/builds/retry", {"assignment": 832, "revision": "c" * 64,
-                                                                                      "finding": finding}]])
+                                                                                      "finding": finding, "run": "r9"}]])
         self.assertIn("system: sd:14 sent to its builder with the lane's finding", out["R"]["said"])
 
     def test_fix_is_off_with_its_reason_when_no_build_run_holds_the_branch(self):

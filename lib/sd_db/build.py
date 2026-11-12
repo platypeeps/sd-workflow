@@ -1217,20 +1217,40 @@ def _send_back(connection, members: list[dict], finding: str, stamp: str, *, who
         add_note(connection, member["item"], "comment", f"Build assignment {member['id']} queued again by {who}: {said}")
 
 
-def lane_fix(connection, run: str, finding: str, *, who: str) -> list[int]:
-    """Fix on a failed lane entry (pack sd:8584): the bundle whose run ended `lane_failed` goes back to its builder
-    with `finding` as a Send to builder note, as a conflict's rebuild does; the items queued again. The caller holds
-    the transaction and checked the lead's revision. A run that is not its lead's latest released `lane_failed` one,
-    or a bundle with no member left to send back, is `BuildRefused` and writes nothing."""
+def lane_fix_check(connection, run: str) -> tuple[list[dict], str, dict]:
+    """Whether Fix on a failed lane entry (pack sd:8584) takes build run `run`: its bundle's members to send back, and
+    the lane entry's key and body to hand back. Fix's state on the page and its press both read this one check.
+
+    Only one state passes: `run` is its lead's latest run, released, ended `lane_failed`; the lead assignment is
+    `done`; a member is still `in_progress`; and the branch's newest lane entry failed (`_lane_entry`). Every other
+    state is `BuildRefused` with its reason, so a blocked or cancelled rebuild is never a plain Send to builder."""
     read = connection.execute("SELECT * FROM runner_run WHERE id = ?", (run,)).fetchone()
-    latest = read and connection.execute("SELECT id FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
-                                         (read["assignment"],)).fetchone()
-    if read is None or read["outcome"] != "lane_failed" or read["released_at"] is None or latest["id"] != run:
-        raise BuildRefused(f"build run {run} is not its bundle's latest lane_failed run")
+    if read is None:
+        raise BuildRefused(f"no build run {run}")
+    latest = connection.execute("SELECT id FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
+                                (read["assignment"],)).fetchone()
+    status = connection.execute("SELECT status FROM assignment WHERE id = ?", (read["assignment"],)).fetchone()
+    if latest["id"] != run:
+        raise BuildRefused(f"build run {latest['id']} is newer than {run}")
+    if read["released_at"] is None:
+        raise BuildRefused(f"build run {run} still holds its lease")
+    if read["outcome"] != "lane_failed":
+        raise BuildRefused(f"build run {run} ended {read['outcome'] or 'nothing yet'}, not lane_failed; Fix sends "
+                           "back only a bundle whose lane entry failed")
+    if status is None or status[0] != "done":
+        raise BuildRefused(f"the bundle is {status[0] if status else 'gone'} again")
     members = _sent_back(connection, dict(read))
     if not members:
-        raise BuildRefused(f"build run {run}'s lead item moved on since the lane failed; build it from Tasks")
-    key, entry = _lane_entry(connection, read["branch"])
+        raise BuildRefused("its lead item moved on since the lane failed; build it from Tasks")
+    return members, *_lane_entry(connection, read["branch"])
+
+
+def lane_fix(connection, run: str, finding: str, *, who: str) -> list[int]:
+    """Fix on a failed lane entry (pack sd:8584): the bundle whose run ended `lane_failed` goes back to its builder
+    with `finding` as a Send to builder note, as a conflict's rebuild does; the items queued again. The lane entry is
+    handed back to the builder first. The caller holds the transaction and checked the lead's revision. A state
+    `lane_fix_check` refuses is `BuildRefused` and writes nothing."""
+    members, key, entry = lane_fix_check(connection, run)
     stamp = clock()
     # The builder now owns the worktree: the entry is cancelled, and `sd_lane.retry` refuses one `handed_back`.
     entry.update(status="cancelled", finished_at=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
