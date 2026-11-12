@@ -970,7 +970,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     // build holding it. Build registers ahead of TD's commands, so it is the act wherever it is on; elsewhere the act is
     // the move to the next status, as on Tasks' list (view 'list').
     const sel = () => isItem(row()) ? row() : null;
-    const ready = o => taskOf(o.id) || (SUGG.has(o.id) ? { id: SUGG.get(o.id).id, status: SUGG.get(o.id).status, repo: SUGG.get(o.id).repo, repo_path: SUGG.get(o.id).repo, assignment: null } : null);
+    const ready = o => taskOf(o.id) || (SUGG.has(o.id) ? { id: SUGG.get(o.id).id, status: SUGG.get(o.id).status, repo: SUGG.get(o.id).repo, repo_path: SUGG.get(o.id).repo, kind: SUGG.get(o.id).kind, assignment: null } : null);
     C.register(K.build({ row: ready, reread: () => reading.reread(), primary: () => true }));
     TD = window.taskDetails.attach({ details: $('details'), rows: () => [...new Map([...OPENI, ...SROW]).values()], byKey: taskOf, selected: sel,
       read: () => DOC && DOC.now, view: () => 'list', render: () => { if (sel()) TD.renderDetails(); }, reread: () => reading.reread(),

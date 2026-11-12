@@ -178,6 +178,9 @@
   // a bundle when there is room; until then each row shows its assignment as queued. Tasks and Today's suggested Queue
   // rows (pack sd:7271) register it: `row(o)` is the item's { id, status, repo, assignment }, or nothing once the page no
   // longer lists it; `reread()` reads the page again after the press.
+  // build: sd_db.runner.RUNNABLE_KINDS, the kinds build._item takes; test_v2_tasks holds it to the library (pack sd:8532).
+  const BUILD_KINDS = ['work', 'task', 'report'];
+  const buildKinds = `${BUILD_KINDS.slice(0, -1).join(', ')} or ${BUILD_KINDS.at(-1)}`;
   function build({ row, reread, primary = () => false }) {
     const { html, put, plural } = window.markup;
     const toast = m => window.shell.toast(m);
@@ -222,7 +225,9 @@
     return { id: 'item.build', on: 'item', label: 'Build', icon: 'rocket', risk: 'safe', bulk: true, executes: true, primary,
       does: 'Queues an unattended build for each item, grouped by repo.',
       when: o => { const t = row(o); return !t ? 'the task is no longer listed' : t.status !== 'ready' ? `a build takes a ready task; this one is ${String(t.status || '').replace(/_/g, ' ').toLowerCase()}`
-        : !t.repo_path ? 'a build needs a repository' : t.assignment === 'running' || t.assignment === 'queued' ? `an agent run is ${t.assignment} for it` : true; },
+        : !t.repo_path ? 'a build needs a repository'
+        : t.kind && !BUILD_KINDS.includes(t.kind) ? `a build takes a ${buildKinds} item; this one's kind is ${t.kind}. Make it a task first: sd task edit ${t.id} --kind task`
+        : t.assignment === 'running' || t.assignment === 'queued' ? `an agent run is ${t.assignment} for it` : true; },
       cli: o => `sd assignments build ${row(o)?.id ?? o.id}`,
       sends: () => 'POST /api/tasks/build {items, revisions}',
       batch: (objs, done) => ask(objs, done),

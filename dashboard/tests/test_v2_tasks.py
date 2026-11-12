@@ -2304,6 +2304,26 @@ if (D) { D.returnValue = 'build'; D.onclose(); await flush(); }"""
         out = self.run_page(f"R.off = cmd('item.build').when(C.get('{ask}'));", "() => [404, {}]")
         self.assertEqual(out["R"]["off"], "a build needs a repository")
 
+    def test_build_is_off_for_a_kind_no_build_takes_and_names_the_edit(self):
+        """Pack sd:8532. build._item refuses a kind outside runner.RUNNABLE_KINDS, so a ready followup with a repository
+        offers Build greyed out, with why and the command that makes it a task; a ready task in the same repo is on."""
+        followup = self.item("Answer the question", kind="followup", priority=3, repo=self.repo())
+        workflow.change_status(self.connection, followup, "ready", who="test")
+        self.doc = tasks_screen.document(self.connection, now=NOW)
+        out = self.run_page(f"R.off = cmd('item.build').when(C.get('{followup}'));"
+                            f" R.on = cmd('item.build').when(C.get('{self.ids['plan']}'));", "() => [404, {}]")
+        self.assertEqual(out["R"]["off"], "a build takes a work, task or report item; this one's kind is followup."
+                                          f" Make it a task first: sd task edit {followup} --kind task")
+        self.assertIs(out["R"]["on"], True)
+
+    def test_the_build_kinds_are_the_runners(self):
+        """Pack sd:8532: commands.js's BUILD_KINDS is runner.RUNNABLE_KINDS, the kinds build._item accepts."""
+        from sd_db import runner
+
+        listed = re.search(r"const BUILD_KINDS = \[([^\]]*)\]", COMMANDS_JS)
+        self.assertIsNotNone(listed, "commands.js names no BUILD_KINDS")
+        self.assertEqual(tuple(re.findall(r"'([^']+)'", listed.group(1))), runner.RUNNABLE_KINDS)
+
     def test_build_shows_the_bundles_first_then_posts_the_items_with_the_revisions_it_read(self):
         """Pack sd:6095. Build on a ready row reads the plan, shows its bundle, and posts only on Build."""
         plan, port = self.ids["plan"], self.ids["port"]
