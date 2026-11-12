@@ -120,8 +120,9 @@ def always_run(modules: dict[str, str]) -> frozenset[str]:
 
 
 #: Folders whose `test_*.py` files are modules this script selects from:
-#: the pack's own, and the dashboard's, moved here from system (sd:5987).
-TEST_DIRS = ("tests", "dashboard/tests")
+#: the pack's own, the library's and the dashboard's, the last two moved
+#: here from system (sd:5987). The runner shards all three (sd:8553).
+TEST_DIRS = ("tests", "tests/sd_db", "dashboard/tests")
 
 
 def module_name(rel: str) -> str:
@@ -186,9 +187,11 @@ def full_reason(root: pathlib.Path, rel: str | None, raw: str) -> str | None:
         return f"{rel} is a path the full suite answers for"
     if (root / rel).is_dir():
         return f"{rel} is a directory"
+    if any(re.fullmatch(rf"{re.escape(folder)}/test_[^/]*\.py", rel)
+           for folder in TEST_DIRS):
+        return None
     for folder in TEST_DIRS:
-        if rel.startswith(f"{folder}/") and not re.fullmatch(
-                rf"{re.escape(folder)}/test_[^/]*\.py", rel):
+        if rel.startswith(f"{folder}/"):
             return f"{rel} is under {folder}/ and is not a test module"
     return None
 
