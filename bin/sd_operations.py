@@ -236,34 +236,34 @@ def gate_load() -> tuple[float | None, float | None]:
     return float(load[1]), float(cap)
 
 
-def interactive_builders(connection: Any, now: str, key: Any) -> list[dict] | None:
-    """One `{repo, session_id}` per interactive builder, as the dashboard counts them; None when not counted.
+def interactive_builders(connection: Any, now: str, key: Any) -> tuple[list[dict] | None, str]:
+    """One `{repo, session_id}` per slot the dashboard's `claude_sessions.builders` holds, and "";
+    (None, why) when not counted.
 
-    `repo` is the registered repository the session's cwd lies in, else None
+    `repo` is the registered repository the holder's cwd lies in, else None
     (it counts against the machine only). A cwd in a linked worktree, such as
     one outside `~/repos`, lies in its main checkout, read from git's common
-    dir by `sd_lib.main_worktree_root` (pack sd:6112).
+    dir by `sd_lib.main_worktree_root` (pack sd:6112). The holders are the one
+    rule: an unread session is one slot, not an uncounted machine (pack sd:8606).
     """
     import sd_lib
     sys.path.insert(0, str(BIN.parent / "dashboard"))
     try:
         # By name, as `sd_work` loads its modules: the dashboard is not on bin/'s lint path.
         claude_sessions = importlib.import_module("sd_dashboard.claude_sessions")
-        document = claude_sessions.document(connection, now=now)
-        if document["builders"]["running"] is None:
-            return None
+        counted = claude_sessions.document(connection, now=now)["builders"]
+        if counted["running"] is None:
+            return None, counted["why"] or "no reason was given"
         repos = [row["path"] for row in connection.execute("SELECT path FROM repo")]
         found = []
-        for session in document["sessions"] or []:
-            count = sum(1 for agent in session["agents"] if agent["builder"] and agent["state"] not in ("idle", "stalled"))
-            count += 1 if session["builder"] and session["status"] != "idle" else 0
-            cwd = key(str(sd_lib.main_worktree_root(Path(session["cwd"]).resolve()))) if session.get("cwd") else ""
+        for holder in counted["holders"]:
+            cwd = key(str(sd_lib.main_worktree_root(Path(holder["cwd"]).resolve()))) if holder.get("cwd") else ""
             repo = next((path for path in repos if cwd and (cwd == path or cwd.startswith(path.rstrip("/") + "/"))),
                         None)
-            found += [{"repo": repo, "session_id": session["id"]}] * count
-        return found
-    except Exception:  # noqa: BLE001 -- any failure is "not counted", which claims nothing
-        return None
+            found.append({"repo": repo, "session_id": holder["session_id"]})
+        return found, ""
+    except Exception as error:  # noqa: BLE001 -- any failure is "not counted", which claims nothing
+        return None, f"{type(error).__name__}: {error}"[:300]
     finally:
         sys.path.remove(str(BIN.parent / "dashboard"))
 
@@ -444,9 +444,11 @@ def tick(sd_db: Any, build: Any, build_run: Any, root: Path | None, why: str, un
         def lane(row: dict, items: list[int]) -> dict | None:
             return build_run.lane_entry(tools(build_run).ship, build_run.paths.expand(row["repo"]), items)
 
+        interactive, uncounted = interactive_builders(connection, build_run.now(), build_run.paths.key)
+        if interactive is None:  # the beat names the reason, so the hub can say why (pack sd:8606)
+            why = why or f"{build.UNREAD[1]}: {uncounted}"
         result = build_run.dispatch(connection, owner="build-dispatch", load=load, load_cap=load_cap,
-                                    interactive=interactive_builders(connection, build_run.now(), build_run.paths.key),
-                                    spawn=spawn, lane=lane, why=why)
+                                    interactive=interactive, spawn=spawn, lane=lane, why=why)
         result["pushed"] = push_failures(connection)
         if root is not None and not why:  # the bulk root answered the probe
             result["logs_moved"] = build_run.archive(connection, build_run.local_root(), root)

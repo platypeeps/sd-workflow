@@ -512,14 +512,15 @@ def cancel_job(connection: sqlite3.Connection, job: str, *, expected_revision: s
 
 def assignment_state(connection: sqlite3.Connection, assignment: int) -> dict:
     _identifier(assignment, "assignment")
-    # The item's status and an unreleased runner attempt decide whether a
-    # blocked row may be cancelled, so both are in the row the revision hashes.
+    # An unreleased runner attempt, its own or its bundle lead's, decides
+    # whether a blocked row may be cancelled, so it is in the row the
+    # revision hashes, as the item's status is.
     # A running build's bundle run is its lead's (`build.claim`), and the
     # cancel is asked on that run, so the run's id is in the row too; an
     # ended run the reap has not released yet takes it as well.
     row = connection.execute("SELECT assignment.*, item.title AS title, item.status AS item_status, "
-                             "EXISTS (SELECT 1 FROM runner_run WHERE runner_run.assignment=assignment.id "
-                             "AND runner_run.released_at IS NULL) AS leased, "
+                             "EXISTS (SELECT 1 FROM runner_run WHERE runner_run.assignment "
+                             "IN (assignment.id, assignment.parent) AND runner_run.released_at IS NULL) AS leased, "
                              "(SELECT runner_run.id FROM runner_run WHERE runner_run.assignment="
                              "COALESCE(assignment.parent, assignment.id) AND runner_run.released_at IS NULL) "
                              "AS build_run, "
@@ -530,10 +531,11 @@ def assignment_state(connection: sqlite3.Connection, assignment: int) -> dict:
                              (assignment,)).fetchone()
     if row is None:
         raise WorkflowError(f"no assignment {assignment}")
-    # A blocked assignment whose item shipped is clutter nothing will run
-    # again (sd:2082); cancelled is terminal, so clearing it is safe once no
-    # runner attempt holds its lease. One whose item is open may still be
-    # requeued, and stays the runner's to settle.
+    # A blocked assignment is clutter nothing will run again (sd:2082): a
+    # requeue makes a new row, and the item's status is the operator's. So
+    # cancelled, which is terminal, is safe once no runner attempt holds its
+    # lease, whatever the item's status: an open item's dead rows piled up
+    # with no way to clear them (pack sd:8606).
     if row["status"] == "queued":
         reason = ""
     elif row["status"] == "running" and row["scope"] == "build" and row["build_run"]:
@@ -544,9 +546,7 @@ def assignment_state(connection: sqlite3.Connection, assignment: int) -> dict:
     elif row["status"] == "running":
         reason = "running assignment has no supported cancellation backend"
     elif row["status"] != "blocked":
-        reason = "only a queued assignment, or a blocked one whose item is done, can be cancelled"
-    elif row["item_status"] != "done":
-        reason = "a blocked assignment can be cancelled only once its item is done"
+        reason = "only a queued or blocked assignment can be cancelled"
     elif row["leased"]:
         reason = "a runner attempt still holds this assignment's lease"
     else:

@@ -134,6 +134,23 @@ class BuildRoutes(Fixture):
         self.assertEqual((out["room"]["machine"], out["room"]["why"], out["bundles"][0]["room"]),
                          (0, "the load was not read", 0))
 
+    def test_the_room_counts_the_slots_the_session_count_holds(self):
+        """pack sd:8606: the Build dialog counted a stalled builder that `claude_sessions.builders` frees (pack
+        sd:6400), and an unread session made its whole room unread. Both read `builders`' holders now: one slot per
+        holder, against the repository its cwd lies in."""
+        from sd_dashboard import claude_sessions
+
+        def session(ident, status, agents, why=()):
+            return {"id": ident, "name": ident, "cwd": f"{REPO}/src", "status": status, "builder": False, "age": 5,
+                    "quiet": 5, "safe": {"state": "unknown", "why": list(why)},
+                    "agents": [{"name": f"{ident}-b", "builder": True, "state": state, "age": 5} for state in agents]}
+
+        listed = [session("s1", "busy", ["stalled"]),
+                  session("s2", "busy", [], why=["no transcript was found, so its last action and builders were not read"])]
+        document = {"sessions": listed, "builders": claude_sessions.builders(listed, "")}
+        found = builds.interactive(self.connection, now=NOW, sessions=lambda connection, *, now: document)
+        self.assertEqual(found, [{"repo": REPO, "session_id": "s2"}])
+
     def test_the_plan_route_reads_its_items(self):
         item = self.ready()
         with patch.object(builds, "_room", lambda connection, **_: {"machine": 6, "used": {}, "held": [], "why": ""}):
@@ -500,8 +517,8 @@ class LaneFix(Fixture):
 
     def test_fix_is_off_and_refused_when_a_rebuilt_bundle_ended_blocked_or_cancelled(self):
         """Round 2, rows 6 and 7: a conflict rebuild queued the bundle, its next run ended blocked or cancelled, and
-        run 1's failed entry is still a Queue row. Fix there is off, and its press is refused: a plain Send to
-        builder would leave that entry retryable."""
+        run 1's entry is still a Queue row. Fix there is off, and its press is refused. The rebuild handed that
+        entry back itself (pack sd:8601), so it is not retryable."""
         for outcome in ("blocked", "cancelled"):
             with self.subTest(outcome=outcome):
                 items = [self.ready()]
@@ -520,7 +537,8 @@ class LaneFix(Fixture):
                     status, _, body = self.fix(fix, run=run)
                     self.assertEqual(status, 400, body)
                     self.assertIn("Fix refused", body["error"])
-                self.assertEqual((self.queued(), self.lane_entry(f"e-{outcome}")["status"]), (0, "failed"))
+                handed = self.lane_entry(f"e-{outcome}")
+                self.assertEqual((self.queued(), handed["status"], handed["handed_back"]["by"]), (0, "cancelled", "build"))
 
     def test_fix_refuses_while_the_lane_holds_the_branch_again_or_holds_no_entry_and_writes_nothing(self):
         """Round 1: a Retry from another page put the branch back in the lane; Fix would hand its worktree to a

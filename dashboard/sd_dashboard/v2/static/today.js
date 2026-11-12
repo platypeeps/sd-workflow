@@ -381,9 +381,10 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   };
   // Fix's finding, which the operator may edit: the failure, the lane's next action and the log the builder reads.
   const finding = r => [`The lane's ${r.step || 'run'} failed at head ${r.head}: ${String(r.reason || r.status).replace(/[.\s]*$/, '.')}`,
-    (r.failure || {}).next_action ? `The lane says next: ${r.failure.next_action}` : '', r.prepare_log ? `Prepare log: ${r.prepare_log}` : '']
+    (r.failure || {}).next_action ? `The lane says next: ${r.failure.next_action}` : '', r.log ? `${r.step === 'merge' ? 'Merge' : 'Prepare'} log: ${r.log}` : '']
     .filter(Boolean).join(' ').slice(0, 4000);
-  const back = r => !QV.lanes.requeue ? '' : html`<div class="ctl" role="group" aria-label="Cancel of sd:${String(r.item)}">${sb('requeue', r, 'Re-queue', `Re-queue sd:${r.item} at head ${r.head}`, html` data-head="${r.expected_head}"`)}</div>`;
+  // A row handed back to its builder names why and offers no Re-queue: `lane retry` refuses it (pack sd:8601).
+  const back = r => !QV.lanes.requeue || r.reason ? '' : html`<div class="ctl" role="group" aria-label="Cancel of sd:${String(r.item)}">${sb('requeue', r, 'Re-queue', `Re-queue sd:${r.item} at head ${r.head}`, html` data-head="${r.expected_head}"`)}</div>`;
   const free = r => !r.claim ? '' : html`<div class="ctl" role="group" aria-label="Claim of sd:${String(r.item)}">${sb('reclaim', r, 'Release…', `Release sd:${r.item} from ${r.host || 'its holder'}`, html` data-claim="${r.claim}"`)}</div>`;
   // Each lane state's glyph, type and fact line. A cancelled or landed entry is an ended row.
   const ENTRY = {
@@ -391,7 +392,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     next: r => [r.held ? 'caution' : 'queued', 'next', html`${r.held ? 'held' : 'position'} ${r.position} · gate <b>${r.gate}</b>${r.gate_summary ? ` (${r.gate_summary})` : ''} · head ${r.head || 'not recorded'}${r.held ? ' · skipped until released' : ''}`],
     building: r => [{ running: 'ok', pass: 'ok', fail: 'warning' }[r.gate] || 'unknown', 'working', html`gate <b>${r.gate}</b>${r.summary ? ` · ${r.summary}` : ''}${r.head ? ` · head ${r.head}` : ''} · log changed ${at(new Date(r.changed * 1000).toISOString())}`],
     blocked: r => ['warning', 'blocked', html`<b>${r.who} acts</b> · ${r.status}${r.step ? ` at ${r.step}` : ''} · ${r.reason} · head ${r.head || 'not recorded'}${moved(r)}${answered(r.failure)}`],
-    cancelled: r => ['queued', 'ended', html`cancelled at ${at(r.finished)} · head ${r.head || 'not recorded'}${QV.lanes.requeue ? '' : ` · Re-queue off: ${QV.lanes.requeue_off || 'not known whether the pack takes it'}`}`],
+    cancelled: r => ['queued', 'ended', html`cancelled at ${at(r.finished)} · head ${r.head || 'not recorded'}${r.reason ? ` · ${r.reason}` : QV.lanes.requeue ? '' : ` · Re-queue off: ${QV.lanes.requeue_off || 'not known whether the pack takes it'}`}`],
     landed: r => ['ok', 'ended', html`landed · ${r.pr ? `PR #${r.pr}` : 'PR not named'} · merge ${r.commit || 'not recorded'} · ${at(r.finished)}`],
   };
   const entryId = (l, r) => `entry:${l.path}:${r.item}`;

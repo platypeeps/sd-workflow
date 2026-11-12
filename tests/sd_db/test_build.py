@@ -1618,8 +1618,9 @@ class Hosts(Case):
 
     def test_a_press_queues_on_a_fresh_beat_whose_count_did_not_read(self):
         """sd:8055: an unread load or builder count lasts one tick (15 of 265 beats under load), so the press
-        queues and the satellite claims at its next counted beat; the Builds panel names the reason."""
-        for why in build.UNREAD:
+        queues and the satellite claims at its next counted beat; the Builds panel names the reason. A count's
+        beat carries its reason after the constant (pack sd:8606) and still queues."""
+        for why in (*build.UNREAD, f"{build.UNREAD[1]}: claude agents --json gave no answer in 10 s"):
             with self.subTest(why=why):
                 item = self.item(repo=SAT)
                 record_state(self.db, "heartbeat", key="build-dispatch@work", body={"pid": 1, "why": why})

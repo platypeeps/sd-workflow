@@ -1878,7 +1878,24 @@ class Tick(Case):
         answer = next((self.entries[item] for item in items if item in self.entries), None)
         if isinstance(answer, Exception):
             raise answer
+        if answer is not None:  # the lane's own store holds what `sd-ship lane list` reads (pack sd:8601)
+            self.store(answer, row["branch"])
         return answer
+
+    def store(self, entry, branch):
+        """A lane entry as `sd_lane.store` writes it, a new `checkpoint` row of its key, unless that row is newest."""
+        body = json.dumps({"branch": branch, **entry}, sort_keys=True)
+        key = f"lane:v1:example/repo:{entry['id']}"
+        newest = self.db.execute("SELECT body FROM state WHERE key = ? ORDER BY id DESC LIMIT 1", (key,)).fetchone()
+        if newest is None or newest[0] != body and json.loads(newest[0]).get("status") != "cancelled":
+            with self.db:
+                self.db.execute("INSERT INTO state(kind, key, timestamp, body) VALUES ('checkpoint', ?, ?, ?)",
+                                (key, build.clock(), body))
+
+    def stored(self, ident):
+        found = self.db.execute("SELECT body FROM state WHERE key = ? ORDER BY id DESC LIMIT 1",
+                                (f"lane:v1:example/repo:{ident}",)).fetchone()
+        return json.loads(found[0]) if found else None
 
     def tick(self, **inputs):
         return build_run.dispatch(self.db, owner="fixture", spawn=self.spawned.append, lane=self.lane,
@@ -1981,6 +1998,51 @@ class Tick(Case):
         self.assertEqual((again["assignment"], again["branch"]), (run["assignment"], run["branch"]))
         notes = [row["body"] for row in self.db.execute("SELECT body FROM note WHERE item = ?", self.items)]
         self.assertTrue(any(body.startswith(build.REBUILD) for body in notes), notes)
+        # pack sd:8601: the failed entry is handed back to the builder, as Fix hands it, so `lane retry` refuses it.
+        handed = self.stored("e1")
+        self.assertEqual((handed["status"], handed["handed_back"]["run"], handed["handed_back"]["by"]),
+                         ("cancelled", run["id"], "build"), handed)
+
+    def test_a_conflict_whose_entry_is_not_the_one_read_is_left_to_the_operator(self):
+        """pack sd:8601, failure table rows 1 to 3: the rebuild hands back the entry the watch read, or none. A
+        newer entry on the branch (a Retry since), a lane store not read, or no entry stored leaves the run
+        lane_failed, its bundle unqueued and no entry handed back, with a note that says why."""
+        for case in ("newer", "unread", "none"):
+            with self.subTest(case=case):
+                run = self.enqueued()
+                failed = {"id": f"f-{case}", "status": "failed", "reason": self.CONFLICT}
+                self.entries[self.items[0]] = failed
+                if case == "newer":  # a Retry since: the hub took it after the failed one
+                    self.store(failed, run["branch"])
+                    self.store({"id": f"g-{case}", "status": "pending"}, run["branch"])
+                with mock.patch.object(self, "lane", lambda row, items, failed=failed: failed) if case != "newer" else contextlib.nullcontext():
+                    if case == "unread":
+                        with self.db:
+                            self.db.execute("INSERT INTO state(kind, key, timestamp, body) VALUES "
+                                            "('checkpoint', 'lane:v1:example/repo:bad', ?, 'not json')", (build.clock(),))
+                    self.assertEqual(self.tick()["claimed"], [])
+                with self.db:
+                    self.db.execute("DELETE FROM state WHERE key = 'lane:v1:example/repo:bad'")
+                self.assertEqual(build.run(self.db, run["id"])["outcome"], "lane_failed")
+                self.assertEqual(self.statuses(), ["in_progress"])
+                for ident in (f"f-{case}", f"g-{case}"):
+                    entry = self.stored(ident)
+                    self.assertTrue(entry is None or "handed_back" not in entry, entry)
+                notes = [row["body"] for row in self.db.execute("SELECT body FROM note WHERE item = ?", self.items)]
+                self.assertTrue(any(body.startswith(f"Build run {run['id']}: no rebuild") for body in notes), notes)
+
+    def test_a_rebuild_stopped_after_the_hand_back_write_leaves_nothing_and_the_next_tick_finishes(self):
+        """pack sd:8601, failure table row 4: the hand-back and the send-back share lane_failed's one transaction."""
+        run = self.enqueued()
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": self.CONFLICT}
+        self.store(self.entries[self.items[0]], run["branch"])
+        with mock.patch.object(build, "_send_back", side_effect=RuntimeError("stopped between the steps")):
+            with self.assertRaises(RuntimeError):
+                build.lane_failed(self.db, build.run(self.db, run["id"]), self.CONFLICT, entry="e1")
+        row = build.run(self.db, run["id"])
+        self.assertEqual((row["step"], row["outcome"], "handed_back" in self.stored("e1")), ("enqueued", None, False))
+        self.assertEqual(len(self.tick()["claimed"]), 1)
+        self.assertEqual(self.stored("e1")["handed_back"]["by"], "build")
 
     def test_a_rebuild_names_the_base_that_conflicted(self):
         """pack sd:7008: the finding said origin/main whatever base the lane merged."""
@@ -2025,8 +2087,8 @@ class Tick(Case):
     def test_conflict_rebuilds_stop_at_their_cap(self):
         """pack sd:6940: past `CONFLICT_REBUILDS` the bundle stays lane_failed for the operator."""
         run = self.enqueued()
-        for _ in range(build.CONFLICT_REBUILDS):
-            self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": self.CONFLICT}
+        for n in range(build.CONFLICT_REBUILDS):  # each enqueue is a new lane entry
+            self.entries[self.items[0]] = {"id": f"e{n}", "status": "failed", "reason": self.CONFLICT}
             claimed = self.tick()["claimed"][0]
             build.write(self.db, claimed, step="enqueuing")
             self.assertTrue(build.enqueued(self.db, claimed))
