@@ -1217,6 +1217,15 @@ def _send_back(connection, members: list[dict], finding: str, stamp: str, *, who
         add_note(connection, member["item"], "comment", f"Build assignment {member['id']} queued again by {who}: {said}")
 
 
+def branch_run(connection, branch: str) -> dict | None:
+    """The newest build run on `branch`, or None: the run that enqueued a lane entry on it (pack sd:8584)."""
+    found = connection.execute(
+        "SELECT runner_run.* FROM runner_run JOIN assignment ON assignment.id = runner_run.assignment "
+        "WHERE runner_run.branch = ? AND assignment.scope = ? ORDER BY runner_run.created_at DESC, runner_run.run DESC "
+        "LIMIT 1", (branch, SCOPE)).fetchone()
+    return dict(found) if found else None
+
+
 def lane_fix_check(connection, run: str) -> tuple[list[dict], str, dict]:
     """Whether Fix on a failed lane entry (pack sd:8584) takes build run `run`: its bundle's members to send back, and
     the lane entry's key and body to hand back. Fix's state on the page and its press both read this one check.

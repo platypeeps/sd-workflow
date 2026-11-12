@@ -374,10 +374,7 @@ def lane_fix_state(connection, branch: str | None) -> dict:
     if not branch:
         return {"allowed": False, "reason": "the lane entry names no branch"}
     try:
-        run = connection.execute(
-            "SELECT runner_run.* FROM runner_run JOIN assignment ON assignment.id = runner_run.assignment "
-            "WHERE runner_run.branch = ? AND assignment.scope = ? ORDER BY runner_run.created_at DESC, runner_run.run DESC "
-            "LIMIT 1", (branch, build.SCOPE)).fetchone()
+        run = build.branch_run(connection, branch)
         if run is None:
             return {"allowed": False, "reason": f"no build run holds branch {branch}; send the finding to the session "
                                                 "that enqueued it"}

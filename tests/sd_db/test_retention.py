@@ -695,6 +695,8 @@ class EveryCheckpointWriter(unittest.TestCase):
                                    "ship-adjudication-no-item:"),
         "bin/sd_ship_review.py": ("ship:", "ship-review-no-item:"),
         "lib/sd_db/backup.py": ("<backup run id>",),
+        # Fix hands a failed lane entry back to its builder, in the build's own transaction (pack sd:8584).
+        "lib/sd_db/build.py": ("lane:",),
         "lib/sd_db/contribution_sync.py": ("contribution-refresh-queue",),
         "lib/sd_db/contributions.py": ("contribution:",),
         "lib/sd_db/jira_moves.py": ("jira-moves",),
