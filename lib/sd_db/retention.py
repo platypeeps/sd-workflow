@@ -401,12 +401,9 @@ def _digest(key: bytes | None, body: bytes | None) -> str:
 
 
 def _sync(fd: int) -> None:
-    """Flush `fd` to the device: `F_FULLFSYNC` where macOS has it, since its `fsync` stops at the drive's cache."""
-    try:
-        import fcntl  # noqa: PLC0415 - not on every platform
-        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
-    except (ImportError, AttributeError, OSError):
-        os.fsync(fd)
+    """Flush `fd` with `fsync`, as the runner journal does; only that opener may import fcntl."""
+    # ponytail: macOS fsync stops at the drive cache; route F_FULLFSYNC through runner_journal if a power loss ever costs an archive.
+    os.fsync(fd)
 
 
 def write_archive(connection, ids: list[int], folder: Path, name: str) -> list[tuple]:

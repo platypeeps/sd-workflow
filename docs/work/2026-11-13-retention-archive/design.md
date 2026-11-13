@@ -44,7 +44,7 @@ Archive, then delete, for every victim:
 
 1. Read the victim ids (no lock).
 2. Stream those rows into `<bulk root>/sd-workflow/db-archive/.<name>.<pid>.part`
-   as gzip JSON lines; `F_FULLFSYNC` (or `fsync`) the file, rename it to
+   as gzip JSON lines; `fsync` the file, rename it to
    `<name>`, fsync the folder.
    `<name>` is `<UTC date>-<backup run id>.jsonl.gz`: one file per prune.
    One file per run, not an append: a torn append would spoil the rows an
