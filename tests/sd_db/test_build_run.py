@@ -2047,6 +2047,12 @@ class Tick(Case):
                 self.assertTrue(any(body.startswith(f"Build run {run['id']}: no rebuild") for body in notes), notes)
                 if case == "unread":
                     self.assertTrue(any("lane:v1:example/repo:bad was not read" in body for body in notes), notes)
+                # pack sd:8636: the refusal is the rebuild's, so it names the rebuild and not Fix.
+                said = {"newer": "the rebuild waits until it ends", "unread": "the rebuild waits for a readable lane",
+                        "none": "so the rebuild writes nothing"}[case]
+                refusals = [body for body in notes if body.startswith(f"Build run {run['id']}: no rebuild")]
+                self.assertTrue(all(said in body and "Fix writes" not in body and "Fix waits" not in body
+                                    for body in refusals), refusals)
 
     def test_a_rebuild_stopped_after_the_hand_back_write_leaves_nothing_and_the_next_tick_finishes(self):
         """pack sd:8601, failure table row 4: the hand-back and the send-back share lane_failed's one transaction."""

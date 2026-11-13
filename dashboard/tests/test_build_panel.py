@@ -568,6 +568,25 @@ class LaneFix(Fixture):
         self.assertEqual((self.queued(), self.connection.execute(
             "SELECT COUNT(*) FROM note WHERE body LIKE 'Send to builder:%'").fetchone()[0]), (0, 0))
 
+    def test_an_unreadable_lane_entry_of_another_repository_leaves_fix_on(self):
+        """pack sd:8636: Fix read every repository's lane and refused on any row not JSON. It reads the lane of the
+        entry the watch named in the run's detail, as the conflict rebuild does (pack sd:8615)."""
+        items = [self.ready()]
+        run = self.lane_failed(items, reason="lane entry e-failed failed: local review blocking: 1/1 completed")
+        bad = "INSERT INTO state(kind, key, timestamp, body) VALUES ('checkpoint', ?, ?, 'not json')"
+        with self.connection:  # its own repository's lane is this branch's: an unread row there is unknown
+            self.connection.execute(bad, ("lane:v1:example/repo:bad", clock()))
+        state = builds.lane_fix_state(self.connection, run["branch"])
+        self.assertEqual((state["allowed"], "lane:v1:example/repo:bad was not read" in state["reason"]), (False, True))
+        with self.connection:
+            self.connection.execute("DELETE FROM state WHERE key = 'lane:v1:example/repo:bad'")
+            self.connection.execute(bad, ("lane:v1:example/other:bad", clock()))
+        fix = builds.lane_fix_state(self.connection, run["branch"])
+        self.assertEqual((fix["allowed"], fix["assignment"]), (True, run["assignment"]), fix)
+        status, _, body = self.fix(fix)
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.lane_entry("e-failed")["status"], "cancelled")
+
     def test_retry_without_a_finding_still_refuses_a_lane_failed_run_and_writes_nothing(self):
         run = self.lane_failed([self.ready()])
         fix = builds.lane_fix_state(self.connection, run["branch"])
