@@ -33,7 +33,7 @@ from . import support
 from .test_retention import NOW, PruneCase, ago
 
 sys.path.insert(0, str(support.PACK / "bin"))
-import sd_lane  # noqa: E402
+import sd_lane  # type: ignore[import-not-found]  # noqa: E402
 
 QUEUE = contribution_sync.QUEUE
 
@@ -287,6 +287,7 @@ class TheArchive(ArchiveCase):
         snapshot = self.backup()
         pruned = retention.prune(self.db, snapshot, now=NOW, bulk_root=self.bulk)
         name = f"{NOW.date().isoformat()}-{snapshot.run_id}.jsonl.gz"
+        assert pruned.compacted is not None
         self.assertEqual((pruned.checkpoints, pruned.compacted.path), (2, self.folder / name))
         text = json.loads(self.db.execute("SELECT body FROM item WHERE id=?", (pruned.report,)).fetchone()[0])["text"]
         self.assertIn(f"Archived 2 checkpoint row(s) to {self.folder / name}, read back, before the delete", text)
@@ -301,14 +302,14 @@ class TheArchiveAtTheExtremes(ArchiveCase):
 
     def test_every_extreme_row_round_trips(self):
         generator = random.Random(8655)
-        ids = []
+        ids: list[int] = []
         for _ in range(60):
             key, body = generator.choice(self.KEYS), generator.choice(self.BODIES)
             storage = generator.choice(("TEXT", "BLOB"))
             cursor = self.db.execute(
                 "INSERT INTO state (kind, key, timestamp, body) VALUES ('checkpoint', CAST(? AS TEXT), ?, "
                 f"CAST(? AS {storage}))", (key, ago(days=generator.randint(0, 400)), body))
-            ids.append(cursor.lastrowid)
+            ids.append(int(cursor.lastrowid or 0))
         before = {ident: self.raw(ident) for ident in ids}
         written = retention.write_archive(self.db, ids, self.folder, "extremes.jsonl.gz")
         self.assertEqual([row[0] for row in written], ids)
@@ -338,8 +339,7 @@ class TheVacuum(ArchiveCase):
         for _ in range(megabytes):
             record_state(self.db, "checkpoint", key="ship:scratch", body="y" * (1024 * 1024))
         self.db.execute("DELETE FROM state WHERE key='ship:scratch'")
-        return self.db.execute("PRAGMA freelist_count").fetchone()[0] * self.db.execute(
-            "PRAGMA page_size").fetchone()[0]
+        return retention._size(self.db)[1]
 
     def test_under_the_threshold_it_does_not_run(self):
         free = self.free(1)
@@ -369,8 +369,7 @@ class TheVacuum(ArchiveCase):
         with self.assertRaisesRegex(sqlite3.OperationalError, "locked|busy"):
             retention.vacuum(self.db, threshold=free, busy_ms=50)
         other.execute("COMMIT")
-        self.assertEqual(self.db.execute("PRAGMA freelist_count").fetchone()[0] * self.db.execute(
-            "PRAGMA page_size").fetchone()[0], free)
+        self.assertEqual(retention._size(self.db)[1], free)
         self.assertTrue(retention.vacuum(self.db, threshold=free).ran)
         self.assertEqual(self.ids("ship:other"), [self.ids("ship:other")[0]])
 
@@ -410,7 +409,7 @@ class TheBulkRoot(ArchiveCase):
         return {"XDG_CONFIG_HOME": str(self.root / "config"), "HOME": str(self.home)}
 
     def test_unset_set_and_unreadable(self):
-        cases = (({}, (None, "")),
+        cases: tuple[tuple[object, tuple | None], ...] = (({}, (None, "")),
                  ({"config": {"sd": {"bulk_storage_root": str(self.bulk)}}}, (self.bulk, "")),
                  ({"config": {"sd": {"bulk_storage_root": "relative/path"}}}, None),
                  ("{not json", None))
@@ -437,7 +436,6 @@ class TheBulkRoot(ArchiveCase):
         self.assertIn("the VACUUM did not run: database is locked", error.getvalue())
         self.assertEqual(len(self.ids("ship:idle")), 1)
 
-    @hub_only
     def test_the_job_archives_to_the_bulk_root_and_vacuums(self):
         """Older state: whole lane and queue keys, as every store before this change holds them."""
         lane = self.rows("lane:v1:example/repo:old", days=45, count=3)
@@ -457,7 +455,7 @@ class TheBulkRoot(ArchiveCase):
         self.assertIn("4 superseded checkpoint row(s) removed", output)
         self.assertIn(f"4 checkpoint row(s) archived to {self.folder}", output)
         vacuumed = re.search(r"vacuumed (\d+) bytes to (\d+) bytes", output)
-        self.assertIsNotNone(vacuumed, output)
+        assert vacuumed is not None, output
         before, after = map(int, vacuumed.groups())
         self.assertLess(after, before - 50 * 1024 * 1024)
         self.assertEqual(self.ids("lane:v1:example/repo:old"), [lane[0], lane[-1]])

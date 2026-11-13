@@ -536,6 +536,7 @@ class Vacuumed:
 
 def _size(connection) -> tuple[int, int]:
     """The database's logical bytes and its free bytes."""
+    refuse_hub_only(connection, "the vacuum")
     page = connection.execute("PRAGMA page_size").fetchone()[0]
     return (connection.execute("PRAGMA page_count").fetchone()[0] * page,
             connection.execute("PRAGMA freelist_count").fetchone()[0] * page)
@@ -543,6 +544,7 @@ def _size(connection) -> tuple[int, int]:
 
 def _wal(connection) -> int:
     """The bytes of the database's WAL file; 0 when it has none."""
+    refuse_hub_only(connection, "the vacuum")
     path = next((row[2] for row in connection.execute("PRAGMA database_list") if row[1] == "main"), "")
     try:
         return os.stat(f"{path}-wal").st_size if path else 0
@@ -721,16 +723,16 @@ def prune(connection, backup: Snapshot, *, now: datetime | None = None, bulk_roo
     unreadable = [row[0] for row in connection.execute(
         "SELECT id FROM item WHERE kind='report' AND status='planning'"
         f" AND {reporting.UNREADABLE_FIELDS} ORDER BY id")]
-    attention = {}
+    bases: list[str] = []
     if unreadable:
         named = item_refs(connection, unreadable)
         refs = [named[item] for item in unreadable]
         text += _unreadable(refs, UNREADABLE_TEXT_IDS) + "\n"
-        attention = {"attention": True, "attention_basis": _unreadable(refs, UNREADABLE_BASIS_IDS)}
+        bases.append(_unreadable(refs, UNREADABLE_BASIS_IDS))
     if compacted.attention:
         # `ingest` refuses a basis past 2000 characters; the text holds the whole reason.
-        basis = "; ".join(filter(None, (attention.get("attention_basis"), compacted.why[:ARCHIVE_BASIS])))
-        attention = {"attention": True, "attention_basis": basis}
+        bases.append(compacted.why[:ARCHIVE_BASIS])
+    attention = {"attention": True, "attention_basis": "; ".join(bases)} if bases else {}
     # One backup, one prune, one report: the row's identity is the backup's
     # run id, so a second prune against the same snapshot is refused by
     # `ingest` as a report that already exists with different evidence.

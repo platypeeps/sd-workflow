@@ -1808,7 +1808,7 @@ class TheJobsPruneFailureBesideABrokenSource(BackupCase):
         finally:
             raw.close()
 
-        def refuse(connection, snapshot):
+        def refuse(connection, snapshot, **_):
             raise SdDbError("the retention table said no")
 
         with mock.patch.dict(os.environ, {"HOME": str(self.home)}), \
