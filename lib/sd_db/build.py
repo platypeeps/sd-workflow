@@ -89,6 +89,8 @@ FINDING = "Send to builder: "
 #: its own, under its lead, with this finding (pack sd:6940); `CONFLICT_REBUILDS` times, then the operator decides.
 #: `REBUILD` is the note's stable prefix the rebuild count matches; the base it names follows it (pack sd:7008).
 CONFLICT = re.compile(r"\bmerging (origin/\S+) into \S+ conflicts\b")
+#: The lane entry a `lane_failed` run's detail names, as `build_run.watch` writes it: `lane entry <id> <status>: ...`.
+LANE_ENTRY = re.compile(r"^lane entry (\S+) ")
 REBUILD = FINDING + "the lane's merge of "
 CONFLICT_REBUILDS = 2
 #: The model a bundle runs on (Q60): Sonnet only when every member's `fields.work_kind` is `mechanical`.
@@ -1197,7 +1199,7 @@ def _rebuild(connection, read: dict, reason: str, stamp: str, base: str, entry: 
     finding = (f"{REBUILD}{base} conflicted. Merge {base} into {read['branch']}, resolve each conflict, run the tests the "
                f"conflict touched, and commit the merge; the lane said: {reason}"[:2000])
     try:
-        key, found = _lane_entry(connection, read["branch"], entry)
+        key, found = _lane_entry(connection, read["branch"], entry, actor="the rebuild")
         if entry is not None and found.get("id") != entry:
             raise BuildRefused(f"branch {read['branch']}'s newest lane entry is {found.get('id')}, not {entry}")
     except BuildRefused as refusal:
@@ -1267,7 +1269,8 @@ def lane_fix_check(connection, run: str) -> tuple[list[dict], str, dict]:
     members = _sent_back(connection, dict(read))
     if not members:
         raise BuildRefused("its lead item moved on since the lane failed; build it from Tasks")
-    return members, *_lane_entry(connection, read["branch"])
+    named = LANE_ENTRY.match(read["detail"] or "")
+    return members, *_lane_entry(connection, read["branch"], named.group(1) if named else None)
 
 
 def lane_fix(connection, run: str, finding: str, *, who: str) -> list[int]:
@@ -1294,13 +1297,14 @@ def _hand_back(connection, key: str, entry: dict, run: str, *, who: str, by: str
                        (key, stamp, json.dumps(entry, sort_keys=True)))
 
 
-def _lane_entry(connection, branch: str, ident: str | None = None) -> tuple[str, dict]:
+def _lane_entry(connection, branch: str, ident: str | None = None, *, actor: str = "Fix") -> tuple[str, dict]:
     """The newest lane entry on `branch`, by the order the hub took them (`sd_lane.enqueue_order`), and its key, when
     it ended `failed` or `skipped`. Any other end is `BuildRefused`: pending or running is the lane's again (a Retry),
     and none read or one unreadable is unknown, never a failure to hand back (round 1 of pack sd:8584).
 
     With `ident`, the entry the watch read, only its repository's lane is read: its key names that repository, and an
-    unreadable row in another repository's lane is not this branch's (pack sd:8615)."""
+    unreadable row in another repository's lane is not this branch's (pack sd:8615). Fix passes the one its run's
+    detail names (pack sd:8636). Each refusal names `actor`, the step that reads it: Fix, or the rebuild."""
     ranges = [reads.LANE_KEYS]
     if ident is not None:
         suffix = f":{ident}"
@@ -1308,7 +1312,7 @@ def _lane_entry(connection, branch: str, ident: str | None = None) -> tuple[str,
             "SELECT DISTINCT key FROM state WHERE kind = 'checkpoint' AND key >= ? AND key < ? AND substr(key, ?) = ?",
             (*reads.LANE_KEYS, -len(suffix), suffix))]
         if not keys:
-            raise BuildRefused(f"lane entry {ident} is not stored; the lane's state is unknown, so Fix writes nothing")
+            raise BuildRefused(f"lane entry {ident} is not stored; the lane's state is unknown, so {actor} writes nothing")
         # `lane:v1:<owner/name>:`; `;` is the character after `:`, so the two bound one repository's keys.
         ranges = [(prefix, prefix[:-1] + ";") for prefix in sorted({key[:-len(ident)] for key in keys})]
     rows = [row for low, high in ranges for row in connection.execute(
@@ -1320,16 +1324,17 @@ def _lane_entry(connection, branch: str, ident: str | None = None) -> tuple[str,
         try:
             entry = json.loads(row["body"])
         except (TypeError, ValueError):
-            raise BuildRefused(f"lane entry {row['key']} was not read; Fix waits for a readable lane") from None
+            raise BuildRefused(f"lane entry {row['key']} was not read; {actor} waits for a readable lane") from None
         if isinstance(entry, dict) and entry.get("branch") == branch:
             found.append((row["first"], row["key"], entry))
     if not found:
-        raise BuildRefused(f"no lane entry holds branch {branch}; the lane's state is unknown, so Fix writes nothing")
+        raise BuildRefused(f"no lane entry holds branch {branch}; the lane's state is unknown, so {actor} writes "
+                           "nothing")
     _, key, entry = max(found, key=lambda each: each[0])
     if entry.get("status") in ("pending", "running"):
-        raise BuildRefused(f"the lane holds branch {branch} again ({entry['status']}); Fix waits until it ends")
+        raise BuildRefused(f"the lane holds branch {branch} again ({entry['status']}); {actor} waits until it ends")
     if entry.get("status") not in ("failed", "skipped"):
-        raise BuildRefused(f"branch {branch}'s newest lane entry is {entry.get('status')}; Fix takes a failed one")
+        raise BuildRefused(f"branch {branch}'s newest lane entry is {entry.get('status')}; {actor} takes a failed one")
     return key, entry
 
 

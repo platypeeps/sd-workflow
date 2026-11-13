@@ -449,6 +449,13 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     <td class="what">${a.item ? html`<a href="${shell.itemHref(a.item)}">#${a.item} ${a.title || a.role}</a>` : a.title || a.role}</td>
     <td class="detail"><b>${a.status}</b> · assignment ${String(a.id)} · ${a.role} · since ${at(a.started || a.queued_at)}${waitOn(a) ? ` · ${waitOn(a)}` : ''}</td><td class="num"></td>
     <td class="act"><div class="ctl" role="group" aria-label="Assignment ${String(a.id)}">${asgBtn(a.id)}</div></td></tr>`];
+  // system sd:8651: each blocked build assignment `sd today` lists (/api/queue/runner's `blocked`), with its reason. Retry is
+  // its bundle lead's (/api/queue/builds/retry); Cancel asks first and posts the assignment cancel route; off says why.
+  const ab = (act, a, label, aria, off) => html`<button class="btn quiet sm" type="button" data-asg="${act}" data-id="${String(a.id)}" aria-label="${aria}"${off ? html` disabled title="${off}"` : QV.busy ? html` disabled` : ''}>${label}</button>`;
+  const blockedAsg = a => ['blocked', 'warning', html`<tr class="child" data-type="blocked" data-asg-row="${String(a.id)}">${marker('warning', 'blocked')}
+    <td class="what">${a.item ? html`<a href="${shell.itemHref(a.item)}">#${a.item} ${a.title}</a>` : a.title}</td>
+    <td class="detail"><b>blocked build</b> · assignment ${String(a.id)}${a.lead !== a.id ? ` of bundle ${a.lead}` : ''} · ${a.why} · since ${at(a.since)}</td><td class="num"></td>
+    <td class="act"><div class="ctl" role="group" aria-label="Assignment ${String(a.id)}">${ab('retry', a, 'Retry', `Retry assignment ${a.id}: queue its bundle again`, a.retry.allowed ? '' : a.retry.reason || 'retry is off')}${ab('cancel', a, 'Cancel…', `Cancel assignment ${a.id}`, a.cancel.allowed ? '' : a.cancel.reason || 'cancel is off')}${asgBtn(a.id)}</div></td></tr>`];
   // A live item (In motion's sources: worktrees and processes, herdr agents, Fix notes, lane-less sessions): its sessions in
   // the row, Open item, Show assignment and Fix in its actions, and its Details on a click (sd:6714).
   function liveRow(item, rows) {
@@ -524,6 +531,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     const B = QV.built && !QV.built.error ? QV.built : { runs: [], recent: [] }, held = new Set();
     B.runs.forEach(r => { r.items.forEach(m => held.add(m.assignment)); add(r.repo, runRow(r)); });
     ((QV.runner || {}).live || []).filter(a => !held.has(a.id)).forEach(a => add(a.repo, asgRow(a)));
+    ((QV.runner || {}).blocked || []).filter(a => !held.has(a.id)).forEach(a => add(a.repo, blockedAsg(a)));
     // A prepared entry and its item's PR wait are one row (pack sd:7859): the lane's, leading with the wait.
     const waitOf = new Map(prs.map(p => [Number(p.item), p])), drawn = new Set();
     (QV.lanes ? QV.lanes.lanes : []).forEach(l => { l.rows.forEach(r => {
@@ -566,7 +574,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     // pack sd:7470: merging is the leftmost box; pack sd:8137: review follows it.
     const { working: w, merging: m, next: n, blocked: b, review: v, suggested: s } = g.n, you = g.rows.filter(c => c.pr === 'you').length;
     // Each box says its count and what it counts, in its title (pack sd:7383); the label above says all six at once.
-    return html`<td class="detail pipe" aria-label="${m} merging, ${v} review, ${w} working, ${n} next, ${b} blocked, ${s} suggested">${pip('merging', m, ' on', 'merging: claimed by the lane runner, being merged')}${pip('review', v, you ? ' caution' : ' on', `review: pull requests waiting on a review, ${you} on you, ${v - you} on reviewers`)}${pip('working', w, ' on', 'working: live sessions, build runs and lane gates now running')}${pip('next', n, ' on', 'next: queued in the lane, not started')}${pip('blocked', b, ' warn', 'blocked: stopped in the lane until someone acts')}${pip('suggested', s, ' on', `suggested: up to ${NEXT} items to do next: ready, due today or overdue, planned or unscheduled`)}</td>`;
+    return html`<td class="detail pipe" aria-label="${m} merging, ${v} review, ${w} working, ${n} next, ${b} blocked, ${s} suggested">${pip('merging', m, ' on', 'merging: claimed by the lane runner, being merged')}${pip('review', v, you ? ' caution' : ' on', `review: pull requests waiting on a review, ${you} on you, ${v - you} on reviewers`)}${pip('working', w, ' on', 'working: live sessions, build runs and lane gates now running')}${pip('next', n, ' on', 'next: queued in the lane, not started')}${pip('blocked', b, ' warn', 'blocked: stopped in the lane or a build until someone acts')}${pip('suggested', s, ' on', `suggested: up to ${NEXT} items to do next: ready, due today or overdue, planned or unscheduled`)}</td>`;
   }
   function queueView() {
     const unread = [];
@@ -792,6 +800,27 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     } catch (err) {
       qSaid = { ok: false, text: err.status >= 400 && err.status < 500 ? `Run ${r.run} not ${done}: ${err.message}`
         : `Not known whether run ${r.run} was ${done}: ${err.message} Read the view before you act again.` };
+    }
+    QV.busy = false;
+    await loadQueue();
+  }
+
+  async function asgAct(b) {
+    const a = (((QV.runner || {}).blocked) || []).find(x => String(x.id) === b.dataset.id);
+    if (QV.busy || !a) return;
+    const act = b.dataset.asg, what = `sd:${a.item}`;
+    if (act === 'cancel' && !(await shell.confirm({ title: `Cancel build assignment ${a.id} (${what})?`,
+      body: 'The blocked assignment ends cancelled, and nothing builds it. The item keeps its status; Build on Tasks queues it again.',
+      cli: `sd assignments cancel ${a.id} --if-revision ${a.cancel.revision}`, ok: 'Cancel assignment', keep: 'Keep it' }))) return;
+    const done = act === 'cancel' ? 'cancelled' : 'retried';
+    QV.busy = true; queueView();
+    try {
+      if (act === 'cancel') await shell.post(`/api/assignments/${a.id}/cancel`, { revision: a.cancel.revision });
+      else await shell.post('/api/queue/builds/retry', { assignment: a.retry.assignment, revision: a.retry.revision });
+      qSaid = { ok: true, text: act === 'cancel' ? `Assignment ${a.id} (${what}) cancelled.` : `${what}'s bundle queued again for build.` };
+    } catch (err) {
+      qSaid = { ok: false, text: err.status >= 400 && err.status < 500 ? `Assignment ${a.id} not ${done}: ${err.message}`
+        : `Not known whether assignment ${a.id} was ${done}: ${err.message} Read the view before you act again.` };
     }
     QV.busy = false;
     await loadQueue();
@@ -1187,6 +1216,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       if (e.target.closest('.rowact')) return;
       const w = e.target.closest('button[data-act]'); if (w) { if (!w.disabled) laneAct(w); return; }
       const b = e.target.closest('button[data-build]'); if (b) { if (!b.disabled) buildAct(b); return; }
+      const g = e.target.closest('button[data-asg]'); if (g) { if (!g.disabled) asgAct(g); return; }
       // pack sd:8138: a box opens its repo filtered to its rows; a second press clears, another switches. No disclosure toggle.
       const t = e.target.closest('button[data-tile]');
       if (t) { if (t.disabled) return; const { repo, tile: box } = t.dataset, same = qOpen === repo && qTile && qTile.box === box;

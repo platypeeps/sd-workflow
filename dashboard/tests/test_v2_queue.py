@@ -1521,7 +1521,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
            "review": "review: pull requests waiting on a review, 0 on you, 0 on reviewers",
            "working": "working: live sessions, build runs and lane gates now running",
            "next": "next: queued in the lane, not started",
-           "blocked": "blocked: stopped in the lane until someone acts",
+           "blocked": "blocked: stopped in the lane or a build until someone acts",
            "suggested": "suggested: up to 9 items to do next: ready, due today or overdue, planned or unscheduled"}
 
     def test_each_box_says_its_count_and_what_it_counts_on_hover(self):
@@ -2412,6 +2412,34 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertEqual([p[:2] for p in out["posts"]], [["/api/assignments/7/cancel", {"revision": "a" * 64}],
                                                          ["/api/queue/builds/retry", {"assignment": 5, "revision": "b" * 64,
                                                                                       "finding": "Fix the label"}]])
+
+    def test_a_blocked_build_assignment_is_a_blocked_row_with_its_reason_retry_and_cancel(self):
+        """system sd:8651: `sd today` listed blocked build assignments the Queue view drew no row for. Each is a blocked
+        row with its reason; Retry posts its bundle lead's retry, Cancel asks first, and an off control says why."""
+        def blocked(n, lead, retry):
+            return {"id": n, "item": n, "title": f"Built {n}", "repo": "/repos/alpha", "lead": lead, "since": NOW,
+                    "why": f"build run r{lead} enqueued no commit with a `Closes: sd:{n}` trailer",
+                    "cancel": {"assignment": n, "revision": "d" * 64, "allowed": True, "reason": ""},
+                    "retry": {"assignment": lead, "revision": "e" * 64, "bundle": "blocked", **retry}}
+        runner = {**self.RUNNER, "blocked": [blocked(572, 571, {"allowed": True, "reason": ""}),
+                                             blocked(725, 725, {"allowed": False, "reason": "it never ran"})]}
+        out = self.run_view("open('alpha'); R.html = ELS.queue.html; R.kids = kids();"
+                            "window.shell.confirm = a => { OUT.asked = a; return Promise.resolve(true); };"
+                            "act('button[data-asg]', { asg: 'retry', id: '572' }); await flush(); await flush();"
+                            "act('button[data-asg]', { asg: 'cancel', id: '725' }); await flush(); await flush();",
+                            answers={"/api/queue/runner": [200, runner], "/api/assignments/725/cancel": [200, {"ok": True}],
+                                     "/api/queue/builds/retry": [200, {"run": "r571", "queued": []}]})
+        html = out["R"]["html"]
+        rows = dict(re.findall(r'<tr class="child" data-type="blocked" data-asg-row="(\d+)">(.*?)</tr>', html, re.S))
+        self.assertEqual(sorted(rows), ["572", "725"])
+        self.assertIn("<b>blocked build</b> · assignment 572 of bundle 571 · build run r571 enqueued no commit", rows["572"])
+        self.assertIn('data-asg="retry" data-id="572"', rows["572"])
+        self.assertRegex(rows["725"], r'data-asg="retry" data-id="725"[^>]* disabled title="it never ran"')
+        self.assertIn('data-asg="cancel" data-id="725"', rows["725"])
+        self.assertIn(", 2 blocked,", html)
+        self.assertEqual(out["asked"]["cli"], f"sd assignments cancel 725 --if-revision {'d' * 64}")
+        self.assertEqual([p[:2] for p in out["posts"]], [["/api/queue/builds/retry", {"assignment": 571, "revision": "e" * 64}],
+                                                         ["/api/assignments/725/cancel", {"revision": "d" * 64}]])
 
     NEXT = "Run `sd-ship adjudicate --item 14` to print each blocking finding in full; fix them."
 

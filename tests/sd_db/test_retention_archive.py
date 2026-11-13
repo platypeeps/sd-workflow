@@ -177,7 +177,7 @@ class TheArchive(ArchiveCase):
     @hub_only
     def test_a_failed_victim_read_removes_nothing(self):
         ids = self.rows("ship:idle", days=10)
-        with mock.patch.object(retention, "checkpoint_victims", side_effect=sqlite3.OperationalError("disk I/O error")):
+        with mock.patch.object(retention, "_victims", side_effect=sqlite3.OperationalError("disk I/O error")):
             with self.assertRaisesRegex(sqlite3.OperationalError, "disk I/O error"):
                 retention.prune(self.db, self.backup(), now=NOW, bulk_root=self.bulk)
         self.assertEqual((self.ids("ship:idle"), self.files()), (ids, []))
@@ -191,6 +191,28 @@ class TheArchive(ArchiveCase):
         self.assertEqual((compacted.deleted, compacted.attention), (0, True))
         self.assertIn("read back 1 row(s) of 2 written", compacted.why)
         self.assertEqual(self.files(), [])
+
+    def test_a_corrupt_archive_deletes_nothing_and_is_not_kept(self):
+        """A torn deflate stream or a line of the wrong shape is `ArchiveFailed` too (sd:8657)."""
+        ids = self.rows("ship:idle", days=10)
+        real = retention.read_archive
+
+        def torn(path):
+            packed = bytearray(path.read_bytes())
+            packed[12:-8] = bytes(len(packed) - 20)
+            path.write_bytes(bytes(packed))
+            return real(path)
+
+        def misshapen(path):
+            path.write_bytes(gzip.compress(json.dumps(
+                {"id": ids[0], "timestamp": "t", "resolved_at": None, "key": 5, "body": None}).encode() + b"\n"))
+            return real(path)
+        for name, corrupt in (("torn", torn), ("misshapen", misshapen)):
+            with self.subTest(name), mock.patch.object(retention, "read_archive", side_effect=corrupt):
+                compacted = self.compact(name=f"{name}.jsonl.gz")
+                self.assertEqual((compacted.deleted, compacted.attention), (0, True))
+                self.assertIn("was not written", compacted.why)
+                self.assertEqual((self.ids("ship:idle"), self.files()), (ids, []))
 
     def test_no_bulk_root_deletes_no_checkpoint_row_and_says_so(self):
         ids = self.rows("ship:idle", days=10)
@@ -263,6 +285,34 @@ class TheArchive(ArchiveCase):
             compacted = self.compact()
         self.assertEqual((compacted.archived, compacted.deleted), (2, 1))
         self.assertEqual(self.ids("ship:idle"), [ids[0], ids[2]])
+
+    def test_under_the_write_lock_only_the_archived_rows_are_read_from_the_table(self):
+        """`resolved_at` sits after `body`, so the victim read walks every body: it runs before the lock (sd:8657)."""
+        self.rows("ship:live", days=0)
+        ids = self.rows("ship:idle", days=10)
+        inside = []
+        self.db.set_trace_callback(lambda sql: inside.append(sql) if self.db.in_transaction else None)
+        try:
+            compacted = self.compact()
+        finally:
+            self.db.set_trace_callback(None)
+        self.assertEqual((compacted.deleted, self.ids("ship:idle")), (2, ids[-1:]))
+        reads = [sql for sql in inside if sql.lstrip().upper().startswith(("SELECT", "DELETE"))]
+        self.assertTrue(reads)
+        path = next(row[2] for row in self.db.execute("PRAGMA database_list") if row[1] == "main")
+        with contextlib.closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as plain:
+            plans = [row[3] for sql in reads for row in plain.execute("EXPLAIN QUERY PLAN " + sql)]
+        wide = [plan for plan in plans if re.match(r"(SCAN|SEARCH) (?!\()", plan)
+                and not re.search(r"USING (INTEGER PRIMARY KEY|COVERING INDEX)", plan)]
+        self.assertEqual(wide, [], plans)
+
+    def test_the_archive_and_its_folder_are_fully_synced(self):
+        """macOS `fsync` stops at the drive cache; the archive takes the full sync (sd:8657)."""
+        self.rows("ship:idle", days=10)
+        synced: list[int] = []
+        with mock.patch.object(retention.runner_journal, "full_sync", side_effect=synced.append):
+            self.assertEqual(self.compact().deleted, 2)
+        self.assertEqual(len(synced), 2)
 
     def test_a_stale_part_file_is_removed_by_the_next_run(self):
         self.folder.mkdir(parents=True)
@@ -435,6 +485,27 @@ class TheBulkRoot(ArchiveCase):
         self.assertIn("2 superseded checkpoint row(s) removed", error.getvalue())
         self.assertIn("the VACUUM did not run: database is locked", error.getvalue())
         self.assertEqual(len(self.ids("ship:idle")), 1)
+
+    def test_a_failure_after_the_vacuum_ran_names_its_stage(self):
+        """The WAL checkpoint or the size read failing is not the VACUUM failing (sd:8657)."""
+        self.rows("ship:idle", days=10)
+        real = retention._size
+        calls = []
+
+        def size(connection):
+            calls.append(1)
+            if len(calls) > 1:
+                raise sqlite3.OperationalError("disk I/O error")
+            return real(connection)
+        error = io.StringIO()
+        with mock.patch.dict(os.environ, self.config({"config": {"sd": {"bulk_storage_root": str(self.bulk)}}})), \
+                mock.patch.object(backup_job, "vacuum", side_effect=lambda c: retention.vacuum(c, threshold=0)), \
+                mock.patch.object(retention, "_size", side_effect=size), \
+                contextlib.redirect_stderr(error), contextlib.redirect_stdout(io.StringIO()):
+            code = backup_job.main([])
+        self.assertEqual(code, 1)
+        self.assertNotIn("did not run", error.getvalue())
+        self.assertIn("the VACUUM ran, then the size read failed: OperationalError: disk I/O error", error.getvalue())
 
     def test_the_job_archives_to_the_bulk_root_and_vacuums(self):
         """Older state: whole lane and queue keys, as every store before this change holds them."""

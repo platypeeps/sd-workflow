@@ -13,7 +13,7 @@ from pathlib import Path
 from ..backup import prune_older, require_mount, run
 from ..database import connect
 from ..errors import BackupError, SdDbError
-from ..retention import prune, vacuum
+from ..retention import VacuumStageFailed, prune, vacuum
 
 #: The job's exit code when the BACKUP PASSED but the SOURCE is referentially
 #: broken. It is not 1, because 1 means the documented failure -- the library
@@ -200,7 +200,11 @@ def main(argv: list[str] | None = None) -> int:
             pruned = prune(connection, snapshot, bulk_root=root, unresolved=unresolved)
             try:
                 vacuumed = vacuum(connection)
-            except (sqlite3.Error, SdDbError) as failure:
+            except VacuumStageFailed as failure:
+                print(f"sd-db backup: the backup passed at {snapshot.directory} and the prune ran: {pruned} "
+                      f"(report #{pruned.report}); {failure}{broken}", file=sys.stderr)
+                return 1
+            except (sqlite3.Error, OSError, SdDbError) as failure:
                 # VACUUM is all or nothing: it changed nothing, and the free
                 # pages it reads make the next night try again.
                 print(f"sd-db backup: the backup passed at {snapshot.directory} and the prune ran: {pruned} "

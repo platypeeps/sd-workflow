@@ -333,7 +333,8 @@ class TheDocument(ScreenCase):
         self.assertNotIn("assignments", doc["sources"])
         lane = queue_screen.runner(self.connection)
         self.assertNotIn("merges", lane)
-        self.assertEqual(sorted(lane), ["live"])
+        # sd:8651: blocked builds are live work for Queue, not history.
+        self.assertEqual(sorted(lane), ["blocked", "live"])
         self.assertEqual((doc["sessions"]["registered"], doc["sessions"]["abandoned"]), (2, 1))
         jobs = {job["name"]: job for job in doc["jobs"]}
         self.assertEqual((jobs["nightly-sync"]["state"], jobs["nightly-sync"]["capabilities"]["retry"]["allowed"]), ("failed", True))

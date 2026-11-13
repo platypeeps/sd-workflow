@@ -384,11 +384,36 @@ def queues(connection: sqlite3.Connection, *, repos: Iterable[str | None] | None
     step a stopped entry stopped at and `place` for a queued one.
     """
     keep = _keep(repos)
-    where, values = repo_in("item.repo", keep)
-    built = connection.execute(
+    built = builds(connection, repos=keep)
+    building = {row["item"] for row in built}
+    found = [{"queue": "ready", "id": row["id"], "repo": row["repo"], "title": row["title"], "status": "ready",
+              "detail": f"P{row['priority']}" if row["priority"] is not None else "-", "since": row["status_since"]}
+             for row in backlog_items(connection, status="ready", now=now)
+             if (keep is None or row["repo"] in keep) and row["id"] not in building and not row["scheduled"]]
+    found += [{"queue": "build", "id": row["item"], "repo": row["repo"], "title": row["title"], "status": row["status"],
+               "detail": row["why"] if row["status"] == "blocked" and row["why"] else row["step"] or "-",
+               "since": row["since"]} for row in built]
+    entries = (lane if lane is not None else landing(connection, repos=keep))["entries"]
+    found += [{"queue": "lane", "id": entry["id"], "repo": entry["repo"], "title": entry["title"],
+               "status": entry["status"], "detail": entry.get("step") or "-", "since": entry["since"],
+               "place": entry["place"]} for entry in entries]
+    return found
+
+
+def builds(connection: sqlite3.Connection, *, repos: Iterable[str | None] | None = None) -> list[dict]:
+    """Each queued, running or blocked build assignment, oldest first: the Queues panel's build rows, and the
+    blocked build rows Queue lists (system sd:8651), from this one read.
+
+    Each is `assignment`, `lead` (its bundle's lead, itself when it leads), `item`, `repo`, `title`, `status`,
+    `since`, `step` (its own newest run's), and `why`: for a blocked one the first line of the reason its own newest
+    run ended with, else of its own result, which a member with no run of its own, or one never built, carries.
+    """
+    where, values = repo_in("item.repo", _keep(repos))
+    rows = connection.execute(
         f"""
-        SELECT assignment.item AS id, item.repo, item.title, assignment.status, assignment.queued_at AS since,
-               run.step, run.outcome, run.detail
+        SELECT assignment.id AS assignment, COALESCE(assignment.parent, assignment.id) AS lead,
+               assignment.item, item.repo, item.title, assignment.status, assignment.queued_at AS since,
+               assignment.result, run.step, run.detail
           FROM assignment JOIN item ON item.id = assignment.item
           LEFT JOIN runner_run AS run ON run.rowid = (SELECT rowid FROM runner_run
                                                       WHERE runner_run.assignment = assignment.id
@@ -397,19 +422,10 @@ def queues(connection: sqlite3.Connection, *, repos: Iterable[str | None] | None
            AND {where}
          ORDER BY assignment.queued_at, assignment.id
         """, (*BUILD_STATES, *values)).fetchall()
-    building = {row["id"] for row in built}
-    found = [{"queue": "ready", "id": row["id"], "repo": row["repo"], "title": row["title"], "status": "ready",
-              "detail": f"P{row['priority']}" if row["priority"] is not None else "-", "since": row["status_since"]}
-             for row in backlog_items(connection, status="ready", now=now)
-             if (keep is None or row["repo"] in keep) and row["id"] not in building and not row["scheduled"]]
-    found += [{"queue": "build", "id": row["id"], "repo": row["repo"], "title": row["title"], "status": row["status"],
-               "detail": _first_line(row["detail"]) if row["status"] == "blocked" and row["detail"]
-               else row["step"] or "-", "since": row["since"]} for row in built]
-    entries = (lane if lane is not None else landing(connection, repos=keep))["entries"]
-    found += [{"queue": "lane", "id": entry["id"], "repo": entry["repo"], "title": entry["title"],
-               "status": entry["status"], "detail": entry.get("step") or "-", "since": entry["since"],
-               "place": entry["place"]} for entry in entries]
-    return found
+    return [{"assignment": row["assignment"], "lead": row["lead"], "item": row["item"], "repo": row["repo"],
+             "title": row["title"], "status": row["status"], "since": row["since"], "step": row["step"],
+             "why": _first_line(row["detail"] or row["result"]) if row["status"] == "blocked" else ""}
+            for row in rows]
 
 
 #: The state key prefix of a failure already pushed, one `watermark` row per entry or run (pack sd:6946).

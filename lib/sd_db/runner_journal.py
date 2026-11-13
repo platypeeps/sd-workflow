@@ -67,6 +67,28 @@ def _bytes(value: dict) -> bytes:
     return json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
 
 
+#: What `F_FULLFSYNC` raises on a file system that cannot take it; `fsync` is the most it has.
+_NO_FULL_SYNC = frozenset({errno.ENOTSUP, errno.EOPNOTSUPP, errno.EINVAL, errno.ENOTTY})
+
+
+def full_sync(descriptor: int) -> None:
+    """Flush `descriptor` past the drive's own cache: `F_FULLFSYNC` where the platform has it, else `fsync`.
+
+    macOS `fsync` stops at the drive's write cache. It lives here because
+    this module is the one fcntl importer. A file system that refuses the
+    full sync gets `fsync`; any other fault is raised, not downgraded.
+    """
+    command = getattr(fcntl, "F_FULLFSYNC", None)
+    if command is not None:
+        try:
+            fcntl.fcntl(descriptor, command)
+            return
+        except OSError as error:
+            if error.errno not in _NO_FULL_SYNC:
+                raise
+    os.fsync(descriptor)
+
+
 def fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY)
     try:

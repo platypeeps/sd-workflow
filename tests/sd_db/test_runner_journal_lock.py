@@ -306,3 +306,50 @@ class HardenedLock(unittest.TestCase):
                     if any(name == "fcntl" or name.startswith("fcntl.") for name in names):
                         importers.add(str(source.relative_to(REPO_ROOT)))
         self.assertEqual(sorted(importers), [OPENER])
+
+
+class FullSync(unittest.TestCase):
+    """`full_sync` asks the drive to flush its cache, where the platform can (sd:8657)."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root)
+        self.descriptor = os.open(self.root / "file", os.O_WRONLY | os.O_CREAT, 0o600)
+        self.addCleanup(os.close, self.descriptor)
+
+    def synced(self, fault=None):
+        """The (F_FULLFSYNC calls, fsync calls) one `full_sync` makes, its fcntl failing with `fault`."""
+        calls: list[tuple[int, int]] = []
+        plain: list[int] = []
+
+        class Fcntl:
+            F_FULLFSYNC = 51
+
+            @staticmethod
+            def fcntl(descriptor, command):
+                calls.append((descriptor, command))
+                if fault is not None:
+                    raise OSError(fault, os.strerror(fault))
+                return 0
+        with patch.object(runner_journal, "fcntl", Fcntl), patch.object(runner_journal.os, "fsync", plain.append):
+            runner_journal.full_sync(self.descriptor)
+        return calls, plain
+
+    def test_it_takes_f_fullfsync_where_the_platform_has_it(self):
+        self.assertEqual(self.synced(), ([(self.descriptor, 51)], []))
+
+    def test_a_file_system_without_it_gets_fsync(self):
+        for fault in (errno.ENOTSUP, errno.EINVAL, errno.ENOTTY):
+            with self.subTest(errno.errorcode[fault]):
+                self.assertEqual(self.synced(fault), ([(self.descriptor, 51)], [self.descriptor]))
+
+    def test_any_other_fault_is_raised_not_downgraded(self):
+        with self.assertRaises(OSError) as raised:
+            self.synced(errno.EIO)
+        self.assertEqual(raised.exception.errno, errno.EIO)
+
+    def test_a_platform_without_it_gets_fsync(self):
+        plain: list[int] = []
+        with patch.object(runner_journal, "fcntl", object()), patch.object(runner_journal.os, "fsync", plain.append):
+            runner_journal.full_sync(self.descriptor)
+        self.assertEqual(plain, [self.descriptor])
