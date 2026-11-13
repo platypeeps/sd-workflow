@@ -161,7 +161,7 @@ class TheArchive(ArchiveCase):
         self.assertEqual({record["id"]: self.decoded(record) for record in records}, before)
         self.assertEqual(self.ids("ship:idle"), ids[-1:])
 
-    def test_a_failed_archive_write_deletes_nothing_and_the_report_says_why(self):
+    def test_a_failed_archive_write_deletes_nothing_and_says_why(self):
         ids = self.rows("ship:idle", days=10)
         with mock.patch.object(retention.gzip.GzipFile, "write", side_effect=OSError(28, "No space left on device")):
             pruned = retention.prune(self.db, self.backup(), now=NOW, bulk_root=self.bulk)
@@ -192,7 +192,7 @@ class TheArchive(ArchiveCase):
         self.assertIn("read back 1 row(s) of 2 written", compacted.why)
         self.assertEqual(self.files(), [])
 
-    def test_no_bulk_root_deletes_no_checkpoint_row_and_the_report_says_so(self):
+    def test_no_bulk_root_deletes_no_checkpoint_row_and_says_so(self):
         ids = self.rows("ship:idle", days=10)
         pruned = retention.prune(self.db, self.backup(), now=NOW)
         self.assertEqual((self.ids("ship:idle"), pruned.checkpoints), (ids, 0))
@@ -200,7 +200,7 @@ class TheArchive(ArchiveCase):
         self.assertFalse(json.loads(report["fields"]).get("attention"))
         self.assertIn("2 checkpoint row(s) kept: sd.bulk_storage_root is unset", json.loads(report["body"])["text"])
 
-    def test_a_bulk_root_that_is_not_a_folder_deletes_nothing_and_asks_for_a_person(self):
+    def test_an_unusable_bulk_root_deletes_nothing_and_asks_for_a_person(self):
         ids = self.rows("ship:idle", days=10)
         for root, unresolved, says in ((self.root / "unmounted", "", "is not a folder"),
                                        (None, "sd.bulk_storage_root was not read: ConfigError", "was not read")):
@@ -211,7 +211,7 @@ class TheArchive(ArchiveCase):
                 self.assertEqual(self.ids("ship:idle"), ids)
         self.assertFalse((self.root / "unmounted").exists())
 
-    def test_a_stop_after_the_archive_before_the_delete_is_finished_by_the_next_run(self):
+    def test_a_stop_before_the_delete_is_finished_by_the_next_run(self):
         ids = self.rows("ship:idle", days=10)
         real = retention.write_archive
 
@@ -226,7 +226,7 @@ class TheArchive(ArchiveCase):
         self.assertEqual(self.files(), ["first.jsonl.gz", "second.jsonl.gz"])
         self.assertEqual([line["id"] for line in self.lines(self.folder / "second.jsonl.gz")], ids[:-1])
 
-    def test_a_stop_inside_the_delete_rolls_back_and_the_next_run_finishes(self):
+    def test_a_stop_mid_delete_rolls_back_and_the_next_run_finishes(self):
         ids = self.rows("ship:idle", days=10, count=4)
         self.db.execute(f"CREATE TEMP TRIGGER stop BEFORE DELETE ON main.state WHEN old.id = {ids[1]}"
                         " BEGIN SELECT RAISE(ABORT, 'stopped mid-delete'); END")
@@ -359,7 +359,7 @@ class TheVacuum(ArchiveCase):
         self.assertEqual(str(vacuumed), f"vacuumed {vacuumed.before} bytes to {vacuumed.after} bytes")
         self.assertEqual(self.db.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
 
-    def test_a_writer_holding_the_lock_skips_it_and_the_next_night_runs_it(self):
+    def test_a_held_lock_skips_it_and_the_next_night_runs_it(self):
         free = self.free(3)
         other = connect(home=self.home)
         self.addCleanup(other.close)
@@ -373,7 +373,7 @@ class TheVacuum(ArchiveCase):
         self.assertTrue(retention.vacuum(self.db, threshold=free).ran)
         self.assertEqual(self.ids("ship:other"), [self.ids("ship:other")[0]])
 
-    def test_a_reader_holding_a_snapshot_leaves_the_checkpoint_to_the_next_night(self):
+    def test_a_reader_leaves_the_checkpoint_to_the_next_night(self):
         free = self.free(3)
         reader = connect(home=self.home, write=False)
         self.addCleanup(reader.close)

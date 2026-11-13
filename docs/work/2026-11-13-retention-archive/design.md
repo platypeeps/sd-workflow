@@ -94,18 +94,18 @@ All tests are in `tests/sd_db/test_retention_archive.py` unless named with `test
 | Step | State moved | Failure | Recovery | Test |
 | --- | --- | --- | --- | --- |
 | read victims | none | a query error | the prune fails before any write | `test_a_failed_victim_read_removes_nothing` |
-| write the part file | a part file | a write error, full disk, TERM | nothing deleted; the part file is removed, and the next run removes any left | `test_a_failed_archive_write_deletes_nothing_and_the_report_says_why`, `test_a_stale_part_file_is_removed_by_the_next_run` |
-| rename into place | an unverified archive | a stop before the read-back | nothing deleted; the next run archives the rows under its own name and deletes them | `test_a_stop_after_the_archive_before_the_delete_is_finished_by_the_next_run` |
+| write the part file | a part file | a write error, full disk, TERM | nothing deleted; the part file is removed, and the next run removes any left | `test_a_failed_archive_write_deletes_nothing_and_says_why`, `test_a_stale_part_file_is_removed_by_the_next_run` |
+| rename into place | an unverified archive | a stop before the read-back | nothing deleted; the next run archives the rows under its own name and deletes them | `test_a_stop_before_the_delete_is_finished_by_the_next_run` |
 | rename into place | none | the name is taken | nothing deleted, the old file kept, the report asks for a person | `test_an_archive_name_already_taken_deletes_nothing` |
 | read back | none | a short file or other rows | the file is removed, nothing deleted, the report asks for a person | `test_an_archive_that_reads_back_short_deletes_nothing` |
-| delete, one transaction | the victim rows | a stop mid-delete | the rollback keeps every row; the next run archives and deletes them | `test_a_stop_inside_the_delete_rolls_back_and_the_next_run_finishes` |
+| delete, one transaction | the victim rows | a stop mid-delete | the rollback keeps every row; the next run archives and deletes them | `test_a_stop_mid_delete_rolls_back_and_the_next_run_finishes` |
 | delete | none for a revived key | a key written since the read would lose rows | the second read finds no victim; the archive holds a copy only | `test_a_key_revived_between_archive_and_delete_keeps_its_rows` |
 | delete | none for that row | a row resolved since the archive | the row stays for the next night | `test_a_row_resolved_after_its_archive_is_kept` |
-| no bulk root | none | unset | no checkpoint row deleted; the report says so | `test_no_bulk_root_deletes_no_checkpoint_row_and_the_report_says_so` |
-| no bulk root | none | unreadable setting, not a folder | no checkpoint row deleted; the report asks for a person | `test_a_bulk_root_that_is_not_a_folder_deletes_nothing_and_asks_for_a_person`, `test_unset_set_and_unreadable` |
+| no bulk root | none | unset | no checkpoint row deleted; the report says so | `test_no_bulk_root_deletes_no_checkpoint_row_and_says_so` |
+| no bulk root | none | unreadable setting, not a folder | no checkpoint row deleted; the report asks for a person | `test_an_unusable_bulk_root_deletes_nothing_and_asks_for_a_person`, `test_unset_set_and_unreadable` |
 | prune report | the report item | a stop after the delete | the rerun deletes nothing more and files the report | `test_retention.test_a_prune_stopped_after_the_compaction_is_finished_by_the_next_run` |
-| VACUUM | the whole file, atomically | another writer holds the lock past 60 s | nothing changed; the job exits 1 naming it; the free pages make the next night run it | `test_a_writer_holding_the_lock_skips_it_and_the_next_night_runs_it`, `test_a_vacuum_that_did_not_run_fails_the_job_and_names_why` |
-| WAL checkpoint | the WAL into the file | a reader holds an older snapshot | the job says so; a WAL past 50 MiB is checkpointed the next night | `test_a_reader_holding_a_snapshot_leaves_the_checkpoint_to_the_next_night` |
+| VACUUM | the whole file, atomically | another writer holds the lock past 60 s | nothing changed; the job exits 1 naming it; the free pages make the next night run it | `test_a_held_lock_skips_it_and_the_next_night_runs_it`, `test_a_vacuum_that_did_not_run_fails_the_job_and_names_why` |
+| WAL checkpoint | the WAL into the file | a reader holds an older snapshot | the job says so; a WAL past 50 MiB is checkpointed the next night | `test_a_reader_leaves_the_checkpoint_to_the_next_night` |
 | older state | none | a store with whole `lane:` and queue keys | the first night archives them like any victim | `test_the_job_archives_to_the_bulk_root_and_vacuums` |
 
 ## Acceptance criteria
