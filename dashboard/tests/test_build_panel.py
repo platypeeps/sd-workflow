@@ -120,9 +120,11 @@ class BuildRoutes(Fixture):
         out = plan()
         self.assertEqual([row["id"] for row in out["refused"]], [sat], "no dispatcher beats there")
         self.assertIn("lane runs on work, and no build-dispatch@work beat", out["refused"][0]["why"])
+        fixed = build.clock()  # one clock for stamp and read: a busy gate let a second pass between them
         record_state(self.connection, "heartbeat", key="build-dispatch@work",
-                     timestamp=(datetime.fromisoformat(build.clock()) - timedelta(seconds=42)).isoformat(), body={})
-        out = plan()
+                     timestamp=(datetime.fromisoformat(fixed) - timedelta(seconds=42)).isoformat(), body={})
+        with patch.object(build, "clock", return_value=fixed):
+            out = plan()
         self.assertEqual(out["refused"], [])
         self.assertEqual([(bundle["name"], bundle["host"], bundle["room"], bundle["beat"])
                           for bundle in out["bundles"]], [("alpha", "", build.REPO_CAP, None), ("sat", "work", 0, 42)])

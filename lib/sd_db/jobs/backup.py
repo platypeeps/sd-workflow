@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import os
+import sqlite3
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
@@ -11,7 +13,7 @@ from pathlib import Path
 from ..backup import prune_older, require_mount, run
 from ..database import connect
 from ..errors import BackupError, SdDbError
-from ..retention import prune
+from ..retention import prune, vacuum
 
 #: The job's exit code when the BACKUP PASSED but the SOURCE is referentially
 #: broken. It is not 1, because 1 means the documented failure -- the library
@@ -32,6 +34,32 @@ from ..retention import prune
 #: are indistinguishable and a typo mails "the source is referentially
 #: broken".
 BROKEN_SOURCE = 3
+
+
+def bulk_root() -> tuple[Path | None, str]:
+    """`sd.bulk_storage_root` and, when it is set and unread, why: None and "" when it is unset.
+
+    Read by `bin/sd_lib.core_setting`, the resolver the build log archive
+    uses (`sd_operations.log_root`), from this checkout's own `bin/`: the
+    job runs as `-m sd_db.jobs.backup` with only `lib/` on its path.
+    """
+    path = Path(__file__).resolve().parents[3] / "bin" / "sd_lib.py"
+    try:
+        spec = importlib.util.spec_from_file_location("sd_lib", path)
+        if spec is None or spec.loader is None:
+            raise ImportError(f"{path} cannot be loaded")
+        module = sys.modules.get("sd_lib")
+        if module is None:
+            module = sys.modules["sd_lib"] = importlib.util.module_from_spec(spec)
+            try:
+                spec.loader.exec_module(module)
+            except BaseException:
+                del sys.modules["sd_lib"]
+                raise
+        value = module.core_setting("bulk_storage_root")
+    except Exception as error:  # noqa: BLE001 - an unread setting is unknown, never unset
+        return None, f"sd.bulk_storage_root was not read: {type(error).__name__}: {error}"
+    return (Path(os.path.expanduser(value)), "") if value else (None, "")
 
 
 def retention(value: str) -> int | None:
@@ -165,10 +193,19 @@ def main(argv: list[str] | None = None) -> int:
     # anything short of a restored-and-compared snapshot, so reaching this
     # line is the backup having passed. A prune that fails is the job
     # failing -- the backup is on disk either way, and the mail says which.
+    root, unresolved = bulk_root()
     try:
         connection = connect(home=home)
         try:
-            pruned = prune(connection, snapshot)
+            pruned = prune(connection, snapshot, bulk_root=root, unresolved=unresolved)
+            try:
+                vacuumed = vacuum(connection)
+            except (sqlite3.Error, SdDbError) as failure:
+                # VACUUM is all or nothing: it changed nothing, and the free
+                # pages it reads make the next night try again.
+                print(f"sd-db backup: the backup passed at {snapshot.directory} and the prune ran: {pruned} "
+                      f"(report #{pruned.report}); the VACUUM did not run: {failure}{broken}", file=sys.stderr)
+                return 1
         finally:
             connection.close()
     except (OSError, SdDbError) as failure:
@@ -184,10 +221,20 @@ def main(argv: list[str] | None = None) -> int:
         f"sd-db backup: {snapshot.directory} — {rows} row(s) across "
         f"{len(snapshot.counts)} table(s), restored and compared; {beside}; "
         f"{len(snapshot.removed)} old snapshot(s) removed; pruned: {pruned} "
-        f"(report #{pruned.report}){broken}",
+        f"(report #{pruned.report}); {_archived(pruned)}{vacuumed}{broken}",
         file=stream,
     )
     return BROKEN_SOURCE if snapshot.violations else 0
+
+
+def _archived(pruned) -> str:
+    """What the checkpoint step archived, or why it kept rows, as a clause ending in "; "; empty when neither."""
+    compacted = pruned.compacted
+    if compacted is None:
+        return ""
+    if compacted.path is not None:
+        return f"{compacted.archived} checkpoint row(s) archived to {compacted.path}; "
+    return f"{compacted.why}; " if compacted.why else ""
 
 
 if __name__ == "__main__":
