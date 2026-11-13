@@ -106,6 +106,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -212,6 +213,10 @@ class RetentionRefused(SdDbError):
 
 class ArchiveFailed(SdDbError):
     """The archive was not written or did not read back; no checkpoint row was deleted."""
+
+
+class VacuumStageFailed(SdDbError):
+    """The VACUUM ran, or was not due, and a later stage failed; the message names both."""
 
 
 @dataclass(frozen=True)
@@ -586,7 +591,9 @@ def vacuum(connection, *, threshold: int = VACUUM_FREE_BYTES, busy_ms: int = VAC
     the caller. The WAL is then checkpointed and truncated, with the
     connection's own `busy_timeout`, since a waiting checkpoint holds off
     every writer; a reader on an older snapshot leaves it, and a WAL file
-    still past `threshold` the next night is checkpointed then.
+    still past `threshold` the next night is checkpointed then. A fault in
+    that checkpoint or the size read after it raises `VacuumStageFailed`,
+    which names the stage: the VACUUM itself did run.
     """
     refuse_hub_only(connection, "the vacuum")
     if connection.in_transaction:
@@ -605,9 +612,15 @@ def vacuum(connection, *, threshold: int = VACUUM_FREE_BYTES, busy_ms: int = VAC
             connection.execute(f"PRAGMA busy_timeout = {int(held)}")
     else:
         why += f"; the WAL held {wal} bytes, so it was checkpointed"
-    busy = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
-    return Vacuumed(before=before, after=_size(connection)[0], ran=ran, checkpointed=not busy, wal=_wal(connection),
-                    why=why)
+    stage = "WAL checkpoint"
+    try:
+        busy = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+        stage = "size read"
+        after, wal = _size(connection)[0], _wal(connection)
+    except (sqlite3.Error, OSError) as error:
+        done = "the VACUUM ran" if ran else f"the VACUUM was not due ({why})"
+        raise VacuumStageFailed(f"{done}, then the {stage} failed: {type(error).__name__}: {error}") from error
+    return Vacuumed(before=before, after=after, ran=ran, checkpointed=not busy, wal=wal, why=why)
 
 
 def settle_clean_reports(connection, *, now: datetime) -> int:

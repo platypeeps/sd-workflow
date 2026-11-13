@@ -456,6 +456,27 @@ class TheBulkRoot(ArchiveCase):
         self.assertIn("the VACUUM did not run: database is locked", error.getvalue())
         self.assertEqual(len(self.ids("ship:idle")), 1)
 
+    def test_a_failure_after_the_vacuum_ran_names_its_stage(self):
+        """The WAL checkpoint or the size read failing is not the VACUUM failing (sd:8657)."""
+        self.rows("ship:idle", days=10)
+        real = retention._size
+        calls = []
+
+        def size(connection):
+            calls.append(1)
+            if len(calls) > 1:
+                raise sqlite3.OperationalError("disk I/O error")
+            return real(connection)
+        error = io.StringIO()
+        with mock.patch.dict(os.environ, self.config({"config": {"sd": {"bulk_storage_root": str(self.bulk)}}})), \
+                mock.patch.object(backup_job, "vacuum", side_effect=lambda c: retention.vacuum(c, threshold=0)), \
+                mock.patch.object(retention, "_size", side_effect=size), \
+                contextlib.redirect_stderr(error), contextlib.redirect_stdout(io.StringIO()):
+            code = backup_job.main([])
+        self.assertEqual(code, 1)
+        self.assertNotIn("did not run", error.getvalue())
+        self.assertIn("the VACUUM ran, then the size read failed: OperationalError: disk I/O error", error.getvalue())
+
     def test_the_job_archives_to_the_bulk_root_and_vacuums(self):
         """Older state: whole lane and queue keys, as every store before this change holds them."""
         lane = self.rows("lane:v1:example/repo:old", days=45, count=3)
