@@ -319,7 +319,8 @@ class FullSync(unittest.TestCase):
 
     def synced(self, fault=None):
         """The (F_FULLFSYNC calls, fsync calls) one `full_sync` makes, its fcntl failing with `fault`."""
-        calls, plain = [], []
+        calls: list[tuple[int, int]] = []
+        plain: list[int] = []
 
         class Fcntl:
             F_FULLFSYNC = 51
@@ -348,7 +349,7 @@ class FullSync(unittest.TestCase):
         self.assertEqual(raised.exception.errno, errno.EIO)
 
     def test_a_platform_without_it_gets_fsync(self):
-        plain = []
+        plain: list[int] = []
         with patch.object(runner_journal, "fcntl", object()), patch.object(runner_journal.os, "fsync", plain.append):
             runner_journal.full_sync(self.descriptor)
         self.assertEqual(plain, [self.descriptor])

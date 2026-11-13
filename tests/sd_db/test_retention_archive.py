@@ -309,7 +309,7 @@ class TheArchive(ArchiveCase):
     def test_the_archive_and_its_folder_are_fully_synced(self):
         """macOS `fsync` stops at the drive cache; the archive takes the full sync (sd:8657)."""
         self.rows("ship:idle", days=10)
-        synced = []
+        synced: list[int] = []
         with mock.patch.object(retention.runner_journal, "full_sync", side_effect=synced.append):
             self.assertEqual(self.compact().deleted, 2)
         self.assertEqual(len(synced), 2)
