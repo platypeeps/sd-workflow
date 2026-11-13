@@ -587,6 +587,14 @@ class LaneFix(Fixture):
         self.assertEqual(status, 200, body)
         self.assertEqual(self.lane_entry("e-failed")["status"], "cancelled")
 
+    def test_a_detail_naming_no_entry_id_reads_the_branchs_newest_entry(self):
+        """pack sd:8665: a watch that read no entry id writes `lane entry None failed`; Fix read `None` as the id
+        and refused, since no key ends `:None`. Only a real id names an entry."""
+        items = [self.ready()]
+        run = self.lane_failed(items, reason="lane entry None failed: local review blocking: 1/1 completed")
+        fix = builds.lane_fix_state(self.connection, run["branch"])
+        self.assertEqual((fix["allowed"], fix["reason"]), (True, ""), fix)
+
     def test_retry_without_a_finding_still_refuses_a_lane_failed_run_and_writes_nothing(self):
         run = self.lane_failed([self.ready()])
         fix = builds.lane_fix_state(self.connection, run["branch"])
@@ -656,6 +664,35 @@ class BlockedBuildRows(Fixture):
         self.assertEqual(status, 200, body)
         self.assertEqual(self.runner(), {})
 
+
+    def test_a_blocked_row_not_read_keeps_the_other_rows_and_says_why(self):
+        """pack sd:8665: one blocked row whose assignment read failed answered 500 and hid every live and blocked
+        row; it is a row with Cancel and Retry off and the read's error, as a build run's row is (`_open_row`)."""
+        import sqlite3
+        from unittest import mock
+
+        from sd_db import operations
+
+        good, bad = self.ready(), self.ready()
+        for item in (good, bad):
+            build.queue(self.connection, [item], who="fixture")
+        with self.connection:
+            self.connection.execute("UPDATE assignment SET status = 'blocked', result = 'stuck' WHERE scope = 'build'")
+        broken = self.connection.execute("SELECT id FROM assignment WHERE item = ? AND scope = 'build'",
+                                         (bad,)).fetchone()[0]
+        real = operations.assignment_state
+
+        def read(connection, assignment):
+            if assignment == broken:
+                raise sqlite3.DatabaseError("database disk image is malformed")
+            return real(connection, assignment)
+        with mock.patch.object(operations, "assignment_state", side_effect=read):
+            rows = self.runner()
+        self.assertEqual(sorted(rows), sorted([good, bad]))
+        self.assertTrue(rows[good]["cancel"]["allowed"], rows[good])
+        for action in ("cancel", "retry"):
+            self.assertEqual((rows[bad][action]["allowed"], rows[bad][action]["reason"]),
+                             (False, "the assignment was not read: database disk image is malformed"), rows[bad])
 
 class AutoPickup(Fixture):
     """pack sd:6097: the Builds panel shows auto-pickup and its On and Off write it, bound to the value read."""
