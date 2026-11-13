@@ -401,7 +401,8 @@ class Compacted:
     attention: bool = False
 
 
-def _chunks(values: list, size: int = CHUNK):
+def _chunks(values: list, size: int | None = None):
+    size = size or CHUNK  # read at the call, so a test's patched CHUNK reaches it
     for start in range(0, len(values), size):
         yield values[start:start + size]
 
@@ -534,14 +535,14 @@ def compact_checkpoints(connection, *, now: datetime, root: Path | None, name: s
     deleted = freed = 0
     with transaction(connection):
         archived = {row[0]: row for row in written if row[0] in bounds}
-        for chunk in _chunks(sorted(archived)):
-            same = [row["id"] for row in _still_due(connection, chunk)
-                    if (row["timestamp"], row["resolved_at"]) == archived[row["id"]][1:3]
-                    and (row["first"], row["last"]) == bounds[row["id"]]]
-            if same:
-                deleted += connection.execute(
-                    f"DELETE FROM state WHERE id IN ({','.join('?' * len(same))})", same).rowcount
-                freed += sum(archived[ident][4] for ident in same)
+        # Every bound is read before the first delete: a delete moves its key's MIN(id) (pack sd:8665).
+        same = [row["id"] for chunk in _chunks(sorted(archived)) for row in _still_due(connection, chunk)
+                if (row["timestamp"], row["resolved_at"]) == archived[row["id"]][1:3]
+                and (row["first"], row["last"]) == bounds[row["id"]]]
+        for chunk in _chunks(same):
+            deleted += connection.execute(
+                f"DELETE FROM state WHERE id IN ({','.join('?' * len(chunk))})", chunk).rowcount
+            freed += sum(archived[ident][4] for ident in chunk)
     return Compacted(deleted=deleted, archived=len(written), freed=freed, path=folder / name)
 
 

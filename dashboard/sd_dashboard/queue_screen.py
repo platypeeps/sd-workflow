@@ -502,14 +502,19 @@ def _blocked(connection, row: dict) -> dict:
     its Retry, which is its bundle lead's (`builds._retry_state`, the check `builds.retry` makes); off says why."""
     from .builds import _retry_state
 
-    current = operations.assignment_state(connection, row["assignment"])
-    cancel = {"assignment": row["assignment"], "revision": current["revision"], **current["capabilities"]["cancel"]}
-    lead = runner_state(connection, row["lead"])
-    if lead["run"] is None:
-        retry = {"assignment": row["lead"], "revision": lead["revision"], "allowed": False,
-                 "reason": "it never ran; Cancel clears it, or build the item again from Tasks", "bundle": lead["status"]}
-    else:
-        retry = _retry_state(connection, lead["run"])
+    try:
+        current = operations.assignment_state(connection, row["assignment"])
+        cancel = {"assignment": row["assignment"], "revision": current["revision"], **current["capabilities"]["cancel"]}
+        lead = runner_state(connection, row["lead"])
+        if lead["run"] is None:
+            retry = {"assignment": row["lead"], "revision": lead["revision"], "allowed": False,
+                     "reason": "it never ran; Cancel clears it, or build the item again from Tasks",
+                     "bundle": lead["status"]}
+        else:
+            retry = _retry_state(connection, lead["run"])
+    except (SdDbError, sqlite3.Error) as failure:  # one unread row hides no other (pack sd:8665), as `_open_row`
+        off = {"revision": "", "allowed": False, "reason": f"the assignment was not read: {failure}"}
+        cancel, retry = {"assignment": row["assignment"], **off}, {"assignment": row["lead"], **off}
     return {"id": row["assignment"], "item": row["item"], "title": row["title"], "repo": row["repo"],
             "why": row["why"] or "no reason recorded", "since": row["since"], "lead": row["lead"], "cancel": cancel,
             "retry": retry}

@@ -259,6 +259,15 @@ class TheArchive(ArchiveCase):
         self.assertEqual(self.compact(name="second.jsonl.gz").deleted, 3)
         self.assertEqual(self.ids("ship:idle"), ids[-1:])
 
+    def test_a_key_whose_rows_span_chunks_drains_in_one_run(self):
+        """pack sd:8665: the bounds were re-read per chunk after the earlier chunks' deletes, so a key's first row
+        was gone and every later chunk kept its rows: one chunk a night, the rest archived again."""
+        ids = self.rows("ship:idle", days=10, count=4)
+        with mock.patch.object(retention, "CHUNK", 1):
+            compacted = self.compact()
+        self.assertEqual((compacted.archived, compacted.deleted), (3, 3))
+        self.assertEqual(self.ids("ship:idle"), ids[-1:])
+
     def test_a_key_revived_between_archive_and_delete_keeps_its_rows(self):
         ids = self.rows("ship:idle", days=10)
         real = retention.write_archive

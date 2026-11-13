@@ -90,7 +90,8 @@ FINDING = "Send to builder: "
 #: `REBUILD` is the note's stable prefix the rebuild count matches; the base it names follows it (pack sd:7008).
 CONFLICT = re.compile(r"\bmerging (origin/\S+) into \S+ conflicts\b")
 #: The lane entry a `lane_failed` run's detail names, as `build_run.watch` writes it: `lane entry <id> <status>: ...`.
-LANE_ENTRY = re.compile(r"^lane entry (\S+) ")
+#: `None` is a watch that read no id, not an id (pack sd:8665).
+LANE_ENTRY = re.compile(r"^lane entry (?!None )(\S+) ")
 REBUILD = FINDING + "the lane's merge of "
 CONFLICT_REBUILDS = 2
 #: The model a bundle runs on (Q60): Sonnet only when every member's `fields.work_kind` is `mechanical`.
