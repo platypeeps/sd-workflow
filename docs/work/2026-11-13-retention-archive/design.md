@@ -68,8 +68,11 @@ VACUUM: the backup job runs `retention.vacuum` after the prune passed.
 It runs when the free pages hold 50 MiB or more, not when this prune freed
 50 MiB: a VACUUM a held lock skipped then runs the next night.
 It waits up to 60 s for the write lock (`busy_timeout`), never inside a
-transaction, then runs `PRAGMA wal_checkpoint(TRUNCATE)`, and reports the
-logical size (`page_count * page_size`) before and after.
+transaction, then runs `PRAGMA wal_checkpoint(TRUNCATE)` with the
+connection's own 5 s timeout, and reports the logical size
+(`page_count * page_size`) before and after. A WAL file a reader kept at
+50 MiB or more is checkpointed the next night, VACUUM or not.
+A VACUUM that did not run exits the job 1, naming why.
 
 Rejected: holding the write lock from the read to the delete. The first
 night streams about 400 MB to gzip, and every other writer would wait out
@@ -86,67 +89,43 @@ answer without the hold.
 
 ## Failure table
 
-- Step: read victims. State moved: none. Failure: a query error.
-  Recovery: the prune fails before any delete, as before.
-  Test: `test_a_failed_archive_write_deletes_nothing_and_the_report_says_why`.
-- Step: write the part file. State moved: a part file in the archive folder.
-  Failure: a write error, a full disk, a TERM.
-  Recovery: nothing deleted; the part file is removed; the next run removes
-  any part file left. Tests:
-  `test_a_failed_archive_write_deletes_nothing_and_the_report_says_why`,
-  `test_a_stale_part_file_is_removed_by_the_next_run`.
-- Step: rename to the final name. State moved: an unverified archive.
-  Failure: a stop before the read-back. Recovery: nothing deleted; the next
-  run archives the same rows under its own run id and deletes them.
-  Test: `test_a_stop_after_the_archive_before_the_delete_is_finished_by_the_next_run`.
-- Step: read the archive back. State moved: none. Failure: a short file or
-  a changed row. Recovery: the file is removed, nothing deleted, the report
-  asks for a person. Test:
-  `test_an_archive_that_reads_back_short_deletes_nothing`.
-- Step: delete in one transaction. State moved: the victim rows.
-  Failure: a stop mid-delete. Recovery: the rollback keeps every row; the
-  next run archives them again and deletes them. Test:
-  `test_a_stop_inside_the_delete_rolls_back_and_the_next_run_finishes`.
-- Step: delete, with a key written since step 1. State moved: none for that
-  key. Failure: a revived key would lose its middle rows. Recovery: the
-  second read finds it is no victim; the archive holds a copy only.
-  Test: `test_a_key_revived_between_archive_and_delete_keeps_its_rows`.
-- Step: delete, with a row resolved since step 1. State moved: none for
-  that row. Failure: the archive would hold an older `resolved_at`.
-  Recovery: the row stays for the next night. Test:
-  `test_a_row_resolved_after_its_archive_is_kept`.
-- Step: no bulk root. State moved: none. Failure: unset, malformed, or not
-  a folder. Recovery: no checkpoint row deleted; the report says why.
-  Tests: `test_no_bulk_root_deletes_no_checkpoint_row_and_the_report_says_so`,
-  `test_a_bulk_root_that_is_not_a_folder_deletes_nothing_and_asks_for_a_person`.
-- Step: the prune report. State moved: the report item. Failure: a stop
-  after the delete. Recovery: the rerun deletes nothing more and files the
-  report, as before. Test:
-  `test_a_prune_stopped_after_the_compaction_is_finished_by_the_next_run`.
-- Step: VACUUM. State moved: the whole file, atomically. Failure: another
-  writer holds the lock past the wait. Recovery: VACUUM changed nothing;
-  the job exits 1 naming it; the free pages stay and the next night runs it.
-  Test: `test_a_writer_holding_the_lock_skips_it_and_the_next_night_runs_it`.
-- Step: WAL checkpoint. State moved: the WAL into the file. Failure: a
-  reader holds an older snapshot. Recovery: the job says the file shrinks
-  at a later checkpoint; SQLite's own checkpoints finish it. Test:
-  `test_a_reader_holding_a_snapshot_leaves_the_checkpoint_unfinished`.
-- Step: older state. State moved: none. Failure: a store from before this
-  change, with whole `lane:` and queue keys. Recovery: the first night
-  archives them like any other victim. Test:
-  `test_the_job_archives_to_the_bulk_root_and_vacuums`.
+All tests are in `tests/sd_db/test_retention_archive.py` unless named with `test_retention.`.
+
+| Step | State moved | Failure | Recovery | Test |
+| --- | --- | --- | --- | --- |
+| read victims | none | a query error | the prune fails before any write | `test_a_failed_victim_read_removes_nothing` |
+| write the part file | a part file | a write error, full disk, TERM | nothing deleted; the part file is removed, and the next run removes any left | `test_a_failed_archive_write_deletes_nothing_and_the_report_says_why`, `test_a_stale_part_file_is_removed_by_the_next_run` |
+| rename into place | an unverified archive | a stop before the read-back | nothing deleted; the next run archives the rows under its own name and deletes them | `test_a_stop_after_the_archive_before_the_delete_is_finished_by_the_next_run` |
+| rename into place | none | the name is taken | nothing deleted, the old file kept, the report asks for a person | `test_an_archive_name_already_taken_deletes_nothing` |
+| read back | none | a short file or other rows | the file is removed, nothing deleted, the report asks for a person | `test_an_archive_that_reads_back_short_deletes_nothing` |
+| delete, one transaction | the victim rows | a stop mid-delete | the rollback keeps every row; the next run archives and deletes them | `test_a_stop_inside_the_delete_rolls_back_and_the_next_run_finishes` |
+| delete | none for a revived key | a key written since the read would lose rows | the second read finds no victim; the archive holds a copy only | `test_a_key_revived_between_archive_and_delete_keeps_its_rows` |
+| delete | none for that row | a row resolved since the archive | the row stays for the next night | `test_a_row_resolved_after_its_archive_is_kept` |
+| no bulk root | none | unset | no checkpoint row deleted; the report says so | `test_no_bulk_root_deletes_no_checkpoint_row_and_the_report_says_so` |
+| no bulk root | none | unreadable setting, not a folder | no checkpoint row deleted; the report asks for a person | `test_a_bulk_root_that_is_not_a_folder_deletes_nothing_and_asks_for_a_person`, `test_unset_set_and_unreadable` |
+| prune report | the report item | a stop after the delete | the rerun deletes nothing more and files the report | `test_retention.test_a_prune_stopped_after_the_compaction_is_finished_by_the_next_run` |
+| VACUUM | the whole file, atomically | another writer holds the lock past 60 s | nothing changed; the job exits 1 naming it; the free pages make the next night run it | `test_a_writer_holding_the_lock_skips_it_and_the_next_night_runs_it`, `test_a_vacuum_that_did_not_run_fails_the_job_and_names_why` |
+| WAL checkpoint | the WAL into the file | a reader holds an older snapshot | the job says so; a WAL past 50 MiB is checkpointed the next night | `test_a_reader_holding_a_snapshot_leaves_the_checkpoint_to_the_next_night` |
+| older state | none | a store with whole `lane:` and queue keys | the first night archives them like any victim | `test_the_job_archives_to_the_bulk_root_and_vacuums` |
 
 ## Acceptance criteria
 
 - `python -m unittest tests.sd_db.test_retention tests.sd_db.test_retention_archive`
   passes with 0 failures.
 - A pruned row's archive line decodes to the row's exact key and body bytes.
+- On a copy of the 2026-11-13 snapshot: 2452 victims, 348 MB of body bytes
+  freed, a 17.5 MB archive, and 978 MB to 615 MB after VACUUM.
 
 ## Risks
 
-- VACUUM holds the write lock while it runs: about the time to copy the file.
-  A writer without `database.Patient` that waits past its 5 s `busy_timeout`
-  fails. The job runs at night, and only when 50 MiB are free.
+- VACUUM holds the write lock while it runs: 4.0 s on a copy of the
+  978 MB snapshot. A writer without `database.Patient` that waits past its
+  5 s `busy_timeout` fails. The job runs at night, and only when 50 MiB are
+  free. The TRUNCATE checkpoint after it waits 5 s at most, the
+  connection's own timeout, since a waiting checkpoint holds off writers.
+- The lane rule frees less than the item's estimate at first: 1187 rows,
+  8 MB, on the snapshot, since most `lane:` keys were written in the last
+  30 days. Each key's middle rows go once it sits 30 days.
 - VACUUM needs free disk of about twice the file: a temporary copy and a WAL
   as large as the file until the checkpoint.
 - A hung bulk root hangs the archive write; the backup job's time bound

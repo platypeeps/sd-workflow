@@ -7,7 +7,9 @@ the rows and handing the prune its `now`; nothing sleeps.
 """
 
 import base64
+import contextlib
 import gzip
+import io
 import json
 import os
 import random
@@ -171,6 +173,14 @@ class TheArchive(ArchiveCase):
         self.assertTrue(fields["attention"])
         self.assertIn("2 checkpoint row(s) kept: the archive", fields["report"]["attention_basis"])
         self.assertIn("No space left on device", json.loads(report["body"])["text"])
+
+    @hub_only
+    def test_a_failed_victim_read_removes_nothing(self):
+        ids = self.rows("ship:idle", days=10)
+        with mock.patch.object(retention, "checkpoint_victims", side_effect=sqlite3.OperationalError("disk I/O error")):
+            with self.assertRaisesRegex(sqlite3.OperationalError, "disk I/O error"):
+                retention.prune(self.db, self.backup(), now=NOW, bulk_root=self.bulk)
+        self.assertEqual((self.ids("ship:idle"), self.files()), (ids, []))
 
     def test_an_archive_that_reads_back_short_deletes_nothing(self):
         ids = self.rows("ship:idle", days=10)
@@ -412,6 +422,20 @@ class TheBulkRoot(ArchiveCase):
                     self.assertIn("sd.bulk_storage_root was not read: ConfigError", found[1])
                 else:
                     self.assertEqual(found, expected)
+
+    @hub_only
+    def test_a_vacuum_that_did_not_run_fails_the_job_and_names_why(self):
+        self.rows("ship:idle", days=10)
+        error = io.StringIO()
+        with mock.patch.dict(os.environ, self.config({"config": {"sd": {"bulk_storage_root": str(self.bulk)}}})), \
+                mock.patch.object(backup_job, "vacuum", side_effect=sqlite3.OperationalError("database is locked")), \
+                contextlib.redirect_stderr(error), contextlib.redirect_stdout(io.StringIO()):
+            code = backup_job.main([])
+        self.assertEqual(code, 1)
+        self.assertIn("and the prune ran: ", error.getvalue())
+        self.assertIn("2 superseded checkpoint row(s) removed", error.getvalue())
+        self.assertIn("the VACUUM did not run: database is locked", error.getvalue())
+        self.assertEqual(len(self.ids("ship:idle")), 1)
 
     @hub_only
     def test_the_job_archives_to_the_bulk_root_and_vacuums(self):
