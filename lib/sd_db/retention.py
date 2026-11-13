@@ -18,16 +18,28 @@ its snapshot restored and compared, and never before. What the table says:
                      per tick, and the newest is the only one any reader asks
                      for. A `session:` row older than `sessions.STALE` goes
                      whole: that session ended without its hook (sd:6024).
-    checkpoint rows  one per key, once the key sat a week (sd:3472).  For
-                     the keys `NEWEST_ONLY_CHECKPOINTS` names every reader
-                     takes the newest row (`ship.read`, `LIMIT 1`, `MAX(id)`),
-                     yet `ship.save` appends one before each side effect: 24k
-                     `ship:` rows held 700 MB on 2026-10-12. A key whose
-                     newest row is younger than `CHECKPOINT_IDLE_AGE` keeps
-                     every row, so a live ship's phases stay readable, and
-                     the hourly backups keep a dropped row a week more.
-                     `KEPT_CHECKPOINTS` names every other checkpoint key a
-                     writer uses, and why it stays whole.
+    checkpoint rows  archived, then dropped, by three rules (sd:3472, sd:8655).
+                     `NEWEST_ONLY_CHECKPOINTS`: one row per key, once the
+                     key sat a week. Every reader takes the newest row
+                     (`ship.read`, `LIMIT 1`, `MAX(id)`), yet `ship.save`
+                     appends one before each side effect: 24k `ship:` rows
+                     held 700 MB on 2026-10-12. A key whose newest row is
+                     younger than `CHECKPOINT_IDLE_AGE` keeps every row, so
+                     a live ship's phases stay readable.
+                     `NEWEST_AND_RESOLVED_CHECKPOINTS`: the newest row and
+                     the newest resolved row, at any age: `contribution_sync`
+                     and `removal` read only the newest resolved one, and
+                     the one key held 408 rows, 305 MB, on 2026-11-13.
+                     `FIRST_AND_NEWEST_CHECKPOINTS`: the first row and the
+                     newest, once the newest is older than `LANE_IDLE_AGE`:
+                     `sd_lane.enqueue_order` reads the first as the queue
+                     order, the lane reads the newest, and `entry_times`
+                     reads the rows between only inside its 7-day window.
+                     Each dropped row goes first to a gzip JSON-lines file
+                     under `<bulk root>/sd-workflow/db-archive/`, read back
+                     and matched row for row; no bulk root, or an archive
+                     that fails, drops none. `KEPT_CHECKPOINTS` names every
+                     other checkpoint key a writer uses, and why it stays.
     clean reports    seven days in `planning`, then `done`.  `reporting.ingest`
                      opens every report as `planning`; an attention report
                      carries a followup and waits for a person, a clean one
@@ -86,6 +98,9 @@ directory verified again and its checkpoint row found in this database.
 
 from __future__ import annotations
 
+import base64
+import gzip
+import hashlib
 import json
 import os
 import re
@@ -116,15 +131,35 @@ NEWEST_ONLY_CHECKPOINTS = (
     "review:", "jira-moves",
 )
 
+#: Checkpoint keys, whole keys and not prefixes, whose readers take the newest
+#: row and the newest resolved row: `contribution_sync._queue` and
+#: `removal._malformed`, `resolved_at IS NOT NULL ORDER BY id DESC LIMIT 1`.
+#: The rows between go at any age.
+NEWEST_AND_RESOLVED_CHECKPOINTS = ("contribution-refresh-queue",)
+
+#: Checkpoint key prefixes whose readers take each key's first row and its
+#: newest: `sd_lane.enqueue_order`, `today` and `build` read `MIN(id)`, the
+#: lane and `reads.lane_entries` read `MAX(id)`.
+FIRST_AND_NEWEST_CHECKPOINTS = ("lane:",)
+
+#: How long a `FIRST_AND_NEWEST_CHECKPOINTS` key goes unwritten before its
+#: middle rows go: far past `sd_lane.TIMES_DAYS`, the window in which
+#: `entry_times` reads them.
+LANE_IDLE_AGE = timedelta(days=30)
+
 #: Checkpoint keys retention never compacts, and why. A backup run id has no
 #: prefix: it is 32 hex digits, one row per run.
 KEPT_CHECKPOINTS = {
-    "lane:": "`sd_lane.enqueue_order` reads each key's first row as the queue order",
     "operator-action": "`reporting.metrics` counts every row by week",
     "operations:": "each row is a request or a cancel the operator made",
-    "contribution-refresh-queue": "`removal` reads the newest resolved row, which need not be the newest",
     "<backup run id>": "one row per run; `backup.passed` finds it by key",
 }
+
+#: Where, under the bulk root, the prune writes the rows it drops.
+ARCHIVE_FOLDER = Path("sd-workflow") / "db-archive"
+
+#: How many ids one statement names: far under SQLite's variable limit.
+CHUNK = 500
 
 #: How long a clean run report waits in `planning` for an acknowledgement
 #: before retention settles it.
@@ -156,11 +191,19 @@ JOB = "sd-db-prune"
 UNREADABLE_TEXT_IDS = 1000
 UNREADABLE_BASIS_IDS = 20
 
+#: How much of an archive fault the attention basis carries, beside up to
+#: `UNREADABLE_BASIS_IDS` ids, inside `ingest`'s 2000 characters.
+ARCHIVE_BASIS = 600
+
 LOG_NAME = re.compile(r"[a-f0-9]{32}\.log")
 
 
 class RetentionRefused(SdDbError):
     """The prune did not run, and nothing was removed."""
+
+
+class ArchiveFailed(SdDbError):
+    """The archive was not written or did not read back; no checkpoint row was deleted."""
 
 
 @dataclass(frozen=True)
@@ -173,6 +216,8 @@ class Pruned:
     report: int
     parked: int = 0
     checkpoints: int = 0
+    #: The checkpoint step's archive and its reason for keeping rows; not a count.
+    compacted: Compacted | None = None
 
     @property
     def counts(self) -> dict[str, int]:
@@ -270,23 +315,196 @@ def compact_heartbeats(connection, *, now: datetime | None = None) -> int:
     return cursor.rowcount + stale
 
 
-def compact_checkpoints(connection, *, now: datetime) -> int:
-    """One row per `NEWEST_ONLY_CHECKPOINTS` key whose newest row is older than `CHECKPOINT_IDLE_AGE`.
+def _prefixed(prefixes: tuple[str, ...]) -> tuple[str, list]:
+    """A predicate true for a key that starts with one of `prefixes`, and its parameters.
+
+    `substr`, not `LIKE`: `LIKE` folds case and reads `_` as a wildcard.
+    """
+    return (" OR ".join("substr(key, 1, ?) = ?" for _ in prefixes),
+            [value for prefix in prefixes for value in (len(prefix), prefix)])
+
+
+def checkpoint_victims(connection, *, now: datetime) -> list[int]:
+    """The checkpoint rows the three rules drop, by id, oldest first.
 
     Newest is the highest id, the row `ship.read` takes, so the revision a
-    `ship.save` compares against is never the one removed. `substr`, not
-    `LIKE`: `LIKE` folds case and reads `_` as a wildcard.
+    `ship.save` compares against is never one of them. The age is the
+    key's newest timestamp, as it always was.
     """
-    match = " OR ".join("substr(key, 1, ?) = ?" for _ in NEWEST_ONLY_CHECKPOINTS)
-    prefixes = [value for prefix in NEWEST_ONLY_CHECKPOINTS for value in (len(prefix), prefix)]
+    newest, newest_args = _prefixed(NEWEST_ONLY_CHECKPOINTS)
+    queue, queue_args = f"key IN ({', '.join('?' for _ in NEWEST_AND_RESOLVED_CHECKPOINTS)})", [
+        *NEWEST_AND_RESOLVED_CHECKPOINTS]
+    lane, lane_args = _prefixed(FIRST_AND_NEWEST_CHECKPOINTS)
+    sql = (
+        "SELECT id FROM (SELECT id, rule, ROW_NUMBER() OVER (PARTITION BY key ORDER BY id DESC) AS rank,"
+        "  MIN(id) OVER (PARTITION BY key) AS first, MAX(timestamp) OVER (PARTITION BY key) AS newest,"
+        "  MAX(CASE WHEN resolved_at IS NOT NULL THEN id END) OVER (PARTITION BY key) AS resolved"
+        f" FROM (SELECT id, key, timestamp, resolved_at, CASE WHEN {newest} THEN 1 WHEN {queue} THEN 2"
+        f"  WHEN {lane} THEN 3 END AS rule FROM state WHERE kind='checkpoint') WHERE rule IS NOT NULL)"
+        " WHERE rank > 1 AND ((rule = 1 AND newest < ?) OR (rule = 2 AND id IS NOT resolved)"
+        "  OR (rule = 3 AND newest < ? AND id != first)) ORDER BY id")
+    return [row[0] for row in connection.execute(sql, (
+        *newest_args, *queue_args, *lane_args,
+        _cutoff(now, CHECKPOINT_IDLE_AGE), _cutoff(now, LANE_IDLE_AGE)))]
+
+
+@dataclass(frozen=True)
+class Compacted:
+    """What the checkpoint step did: rows deleted, rows archived, body bytes freed, and why it stopped."""
+
+    deleted: int = 0
+    archived: int = 0
+    freed: int = 0
+    path: Path | None = None
+    #: Why no row was deleted though some were due; empty when the rules found none or all went.
+    why: str = ""
+    #: The `why` is a fault a person must look at, not the bulk root left unset.
+    attention: bool = False
+
+
+def _chunks(values: list, size: int = CHUNK):
+    for start in range(0, len(values), size):
+        yield values[start:start + size]
+
+
+def _encoded(name: str, raw: bytes | None) -> dict:
+    """`raw` as JSON: `name` for null or UTF-8, `<name>_b64` for any other bytes, as stored."""
+    if raw is None:
+        return {name: None}
+    try:
+        return {name: bytes(raw).decode("utf-8")}
+    except UnicodeDecodeError:
+        return {f"{name}_b64": base64.b64encode(raw).decode("ascii")}
+
+
+def _decoded(record: dict, name: str) -> bytes | None:
+    if f"{name}_b64" in record:
+        return base64.b64decode(record[f"{name}_b64"], validate=True)
+    value = record[name]
+    return None if value is None else value.encode("utf-8")
+
+
+def _digest(key: bytes | None, body: bytes | None) -> str:
+    """A row's key and body bytes, with null told from empty."""
+    digest = hashlib.sha256()
+    for raw in (key, body):
+        digest.update(b"\x00" if raw is None else b"\x01" + len(raw).to_bytes(8, "big") + bytes(raw))
+    return digest.hexdigest()
+
+
+def _sync(fd: int) -> None:
+    """Flush `fd` to the device: `F_FULLFSYNC` where macOS has it, since its `fsync` stops at the drive's cache."""
+    try:
+        import fcntl  # noqa: PLC0415 - not on every platform
+        fcntl.fcntl(fd, fcntl.F_FULLFSYNC)
+    except (ImportError, AttributeError, OSError):
+        os.fsync(fd)
+
+
+def write_archive(connection, ids: list[int], folder: Path, name: str) -> list[tuple]:
+    """Write rows `ids` to `folder/name`, synced, and read it back; each row's (id, timestamp, resolved_at, digest).
+
+    The rows go to a part file first and reach `name` by rename, so a stop
+    leaves no file under the final name with part of the rows in it. Raises
+    `ArchiveFailed` for any write or read-back fault; a failed file is removed.
+    """
+    final, part = folder / name, folder / f".{name}.{os.getpid()}.part"
+    written: list[tuple] = []
+    renamed = False
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        for stale in folder.glob(".*.part"):
+            stale.unlink(missing_ok=True)  # a stopped run's; it deleted nothing
+        if final.exists():
+            raise ArchiveFailed(f"{final} already exists; one prune writes one archive")
+        with open(part, "xb") as raw:
+            with gzip.GzipFile(fileobj=raw, mode="wb", mtime=0) as packed:
+                for chunk in _chunks(ids):
+                    for row in connection.execute(
+                            "SELECT id, kind, CAST(key AS BLOB) AS key, timestamp, resolved_at, typeof(body) AS type,"
+                            f" CAST(body AS BLOB) AS body FROM state WHERE id IN ({','.join('?' * len(chunk))})"
+                            " ORDER BY id", chunk):
+                        record = {"id": row["id"], "kind": row["kind"], "timestamp": row["timestamp"],
+                                  "resolved_at": row["resolved_at"], "type": row["type"],
+                                  **_encoded("key", row["key"]), **_encoded("body", row["body"])}
+                        packed.write(json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n")
+                        written.append((row["id"], row["timestamp"], row["resolved_at"],
+                                        _digest(row["key"], row["body"]), len(row["body"] or b"")))
+            raw.flush()
+            _sync(raw.fileno())
+        os.replace(part, final)
+        renamed = True
+        directory = os.open(folder, os.O_RDONLY)
+        try:
+            _sync(directory)
+        finally:
+            os.close(directory)
+        found = read_archive(final)
+    except ArchiveFailed:
+        raise
+    except (OSError, EOFError, ValueError, KeyError, TypeError) as error:
+        if renamed:
+            final.unlink(missing_ok=True)
+        raise ArchiveFailed(f"the archive {final} was not written: {type(error).__name__}: {error}") from error
+    finally:
+        part.unlink(missing_ok=True)
+    if found != [row[:4] for row in written]:
+        final.unlink(missing_ok=True)
+        raise ArchiveFailed(f"the archive {final} read back {len(found)} row(s) of {len(written)} written, "
+                            "or not the rows written")
+    return written
+
+
+def read_archive(path: Path) -> list[tuple]:
+    """Each line of the archive at `path` as (id, timestamp, resolved_at, digest of its key and body bytes)."""
+    found = []
+    with gzip.open(path, "rb") as packed:
+        for line in packed:
+            record = json.loads(line)
+            found.append((record["id"], record["timestamp"], record["resolved_at"],
+                          _digest(_decoded(record, "key"), _decoded(record, "body"))))
+    return found
+
+
+def compact_checkpoints(connection, *, now: datetime, root: Path | None, name: str | None = None,
+                        unresolved: str = "") -> Compacted:
+    """Archive each `checkpoint_victims` row under `root`, read it back, then delete it.
+
+    `root` is the bulk root; None is no bulk root, and `unresolved` says
+    why when it was set and could not be read. Without one, or with an
+    archive that fails, no row is deleted. The delete is one transaction
+    that reads the victims again: a key written since the archive, or a
+    row resolved since, keeps its rows; the archive holds a copy only.
+    """
+    ids = checkpoint_victims(connection, now=now)
+    if not ids:
+        return Compacted()
+    kept = f"{len(ids)} checkpoint row(s) kept"
+    if root is None:
+        if unresolved:
+            return Compacted(why=f"{kept}: {unresolved}", attention=True)
+        return Compacted(why=f"{kept}: sd.bulk_storage_root is unset, and no row goes unarchived")
+    if not root.is_dir():
+        return Compacted(why=f"{kept}: the bulk root {root} is not a folder", attention=True)
+    folder = root / ARCHIVE_FOLDER
+    name = name or f"{now.astimezone(UTC).date().isoformat()}.jsonl.gz"
+    try:
+        written = write_archive(connection, ids, folder, name)
+    except ArchiveFailed as failure:
+        return Compacted(why=f"{kept}: {failure}", attention=True)
+    deleted = freed = 0
     with transaction(connection):
-        cursor = connection.execute(
-            "DELETE FROM state WHERE id IN ("
-            "  SELECT id FROM (SELECT id, ROW_NUMBER() OVER (PARTITION BY key ORDER BY id DESC) AS rank,"
-            "                         MAX(timestamp) OVER (PARTITION BY key) AS newest"
-            f"                  FROM state WHERE kind='checkpoint' AND ({match}))"
-            "  WHERE rank > 1 AND newest < ?)", (*prefixes, _cutoff(now, CHECKPOINT_IDLE_AGE)))
-    return cursor.rowcount
+        due = set(checkpoint_victims(connection, now=now))
+        archived = {row[0]: row for row in written if row[0] in due}
+        for chunk in _chunks(sorted(archived)):
+            same = [row["id"] for row in connection.execute(
+                f"SELECT id, timestamp, resolved_at FROM state WHERE id IN ({','.join('?' * len(chunk))})", chunk)
+                    if (row["timestamp"], row["resolved_at"]) == archived[row["id"]][1:3]]
+            if same:
+                deleted += connection.execute(
+                    f"DELETE FROM state WHERE id IN ({','.join('?' * len(same))})", same).rowcount
+                freed += sum(archived[ident][4] for ident in same)
+    return Compacted(deleted=deleted, archived=len(written), freed=freed, path=folder / name)
 
 
 def settle_clean_reports(connection, *, now: datetime) -> int:
@@ -372,8 +590,13 @@ def _unreadable(refs: list[str], limit: int) -> str:
     return f"{len(refs)} report(s) in planning have unreadable fields: {named}{more}"
 
 
-def prune(connection, backup: Snapshot, *, now: datetime | None = None) -> Pruned:
-    """Run the retention table against this database, after `backup` passed."""
+def prune(connection, backup: Snapshot, *, now: datetime | None = None, bulk_root: Path | None = None,
+          unresolved: str = "") -> Pruned:
+    """Run the retention table against this database, after `backup` passed.
+
+    `bulk_root` is where the dropped checkpoint rows are archived first, and
+    `unresolved` why a set root could not be read; see `compact_checkpoints`.
+    """
     refuse_hub_only(connection, "the retention prune")
     now = now or datetime.now(UTC)
     if now.tzinfo is None:
@@ -397,13 +620,20 @@ def prune(connection, backup: Snapshot, *, now: datetime | None = None) -> Prune
     stamp = now.astimezone(UTC).isoformat(timespec="seconds")
     exec_outputs = expire_exec_outputs(connection, now=now)
     heartbeats = compact_heartbeats(connection, now=now)
-    checkpoints = compact_checkpoints(connection, now=now)
+    compacted = compact_checkpoints(connection, now=now, root=bulk_root, unresolved=unresolved,
+                                    name=f"{now.astimezone(UTC).date().isoformat()}-{backup.run_id}.jsonl.gz")
+    checkpoints = compacted.deleted
     clean_reports = settle_clean_reports(connection, now=now)
     parked = park_untouched(connection, now=now)
     result = Pruned(exec_outputs=exec_outputs, heartbeats=heartbeats, clean_reports=clean_reports, report=0,
-                    parked=len(parked), checkpoints=checkpoints)
+                    parked=len(parked), checkpoints=checkpoints, compacted=compacted)
     text = (f"sd-db prune after backup {backup.directory.name} ({backup.run_id}): {result}; "
             f"cost rows and exec notes are never pruned.\n")
+    if compacted.path is not None:
+        text += (f"Archived {compacted.archived} checkpoint row(s) to {compacted.path}, read back, before "
+                 f"the delete; {compacted.freed} body byte(s) freed.\n")
+    if compacted.why:
+        text += compacted.why + "\n"
     if parked:
         named = item_refs(connection, parked)
         text += "Parked: " + ", ".join(named[item] for item in parked) + "\n"
@@ -421,6 +651,10 @@ def prune(connection, backup: Snapshot, *, now: datetime | None = None) -> Prune
         refs = [named[item] for item in unreadable]
         text += _unreadable(refs, UNREADABLE_TEXT_IDS) + "\n"
         attention = {"attention": True, "attention_basis": _unreadable(refs, UNREADABLE_BASIS_IDS)}
+    if compacted.attention:
+        # `ingest` refuses a basis past 2000 characters; the text holds the whole reason.
+        basis = "; ".join(filter(None, (attention.get("attention_basis"), compacted.why[:ARCHIVE_BASIS])))
+        attention = {"attention": True, "attention_basis": basis}
     # One backup, one prune, one report: the row's identity is the backup's
     # run id, so a second prune against the same snapshot is refused by
     # `ingest` as a report that already exists with different evidence.
@@ -428,4 +662,4 @@ def prune(connection, backup: Snapshot, *, now: datetime | None = None) -> Prune
                              exit_code=0, text=text, source_path=str(backup.directory), removed=result.counts,
                              **attention)
     return Pruned(exec_outputs=exec_outputs, heartbeats=heartbeats, clean_reports=clean_reports,
-                  report=state["item"]["id"], parked=len(parked), checkpoints=checkpoints)
+                  report=state["item"]["id"], parked=len(parked), checkpoints=checkpoints, compacted=compacted)

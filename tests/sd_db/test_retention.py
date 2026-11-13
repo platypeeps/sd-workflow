@@ -618,7 +618,18 @@ class AnUnreadableReport(PruneCase):
 
 
 class TheCheckpointRows(PruneCase):
-    """One row per newest-only checkpoint key once the key sat a week (sd:3472)."""
+    """One row per newest-only checkpoint key once the key sat a week (sd:3472).
+
+    Each dropped row is archived under the bulk root first (sd:8655).
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.bulk = self.root / "bulk"
+        self.bulk.mkdir()
+
+    def compact(self):
+        return retention.compact_checkpoints(self.db, now=NOW, root=self.bulk).deleted
 
     def rows(self, key, *, days, count=3):
         """`count` receipts under `key`, the newest written `days` ago; returns their ids, oldest first."""
@@ -631,7 +642,7 @@ class TheCheckpointRows(PruneCase):
     def test_an_idle_newest_only_key_keeps_its_newest_row_and_ship_read_still_answers(self):
         idle, live = self.rows("ship:idle", days=8), self.rows("ship:live", days=6)
         receipt = self.rows("sd-gate-receipt:v1:idle", days=30, count=2)
-        removed = retention.compact_checkpoints(self.db, now=NOW)
+        removed = self.compact()
         self.assertEqual(removed, 3)
         self.assertEqual(self.ids("ship:idle"), idle[-1:])
         self.assertEqual(self.ids("ship:live"), live)
@@ -639,13 +650,13 @@ class TheCheckpointRows(PruneCase):
         self.assertEqual(ship.read(self.db, "ship:idle"), (idle[-1], {"protocol": 1, "step": 2}))
         # The revision a waiting `ship.save` holds is the row that stayed.
         self.assertGreater(ship.save(self.db, "ship:idle", idle[-1], {"step": 3}), idle[-1])
-        self.assertEqual(retention.compact_checkpoints(self.db, now=NOW), 0)
+        self.assertEqual(self.compact(), 0)
 
     def test_a_kept_key_and_a_lookalike_keep_every_row(self):
-        lane = self.rows("lane:v1:example/repo:entry", days=30)
+        lane = self.rows("lane:v1:example/repo:entry", days=29)
         operator = self.rows("operator-action", days=30)
         lookalike = self.rows("Ship:upper", days=30) + self.rows("shipX:wildcard", days=30)
-        self.assertEqual(retention.compact_checkpoints(self.db, now=NOW), 0)
+        self.assertEqual(self.compact(), 0)
         self.assertEqual(self.ids("lane:v1:example/repo:entry"), lane)
         self.assertEqual(self.ids("operator-action"), operator)
         self.assertEqual(self.ids("Ship:upper") + self.ids("shipX:wildcard"), lookalike)
@@ -653,7 +664,7 @@ class TheCheckpointRows(PruneCase):
     @hub_only
     def test_the_prune_compacts_them_and_its_report_counts_them(self):
         kept = self.rows("ship:idle", days=10)[-1]
-        pruned = prune(self.db, self.backup(), now=NOW)
+        pruned = prune(self.db, self.backup(), now=NOW, bulk_root=self.bulk)
         self.assertEqual(pruned.counts["checkpoints"], 2)
         self.assertEqual(self.ids("ship:idle"), [kept])
         report = self.db.execute("SELECT * FROM item WHERE id=?", (pruned.report,)).fetchone()
@@ -667,10 +678,10 @@ class TheCheckpointRows(PruneCase):
         snapshot = self.backup()
         with mock.patch.object(retention, "settle_clean_reports", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
-                prune(self.db, snapshot, now=NOW)
+                prune(self.db, snapshot, now=NOW, bulk_root=self.bulk)
         self.assertEqual(self.ids("ship:idle"), [kept])
         self.assertEqual(self.db.execute("SELECT count(*) FROM item WHERE kind='report'").fetchone()[0], 0)
-        pruned = prune(self.db, snapshot, now=NOW)
+        pruned = prune(self.db, snapshot, now=NOW, bulk_root=self.bulk)
         self.assertEqual((pruned.counts["checkpoints"], self.ids("ship:idle")), (0, [kept]))
         self.assertTrue(pruned.report)
 
@@ -720,9 +731,10 @@ class EveryCheckpointWriter(unittest.TestCase):
 
     def test_every_prefix_is_classified_once_and_every_class_entry_has_a_writer(self):
         written = {prefix for prefixes in self.WRITERS.values() for prefix in prefixes}
-        compacted, kept = set(retention.NEWEST_ONLY_CHECKPOINTS), set(retention.KEPT_CHECKPOINTS)
-        self.assertEqual(compacted & kept, set())
-        self.assertEqual(written, compacted | kept)
+        classes = [set(retention.NEWEST_ONLY_CHECKPOINTS), set(retention.NEWEST_AND_RESOLVED_CHECKPOINTS),
+                   set(retention.FIRST_AND_NEWEST_CHECKPOINTS), set(retention.KEPT_CHECKPOINTS)]
+        self.assertEqual(sum(len(each) for each in classes), len(set().union(*classes)))
+        self.assertEqual(written, set().union(*classes))
 
     def test_every_listed_prefix_is_spelled_in_the_tree(self):
         text = "\n".join(text for _, text in self.sources())
