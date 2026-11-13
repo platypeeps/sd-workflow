@@ -112,7 +112,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from . import reporting, sessions
+from . import reporting, runner_journal, sessions
 from .backup import Snapshot, passed
 from .database import refuse_hub_only, transaction
 from .errors import SdDbError
@@ -432,9 +432,8 @@ def _digest(key: bytes | None, body: bytes | None) -> str:
 
 
 def _sync(fd: int) -> None:
-    """Flush `fd` with `fsync`, as the runner journal does; only that opener may import fcntl."""
-    # ponytail: macOS fsync stops at the drive cache; route F_FULLFSYNC through runner_journal if a power loss ever costs an archive.
-    os.fsync(fd)
+    """Flush `fd` to the drive itself through `runner_journal.full_sync`, the one fcntl importer."""
+    runner_journal.full_sync(fd)
 
 
 def write_archive(connection, ids: list[int], folder: Path, name: str) -> list[tuple]:

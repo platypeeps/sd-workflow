@@ -306,6 +306,14 @@ class TheArchive(ArchiveCase):
                 and not re.search(r"USING (INTEGER PRIMARY KEY|COVERING INDEX)", plan)]
         self.assertEqual(wide, [], plans)
 
+    def test_the_archive_and_its_folder_are_fully_synced(self):
+        """macOS `fsync` stops at the drive cache; the archive takes the full sync (sd:8657)."""
+        self.rows("ship:idle", days=10)
+        synced = []
+        with mock.patch.object(retention.runner_journal, "full_sync", side_effect=synced.append):
+            self.assertEqual(self.compact().deleted, 2)
+        self.assertEqual(len(synced), 2)
+
     def test_a_stale_part_file_is_removed_by_the_next_run(self):
         self.folder.mkdir(parents=True)
         stale = self.folder / ".2026-09-11-abc.jsonl.gz.99999.part"

@@ -44,16 +44,22 @@ Archive, then delete, for every victim:
 
 1. Read the victim ids (no lock).
 2. Stream those rows into `<bulk root>/sd-workflow/db-archive/.<name>.<pid>.part`
-   as gzip JSON lines; `fsync` the file, rename it to
-   `<name>`, fsync the folder.
+   as gzip JSON lines; full-sync the file, rename it to
+   `<name>`, full-sync the folder. The full sync is
+   `runner_journal.full_sync`: `F_FULLFSYNC` where the platform has it,
+   since macOS `fsync` stops at the drive cache, else `fsync`.
    `<name>` is `<UTC date>-<backup run id>.jsonl.gz`: one file per prune.
    One file per run, not an append: a torn append would spoil the rows an
    earlier night verified, and the run id ties the file to its prune report.
 3. Read the file back: the ids, timestamps, `resolved_at` and a SHA-256 of
    each row's raw key and body bytes must equal what step 2 wrote.
-4. One `BEGIN IMMEDIATE`: read the victims again, and delete an archived row
-   only if it is still a victim and its timestamp and `resolved_at` are the
-   archived ones. No writer updates a checkpoint body.
+4. One `BEGIN IMMEDIATE`: delete an archived row only if its key's first
+   and newest ids are the ones step 1 read, and its timestamp and
+   `resolved_at` are the archived ones. Step 1's read takes `resolved_at`,
+   which sits after `body`, from every checkpoint row, so it stays out of
+   the lock; this re-check reads the archived rows by id and the key
+   bounds from the `state_by_kind_key` index. No writer updates a
+   checkpoint body.
 
 A row's key and body are read as `CAST(... AS BLOB)` with `typeof(body)`:
 a body that is not valid UTF-8 goes as `body_b64`, every other as `body`.
@@ -131,6 +137,8 @@ All tests are in `tests/sd_db/test_retention_archive.py` unless named with `test
 - A hung bulk root hangs the archive write; the backup job's time bound
   stops it, and nothing is deleted before the read-back passed.
 - The read-back reads the file through the page cache, so it proves the
-  bytes, and the full fsync before it is what proves they are on the disk.
+  bytes, not that they are on the disk. The full sync before it is what
+  puts them there; on a file system that refuses `F_FULLFSYNC` it is a
+  plain `fsync`, which a drive cache can still hold at a power loss.
 - Evidence: the delete is tied to the archive by row id, timestamp and
   `resolved_at`, and to the prune by the backup run id in the file name.
