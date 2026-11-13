@@ -358,6 +358,8 @@ class OperationsCLI(unittest.TestCase):
         kwargs = run.dispatch.call_args.kwargs
         self.assertEqual((kwargs["interactive"], kwargs["why"]),
                          (None, "the interactive builders were not counted: claude agents --json gave no answer in 10 s"))
+        # pack sd:8615: the reason is the claim's, not the bulk root's: an uncounted machine still archives its logs.
+        run.archive.assert_called_once_with(self.connection, Path("/local"), Path("/bulk"))
 
     def test_a_builder_in_a_linked_worktree_counts_against_its_repository(self):
         """pack sd:6112: a cwd in a worktree outside the checkout is its registered repository, by git's common dir."""

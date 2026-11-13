@@ -445,10 +445,11 @@ def tick(sd_db: Any, build: Any, build_run: Any, root: Path | None, why: str, un
             return build_run.lane_entry(tools(build_run).ship, build_run.paths.expand(row["repo"]), items)
 
         interactive, uncounted = interactive_builders(connection, build_run.now(), build_run.paths.key)
-        if interactive is None:  # the beat names the reason, so the hub can say why (pack sd:8606)
-            why = why or f"{build.UNREAD[1]}: {uncounted}"
+        # The beat names the reason, so the hub can say why (pack sd:8606). The claim's own name: `why` also says
+        # whether the bulk root answered, and an uncounted machine still archives its logs (pack sd:8615).
+        refusal = why or (f"{build.UNREAD[1]}: {uncounted}" if interactive is None else "")
         result = build_run.dispatch(connection, owner="build-dispatch", load=load, load_cap=load_cap,
-                                    interactive=interactive, spawn=spawn, lane=lane, why=why)
+                                    interactive=interactive, spawn=spawn, lane=lane, why=refusal)
         result["pushed"] = push_failures(connection)
         if root is not None and not why:  # the bulk root answered the probe
             result["logs_moved"] = build_run.archive(connection, build_run.local_root(), root)

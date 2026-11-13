@@ -455,6 +455,15 @@ class TheRows(Lane, ScreenCase):
         rows = [row for row in self.doc()["lanes"][0]["rows"] if row["state"] == "cancelled"]
         self.assertEqual([(row["item"], row["reason"]) for row in rows], [(1, None)])
 
+    def test_a_handed_back_reason_is_its_first_line_as_a_blocked_rows_is(self):
+        """pack sd:8615: a hand-back's reason carries the failure it ended, a log tail included; the row took it
+        whole, where a blocked row takes its first line."""
+        why = "handed back to its builder by a conflict rebuild (build run r9); it was failed: conflict"
+        self.list([{**e, "handed_back": {"run": "r9", "by": "build"}, "reason": f"\n{why}\nCONFLICT (content): a.py\n"}
+                   if e["item"] == 1 else e for e in self.entries()])
+        rows = [row for row in self.doc()["lanes"][0]["rows"] if row["state"] == "cancelled"]
+        self.assertEqual([(row["item"], row["reason"]) for row in rows], [(1, why)])
+
     def test_a_cancelled_entry_that_is_not_its_items_newest_or_is_old_has_no_row(self):
         later = {"item": 1, "title": "Cancelled", "status": "pending", "expected_head": "1" * 40}
         old = {"item": 16, "title": "Cancelled last week", "status": "cancelled", "expected_head": "6" * 40,

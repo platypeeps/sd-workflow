@@ -456,8 +456,10 @@ def rows(entries: list[dict], *, path: str, lane: Path, now: float, done: frozen
             finished = _when(entry.get("finished_at"))
             if finished and now - finished <= BLOCKED_DAYS * 86400:
                 head = str(entry.get("expected_head") or "")
-                # A hand-back to a builder names why, and `lane retry` refuses it (pack sd:8584, sd:8601).
-                why = (str(entry.get("reason") or "").strip() or "handed back to its builder") if entry.get("handed_back") else None
+                # A hand-back to a builder names why, and `lane retry` refuses it (pack sd:8584, sd:8601); its first
+                # line, as a blocked row's (pack sd:8615).
+                why = ((str(entry.get("reason") or "").strip().splitlines() or ["handed back to its builder"])[0]
+                       if entry.get("handed_back") else None)
                 cancelled.append({**base, "state": "cancelled", "finished": entry.get("finished_at"),
                                   "head": head[:12], "expected_head": head, "reason": why})
         elif status == "merged":
