@@ -339,21 +339,46 @@ def checkpoint_victims(connection, *, now: datetime) -> list[int]:
     `ship.save` compares against is never one of them. The age is the
     key's newest timestamp, as it always was.
     """
+    return [row[0] for row in _victims(connection, now=now)]
+
+
+def _victims(connection, *, now: datetime) -> list[tuple[int, int, int]]:
+    """Each `checkpoint_victims` row as (id, its key's first id, its key's newest id), from one read.
+
+    This read takes `resolved_at` from every checkpoint row, and that
+    column sits after `body`, so it walks each body's overflow pages: run
+    it outside the write lock. `_still_due` re-checks the bounds under it.
+    """
     newest, newest_args = _prefixed(NEWEST_ONLY_CHECKPOINTS)
     queue, queue_args = f"key IN ({', '.join('?' for _ in NEWEST_AND_RESOLVED_CHECKPOINTS)})", [
         *NEWEST_AND_RESOLVED_CHECKPOINTS]
     lane, lane_args = _prefixed(FIRST_AND_NEWEST_CHECKPOINTS)
     sql = (
-        "SELECT id FROM (SELECT id, rule, ROW_NUMBER() OVER (PARTITION BY key ORDER BY id DESC) AS rank,"
-        "  MIN(id) OVER (PARTITION BY key) AS first, MAX(timestamp) OVER (PARTITION BY key) AS newest,"
+        "SELECT id, first, last FROM (SELECT id, rule, ROW_NUMBER() OVER (PARTITION BY key ORDER BY id DESC) AS rank,"
+        "  MIN(id) OVER (PARTITION BY key) AS first, MAX(id) OVER (PARTITION BY key) AS last,"
+        "  MAX(timestamp) OVER (PARTITION BY key) AS newest,"
         "  MAX(CASE WHEN resolved_at IS NOT NULL THEN id END) OVER (PARTITION BY key) AS resolved"
         f" FROM (SELECT id, key, timestamp, resolved_at, CASE WHEN {newest} THEN 1 WHEN {queue} THEN 2"
         f"  WHEN {lane} THEN 3 END AS rule FROM state WHERE kind='checkpoint') WHERE rule IS NOT NULL)"
         " WHERE rank > 1 AND ((rule = 1 AND newest < ?) OR (rule = 2 AND id IS NOT resolved)"
         "  OR (rule = 3 AND newest < ? AND id != first)) ORDER BY id")
-    return [row[0] for row in connection.execute(sql, (
+    return [(row[0], row[1], row[2]) for row in connection.execute(sql, (
         *newest_args, *queue_args, *lane_args,
         _cutoff(now, CHECKPOINT_IDLE_AGE), _cutoff(now, LANE_IDLE_AGE)))]
+
+
+def _still_due(connection, chunk: list[int]):
+    """Rows `chunk` as (id, timestamp, resolved_at, key's first id, key's newest id), read under the lock.
+
+    Each row is a rowid lookup and each bound an index-only read of
+    `state_by_kind_key`, so no row outside `chunk` is read from the table.
+    `resolved_at` is read for the chunk's rows only, whose overflow pages
+    the delete frees anyway.
+    """
+    bound = "(SELECT {}(id) FROM state AS other WHERE other.kind = 'checkpoint' AND other.key = row.key)"
+    return connection.execute(
+        f"SELECT id, timestamp, resolved_at, {bound.format('MIN')} AS first, {bound.format('MAX')} AS last"
+        f" FROM state AS row WHERE id IN ({','.join('?' * len(chunk))})", chunk)
 
 
 @dataclass(frozen=True)
@@ -477,11 +502,15 @@ def compact_checkpoints(connection, *, now: datetime, root: Path | None, name: s
 
     `root` is the bulk root; None is no bulk root, and `unresolved` says
     why when it was set and could not be read. Without one, or with an
-    archive that fails, no row is deleted. The delete is one transaction
-    that reads the victims again: a key written since the archive, or a
-    row resolved since, keeps its rows; the archive holds a copy only.
+    archive that fails, no row is deleted. The victims are read before
+    the write lock, since that read walks every checkpoint body. The
+    delete is one transaction that re-checks each victim by `_still_due`:
+    a key written or cut since that read, or a row resolved since its
+    archive, keeps its rows; the archive holds a copy only.
     """
-    ids = checkpoint_victims(connection, now=now)
+    victims = _victims(connection, now=now)
+    bounds = {ident: (first, last) for ident, first, last in victims}
+    ids = [ident for ident, _, _ in victims]
     if not ids:
         return Compacted()
     kept = f"{len(ids)} checkpoint row(s) kept"
@@ -499,12 +528,11 @@ def compact_checkpoints(connection, *, now: datetime, root: Path | None, name: s
         return Compacted(why=f"{kept}: {failure}", attention=True)
     deleted = freed = 0
     with transaction(connection):
-        due = set(checkpoint_victims(connection, now=now))
-        archived = {row[0]: row for row in written if row[0] in due}
+        archived = {row[0]: row for row in written if row[0] in bounds}
         for chunk in _chunks(sorted(archived)):
-            same = [row["id"] for row in connection.execute(
-                f"SELECT id, timestamp, resolved_at FROM state WHERE id IN ({','.join('?' * len(chunk))})", chunk)
-                    if (row["timestamp"], row["resolved_at"]) == archived[row["id"]][1:3]]
+            same = [row["id"] for row in _still_due(connection, chunk)
+                    if (row["timestamp"], row["resolved_at"]) == archived[row["id"]][1:3]
+                    and (row["first"], row["last"]) == bounds[row["id"]]]
             if same:
                 deleted += connection.execute(
                     f"DELETE FROM state WHERE id IN ({','.join('?' * len(same))})", same).rowcount

@@ -177,7 +177,7 @@ class TheArchive(ArchiveCase):
     @hub_only
     def test_a_failed_victim_read_removes_nothing(self):
         ids = self.rows("ship:idle", days=10)
-        with mock.patch.object(retention, "checkpoint_victims", side_effect=sqlite3.OperationalError("disk I/O error")):
+        with mock.patch.object(retention, "_victims", side_effect=sqlite3.OperationalError("disk I/O error")):
             with self.assertRaisesRegex(sqlite3.OperationalError, "disk I/O error"):
                 retention.prune(self.db, self.backup(), now=NOW, bulk_root=self.bulk)
         self.assertEqual((self.ids("ship:idle"), self.files()), (ids, []))
@@ -263,6 +263,26 @@ class TheArchive(ArchiveCase):
             compacted = self.compact()
         self.assertEqual((compacted.archived, compacted.deleted), (2, 1))
         self.assertEqual(self.ids("ship:idle"), [ids[0], ids[2]])
+
+    def test_under_the_write_lock_only_the_archived_rows_are_read_from_the_table(self):
+        """`resolved_at` sits after `body`, so the victim read walks every body: it runs before the lock (sd:8657)."""
+        self.rows("ship:live", days=0)
+        ids = self.rows("ship:idle", days=10)
+        inside = []
+        self.db.set_trace_callback(lambda sql: inside.append(sql) if self.db.in_transaction else None)
+        try:
+            compacted = self.compact()
+        finally:
+            self.db.set_trace_callback(None)
+        self.assertEqual((compacted.deleted, self.ids("ship:idle")), (2, ids[-1:]))
+        reads = [sql for sql in inside if sql.lstrip().upper().startswith(("SELECT", "DELETE"))]
+        self.assertTrue(reads)
+        path = next(row[2] for row in self.db.execute("PRAGMA database_list") if row[1] == "main")
+        with contextlib.closing(sqlite3.connect(f"file:{path}?mode=ro", uri=True)) as plain:
+            plans = [row[3] for sql in reads for row in plain.execute("EXPLAIN QUERY PLAN " + sql)]
+        wide = [plan for plan in plans if re.match(r"(SCAN|SEARCH) (?!\()", plan)
+                and not re.search(r"USING (INTEGER PRIMARY KEY|COVERING INDEX)", plan)]
+        self.assertEqual(wide, [], plans)
 
     def test_a_stale_part_file_is_removed_by_the_next_run(self):
         self.folder.mkdir(parents=True)
