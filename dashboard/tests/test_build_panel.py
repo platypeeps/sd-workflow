@@ -613,6 +613,50 @@ class LaneFix(Fixture):
             "SELECT COUNT(*) FROM note WHERE body LIKE 'Send to builder:%'").fetchone()[0]), (0, 0))
 
 
+class BlockedBuildRows(Fixture):
+    """system sd:8651: Queue lists each blocked build assignment `sd today` lists, with its reason, Cancel and Retry.
+
+    The Builds panel reads runs, so a member with no run of its own, or an assignment that never ran, was no row."""
+
+    claimed = BuildsPanel.claimed
+    blocked = BuildsPanel.blocked
+
+    def runner(self):
+        status, _, body = self.request("/api/queue/runner", headers={"Cookie": self.cookie})
+        self.assertEqual(status, 200, body)
+        return {row["item"]: row for row in json.loads(body)["blocked"]}
+
+    def test_each_blocked_build_assignment_is_a_row_with_its_reason_cancel_and_retry(self):
+        from sd_db import today
+
+        items = [self.ready(), self.ready()]
+        run = self.blocked(items)
+        lone = self.ready()
+        build.queue(self.connection, [lone], who="fixture")
+        with self.connection:  # what the claim writes when a satellite's dispatcher does not beat
+            self.connection.execute("UPDATE assignment SET status = 'blocked', result = ? WHERE item = ? AND scope = 'build'",
+                                    (f"item {lone}'s lane runs on host-b, and no beat is under 600 s old; not built", lone))
+        rows = self.runner()
+        listed = sorted(row["id"] for row in today.queues(self.connection)
+                        if row["queue"] == "build" and row["status"] == "blocked")
+        self.assertEqual(sorted(rows), listed)
+        self.assertEqual(sorted(rows), sorted(items + [lone]))
+        lead, member, alone = rows[items[0]], rows[items[1]], rows[lone]
+        for row in (lead, member):
+            self.assertEqual((row["retry"]["allowed"], row["retry"]["assignment"]), (True, run["assignment"]), row)
+            self.assertTrue(row["why"], row)
+        self.assertTrue(alone["why"].startswith(f"item {lone}'s lane runs on host-b"), alone)
+        self.assertEqual((alone["retry"]["allowed"], alone["retry"]["reason"]),
+                         (False, "it never ran; Cancel clears it, or build the item again from Tasks"))
+        self.assertTrue(all(row["cancel"]["allowed"] for row in rows.values()), rows)
+        status, _, body = self.post(f"/api/assignments/{alone['id']}/cancel", {"revision": alone["cancel"]["revision"]})
+        self.assertEqual(status, 200, body)
+        status, _, body = self.post("/api/queue/builds/retry", {"assignment": lead["retry"]["assignment"],
+                                                               "revision": lead["retry"]["revision"]})
+        self.assertEqual(status, 200, body)
+        self.assertEqual(self.runner(), {})
+
+
 class AutoPickup(Fixture):
     """pack sd:6097: the Builds panel shows auto-pickup and its On and Off write it, bound to the value read."""
 

@@ -90,8 +90,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sd_db import reads
+from sd_db import operations, reads, today
 from sd_db.errors import SdDbError
+from sd_db.runner import queue_state as runner_state
 
 from . import pack_module
 
@@ -487,9 +488,31 @@ def _gates() -> dict:
 def runner(connection) -> dict:
     """Overview's runner assignments (pack sd:7115, from Management's Ship lane; pack sd:7217 retired its own view): the
     queued and running assignments. The items at `ready_to_send` are Writing's to show; the idle author runner's finished
-    assignments and merge history are not listed (sd:5472)."""
+    assignments and merge history are not listed (sd:5472).
+
+    `blocked` is each blocked build assignment, the rows `sd today`'s Queues lists (`today.builds`, system sd:8651):
+    the Builds panel reads runs, so a member with no run of its own, or one never built, was no row on Queue."""
     keys = ("id", "item", "title", "repo", "role", "provider", "status", "lane", "queued_at", "started", "ended")
-    return {"live": [{key: row[key] for key in keys} for row in reads.assignment_ledger(connection, live=True)]}
+    return {"live": [{key: row[key] for key in keys} for row in reads.assignment_ledger(connection, live=True)],
+            "blocked": [_blocked(connection, row) for row in today.builds(connection) if row["status"] == "blocked"]}
+
+
+def _blocked(connection, row: dict) -> dict:
+    """One blocked build assignment: its reason, its Cancel (`operations.assignment_state`, the route's own check) and
+    its Retry, which is its bundle lead's (`builds._retry_state`, the check `builds.retry` makes); off says why."""
+    from .builds import _retry_state
+
+    current = operations.assignment_state(connection, row["assignment"])
+    cancel = {"assignment": row["assignment"], "revision": current["revision"], **current["capabilities"]["cancel"]}
+    lead = runner_state(connection, row["lead"])
+    if lead["run"] is None:
+        retry = {"assignment": row["lead"], "revision": lead["revision"], "allowed": False,
+                 "reason": "it never ran; Cancel clears it, or build the item again from Tasks", "bundle": lead["status"]}
+    else:
+        retry = _retry_state(connection, lead["run"])
+    return {"id": row["assignment"], "item": row["item"], "title": row["title"], "repo": row["repo"],
+            "why": row["why"] or "no reason recorded", "since": row["since"], "lead": row["lead"], "cancel": cancel,
+            "retry": retry}
 
 
 #: The lane states that keep an item's row in the lane: its pull request waits there, not on review (pack sd:7859).
