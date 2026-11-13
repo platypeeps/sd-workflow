@@ -1197,7 +1197,7 @@ def _rebuild(connection, read: dict, reason: str, stamp: str, base: str, entry: 
     finding = (f"{REBUILD}{base} conflicted. Merge {base} into {read['branch']}, resolve each conflict, run the tests the "
                f"conflict touched, and commit the merge; the lane said: {reason}"[:2000])
     try:
-        key, found = _lane_entry(connection, read["branch"])
+        key, found = _lane_entry(connection, read["branch"], entry)
         if entry is not None and found.get("id") != entry:
             raise BuildRefused(f"branch {read['branch']}'s newest lane entry is {found.get('id')}, not {entry}")
     except BuildRefused as refusal:
@@ -1294,15 +1294,29 @@ def _hand_back(connection, key: str, entry: dict, run: str, *, who: str, by: str
                        (key, stamp, json.dumps(entry, sort_keys=True)))
 
 
-def _lane_entry(connection, branch: str) -> tuple[str, dict]:
+def _lane_entry(connection, branch: str, ident: str | None = None) -> tuple[str, dict]:
     """The newest lane entry on `branch`, by the order the hub took them (`sd_lane.enqueue_order`), and its key, when
     it ended `failed` or `skipped`. Any other end is `BuildRefused`: pending or running is the lane's again (a Retry),
-    and none read or one unreadable is unknown, never a failure to hand back (round 1 of pack sd:8584)."""
+    and none read or one unreadable is unknown, never a failure to hand back (round 1 of pack sd:8584).
+
+    With `ident`, the entry the watch read, only its repository's lane is read: its key names that repository, and an
+    unreadable row in another repository's lane is not this branch's (pack sd:8615)."""
+    ranges = [reads.LANE_KEYS]
+    if ident is not None:
+        suffix = f":{ident}"
+        keys = [row[0] for row in connection.execute(
+            "SELECT DISTINCT key FROM state WHERE kind = 'checkpoint' AND key >= ? AND key < ? AND substr(key, ?) = ?",
+            (*reads.LANE_KEYS, -len(suffix), suffix))]
+        if not keys:
+            raise BuildRefused(f"lane entry {ident} is not stored; the lane's state is unknown, so Fix writes nothing")
+        # `lane:v1:<owner/name>:`; `;` is the character after `:`, so the two bound one repository's keys.
+        ranges = [(prefix, prefix[:-1] + ";") for prefix in sorted({key[:-len(ident)] for key in keys})]
+    rows = [row for low, high in ranges for row in connection.execute(
+        "SELECT state.key, state.body, keys.first FROM state JOIN (SELECT key, MIN(id) AS first, MAX(id) AS last "
+        "FROM state WHERE kind = 'checkpoint' AND key >= ? AND key < ? GROUP BY key) AS keys ON state.id = keys.last",
+        (low, high))]
     found = []
-    for row in connection.execute(
-            "SELECT state.key, state.body, keys.first FROM state JOIN (SELECT key, MIN(id) AS first, MAX(id) AS last "
-            "FROM state WHERE kind = 'checkpoint' AND key >= ? AND key < ? GROUP BY key) AS keys ON state.id = keys.last",
-            reads.LANE_KEYS):
+    for row in rows:
         try:
             entry = json.loads(row["body"])
         except (TypeError, ValueError):
