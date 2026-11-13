@@ -64,6 +64,8 @@ its snapshot restored and compared, and never before. What the table says:
                      hourly job keeps a rolling week with `--keep-days 7`
                      and skips this prune with `--no-row-prune`, so it
                      files no report item.
+    free pages       a VACUUM once `VACUUM_FREE_BYTES` are free, by the
+                     backup job after this prune, never inside it.
     kept worktrees   never.  A kept clone may hold work; this prune does not
                      touch it.
     untouched P4     thirty days, then parked (sd:3007).  An open priority-4
@@ -160,6 +162,12 @@ ARCHIVE_FOLDER = Path("sd-workflow") / "db-archive"
 
 #: How many ids one statement names: far under SQLite's variable limit.
 CHUNK = 500
+
+#: The free pages, in bytes, that make `vacuum` run.
+VACUUM_FREE_BYTES = 50 * 1024 * 1024
+
+#: How long, in milliseconds, `vacuum` waits for another writer's transaction.
+VACUUM_BUSY_MS = 60_000
 
 #: How long a clean run report waits in `planning` for an acknowledgement
 #: before retention settles it.
@@ -505,6 +513,74 @@ def compact_checkpoints(connection, *, now: datetime, root: Path | None, name: s
                     f"DELETE FROM state WHERE id IN ({','.join('?' * len(same))})", same).rowcount
                 freed += sum(archived[ident][4] for ident in same)
     return Compacted(deleted=deleted, archived=len(written), freed=freed, path=folder / name)
+
+
+@dataclass(frozen=True)
+class Vacuumed:
+    """The database's logical size, `page_count * page_size`, before and after, and its WAL file after."""
+
+    before: int
+    after: int
+    ran: bool
+    #: The WAL checkpoint finished: False while a reader still held an older snapshot.
+    checkpointed: bool = True
+    wal: int = 0
+    why: str = ""
+
+    def __str__(self) -> str:
+        done = f"vacuumed {self.before} bytes to {self.after} bytes" if self.ran else f"vacuum not run: {self.why}"
+        if not self.checkpointed:
+            done += f"; a reader held the WAL at {self.wal} bytes, so the next night checkpoints it"
+        return done
+
+
+def _size(connection) -> tuple[int, int]:
+    """The database's logical bytes and its free bytes."""
+    page = connection.execute("PRAGMA page_size").fetchone()[0]
+    return (connection.execute("PRAGMA page_count").fetchone()[0] * page,
+            connection.execute("PRAGMA freelist_count").fetchone()[0] * page)
+
+
+def _wal(connection) -> int:
+    """The bytes of the database's WAL file; 0 when it has none."""
+    path = next((row[2] for row in connection.execute("PRAGMA database_list") if row[1] == "main"), "")
+    try:
+        return os.stat(f"{path}-wal").st_size if path else 0
+    except FileNotFoundError:
+        return 0
+
+
+def vacuum(connection, *, threshold: int = VACUUM_FREE_BYTES, busy_ms: int = VACUUM_BUSY_MS) -> Vacuumed:
+    """VACUUM once `threshold` bytes of pages are free, waiting `busy_ms` for another writer's transaction.
+
+    It reads the free pages, not what tonight's prune freed, so a VACUUM a
+    held lock stopped runs the next night. VACUUM is all or nothing: a lock
+    it never got changed nothing, and `sqlite3.OperationalError` says so to
+    the caller. The WAL is then checkpointed and truncated, with the
+    connection's own `busy_timeout`, since a waiting checkpoint holds off
+    every writer; a reader on an older snapshot leaves it, and a WAL file
+    still past `threshold` the next night is checkpointed then.
+    """
+    refuse_hub_only(connection, "the vacuum")
+    if connection.in_transaction:
+        raise RetentionRefused("VACUUM cannot run inside a transaction")
+    before, free = _size(connection)
+    ran, wal = free >= threshold, _wal(connection)
+    why = "" if ran else f"{free} free bytes, under the {threshold} that start one"
+    if not ran and wal < threshold:
+        return Vacuumed(before=before, after=before, ran=False, wal=wal, why=why)
+    if ran:
+        held = connection.execute("PRAGMA busy_timeout").fetchone()[0]
+        connection.execute(f"PRAGMA busy_timeout = {int(busy_ms)}")
+        try:
+            connection.execute("VACUUM")
+        finally:
+            connection.execute(f"PRAGMA busy_timeout = {int(held)}")
+    else:
+        why += f"; the WAL held {wal} bytes, so it was checkpointed"
+    busy = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+    return Vacuumed(before=before, after=_size(connection)[0], ran=ran, checkpointed=not busy, wal=_wal(connection),
+                    why=why)
 
 
 def settle_clean_reports(connection, *, now: datetime) -> int:

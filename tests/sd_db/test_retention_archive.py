@@ -1,7 +1,8 @@
-"""The checkpoint archive (sd:8655): each dropped row goes to the bulk root first.
+"""The checkpoint archive (sd:8655): each dropped row goes to the bulk root first, and the file shrinks.
 
 Every rule's kept rows, every step of archive-then-delete stopped or failed,
-and the rows at the extremes the archive must carry byte for byte. Ages are seeded by backdating
+the rows at the extremes the archive must carry byte for byte, and the
+VACUUM the backup job runs after the prune. Ages are seeded by backdating
 the rows and handing the prune its `now`; nothing sleeps.
 """
 
@@ -10,14 +11,17 @@ import gzip
 import json
 import os
 import random
+import re
 import shutil
 import sqlite3
 import subprocess
 import sys
 from datetime import timedelta
+from pathlib import Path
 from unittest import mock
 
 from sd_db import contribution_sync, removal, retention
+from sd_db.database import connect
 from sd_db.jobs import backup as backup_job
 from sd_db.testing import Stubs
 from sd_db.testing.wire import hub_only
@@ -315,6 +319,77 @@ class TheArchiveAtTheExtremes(ArchiveCase):
         self.assertEqual(retention.checkpoint_victims(self.db, now=NOW), [])
 
 
+@hub_only
+class TheVacuum(ArchiveCase):
+    """VACUUM once 50 MiB of pages are free; a held lock skips it and the next night runs it."""
+
+    def free(self, megabytes=3):
+        """Write then delete `megabytes` of rows, leaving their pages free."""
+        for _ in range(megabytes):
+            record_state(self.db, "checkpoint", key="ship:scratch", body="y" * (1024 * 1024))
+        self.db.execute("DELETE FROM state WHERE key='ship:scratch'")
+        return self.db.execute("PRAGMA freelist_count").fetchone()[0] * self.db.execute(
+            "PRAGMA page_size").fetchone()[0]
+
+    def test_under_the_threshold_it_does_not_run(self):
+        free = self.free(1)
+        vacuumed = retention.vacuum(self.db)
+        self.assertFalse(vacuumed.ran)
+        self.assertEqual(vacuumed.before, vacuumed.after)
+        self.assertIn(f"{free} free bytes, under the {retention.VACUUM_FREE_BYTES}", str(vacuumed))
+        self.assertEqual(retention.VACUUM_FREE_BYTES, 50 * 1024 * 1024)
+
+    def test_over_it_the_database_shrinks_and_both_sizes_are_reported(self):
+        free = self.free(3)
+        vacuumed = retention.vacuum(self.db, threshold=free)
+        self.assertTrue(vacuumed.ran and vacuumed.checkpointed)
+        self.assertLessEqual(vacuumed.after, vacuumed.before - free)
+        self.assertEqual(self.db.execute("PRAGMA freelist_count").fetchone()[0], 0)
+        self.assertEqual(Path(self.state / "sd.db").stat().st_size, vacuumed.after)
+        self.assertEqual(str(vacuumed), f"vacuumed {vacuumed.before} bytes to {vacuumed.after} bytes")
+        self.assertEqual(self.db.execute("PRAGMA busy_timeout").fetchone()[0], 5000)
+
+    def test_a_writer_holding_the_lock_skips_it_and_the_next_night_runs_it(self):
+        free = self.free(3)
+        other = connect(home=self.home)
+        self.addCleanup(other.close)
+        other.execute("BEGIN IMMEDIATE")
+        other.execute("INSERT INTO state (kind, key, timestamp, body) VALUES ('checkpoint', 'ship:other', ?, '{}')",
+                      (ago(days=0),))
+        with self.assertRaisesRegex(sqlite3.OperationalError, "locked|busy"):
+            retention.vacuum(self.db, threshold=free, busy_ms=50)
+        other.execute("COMMIT")
+        self.assertEqual(self.db.execute("PRAGMA freelist_count").fetchone()[0] * self.db.execute(
+            "PRAGMA page_size").fetchone()[0], free)
+        self.assertTrue(retention.vacuum(self.db, threshold=free).ran)
+        self.assertEqual(self.ids("ship:other"), [self.ids("ship:other")[0]])
+
+    def test_a_reader_holding_a_snapshot_leaves_the_checkpoint_to_the_next_night(self):
+        free = self.free(3)
+        reader = connect(home=self.home, write=False)
+        self.addCleanup(reader.close)
+        reader.execute("BEGIN")
+        reader.execute("SELECT count(*) FROM state").fetchone()
+        self.db.execute("PRAGMA busy_timeout = 100")  # the checkpoint waits the connection's own timeout
+        vacuumed = retention.vacuum(self.db, threshold=free)
+        self.assertTrue(vacuumed.ran)
+        self.assertFalse(vacuumed.checkpointed)
+        self.assertGreaterEqual(vacuumed.wal, free)
+        self.assertIn(f"a reader held the WAL at {vacuumed.wal} bytes", str(vacuumed))
+        reader.execute("ROLLBACK")
+        night = retention.vacuum(self.db, threshold=free)
+        self.assertFalse(night.ran)
+        self.assertTrue(night.checkpointed)
+        self.assertEqual((night.wal, Path(f"{self.state / 'sd.db'}-wal").stat().st_size), (0, 0))
+        self.assertIn("so it was checkpointed", str(night))
+
+    def test_inside_a_transaction_it_refuses(self):
+        self.db.execute("BEGIN IMMEDIATE")
+        self.addCleanup(lambda: self.db.in_transaction and self.db.execute("ROLLBACK"))
+        with self.assertRaisesRegex(retention.RetentionRefused, "inside a transaction"):
+            retention.vacuum(self.db, threshold=0)
+
+
 class TheBulkRoot(ArchiveCase):
     """The job reads `sd.bulk_storage_root` through `sd_lib`, as the build log archive does."""
 
@@ -339,7 +414,7 @@ class TheBulkRoot(ArchiveCase):
                     self.assertEqual(found, expected)
 
     @hub_only
-    def test_the_job_archives_to_the_bulk_root(self):
+    def test_the_job_archives_to_the_bulk_root_and_vacuums(self):
         """Older state: whole lane and queue keys, as every store before this change holds them."""
         lane = self.rows("lane:v1:example/repo:old", days=45, count=3)
         queue = self.rows(QUEUE, days=0, count=4, resolved=(0, 1, 2, 3))
@@ -357,6 +432,10 @@ class TheBulkRoot(ArchiveCase):
         self.assertEqual(completed.returncode, 0, output)
         self.assertIn("4 superseded checkpoint row(s) removed", output)
         self.assertIn(f"4 checkpoint row(s) archived to {self.folder}", output)
+        vacuumed = re.search(r"vacuumed (\d+) bytes to (\d+) bytes", output)
+        self.assertIsNotNone(vacuumed, output)
+        before, after = map(int, vacuumed.groups())
+        self.assertLess(after, before - 50 * 1024 * 1024)
         self.assertEqual(self.ids("lane:v1:example/repo:old"), [lane[0], lane[-1]])
         self.assertEqual(self.ids(QUEUE), queue[-1:])
         (archive,) = self.folder.iterdir()
