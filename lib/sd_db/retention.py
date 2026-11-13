@@ -107,6 +107,7 @@ import json
 import os
 import re
 import sqlite3
+import zlib
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -477,7 +478,7 @@ def write_archive(connection, ids: list[int], folder: Path, name: str) -> list[t
         found = read_archive(final)
     except ArchiveFailed:
         raise
-    except (OSError, EOFError, ValueError, KeyError, TypeError) as error:
+    except (OSError, EOFError, ValueError, KeyError, TypeError, AttributeError, zlib.error) as error:
         if renamed:
             final.unlink(missing_ok=True)
         raise ArchiveFailed(f"the archive {final} was not written: {type(error).__name__}: {error}") from error

@@ -192,6 +192,28 @@ class TheArchive(ArchiveCase):
         self.assertIn("read back 1 row(s) of 2 written", compacted.why)
         self.assertEqual(self.files(), [])
 
+    def test_a_corrupt_archive_deletes_nothing_and_is_not_kept(self):
+        """A torn deflate stream or a line of the wrong shape is `ArchiveFailed` too (sd:8657)."""
+        ids = self.rows("ship:idle", days=10)
+        real = retention.read_archive
+
+        def torn(path):
+            packed = bytearray(path.read_bytes())
+            packed[12:-8] = bytes(len(packed) - 20)
+            path.write_bytes(bytes(packed))
+            return real(path)
+
+        def misshapen(path):
+            path.write_bytes(gzip.compress(json.dumps(
+                {"id": ids[0], "timestamp": "t", "resolved_at": None, "key": 5, "body": None}).encode() + b"\n"))
+            return real(path)
+        for name, corrupt in (("torn", torn), ("misshapen", misshapen)):
+            with self.subTest(name), mock.patch.object(retention, "read_archive", side_effect=corrupt):
+                compacted = self.compact(name=f"{name}.jsonl.gz")
+                self.assertEqual((compacted.deleted, compacted.attention), (0, True))
+                self.assertIn("was not written", compacted.why)
+                self.assertEqual((self.ids("ship:idle"), self.files()), (ids, []))
+
     def test_no_bulk_root_deletes_no_checkpoint_row_and_says_so(self):
         ids = self.rows("ship:idle", days=10)
         pruned = retention.prune(self.db, self.backup(), now=NOW)
