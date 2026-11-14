@@ -65,6 +65,8 @@ HELPER = ("sd_lib", "import_sd_db")
 #: Each reason names the caller that ran it. Kept short on purpose: the
 #: ordinary fix for a new entry is a helper call, not a line here.
 REACHED_WITH_THE_LIBRARY = {
+    # `rows` is `_rows()`, that is `sd_handoff_rows`, so `rows.library()` ran first (sd:8721).
+    "sd_shadow.py::shadow_sync": "shadow_sync() calls rows.library() (sd_handoff_rows) before the import",
     # Only called from `run`, after `sd_handoff_rows.library()`.
     "sd_operations.py::service_result": "run() calls sd_handoff_rows.library() first",
     # Only called from `cmd_user`, once `open_library` returned a connection.

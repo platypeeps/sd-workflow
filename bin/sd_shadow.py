@@ -243,7 +243,10 @@ def shadow_sync(args) -> int:
     strict = bool(getattr(args, "strict", False))
     code = 0
     refused = refusals()
-    connection = rows.connect(sd_db, write=True)
+    from sd_db.database import Patient  # noqa: PLC0415 - `library()` made it importable
+
+    # sd:8721: a write lock held past one busy_timeout is waited out, as `sd-ship`'s is.
+    connection = Patient(rows.connect(sd_db, write=True))
     try:
         for name in names:
             if recovery and name != "github":
