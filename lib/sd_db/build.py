@@ -552,13 +552,16 @@ def queue_again(connection, items: list[int], *, who: str) -> list[dict]:
     with transaction(connection):
         leads, fresh = [], []
         for item in items:
-            row = connection.execute("SELECT id, parent FROM assignment WHERE item = ? AND scope = ? "
+            row = connection.execute("SELECT id, parent, status FROM assignment WHERE item = ? AND scope = ? "
                                      "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
             lead = row and (row["parent"] or row["id"])
             state = queue_state(connection, lead) if lead else None
             # A build cancelled before any claim, or one the claim refused (`_refuse`), never ran: no worktree to
-            # resume, so it is a fresh press, as the dashboard's "it never ran" hint says.
-            if state and state["status"] in AGAIN and state["run"] is not None:
+            # resume, so it is a fresh press, as the dashboard's "it never ran" hint says. A bundle may end mixed
+            # (`enqueued` marks a delivered member done): `retry` takes only members in the lead's status, so the
+            # item's own assignment must be in it, or Retry would requeue the lead's items and not this one.
+            if (state and state["status"] in AGAIN and state["run"] is not None
+                    and row["status"] == state["status"]):
                 leads += [] if lead in leads else [lead]
             else:
                 fresh.append(item)

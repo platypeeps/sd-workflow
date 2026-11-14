@@ -704,6 +704,21 @@ class Reap(Case):
                                                         "has queued assignment"):
             build.queue_again(self.db, [self.items[0]], who="operator")
 
+    def test_build_again_on_a_done_member_of_a_blocked_bundle_queues_it_fresh(self):
+        """pack sd:8785 review: a bundle ends mixed (`enqueued` marks a delivered member done, blocks the rest).
+        Building the done member again presses it fresh and leaves the lead's blocked item alone."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        lead, member = sorted(member["id"] for member in build.run(self.db, row["id"])["members"])
+        self.db.execute("UPDATE assignment SET status = 'done' WHERE id = ?", (member,))
+        transition(self.db, self.items[1], "ready", who="operator", reason="fixture")
+        queued = build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual([(entry["item"], entry["status"]) for entry in queued], [(self.items[1], "queued")])
+        self.assertNotIn(queued[0]["id"], (lead, member))
+        self.assertEqual(self.statuses([self.items[0]]), ["blocked"])
+        self.assertEqual(runner.queue_state(self.db, lead)["status"], "blocked")
+
     def lose(self, **fields):
         """Lose the current run at a stale beat; the fresh row the reap opened."""
         if fields:
