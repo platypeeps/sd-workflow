@@ -1566,6 +1566,29 @@ class Hosts(Case):
                       self.count("SELECT body FROM note WHERE item = ? ORDER BY id DESC LIMIT 1", item))
         self.assertEqual(self.statuses([item]), ["ready"], "the item is free again")
 
+    def test_a_beat_blocked_row_queues_again_once_the_satellite_beats(self):
+        """Pack sd:8745: a slow-DB stretch left the satellite's beat stale, and the hub blocked its rows for good.
+        Once a fresh beat is back, the hub's claim puts such a row back to queued for the satellite to claim; an
+        item moved on, or a row requeued by hand since, stays as it is."""
+        item, moved, again = self.item(repo=SAT), self.item(repo=SAT), self.item(repo=SAT)
+        rows = [build.queue(self.db, [each], who="operator")[0]["id"] for each in (item, moved, again)]
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual([self.count("SELECT status FROM assignment WHERE id = ?", row) for row in rows],
+                         ["blocked"] * 3)
+        transition(self.db, moved, "planning", who="operator")
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        fresh = build.queue(self.db, [again], who="operator")[0]["id"]
+        self.assertIsNone(self.claim(hosts=HUB), "the hub claims none of the satellite's lane")
+        self.assertEqual([self.count("SELECT status FROM assignment WHERE id = ?", row) for row in (*rows, fresh)],
+                         ["queued", "blocked", "blocked", "queued"])
+        self.assertIsNone(self.count("SELECT result FROM assignment WHERE id = ?", rows[0]))
+        self.assertIn(f"Build assignment {rows[0]} queued again",
+                      self.count("SELECT body FROM note WHERE item = ? ORDER BY id DESC LIMIT 1", item))
+        run = self.claim(hosts=WORK)
+        assert run is not None
+        self.assertEqual(run["assignment"], rows[0], "the satellite claims it")
+
     def test_the_hub_blocks_a_row_whose_satellite_beat_comes_from_a_clock_ahead(self):
         """Pack sd:7955: a beat stamped more than STALE_SECONDS after now has no age to trust, so the claim blocks
         the row as for a stale beat, and its note names the skew, not a dead dispatcher."""

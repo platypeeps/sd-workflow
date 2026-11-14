@@ -786,6 +786,8 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
     with transaction(connection):
         if restoration_pending(connection):
             raise BuildRefused(RESTORING)
+        if None in hosts:
+            _requeue_beat_blocked(connection, hosts)
         queued = connection.execute(
             "SELECT assignment.id, assignment.item, assignment.parent, assignment.run_count, item.repo, "
             "repo.lane_host FROM assignment JOIN item ON item.id = assignment.item "
@@ -864,6 +866,33 @@ def _refuse(connection, row, reason: str) -> None:
     connection.execute("UPDATE assignment SET status = 'blocked', ended = ?, result = ? "
                        "WHERE id = ? AND status = 'queued'", (clock(), reason, row["id"]))
     add_note(connection, row["item"], "comment", f"Build assignment {row['id']} blocked: {reason}")
+
+
+def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
+    """Put back to queued each build the hub's claim blocked on another host's quiet dispatcher, once that host's
+    beat is fresh and not stuck again (pack sd:8745): a slow-DB stretch blocked them for good before.
+
+    Only the item's newest build, its item still `ready`, no other assignment
+    owning it, and its lane still on the host the block names: an item moved
+    on, or a build requeued by hand since, stays as it is.
+    """
+    rows = connection.execute(
+        f"SELECT assignment.id, assignment.item, assignment.result, repo.lane_host FROM assignment "
+        f"JOIN item ON item.id = assignment.item LEFT JOIN repo ON repo.path = item.repo "
+        f"WHERE assignment.scope = ? AND assignment.status = 'blocked' AND item.status = 'ready' "
+        f"AND assignment.result LIKE ? AND assignment.id = (SELECT MAX(newest.id) FROM assignment newest "
+        f"WHERE newest.item = assignment.item AND newest.scope = assignment.scope) "
+        f"AND NOT EXISTS (SELECT 1 FROM assignment other WHERE other.item = assignment.item "
+        f"AND other.status IN {OWNING})", (SCOPE, "%'s lane runs on %")).fetchall()
+    for row in rows:
+        away = lane_of(connection, row["lane_host"])
+        if (away is None or away in hosts or not row["result"].startswith(f"item {row['item']}'s lane runs on {away}, ")
+                or dispatcher_gone(connection, away) or dispatcher_stuck(connection, away)):
+            continue
+        connection.execute("UPDATE assignment SET status = 'queued', ended = NULL, result = NULL "
+                           "WHERE id = ? AND status = 'blocked'", (row["id"],))
+        add_note(connection, row["item"], "comment",
+                 f"Build assignment {row['id']} queued again: the {HEARTBEAT}@{away} beat is fresh")
 
 
 def _refused_repo(connection, row) -> bool:
