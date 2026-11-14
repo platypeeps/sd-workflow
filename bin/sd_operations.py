@@ -101,7 +101,7 @@ def queue_builds(args: argparse.Namespace) -> int:
         raise WorkRefusal("update this pack checkout, whose lib/ is the sd_db bin/ runs for builds") from None
     connection = sd_handoff_rows.connect(sd_db, write=True)
     try:
-        queued = build.queue_again(connection, args.items, who=getpass.getuser())
+        queued = build.queue_again(connection, args.items, who=getpass.getuser(), finding=args.finding)
     except (sd_db.SdDbError, ValueError) as error:
         raise WorkRefusal(str(error)) from error
     finally:
@@ -548,6 +548,8 @@ def register(groups: Any) -> None:
                                                     "selection or none")
             parser.set_defaults(handler=queue_builds)
             parser.add_argument("items", nargs="+", type=item_id, help=ITEM_HELP)
+            parser.add_argument("--finding", default="", metavar="TEXT",
+                                help="Send to builder: the note the retried or fixed bundle's builder reads")
             parser.add_argument("--json", action="store_true")
             # One verb for the dispatcher (ruling #31545, pack sd:6356): the tick, and with a flag its supervisor or
             # the sessions it counts.

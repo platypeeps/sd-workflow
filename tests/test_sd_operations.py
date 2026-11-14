@@ -104,15 +104,17 @@ class OperationsCLI(unittest.TestCase):
         builds.queue_again = queue
         with patch.dict(sys.modules, {"sd_db.build": builds}), patch.object(sd_db, "build", builds, create=True):
             code, output = self.call("assignments", "build", "sd:7", "9")
+            self.call("assignments", "build", "7", "--finding", "check the parser")
+            self.assertEqual(queue.call_args.kwargs, {"who": "operator", "finding": "check the parser"})
             with self.assertRaises(cli.WorkRefusal):
                 queue.side_effect = sd_db.SdDbError("item 9 is planning; a build takes a ready item")
                 self.call("assignments", "build", "9")
         self.assertEqual(code, 0)
         self.assertEqual(output.splitlines(), ["#31  queued  build  sd:7", "#32  queued  build  sd:9"])
         self.assertEqual(queue.call_args_list[0].args[1:], ([7, 9],))
-        self.assertEqual(queue.call_args_list[0].kwargs, {"who": "operator"})
+        self.assertEqual(queue.call_args_list[0].kwargs, {"who": "operator", "finding": ""})
         self.connect.assert_called_with(sd_db, write=True)
-        self.assertEqual(self.connection.close.call_count, 2)
+        self.assertEqual(self.connection.close.call_count, 3)
 
     def test_beat_is_one_verb_with_the_leads_start_and_end_as_flags(self):
         """pack sd:7221 (ruling note #41072): `beat ITEM` beats a teammate run; `--start` and `--end` are the lead's."""

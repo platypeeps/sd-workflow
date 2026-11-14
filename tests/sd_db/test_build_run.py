@@ -2013,6 +2013,15 @@ class Tick(Case):
         notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", self.items)]
         self.assertTrue(any(body.startswith(build.FINDING) and "gate red" in body for body in notes), notes)
 
+    def test_build_again_with_a_finding_on_a_failed_lane_entry_sends_it(self):
+        """pack sd:8792: `--finding` on a Fix is the note the builder reads, in place of the lane's reason."""
+        self.enqueued()
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red"}
+        self.tick()
+        build.queue_again(self.db, self.items, who="operator", finding="pin the fixture clock")
+        notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", self.items)]
+        self.assertIn(build.FINDING + "pin the fixture clock", notes)
+
     CONFLICT = ("merging origin/main into build/sd-1 conflicts; the branch is unchanged; "
                 "sd-ship lane retry --item 1 queues it again")
 
