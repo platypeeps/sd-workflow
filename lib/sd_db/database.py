@@ -75,6 +75,8 @@ def served_by(target, home: Path | str | None = None) -> str | None:
     """
     from . import hub, remote
 
+    if isinstance(target, Patient):  # sd:8721: the wrap retries; the hub is the wrapped one's
+        target = target.connection
     if isinstance(target, remote.Connection):
         return f"{target.host}:{target.port}"
     if not isinstance(target, (str, os.PathLike)):
