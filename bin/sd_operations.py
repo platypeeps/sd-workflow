@@ -40,6 +40,40 @@ def service_result(connection: Any, args: argparse.Namespace) -> Any:
                      who=getpass.getuser())
 
 
+#: The assignment statuses `get --wait` waits out: a build not yet ended (pack sd:8793).
+WAITING = ("queued", "claimed", "running", "ending")
+POLL_SECONDS = 30
+
+
+def get_assignments(args: argparse.Namespace) -> int:
+    """`sd assignments get N...`: each assignment as `get` prints it; `--wait` polls until every one has left
+    `WAITING`, exit 1 at `--timeout` minutes (default 240), in place of session-written poll scripts (pack sd:8793)."""
+    if args.timeout is not None and not args.wait:
+        raise WorkRefusal("--timeout goes with --wait")
+    sd_db = sd_handoff_rows.library()
+    try:
+        import sd_db.operations as operations
+    except ImportError:
+        raise WorkRefusal("update this pack checkout, whose lib/ is the sd_db bin/ runs for job controls") from None
+    deadline = time.monotonic() + 60 * (240 if args.timeout is None else args.timeout)
+    while True:
+        connection = sd_handoff_rows.connect(sd_db, write=False)
+        try:
+            states = [operations.assignment_state(connection, int(ident)) for ident in args.identity]
+        except (sd_db.SdDbError, ValueError) as error:
+            raise WorkRefusal(str(error)) from error
+        finally:
+            connection.close()
+        ended = all(state["status"] not in WAITING for state in states)
+        left = deadline - time.monotonic()
+        if not args.wait or ended or left <= 0:
+            break
+        time.sleep(min(POLL_SECONDS, left))
+    for state in states:
+        print(json.dumps(state, ensure_ascii=False) if args.json else json.dumps(state, ensure_ascii=False, indent=2))
+    return 0 if not args.wait or ended else 1
+
+
 def run(args: argparse.Namespace) -> int:
     sd_db = sd_handoff_rows.library()
     try:
@@ -537,7 +571,14 @@ def register(groups: Any) -> None:
             parser = verbs.add_parser(action)
             parser.set_defaults(handler=run, operation_group=name, operation=action)
             parser.add_argument("--json", action="store_true")
-            if action != "list":
+            if (name, action) == ("assignments", "get"):
+                parser.set_defaults(handler=get_assignments)
+                parser.add_argument("identity", nargs="+", help="assignment ID")
+                parser.add_argument("--wait", action="store_true",
+                                    help="poll until every assignment has left queued, claimed and running")
+                parser.add_argument("--timeout", type=float, metavar="MIN",
+                                    help="with --wait: give up after MIN minutes, exit 1 (default 240)")
+            elif action != "list":
                 parser.add_argument("identity", help={"jobs": "registered job name",
                     "assignments": "assignment ID", "services": "launchd label (get also accepts system:LABEL)"}[name])
             if action in {"retry", "cancel", "start", "stop", "restart"}:

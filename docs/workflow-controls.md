@@ -37,7 +37,8 @@ progress belongs to the database.
 | Run the adversarial gate on a draft | `sd writing adversarial --piece YEAR/slug` — renders the shared `writing-draft` lens, runs codex read-only on the checkout, and writes `adversarial.md` stamped with the draft it read; `sd writing gate` records the verdict |
 | Mark a review companion current after a revision | `sd writing reconcile --piece YEAR/slug --artifact adversarial\|research --note-file PATH` — refuses an adversarial reconcile once more than 25 % of the draft is prose the last run did not read |
 | Park or revive a piece | Item screen, or `sd writing park --piece YEAR/slug [--revive]` |
-| Observe jobs and assignments | Operations → Jobs, `sd jobs list`, `sd assignments list` |
+| Observe jobs and assignments | Operations → Jobs, `sd jobs list`, `sd assignments list`, `sd assignments get ID [ID ...]` |
+| Wait until builds end | `sd assignments get ID [ID ...] --wait [--timeout MIN]`; polls until each has left queued, claimed and running; exit 1 at the timeout (default 240 minutes) |
 | Inspect launchd services | Operations → Services, or `sd services list` |
 | Start, stop or restart an eligible user service | Operations → Services, or `sd services start/stop/restart LABEL` |
 | Inspect configured ports and observed TCP listeners | Operations → Ports |
