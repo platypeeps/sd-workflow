@@ -560,6 +560,42 @@ class TheShadowSync(SuggestCase):
         self.assertEqual(2, len(self.shadow_rows()))
 
 
+class TheShadowSyncWaitsOutALock(unittest.TestCase):
+    """sd:8721: a write lock held past one `busy_timeout` delays the sync, not fails it."""
+
+    def test_a_lock_released_after_two_seconds_lets_the_sync_write(self):
+        import sqlite3
+        import threading
+
+        with tempfile.TemporaryDirectory() as home:
+            path = Path(home) / "sd.db"
+            sqlite3.connect(path).execute("CREATE TABLE marks (id INTEGER)").connection.close()
+            holder = sqlite3.connect(path, isolation_level=None, check_same_thread=False)
+            holder.execute("BEGIN IMMEDIATE")
+            release = threading.Timer(2, holder.execute, ("COMMIT",))
+
+            def sync_shadow(connection, **_options):
+                with sd_db.transaction(connection):
+                    connection.execute("INSERT INTO marks VALUES (1)")
+                return TheShadowSyncOverTrackers.Synced()
+
+            library = MagicMock(TRACKERS=("github",), sync_shadow=sync_shadow)
+            # A 100 ms busy_timeout stands in for the 5 s one the lock outlasts.
+            opened = sqlite3.connect(path, isolation_level=None, timeout=0.1)
+            release.start()
+            try:
+                with patch.object(sd_handoff_rows, "library", return_value=library), \
+                        patch.object(sd_handoff_rows, "connect", return_value=opened), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    code = sd_shadow.shadow_sync(Args(strict=True))
+            finally:
+                release.join()
+                holder.close()
+            self.assertEqual(0, code)
+            with contextlib.closing(sqlite3.connect(path)) as check:
+                self.assertEqual([(1,)], check.execute("SELECT id FROM marks").fetchall())
+
+
 class TheShadowSyncOverTrackers(unittest.TestCase):
     """sd:361 step 6: the verb runs every tracker the library names.
 
