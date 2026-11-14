@@ -125,6 +125,8 @@ sd_suggest = load("sd_suggest")
 sd_shadow = load("sd_shadow")
 
 import sd_db  # noqa: E402 - after the path juggling above
+import sd_db.database  # noqa: E402
+import sd_db.remote  # noqa: E402
 
 
 class Args:
@@ -594,6 +596,32 @@ class TheShadowSyncWaitsOutALock(unittest.TestCase):
             self.assertEqual(0, code)
             with contextlib.closing(sqlite3.connect(path)) as check:
                 self.assertEqual([(1,)], check.execute("SELECT id FROM marks").fetchall())
+
+
+class TheShadowSyncStaysHubOnly(unittest.TestCase):
+    """sd:8721 review: the `Patient` wrap must not hide a hub connection from `HubOnly`."""
+
+    class HubConnection(sd_db.remote.Connection):
+        """A `remote.Connection` that reached no hub: the refusal must come first."""
+
+        def __init__(self):  # noqa: D107 - no socket
+            self.host, self.port = "hub.example.test", 8769
+
+        def execute(self, sql, parameters=()):
+            raise AssertionError(f"a satellite sync sent {sql!r}")
+
+        def close(self):
+            pass
+
+    def test_served_by_sees_the_hub_through_a_patient(self):
+        wrapped = sd_db.database.Patient(self.HubConnection())
+        self.assertEqual("hub.example.test:8769", sd_db.database.served_by(wrapped))
+
+    def test_a_satellite_sync_exits_hub_only(self):
+        with patch.object(sd_handoff_rows, "connect", return_value=self.HubConnection()), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            code = sd_shadow.shadow_sync(Args(strict=True))
+        self.assertEqual(sd_shadow.EXIT_HUB_ONLY, code)
 
 
 class TheShadowSyncOverTrackers(unittest.TestCase):
