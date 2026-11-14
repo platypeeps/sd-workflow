@@ -97,10 +97,11 @@ class OperationsCLI(unittest.TestCase):
             self.connection, 8, expected_revision="fresh", who="operator")
 
     def test_assignments_build_queues_every_item_on_a_write_connection(self):
-        """pack sd:6093: the Build press from the CLI, the items as `sd:N` or bare."""
+        """pack sd:6093: the Build press from the CLI, the items as `sd:N` or bare; pack sd:8785: through
+        `queue_again`, which retries a blocked or cancelled bundle instead of queuing a new one."""
         queue = Mock(return_value=[{"id": 31, "item": 7, "status": "queued"}, {"id": 32, "item": 9, "status": "queued"}])
         builds = types.ModuleType("sd_db.build")
-        builds.queue = queue
+        builds.queue_again = queue
         with patch.dict(sys.modules, {"sd_db.build": builds}), patch.object(sd_db, "build", builds, create=True):
             code, output = self.call("assignments", "build", "sd:7", "9")
             with self.assertRaises(cli.WorkRefusal):

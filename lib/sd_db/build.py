@@ -41,7 +41,14 @@ from zoneinfo import ZoneInfo
 from . import hub, paths, reads
 from .database import served_by, transaction
 from .errors import SdDbError
-from .runner import IN_SESSION, OWNING, RUNNABLE_KINDS, queue_state, restoration_pending
+from .runner import (
+    IN_SESSION,
+    OWNING,
+    RUNNABLE_KINDS,
+    queue_state,
+    requeue,
+    restoration_pending,
+)
 from .ship import this_host
 from .writes import (
     add_note,
@@ -85,6 +92,8 @@ STEPS = ("claimed", "worktree", "building", "reviewing", "fixing", "enqueuing", 
 DRAFT_STEPS = ("claimed", "drafting")
 #: A note that sends the operator's finding to a bundle's next builder: Send to builder (pack sd:6020).
 FINDING = "Send to builder: "
+#: The bundle statuses Retry and Send to builder take: each keeps its worktree.
+AGAIN = ("blocked", "cancelled")
 #: A lane entry that failed only because prepare's merge of origin/<base> conflicted goes back to its builder on
 #: its own, under its lead, with this finding (pack sd:6940); `CONFLICT_REBUILDS` times, then the operator decides.
 #: `REBUILD` is the note's stable prefix the rebuild count matches; the base it names follows it (pack sd:7008).
@@ -474,6 +483,90 @@ def queue(connection, items: list[int], *, who: str, expected_revisions: dict | 
             add_note(connection, item, "comment", f"Build assignment {ident} queued by {who}")
             created.append(ident)
         return [queue_state(connection, ident) for ident in created]
+
+
+def retry_state(connection, run: dict) -> dict:
+    """Retry on an ended run: only the lead's latest run, released, whose bundle ended blocked or cancelled.
+
+    A bundle blocks on a `blocked` outcome and on a second loss at one step, whose run keeps the loss as its
+    outcome (`LOSSES`); the lead assignment's `blocked` status covers both. A `lane_failed` run's bundle ended
+    otherwise, so it refuses. A cancelled bundle keeps its worktree too, so Send to builder may resume it (pack sd:6020).
+    """
+    current = queue_state(connection, run["assignment"])
+    latest = current["run"]
+    reason = ""
+    if latest["id"] != run["id"]:
+        reason = f"run {latest['id']} is newer"
+    elif latest["released_at"] is None:
+        reason = "the run still holds its lease"
+    elif current["status"] not in AGAIN:
+        reason = f"the bundle ended {current['status']}; Retry takes a blocked or cancelled one"
+    return {"assignment": run["assignment"], "revision": current["revision"], "allowed": not reason, "reason": reason,
+            "bundle": current["status"]}
+
+
+def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
+    """Retry a blocked or cancelled build bundle under its lead `assignment`: each such member's item to `ready`, a
+    `finding` note on it when one is sent (Send to builder), then its assignment queued again, in one transaction.
+    Each item must pass the press's own check once it is ready, so a retried bundle is one the next claim can take.
+    The Builds panel and `sd assignments build` share it (pack sd:8785)."""
+    with transaction(connection):
+        current = queue_state(connection, assignment)
+        if current["scope"] != SCOPE:
+            raise BuildRefused(f"assignment {assignment} is not a build")
+        run = current["run"]
+        state = retry_state(connection, run) if run else {"allowed": False, "reason": "it never ran"}
+        if not state["allowed"]:
+            raise BuildRefused(f"Retry refused: {state['reason']}")
+        members = _members(connection, assignment, current["status"])
+        if not members:
+            raise BuildRefused(f"Retry refused: build run {run['id']} has no {current['status']} member")
+        items = reads.items_by_ids(connection, [member["item"] for member in members])
+        queued = []
+        for member in members:
+            item = items.get(member["item"])
+            if item is not None and item["status"] == "blocked":
+                transition(connection, member["item"], "ready", who=who, reason=f"Retry of build run {run['id']}")
+            unpark(connection, member["item"])
+            try:
+                _item(connection, member["item"])
+            except BuildRefused as refusal:
+                raise BuildRefused(f"Retry refused: {refusal}") from None
+            if finding:
+                add_note(connection, member["item"], "comment", FINDING + finding)
+            fresh = queue_state(connection, member["id"])["revision"]
+            queued.append(requeue(connection, member["id"], expected_revision=fresh, who=who))
+            add_note(connection, member["item"], "comment",
+                     f"Build assignment {member['id']} queued again by {who}: "
+                     f"{'Send to builder' if finding else 'Retry'} of build run {run['id']}")
+        return {"run": run["id"], "queued": [{"id": row["id"], "item": row["item"], "status": row["status"]}
+                                             for row in queued]}
+
+
+def queue_again(connection, items: list[int], *, who: str) -> list[dict]:
+    """`sd assignments build`: an item whose latest build bundle ran and ended blocked or cancelled is Retry of that
+    bundle (`retry`, its assignments and worktree kept); every other item is the Build press (`queue`). One transaction,
+    so one refusal writes nothing (pack sd:8785)."""
+    if not items or len(set(items)) != len(items) or any(type(item) is not int for item in items):
+        raise BuildRefused("select one or more distinct items")
+    with transaction(connection):
+        leads, fresh = [], []
+        for item in items:
+            row = connection.execute("SELECT id, parent, status FROM assignment WHERE item = ? AND scope = ? "
+                                     "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
+            lead = row and (row["parent"] or row["id"])
+            state = queue_state(connection, lead) if lead else None
+            # A build cancelled before any claim, or one the claim refused (`_refuse`), never ran: no worktree to
+            # resume, so it is a fresh press, as the dashboard's "it never ran" hint says. A bundle may end mixed
+            # (`enqueued` marks a delivered member done): `retry` takes only members in the lead's status, so the
+            # item's own assignment must be in it, or Retry would requeue the lead's items and not this one.
+            if (state and state["status"] in AGAIN and state["run"] is not None
+                    and row["status"] == state["status"]):
+                leads += [] if lead in leads else [lead]
+            else:
+                fresh.append(item)
+        queued = [entry for lead in leads for entry in retry(connection, lead, who=who)["queued"]]
+        return queued + (queue(connection, fresh, who=who) if fresh else [])
 
 
 def eligible(connection, *, now: str | None = None) -> list[dict]:

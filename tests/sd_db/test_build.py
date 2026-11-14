@@ -134,6 +134,21 @@ class Queue(Case):
         self.assertEqual(self.count("SELECT COUNT(*) FROM assignment"), before)
         self.assertEqual(self.statuses([ready]), ["ready"])
 
+    def test_build_again_on_a_build_that_never_ran_queues_a_fresh_one(self):
+        """pack sd:8785 review: a queued build cancelled before any claim, or one the claim refused (`_refuse`),
+        has no run to retry: `queue_again` queues a fresh assignment for each, as the press did before."""
+        cancelled, refused = self.item(), self.item()
+        first = {row["item"]: row for row in build.queue(self.db, [cancelled, refused], who="operator")}
+        runner.request_cancel(self.db, first[cancelled]["id"], expected_revision=first[cancelled]["revision"],
+                              who="operator")
+        build._refuse(self.db, self.db.execute("SELECT * FROM assignment WHERE id = ?",
+                                               (first[refused]["id"],)).fetchone(), "fixture refusal")
+        queued = build.queue_again(self.db, [cancelled, refused], who="operator")
+        self.assertEqual([(row["item"], row["status"]) for row in queued],
+                         [(cancelled, "queued"), (refused, "queued")])
+        self.assertNotIn(first[cancelled]["id"], [row["id"] for row in queued])
+        self.assertNotIn(first[refused]["id"], [row["id"] for row in queued])
+
     def test_press_queues_a_satellite_lane_item(self):
         """Pack sd:7933, failure table Press: a lane on a satellite takes a press; its host builds it."""
         upsert_repo(self.db, "/fixture/sat", remote="/fixture/r-sat", managed=1)
@@ -669,6 +684,40 @@ class Reap(Case):
         self.assertIn("lost at step building", note["body"])
         self.assertIn(row["work_path"], note["body"])
         self.assertEqual(self.count("SELECT COUNT(*) FROM runner_lease WHERE released_at IS NULL"), 0)
+
+    def test_build_on_a_blocked_bundle_requeues_its_assignment(self):
+        """pack sd:8785: `sd assignments build N` on a blocked bundle is Retry: its assignments queued again,
+        worktree kept, no new row; a ready item beside it gets a fresh assignment in the same call."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        members = sorted(member["id"] for member in build.run(self.db, row["id"])["members"])
+        fresh = self.item()
+        before = self.count("SELECT COUNT(*) FROM assignment")
+        queued = build.queue_again(self.db, [self.items[1], fresh], who="operator")
+        self.assertEqual(sorted(entry["id"] for entry in queued if entry["item"] in self.items), members)
+        self.assertEqual({entry["status"] for entry in queued}, {"queued"})
+        self.assertEqual([entry["item"] for entry in queued if entry["item"] == fresh], [fresh])
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment"), before + 1)
+        self.assertEqual(self.statuses(self.items), ["ready", "ready"])
+        with self.assertRaisesRegex(build.BuildRefused, "Retry refused: run .* has no blocked member|"
+                                                        "has queued assignment"):
+            build.queue_again(self.db, [self.items[0]], who="operator")
+
+    def test_build_again_on_a_done_member_of_a_blocked_bundle_queues_it_fresh(self):
+        """pack sd:8785 review: a bundle ends mixed (`enqueued` marks a delivered member done, blocks the rest).
+        Building the done member again presses it fresh and leaves the lead's blocked item alone."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        lead, member = sorted(member["id"] for member in build.run(self.db, row["id"])["members"])
+        self.db.execute("UPDATE assignment SET status = 'done' WHERE id = ?", (member,))
+        transition(self.db, self.items[1], "ready", who="operator", reason="fixture")
+        queued = build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual([(entry["item"], entry["status"]) for entry in queued], [(self.items[1], "queued")])
+        self.assertNotIn(queued[0]["id"], (lead, member))
+        self.assertEqual(self.statuses([self.items[0]]), ["blocked"])
+        self.assertEqual(runner.queue_state(self.db, lead)["status"], "blocked")
 
     def lose(self, **fields):
         """Lose the current run at a stale beat; the fresh row the reap opened."""

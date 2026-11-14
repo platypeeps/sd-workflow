@@ -10,7 +10,7 @@ takes seconds, not a slot; a kickstart that fails only says so, and the next tic
 
 `panel` is Queue's Builds panel: one row per open build run; under Show All, the ended build runs too, however old,
 with their outcome (pack sd:6834: a parked item's note points here for Retry). `retry` is Retry on a blocked or cancelled run: each such member's item goes back to `ready` and
-its assignment is queued again (`runner.requeue`), in one transaction. With a `finding` it is Send to builder (pack
+its assignment is queued again (`build.retry`, shared with `sd assignments build`), in one transaction. With a `finding` it is Send to builder (pack
 sd:6020): the finding is a `build.FINDING` note on each item first, and the claim keeps the bundle under its lead, so
 the next builder resumes the same worktree and its brief names the finding. Cancel on a running build is the route that
 exists, `/api/assignments/<lead>/cancel` (`operations.cancel_assignment`), bound to the revision this panel read.
@@ -34,7 +34,7 @@ from sd_db import repos as sd_repos
 from sd_db.config import label_prefix
 from sd_db.database import transaction
 from sd_db.errors import SdDbError
-from sd_db.writes import SettingStale, add_note, set_setting, transition
+from sd_db.writes import SettingStale, set_setting
 
 __all__ = ["ENDED_MAX", "JOB", "QUIET_SECONDS", "answer", "file_and_build", "fix_flaky", "kickstart", "lane_fix_state", "panel",
            "pickup", "plan", "press", "retry"]
@@ -47,8 +47,6 @@ QUIET_SECONDS = 15 * 60
 # ponytail: a flat cap; page it if the parked runs ever outnumber it.
 ENDED_MAX = 500
 KICKSTART_SECONDS = 5
-#: The bundle statuses Retry and Send to builder take: each keeps its worktree.
-AGAIN = ("blocked", "cancelled")
 #: The longest finding Send to builder takes, as a note line the brief quotes.
 FINDING_MAX = 4000
 #: The steps a builder writes its log in; a quiet log elsewhere (a review, the lane) is not a stall.
@@ -346,26 +344,6 @@ def _teammate_row(connection, run: dict, now: str) -> dict:
                        "reason": f"its lead ends it: sd assignments beat {first} --end"}}
 
 
-def _retry_state(connection, run: dict) -> dict:
-    """Retry on an ended run: only the lead's latest run, released, whose bundle ended blocked or cancelled.
-
-    A bundle blocks on a `blocked` outcome and on a second loss at one step, whose run keeps the loss as its
-    outcome (`build.LOSSES`); the lead assignment's `blocked` status covers both.
-    A cancelled bundle keeps its worktree too, so Send to builder may resume it (pack sd:6020).
-    """
-    current = runner.queue_state(connection, run["assignment"])
-    latest = current["run"]
-    reason = ""
-    if latest["id"] != run["id"]:
-        reason = f"run {latest['id']} is newer"
-    elif latest["released_at"] is None:
-        reason = "the run still holds its lease"
-    elif current["status"] not in AGAIN:
-        reason = f"the bundle ended {current['status']}; Retry takes a blocked or cancelled one"
-    return {"assignment": run["assignment"], "revision": current["revision"], "allowed": not reason, "reason": reason,
-            "bundle": current["status"]}
-
-
 def lane_fix_state(connection, branch: str | None) -> dict:
     """Fix on a failed lane entry (pack sd:8584): the newest build run holding `branch`, with the lead's revision, and
     whether Fix takes it: `build.lane_fix_check`, the check its press makes. Off with the reason in every other state:
@@ -412,7 +390,7 @@ def panel(connection, *, now: str, show: str = "active") -> dict:
                            "outcome": row["outcome"], "detail": row["detail"] or "",
                            "ended": row["released_at"], "step": row["step"] or "claimed", "model": row["model"] or "",
                            "usd": round(build.run_spent(connection, row["id"]), 2), "log": row["log_path"] or "",
-                           "worktree": row["work_path"] or "", "retry": _retry_state(connection, row)})
+                           "worktree": row["work_path"] or "", "retry": build.retry_state(connection, row)})
     except (SdDbError, sqlite3.Error, ValueError, TypeError, KeyError) as failure:
         return {"runs": [], "recent": [], "error": str(failure) or "the build runs could not be read", "read": now,
                 "show": show}
@@ -476,30 +454,7 @@ def retry(connection, assignment: int, *, expected_revision: str, who: str, find
             return {"run": run, "queued": [{"id": member["id"], "item": member["item"], "status": "queued"}
                                            for member in build._members(connection, assignment, "queued")
                                            if member["item"] in items]}
-        run = current["run"]
-        state = _retry_state(connection, run) if run else {"allowed": False, "reason": "it never ran"}
-        if not state["allowed"]:
-            raise workflow.WorkflowError(f"Retry refused: {state['reason']}")
-        members = build._members(connection, assignment, current["status"])
-        if not members:
-            raise workflow.WorkflowError(f"Retry refused: build run {run['id']} has no {current['status']} member")
-        items = reads.items_by_ids(connection, [member["item"] for member in members])
-        queued = []
-        for member in members:
-            item = items.get(member["item"])
-            if item is not None and item["status"] == "blocked":
-                transition(connection, member["item"], "ready", who=who, reason=f"Retry of build run {run['id']}")
-            build.unpark(connection, member["item"])
-            try:
-                build._item(connection, member["item"])
-            except build.BuildRefused as refusal:
-                raise workflow.WorkflowError(f"Retry refused: {refusal}") from None
-            if finding:
-                add_note(connection, member["item"], "comment", build.FINDING + finding)
-            fresh = runner.queue_state(connection, member["id"])["revision"]
-            queued.append(runner.requeue(connection, member["id"], expected_revision=fresh, who=who))
-            add_note(connection, member["item"], "comment",
-                     f"Build assignment {member['id']} queued again by {who}: "
-                     f"{'Send to builder' if finding else 'Retry'} of build run {run['id']}")
-        return {"run": run["id"], "queued": [{"id": row["id"], "item": row["item"], "status": row["status"]}
-                                             for row in queued]}
+        try:
+            return build.retry(connection, assignment, who=who, finding=finding)
+        except build.BuildRefused as refusal:
+            raise workflow.WorkflowError(str(refusal)) from None
