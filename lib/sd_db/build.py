@@ -544,8 +544,8 @@ def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
 
 
 def queue_again(connection, items: list[int], *, who: str) -> list[dict]:
-    """`sd assignments build`: an item whose latest build bundle ended blocked or cancelled is Retry of that bundle
-    (`retry`, its assignments and worktree kept); every other item is the Build press (`queue`). One transaction,
+    """`sd assignments build`: an item whose latest build bundle ran and ended blocked or cancelled is Retry of that
+    bundle (`retry`, its assignments and worktree kept); every other item is the Build press (`queue`). One transaction,
     so one refusal writes nothing (pack sd:8785)."""
     if not items or len(set(items)) != len(items) or any(type(item) is not int for item in items):
         raise BuildRefused("select one or more distinct items")
@@ -555,7 +555,10 @@ def queue_again(connection, items: list[int], *, who: str) -> list[dict]:
             row = connection.execute("SELECT id, parent FROM assignment WHERE item = ? AND scope = ? "
                                      "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
             lead = row and (row["parent"] or row["id"])
-            if lead and queue_state(connection, lead)["status"] in AGAIN:
+            state = queue_state(connection, lead) if lead else None
+            # A build cancelled before any claim, or one the claim refused (`_refuse`), never ran: no worktree to
+            # resume, so it is a fresh press, as the dashboard's "it never ran" hint says.
+            if state and state["status"] in AGAIN and state["run"] is not None:
                 leads += [] if lead in leads else [lead]
             else:
                 fresh.append(item)

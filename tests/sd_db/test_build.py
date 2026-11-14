@@ -134,6 +134,21 @@ class Queue(Case):
         self.assertEqual(self.count("SELECT COUNT(*) FROM assignment"), before)
         self.assertEqual(self.statuses([ready]), ["ready"])
 
+    def test_build_again_on_a_build_that_never_ran_queues_a_fresh_one(self):
+        """pack sd:8785 review: a queued build cancelled before any claim, or one the claim refused (`_refuse`),
+        has no run to retry: `queue_again` queues a fresh assignment for each, as the press did before."""
+        cancelled, refused = self.item(), self.item()
+        first = {row["item"]: row for row in build.queue(self.db, [cancelled, refused], who="operator")}
+        runner.request_cancel(self.db, first[cancelled]["id"], expected_revision=first[cancelled]["revision"],
+                              who="operator")
+        build._refuse(self.db, self.db.execute("SELECT * FROM assignment WHERE id = ?",
+                                               (first[refused]["id"],)).fetchone(), "fixture refusal")
+        queued = build.queue_again(self.db, [cancelled, refused], who="operator")
+        self.assertEqual([(row["item"], row["status"]) for row in queued],
+                         [(cancelled, "queued"), (refused, "queued")])
+        self.assertNotIn(first[cancelled]["id"], [row["id"] for row in queued])
+        self.assertNotIn(first[refused]["id"], [row["id"] for row in queued])
+
     def test_press_queues_a_satellite_lane_item(self):
         """Pack sd:7933, failure table Press: a lane on a satellite takes a press; its host builds it."""
         upsert_repo(self.db, "/fixture/sat", remote="/fixture/r-sat", managed=1)
