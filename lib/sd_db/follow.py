@@ -11,8 +11,9 @@ build this process loaded, and `follow` changes the files on disk, not the
 code in memory. So `attempt` runs the follow as a child, bounded, and on
 success replaces this process with the same command, which loads the
 followed build. Only an entrypoint that may run again from its start
-installs it, through `hub.on_mismatch`; a server, a lane runner or a ship
-keeps the refusal.
+installs it, through `hub.on_mismatch`; a server, a lane runner, a ship
+or a build-dispatch tick keeps the refusal. A tick's 75 s budget cannot
+hold a follow, and the repo-sync-follow job does it (pack sd:8685).
 
 Guards:
 

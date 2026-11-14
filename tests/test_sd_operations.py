@@ -267,6 +267,34 @@ class OperationsCLI(unittest.TestCase):
         self.assertEqual((code, output), (0, "skipped: database is locked\n"))
         self.connection.close.assert_called_once()
 
+    def test_a_build_mismatch_skips_the_tick_without_a_follow(self):
+        """pack sd:8685: a satellite tick ran `repo-sync follow` on the hub's refusal, past its 75 s budget, for
+        24 min; no beat came and the hub ended a run. The tick keeps the refusal; the follow job follows."""
+        import sd_lib
+        from sd_db import hub, remote
+        run = self.builds()
+        follow = Mock()
+        mismatch = remote.BuildMismatch("package", "1.0", "1.1", hub_build="hub-digest")
+
+        def refused(*_args, **_kwargs):
+            if hub.on_mismatch is not None:  # what `hub.Hub.open` does
+                hub.on_mismatch(mismatch)
+            raise mismatch
+        self.connect.side_effect = refused
+        with patch.object(hub, "on_mismatch", follow), patch.object(sd_lib, "on_mismatch", follow):
+            code, output = self.tick(run)
+        follow.assert_not_called()
+        run.dispatch.assert_not_called()
+        self.assertEqual((code, output), (0, "skipped: sd_db build mismatch; the follow job follows\n"))
+
+    def test_the_load_read_does_not_follow_either(self):
+        """pack sd:8685: `sd gate status`, the tick's child, carries the marker that keeps the refusal."""
+        from sd_db import follow
+        done = types.SimpleNamespace(returncode=1, stdout="")
+        with patch.object(cli.subprocess, "run", return_value=done) as spawned:
+            cli.gate_load()
+        self.assertEqual(spawned.call_args.kwargs["env"][follow.MARKER], "1")
+
     def test_a_tick_past_its_deadline_skips_with_exit_0(self):
         """pack sd:6494: three slots ran to the job's 90 s JOB_TIMEOUT, printing nothing."""
         run = self.builds()
