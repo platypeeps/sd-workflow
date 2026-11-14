@@ -1593,7 +1593,8 @@ def import_sd_db() -> Imported:
 #: What `import_sd_db` sets `sd_db.hub.on_mismatch` to (sd:4748). `bin/sd`
 #: sets it to follow the hub's pins and run the command again on a satellite
 #: whose build the hub refuses. `None` in every other entrypoint: a ship, a
-#: review or a lane runner may not be run again from its start.
+#: review or a lane runner may not be run again from its start, and a
+#: build-dispatch tick sets it back to `None` (pack sd:8685).
 on_mismatch: Callable[[Any], None] | None = None
 
 

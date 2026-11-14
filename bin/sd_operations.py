@@ -223,9 +223,13 @@ def writable(root: Path) -> bool | None:
 
 def gate_load() -> tuple[float | None, float | None]:
     """The five-minute load and its cap from `sd gate status --json`; (None, None) when unread."""
+    sd_handoff_rows.library()
+    from sd_db import follow  # noqa: PLC0415 - after the helper
     try:
+        # The marker keeps a mismatch refused in the child too: no follow under GATE_SECONDS (pack sd:8685).
         done = subprocess.run([sys.executable, str(BIN / "sd"), "gate", "status", "--json"], capture_output=True,
-                              text=True, timeout=GATE_SECONDS, check=False, stdin=subprocess.DEVNULL)
+                              text=True, timeout=GATE_SECONDS, check=False, stdin=subprocess.DEVNULL,
+                              env={**os.environ, follow.MARKER: "1"})
         answer = json.loads(done.stdout) if done.returncode == 0 else {}
     except (OSError, subprocess.SubprocessError, ValueError):
         return None, None
@@ -382,7 +386,12 @@ class Overdue(BaseException):
 def dispatch_builds(args: argparse.Namespace) -> int:
     """`sd assignments dispatch`: one build-dispatch tick (pack sd:6094)."""
     import sd_lib
+    # A follow takes 2-4 min, past the tick's budget, and holds the refresh lock the repo-sync-follow job
+    # waits on: the tick keeps the refusal, as a lane runner does, and that job follows (pack sd:8685).
+    sd_lib.on_mismatch = None
     sd_db, build, build_run = build_modules()
+    from sd_db import hub, remote  # noqa: PLC0415 - the copy build_modules imported
+    hub.on_mismatch = None
     why = ""
     try:
         root = log_root()
@@ -406,6 +415,9 @@ def dispatch_builds(args: argparse.Namespace) -> int:
     except Overdue:
         result = None
         print(f"skipped: the tick ran past {TICK_SECONDS:g} s")
+    except remote.BuildMismatch:
+        result = None
+        print("skipped: sd_db build mismatch; the follow job follows")
     except sqlite3.OperationalError as error:
         if "locked" not in str(error) and "busy" not in str(error):
             raise WorkRefusal(str(error)) from error
