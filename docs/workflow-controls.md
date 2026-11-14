@@ -44,7 +44,7 @@ progress belongs to the database.
 | Find items by age in status | Operations → Progress; a bar opens matching Backlog items |
 | See weekly numbers, cost and providers | Operations → Usage |
 | Request a supported retry or stop | Operations, `sd jobs retry NAME`, `sd jobs cancel NAME` |
-| Queue a build of ready items | `sd assignments build ID [ID ...]`; an item whose bundle ended blocked or cancelled is retried, worktree kept; one refusal refuses the selection |
+| Queue a build of ready items | `sd assignments build ID [ID ...]`; an item whose bundle ended blocked or cancelled is retried, worktree kept; one whose lane entry failed is Fix, the lane's reason its finding; one refusal refuses the selection |
 | Run one build-dispatch tick: reap, lane watch, claim, spawn | `sd assignments dispatch`; the hub's job runs it |
 | Supervise one build run, or list the live sessions | `sd assignments dispatch --supervise RUN`, `sd assignments dispatch --sessions` |
 | Cancel a queued assignment or a running build | Operations, or `sd assignments cancel ID` |

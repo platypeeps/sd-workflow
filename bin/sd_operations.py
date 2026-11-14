@@ -92,7 +92,8 @@ def run(args: argparse.Namespace) -> int:
 
 def queue_builds(args: argparse.Namespace) -> int:
     """`sd assignments build`: the Build press, one queued build assignment per item (pack sd:6093); an item whose
-    latest bundle ended blocked or cancelled is Retry of that bundle instead (pack sd:8785)."""
+    latest bundle ended blocked or cancelled is Retry of that bundle instead (pack sd:8785), and one whose lane entry
+    failed is the panel's Fix (pack sd:8791)."""
     sd_db = sd_handoff_rows.library()
     try:
         import sd_db.build as build
@@ -542,8 +543,9 @@ def register(groups: Any) -> None:
             if action in {"retry", "cancel", "start", "stop", "restart"}:
                 parser.add_argument("--if-revision", help="require the exact revision you inspected")
         if name == "assignments":
-            parser = verbs.add_parser("build", help="queue a build of each ready item, or retry its blocked or "
-                                                    "cancelled bundle; the whole selection or none")
+            parser = verbs.add_parser("build", help="queue a build of each ready item, retry its blocked or "
+                                                    "cancelled bundle, or Fix its failed lane entry; the whole "
+                                                    "selection or none")
             parser.set_defaults(handler=queue_builds)
             parser.add_argument("items", nargs="+", type=item_id, help=ITEM_HELP)
             parser.add_argument("--json", action="store_true")
