@@ -670,6 +670,25 @@ class Reap(Case):
         self.assertIn(row["work_path"], note["body"])
         self.assertEqual(self.count("SELECT COUNT(*) FROM runner_lease WHERE released_at IS NULL"), 0)
 
+    def test_build_on_a_blocked_bundle_requeues_its_assignment(self):
+        """pack sd:8785: `sd assignments build N` on a blocked bundle is Retry: its assignments queued again,
+        worktree kept, no new row; a ready item beside it gets a fresh assignment in the same call."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        members = sorted(member["id"] for member in build.run(self.db, row["id"])["members"])
+        fresh = self.item()
+        before = self.count("SELECT COUNT(*) FROM assignment")
+        queued = build.queue_again(self.db, [self.items[1], fresh], who="operator")
+        self.assertEqual(sorted(entry["id"] for entry in queued if entry["item"] in self.items), members)
+        self.assertEqual({entry["status"] for entry in queued}, {"queued"})
+        self.assertEqual([entry["item"] for entry in queued if entry["item"] == fresh], [fresh])
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment"), before + 1)
+        self.assertEqual(self.statuses(self.items), ["ready", "ready"])
+        with self.assertRaisesRegex(build.BuildRefused, "Retry refused: run .* has no blocked member|"
+                                                        "has queued assignment"):
+            build.queue_again(self.db, [self.items[0]], who="operator")
+
     def lose(self, **fields):
         """Lose the current run at a stale beat; the fresh row the reap opened."""
         if fields:

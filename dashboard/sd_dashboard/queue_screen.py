@@ -499,8 +499,8 @@ def runner(connection) -> dict:
 
 def _blocked(connection, row: dict) -> dict:
     """One blocked build assignment: its reason, its Cancel (`operations.assignment_state`, the route's own check) and
-    its Retry, which is its bundle lead's (`builds._retry_state`, the check `builds.retry` makes); off says why."""
-    from .builds import _retry_state
+    its Retry, which is its bundle lead's (`build.retry_state`, the check `build.retry` makes); off says why."""
+    from sd_db.build import retry_state
 
     try:
         current = operations.assignment_state(connection, row["assignment"])
@@ -511,7 +511,7 @@ def _blocked(connection, row: dict) -> dict:
                      "reason": "it never ran; Cancel clears it, or build the item again from Tasks",
                      "bundle": lead["status"]}
         else:
-            retry = _retry_state(connection, lead["run"])
+            retry = retry_state(connection, lead["run"])
     except (SdDbError, sqlite3.Error) as failure:  # one unread row hides no other (pack sd:8665), as `_open_row`
         off = {"revision": "", "allowed": False, "reason": f"the assignment was not read: {failure}"}
         cancel, retry = {"assignment": row["assignment"], **off}, {"assignment": row["lead"], **off}

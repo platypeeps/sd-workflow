@@ -91,7 +91,8 @@ def run(args: argparse.Namespace) -> int:
 
 
 def queue_builds(args: argparse.Namespace) -> int:
-    """`sd assignments build`: the Build press, one queued build assignment per item (pack sd:6093)."""
+    """`sd assignments build`: the Build press, one queued build assignment per item (pack sd:6093); an item whose
+    latest bundle ended blocked or cancelled is Retry of that bundle instead (pack sd:8785)."""
     sd_db = sd_handoff_rows.library()
     try:
         import sd_db.build as build
@@ -99,7 +100,7 @@ def queue_builds(args: argparse.Namespace) -> int:
         raise WorkRefusal("update this pack checkout, whose lib/ is the sd_db bin/ runs for builds") from None
     connection = sd_handoff_rows.connect(sd_db, write=True)
     try:
-        queued = build.queue(connection, args.items, who=getpass.getuser())
+        queued = build.queue_again(connection, args.items, who=getpass.getuser())
     except (sd_db.SdDbError, ValueError) as error:
         raise WorkRefusal(str(error)) from error
     finally:
@@ -541,7 +542,8 @@ def register(groups: Any) -> None:
             if action in {"retry", "cancel", "start", "stop", "restart"}:
                 parser.add_argument("--if-revision", help="require the exact revision you inspected")
         if name == "assignments":
-            parser = verbs.add_parser("build", help="queue a build of each ready item; the whole selection or none")
+            parser = verbs.add_parser("build", help="queue a build of each ready item, or retry its blocked or "
+                                                    "cancelled bundle; the whole selection or none")
             parser.set_defaults(handler=queue_builds)
             parser.add_argument("items", nargs="+", type=item_id, help=ITEM_HELP)
             parser.add_argument("--json", action="store_true")
