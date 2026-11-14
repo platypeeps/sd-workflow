@@ -595,20 +595,20 @@ def dispatch(connection, *, owner: str, load: float | None, load_cap: float | No
     if not why:
         picked = build.pickup(connection, build.room(connection, load=load, load_cap=load_cap,
                                                      interactive=interactive, hosts=hosts))
+    # One start per tick: the load read before the claim does not see a builder that starts in it, so a quiet
+    # load let one tick start a bundle per repository, and the load went to 300 (pack sd:8747). The next tick
+    # reads the load again.
     claimed: list[str] = []
-    while not why and len(claimed) < build.MACHINE_CAP:
+    if not why:
         try:
             taken = build.claim(connection, owner=owner, load=load, load_cap=load_cap, interactive=interactive,
                                 root=root, hosts=hosts)
         except build.BuildRefused as refusal:
-            why = str(refusal)
-            break
-        if taken is None:
-            break
-        claimed.append(taken["id"])
+            why, taken = str(refusal), None
+        claimed += [taken["id"]] if taken else []
     drafted: list[str] = []
-    if not why and hub:
-        # After the builds: a draft takes what machine room they leave, and no repository slot.
+    if not why and hub and not claimed:
+        # A tick that claimed no build: a draft takes what machine room the builds leave, and no repository slot.
         available = build.room(connection, load=load, load_cap=load_cap, interactive=interactive, hosts=hosts)
         taken = draft.claim(connection, owner=owner, available=available)
         drafted += [taken["id"]] if taken else []

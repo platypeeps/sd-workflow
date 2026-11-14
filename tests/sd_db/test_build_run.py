@@ -1927,6 +1927,20 @@ class Tick(Case):
         again = self.tick()
         self.assertEqual((again["claimed"], again["spawned"]), ([], []), "a registered run is not spawned again")
 
+    def test_a_tick_starts_one_bundle_so_the_next_load_read_sees_it(self):
+        """Pack sd:8747: one tick claimed a bundle per repository on one quiet load read, eight builds at once, and
+        the load went to 300. A tick claims one; the next tick reads the load again before it claims another."""
+        repos = [str(self.repo)]
+        for name in ("second", "third"):
+            other = support.repository(self.root / name, bare=self.root / f"{name}.git")
+            upsert_repo(self.db, str(other), remote=f"https://github.com/fixture/{name}.git", managed=1)
+            repos.append(str(other))
+        build.queue(self.db, [create_item(self.db, kind="task", title="Built", repo=repo, status="ready")
+                              for repo in repos], who="operator")
+        self.assertEqual(len(self.tick()["claimed"]), 1, "one start per tick")
+        self.assertEqual(len(self.tick()["claimed"]), 1, "the next tick takes the next")
+        self.assertEqual(self.tick(load=50.0)["claimed"], [], "a load above the cap starts none")
+
     def test_an_unread_load_says_why(self):
         """Pack sd:7933, failure table Claim, load unread: no claim, and the tick names the unread input."""
         build.queue(self.db, [create_item(self.db, kind="task", title="Built", repo=str(self.repo),
