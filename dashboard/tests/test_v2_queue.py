@@ -1702,6 +1702,15 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertIn("· on work · log <code>/logs/r1.jsonl</code>", out["R"]["alpha"])
         self.assertNotIn("tail -f", out["R"]["alpha"])
 
+    def test_a_run_in_the_lane_reads_merging_not_working(self):
+        """sd:8960: a build run at `enqueued` waits on review, so its row says merging."""
+        run = {**self.BUILDS["runs"][0], "step": "enqueued", "state": "merging", "why": "waits on review"}
+        out = self.run_view("open('alpha'); R.alpha = ELS.queue.html;",
+                            answers={"/api/queue/builds?show=all": [200, {**self.BUILDS, "runs": [run]}]})
+        self.assertIn("<b>merging</b> · build r1", out["R"]["alpha"])
+        self.assertIn(" · waits on review</td>", out["R"]["alpha"])
+        self.assertNotIn("g-unknown", re.search(r'<tr[^>]*data-run="r1".*?</tr>', out["R"]["alpha"], re.S).group(0))
+
     def test_a_queued_satellite_build_names_why_its_dispatcher_claims_nothing(self):
         """Review round 5: a queued build the hub leaves queued shows the satellite's reason on its row."""
         builds = {**self.BUILDS, "unclaimed": {"41": "work claims nothing: the load was not read"}}

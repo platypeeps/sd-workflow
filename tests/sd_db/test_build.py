@@ -17,12 +17,13 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
-from sd_db import build, draft, operations, recovery, remote, runner, workflow
+from sd_db import build, draft, operations, recovery, remote, runner, today, workflow
 from sd_db.database import connect
 from sd_db.errors import BackupError
 from sd_db.migrate import initialise
 from sd_db.workflow import item_state
 from sd_db.writes import (
+    add_note,
     create_assignment,
     create_item,
     read_settings,
@@ -515,6 +516,50 @@ class Writes(Case):
         self.assertEqual((row["step"], row["outcome"], row["released_at"]), ("enqueued", None, None),
                          "the run stays open for steps 7 and 8")
         self.assertFalse(build.enqueued(self.db, self.bundle["id"]), "enqueued once")
+
+    def test_a_member_no_trailer_names_reads_merging_not_blocked(self):
+        """sd:8960: a member the branch names in no `Closes:` trailer waits on the merge with its bundle: its
+        assignment stays running and reads merging, its item stays open with a note, and the run's end closes it."""
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        self.assertTrue(build.enqueued(self.db, self.bundle["id"], [self.items[0]]))
+        self.assertEqual([m["status"] for m in build.run(self.db, self.bundle["id"])["members"]], ["done", "running"])
+        self.assertEqual(self.statuses(self.items), ["in_progress", "in_progress"])
+        note = self.db.execute("SELECT kind, body FROM note WHERE item = ? AND body LIKE '%Closes: sd:%'",
+                               (self.items[1],)).fetchone()
+        self.assertEqual(note["kind"], "comment")
+        self.assertIn("returns it to planning", note["body"])
+        self.assertIn(f"`Closes: sd:{self.items[1]}`", note["body"])
+        self.assertEqual([(row["item"], row["status"]) for row in today.builds(self.db)], [(self.items[1], "merging")])
+        self.assertEqual(build.end(self.db, self.bundle["id"], "done", "cleaned")["outcome"], "done")
+        self.assertEqual([m["status"] for m in build.run(self.db, self.bundle["id"])["members"]], ["done", "done"])
+        self.assertEqual(self.statuses(self.items), ["in_progress", "planning"],
+                         "lane finding #57141: an undelivered member returns to planning, not ready, at the run's end")
+        reason = self.db.execute("SELECT body FROM note WHERE item = ? AND kind = 'status_change' ORDER BY id DESC",
+                                 (self.items[1],)).fetchone()["body"]
+        self.assertIn(self.bundle["id"], reason, "the note names the run")
+
+    def test_a_failed_lane_entry_returns_the_member_no_trailer_names_to_planning(self):
+        """Lane finding #57141: a lane failure ends the held member too; its item does not stay in_progress."""
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        build.enqueued(self.db, self.bundle["id"], [self.items[0]])
+        read = dict(self.db.execute("SELECT * FROM runner_run WHERE id = ?", (self.bundle["id"],)).fetchone())
+        self.assertTrue(build.lane_failed(self.db, read, "lane failed in prepare"))
+        self.assertEqual(build.run(self.db, self.bundle["id"])["members"][1]["status"], "done")
+        self.assertEqual(self.statuses(self.items)[1], "planning")
+
+    def test_a_cancelled_lane_run_cancels_the_member_no_trailer_names(self):
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        build.enqueued(self.db, self.bundle["id"], [self.items[0]])
+        build.end(self.db, self.bundle["id"], "cancelled", "cancelled by operator")
+        self.assertEqual([m["status"] for m in build.run(self.db, self.bundle["id"])["members"]],
+                         ["cancelled", "cancelled"])
+
+    def test_a_member_skipped_with_an_open_question_is_blocked(self):
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        add_note(self.db, self.items[1], "question", "Which?\nOption: A (Recommended)\nOption: B")
+        build.enqueued(self.db, self.bundle["id"], [self.items[0]])
+        self.assertEqual([m["status"] for m in build.run(self.db, self.bundle["id"])["members"]], ["done", "blocked"])
+        self.assertEqual(self.statuses(self.items), ["in_progress", "blocked"])
 
     def test_an_enqueued_bundle_frees_its_repository_slot(self):
         """Sd:8277: the lane is serial on its own; a bundle in it no longer holds the next bundle back."""

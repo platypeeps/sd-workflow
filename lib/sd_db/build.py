@@ -1048,6 +1048,31 @@ def _members(connection, lead: int, status: str = "running") -> list[dict]:
         "ORDER BY id = ? DESC, id", (lead, lead, status, SCOPE, lead))]
 
 
+def _ending(connection, row) -> list[dict]:
+    """The members a run's end acts on: `running` ones before the lane; at a lane step the `done` ones and each
+    one no trailer named, still `running` (sd:8960)."""
+    if row["step"] not in LANE_STEPS:
+        return _members(connection, row["assignment"])
+    return sorted(_members(connection, row["assignment"], "done") + _members(connection, row["assignment"]),
+                  key=lambda member: (member["id"] != row["assignment"], member["id"]))
+
+
+def _end_held(connection, row, stamp: str) -> None:
+    """A released lane-step run ends each member no trailer named `done` and returns its item, still
+    `in_progress`, to `planning` with a note naming the run: no delivery is established, and `ready` would
+    let auto-pickup requeue it unseen (sd:8960)."""
+    if row["step"] in LANE_STEPS:
+        for member in _members(connection, row["assignment"]):
+            connection.execute("UPDATE assignment SET status = 'done', ended = ?, result = ? WHERE id = ?",
+                               (stamp, f"build run {row['id']} ended; no `Closes: sd:{member['item']}` trailer, "
+                                       "so the item returns to planning", member["id"]))
+            status = connection.execute("SELECT status FROM item WHERE id = ?", (member["item"],)).fetchone()
+            if status is not None and status["status"] == "in_progress":
+                transition(connection, member["item"], "planning", who="build",
+                           reason=f"build run {row['id']} ended with no `Closes: sd:{member['item']}` trailer: "
+                                  "check whether its work landed, then close it or queue it again")
+
+
 def run(connection, ident: str) -> dict:
     """One run with its bundle: the lead first, then the members."""
     row = connection.execute("SELECT * FROM runner_run WHERE id = ?", (ident,)).fetchone()
@@ -1181,9 +1206,11 @@ def enqueuing(connection, ident: str) -> bool:
 def enqueued(connection, ident: str, delivered: Collection[int] | None = None, *, held_by: str = "the lane") -> bool:
     """The `enqueued` step: the lease released and the members `done`, the items left `in_progress` for the lane.
 
-    `delivered` is the items the lane entry delivers; a member outside it
-    (the builder skipped it) ends `blocked` with its item and a note, so the
-    merge leaves it open. None delivers every member. The run stays open,
+    `delivered` is the items the lane entry delivers; the merge leaves a
+    member outside it open. One the builder skipped with an open question
+    ends `blocked` with its item. Any other (its work may be on the branch
+    under another item's trailer) stays `running` with a note and reads
+    merging until the run ends (sd:8960). None delivers every member. The run stays open,
     `released_at` and `outcome` null, until step 7 ends it; `reap` skips it
     meanwhile. One compare-and-set on the run, open and not yet at a lane
     step; False, with no row changed, for a late supervisor whose run was
@@ -1200,7 +1227,8 @@ def enqueued(connection, ident: str, delivered: Collection[int] | None = None, *
                 f"AND outcome IS NULL AND cancel_requested IS NULL AND (step IS NULL OR step NOT IN ({marks}))",
                 (stamp, ident, *LANE_STEPS)).rowcount != 1:
             return False
-        lead = connection.execute("SELECT assignment FROM runner_run WHERE id = ?", (ident,)).fetchone()["assignment"]
+        run = connection.execute("SELECT assignment, created_at FROM runner_run WHERE id = ?", (ident,)).fetchone()
+        lead = run["assignment"]
         connection.execute("UPDATE runner_lease SET released_at = ? WHERE run = ? AND released_at IS NULL", (stamp, ident))
         members = _members(connection, lead)
         skipped = [member for member in members if delivered is not None and member["item"] not in delivered]
@@ -1209,8 +1237,13 @@ def enqueued(connection, ident: str, delivered: Collection[int] | None = None, *
                 connection.execute("UPDATE assignment SET status = 'done', ended = ?, result = ? WHERE id = ?",
                                    (stamp, f"build run {ident} enqueued in {held_by}", member["id"]))
         for member in skipped:
-            _block(connection, [member], f"build run {ident} enqueued no commit with a `Closes: sd:{member['item']}` "
-                                         "trailer, so the merge leaves this item open", stamp)
+            missing = f"build run {ident} enqueued no commit with a `Closes: sd:{member['item']}` trailer"
+            if open_question(connection, [member["item"]], run["created_at"]):
+                _block(connection, [member], f"{missing}, so the merge leaves this item open", stamp)
+            else:
+                add_note(connection, member["item"], "comment",
+                         f"B{missing[1:]}: the merge leaves this item open, "
+                         "and the run's end returns it to planning")
         return True
 
 
@@ -1241,7 +1274,7 @@ def end(connection, ident: str, outcome: str, detail: str, *, question: str | No
             return None
         row = dict(connection.execute("SELECT * FROM runner_run WHERE id = ?", (ident,)).fetchone())
         if question:
-            for member in _members(connection, row["assignment"], "done" if row["step"] in LANE_STEPS else "running"):
+            for member in _ending(connection, row):
                 add_note(connection, member["item"], "question", question)
         if outcome == "done":
             stamp = clock()
@@ -1249,6 +1282,7 @@ def end(connection, ident: str, outcome: str, detail: str, *, question: str | No
                                (stamp, stamp, ident))
             connection.execute("UPDATE runner_lease SET released_at = ? WHERE run = ? AND released_at IS NULL",
                                (stamp, ident))
+            _end_held(connection, row, stamp)
             return {"run": ident, "outcome": "done", "retry": None, "blocked": None}
         return _settle(connection, row, block=detail if outcome == "blocked" else None)
 
@@ -1326,6 +1360,8 @@ def lane_failed(connection, read: dict, reason: str, *, entry: str | None = None
                            (stamp, read["id"]))
         if conflict := CONFLICT.search(reason):
             _rebuild(connection, read, reason, stamp, conflict.group(1), entry)
+        # After the rebuild: a member no trailer named is no delivered work to queue again.
+        _end_held(connection, {**read, "step": "enqueued"}, stamp)
         return True
 
 
@@ -1868,7 +1904,7 @@ def _settle(connection, read: dict, *, block: str | None = None) -> dict | None:
             return None
         stamp = clock()
         lead = row["assignment"]
-        members = _members(connection, lead, "done" if row["step"] in LANE_STEPS else "running")
+        members = _ending(connection, row)
         if block is not None:
             # A process may live: the run stays unreleased and keeps its
             # lease, so it still counts in `room`, until `_release` finds
@@ -1913,6 +1949,7 @@ def _settle(connection, read: dict, *, block: str | None = None) -> dict | None:
                     add_note(connection, member["item"], "comment",
                              f"Build run {ident} lost at cleaning a second time; worktree {row['work_path']} kept: "
                              f"remove it by hand once it is clean")
+                _end_held(connection, row, stamp)
                 return {"run": ident, "outcome": "done", "retry": None, "blocked": None}
             else:
                 reason = (f"build run {ident} lost at step {row['step']} a second time; "
