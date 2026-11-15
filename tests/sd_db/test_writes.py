@@ -157,6 +157,24 @@ class TheStatusRule(WriteCase):
         self.assertIn("moved to done by operator; it was skipped: c broke", latest["c"]["reason"])
         self.assertTrue(latest["d"]["finished_at"].endswith("Z"))
 
+    def test_a_malformed_lane_entry_never_blocks_a_move_to_done(self):
+        """pack sd:8850 review round 2: any lane row in any repository is read on the way to done; one whose
+        `item`, `closes` or `id` is not the shape the lane writes is skipped, never a TypeError."""
+        from sd_db.reads import item_lane_entries
+
+        item = create_item(self.connection, kind="task", title="A thing")
+        for ident, body in (("m1", {"id": "m1", "item": 1, "closes": 7}), ("m2", {"id": "m2", "item": 1, "closes": [{}]}),
+                            ("m3", {"id": ["x"], "item": item, "status": "failed"}),
+                            ("m4", {"id": "m4", "item": [item], "status": "failed"}),
+                            ("m5", {"id": "m5", "item": item, "closes": "7", "status": "failed"}),
+                            ("ok", {"id": "ok", "item": item, "status": "failed"})):
+            self.raw_state("checkpoint", f"lane:v1:example/repo:{ident}", json.dumps(body))
+        self.assertEqual([entry["id"] for _, _, entry in item_lane_entries(self.connection, item)], ["ok"])
+        transition(self.connection, item, "done", who="operator")
+        status = self.connection.execute(
+            "SELECT body FROM state WHERE key = 'lane:v1:example/repo:ok' ORDER BY id DESC LIMIT 1").fetchone()[0]
+        self.assertEqual(json.loads(status)["status"], "cancelled")
+
     def test_a_failed_transition_leaves_no_note_behind(self):
         """The note and the row are one transaction, in both directions."""
         with self.assertRaises(TransitionRefused):

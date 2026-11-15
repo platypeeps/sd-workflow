@@ -1595,7 +1595,9 @@ def item_lane_entries(connection: sqlite3.Connection, item: int) -> list[tuple[s
     """Each lane entry, in every repository's lane, that delivers `item` (`lane_delivered`): its key, its first row id
     (the order the hub took it, as `sd_lane.enqueue_order` reads it) and its latest body, oldest first.
 
-    A row whose body is not a JSON object is skipped: it is no entry of this item's to judge (pack sd:8850).
+    A row whose body is not a JSON object, or whose `id`, `item` or `closes` is not the shape the lane writes (a
+    text id, an integer item or none, a list of integers or none), is skipped: it is no entry of this item's to
+    judge, and one malformed row must not stop every move to done (pack sd:8850).
     """
     found = []
     for row in connection.execute(
@@ -1606,9 +1608,20 @@ def item_lane_entries(connection: sqlite3.Connection, item: int) -> list[tuple[s
             entry = json.loads(row["body"])
         except (TypeError, ValueError):
             continue
-        if isinstance(entry, dict) and "id" in entry and item in lane_delivered(entry):
+        if _lane_shaped(entry) and item in lane_delivered(entry):
             found.append((row["key"], row["first"], entry))
     return sorted(found, key=lambda each: each[1])
+
+
+def _lane_shaped(entry: Any) -> bool:
+    """Whether a lane body has the `id`, `item` and `closes` shapes `item_lane_entries` reads."""
+    def whole(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    return (isinstance(entry, dict) and isinstance(entry.get("id"), str) and bool(entry["id"])
+            and (entry.get("item") is None or whole(entry["item"]))
+            and (entry.get("closes") is None or (isinstance(entry["closes"], list)
+                                                 and all(whole(each) for each in entry["closes"]))))
 
 
 def lane_delivered(entry: dict) -> list:
