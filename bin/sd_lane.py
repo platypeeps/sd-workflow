@@ -2054,8 +2054,7 @@ def draw_shots(worktree: pathlib.Path, out: pathlib.Path) -> dict[str, Any]:
     try:
         stdout, stderr = child.communicate(timeout=SHOTS_SECONDS)
     except subprocess.TimeoutExpired:
-        end_group(child.pid, signal.SIGKILL)  # its Chrome too: the session it leads
-        child.communicate()
+        sd_lib.end_group(child)  # its Chrome too: the session it leads; bounded, whatever holds a pipe (sd:8820)
         return {"shots_warning": f"dashboard.sh shots took over {SHOTS_SECONDS} s"}
     if child.returncode:
         said = stderr.strip().splitlines() or [f"exit {child.returncode}"]
@@ -2178,9 +2177,7 @@ class SpeculativeGate(threading.Thread):
         return False
 
 
-def end_group(group: int, number: int) -> None:
-    with contextlib.suppress(ProcessLookupError, PermissionError):  # already gone
-        os.killpg(group, number)
+end_group = sd_lib.signal_group
 
 
 def gate_run() -> Any:
