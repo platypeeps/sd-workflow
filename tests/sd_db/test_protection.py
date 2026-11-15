@@ -85,6 +85,17 @@ class Classify(unittest.TestCase):
         self.assertIn("a red PR still merges", result["gaps"][1]["gap"])
         self.assertEqual(result["detail"]["required_approving_review_count"], 0)
 
+    def test_fewer_approvals_than_the_policy_asks_is_the_reviews_gap(self):
+        def reviews(count, human):
+            return [gap["gap"] for gap in protection.classify(
+                full_protection(required_pull_request_reviews={"required_approving_review_count": count}),
+                repo_payload(), MAIN, {"CI Result"}, [], human=human)["gaps"]]
+        self.assertEqual(reviews(0, 0), [])
+        self.assertEqual(len(reviews(0, 1)), 1)
+        self.assertEqual(reviews(1, 2), ["a pull request is required but 1 approval is fewer than the 2 "
+                                         "the repository policy asks for"])
+        self.assertEqual(reviews(2, 2), [])
+
     def test_an_absent_reviews_object_and_zero_approvals_are_worded_apart(self):
         absent = protection.classify(full_protection(required_pull_request_reviews=None),
                                      repo_payload(), MAIN, {"CI Result"}, [])
@@ -601,6 +612,20 @@ class Sync(SyncCase):
         self.assertEqual(row["status"], "protected")
         self.assertEqual(json.loads(row["body"])["detail"]["required_approving_review_count"], 2)
         self.assertIn(protection.rules_path("platypeeps", "deep", MAIN, 2), transport.calls)
+
+    def test_the_approvals_gap_follows_the_policy_review_human(self):
+        """Pack sd:8823: the standard sets 0 approvals, and `policy.review.human` (0 when undeclared) is
+        the count a repository asks for; only fewer than that is a `reviews` gap."""
+        path = self.register("solo", "git@github.com:platypeeps/solo.git", PR_WORKFLOW)
+        rows = {"repos/platypeeps/solo": repo_payload(),
+                f"repos/platypeeps/solo/branches/{MAIN}/protection": full_protection(
+                    required_pull_request_reviews={"required_approving_review_count": 0})}
+        for declarations, expected in ((None, []), ('{"policy":{"review":{"human":1}}}', ["reviews"])):
+            with self.subTest(declarations=declarations):
+                self.db.execute("UPDATE repo SET declarations = ? WHERE path = ?", (declarations, path))
+                protection.sync(self.db, client=self.client(rows)[0], observed_at=AT)
+                gaps = json.loads(self.stored()[path]["body"])["gaps"]
+                self.assertEqual([gap["id"] for gap in gaps if gap["id"] == "reviews"], expected)
 
     def test_a_second_sync_replaces_the_row_rather_than_adding_one(self):
         path = self.register("one", "git@github.com:platypeeps/one.git", PR_WORKFLOW)
@@ -1123,7 +1148,8 @@ class Baseline(SyncCase):
         self.assertEqual(body["detail"]["produced_contexts"], ["sd/local-gate"])
         self.assertEqual(body["detail"]["required_not_produced"], [])
         self.assertEqual(body["detail"]["produced_not_required"], [])
-        self.assertEqual(ids(body), ["reviews"])
+        # No policy asks for an approval, so its 0 is no `reviews` gap (pack sd:8823).
+        self.assertEqual(ids(body), [])
         self.assertIn("repo.ci is local", body["detail"]["workflow_notes"][-1])
 
     def test_a_local_mode_repository_requiring_ci_is_flagged_and_named_the_local_gate(self):
