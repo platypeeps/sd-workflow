@@ -247,7 +247,22 @@ class Standard(unittest.TestCase):
     # --- G9 waits on G1: workflows go off only once sd/local-gate is the required check ----------------
 
     def actions_writes(self) -> list:
-        return [entry for entry in self.github.writes if entry[1].startswith("/actions")]
+        return [entry for entry in self.github.writes if "/actions" in entry[1]]
+
+    def test_the_actions_filter_sees_an_actions_write(self) -> None:
+        """Pack sd:8823: the log holds the full prefixed path, so a `startswith` filter saw nothing."""
+        code, out = self.run_verb(apply=True)
+        self.assertEqual(code, 0, out)
+        self.assertTrue(self.actions_writes())
+
+    def test_unread_protection_holds_the_lane_steps(self) -> None:
+        """Pack sd:8823: a G1 that was not read is no protection known to require sd/local-gate."""
+        self.github = FakeGitHub(model(fail={"GET /branches/main/protection": (502, "Bad Gateway")}))
+        code, out = self.run_verb(apply=True)
+        results = {step["key"]: step.get("result") for step in out["steps"] if step["key"] in sd_standard.LAST}
+        self.assertTrue(all(str(result).startswith("held") for result in results.values()), results)
+        self.assertEqual(self.row()["managed"], 0)
+        self.assertEqual(code, sd_standard.EXIT_FAILED)
 
     def test_a_ruleset_holds_actions_on(self) -> None:
         ruleset = {"id": 7, "name": "guard", "target": "branch", "enforcement": "active",

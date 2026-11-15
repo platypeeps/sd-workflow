@@ -178,6 +178,13 @@ def policy_ci(declarations: Any) -> str:
     return provider if isinstance(provider, str) and provider in CI_PROVIDERS else "github"
 
 
+def policy_human(declarations: Any) -> int:
+    """The approvals a row's `policy.review.human` asks for; 0, the policy default, when unset or unread."""
+    review = policy_of(declarations).get("review")
+    human = review.get("human") if isinstance(review, dict) else None
+    return human if isinstance(human, int) and not isinstance(human, bool) and human > 0 else 0
+
+
 def declarations_text(value: dict[str, Any]) -> str:
     """`value` as `repo.declarations` stores it: compact JSON with sorted keys."""
     return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False)

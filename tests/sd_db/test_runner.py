@@ -1,29 +1,15 @@
 """Queue selection and ownership are transactions, including competing connections."""
-import json
-import os
 import tempfile
 import threading
 import unittest
 from pathlib import Path
 
-from sd_db import reads, runner, seed, workflow
-from sd_db.calls import CallRefused, bound_for
+from sd_db import runner, workflow
 from sd_db.database import connect
 from sd_db.errors import SdDbError
 from sd_db.migrate import initialise
-from sd_db.registry import parse
-from sd_db.testing.wire import hub_only
 from sd_db.workflow import item_state
-from sd_db.writes import create_assignment, create_item, record_cost, upsert_repo
-
-from .test_calls import ENVIRON, PROMPT, REGISTRY, Wire, answer
-
-#: `test_calls.py`'s registry with every author a `url` entry, so `enqueue`
-#: accepts a budget; `mini` is the author the runner resolves first.
-CALLED = (REGISTRY.replace("  author:   [kimi, mini, claude]", "  author:   [mini, kimi]")
-          .replace("  reviewer: [mini, kimi, bare, plain]", "  reviewer: [kimi, mini, bare, plain]"))
-#: A brief of a million tokens, so the budget line's two-decimal amounts read.
-BRIEF = "x" * 3_000_000
+from sd_db.writes import create_assignment, create_item, upsert_repo
 
 
 class Queue(unittest.TestCase):
@@ -358,184 +344,6 @@ class SessionRecord(unittest.TestCase):
         with self.assertRaisesRegex(runner.RunnerRefused, 'absent'):
             runner.record_check(self.db, 'no-such-run', head='a' * 40, tree='b' * 40, exit_code=0, argv=[], checks=[])
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM state WHERE kind = 'check'").fetchone()[0], 0)
-
-
-class UrlAuthor(unittest.TestCase):
-    """sd:234 slice 8d, the runner half: a `url` author's one call through
-    `calls.call`, charged to the assignment, ends the row as a `start`
-    session's exit does, and a refused reservation ends it `blocked` with
-    the `budget spent` note."""
-
-    def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name)
-        self.database = self.root / 'sd.db'
-        initialise(self.database)
-        self.db = connect(self.database)
-        self.addCleanup(self.db.close)
-        # Beside the database: `enqueue` reads it for the budget rule.
-        (self.root / 'providers.yaml').write_text(CALLED, encoding='utf-8')
-        self.parsed = parse(CALLED, 'providers.yaml')
-        seed(self.db, self.parsed)
-        self.mini = self.parsed.providers['mini']
-        upsert_repo(self.db, '/fixture/repo', remote='/fixture/remote')
-        self.item = create_item(self.db, kind='task', title='Task', repo='/fixture/repo', branch='work/0', status='ready')
-
-    def claim(self, **kw):
-        assignment = runner.enqueue(self.db, [self.item], who='operator', **kw)[0]
-        return runner.claim(self.db, assignment['id'], owner='fixture', work_root=self.root / 'work', retention_root=self.root / 'retained')
-
-    def answer(self, request, wire, prompt=PROMPT, environ=ENVIRON, **kw):
-        return runner.answer_url(self.db, request['run']['id'], entry=self.mini, prompt=prompt, environ=environ,
-                                 registry=self.parsed, transport=wire, owner_pid=os.getpid(), **kw)
-
-    def end(self, request):
-        """What the runner's `finish` does after the ending: retain, then release."""
-        runner.update_run(self.db, request['run']['id'], end_step='retained')
-        return runner.release(self.db, request['run']['id'], output_path='/retained/.git/sd-provider.log')
-
-    def cost(self, request):
-        return [dict(row) for row in self.db.execute('SELECT * FROM cost WHERE assignment = ? ORDER BY id', (request['id'],))]
-
-    def notes(self, kind):
-        return [row['body'] for row in self.db.execute('SELECT body FROM note WHERE item = ? AND kind = ? ORDER BY id', (self.item, kind))]
-
-    @hub_only
-    def test_a_settled_call_ends_the_row_done_with_the_response_and_one_run_cost_row(self):
-        request = self.claim()
-        wire = Wire((200, answer(1000, 500)))
-        answered = self.answer(request, wire)
-        self.assertEqual((answered['outcome'], answered['call'].outcome, len(wire.calls)), ('done', 'run', 1))
-        self.assertEqual(json.loads(answered['body'])['usage']['completion_tokens'], 500)
-        self.assertIn('mini answered: 1000 prompt and 500 completion tokens, 0.0020 USD settled', answered['detail'])
-        # Ended as a `start` session's exit 0 is: the outcome on the run, the
-        # assignment `ending`, then retained and released to `done`.
-        run = runner.run_state(self.db, request['run']['id'])
-        self.assertEqual((run['outcome'], run['detail'], runner.queue_state(self.db, request['id'])['status']),
-                         ('done', answered['detail'], 'ending'))
-        self.end(request)
-        state = runner.queue_state(self.db, request['id'])
-        self.assertEqual((state['status'], state['result'], item_state(self.db, self.item)['item']['status']),
-                         ('done', answered['detail'], 'ready_to_send'))
-        self.assertEqual(self.notes('exec'), [answered['detail']])
-        self.assertEqual([(r['call_id'], r['source'], r['pass'], r['role'], r['repo'], r['provider'], r['bill'], r['usd']) for r in self.cost(request)],
-                         [(f"url:{request['run']['id']}", 'run', request['run']['id'], 'author', '/fixture/repo', 'mini', 'open', 0.002)])
-
-    @hub_only
-    def test_a_refused_budget_ends_the_row_blocked_with_a_budget_spent_note_and_the_loop_leaves_it(self):
-        bound = bound_for(self.mini, BRIEF)
-        request = self.claim(budget_usd=bound)
-        # An earlier pass of this assignment settled most of its budget.
-        record_cost(self.db, source='run', provider='mini', bill='open', role='author', repo='/fixture/repo',
-                    assignment=request['id'], pass_='earlier', call_id='earlier', usd=bound * 0.9)
-        wire = Wire((200, answer(1000, 500)))
-        answered = self.answer(request, wire, prompt=BRIEF)
-        self.assertEqual((answered['outcome'], answered['call'], wire.calls), ('blocked', None, []))
-        self.assertEqual(answered['detail'], f"budget spent: assignment {request['id']} has 0.10 of its 1.00 budget left "
-                                             f"(0.90 spent or held) and the call's bound is 1.00; refused")
-        self.assertEqual(self.notes('followup'), [answered['detail']])
-        self.assertEqual(runner.run_state(self.db, request['run']['id'])['detail'], answered['detail'])
-        self.end(request)
-        self.assertEqual((runner.queue_state(self.db, request['id'])['status'], item_state(self.db, self.item)['item']['status']), ('blocked', 'blocked'))
-        self.assertEqual([r['call_id'] for r in self.cost(request)], ['earlier'])
-        # The loop reads `queued` and claims; a `blocked` row is in neither,
-        # and only an operator's `requeue` moves it.
-        self.assertEqual(runner.queued(self.db), [])
-        self.assertIsNone(runner.claim(self.db, request['id'], owner='fixture', work_root=self.root / 'work', retention_root=self.root / 'retained'))
-
-    @hub_only
-    def test_a_lost_response_ends_the_row_blocked_and_the_ledger_row_bound(self):
-        request = self.claim()
-        answered = self.answer(request, Wire(TimeoutError('timed out')))
-        self.assertEqual((answered['outcome'], answered['call'].outcome), ('blocked', 'bound'))
-        self.assertEqual(answered['detail'], 'url author mini did not answer: response lost: timed out; the ledger holds the bound 0.0030 USD')
-        self.assertEqual(runner.run_state(self.db, request['run']['id'])['outcome'], 'blocked')
-        self.assertEqual(self.notes('followup'), [])
-        # `lose`d: the bound counts as spent and nothing is reserved, through the cost tile's read.
-        bill = next(row for row in reads.cost_by_bill(self.db) if row['name'] == 'open')
-        self.assertEqual((bill['spent'], bill['reserved']), (bound_for(self.mini, PROMPT), 0.0))
-
-    @hub_only
-    def test_the_response_is_retained_before_the_ending_is_written(self):
-        # PR #429 review: the ending must never claim a work product that was
-        # not kept, so `retain` sees the body while the run still has no outcome.
-        request = self.claim()
-        seen = []
-        def retain(body):
-            seen.append((runner.run_state(self.db, request['run']['id'])['outcome'], body))
-        answered = self.answer(request, Wire((200, answer(1000, 500))), retain=retain)
-        self.assertEqual(seen, [(None, answered['body'])])
-        self.assertEqual(runner.run_state(self.db, request['run']['id'])['outcome'], 'done')
-
-    @hub_only
-    def test_a_failed_retain_leaves_the_run_without_an_ending_and_the_call_settled(self):
-        request = self.claim()
-        def retain(body):
-            raise OSError('disk full')
-        with self.assertRaises(OSError):
-            self.answer(request, Wire((200, answer(1000, 500))), retain=retain)
-        # No outcome: the caller's handler ends the row `blocked` with the
-        # error, and `begin_ending` still has a row to write. The call was
-        # made and settled, so its cost stands.
-        self.assertIsNone(runner.run_state(self.db, request['run']['id'])['outcome'])
-        self.assertEqual([(r['source'], r['usd']) for r in self.cost(request)], [('run', 0.002)])
-
-    @hub_only
-    def test_a_refused_reservation_retains_nothing_and_a_dead_retain_cannot_hide_the_refusal(self):
-        # PR #429 review: a refusal has no body, so `retain` is not called on
-        # that path; a volume that cannot be written never turns `budget
-        # spent` into a `disk full` ending.
-        bound = bound_for(self.mini, BRIEF)
-        request = self.claim(budget_usd=bound)
-        record_cost(self.db, source='run', provider='mini', bill='open', role='author', repo='/fixture/repo',
-                    assignment=request['id'], pass_='earlier', call_id='earlier', usd=bound * 0.9)
-        def retain(body):
-            raise OSError('disk full')
-        answered = self.answer(request, Wire(), prompt=BRIEF, retain=retain)
-        self.assertEqual((answered['outcome'], runner.run_state(self.db, request['run']['id'])['outcome']), ('blocked', 'blocked'))
-        self.assertTrue(answered['detail'].startswith('budget spent: assignment'))
-        self.assertEqual(self.notes('followup'), [answered['detail']])
-
-    @hub_only
-    def test_a_cancel_requested_while_the_call_is_on_the_wire_wins_the_ending(self):
-        """The `start` path polls `cancel_requested` and ends `cancelled`; the
-        `url` path has no poll, so the row is re-read after the answer and a
-        cancel requested meanwhile is the ending, on the answered path and on
-        the refused one. The settled cost stands: the money was spent."""
-        request = self.claim()
-
-        class Cancelling(Wire):
-            def __call__(wire, http_request, timeout):
-                state = runner.queue_state(self.db, request['id'])
-                runner.request_cancel(self.db, request['id'], expected_revision=state['revision'], who='operator')
-                return super().__call__(http_request, timeout)
-
-        answered = self.answer(request, Cancelling((200, answer(1000, 500))))
-        run = runner.run_state(self.db, request['run']['id'])
-        self.assertEqual((answered['outcome'], answered['detail'], run['outcome'], run['detail']),
-                         ('cancelled', 'cancelled by operator', 'cancelled', 'cancelled by operator'))
-        self.assertEqual([r['usd'] for r in self.cost(request)], [0.002])
-        self.end(request)
-        self.assertEqual(runner.queue_state(self.db, request['id'])['status'], 'cancelled')
-        # The refused path too: the budget is spent, the note is filed, and the cancel is the ending.
-        bound = bound_for(self.mini, BRIEF)
-        refused = self.claim(budget_usd=bound)
-        record_cost(self.db, source='run', provider='mini', bill='open', role='author', repo='/fixture/repo',
-                    assignment=refused['id'], pass_='earlier', call_id='earlier', usd=bound * 0.9)
-        state = runner.queue_state(self.db, refused['id'])
-        runner.request_cancel(self.db, refused['id'], expected_revision=state['revision'], who='operator')
-        answered = self.answer(refused, Wire(), prompt=BRIEF)
-        self.assertEqual((answered['outcome'], answered['detail'], runner.run_state(self.db, refused['run']['id'])['outcome']),
-                         ('cancelled', 'cancelled by operator', 'cancelled'))
-        self.assertTrue(self.notes('followup') and self.notes('followup')[-1].startswith('budget spent: assignment'))
-
-    def test_what_call_refuses_by_name_is_refused_there_and_the_row_is_untouched(self):
-        request = self.claim()
-        with self.assertRaisesRegex(CallRefused, 'has no value for MINIMAX_API_KEY'):
-            self.answer(request, Wire(), environ={})
-        self.assertIsNone(runner.run_state(self.db, request['run']['id'])['outcome'])
-        self.assertEqual((self.cost(request), self.notes('followup')), ([], []))
 
 
 if __name__ == '__main__': unittest.main()

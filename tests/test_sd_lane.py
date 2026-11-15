@@ -2549,6 +2549,27 @@ class HubReads(SharedQueue):
         self.assertLess(waited, 1.0, "a queue read waited on the write lock")
         self.assertEqual(len(entries), 1)
 
+    def held(self) -> Any:
+        import sd_db
+        writer = sd_db.connect(home=self.tmp)
+        self.addCleanup(writer.close)
+        writer.execute("BEGIN IMMEDIATE")
+        self.addCleanup(lambda: writer.in_transaction and writer.execute("ROLLBACK"))
+        return writer
+
+    def test_the_watch_poll_and_the_freeze_check_do_not_wait_on_a_writer(self) -> None:
+        """sd:8819: `lane watch` and the runner's freeze check read while a hub writer holds the lock."""
+        writer, queue = self.held(), self.store()
+        # A read that waited would fail HUB_UNAVAILABLE and pause; the pause ends the writer, so the test ends.
+        released = mock.patch.object(sd_lane, "watch_pause", lambda: writer.execute("ROLLBACK"))
+        started = time.monotonic()
+        with released:
+            sd_lane.watch_items(queue, [7], write=lambda line: None)
+            stop = sd_lane.freeze_stop(queue)
+        self.assertLess(time.monotonic() - started, 1.0, "a hub read waited on the write lock")
+        self.assertIsNone(stop)
+        self.assertTrue(writer.in_transaction, "a hub read waited until the writer rolled back")
+
 
 class EnqueuePrechecks(SharedQueue):
     """sd:5989. Enqueue refuses, in seconds, what the lane would skip or fail before its review.
@@ -6127,6 +6148,49 @@ class Shots(Lane):
     def test_a_repository_without_the_dashboard_draws_nothing(self) -> None:
         entry = self.run_one()
         self.assertEqual(("shots" in entry, "shots_warning" in entry, self.bodies), (False, False, ["Item: sd:1\n"]))
+
+
+class ShotsEnd(unittest.TestCase):
+    """sd:8820: a timed-out `dashboard.sh shots` ends in a bounded time, whatever holds its pipe."""
+
+    HOLDER = ("import os, pathlib, sys, time; os.setsid(); "
+              "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)")
+
+    def test_an_escaped_pipe_holder_and_a_refused_group_kill_end_in_a_bounded_time(self) -> None:
+        tree = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", str(tree)], check=False))
+        holder = tree / "holder.pid"
+        script = tree / "dashboard" / "dashboard.sh"
+        script.parent.mkdir()
+        script.write_text(f"#!/bin/sh\n{sys.executable} -c {self.HOLDER!r} {holder} &\nexec sleep 60\n",
+                          encoding="utf-8")
+        script.chmod(0o755)
+        children: list[subprocess.Popen] = []
+        real = subprocess.Popen
+
+        def popen(*args: Any, **kwargs: Any) -> subprocess.Popen:
+            children.append(real(*args, **kwargs))
+            return children[-1]
+
+        def refused(group: int, number: int) -> None:
+            raise PermissionError(1, "Operation not permitted")  # macOS for an exiting group (sd:7900)
+
+        answer: list[dict[str, Any]] = []
+        with mock.patch.object(sd_lane, "SHOTS_SECONDS", 0.5), mock.patch.object(sd_lane.sd_lib, "GROUP_CLEANUP_SECONDS", 0.5), \
+                mock.patch.object(sd_lane, "origin_tip", lambda tree: "base"), \
+                mock.patch.object(sd_lane.subprocess, "Popen", popen), mock.patch.object(os, "killpg", refused):
+            worker = threading.Thread(target=lambda: answer.append(sd_lane.draw_shots(tree, tree / "out")), daemon=True)
+            worker.start()
+            worker.join(10)
+        for pid in [int(holder.read_text())] if holder.exists() else []:
+            with contextlib.suppress(OSError):
+                os.kill(pid, signal.SIGKILL)
+        for child in children:
+            with contextlib.suppress(OSError):
+                child.kill()
+        self.assertFalse(worker.is_alive(), "draw_shots waited on a pipe a descendant held")
+        self.assertEqual(answer, [{"shots_warning": "dashboard.sh shots took over 0.5 s"}])
+        self.assertIsNotNone(children[0].returncode, "the leader was not reaped")
 
 
 if __name__ == "__main__":

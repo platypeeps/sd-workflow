@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import datetime
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -102,6 +104,25 @@ class TheSections(TodayCase):
         self.assertEqual([(row["place"], row["since"], row["repo"]) for row in entries],
                          [(1, "2026-09-06T11:55:00Z", APP), (2, WHEN, APP)])
         self.assertNotIn("eta", entries[0])
+
+    def test_one_unreadable_checkpoint_hides_no_other_lane_row(self):
+        """Pack sd:8822: a bad body beside healthy rows is counted, not raised."""
+        healthy = self.item("Healthy")
+        self.lane("o/r", "e1", item=healthy, status="running", position=1)
+        for entry, body in (("bad", "{not json"), ("list", "[1]")):
+            self.connection.execute(
+                "INSERT INTO state(kind, key, timestamp, body) VALUES ('checkpoint', ?, ?, ?)",
+                (f"{today.LANE_KEY_PREFIX}o/r:{entry}", WHEN, body))
+        found = today.landing(self.connection)
+        self.assertEqual([row["id"] for row in found["entries"]], [healthy])
+        self.assertEqual(found["unread"], 2)
+        # sd_views imports its bin/ neighbours lazily, so bin/ stays on the path, as tests/test_item_refs.py has it.
+        if (bin_dir := str(Path(__file__).resolve().parents[2] / "bin")) not in sys.path:
+            sys.path.insert(0, bin_dir)
+        import sd_views  # noqa: PLC0415
+        text = sd_views.render_sections(today.sections(self.connection, now=NOW), keys=["landing"],
+                                        now=datetime.datetime(2026, 9, 6, 12, tzinfo=datetime.timezone.utc))
+        self.assertIn("2 lane checkpoints unreadable", text)
 
     def test_landing_carries_the_gate_or_why_it_is_unknown(self):
         snapshot = {"holders": [{"slot": 1, "pid": 7, "label": "tests", "since": WHEN, "cwd": "/tmp"}],

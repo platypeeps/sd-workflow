@@ -3751,20 +3751,25 @@ def _drained(process: subprocess.Popen) -> tuple[str, str]:
     return output or "", errors or ""
 
 
-def _end_group(process: subprocess.Popen, *, drain: bool = False) -> tuple[str, str]:
+def end_group(process: subprocess.Popen, *, drain: bool = False) -> tuple[str, str]:
     """End the group `process` leads, and reap it: SIGTERM, up to `GROUP_CLEANUP_SECONDS` for the leader, then SIGKILL.
 
     SIGTERM first lets a leader end what it started in groups of its own (sd:2978): `sd-check`, killed outright by
     `sd gate check`, left its `make check` running. With `drain`, returns what the group wrote, read before its
-    streams close (sd:3414); else two empty strings.
+    streams close (sd:3414); else two empty strings. Every wait is bounded and the streams close, so a
+    descendant in a group of its own that holds a pipe stops nothing. A group kill refused EPERM (macOS for
+    an exiting group, sd:7900) signals the leader alone (sd:8820).
     """
     import signal  # noqa: PLC0415 - only the group helpers need it
 
     for number in (signal.SIGTERM, signal.SIGKILL):
         try:
             os.killpg(process.pid, number)
-        except (ProcessLookupError, PermissionError):
+        except ProcessLookupError:
             pass
+        except PermissionError:
+            with contextlib.suppress(OSError):
+                process.send_signal(number)
         try:
             process.wait(timeout=GROUP_CLEANUP_SECONDS)
         except subprocess.TimeoutExpired:
@@ -3847,7 +3852,7 @@ def run_group(argv: list[str], *, cwd: pathlib.Path, env: dict[str, str], timeou
         finally:
             if started is not None:
                 started(None)
-            written = _end_group(process, drain=timed_out)
+            written = end_group(process, drain=timed_out)
         if timed_out:
             raise GroupTimeout(f"{argv[0]}: timed out after {timeout}s", *written)
     return subprocess.CompletedProcess(list(argv), process.returncode, output or "", errors or "")
@@ -3887,7 +3892,7 @@ class ThreadGroups:
                 self._holders.add(threading.current_thread())
                 ending = self._ending
             if ending:
-                _signal_group(pid, signal.SIGTERM)
+                signal_group(pid, signal.SIGTERM)
         return heard_group
 
     def reopen_groups(self) -> None:
@@ -3923,17 +3928,17 @@ class ThreadGroups:
         with self._lock:
             self._ending, live = True, set(self._live)
         for pid in live:
-            _signal_group(pid, signal.SIGTERM)
+            signal_group(pid, signal.SIGTERM)
         deadline, left = time.monotonic() + GROUP_CLEANUP_SECONDS, live
         while left and time.monotonic() < deadline:
             time.sleep(0.05)
             with self._lock:
                 left = live & self._live
         for pid in left:
-            _signal_group(pid, signal.SIGKILL)
+            signal_group(pid, signal.SIGKILL)
 
 
-def _signal_group(pid: int, number: int) -> None:
+def signal_group(pid: int, number: int) -> None:
     with contextlib.suppress(ProcessLookupError, PermissionError):  # already gone
         os.killpg(pid, number)
 

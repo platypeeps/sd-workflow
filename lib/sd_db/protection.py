@@ -128,7 +128,7 @@ from urllib.parse import quote
 
 from . import paths as sdpaths
 from .database import transaction
-from .writes import policy_ci
+from .writes import policy_ci, policy_human
 
 GAP_IDS = (
     "enforce_admins",
@@ -767,11 +767,13 @@ def _protection_gaps(
     default_branch: str,
     produced: set[str] | None,
     notes: list[str],
+    human: int = 1,
 ) -> tuple[list[dict[str, str]], dict[str, Any]]:
     """`_protection_gaps` as `bin/sd-status` has it, plus one case: `produced`
     is None when the checkout could not be read, and then the two gaps that
     compare required against produced are not reported rather than reported
-    against an empty set."""
+    against an empty set. `human` is the approvals the repository's policy
+    asks for; fewer is the `reviews` gap (pack sd:8823)."""
     gaps: list[dict[str, str]] = []
     checks = protection.get("required_status_checks") or {}
     reviews = protection.get("required_pull_request_reviews")
@@ -891,7 +893,11 @@ def _protection_gaps(
         approvals = 0
     else:
         approvals = int(reviews.get("required_approving_review_count") or 0)
-        if approvals < 1:
+        if 0 < approvals < human:
+            gaps.append({"id": "reviews", "gap": (
+                f"a pull request is required but {approvals} approval{'s are' if approvals > 1 else ' is'} "
+                f"fewer than the {human} the repository policy asks for")})
+        elif approvals < human:
             # The `required_pull_request_reviews` object is what requires a
             # pull request at all; what asks for nothing is the approval
             # count. The two wordings are deliberately different.
@@ -1034,6 +1040,7 @@ def classify(
     classic_present: bool | None = None,
     ci: str | None = None,
     ruleset_present: bool | None = None,
+    human: int = 1,
 ) -> dict[str, Any]:
     """Pure. `protection` is the protection object, or None for a 404.
 
@@ -1085,7 +1092,7 @@ def classify(
             "workflow_notes": list(notes),
         }
         return {"status": "unprotected", "gaps": gaps, "detail": detail, "merge_settings": settings}
-    gaps, detail = _protection_gaps(protection, default_branch, produced, notes)
+    gaps, detail = _protection_gaps(protection, default_branch, produced, notes, human)
     return {"status": "protected", "gaps": gaps, "detail": detail, "merge_settings": settings}
 
 
@@ -1661,7 +1668,7 @@ def _malformed(error: Exception) -> str:
 
 
 def observe(client, path: str, owner: str, name: str, *, observed_at: str,
-            ci: str | None = None, seen: dict[str, Any] | None = None) -> dict[str, Any]:
+            ci: str | None = None, seen: dict[str, Any] | None = None, human: int = 1) -> dict[str, Any]:
     """One repository's basic observation: the repository, its classic
     protection and the branch's rules, and a row whatever they answer.
 
@@ -1746,7 +1753,7 @@ def observe(client, path: str, owner: str, name: str, *, observed_at: str,
         # unknown (sd:1359). Outside, it raised through `sync`.
         result = classify(protection, repo, default_branch, produced, notes,
                           owner=owner, classic_present=classic is not None, ci=ci,
-                          ruleset_present=None if rules_error is not None else bool(rules))
+                          ruleset_present=None if rules_error is not None else bool(rules), human=human)
     except MALFORMED as error:
         return _unknown(path, observed_at, _malformed(error),
                         default_branch=default_branch, requests=client.budget.requests - before)
@@ -1768,7 +1775,7 @@ def observe(client, path: str, owner: str, name: str, *, observed_at: str,
     if isinstance(protection, dict) and protection.get("source") in (RULESET_SOURCE, COMBINED_SOURCE):
         row["_enrich"] = {"owner": owner, "name": name, "rules": rules, "repo": repo, "classic": classic,
                           "default_branch": default_branch, "produced": produced, "notes": notes,
-                          "ci": ci}
+                          "ci": ci, "human": human}
     return row
 
 
@@ -1788,7 +1795,7 @@ def enrich(client, row: dict[str, Any]) -> None:
     protection = _layered(pending["classic"], pending["rules"], entries)
     result = classify(protection, pending["repo"], pending["default_branch"], pending["produced"], pending["notes"],
                       owner=pending["owner"], classic_present=pending["classic"] is not None,
-                      ci=pending["ci"], ruleset_present=bool(pending["rules"]))
+                      ci=pending["ci"], ruleset_present=bool(pending["rules"]), human=pending["human"])
     row["status"] = result["status"]
     row["body"]["gaps"] = result["gaps"]
     row["body"]["detail"] = result["detail"]
@@ -1939,7 +1946,7 @@ def sync(connection: sqlite3.Connection, *, client, observed_at: str) -> dict[st
         summary["attempted"] += 1
         seen: dict[str, Any] = {}
         row = observe(client, str(registered["path"]), *slug, observed_at=observed_at, ci=policy_ci(registered["declarations"]),
-                      seen=seen)
+                      seen=seen, human=policy_human(registered["declarations"]))
         rows.append((slug, row, registered, seen.get("repo")))
     # Every repository has its basic observation before any bypass list is
     # read: the basic observation is three a repository, a gating ruleset
