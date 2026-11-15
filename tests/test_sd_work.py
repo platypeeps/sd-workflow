@@ -964,6 +964,45 @@ class TaskCLI(unittest.TestCase):
                 listed = json.loads(self.call("store", "items", "--open", "--here", "--json", cwd=cwd).stdout)
                 self.assertEqual([row["title"] for row in listed], ["Mine"])
 
+    def test_store_items_filters_by_belongs_to_ref_and_grep(self):
+        """sd:8854: `--belongs-to`, `--ref` and `--grep` answer what sessions read sd.db for.
+
+        `--grep` matches title, body and note bodies and names each hit; it and
+        `--ref` also read a done item older than the week the listing keeps.
+        """
+        root, other = self._checkout("searched"), self._checkout("unsearched")
+        with database(sd_db.default_path(self.home), write=True) as connection:
+            sd_db.repos.add(connection, root, home=self.home)
+            sd_db.repos.add(connection, other, home=self.home)
+
+        def add(*args, cwd):
+            return json.loads(self.call("task", "add", "--priority", "3", *args, "--json", cwd=cwd).stdout)["item"]["id"]
+
+        titled = add("Rotate the Widget key", cwd=root)
+        bodied = add("Plain", "--body", "the widget log", "--ref", "astra:s12", cwd=other)
+        noted = add("Quiet", cwd=root)
+        note = json.loads(self.call("task", "note", noted, "a WIDGET clue", "--json").stdout)["note"]["id"]
+        old = add("Old widget", "--ref", "job:sync:42", cwd=root)
+        self.call("task", "status", old, "done")
+        add("Unrelated", cwd=root)
+        with database(sd_db.default_path(self.home), write=True) as connection:
+            connection.execute("UPDATE note SET timestamp = '2025-01-01T00:00:00Z' WHERE item = ?", (old,))
+            connection.execute("UPDATE item SET created_at = '2025-01-01T00:00:00Z' WHERE id = ?", (old,))
+
+        def items(*args):
+            return json.loads(self.call("store", "items", *args, "--json").stdout)
+
+        self.assertNotIn(old, [row["id"] for row in items()])
+        found = {row["id"]: row["matches"] for row in items("--grep", "widget")}
+        self.assertEqual(found, {titled: ["title"], bodied: ["body"], noted: [f"note #{note}"], old: ["title"]})
+        self.assertEqual([row["id"] for row in items("--ref", "astra:s12")], [bodied])
+        self.assertEqual([row["id"] for row in items("--ref", "job:sync:42")], [old])
+        self.assertEqual([row["id"] for row in items("--grep", "widget", "--belongs-to", str(other))], [bodied])
+        self.assertEqual([row["id"] for row in items("--grep", "widget", "--open")], [titled, bodied, noted])
+        self.assertEqual(items("--grep", "100%"), [])
+        text = self.call("store", "items", "--grep", "widget").stdout
+        self.assertIn(f"  match: note #{note}", text)
+
     def test_a_filed_task_can_be_moved_between_repositories_and_off_them(self):
         """The move a hand-written `UPDATE item.repo` used to be (sd:507, sd:452).
 
