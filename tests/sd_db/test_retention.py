@@ -652,6 +652,23 @@ class TheCheckpointRows(PruneCase):
         self.assertGreater(ship.save(self.db, "ship:idle", idle[-1], {"step": 3}), idle[-1])
         self.assertEqual(self.compact(), 0)
 
+    def test_a_stale_ship_or_gate_receipt_key_loses_its_newest_row_too(self):
+        """Past `STALE_KEY_AGE` a `ship:` or `sd-gate-receipt:` key goes whole (sd:8879); an owed close stays."""
+        self.rows("ship:stale", days=31), self.rows("sd-gate-receipt:v1:stale", days=31, count=1)
+        recent = self.rows("ship:recent", days=29)
+        other = self.rows("sd-check-receipt:stale", days=31)
+        owed = record_state(self.db, "checkpoint", key="ship:owed", timestamp=ago(days=60),
+                            body={"protocol": 1, "closing_owed": {"item": 7}})
+        record_state(self.db, "checkpoint", key="ship:paid", timestamp=ago(days=60),
+                            body={"protocol": 1, "closing_owed": {"item": 8}, "closing_paid": "abc"})
+        self.assertEqual(self.compact(), 3 + 1 + 2 + 2 + 1)
+        self.assertEqual(self.ids("ship:stale") + self.ids("sd-gate-receipt:v1:stale") + self.ids("ship:paid"), [])
+        self.assertEqual(self.ids("ship:recent"), recent[-1:])
+        self.assertEqual(self.ids("sd-check-receipt:stale"), other[-1:])
+        self.assertEqual(self.ids("ship:owed"), [owed])
+        self.assertEqual(ship.read(self.db, "ship:stale"), (0, {}))
+        self.assertEqual(retention.STALE_KEY_AGE, timedelta(days=30))
+
     def test_a_kept_key_and_a_lookalike_keep_every_row(self):
         lane = self.rows("lane:v1:example/repo:entry", days=29)
         operator = self.rows("operator-action", days=30)
