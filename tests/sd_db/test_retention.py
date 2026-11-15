@@ -652,22 +652,38 @@ class TheCheckpointRows(PruneCase):
         self.assertGreater(ship.save(self.db, "ship:idle", idle[-1], {"step": 3}), idle[-1])
         self.assertEqual(self.compact(), 0)
 
-    def test_a_stale_ship_or_gate_receipt_key_loses_its_newest_row_too(self):
-        """Past `STALE_KEY_AGE` a `ship:` or `sd-gate-receipt:` key goes whole (sd:8879); an owed close stays."""
-        self.rows("ship:stale", days=31), self.rows("sd-gate-receipt:v1:stale", days=31, count=1)
-        recent = self.rows("ship:recent", days=29)
+    def receipt(self, key, *, days, **body):
+        return record_state(self.db, "checkpoint", key=key, timestamp=ago(days=days), body={"protocol": 1, **body})
+
+    def test_a_stale_merged_ship_or_gate_receipt_key_loses_its_newest_row_too(self):
+        """Past `STALE_KEY_AGE` a merged `ship:` key or an `sd-gate-receipt:` key goes whole (sd:8879)."""
+        self.rows("ship:stale", days=32, count=2)
+        self.receipt("ship:stale", days=31, phase="merged")
+        self.rows("sd-gate-receipt:v1:stale", days=31, count=1)
+        recent = self.receipt("ship:recent", days=29, phase="merged")
         other = self.rows("sd-check-receipt:stale", days=31)
-        owed = record_state(self.db, "checkpoint", key="ship:owed", timestamp=ago(days=60),
-                            body={"protocol": 1, "closing_owed": {"item": 7}})
-        record_state(self.db, "checkpoint", key="ship:paid", timestamp=ago(days=60),
-                            body={"protocol": 1, "closing_owed": {"item": 8}, "closing_paid": "abc"})
-        self.assertEqual(self.compact(), 3 + 1 + 2 + 2 + 1)
+        self.receipt("ship:paid", days=60, phase="merged", closing_owed={"item": 8}, closing_paid="abc")
+        self.assertEqual(self.compact(), 3 + 1 + 2 + 1)
         self.assertEqual(self.ids("ship:stale") + self.ids("sd-gate-receipt:v1:stale") + self.ids("ship:paid"), [])
-        self.assertEqual(self.ids("ship:recent"), recent[-1:])
+        self.assertEqual(self.ids("ship:recent"), [recent])
         self.assertEqual(self.ids("sd-check-receipt:stale"), other[-1:])
-        self.assertEqual(self.ids("ship:owed"), [owed])
         self.assertEqual(ship.read(self.db, "ship:stale"), (0, {}))
         self.assertEqual(retention.STALE_KEY_AGE, timedelta(days=30))
+
+    def test_an_unfinished_or_owing_ship_receipt_keeps_its_newest_row_at_any_age(self):
+        """Review of sd:8879: idle is not finished. A paused prepare or an interrupted merge must still resume,
+        and `ship.for_item` must still find it; a merged receipt that owes a close waits for its carrier."""
+        kept = {}
+        for phase in ("new", "push_dispatch", "ready_to_send", "reviewed", "ci_passed", "merge_dispatch", None):
+            body = {"repository": "example/repo", "branch": f"b-{phase}", "item": 9}
+            kept[phase] = self.receipt(f"ship:{phase}", days=90, **body, **({"phase": phase} if phase else {}))
+        owed = self.receipt("ship:owed", days=60, phase="merged", closing_owed={"item": 7})
+        self.assertEqual(self.compact(), 0)
+        for phase, ident in kept.items():
+            with self.subTest(phase=phase):
+                self.assertEqual(ship.read(self.db, f"ship:{phase}")[0], ident)
+        self.assertEqual(ship.for_item(self.db, "example/repo", 9, "b-merge_dispatch")[1], kept["merge_dispatch"])
+        self.assertEqual(self.ids("ship:owed"), [owed])
 
     def test_a_kept_key_and_a_lookalike_keep_every_row(self):
         lane = self.rows("lane:v1:example/repo:entry", days=29)

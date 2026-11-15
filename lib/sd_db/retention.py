@@ -26,8 +26,8 @@ its snapshot restored and compared, and never before. What the table says:
                      held 700 MB on 2026-10-12. A key whose newest row is
                      younger than `CHECKPOINT_IDLE_AGE` keeps every row, so
                      a live ship's phases stay readable. `STALE_CHECKPOINTS`:
-                     a `ship:` or `sd-gate-receipt:` key goes whole once it
-                     sat `STALE_KEY_AGE`, but for an unpaid owed close.
+                     an `sd-gate-receipt:` key, or a merged `ship:` key that
+                     owes no close, goes whole once it sat `STALE_KEY_AGE`.
                      `NEWEST_AND_RESOLVED_CHECKPOINTS`: the newest row and
                      the newest resolved row, at any age: `contribution_sync`
                      and `removal` read only the newest resolved one, and
@@ -140,10 +140,11 @@ NEWEST_ONLY_CHECKPOINTS = (
 #: Newest-only prefixes whose newest row goes too once the key sat
 #: `STALE_KEY_AGE` (sd:8879): after the rules above, these newest rows held
 #: most of 426 MB on 2026-11-14. A gate receipt stands six hours at most
-#: (`sd_gate_receipts.TREE_REUSE_WINDOW_SECONDS`). A ship receipt's readers
-#: resume, link or watch a live ship; past a month they read none, as for a
-#: branch never shipped. The one exception is a `closing_owed` not yet
-#: `closing_paid`: `sd_ship_squash.owed_closes` pays it on a later squash.
+#: (`sd_gate_receipts.TREE_REUSE_WINDOW_SECONDS`). A ship receipt goes only
+#: once its phase is `merged`: an unfinished one, a paused prepare or an
+#: interrupted merge, is what resume, watch and reconcile read, at any age.
+#: A merged one with a `closing_owed` not yet `closing_paid` stays too:
+#: `sd_ship_squash.owed_closes` pays it on a later squash.
 STALE_CHECKPOINTS = ("ship:", "sd-gate-receipt:")
 
 #: How long a `STALE_CHECKPOINTS` key goes unwritten before its newest row goes.
@@ -375,9 +376,11 @@ def _victims(connection, *, now: datetime) -> list[tuple[int, int, int]]:
         *NEWEST_AND_RESOLVED_CHECKPOINTS]
     lane, lane_args = _prefixed(FIRST_AND_NEWEST_CHECKPOINTS)
     stale, stale_args = _prefixed(STALE_CHECKPOINTS)
-    owed = ("EXISTS (SELECT 1 FROM state AS row WHERE row.id = ranked.id AND json_valid(row.body)"
-            " AND json_extract(row.body, '$.closing_owed') IS NOT NULL"
-            " AND json_extract(row.body, '$.closing_paid') IS NULL)")
+    # A `ship:` row goes only once merged and owing no close: idle is not finished (review of sd:8879).
+    held = ("substr(ranked.key, 1, 5) = 'ship:' AND NOT EXISTS (SELECT 1 FROM state AS row"
+            " WHERE row.id = ranked.id AND json_valid(row.body) AND json_extract(row.body, '$.phase') = 'merged'"
+            " AND (json_extract(row.body, '$.closing_owed') IS NULL"
+            " OR json_extract(row.body, '$.closing_paid') IS NOT NULL))")
     sql = (
         "SELECT id, first, last FROM (SELECT id, key, rule,"
         "  ROW_NUMBER() OVER (PARTITION BY key ORDER BY id DESC) AS rank,"
@@ -388,7 +391,7 @@ def _victims(connection, *, now: datetime) -> list[tuple[int, int, int]]:
         f"  WHEN {lane} THEN 3 END AS rule FROM state WHERE kind='checkpoint') WHERE rule IS NOT NULL) AS ranked"
         " WHERE (rank > 1 AND ((rule = 1 AND newest < ?) OR (rule = 2 AND id IS NOT resolved)"
         "  OR (rule = 3 AND newest < ? AND id != first)))"
-        f" OR (rank = 1 AND rule = 1 AND newest < ? AND ({stale}) AND NOT {owed}) ORDER BY id")
+        f" OR (rank = 1 AND rule = 1 AND newest < ? AND ({stale}) AND NOT ({held})) ORDER BY id")
     return [(row[0], row[1], row[2]) for row in connection.execute(sql, (
         *newest_args, *queue_args, *lane_args,
         _cutoff(now, CHECKPOINT_IDLE_AGE), _cutoff(now, LANE_IDLE_AGE), _cutoff(now, STALE_KEY_AGE),
