@@ -84,6 +84,15 @@ class TheProblems(ReportsCase):
         self.assertEqual((len(whole["problems"]), whole["problems_more"], whole["problems_capped"]), (1, 2, False))
         self.assertEqual((len(full["problems"]), full["problems_more"], full["problems_capped"]), (1, 1, True))
 
+    def test_an_open_report_behind_newer_quiet_ones_still_shows(self):
+        # sd:8795: the read filtered open reports after its LIMIT, so newer
+        # quiet reports filling the read hid an older open one.
+        item = self.report("nas-full-copy", "r1")
+        self.report("cleanup", "r2", exit_code=0, attention=False, basis="")
+        with mock.patch.object(today_reports, "READ", 1):
+            [row] = self.read()["problems"]
+        self.assertEqual(row["item"], item)
+
     def test_open_reports_count_in_todays_badge(self):
         self.report("nas-full-copy", "r1")
         today = self.today()

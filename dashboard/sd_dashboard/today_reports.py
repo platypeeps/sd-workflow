@@ -40,20 +40,9 @@ SHOWN = 50
 #: The last characters of a report's body Details shows.
 BODY_CHARS = 2000
 
-#: Report rows read per refresh, newest first: `reporting.reports` reads at most 200. An open report older than the
-#: newest `READ` is on Reports only, and the count then says `+`.
+#: Open report rows read per refresh, newest first: `reporting.reports` reads at most 200. An open report older than
+#: the newest `READ` open ones is on Reports only, and the count then says `+`.
 READ = 200
-
-
-def _open(row) -> bool:
-    """Not done, and `fields.attention` is not false; fields that do not parse ask for a person too."""
-    if row["status"] == "done":
-        return False
-    try:
-        fields = json.loads(row["fields"] or "null")
-    except ValueError:
-        return True
-    return not (isinstance(fields, dict) and fields.get("attention") is False)
 
 
 #: A status change's body, as `writes.transition` writes it: `<old> -> <new> by <who>`, then `: <reason>` if given.
@@ -115,11 +104,11 @@ def _problem(connection, row, revision: str, now: datetime) -> dict:
 
 def problems(connection: sqlite3.Connection, now: datetime) -> tuple[list[dict], int, bool]:
     """The open reports that ask for a person, newest first and at most `SHOWN`; how many more; whether the read was full."""
-    read = reporting.reports(connection, limit=READ)
-    found = [row for row in read if _open(row)]
+    # `reporting.OPEN_REPORT` filters before the limit (sd:8795): newer quiet reports no longer hide an open one.
+    found = reporting.reports(connection, limit=READ, open_only=True)
     rows = found[:SHOWN]
     revisions = reads.revisions(connection, [row["id"] for row in rows])
-    return [_problem(connection, row, revisions[row["id"]], now) for row in rows], len(found) - len(rows), len(read) >= READ
+    return [_problem(connection, row, revisions[row["id"]], now) for row in rows], len(found) - len(rows), len(found) >= READ
 
 
 def seen_row(row: dict) -> dict:
