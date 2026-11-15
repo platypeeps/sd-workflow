@@ -255,6 +255,20 @@ class SecondBranch(Case):
         with self.assertRaisesRegex(teammate.TeammateRefused, "state-move or in-lane"):
             self.second([later], reason="because")
 
+    def test_a_headless_build_run_holds_the_repositorys_one_branch(self):
+        """sd:8821: a live build run of the repository refuses a teammate start on another branch."""
+        built = self.item(status="ready")
+        build.queue(self.db, [built], who="operator")
+        run = build.claim(self.db, owner="fixture", root=self.root / "worktrees", load=1.0, load_cap=40.0,
+                          interactive=[])
+        self.assertIsNotNone(run)
+        branch = self.db.execute("SELECT branch FROM runner_run").fetchone()["branch"]
+        later = self.item()
+        with self.assertRaisesRegex(teammate.TeammateRefused, rf"open branch {branch} .*\(build run \w+\)"):
+            self.second([later])
+        self.second([later], reason="in-lane")
+        self.assertIn(f"beside {branch}: in-lane", self.notes(later)[-2])
+
     def test_the_same_branch_another_repo_and_an_ended_run_are_not_a_second_branch(self):
         runs = [self.start([self.item()]), self.start([self.item()])]
         self.second([self.item(repo=B)])

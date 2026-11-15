@@ -176,7 +176,8 @@ def start(connection, items: list[int], *, worktree: str, branch: str, budget_mi
     """Register one teammate run for `items`, the first its lead; the run, as `build.run` reads it.
 
     pack sd:7737: one open bundle branch per repository. Another open run of
-    the repository on another branch refuses the start, naming its branch and
+    the repository on another branch, a teammate's or a headless build's
+    (sd:8821), refuses the start, naming its branch and
     worktree, unless `into` names that branch (a side branch that merges into
     the bundle) or `reason` is one of `SECOND_BRANCH`, which each item records.
     An open run is never in the lane: enqueue refuses an item one holds.
@@ -226,7 +227,9 @@ def start(connection, items: list[int], *, worktree: str, branch: str, budget_mi
         repo = repos.pop()
         mine = {branch, into} - {None}
         beside = []
-        for open_run in open_runs(connection):
+        # A headless build holds the repository's one branch too (sd:8821).
+        live = [*open_runs(connection), *({**run, "scope": build.SCOPE} for run in build.open_runs(connection))]
+        for open_run in live:
             if open_run["repo"] != repo or open_run["outcome"] is not None:
                 continue
             target = _into(connection, open_run)
@@ -237,7 +240,7 @@ def start(connection, items: list[int], *, worktree: str, branch: str, budget_mi
             bundle = other["into"] or other["branch"]
             side = f", a side branch of {other['into']}" if other["into"] else ""
             raise TeammateRefused(
-                f"{repo} has open branch {other['branch']} in {other['work_path']} (teammate run {other['id']}"
+                f"{repo} has open branch {other['branch']} in {other['work_path']} ({other.get('scope', SCOPE)} run {other['id']}"
                 f"{side}): one open bundle branch per repository; build these items there, pass --into "
                 f"{bundle} for a side branch that merges into it, or --reason state-move or "
                 "--reason in-lane for a second pull request")

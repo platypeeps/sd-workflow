@@ -183,8 +183,14 @@ class ItemRefs(unittest.TestCase):
         ended = {stuck: {"status": "failed", "reason": "a blocking finding"},
                  planned: {"status": "merged", "merge_commit": "c0ffee" * 7}}
         lines: list[str] = []
-        with unittest.mock.patch.object(sd_lane, "on_hub", lambda queue, read: ended):
+        modes: list[bool] = []
+
+        def read(queue: object, work: object, *, write: bool = True) -> dict:
+            modes.append(write)
+            return ended
+        with unittest.mock.patch.object(sd_lane, "on_hub", read):
             self.assertEqual(sd_lane.watch_items(queue, [stuck, planned], lines.append), 1)
+        self.assertEqual(modes, [False], "the watch poll reads without the write lock (sd:8819)")
         self.assertNamed("\n".join(lines))
 
 
