@@ -263,6 +263,10 @@ class RemoveBuildOutput(Isolated, ScreenCase):
         super().setUp()
         self.alpha = self.cloned("alpha")
         self.repo(str(self.alpha))
+        # No real `lsof`: each test names the working folders it reads.
+        self.cwds = patch.object(health_collectors, "_cwds", return_value=[])
+        self.cwds.start()
+        self.addCleanup(self.cwds.stop)
 
     def tree(self, name: str, *dirs: str) -> Path:
         tree = self.root / f"wt-{name}"
@@ -288,6 +292,21 @@ class RemoveBuildOutput(Isolated, ScreenCase):
         self.assertEqual(answer["refused"], [{"name": str(dirty), "why": "it has uncommitted changes"}])
         self.assertFalse((one / "target").exists() or (one / "node_modules").exists())
         self.assertTrue((dirty / "target" / "deep" / "file").exists())
+
+    def test_a_worktree_a_process_works_in_keeps_its_build_output(self):
+        """pack sd:8818: a merged, clean worktree a build or a test run works in keeps the folders it is using, as
+        a merged worktree does; an `lsof` with no answer keeps every one."""
+        one, two = self.tree("one", "target"), self.tree("two", "node_modules")
+        row = self.row()
+        with patch.object(health_collectors, "_cwds", return_value=["/elsewhere", os.path.realpath(two / "src")]):
+            answer = self.write(row["id"], row["revision"])
+        self.assertEqual(answer["done"], [f"{one}/target"])
+        self.assertEqual(answer["refused"], [{"name": str(two), "why": f"a process works in {two}/src"}])
+        self.assertTrue((two / "node_modules" / "deep" / "file").exists())
+        with patch.object(health_collectors, "_cwds", return_value=None), \
+                self.assertRaisesRegex(ValueError, "lsof gave no answer"):
+            self.write(row["id"], self.row()["revision"])
+        self.assertTrue((two / "node_modules").exists())
 
     def test_a_status_changed_since_the_read_is_stale_and_nothing_is_removed(self):
         one = self.tree("one", "target")
