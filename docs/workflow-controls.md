@@ -38,7 +38,7 @@ progress belongs to the database.
 | Mark a review companion current after a revision | `sd writing reconcile --piece YEAR/slug --artifact adversarial\|research --note-file PATH` — refuses an adversarial reconcile once more than 25 % of the draft is prose the last run did not read |
 | Park or revive a piece | Item screen, or `sd writing park --piece YEAR/slug [--revive]` |
 | Observe jobs and assignments | Operations → Jobs, `sd jobs list`, `sd assignments list`, `sd assignments get ID [ID ...]` |
-| Wait until builds end | `sd assignments get ID [ID ...] --wait [--timeout MIN]`; polls until each has left queued, claimed and running; exit 1 at the timeout (default 240 minutes) |
+| Wait until builds end | `sd assignments get ID [ID ...] --wait [--timeout MIN] [--until merged]`; polls until each has left queued, claimed and running; `--until merged` also waits out a done build's lane entry and exits 0 only when each merged; exit 1 at the timeout (default 240 minutes) |
 | Inspect launchd services | Operations → Services, or `sd services list` |
 | Start, stop or restart an eligible user service | Operations → Services, or `sd services start/stop/restart LABEL` |
 | Inspect configured ports and observed TCP listeners | Operations → Ports |

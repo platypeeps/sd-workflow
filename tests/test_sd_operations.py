@@ -135,6 +135,38 @@ class OperationsCLI(unittest.TestCase):
         with self.assertRaisesRegex(cli.WorkRefusal, "--timeout goes with --wait"):
             self.call("assignments", "get", "8", "--timeout", "1")
 
+    def test_assignments_get_wait_until_merged_waits_through_the_lane(self):
+        """pack sd:8798: `--until merged` waits on past a done build until its item's lane entry ends; 0 only when
+        each one merged, 1 when one failed, a build ended other than done, or at the timeout."""
+        clock = [0.0]
+        sleep = Mock(side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+        self.service.assignment_state.side_effect = (
+            lambda connection, ident: {"id": ident, "item": ident + 100, "status": "done", "revision": "r"})
+        lanes = {108: iter(["pending", "running", "merged"]), 109: iter(["merged"])}
+        self.service.lane_state = Mock(side_effect=lambda connection, item: {"id": f"e{item}",
+                                                                             "status": next(lanes[item], "merged")})
+        with patch.object(cli.time, "monotonic", lambda: clock[0]), patch.object(cli.time, "sleep", sleep):
+            code, output = self.call("assignments", "get", "8", "9", "--wait", "--until", "merged", "--json")
+            self.assertEqual((code, sleep.call_count), (0, 2))
+            self.assertEqual([json.loads(line)["lane"]["status"] for line in output.splitlines()], ["merged"] * 2)
+            lanes[108] = iter(["failed"])
+            code, output = self.call("assignments", "get", "8", "--wait", "--until", "merged", "--json")
+            self.assertEqual((code, json.loads(output)["lane"]["status"]), (1, "failed"))
+            self.service.lane_state.side_effect = None
+            self.service.lane_state.return_value = {"id": "e1", "status": "running"}
+            clock[0] = 0.0
+            code, output = self.call("assignments", "get", "8", "--wait", "--until", "merged", "--timeout", "1",
+                                     "--json")
+            self.assertEqual((code, clock[0]), (1, 60.0))
+            self.service.assignment_state.side_effect = (
+                lambda connection, ident: {"id": ident, "item": 7, "status": "blocked", "revision": "r"})
+            calls = self.service.lane_state.call_count
+            code, output = self.call("assignments", "get", "8", "--wait", "--until", "merged", "--json")
+            self.assertEqual((code, self.service.lane_state.call_count, "lane" in json.loads(output)),
+                             (1, calls, False))
+        with self.assertRaisesRegex(cli.WorkRefusal, "--until goes with --wait"):
+            self.call("assignments", "get", "8", "--until", "merged")
+
     def test_beat_is_one_verb_with_the_leads_start_and_end_as_flags(self):
         """pack sd:7221 (ruling note #41072): `beat ITEM` beats a teammate run; `--start` and `--end` are the lead's."""
         team = types.ModuleType("sd_db.teammate")

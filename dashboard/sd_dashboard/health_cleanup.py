@@ -18,7 +18,8 @@ until the last one, so a stop between any two leaves it in the next read, which 
 `checkout --detach` in the tree, `update-ref -d refs/heads/<b> <head>`, and `git worktree remove <path>` without
 `--force`, which refuses uncommitted or untracked files on its own. A branch that moved here or on origin, a process
 working in the tree, a live session on this machine that holds it (`sd_db.sessions`, pack sd:6024), or files that are
-not build output keep the tree, and the answer says why. A held tree keeps its build output too.
+not build output keep the tree, and the answer says why. A held tree, or one a process works in (pack sd:8818), keeps
+its build output too.
 
 Each write reads its subject again first and refuses a digest that differs from the page's (409): evidence from
 another row, or a subject that changed since the read, writes nothing. Then each step keeps git's own guard:
@@ -200,8 +201,11 @@ def remove_build_output(connection, expected: str):
     for tree in merged:
         try:
             # Read again just before this worktree's folders go: a step that moved since the read above keeps them.
-            kept = "it has uncommitted changes" if tree["status"] else _held(connection, tree["path"]) or _still_removable(
-                Walk(WRITE_SECONDS, "the worktree check"), {**tree, "repo_disk": str(paths.disk(tree["repo"]))})
+            # A process working in the tree may be using them, as a merged worktree's removal reads (pack sd:8818).
+            walk = Walk(WRITE_SECONDS, "the worktree check")
+            kept = ("it has uncommitted changes" if tree["status"] else _held(connection, tree["path"])
+                    or health_collectors.busy(tree["path"], health_collectors._cwds(walk)) or _still_removable(
+                        walk, {**tree, "repo_disk": str(paths.disk(tree["repo"]))}))
         except (reads.OverBudget, _Unread) as error:
             return _unknown(f"{tree['path']} was not checked again before its folders went ({error}); it and the "
                             "worktrees after it were left", done=done, refused=refused)
