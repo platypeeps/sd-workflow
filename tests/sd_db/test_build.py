@@ -767,12 +767,12 @@ class Reap(Case):
 
     def test_a_second_loss_at_checking_turns_off_and_files(self):
         """pack sd:6094 (c): health unknown after a second loss, so auto-pickup off, an item filed, then cleaning."""
-        set_setting(self.db, "build.auto_pickup_until", "2026-10-25T13:00:00+00:00")
+        build.set_pickup(self.db, True)
         self.at_lane_step("checking")
         items = self.count("SELECT COUNT(*) FROM item")
         self.assertIsNotNone(self.lose()["retry"], "a first loss at checking retries")
         settled = self.lose()
-        self.assertEqual(read_settings(self.db, ["build.auto_pickup_until"]), {"build.auto_pickup_until": None})
+        self.assertEqual(read_settings(self.db, [build.AUTO_PICKUP]), {build.AUTO_PICKUP: None})
         filed = self.db.execute("SELECT * FROM item WHERE id > ? ORDER BY id", (max(self.items),)).fetchall()
         self.assertEqual((self.count("SELECT COUNT(*) FROM item"), len(filed)), (items + 1, 1))
         self.assertIn("health unknown", filed[0]["title"])
@@ -1310,7 +1310,7 @@ class Backup(Case):
 
 
 class Pickup(Case):
-    """pack sd:6097, design "Auto-pickup": timed pickup of ready items, and the rules that turn it off."""
+    """pack sd:6097, design "Auto-pickup": pickup of ready items while on, and the rules that turn it off."""
 
     NOW = "2026-11-03T20:00:00+00:00"
 
@@ -1320,21 +1320,23 @@ class Pickup(Case):
     def room(self, **inputs):
         return build.room(self.db, **{**IDLE, **inputs})
 
-    def test_on_ends_at_the_next_nine_in_denver(self):
-        """pack sd:7698: On runs until the next 09:00 America/Denver."""
-        self.assertEqual(build.morning("2026-11-05T15:00:00+00:00"), "2026-11-05T16:00:00+00:00",
-                         "On at 08:00 MST ends 09:00 the same day")
-        self.assertEqual(build.morning("2026-11-05T16:30:00+00:00"), "2026-11-06T16:00:00+00:00",
-                         "On at 09:30 MST ends 09:00 the next day")
-        self.assertEqual(build.morning("2026-11-05T16:00:00+00:00"), "2026-11-06T16:00:00+00:00", "09:00 itself is past")
-        self.assertEqual(build.morning("2026-11-03T20:00:00+00:00"), "2026-11-04T16:00:00+00:00", "MST: 09:00 is 16:00Z")
-        self.assertEqual(build.morning("2026-07-01T20:00:00+00:00"), "2026-07-02T15:00:00+00:00", "MDT: 15:00Z")
-        state = self.on()
-        self.assertEqual((state["on"], state["until"]), (True, "2026-11-04T16:00:00+00:00"))
-        self.assertFalse(build.pickup_state(self.db, now="2026-11-04T16:00:00+00:00")["on"], "the end is off")
-        self.assertEqual(build.set_pickup(self.db, False, now=self.NOW)["until"], None)
-        set_setting(self.db, build.AUTO_PICKUP, "tomorrow")
-        self.assertFalse(build.pickup_state(self.db, now=self.NOW)["on"], "a value that does not read is off")
+    def test_on_stays_on_until_off(self):
+        """pack sd:8930: On has no end; it stays on past 09:00 America/Denver and the next day, until Off."""
+        build.set_pickup(self.db, True, now="2026-11-04T15:59:00+00:00")  # 08:59 MST
+        for later_on in ("2026-11-04T16:01:00+00:00", "2026-11-05T16:01:00+00:00", "2027-07-01T15:00:00+00:00"):
+            self.assertTrue(build.pickup_state(self.db, now=later_on)["on"], f"still on at {later_on}")
+        self.assertEqual(build.pickup_state(self.db)["value"], "on")
+        self.assertEqual(build.set_pickup(self.db, False, now=self.NOW)["value"], None)
+        self.assertFalse(build.pickup_state(self.db)["on"], "Off is off")
+
+    def test_a_value_that_does_not_read_on_is_off(self):
+        """Only "on" reads on: an old build's end (an ISO timestamp, past or future) or any other text is off."""
+        for value in ("2099-01-01T16:00:00+00:00", "2026-11-04T16:00:00+00:00", "tomorrow", "On", "true"):
+            set_setting(self.db, build.AUTO_PICKUP, value)
+            self.assertFalse(build.pickup_state(self.db, now=self.NOW)["on"], value)
+        set_setting(self.db, "build.auto_pickup_until", "2099-01-01T16:00:00+00:00")
+        set_setting(self.db, build.AUTO_PICKUP, None)
+        self.assertFalse(build.pickup_state(self.db, now=self.NOW)["on"], "the old build's key is not read")
 
     def test_pickup_fills_the_room_by_priority_while_on(self):
         a = [self.item(priority=n) for n in (1, 2, 3, 4)]
@@ -1398,7 +1400,7 @@ class Pickup(Case):
 
     def picked_run(self):
         item = self.item()
-        set_setting(self.db, build.AUTO_PICKUP, "2026-11-04T14:00:00+00:00")
+        build.set_pickup(self.db, True, now=self.NOW)
         build.queue(self.db, [item], who=build.PICKUP)
         bundle = self.claim()
         build.write(self.db, bundle["id"], step="enqueuing")
