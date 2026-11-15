@@ -424,8 +424,9 @@ def _transition(
             "UPDATE item SET status = ?, updated_at = ? WHERE id = ?",
             (target, stamp, item),
         )
+        if target in UNBUILT:
+            cancel_unwanted_blocked(connection, item, stamp, f"item {item} moved to {target} by {who}")
         if target == "done":
-            cancel_done_blocked(connection, item, stamp, f"item {item} moved to done by {who}")
             cancel_done_lane(connection, item, stamp, f"item {item} moved to done by {who}")
         note = f"{current} -> {target} by {who}"
         if reason:
@@ -437,20 +438,25 @@ def _transition(
     return current
 
 
-def cancel_done_blocked(connection: sqlite3.Connection, item: int, stamp: str, why: str) -> None:
-    """Cancel a done item's blocked assignments that no unreleased run holds (sd:6996).
+#: The statuses whose item wants no build: done (sd:6996), and back in planning (sd:8846).
+UNBUILT = ("done", "planning")
+
+
+def cancel_unwanted_blocked(connection: sqlite3.Connection, item: int, stamp: str, why: str) -> None:
+    """Cancel the blocked assignments of an item in an `UNBUILT` status that no unreleased run holds (sd:6996).
 
     A blocked row waits on an operator for work the item no longer needs, so
-    left open it lingers on every surface. One whose run still holds its
+    left open it lingers on every surface; a dispatch tick that retries a
+    blocked build would run an item the operator took back to planning. One whose run still holds its
     lease (its own, or its bundle lead's) stays the runner's; `build._release`
     calls this again once the lease is gone.
     """
     connection.execute(
         "UPDATE assignment SET status = 'cancelled', ended = ?, result = ? "
-        "WHERE item = ? AND status = 'blocked' AND EXISTS (SELECT 1 FROM item WHERE id = ? AND status = 'done') "
+        "WHERE item = ? AND status = 'blocked' AND EXISTS (SELECT 1 FROM item WHERE id = ? AND status IN (?, ?)) "
         "AND NOT EXISTS (SELECT 1 FROM runner_run WHERE runner_run.released_at IS NULL "
         "AND runner_run.assignment IN (assignment.id, assignment.parent))",
-        (stamp, why, item, item),
+        (stamp, why, item, item, *UNBUILT),
     )
 
 

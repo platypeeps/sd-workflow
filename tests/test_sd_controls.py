@@ -108,6 +108,23 @@ class Controls(unittest.TestCase):
         self.assertEqual(listed.returncode, 0, listed.stderr)
         return json.loads(listed.stdout)
 
+    def test_reports_list_open_is_a_table_of_open_reports(self):
+        """sd:8795: `sd reports list --open` prints the open reports as a table."""
+        filed = json.loads(self.cli(*self.ingest(
+            "findings", 0, "Observed drift.\nSD_REPORT_ATTENTION: two stale rows\n")).stdout)
+        item = filed["item"]["id"]
+        listed = self.cli("reports", "list", "--open")
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        head, rule, row = listed.stdout.splitlines()
+        self.assertEqual(head.split(), ["ID", "Status", "Filed", "Job", "Title"])
+        self.assertTrue(rule.startswith("--"))
+        self.assertTrue(row.startswith(f"#{item} "), row)
+        self.assertIn("fixture", row)
+        done = self.cli("reports", "acknowledge", str(item), "--resolve-followups", "--json")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.cli("reports", "list", "--open").stdout, "no open reports\n")
+        self.assertEqual(json.loads(self.cli("reports", "list", "--open", "--json").stdout), [])
+
     def test_report_ingestion_is_replayable_and_acknowledged(self):
         # A clean tick is not an event: the library records a heartbeat and
         # files no report (system sd:739), and replaying the same run records

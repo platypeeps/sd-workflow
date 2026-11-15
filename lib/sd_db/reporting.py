@@ -760,10 +760,17 @@ def ingest_log(connection, *, job, run_id, started, ended, exit_code, log_path, 
         return {"recorded": "report", "why": basis if attention else "the job recovered", **state}
 
 
-def reports(connection, *, limit=200):
+#: An open report: not done, and `fields.attention` is not false; fields that do not parse ask for a person too.
+OPEN_REPORT = ("status != 'done' AND COALESCE(CASE WHEN json_valid(fields)"
+               " THEN json_type(fields, '$.attention') END, '') != 'false'")
+
+
+def reports(connection, *, limit=200, open_only=False):
+    """The newest reports, at most 200; `open_only` filters before the limit, so an old open one is not cut (sd:8795)."""
+    where = " AND " + OPEN_REPORT if open_only else ""
     return [dict(row) for row in connection.execute(
-        "SELECT * FROM item WHERE kind='report' AND source IS NOT 'brief' ORDER BY created_at DESC,id DESC LIMIT ?",
-        (min(200, max(1, limit)),))]
+        "SELECT * FROM item WHERE kind='report' AND source IS NOT 'brief'" + where
+        + " ORDER BY created_at DESC,id DESC LIMIT ?", (min(200, max(1, limit)),))]
 
 
 def _refuse_brief(row):
