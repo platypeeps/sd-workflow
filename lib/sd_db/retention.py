@@ -27,7 +27,8 @@ its snapshot restored and compared, and never before. What the table says:
                      younger than `CHECKPOINT_IDLE_AGE` keeps every row, so
                      a live ship's phases stay readable. `STALE_CHECKPOINTS`:
                      an `sd-gate-receipt:` key, or a merged `ship:` key that
-                     owes no close, goes whole once it sat `STALE_KEY_AGE`.
+                     owes no close and whose items are done, goes whole once
+                     it sat `STALE_KEY_AGE`.
                      `NEWEST_AND_RESOLVED_CHECKPOINTS`: the newest row and
                      the newest resolved row, at any age: `contribution_sync`
                      and `removal` read only the newest resolved one, and
@@ -144,7 +145,8 @@ NEWEST_ONLY_CHECKPOINTS = (
 #: once its phase is `merged`: an unfinished one, a paused prepare or an
 #: interrupted merge, is what resume, watch and reconcile read, at any age.
 #: A merged one with a `closing_owed` not yet `closing_paid` stays too:
-#: `sd_ship_squash.owed_closes` pays it on a later squash.
+#: `sd_ship_squash.owed_closes` pays it on a later squash. So does one
+#: whose delivered or co-delivered items are not all `done` (`_delivered`).
 STALE_CHECKPOINTS = ("ship:", "sd-gate-receipt:")
 
 #: How long a `STALE_CHECKPOINTS` key goes unwritten before its newest row goes.
@@ -392,10 +394,47 @@ def _victims(connection, *, now: datetime) -> list[tuple[int, int, int]]:
         " WHERE (rank > 1 AND ((rule = 1 AND newest < ?) OR (rule = 2 AND id IS NOT resolved)"
         "  OR (rule = 3 AND newest < ? AND id != first)))"
         f" OR (rank = 1 AND rule = 1 AND newest < ? AND ({stale}) AND NOT ({held})) ORDER BY id")
-    return [(row[0], row[1], row[2]) for row in connection.execute(sql, (
+    rows = [(row[0], row[1], row[2]) for row in connection.execute(sql, (
         *newest_args, *queue_args, *lane_args,
         _cutoff(now, CHECKPOINT_IDLE_AGE), _cutoff(now, LANE_IDLE_AGE), _cutoff(now, STALE_KEY_AGE),
         *stale_args))]
+    # A newest row here is a stale key's; a ship receipt's goes only once each item it closes is done.
+    return [row for row in rows if row[0] != row[2] or _delivered(connection, row[0])]
+
+
+#: The `sd:<n>` ids a receipt's title names, as `sd_ship_body.title_ids` reads them.
+TITLE_ID = re.compile(r"\bsd:([0-9]+)\b")
+
+
+def _delivered(connection, ident: int) -> bool:
+    """Whether newest row `ident` may go: not a ship receipt, or each item its merge closes is `done`.
+
+    `sd-ship` saves `merged` before it records delivery or closes the
+    co-delivered items (review of sd:8879), so a delivery error or a
+    landed-tree hold leaves a merged receipt reconcile still needs. Those
+    items are its `item` when it delivers, and its stored `closing` items,
+    or, for a receipt prepared before sd:3704, its title's. An item with
+    no row keeps the receipt: nothing says it was delivered.
+    """
+    row = connection.execute("SELECT key, body FROM state WHERE id = ?", (ident,)).fetchone()
+    if row is None or not str(row["key"]).startswith("ship:"):
+        return True
+    try:
+        body = json.loads(row["body"])
+        closing = body.get("closing")
+        named = closing["items"] if isinstance(closing, dict) else [
+            int(number) for number in TITLE_ID.findall(str(body.get("title") or ""))]
+        items = {*([body["item"]] if body.get("deliver") else []), *named}
+        if not all(type(item) is int for item in items):
+            return False
+    except (TypeError, ValueError, KeyError, AttributeError):
+        return False
+    if not items:
+        return True
+    marks = ",".join("?" * len(items))
+    found = connection.execute(f"SELECT COUNT(*) FROM item WHERE status = 'done' AND id IN ({marks})",
+                               sorted(items)).fetchone()[0]
+    return found == len(items)
 
 
 def _still_due(connection, chunk: list[int]):

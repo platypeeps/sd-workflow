@@ -685,6 +685,27 @@ class TheCheckpointRows(PruneCase):
         self.assertEqual(ship.for_item(self.db, "example/repo", 9, "b-merge_dispatch")[1], kept["merge_dispatch"])
         self.assertEqual(self.ids("ship:owed"), [owed])
 
+    def test_a_merged_receipt_keeps_its_newest_row_until_each_item_it_delivers_is_done(self):
+        """Review of sd:8879: `sd-ship` saves `merged` before it records delivery or closes the co-delivered items,
+        so a delivery error or a landed-tree hold leaves a merged receipt that reconcile still needs."""
+        done = create_item(self.db, kind="task", title="Done", repo=str(self.repo), status="done")
+        open_ = create_item(self.db, kind="task", title="Open", repo=str(self.repo), status="ready")
+        merged = {"phase": "merged", "repository": "example/repo"}
+        pending = self.receipt("ship:pending", days=60, **merged, item=open_, deliver=True, branch="b-pending")
+        closes = self.receipt("ship:closes", days=60, **merged, item=done, deliver=True,
+                              closing={"items": [done, open_]})
+        legacy = self.receipt("ship:legacy", days=60, **merged, item=done, deliver=True,
+                              title=f"fix: two (sd:{done}, sd:{open_})")
+        gone = self.receipt("ship:gone", days=60, **merged, item=done + 1000, deliver=True)
+        self.receipt("ship:settled", days=60, **merged, item=done, deliver=True, closing={"items": [done]},
+                     title=f"fix: one (sd:{done})")
+        self.receipt("ship:undelivered", days=60, **merged, item=open_, deliver=False)
+        self.assertEqual(self.compact(), 2)
+        self.assertEqual([self.ids(key) for key in ("ship:pending", "ship:closes", "ship:legacy", "ship:gone")],
+                         [[pending], [closes], [legacy], [gone]])
+        self.assertEqual(self.ids("ship:settled") + self.ids("ship:undelivered"), [])
+        self.assertEqual(ship.for_item(self.db, "example/repo", open_, "b-pending")[1], pending)
+
     def test_a_kept_key_and_a_lookalike_keep_every_row(self):
         lane = self.rows("lane:v1:example/repo:entry", days=29)
         operator = self.rows("operator-action", days=30)
