@@ -578,18 +578,25 @@ class Operations(unittest.TestCase):
                 self.assertEqual(self.snapshot()["state"], "interrupted")
         self.assertEqual(self.actions(), [["/bin/launchctl", "kill", "SIGTERM", self.service]] * 3)
 
-    def test_lane_state_is_the_newest_entry_not_cancelled_that_delivers_the_item(self):
-        """pack sd:8798: what `get --wait --until merged` waits on; a member is delivered by its lead's entry."""
+    def test_lane_state_is_the_newest_entry_that_delivers_the_item(self):
+        """pack sd:8798: what `get --wait --until merged` waits on; a member is delivered by its lead's entry. The
+        current attempt's cancel is its end: an older merge never stands in for it (review round 1)."""
         item = capture_task(self.db, title="Task", who="operator")["item"]["id"]
         self.assertIsNone(lane_state(self.db, item))
-        for ident, body in (("a", {"item": item, "status": "failed"}), ("b", {"item": 1, "closes": [item],
-                            "status": "merged", "merge_commit": "c0ffee"}), ("c", {"item": item, "status": "cancelled"})):
+
+        def entry(ident, **body):
             self.db.execute("INSERT INTO state (kind, key, timestamp, body) VALUES ('checkpoint', ?, 'now', ?)",
                             (f"lane:v1:example/repo:{ident}", json.dumps({"id": ident, **body})))
+
+        entry("a", item=item, status="failed")
+        entry("b", item=1, closes=[item], status="merged", merge_commit="c0ffee")
         self.db.execute("INSERT INTO state (kind, key, timestamp, body) VALUES ('checkpoint', 'lane:v1:x:d', 'now', "
                         "'not json')")
         self.assertEqual(lane_state(self.db, item),
                          {"id": "b", "status": "merged", "reason": None, "merge_commit": "c0ffee"})
+        entry("c", item=item, status="cancelled", reason="handed back")
+        self.assertEqual(lane_state(self.db, item),
+                         {"id": "c", "status": "cancelled", "reason": "handed back", "merge_commit": None})
 
     def test_assignment_cancel_is_queued_only_atomic_and_does_not_complete_item(self):
         item = capture_task(self.db, title="Task", who="operator")["item"]["id"]

@@ -559,9 +559,10 @@ def assignment_state(connection: sqlite3.Connection, assignment: int) -> dict:
 
 
 def lane_state(connection: sqlite3.Connection, item: int) -> dict | None:
-    """The newest lane entry, not cancelled, that delivers `item`: its id, status, reason and merge commit; None when
-    there is none. `sd assignments get --wait --until merged` waits while it is pending or running (pack sd:8798)."""
-    found = [entry for _, _, entry in reads.item_lane_entries(connection, item) if entry.get("status") != "cancelled"]
+    """The newest lane entry that delivers `item`: its id, status, reason and merge commit; None when there is none.
+    `sd assignments get --wait --until merged` waits while it is pending or running (pack sd:8798). A cancelled one
+    counts: it is the current attempt's end, and an older merge must not stand in for it."""
+    found = [entry for _, _, entry in reads.item_lane_entries(connection, item)]
     return {key: found[-1].get(key) for key in ("id", "status", "reason", "merge_commit")} if found else None
 
 
