@@ -26,7 +26,12 @@
     const blob = typeof Blob !== 'undefined' && body instanceof Blob;
     const r = await fetch(path, { method: 'POST', headers: { 'Content-Type': blob ? 'application/octet-stream' : 'application/json', 'X-SD-CSRF': csrf(), ...headers },
       body: blob ? body : JSON.stringify(body), ...(signal ? { signal } : {}) });
-    const out = await r.json().catch(() => ({}));
+    // sd:8828: a 2xx whose body cannot be read may or may not have landed, so it rejects as unknown with no status, as a
+    // write with no answer does (sd:8033): no success toast, no Undo, no landed count.
+    const out = await r.json().catch(() => {
+      if (r.ok) throw Object.assign(new Error(`the answer (HTTP ${r.status}) could not be read, so whether it changed is not known`), { unknown: true });
+      return {};
+    });
     if (!r.ok) { const e = new Error(out.error || `HTTP ${r.status}`); e.stale = r.status === 409; e.status = r.status; throw e; }
     return out;
   }
