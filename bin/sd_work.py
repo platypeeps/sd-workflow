@@ -1213,6 +1213,7 @@ def _today_repos(connection: Any, names: list[str] | None) -> tuple[list[str | N
 def _here_repos(connection: Any) -> tuple[list[str | None], str]:
     """`--here`'s `item.repo` keys (sd:8844): cwd's registered repository, then its companions, as
     `sd.status_companions` lists them, else as its research watchlist names them; refused outside one."""
+    sd_lib.import_sd_db()  # the gateway first, as for every sd_db import here
     from sd_db import repos
 
     root = sd_lib.repo_root()
