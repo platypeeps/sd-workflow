@@ -143,6 +143,49 @@ class TheStatusRule(WriteCase):
         self.assertEqual(
             self.connection.execute("SELECT status FROM assignment WHERE id = ?", (held,)).fetchone()[0], "blocked")
 
+    def test_done_cancels_the_items_newest_failed_lane_entries_only(self):
+        """pack sd:8850. Closing an item clears its failed or skipped lane entries newer than its last merge, as
+        `lane cancel` does (pack sd:5838), so Landing drops it; an older one, another item's, and one beside a
+        pending entry stay."""
+        item = create_item(self.connection, kind="task", title="A thing")
+        other = create_item(self.connection, kind="task", title="Another")
+        held = create_item(self.connection, kind="task", title="Held")
+        key = "lane:v1:example/repo:{}".format
+        for ident, owner, status in (("a", item, "failed"), ("b", item, "merged"), ("c", item, "skipped"),
+                                     ("d", item, "failed"), ("e", other, "failed"), ("f", held, "failed"),
+                                     ("g", held, "pending")):
+            self.raw_state("checkpoint", key(ident), json.dumps(
+                {"id": ident, "item": owner, "status": status, "reason": f"{ident} broke"}))
+        self.raw_state("checkpoint", "lane:v1:example/other:h", "not json")
+        for each in (item, other, held):
+            transition(self.connection, each, "done" if each != other else "blocked", who="operator")
+        latest = {row[0][len("lane:v1:example/repo:"):]: json.loads(row[1]) for row in self.connection.execute(
+            "SELECT key, body FROM state WHERE id IN (SELECT MAX(id) FROM state WHERE key LIKE 'lane:v1:example/"
+            "repo:%' GROUP BY key)")}
+        self.assertEqual({ident: entry["status"] for ident, entry in latest.items()},
+                         {"a": "failed", "b": "merged", "c": "cancelled", "d": "cancelled", "e": "failed",
+                          "f": "failed", "g": "pending"})
+        self.assertIn("moved to done by operator; it was skipped: c broke", latest["c"]["reason"])
+        self.assertTrue(latest["d"]["finished_at"].endswith("Z"))
+
+    def test_a_malformed_lane_entry_never_blocks_a_move_to_done(self):
+        """pack sd:8850 review round 2: any lane row in any repository is read on the way to done; one whose
+        `item`, `closes` or `id` is not the shape the lane writes is skipped, never a TypeError."""
+        from sd_db.reads import item_lane_entries
+
+        item = create_item(self.connection, kind="task", title="A thing")
+        for ident, body in (("m1", {"id": "m1", "item": 1, "closes": 7}), ("m2", {"id": "m2", "item": 1, "closes": [{}]}),
+                            ("m3", {"id": ["x"], "item": item, "status": "failed"}),
+                            ("m4", {"id": "m4", "item": [item], "status": "failed"}),
+                            ("m5", {"id": "m5", "item": item, "closes": "7", "status": "failed"}),
+                            ("ok", {"id": "ok", "item": item, "status": "failed"})):
+            self.raw_state("checkpoint", f"lane:v1:example/repo:{ident}", json.dumps(body))
+        self.assertEqual([entry["id"] for _, _, entry in item_lane_entries(self.connection, item)], ["ok"])
+        transition(self.connection, item, "done", who="operator")
+        status = self.connection.execute(
+            "SELECT body FROM state WHERE key = 'lane:v1:example/repo:ok' ORDER BY id DESC LIMIT 1").fetchone()[0]
+        self.assertEqual(json.loads(status)["status"], "cancelled")
+
     def test_a_failed_transition_leaves_no_note_behind(self):
         """The note and the row are one transaction, in both directions."""
         with self.assertRaises(TransitionRefused):

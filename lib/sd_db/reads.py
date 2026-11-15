@@ -1591,6 +1591,39 @@ def lane_entries(connection: sqlite3.Connection) -> list[sqlite3.Row]:
         " AND key >= ? AND key < ? GROUP BY key)", LANE_KEYS).fetchall()
 
 
+def item_lane_entries(connection: sqlite3.Connection, item: int) -> list[tuple[str, int, dict]]:
+    """Each lane entry, in every repository's lane, that delivers `item` (`lane_delivered`): its key, its first row id
+    (the order the hub took it, as `sd_lane.enqueue_order` reads it) and its latest body, oldest first.
+
+    A row whose body is not a JSON object, or whose `id`, `item` or `closes` is not the shape the lane writes (a
+    text id, an integer item or none, a list of integers or none), is skipped: it is no entry of this item's to
+    judge, and one malformed row must not stop every move to done (pack sd:8850).
+    """
+    found = []
+    for row in connection.execute(
+            "SELECT state.key, state.body, keys.first FROM state JOIN (SELECT key, MIN(id) AS first, MAX(id) AS last "
+            "FROM state WHERE kind = 'checkpoint' AND key >= ? AND key < ? GROUP BY key) AS keys "
+            "ON state.id = keys.last", LANE_KEYS):
+        try:
+            entry = json.loads(row["body"])
+        except (TypeError, ValueError):
+            continue
+        if _lane_shaped(entry) and item in lane_delivered(entry):
+            found.append((row["key"], row["first"], entry))
+    return sorted(found, key=lambda each: each[1])
+
+
+def _lane_shaped(entry: Any) -> bool:
+    """Whether a lane body has the `id`, `item` and `closes` shapes `item_lane_entries` reads."""
+    def whole(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool)
+
+    return (isinstance(entry, dict) and isinstance(entry.get("id"), str) and bool(entry["id"])
+            and (entry.get("item") is None or whole(entry["item"]))
+            and (entry.get("closes") is None or (isinstance(entry["closes"], list)
+                                                 and all(whole(each) for each in entry["closes"]))))
+
+
 def lane_delivered(entry: dict) -> list:
     """The items a lane entry delivers: its own item, then each of its `closes`, once each (pack sd:7288).
 
@@ -1598,6 +1631,31 @@ def lane_delivered(entry: dict) -> list:
     push, and `teammate.start` checks a new run's items against it.
     """
     return list(dict.fromkeys([entry.get("item"), *(entry.get("closes") or ())]))
+
+
+def stale_lane_ended(entries: list[dict[str, Any]], item: int, order: dict[str, int]) -> list[dict[str, Any]]:
+    """`item`'s failed and skipped entries newer than its newest merged or prepared one, newest first (pack sd:5838).
+
+    `sd_lane.cancel` and an item's move to done (`writes.cancel_done_lane`, pack sd:8850) clear these.
+
+    Only when its newest entry by `order` (`enqueue_order`) that is not
+    cancelled is failed or skipped, and none is pending or running.
+    Landing reads the same newest entry: it skips cancelled ones, such as
+    a retry cancelled while pending, so an older failed one would take the
+    place of the one cancelled. One before a merge or a prepared entry is
+    history and stays.
+    """
+    mine = sorted((row for row in entries if row.get("item") == item and row.get("status") != "cancelled"),
+                  key=lambda row: order.get(row["id"], 0), reverse=True)
+    if (not mine or mine[0].get("status") not in ("failed", "skipped")
+            or any(row.get("status") in ("pending", "running") for row in mine)):
+        return []
+    ended = []
+    for row in mine:
+        if row.get("status") in ("merged", "prepared"):
+            break
+        ended.append(row)
+    return ended
 
 
 def build_runs(connection: sqlite3.Connection) -> list[sqlite3.Row]:
@@ -1622,4 +1680,4 @@ def launch_notes(connection: sqlite3.Connection, prefix: str) -> list[sqlite3.Ro
         (len(prefix), prefix)).fetchall()
 
 
-__all__ += ["build_runs", "lane_delivered", "lane_entries", "launch_notes"]
+__all__ += ["build_runs", "item_lane_entries", "lane_delivered", "lane_entries", "launch_notes", "stale_lane_ended"]
