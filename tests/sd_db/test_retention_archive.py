@@ -483,7 +483,7 @@ class TheBulkRoot(ArchiveCase):
 
     @hub_only
     def test_a_vacuum_that_did_not_run_fails_the_job_and_names_why(self):
-        self.rows("ship:idle", days=10)
+        self.rows("review:idle", days=10)  # the job runs at the clock's now: no `STALE_CHECKPOINTS` key
         error = io.StringIO()
         with mock.patch.dict(os.environ, self.config({"config": {"sd": {"bulk_storage_root": str(self.bulk)}}})), \
                 mock.patch.object(backup_job, "vacuum", side_effect=sqlite3.OperationalError("database is locked")), \
@@ -493,7 +493,7 @@ class TheBulkRoot(ArchiveCase):
         self.assertIn("and the prune ran: ", error.getvalue())
         self.assertIn("2 superseded checkpoint row(s) removed", error.getvalue())
         self.assertIn("the VACUUM did not run: database is locked", error.getvalue())
-        self.assertEqual(len(self.ids("ship:idle")), 1)
+        self.assertEqual(len(self.ids("review:idle")), 1)
 
     def test_a_failure_after_the_vacuum_ran_names_its_stage(self):
         """The WAL checkpoint or the size read failing is not the VACUUM failing (sd:8657)."""

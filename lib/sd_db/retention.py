@@ -25,7 +25,10 @@ its snapshot restored and compared, and never before. What the table says:
                      appends one before each side effect: 24k `ship:` rows
                      held 700 MB on 2026-10-12. A key whose newest row is
                      younger than `CHECKPOINT_IDLE_AGE` keeps every row, so
-                     a live ship's phases stay readable.
+                     a live ship's phases stay readable. `STALE_CHECKPOINTS`:
+                     an `sd-gate-receipt:` key, or a merged `ship:` key that
+                     owes no close and whose items are done, goes whole once
+                     it sat `STALE_KEY_AGE`.
                      `NEWEST_AND_RESOLVED_CHECKPOINTS`: the newest row and
                      the newest resolved row, at any age: `contribution_sync`
                      and `removal` read only the newest resolved one, and
@@ -134,6 +137,20 @@ NEWEST_ONLY_CHECKPOINTS = (
     "ship-adjudication-no-item:", "sd-gate-receipt:", "sd-check-receipt:", "contribution:", "provider-orders:",
     "review:", "jira-moves",
 )
+
+#: Newest-only prefixes whose newest row goes too once the key sat
+#: `STALE_KEY_AGE` (sd:8879): after the rules above, these newest rows held
+#: most of 426 MB on 2026-11-14. A gate receipt stands six hours at most
+#: (`sd_gate_receipts.TREE_REUSE_WINDOW_SECONDS`). A ship receipt goes only
+#: once its phase is `merged`: an unfinished one, a paused prepare or an
+#: interrupted merge, is what resume, watch and reconcile read, at any age.
+#: A merged one with a `closing_owed` not yet `closing_paid` stays too:
+#: `sd_ship_squash.owed_closes` pays it on a later squash. So does one
+#: whose delivered or co-delivered items are not all `done` (`_delivered`).
+STALE_CHECKPOINTS = ("ship:", "sd-gate-receipt:")
+
+#: How long a `STALE_CHECKPOINTS` key goes unwritten before its newest row goes.
+STALE_KEY_AGE = timedelta(days=30)
 
 #: Checkpoint keys, whole keys and not prefixes, whose readers take the newest
 #: row and the newest resolved row: `contribution_sync._queue` and
@@ -342,8 +359,9 @@ def checkpoint_victims(connection, *, now: datetime) -> list[int]:
     """The checkpoint rows the three rules drop, by id, oldest first.
 
     Newest is the highest id, the row `ship.read` takes, so the revision a
-    `ship.save` compares against is never one of them. The age is the
-    key's newest timestamp, as it always was.
+    `ship.save` compares against is never one of them, but for a
+    `STALE_CHECKPOINTS` key a month idle: a save racing that delete finds
+    its revision gone and refuses. The age is the key's newest timestamp.
     """
     return [row[0] for row in _victims(connection, now=now)]
 
@@ -359,18 +377,64 @@ def _victims(connection, *, now: datetime) -> list[tuple[int, int, int]]:
     queue, queue_args = f"key IN ({', '.join('?' for _ in NEWEST_AND_RESOLVED_CHECKPOINTS)})", [
         *NEWEST_AND_RESOLVED_CHECKPOINTS]
     lane, lane_args = _prefixed(FIRST_AND_NEWEST_CHECKPOINTS)
+    stale, stale_args = _prefixed(STALE_CHECKPOINTS)
+    # A `ship:` row goes only once merged and owing no close: idle is not finished (review of sd:8879).
+    held = ("substr(ranked.key, 1, 5) = 'ship:' AND NOT EXISTS (SELECT 1 FROM state AS row"
+            " WHERE row.id = ranked.id AND json_valid(row.body) AND json_extract(row.body, '$.phase') = 'merged'"
+            " AND (json_extract(row.body, '$.closing_owed') IS NULL"
+            " OR json_extract(row.body, '$.closing_paid') IS NOT NULL))")
     sql = (
-        "SELECT id, first, last FROM (SELECT id, rule, ROW_NUMBER() OVER (PARTITION BY key ORDER BY id DESC) AS rank,"
+        "SELECT id, first, last FROM (SELECT id, key, rule,"
+        "  ROW_NUMBER() OVER (PARTITION BY key ORDER BY id DESC) AS rank,"
         "  MIN(id) OVER (PARTITION BY key) AS first, MAX(id) OVER (PARTITION BY key) AS last,"
         "  MAX(timestamp) OVER (PARTITION BY key) AS newest,"
         "  MAX(CASE WHEN resolved_at IS NOT NULL THEN id END) OVER (PARTITION BY key) AS resolved"
         f" FROM (SELECT id, key, timestamp, resolved_at, CASE WHEN {newest} THEN 1 WHEN {queue} THEN 2"
-        f"  WHEN {lane} THEN 3 END AS rule FROM state WHERE kind='checkpoint') WHERE rule IS NOT NULL)"
-        " WHERE rank > 1 AND ((rule = 1 AND newest < ?) OR (rule = 2 AND id IS NOT resolved)"
-        "  OR (rule = 3 AND newest < ? AND id != first)) ORDER BY id")
-    return [(row[0], row[1], row[2]) for row in connection.execute(sql, (
+        f"  WHEN {lane} THEN 3 END AS rule FROM state WHERE kind='checkpoint') WHERE rule IS NOT NULL) AS ranked"
+        " WHERE (rank > 1 AND ((rule = 1 AND newest < ?) OR (rule = 2 AND id IS NOT resolved)"
+        "  OR (rule = 3 AND newest < ? AND id != first)))"
+        f" OR (rank = 1 AND rule = 1 AND newest < ? AND ({stale}) AND NOT ({held})) ORDER BY id")
+    rows = [(row[0], row[1], row[2]) for row in connection.execute(sql, (
         *newest_args, *queue_args, *lane_args,
-        _cutoff(now, CHECKPOINT_IDLE_AGE), _cutoff(now, LANE_IDLE_AGE)))]
+        _cutoff(now, CHECKPOINT_IDLE_AGE), _cutoff(now, LANE_IDLE_AGE), _cutoff(now, STALE_KEY_AGE),
+        *stale_args))]
+    # A newest row here is a stale key's; a ship receipt's goes only once each item it closes is done.
+    return [row for row in rows if row[0] != row[2] or _delivered(connection, row[0])]
+
+
+#: The `sd:<n>` ids a receipt's title names, as `sd_ship_body.title_ids` reads them.
+TITLE_ID = re.compile(r"\bsd:([0-9]+)\b")
+
+
+def _delivered(connection, ident: int) -> bool:
+    """Whether newest row `ident` may go: not a ship receipt, or each item its merge closes is `done`.
+
+    `sd-ship` saves `merged` before it records delivery or closes the
+    co-delivered items (review of sd:8879), so a delivery error or a
+    landed-tree hold leaves a merged receipt reconcile still needs. Those
+    items are its `item` when it delivers, and its stored `closing` items,
+    or, for a receipt prepared before sd:3704, its title's. An item with
+    no row keeps the receipt: nothing says it was delivered.
+    """
+    row = connection.execute("SELECT key, body FROM state WHERE id = ?", (ident,)).fetchone()
+    if row is None or not str(row["key"]).startswith("ship:"):
+        return True
+    try:
+        body = json.loads(row["body"])
+        closing = body.get("closing")
+        named = closing["items"] if isinstance(closing, dict) else [
+            int(number) for number in TITLE_ID.findall(str(body.get("title") or ""))]
+        items = {*([body["item"]] if body.get("deliver") else []), *named}
+        if not all(type(item) is int for item in items):
+            return False
+    except (TypeError, ValueError, KeyError, AttributeError):
+        return False
+    if not items:
+        return True
+    marks = ",".join("?" * len(items))
+    found = connection.execute(f"SELECT COUNT(*) FROM item WHERE status = 'done' AND id IN ({marks})",
+                               sorted(items)).fetchone()[0]
+    return found == len(items)
 
 
 def _still_due(connection, chunk: list[int]):
