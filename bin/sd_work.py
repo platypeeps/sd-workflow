@@ -1158,7 +1158,7 @@ def _answer(workflow: Any, connection: Any, args: argparse.Namespace, body: str,
     from sd_db.review import REF_SOURCE  # noqa: PLC0415 - after the helper
 
     with workflow.transaction(connection):
-        asked = connection.execute("SELECT item, kind, resolved_at FROM note WHERE id = ?",
+        asked = connection.execute("SELECT item, kind, resolved_at, body FROM note WHERE id = ?",
                                    (args.answers,)).fetchone()
         if asked is None:
             raise WorkRefusal(f"no note {args.answers}")
@@ -1169,7 +1169,11 @@ def _answer(workflow: Any, connection: Any, args: argparse.Namespace, body: str,
         if asked["resolved_at"] is not None:
             raise WorkRefusal(f"note {args.answers} is already resolved, at {asked['resolved_at']}")
         item = workflow.item_state(connection, args.item)["item"]
-        if item["source"] == REF_SOURCE and (item["external_id"] or "").startswith("review:"):
+        # A question with no `Option:` line has no label to rule, so it is answered plainly (sd:8975).
+        offers = any((tag := review.TAGGED.match(line)) and tag[1] == "Option"
+                     for line in (asked["body"] or "").splitlines())
+        if item["source"] == REF_SOURCE and (item["external_id"] or "").startswith("review:") and (
+                offers or getattr(args, "option", None) is not None):
             return _rule_batch(review, workflow, connection, args, body, who, revision)
         if getattr(args, "option", None) is not None:
             raise WorkRefusal(f"sd:{args.item} is not a review batch, so --option rules nothing: drop it")
