@@ -2876,8 +2876,11 @@ def remove_merged(root: pathlib.Path, branch: str, merged: str) -> dict:
     if advertised and advertised[0] != merged:
         kept[f"origin/{branch}"] = "it moved past the merged head"
     elif advertised:
-        git(main, "push", "--quiet", "origin", "--delete", branch)
-        removed.append(f"origin/{branch}")
+        try:  # the lease: a push since `ls-remote` keeps the branch (sd:8827)
+            git(main, "push", "--quiet", f"--force-with-lease=refs/heads/{branch}:{merged}", "origin", "--delete", branch)
+            removed.append(f"origin/{branch}")
+        except Refusal as error:
+            kept[f"origin/{branch}"] = f"its delete was refused: {error}"
     for name, why in kept.items():
         print(f"sd-ship: kept {name}: {why}", file=sys.stderr)
     return {"removed": removed, "kept": kept}
