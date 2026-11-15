@@ -448,7 +448,7 @@ A different label is refused unless `--replace` says to overwrite it.
 A `kev` or `haiku` comparison row is refused: a pair's label lives on its Jev row.
 A choice is labelled with a whole position from 1.
 
-    bin/sd-db judgments unlabelled --stage JEV_SD_REVIEW --prefix sd-review-tier: --json
+    bin/sd-db judgments unlabelled --stage JEV_SD_REVIEW_TRIAGE --prefix sd-review-triage: --json
     bin/sd-db judgments label --row 42 --override 3 --source outcome.example
 
 No labeller writes this table yet.

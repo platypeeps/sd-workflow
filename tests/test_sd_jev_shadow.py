@@ -103,13 +103,13 @@ class TriageTests(ReviewFixture):
         return noise.getvalue()
 
     def review(self, root: pathlib.Path, findings) -> tuple[str, str]:
-        """One review, its tier reading off, as its JSON bytes and its stderr."""
+        """One review, as its JSON bytes and its stderr."""
         runner = FakeRunner({"sd-check": sd_review.Completed(0, "{}", ""),
                              "codex": sd_review.Completed(0, json.dumps({"findings": findings}), "")})
         self.codex_home = getattr(self, "codex_home", None) or self.chatgpt_home()
         noise = io.StringIO()
         with contextlib.redirect_stderr(noise):
-            result = sd_review.review(root, namespace(), runner, self.environment(JEV_SD_REVIEW="0"),
+            result = sd_review.review(root, namespace(), runner, self.environment(),
                                       self.codex_home)
         # A slot wait is load, not Jev: it differs between two runs on a busy machine (sd:6344).
         result["review_slot"].pop("waited_seconds", None)
@@ -218,6 +218,14 @@ class TriageTests(ReviewFixture):
         self.assertEqual(self.triage([FINDING], JEV_SD_REVIEW_TRIAGE="0"), "")
         self.assertEqual((stubs.jev(), stubs.gh()), ([], []))
 
+    def test_the_off_word_vocabulary_matches_the_one_it_was_copied_from(self):
+        """`jev` is private and this repository is public, so `JEV_FLAG_OFF`
+        is a copy and not an import. Two copies drift; this pins the words."""
+
+        self.assertEqual(sd_review.sd_lib.JEV_FLAG_OFF,
+                         ("0", "off", "false", "no", "disabled"))
+        self.assertFalse(sd_review.sd_lib.jev_stage_off(None), "unset must mean on")
+
     def test_a_jev_that_cannot_answer_asks_github_nothing(self):
         stubs = Stubs(self.tool_bin, gate=3)
         self.assertEqual(self.triage([FINDING]), "")
@@ -242,7 +250,7 @@ class TriageTests(ReviewFixture):
         """Review of 857d6d039: `github_head` ran before the switch, so an origin
         that does not decode failed a review whose stage was off."""
         stubs = Stubs(self.tool_bin)
-        with unittest.mock.patch.object(sd_jev.sd_lib, "github_head", side_effect=UnicodeDecodeError(
+        with unittest.mock.patch.object(sd_review.sd_lib, "github_head", side_effect=UnicodeDecodeError(
                 "utf-8", b"\xff", 0, 1, "invalid start byte")) as head:
             self.assertEqual(self.triage([FINDING], JEV_SD_REVIEW_TRIAGE="0"), "")
         head.assert_not_called()
@@ -251,7 +259,7 @@ class TriageTests(ReviewFixture):
     def test_any_failure_in_a_shadow_stage_is_a_note_not_an_exception(self):
         Stubs(self.tool_bin)
         root, said, noise = self.repo(), io.StringIO(), io.StringIO()
-        with unittest.mock.patch.object(sd_jev.sd_lib, "github_head", side_effect=RuntimeError("boom")), \
+        with unittest.mock.patch.object(sd_review.sd_lib, "github_head", side_effect=RuntimeError("boom")), \
                 contextlib.redirect_stderr(noise):
             sd_jev.jev_triage([FINDING], self.environment(), root, said)
             sd_work._dedupe((None, None, {"item": {"id": 2, "title": "new", "repo": str(root)}}),

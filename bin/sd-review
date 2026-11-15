@@ -1959,26 +1959,7 @@ def review(
     # lane, so this is where a `mode: guest` checkout finds out; `sd_lib` owns the rule.
     if subject.scope == "planning" and (refusal := sd_lib.guest_artifact_refusal(root, subject.paths)):
         raise UsageError(refusal)
-    # Timed for the Jev ledger's paired row only (sd:2359): the routing is the
-    # baseline Jev's tier is compared with, and this is what that baseline cost.
-    routing_started = time.monotonic()
     plan = sd_route.route(subject.paths, subject.lines, args.draft, policy)
-    routing_ms = int((time.monotonic() - routing_started) * 1000)
-    # Optional and experimental, and on wherever a `jev` on PATH says it can
-    # answer -- `JEV_SD_REVIEW=0` switches it off. Without one this returns the
-    # routed tier untouched and no record, silently, and the result below is
-    # byte-for-byte what it was. `bin/sd_jev.py` owns the contract and says
-    # exactly what leaves the machine, and which failures are loud.
-    jev_choice, jev_reading = sd_jev.jev_tier(
-        plan.tier, policy["tier_order"], subject.paths, subject.lines, plan.reason, env,
-        root=str(root), baseline_ms=routing_ms)
-    if jev_reading is not None:
-        plan = plan._replace(
-            tier=jev_choice,
-            depth=sd_route.TIER_DEPTH.get(jev_choice, sd_route.DEFAULT_DEPTH),
-            reason=f"{plan.reason}; Jev read the diff and chose tier "
-                   + (f"{jev_reading['below_routed']}, below the routed tier, which stands"
-                      if "below_routed" in jev_reading else jev_choice))
     # Read from the home this run was handed, not from the process's, so a run
     # given a different environment reads that operator's pins. A missing
     # registry reports rather than raises; `read_or_report` says why.
@@ -2164,10 +2145,6 @@ def review(
         "explain_only": bool(args.explain),
         "dry_run": bool(args.dry_run),
     }
-    if jev_reading is not None:
-        # Present only when a reading was actually taken, so its absence is the
-        # old output rather than a new key saying nothing happened.
-        result["jev"] = jev_reading
 
     if preflight:
         return provider_preflight(result, chosen, root, subject, runner, env, args, client, ledger)
@@ -2221,7 +2198,7 @@ def review(
     finally:
         slot.give_back()  # sd:2523: on every exit; the gate below queues in its own pool
     # Shadow only (sd:2092): Jev's kind for each finding goes to its ledger and
-    # is never read back, for a public repository only. `bin/sd_jev.py` says what is sent.
+    # is never read back, for a public repository only. `bin/sd_jev_shadow.py` says what is sent.
     sd_jev.jev_triage(result["findings"], env, root)
     if reused is not None or result["status"] not in GATED_STATUSES or unmanaged:
         result["check"] = reused or {"status": NOT_RUN_CHECK, "exit_code": None, "reason": f"{unmanaged}; review only" if unmanaged
