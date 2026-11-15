@@ -391,30 +391,30 @@ def panel(connection, *, now: str, show: str = "active") -> dict:
 
 
 def _pickup(connection, now: str) -> dict:
-    """Auto-pickup's state for the panel's control (pack sd:6097): `on`, `until`, or `error` when unread."""
+    """Auto-pickup's state for the panel's control (pack sd:6097): `on`, `value` (the text read, which the
+    write is bound to), or `error` when unread."""
     try:
         state = build.pickup_state(connection, now=now)
     except (SdDbError, sqlite3.Error) as failure:
-        return {"on": None, "until": None, "error": str(failure)}
-    return {"on": state["on"], "until": state["until"], "next": build.morning(now), "error": ""}
+        return {"on": None, "value": None, "error": str(failure)}
+    return {"on": state["on"], "value": state["value"], "error": ""}
 
 
 def pickup(payload: dict):
-    """POST /api/queue/builds/pickup: `{on, until}`, `until` the end the panel read (null when off); the write
-    `action_route` runs, or ValueError. On ends at the next 09:00 America/Denver; Off clears it. A value
+    """POST /api/queue/builds/pickup: `{on, value}`, `value` the setting the panel read (null when off); the
+    write `action_route` runs, or ValueError. On stays on until Off (pack sd:8930); Off clears it. A value
     that moved since the read is a 409 and writes nothing."""
-    if (set(payload) != {"on", "until"} or type(payload["on"]) is not bool
-            or not (payload["until"] is None or isinstance(payload["until"], str))):
-        raise ValueError("Auto-pickup takes on (true or false) and the end the panel read.")
+    if (set(payload) != {"on", "value"} or type(payload["on"]) is not bool
+            or not (payload["value"] is None or isinstance(payload["value"], str))):
+        raise ValueError("Auto-pickup takes on (true or false) and the value the panel read.")
 
     def write(connection):
         try:
-            set_setting(connection, build.AUTO_PICKUP, build.morning() if payload["on"] else None,
-                        before=payload["until"])
+            set_setting(connection, build.AUTO_PICKUP, "on" if payload["on"] else None, before=payload["value"])
         except SettingStale:
             return 409, {"error": "Auto-pickup changed since the panel read it. Read it again.", "reload": True}
         state = build.pickup_state(connection)
-        return {"on": state["on"], "until": state["until"], "kickstart": kickstart() if state["on"] else None}
+        return {"on": state["on"], "value": state["value"], "kickstart": kickstart() if state["on"] else None}
 
     return write
 
