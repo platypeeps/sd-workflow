@@ -261,16 +261,21 @@ def _disposable(name: str) -> bool:
     return any(part in DISPOSABLE or part.endswith(".egg-info") for part in name.rstrip("/").split("/"))
 
 
+def busy(path: str, cwds: list[str] | None) -> str:
+    """'' when no process `lsof` saw works in the tree at `path`; else why it stays. No answer keeps it."""
+    if cwds is None:
+        return "not known whether a process works in it: lsof gave no answer"
+    real = os.path.realpath(path)
+    found = next((cwd for cwd in cwds if cwd == real or cwd.startswith(real + os.sep)), None)
+    return f"a process works in {found}" if found else ""
+
+
 def merged_tree_kept(walk: Walk, tree: dict, cwds: list[str] | None) -> str:
     """'' when a merged worktree can go; otherwise why it stays. A probe that gave no answer keeps it."""
     if tree["branch"] not in ("", tree["lane_branch"]):
         return f"it is on {tree['branch']}, not the merged branch {tree['lane_branch'] or '(none)'}"
-    if cwds is None:
-        return "not known whether a process works in it: lsof gave no answer"
-    real = os.path.realpath(tree["path"])
-    busy = next((cwd for cwd in cwds if cwd == real or cwd.startswith(real + os.sep)), None)
-    if busy:
-        return f"a process works in {busy}"
+    if kept := busy(tree["path"], cwds):
+        return kept
     status = walk.git(Path(tree["path"]), "status", "--porcelain", "-z", "--ignored")
     if status is None or status.returncode != 0:
         return "its status was not read"

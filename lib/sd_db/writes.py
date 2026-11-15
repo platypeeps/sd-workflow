@@ -27,6 +27,7 @@ from typing import Any
 from . import paths
 from .database import transaction
 from .errors import SdDbError
+from .reads import item_lane_entries, stale_lane_ended
 
 #: The item statuses, and the note kind a change writes.
 STATUSES = ("planning", "ready", "in_progress", "ready_to_send", "blocked", "done")
@@ -425,6 +426,8 @@ def _transition(
         )
         if target in UNBUILT:
             cancel_unwanted_blocked(connection, item, stamp, f"item {item} moved to {target} by {who}")
+        if target == "done":
+            cancel_done_lane(connection, item, stamp, f"item {item} moved to done by {who}")
         note = f"{current} -> {target} by {who}"
         if reason:
             note += f": {reason}"
@@ -455,6 +458,25 @@ def cancel_unwanted_blocked(connection: sqlite3.Connection, item: int, stamp: st
         "AND runner_run.assignment IN (assignment.id, assignment.parent))",
         (stamp, why, item, item, *UNBUILT),
     )
+
+
+def cancel_done_lane(connection: sqlite3.Connection, item: int, stamp: str, why: str) -> None:
+    """Cancel a done item's failed or skipped lane entries newer than its last merge, in each repository's lane
+    (pack sd:8850), by the rule `lane cancel` applies (`reads.stale_lane_ended`): left, Landing showed the closed
+    item for ever."""
+    lanes: dict[str, tuple[list[dict[str, Any]], dict[str, int]]] = {}
+    for key, first, entry in item_lane_entries(connection, item):
+        entries, order = lanes.setdefault(key.rpartition(":")[0], ([], {}))
+        entries.append(entry)
+        order[entry["id"]] = first
+    finished = datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for prefix, (entries, order) in lanes.items():
+        for entry in stale_lane_ended(entries, item, order):
+            entry.update(status="cancelled", finished_at=finished,
+                         reason=f"cancelled: {why}; it was {entry.get('status')}: "
+                                f"{entry.get('reason') or 'no reason kept'}"[:2000])
+            connection.execute("INSERT INTO state(kind, key, timestamp, body) VALUES ('checkpoint', ?, ?, ?)",
+                               (f"{prefix}:{entry['id']}", stamp, json.dumps(entry, sort_keys=True)))
 
 
 def set_item_fields(
