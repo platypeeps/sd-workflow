@@ -560,19 +560,31 @@ def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
                                              for row in queued]}
 
 
-def queue_again(connection, items: list[int], *, who: str) -> list[dict]:
+def queue_again(connection, items: list[int], *, who: str, finding: str = "") -> list[dict]:
     """`sd assignments build`: an item whose latest build bundle ran and ended blocked or cancelled is Retry of that
-    bundle (`retry`, its assignments and worktree kept); every other item is the Build press (`queue`). One transaction,
-    so one refusal writes nothing (pack sd:8785)."""
+    bundle (`retry`, its assignments and worktree kept); one whose lane entry failed is Fix (`lane_fix`, pack sd:8791);
+    every other item is the Build press (`queue`). One transaction, so one refusal writes nothing (pack sd:8785).
+    A `finding` is Send to builder on a Retry or a Fix; a fresh build has no builder to send it to (pack sd:8792)."""
     if not items or len(set(items)) != len(items) or any(type(item) is not int for item in items):
         raise BuildRefused("select one or more distinct items")
+    finding = finding.strip()
     with transaction(connection):
-        leads, fresh = [], []
+        leads, fixes, fresh = [], [], []
         for item in items:
             row = connection.execute("SELECT id, parent, status FROM assignment WHERE item = ? AND scope = ? "
                                      "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
             lead = row and (row["parent"] or row["id"])
             state = queue_state(connection, lead) if lead else None
+            # A bundle whose lane entry failed is the panel's Fix when its check passes (pack sd:8791); a state Fix
+            # refuses, such as an item moved back to ready, is a fresh press with that press's own check.
+            if state and (state["run"] or {}).get("outcome") == "lane_failed":
+                try:
+                    members = lane_fix_check(connection, state["run"]["id"])[0]
+                except BuildRefused:
+                    members = []
+                if item in [member["item"] for member in members]:
+                    fixes += [] if state["run"] in fixes else [state["run"]]
+                    continue
             # A build cancelled before any claim, or one the claim refused (`_refuse`), never ran: no worktree to
             # resume, so it is a fresh press, as the dashboard's "it never ran" hint says. A bundle may end mixed
             # (`enqueued` marks a delivered member done): `retry` takes only members in the lead's status, so the
@@ -582,7 +594,15 @@ def queue_again(connection, items: list[int], *, who: str) -> list[dict]:
                 leads += [] if lead in leads else [lead]
             else:
                 fresh.append(item)
-        queued = [entry for lead in leads for entry in retry(connection, lead, who=who)["queued"]]
+        if finding and fresh:
+            raise BuildRefused(f"--finding goes to a Retry or a Fix; {', '.join(f'sd:{item}' for item in fresh)} "
+                               "would be a fresh build, with no builder to send it to")
+        queued = [entry for lead in leads for entry in retry(connection, lead, who=who, finding=finding)["queued"]]
+        for run in fixes:
+            fixed = lane_fix(connection, run["id"],
+                             finding or f"the lane entry failed; fix what it names: {run['detail']}"[:2000], who=who)
+            queued += [{"id": member["id"], "item": member["item"], "status": "queued"}
+                       for member in _members(connection, run["assignment"], "queued") if member["item"] in fixed]
         return queued + (queue(connection, fresh, who=who) if fresh else [])
 
 

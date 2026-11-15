@@ -1998,6 +1998,30 @@ class Tick(Case):
         self.assertEqual(self.spawned, [])
         self.assertEqual(self.statuses(), ["in_progress"], "only a catch-up conflict goes back to a builder")
 
+    def test_build_again_on_a_failed_lane_entry_is_fix(self):
+        """pack sd:8791: `sd assignments build N` on a lane_failed run is the panel's Fix: the entry handed back,
+        the bundle queued again under its lead with the lane's reason as the finding. It refused before."""
+        run = self.enqueued()
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red"}
+        self.tick()
+        queued = build.queue_again(self.db, self.items, who="operator")
+        self.assertEqual([(entry["id"], entry["item"], entry["status"]) for entry in queued],
+                         [(run["assignment"], self.items[0], "queued")])
+        self.assertEqual(self.statuses(), ["ready"])
+        handed = self.stored("e1")
+        self.assertEqual((handed["status"], handed["handed_back"]["by"]), ("cancelled", "operator"))
+        notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", self.items)]
+        self.assertTrue(any(body.startswith(build.FINDING) and "gate red" in body for body in notes), notes)
+
+    def test_build_again_with_a_finding_on_a_failed_lane_entry_sends_it(self):
+        """pack sd:8792: `--finding` on a Fix is the note the builder reads, in place of the lane's reason."""
+        self.enqueued()
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red"}
+        self.tick()
+        build.queue_again(self.db, self.items, who="operator", finding="pin the fixture clock")
+        notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", self.items)]
+        self.assertIn(build.FINDING + "pin the fixture clock", notes)
+
     CONFLICT = ("merging origin/main into build/sd-1 conflicts; the branch is unchanged; "
                 "sd-ship lane retry --item 1 queues it again")
 
