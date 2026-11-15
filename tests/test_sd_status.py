@@ -3076,7 +3076,7 @@ class ViewsTests(InventoryFixture):
         stream = io.StringIO()
         status._render_views(section, stream.write, width=100)
         self.assertRegex(stream.getvalue(), rf"\n  #{made['~/repos/example.test/lib']} +lib +planning ")
-        self.assertEqual(status.companions(key, None), [])
+        self.assertEqual(sd_db.repos.companions(key, None), [])
 
     def test_a_companion_setting_that_does_not_read_is_named_not_dropped(self) -> None:
         import sd_db

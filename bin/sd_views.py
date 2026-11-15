@@ -36,6 +36,8 @@ CELL_MAX = 32
 HEADINGS = {"attention": "Attention", "operations": "Operations, this machine", "decisions": "Decisions", "landing": "Landing now", "queues": "Queues", "delivered": "Delivered",
             "planned": "Planned", "blocked": "Blocked", "unscheduled": "Unscheduled", "followups": "Followups",
             "work": "Work"}
+#: The sections only `sd today --here` adds, after the rest (sd:8844).
+HERE = {"issues": "Issues"}
 #: The sections that print whole.
 UNCAPPED = frozenset({"work", "queues"})
 
@@ -125,12 +127,14 @@ def columns(section: str, now: datetime.datetime) -> list[tuple[str, Cell]]:
         "blocked": [("Waiting on", lambda row: row.get("why") or "-")],
         "unscheduled": [("Priority", lambda row: f"P{row['priority']}" if row.get("priority") is not None else "-")],
         "followups": [("Note", lambda row: f"#{row['note']}")],
+        "issues": [("Why", lambda row: row.get("why") or "-")],
         "work": [("Due", lambda row: day(row["due"], now, zone=False) if row.get("due") else "-"),
                  ("Priority", lambda row: f"P{row['priority']}" if row.get("priority") is not None else "-")],
     }
     moment = {"attention": when("at"), "decisions": when("at"), "landing": when("since", local), "queues": when("since"),
               "delivered": when("at", local), "planned": when("due", days), "blocked": when("since"),
-              "unscheduled": when("created_at"), "followups": when("at"), "work": when("status_since")}[section]
+              "unscheduled": when("created_at"), "followups": when("at"), "work": when("status_since"),
+              "issues": when("at")}[section]
     return [("ID", _id), ("Repo", _repo), ("State", STATES.get(section, _state)), *own[section],
             ("Title", _title), ("When", moment)]
 
@@ -194,7 +198,7 @@ def table(heads: list[str], rows: list[list[str]], width: int, flex: str = "Titl
 def section_table(section: str, rows: list[dict[str, Any]], now: datetime.datetime, width: int, *,
                   show_all: bool = False) -> list[str]:
     """One section: its heading, its table capped at `ROWS` unless `UNCAPPED` or `show_all`, and the `… N more` line."""
-    lines = [f"{HEADINGS[section]} ({len(rows)})"]
+    lines = [f"{({**HEADINGS, **HERE})[section]} ({len(rows)})"]
     if not rows:
         return lines
     shown = rows if show_all or section in UNCAPPED else rows[:ROWS]
@@ -256,7 +260,7 @@ def render_sections(found: dict[str, Any], *, now: datetime.datetime, width: int
 
     `show_all` prints every row of every section, with no `… N more` line.
     """
-    order = list(keys if keys is not None else HEADINGS)
+    order = list(keys if keys is not None else [*HEADINGS, *(key for key in HERE if key in found)])
     lines = [summary_line(found["summary"], order)]
     for key in order:
         if key == "operations":

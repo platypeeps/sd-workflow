@@ -487,7 +487,8 @@ def _today_gate() -> Any:
     return sd_gate_slots.machine_snapshot(dict(os.environ))
 
 
-def _print_today(connection: Any, repos: list[str | None] | None, *, show_all: bool = False) -> None:
+def _print_today(connection: Any, repos: list[str | None] | None, *, show_all: bool = False,
+                 issues: bool = False) -> None:
     """`sd today` as text: `sd_db.today.sections` in the one layout `sd_views` gives it and `sd-status` (sd:5098)."""
     import shutil
 
@@ -498,6 +499,9 @@ def _print_today(connection: Any, repos: list[str | None] | None, *, show_all: b
 
     now = datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
     found = today.sections(connection, repos=repos, now=now.strftime("%Y-%m-%dT%H:%M:%SZ"), gate=_today_gate())
+    if issues and repos is not None:  # `--here` (sd:8844)
+        found["issues"] = today.issues(connection, repos=repos)
+        found["summary"]["issues"] = len(found["issues"])
     width = shutil.get_terminal_size((sd_views.DEFAULT_WIDTH, 24)).columns
     print(sd_views.render_sections(found, now=now, width=width, show_all=show_all), end="")
     line = _session_age_line(os.environ)
@@ -1206,12 +1210,31 @@ def _today_repos(connection: Any, names: list[str] | None) -> tuple[list[str | N
     return [key for name in names for key in known[name]], ""
 
 
+def _here_repos(connection: Any) -> tuple[list[str | None], str]:
+    """`--here`'s `item.repo` keys (sd:8844): cwd's registered repository, then its companions, as
+    `sd.status_companions` lists them, else as its research watchlist names them; refused outside one."""
+    from sd_db import repos
+
+    here = pathlib.Path.cwd()
+    root = sd_lib.repo_root()
+    found = sd_lib.repo_row(connection, str(sd_lib.main_worktree_root(root))) if root else None
+    if found is None:
+        raise WorkRefusal(f"--here: {root or here} is not a registered repository")
+    repo = str(found["path"])
+    try:
+        others = repos.companions(repo, sd_lib.core_setting("status_companions"))
+    except sd_lib.ConfigError as error:
+        raise WorkRefusal(f"--here: sd.status_companions does not read: {error}") from None
+    others = others or repos.watched(connection, sd_lib.main_worktree_root(root))
+    return list(dict.fromkeys([repo, *others])), ""
+
+
 def run_today(args: argparse.Namespace) -> int:
     """`sd today`: `today_items` as rows for `--json`, and the dashboard's Today sections for a person (sd:3501)."""
     sd_db, _ = _library()
     connection = sd_handoff_rows.connect(sd_db, write=False)
     try:
-        keep, unknown = _today_repos(connection, args.only)
+        keep, unknown = _here_repos(connection) if args.here else _today_repos(connection, args.only)
         if unknown:
             print(f"sd: {unknown}", file=sys.stderr)
             return 2
@@ -1220,7 +1243,7 @@ def run_today(args: argparse.Namespace) -> int:
 
             _emit(today.work(connection, repos=keep), machine=True)
         else:
-            _print_today(connection, keep, show_all=args.all)
+            _print_today(connection, keep, show_all=args.all, issues=args.here)
         return 0
     except sd_db.SdDbError as error:
         raise WorkRefusal(str(error)) from error
@@ -1590,9 +1613,13 @@ def register(groups: Any, store: Any) -> None:
     today = groups.add_parser(
         "today", help="reports needing attention, decisions, open followups, then due and active work")
     _output(today, "today")
-    today.add_argument("--only", action="append", metavar="NAME",
+    scope = today.add_mutually_exclusive_group()
+    scope.add_argument("--only", action="append", metavar="NAME",
                        help="keep only this repository's rows, by short name (system), or fleet for items in "
                             "none; repeat for more; every section and count follows")
+    scope.add_argument("--here", action="store_true",
+                       help="keep only this checkout's registered repository and its companions "
+                            "(sd.status_companions, or a research repo's watchlist), with their open issues")
     today.add_argument("--all", action="store_true",
                        help="print every row of every section, not five and `… N more` (text view only)")
     today.set_defaults(handler=run_today)

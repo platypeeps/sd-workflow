@@ -765,6 +765,39 @@ def mail_aliases(connection: sqlite3.Connection, path: Path | str) -> list[str]:
     return list(setting.get("email", {}).get(channels.ALIASES, []))
 
 
+def companions(repo: str, value: str | None) -> list[str]:
+    """The repositories `sd.status_companions` lists beside `repo`: `<repo>=<other>[,<other>]`, `;` between.
+
+    `sd-status` and `sd today --here` read it (sd:8844).
+    """
+    for entry in (value or "").split(";"):
+        name, _, others = entry.partition("=")
+        if name == repo:
+            return [other for other in others.split(",") if other and other != repo]
+    return []
+
+
+#: A research repository's tracked sources (the research-repo standard); `watched` reads it.
+WATCHLIST = Path("20-map") / "MAP-source-watchlist.md"
+_WATCHED = re.compile(r"(?:github\.com/|`)([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)")
+
+
+def watched(connection: sqlite3.Connection, root: Path | str) -> list[str]:
+    """The registered repositories `root`'s watchlist names, by `owner/name`, in its order; `[]` without one.
+
+    A research repository's companions for `sd today --here` (sd:8844): no setting row, the file says.
+    """
+    try:
+        text = (Path(root) / WATCHLIST).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    from .today import repo_keys
+
+    keys = repo_keys(connection)
+    named = (keys.get(slug.lower().removesuffix(".git")) for slug in _WATCHED.findall(text))
+    return list(dict.fromkeys(path for path in named if path))
+
+
 #: The `shadow.reason` values that make an issue the operator's (sd:4636).
 #: `watched` and NULL (unknown) rows stay synced and stay off Today and Tasks.
 MINE = ("assigned", "filed")

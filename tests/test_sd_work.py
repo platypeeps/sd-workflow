@@ -1723,6 +1723,44 @@ class TodayIsTheDashboardsToday(unittest.TestCase):
         self.assertEqual([line.split()[0] for line in work], [f"#{later}", f"#{late}"])
         self.assertTrue(all(" late " in line for line in work), work)
 
+    _checkout = TaskCLI._checkout
+
+    def test_today_here_keeps_this_repo_its_companions_and_their_open_issues(self):
+        """sd:8844: --here is --only for cwd's registered repository and its companions, with an Issues section."""
+        roots = {name: self._checkout(name) for name in ("app", "lib", "other", "notes")}
+        (roots["notes"] / "20-map").mkdir()
+        (roots["notes"] / "20-map" / "MAP-source-watchlist.md").write_text(
+            "| `example/other` | pinned |\n| https://github.com/example/gone | not registered |\n")
+        with database(sd_db.default_path(self.home), write=True) as connection:
+            for name, root in roots.items():
+                sd_db.repos.add(connection, root, remote=f"https://github.com/example/{name}.git", home=self.home)
+            sd_db.writes.set_setting(connection, "sd.status_companions", "~/app=~/lib")
+            for name, number, reason in (("app", 1, None), ("app", 2, "assigned"), ("other", 3, None)):
+                sd_db.writes.upsert_shadow(connection, tracker="github", repo=f"example/{name}", number=number,
+                                           url=f"https://github.com/example/{name}/issues/{number}",
+                                           title=f"Issue {number}", kind="issue", state="open", reason=reason)
+        made = {name: self.task(f"Work in {name}", "--belongs-to", root) for name, root in roots.items()}
+
+        text = self.call("today", "--here", "--all", cwd=roots["app"]).stdout
+        self.assertIn(f"#{made['app']} ", text)
+        self.assertIn(f"#{made['lib']} ", text)
+        self.assertNotIn(f"#{made['other']} ", text)
+        lines = text.splitlines()
+        issues = lines[lines.index("Issues (2)") + 3:]
+        self.assertRegex(issues[0], r"^#2 +app +open +needs you +Issue 2")
+        self.assertRegex(issues[1], r"^#1 +app +open +- +Issue 1")
+        self.assertNotIn("Issues (", self.call("today", cwd=roots["app"]).stdout)
+
+        # A research repository's companions are the registered repositories its watchlist names.
+        text = self.call("today", "--here", cwd=roots["notes"]).stdout
+        self.assertIn(f"#{made['other']} ", text)
+        self.assertNotIn(f"#{made['app']} ", text)
+        self.assertIn("Issues (1)", text)
+
+        refused = self.call("today", "--here", code=1).stderr
+        self.assertIn("--here", refused)
+        self.assertIn("not a registered repository", refused)
+
     def test_today_shows_gate_holders_and_an_unknown_gate(self):
         """sd:5098: the holders `sd gate status --json` reads; a failed read is unknown, not an idle gate."""
         import fcntl
