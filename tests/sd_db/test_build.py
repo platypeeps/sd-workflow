@@ -213,6 +213,14 @@ class Queue(Case):
         build.queue(self.db, [held], who="operator")
         self.assertEqual([row["id"] for row in build.eligible(self.db)], [high, low])
 
+    def test_eligible_skips_a_recurring_item(self):
+        """Pack sd:8861: a weekly chore was picked up and skipped; a recurring item is not code to build."""
+        plain = self.item()
+        chore = create_item(self.db, kind="task", title="Weekly chore", repo=A, status="ready",
+                            recurrence="FREQ=WEEKLY;BYDAY=MO", recurrence_anchor="completion")
+        self.assertEqual([row["id"] for row in build.eligible(self.db)], [plain])
+        self.assertNotIn(chore, [row["id"] for row in build.eligible(self.db)])
+
 
 class Claim(Case):
     def test_a_bundle_is_one_run_one_lease_and_its_items_in_progress(self):

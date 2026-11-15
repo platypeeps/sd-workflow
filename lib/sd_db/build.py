@@ -610,13 +610,15 @@ def eligible(connection, *, now: str | None = None) -> list[dict]:
     """The ready items a build may take, highest priority first: auto-pickup's selection.
 
     `reads.backlog_items` gives the unparked rows in priority order; a
-    scheduled occurrence, every row `queue` would refuse and another host's
-    lane are left out: each lane host's dispatcher picks for its own lanes,
+    recurring row, every row `queue` would refuse and another host's lane
+    are left out: each lane host's dispatcher picks for its own lanes,
     under its own caps, and its claim takes the row (sd:8393, pack sd:7933).
+    A recurring row is a chore, not code: a weekly one was picked up and
+    skipped (pack sd:8861); a press still takes one by hand.
     """
     hosts, found = lane_hosts(connection), []
     for row in reads.backlog_items(connection, status="ready", now=now):
-        if row["scheduled"]:
+        if row["recurrence"]:  # a scheduled occurrence recurs too
             continue
         try:
             taken = _item(connection, row["id"])
