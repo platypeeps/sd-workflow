@@ -437,6 +437,8 @@ def _print_rows(rows: list[dict[str, Any]], *, moved: bool = False, today: str |
             print(line)
         if row.get("ref"):
             print(f"  ref: {row['ref']}")
+        if row.get("matches"):
+            print(f"  match: {', '.join(row['matches'])}")
         area = _area(row)
         if area:
             print(f"  area: {area}")
@@ -1061,14 +1063,35 @@ def _items(sd_db: Any, workflow: Any, args: argparse.Namespace, connection: Any)
     """`sd store items`, filtered as its flags ask.
 
     sd:3197. `--here` names the checkout as `task add --here` does, refusals included.
+    sd:8854. `--belongs-to` names another checkout the way `task add` does;
+    `--ref` and `--grep` also read done items older than the listing's week,
+    and a `--grep` row names each hit under `matches`.
     """
     here = (_task_repo(argparse.Namespace(kind=None, no_repo=False, here=True), connection, workflow)
-            if args.here else None)
-    return [row for row in (dict(found) for found in sd_db.reads.backlog_items(connection, repo=here))
+            if args.here else _belongs_to(args.belongs_to) if getattr(args, "belongs_to", None) else None)
+    ref, needle = getattr(args, "ref", None), getattr(args, "grep", None)
+    # ponytail: every done row is read when searching; a SQL filter if the store outgrows a scan.
+    rows = [row for row in (dict(found) for found in sd_db.reads.backlog_items(
+                connection, repo=here, include_done_days=36500 if ref or needle else 7))
             if (not args.open or row["status"] != "done")
             and (not args.kind or row["kind"] == args.kind)
             and (not args.status or row["status"] == args.status)
-            and (getattr(args, "since", None) is None or _touched_since(row, args.since))]
+            and (getattr(args, "since", None) is None or _touched_since(row, args.since))
+            and (not ref or ref in (f"{row['source']}:{row['external_id']}",
+                                    row["external_id"] if row["source"] == REF_SOURCE else None))]
+    return _grep(connection, rows, needle) if needle else rows
+
+
+def _grep(connection: Any, rows: list[dict[str, Any]], needle: str) -> list[dict[str, Any]]:
+    """The rows whose title, body or a note holds `needle`, any case, each naming its hits (sd:8854)."""
+    wanted = needle.lower()
+    notes: dict[int, list[str]] = {}
+    for note in connection.execute("SELECT item, id FROM note WHERE instr(lower(body), ?) ORDER BY id", (wanted,)):
+        notes.setdefault(note["item"], []).append(f"note #{note['id']}")
+    for row in rows:
+        row["matches"] = [field for field in ("title", "body") if wanted in (row[field] or "").lower()]
+        row["matches"] += notes.get(row["id"], [])
+    return [row for row in rows if row["matches"]]
 
 
 def _note_text(args: argparse.Namespace) -> str:
@@ -1627,11 +1650,17 @@ def register(groups: Any, store: Any) -> None:
 
     items = store.add_parser("items", help="workspace items from the shared database")
     items.add_argument("--open", action="store_true", help="exclude done items")
-    items.add_argument("--here", action="store_true",
+    where = items.add_mutually_exclusive_group()
+    where.add_argument("--here", action="store_true",
                        help="only this checkout's items; refuse unless it is registered in the sd database")
+    where.add_argument("--belongs-to", metavar="PATH", help="only the items of the registered checkout at PATH")
     items.add_argument("--kind", help="filter by item kind, such as task or followup; `report`, a scheduled "
                                       "job's run, closes with `sd reports acknowledge N`")
     items.add_argument("--status", help="filter by workflow status")
+    items.add_argument("--ref", metavar="SOURCE:ID", help="only the item filed with this reference, such as "
+                                                          "job:repo-sync:42; done items of any age too")
+    items.add_argument("--grep", metavar="TEXT", help="only items whose title, body or a note holds TEXT, any "
+                                                      "case, each naming its hits; done items of any age too")
     items.add_argument("--since", type=since, metavar="DATE|DURATION",
                        help="only items created or updated since then: YYYY-MM-DD (00:00 UTC) "
                             "or a duration back from now, such as 90m, 6h, 2d or 1w")

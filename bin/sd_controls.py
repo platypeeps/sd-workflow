@@ -113,6 +113,35 @@ def acknowledge_reports(args: argparse.Namespace, connection: Any, reporting: An
                                  **keywords)
 
 
+def open_table(rows: list[dict[str, Any]]) -> str:
+    """`sd reports list --open` as text (sd:8795): one row per open report, newest first."""
+    import shutil
+
+    import sd_views
+    if not rows:
+        return "no open reports"
+
+    def job(row: dict[str, Any]) -> str:
+        try:
+            report = json.loads(row["fields"] or "{}").get("report") or {}
+        except (ValueError, AttributeError):
+            return "-"
+        return str(report.get("job") or "-") if isinstance(report, dict) else "-"
+
+    width = shutil.get_terminal_size((sd_views.DEFAULT_WIDTH, 24)).columns
+    return "\n".join(sd_views.table(["ID", "Status", "Filed", "Job", "Title"],
+                                    [[f"#{row['id']}", row["status"], row["created_at"], job(row), row["title"]]
+                                     for row in rows], width))
+
+
+def list_reports(args: argparse.Namespace, connection: Any, reporting: Any) -> int:
+    """`sd reports list`: JSON rows; with `--open` only the open ones, a table unless `--json`."""
+    rows = reporting.reports(connection, open_only=args.open)
+    print(open_table(rows) if args.open and not args.json
+          else json.dumps(rows, ensure_ascii=False, indent=None if args.json else 2))
+    return 0
+
+
 def run(args: argparse.Namespace) -> int:
     sd_db = sd_handoff_rows.library()
     try:
@@ -143,7 +172,7 @@ def run(args: argparse.Namespace) -> int:
                 result = provider_controls.configure(connection, enabled=proposal["enabled"], orders=proposal["orders"],
                     expected_revision=proposal["revision"], who=getpass.getuser())
         elif args.control_action == "list":
-            result = reporting.reports(connection)
+            return list_reports(args, connection, reporting)
         elif args.control_action == "acknowledge":
             result = acknowledge_reports(args, connection, reporting, workflow)
             if before is not None and not args.apply and not args.json:
@@ -356,6 +385,9 @@ def register(groups: Any) -> None:
             command = verbs.add_parser(action)
             command.set_defaults(handler=run, control_group=name, control_action=action)
             command.add_argument("--json", action="store_true")
+            if name == "reports" and action == "list":
+                command.add_argument("--open", action="store_true",
+                                     help="only open reports, newest 200, as a table unless --json")
             if action == "configure":
                 command.add_argument("--file", required=True, help="JSON containing revision, enabled flags and both role orders")
             if action == "acknowledge":
