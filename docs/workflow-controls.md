@@ -37,14 +37,15 @@ progress belongs to the database.
 | Run the adversarial gate on a draft | `sd writing adversarial --piece YEAR/slug` — renders the shared `writing-draft` lens, runs codex read-only on the checkout, and writes `adversarial.md` stamped with the draft it read; `sd writing gate` records the verdict |
 | Mark a review companion current after a revision | `sd writing reconcile --piece YEAR/slug --artifact adversarial\|research --note-file PATH` — refuses an adversarial reconcile once more than 25 % of the draft is prose the last run did not read |
 | Park or revive a piece | Item screen, or `sd writing park --piece YEAR/slug [--revive]` |
-| Observe jobs and assignments | Operations → Jobs, `sd jobs list`, `sd assignments list` |
+| Observe jobs and assignments | Operations → Jobs, `sd jobs list`, `sd assignments list`, `sd assignments get ID [ID ...]` |
+| Wait until builds end | `sd assignments get ID [ID ...] --wait [--timeout MIN]`; polls until each has left queued, claimed and running; exit 1 at the timeout (default 240 minutes) |
 | Inspect launchd services | Operations → Services, or `sd services list` |
 | Start, stop or restart an eligible user service | Operations → Services, or `sd services start/stop/restart LABEL` |
 | Inspect configured ports and observed TCP listeners | Operations → Ports |
 | Find items by age in status | Operations → Progress; a bar opens matching Backlog items |
 | See weekly numbers, cost and providers | Operations → Usage |
 | Request a supported retry or stop | Operations, `sd jobs retry NAME`, `sd jobs cancel NAME` |
-| Queue a build of ready items | `sd assignments build ID [ID ...]`; an item whose bundle ended blocked or cancelled is retried, worktree kept; one refusal refuses the selection |
+| Queue a build of ready items | `sd assignments build ID [ID ...]`; an item whose bundle ended blocked or cancelled is retried, worktree kept; one whose lane entry failed is Fix, the lane's reason its finding; `--finding TEXT` is Send to builder on a retry or Fix, refused on a fresh build; one refusal refuses the selection |
 | Run one build-dispatch tick: reap, lane watch, claim, spawn | `sd assignments dispatch`; the hub's job runs it |
 | Supervise one build run, or list the live sessions | `sd assignments dispatch --supervise RUN`, `sd assignments dispatch --sessions` |
 | Cancel a queued assignment or a running build | Operations, or `sd assignments cancel ID` |

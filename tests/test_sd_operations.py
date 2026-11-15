@@ -104,15 +104,36 @@ class OperationsCLI(unittest.TestCase):
         builds.queue_again = queue
         with patch.dict(sys.modules, {"sd_db.build": builds}), patch.object(sd_db, "build", builds, create=True):
             code, output = self.call("assignments", "build", "sd:7", "9")
+            self.call("assignments", "build", "7", "--finding", "check the parser")
+            self.assertEqual(queue.call_args.kwargs, {"who": "operator", "finding": "check the parser"})
             with self.assertRaises(cli.WorkRefusal):
                 queue.side_effect = sd_db.SdDbError("item 9 is planning; a build takes a ready item")
                 self.call("assignments", "build", "9")
         self.assertEqual(code, 0)
         self.assertEqual(output.splitlines(), ["#31  queued  build  sd:7", "#32  queued  build  sd:9"])
         self.assertEqual(queue.call_args_list[0].args[1:], ([7, 9],))
-        self.assertEqual(queue.call_args_list[0].kwargs, {"who": "operator"})
+        self.assertEqual(queue.call_args_list[0].kwargs, {"who": "operator", "finding": ""})
         self.connect.assert_called_with(sd_db, write=True)
-        self.assertEqual(self.connection.close.call_count, 2)
+        self.assertEqual(self.connection.close.call_count, 3)
+
+    def test_assignments_get_wait_blocks_until_each_build_ends(self):
+        """pack sd:8793: `get N... --wait` polls on a fake clock until every assignment leaves queued, claimed or
+        running, then prints each as get does: 0 when all ended, 1 at the timeout."""
+        clock = [0.0]
+        sleep = Mock(side_effect=lambda seconds: clock.__setitem__(0, clock[0] + seconds))
+        states = {8: iter(["queued", "running", "done"]), 9: iter(["blocked"] * 3)}
+        self.service.assignment_state.side_effect = (
+            lambda connection, ident: {"id": ident, "status": next(states[ident], "done"), "revision": "r"})
+        with patch.object(cli.time, "monotonic", lambda: clock[0]), patch.object(cli.time, "sleep", sleep):
+            code, output = self.call("assignments", "get", "8", "9", "--wait", "--json")
+            self.assertEqual((code, sleep.call_count), (0, 2))
+            self.assertEqual([json.loads(line)["status"] for line in output.splitlines()], ["done", "blocked"])
+            self.service.assignment_state.side_effect = None
+            clock[0], sleep.call_count = 0.0, 0
+            code, output = self.call("assignments", "get", "8", "--wait", "--timeout", "1", "--json")
+            self.assertEqual((code, clock[0], json.loads(output)["status"]), (1, 60.0, "queued"))
+        with self.assertRaisesRegex(cli.WorkRefusal, "--timeout goes with --wait"):
+            self.call("assignments", "get", "8", "--timeout", "1")
 
     def test_beat_is_one_verb_with_the_leads_start_and_end_as_flags(self):
         """pack sd:7221 (ruling note #41072): `beat ITEM` beats a teammate run; `--start` and `--end` are the lead's."""
