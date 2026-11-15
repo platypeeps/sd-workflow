@@ -602,7 +602,10 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     put($('queue-filters'), shell.list.fseg('qshow', 'Show', [['suggested', 'Suggested'], ['open', 'All items'], ['ended', 'Ended builds']].map(([v, label]) =>
       ({ v, pressed: qShow.has(v), label: n(v) === null ? html`${label}` : html`${label} <span class="n">${String(n(v))}</span>` }))));
     const prs = prTally(every);
-    put($('queue-tally'), html`${tally(every.filter(c => !QSHOW.includes(c.type))).map(([t, n]) => html`<span>${n} ${t}</span>`)}${prs ? html`<span>${prs}</span>` : ''}`);
+    // sd:8953: the parked tasks Tasks reads (parked_at, not a status), less the idea kinds; it opens Tasks' Parked chip.
+    const ideas = new Set((QV.tasks && QV.tasks.ideas) || []);
+    const parked = QV.tasks ? QV.tasks.rows.filter(t => t.parked && !ideas.has(t.kind)).length : 0;
+    put($('queue-tally'), html`${tally(every.filter(c => !QSHOW.includes(c.type))).map(([t, n]) => html`<span>${n} ${t}</span>`)}${prs ? html`<span>${prs}</span>` : ''}${parked ? html`<a href="/tasks?parked=1&amp;realm=all">${String(parked)} parked</a>` : ''}`);
     // Auto-pickup (pack sd:6097): its state, and On or Off, bound to the value this read saw. On has no end (pack sd:8930).
     const pk = QV.built && QV.built.pickup;
     put($('queue-pickup'), !pk ? html`` : pk.error ? html`Auto-pickup not read: ${pk.error}`
