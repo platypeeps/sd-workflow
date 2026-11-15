@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import functools
 import os
+import re
 import sqlite3
 import subprocess
 from datetime import datetime
@@ -113,6 +114,23 @@ def _room(connection, *, now: str, sessions=None, gate=None) -> dict:
                                                                                         sessions=sessions))
 
 
+#: A status change into a wait that gave its reason: `<from> -> <to> by <who>: <reason>` (writes.transition).
+WAITED = re.compile(r"\w+ -> (?:planning|blocked) by [^:]*: (.+)", re.DOTALL)
+
+
+def _waits(connection, ids: list[int]) -> dict[int, dict]:
+    """Each item's `parked_at` and `waited`, the note and reason of its latest move to planning or blocked that
+    gave one, else None (pack sd:8964): the dialog shows what an item waited on before the press."""
+    marks = ",".join("?" * len(ids))
+    found = {row["id"]: {"parked_at": row["parked_at"], "waited": None} for row in connection.execute(
+        f"SELECT id, parked_at FROM item WHERE id IN ({marks})", ids)}
+    for note in connection.execute(f"SELECT id, item, body FROM note WHERE kind = 'status_change' AND item IN ({marks})"
+                                   " ORDER BY id", ids):
+        if moved := WAITED.fullmatch(note["body"] or ""):
+            found[note["item"]]["waited"] = {"note": note["id"], "why": moved[1]}
+    return found
+
+
 def plan(connection, items: list[int], *, now: str, sessions=None, gate=None) -> dict:
     """What a Build press on `items` would queue: `bundles` by repository, `refused` with each reason, the `room` now.
 
@@ -128,6 +146,7 @@ def plan(connection, items: list[int], *, now: str, sessions=None, gate=None) ->
         except build.BuildRefused as refusal:
             refused.append({"id": item, "why": str(refusal)})
     revisions = reads.revisions(connection, [row["id"] for row in taken]) if taken else {}
+    waits = _waits(connection, [row["id"] for row in taken]) if taken else {}
     room = _room(connection, now=now, sessions=sessions, gate=gate)
     groups: dict[str, list[dict]] = {}
     for row in taken:
@@ -142,7 +161,8 @@ def plan(connection, items: list[int], *, now: str, sessions=None, gate=None) ->
                             "room": 0 if host else build.room_for(room, repo),
                             "model": build._model(connection, [row["id"] for row in chunk]),
                             "branch": "build/sd-<lead assignment>",
-                            "items": [{"id": row["id"], "title": row["title"], "revision": revisions[row["id"]]}
+                            "items": [{"id": row["id"], "title": row["title"], "revision": revisions[row["id"]],
+                                       **waits[row["id"]]}
                                       for row in chunk]})
     return {"read": now, "bundles": bundles, "refused": refused,
             "room": {"machine": room["machine"], "why": room["why"], "cap": build.MACHINE_CAP,
