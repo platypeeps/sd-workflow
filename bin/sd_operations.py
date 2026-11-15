@@ -442,7 +442,7 @@ def dispatch_builds(args: argparse.Namespace) -> int:
     sd_db, build, build_run = build_modules()
     from sd_db import hub, remote  # noqa: PLC0415 - the copy build_modules imported
     hub.on_mismatch = None
-    why = ""
+    why = skip = ""
     try:
         root = log_root()
     except sd_lib.ConfigError as error:  # a malformed setting is unread: no claim, but the reap and watch run
@@ -450,8 +450,10 @@ def dispatch_builds(args: argparse.Namespace) -> int:
     if root is None and not why:
         why = "sd.bulk_storage_root is unset, so a build run has no log folder"
     elif root is not None and (ready := writable(root)) is not True:
-        why = (f"the log folder {root} is not writable" if ready is False
-               else f"the log folder {root} did not answer in {PROBE_SECONDS:g} s")
+        # A live run logs locally (pack sd:8246): a bulk root that takes no write holds the archive, not the
+        # claim; the ended runs' files wait locally for a tick whose bulk root answers (pack sd:8845).
+        skip = (f"the bulk root {root} is not writable" if ready is False
+                else f"the bulk root {root} did not answer in {PROBE_SECONDS:g} s")
 
     def overdue(*_: Any) -> None:
         raise Overdue
@@ -461,7 +463,7 @@ def dispatch_builds(args: argparse.Namespace) -> int:
     signal.setitimer(signal.ITIMER_REAL, TICK_SECONDS)
     unstarted: dict[str, str] = {}
     try:
-        result = tick(sd_db, build, build_run, root, why, unstarted)
+        result = tick(sd_db, build, build_run, root, why, unstarted, archive=not skip)
     except Overdue:
         result = None
         print(f"skipped: the tick ran past {TICK_SECONDS:g} s")
@@ -479,17 +481,23 @@ def dispatch_builds(args: argparse.Namespace) -> int:
         build_run.archive_wait(TICK_SECONDS - (time.monotonic() - armed))
     if result is None:
         return 0
+    if skip:
+        result["archive_skipped"] = skip
     if unstarted:  # an unwritable run log skips that run's supervisor, not the tick
         result["spawned"] = [ident for ident in result["spawned"] if ident not in unstarted]
         result["why"] = "; ".join(filter(None, [result["why"], *unstarted.values()]))
     print(json.dumps(result, ensure_ascii=False) if args.json else
           f"reaped {len(result['reaped'])}, moved {len(result['moved'])}, swept {len(result['swept'])}, claimed {len(result['claimed'])}, "
-          f"drafted {len(result['drafted'])}, spawned {len(result['spawned'])}" + (f"; no claim: {result['why']}" if result["why"] else ""))
+          f"drafted {len(result['drafted'])}, spawned {len(result['spawned'])}" + (f"; no claim: {result['why']}" if result["why"] else "")
+          + (f"; no archive: {skip}" if skip else ""))
     return 0
 
 
-def tick(sd_db: Any, build: Any, build_run: Any, root: Path | None, why: str, unstarted: dict[str, str]) -> dict:
-    """`dispatch_builds`' tick in the database; each run whose supervisor could not start goes in `unstarted`."""
+def tick(sd_db: Any, build: Any, build_run: Any, root: Path | None, why: str, unstarted: dict[str, str], *,
+         archive: bool = True) -> dict:
+    """`dispatch_builds`' tick in the database; each run whose supervisor could not start goes in `unstarted`.
+
+    `archive` False: the bulk root did not take a write, so no ended run's files move to it this tick."""
     load, load_cap = gate_load()
     connection = sd_handoff_rows.connect(sd_db, write=True)
     try:
@@ -513,7 +521,7 @@ def tick(sd_db: Any, build: Any, build_run: Any, root: Path | None, why: str, un
         result = build_run.dispatch(connection, owner="build-dispatch", load=load, load_cap=load_cap,
                                     interactive=interactive, spawn=spawn, lane=lane, why=refusal)
         result["pushed"] = push_failures(connection)
-        if root is not None and not why:  # the bulk root answered the probe
+        if root is not None and not why and archive:  # the bulk root answered the probe
             result["logs_moved"] = build_run.archive(connection, build_run.local_root(), root)
     except (sd_db.SdDbError, ValueError, OSError) as error:
         raise WorkRefusal(str(error)) from error

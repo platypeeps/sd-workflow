@@ -360,17 +360,32 @@ class OperationsCLI(unittest.TestCase):
         self.assertEqual((code, output), (0, "skipped: the tick ran past 0.2 s\n"))
         self.connection.close.assert_called_once()
 
-    def test_a_hung_log_folder_probe_claims_nothing_within_its_bound(self):
-        """pack sd:6749: a stat on a hung bulk volume blocked the tick before its alarm was set."""
+    def test_a_hung_bulk_root_probe_claims_within_its_bound_and_skips_the_archive(self):
+        """pack sd:6749: a stat on a hung bulk volume blocked the tick before its alarm was set. pack sd:8845: a live
+        run logs locally (sd:8246), so a hung bulk root holds only the archive, not the claim."""
         run = self.builds()
         with patch.object(cli, "PROBE_SECONDS", 0.2, create=True), \
                 patch.object(cli.os, "access", side_effect=lambda *_: time.sleep(5)), \
                 patch.object(Path, "is_dir", return_value=True):
             started = time.monotonic()
-            code, _ = self.tick(run)
+            code, output = self.tick(run)
         self.assertLess(time.monotonic() - started, 2)
         self.assertEqual(code, 0)
-        self.assertIn("did not answer in 0.2 s", run.dispatch.call_args.kwargs["why"])
+        self.assertEqual(run.dispatch.call_args.kwargs["why"], "")
+        run.archive.assert_not_called()
+        self.assertIn("no archive: the bulk root /bulk did not answer in 0.2 s", output)
+
+    def test_an_unwritable_bulk_root_claims_and_skips_the_archive(self):
+        """pack sd:8845: an ejected or read-only bulk root refused every new build, though a live run logs to the
+        local folder (sd:8246); the ended runs' files wait there for a tick whose bulk root takes a write."""
+        run = self.builds()
+        with patch.object(cli, "writable", return_value=False):
+            code, output = self.tick(run)
+        self.assertEqual(code, 0)
+        self.assertEqual(run.dispatch.call_args.kwargs["why"], "")
+        run.archive.assert_not_called()
+        self.assertIn("claimed 1", output)
+        self.assertIn("no archive: the bulk root /bulk is not writable", output)
 
     def test_an_unwritable_run_log_skips_its_spawn_with_exit_0(self):
         """pack sd:6494: EPERM opening a run's supervisor log failed every tick with rc=1."""
