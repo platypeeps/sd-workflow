@@ -1735,7 +1735,7 @@ class TodayIsTheDashboardsToday(unittest.TestCase):
             for name, root in roots.items():
                 sd_db.repos.add(connection, root, remote=f"https://github.com/example/{name}.git", home=self.home)
             sd_db.writes.set_setting(connection, "sd.status_companions", "~/app=~/lib")
-            for name, number, reason in (("app", 1, None), ("app", 2, "assigned"), ("other", 3, None)):
+            for name, number, reason in (("app", 901, None), ("app", 902, "assigned"), ("other", 903, None)):
                 sd_db.writes.upsert_shadow(connection, tracker="github", repo=f"example/{name}", number=number,
                                            url=f"https://github.com/example/{name}/issues/{number}",
                                            title=f"Issue {number}", kind="issue", state="open", reason=reason)
@@ -1747,8 +1747,8 @@ class TodayIsTheDashboardsToday(unittest.TestCase):
         self.assertNotIn(f"#{made['other']} ", text)
         lines = text.splitlines()
         issues = lines[lines.index("Issues (2)") + 3:]
-        self.assertRegex(issues[0], r"^#2 +app +open +needs you +Issue 2")
-        self.assertRegex(issues[1], r"^#1 +app +open +- +Issue 1")
+        self.assertRegex(issues[0], r"^#902 +app +open +needs you +Issue 902")
+        self.assertRegex(issues[1], r"^#901 +app +open +- +Issue 901")
         self.assertNotIn("Issues (", self.call("today", cwd=roots["app"]).stdout)
 
         # A research repository's companions are the registered repositories its watchlist names.
