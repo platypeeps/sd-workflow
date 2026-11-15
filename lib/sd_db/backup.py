@@ -896,7 +896,8 @@ def _retention_inventory(directory: Path, *, moved: bool = False, hashed: bool =
 
 
 def _record_backup(directory: Path, source: Path, run_id: str, counts: dict[str, int], *,
-                   checkpointed: bool = True, store: dict[str, list[int] | None] | None = None) -> None:
+                   checkpointed: bool = True, store: dict[str, list[int] | None] | None = None,
+                   forensic: bool = False) -> None:
     # `checkpoint: false` is a note for the reader, not a key `_owned_backup`
     # honours: it re-verifies through the checkpoint row, so a snapshot
     # without one is never owned, never pruned, and never counted for `--keep`.
@@ -906,6 +907,10 @@ def _record_backup(directory: Path, source: Path, run_id: str, counts: dict[str,
     if store is not None:
         # `migration_backup` compares it with the live store (`_snapshot`).
         value["store"] = store
+    if forensic:
+        # The source had foreign-key violations, so `restore` refuses this copy;
+        # `prune` keeps it but leaves it out of the kept count (sd:8817).
+        value["forensic"] = True
     _write_recovery_record(directory / BACKUP_MANIFEST, (json.dumps(value, sort_keys=True) + "\n").encode())
 
 
@@ -1212,7 +1217,9 @@ def prune(root: Path, keep: int | None = KEEP) -> list[Path]:
     """Apply requested retention only to unchanged, verified owned backups.
 
     The newest `keep` owned backups are found newest first; each older one is
-    then verified and removed in turn, oldest first.
+    then verified and removed in turn, oldest first. A forensic copy among the
+    newest is kept but not counted, so it never displaces the restorable
+    snapshot the keep exists for (sd:8817).
     """
     _check_keep(keep)
     if keep is None:
@@ -1222,10 +1229,16 @@ def prune(root: Path, keep: int | None = KEEP) -> list[Path]:
     dated = sorted((path for path in root.iterdir() if DATED_NAME.fullmatch(path.name)), key=_directory_order)
     held = 0
     while dated and held < keep:
-        if _owned_backup(dated.pop()) is not None:
+        newest = dated.pop()
+        if _owned_backup(newest) is not None and not _forensic(newest):
             held += 1
     return [_remove_owned(path, identity, _manifest_identity)
             for path in dated if (identity := _owned_backup(path)) is not None]
+
+
+def _forensic(directory: Path) -> bool:
+    """Whether the verified backup in `directory` is a forensic copy (`run`)."""
+    return json.loads((directory / BACKUP_MANIFEST).read_bytes()).get("forensic") is True
 
 
 def _taken_at(directory: Path) -> datetime:
@@ -1682,7 +1695,8 @@ def run(
         checked.close()
 
     try:
-        _record_backup(directory, source, run_id, counts, checkpointed=checkpointed, store=store)
+        _record_backup(directory, source, run_id, counts, checkpointed=checkpointed, store=store,
+                       forensic=bool(violations))
     except OSError as error:
         raise BackupError(f"backup ownership was not recorded: {error}") from None
     try:
