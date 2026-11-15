@@ -698,15 +698,16 @@ class AutoPickup(Fixture):
     """pack sd:6097: the Builds panel shows auto-pickup and its On and Off write it, bound to the value read."""
 
     def test_on_and_off_write_the_setting_against_the_value_read(self):
+        """pack sd:8930: On writes "on" with no end; Off clears it; each is bound to the value the panel read."""
         state = builds.panel(self.connection, now=clock())["pickup"]
-        self.assertEqual((state["on"], state["until"], state["error"]), (False, None, ""))
-        status, _, body = self.post("/api/queue/builds/pickup", {"on": True, "until": None})
-        self.assertEqual((status, body["on"], body["until"]), (200, True, build.morning()), body)
+        self.assertEqual(state, {"on": False, "value": None, "error": ""}, "no end and no next 09:00")
+        status, _, body = self.post("/api/queue/builds/pickup", {"on": True, "value": None})
+        self.assertEqual((status, body["on"], body["value"]), (200, True, "on"), body)
         self.assertEqual(len(self.kicks), 1, "On starts a tick now")
-        status, _, body = self.post("/api/queue/builds/pickup", {"on": False, "until": None})
+        status, _, body = self.post("/api/queue/builds/pickup", {"on": False, "value": None})
         self.assertEqual(status, 409, body)
         self.assertTrue(build.pickup_state(self.connection)["on"], "a stale Off writes nothing")
-        status, _, body = self.post("/api/queue/builds/pickup", {"on": False, "until": build.morning()})
+        status, _, body = self.post("/api/queue/builds/pickup", {"on": False, "value": "on"})
         self.assertEqual((status, body["on"]), (200, False), body)
-        for payload in ({"on": "yes", "until": None}, {"on": True}):
+        for payload in ({"on": "yes", "value": None}, {"on": True}, {"on": True, "until": None}):
             self.assertEqual(self.post("/api/queue/builds/pickup", payload)[0], 400, payload)
