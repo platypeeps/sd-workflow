@@ -75,7 +75,6 @@ Do not substitute another diff or copy a cap into this procedure.
    Branch and `pr` scope run it in a clean detached worktree at the reviewed head, so an edit in the checkout during the run is not what passes.
    Explicit `--reuse-check` can reuse eligible full-check evidence; a reused receipt runs no gate.
    A failing gate fails the review.
-   Under `repo.ci = local`, follow the round order below instead.
 
 Reviewing tiers ask two independent local reviews: the first two entries on the reviewer order, run at once.
 With one eligible reader, the review asks one, and `review_shortfall` and a `shortfall` line say so.
@@ -89,18 +88,6 @@ The registry uses read-only database controls when available.
 A missing database permits file defaults without creating a database.
 An unreadable database stops execution instead of ignoring operator controls.
 
-### Branch rounds under `repo.ci = local`
-
-1. Run `sd gate check --base main` at the head, inside any lock the brief names.
-   It runs the full check in a clean worktree, takes a gate slot, and records a pass.
-2. Review with `sd-review --scope branch --gate-check main` within 30 minutes of that pass.
-   This form reuses the pass and runs no second check.
-3. Run both with the same environment. The receipt binds it, so a one-off prefix such as `TEST_WORKERS=6` on one of them reruns the full check.
-4. After a fix commit, run step 1 again before the next round.
-
-Never run the plain branch form there: it runs a second full check in the checkout, outside any lock around the gate, and reuses no pass.
-`WORKFLOW.md`, section **Parallel work**, holds the rule (sd:2603).
-
 ### The builder chain
 
 A builder runs one chain per round, in its own worktree, at HEAD.
@@ -110,19 +97,17 @@ The lane root is `SD_LANE_ROOT`, else `sd.lane_root`, else `$XDG_STATE_HOME/sd/l
 `<item>` is the sd item number; `N` is the round, from 1.
 
 ```
-sd gate check --base main > "$LOG/gate-<item>-rN.log" 2>&1; echo "gate exit $?" >> "$LOG/gate-<item>-rN.log"
-sd-review --scope branch --gate-check main > "$LOG/review-<item>-rN.log" 2>&1; echo "review exit $?" >> "$LOG/review-<item>-rN.log"
+sd-review --scope branch > "$LOG/review-<item>-rN.log" 2>&1; echo "review exit $?" >> "$LOG/review-<item>-rN.log"
 ```
 
-1. Run the gate line first. Run the review line only after `gate exit 0`.
-2. Read the gate verdict from its `gate exit N` line.
-   Read the review verdict from the `sd-review: <status>` line, which comes just before `review exit N`.
-   Report both as one line: `gate-<item>-rN exit 0; review-<item>-rN clean`.
-3. Run each line in the foreground, or as a background command that wakes the agent on exit.
+1. Read the verdict from the `sd-review: <status>` line, which comes just before `review exit N`.
+   Report it as one line: `review-<item>-rN clean`.
+2. Run the line in the foreground, or as a background command that wakes the agent on exit.
    Never wait with `Monitor` or `sleep`: `Monitor` stops at 30 minutes and leaves the agent idle.
-4. Use these names and no others.
-   `sd-ship lane watch` scans every `*.log` under the lane root for gate ends, so a fixed name keeps each round findable.
+3. Use this name and no other, so each round stays findable in the lane log folder.
    To wait on lane items, run `sd-ship lane watch --item <id>`: a bare watch never exits.
+4. Run no `sd gate check` before the review: the lane's prepare gate is the one full run (sd:5800).
+   A pre-enqueue pass is reused only while main has not moved, so it doubles gate load.
 
 The chain adds no verb and no PR body check.
 
