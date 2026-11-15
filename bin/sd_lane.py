@@ -1164,7 +1164,7 @@ def cancel(root: pathlib.Path, item: int, environ: dict[str, str], *,
     With neither, a prepared entry whose work merged outside the lane is
     cancelled (sd:5743); `merged_by_hand` reads the proof. An item whose
     newest entry failed or was skipped has those entries cancelled
-    (`stale_ended`, pack sd:5838): its work landed in another item's bundle,
+    (`reads.stale_lane_ended`, pack sd:5838): its work landed in another item's bundle,
     and Landing showed it for ever.
     """
     if expected_claim is not None and not all(expected_claim.partition(":")[::2]):
@@ -1195,7 +1195,9 @@ def cancel(root: pathlib.Path, item: int, environ: dict[str, str], *,
                                 "it is not stuck, so it is not released", code="holder_alive")
             reclaim(running, released=True)
             return running
-        ended = stale_ended(entries, item, order)
+        from sd_db.reads import stale_lane_ended  # noqa: PLC0415 - `update` required sd_db
+
+        ended = stale_lane_ended(entries, item, order)
         for row in ended:
             row.update(status="cancelled", finished_at=stamp_now(),
                        reason=f"cancelled by the operator on {this_host()}; it was {row.get('status')}: "
@@ -1222,29 +1224,6 @@ def stale_prepared(entries: list[dict[str, Any]], item: int) -> list[dict[str, A
     if any(row.get("item") == item and row.get("status") in ("pending", "running") for row in entries):
         return []
     return [row for row in entries if row.get("item") == item and row.get("status") == "prepared"]
-
-
-def stale_ended(entries: list[dict[str, Any]], item: int, order: dict[str, int]) -> list[dict[str, Any]]:
-    """`item`'s failed and skipped entries newer than its newest merged or prepared one, newest first (pack sd:5838).
-
-    Only when its newest entry by `order` (`enqueue_order`) that is not
-    cancelled is failed or skipped, and none is pending or running.
-    Landing reads the same newest entry: it skips cancelled ones, such as
-    a retry cancelled while pending, so an older failed one would take the
-    place of the one cancelled. One before a merge or a prepared entry is
-    history and stays.
-    """
-    mine = sorted((row for row in entries if row.get("item") == item and row.get("status") != "cancelled"),
-                  key=lambda row: order.get(row["id"], 0), reverse=True)
-    if (not mine or mine[0].get("status") not in ("failed", "skipped")
-            or any(row.get("status") in ("pending", "running") for row in mine)):
-        return []
-    ended = []
-    for row in mine:
-        if row.get("status") in ("merged", "prepared"):
-            break
-        ended.append(row)
-    return ended
 
 
 def merged_by_hand(root: pathlib.Path, entry: dict[str, Any], receipts: list[dict[str, Any]], *,
