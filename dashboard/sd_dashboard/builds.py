@@ -289,8 +289,11 @@ def _open_row(connection, run: dict, now: str) -> dict:
     quiet = None if host else _log_quiet(run["log_path"], now)
     waiting = _waiting(connection, run, [member["item"] for member in members])
     lost = step != "enqueued" and run["outcome"] is None and (beat is None or beat >= build.STALE_SECONDS)
-    state = ("waiting" if waiting else "lost" if lost
+    # sd:8960: a run in the lane waits on review, not on its builder.
+    merging = step == "enqueued" and run["outcome"] is None
+    state = ("waiting" if waiting else "lost" if lost else "merging" if merging
              else "stalled" if step in LOGGING and quiet is not None and quiet >= QUIET_SECONDS else "working")
+    waiting = waiting or ("waits on review" if merging else "")
     cancel = {"assignment": run["assignment"], "allowed": False, "reason": "", "revision": ""}
     try:
         current = operations.assignment_state(connection, run["assignment"])

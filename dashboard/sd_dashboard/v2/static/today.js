@@ -411,9 +411,10 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       <td class="detail">${p ? html`${prFacts(p)} · ` : ''}${facts}${shots(r)}</td><td class="num">${r.state === 'next' ? `#${r.position}` : p ? dur(p.waited) : ''}</td>
       <td class="act">${ctl}${p ? prWaitLink(p) : ''}${id ? shell.commands.rowActions(id) : ''}</td></tr>`, p && p.on];
   }
-  // A build run's state (pack sd:6095): working; waiting on me (held, or an open question asks); stalled (the log has not
-  // grown for 15 min); lost (no supervisor beat for 3 min, which the dispatcher's next reap settles).
-  const RUNSTATE = { working: 'ok', waiting: 'warning', stalled: 'caution', lost: 'unknown' };
+  // A build run's state (pack sd:6095): working; merging (in the lane, waits on review, sd:8960); waiting on me (held,
+  // or an open question asks); stalled (the log has not grown for 15 min); lost (no supervisor beat for 3 min, which the
+  // dispatcher's next reap settles).
+  const RUNSTATE = { working: 'ok', merging: 'queued', waiting: 'warning', stalled: 'caution', lost: 'unknown' };
   const names = r => r.items.length ? html`${r.items.map((m, i) => html`${i ? '; ' : ''}<a href="${shell.itemHref(m.item)}">#${m.item} ${m.title}</a>`)}` : 'no items recorded';
   const bb = (act, r, label, aria, off) => html`<button class="btn quiet sm" type="button" data-build="${act}" data-run="${r.run}" aria-label="${aria}"${off ? html` disabled title="${off}"` : QV.busy ? html` disabled` : ''}>${label}</button>`;
   // Open PR (pack sd:6020 ruling #31553): the pull request `sd-ship` opened for the row's branch; none shows nothing.
