@@ -1590,6 +1590,16 @@ class TheReferentialCheckOnTheSnapshot(BackupCase):
         # Refused before touching the target, not part way through it.
         self.assertFalse((other / ".local/share/sd/sd.db").exists())
 
+    def test_a_forensic_snapshot_does_not_count_toward_keep(self):
+        """sd:8817. With keep=1 a good snapshot, then a forensic one: the
+        forensic copy is kept but not counted, so the good one stays."""
+        good = run(home=self.home, keep=1)
+        self.orphan()
+        forensic = run(home=self.home, keep=1)
+        self.assertEqual(len(forensic.violations), 1)
+        self.assertTrue(good.directory.is_dir())
+        self.assertTrue(forensic.directory.is_dir())
+
     def test_a_clean_snapshot_still_restores(self):
         """The other side of the same contract, so the refusal above is not
         simply `restore` being broken."""
