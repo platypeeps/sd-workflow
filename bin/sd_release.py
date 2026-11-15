@@ -302,7 +302,8 @@ def _merge(state: dict, release: dict, acts: dict, world: Any, types: list[str])
     checks = world.pr_state(state["pr"], acts, release["key"], state["version"])
     if checks != "green":
         raise Wait(f"{state['pr']} stays open: {checks}", failed=checks.startswith("red"))
-    _ask(state, "merge", acts.get("push", "auto"), f"merge {state['pr']}, its checks green?", world)
+    # the merge permission (`repo.runner_merge`, policy `merge`), never `push`: absent asks (sd:8816)
+    _ask(state, "merge", "auto" if acts.get("merge") == "auto" else "ask", f"merge {state['pr']}, its checks green?", world)
     world.merge_bump(state["pr"])
     merged = world.merged(state["pr"], release["key"], state["version"])
     if not merged:  # `gh pr merge` exits 0 when it only adds the PR to a merge queue

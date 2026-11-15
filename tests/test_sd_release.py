@@ -26,7 +26,7 @@ RELEASE = {"deploy_repo": "~/repos/org/deploy", "file": "values.yaml", "key": "i
 TAG_ONLY = {"verify": "check-rollout"}
 VALUES = "image:\n  repository: org/app\n  tag: \"0.17.2\"  # set by the release\nreplicas: 2\n"
 ORG = {"push": "ask", "pr": "ask"}
-MANAGED = {"push": "auto", "pr": "auto"}
+MANAGED = {"push": "auto", "pr": "auto", "merge": "auto"}
 IDENTITY = {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@example.test",
             "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@example.test"}
 PR = "https://github.com/org/deploy/pull/7"
@@ -364,6 +364,16 @@ class Chain(unittest.TestCase):
         state = run(world, acts=ORG, deploy_acts=ORG, state=state)
         self.assertEqual(state["step"], "stopped")
         self.assertIn("the operator stopped the chain at merge", state["reason"])
+
+    def test_the_merge_asks_by_the_merge_permission_not_the_push_act(self):
+        """sd:8816: push auto and merge manual merged the bump without asking (class sd:7014, sd:7366)."""
+        for deploy in ({**MANAGED, "merge": "ask"}, {"push": "auto", "pr": "auto"}):
+            with self.subTest(deploy=deploy):
+                world = World()
+                state = run(world, deploy_acts=deploy)
+                self.assertEqual((state["step"], world.asked), ("merge", ["merge"]))
+                self.assertIn("waiting", state["reason"])
+                self.assertFalse([act for act in world.acts if act.startswith("merge")], "no merge call")
 
     def test_the_bump_asks_when_its_commit_or_push_is_held_at_ask(self):
         """Review: the bump checked only `pr`, though `open_bump` also commits and pushes a branch."""

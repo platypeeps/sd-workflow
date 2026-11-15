@@ -1421,15 +1421,6 @@ def _item_statuses(connection: Any, items: list[Any]) -> dict[Any, str]:
 VIEW_KEYS = ("landing", "delivered", "planned", "blocked", "unscheduled", "work")
 
 
-def companions(repo: str, value: str | None) -> list[str]:
-    """The repositories `sd.status_companions` lists beside `repo`: `<repo>=<other>[,<other>]`, `;` between."""
-    for entry in (value or "").split(";"):
-        name, _, others = entry.partition("=")
-        if name == repo:
-            return [other for other in others.split(",") if other and other != repo]
-    return []
-
-
 def views_section(root: pathlib.Path, environ: dict[str, str]) -> dict[str, Any]:
     """`sd today`'s sections for this repository, read by the same `sd_db.today` functions (sd:5098).
 
@@ -1446,6 +1437,7 @@ def views_section(root: pathlib.Path, environ: dict[str, str]) -> dict[str, Any]
         try:
             import sd_db
             from sd_db import today
+            from sd_db.repos import companions
 
             repos, unread = [sd_lib.registered_base(root, sd_db, connection)], ""
             try:

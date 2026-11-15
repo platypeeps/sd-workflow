@@ -12,6 +12,7 @@ It is the one home of the operator's status format; other skills and docs point 
 ## Steps
 
 1. Run `sd today | head -120`. It is read-only and derives every section from the shared database, the lane and the gate queue.
+   For "next here" or "what next in this repo", run `sd today --here | head -120`: this repo, its companions and their open issues; the format below is unchanged.
 2. Collect what only this session knows:
    - the builders and agents running now, from `ListAgents` where the harness has it, with each one's item and budget;
    - this session's open threads: recommendations not acted on, followups and questions no `sd task note` holds yet, and commits or worktrees not landed (`git status`, `git log origin/main..`, `git worktree list`).
