@@ -23,7 +23,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from xml.parsers.expat import ExpatError
 
-from . import build, config, runner_journal
+from . import build, config, reads, runner_journal
 from .database import refuse_hub_only, transaction
 from .runner import RunnerRefused
 from .workflow import StaleItem, WorkflowError, _identifier, _text
@@ -556,6 +556,13 @@ def assignment_state(connection: sqlite3.Connection, assignment: int) -> dict:
     result["revision"] = _digest(dict(row))
     result["capabilities"] = {"cancel": {"allowed": not reason, "reason": reason}}
     return result
+
+
+def lane_state(connection: sqlite3.Connection, item: int) -> dict | None:
+    """The newest lane entry, not cancelled, that delivers `item`: its id, status, reason and merge commit; None when
+    there is none. `sd assignments get --wait --until merged` waits while it is pending or running (pack sd:8798)."""
+    found = [entry for _, _, entry in reads.item_lane_entries(connection, item) if entry.get("status") != "cancelled"]
+    return {key: found[-1].get(key) for key in ("id", "status", "reason", "merge_commit")} if found else None
 
 
 def cancel_assignment(connection: sqlite3.Connection, assignment: int, *, expected_revision: str, who) -> dict:
