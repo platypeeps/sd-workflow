@@ -34,9 +34,8 @@ import subprocess
 import time
 import uuid
 from collections.abc import Collection
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from . import hub, paths, reads
 from .database import served_by, transaction
@@ -129,15 +128,14 @@ DRAFT_PULL = "draft pull request "
 #: The steps a cancel may stop: from `enqueuing` on, the lane may hold the branch (design, "Liveness").
 CANCELLABLE = ("claimed", "worktree", "building", "reviewing", "fixing")
 ACTIVE = ("queued", "running", "ending")
-#: Auto-pickup's end, a UTC timestamp, or none for off (design, "Auto-pickup").
-AUTO_PICKUP = "build.auto_pickup_until"
+#: Auto-pickup: "on", or none for off; On stays on until Off or a safety turn-off (pack sd:8930). The old
+#: build's key, `build.auto_pickup_until`, held a 09:00 end; nothing reads it, so it reads off.
+AUTO_PICKUP = "build.auto_pickup"
 #: Who auto-pickup queues as. Its queue note on the lead's item marks the bundle as auto-pickup's for every run
 #: and retry of it, so the merge gets `checking` and the two-blocked rule counts it (pack sd:6097).
 PICKUP = "auto-pickup"
 #: The title prefix of the item a failed health check after an auto-pickup merge files; the push reads it.
 HEALTH = "Auto-pickup off: health failed after the merge of "
-#: On ends at the next 09:00 here (design, "Auto-pickup"; pack sd:7698).
-MORNING, ZONE = 9, ZoneInfo("America/Denver")
 
 
 class BuildRefused(SdDbError):
@@ -630,31 +628,20 @@ def eligible(connection, *, now: str | None = None) -> list[dict]:
     return found
 
 
-def morning(now: str | None = None) -> str:
-    """The next 09:00 America/Denver after `now`, in UTC: where On ends."""
-    here = datetime.fromisoformat(now or clock()).astimezone(ZONE)
-    end = here.replace(hour=MORNING, minute=0, second=0, microsecond=0)
-    if end <= here:
-        end = (here + timedelta(days=1)).replace(hour=MORNING, minute=0, second=0, microsecond=0)
-    return end.astimezone(UTC).isoformat(timespec="seconds")
-
-
 def pickup_state(connection, *, now: str | None = None) -> dict:
-    """Auto-pickup now: `on`, `until` (the end set, or None) and `since` (when the setting was last written)."""
-    until = read_settings(connection, [AUTO_PICKUP]).get(AUTO_PICKUP)
+    """Auto-pickup now: `on`, `value` (the text stored, or None) and `since` (when the setting was last written).
+
+    Only "on" reads on: any other value, such as an old build's end, is off, never on. `now` is unused and kept
+    for the callers that pass the tick's clock."""
+    value = read_settings(connection, [AUTO_PICKUP]).get(AUTO_PICKUP)
     row = connection.execute("SELECT timestamp FROM state WHERE kind = 'setting' AND key = ? ORDER BY id DESC LIMIT 1",
                              (AUTO_PICKUP,)).fetchone()
-    try:
-        end = datetime.fromisoformat(until) if until else None
-        on = end is not None and end.tzinfo is not None and end > datetime.fromisoformat(now or clock())
-    except ValueError:
-        on = False  # a value that does not read is off, never on
-    return {"on": on, "until": until, "since": row["timestamp"] if row else None}
+    return {"on": value == "on", "value": value, "since": row["timestamp"] if row else None}
 
 
 def set_pickup(connection, on: bool, *, now: str | None = None) -> dict:
-    """On writes the next morning's end; Off writes none. The state after."""
-    set_setting(connection, AUTO_PICKUP, morning(now) if on else None)
+    """On writes "on"; Off writes none. The state after."""
+    set_setting(connection, AUTO_PICKUP, "on" if on else None)
     return pickup_state(connection, now=now)
 
 
