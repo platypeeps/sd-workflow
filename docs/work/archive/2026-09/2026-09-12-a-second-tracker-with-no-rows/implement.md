@@ -60,9 +60,9 @@ since R11-D48. The pack half is on the order of forty lines in
       equals the operator's own accountId, read from Jira by hand. This is
       the direct question, and it is the check that carries the design's last
       risk: a token minted for another account collects that account's
-      involvement and reports success. It answered
-      `5e9a44b37bc0680c2ccd38af`, the account that both files and is assigned
-      `LOG-23818`, so the token is the operator's own.
+      involvement and reports success. It answered the operator's
+      own account id (redacted, sd:8824), the account that both files
+      and is assigned `LOG-23818`, so the token is the operator's own.
       (d) A specific issue key is named only after asserting that its
       `updated` date falls inside `FIRST_RUN_WINDOW` (in `dashboard/jira.py`, retired at sd:719 step 4);
       otherwise take the newest key the query itself returned. `LOG-23818`,
