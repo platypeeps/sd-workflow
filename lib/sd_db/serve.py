@@ -788,6 +788,10 @@ class Session(socketserver.BaseRequestHandler):
                 if first_sql and connection is not None and not connection.in_transaction:
                     server.log.transaction(self.number, frames, gap, time.monotonic() - opened_at, gap_before)
                     first_sql = ""
+                # A peer that stops reading the answer is as silent as one
+                # that stops sending: bounded inside a transaction (sd:8819).
+                held = connection is not None and connection.in_transaction
+                sock.settimeout(server.idle_timeout if held else None)
                 try:
                     remote.send_frame(sock, answer)
                 except remote.RemoteError as error:

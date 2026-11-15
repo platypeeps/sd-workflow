@@ -574,6 +574,25 @@ class TheOwnership(OutcomeCase):
         self.addCleanup(raw.close)
         self.assertEqual([row[0] for row in raw.execute("SELECT name FROM probe")], ["hub"])
 
+    def test_a_reply_the_peer_stops_reading_is_rolled_back_in_the_idle_timeout(self):
+        """sd:8819: the reply send inside a write transaction is bounded too:
+        a peer that stops reading a large answer loses the transaction, and
+        a hub writer gets the lock inside its own wait."""
+        self.hub.stop()
+        self.hub = InProcess(self.path, idle_timeout=0.3)
+        self.addCleanup(self.hub.stop)
+        sock = self.raw()
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+        self.assertTrue(self.execute(sock, "BEGIN IMMEDIATE", rid=remote.new_request_id())["ok"])
+        self.assertTrue(self.execute(sock, "INSERT INTO probe (name) VALUES ('held')")["ok"])
+        remote.send_frame(sock, remote.request("execute", sql="SELECT zeroblob(64000000)", params=[]))
+        local = sqlite3.connect(self.path, timeout=5, isolation_level=None)
+        self.addCleanup(local.close)
+        local.execute("BEGIN IMMEDIATE")
+        local.execute("INSERT INTO probe (name) VALUES ('hub')")
+        local.execute("COMMIT")
+        self.assertEqual([row[0] for row in local.execute("SELECT name FROM probe")], ["hub"])
+
     def test_executescript_inside_a_write_transaction_is_refused(self):
         client = self.connect()
         client.execute("BEGIN IMMEDIATE")

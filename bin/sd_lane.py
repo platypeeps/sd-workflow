@@ -1575,7 +1575,7 @@ def check_unmerged(root: pathlib.Path, queue: Queue, cancelled: dict[str, Any]) 
         except WorkflowError as error:
             raise LaneError(f"sd:{item}'s ship receipt for {branch} cannot be read ({error}), so whether {head} "
                             "merged is unknown; nothing was queued") from None
-    found = on_hub(queue, branch_receipt)
+    found = on_hub(queue, branch_receipt, write=False)
     if found.get("phase") not in ("merged", "merge_dispatch"):
         return
     merged = str(found.get("head") or "")
@@ -1669,7 +1669,7 @@ def retry(root: pathlib.Path, item: int, environ: dict[str, str], *, manual: boo
         newest_at_expected_head(connection)
         check_successor(connection, queue.repository, last)
     queue = queue_for(root, environ)
-    last = on_hub(queue, newest_at_expected_head)
+    last = on_hub(queue, newest_at_expected_head, write=False)
     if last.get("status") in ("pending", "running"):
         raise LaneError(f"sd:{item} is already queued in this lane")
     cancelled = last.get("status") == "cancelled"
@@ -2473,7 +2473,7 @@ def reap_refusal(queue: Queue, entry: dict[str, Any], tree: pathlib.Path, main: 
     if kept := local_data(tree):
         return kept
     try:
-        return on_hub(queue, lambda connection: builder_busy(connection, tree, int(entry["item"])))
+        return on_hub(queue, lambda connection: builder_busy(connection, tree, int(entry["item"])), write=False)
     except LaneError as error:
         return f"the hub was not read: {error}"
 
@@ -2799,7 +2799,7 @@ def release_frozen(queue: Queue, deploy: pathlib.Path | None = None) -> Callable
         target = repository_of(deploy) if on_deploy and deploy is not None else queue.repository
         if target is None:  # unknown, not open
             return f"the deploy repository {deploy} names no GitHub repository, so its freeze is unknown"
-        window = on_hub(queue, lambda connection: freeze_window(connection, target))
+        window = on_hub(queue, lambda connection: freeze_window(connection, target), write=False)
         return None if window is None else f"{target} is frozen until {window['until']}: {window['reason']}"
     return frozen
 
@@ -2817,7 +2817,7 @@ def release_ruling(queue: Queue, item: int, main: pathlib.Path) -> Callable[[str
             ruled = connection.execute("SELECT body FROM note WHERE item = ? AND kind = 'decision' AND body LIKE ? "
                                        "ORDER BY id DESC LIMIT 1", (item, f"Ruling on note #{asked['id']}:%")).fetchone()
             return True, None if ruled is None else ruled["body"].split(":", 1)[1].strip()
-        asked, ruled = on_hub(queue, read_ruling)
+        asked, ruled = on_hub(queue, read_ruling, write=False)
         if not asked:
             default_note(item, f"{head}{question} Rule it with `sd task note {item} go --kind decision "
                                "--answers <this note>`; any other ruling stops the chain.", main, "question")
@@ -3860,7 +3860,7 @@ def freeze_stop(queue: Queue) -> str | None:
     """
     require_sd_db()
     from sd_db.writes import freeze_window  # noqa: PLC0415
-    window = on_hub(queue, lambda connection: freeze_window(connection, queue.repository))
+    window = on_hub(queue, lambda connection: freeze_window(connection, queue.repository), write=False)
     if window is None:
         return None
     return (f"{queue.repository} is frozen until {window['until']}: {window['reason']}; "
@@ -4206,7 +4206,7 @@ def new_work(environ: dict[str, str],
         return {checkout: frozenset(str(row["id"]) for row in stored(connection, queue.repository) if runnable(row))
                 for checkout, queue in queues.items()}
     try:
-        ids = on_hub(next(iter(queues.values())), runnable_by_lane)
+        ids = on_hub(next(iter(queues.values())), runnable_by_lane, write=False)
     except LaneError:
         return {}
     found: dict[pathlib.Path, frozenset[str]] = {}
@@ -4445,7 +4445,8 @@ def watch_items(queue: Queue, items: list[int], write: Callable[[str], Any] = pr
     while True:
         try:
             newest = on_hub(queue, lambda connection: {
-                item: newest_entry(connection, queue.repository, item, skip=("cancelled",)) for item in left})
+                item: newest_entry(connection, queue.repository, item, skip=("cancelled",)) for item in left},
+                write=False)
         except BuildRefused:
             raise
         except LaneError as error:

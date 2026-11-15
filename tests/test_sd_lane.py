@@ -2549,6 +2549,27 @@ class HubReads(SharedQueue):
         self.assertLess(waited, 1.0, "a queue read waited on the write lock")
         self.assertEqual(len(entries), 1)
 
+    def held(self) -> Any:
+        import sd_db
+        writer = sd_db.connect(home=self.tmp)
+        self.addCleanup(writer.close)
+        writer.execute("BEGIN IMMEDIATE")
+        self.addCleanup(lambda: writer.in_transaction and writer.execute("ROLLBACK"))
+        return writer
+
+    def test_the_watch_poll_and_the_freeze_check_do_not_wait_on_a_writer(self) -> None:
+        """sd:8819: `lane watch` and the runner's freeze check read while a hub writer holds the lock."""
+        writer, queue = self.held(), self.store()
+        # A read that waited would fail HUB_UNAVAILABLE and pause; the pause ends the writer, so the test ends.
+        released = mock.patch.object(sd_lane, "watch_pause", lambda: writer.execute("ROLLBACK"))
+        started = time.monotonic()
+        with released:
+            sd_lane.watch_items(queue, [7], write=lambda line: None)
+            stop = sd_lane.freeze_stop(queue)
+        self.assertLess(time.monotonic() - started, 1.0, "a hub read waited on the write lock")
+        self.assertIsNone(stop)
+        self.assertTrue(writer.in_transaction, "a hub read waited until the writer rolled back")
+
 
 class EnqueuePrechecks(SharedQueue):
     """sd:5989. Enqueue refuses, in seconds, what the lane would skip or fail before its review.
