@@ -52,7 +52,7 @@ from .runner import (
 from .ship import this_host
 from .writes import (
     add_note,
-    cancel_done_blocked,
+    cancel_unwanted_blocked,
     create_assignment,
     create_item,
     read_settings,
@@ -1839,7 +1839,8 @@ def _release(connection, read: dict, *, probe=Probe) -> bool:
         connection.execute("UPDATE runner_lease SET released_at = ? WHERE run = ? AND released_at IS NULL",
                            (stamp, read["id"]))
         for member in _members(connection, read["assignment"], "blocked"):
-            cancel_done_blocked(connection, member["item"], stamp, f"build run {read['id']} released; item is done")
+            cancel_unwanted_blocked(connection, member["item"], stamp,
+                                    f"build run {read['id']} released; item is done or in planning")
         if read["outcome"] == "blocked":
             _park(connection, read["id"], read["assignment"], stamp)
         return True

@@ -120,6 +120,17 @@ class TheStatusRule(WriteCase):
         self.assertEqual(status[finished]["status"], "done")
         self.assertEqual(status[elsewhere]["status"], "blocked")
 
+    def test_planning_cancels_the_items_blocked_assignments_too(self):
+        """sd:8846. An item returned to planning wants no build, so its blocked one ends."""
+        item = create_item(self.connection, kind="task", title="A thing", status="in_progress")
+        blocked = create_assignment(self.connection, role="author", status="blocked", item=item)
+        transition(self.connection, item, "ready", who="me")
+        self.assertEqual(
+            self.connection.execute("SELECT status FROM assignment WHERE id = ?", (blocked,)).fetchone()[0], "blocked")
+        transition(self.connection, item, "planning", who="me")
+        row = self.connection.execute("SELECT status, result FROM assignment WHERE id = ?", (blocked,)).fetchone()
+        self.assertEqual((row["status"], row["result"]), ("cancelled", f"item {item} moved to planning by me"))
+
     def test_done_leaves_a_blocked_assignment_a_run_still_holds(self):
         """sd:6996. The lease keeps the row the runner's; `build._release` cancels it later."""
         item = create_item(self.connection, kind="task", title="A thing")
