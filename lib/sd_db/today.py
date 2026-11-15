@@ -296,6 +296,28 @@ def repo_keys(connection: sqlite3.Connection) -> dict[str, str]:
     return keys
 
 
+def issues(connection: sqlite3.Connection, *, repos: Iterable[str | None]) -> list[dict]:
+    """The open GitHub issues of `repos`' remotes for `sd today --here` (sd:8844), the operator's first.
+
+    Each row is `id` (the issue number), `repo`, `status`, `why` (`needs you` for an issue assigned to or filed
+    by the operator, `repos.MINE`), `title`, `url` and `at` (last seen); newest seen first within each group.
+    """
+    from .repos import MINE
+
+    keep = set(repos)
+    by_slug = {slug: path for slug, path in repo_keys(connection).items() if path in keep}
+    if not by_slug:
+        return []
+    rows = connection.execute(
+        "SELECT repo, number, url, title, reason, last_seen FROM shadow WHERE tracker = 'github' "
+        f"AND kind = 'issue' AND state = 'open' AND lower(repo) IN ({', '.join('?' for _ in by_slug)}) "
+        "ORDER BY last_seen DESC, id DESC", list(by_slug)).fetchall()
+    found = [{"id": row["number"], "repo": by_slug[row["repo"].lower()], "status": "open",
+              "why": "needs you" if row["reason"] in MINE else "", "title": row["title"], "url": row["url"],
+              "at": row["last_seen"]} for row in rows]
+    return sorted(found, key=lambda row: not row["why"])
+
+
 def _gate(gate: Any) -> dict | None:
     """`sd gate status --json`'s holders and waiters, or the reason they could not be read."""
     if gate is None:
