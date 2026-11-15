@@ -463,14 +463,20 @@ def run_steps(plan: Plan) -> int:
     """Run every `change` step in order, each on its own; returns how many failed.
 
     A failure stops nothing but `LAST`, and G9 after a G1 failure: the repository joins the lane only after every other
-    step held, and its workflows go off only once protection requires sd/local-gate.
+    step held, and its workflows go off only once protection requires sd/local-gate. A G1 that was not read holds
+    `LAST` too, and each step it holds counts as failed (pack sd:8823).
     """
     failed, failed_keys = 0, set()
+    unread = any(step.key == "G1" and step.state == "unknown" for step in plan.steps)
     for step in plan.steps:
         if step.state != "change" or step.write is None:
             continue
         if step.key in LAST and failed:
             step.result = "held: an earlier step failed, so the repository stays outside the lane; apply again"
+            continue
+        if step.key in LAST and unread:
+            failed += 1
+            step.result = "held: protection (G1) was not read, so the repository stays outside the lane; apply again"
             continue
         if step.key == "G9" and "G1" in failed_keys:
             step.result = "held: protection (G1) failed, so the workflows stay on while their checks are required; apply again"

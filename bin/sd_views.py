@@ -268,6 +268,8 @@ def render_sections(found: dict[str, Any], *, now: datetime.datetime, width: int
             continue
         rows = found[key]["entries"] if key == "landing" else found[key]
         lines += ["", *section_table(key, rows, now, width, show_all=show_all)]
+        if key == "landing" and (unread := found[key].get("unread")):
+            lines.append(f"{unread} lane {'checkpoint' if unread == 1 else 'checkpoints'} unreadable")
         if key == "delivered" and found.get("closed_by_hand"):
             lines.append(f"+{len(found['closed_by_hand'])} closed by hand")
         if key == "decisions" and (batched := found["summary"].get("review_questions")):

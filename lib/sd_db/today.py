@@ -357,8 +357,16 @@ def landing(connection: sqlite3.Connection, *, repos: Iterable[str | None] | Non
     ).fetchall()
     keys, keep = repo_keys(connection), _keep(repos)
     newest: dict[tuple[str, Any], tuple[int, dict]] = {}
+    unread = 0
     for row in rows:
-        entry = json.loads(row["body"])
+        # One bad checkpoint is counted, never the end of every other row (pack sd:8822).
+        try:
+            entry = json.loads(row["body"])
+        except (TypeError, ValueError):
+            entry = None
+        if not isinstance(entry, dict):
+            unread += 1
+            continue
         repository = row["key"][len(LANE_KEY_PREFIX):].rpartition(":")[0]
         # An unregistered repository's entry has no key: it is no repository's, not one of no repository.
         if keep is not None and (keys.get(repository.lower()) is None or keys[repository.lower()] not in keep):
@@ -387,7 +395,7 @@ def landing(connection: sqlite3.Connection, *, repos: Iterable[str | None] | Non
                       "title": row["title"] if row is not None else entry.get("title", "")})
     rank = {status: index for index, status in enumerate(LANE_ORDER)}
     found.sort(key=lambda entry: rank.get(str(entry["status"]), len(rank)))
-    return {"entries": found, "gate": _gate(gate)}
+    return {"entries": found, "gate": _gate(gate), "unread": unread}
 
 
 #: The build assignment states the Queues panel lists (pack sd:6946).
