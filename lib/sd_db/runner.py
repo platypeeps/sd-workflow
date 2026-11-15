@@ -597,25 +597,6 @@ def record_merge(connection, item: int, *, evidence: dict, run_id: str | None = 
         return ident
 
 
-def queue_automatic_merges(connection) -> list[dict]:
-    """Only a successfully prepared author can request the exclusive merge lane."""
-    created = []
-    with transaction(connection):
-        candidates = connection.execute("SELECT assignment.id, assignment.item FROM assignment "
-            "JOIN item ON item.id = assignment.item JOIN repo ON repo.path = item.repo "
-            "JOIN runner_run ON runner_run.assignment = assignment.id "
-            "WHERE assignment.role = 'author' AND assignment.status = 'done' AND item.status = 'ready_to_send' "
-            f"AND {writes.MERGE_SQL.format(t='repo')} = 'auto' AND runner_run.released_at IS NOT NULL "
-            "AND runner_run.reviewed_head IS NOT NULL ORDER BY assignment.id").fetchall()
-        for candidate in candidates:
-            exists = connection.execute("SELECT 1 FROM assignment WHERE item = ? AND role = 'merge'", (candidate["item"],)).fetchone()
-            if not exists:
-                rows = enqueue(connection, [candidate["item"]], role="merge", scope="merge", who="runner")
-                connection.execute("UPDATE assignment SET parent = ? WHERE id = ?", (candidate["id"], rows[0]["id"]))
-                created.append(queue_state(connection, rows[0]["id"]))
-    return created
-
-
 def delivery_candidates(connection) -> list[dict]:
     """The items a push is owed, by kind and not by exception.
 
@@ -766,86 +747,6 @@ def record_hard_stop(connection, ident: str, *, kind: str, evidence: str) -> int
             return None
         body = f"hard stop: {kind}: {evidence}".strip()
         return add_note(connection, assignment["item"], "followup", body[:8000], session=ident)
-
-
-def answer_url(connection, ident: str, *, entry, prompt: str, environ, registry=None,
-               transport=None, timeout=None, now=None, owner_pid=None, retain=None) -> dict:
-    """A `url` author's one call, and the row's ending from what it came to.
-
-    sd:234 slice 8d, the runner half. On a `start` entry the session is a
-    process the runner supervises; on a `url` entry there is no process, so
-    the runner hands the same prompt here and `calls.call` puts it on the
-    wire, charged to the run's assignment -- the ledger's scope, so a
-    budgeted row is refused at `budget spent` -- with the run as its pass
-    and one call id per run, `url:<run id>`, so a second call under the
-    same run is the ledger's retry refusal and never a second request.
-
-    What the call came to decides the ending, written with `begin_ending`
-    as a `start` session's exit code decides it in the runner: `run` is
-    `done` with the settled cost in `detail`; `bound` -- a lost response,
-    a body with no usage -- is `blocked` naming the reason, the ledger
-    holding the bound; a refused reservation (`LedgerRefused` from the
-    assignment's budget or the bill's cap) is `blocked` with the ledger's
-    exposure line as `detail` and the same line filed as an open `followup`
-    on the item, which is requirement 6's `budget spent` note with the
-    amount -- the ledger's message begins `budget spent:` for a budget.
-    What `call` refuses by name (`CallRefused`, or a `LedgerRefused` about
-    the call itself) is raised through unchanged; the runner ends the row
-    on it as on any refusal. The response body is returned for the runner
-    to write where a `start` session's output goes; nothing here touches
-    a file. `retain`, when given, is called with that body before the
-    ending is written, so an ending never claims a work product that was
-    not kept: what `retain` raises leaves the run with no outcome, for the
-    caller's handler to end it on the error, the call already settled. A
-    refused reservation has no body and calls `retain` not at all.
-    A cancel requested while the call was on the wire wins the ending,
-    answered or refused: the `start` path polls `cancel_requested` and this
-    path has no poll, so the row is re-read after the wire; the settled
-    cost and the retained body stand.
-    """
-    from .calls import call
-    run = run_state(connection, ident)
-    assignment = queue_state(connection, run["assignment"])
-    if run["released_at"] or run["outcome"] or assignment["status"] != "running":
-        raise RunnerRefused(f"run {ident} is not the active attempt of a running assignment")
-    if assignment["role"] not in ("author", "reviewer"):
-        raise RunnerRefused(f"a {assignment['role']!r} row calls no provider")
-    try:
-        result = call(connection, entry=entry, prompt=prompt, environ=environ, assignment=assignment["id"],
-                      pass_=ident, role=assignment["role"], repo=run["repo"], call_id=f"url:{ident}",
-                      registry=registry, transport=transport, timeout=timeout, now=now, owner_pid=owner_pid)
-    except ledger.LedgerRefused as refused:
-        if refused.scope not in ("assignment", "bill"):
-            raise
-        detail = str(refused)
-        # No body to keep: `retain` is not called, so an unwritable volume
-        # cannot turn the refusal into another ending, and `release` names
-        # the provider log only where one exists.
-        with transaction(connection):
-            note = add_note(connection, assignment["item"], "followup", detail, session=ident) if assignment["item"] is not None else None
-            outcome, detail = _cancel_wins(connection, ident, "blocked", detail)
-            begin_ending(connection, ident, outcome=outcome, detail=detail)
-        return {"outcome": outcome, "detail": detail, "body": "", "call": None, "note": note}
-    if result.outcome == "run":
-        outcome = "done"
-        detail = (f"url author {entry.name} answered: {result.tokens_in} prompt and {result.tokens_out} completion tokens, "
-                  f"{result.usd:.4f} USD settled; the response is the retained provider log")
-    else:
-        outcome = "blocked"
-        detail = f"url author {entry.name} did not answer: {result.reason}; the ledger holds the bound {result.bound:.4f} USD"
-    if retain is not None:
-        retain(result.body)
-    outcome, detail = _cancel_wins(connection, ident, outcome, detail)
-    begin_ending(connection, ident, outcome=outcome, detail=detail)
-    return {"outcome": outcome, "detail": detail, "body": result.body, "call": result, "note": None}
-
-
-def _cancel_wins(connection, ident: str, outcome: str, detail: str) -> tuple[str, str]:
-    """The ending after the wire: a cancel requested meanwhile, or the call's own."""
-    run = run_state(connection, ident)
-    if run["cancel_requested"]:
-        return "cancelled", run["cancel_requested"]
-    return outcome, detail
 
 
 def ship_receipt(connection, ident: str) -> dict:
