@@ -716,6 +716,8 @@ class EveryCheckpointWriter(unittest.TestCase):
         "lib/sd_db/reporting.py": ("operator-action",),
         "lib/sd_db/services.py": ("operations:",),
         "lib/sd_db/ship.py": ("ship:",),
+        # Closing an item cancels its stale failed lane entry (pack sd:8850).
+        "lib/sd_db/writes.py": ("lane:",),
     }
 
     def sources(self):
