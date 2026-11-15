@@ -519,8 +519,7 @@ RULES: tuple[Rule, ...] = (
         scope="code",
         teaches="skills/sd-ship/SKILL.md#Executable interface",
     ),
-    #: Gate receipt reuse (sd:1912), registered so the skill line that tells a
-    #: builder to run `sd gate check` can cite what prepare does with the pass.
+    #: Gate receipt reuse (sd:1912): what prepare does with an earlier pass.
     #: The operator ruled on 2026-10-04 that this route supersedes the
     #: `sd-check --reuse-check` contract the item first planned.
     Rule(

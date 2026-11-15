@@ -143,7 +143,7 @@ subcommand changes cwd first, as `git -C` does (R10-D6 names it).
 Use the matching installed `sd_db` library.
 `--database PATH` selects an explicitly provisioned receipt/provider database; otherwise use operator HOME.
 The runner uses its provisioned interpreter.
-Before a head goes to the lane, run `sd gate check` on it under the repository's gate lock; prepare's gate reuses that pass instead of running the check again (R15-D1).
+Prepare's gate is the one full run (sd:5800); it reuses a pass only at the same head and binding (R15-D1).
 
 For itemless work, reuse its stable review ID.
 For genuinely new work, allocate it with `sd-ship review --no-item --create-record --assert-new-work --json`.

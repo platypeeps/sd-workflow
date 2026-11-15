@@ -419,9 +419,6 @@ Gates and reviews:
 
 - **Iterate on the fast path; gate once before the push.** `make check CHANGED="<paths>"` runs the tests those paths need.
   Only the full gate counts as evidence.
-- **Gate first, then review the same head (sd:2603).** Run `sd gate check --base main`, then `sd-review --scope branch --gate-check main` within 30 minutes.
-  Run both with the same environment, since the receipt binds it. A fix commit moves the head, so it needs a new gate pass.
-  Never run plain `sd-review --scope branch` under `repo.ci = local`: it runs a second full check and reuses no pass.
 - **A change that moves state in steps carries a failure table before review round 1:**
   each step, the state it moved, the failure, the recovery and the test.
 - **A repeating finding starts a class pass.** The trigger is two findings of one class in different rounds, or three blocking rounds in a row.

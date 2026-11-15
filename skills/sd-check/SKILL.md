@@ -129,8 +129,8 @@ Receipt-storage failure reports `receipt_error` and provides no reusable receipt
   does; it exists on the lane commands only, because a permission layer that
   approves a command line sees `-C` and does not see a `cd <dir> &&` in front.
 - **Never treat sd-check as a gate you can wave through.** `sd-review` runs it
-  first, and a failing deterministic gate is a failing review: no model is
-  asked to guess at a change that does not build.
+  after a review that does not block, and a failing deterministic gate is
+  a failing review: no change that does not build passes review.
 - Keep wrapper effects separate from repository check effects.
   The wrapper changes no Git state and makes no network calls itself.
   Default execution stores nothing; explicit receipt recording permits only its shared-database checkpoint writes.
