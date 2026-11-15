@@ -1215,17 +1215,17 @@ def _here_repos(connection: Any) -> tuple[list[str | None], str]:
     `sd.status_companions` lists them, else as its research watchlist names them; refused outside one."""
     from sd_db import repos
 
-    here = pathlib.Path.cwd()
     root = sd_lib.repo_root()
-    found = sd_lib.repo_row(connection, str(sd_lib.main_worktree_root(root))) if root else None
+    base = sd_lib.main_worktree_root(root) if root else pathlib.Path.cwd()
+    found = sd_lib.repo_row(connection, str(base)) if root else None
     if found is None:
-        raise WorkRefusal(f"--here: {root or here} is not a registered repository")
+        raise WorkRefusal(f"--here: {base} is not a registered repository")
     repo = str(found["path"])
     try:
         others = repos.companions(repo, sd_lib.core_setting("status_companions"))
     except sd_lib.ConfigError as error:
         raise WorkRefusal(f"--here: sd.status_companions does not read: {error}") from None
-    others = others or repos.watched(connection, sd_lib.main_worktree_root(root))
+    others = others or repos.watched(connection, base)
     return list(dict.fromkeys([repo, *others])), ""
 
 
