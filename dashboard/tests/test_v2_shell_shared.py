@@ -137,6 +137,22 @@ class TheFetchHelpers(unittest.TestCase):
         self.assertEqual(out["read"], "changed since")
         self.assertEqual(out["posts"][0], ["/fine", {"a": 1}, 64])
 
+    def test_a_200_whose_body_cannot_be_read_is_an_unknown_outcome(self):
+        # sd:8828: a 200 whose JSON failed to parse resolved as {}, so the
+        # shell toasted success and offered Undo. It may or may not have
+        # landed: post rejects marked unknown, with no status, as for no answer.
+        out = run_js(SETTLE_JS + """ANSWER = () => [200, new SyntaxError('truncated')];
+  const c = { label: 'Move', on: 'item', risk: 'undo', undo() {} }, o = { id: 1, label: '#1' }, toasts = [];
+  const toast = (m, undo) => toasts.push([m, !!undo]);
+  R.err = await post('/x', {}).catch(e => [e.message, !!e.unknown, e.status === undefined]);
+  await settleOne(c, o, post('/x', {}), { toast });
+  R.bulk = await settleBulk(c, [o], [post('/x', {})], { toast, plural: (n, w) => `${n} ${w}s` });
+  R.toasts = toasts;""")
+        self.assertEqual(out["err"], [
+            "the answer (HTTP 200) could not be read, so whether it changed is not known", True, True])
+        self.assertEqual(out["bulk"], {"landed": 0, "stale": 0, "failed": 0, "unknown": 1})
+        self.assertEqual([t[1] for t in out["toasts"]], [False, False], "an unknown outcome offers no Undo")
+
 
 # sd:3520: the shell files every capture. A page hook only adds to it; with none, the dialog still files a row.
 CAPTURE = re.search(r"^  // capture:start\n(.*?)^  // capture:end$", SHELL_JS, re.S | re.M)

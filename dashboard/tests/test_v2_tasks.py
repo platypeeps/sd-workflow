@@ -446,7 +446,7 @@ var ANSWER = null;
 function fetch(path, o) {
   var body = o && o.body ? JSON.parse(o.body) : null;
   if (o && o.method === 'POST') OUT.posts.push([path, body, o.headers['X-SD-CSRF'].length]); else OUT.gets.push(path);
-  return Promise.resolve(ANSWER(path, body)).then(a => ({ ok: a[0] < 300, status: a[0], json: () => Promise.resolve(a[1]) }));
+  return Promise.resolve(ANSWER(path, body)).then(a => ({ ok: a[0] < 300, status: a[0], json: () => a[1] instanceof Error ? Promise.reject(a[1]) : Promise.resolve(a[1]) }));
 }
 """
 SHELL = SETTLE_JS + FETCH_JS + ITEM_JS + r"""
