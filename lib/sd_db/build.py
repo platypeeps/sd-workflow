@@ -485,6 +485,23 @@ def queue(connection, items: list[int], *, who: str, expected_revisions: dict | 
         return [queue_state(connection, ident) for ident in created]
 
 
+def file_and_queue(connection, capture, *, who: str) -> dict:
+    """File-then-build (pack sd:8113, sd:8794): `capture()` files the task, or answers the open one (`existing`);
+    a new one goes to ready and its build queues as the Build press queues it, in `queued`. A refused build leaves
+    the item filed, ready, and names why in `build_error`; nothing retries it."""
+    from .workflow import change_status, item_state
+    state = capture()
+    if state.get("existing"):
+        return state
+    item = state["item"]["id"]
+    change_status(connection, item, "ready", who=who, expected_revision=state["revision"])
+    try:
+        queued = queue(connection, [item], who=who)
+    except BuildRefused as refusal:
+        return {**item_state(connection, item), "existing": False, "build_error": str(refusal)}
+    return {**item_state(connection, item), "existing": False, "queued": queued}
+
+
 def retry_state(connection, run: dict) -> dict:
     """Retry on an ended run: only the lead's latest run, released, whose bundle ended blocked or cancelled.
 

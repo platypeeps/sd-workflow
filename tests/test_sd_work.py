@@ -1289,6 +1289,35 @@ class TaskCLI(unittest.TestCase):
         self.call("task", "add", "--priority", "3", "Task", "--due", "tomorrow", code=1)
 
 
+class TaskAddBuild(unittest.TestCase):
+    """sd:8794. `sd task add --build` files the task, sets it ready and queues its build in one step."""
+
+    setUp = TaskCLI.setUp
+    call = TaskCLI.call
+    _checkout = TaskCLI._checkout
+
+    def test_add_build_queues_the_build_and_a_refusal_keeps_the_item_ready(self):
+        root = self._checkout("built")
+        with database(sd_db.default_path(self.home), write=True) as connection:
+            sd_db.repos.add(connection, root, remote="https://github.com/example/app.git", home=self.home)
+        filed = self.call("task", "add", "--priority", "3", "Build me", "--build", cwd=root).stdout
+        item = re.search(r"sd:(\d+)", filed).group(1)
+        self.assertRegex(filed, rf"#\d+ +queued +build +sd:{item}")
+        shown = json.loads(self.call("store", "item", item, "--json").stdout)
+        self.assertEqual(shown["item"]["status"], "ready")
+
+        # No repository: the build refuses, the item stays filed and ready, and the refusal is named.
+        refused = self.call("task", "add", "--priority", "3", "No repo", "--build", "--no-repo", "--json", code=1)
+        state = json.loads(refused.stdout)
+        self.assertEqual(state["item"]["status"], "ready")
+        self.assertIn("needs a registered repository", refused.stderr)
+
+    def test_build_takes_a_task_only(self):
+        refused = self.call("task", "add", "--priority", "3", "F", "--kind", "followup", "--build", code=1)
+        self.assertIn("--build files a task", refused.stderr)
+        self.assertEqual(json.loads(self.call("store", "items", "--json").stdout), [])
+
+
 class TaskRef(unittest.TestCase):
     """sd:1902. `sd task add --ref` files one row per occurrence and prints it back."""
 
