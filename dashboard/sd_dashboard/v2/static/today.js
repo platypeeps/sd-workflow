@@ -530,7 +530,10 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     ((ACTIVE || {}).rows || []).filter(r => !waits.has(Number(r.item))).forEach(r => { if (!live.has(r.item)) live.set(r.item, []); live.get(r.item).push(r); });
     live.forEach((rows, item) => add(rows[0].repo, liveRow(item, rows)));
     const B = QV.built && !QV.built.error ? QV.built : { runs: [], recent: [] }, held = new Set();
-    B.runs.forEach(r => { r.items.forEach(m => held.add(m.assignment)); add(r.repo, runRow(r)); });
+    // sd:9022: a run in the lane (merging) whose every member waits on its PR is that PR row alone; its assignments stay
+    // held, so no runner row. A working, stalled, lost or waiting run keeps its row and its actions.
+    const inPr = r => r.state === 'merging' && r.items.length && r.items.every(m => waits.has(Number(m.item)));
+    B.runs.forEach(r => { r.items.forEach(m => held.add(m.assignment)); if (!inPr(r)) add(r.repo, runRow(r)); });
     ((QV.runner || {}).live || []).filter(a => !held.has(a.id)).forEach(a => add(a.repo, asgRow(a)));
     ((QV.runner || {}).blocked || []).filter(a => !held.has(a.id)).forEach(a => add(a.repo, blockedAsg(a)));
     // A prepared entry and its item's PR wait are one row (pack sd:7859): the lane's, leading with the wait.
