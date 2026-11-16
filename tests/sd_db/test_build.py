@@ -555,6 +555,15 @@ class Writes(Case):
         self.assertEqual(cancel, {"allowed": True, "reason": ""})
         self.assertEqual([row["item"] for row in self.build_again(self.items[1])], [self.items[1]])
 
+    def test_a_skipped_member_closed_while_the_build_ran_stays_done(self):
+        """Lead review of ece6f2956: a skipped item the operator closed during the build stays `done`, and its move
+        refuses nothing, so the delivered member still reaches the lane."""
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (self.items[1],))
+        self.skip(self.items[1])
+        self.assertEqual(self.statuses(self.items), ["in_progress", "done"])
+        self.assertEqual([m["status"] for m in build.run(self.db, self.bundle["id"])["members"]], ["done", "cancelled"])
+        self.assertEqual(build.run(self.db, self.bundle["id"])["step"], "enqueued")
+
     def test_a_skipped_lead_is_a_fresh_build_while_its_run_is_in_the_lane(self):
         """A skipped lead's bundle reads its status, yet its run still waits on the lane for the other members:
         `sd assignments build` takes it as a fresh build, not a Retry the open run refuses."""

@@ -1245,8 +1245,9 @@ def enqueued(connection, ident: str, delivered: Collection[int] | None = None, *
             else:
                 connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
                                    (stamp, f"{missing}, so the item returns to planning", member["id"]))
-                transition(connection, member["item"], "planning", who="build",
-                           reason=f"{missing}: check whether its work landed, then close it or queue it again")
+                # `_move`, as `_block` moves: an item the operator closed meanwhile stays closed (lead review).
+                _move(connection, member["item"], "planning",
+                      f"{missing}: check whether its work landed, then close it or queue it again")
         return True
 
 
