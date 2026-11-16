@@ -43,6 +43,9 @@ class StartNext(ScreenCase):
         kick = patch.object(builds, "kickstart", lambda: self.kicks.append(1) or {"ok": True, "service": "x", "why": ""})
         kick.start()
         self.addCleanup(kick.stop)
+        cores = patch.object(build.os, "cpu_count", return_value=16)  # a builder load cap of 24 (sd:9094)
+        cores.start()
+        self.addCleanup(cores.stop)
 
     def repo(self, path="/repos/system"):
         """A managed repository with a remote, hosted here: one a Build press takes."""
@@ -114,12 +117,11 @@ class StartNext(ScreenCase):
         self.ready("Waiting")
         cases = [
             (dict(sessions=sessions(running=6)), "6 builders run already; the cap is 6"),
-            (dict(gate=gate(load5=41.5)), "the five-minute load is 41.5, above the cap of 40"),
+            (dict(gate=gate(load5=41.5)), "the five-minute load is 41.5, above the cap of 24"),
             (dict(sessions=sessions(running=None, why="claude agents --json gave no answer in 10 s")),
              "the running builders were not counted: claude agents --json gave no answer in 10 s"),
             (dict(gate=lambda: {"load": []}), "the load was not read: sd gate status gave no load or load cap"),
             (dict(gate=gate(load5=float("nan"))), "the load was not read: sd gate status gave no load or load cap"),
-            (dict(gate=gate(load_max=float("inf"))), "the load was not read: sd gate status gave no load or load cap"),
         ]
         for seams, refusal in cases:
             out = self.plan(**seams)
@@ -129,11 +131,12 @@ class StartNext(ScreenCase):
         self.assertEqual((self.launched, self.kicks), ([], []))
         self.assertEqual(self.builds_of(out["eligible"][0]["id"]), [])
 
-    def test_a_load_cap_of_zero_is_the_load_rule_off(self):
-        """pack sd:6111: the gate's `load_max` of 0 is no cap, as `build.room` and the lane's `load_stop` read it."""
-        waiting = self.ready("Waiting")
+    def test_the_gate_load_rule_off_leaves_the_builder_cap(self):
+        """sd:9094: the gate's `load_max` of 0 is its own rule off; builders still stop at 1.5x the cores."""
+        self.ready("Waiting")
         out = self.plan(gate=gate(load5=41.5, load_max=0.0))
-        self.assertEqual((out["room"], out["refusal"], [row["id"] for row in out["start"]]), (1, "", [waiting]))
+        self.assertEqual((out["room"], out["load_max"], out["refusal"]),
+                         (0, 24.0, "the five-minute load is 41.5, above the cap of 24"))
 
     def test_a_run_queues_a_build_of_each_item_and_starts_no_herdr_session(self):
         """Build step 5's fail-first (pack sd:6096): Start next writes a queued build assignment per item, kickstarts
