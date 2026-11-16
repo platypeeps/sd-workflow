@@ -575,6 +575,12 @@ class MirrorTargetTests(Configured):
 
 
 class EnqueueTests(Fixture):
+    def setUp(self) -> None:
+        super().setUp()
+        (self.repo / "10-x").mkdir()
+        for name in ("a", "b"):
+            (self.repo / "10-x" / (name + ".md")).write_text("# %s\n\nfirst\n" % name.upper(), encoding="utf-8")
+
     def docs(self) -> list[dict]:
         return [
             dict(
@@ -644,6 +650,35 @@ class EnqueueTests(Fixture):
             sorted(p.name for p in PUBLISH.QUEUE.iterdir()),
             ["my-research.a.drive.json", "my-research.a.notion.json"],
         )
+
+    def test_a_missing_source_queues_no_empty_replacement(self) -> None:
+        """sd:8825: an unreadable source read as "", so the drain replaced
+        the mirror with an empty page."""
+        reports = PUBLISH.enqueue(self.repo, [dict(
+            src="10-x/gone.md", out="gone", title="Gone", notion=dict())])
+        self.assertEqual(list(PUBLISH.QUEUE.glob("*.json")), [])
+        self.assertTrue(any("gone: the request was not written" in line
+                            for line in reports), reports)
+
+    def test_a_failed_write_keeps_the_last_request(self) -> None:
+        """sd:8825: a plain write truncated the queued request first, so a
+        write that failed part way left half a request for the drain."""
+        doc = dict(src="10-x/a.md", out="a", title="A", notion=dict())
+        PUBLISH.enqueue(self.repo, [doc])
+        path = PUBLISH.QUEUE / "my-research.a.notion.json"
+        before = path.read_text(encoding="utf-8")
+        (self.repo / "10-x" / "a.md").write_text("# A\n\nsecond\n", encoding="utf-8")
+        real = Path.write_text
+
+        def torn(self_path: Path, text: str, *args, **kwargs):
+            real(self_path, text[:10], *args, **kwargs)
+            raise OSError(28, "No space left on device")
+
+        with unittest.mock.patch.object(Path, "write_text", torn):
+            PUBLISH.enqueue(self.repo, [doc])
+        self.assertEqual(path.read_text(encoding="utf-8"), before)
+        self.assertEqual(sorted(p.name for p in PUBLISH.QUEUE.iterdir()),
+                         ["my-research.a.notion.json"])
 
     def test_a_re_render_replaces_rather_than_queues_twice(self) -> None:
         PUBLISH.enqueue(self.repo, self.docs())
@@ -739,17 +774,19 @@ class EnqueueTests(Fixture):
     def test_another_repo_of_the_same_name_carries_nothing(self) -> None:
         """The queue key is the repo's basename, so two checkouts called
         `research` share a request path and a default container. Adopting
-        across that would hand one repo's brief the other's page."""
+        across that would hand one repo's brief the other's page, and a plain
+        overwrite lost the first one's request (sd:8825): it is refused."""
         doc = [dict(out="report", title="Report", notion=dict())]
         mine = self.root / "mine" / "research"
         theirs = self.root / "theirs" / "research"
         PUBLISH.enqueue(mine, doc)
         path = self.drained("research.report.notion.json", page="mine")
 
-        PUBLISH.enqueue(theirs, doc)
+        reports = PUBLISH.enqueue(theirs, doc)
         wrote = json.loads(path.read_text())
-        self.assertEqual(wrote["page"], "")
-        self.assertEqual(wrote["repo"], str(theirs))
+        self.assertEqual((wrote["page"], wrote["repo"]), ("mine", str(mine)))
+        self.assertIn("mirror: report: research.report.notion.json belongs to %s, "
+                      "a repo of the same name; not queued" % mine, reports)
 
     def test_another_document_of_the_same_name_carries_nothing(self) -> None:
         """`document` is compared for the same reason `repo` is: neither is

@@ -1350,11 +1350,10 @@ def source_text(path: Path) -> str:
     what was queued and not what the path holds when the drain gets to it.
     Decoded with replacement rather than refused: a stray byte in a brief is
     a brief with one odd character, not a brief that does not publish.
+    A source that cannot be read raises (sd:8825): read as "", it queued an
+    empty replacement of the mirror.
     """
-    try:
-        return path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return ""
+    return path.read_text(encoding="utf-8", errors="replace")
 
 
 #: A fence opener at any indent; its closer is the same character, at least
@@ -2277,7 +2276,15 @@ def wanted_targets(docs: list[dict[str, Any]], home: Path, channels: dict[str, d
         targets, problems = mirror_targets(cfg, home, channels)
         problems += designated_item(cfg)[1]
         reports += ["mirror: %s in %s" % (p, cfg.get("out", "?")) for p in problems]
-        wanted += [(cfg, target) for target in targets]
+        for target in targets:
+            out = str(cfg.get("out", "")).strip()
+            name = "%s.%s.%s.json" % (repo_key(home), out or "doc", target["destination"])
+            owner = foreign_owner(name, home)
+            if owner:
+                reports.append("mirror: %s: %s belongs to %s, a repo of the same name; not queued"
+                               % (out, name, owner))
+            else:
+                wanted.append((cfg, target))
     return wanted, reports
 
 
@@ -2305,7 +2312,30 @@ def drawn(request: dict[str, Any]) -> str:
 def write_request(path: Path, request: dict[str, Any], digest: str) -> None:
     """Write `request` as the generation `digest`: what `mirror_delivered()` acknowledges."""
     request["fingerprint"] = digest
-    path.write_text(json.dumps(request, indent=2) + "\n", encoding="utf-8")
+    # Beside it and renamed into place (sd:8825): a failed write keeps the last
+    # request whole. A short dot name: no `*.json` glob reads it as a request,
+    # and a request name near the 255-byte bound still fits.
+    handle, name = tempfile.mkstemp(dir=path.parent, prefix=".", suffix=".part")
+    os.close(handle)
+    part = Path(name)
+    try:
+        part.write_text(json.dumps(request, indent=2) + "\n", encoding="utf-8")
+        os.replace(part, path)
+    finally:
+        part.unlink(missing_ok=True)
+
+
+def foreign_owner(name: str, home: Path) -> str:
+    """The other repo that owns request `name`, or "" (sd:8825).
+
+    `repo_key` is the directory's name, so two repos of one name share each
+    request name; the request or receipt already there keeps its owner.
+    """
+    for record in (QUEUE / name, receipts() / name):
+        owner = load_record(record).get("repo")
+        if owner and owner != str(home):
+            return str(owner)
+    return ""
 
 
 def stale_requests(home: Path, channels: dict[str, dict[str, str]] | None) -> list[str]:
