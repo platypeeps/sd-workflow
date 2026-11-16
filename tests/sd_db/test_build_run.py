@@ -3750,6 +3750,17 @@ class Budget(unittest.TestCase):
         """25 of 263 runs died at 3600 s, 13 building and 12 reviewing (sd:8204)."""
         self.assertEqual(build_run.TIMEOUT_SECONDS, 7200)
 
+    def test_a_supervisor_reads_its_machine_budget(self):
+        """sd:9109: the child timeout was 7200 s at any sd.bundle_max; it now scales with it."""
+        with mock.patch.object(build_run.build, "budget_minutes", return_value=200), \
+                mock.patch.object(build_run.build, "run", return_value={"repo": "~/repos/a", "work_path": "/w",
+                                                                       "assignment": 1}), \
+                mock.patch.object(build_run, "_lead_item", return_value=(1, [])), \
+                mock.patch.object(build_run.Supervisor, "take_resume"):
+            supervisor = build_run.Supervisor(mock.Mock(), "r", tools=mock.Mock(), log_root=Path("/l"),
+                                              cited=lambda *_: None)
+        self.assertEqual(supervisor.timeout, 12000)
+
 
 class ChildEnvironment(unittest.TestCase):
     """Only a repository's own checks get GITHUB_TOKEN from the operator's PAT (sd:8506, sd:8515)."""

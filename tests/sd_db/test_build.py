@@ -84,6 +84,10 @@ class Case(unittest.TestCase):
                        mock.patch("sd_db.hub.configured", return_value=False)):
             pinned.start()
             self.addCleanup(pinned.stop)
+        # The machine's own `sd.bundle_max` never reaches a test: an empty config folder reads the default.
+        config = mock.patch.dict("os.environ", {"XDG_CONFIG_HOME": str(self.root / "config")})
+        config.start()
+        self.addCleanup(config.stop)
         self.database = self.root / "sd.db"
         initialise(self.database)
         self.db = connect(self.database)
@@ -277,6 +281,22 @@ class Claim(Case):
         build.end(self.db, first["id"], "cancelled", "the operator cancelled it")
         third = self.claim()
         self.assertEqual((third["repo"], len(third["members"])), (A, 1), "the next bundle takes the fourth")
+
+    def bundle_max(self, value):
+        folder = self.root / "config" / "sd-ai-command-pack"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "config.json").write_text(json.dumps({"config": {"sd": {"bundle_max": value}}}))
+
+    def test_a_machine_bundle_max_sizes_its_bundles_and_budget(self):
+        """sd:9109: BUNDLE_MAX was one constant; a machine's sd.bundle_max now sets its own bundle and budget."""
+        self.assertEqual((build.bundle_max(), build.budget_minutes()), (3, 120))
+        self.bundle_max("5")
+        self.assertEqual((build.bundle_max(), build.budget_minutes()), (5, 200))
+        build.queue(self.db, [self.item(priority=1) for _ in range(6)], who="operator")
+        self.assertEqual(len(self.claim()["members"]), 5)
+        for bad in ("0", "abc", 7):
+            self.bundle_max(bad)
+            self.assertEqual(build.bundle_max(), build.BUNDLE_MAX, f"{bad!r} reads the default")
 
     def test_a_long_queue_of_small_items_fills_a_bigger_bundle(self):
         """sd:8992: a bundle took three items however small; a mechanical item now weighs half a slot."""

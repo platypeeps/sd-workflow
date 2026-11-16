@@ -144,6 +144,10 @@ CORE_CONFIG = {
     "gate_load_max": {"pattern": r"[0-9]+(\.[0-9]+)?",
                       "description": "The gate queue starts a gate only while load1 is below this; 0 is no load "
                                      "condition. Unset is none; SD_GATE_LOAD_MAX overrides it for one run."},
+    "bundle_max": {"pattern": "[1-9][0-9]?",
+                   "description": "How many items one build bundle takes when this machine claims it, a mechanical "
+                                  "item half of one; a build child's budget scales with it from 120 minutes at 3. "
+                                  "Unset reads 3. It grants nothing."},
     "review_slots": {"pattern": "[0-9]+",
                      "description": "How many reviews may run their reviewers at once on this machine; 0 is no cap. "
                                     "Unset reads 2; SD_REVIEW_SLOTS overrides it for one run."},
