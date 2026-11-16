@@ -4,8 +4,8 @@ Design: system `docs/work/2026-10-24-build-dispatcher/design.md`, step 1.
 
 A Build press queues one `assignment` per item: role `author`, lane
 `parallel`, scope `build`. A claim takes up to `BUNDLE_MAX` queued builds of
-one repository as a bundle: one `runner_run` (the attempt) and one
-`runner_lease` on branch `build/sd-<lead>`, every member `running` with its
+one repository as a bundle, more when they are small (`bundled`): one
+`runner_run` (the attempt) and one `runner_lease` on branch `build/sd-<lead>`, every member `running` with its
 `parent` the lead, and every item `in_progress`. While an assignment is
 queued or running, `workflow.change_status` refuses the item's status writes
 (criterion 7.19); a cancel is the way out.
@@ -284,10 +284,10 @@ def unclaimed(connection) -> dict[str, str]:
     (review round 5)."""
     found = {}
     for row in connection.execute(
-            "SELECT assignment.id, repo.lane_host FROM assignment JOIN item ON item.id = assignment.item "
-            "LEFT JOIN repo ON repo.path = item.repo WHERE assignment.scope = ? AND assignment.status = 'queued'",
-            (SCOPE,)):
-        host = lane_of(connection, row["lane_host"])
+            "SELECT assignment.id, assignment.parent, assignment.run_count, repo.lane_host FROM assignment "
+            "JOIN item ON item.id = assignment.item LEFT JOIN repo ON repo.path = item.repo "
+            "WHERE assignment.scope = ? AND assignment.status = 'queued'", (SCOPE,)):
+        host = _route(connection, row["lane_host"], _lead(row))
         why = dispatcher_why(connection, host) if host and not dispatcher_gone(connection, host) else None
         if why:
             found[str(row["id"])] = f"{host} claims nothing: {why}"
@@ -311,6 +311,42 @@ def _why(row) -> str | None:
     except (TypeError, ValueError, AttributeError):
         why = None
     return why if isinstance(why, str) and why else None
+
+
+def overloaded(connection, host: str) -> bool:
+    """Whether the satellite `host`'s fresh beat says its five-minute load is over its cap: the hub's claim then
+    builds that lane's queued rows itself, and the satellite's lane still lands them (sd:8991)."""
+    if dispatcher_gone(connection, host):
+        return False
+    row = _beat(connection, host)
+    try:
+        load = json.loads(row["body"]).get("load") if row else None
+    except (TypeError, ValueError, AttributeError):
+        load = None
+    return isinstance(load, str) and bool(load)
+
+
+def _checked_out(repo: str) -> bool:
+    """Whether `repo` has a checkout on this machine's disk, which a build's worktree comes from (sd:8991)."""
+    return (paths.expand(repo) / ".git").exists()
+
+
+def _lead(row) -> int | None:
+    """The lead assignment of `row`'s bundle once it ran, or None for a fresh row that never ran."""
+    return row["parent"] or (row["id"] if row["run_count"] else None)
+
+
+def _route(connection, lane_host: str | None, lead: int | None) -> str | None:
+    """`lane_of` the host whose dispatcher claims a build of the repository whose lane is `lane_host`, for the
+    bundle `lead` leads (None when it never ran): its lane now, as a retry follows `repo.lane_host`, except a bundle
+    the hub built under the overload fallback for a satellite's lane, whose commits sit in the hub's worktree: that
+    one builds on the hub again (sd:8991). The one rule for a claim, Retry, pickup and the Builds panel."""
+    lane = lane_of(connection, lane_host)
+    if lane is None or lead is None:
+        return lane
+    ran = connection.execute("SELECT owner FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
+                             (lead,)).fetchone()
+    return None if ran and lane_of(connection, run_host(ran["owner"])) is None else lane
 
 
 def run_owner(owner: str, lane_host: str | None) -> str:
@@ -360,8 +396,9 @@ _REPO = ("SELECT item.*, repo.path AS repo_path, repo.remote, repo.managed, repo
          "FROM item LEFT JOIN repo ON repo.path = item.repo WHERE item.id = ?")
 
 
-def _item(connection, item: int) -> dict:
-    """The item a build may take, or the refusal that names why not."""
+def _item(connection, item: int, *, lead: int | None = None) -> dict:
+    """The item a build may take, or the refusal that names why not; `lead` is the bundle a Retry queues again,
+    whose lane `_route` reads (sd:8991)."""
     row = connection.execute(_REPO, (item,)).fetchone()
     if row is None:
         raise BuildRefused(f"no item {item}")
@@ -373,7 +410,7 @@ def _item(connection, item: int) -> dict:
     refused = _repo_refusal(row, connection)
     if refused:
         raise BuildRefused(refused)
-    away = lane_of(connection, row["lane_host"])
+    away = _route(connection, row["lane_host"], lead)
     gone = dispatcher_refusal(connection, away) if away else None
     if away and gone:
         # Nothing claims a satellite's press until its own dispatcher ticks, and the press locks the item. A beat
@@ -565,7 +602,7 @@ def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
                 transition(connection, member["item"], "ready", who=who, reason=f"Retry of build run {run['id']}")
             unpark(connection, member["item"])
             try:
-                _item(connection, member["item"])
+                _item(connection, member["item"], lead=assignment)
             except BuildRefused as refusal:
                 raise BuildRefused(f"Retry refused: {refusal}") from None
             if finding:
@@ -682,7 +719,7 @@ def pickup(connection, available: dict, *, now: str | None = None) -> list[int]:
     queued in a repository with room, nothing is picked and the claim
     drains it. A press waiting on a full repository holds no other one: at
     one bundle building per repository it may wait a whole build (pack sd:8158).
-    Each free builder slot takes one bundle of up to `BUNDLE_MAX` items of
+    Each free builder slot takes one bundle (`bundled`) of
     one repository, each repository at most its `room_for`. No room, or no
     item, queues nothing.
     """
@@ -690,9 +727,9 @@ def pickup(connection, available: dict, *, now: str | None = None) -> list[int]:
         return []
     # Only this host's presses hold it: the hub never claims a satellite's.
     hosts = lane_hosts(connection)
-    if any(lane_of(connection, row["lane_host"]) in hosts and room_for(available, row["repo"]) > 0
+    if any(_route(connection, row["lane_host"], _lead(row)) in hosts and room_for(available, row["repo"]) > 0
            for row in connection.execute(
-            "SELECT item.repo, repo.lane_host FROM assignment JOIN item ON item.id = assignment.item "
+            "SELECT assignment.id, assignment.parent, assignment.run_count, item.repo, repo.lane_host FROM assignment JOIN item ON item.id = assignment.item "
             "LEFT JOIN repo ON repo.path = item.repo WHERE assignment.status = 'queued' AND assignment.scope = ?",
             (SCOPE,))):
         return []
@@ -701,7 +738,7 @@ def pickup(connection, available: dict, *, now: str | None = None) -> list[int]:
     for row in eligible(connection, now=now):
         repo = row["repo"]
         taken = bundles.setdefault(repo, [])
-        if taken and len(taken[-1]) < BUNDLE_MAX:
+        if taken and bundled(connection, [*taken[-1], row["id"]]) > len(taken[-1]):
             taken[-1].append(row["id"])
         elif slots > 0 and len(taken) < room_for(available, repo):
             taken.append([row["id"]])
@@ -825,8 +862,10 @@ def room(connection, *, load: float | None, load_cap: float | None, interactive:
         (SCOPE, *LANE_STEPS)).fetchall() if mine(row, hosts)]
     headless = {row["session_id"] for row in [*builds, *drafts, *lane] if row["session_id"]}
     used: dict[str, int] = {}
-    for row in builds:
-        used[row["repo"]] = used.get(row["repo"], 0) + 1
+    # Every host's builds hold a repository's slot: the hub may build a satellite's lane (sd:8991).
+    for row in leases:
+        if row["scope"] == SCOPE:
+            used[row["repo"]] = used.get(row["repo"], 0) + 1
     others = [entry for entry in interactive or [] if not (entry.get("session_id") and entry["session_id"] in headless)]
     for entry in others:
         repo = _key(entry.get("repo"))
@@ -848,16 +887,32 @@ def room_for(available: dict, repo: str) -> int:
     return max(0, min(available["machine"], REPO_CAP - available["used"].get(repo, 0)))
 
 
+def _mechanical(connection, item: int) -> bool:
+    """Whether `item`'s `fields.work_kind` is `mechanical`: the one size signal an item carries."""
+    row = connection.execute("SELECT fields FROM item WHERE id = ?", (item,)).fetchone()
+    try:
+        fields = json.loads(row["fields"] or "{}") if row else {}
+    except ValueError:
+        fields = {}
+    return isinstance(fields, dict) and fields.get("work_kind") == "mechanical"
+
+
 def _model(connection, items: list[int]) -> str:
-    for item in items:
-        row = connection.execute("SELECT fields FROM item WHERE id = ?", (item,)).fetchone()
-        try:
-            fields = json.loads(row["fields"] or "{}") if row else {}
-        except ValueError:
-            fields = {}
-        if not isinstance(fields, dict) or fields.get("work_kind") != "mechanical":
-            return OPUS
-    return SONNET
+    return SONNET if all(_mechanical(connection, item) for item in items) else OPUS
+
+
+def bundled(connection, items: list[int]) -> int:
+    """How many of `items`, in order, one bundle takes: `BUNDLE_MAX` slots, a mechanical item half of one.
+
+    A long queue of small items so fills a bundle past `BUNDLE_MAX`, up to twice it, on the one bundle branch
+    (sd:8992); the claim, auto-pickup and the Build dialog split bundles by it.
+    """
+    spent = 0.0
+    for count, item in enumerate(items):
+        spent += 0.5 if _mechanical(connection, item) else 1
+        if spent > BUNDLE_MAX:
+            return count
+    return len(items)
 
 
 def branch(lead: int) -> str:
@@ -939,12 +994,19 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             "LEFT JOIN repo ON repo.path = item.repo "
             "WHERE assignment.status = 'queued' AND assignment.scope = ? AND item.repo IS NOT NULL "
             "ORDER BY item.priority IS NULL, item.priority, assignment.queued_at, assignment.id", (SCOPE,)).fetchall()
-        lanes = {row["id"]: lane_of(connection, row["lane_host"]) for row in queued}
+        lanes = {row["id"]: _route(connection, row["lane_host"], _lead(row)) for row in queued}
+        if None in hosts:
+            # A satellite over its load cap claims nothing: the hub builds its fresh rows of a repository checked out
+            # here, under the hub's caps (sd:8991). A retry stays on its lane: its work is in that lane's worktree.
+            over = {host for host in set(lanes.values()) - set(hosts) if host and overloaded(connection, host)}
+            lanes = {row["id"]: None if (lanes[row["id"]] in over and _lead(row) is None
+                                         and _checked_out(row["repo"])) else lanes[row["id"]]
+                     for row in queued}
         if None in hosts:
             # The hub blocks another host's row once that host's dispatcher went quiet: a lane moved after the
             # press, or a dispatcher that died after it, would leave the item locked with no word. A fresh beat
             # that names a `why` leaves the row queued, as that reason may last one tick (review round 5), until
-            # `STUCK_TICKS` beats in a row name one (sd:8081).
+            # `STUCK_TICKS` beats in a row name one (sd:8081). Only once every row is routed (sd:8991).
             for row in queued:
                 away = lanes[row["id"]]
                 gone = (dispatcher_gone(connection, away) or dispatcher_stuck(connection, away)
@@ -958,7 +1020,7 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
         repo = next((row["repo"] for row in queued if room_for(available, row["repo"]) > 0), None)
         if repo is None:
             return None
-        bundle = _bundle([row for row in queued if row["repo"] == repo])
+        bundle = _bundle(connection, [row for row in queued if row["repo"] == repo])
         lead = bundle[0]["id"]
         ids = [row["id"] for row in bundle]
         marks = ", ".join("?" for _ in ids)
@@ -991,17 +1053,18 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
         return run(connection, ident)
 
 
-def _bundle(rows: list) -> list:
+def _bundle(connection, rows: list) -> list:
     """The queued rows of one repository a claim takes, best first.
 
     A bundle that ran before claims alone, its old lead first, so its run
     gets the lead's branch and worktree back (pack sd:6020); fresh rows
-    bundle with fresh rows only, up to `BUNDLE_MAX`.
+    bundle with fresh rows only, as many as `bundled` takes.
     """
     best = rows[0]
     group = best["parent"] or (best["id"] if best["run_count"] else None)
     if group is None:
-        return [row for row in rows if row["parent"] is None and not row["run_count"]][:BUNDLE_MAX]
+        fresh = [row for row in rows if row["parent"] is None and not row["run_count"]]
+        return fresh[:bundled(connection, [row["item"] for row in fresh])]
     return sorted((row for row in rows if group in (row["id"], row["parent"])), key=lambda row: row["id"] != group)
 
 
@@ -1018,11 +1081,13 @@ def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
     beat is fresh and not stuck again (pack sd:8745): a slow-DB stretch blocked them for good before.
 
     Only the item's newest build, its item still `ready`, no other assignment
-    owning it, and its lane still on the host the block names: an item moved
-    on, or a build requeued by hand since, stays as it is.
+    owning it, and its lane (`_route`) still on the host the block names, or
+    moved to this hub's own lanes (sd:8991): an item moved on, or a build
+    requeued by hand since, stays as it is.
     """
     rows = connection.execute(
-        f"SELECT assignment.id, assignment.item, assignment.result, repo.lane_host FROM assignment "
+        f"SELECT assignment.id, assignment.item, assignment.parent, assignment.run_count, assignment.result, "
+        f"repo.lane_host FROM assignment "
         f"JOIN item ON item.id = assignment.item LEFT JOIN repo ON repo.path = item.repo "
         f"WHERE assignment.scope = ? AND assignment.status = 'blocked' AND item.status = 'ready' "
         f"AND assignment.result LIKE ? AND assignment.id = (SELECT MAX(newest.id) FROM assignment newest "
@@ -1030,14 +1095,17 @@ def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
         f"AND NOT EXISTS (SELECT 1 FROM assignment other WHERE other.item = assignment.item "
         f"AND other.status IN {OWNING})", (SCOPE, "%'s lane runs on %")).fetchall()
     for row in rows:
-        away = lane_of(connection, row["lane_host"])
-        if (away is None or away in hosts or not row["result"].startswith(f"item {row['item']}'s lane runs on {away}, ")
+        away = _route(connection, row["lane_host"], _lead(row))
+        if away in hosts:
+            why = "its lane runs on this host now"
+        elif (away is None or not row["result"].startswith(f"item {row['item']}'s lane runs on {away}, ")
                 or dispatcher_gone(connection, away) or dispatcher_stuck(connection, away)):
             continue
+        else:
+            why = f"the {HEARTBEAT}@{away} beat is fresh"
         connection.execute("UPDATE assignment SET status = 'queued', ended = NULL, result = NULL "
                            "WHERE id = ? AND status = 'blocked'", (row["id"],))
-        add_note(connection, row["item"], "comment",
-                 f"Build assignment {row['id']} queued again: the {HEARTBEAT}@{away} beat is fresh")
+        add_note(connection, row["item"], "comment", f"Build assignment {row['id']} queued again: {why}")
 
 
 def _refused_repo(connection, row) -> bool:

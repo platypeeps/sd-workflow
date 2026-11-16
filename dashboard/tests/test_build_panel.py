@@ -235,7 +235,9 @@ class BuildsPanel(Fixture):
                                 (str(log), run["id"]))
         row = builds.panel(self.connection, now="2099-01-02T01:00:00Z")["runs"][0]
         self.assertEqual((row["host"], row["log"], row["quiet"]), ("work", str(log), None))
-        hub = self.claimed([self.ready()])
+        # Its own repository: a satellite's bundle holds the repository slot it builds in (sd:8991).
+        upsert_repo(self.connection, "/fixture/repos/other", remote="/fixture/remote-other", managed=1)
+        hub = self.claimed([self.item("Build me", kind="task", status="ready", repo="/fixture/repos/other")])
         self.connection.execute("UPDATE runner_run SET log_path = ? WHERE id = ?", (str(log), hub["id"]))
         rows = {row["run"]: row for row in builds.panel(self.connection, now="2099-01-02T01:00:00Z")["runs"]}
         self.assertEqual(rows[hub["id"]]["host"], "")

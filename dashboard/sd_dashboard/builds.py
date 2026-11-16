@@ -2,9 +2,8 @@
 
 Design: system `docs/work/2026-10-24-build-dispatcher/design.md`, step 4 and its Dashboard section.
 
-`plan` is what the Build dialog shows before anything is written: each repository's bundles of up to
-`build.BUNDLE_MAX` items with the model and the room now, and every selected item a press would refuse, with
-why. `press` is the Build press: `build.queue` with the revisions the dialog read, the whole selection or none. A
+`plan` is what the Build dialog shows before anything is written: each repository's bundles (`build.bundled`)
+with the model and the room now, and every selected item a press would refuse, with why. `press` is the Build press: `build.queue` with the revisions the dialog read, the whole selection or none. A
 refusal is a 409 and writes nothing. After the queue lands it kickstarts the `build-dispatch` job, so a claim
 takes seconds, not a slot; a kickstart that fails only says so, and the next tick claims the rows.
 
@@ -135,8 +134,9 @@ def plan(connection, items: list[int], *, now: str, sessions=None, gate=None) ->
         groups.setdefault(row["repo"], []).append(row)
     bundles = []
     for repo, rows in groups.items():
-        for start in range(0, len(rows), build.BUNDLE_MAX):
-            chunk = rows[start:start + build.BUNDLE_MAX]
+        while rows:
+            size = build.bundled(connection, [row["id"] for row in rows])
+            chunk, rows = rows[:size], rows[size:]
             host = build.lane_of(connection, chunk[0]["lane_host"]) or ""
             bundles.append({"repo": repo, "name": Path(repo).name, "host": host,
                             "beat": build.dispatcher_beat(connection, host) if host else None,
