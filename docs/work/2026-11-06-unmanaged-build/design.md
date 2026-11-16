@@ -99,7 +99,10 @@ when the run's repository reads unmanaged.
 
 Rejected: letting `sd-check` or `sd-ship` run in an unmanaged checkout.
 Both refuse there on purpose (sd:2566), and `sd-ship` writes receipts and
-merges. Rejected: a new run column for the mode. The run's `detail` is
+merges. Superseded by sd:9100 (operator 2026-11-16): a plain
+`sd-check` and `sd-ship prepare` and `merge` now run there, with no
+receipt; `--record-receipt` and the lane still refuse.
+Rejected: a new run column for the mode. The run's `detail` is
 unset on an open run until it ends, so it carries the draft's address at
 `enqueued` with no schema change.
 
