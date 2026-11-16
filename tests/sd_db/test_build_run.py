@@ -2531,6 +2531,61 @@ class Archive(Case):
             self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs), [])
         self.assertEqual(path.read_text(), "## Summary\n\nthe retry's body\n")
 
+    @staticmethod
+    def landed_copy_stat(target: Path, landed):
+        """Patch `Path.stat` so a stat of `target` once its copy landed calls `landed()` instead."""
+        real = Path.stat
+
+        def stat(self_, *args, **kwargs):
+            if self_ == target and os.path.exists(target):
+                return landed()
+            return real(self_, *args, **kwargs)
+
+        return mock.patch.object(Path, "stat", stat)
+
+    def test_a_bulk_io_error_after_the_copy_keeps_the_local_file(self):
+        """sd:8826 lane round 1: the tick checked the copy with `target.stat()` outside the worker, so an
+        I/O error from the bulk root escaped and aborted the tick."""
+        path, target = self.ended("sd-{assignment}.body.md")
+
+        def failed():
+            raise OSError(5, "Input/output error")
+
+        with self.landed_copy_stat(target, failed):
+            self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs), [])
+        self.assertTrue(path.exists(), "an unread copy leaves the local file")
+        self.assertEqual(self.db.execute("SELECT log_path FROM runner_run WHERE id = ?",
+                                         (self.bundle["id"],)).fetchone()[0], str(path))
+
+    def test_a_bulk_stall_after_the_copy_keeps_the_tick_in_its_deadline(self):
+        """sd:8826 lane round 1: the tick's `target.stat()` after the copy hung on a stalled bulk root, past
+        the worker's deadline."""
+        path, target = self.ended("sd-{assignment}.body.md")
+        release = threading.Event()
+        self.addCleanup(release.set)
+
+        def stalled():
+            release.wait(30)
+            raise OSError(5, "Input/output error")
+
+        result: list = []
+
+        def run_tick():
+            with contextlib.closing(connect(self.database)) as connection:  # a connection is one thread's
+                result.append(build_run.archive(connection, self.root / "local", self.logs, deadline=0.3))
+
+        with self.landed_copy_stat(target, stalled):
+            tick = threading.Thread(target=run_tick, daemon=True)
+            tick.start()
+            tick.join(5)
+            alive = tick.is_alive()
+            release.set()
+            tick.join(5)
+            self.join_archive_workers()
+        self.assertFalse(alive, "the tick returns within the worker's deadline")
+        self.assertEqual(result, [[]])
+        self.assertTrue(path.exists(), "a copy the worker could not check leaves the local file")
+
     def test_a_failed_copy_never_truncates_the_archived_log(self):
         """sd:8275 lane round 1: a copy opened the archive itself with truncation, so a late or failed copy
         could empty the one complete log after the rows named it and the local file went."""

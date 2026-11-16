@@ -664,14 +664,23 @@ ARCHIVE_DEADLINE_SECONDS = 20
 ARCHIVE_LOCK = ".archive.lock"
 
 
-def _same_copy(path: Path, target: Path) -> bool:
-    """Whether `target` is a finished copy of `path`: a copy lands only by rename, and `copy2` keeps the
-    size and mtime; two seconds of slack for a volume that stores coarse times."""
+def _signature(stat: os.stat_result) -> tuple[int, int, int]:
+    """What a local file's rewrite changes: its inode, size and mtime."""
+    return stat.st_ino, stat.st_size, stat.st_mtime_ns
+
+
+def _same_copy(path: Path, target: Path) -> tuple[int, int, int] | None:
+    """The signature of `path` when `target` is a finished copy of it, else None: a copy lands only by
+    rename, and `copy2` keeps the size and mtime; two seconds of slack for a volume that stores coarse times.
+
+    It stats the bulk root, so only the bounded copier calls it (sd:8826 lane round 1)."""
     try:
         source, copy = path.stat(), target.stat()
     except FileNotFoundError:
-        return False
-    return copy.st_size == source.st_size and abs(copy.st_mtime - source.st_mtime) <= 2
+        return None
+    if copy.st_size == source.st_size and abs(copy.st_mtime - source.st_mtime) <= 2:
+        return _signature(source)
+    return None
 
 
 def _released(connection, path: Path) -> bool:
@@ -742,15 +751,15 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
         if isinstance(refused.__cause__, BlockingIOError):
             return []  # an earlier copier still runs: it may hold any of these files open
         raise OSError(str(refused)) from refused
-    copied: list[tuple[Path, Path]] = []
+    copied: list[tuple[Path, Path, tuple[int, int, int]]] = []
 
     def copy() -> None:
         try:
             fresh, killed = [], []
             for path, target in pending:
                 try:
-                    if _same_copy(path, target):
-                        copied.append((path, target))
+                    if (signature := _same_copy(path, target)) is not None:
+                        copied.append((path, target, signature))
                     elif any(target.parent.glob(f".{target.name}.*.part")):
                         killed.append((path, target))  # outlasted a tick: the others go first (sd:8339)
                     else:
@@ -763,13 +772,17 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
                     target.parent.mkdir(parents=True, exist_ok=True)
                     for stale in target.parent.glob(f".{target.name}.*.part"):
                         stale.unlink(missing_ok=True)  # a killed copier's; the lock says none runs
+                    before = _signature(path.stat())
                     shutil.copy2(path, part)
                     os.replace(part, target)
+                    # The source's signature as the copy landed: the tick compares it locally (sd:8826).
+                    signature = _same_copy(path, target)
                 except OSError:
                     with contextlib.suppress(OSError):
                         part.unlink(missing_ok=True)
                     continue
-                copied.append((path, target))
+                if signature == before:  # a source rewritten mid-copy waits for a later tick
+                    copied.append((path, target, before))
         finally:
             held.close()
 
@@ -779,10 +792,15 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
     worker.join(deadline)
     moved = []
     # A copy still running past the deadline is not in this snapshot; a later tick collects it.
-    for path, target in list(copied):
+    for path, target, signature in list(copied):
         old, new = str(path), str(target)
         # A retry may have started and rewritten an assignment's title or body since the scan (sd:8826).
-        if not _released(connection, path) or not _same_copy(path, target):
+        # The tick reads only the local file: a bulk root stat here ran outside the deadline (lane round 1).
+        try:
+            current = _signature(path.stat())
+        except OSError:
+            continue
+        if not _released(connection, path) or current != signature:
             continue
         # The local file goes only after the rows name the copy: a failed write leaves it for the next tick.
         with transaction(connection):
