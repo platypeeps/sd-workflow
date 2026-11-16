@@ -595,6 +595,11 @@ def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
         if not members:
             raise BuildRefused(f"Retry refused: build run {run['id']} has no {current['status']} member")
         items = reads.items_by_ids(connection, [member["item"] for member in members])
+        # A member done since the bundle ended, by another build, has nothing to retry: it stays as it ended (sd:9015).
+        members = [member for member in members
+                   if items.get(member["item"]) is None or items[member["item"]]["status"] != "done"]
+        if not members:
+            raise BuildRefused(f"Retry refused: every {current['status']} member of build run {run['id']} is done")
         queued = []
         for member in members:
             item = items.get(member["item"])

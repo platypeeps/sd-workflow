@@ -872,6 +872,20 @@ class Reap(Case):
         self.assertEqual(self.statuses([self.items[0]]), ["blocked"])
         self.assertEqual(runner.queue_state(self.db, lead)["status"], "blocked")
 
+    def test_build_again_on_a_cancelled_bundle_skips_a_member_since_done(self):
+        """sd:9015: a cancel moves the bundle's items to ready; one of them may be done since, by another build.
+        Building the rest again is Retry without it: the done member's assignment stays cancelled."""
+        build.write(self.db, self.bundle["id"], step="building")
+        build.end(self.db, self.bundle["id"], "cancelled", "operator cancel")
+        lead, member = sorted(member["id"] for member in build.run(self.db, self.bundle["id"])["members"])
+        self.assertEqual(self.statuses(self.items), ["ready", "ready"])
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (self.items[0],))
+        queued = build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual([(entry["id"], entry["item"], entry["status"]) for entry in queued],
+                         [(member, self.items[1], "queued")])
+        self.assertEqual(runner.queue_state(self.db, lead)["status"], "cancelled")
+        self.assertEqual(self.statuses(self.items), ["done", "ready"])
+
     def lose(self, **fields):
         """Lose the current run at a stale beat; the fresh row the reap opened."""
         if fields:
