@@ -166,6 +166,15 @@ class TheDirectCommands(Fixture):
         self.assertIn("repo.managed = no", refused.stderr)
         self.assertIn("records no receipt", refused.stderr)
 
+    def test_sd_status_reads_an_unmanaged_checkout(self) -> None:
+        """sd:9100: sd-status is read-only, so it reports there as anywhere."""
+        root = self.checkout("theirs")
+        self.register(root, managed=0)
+        done = self.run_command("sd-status", root)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertNotIn("repo.managed", done.stdout + done.stderr)
+        self.assertIn("setup", json.loads(done.stdout))
+
     def test_sd_ship_reads_the_database_it_is_given(self) -> None:
         root = self.checkout("theirs")
         self.register(root, managed=1)
