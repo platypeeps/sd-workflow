@@ -1466,7 +1466,8 @@ def is_managed(row: Any) -> bool:
     """Whether a `repo` row may be walked by a pack tool: `managed` set, or no such column.
 
     sd:1619 added `repo.managed`; the operator sets it by hand on their own
-    repositories, and the rest must not use any pack capability (sd:1620). A
+    repositories (sd:1620). A fleet walk skips an unmanaged row: fleet and ci
+    write pack config into the repository, and the lane merges unasked. A
     database older than the column says nothing, so its rows stay in: an old
     library must not empty every fleet verb.
     """
@@ -1486,6 +1487,13 @@ def managed_rows(rows: Iterable[Any]) -> list[Any]:
 
 def unmanaged(root: pathlib.Path | str, *, warn: bool = True, database: pathlib.Path | str | None = None) -> str | None:
     """The refusal for a direct call in an unmanaged repository, or None to proceed.
+
+    Which tools run there (sd:9100): the ones that leave no pack state in the
+    repository. `sd-review` reviews, with no gate check and no receipt (pack
+    sd:5953); a plain `sd-check` runs locally, with no receipt and no
+    `sd/local-gate` status; `sd-status` reads; `sd-ship prepare` and `merge`
+    go through GitHub alone. `sd-check --record-receipt`, every other
+    `sd-ship` verb, `sd-ship lane enqueue`, `sd fleet` and `sd ci` refuse.
 
     Only a row that exists and says `managed = 0` refuses. No library, no
     database, no column and any read fault proceed in silence: a public user
