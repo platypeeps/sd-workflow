@@ -386,6 +386,23 @@ def _item(connection, item: int) -> dict:
     return dict(row)
 
 
+#: A status change into a wait that gave its reason: `<from> -> <to> by <who>: <reason>` (writes.transition).
+WAITED = re.compile(r"\w+ -> (?:planning|blocked) by [^:]*: (.+)", re.DOTALL)
+
+
+def waits(connection, ids: list[int]) -> dict[int, dict]:
+    """Each item's `parked_at` and `waited`, the note and reason of its latest move to planning or blocked that
+    gave one, else None (pack sd:8964): the dialog shows what an item waited on before the press."""
+    marks = ",".join("?" * len(ids))
+    found = {row["id"]: {"parked_at": row["parked_at"], "waited": None} for row in connection.execute(
+        f"SELECT id, parked_at FROM item WHERE id IN ({marks})", ids)}
+    for note in connection.execute(f"SELECT id, item, body FROM note WHERE kind = 'status_change' AND item IN ({marks})"
+                                   " ORDER BY id", ids):
+        if moved := WAITED.fullmatch(note["body"] or ""):
+            found[note["item"]]["waited"] = {"note": note["id"], "why": moved[1]}
+    return found
+
+
 def dispatcher_beat(connection, host: str) -> int | None:
     """Seconds since the build-dispatch tick on the satellite `host` last beat; None when it never did, or when
     its beat does not read: an unread beat is no beat.

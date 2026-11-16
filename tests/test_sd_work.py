@@ -562,6 +562,23 @@ class TaskCLI(unittest.TestCase):
         self.assertIn("review batch", refused.stderr)
         self.assertEqual(json.loads(self.call("task", "show", item, "--json").stdout), before)
 
+    def test_answers_rules_a_question_with_no_options_on_a_review_ref_item(self):
+        """sd:8975: a plain question on a review-ref item has no label to name, so --option
+        cannot rule it; `--answers` records the decision and resolves it as on any item."""
+        with database(home=self.home) as connection:
+            item = sd_db.create_item(connection, kind="task", title="Finding", source="task-ref",
+                                     external_id="review:example-9")
+            # A question from before `check_question` (pack sd:6708) has no `Option:` lines.
+            asked = connection.execute(
+                "INSERT INTO note (item, timestamp, kind, body) VALUES (?, ?, 'question', ?)",
+                (item, "2026-11-15T20:00:00+00:00", "Do taps and nudges look the same?")).lastrowid
+            connection.commit()
+        state = json.loads(self.call("task", "note", item, "Confirm destructive taps only",
+                                     "--kind", "decision", "--answers", asked, "--json").stdout)
+        self.assertEqual((state["note"]["kind"], state["note"]["body"]),
+                         ("decision", f"Ruling on note #{asked}: Confirm destructive taps only"))
+        self.assertTrue(next(note for note in state["notes"] if note["id"] == asked)["resolved_at"])
+
     def test_all_public_note_kinds_parse_and_persist_without_internal_kinds(self):
         self.assertEqual(set(NOTE_KINDS), {"comment", "followup", "question", "decision", "proposal"})
         state = json.loads(self.call("task", "add", "--priority", "3", "Parent task", "--json").stdout)

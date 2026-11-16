@@ -128,6 +128,7 @@ def plan(connection, items: list[int], *, now: str, sessions=None, gate=None) ->
         except build.BuildRefused as refusal:
             refused.append({"id": item, "why": str(refusal)})
     revisions = reads.revisions(connection, [row["id"] for row in taken]) if taken else {}
+    waits = build.waits(connection, [row["id"] for row in taken]) if taken else {}
     room = _room(connection, now=now, sessions=sessions, gate=gate)
     groups: dict[str, list[dict]] = {}
     for row in taken:
@@ -142,7 +143,8 @@ def plan(connection, items: list[int], *, now: str, sessions=None, gate=None) ->
                             "room": 0 if host else build.room_for(room, repo),
                             "model": build._model(connection, [row["id"] for row in chunk]),
                             "branch": "build/sd-<lead assignment>",
-                            "items": [{"id": row["id"], "title": row["title"], "revision": revisions[row["id"]]}
+                            "items": [{"id": row["id"], "title": row["title"], "revision": revisions[row["id"]],
+                                       **waits[row["id"]]}
                                       for row in chunk]})
     return {"read": now, "bundles": bundles, "refused": refused,
             "room": {"machine": room["machine"], "why": room["why"], "cap": build.MACHINE_CAP,

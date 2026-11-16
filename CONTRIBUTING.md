@@ -159,41 +159,9 @@ python3 tests/test_doc_citations.py --repoint --apply
 The repair tool matches anchored text. It refuses ambiguous or missing matches.
 Do not replace line numbers without checking their targets.
 
-#### The optional review-tier reading
-
-`bin/sd-review` takes an optional second reading through `jev`. `sd_route.route` decides the tier and
-keeps the decision; the reading is a second opinion over a diff shape the
-policy's globs cannot see, and it is taken wherever `jev` says it can answer.
-It needs no per-repository opt-in, because it sends no prose.
-
-What leaves the machine: the tier names, the repository-relative paths the
-change touches (capped, then a count), the number of lines it moves, and the
-routing reason `sd_route` composed. **No file contents, no diff, no code**, and
-no absolute path, repository name, branch, author or commit message.
-
-**The tier names are the running checkout's, not this one's.** `load_policy` reads the policy out of the
-repository the command runs in, and `sd-review` hands that policy's
-`tier_order` straight to the reading. The four standard tiers carry a fixed
-description; **a tier a repository invented is sent as a bare name, with
-nothing to say what it means.** So a private repo that declares a tier called
-`embargo-legal` sends that string to a third-party model, and the name is the
-whole of what arrives. Name your tiers as though they leave the machine,
-because they do.
-
-```bash
-JEV_SD_REVIEW=0 sd-review --scope branch    # or export it once
-```
-
-The same vocabulary and the same subtract-only rule apply. **It prints no
-*note*, which is not the same as changing nothing**: on the path where the
-reading works, the result object gains a `jev` key, the routing reason gains a
-clause, and the tier itself may move — that is the point of taking it. The
-note naming this switch appears only when the reading was attempted and
-failed.
-
 #### The shadow readings: finding triage and duplicate hints
 
-Two more stages ask Jev with `--shadow`: `jev` prints the answer handed to it
+Two stages ask Jev with `--shadow`: `jev` prints the answer handed to it
 and records its own judgment beside it in the ledger. Nothing reads the
 judgment back, so neither changes an output, an exit code or a status.
 
@@ -216,16 +184,8 @@ nothing, and nothing retries it hosted.
 could be taken, and sends nothing unless the answer is `private: false`. No
 `gh`, a failing `gh` and a private answer all read as private.
 
-**The hint-blind twin follows the tier reading instead.** `JEV_SD_REVIEW_BLIND`
-(sd:2969) asks, after the tier reading's gate passes, the same tier question
-without `deterministic_routing_said`, so the ledger shows how far the rule's
-reason steers the answer. Sent: the reading's state less that reason. It sends
-less than the reading, so it goes where the reading goes, hosted Jev and private
-repositories included. `--shadow` prints the routed tier, and nothing reads
-Jev's answer.
-
 ```bash
-JEV_SD_REVIEW_TRIAGE=0 JEV_SD_TASK_DEDUPE=0 JEV_SD_REVIEW_BLIND=0    # any, for a run or a shell
+JEV_SD_REVIEW_TRIAGE=0 JEV_SD_TASK_DEDUPE=0    # either, for a run or a shell
 ```
 
 #### Subject and run in the ledger
@@ -237,7 +197,7 @@ join the judgment, and inherits one `JEV_RUN` per run (sd:2954).
 A subject holds no content: it is an existing id, or the first 16 hex of the
 SHA-256 of a stable identifier.
 
-- `sd-review` tier and triage, and `sd task add`: unchanged subjects.
+- `sd-review` triage and `sd task add`: unchanged subjects.
 - `sd-docs-lint`: `sd-docs-lint:<16 hex>` over the batch's sorted origins
   (`<item>/<file> `<citation>``), one per line; the weak-reading note names
   each origin, so an outcome recomputes the key from it.

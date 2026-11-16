@@ -1621,7 +1621,6 @@ UNSHIELDED = {
     "test_sd_review_check_receipt.py": 1,
     "test_sd_review_empty_subject.py": 2,
     "test_sd_review_gate_check.py": 1,
-    "test_sd_review_jev.py": 7,
     "test_sd_review_lens.py": 2,
     "test_sd_review_output_contract.py": 4,
     "test_sd_review_oversize.py": 17,

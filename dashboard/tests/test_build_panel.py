@@ -107,6 +107,25 @@ class BuildRoutes(Fixture):
         self.assertEqual([row["id"] for row in out["refused"]], [planning])
         self.assertEqual((out["room"]["machine"], out["room"]["why"], out["bundles"][0]["room"]), (6, "", build.REPO_CAP))
 
+    def test_the_plan_shows_each_items_wait_before_the_press(self):
+        """Pack sd:8964: a readied item that waited on outside work showed nothing of it in the Build dialog.
+        Each item carries its parked_at and the reason of its latest move to planning or blocked that gave one."""
+        waited, parked, plain = self.ready(), self.ready(), self.ready()
+        self.connection.execute("UPDATE item SET parked_at = '2026-11-01T00:00:00+00:00' WHERE id = ?", (parked,))
+        for target, reason in (("blocked", "waits on the governance API"), ("planning", "waits on the next trial"),
+                               ("ready", "readied"), ("planning", None), ("ready", None)):
+            transition(self.connection, waited, target, who="operator", reason=reason)
+        out = builds.plan(self.connection, [waited, parked, plain], now=NOW,
+                          sessions=lambda connection, *, now: {"sessions": [], "builders": {"running": 0, "why": ""}},
+                          gate=lambda: {"load": [1.0, 1.0, 1.0], "load_max": 40.0})
+        rows = {row["id"]: row for bundle in out["bundles"] for row in bundle["items"]}
+        moved = self.connection.execute("SELECT id FROM note WHERE item = ? AND body LIKE '%next trial'",
+                                        (waited,)).fetchone()["id"]
+        self.assertEqual((rows[waited]["parked_at"], rows[waited]["waited"]),
+                         (None, {"note": moved, "why": "waits on the next trial"}))
+        self.assertEqual((rows[parked]["parked_at"], rows[parked]["waited"]), ("2026-11-01T00:00:00+00:00", None))
+        self.assertEqual((rows[plain]["parked_at"], rows[plain]["waited"]), (None, None))
+
     def test_the_plan_names_the_satellite_that_runs_a_bundle(self):
         """Pack sd:7933: a satellite lane's bundle names its host and none of the hub's room."""
         hub = self.ready()

@@ -174,10 +174,9 @@ class NeverPostsTests(unittest.TestCase):
             # `gh` and posting-fragment assertions above cover the entry point
             # that would have to do the posting.
             "sd_registry",
-            # The optional Jev tier reading. It runs one bounded local command
-            # and only when an explicit opt-in is set, so it widens the
-            # allow-list by a subprocess and not by a way out to GitHub; the
-            # never-posts assertions below cover it like the rest of the lane.
+            # The Jev shadow triage's entry point. It runs bounded local
+            # commands, so it widens the allow-list by a subprocess and not by
+            # a way out to GitHub; the never-posts assertions below cover it.
             "sd_jev",
             # Focused local readers; only sd-check explicitly calls receipt writers.
             "sd_check_receipts",
@@ -972,11 +971,14 @@ class LineBudgetTests(unittest.TestCase):
         # 4899 -> 4937 is pack sd:8503, the operator raising the 4900
         # ceiling (2026-11-12): each reader's wall clock and reported cost
         # (+38 in `bin/sd-review`), so a report shows what each reader took.
+        #
+        # 4937 -> 4619 is sd:8972: the Jev tier reading and its hint-blind
+        # twin are deleted, `bin/sd_jev.py` keeps the shadow stages' helpers.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4937,
+            4619,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

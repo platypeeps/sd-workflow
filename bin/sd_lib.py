@@ -3625,7 +3625,7 @@ def acknowledgement_problems(label: str, entry: Any) -> list[str]:
 #: This vocabulary is `jev.py`'s `FLAG_OFF`, copied rather than imported: `jev`
 #: ships in a private companion repository and this one is public, so there is
 #: nothing to import from. Two copies drift, so the words are pinned by
-#: `tests/test_sd_review_jev.py` and named here to be grepped for.
+#: `tests/test_sd_jev_shadow.py` and named here to be grepped for.
 JEV_FLAG_OFF = ("0", "off", "false", "no", "disabled")
 
 
