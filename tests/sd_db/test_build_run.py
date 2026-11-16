@@ -2895,6 +2895,7 @@ class Hosts(Case):
     def test_the_hub_builds_a_satellite_lane_while_its_host_is_over_the_load_cap(self):
         """sd:8991: a satellite over its load cap claimed nothing, and the hub left its rows queued; the hub now
         builds them itself, and the repository's one slot holds the satellite's claim off meanwhile."""
+        (self.satellite / ".git").mkdir(parents=True)  # the hub builds only a repository checked out here
         _, sat = self.both()
         with self.on("work"):
             self.assertEqual(self.tick(load=30.0, load_cap=24.0)["claimed"], [])

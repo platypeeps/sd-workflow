@@ -326,6 +326,22 @@ def overloaded(connection, host: str) -> bool:
     return isinstance(load, str) and bool(load)
 
 
+def _checked_out(repo: str) -> bool:
+    """Whether `repo` has a checkout on this machine's disk, which a build's worktree comes from (sd:8991)."""
+    return (paths.expand(repo) / ".git").exists()
+
+
+def _ran_on(connection, row) -> tuple[str | None] | None:
+    """`(run_host,)` of the latest run of `row`'s bundle, or None when it never ran: a retry keeps its commits in
+    that host's worktree and branch, so it builds there again, whatever lane its repository names now (sd:8991)."""
+    lead = row["parent"] or (row["id"] if row["run_count"] else None)
+    if lead is None:
+        return None
+    ran = connection.execute("SELECT owner FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
+                             (lead,)).fetchone()
+    return (run_host(ran["owner"]),) if ran else None
+
+
 def run_owner(owner: str, lane_host: str | None) -> str:
     """The `runner_run.owner` a claim writes: the role on a hub lane, `<role>@<lane host>` on a satellite's."""
     return owner if lane_host is None else f"{owner}@{lane_host}"
@@ -972,9 +988,15 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             "ORDER BY item.priority IS NULL, item.priority, assignment.queued_at, assignment.id", (SCOPE,)).fetchall()
         lanes = {row["id"]: lane_of(connection, row["lane_host"]) for row in queued}
         if None in hosts:
-            # A satellite over its load cap claims nothing: the hub builds its rows, under the hub's caps (sd:8991).
+            # A satellite over its load cap claims nothing: the hub builds its fresh rows of a repository checked out
+            # here, under the hub's caps (sd:8991). A retry's work is where it ran: `_ran_on` below keeps it there.
             over = {host for host in set(lanes.values()) - set(hosts) if host and overloaded(connection, host)}
-            lanes = {ident: None if host in over else host for ident, host in lanes.items()}
+            lanes = {row["id"]: None if lanes[row["id"]] in over and _checked_out(row["repo"]) else lanes[row["id"]]
+                     for row in queued}
+        for row in queued:
+            ran = _ran_on(connection, row)
+            if ran is not None:
+                lanes[row["id"]] = lane_of(connection, ran[0])
             # The hub blocks another host's row once that host's dispatcher went quiet: a lane moved after the
             # press, or a dispatcher that died after it, would leave the item locked with no word. A fresh beat
             # that names a `why` leaves the row queued, as that reason may last one tick (review round 5), until

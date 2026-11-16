@@ -1613,6 +1613,53 @@ class Hosts(Case):
         self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", hub[0]["id"]), "queued")
         self.assertEqual(self.claim(hosts=HUB)["owner"], "fixture", "the hub's run keeps the role as its owner")
 
+    OVER = {"load": "the five-minute load is 30, above the cap of 24"}
+
+    def test_the_hub_takes_no_overloaded_satellite_row_whose_repository_it_has_not_checked_out(self):
+        """sd:8991 review: the hub claimed a satellite's row for a repository with no checkout on its disk, and the
+        run blocked at the worktree step, once per queued row while the satellite stayed busy."""
+        build.queue(self.db, [self.item(repo=SAT)], who="operator")
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT status FROM assignment"), "queued", "skipped, not blocked")
+
+    def retried(self, run):
+        """`run`'s bundle ended blocked and released, and queued again as Retry does."""
+        stamp = build.clock()
+        self.db.execute("UPDATE runner_run SET outcome = 'blocked', released_at = ? WHERE id = ?", (stamp, run["id"]))
+        self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (stamp, run["id"]))
+        self.db.execute("UPDATE assignment SET status = 'queued' WHERE id = ?", (run["assignment"],))
+        self.db.execute("UPDATE item SET status = 'ready' WHERE id = (SELECT item FROM assignment WHERE id = ?)",
+                        (run["assignment"],))
+
+    def checkout(self):
+        """The satellite repository, checked out on this disk too; its path."""
+        checkout = self.root / "sat"
+        (checkout / ".git").mkdir(parents=True)
+        self.db.execute("UPDATE repo SET path = ? WHERE path = ?", (str(checkout), SAT))
+        return str(checkout)
+
+    def test_a_satellites_retry_stays_on_the_satellite_while_it_is_over_its_cap(self):
+        """sd:8991 review: a retry keeps its commits in the worktree of the host that ran it; an overloaded
+        satellite's retry moved to the hub without that work."""
+        build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
+        self.retried(self.claim(hosts=WORK))
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
+        self.assertIsNone(self.claim(hosts=HUB), "the satellite's retry waits for the satellite")
+        self.assertEqual(self.claim(hosts=WORK)["owner"], "fixture@work")
+
+    def test_the_hubs_fallback_retry_stays_on_the_hub(self):
+        """sd:8991 review: the retry of a bundle the hub built for a busy satellite moved back to the satellite,
+        whose disk holds none of its work."""
+        build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
+        fallback = self.claim(hosts=HUB)
+        self.assertEqual(fallback["owner"], "fixture", "a fresh row of a checked-out repository moves")
+        self.retried(fallback)
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        self.assertIsNone(self.claim(hosts=WORK), "the hub's fallback retry waits for the hub")
+        self.assertEqual(self.claim(hosts=HUB)["owner"], "fixture")
+
     def test_a_lane_move_before_the_claim_moves_the_claim(self):
         build.queue(self.db, [self.item(repo=SAT)], who="operator")
         self.db.execute("UPDATE repo SET lane_host = NULL WHERE path = ?", (SAT,))
