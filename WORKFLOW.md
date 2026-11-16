@@ -55,7 +55,8 @@ Do not replace required approval with a proposal that the user can veto afterwar
 These run without being asked.
 
 - No pack command runs in a checkout whose `repo.managed` is no (sd:1620, sd:2566).
-  `sd-ship`, `sd-check`, `sd-status` and `sd-ship lane enqueue` refuse there, dry runs included.
+  `sd-ship`, `sd-check --record-receipt`, `sd-status` and `sd-ship lane enqueue` refuse there.
+  A plain `sd-check` runs there: a local run, with no receipt and no `sd/local-gate` status (sd:9100).
   `sd-ship prepare` and `merge` are the exception: they read readiness from GitHub alone (sd:9100).
   Merge needs the policy's `merge_method`, an open approved PR at `--expected-head`, checks SUCCESS and CLEAN.
   `sd-review` runs there, review only: it reads a diff, and its gate check does not run (sd:5953).

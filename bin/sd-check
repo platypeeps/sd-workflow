@@ -677,6 +677,17 @@ def run_scope(args: argparse.Namespace, root: pathlib.Path, detection: sd_lib.De
         raise UsageError(str(error)) from None
 
 
+def refuse_unmanaged_receipt(root: pathlib.Path, args: argparse.Namespace) -> None:
+    """Refuse --record-receipt in a checkout whose row says managed = 0 (sd:9100).
+
+    A plain run there is local: no receipt, and no `sd/local-gate` status,
+    which sd-check never posts itself. Dry runs and plain runs proceed.
+    """
+    if args.record_receipt:
+        sd_lib.refuse_unmanaged(root, lambda why: UsageError(
+            f"{why}; sd-check runs there, but records no receipt (sd:9100)"), args.database)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
@@ -692,7 +703,7 @@ def main(argv: list[str] | None = None) -> int:
         root = sd_lib.repo_root(None)
         if root is None:
             raise UsageError(f"{pathlib.Path.cwd()} is not inside a git repository")
-        sd_lib.refuse_unmanaged(root, UsageError, args.database)  # dry runs included
+        refuse_unmanaged_receipt(root, args)
         detection = sd_lib.detect_entrypoints(root)
         if args.database and not args.record_receipt:
             raise UsageError("--database requires --record-receipt")
