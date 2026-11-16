@@ -2330,14 +2330,18 @@ def foreign_owner(name: str, home: Path) -> str:
 
     `repo_key` is the directory's name, so two repos of one name share each
     request name; the request or receipt already there keeps its owner.
-    An owner that is no directory any more, a checkout since moved or
-    deleted, owns nothing: its receipt would refuse this repo for good
+    A pending request keeps its owner even when that checkout is gone: it
+    holds content no drain has published, and writing over it loses that.
+    Only a drained receipt, its request removed, of an owner that is no
+    directory any more owns nothing: it would refuse this repo for good
     (sd:8990).
     """
-    for record in (QUEUE / name, receipts() / name):
-        owner = load_record(record).get("repo")
-        if owner and owner != str(home) and Path(owner).is_dir():
-            return str(owner)
+    owner = load_record(QUEUE / name).get("repo")
+    if owner and owner != str(home):
+        return str(owner)
+    owner = load_record(receipts() / name).get("repo")
+    if owner and owner != str(home) and Path(owner).is_dir():
+        return str(owner)
     return ""
 
 

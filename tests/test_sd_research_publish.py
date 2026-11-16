@@ -789,10 +789,31 @@ class EnqueueTests(Fixture):
         self.assertIn("mirror: report: research.report.notion.json belongs to %s, "
                       "a repo of the same name; not queued" % mine, reports)
 
-    def test_a_same_name_owner_that_no_longer_exists_owns_nothing(self) -> None:
+    def test_a_drained_receipt_of_a_gone_same_name_owner_owns_nothing(self) -> None:
         """sd:8990: the receipt of a checkout since moved or deleted named an
-        owner no repo is, and refused this repo's mirrors for good. An owner
-        path that is not a directory any more owns nothing."""
+        owner no repo is, and refused this repo's mirrors for good. A drained
+        receipt, its request delivered and removed, of an owner path that is
+        not a directory any more owns nothing."""
+        doc = [dict(out="report", title="Report", notion=dict())]
+        name = "research.report.notion.json"
+        gone = self.root / "gone" / "research"
+        here = self.root / "here" / "research"
+        gone.mkdir(parents=True)
+        PUBLISH.enqueue(gone, doc)
+        path = PUBLISH.QUEUE / name
+        PUBLISH.mirror_delivered(name, json.loads(path.read_text())["fingerprint"],
+                                 "https://example.test/gone")
+        self.assertFalse(path.exists())
+        gone.rmdir()
+
+        reports = PUBLISH.enqueue(here, doc)
+        self.assertEqual(json.loads(path.read_text())["repo"], str(here))
+        self.assertFalse([r for r in reports if "a repo of the same name" in r], reports)
+
+    def test_a_pending_request_of_a_gone_same_name_owner_survives(self) -> None:
+        """sd:8990 lane review: a missing checkout says nothing of its
+        undelivered request. Overwriting it lost content no drain had
+        published, so the request stays and the publish names it."""
         doc = [dict(out="report", title="Report", notion=dict())]
         gone = self.root / "gone" / "research"
         here = self.root / "here" / "research"
@@ -803,8 +824,9 @@ class EnqueueTests(Fixture):
 
         reports = PUBLISH.enqueue(here, doc)
         wrote = json.loads(path.read_text())
-        self.assertEqual((wrote["repo"], wrote["page"]), (str(here), ""))
-        self.assertFalse([r for r in reports if "a repo of the same name" in r], reports)
+        self.assertEqual((wrote["repo"], wrote["page"]), (str(gone), "gone"))
+        self.assertIn("mirror: report: research.report.notion.json belongs to %s, "
+                      "a repo of the same name; not queued" % gone, reports)
 
     def test_another_document_of_the_same_name_carries_nothing(self) -> None:
         """`document` is compared for the same reason `repo` is: neither is
