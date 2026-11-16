@@ -536,7 +536,7 @@ Draining is six steps per request, and the order matters:
      that fails, or a `highlight` that exits non-zero, leaves the request: an
      unknown baseline would mark nothing or everything. Three writes carry
      no mark. A create has nothing to compare against. A Notion mirror is out
-     of scope for now. And `sd-publish-drive`'s publishing folder is not a
+     of scope for now. And a Drive publishing folder is not a
      mirror: a blog publishes from it, so a review mark there would ship.
      The headless Publish now drain gets `get_doc_as_markdown`,
      `update_drive_file`, `highlight` and Write to `sd-<run id>-*` names

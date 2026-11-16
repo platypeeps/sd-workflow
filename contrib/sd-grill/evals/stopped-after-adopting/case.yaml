@@ -1,6 +1,0 @@
-schema_version: "1.0"
-name: stopped-after-adopting
-context:
-  # Turns 1 and 2 of tests/fixtures/conduct/sd-grill-stopped-after-adopting.json,
-  # text only: Q1 is open, the user asks for options, Q2 offers A to D.
-  history_file: history.jsonl

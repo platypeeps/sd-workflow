@@ -22,9 +22,9 @@ draft, or similar artifact already exists and needs a focused or full editorial
 review. This workflow can report findings only or apply a specifically
 authorized revision after the report.
 
-Do not use for topic discovery (`sd-topic-radar`), original article development
+Do not use for topic discovery, original article development
 (`sd-author`), primary research (`sd-research`), claim-only auditing
-(`sd-fact-check`), or adversarial premise review (`sd-red-team`). These are
+(`sd-fact-check`), or adversarial premise review. These are
 separate capability handoffs, not prerequisites.
 
 The `voice-consistency` pass here measures the draft against its own
@@ -184,5 +184,5 @@ reading, searching, or editing.
   approval-to-change mapping, re-check results, and remaining findings when edit
   mode was authorized; and
 - **Handoffs and limits** — explicitly not-published status plus any separate
-  `sd-fact-check`, `sd-research`, `sd-red-team`, or `sd-author`
+  `sd-fact-check`, `sd-research`, or `sd-author`
   work that remains not run.

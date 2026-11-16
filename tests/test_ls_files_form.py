@@ -117,11 +117,6 @@ PROSE_SUFFIX = ".md"
 #: came with it from the system checkout (sd:5987) and are its static files.
 ASSET_PREFIX = ("bin/fonts/", "dashboard/sd_dashboard/v2/static/fonts/")
 
-#: Not code either: transcripts the conduct harness recorded from a live model
-#: run (sd:1149). A command in one is what the model typed, kept verbatim as
-#: evidence; rewriting it to satisfy this guard would falsify the recording.
-RECORDED_PREFIX = "tests/fixtures/conduct/"
-
 #: Floors, not counts. They fail when the scan stops reaching the repository
 #: -- a moved directory, a recogniser that matches nothing -- and they do not
 #: move when a call site is added or deleted, which is the drift that put a
@@ -257,7 +252,7 @@ def surface(root: pathlib.Path = REPO_ROOT) -> list[str]:
     return [name for name in listed.split("\0")
             if name
             and not name.endswith(PROSE_SUFFIX)
-            and not name.startswith((*ASSET_PREFIX, RECORDED_PREFIX))]
+            and not name.startswith(ASSET_PREFIX)]
 
 
 def scan(root: pathlib.Path = REPO_ROOT) -> tuple[list[Site], list[str]]:

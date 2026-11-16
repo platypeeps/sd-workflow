@@ -620,16 +620,11 @@ class AnUnreadableReport(PruneCase):
 class TheCheckpointRows(PruneCase):
     """One row per newest-only checkpoint key once the key sat a week (sd:3472).
 
-    Each dropped row is archived under the bulk root first (sd:8655).
+    A dropped row is deleted outright; no copy goes anywhere (sd:9064).
     """
 
-    def setUp(self):
-        super().setUp()
-        self.bulk = self.root / "bulk"
-        self.bulk.mkdir()
-
     def compact(self):
-        return retention.compact_checkpoints(self.db, now=NOW, root=self.bulk).deleted
+        return retention.compact_checkpoints(self.db, now=NOW)
 
     def rows(self, key, *, days, count=3):
         """`count` receipts under `key`, the newest written `days` ago; returns their ids, oldest first."""
@@ -718,12 +713,24 @@ class TheCheckpointRows(PruneCase):
     @hub_only
     def test_the_prune_compacts_them_and_its_report_counts_them(self):
         kept = self.rows("ship:idle", days=10)[-1]
-        pruned = prune(self.db, self.backup(), now=NOW, bulk_root=self.bulk)
+        pruned = prune(self.db, self.backup(), now=NOW)
         self.assertEqual(pruned.counts["checkpoints"], 2)
         self.assertEqual(self.ids("ship:idle"), [kept])
         report = self.db.execute("SELECT * FROM item WHERE id=?", (pruned.report,)).fetchone()
         self.assertEqual(json.loads(report["fields"])["report"]["removed"]["checkpoints"], 2)
         self.assertIn("2 superseded checkpoint row(s) removed", json.loads(report["body"])["text"])
+
+    @hub_only
+    def test_the_prune_deletes_them_outright_and_writes_no_archive(self):
+        """sd:9064: no bulk root, no archive; the rows still go, and no file is written beside the database."""
+        kept = self.rows("ship:idle", days=10)[-1]
+        before = sorted(path for path in self.root.rglob("*") if "backups" not in path.parts)
+        pruned = prune(self.db, self.backup(), now=NOW)
+        self.assertEqual((pruned.counts["checkpoints"], self.ids("ship:idle")), (2, [kept]))
+        written = [path for path in self.root.rglob("*") if "backups" not in path.parts and path not in before]
+        self.assertEqual([path for path in written if path.name.endswith(".jsonl.gz")], [])
+        text = json.loads(self.db.execute("SELECT body FROM item WHERE id=?", (pruned.report,)).fetchone()[0])["text"]
+        self.assertNotIn("archive", text.lower())
 
     @hub_only
     def test_a_prune_stopped_after_the_compaction_is_finished_by_the_next_run(self):
@@ -732,10 +739,10 @@ class TheCheckpointRows(PruneCase):
         snapshot = self.backup()
         with mock.patch.object(retention, "settle_clean_reports", side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
-                prune(self.db, snapshot, now=NOW, bulk_root=self.bulk)
+                prune(self.db, snapshot, now=NOW)
         self.assertEqual(self.ids("ship:idle"), [kept])
         self.assertEqual(self.db.execute("SELECT count(*) FROM item WHERE kind='report'").fetchone()[0], 0)
-        pruned = prune(self.db, snapshot, now=NOW, bulk_root=self.bulk)
+        pruned = prune(self.db, snapshot, now=NOW)
         self.assertEqual((pruned.counts["checkpoints"], self.ids("ship:idle")), (0, [kept]))
         self.assertTrue(pruned.report)
 

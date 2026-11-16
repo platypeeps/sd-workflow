@@ -107,13 +107,13 @@ class WhatCountsAsAUse(Fixture):
         """
 
         connection = self.database()
-        where = str(self.home / ".claude" / "skills" / "sd-grill" / "SKILL.md")
+        where = str(self.home / ".claude" / "skills" / "sd-decide" / "SKILL.md")
         self.fire(payload(
             hook_event_name="PreToolUse", tool_name="Read",
             tool_input={"file_path": where}))
         self.assertEqual(
             [(r["skill"], r["mode"]) for r in self.rows(connection)],
-            [("sd-grill", "path")],
+            [("sd-decide", "path")],
         )
 
     def test_a_slash_prompt_is_a_direct_use(self) -> None:

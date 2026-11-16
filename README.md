@@ -499,7 +499,7 @@ rest safe:
 
 ## Commands
 
-There are eleven named surfaces, all commands.
+There are eight named surfaces, all commands.
 All platforms preserve Markdown bodies.
 Codex invocation metadata uses the [adapter](#codex-invocation-metadata).
 Each surface has one `SKILL.md` file under `skills/` or `contrib/`.
@@ -510,17 +510,17 @@ knowledge and procedure with no standing side-effect authority, loaded when
 relevant rather than invoked. They are not listed here: `sd skill list`
 reads both roots, which are the only two inventories that cannot go stale.
 
-`sd-plan`, `sd-spec`, `sd-skill-adopt`, `sd-tips`, `sd-draft-review` and `sd-publish-drive` are the named surfaces in `contrib/`.
+`sd-plan`, `sd-spec` and `sd-skill-adopt` are the named surfaces in `contrib/`.
 They install with `sd skill try` instead of the default installer.
 They remain commands because they authorize side effects.
-Each of the eleven commands sets `disable-model-invocation`.
+Each of the eight commands sets `disable-model-invocation`.
 Every other surface omits that marker.
 
 **Runs as** identifies the execution form.
 `bin/` means the pack ships an executable entry point.
 **prose** means an agent follows the skill without a runner.
 For prose surfaces, the skill is the implementation.
-Five of the eleven are prose.
+Two of the eight are prose.
 Each prose skill has a "State of the tooling" section.
 `tests/test_skill_frontmatter.py` checks each claim against the filesystem.
 
@@ -534,9 +534,6 @@ Each prose skill has a "State of the tooling" section.
 | `sd-status` | `bin/` | Read-only: derived status, open PRs, branch-protection gaps and the states this repo accepts (its `status` declaration) |
 | `sd-skill-adopt` | `bin/` | Safety pre-screen, lint, and canonical transform for an incoming skill |
 | `sd-handoff` | `bin/` | Write the local session packet for this directory; `/clear` restores it |
-| `sd-tips` | prose | File scored tips into a writing content repository's vault inbox |
-| `sd-draft-review` | prose | Push a draft to a private review Google Doc, or pull its comments and edits back |
-| `sd-publish-drive` | prose | Final gates, one tip, and the confirmed push to the Drive publishing folder |
 
 ## Maintaining
 

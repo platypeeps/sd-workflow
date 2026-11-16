@@ -609,7 +609,8 @@ def register(groups: Any) -> None:
             if action in {"retry", "cancel", "start", "stop", "restart"}:
                 parser.add_argument("--if-revision", help="require the exact revision you inspected")
         if name == "assignments":
-            parser = verbs.add_parser("build", help="queue a build of each ready item, retry its blocked or "
+            parser = verbs.add_parser("build", help="queue a build of each item, a planning one set ready "
+                                                    "first; retry its blocked or "
                                                     "cancelled bundle, or Fix its failed lane entry; the whole "
                                                     "selection or none")
             parser.set_defaults(handler=queue_builds)

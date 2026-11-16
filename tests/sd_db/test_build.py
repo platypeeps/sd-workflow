@@ -106,6 +106,19 @@ class Case(unittest.TestCase):
 
 
 class Queue(Case):
+    def test_build_readies_a_planning_item_and_a_refusal_writes_nothing(self):
+        """sd:9063: `sd assignments build` is the one verb; it takes a just-filed planning task, as `task add
+        --build` did, and one refused item in the selection leaves every item as it was."""
+        planning = self.item(status="planning")
+        queued = build.queue_again(self.db, [planning], who="operator")
+        self.assertEqual([(entry["item"], entry["status"]) for entry in queued], [(planning, "queued")])
+        self.assertEqual(item_state(self.db, planning)["item"]["status"], "ready")
+        other, busy = self.item(status="planning"), self.item()
+        build.queue(self.db, [busy], who="operator")
+        with self.assertRaisesRegex(build.BuildRefused, "has queued assignment"):
+            build.queue_again(self.db, [other, busy], who="operator")
+        self.assertEqual(item_state(self.db, other)["item"]["status"], "planning")
+
     def test_queue_refuses_whole_selection(self):
         """Failure table, Press: one refusal refuses every item, and nothing is written."""
         ready, planning = self.item(), self.item(status="planning")

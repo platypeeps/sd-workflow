@@ -1297,8 +1297,6 @@ def run(args: argparse.Namespace) -> int:
             result = _items(sd_db, workflow, args, connection)
         elif action == "item":
             result = workflow.item_state(connection, args.item)
-        elif action == "add" and getattr(args, "build", False):
-            result, dedupe = _add_build(sd_db, workflow, args, connection, who)
         elif action == "add":
             result, dedupe = _add(sd_db, workflow, args, connection, who)
         elif action == "edit" and getattr(args, "experiment", None):
@@ -1326,7 +1324,7 @@ def run(args: argparse.Namespace) -> int:
         _emit(result, machine=args.json, moved=moved, following=following,
               audit=getattr(args, "audit", False), audited=workflow.is_audit_note)
         _dedupe(dedupe)
-        return _built(result, machine=args.json) if getattr(args, "build", False) else 0
+        return 0
     except sd_db.SdDbError as error:
         raise WorkRefusal(str(error)) from error
     finally:
@@ -1344,38 +1342,6 @@ def _add(sd_db: Any, workflow: Any, args: argparse.Namespace, connection: Any,
     _kinds(workflow)
     state = _capture(sd_db, workflow, args, connection, who)
     return state, (sd_db, connection, state)
-
-
-def _add_build(sd_db: Any, workflow: Any, args: argparse.Namespace, connection: Any,
-               who: str) -> tuple[dict, tuple[Any, Any, dict]]:
-    """`add --build` (sd:8794): `_add`, then ready and the build queued, as the dashboard's Fix does."""
-    if args.kind != "task":
-        raise WorkRefusal(f"--build files a task, not a {args.kind}")
-    try:
-        import sd_db.build as build
-    except ImportError:
-        raise WorkRefusal("update this pack checkout, whose lib/ is the sd_db bin/ runs for builds") from None
-    filed: list[tuple[Any, Any, dict]] = []
-
-    def capture() -> dict:
-        state, dedupe = _add(sd_db, workflow, args, connection, who)
-        filed.append(dedupe)
-        return state
-
-    with workflow.transaction(connection):
-        state = build.file_and_queue(connection, capture, who=who)
-    return state, filed[0]
-
-
-def _built(state: dict, *, machine: bool) -> int:
-    """`add --build`'s queued line, or its refusal on stderr and exit 1; the item stays filed and ready."""
-    if state.get("build_error"):
-        print(f"sd: filed sd:{state['item']['id']}, but its build did not queue: {state['build_error']}",
-              file=sys.stderr)
-        return 1
-    for entry in [] if machine else state["queued"]:
-        print(f"#{entry['id']}  {entry['status']}  build  sd:{entry['item']}")
-    return 0
 
 
 #: The duplicate hint's stage, its name in the judgment ledger, and its shadow
@@ -1692,9 +1658,6 @@ def register(groups: Any, store: Any) -> None:
     add.add_argument("--ref", metavar="SOURCE:ID",
                      help="the occurrence that raised the item, such as job:repo-sync:42; a second "
                           "add with the same reference refuses and names the item")
-    add.add_argument("--build", action="store_true",
-                     help="file the task, set it ready and queue its build, as sd assignments build "
-                          "does; a refused build keeps it ready, names why and exits 1")
     where = add.add_mutually_exclusive_group()
     where.add_argument("--here", action="store_true",
                        help="refuse unless this is a checkout registered in the sd database "

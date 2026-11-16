@@ -28,7 +28,7 @@ known about X", policy or market questions, due-diligence style reading.
 Do not use for:
 
 - single-fact lookups — just answer them directly;
-- breadth-first inventories of a market or category — that is `sd-scan`;
+- breadth-first inventories of a market or category;
 - synthesizing material the user already supplied.
 
 ## Arguments
@@ -81,7 +81,7 @@ before the first search.
 
 With `piece=` or `from=idea`, run from the root of a content repository (it
 holds `content/`, `profile/` and `templates/`). Keep to notes and sources;
-draft prose is `sd-draft` work.
+draft prose is separate work.
 
 1. **Find the work.** `piece=`: `sd writing get --piece <year>/<slug> --json`
    and use the registered `item.path`; a revived piece may stay under
@@ -117,7 +117,7 @@ draft prose is `sd-draft` work.
 7. Report per piece: folder, source count, the topic notes and profiles that
    fed in, ground truth that proved wrong (fix it in that topic note), what
    the remedy evidence covers and does not, and open questions. For
-   `from=idea`, offer `sd-draft` for the first draft.
+   `from=idea`, offer to draft it next.
 
 ## Sub-agent dispatch
 

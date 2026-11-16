@@ -23,11 +23,10 @@ Use when the user wants a recommendation between at least two known options and
 the choice is consequential enough to expose criteria, constraints, tradeoffs,
 uncertainty, and reversal conditions.
 
-Do not use to discover candidates (`sd-scan`), answer open evidence questions
+Do not use to discover candidates, answer open evidence questions
 (`sd-research`), synthesize a supplied corpus (`sd-digest`), or build the plan
-after a decision (`sd-objective-plan`). A neutral comparison without a recommendation
-belongs to `sd-compare`; if it is unavailable, say so instead of silently
-turning the request into a decision.
+after a decision. A neutral comparison without a recommendation is not a
+decision; say so instead of silently turning the request into one.
 
 ## Arguments
 
@@ -55,9 +54,8 @@ evaluating any option.
    assumptions before continuing.
 2. Check option eligibility against hard constraints. Keep disqualified options
    visible with the reason instead of removing them from the record.
-3. Route missing candidate discovery to `sd-scan`, open evidence questions to
-   `sd-research`, supplied-document reconciliation to `sd-digest`, and a
-   recommendation-free comparison to `sd-compare` when available.
+3. Route open evidence questions to `sd-research` and supplied-document
+   reconciliation to `sd-digest`; name missing candidate discovery as a gap.
 4. Build one option-by-criterion matrix. For every cell, separate sourced fact,
    inference, and judgment; use `unknown` when the evidence does not support a
    conclusion. Apply source quality and dating rules to external claims.
@@ -69,8 +67,8 @@ evaluating any option.
    reversible, staged, or difficult to unwind.
 7. Recommend one option when the evidence supports it. Calibrate confidence,
    show the decisive tradeoffs and missing evidence, and name the smallest next
-   action. Hand accepted decisions to `sd-objective-plan` when detailed planning is
-   requested separately.
+   action. Hand accepted decisions to a separate plan when detailed planning is
+   requested.
 8. Deliver the requested brief or memo without executing the choice.
 
 ## Safety rules

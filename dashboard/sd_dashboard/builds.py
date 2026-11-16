@@ -197,11 +197,20 @@ def press(payload: dict, *, start=None):
 
 
 def file_and_build(connection, capture, *, who: str = "dashboard") -> dict:
-    """Fix's file-then-build (pack sd:8113): `build.file_and_queue`, its queued rows as a press answers them."""
-    state = build.file_and_queue(connection, capture, who=who)
-    if "queued" not in state:
+    """Fix's file-then-build (pack sd:8113): `capture()` files the task, or answers the open one (`existing`); a new
+    one goes to ready, then `build.queue_again`, the one verb that starts a build (sd:9063), queues it, its rows as
+    a press answers them. A refused build leaves the item filed and ready, and names why in `build_error`."""
+    state = capture()
+    if state.get("existing"):
         return state
-    return {**state, **answer(connection, state["queued"], kickstart)}
+    item = state["item"]["id"]
+    workflow.change_status(connection, item, "ready", who=who, expected_revision=state["revision"])
+    try:
+        queued = build.queue_again(connection, [item], who=who)
+    except build.BuildRefused as refusal:
+        return {**workflow.item_state(connection, item), "existing": False, "build_error": str(refusal)}
+    return {**workflow.item_state(connection, item), "existing": False, "queued": queued,
+            **answer(connection, queued, kickstart)}
 
 
 #: The ask every flaky Fix brief ends with (pack sd:8113).

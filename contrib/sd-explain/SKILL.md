@@ -24,8 +24,8 @@ Use when the user asks what a concept means, how a mechanism works, why an
 outcome occurs, or how to understand one technical question without losing
 necessary precision.
 
-Do not use for a full curriculum (`sd-learn`), a durable study artifact
-(`sd-study-guide`), mastery assessment (`sd-socratic-review`), open-ended
+Do not use for a full curriculum, a durable study artifact, mastery
+assessment, open-ended
 evidence gathering (`sd-research`), or claim-by-claim verification
 (`sd-fact-check`). If a named sibling is unavailable, say so.
 
@@ -135,7 +135,6 @@ building the explanation.
 - **Established so far** — compact follow-up context containing the active
   question, agreed model, definitions, assumptions, and unresolved claims;
 - **Next learning step and handoffs** — the next useful question plus any
-  explicit `sd-research`, `sd-fact-check`, `sd-learn`, `sd-study-guide`, or
-  `sd-socratic-review` handoff with status `not run`;
+  explicit `sd-research` or `sd-fact-check` handoff with status `not run`;
 - **Sources and limits** — cited mutable claims, unresolved evidence needs,
   read-only status, and actions not performed.

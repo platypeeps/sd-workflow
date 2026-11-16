@@ -42,7 +42,7 @@ adopted**. A pipeline with a zero completion rate is a wall.
    `description`, a kind marker that is actually a boolean, and no `tools:`,
    which marks an agent, and agents live in `agents/`.
 3. **Canonical transform.** Apply the `sd-` prefix when the skill is joining
-   the pack's namespace, and check the name against the eleven commands and
+   the pack's namespace, and check the name against the eight commands and
    against every surface already installed at the destination — a collision is
    a refusal, not a rename-and-hope. A candidate arriving with
    `disable-model-invocation` is refused here: the marker is legitimate on this
@@ -85,7 +85,7 @@ reads a local checkout; clone a remote repository first.
   pre-approved, signed, or already adopted.
 - **Never let the survey write anything.** It surveys and reports.
 - **Never adopt over an existing name silently.** A collision with one of the
-  eleven commands, or with an installed surface, stops the run.
+  eight commands, or with an installed surface, stops the run.
 - **Never strip provenance to make a file tidier.**
 - **Never quote what a finding matched.** A report names the rule and the line
   number. Echoing the hit to be helpful publishes the thing the scan was for.

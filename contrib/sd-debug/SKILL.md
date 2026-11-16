@@ -23,19 +23,10 @@ Use when something observably does not work and the cause is not yet known —
 before the first edit, and especially when the first plausible cause is already
 obvious. An obvious cause is a hypothesis with a head start, not a conclusion.
 
-Do not use it to analyse an incident that is already over and needs an
-organisational account (`sd-postmortem`), to draw lessons from a debugging
-effort that has already finished (`sd-retro`, which accepts a completed
-software-delivery stream — the seam is that this skill runs while the
-investigation is open and hands over when it closes in any of its three states,
-`stalled` included, while `sd-retro` starts from a stream that is already
-over), to run this repository's own checks (`sd-check`), to
-review a diff for defects that have not manifested (`sd-review`), to attack an
-artifact's assumptions adversarially (`sd-red-team`), or to plan the work the
-fix turns into (`sd-plan`). Rust async and concurrency faults have their own
-body of knowledge in `sd-rust-async`; this skill is the language-agnostic
-discipline and applies alongside it rather than instead of it. Those are
-handoffs; report an unavailable sibling rather than implying it ran.
+Do not use it to run this repository's own checks (`sd-check`), to
+review a diff for defects that have not manifested (`sd-review`), or to plan
+the work the fix turns into (`sd-plan`). Those are handoffs; report an
+unavailable sibling rather than implying it ran.
 
 ## Arguments
 
@@ -198,8 +189,8 @@ fix.
 - **Edits in the tree** — every file changed and whether it is a verified fix or
   an experiment awaiting revert;
 - **Closing state** — `fixed`, `diagnosed`, or `stalled`, and what ended it; and
-- **Handoffs** — proposed `sd-plan`, `sd-review`, `sd-postmortem` or
-  `sd-rust-async` work, each `not run` or `unavailable`, plus the statement that
+- **Handoffs** — proposed `sd-plan` or `sd-review` work, each `not run` or
+  `unavailable`, plus the statement that
   nothing was committed, branched, or pushed.
 
 ## Lineage
@@ -208,5 +199,4 @@ The reproduction gate, the insistence that a hypothesis predict something that
 could fail, and the refusal to accept a green run as a fix are adapted from the
 `systematic-debugging` skill in `github.com/obra/superpowers` (MIT, revision
 `b36e082`). The evidence classes, the ledger that reports what it eliminated,
-and the closed set of closing states are this pack's, from `sd-grill` and
-`sd-socratic-review`.
+and the closed set of closing states are this pack's.
