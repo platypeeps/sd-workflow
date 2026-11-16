@@ -1619,14 +1619,16 @@ class Hosts(Case):
         self.assertIsNone(self.claim(hosts=WORK))
         self.assertEqual(self.claim(hosts=HUB)["owner"], "fixture")
 
-    def test_room_counts_only_this_hosts_runs(self):
+    def test_room_counts_only_this_hosts_runs_but_every_hosts_repository_slot(self):
+        """The machine cap is per host; a repository's slot is held by any host's bundle, as the hub may build a
+        satellite's lane (sd:8991)."""
         self.satellite_run()
         build.queue(self.db, [self.item()], who="operator")
         self.claim(hosts=HUB)
-        for hosts, repo in ((HUB, A), (WORK, SAT)):
+        for hosts in (HUB, WORK):
             with self.subTest(hosts=hosts):
                 room = build.room(self.db, **IDLE, hosts=hosts)
-                self.assertEqual((room["machine"], room["used"]), (build.MACHINE_CAP - 1, {repo: 1}))
+                self.assertEqual((room["machine"], room["used"]), (build.MACHINE_CAP - 1, {A: 1, SAT: 1}))
 
     def test_auto_pickup_runs_on_each_lane_host_for_its_own_lanes(self):
         """Sd:8393: a satellite lane's ready item got no build while pickup ran on the hub only; each host's

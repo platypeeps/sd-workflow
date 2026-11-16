@@ -313,6 +313,19 @@ def _why(row) -> str | None:
     return why if isinstance(why, str) and why else None
 
 
+def overloaded(connection, host: str) -> bool:
+    """Whether the satellite `host`'s fresh beat says its five-minute load is over its cap: the hub's claim then
+    builds that lane's queued rows itself, and the satellite's lane still lands them (sd:8991)."""
+    if dispatcher_gone(connection, host):
+        return False
+    row = _beat(connection, host)
+    try:
+        load = json.loads(row["body"]).get("load") if row else None
+    except (TypeError, ValueError, AttributeError):
+        load = None
+    return isinstance(load, str) and bool(load)
+
+
 def run_owner(owner: str, lane_host: str | None) -> str:
     """The `runner_run.owner` a claim writes: the role on a hub lane, `<role>@<lane host>` on a satellite's."""
     return owner if lane_host is None else f"{owner}@{lane_host}"
@@ -825,8 +838,10 @@ def room(connection, *, load: float | None, load_cap: float | None, interactive:
         (SCOPE, *LANE_STEPS)).fetchall() if mine(row, hosts)]
     headless = {row["session_id"] for row in [*builds, *drafts, *lane] if row["session_id"]}
     used: dict[str, int] = {}
-    for row in builds:
-        used[row["repo"]] = used.get(row["repo"], 0) + 1
+    # Every host's builds hold a repository's slot: the hub may build a satellite's lane (sd:8991).
+    for row in leases:
+        if row["scope"] == SCOPE:
+            used[row["repo"]] = used.get(row["repo"], 0) + 1
     others = [entry for entry in interactive or [] if not (entry.get("session_id") and entry["session_id"] in headless)]
     for entry in others:
         repo = _key(entry.get("repo"))
@@ -957,6 +972,9 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             "ORDER BY item.priority IS NULL, item.priority, assignment.queued_at, assignment.id", (SCOPE,)).fetchall()
         lanes = {row["id"]: lane_of(connection, row["lane_host"]) for row in queued}
         if None in hosts:
+            # A satellite over its load cap claims nothing: the hub builds its rows, under the hub's caps (sd:8991).
+            over = {host for host in set(lanes.values()) - set(hosts) if host and overloaded(connection, host)}
+            lanes = {ident: None if host in over else host for ident, host in lanes.items()}
             # The hub blocks another host's row once that host's dispatcher went quiet: a lane moved after the
             # press, or a dispatcher that died after it, would leave the item locked with no word. A fresh beat
             # that names a `why` leaves the row queued, as that reason may last one tick (review round 5), until
