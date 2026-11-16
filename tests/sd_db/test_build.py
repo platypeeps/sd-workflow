@@ -265,6 +265,14 @@ class Claim(Case):
         third = self.claim()
         self.assertEqual((third["repo"], len(third["members"])), (A, 1), "the next bundle takes the fourth")
 
+    def test_a_long_queue_of_small_items_fills_a_bigger_bundle(self):
+        """sd:8992: a bundle took three items however small; a mechanical item now weighs half a slot."""
+        small = {"work_kind": "mechanical"}
+        build.queue(self.db, [self.item(priority=1), *(self.item(priority=2, fields=small) for _ in range(6))],
+                    who="operator")
+        self.assertEqual(len(self.claim()["members"]), 5, "one whole slot and four half ones")
+        self.assertEqual([build.bundled(self.db, items) for items in ([], [self.item()] * 4)], [0, 3])
+
     def test_one_running_bundle_fills_its_repository_not_another(self):
         """sd:8158: one bundle per repository at a time, so later items wait for it and the next bundle takes them."""
         build.queue(self.db, [self.item()], who="operator")

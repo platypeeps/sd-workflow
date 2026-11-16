@@ -4,8 +4,8 @@ Design: system `docs/work/2026-10-24-build-dispatcher/design.md`, step 1.
 
 A Build press queues one `assignment` per item: role `author`, lane
 `parallel`, scope `build`. A claim takes up to `BUNDLE_MAX` queued builds of
-one repository as a bundle: one `runner_run` (the attempt) and one
-`runner_lease` on branch `build/sd-<lead>`, every member `running` with its
+one repository as a bundle, more when they are small (`bundled`): one
+`runner_run` (the attempt) and one `runner_lease` on branch `build/sd-<lead>`, every member `running` with its
 `parent` the lead, and every item `in_progress`. While an assignment is
 queued or running, `workflow.change_status` refuses the item's status writes
 (criterion 7.19); a cancel is the way out.
@@ -682,7 +682,7 @@ def pickup(connection, available: dict, *, now: str | None = None) -> list[int]:
     queued in a repository with room, nothing is picked and the claim
     drains it. A press waiting on a full repository holds no other one: at
     one bundle building per repository it may wait a whole build (pack sd:8158).
-    Each free builder slot takes one bundle of up to `BUNDLE_MAX` items of
+    Each free builder slot takes one bundle (`bundled`) of
     one repository, each repository at most its `room_for`. No room, or no
     item, queues nothing.
     """
@@ -701,7 +701,7 @@ def pickup(connection, available: dict, *, now: str | None = None) -> list[int]:
     for row in eligible(connection, now=now):
         repo = row["repo"]
         taken = bundles.setdefault(repo, [])
-        if taken and len(taken[-1]) < BUNDLE_MAX:
+        if taken and bundled(connection, [*taken[-1], row["id"]]) > len(taken[-1]):
             taken[-1].append(row["id"])
         elif slots > 0 and len(taken) < room_for(available, repo):
             taken.append([row["id"]])
@@ -848,16 +848,32 @@ def room_for(available: dict, repo: str) -> int:
     return max(0, min(available["machine"], REPO_CAP - available["used"].get(repo, 0)))
 
 
+def _mechanical(connection, item: int) -> bool:
+    """Whether `item`'s `fields.work_kind` is `mechanical`: the one size signal an item carries."""
+    row = connection.execute("SELECT fields FROM item WHERE id = ?", (item,)).fetchone()
+    try:
+        fields = json.loads(row["fields"] or "{}") if row else {}
+    except ValueError:
+        fields = {}
+    return isinstance(fields, dict) and fields.get("work_kind") == "mechanical"
+
+
 def _model(connection, items: list[int]) -> str:
-    for item in items:
-        row = connection.execute("SELECT fields FROM item WHERE id = ?", (item,)).fetchone()
-        try:
-            fields = json.loads(row["fields"] or "{}") if row else {}
-        except ValueError:
-            fields = {}
-        if not isinstance(fields, dict) or fields.get("work_kind") != "mechanical":
-            return OPUS
-    return SONNET
+    return SONNET if all(_mechanical(connection, item) for item in items) else OPUS
+
+
+def bundled(connection, items: list[int]) -> int:
+    """How many of `items`, in order, one bundle takes: `BUNDLE_MAX` slots, a mechanical item half of one.
+
+    A long queue of small items so fills a bundle past `BUNDLE_MAX`, up to twice it, on the one bundle branch
+    (sd:8992); the claim, auto-pickup and the Build dialog split bundles by it.
+    """
+    spent = 0.0
+    for count, item in enumerate(items):
+        spent += 0.5 if _mechanical(connection, item) else 1
+        if spent > BUNDLE_MAX:
+            return count
+    return len(items)
 
 
 def branch(lead: int) -> str:
@@ -958,7 +974,7 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
         repo = next((row["repo"] for row in queued if room_for(available, row["repo"]) > 0), None)
         if repo is None:
             return None
-        bundle = _bundle([row for row in queued if row["repo"] == repo])
+        bundle = _bundle(connection, [row for row in queued if row["repo"] == repo])
         lead = bundle[0]["id"]
         ids = [row["id"] for row in bundle]
         marks = ", ".join("?" for _ in ids)
@@ -991,17 +1007,18 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
         return run(connection, ident)
 
 
-def _bundle(rows: list) -> list:
+def _bundle(connection, rows: list) -> list:
     """The queued rows of one repository a claim takes, best first.
 
     A bundle that ran before claims alone, its old lead first, so its run
     gets the lead's branch and worktree back (pack sd:6020); fresh rows
-    bundle with fresh rows only, up to `BUNDLE_MAX`.
+    bundle with fresh rows only, as many as `bundled` takes.
     """
     best = rows[0]
     group = best["parent"] or (best["id"] if best["run_count"] else None)
     if group is None:
-        return [row for row in rows if row["parent"] is None and not row["run_count"]][:BUNDLE_MAX]
+        fresh = [row for row in rows if row["parent"] is None and not row["run_count"]]
+        return fresh[:bundled(connection, [row["item"] for row in fresh])]
     return sorted((row for row in rows if group in (row["id"], row["parent"])), key=lambda row: row["id"] != group)
 
 
