@@ -284,10 +284,10 @@ def unclaimed(connection) -> dict[str, str]:
     (review round 5)."""
     found = {}
     for row in connection.execute(
-            "SELECT assignment.id, repo.lane_host FROM assignment JOIN item ON item.id = assignment.item "
-            "LEFT JOIN repo ON repo.path = item.repo WHERE assignment.scope = ? AND assignment.status = 'queued'",
-            (SCOPE,)):
-        host = lane_of(connection, row["lane_host"])
+            "SELECT assignment.id, assignment.parent, assignment.run_count, repo.lane_host FROM assignment "
+            "JOIN item ON item.id = assignment.item LEFT JOIN repo ON repo.path = item.repo "
+            "WHERE assignment.scope = ? AND assignment.status = 'queued'", (SCOPE,)):
+        host = _route(connection, row["lane_host"], _lead(row))
         why = dispatcher_why(connection, host) if host and not dispatcher_gone(connection, host) else None
         if why:
             found[str(row["id"])] = f"{host} claims nothing: {why}"
@@ -331,15 +331,22 @@ def _checked_out(repo: str) -> bool:
     return (paths.expand(repo) / ".git").exists()
 
 
-def _ran_on(connection, row) -> tuple[str | None] | None:
-    """`(run_host,)` of the latest run of `row`'s bundle, or None when it never ran: a retry keeps its commits in
-    that host's worktree and branch, so it builds there again, whatever lane its repository names now (sd:8991)."""
-    lead = row["parent"] or (row["id"] if row["run_count"] else None)
-    if lead is None:
-        return None
+def _lead(row) -> int | None:
+    """The lead assignment of `row`'s bundle once it ran, or None for a fresh row that never ran."""
+    return row["parent"] or (row["id"] if row["run_count"] else None)
+
+
+def _route(connection, lane_host: str | None, lead: int | None) -> str | None:
+    """`lane_of` the host whose dispatcher claims a build of the repository whose lane is `lane_host`, for the
+    bundle `lead` leads (None when it never ran): its lane now, as a retry follows `repo.lane_host`, except a bundle
+    the hub built under the overload fallback for a satellite's lane, whose commits sit in the hub's worktree: that
+    one builds on the hub again (sd:8991). The one rule for a claim, Retry, pickup and the Builds panel."""
+    lane = lane_of(connection, lane_host)
+    if lane is None or lead is None:
+        return lane
     ran = connection.execute("SELECT owner FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
                              (lead,)).fetchone()
-    return (run_host(ran["owner"]),) if ran else None
+    return None if ran and lane_of(connection, run_host(ran["owner"])) is None else lane
 
 
 def run_owner(owner: str, lane_host: str | None) -> str:
@@ -389,8 +396,9 @@ _REPO = ("SELECT item.*, repo.path AS repo_path, repo.remote, repo.managed, repo
          "FROM item LEFT JOIN repo ON repo.path = item.repo WHERE item.id = ?")
 
 
-def _item(connection, item: int) -> dict:
-    """The item a build may take, or the refusal that names why not."""
+def _item(connection, item: int, *, lead: int | None = None) -> dict:
+    """The item a build may take, or the refusal that names why not; `lead` is the bundle a Retry queues again,
+    whose lane `_route` reads (sd:8991)."""
     row = connection.execute(_REPO, (item,)).fetchone()
     if row is None:
         raise BuildRefused(f"no item {item}")
@@ -402,7 +410,7 @@ def _item(connection, item: int) -> dict:
     refused = _repo_refusal(row, connection)
     if refused:
         raise BuildRefused(refused)
-    away = lane_of(connection, row["lane_host"])
+    away = _route(connection, row["lane_host"], lead)
     gone = dispatcher_refusal(connection, away) if away else None
     if away and gone:
         # Nothing claims a satellite's press until its own dispatcher ticks, and the press locks the item. A beat
@@ -594,7 +602,7 @@ def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
                 transition(connection, member["item"], "ready", who=who, reason=f"Retry of build run {run['id']}")
             unpark(connection, member["item"])
             try:
-                _item(connection, member["item"])
+                _item(connection, member["item"], lead=assignment)
             except BuildRefused as refusal:
                 raise BuildRefused(f"Retry refused: {refusal}") from None
             if finding:
@@ -719,9 +727,9 @@ def pickup(connection, available: dict, *, now: str | None = None) -> list[int]:
         return []
     # Only this host's presses hold it: the hub never claims a satellite's.
     hosts = lane_hosts(connection)
-    if any(lane_of(connection, row["lane_host"]) in hosts and room_for(available, row["repo"]) > 0
+    if any(_route(connection, row["lane_host"], _lead(row)) in hosts and room_for(available, row["repo"]) > 0
            for row in connection.execute(
-            "SELECT item.repo, repo.lane_host FROM assignment JOIN item ON item.id = assignment.item "
+            "SELECT assignment.id, assignment.parent, assignment.run_count, item.repo, repo.lane_host FROM assignment JOIN item ON item.id = assignment.item "
             "LEFT JOIN repo ON repo.path = item.repo WHERE assignment.status = 'queued' AND assignment.scope = ?",
             (SCOPE,))):
         return []
@@ -986,17 +994,14 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             "LEFT JOIN repo ON repo.path = item.repo "
             "WHERE assignment.status = 'queued' AND assignment.scope = ? AND item.repo IS NOT NULL "
             "ORDER BY item.priority IS NULL, item.priority, assignment.queued_at, assignment.id", (SCOPE,)).fetchall()
-        lanes = {row["id"]: lane_of(connection, row["lane_host"]) for row in queued}
+        lanes = {row["id"]: _route(connection, row["lane_host"], _lead(row)) for row in queued}
         if None in hosts:
             # A satellite over its load cap claims nothing: the hub builds its fresh rows of a repository checked out
-            # here, under the hub's caps (sd:8991). A retry's work is where it ran: `_ran_on` below keeps it there.
+            # here, under the hub's caps (sd:8991). A retry stays on its lane: its work is in that lane's worktree.
             over = {host for host in set(lanes.values()) - set(hosts) if host and overloaded(connection, host)}
-            lanes = {row["id"]: None if lanes[row["id"]] in over and _checked_out(row["repo"]) else lanes[row["id"]]
+            lanes = {row["id"]: None if (lanes[row["id"]] in over and _lead(row) is None
+                                         and _checked_out(row["repo"])) else lanes[row["id"]]
                      for row in queued}
-        for row in queued:
-            ran = _ran_on(connection, row)
-            if ran is not None:
-                lanes[row["id"]] = lane_of(connection, ran[0])
         if None in hosts:
             # The hub blocks another host's row once that host's dispatcher went quiet: a lane moved after the
             # press, or a dispatcher that died after it, would leave the item locked with no word. A fresh beat
@@ -1076,11 +1081,13 @@ def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
     beat is fresh and not stuck again (pack sd:8745): a slow-DB stretch blocked them for good before.
 
     Only the item's newest build, its item still `ready`, no other assignment
-    owning it, and its lane still on the host the block names: an item moved
-    on, or a build requeued by hand since, stays as it is.
+    owning it, and its lane (`_route`) still on the host the block names, or
+    moved to this hub's own lanes (sd:8991): an item moved on, or a build
+    requeued by hand since, stays as it is.
     """
     rows = connection.execute(
-        f"SELECT assignment.id, assignment.item, assignment.result, repo.lane_host FROM assignment "
+        f"SELECT assignment.id, assignment.item, assignment.parent, assignment.run_count, assignment.result, "
+        f"repo.lane_host FROM assignment "
         f"JOIN item ON item.id = assignment.item LEFT JOIN repo ON repo.path = item.repo "
         f"WHERE assignment.scope = ? AND assignment.status = 'blocked' AND item.status = 'ready' "
         f"AND assignment.result LIKE ? AND assignment.id = (SELECT MAX(newest.id) FROM assignment newest "
@@ -1088,14 +1095,17 @@ def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
         f"AND NOT EXISTS (SELECT 1 FROM assignment other WHERE other.item = assignment.item "
         f"AND other.status IN {OWNING})", (SCOPE, "%'s lane runs on %")).fetchall()
     for row in rows:
-        away = lane_of(connection, row["lane_host"])
-        if (away is None or away in hosts or not row["result"].startswith(f"item {row['item']}'s lane runs on {away}, ")
+        away = _route(connection, row["lane_host"], _lead(row))
+        if away in hosts:
+            why = "its lane runs on this host now"
+        elif (away is None or not row["result"].startswith(f"item {row['item']}'s lane runs on {away}, ")
                 or dispatcher_gone(connection, away) or dispatcher_stuck(connection, away)):
             continue
+        else:
+            why = f"the {HEARTBEAT}@{away} beat is fresh"
         connection.execute("UPDATE assignment SET status = 'queued', ended = NULL, result = NULL "
                            "WHERE id = ? AND status = 'blocked'", (row["id"],))
-        add_note(connection, row["item"], "comment",
-                 f"Build assignment {row['id']} queued again: the {HEARTBEAT}@{away} beat is fresh")
+        add_note(connection, row["item"], "comment", f"Build assignment {row['id']} queued again: {why}")
 
 
 def _refused_repo(connection, row) -> bool:
