@@ -658,6 +658,9 @@ The reserved `sd` namespace declares these settings:
   see [Parallel work](#parallel-work).
 - `sd.review_slots`: how many reviews may run their reviewers at once on this machine; `0` is no cap.
   Absence reads 2. `SD_REVIEW_SLOTS` overrides it for one run. It grants nothing.
+- `sd.bundle_max`: how many items one build bundle takes when this machine claims it, a mechanical item half
+  of one. Absence reads 3. The claim fixes a build child's budget at 120 minutes per 3 slots it took, never
+  less (sd:9109). It grants nothing.
 - `sd.gate_load_max`: the gate queue starts a gate only while load1 is below this; `0` is no load condition.
   Absence is no load condition (sd:2607). `SD_GATE_LOAD_MAX` overrides it for one run. It grants nothing.
 - `sd.gate_settle_seconds`: seconds between two gate starts, and of low load1 while load5 is high; `0` is none.
