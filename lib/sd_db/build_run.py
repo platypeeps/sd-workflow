@@ -674,6 +674,17 @@ def _same_copy(path: Path, target: Path) -> bool:
     return copy.st_size == source.st_size and abs(copy.st_mtime - source.st_mtime) <= 2
 
 
+def _released(connection, path: Path) -> bool:
+    """Whether every run that owns `path` ended and was released: all of the assignment's for its
+    `sd-N.title` or `.body.md`, else the run its name starts with."""
+    owner = re.fullmatch(r"sd-(\d+)\.(?:title|body\.md)", path.name)
+    ended = "SELECT outcome IS NOT NULL AND released_at IS NOT NULL FROM runner_run WHERE "
+    rows = connection.execute(ended + "assignment = ?", (int(owner[1]),)) if owner \
+        else connection.execute(ended + "id = ?", (path.name.split(".", 1)[0],))
+    released = [row[0] for row in rows]
+    return bool(released) and all(released)
+
+
 class _ArchiveLocked(Exception):
     """`runner_journal.lock` refused the archive lock: held by a live copier when its cause is BlockingIOError."""
 
@@ -713,12 +724,7 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
     """
     pending, cutoff = [], time.time() - settle
     for path in sorted(local.glob("*/build/*")):
-        owner = re.fullmatch(r"sd-(\d+)\.(?:title|body\.md)", path.name)
-        ended = "SELECT outcome IS NOT NULL AND released_at IS NOT NULL FROM runner_run WHERE "
-        rows = connection.execute(ended + "assignment = ?", (int(owner[1]),)) if owner \
-            else connection.execute(ended + "id = ?", (path.name.split(".", 1)[0],))
-        released = [row[0] for row in rows]
-        if not released or not all(released):
+        if not _released(connection, path):
             continue
         try:
             if path.stat().st_mtime > cutoff:
@@ -775,6 +781,9 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
     # A copy still running past the deadline is not in this snapshot; a later tick collects it.
     for path, target in list(copied):
         old, new = str(path), str(target)
+        # A retry may have started and rewritten an assignment's title or body since the scan (sd:8826).
+        if not _released(connection, path) or not _same_copy(path, target):
+            continue
         # The local file goes only after the rows name the copy: a failed write leaves it for the next tick.
         with transaction(connection):
             connection.execute("UPDATE runner_run SET log_path = ? WHERE log_path = ?", (new, old))

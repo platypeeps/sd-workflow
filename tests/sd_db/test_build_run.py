@@ -2396,7 +2396,7 @@ class Archive(Case):
         local = self.root / "local"
         folder = build_run.log_dir(local, str(self.repo))
         folder.mkdir(parents=True)
-        path = folder / name.format(run=self.bundle["id"])
+        path = folder / name.format(run=self.bundle["id"], assignment=self.bundle["assignment"])
         path.write_text("x")
         os.utime(path, (0, 0))
         self.db.execute("UPDATE runner_run SET outcome = 'blocked', released_at = ?, log_path = ?, detail = ? "
@@ -2511,6 +2511,25 @@ class Archive(Case):
             release.set()
             self.join_archive_workers()
         self.assertEqual(moved, [str(target.with_name(later.name))])
+
+    def test_a_retrys_new_body_survives_the_archive(self):
+        """sd:8826: the body moved once every run of its assignment ended; a retry that started and wrote a
+        new body while the copy ran lost it to the unlink after the copy."""
+        path, target = self.ended("sd-{assignment}.body.md")
+        real = shutil.copy2
+
+        def retried(source, destination, *args, **kwargs):
+            real(source, destination, *args, **kwargs)
+            with contextlib.closing(connect(self.database)) as other, other:
+                other.execute("INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, "
+                              "retained_path, created_at, updated_at) SELECT 'retry', assignment, run + 1, "
+                              "repo, branch, owner, work_path, retained_path, created_at, updated_at "
+                              "FROM runner_run WHERE id = ?", (self.bundle["id"],))
+            path.write_text("## Summary\n\nthe retry's body\n")
+
+        with mock.patch.object(build_run.shutil, "copy2", side_effect=retried):
+            self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs), [])
+        self.assertEqual(path.read_text(), "## Summary\n\nthe retry's body\n")
 
     def test_a_failed_copy_never_truncates_the_archived_log(self):
         """sd:8275 lane round 1: a copy opened the archive itself with truncation, so a late or failed copy
