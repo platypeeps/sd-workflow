@@ -1571,6 +1571,7 @@ class Supervisor:
         if session:
             argv += ["--resume", session]
         offset = self.start_offset(role)
+        before = self.read_head()
         self.child(argv, cwd=self.work, name="claude", out=self.log, session=session is None, offset=offset, role=role)
         with open(self.log, "rb") as handle:
             handle.seek(offset)
@@ -1584,10 +1585,18 @@ class Supervisor:
             if not build.write(self.db, self.ident, **fields):
                 raise Lost
             self.once("cost", lambda: self.cost(final))
-        if verdict["state"] == "pass":
+        # A denial the builder got past, its result a success, a new commit of its own and its worktree finished,
+        # is no loss: the review and the gate judge the work, and the report names the call (sd:9054). A fix
+        # round or a resumed run starts ahead, so only a moved head shows this child committed.
+        got_past = (verdict["state"] == "denied" and final.get("subtype") == "success"
+                    and final.get("is_error") is False and before is not None
+                    and self.read_head() not in (None, before) and not self.unfinished())
+        if verdict["state"] == "pass" or got_past:
             if isinstance(final, dict) and isinstance(final.get("result"), str) and final["result"].strip():
+                denied = f"\nDenied on the way: {verdict['calls']}"[:2000] if got_past else ""
                 self.once("report", lambda: add_note(self.db, self.lead, "comment",
-                                                     f"Build run {self.ident} report:\n{final['result'][:8000]}"))
+                                                     f"Build run {self.ident} report:\n{final['result'][:8000]}"
+                                                     f"{denied}"))
             problem = self.unfinished()
             return self.finish("blocked", problem) if problem else then
         if verdict["state"] == "denied":
@@ -1660,6 +1669,13 @@ class Supervisor:
         except Unread:
             return "origin/main"
         return ref.strip() or "origin/main"
+
+    def read_head(self) -> str | None:
+        """The worktree's head, or None when it does not read."""
+        try:
+            return self.head()
+        except Unread:
+            return None
 
     def head(self) -> str:
         return _read([*self.tools.git, "-C", str(self.work), "rev-parse", "HEAD"], env=self.env).strip()

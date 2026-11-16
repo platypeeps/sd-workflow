@@ -577,7 +577,12 @@ def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
         members = _members(connection, assignment, current["status"])
         if not members:
             raise BuildRefused(f"Retry refused: build run {run['id']} has no {current['status']} member")
-        items = reads.items_by_ids(connection, [member["item"] for member in members])
+        items = reads.items_by_ids(connection, [current["item"], *(member["item"] for member in members)])
+        # A member done since the bundle ended, by another build, has nothing to retry: it stays as it ended
+        # (sd:9015). A done lead refuses: the claim would lead with a member, on a new branch and worktree.
+        if _done(items, current["item"]):
+            raise BuildRefused(f"Retry refused: its lead sd:{current['item']} is done")
+        members = [member for member in members if not _done(items, member["item"])]
         queued = []
         for member in members:
             item = items.get(member["item"])
@@ -597,6 +602,10 @@ def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
                      f"{'Send to builder' if finding else 'Retry'} of build run {run['id']}")
         return {"run": run["id"], "queued": [{"id": row["id"], "item": row["item"], "status": row["status"]}
                                              for row in queued]}
+
+
+def _done(items: dict, item: int) -> bool:
+    return item in items and items[item]["status"] == "done"
 
 
 def queue_again(connection, items: list[int], *, who: str, finding: str = "") -> list[dict]:
@@ -633,7 +642,8 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             # A skipped lead of a run still in the lane is no ended bundle: the run holds it no longer (sd:8960).
             if (state and state["status"] in AGAIN and state["run"] is not None
                     and row["status"] == state["status"]
-                    and not (state["run"]["outcome"] is None and state["run"]["step"] in LANE_STEPS)):
+                    and not (state["run"]["outcome"] is None and state["run"]["step"] in LANE_STEPS)
+                    and not _done(reads.items_by_ids(connection, [state["item"]]), state["item"])):
                 leads += [] if lead in leads else [lead]
             else:
                 fresh.append(item)

@@ -125,6 +125,11 @@ FAKE = textwrap.dedent('''
             time.sleep(3)
         if mode == "silent":
             sys.exit(0)
+        if mode == "deny":  # denied a call, the builder stopped with its work unfinished
+            line({"type": "result", "subtype": "success", "is_error": False, "session_id": session,
+                  "result": "denied", "permission_denials": [{"tool_name": "Bash",
+                                                              "tool_input": {"command": "git push"}}]})
+            sys.exit(3)
         Path("work.txt").write_text(Path("work.txt").read_text() + mode + "\\n" if Path("work.txt").exists()
                                     else mode + "\\n")
         git("add", "work.txt")
@@ -162,14 +167,14 @@ FAKE = textwrap.dedent('''
         final = {"type": "result", "subtype": "success", "is_error": False, "permission_denials": [],
                  "session_id": session, "result": f"built ({mode})", "total_cost_usd": 0.42,
                  "usage": {"input_tokens": 10, "output_tokens": 20}}
-        if mode == "deny":
-            final["permission_denials"] = [{"tool_name": "Bash", "tool_input": {"command": "git push"}}]
+        if mode == "deny-read":  # sd:9054: a read denied on the way, the work finished all the same
+            final["permission_denials"] = [{"tool_name": "Bash", "tool_input": {"command": "rtk git show HEAD"}}]
         if mode == "max_turns":
             final.update(subtype="error_max_turns", is_error=True)
         if mode == "other":
             final["session_id"] = "session-of-another-run"
         line(final)
-        sys.exit(3 if mode in ("deny", "exit3") else 0)
+        sys.exit(3 if mode == "exit3" else 0)
     if role == "sd-review":
         work = sys.argv[sys.argv.index("-C") + 1]
         review, args = real("sd-review")
@@ -709,6 +714,27 @@ class Supervise(Case):
         self.write_pr()
         self.plan(claude=["exit3"], sd_review=["clean"])
         self.assertEqual(self.supervisor().run()["step"], "enqueued")
+
+    def test_a_denial_the_builder_got_past_with_its_work_finished_passes(self):
+        """sd:9054: a denied read-only call, then the work finished, is no loss: the run goes on, and the
+        report names the denied call. A denial that left the work unfinished still loses (pack sd:6723)."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["deny-read"], sd_review=["clean"])
+        ended = self.supervisor().run()
+        self.assertEqual((ended.get("outcome"), ended.get("step")), (None, "enqueued"))
+        report = self.db.execute("SELECT body FROM note WHERE item = ? AND body LIKE 'Build run % report:%'",
+                                 (self.items[0],)).fetchone()["body"]
+        self.assertIn("Denied on the way: Bash `rtk git show HEAD`", report)
+
+    def test_a_denied_fix_round_that_committed_nothing_is_a_denial(self):
+        """sd:9054 review: on a fix round the branch is ahead already; a denial passes only when the child
+        itself committed, so one that stopped the fix is a denial, not another review round."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "deny"], sd_review=["blocking", "clean"])
+        ended = self.supervisor().run()
+        self.assertEqual((ended.get("outcome"), len(self.calls("sd-review"))), ("denied", 1))
 
     def test_a_line_of_another_session_blocks(self):
         self.press()
