@@ -517,49 +517,100 @@ class Writes(Case):
                          "the run stays open for steps 7 and 8")
         self.assertFalse(build.enqueued(self.db, self.bundle["id"]), "enqueued once")
 
-    def test_a_member_no_trailer_names_reads_merging_not_blocked(self):
-        """sd:8960: a member the branch names in no `Closes:` trailer waits on the merge with its bundle: its
-        assignment stays running and reads merging, its item stays open with a note, and the run's end closes it."""
+    def skip(self, item, *, question=False):
+        """Enqueue the bundle with `item` named in no `Closes:` trailer, the builder asking about it or not."""
         build.write(self.db, self.bundle["id"], step="enqueuing")
-        self.assertTrue(build.enqueued(self.db, self.bundle["id"], [self.items[0]]))
-        self.assertEqual([m["status"] for m in build.run(self.db, self.bundle["id"])["members"]], ["done", "running"])
-        self.assertEqual(self.statuses(self.items), ["in_progress", "in_progress"])
-        note = self.db.execute("SELECT kind, body FROM note WHERE item = ? AND body LIKE '%Closes: sd:%'",
-                               (self.items[1],)).fetchone()
-        self.assertEqual(note["kind"], "comment")
-        self.assertIn("returns it to planning", note["body"])
-        self.assertIn(f"`Closes: sd:{self.items[1]}`", note["body"])
-        self.assertEqual([(row["item"], row["status"]) for row in today.builds(self.db)], [(self.items[1], "merging")])
-        self.assertEqual(build.end(self.db, self.bundle["id"], "done", "cleaned")["outcome"], "done")
-        self.assertEqual([m["status"] for m in build.run(self.db, self.bundle["id"])["members"]], ["done", "done"])
-        self.assertEqual(self.statuses(self.items), ["in_progress", "planning"],
-                         "lane finding #57141: an undelivered member returns to planning, not ready, at the run's end")
+        if question:
+            add_note(self.db, item, "question", "Which?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, self.bundle["id"], [other for other in self.items if other != item]))
+
+    def build_again(self, item):
+        """The operator's way back for a skipped item while its old run sits at `enqueued`: Ready, then Build."""
+        workflow.change_status(self.db, item, "ready", who="operator")
+        return build.queue_again(self.db, [item], who="operator")
+
+    def test_a_member_no_trailer_names_ends_at_enqueue_and_returns_to_planning(self):
+        """sd:8960, lane review of build/sd-1049: a member the builder skipped with no question ends at enqueue and
+        its item returns to planning with a note naming the run; nothing reads it blocked, and the run holds it no
+        longer, so the operator may move it and build it while the bundle waits on the lane."""
+        self.skip(self.items[1])
+        self.assertEqual([m["status"] for m in build.run(self.db, self.bundle["id"])["members"]], ["done", "cancelled"])
+        self.assertEqual(self.statuses(self.items), ["in_progress", "planning"])
         reason = self.db.execute("SELECT body FROM note WHERE item = ? AND kind = 'status_change' ORDER BY id DESC",
                                  (self.items[1],)).fetchone()["body"]
         self.assertIn(self.bundle["id"], reason, "the note names the run")
+        self.assertIn(f"`Closes: sd:{self.items[1]}`", reason)
+        self.assertEqual(today.builds(self.db), [], "no blocked, running or merging row for it")
+        self.assertEqual([row["item"] for row in self.build_again(self.items[1])], [self.items[1]])
+        self.assertEqual(self.claim()["members"][0]["item"], self.items[1], "the claim's re-check takes it too")
 
-    def test_a_failed_lane_entry_returns_the_member_no_trailer_names_to_planning(self):
-        """Lane finding #57141: a lane failure ends the held member too; its item does not stay in_progress."""
-        build.write(self.db, self.bundle["id"], step="enqueuing")
-        build.enqueued(self.db, self.bundle["id"], [self.items[0]])
-        read = dict(self.db.execute("SELECT * FROM runner_run WHERE id = ?", (self.bundle["id"],)).fetchone())
-        self.assertTrue(build.lane_failed(self.db, read, "lane failed in prepare"))
-        self.assertEqual(build.run(self.db, self.bundle["id"])["members"][1]["status"], "done")
-        self.assertEqual(self.statuses(self.items)[1], "planning")
-
-    def test_a_cancelled_lane_run_cancels_the_member_no_trailer_names(self):
-        build.write(self.db, self.bundle["id"], step="enqueuing")
-        build.enqueued(self.db, self.bundle["id"], [self.items[0]])
-        build.end(self.db, self.bundle["id"], "cancelled", "cancelled by operator")
-        self.assertEqual([m["status"] for m in build.run(self.db, self.bundle["id"])["members"]],
-                         ["cancelled", "cancelled"])
-
-    def test_a_member_skipped_with_an_open_question_is_blocked(self):
-        build.write(self.db, self.bundle["id"], step="enqueuing")
-        add_note(self.db, self.items[1], "question", "Which?\nOption: A (Recommended)\nOption: B")
-        build.enqueued(self.db, self.bundle["id"], [self.items[0]])
-        self.assertEqual([m["status"] for m in build.run(self.db, self.bundle["id"])["members"]], ["done", "blocked"])
+    def test_a_member_skipped_with_an_open_question_is_blocked_and_free(self):
+        """Lane review of build/sd-1049 (live: sd:8848): a member skipped with a question ends
+        blocked, and the open run at `enqueued` neither refuses its cancel nor holds its item against a build."""
+        self.skip(self.items[1], question=True)
+        members = build.run(self.db, self.bundle["id"])["members"]
+        self.assertEqual([m["status"] for m in members], ["done", "blocked"])
         self.assertEqual(self.statuses(self.items), ["in_progress", "blocked"])
+        cancel = operations.assignment_state(self.db, members[1]["id"])["capabilities"]["cancel"]
+        self.assertEqual(cancel, {"allowed": True, "reason": ""})
+        self.assertEqual([row["item"] for row in self.build_again(self.items[1])], [self.items[1]])
+
+    def test_a_skipped_lead_is_a_fresh_build_while_its_run_is_in_the_lane(self):
+        """A skipped lead's bundle reads its status, yet its run still waits on the lane for the other members:
+        `sd assignments build` takes it as a fresh build, not a Retry the open run refuses."""
+        for question in (False, True):
+            with self.subTest(question=question):
+                self.setUp()
+                self.skip(self.items[0], question=question)
+                self.assertEqual([row["item"] for row in self.build_again(self.items[0])], [self.items[0]])
+
+    def test_a_delivered_member_still_holds_its_item(self):
+        """Guard: at a lane step the run holds each member it delivers; the lane owns that item until the merge."""
+        self.skip(self.items[1])
+        transition(self.db, self.items[0], "ready", who="operator", reason="fixture")
+        with self.assertRaisesRegex(build.BuildRefused, "held by build run"):
+            build.queue(self.db, [self.items[0]], who="operator")
+
+    def test_a_held_lane_run_holds_every_member(self):
+        """Guard: a held run (`blocked` or `abandoned`) keeps its lease while a process may live: every member stays
+        held, a skipped one too, until a reap releases the run."""
+        self.skip(self.items[1])
+        build.abandon(self.db, "fixture restore")
+        transition(self.db, self.items[1], "ready", who="operator", reason="fixture")
+        with self.assertRaisesRegex(build.BuildRefused, "held by build run"):
+            build.queue(self.db, [self.items[1]], who="operator")
+
+    def test_the_run_end_leaves_a_skipped_member_as_it_is(self):
+        """A done, failed or cancelled end of the run touches only the members it delivered: a skipped item the
+        operator queued again stays queued, and a cancel moves no planning item to ready."""
+        for outcome in ("done", "lane_failed", "cancelled"):
+            with self.subTest(outcome=outcome):
+                self.setUp()
+                self.skip(self.items[1])
+                again = self.build_again(self.items[1])[0]["id"]
+                if outcome == "lane_failed":
+                    read = dict(self.db.execute("SELECT * FROM runner_run WHERE id = ?",
+                                                (self.bundle["id"],)).fetchone())
+                    self.assertTrue(build.lane_failed(self.db, read, "lane failed in prepare"))
+                else:
+                    build.end(self.db, self.bundle["id"], outcome, f"{outcome} by fixture")
+                self.assertEqual(self.statuses(self.items)[1], "ready")
+                self.assertEqual(self.db.execute("SELECT status FROM assignment WHERE id = ?", (again,)).fetchone()[0],
+                                 "queued")
+                self.assertEqual(build.run(self.db, self.bundle["id"])["members"][1]["status"], "cancelled")
+
+    def test_enqueued_writes_nothing_when_a_skipped_member_cannot_move(self):
+        """Failure table, enqueued: the run's step, the lease, the members and the items move in one transaction;
+        a failed item move leaves the run at `enqueuing` with its lease, for the supervisor to enqueue again."""
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        with mock.patch.object(build, "transition", side_effect=RuntimeError("disk full")):
+            with self.assertRaises(RuntimeError):
+                build.enqueued(self.db, self.bundle["id"], [self.items[0]])
+        self.assertEqual(build.run(self.db, self.bundle["id"])["step"], "enqueuing")
+        self.assertEqual([m["status"] for m in build.run(self.db, self.bundle["id"])["members"]], ["running", "running"])
+        self.assertEqual(self.count("SELECT COUNT(*) FROM runner_lease WHERE released_at IS NULL"), 1)
+        self.assertTrue(build.enqueued(self.db, self.bundle["id"], [self.items[0]]))
+        self.assertEqual(self.statuses(self.items), ["in_progress", "planning"])
 
     def test_an_enqueued_bundle_frees_its_repository_slot(self):
         """Sd:8277: the lane is serial on its own; a bundle in it no longer holds the next bundle back."""

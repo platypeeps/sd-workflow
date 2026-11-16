@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from . import hub
-from .build import HEALTH, LANE_STEPS
+from .build import HEALTH
 from .reads import (
     IDEA_KINDS,
     REVIEW_BATCH,
@@ -437,18 +437,13 @@ def builds(connection: sqlite3.Connection, *, repos: Iterable[str | None] | None
     Each is `assignment`, `lead` (its bundle's lead, itself when it leads), `item`, `repo`, `title`, `status`,
     `since`, `step` (its own newest run's), and `why`: for a blocked one the first line of the reason its own newest
     run ended with, else of its own result, which a member with no run of its own, or one never built, carries.
-    A running one whose bundle's open run is at a lane step reads `merging` (sd:8960): no trailer named it, so it
-    waits on review with the bundle and the merge leaves its item open.
     """
     where, values = repo_in("item.repo", _keep(repos))
     rows = connection.execute(
         f"""
         SELECT assignment.id AS assignment, COALESCE(assignment.parent, assignment.id) AS lead,
                assignment.item, item.repo, item.title, assignment.status, assignment.queued_at AS since,
-               assignment.result, run.step, run.detail,
-               (SELECT lead.step FROM runner_run AS lead
-                 WHERE lead.assignment = COALESCE(assignment.parent, assignment.id) AND lead.released_at IS NULL
-                 ORDER BY lead.run DESC LIMIT 1) AS lead_step
+               assignment.result, run.step, run.detail
           FROM assignment JOIN item ON item.id = assignment.item
           LEFT JOIN runner_run AS run ON run.rowid = (SELECT rowid FROM runner_run
                                                       WHERE runner_run.assignment = assignment.id
@@ -458,8 +453,7 @@ def builds(connection: sqlite3.Connection, *, repos: Iterable[str | None] | None
          ORDER BY assignment.queued_at, assignment.id
         """, (*BUILD_STATES, *values)).fetchall()
     return [{"assignment": row["assignment"], "lead": row["lead"], "item": row["item"], "repo": row["repo"],
-             "title": row["title"], "since": row["since"], "step": row["step"],
-             "status": "merging" if row["status"] == "running" and row["lead_step"] in LANE_STEPS else row["status"],
+             "title": row["title"], "status": row["status"], "since": row["since"], "step": row["step"],
              "why": _first_line(row["detail"] or row["result"]) if row["status"] == "blocked" else ""}
             for row in rows]
 
