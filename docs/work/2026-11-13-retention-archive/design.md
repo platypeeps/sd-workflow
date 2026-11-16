@@ -7,6 +7,8 @@ branch: build/bundle-8655
 
 # Design — retention-archive
 
+Superseded by sd:9064: the archive is gone; old checkpoint rows are deleted outright.
+
 Write this page only for a change that moves state in steps.
 The item's row holds status, progress and decisions; this page holds the shape.
 
