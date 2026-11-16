@@ -552,6 +552,16 @@ class Writes(Case):
         self.assertEqual([row["item"] for row in self.build_again(self.items[1])], [self.items[1]])
         self.assertEqual(self.claim()["members"][0]["item"], self.items[1], "the claim's re-check takes it too")
 
+    def test_a_member_no_trailer_names_gets_a_followup(self):
+        """sd:8994: the move to planning left no followup, so nothing asked the operator to check whether the
+        skipped member's work landed; `_block` leaves one, and so does this branch."""
+        self.skip(self.items[1])
+        bodies = [row["body"] for row in self.db.execute(
+            "SELECT body FROM note WHERE item = ? AND kind = 'followup'", (self.items[1],))]
+        self.assertEqual(len(bodies), 1, bodies)
+        self.assertIn(self.bundle["id"], bodies[0])
+        self.assertIn("check whether its work landed", bodies[0])
+
     def test_a_member_skipped_with_an_open_question_is_blocked_and_free(self):
         """Lane review of build/sd-1049 (live: sd:8848): a member skipped with a question ends
         blocked, and the open run at `enqueued` neither refuses its cancel nor holds its item against a build."""
