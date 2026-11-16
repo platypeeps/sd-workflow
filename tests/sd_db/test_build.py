@@ -580,6 +580,13 @@ class Writes(Case):
         with self.assertRaisesRegex(build.BuildRefused, "held by build run"):
             build.queue(self.db, [self.items[0]], who="operator")
 
+    def test_an_open_run_with_no_step_still_holds_its_items(self):
+        """Gate failure of ebce96efb: `step IN (...)` is NULL on a NULL step, and `NOT NULL` dropped the hold; an
+        open run with no step recorded still holds every member."""
+        self.db.execute("UPDATE runner_run SET step = NULL WHERE id = ?", (self.bundle["id"],))
+        for item in self.items:
+            self.assertIn("held by build run", build._held(self.db, item) or "")
+
     def test_a_held_lane_run_holds_every_member(self):
         """Guard: a held run (`blocked` or `abandoned`) keeps its lease while a process may live: every member stays
         held, a skipped one too, until a reap releases the run."""

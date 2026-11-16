@@ -123,7 +123,9 @@ LOSSES = ("interrupted", "timed_out", "error_max_turns", "denied")
 #: Only `enqueued` has no supervisor, so only it is left out of the reap.
 LANE_STEPS = ("enqueued", "checking", "cleaning")
 #: An open `runner_run` at a lane step, as SQL: it holds only the members it delivered (`_holding`, sd:8960).
-IN_LANE = (f"(runner_run.outcome IS NULL AND runner_run.step IN ({', '.join(repr(step) for step in LANE_STEPS)}))")
+#: Never NULL: callers negate it, and `NOT NULL` would drop the hold of a run with no step (gate of ebce96efb).
+IN_LANE = (f"(runner_run.outcome IS NULL AND runner_run.step IS NOT NULL "
+           f"AND runner_run.step IN ({', '.join(repr(step) for step in LANE_STEPS)}))")
 #: An unmanaged repository's run at `enqueued` names its draft pull request in `detail`, which a lane run leaves
 #: unset until it ends: the tick's watch reads that pull request, not the lane (pack sd:7868).
 DRAFT_PULL = "draft pull request "
@@ -883,7 +885,7 @@ def _holding(item: str) -> str:
     return (f"SELECT runner_run.id, runner_run.outcome FROM assignment holder JOIN runner_run "
             f"ON runner_run.assignment = COALESCE(holder.parent, holder.id) WHERE holder.item = {item} "
             f"AND holder.scope = '{SCOPE}' AND runner_run.released_at IS NULL AND NOT ({IN_LANE} "
-            f"AND holder.status != 'done')")
+            f"AND holder.status IS NOT 'done')")
 
 
 def _held(connection, item: int) -> str | None:
