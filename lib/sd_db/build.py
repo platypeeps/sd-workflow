@@ -541,23 +541,6 @@ def queue(connection, items: list[int], *, who: str, expected_revisions: dict | 
         return [queue_state(connection, ident) for ident in created]
 
 
-def file_and_queue(connection, capture, *, who: str) -> dict:
-    """File-then-build (pack sd:8113, sd:8794): `capture()` files the task, or answers the open one (`existing`);
-    a new one goes to ready and its build queues as the Build press queues it, in `queued`. A refused build leaves
-    the item filed, ready, and names why in `build_error`; nothing retries it."""
-    from .workflow import change_status, item_state
-    state = capture()
-    if state.get("existing"):
-        return state
-    item = state["item"]["id"]
-    change_status(connection, item, "ready", who=who, expected_revision=state["revision"])
-    try:
-        queued = queue(connection, [item], who=who)
-    except BuildRefused as refusal:
-        return {**item_state(connection, item), "existing": False, "build_error": str(refusal)}
-    return {**item_state(connection, item), "existing": False, "queued": queued}
-
-
 def retry_state(connection, run: dict) -> dict:
     """Retry on an ended run: only the lead's latest run, released, whose bundle ended blocked or cancelled.
 
@@ -619,7 +602,9 @@ def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
 def queue_again(connection, items: list[int], *, who: str, finding: str = "") -> list[dict]:
     """`sd assignments build`: an item whose latest build bundle ran and ended blocked or cancelled is Retry of that
     bundle (`retry`, its assignments and worktree kept); one whose lane entry failed is Fix (`lane_fix`, pack sd:8791);
-    every other item is the Build press (`queue`). One transaction, so one refusal writes nothing (pack sd:8785).
+    every other item is the Build press (`queue`), a `planning` one set ready first: the one verb that starts a
+    build, so a task just filed builds with no status step (sd:9063). One transaction, so one refusal writes
+    nothing, the ready step included (pack sd:8785).
     A `finding` is Send to builder on a Retry or a Fix; a fresh build has no builder to send it to (pack sd:8792)."""
     if not items or len(set(items)) != len(items) or any(type(item) is not int for item in items):
         raise BuildRefused("select one or more distinct items")
@@ -661,6 +646,12 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                              finding or f"the lane entry failed; fix what it names: {run['detail']}"[:2000], who=who)
             queued += [{"id": member["id"], "item": member["item"], "status": "queued"}
                        for member in _members(connection, run["assignment"], "queued") if member["item"] in fixed]
+        if fresh:
+            from .workflow import change_status, item_state
+            for item in fresh:
+                state = item_state(connection, item)
+                if state["item"]["status"] == "planning":
+                    change_status(connection, item, "ready", who=who, expected_revision=state["revision"])
         return queued + (queue(connection, fresh, who=who) if fresh else [])
 
 
