@@ -188,6 +188,8 @@
     const dlg = document.createElement('dialog');
     dlg.className = 'palette date-dlg start-dlg'; dlg.setAttribute('aria-labelledby', 'build-h');
     document.body.append(dlg);
+    // What each item waited on before the press (pack sd:8964): its park and the reason of its last wait.
+    const wait = r => r.parked_at || r.waited ? html` <small class="why">${r.parked_at ? html`parked <time class="rel" datetime="${r.parked_at}"></time>` : ''}${r.parked_at && r.waited ? ' · ' : ''}${r.waited ? `Last waited: ${r.waited.why} (note #${r.waited.note})` : ''}</small>` : '';
     async function ask(objs, done) {
       const rows = objs.map(row).filter(Boolean);
       if (!rows.length) { toast('Build: no listed task is selected'); return; }
@@ -203,7 +205,7 @@
         ${P.refused.length ? html`<p class="why">▲ Nothing can be queued while one item is refused:</p>
           <ul class="start-list">${P.refused.map(r => html`<li><code>#${String(r.id)}</code> ${r.why}</li>`)}</ul>` : ''}
         ${P.bundles.map(b => html`<section class="build-bundle" aria-label="Bundle in ${b.name}"><h3>${b.name} <small>${b.model} · branch ${b.branch} · ${b.host ? `runs on ${b.host}, whose dispatcher beat ${b.beat} s ago` : b.room ? `${b.room} may start now` : 'waits for room'}</small></h3>
-          <ol class="start-list">${b.items.map(r => html`<li><code>#${String(r.id)}</code> ${r.title}</li>`)}</ol></section>`)}
+          <ol class="start-list">${b.items.map(r => html`<li><code>#${String(r.id)}</code> ${r.title}${wait(r)}</li>`)}</ol></section>`)}
         <p class="why">One run per bundle, ${String(P.budget_minutes)} min each. The items lock until each run ends; Cancel on Queue › Builds stops one.</p>
         <div class="actions">
           ${ok ? html`<button class="btn" value="build" type="submit">Build</button>` : ''}

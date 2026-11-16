@@ -2296,6 +2296,18 @@ R.shown = D.html; R.before = OUT.posts.length; D.returnValue = 'start'; D.onclos
 const D = MADE.find(e => /id="build-h"/.test(e.html || '')); R.shown = D ? D.html : null; R.before = OUT.posts.length;
 if (D) { D.returnValue = 'build'; D.onclose(); await flush(); }"""
 
+    def test_build_shows_each_items_wait_before_the_press(self):
+        """Pack sd:8964: the dialog shows a row's parked_at and the reason it last waited, from the plan."""
+        plan = self.ids["plan"]
+        shown = self.build_plan(plan)
+        shown["bundles"][0]["items"][0].update(parked_at="2026-11-01T00:00:00+00:00",
+                                               waited={"note": 50962, "why": "waits on the <next> trial"})
+        answer = (f"(path, body) => path.startsWith('/api/tasks/build/plan') ? [200, {json.dumps(shown)}] : "
+                  "[404, { error: 'no answer' }]")
+        out = self.run_page(self.BUILD.replace("ITEM", str(plan)), answer)
+        self.assertIn('Last waited: waits on the &lt;next&gt; trial (note #50962)', out["R"]["shown"])
+        self.assertIn('parked <time class="rel" datetime="2026-11-01T00:00:00+00:00"></time>', out["R"]["shown"])
+
     def test_build_refuses_a_ready_item_with_no_repository(self):
         """Pack sd:7275. The row's repo reads 'no repo' (TD.shape), so the check reads repo_path."""
         ask = self.ids["ask"]
