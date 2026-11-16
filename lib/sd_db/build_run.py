@@ -1584,10 +1584,16 @@ class Supervisor:
             if not build.write(self.db, self.ident, **fields):
                 raise Lost
             self.once("cost", lambda: self.cost(final))
-        if verdict["state"] == "pass":
+        # A denial the builder got past, its result a success and its worktree finished, is no loss: the
+        # review and the gate judge the work, and the report names the call (sd:9054).
+        got_past = (verdict["state"] == "denied" and final.get("subtype") == "success"
+                    and final.get("is_error") is False and not self.unfinished())
+        if verdict["state"] == "pass" or got_past:
             if isinstance(final, dict) and isinstance(final.get("result"), str) and final["result"].strip():
+                denied = f"\nDenied on the way: {verdict['calls']}"[:2000] if got_past else ""
                 self.once("report", lambda: add_note(self.db, self.lead, "comment",
-                                                     f"Build run {self.ident} report:\n{final['result'][:8000]}"))
+                                                     f"Build run {self.ident} report:\n{final['result'][:8000]}"
+                                                     f"{denied}"))
             problem = self.unfinished()
             return self.finish("blocked", problem) if problem else then
         if verdict["state"] == "denied":
