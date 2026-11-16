@@ -781,8 +781,11 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
                     with contextlib.suppress(OSError):
                         part.unlink(missing_ok=True)
                     continue
-                if signature == before:  # a source rewritten mid-copy waits for a later tick
+                if signature == before:
                     copied.append((path, target, before))
+                else:  # a source rewritten mid-copy: its torn copy goes, so no later `_same_copy` takes it (sd:8989)
+                    with contextlib.suppress(OSError):
+                        target.unlink(missing_ok=True)
         finally:
             held.close()
 

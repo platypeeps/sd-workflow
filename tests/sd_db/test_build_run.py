@@ -2532,6 +2532,23 @@ class Archive(Case):
             self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs), [])
         self.assertEqual(path.read_text(), "## Summary\n\nthe retry's body\n")
 
+    def test_a_source_rewritten_mid_copy_leaves_no_torn_copy(self):
+        """sd:8989: the copy of a source rewritten mid-copy stayed in place, and its size and mtime could match
+        the new source, so the next tick's `_same_copy` took the torn copy as finished and removed the source."""
+        path, target = self.ended("sd-{assignment}.body.md")
+
+        def torn(source, destination, *args, **kwargs):
+            Path(source).write_text("new")
+            Path(destination).write_text("old")  # the old bytes, as long as the new source
+            shutil.copystat(source, destination)
+
+        with mock.patch.object(build_run.shutil, "copy2", side_effect=torn):
+            self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs), [])
+        self.assertFalse(target.exists(), "a copy whose source moved is removed")
+        os.utime(path, (0, 0))
+        self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs), [str(target)])
+        self.assertEqual(target.read_text(), "new")
+
     @staticmethod
     def landed_copy_stat(target: Path, landed):
         """Patch `Path.stat` so a stat of `target` once its copy landed calls `landed()` instead."""
