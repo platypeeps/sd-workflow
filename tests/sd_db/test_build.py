@@ -1648,6 +1648,40 @@ class Hosts(Case):
         self.assertIsNone(self.claim(hosts=HUB), "the satellite's retry waits for the satellite")
         self.assertEqual(self.claim(hosts=WORK)["owner"], "fixture@work")
 
+    def stale(self, host="work"):
+        """`host`'s dispatcher beat, too old to read as alive."""
+        stamp = (datetime.fromisoformat(build.clock()) - timedelta(seconds=build.STALE_SECONDS + 1)).isoformat()
+        record_state(self.db, "heartbeat", key=f"build-dispatch@{host}", timestamp=stamp, body={})
+
+    def test_a_hub_retry_behind_another_row_is_not_blocked_on_the_satellites_quiet_beat(self):
+        """sd:8991 review round 2: the quiet-dispatcher refusal ran before `_ran_on` routed the later rows, so the
+        retry of the hub's fallback build, queued behind another row, blocked once its satellite went quiet."""
+        build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
+        fallback = self.claim(hosts=HUB)
+        self.retried(fallback)
+        build.queue(self.db, [self.item(priority=1)], who="operator")
+        self.stale()
+        self.claim(hosts=HUB)
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", fallback["assignment"]), "queued")
+        self.assertEqual(self.claim(hosts=HUB)["assignment"], fallback["assignment"], "the hub rebuilds it")
+
+    def test_another_satellite_blocks_no_quiet_satellites_row(self):
+        """sd:8991 review round 2: the refusal ran outside the hub's guard, so one satellite blocked another's rows."""
+        build.queue(self.db, [self.item(repo=SAT)], who="operator")
+        self.stale()
+        self.assertIsNone(self.claim(hosts=frozenset({"other"})))
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE status = 'blocked'"), 0)
+
+    def test_a_quiet_satellites_rows_are_blocked_once(self):
+        """sd:8991 review round 2: the refusal ran once per queued row, writing each blocked note that many times."""
+        items = [self.item(repo=SAT), self.item(repo=SAT)]
+        build.queue(self.db, items, who="operator")
+        self.stale()
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual([self.count("SELECT COUNT(*) FROM note WHERE item = ? AND body LIKE 'Build assignment % "
+                                     "blocked:%'", item) for item in items], [1, 1])
+
     def test_the_hubs_fallback_retry_stays_on_the_hub(self):
         """sd:8991 review: the retry of a bundle the hub built for a busy satellite moved back to the satellite,
         whose disk holds none of its work."""

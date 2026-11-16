@@ -997,10 +997,11 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             ran = _ran_on(connection, row)
             if ran is not None:
                 lanes[row["id"]] = lane_of(connection, ran[0])
+        if None in hosts:
             # The hub blocks another host's row once that host's dispatcher went quiet: a lane moved after the
             # press, or a dispatcher that died after it, would leave the item locked with no word. A fresh beat
             # that names a `why` leaves the row queued, as that reason may last one tick (review round 5), until
-            # `STUCK_TICKS` beats in a row name one (sd:8081).
+            # `STUCK_TICKS` beats in a row name one (sd:8081). Only once every row is routed (sd:8991).
             for row in queued:
                 away = lanes[row["id"]]
                 gone = (dispatcher_gone(connection, away) or dispatcher_stuck(connection, away)
