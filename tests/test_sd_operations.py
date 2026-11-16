@@ -521,16 +521,18 @@ class OperationsCLI(unittest.TestCase):
                             clear=True):
                 load, cap = cli.gate_load()
         self.assertIsInstance(load, float)
-        self.assertEqual(cap, 0.0, "the gate's default load rule is off, which `build.room` reads as no cap")
+        self.assertEqual(cap, 1.5 * os.cpu_count(), "sd:9094: the builder cap, not the gate's rule, which is off")
 
     def test_gate_load_is_unread_on_any_odd_answer(self):
         answers = [("", 1), ("{}", 0), (json.dumps({"load": [1, float("nan"), 1], "load_max": 40}), 0),
-                   (json.dumps({"load": [1.0, 2.5, 3.0], "load_max": 40}), 0)]
+                   (json.dumps({"load": [1.0, 2.5, 3.0], "load_max": 0}), 0)]
         found = []
         for stdout, code in answers:
-            with patch.object(cli.subprocess, "run", return_value=Mock(stdout=stdout, returncode=code)):
+            with patch.object(cli.subprocess, "run", return_value=Mock(stdout=stdout, returncode=code)), \
+                    patch("os.cpu_count", return_value=16):
                 found.append(cli.gate_load())
-        self.assertEqual(found, [(None, None), (None, None), (None, None), (2.5, 40.0)])
+        # sd:9094: the gate's load rule off (0) leaves the builder cap, 1.5x the cores.
+        self.assertEqual(found, [(None, None), (None, None), (None, None), (2.5, 24.0)])
 
     def test_invalid_assignment_identity_refuses_and_closes_connection(self):
         with self.assertRaises(cli.WorkRefusal):
