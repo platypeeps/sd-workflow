@@ -99,9 +99,12 @@ when the run's repository reads unmanaged.
 
 Rejected: letting `sd-check` or `sd-ship` run in an unmanaged checkout.
 Both refuse there on purpose (sd:2566), and `sd-ship` writes receipts and
-merges. Superseded by sd:9100 (operator 2026-11-16): a plain
-`sd-check` and `sd-ship prepare` and `merge` now run there, with no
-receipt; `--record-receipt` and the lane still refuse.
+merges.
+Correction (2026-11-16): the operator's ruling, note #58478 on
+sd:9100, later accepted `sd-ship`, `sd-check` and `sd-status` in an
+unmanaged repo, for one surface for unmanaged repos. `sd-ship`
+`prepare` and `merge` go through GitHub alone, a plain `sd-check`
+records no receipt, and `--record-receipt` and the lane still refuse.
 Rejected: a new run column for the mode. The run's `detail` is
 unset on an open run until it ends, so it carries the draft's address at
 `enqueued` with no schema change.
