@@ -122,6 +122,10 @@ LOSSES = ("interrupted", "timed_out", "error_max_turns", "denied")
 #: The steps from `enqueued` on: the lease is released, the members are `done`, and step 7 releases the run.
 #: Only `enqueued` has no supervisor, so only it is left out of the reap.
 LANE_STEPS = ("enqueued", "checking", "cleaning")
+#: An open `runner_run` at a lane step, as SQL: it holds only the members it delivered (`_holding`, sd:8960).
+#: Never NULL: callers negate it, and `NOT NULL` would drop the hold of a run with no step (gate of ebce96efb).
+IN_LANE = (f"(runner_run.outcome IS NULL AND runner_run.step IS NOT NULL "
+           f"AND runner_run.step IN ({', '.join(repr(step) for step in LANE_STEPS)}))")
 #: An unmanaged repository's run at `enqueued` names its draft pull request in `detail`, which a lane run leaves
 #: unset until it ends: the tick's watch reads that pull request, not the lane (pack sd:7868).
 DRAFT_PULL = "draft pull request "
@@ -604,8 +608,10 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             # resume, so it is a fresh press, as the dashboard's "it never ran" hint says. A bundle may end mixed
             # (`enqueued` marks a delivered member done): `retry` takes only members in the lead's status, so the
             # item's own assignment must be in it, or Retry would requeue the lead's items and not this one.
+            # A skipped lead of a run still in the lane is no ended bundle: the run holds it no longer (sd:8960).
             if (state and state["status"] in AGAIN and state["run"] is not None
-                    and row["status"] == state["status"]):
+                    and row["status"] == state["status"]
+                    and not (state["run"]["outcome"] is None and state["run"]["step"] in LANE_STEPS)):
                 leads += [] if lead in leads else [lead]
             else:
                 fresh.append(item)
@@ -872,11 +878,14 @@ def _holding(item: str) -> str:
 
     A held run (`blocked` or `abandoned`) keeps its lease while a process
     may live in its worktree; the item's status may move, but no build of it
-    starts until a reap releases that run.
+    starts until a reap releases that run. An open run at a lane step holds
+    only the members it delivered (`done`): one `enqueued` left out is free
+    to build while the lane takes the rest (sd:8960).
     """
     return (f"SELECT runner_run.id, runner_run.outcome FROM assignment holder JOIN runner_run "
             f"ON runner_run.assignment = COALESCE(holder.parent, holder.id) WHERE holder.item = {item} "
-            f"AND holder.scope = '{SCOPE}' AND runner_run.released_at IS NULL")
+            f"AND holder.scope = '{SCOPE}' AND runner_run.released_at IS NULL AND NOT ({IN_LANE} "
+            f"AND holder.status IS NOT 'done')")
 
 
 def _held(connection, item: int) -> str | None:
@@ -1198,9 +1207,14 @@ def enqueuing(connection, ident: str) -> bool:
 def enqueued(connection, ident: str, delivered: Collection[int] | None = None, *, held_by: str = "the lane") -> bool:
     """The `enqueued` step: the lease released and the members `done`, the items left `in_progress` for the lane.
 
-    `delivered` is the items the lane entry delivers; a member outside it
-    (the builder skipped it) ends `blocked` with its item and a note, so the
-    merge leaves it open. None delivers every member. The run stays open,
+    `delivered` is the items the lane entry delivers; the merge leaves a
+    member outside it open, and the run holds it no longer (`_holding`).
+    One the builder skipped with an open question ends `blocked` with its
+    item. Any other ends `cancelled`, and its item returns to `planning`
+    with a note naming the run: no delivery is established, and `ready`
+    would let auto-pickup requeue it unseen (sd:8960). Not `done`: each
+    reader of a lane-step run's `done` members takes them as delivered.
+    None delivers every member. The run stays open,
     `released_at` and `outcome` null, until step 7 ends it; `reap` skips it
     meanwhile. One compare-and-set on the run, open and not yet at a lane
     step; False, with no row changed, for a late supervisor whose run was
@@ -1217,7 +1231,8 @@ def enqueued(connection, ident: str, delivered: Collection[int] | None = None, *
                 f"AND outcome IS NULL AND cancel_requested IS NULL AND (step IS NULL OR step NOT IN ({marks}))",
                 (stamp, ident, *LANE_STEPS)).rowcount != 1:
             return False
-        lead = connection.execute("SELECT assignment FROM runner_run WHERE id = ?", (ident,)).fetchone()["assignment"]
+        run = connection.execute("SELECT assignment, created_at FROM runner_run WHERE id = ?", (ident,)).fetchone()
+        lead = run["assignment"]
         connection.execute("UPDATE runner_lease SET released_at = ? WHERE run = ? AND released_at IS NULL", (stamp, ident))
         members = _members(connection, lead)
         skipped = [member for member in members if delivered is not None and member["item"] not in delivered]
@@ -1226,8 +1241,15 @@ def enqueued(connection, ident: str, delivered: Collection[int] | None = None, *
                 connection.execute("UPDATE assignment SET status = 'done', ended = ?, result = ? WHERE id = ?",
                                    (stamp, f"build run {ident} enqueued in {held_by}", member["id"]))
         for member in skipped:
-            _block(connection, [member], f"build run {ident} enqueued no commit with a `Closes: sd:{member['item']}` "
-                                         "trailer, so the merge leaves this item open", stamp)
+            missing = f"build run {ident} enqueued no commit with a `Closes: sd:{member['item']}` trailer"
+            if open_question(connection, [member["item"]], run["created_at"]):
+                _block(connection, [member], f"{missing}, so the merge leaves this item open", stamp)
+            else:
+                connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
+                                   (stamp, f"{missing}, so the item returns to planning", member["id"]))
+                # `_move`, as `_block` moves: an item the operator closed meanwhile stays closed (lead review).
+                _move(connection, member["item"], "planning",
+                      f"{missing}: check whether its work landed, then close it or queue it again")
         return True
 
 

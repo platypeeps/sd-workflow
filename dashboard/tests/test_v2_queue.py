@@ -1702,6 +1702,15 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertIn("· on work · log <code>/logs/r1.jsonl</code>", out["R"]["alpha"])
         self.assertNotIn("tail -f", out["R"]["alpha"])
 
+    def test_a_run_in_the_lane_reads_merging_not_working(self):
+        """sd:8960: a build run at `enqueued` waits on review, so its row says merging."""
+        run = {**self.BUILDS["runs"][0], "step": "enqueued", "state": "merging", "why": "waits on review"}
+        out = self.run_view("open('alpha'); R.alpha = ELS.queue.html;",
+                            answers={"/api/queue/builds?show=all": [200, {**self.BUILDS, "runs": [run]}]})
+        self.assertIn("<b>merging</b> · build r1", out["R"]["alpha"])
+        self.assertIn(" · waits on review</td>", out["R"]["alpha"])
+        self.assertNotIn("g-unknown", re.search(r'<tr[^>]*data-run="r1".*?</tr>', out["R"]["alpha"], re.S).group(0))
+
     def test_a_queued_satellite_build_names_why_its_dispatcher_claims_nothing(self):
         """Review round 5: a queued build the hub leaves queued shows the satellite's reason on its row."""
         builds = {**self.BUILDS, "unclaimed": {"41": "work claims nothing: the load was not read"}}
@@ -1796,6 +1805,20 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertIn('<td class="num"></td>', system, "the review box says it; the num cell repeats nothing")
         out = self.run_view("R.tally = ELS['queue-tally'].html;")
         self.assertNotIn("PR review", out["R"]["tally"], "no PR wait, no count")
+
+    def test_the_tally_counts_parked_tasks_and_opens_the_tasks_parked_chip(self):
+        """sd:8953: parked is the `parked_at` flag, not a status; the Queue tally counts the parked tasks Tasks reads
+        (`backlog_items(parked=True)`) and links to Tasks' Parked chip."""
+        from sd_dashboard import tasks_screen
+        for title in ("Parked one", "Parked two", "Still open"):
+            made = self.item(title, kind="task", priority=4, repo=str(self.checkout))
+            if title.startswith("Parked"):
+                self.connection.execute("UPDATE item SET parked_at = ? WHERE id = ?", (NOW, made))
+        answers = {"/api/tasks": [200, tasks_screen.document(self.connection, now=NOW)]}
+        out = self.run_view("R.tally = ELS['queue-tally'].html;", answers=answers)
+        self.assertIn('<a href="/tasks?parked=1&amp;realm=all">2 parked</a>', out["R"]["tally"])
+        none = self.run_view("R.tally = ELS['queue-tally'].html;")
+        self.assertNotIn("parked", none["R"]["tally"], "no parked task, no tile")
 
     def test_a_pr_wait_counts_in_a_review_box_after_blocked_not_in_blocked(self):
         # pack sd:8083 (operator 2026-11-07): "still not seeing a row tile counter in the queue list for waiting on

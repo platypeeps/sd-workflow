@@ -517,10 +517,12 @@ def assignment_state(connection: sqlite3.Connection, assignment: int) -> dict:
     # revision hashes, as the item's status is.
     # A running build's bundle run is its lead's (`build.claim`), and the
     # cancel is asked on that run, so the run's id is in the row too; an
-    # ended run the reap has not released yet takes it as well.
+    # ended run the reap has not released yet takes it as well. An open run
+    # at a lane step no longer holds a member it left blocked (sd:8960).
     row = connection.execute("SELECT assignment.*, item.title AS title, item.status AS item_status, "
                              "EXISTS (SELECT 1 FROM runner_run WHERE runner_run.assignment "
-                             "IN (assignment.id, assignment.parent) AND runner_run.released_at IS NULL) AS leased, "
+                             "IN (assignment.id, assignment.parent) AND runner_run.released_at IS NULL "
+                             f"AND NOT {build.IN_LANE}) AS leased, "
                              "(SELECT runner_run.id FROM runner_run WHERE runner_run.assignment="
                              "COALESCE(assignment.parent, assignment.id) AND runner_run.released_at IS NULL) "
                              "AS build_run, "

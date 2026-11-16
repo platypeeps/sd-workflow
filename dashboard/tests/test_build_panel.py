@@ -214,6 +214,18 @@ class BuildsPanel(Fixture):
         again = builds.panel(self.connection, now=run["created_at"])["runs"][0]["cancel"]
         self.assertFalse(again["allowed"])
 
+    def test_an_enqueued_run_reads_merging_and_its_untrailed_member_is_no_blocked_row(self):
+        """sd:8960: a run in the lane waits on review; the member no `Closes:` trailer named is no blocked build."""
+        from sd_dashboard import queue_screen
+
+        items = [self.ready(), self.ready()]
+        run = self.claimed(items)
+        build.write(self.connection, run["id"], step="enqueuing")
+        build.enqueued(self.connection, run["id"], [items[0]])
+        row = builds.panel(self.connection, now=run["created_at"])["runs"][0]
+        self.assertEqual((row["step"], row["state"], row["why"]), ("enqueued", "merging", "waits on review"))
+        self.assertEqual(queue_screen.runner(self.connection)["blocked"], [])
+
     def test_a_satellite_run_names_its_host_and_reads_no_log_here(self):
         """Pack sd:7933, failure table Report back: the hub reads no log path a satellite's run names."""
         run = self.claimed([self.ready()])

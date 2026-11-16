@@ -540,15 +540,16 @@ class Supervise(Case):
         self.assertIsNone(self.latest()["cancel_requested"])
 
     def test_a_skipped_member_is_not_delivered(self):
-        """Review round 2: only the members a branch commit's `Closes:` trailer cites are enqueued and done."""
+        """Review round 2: only the members a branch commit's `Closes:` trailer cites are enqueued and done; the
+        other, skipped with no question, ends and returns to planning, not blocked (sd:8960)."""
         self.press(2)
         self.write_pr()
         self.plan(claude=["skip"], sd_review=["clean"])
         self.assertEqual(self.supervisor().run()["step"], "enqueued")
         enqueue = next(call["argv"] for call in self.calls("sd-ship") if "enqueue" in call["argv"])
         self.assertEqual([enqueue[n + 1] for n, arg in enumerate(enqueue) if arg == "--item"], [str(self.items[0])])
-        self.assertEqual(self.statuses(), ["in_progress", "blocked"])
-        self.assertEqual([m["status"] for m in build.run(self.db, self.bundle["id"])["members"]], ["done", "blocked"])
+        self.assertEqual(self.statuses(), ["in_progress", "planning"])
+        self.assertEqual([m["status"] for m in build.run(self.db, self.bundle["id"])["members"]], ["done", "cancelled"])
         note = self.db.execute("SELECT body FROM note WHERE item = ? AND body LIKE '%Closes: sd:%'", (self.items[1],))
         self.assertIsNotNone(note.fetchone(), "the skipped item says why it stays open")
 
@@ -2134,7 +2135,7 @@ class Tick(Case):
         """Review: a rebuild that lost its lead would claim under a child's branch, so none is queued."""
         for case in ("moved", "skipped"):
             with self.subTest(case=case):
-                run = self.enqueued(2, skip_lead=case == "skipped")  # a skipped lead ends blocked
+                run = self.enqueued(2, skip_lead=case == "skipped")  # a skipped lead ends cancelled
                 lead, child = self.items
                 if case == "moved":
                     writes.transition(self.db, lead, "planning", who="operator", reason="moved on")

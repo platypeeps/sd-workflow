@@ -411,9 +411,10 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       <td class="detail">${p ? html`${prFacts(p)} · ` : ''}${facts}${shots(r)}</td><td class="num">${r.state === 'next' ? `#${r.position}` : p ? dur(p.waited) : ''}</td>
       <td class="act">${ctl}${p ? prWaitLink(p) : ''}${id ? shell.commands.rowActions(id) : ''}</td></tr>`, p && p.on];
   }
-  // A build run's state (pack sd:6095): working; waiting on me (held, or an open question asks); stalled (the log has not
-  // grown for 15 min); lost (no supervisor beat for 3 min, which the dispatcher's next reap settles).
-  const RUNSTATE = { working: 'ok', waiting: 'warning', stalled: 'caution', lost: 'unknown' };
+  // A build run's state (pack sd:6095): working; merging (in the lane, waits on review, sd:8960); waiting on me (held,
+  // or an open question asks); stalled (the log has not grown for 15 min); lost (no supervisor beat for 3 min, which the
+  // dispatcher's next reap settles).
+  const RUNSTATE = { working: 'ok', merging: 'queued', waiting: 'warning', stalled: 'caution', lost: 'unknown' };
   const names = r => r.items.length ? html`${r.items.map((m, i) => html`${i ? '; ' : ''}<a href="${shell.itemHref(m.item)}">#${m.item} ${m.title}</a>`)}` : 'no items recorded';
   const bb = (act, r, label, aria, off) => html`<button class="btn quiet sm" type="button" data-build="${act}" data-run="${r.run}" aria-label="${aria}"${off ? html` disabled title="${off}"` : QV.busy ? html` disabled` : ''}>${label}</button>`;
   // Open PR (pack sd:6020 ruling #31553): the pull request `sd-ship` opened for the row's branch; none shows nothing.
@@ -602,7 +603,10 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     put($('queue-filters'), shell.list.fseg('qshow', 'Show', [['suggested', 'Suggested'], ['open', 'All items'], ['ended', 'Ended builds']].map(([v, label]) =>
       ({ v, pressed: qShow.has(v), label: n(v) === null ? html`${label}` : html`${label} <span class="n">${String(n(v))}</span>` }))));
     const prs = prTally(every);
-    put($('queue-tally'), html`${tally(every.filter(c => !QSHOW.includes(c.type))).map(([t, n]) => html`<span>${n} ${t}</span>`)}${prs ? html`<span>${prs}</span>` : ''}`);
+    // sd:8953: the parked tasks Tasks reads (parked_at, not a status), less the idea kinds; it opens Tasks' Parked chip.
+    const ideas = new Set((QV.tasks && QV.tasks.ideas) || []);
+    const parked = QV.tasks ? QV.tasks.rows.filter(t => t.parked && !ideas.has(t.kind)).length : 0;
+    put($('queue-tally'), html`${tally(every.filter(c => !QSHOW.includes(c.type))).map(([t, n]) => html`<span>${n} ${t}</span>`)}${prs ? html`<span>${prs}</span>` : ''}${parked ? html`<a href="/tasks?parked=1&amp;realm=all">${String(parked)} parked</a>` : ''}`);
     // Auto-pickup (pack sd:6097): its state, and On or Off, bound to the value this read saw. On has no end (pack sd:8930).
     const pk = QV.built && QV.built.pickup;
     put($('queue-pickup'), !pk ? html`` : pk.error ? html`Auto-pickup not read: ${pk.error}`

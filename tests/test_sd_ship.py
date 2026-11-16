@@ -3241,6 +3241,25 @@ roles:
         self.assertEqual(cleanup["kept"], {str(self.root): "the main checkout", "topic": "a kept worktree has it checked out"})
         self.assertEqual("", _git(self.root, "ls-remote", "origin", "refs/heads/topic"))
 
+    def test_a_merge_cleanup_keeps_a_remote_branch_pushed_after_its_check(self):
+        """sd:8827: a push between `ls-remote` and the delete lost that commit; the delete carries a lease."""
+        head = _git(self.root, "rev-parse", "HEAD")
+        _git(self.root, "push", "-q", "origin", "HEAD:refs/heads/raced")
+        real = ship.git
+
+        def racing(root, *args):
+            answer = real(root, *args)
+            if args[:1] == ("ls-remote",):  # another session pushes right after the check
+                _git(self.root, "commit", "-q", "--allow-empty", "-m", "late\n\nAuthored-with: human")
+                _git(self.root, "push", "-q", "origin", "HEAD:refs/heads/raced")
+                _git(self.root, "reset", "-q", "--hard", head)
+            return answer
+
+        with patch.object(ship, "git", racing):
+            cleanup = ship.clean_up_merged(self.root, "raced", head)
+        self.assertNotIn("origin/raced", cleanup.get("removed", []), cleanup)
+        self.assertNotEqual("", _git(self.root, "ls-remote", "origin", "refs/heads/raced"), "the late commit stays")
+
     def merged_worktree(self, name: str) -> pathlib.Path:
         """A linked worktree on a branch `name` whose head origin carries, as a merged pull request's is."""
         tree = self.directory / name
