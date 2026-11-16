@@ -73,7 +73,7 @@ and a schema-version change.
 
 ## Ownership and persistence
 
-`sd-profile` is the only mutation owner. Consumer skills are read-only and do
+The user, by hand, is the only mutation owner. Consumer skills are read-only and do
 not modify the profile merely because they loaded or used it.
 
 The first version uses one human-readable Markdown artifact. Obsidian is the
@@ -83,7 +83,7 @@ the same semantic headings and fields and does not require a database. Never
 silently create or synchronize both copies.
 
 Consumers use `profile=auto|off|<locator>` plus optional `audience=`. `off`
-disables profile use for a consumer invocation. The `sd-profile` maintenance
+disables profile use for a consumer invocation. A maintenance
 owner uses `profile=auto|<locator>` because every maintenance operation must
 resolve the exact artifact it will inspect or change. In either surface, `auto`
 resolves only an attached authorized profile or a private host-configured
@@ -151,7 +151,7 @@ changed evidence, contradictions, entries past `review_after`, low-confidence
 hypotheses, overgeneralization or context collapse, assistant-generated feedback
 loops, overlay overlap/drift/inactivity, unused entries, and deletion or
 consolidation candidates. It ends with a numbered change set. Only approved
-changes are applied by `sd-profile`, followed by read-back. A cadence preference
+changes are applied by the user, followed by read-back. A cadence preference
 does not authorize scheduling, source scanning, or mutation.
 
 Direct correction has `basis: explicit` and preserves superseded evidence.

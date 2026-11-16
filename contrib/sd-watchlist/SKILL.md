@@ -21,10 +21,9 @@ Use for a configured set of channels, playlists, searches, feeds, podcasts,
 authors, or saved collections when the user wants material new items since a
 dated checkpoint.
 
-Use `sd-monitor` for general subject-state comparison and host-owned recurrence,
-`sd-brief` for broad catch-up without a bounded watchlist checkpoint, and
-`sd-bookmark-triage` for prioritizing an existing saved-item backlog. Persistence
-and scheduling remain owned by `sd-monitor` or the host.
+Use `sd-brief` for broad catch-up without a bounded watchlist checkpoint.
+General subject-state comparison and prioritizing a saved-item backlog are out
+of scope. Persistence and scheduling remain owned by the host.
 
 ## Arguments
 
@@ -41,7 +40,7 @@ identify them before reading sources, state, or profile data.
 - `checkpoint=` — `new`, a dated cutoff, or a supplied `sd-monitor-state/v1`
   block; missing state enters first-baseline mode. `checkpoint=new` explicitly
   starts first-baseline mode. This skill does not accept `baseline=`; that name
-  belongs to `sd-monitor` and triggers the unknown-argument stop here;
+  triggers the unknown-argument stop here;
 - `interests=` — explicit topics, questions, or projects used for relevance;
 - `exclude=` — source, topic, duration, language, format, or repetition rules;
 - `limit=` — optional maximum ranked items after filtering and deduplication;
@@ -119,8 +118,8 @@ identify them before reading sources, state, or profile data.
     and bounded `pendingItems`. Do not advance a source boundary across
     unavailable, stale, truncated, or unresolved coverage. Output it only; do
     not write, persist, or schedule it.
-14. Propose precise read-only handoffs for selected items to `sd-capture`,
-    `sd-video-notes`, `sd-brief`, or `sd-fact-check`. Include the item, evidence,
+14. Propose precise read-only handoffs for selected items to `sd-brief` or
+    `sd-fact-check`. Include the item, evidence,
     purpose, and limitations; mark every handoff `not run` or `unavailable`.
 15. Audit the report against the source inventory, checkpoint, item ledger,
     identity groups, exclusions, rankings, profile-use note, and next state.
@@ -163,8 +162,7 @@ identify them before reading sources, state, or profile data.
   and counted filtered noise;
 - **Next monitor state** — minimized `sd-monitor-state/v1` output or exact
   validation error plus a separately labeled replacement-baseline proposal;
-- **Downstream handoffs** — proposed `sd-capture`, `sd-video-notes`, `sd-brief`,
-  and `sd-fact-check` payloads, each `not run` or `unavailable`; and
+- **Downstream handoffs** — proposed `sd-brief` and `sd-fact-check` payloads, each `not run` or `unavailable`; and
 - **Capability status** — persistence, scheduling, subscriptions, downloads,
   notifications, collection changes, downstream workflows, and all external
   writes marked `not run`.

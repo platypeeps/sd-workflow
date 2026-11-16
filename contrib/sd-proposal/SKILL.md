@@ -26,7 +26,7 @@ decision-ready case: problem, desired outcome, alternatives, evidence,
 investment, benefits, risks, success criteria, and explicit ask.
 
 Do not use for choosing among already-framed options (`sd-decide`), adversarial
-review (`sd-red-team`), execution planning (`sd-objective-plan`), negotiation, approval,
+review, execution planning, negotiation, approval,
 task creation, or implementation. An accepted proposal is only a clean input to
 the next authorized workflow.
 
@@ -110,7 +110,7 @@ identify them before reading sources, profile content, or workspace artifacts.
     `requested`, `proposed`, `accepted`, `rejected`, and `unknown`; acceptance
     of the document does not approve the intervention or authorize execution.
 13. When the proposal itself is accepted, produce a capability-neutral handoff
-    to `sd-objective-plan` containing the approved outcome, constraints, accepted
+    to a separate plan containing the approved outcome, constraints, accepted
     assumptions, unresolved evidence, decision record, success criteria,
     commitments, and risks. Mark approval, negotiation, task creation,
     implementation planning, and every external write `not run` unless
@@ -161,6 +161,6 @@ identify them before reading sources, profile content, or workspace artifacts.
 - **Commitment and approval ledger** — requested, proposed, accepted, rejected,
   and unknown owners, dates, budgets, staffing, obligations, and decisions;
 - **Planning handoff** — accepted outcome, constraints, assumptions, evidence
-  gaps, success criteria, commitments, and risks for a separate `sd-objective-plan`; and
+  gaps, success criteria, commitments, and risks for a separate plan; and
 - **Execution boundary** — approval, negotiation, task creation, planning,
   implementation, and every external write marked `not run`.

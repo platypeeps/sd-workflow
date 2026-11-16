@@ -27,13 +27,9 @@ contribution, gathering evidence, drafting, reviewing, and preparing a
 publication package.
 
 Article-shaped tutorials centered on an original thesis, argument, firsthand
-experience, or publication contribution stay in `sd-author`. A
-checkpoint-driven guide whose primary outcome is completing and verifying an
-observable result routes to `sd-tutorial`. When the word "tutorial" leaves both
-outcomes plausible, ask one focused question about the intended reader outcome
-before selecting either workflow.
+experience, or publication contribution stay in `sd-author`.
 
-Do not use for research-paper methodology (`sd-paper`), isolated open research
+Do not use for research-paper methodology, isolated open research
 (`sd-research`), claim-only auditing (`sd-fact-check`), source distillation
 (`sd-digest target=...`), or final technical editing (`sd-technical-editor`).
 These are capability handoffs, not required runtime dependencies.
@@ -78,8 +74,7 @@ stop and identify them before reading sources or workspace artifacts.
    - `draft.md`: current prose and declared draft pass; and
    - `review.md`: findings, decisions, approved edits, unresolved issues, and
      the draft revision each review answered.
-3. When no `theme=` is supplied, use `sd-topic-radar` when available to produce
-   ten ranked opportunities. Otherwise derive ten explicitly provisional ideas
+3. When no `theme=` is supplied, derive ten explicitly provisional ideas
    only from authorized current context, disclose source coverage, and do not
    imply that personal activity was searched. Let the user select or revise one
    before authoring begins.

@@ -35,7 +35,7 @@ artifact and must know what survived, what was lost, and whether the ratio was
 safe.
 
 Do not use when the material must first be found on the web
-(`sd-research`), when the job is a market inventory (`sd-scan`), or for a
+(`sd-research`), when the job is a market inventory, or for a
 single short document without `target=` — just read and summarize that
 directly.
 

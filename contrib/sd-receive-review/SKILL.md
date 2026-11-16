@@ -29,10 +29,9 @@ accepted because a reviewer wrote it, with no evidence recorded either way,
 looks exactly like a finding that was checked. Both faces produce a tidy thread
 and neither produces knowledge.
 
-Do not use it to synthesise a corpus of feedback into themes (`sd-feedback`,
-which owns that and disclaims this), to generate adversarial findings in the
-first place (`sd-red-team`), to interrogate an intention before it is built
-(`sd-grill`), or to find the cause of a failure a finding reports (`sd-debug`).
+Do not use it to synthesise a corpus of feedback into themes, to generate
+adversarial findings in the first place, to interrogate an intention before it
+is built, or to find the cause of a failure a finding reports (`sd-debug`).
 
 Two seams are close enough to state precisely. `sd-review` **produces** findings
 on the current diff and disposes of them locally; this skill is what happens
@@ -178,7 +177,7 @@ uses. No finding carries two, and no finding carries none:
   named for each;
 - **Closing state** — `disposed`, `blocked`, or `partial`, and what ended it;
   and
-- **Handoffs** — proposed `sd-plan`, `sd-debug`, `sd-review` or `sd-feedback`
+- **Handoffs** — proposed `sd-plan`, `sd-debug` or `sd-review`
   work, each `not run` or `unavailable`, plus the statement that nothing was
   replied to, resolved, merged, or pushed.
 

@@ -236,7 +236,7 @@ def validate_prefix(manifest: dict[str, object], *, known: dict[str, pathlib.Pat
         # This is also the whole of the command-collision check. Every backbone
         # command is spelled `sd-*`, so a `<prefix>-*` surface can shadow one
         # only when the prefix is `sd` itself -- which this refuses. Enumerating
-        # the eleven commands here would look like a stronger guarantee while
+        # the eight commands here would look like a stronger guarantee while
         # testing the same single condition.
         raise Refusal(f"prefix {value!r} is reserved by the backbone")
     if value in known:
