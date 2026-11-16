@@ -2247,5 +2247,16 @@ class Hosts(Case):
         self.assertEqual(self.statuses([run["members"][0]["item"]]), ["ready"])
 
 
+class LoadCap(unittest.TestCase):
+    def test_the_builder_load_cap_is_one_and_a_half_times_the_cores(self):
+        """sd:9094: builders stop at load5 1.5x cores, whatever the gate's own load rule says."""
+        with mock.patch.object(build.os, "cpu_count", return_value=16):
+            self.assertEqual(build.load_cap(), 24.0)
+            self.assertEqual(build.over_load(50.0, build.load_cap()),
+                             "the five-minute load is 50, above the cap of 24")
+        with mock.patch.object(build.os, "cpu_count", return_value=None):
+            self.assertEqual(build.unread(1.0, build.load_cap(), []), build.UNREAD[0])
+
+
 if __name__ == "__main__":
     unittest.main()

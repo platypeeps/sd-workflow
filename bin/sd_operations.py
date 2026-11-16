@@ -272,7 +272,8 @@ def writable(root: Path) -> bool | None:
 
 
 def gate_load() -> tuple[float | None, float | None]:
-    """The five-minute load and its cap from `sd gate status --json`; (None, None) when unread."""
+    """The five-minute load from `sd gate status --json` and the builder cap, `build.load_cap`; (None, None)
+    when unread. The gate's own `load_max` is not the builders' (sd:9094)."""
     sd_handoff_rows.library()
     from sd_db import follow  # noqa: PLC0415 - after the helper
     try:
@@ -283,9 +284,10 @@ def gate_load() -> tuple[float | None, float | None]:
         answer = json.loads(done.stdout) if done.returncode == 0 else {}
     except (OSError, subprocess.SubprocessError, ValueError):
         return None, None
-    load, cap = (answer.get("load"), answer.get("load_max")) if isinstance(answer, dict) else (None, None)
+    from sd_db import build  # noqa: PLC0415 - after the helper
+    load, cap = answer.get("load") if isinstance(answer, dict) else None, build.load_cap()
     if not (isinstance(load, list) and len(load) >= 2 and isinstance(load[1], (int, float)) and math.isfinite(load[1])
-            and isinstance(cap, (int, float)) and math.isfinite(cap)):
+            and math.isfinite(cap)):
         return None, None
     return float(load[1]), float(cap)
 
