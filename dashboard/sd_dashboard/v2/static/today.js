@@ -526,16 +526,23 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       G.get(k).rows.push({ type, s, tr, pr });
     };
     const live = new Map(), prs = ((QV.lanes || {}).prs || {}).rows || [], waits = new Set(prs.filter(p => p.item != null).map(p => Number(p.item)));
+    // sd:9078: an item with a lane entry not yet ended is that entry's row alone: no live-session, run or blocked
+    // assignment row beside it.
+    const laned = new Set((QV.lanes ? QV.lanes.lanes : []).flatMap(l => l.rows)
+      .filter(r => r.item != null && !['cancelled', 'landed'].includes(r.state)).map(r => Number(r.item)));
     // pack sd:7859: an item waiting on its PR is its PR row alone: no live-session, suggested or open row beside it.
-    ((ACTIVE || {}).rows || []).filter(r => !waits.has(Number(r.item))).forEach(r => { if (!live.has(r.item)) live.set(r.item, []); live.get(r.item).push(r); });
+    ((ACTIVE || {}).rows || []).filter(r => !waits.has(Number(r.item)) && !laned.has(Number(r.item))).forEach(r => { if (!live.has(r.item)) live.set(r.item, []); live.get(r.item).push(r); });
     live.forEach((rows, item) => add(rows[0].repo, liveRow(item, rows)));
     const B = QV.built && !QV.built.error ? QV.built : { runs: [], recent: [] }, held = new Set();
     // sd:9022: a run in the lane (merging) whose every member waits on its PR is that PR row alone; its assignments stay
     // held, so no runner row. A working, stalled, lost or waiting run keeps its row and its actions.
-    const inPr = r => r.state === 'merging' && r.items.length && r.items.every(m => waits.has(Number(m.item)));
+    // sd:9078: a done or cancelled member waits on nothing, and a member's lane entry covers it as its PR row does.
+    const shown = m => waits.has(Number(m.item)) || laned.has(Number(m.item));
+    const inPr = r => r.state === 'merging' && r.items.some(shown)
+      && r.items.filter(m => !['done', 'cancelled'].includes(m.status)).every(shown);
     B.runs.forEach(r => { r.items.forEach(m => held.add(m.assignment)); if (!inPr(r)) add(r.repo, runRow(r)); });
     ((QV.runner || {}).live || []).filter(a => !held.has(a.id)).forEach(a => add(a.repo, asgRow(a)));
-    ((QV.runner || {}).blocked || []).filter(a => !held.has(a.id)).forEach(a => add(a.repo, blockedAsg(a)));
+    ((QV.runner || {}).blocked || []).filter(a => !held.has(a.id) && !laned.has(Number(a.item))).forEach(a => add(a.repo, blockedAsg(a)));
     // A prepared entry and its item's PR wait are one row (pack sd:7859): the lane's, leading with the wait.
     const waitOf = new Map(prs.map(p => [Number(p.item), p])), drawn = new Set();
     (QV.lanes ? QV.lanes.lanes : []).forEach(l => { l.rows.forEach(r => {

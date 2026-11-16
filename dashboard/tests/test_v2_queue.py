@@ -1734,6 +1734,46 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                                      "/api/queue/builds?show=all": [200, {**self.BUILDS, "runs": [both]}]})
         self.assertIn('data-run="r1"', out["R"]["alpha"])
 
+    def test_an_item_shows_once_beside_a_cancelled_member_or_its_lane_entry(self):
+        """sd:9078: three doubles sd:9022 left, each now one row."""
+        run = {**self.BUILDS["runs"][0], "step": "enqueued", "state": "merging", "why": "waits on review",
+               "items": [{"item": 7, "assignment": 7, "status": "running", "title": "Seven"},
+                         {"item": 8, "assignment": 8, "status": "cancelled", "title": "Eight"}]}
+        pr = {"item": 7, "title": "Seven", "repo": "/repos/alpha", "url": "https://github.com/example/alpha/pull/7",
+              "lane": "awaiting_them", "on": "reviewers", "since": NOW, "waited": 60}
+        entry = {"state": "merging", "item": 7, "title": "Seven", "step": "prepare", "host": "hub", "claim_age": 30,
+                 "lease_until": NOW, "lease_passed": False, "head": "abc1234"}
+        lane = {"path": "/repos/alpha", "host": "hub", "runner_merge": "auto", "rows": [entry]}
+
+        def view(prs=(), lanes=(), runs=(), blocked=(), live=()):
+            doc = queue_screen.document(self.connection, now=NOW)
+            doc["prs"] = {"error": "", "rows": list(prs)}
+            doc["lanes"] = [*doc["lanes"], *lanes]
+            self.doc["active"]["rows"] = [self.LIVE, *live]
+            return self.run_view("open('alpha'); R.alpha = ELS.queue.html;", answers={
+                "/api/queue": [200, doc], "/api/queue/builds?show=all": [200, {**self.BUILDS, "runs": list(runs)}],
+                "/api/queue/runner": [200, {**self.RUNNER, "blocked": list(blocked)}]})["R"]["alpha"]
+
+        # A) a bundled run whose other member is cancelled: its PR row alone.
+        with self.subTest(case="A"):
+            html = view(prs=[pr], runs=[run])
+            self.assertNotIn('data-run="r1"', html)
+            self.assertIn('data-pr="7"', html)
+        # B) a run in the lane beside its lane entry: the entry alone.
+        done = {**run, "items": [{**m, "status": "done"} for m in run["items"]]}
+        with self.subTest(case="B"):
+            html = view(lanes=[lane], runs=[done], live=[{**self.LIVE, "item": 7, "repo": "/repos/alpha"}])
+            self.assertNotIn('data-run="r1"', html)
+            self.assertNotIn('data-id="live:7"', html)
+            self.assertIn('data-id="entry:/repos/alpha:7"', html)
+        # C) a blocked assignment beside its lane entry: the entry alone.
+        asg = {"id": 70, "lead": 70, "item": 7, "title": "Seven", "repo": "/repos/alpha", "why": "build run ended",
+               "since": NOW, "retry": {"allowed": True, "reason": ""}, "cancel": {"allowed": True, "reason": ""}}
+        with self.subTest(case="C"):
+            html = view(lanes=[lane], blocked=[asg])
+            self.assertNotIn('data-asg-row="70"', html)
+            self.assertIn('data-id="entry:/repos/alpha:7"', html)
+
     def test_a_run_not_in_the_lane_keeps_its_row_beside_its_items_pr_wait(self):
         """sd:9022 review: a builder fixing an open PR's review is working, not waiting; its row and Cancel stay."""
         lanes = queue_screen.document(self.connection, now=NOW)
