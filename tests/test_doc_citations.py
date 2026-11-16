@@ -183,8 +183,8 @@ honest way to state the rule's coverage:
   where the citation elided the leading directory -- `` `prepare-release.py:338` ``
   for a file under `bin/`. This one is not a guess, and measuring it found a
   live past-end citation the rule as written does not catch:
-  `sd-propose-skills/SKILL.md:126` in the 2026-09-05 page, against a
-  `contrib/sd-propose-skills/SKILL.md` of 114 lines. Thirty-five more sit in
+  a contributed skill's `SKILL.md:126` in the 2026-09-05 page, against a
+  file of 114 lines (the skill has since been retired). Thirty-five more sit in
   archives. Whether the rule should follow a unique suffix was a decision, not
   an oversight, and sd:829 took it: no. Against that one live finding stand
   the 413 above, where a suffix rule has to guess, so a path resolves only

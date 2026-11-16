@@ -189,7 +189,7 @@ class LintTests(unittest.TestCase):
     def test_the_names_real_skills_have_are_not_refused(self) -> None:
         # The rule is worth nothing if it also rejects ordinary names. These are
         # the shapes actually on disk: prefixed, dotted, digits.
-        for benign in ("sd-typed-holes", "cmux", "hyperframes-cli", "v2.plan", "a_b"):
+        for benign in ("sd-receive-review", "cmux", "hyperframes-cli", "v2.plan", "a_b"):
             text = CLEAN.replace("name: candidate", f"name: {benign}")
             with self.subTest(name=benign):
                 self.assertEqual([f.rule for f in adopt.lint(benign, text)], [])
@@ -224,7 +224,7 @@ class InstalledTreeTests(unittest.TestCase):
         # `contrib/` skill on a reader's machine in one command.
         paths = adopt.skill_files(REPO_ROOT / "skills")
         paths += adopt.skill_files(REPO_ROOT / "contrib")
-        self.assertGreater(len(paths), 60, "the skills tree enumerated to almost nothing")
+        self.assertGreater(len(paths), 20, "the skills tree enumerated to almost nothing")
         offenders = []
         for path in paths:
             findings = adopt.lint(path.parent.name, path.read_text(encoding="utf-8"))
@@ -356,7 +356,7 @@ class AdoptRunTests(unittest.TestCase):
     def test_a_candidate_carrying_the_command_marker_is_refused(self) -> None:
         """Adoption may not hand an incoming file standing authority to act.
 
-        The marker is legitimate -- eleven surfaces in this pack carry it -- so
+        The marker is legitimate -- eight surfaces in this pack carry it -- so
         this is a stage-3 policy and not a shape error. Granting it to something
         that arrived from outside is a decision record, not a flag.
         """

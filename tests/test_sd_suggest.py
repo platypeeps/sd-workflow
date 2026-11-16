@@ -348,20 +348,6 @@ class TheCriterion(SuggestCase):
             self.assertNotIn("--method", call, call)
             self.assertNotIn("close", call, call)
 
-    def test_the_proposal_template_is_gone_from_the_contributed_skill(self):
-        """`contrib/sd-propose-skills/` no longer writes a vault note.
-
-        The criterion asks for the note kind to be absent, and the check is
-        the whole directory rather than `SKILL.md`: a template moved into a
-        sibling file would satisfy a check that read one file and would still
-        be the writing path the row replaced.
-        """
-        directory = REPO_ROOT / "contrib" / "sd-propose-skills"
-        found = [path.relative_to(REPO_ROOT).as_posix()
-                 for path in sorted(directory.rglob("*"))
-                 if path.is_file() and "skill-proposal" in path.read_text(encoding="utf-8")]
-        self.assertEqual([], found)
-
 
 class WhatTheRowRecords(SuggestCase):
     """The body, the mode and the item the row is keyed to."""

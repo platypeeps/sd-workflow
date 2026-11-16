@@ -1,7 +1,7 @@
-# sd-monitor State Schema
+# Monitor State Schema
 
 `sd-monitor-state/v1` is a portable interchange artifact for a later
-`sd-monitor` or compatible bounded-delta run. It is output for the user or an
+compatible bounded-delta run. It is output for the user or an
 authorized host capability to retain; producing it does not authorize a skill
 to write a file, update a connected system, or schedule another run.
 
@@ -67,9 +67,8 @@ necessarily the top-level `asOf`. Every pending item needs `key`, `sourceId`,
 - Version `1` is the only supported schema version. Reject a newer version
   without interpreting its fields or attempting a delta comparison.
 - A missing state or caller-specific explicit new-state sentinel starts shared
-  first-state behavior. `contrib/sd-monitor` uses `baseline=new`;
-  `contrib/sd-watchlist` uses `checkpoint=new`. The names are not
-  interchangeable: each skill's own unknown-argument stop refuses the other's,
+  first-state behavior. `contrib/sd-watchlist` uses `checkpoint=new`. The
+  name is not interchangeable with `baseline=`: its unknown-argument stop refuses that,
   and that stop is the skill's instruction, checked by no test here. First-state
   behavior is not a zero-change delta.
 - An unreadable or malformed state cannot support comparison. Report the exact
