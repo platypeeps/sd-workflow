@@ -1711,6 +1711,29 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertIn(" · waits on review</td>", out["R"]["alpha"])
         self.assertNotIn("g-unknown", re.search(r'<tr[^>]*data-run="r1".*?</tr>', out["R"]["alpha"], re.S).group(0))
 
+    def test_a_run_whose_every_item_waits_on_its_pr_is_its_pr_row_alone(self):
+        """sd:9022: a run in the lane plus its item's PR wait drew two rows; pack sd:7859 makes it the PR row alone."""
+        run = {**self.BUILDS["runs"][0], "step": "enqueued", "state": "merging", "why": "waits on review"}
+        lanes = queue_screen.document(self.connection, now=NOW)
+        lanes["prs"] = {"error": "", "rows": [
+            {"item": 7, "title": "Seven", "repo": "/repos/alpha", "url": "https://github.com/example/alpha/pull/7",
+             "lane": "awaiting_them", "on": "reviewers", "since": NOW, "waited": 60}]}
+        out = self.run_view("open('alpha'); R.alpha = ELS.queue.html; R.tally = ELS['queue-tally'].html;",
+                            answers={"/api/queue": [200, lanes],
+                                     "/api/queue/builds?show=all": [200, {**self.BUILDS, "runs": [run]}]})
+        self.assertNotIn('data-run="r1"', out["R"]["alpha"])
+        self.assertIn('data-pr="7"', out["R"]["alpha"])
+        self.assertNotIn('data-type="working"', out["R"]["alpha"], "its assignment draws no runner row either")
+        self.assertIn("<span>1 PR review: 0 on you, 1 on reviewers</span>", out["R"]["tally"])
+        self.assertEqual(self.repo_detail(out["R"]["alpha"], "alpha")[1],
+                         ' aria-label="0 merging, 1 review, 0 working, 0 next, 0 blocked, 0 suggested"')
+        # A run with a member that does not wait on a PR keeps its row.
+        both = {**run, "items": [*run["items"], {"item": 8, "assignment": 8, "status": "running", "title": "Eight"}]}
+        out = self.run_view("open('alpha'); R.alpha = ELS.queue.html;",
+                            answers={"/api/queue": [200, lanes],
+                                     "/api/queue/builds?show=all": [200, {**self.BUILDS, "runs": [both]}]})
+        self.assertIn('data-run="r1"', out["R"]["alpha"])
+
     def test_a_queued_satellite_build_names_why_its_dispatcher_claims_nothing(self):
         """Review round 5: a queued build the hub leaves queued shows the satellite's reason on its row."""
         builds = {**self.BUILDS, "unclaimed": {"41": "work claims nothing: the load was not read"}}
