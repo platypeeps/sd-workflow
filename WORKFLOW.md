@@ -56,6 +56,8 @@ These run without being asked.
 
 - No pack command runs in a checkout whose `repo.managed` is no (sd:1620, sd:2566).
   `sd-ship`, `sd-check`, `sd-status` and `sd-ship lane enqueue` refuse there, dry runs included.
+  `sd-ship prepare` and `merge` are the exception: they read readiness from GitHub alone (sd:9100).
+  Merge needs the policy's `merge_method`, an open approved PR at `--expected-head`, checks SUCCESS and CLEAN.
   `sd-review` runs there, review only: it reads a diff, and its gate check does not run (sd:5953).
   The refusal names the remedy: `sd fleet standard` in that checkout, which sets managed last (sd:7710).
   The Build press and auto-pickup still take a task there, with a GitHub remote (sd:7868).

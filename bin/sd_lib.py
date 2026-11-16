@@ -1522,10 +1522,11 @@ def refuse_unmanaged(root: pathlib.Path | str, error: Callable[[str], Exception]
                      database: pathlib.Path | str | None = None) -> None:
     """Raise `error(refusal)` in an unmanaged checkout (sd:2566); otherwise return.
 
-    The direct-call gate of sd-ship, sd-check, sd-status and
-    `sd-ship lane enqueue`, before any network call or write; sd-review,
-    which reads a diff and writes no repository file, skips it (pack
-    sd:5953). A checkout with no row proceeds without the warning: these
+    The direct-call gate of sd-check, sd-status and `sd-ship lane
+    enqueue`, before any network call or write; sd-ship reads `unmanaged`
+    itself, since its prepare and merge go through GitHub alone (sd:9100);
+    sd-review, which reads a diff and writes no repository file, skips it
+    (pack sd:5953). A checkout with no row proceeds without the warning: these
     run in fixture repositories and in the local gate's temporary trees
     on every call.
     """
