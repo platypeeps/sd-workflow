@@ -5,8 +5,8 @@
 session names (`claude_sessions`), items a Build press would refuse (`build._item`: an active assignment, a repository
 that is not managed, has no remote or runs its lane elsewhere), and items whose repository is no directory on this Mac;
 each one left out is in `skipped` with its reason. The room is the builder cap, `CAP` per machine, less the builders
-running now (`claude_sessions.builders`), and none while the five-minute load is above `sd gate status --json`'s
-`load_max`; a `load_max` of 0 is the load rule off (`build.over_load`, pack sd:6111).
+running now (`claude_sessions.builders`), and none while `sd gate status --json`'s five-minute load is above the
+builder cap, `build.load_cap`; the gate's own `load_max` is not it (sd:9094).
 A count or a load that could not be read is a refusal with its reason, never room.
 
 `run` is the press, in steps, under `STARTING` (Build step 5, pack sd:6096; design: system
@@ -47,7 +47,7 @@ UNREAD = claude_sessions.UNREAD
 
 
 def gate_status() -> dict:
-    """`sd gate status --json`: the load averages and the load cap the gate admits under."""
+    """`sd gate status --json`: the load averages."""
     sd = shutil.which("sd")
     if sd is None:
         raise Unread("sd is not on PATH, so the load was not read")
@@ -66,7 +66,7 @@ def gate_status() -> dict:
 
 def _load(gate) -> tuple[float, float]:
     answer = (gate or gate_status)()
-    load, cap = answer.get("load") if isinstance(answer, dict) else None, answer.get("load_max") if isinstance(answer, dict) else None
+    load, cap = answer.get("load") if isinstance(answer, dict) else None, build.load_cap()
     # NaN compares false with everything, so a NaN load would never be above the cap: it is unread, like inf.
     if not (isinstance(load, list) and len(load) >= 2 and all(isinstance(x, (int, float)) and math.isfinite(x) for x in load[:2])
             and isinstance(cap, (int, float)) and math.isfinite(cap)):

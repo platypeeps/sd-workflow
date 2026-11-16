@@ -820,11 +820,21 @@ def unread(load: float | None, load_cap: float | None, interactive: list[dict] |
     return UNREAD[1] if interactive is None else ""
 
 
+#: Builders start only while load5 is at most this many times the cores: the builder's own cap, apart from the
+#: gate's `sd.gate_load_max`, which is off since sd:2607 as macOS load counts disk waits (operator, sd:9094).
+LOAD_FACTOR = 1.5
+
+
+def load_cap() -> float:
+    """The five-minute load builders start under, `LOAD_FACTOR` times the cores; NaN, unread, when no count."""
+    cores = os.cpu_count()
+    return LOAD_FACTOR * cores if cores else math.nan
+
+
 def over_load(load: float, cap: float) -> str:
     """Why no builder starts under this five-minute load, or "" (pack sd:6111).
 
-    A cap of 0 or less is the gate's load rule off, as the lane's `load_stop`
-    reads it; Start next on the dashboard reads the cap the same way.
+    `cap` is `load_cap`; a cap of 0 or less is none.
     """
     return f"the five-minute load is {load:g}, above the cap of {cap:g}" if 0 < cap < load else ""
 
