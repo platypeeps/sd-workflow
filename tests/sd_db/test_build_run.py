@@ -727,6 +727,15 @@ class Supervise(Case):
                                  (self.items[0],)).fetchone()["body"]
         self.assertIn("Denied on the way: Bash `rtk git show HEAD`", report)
 
+    def test_a_denied_fix_round_that_committed_nothing_is_a_denial(self):
+        """sd:9054 review: on a fix round the branch is ahead already; a denial passes only when the child
+        itself committed, so one that stopped the fix is a denial, not another review round."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "deny"], sd_review=["blocking", "clean"])
+        ended = self.supervisor().run()
+        self.assertEqual((ended.get("outcome"), len(self.calls("sd-review"))), ("denied", 1))
+
     def test_a_line_of_another_session_blocks(self):
         self.press()
         self.plan(claude=["other"])
