@@ -287,16 +287,31 @@ class Claim(Case):
         folder.mkdir(parents=True, exist_ok=True)
         (folder / "config.json").write_text(json.dumps({"config": {"sd": {"bundle_max": value}}}))
 
-    def test_a_machine_bundle_max_sizes_its_bundles_and_budget(self):
-        """sd:9109: BUNDLE_MAX was one constant; a machine's sd.bundle_max now sets its own bundle and budget."""
-        self.assertEqual((build.bundle_max(), build.budget_minutes()), (3, 120))
+    def test_a_machine_bundle_max_sizes_its_bundles(self):
+        """sd:9109: BUNDLE_MAX was one constant; a machine's sd.bundle_max now sets its own bundle size."""
+        self.assertEqual(build.bundle_max(), 3)
         self.bundle_max("5")
-        self.assertEqual((build.bundle_max(), build.budget_minutes()), (5, 200))
+        self.assertEqual(build.bundle_max(), 5)
         build.queue(self.db, [self.item(priority=1) for _ in range(6)], who="operator")
         self.assertEqual(len(self.claim()["members"]), 5)
         for bad in ("0", "abc", 7):
             self.bundle_max(bad)
             self.assertEqual(build.bundle_max(), build.BUNDLE_MAX, f"{bad!r} reads the default")
+
+    def test_a_claim_fixes_its_budget_from_the_bundle_it_took(self):
+        """sd:9109 review: the budget read the machine's cap at supervisor start, so a cap of 1 cut one full item to
+        40 minutes, and a cap changed after the claim changed a claimed bundle's budget."""
+        self.bundle_max("1")
+        build.queue(self.db, [self.item(priority=1)], who="operator")
+        self.assertEqual(build.run(self.db, self.claim()["id"])["budget_minutes"], 120, "never below 120")
+        self.bundle_max("5")
+        build.queue(self.db, [self.item(repo=B, priority=1) for _ in range(5)], who="operator")
+        five = self.claim()
+        self.assertEqual(build.run(self.db, five["id"])["budget_minutes"], 200, "120 per 3 slots")
+        self.bundle_max("2")
+        self.assertEqual(build.run(self.db, five["id"])["budget_minutes"], 200, "a later cap moves nothing")
+        small = {"work_kind": "mechanical"}
+        self.assertEqual(build.budget_minutes(self.db, [self.item(fields=small) for _ in range(10)]), 200)
 
     def test_a_long_queue_of_small_items_fills_a_bigger_bundle(self):
         """sd:8992: a bundle took three items however small; a mechanical item now weighs half a slot."""

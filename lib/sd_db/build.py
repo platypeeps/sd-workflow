@@ -70,7 +70,8 @@ DRAFT = "draft"
 MACHINE_CAP = 6
 REPO_CAP = 1
 #: Items per bundle, so a bundle fits one 120-minute run (lead, note #29482): the default of the machine
-#: setting `sd.bundle_max` (`bundle_max`, sd:9109), and the run's budget at that size (`budget_minutes`).
+#: setting `sd.bundle_max` (`bundle_max`, sd:9109). A run's budget is `BUDGET_MINUTES` per `BUNDLE_MAX` slots
+#: of the bundle it claimed, never less (`budget_minutes`).
 BUNDLE_MAX = 3
 BUDGET_MINUTES = 120
 #: A supervisor beats every 30 s; one silent this long, or unspawned this long after its claim, is lost.
@@ -920,9 +921,18 @@ def bundle_max(environ: dict[str, str] | None = None) -> int:
     return int(value) if isinstance(value, str) and re.fullmatch("[1-9][0-9]?", value) else BUNDLE_MAX
 
 
-def budget_minutes(environ: dict[str, str] | None = None) -> int:
-    """A build child's budget: `BUDGET_MINUTES` per `BUNDLE_MAX` items, scaled to `bundle_max` (sd:9109)."""
-    return BUDGET_MINUTES * bundle_max(environ) // BUNDLE_MAX
+def _slots(connection, item: int) -> float:
+    return 0.5 if _mechanical(connection, item) else 1
+
+
+def budget_minutes(connection, items: list[int]) -> int:
+    """A build child's budget for the bundle `items`: `BUDGET_MINUTES` per `BUNDLE_MAX` slots, never less.
+
+    Fixed at claim from the bundle taken, not the machine's cap, so a small cap never cuts one item below
+    120 minutes and a cap changed later moves no claimed bundle (sd:9109 review).
+    """
+    slots = sum(_slots(connection, item) for item in items)
+    return max(BUDGET_MINUTES, math.ceil(BUDGET_MINUTES * slots / BUNDLE_MAX))
 
 
 def bundled(connection, items: list[int]) -> int:
@@ -933,7 +943,7 @@ def bundled(connection, items: list[int]) -> int:
     """
     spent, cap = 0.0, bundle_max()
     for count, item in enumerate(items):
-        spent += 0.5 if _mechanical(connection, item) else 1
+        spent += _slots(connection, item)
         if spent > cap:
             return count
     return len(items)
@@ -1058,6 +1068,8 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
                     (stamp, lead, lead, *ids, SCOPE)).rowcount
                 if taken != len(ids):
                     raise _Moved
+                connection.execute("UPDATE assignment SET budget_minutes = ? WHERE id = ?",
+                                   (budget_minutes(connection, [row["item"] for row in bundle]), lead))
                 ident = _open_run(connection, lead, repo=repo, owner=run_owner(owner, lanes[lead]),
                                   step="claimed",
                                   model=_model(connection, [row["item"] for row in bundle]),
@@ -1172,6 +1184,8 @@ def run(connection, ident: str) -> dict:
     if row is None:
         raise BuildRefused(f"no build run {ident}")
     result = dict(row)
+    result["budget_minutes"] = connection.execute("SELECT budget_minutes FROM assignment WHERE id = ?",
+                                                  (row["assignment"],)).fetchone()[0]
     result["members"] = [dict(member) for member in connection.execute(
         "SELECT id, item, status FROM assignment WHERE (id = ? OR parent = ?) AND scope = ? ORDER BY id = ? DESC, id",
         (row["assignment"], row["assignment"], SCOPE, row["assignment"]))]

@@ -65,8 +65,8 @@ from .ship import this_host
 from .workflow import WorkflowError
 from .writes import add_note, now, record_cost, record_state
 
-#: A child past this many seconds is ended: TERM to its group, `GRACE_SECONDS`, KILL. The default, at
-#: `build.BUNDLE_MAX` items; a supervisor reads its machine's `build.budget_minutes` (sd:9109).
+#: A child past this many seconds is ended: TERM to its group, `GRACE_SECONDS`, KILL. The floor; a supervisor
+#: reads the budget its claim fixed (`build.budget_minutes`, sd:9109).
 TIMEOUT_SECONDS = build.BUDGET_MINUTES * 60
 GRACE_SECONDS = 20
 BEAT_SECONDS = 30
@@ -860,8 +860,9 @@ class Supervisor:
         self.ident, self.tools, self.probe, self.cited, self.checked = ident, tools, probe, cited, checked
         self.checks = checks
         self.beat_seconds, self.grace = beat_seconds, grace
-        self.timeout = build.budget_minutes() * 60 if timeout is None else timeout
         self.row = build.run(self.db, ident)
+        claimed = self.row.get("budget_minutes") or build.BUDGET_MINUTES
+        self.timeout = max(claimed * 60, TIMEOUT_SECONDS) if timeout is None else timeout
         self.log_root, self.logs = log_root, log_dir(log_root, self.row["repo"])
         self.work = Path(self.row["work_path"])
         self.repo = paths.expand(self.row["repo"])
@@ -1919,8 +1920,7 @@ class DraftSupervisor(Supervisor):
                  beat_seconds: float = BEAT_SECONDS, timeout: float = draft.BUDGET_MINUTES * 60,
                  grace: float = GRACE_SECONDS, probe=Probe, settle_seconds: float = build.STALE_SECONDS):
         self.db, self.ident, self.tools, self.probe = Patient(connection), ident, tools, probe
-        self.beat_seconds, self.grace = beat_seconds, grace
-        self.timeout = build.budget_minutes() * 60 if timeout is None else timeout
+        self.beat_seconds, self.timeout, self.grace = beat_seconds, timeout, grace
         self.row = build.run(self.db, ident)
         self.log_root, self.logs = log_root, log_dir(log_root, self.row["repo"])
         self.repo = self.work = paths.expand(self.row["repo"])
