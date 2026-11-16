@@ -1734,6 +1734,26 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                                      "/api/queue/builds?show=all": [200, {**self.BUILDS, "runs": [both]}]})
         self.assertIn('data-run="r1"', out["R"]["alpha"])
 
+    def test_a_run_not_in_the_lane_keeps_its_row_beside_its_items_pr_wait(self):
+        """sd:9022 review: a builder fixing an open PR's review is working, not waiting; its row and Cancel stay."""
+        lanes = queue_screen.document(self.connection, now=NOW)
+        lanes["prs"] = {"error": "", "rows": [
+            {"item": 7, "title": "Seven", "repo": "/repos/alpha", "url": "https://github.com/example/alpha/pull/7",
+             "lane": "awaiting_them", "on": "you", "since": NOW, "waited": 60}]}
+        for state, why in (("working", ""), ("stalled", ""), ("lost", ""), ("waiting", "question 12")):
+            with self.subTest(state=state):
+                run = {**self.BUILDS["runs"][0], "step": "building", "state": state, "why": why}
+                out = self.run_view("open('alpha'); R.alpha = ELS.queue.html;",
+                                    answers={"/api/queue": [200, lanes],
+                                             "/api/queue/builds?show=all": [200, {**self.BUILDS, "runs": [run]}]})
+                self.assertIn('data-run="r1"', out["R"]["alpha"])
+                self.assertIn('data-pr="7"', out["R"]["alpha"])
+        team = {**self.BUILDS["runs"][0], "run": "t1", "teammate": True, "state": "working", "step": "building"}
+        out = self.run_view("open('alpha'); R.alpha = ELS.queue.html;",
+                            answers={"/api/queue": [200, lanes],
+                                     "/api/queue/builds?show=all": [200, {**self.BUILDS, "runs": [team]}]})
+        self.assertIn('data-run="t1"', out["R"]["alpha"])
+
     def test_a_queued_satellite_build_names_why_its_dispatcher_claims_nothing(self):
         """Review round 5: a queued build the hub leaves queued shows the satellite's reason on its row."""
         builds = {**self.BUILDS, "unclaimed": {"41": "work claims nothing: the load was not read"}}
