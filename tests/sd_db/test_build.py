@@ -265,6 +265,14 @@ class Claim(Case):
         third = self.claim()
         self.assertEqual((third["repo"], len(third["members"])), (A, 1), "the next bundle takes the fourth")
 
+    def test_a_long_queue_of_small_items_fills_a_bigger_bundle(self):
+        """sd:8992: a bundle took three items however small; a mechanical item now weighs half a slot."""
+        small = {"work_kind": "mechanical"}
+        build.queue(self.db, [self.item(priority=1), *(self.item(priority=2, fields=small) for _ in range(6))],
+                    who="operator")
+        self.assertEqual(len(self.claim()["members"]), 5, "one whole slot and four half ones")
+        self.assertEqual([build.bundled(self.db, items) for items in ([], [self.item()] * 4)], [0, 3])
+
     def test_one_running_bundle_fills_its_repository_not_another(self):
         """sd:8158: one bundle per repository at a time, so later items wait for it and the next bundle takes them."""
         build.queue(self.db, [self.item()], who="operator")
@@ -1605,20 +1613,163 @@ class Hosts(Case):
         self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", hub[0]["id"]), "queued")
         self.assertEqual(self.claim(hosts=HUB)["owner"], "fixture", "the hub's run keeps the role as its owner")
 
+    OVER = {"load": "the five-minute load is 30, above the cap of 24"}
+
+    def test_the_hub_takes_no_overloaded_satellite_row_whose_repository_it_has_not_checked_out(self):
+        """sd:8991 review: the hub claimed a satellite's row for a repository with no checkout on its disk, and the
+        run blocked at the worktree step, once per queued row while the satellite stayed busy."""
+        build.queue(self.db, [self.item(repo=SAT)], who="operator")
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT status FROM assignment"), "queued", "skipped, not blocked")
+
+    def retried(self, run):
+        """`run`'s bundle ended blocked and released, and queued again as Retry does."""
+        stamp = build.clock()
+        self.db.execute("UPDATE runner_run SET outcome = 'blocked', released_at = ? WHERE id = ?", (stamp, run["id"]))
+        self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (stamp, run["id"]))
+        self.db.execute("UPDATE assignment SET status = 'queued' WHERE id = ?", (run["assignment"],))
+        self.db.execute("UPDATE item SET status = 'ready' WHERE id = (SELECT item FROM assignment WHERE id = ?)",
+                        (run["assignment"],))
+
+    def checkout(self):
+        """The satellite repository, checked out on this disk too; its path."""
+        checkout = self.root / "sat"
+        (checkout / ".git").mkdir(parents=True)
+        self.db.execute("UPDATE repo SET path = ? WHERE path = ?", (str(checkout), SAT))
+        return str(checkout)
+
+    def test_a_satellites_retry_stays_on_the_satellite_while_it_is_over_its_cap(self):
+        """sd:8991 review: a retry keeps its commits in the worktree of the host that ran it; an overloaded
+        satellite's retry moved to the hub without that work."""
+        build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
+        self.retried(self.claim(hosts=WORK))
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
+        self.assertIsNone(self.claim(hosts=HUB), "the satellite's retry waits for the satellite")
+        self.assertEqual(self.claim(hosts=WORK)["owner"], "fixture@work")
+
+    def stale(self, host="work"):
+        """`host`'s dispatcher beat, too old to read as alive."""
+        stamp = (datetime.fromisoformat(build.clock()) - timedelta(seconds=build.STALE_SECONDS + 1)).isoformat()
+        record_state(self.db, "heartbeat", key=f"build-dispatch@{host}", timestamp=stamp, body={})
+
+    def test_a_hub_retry_behind_another_row_is_not_blocked_on_the_satellites_quiet_beat(self):
+        """sd:8991 review round 2: the quiet-dispatcher refusal ran before `_ran_on` routed the later rows, so the
+        retry of the hub's fallback build, queued behind another row, blocked once its satellite went quiet."""
+        build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
+        fallback = self.claim(hosts=HUB)
+        self.retried(fallback)
+        build.queue(self.db, [self.item(priority=1)], who="operator")
+        self.stale()
+        self.claim(hosts=HUB)
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", fallback["assignment"]), "queued")
+        self.assertEqual(self.claim(hosts=HUB)["assignment"], fallback["assignment"], "the hub rebuilds it")
+
+    def test_another_satellite_blocks_no_quiet_satellites_row(self):
+        """sd:8991 review round 2: the refusal ran outside the hub's guard, so one satellite blocked another's rows."""
+        build.queue(self.db, [self.item(repo=SAT)], who="operator")
+        self.stale()
+        self.assertIsNone(self.claim(hosts=frozenset({"other"})))
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE status = 'blocked'"), 0)
+
+    def test_a_quiet_satellites_rows_are_blocked_once(self):
+        """sd:8991 review round 2: the refusal ran once per queued row, writing each blocked note that many times."""
+        items = [self.item(repo=SAT), self.item(repo=SAT)]
+        build.queue(self.db, items, who="operator")
+        self.stale()
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual([self.count("SELECT COUNT(*) FROM note WHERE item = ? AND body LIKE 'Build assignment % "
+                                     "blocked:%'", item) for item in items], [1, 1])
+
+    def test_the_hubs_fallback_retry_stays_on_the_hub(self):
+        """sd:8991 review: the retry of a bundle the hub built for a busy satellite moved back to the satellite,
+        whose disk holds none of its work."""
+        build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
+        fallback = self.claim(hosts=HUB)
+        self.assertEqual(fallback["owner"], "fixture", "a fresh row of a checked-out repository moves")
+        self.retried(fallback)
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        self.assertIsNone(self.claim(hosts=WORK), "the hub's fallback retry waits for the hub")
+        self.assertEqual(self.claim(hosts=HUB)["owner"], "fixture")
+
+    def test_a_retry_follows_its_lane_moved_from_a_quiet_satellite_to_the_hub(self):
+        """sd:8991 review round 3: `_ran_on` kept every retry on the host of its last run, so a Retry whose lane
+        the operator moved from a down satellite to the hub was blocked on that satellite's quiet beat."""
+        build.queue(self.db, [self.item(repo=SAT)], who="operator")
+        self.retried(self.claim(hosts=WORK))
+        self.stale()
+        self.db.execute("UPDATE repo SET lane_host = NULL WHERE path = ?", (SAT,))
+        run = self.claim(hosts=HUB)
+        self.assertIsNotNone(run, "the hub claims the moved lane's retry")
+        self.assertEqual(run["owner"], "fixture")
+
+    def test_the_hub_requeues_a_row_blocked_on_a_satellite_its_lane_left(self):
+        """sd:8991 review round 3: a row blocked on a quiet satellite stayed blocked once its lane moved to the hub,
+        as `_requeue_beat_blocked` put back only a row whose lane still ran on the host the block names."""
+        build.queue(self.db, [self.item(repo=SAT)], who="operator")
+        retry = self.claim(hosts=WORK)
+        self.retried(retry)
+        self.stale()
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", retry["assignment"]), "blocked")
+        self.db.execute("UPDATE repo SET lane_host = NULL WHERE path = ?", (SAT,))
+        run = self.claim(hosts=HUB)
+        self.assertIsNotNone(run, "put back and claimed by the hub")
+        self.assertEqual(run["assignment"], retry["assignment"])
+
+    def fallback_retried(self):
+        """A bundle the hub built for the busy satellite's lane, ended blocked and released; its run."""
+        build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
+        fallback = self.claim(hosts=HUB)
+        self.retried(fallback)
+        self.db.execute("UPDATE assignment SET status = 'blocked' WHERE id = ?", (fallback["assignment"],))
+        return fallback
+
+    def test_retry_of_the_hubs_fallback_build_is_not_refused_on_the_quiet_satellite(self):
+        """sd:8991 review round 3, class pass: Retry ran the press check on the repository's lane alone, so it
+        refused the retry of a bundle the hub built, which the hub claims, once the satellite went quiet."""
+        fallback = self.fallback_retried()
+        self.stale()
+        build.retry(self.db, fallback["assignment"], who="operator")
+        self.assertEqual(self.claim(hosts=HUB)["assignment"], fallback["assignment"])
+
+    def test_the_builds_panel_names_no_satellite_for_the_hubs_fallback_retry(self):
+        """sd:8991 review round 3, class pass: `unclaimed` read the repository's lane alone, so the panel said the
+        satellite claims nothing for a retry the hub claims."""
+        fallback = self.fallback_retried()
+        self.db.execute("UPDATE assignment SET status = 'queued' WHERE id = ?", (fallback["assignment"],))
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={"why": "no log folder"})
+        self.assertNotIn(str(fallback["assignment"]), build.unclaimed(self.db))
+
+    def test_the_hubs_fallback_retry_holds_the_hubs_pickup(self):
+        """sd:8991 review round 3, class pass: pickup read the repository's lane alone, so a queued retry the hub
+        claims did not hold the hub's pickup."""
+        fallback = self.fallback_retried()
+        self.db.execute("UPDATE assignment SET status = 'queued' WHERE id = ?", (fallback["assignment"],))
+        self.item()
+        build.set_pickup(self.db, True, now=Pickup.NOW)
+        with mock.patch.object(build, "this_host", return_value="hub"):
+            self.assertEqual(build.pickup(self.db, build.room(self.db, **IDLE, hosts=HUB), now=Pickup.NOW), [])
+
     def test_a_lane_move_before_the_claim_moves_the_claim(self):
         build.queue(self.db, [self.item(repo=SAT)], who="operator")
         self.db.execute("UPDATE repo SET lane_host = NULL WHERE path = ?", (SAT,))
         self.assertIsNone(self.claim(hosts=WORK))
         self.assertEqual(self.claim(hosts=HUB)["owner"], "fixture")
 
-    def test_room_counts_only_this_hosts_runs(self):
+    def test_room_counts_only_this_hosts_runs_but_every_hosts_repository_slot(self):
+        """The machine cap is per host; a repository's slot is held by any host's bundle, as the hub may build a
+        satellite's lane (sd:8991)."""
         self.satellite_run()
         build.queue(self.db, [self.item()], who="operator")
         self.claim(hosts=HUB)
-        for hosts, repo in ((HUB, A), (WORK, SAT)):
+        for hosts in (HUB, WORK):
             with self.subTest(hosts=hosts):
                 room = build.room(self.db, **IDLE, hosts=hosts)
-                self.assertEqual((room["machine"], room["used"]), (build.MACHINE_CAP - 1, {repo: 1}))
+                self.assertEqual((room["machine"], room["used"]), (build.MACHINE_CAP - 1, {A: 1, SAT: 1}))
 
     def test_auto_pickup_runs_on_each_lane_host_for_its_own_lanes(self):
         """Sd:8393: a satellite lane's ready item got no build while pickup ran on the hub only; each host's

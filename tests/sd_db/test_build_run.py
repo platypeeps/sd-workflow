@@ -2532,6 +2532,23 @@ class Archive(Case):
             self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs), [])
         self.assertEqual(path.read_text(), "## Summary\n\nthe retry's body\n")
 
+    def test_a_source_rewritten_mid_copy_leaves_no_torn_copy(self):
+        """sd:8989: the copy of a source rewritten mid-copy stayed in place, and its size and mtime could match
+        the new source, so the next tick's `_same_copy` took the torn copy as finished and removed the source."""
+        path, target = self.ended("sd-{assignment}.body.md")
+
+        def torn(source, destination, *args, **kwargs):
+            Path(source).write_text("new")
+            Path(destination).write_text("old")  # the old bytes, as long as the new source
+            shutil.copystat(source, destination)
+
+        with mock.patch.object(build_run.shutil, "copy2", side_effect=torn):
+            self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs), [])
+        self.assertFalse(target.exists(), "a copy whose source moved is removed")
+        os.utime(path, (0, 0))
+        self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs), [str(target)])
+        self.assertEqual(target.read_text(), "new")
+
     @staticmethod
     def landed_copy_stat(target: Path, landed):
         """Patch `Path.stat` so a stat of `target` once its copy landed calls `landed()` instead."""
@@ -2874,6 +2891,24 @@ class Hosts(Case):
         self.assertEqual(build.run(self.db, work["claimed"][0])["owner"], "fixture@work")
         with self.on("hub"):
             self.assertEqual(self.tick()["spawned"], hub["claimed"], "nor the satellite's on the hub")
+
+    def test_the_hub_builds_a_satellite_lane_while_its_host_is_over_the_load_cap(self):
+        """sd:8991: a satellite over its load cap claimed nothing, and the hub left its rows queued; the hub now
+        builds them itself, and the repository's one slot holds the satellite's claim off meanwhile."""
+        (self.satellite / ".git").mkdir(parents=True)  # the hub builds only a repository checked out here
+        _, sat = self.both()
+        with self.on("work"):
+            self.assertEqual(self.tick(load=30.0, load_cap=24.0)["claimed"], [])
+        with self.on("hub"):
+            hub = self.tick()
+            taken = [build.run(self.db, ident) for ident in hub["claimed"]]
+            self.assertEqual([(row["repo"], row["owner"]) for row in taken], [(str(self.repo), "fixture")])
+            taken = [build.run(self.db, ident) for ident in self.tick()["claimed"]]
+            self.assertEqual([(row["repo"], row["owner"]) for row in taken], [(str(self.satellite), "fixture")])
+        later = create_item(self.db, kind="task", title="Later", repo=str(self.satellite), status="ready")
+        build.queue(self.db, [later], who="operator")
+        with self.on("work"):
+            self.assertEqual(self.tick()["claimed"], [], "the hub's bundle holds the repository's slot")
 
     def test_a_tick_that_cannot_claim_says_why_in_its_beat(self):
         """Review round 4: a satellite whose tick claims nothing beats with the reason, and the hub refuses its
