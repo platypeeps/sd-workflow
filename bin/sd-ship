@@ -3398,6 +3398,7 @@ def unmanaged_command(root: pathlib.Path, connection, args, store) -> dict:
         raise Refusal("prepare in an unmanaged repository commits nothing; commit and push the branch first",
                       code="unmanaged_flags_refused", boundary="input", state="operator_decision",
                       next_action="Commit and push the branch, then rerun prepare without --path or --message-file.")
+    sd_lib.import_sd_db()  # the gateway first, as for every sd_db import here
     from sd_db import repos
     path = repos.registered_for(connection, str(root.resolve()), git(root, "config", "--get", "remote.origin.url"))
     if args.item is not None and store.identity(connection, args.item)["repo"]["path"] != path:
@@ -3513,6 +3514,7 @@ def send_merge(api: GitHub, ready: dict, method: str) -> str:
 def merged_result(connection, item, api: GitHub, number: int, method: str, commit: str, ready: dict | None) -> dict:
     """The merge result, and with `item` its one note, written once however many runs reach it."""
     if item is not None:
+        sd_lib.import_sd_db()  # the gateway first, as for every sd_db import here
         from sd_db.database import transaction
         from sd_db.writes import add_note
         body = f"sd-ship merged {api.repository}#{number} by {method} at {commit} (unmanaged repository, sd:9100)"
