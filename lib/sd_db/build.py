@@ -67,6 +67,7 @@ SCOPE = "build"
 DRAFT = "draft"
 #: Code-writing builders per machine, the operator's standing rule, and bundles building per repository at once.
 #: One: later items wait and the next bundle takes them (sd:8158); a bundle in the lane frees it (sd:8277).
+#: `REPO_CAP` is the default of the machine setting `sd.repo_cap` (`repo_cap`, sd:9172).
 MACHINE_CAP = 6
 REPO_CAP = 1
 #: Items per bundle, so a bundle fits one 120-minute run (lead, note #29482): the default of the machine
@@ -894,10 +895,10 @@ def room(connection, *, load: float | None, load_cap: float | None, interactive:
 
 
 def room_for(available: dict, repo: str) -> int:
-    """`room`'s answer for one repository: at most `REPO_CAP` builders there, and none while it is held."""
+    """`room`'s answer for one repository: at most `repo_cap()` builders there, and none while it is held."""
     if available["why"] or repo in available["held"]:
         return 0
-    return max(0, min(available["machine"], REPO_CAP - available["used"].get(repo, 0)))
+    return max(0, min(available["machine"], repo_cap() - available["used"].get(repo, 0)))
 
 
 def _mechanical(connection, item: int) -> bool:
@@ -914,21 +915,31 @@ def _model(connection, items: list[int]) -> str:
     return SONNET if all(_mechanical(connection, item) for item in items) else OPUS
 
 
-def bundle_max(environ: dict[str, str] | None = None) -> int:
-    """This machine's `sd.bundle_max` from the pack's machine config, `BUNDLE_MAX` when unset (sd:9109).
+def _machine_setting(key: str, pattern: str, default: int, environ: dict[str, str] | None) -> int:
+    """This machine's `sd.<key>` from the pack's machine config as a number, `default` when unset.
 
     The machine that claims a bundle reads its own, as `sd.gate_slots` is read
-    (`sd_lib.file_setting`); a value that does not read as a whole number from
-    1 to 99 is the default, so a bad file never stops a dispatcher.
+    (`sd_lib.file_setting`); a value that does not match `pattern` is the
+    default, so a bad file never stops a dispatcher.
     """
     env = os.environ if environ is None else environ
     home = env.get("XDG_CONFIG_HOME") or str(Path(env.get("HOME") or Path.home()) / ".config")
     try:
         config = json.loads((Path(home) / "sd-ai-command-pack" / "config.json").read_text()).get("config", {})
-        value = config.get("sd", {}).get("bundle_max")
+        value = config.get("sd", {}).get(key)
     except (OSError, ValueError, AttributeError):
-        return BUNDLE_MAX
-    return int(value) if isinstance(value, str) and re.fullmatch("[1-9][0-9]?", value) else BUNDLE_MAX
+        return default
+    return int(value) if isinstance(value, str) and re.fullmatch(pattern, value) else default
+
+
+def bundle_max(environ: dict[str, str] | None = None) -> int:
+    """This machine's `sd.bundle_max`, 1 to 99; `BUNDLE_MAX` when unset (sd:9109)."""
+    return _machine_setting("bundle_max", "[1-9][0-9]?", BUNDLE_MAX, environ)
+
+
+def repo_cap(environ: dict[str, str] | None = None) -> int:
+    """This machine's `sd.repo_cap`, bundles building per repository, 1 to 6; `REPO_CAP` when unset (sd:9172)."""
+    return _machine_setting("repo_cap", "[1-6]", REPO_CAP, environ)
 
 
 def _slots(connection, item: int) -> float:
