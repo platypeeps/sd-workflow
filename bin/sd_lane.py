@@ -802,14 +802,13 @@ def enqueue_entry(worktree: pathlib.Path, item: int, title: str, body_file: path
         if claim == "deliver":  # an associate-only claim closes nothing (sd:3365)
             commits = unreverted(worktree, head, branch_commits(worktree, base, head))
             parents = branch_parents(worktree, base, head)
-            cited, repo = on_hub(queue, lambda connection: cited_closes(connection, item, body, commits, closes,
-                                                                        parents))
+            cited = on_hub(queue, lambda connection: cited_closes(connection, item, body, commits, closes, parents))
             entry["closes"] = [*closes, *(row["item"] for row in cited)]
             if cited:  # listed where a reader sees it (sd:5999 lane review)
                 import sd_ship_body  # noqa: PLC0415
                 entry["cited"] = cited
                 entry["body"] = sd_ship_body.with_cited(
-                    body, [f"- {repo} sd:{row['item']}: {row['source']}" for row in cited])
+                    body, [f"- sd:{row['item']}: {row['source']}" for row in cited])  # no repo name (sd:9135)
         on_hub(queue, lambda connection: refuse_teammate(connection, entry))  # the whole set
     require_published(worktree, branch, head, f"{head} names no commit in {worktree}", refuse_before_push,
                       lambda tip: tip_past(worktree, branch, tip, head))
@@ -984,8 +983,8 @@ def branch_parents(worktree: pathlib.Path, base: str, head: str) -> dict[str, tu
 
 def cited_closes(connection: Any, item: int, body: str, commits: list[tuple[str, str]],
                  closes: tuple[int, ...], parents: dict[str, tuple[str, ...]] | None = None
-                 ) -> tuple[list[dict[str, Any]], str]:
-    """The open items of `item`'s repository its commits or body cite, beyond `closes`, and that repository's name (sd:5999).
+                 ) -> list[dict[str, Any]]:
+    """The open items of `item`'s repository its commits or body cite, beyond `closes` (sd:5999).
 
     Each `{"item", "source"}`: a branch commit's `Closes: sd:N` trailer, or a `Lane review
     fix, <repo> sd:N` line (`sd_ship_body.cited_sources`). The merge closes
@@ -996,10 +995,10 @@ def cited_closes(connection: Any, item: int, body: str, commits: list[tuple[str,
     import sd_ship_body  # noqa: PLC0415
     row = connection.execute("SELECT repo FROM item WHERE id = ?", (item,)).fetchone()
     if row is None or not row["repo"]:
-        return [], ""
+        return []
     sources = sd_ship_body.cited_sources(body, commits, parents)
     kept = sd_ship_body.open_cited(connection, item, row["repo"], tuple(sources), closes, body)
-    return [{"item": number, "source": sources[number]} for number in kept], pathlib.Path(row["repo"]).name
+    return [{"item": number, "source": sources[number]} for number in kept]
 
 
 def tip_past(worktree: pathlib.Path, branch: str, tip: str, head: str) -> None:
