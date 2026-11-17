@@ -1727,8 +1727,9 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertIn("<span>1 PR review: 0 on you, 1 on reviewers</span>", out["R"]["tally"])
         self.assertEqual(self.repo_detail(out["R"]["alpha"], "alpha")[1],
                          ' aria-label="0 merging, 1 review, 0 working, 0 next, 0 blocked, 0 suggested"')
-        # A run with a member that does not wait on a PR keeps its row.
-        both = {**run, "items": [*run["items"], {"item": 8, "assignment": 8, "status": "running", "title": "Eight"}]}
+        # A run with a member that does not wait on a PR keeps its row, unless its pull is that PR row's (sd:9114).
+        both = {**run, "pull": "", "items": [*run["items"], {"item": 8, "assignment": 8, "status": "running",
+                                                         "title": "Eight"}]}
         out = self.run_view("open('alpha'); R.alpha = ELS.queue.html;",
                             answers={"/api/queue": [200, lanes],
                                      "/api/queue/builds?show=all": [200, {**self.BUILDS, "runs": [both]}]})
@@ -1773,6 +1774,14 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
             html = view(lanes=[lane], blocked=[asg])
             self.assertNotIn('data-asg-row="70"', html)
             self.assertIn('data-id="entry:/repos/alpha:7"', html)
+        # D) sd:9114: a run in the lane whose PR is a PR row, a member blocked with no PR row of its own: the PR row
+        # alone, matched by the run's pull.
+        bundle = {**run, "pull": pr["url"], "items": [{**run["items"][0], "status": "done"},
+                                                     {**run["items"][1], "status": "blocked"}]}
+        with self.subTest(case="D"):
+            html = view(prs=[pr], runs=[bundle])
+            self.assertNotIn('data-run="r1"', html)
+            self.assertIn('data-pr="7"', html)
 
     def test_a_run_not_in_the_lane_keeps_its_row_beside_its_items_pr_wait(self):
         """sd:9022 review: a builder fixing an open PR's review is working, not waiting; its row and Cancel stay."""
