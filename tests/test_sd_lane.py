@@ -2951,7 +2951,9 @@ class CitedCloses(SharedQueue):
         self.assertEqual((len(self.entries()), "push" in self.git_verbs), (before, False))
 
     def test_each_cited_close_is_listed_in_the_body_and_noted_on_its_item(self) -> None:
-        """Lane review of sd:5999, operator ruling: a reader sees every close by citation, so a wrong one is one reopen."""
+        """Lane review of sd:5999, operator ruling: a reader sees every close by citation, so a wrong one is one reopen.
+
+        Each line names no repository: a private repo's name fails prepare's docs lint (sd:9135)."""
         a, b, c, *_ = self.open
         entry = self.enqueue(f"## Summary\n\nWords.\n\nLane review fix, pack sd:{b}: x.\n\nRefs: sd:{c}\n",
                              f"fix(lane): the slice\n\nCloses: sd:{a}", f"fix: first part (sd:{c})")
@@ -2961,8 +2963,8 @@ class CitedCloses(SharedQueue):
         self.assertEqual(entry["cited"], [{"item": a, "source": f"Closes trailer of commit {first[:12]}"},
                                           {"item": b, "source": "review fix line in the body"}])
         self.assertEqual(entry["body"], f"## Summary\n\nWords.\n\nLane review fix, pack sd:{b}: x.\n\n"
-                                        f"## Closed by citation\n\n- pack sd:{a}: Closes trailer of commit {first[:12]}\n"
-                                        f"- pack sd:{b}: review fix line in the body\n\nRefs: sd:{c}\n")
+                                        f"## Closed by citation\n\n- sd:{a}: Closes trailer of commit {first[:12]}\n"
+                                        f"- sd:{b}: review fix line in the body\n\nRefs: sd:{c}\n")
         bodies: list[str] = []
 
         def ship(argv: list[str], log: pathlib.Path) -> dict:

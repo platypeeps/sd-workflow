@@ -584,7 +584,7 @@ class Supervise(Case):
         head = enqueue[enqueue.index("--expected-head") + 1]
         body = Path(enqueue[enqueue.index("--body-file") + 1]).read_text(encoding="utf-8")
         self.db.execute("UPDATE item SET status = 'in_progress' WHERE id = ?", (self.items[1],))
-        cited, _ = LANE.cited_closes(self.db, self.items[0], body, LANE.branch_commits(work, "main", head), ())
+        cited = LANE.cited_closes(self.db, self.items[0], body, LANE.branch_commits(work, "main", head), ())
         self.assertEqual([row["item"] for row in cited], [])
 
     def test_the_lane_entry_is_found_by_any_delivered_member(self):
