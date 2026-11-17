@@ -46,11 +46,11 @@ BINARY_MARKER = re.compile(r"(?m)^Binary files .* differ\n?")
 MEDIA, SUMMARY = re.compile(r"(?m)^\[binary, not sent\] "), re.compile(r"(?m)^\[(?:binary, not sent\] |renamed\] .*; unchanged lines not sent$)")  # a patch prefixes content lines
 DELETED = re.compile(r"(?m)^deleted file mode ")  # sd:6088: with -D this header is all a deletion sends
 RENAMED = re.compile(r'(?m)^\[renamed\] ("(?:[^"\\]|\\.)*") -> "(?:[^"\\]|\\.)*"; unchanged lines not sent$')
-MEDIA_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"wOFF", b"wOF2", b"%PDF-")
+MEDIA_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"wOFF", b"wOF2", b"%PDF-", b"OggS", b"fLaC", b"ID3")  # sd:9127: audio
 
 
 def is_media(data: bytes) -> bool:
-    return data.startswith(MEDIA_MAGIC) or (data[:4] == b"RIFF" and data[8:12] == b"WEBP")
+    return data.startswith(MEDIA_MAGIC) or (data[:4] == b"RIFF" and data[8:12] in (b"WEBP", b"WAVE"))
 
 
 def as_text(data: bytes) -> str | None:
