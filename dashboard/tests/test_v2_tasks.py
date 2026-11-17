@@ -2897,6 +2897,25 @@ R.reads = OUT.gets.filter(g => g === '/api/tasks/{port}').length;""", answer)
         self.assertEqual([p[:2] for p in out["posts"]], [[f"/api/assignments/{asg['id']}/cancel", {"revision": asg["revision"]}]])
         self.assertGreaterEqual(out["R"]["reads"], 2, "the Details were not read again after the refusal")
 
+    def test_the_cancel_confirm_promises_a_park_only_for_a_build(self):
+        # Review round 4 of pack sd:9222: only a build's cancel parks; the confirm read the status alone, so a
+        # queued or running assignment of another scope was promised a park that does not happen.
+        port = self.ids["port"]
+        (asg,) = self.details[str(port)]["assignments"]
+        carried = asg.get("scope") == "item"
+        texts = {}
+        for scope in ("item", "build"):
+            for status in ("queued", "running"):
+                asg.update(scope=scope, status=status)
+                out = self.run_page(f"""open({port}); await flush();
+R.text = cmd('asg.cancel').consequence(C.get('asg:{asg['id']}'));""")
+                texts[scope, status] = out["R"]["text"]
+        for status in ("queued", "running"):
+            self.assertNotIn("park", texts["item", status])
+            self.assertIn("The item's status is unchanged.", texts["item", status])
+            self.assertIn("Unpark", texts["build", status])
+        self.assertTrue(carried, "the Details carry each assignment's scope")
+
     def test_a_task_added_under_a_filter_that_hides_it_is_not_selected(self):
         # Selection stays on a visible task: a new task the filters hide is added and named, not selected (review, PR #46).
         new = {**self.row("ask"), "id": 99, "title": "Call the bank", "kind": "task", "repo": None, "repo_path": None}

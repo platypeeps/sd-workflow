@@ -626,12 +626,20 @@ def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
                                              for row in queued]}
 
 
-def left(connection, lead: int) -> list[int]:
-    """The items of the members an operator cancelled on their own out of `lead`'s bundle (`ALONE`): an older run's
-    `Closes:` trailer on the branch may still cite one, and the run delivers none of them."""
-    return [row["item"] for row in connection.execute(
-        f"SELECT item FROM assignment WHERE parent = ? AND scope = ? AND NOT {_in_group()} ORDER BY id",
-        (lead, SCOPE))]
+def left(connection, lead: int, items) -> set[int]:
+    """Of `items`, each whose newest build assignment is a member an operator cancelled on its own (`ALONE`) out of a
+    bundle the item `lead` led. The lane neither closes nor demands one on `lead`'s entry, whatever its commits,
+    title or body say: an older run's `Closes:` trailer may still cite it (review round 4 of sd:9222). A later press
+    of the item makes a newer assignment, so it is delivered again."""
+    found = set()
+    for item in dict.fromkeys(items):
+        row = connection.execute(
+            "SELECT member.result, head.item AS lead FROM assignment AS member "
+            "LEFT JOIN assignment AS head ON head.id = member.parent "
+            "WHERE member.item = ? AND member.scope = ? ORDER BY member.id DESC LIMIT 1", (item, SCOPE)).fetchone()
+        if row is not None and row["lead"] == lead and (row["result"] or "").startswith(ALONE):
+            found.add(item)
+    return found
 
 
 def _alone(connection, assignment: int) -> bool:

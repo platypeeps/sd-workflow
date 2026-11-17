@@ -384,14 +384,23 @@ def with_cited(body: str, lines: list[str]) -> str:
     return f"{text}\n\n{section}"
 
 
+def _left(connection, item: int, body: str, named, numbers) -> set[int]:
+    """Of `numbers`, those a delivering merge of `item` leaves open: `item` and `named`, already closed, each a
+    `Refs:` line of `body` names, and each member an operator cancelled on its own out of `item`'s build bundle,
+    read from data so no commit, title or body text delivers it (`build.left`, review round 4 of pack sd:9222)."""
+    sd_lib.import_sd_db()  # every caller holds an sd_db connection, so this finds it
+    from sd_db import build  # noqa: PLC0415
+    return referenced_ids(body) | {item, *named} | build.left(connection, item, numbers)
+
+
 def open_cited(connection, item: int, repo: str, cited, named, body: str) -> tuple[int, ...]:
     """Of `cited`, the items a merge of `item` should close beyond `named`, its later `--item` list (sd:5999).
 
     An item counts when it belongs to `repo`, is a kind a merge closes, and
     is open, as `refuse_left_open` reads them; a `Refs:` line of `body`
-    keeps one open.
+    keeps one open, as does the data `_left` reads.
     """
-    left = referenced_ids(body) | {item, *named}
+    left = _left(connection, item, body, named, cited)
     kept = []
     for number in cited:
         if number in left:
@@ -417,9 +426,10 @@ def refuse_left_open(connection, item: int, repo: str, names, title: str, body: 
     """
     if not deliver:
         return
-    left = referenced_ids(body) | {item, *named}
+    named_ids = tuple(dict.fromkeys(title_ids(title) + summary_ids(body, names)))
+    left = _left(connection, item, body, named, named_ids)
     missing = []
-    for number in dict.fromkeys(title_ids(title) + summary_ids(body, names)):
+    for number in named_ids:
         if number in left:
             continue
         row = connection.execute("SELECT repo, kind, status FROM item WHERE id = ?", (number,)).fetchone()

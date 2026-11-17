@@ -414,7 +414,7 @@ def _details(connection, item: int, *, now: str) -> dict:
         held = operations.assignment_state(connection, assignment["id"])
         assignments.append({
             "id": assignment["id"], "role": assignment["role"], "provider": assignment["provider"],
-            "status": assignment["status"], "started": assignment["started"], "ended": assignment["ended"],
+            "scope": assignment["scope"], "status": assignment["status"], "started": assignment["started"], "ended": assignment["ended"],
             "usd": assignment["usd"], "estimated": bool(assignment["estimated"]),
             "revision": held["revision"], "cancel": held["capabilities"]["cancel"],
         })

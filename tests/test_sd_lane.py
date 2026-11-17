@@ -3079,6 +3079,51 @@ class CitedCloses(SharedQueue):
         entry = self.enqueue("Words.\n", f"fix: the slice\n\nCloses: sd:{self.open[0]}", claim="associate-only")
         self.assertEqual(entry["closes"], [])
 
+    def cancelled_alone(self, lead: int, member: int) -> None:
+        """A build bundle `lead` leads, whose `member` the operator cancelled on its own (pack sd:9222)."""
+        import sd_db
+        from sd_db import build, operations
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            head, child = (sd_db.create_assignment(connection, item=item, role="author", status="queued",
+                                                   lane="parallel") for item in (lead, member))
+            connection.execute("UPDATE assignment SET scope = ? WHERE id IN (?, ?)", (build.SCOPE, head, child))
+            connection.execute("UPDATE assignment SET parent = ? WHERE id = ?", (head, child))
+            connection.commit()
+            state = operations.assignment_state(connection, child)
+            operations.cancel_assignment(connection, child, expected_revision=state["revision"], who="operator")
+        finally:
+            connection.close()
+
+    def test_a_member_cancelled_alone_is_no_cited_close_of_its_lead(self) -> None:
+        """Review round 4 of pack sd:9222: data, not text, keeps the member open. An older run's trailer and a
+        review fix line cite it, with no `Refs:` line, and the lead's entry still leaves it open."""
+        a, b, *_ = self.open
+        self.cancelled_alone(self.own, a)
+        entry = self.enqueue(f"## Summary\n\nWords.\n\nLane review fix, pack sd:{a}: x.\n",
+                             f"fix(lane): the slice\n\nCloses: sd:{a}\nCloses: sd:{b}")
+        self.assertEqual(entry["closes"], [b])
+
+    def test_a_member_cancelled_alone_is_not_demanded_by_title_or_summary(self) -> None:
+        """Review round 4 of pack sd:9222: a retry reverted the closing commit, yet the title and a Summary
+        heading still name the member; the lead's entry queues without it."""
+        a = self.open[0]
+        self.cancelled_alone(self.own, a)
+        tree, _ = self.committed("topic-alone", f"fix(lane): the slice\n\nCloses: sd:{self.own}")
+        self.body.write_text(f"## Summary\n\n- pack sd:{self.own}: the lead\n- pack sd:{a}: the member\n",
+                             encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, f"fix: sd:{self.own} and sd:{a}", self.body, self.environ,
+                                      claim="deliver")
+        self.assertEqual((entry["status"], entry["closes"]), ("pending", []))
+
+    def test_a_member_cancelled_alone_from_another_bundle_still_closes(self) -> None:
+        """Evidence: the exclusion holds for the entry of the member's own lead only. Another item's entry that
+        delivers it closes it as before."""
+        a, *_, other = self.open
+        self.cancelled_alone(other, a)
+        entry = self.enqueue("## Summary\n\nWords.\n", f"fix(lane): the slice\n\nCloses: sd:{a}")
+        self.assertEqual(entry["closes"], [a])
+
     def test_a_failed_hub_read_queues_and_pushes_nothing(self) -> None:
         """Failures: the cited items' read did not answer; that is no "nothing to close"."""
         unanswered = mock.patch.object(sd_lane, "cited_closes", side_effect=sqlite3.OperationalError("disk I/O error"))
