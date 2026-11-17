@@ -14,6 +14,7 @@ import json
 import os
 import pathlib
 import re
+import shlex
 import signal
 import sqlite3
 import subprocess
@@ -3335,6 +3336,201 @@ def identity_unchanged(root, connection, args, store, delivery) -> None:
                       "rerun it")
 
 
+#: The verbs an unmanaged repository runs, through GitHub alone (sd:9100); every other verb refuses there.
+UNMANAGED_VERBS = ("prepare", "merge")
+#: What GitHub says of one pull request's readiness, in one read.
+READINESS = """query($owner: String!, $name: String!, $number: Int!) {
+  repository(owner: $owner, name: $name) { pullRequest(number: $number) {
+    number state headRefOid reviewDecision mergeStateStatus
+    commits(last: 1) { nodes { commit { oid statusCheckRollup { state } } } } } } }"""
+#: Each readiness field, the answer a merge needs, its refusal code, boundary, state and remedy, in order.
+READY = (("state", "OPEN", "pull_request_closed", "input", "operator_decision", "Open the pull request, then retry."),
+         ("head", None, "head_mismatch", "input", "operator_decision",
+          "Push the branch, then retry with --expected-head set to the pull request's head."),
+         ("review_decision", "APPROVED", "not_approved", "review", "operator_decision",
+          "Get the pull request approved on GitHub, then retry."),
+         ("checks", "SUCCESS", "checks_not_passing", "ci", "retryable_failure",
+          "Wait for or fix the checks on the pull request's head, then retry."),
+         ("merge_state", "CLEAN", "merge_state_not_clean", "ci", "retryable_failure",
+          "Resolve what GitHub reports (conflicts, a branch behind its base, protection), then retry."))
+
+
+def github_only(root: pathlib.Path | None, args) -> bool:
+    """Whether this call takes the GitHub-only path: an explicit managed = 0 row and prepare or merge.
+
+    Any other verb in such a checkout refuses (sd:2566). No library, no
+    database and no row answer False, as `sd_lib.unmanaged` reads them, and
+    then the identity flags are checked as before; the GitHub-only path keeps
+    no review record, so --no-item there needs no --review-id.
+    """
+    why = root is not None and sd_lib.unmanaged(root, warn=False, database=args.database)
+    if why and args.command not in UNMANAGED_VERBS:
+        raise unmanaged_refusal(why)
+    if not why:
+        validate_identity(args)
+    if root is None:
+        raise outside_repository()
+    return bool(why)
+
+
+def run_verb(root, connection, database, args, store, readonly, unmanaged: bool) -> dict:
+    """The verb this call runs: the GitHub-only path, a hold or release, or `dispatch`."""
+    if unmanaged:
+        return unmanaged_command(root, connection, args, store)
+    if args.command in ("review", "verify-review") and not args.no_item:
+        raise Refusal("item-backed review and clearance run inside prepare and merge; --no-item selects the standalone record path")
+    if args.command in ("hold", "release"):
+        return hold_command(root, connection, database, args, store)
+    return dispatch(root, connection, database, args, store, readonly)
+
+
+def unmanaged_command(root: pathlib.Path, connection, args, store) -> dict:
+    """`prepare` or `merge` where the row says repo.managed = 0: GitHub alone decides (sd:9100).
+
+    No sd-review, local gate, ship receipt or hold runs: the repository's own
+    GitHub protection is its gate. `prepare` reports readiness at the local
+    HEAD; `merge` sends the PUT with `sha` the expected head, by the declared
+    `merge_method`, and with --item writes one note naming the PR, method and
+    merge commit. A rerun after the merge landed finds it merged and writes a
+    note the first run did not.
+    """
+    if args.command == "prepare" and (args.path or args.message_file):
+        raise Refusal("prepare in an unmanaged repository commits nothing; commit and push the branch first",
+                      code="unmanaged_flags_refused", boundary="input", state="operator_decision",
+                      next_action="Commit and push the branch, then rerun prepare without --path or --message-file.")
+    sd_lib.import_sd_db()  # the gateway first, as for every sd_db import here
+    from sd_db import repos
+    path = repos.registered_for(connection, str(root.resolve()), git(root, "config", "--get", "remote.origin.url"))
+    if args.item is not None and store.identity(connection, args.item)["repo"]["path"] != path:
+        raise Refusal(f"item sd:{args.item} does not belong to {path}", code="item_repository_mismatch",
+                      boundary="input", state="operator_decision",
+                      next_action=f"Run from a checkout of sd:{args.item}'s repository, or use --no-item.")
+    method = declared_merge_method(repos.declarations(connection, path) or {}, path)
+    api = GitHub(root, slug(git(root, "config", "--get", "remote.origin.url")))
+    head = args.expected_head if args.command == "merge" else git(root, "rev-parse", "HEAD")
+    branch = args.branch if args.command == "merge" and args.branch else checkout_branch(root)
+    pull, merged = branch_pull(api, branch, head, args.command)
+    if merged:
+        return merged_result(connection, args.item, api, pull["number"], method, pull["merge_commit_sha"], None)
+    ready = readiness(api, pull["number"], head, method)
+    refuse_unready(ready)
+    if args.command == "prepare":
+        return {"ok": True, "phase": "ready_to_send", "repository": api.repository, "readiness": ready,
+                "workflow": done("ready_to_send", f"Run sd-ship merge --expected-head {head} with the same identity.")}
+    return merged_result(connection, args.item, api, pull["number"], method, send_merge(api, ready, method), ready)
+
+
+def declared_merge_method(declarations: dict, path: str) -> str:
+    """The `policy` declaration's `merge_method`; none declared refuses, naming the command that declares it."""
+    held = declarations.get("policy")
+    policy: dict = held if isinstance(held, dict) else {}
+    if policy.get("merge_method") in ALLOW_FIELD:
+        return policy["merge_method"]
+    command = (f"sd-db repo declare {shlex.quote(path)} policy "
+               f"{shlex.quote(json.dumps({**policy, 'merge_method': 'squash'}, sort_keys=True))}")
+    raise Refusal(f"{path} is unmanaged and its policy declares no merge_method, so sd-ship does not know how to "
+                  f"merge it; declare one (squash, rebase or merge): {command}",
+                  code="merge_method_undeclared", boundary="policy", state="operator_decision",
+                  next_action=f"Run {command}, with the method GitHub allows there, then retry.",
+                  details={"command": command})
+
+
+def checkout_branch(root: pathlib.Path) -> str:
+    """The checked-out branch, whose pull request the GitHub-only path reads."""
+    branch = sd_lib.git_output(["symbolic-ref", "--quiet", "--short", "HEAD"], root)
+    if not branch:
+        raise Refusal("the checkout is on no branch, so no pull request is its own", code="detached_head",
+                      boundary="input", state="operator_decision", next_action="Check out the PR's branch, then retry.")
+    return branch
+
+
+def branch_pull(api: GitHub, branch: str, head: str, command: str) -> tuple[dict, bool]:
+    """The branch's one open pull request, or for merge its PR already merged at `head`: `(pull, merged)`."""
+    pulls = api.pages(f"{api.prefix}/pulls?state=all&head={quote_branch(api.repository, branch)}")
+    opened = [pull for pull in pulls if pull.get("state") == "open"]
+    if len(opened) > 1:
+        raise Refusal(f"{branch} has {len(opened)} open pull requests on {api.repository}",
+                      code="pull_request_ambiguous", boundary="input", state="operator_decision",
+                      next_action="Close all but one, then retry.")
+    landed = [pull for pull in pulls if pull.get("merged_at") and (pull.get("head") or {}).get("sha") == head
+              and pull.get("merge_commit_sha")]
+    if opened or (landed and command == "merge"):
+        return (opened or landed)[0], not opened
+    raise Refusal(f"{branch} has no open pull request on {api.repository}", code="no_pull_request",
+                  boundary="input", state="operator_decision",
+                  next_action="Open a pull request for the branch, then retry.")
+
+
+def readiness(api: GitHub, number: int, head: str, method: str) -> dict:
+    """What GitHub reports for pull request `number`; checks count only when they are of its head commit."""
+    owner, name = api.repository.split("/", 1)
+    value = api.api("graphql", method="POST", body={"query": READINESS,
+                                                    "variables": {"owner": owner, "name": name, "number": number}})
+    pull = ((value.get("data") or {}).get("repository") or {}).get("pullRequest") if isinstance(value, dict) else None
+    if not isinstance(pull, dict) or pull.get("number") != number:
+        raise Refusal(f"GitHub did not report pull request #{number}'s readiness", code="readiness_unread",
+                      boundary="runtime", state="retryable_failure", next_action="Restore GitHub access, then retry.")
+    nodes = (pull.get("commits") or {}).get("nodes") or [{}]
+    commit = (nodes[-1] or {}).get("commit") or {}
+    rollup = (commit.get("statusCheckRollup") or {}).get("state")
+    metadata = api.api(api.prefix)
+    return {"pull": number, "state": pull.get("state"), "head": pull.get("headRefOid"), "expected_head": head,
+            "review_decision": pull.get("reviewDecision"),
+            "checks": rollup if commit.get("oid") == pull.get("headRefOid") else None,
+            "merge_state": pull.get("mergeStateStatus"), "merge_method": method,
+            "method_allowed": isinstance(metadata, dict) and metadata.get(ALLOW_FIELD[method]) is True}
+
+
+def refuse_unready(ready: dict) -> None:
+    """The first readiness field that is not what a merge needs, as its own refusal carrying the whole readiness."""
+    for field, wanted, code, boundary, state, action in READY:
+        wanted = ready["expected_head"] if wanted is None else wanted
+        if ready[field] != wanted:
+            raise Refusal(f"pull request #{ready['pull']} is not ready: {field} is {ready[field]!r}, not {wanted!r}",
+                          code=code, boundary=boundary, state=state, next_action=action, details={"readiness": ready})
+    if not ready["method_allowed"]:
+        raise Refusal(f"GitHub does not allow {ready['merge_method']} merges in this repository, or did not say",
+                      code="merge_method_not_allowed", boundary="policy", state="operator_decision",
+                      next_action="Allow that method on GitHub, or declare a merge_method it allows.",
+                      details={"readiness": ready})
+
+
+def send_merge(api: GitHub, ready: dict, method: str) -> str:
+    """The merge commit: the PUT at `sha` the expected head, read back once when its answer is lost, never resent."""
+    number, head = ready["pull"], ready["expected_head"]
+    try:
+        answer = api.api(f"{api.prefix}/pulls/{number}/merge", method="PUT", body={"sha": head, "merge_method": method})
+        if isinstance(answer, dict) and answer.get("sha"):
+            return answer["sha"]
+        lost = Refusal(f"GitHub's merge answer for #{number} named no commit")
+    except Refusal as error:
+        lost = error
+    pull = api.pull(number)
+    if pull.get("merged") is True and (pull.get("head") or {}).get("sha") == head and pull.get("merge_commit_sha"):
+        return pull["merge_commit_sha"]
+    raise lost
+
+
+def merged_result(connection, item, api: GitHub, number: int, method: str, commit: str, ready: dict | None) -> dict:
+    """The merge result, and with `item` its one note, written once however many runs reach it."""
+    if item is not None:
+        sd_lib.import_sd_db()  # the gateway first, as for every sd_db import here
+        from sd_db.database import transaction
+        from sd_db.writes import add_note
+        body = f"sd-ship merged {api.repository}#{number} by {method} at {commit} (unmanaged repository, sd:9100)"
+        with transaction(connection):
+            if not connection.execute("SELECT 1 FROM note WHERE item = ? AND body = ?", (item, body)).fetchone():
+                add_note(connection, item, "comment", body)
+    return {"ok": True, "phase": "merged", "repository": api.repository, "pull": number, "merge_method": method,
+            "merge_commit": commit, "readiness": ready,
+            "workflow": done("merged", "Delete the merged branch and its worktree when nothing holds them.")}
+
+
+def done(phase: str, next_action: str) -> dict:
+    """A success `workflow` block, the shape `sd_ship_workflow.success` gives the managed verbs."""
+    return {"schema_version": 1, "phase": phase, "state": "success", "blocker": None, "next_action": next_action}
+
+
 def main(argv=None) -> int:
     args = parser().parse_args(argv)
     try:
@@ -3373,22 +3569,15 @@ def main(argv=None) -> int:
                          boundary="runtime", state="operator_decision", next_action="Install the matching sd_db library, then retry."))))
         return 3
     try:
-        validate_identity(args)
         root = sd_lib.repo_root(None)
-        if root is None:
-            raise outside_repository()
-        sd_lib.refuse_unmanaged(root, unmanaged_refusal, args.database)
+        unmanaged = github_only(root, args)
         database = args.database or default_path()
-        readonly = args.command in ("observe", "verify-review") or (args.command == "adjudicate" and args.dispositions_file is None)
+        readonly = (args.command in ("observe", "verify-review") or (unmanaged and args.command == "prepare")
+                    or (args.command == "adjudicate" and args.dispositions_file is None))
         # A write a locked database refused is sent again, not a failed lane entry (sd:6855).
         connection = Patient(connect(database, write=not readonly))
         try:
-            if args.command in ("review", "verify-review") and not args.no_item:
-                raise Refusal("item-backed review and clearance run inside prepare and merge; --no-item selects the standalone record path")
-            if args.command in ("hold", "release"):
-                result = hold_command(root, connection, database, args, ship)
-            else:
-                result = dispatch(root, connection, database, args, ship, readonly)
+            result = run_verb(root, connection, database, args, ship, readonly, unmanaged)
         finally:
             connection.close()
     except (Refusal, WorkflowError, SdDbError, sd_lib.ConfigError, OSError, sqlite3.Error, ValueError, subprocess.SubprocessError) as error:

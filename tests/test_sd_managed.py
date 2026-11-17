@@ -114,11 +114,10 @@ class TheDirectCommands(Fixture):
     def test_each_refuses_an_unmanaged_checkout_naming_the_flag(self) -> None:
         root = self.checkout("theirs")
         self.register(root, managed=0)
-        for name in ("sd-ship", "sd-check", "sd-status"):
+        for name in ("sd-ship",):  # sd-check and sd-status run there since sd:9100
             with self.subTest(name):
                 done = self.run_command(name, root)
-                self.assertEqual(done.returncode, {"sd-ship": 3, "sd-check": 2, "sd-status": 2}[name],
-                                 done.stdout + done.stderr)
+                self.assertEqual(done.returncode, 3, done.stdout + done.stderr)
                 said = done.stdout + done.stderr
                 self.assertIn("repo.managed = no", said)
                 self.assertIn("`sd fleet standard` in ~/theirs", said)
@@ -154,6 +153,27 @@ class TheDirectCommands(Fixture):
             for name in self.COMMANDS:
                 with self.subTest(name, checkout=root.name):
                     self.assertNotIn("repo.managed", (done := self.run_command(name, root)).stdout + done.stderr)
+
+    def test_sd_check_runs_an_unmanaged_checkout_and_refuses_only_a_receipt(self) -> None:
+        """sd:9100: a plain local run, no receipt and no `sd/local-gate` status there."""
+        root = self.checkout("theirs")
+        self.register(root, managed=0)
+        done = self.run_command("sd-check", root)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertNotIn("repo.managed", done.stdout + done.stderr)
+        refused = self.run_command("sd-check", root, "--record-receipt")
+        self.assertEqual(refused.returncode, 2, refused.stdout + refused.stderr)
+        self.assertIn("repo.managed = no", refused.stderr)
+        self.assertIn("records no receipt", refused.stderr)
+
+    def test_sd_status_reads_an_unmanaged_checkout(self) -> None:
+        """sd:9100: sd-status is read-only, so it reports there as anywhere."""
+        root = self.checkout("theirs")
+        self.register(root, managed=0)
+        done = self.run_command("sd-status", root)
+        self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
+        self.assertNotIn("repo.managed", done.stdout + done.stderr)
+        self.assertIn("setup", json.loads(done.stdout))
 
     def test_sd_ship_reads_the_database_it_is_given(self) -> None:
         root = self.checkout("theirs")

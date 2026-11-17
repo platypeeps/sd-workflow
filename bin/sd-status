@@ -3929,7 +3929,6 @@ def main(argv: list[str] | None = None) -> int:
         root = sd_lib.repo_root()
         if root is None:
             raise UsageError(f"{pathlib.Path.cwd()} is not inside a git repository")
-        sd_lib.refuse_unmanaged(root, UsageError)
         with sd_lib.git_read_memo():
             result = collect(root, dict(os.environ), args.limit)
     except sd_lib.ConfigError as error:
