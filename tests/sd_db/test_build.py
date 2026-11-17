@@ -1455,6 +1455,9 @@ class CancelParks(Case):
         bundle = self.claim()
         self.cancel(bundle["assignment"])
         self.assertEqual(self.parked(items), [False, False], "the cancel is asked, not done")
+        asked = self.db.execute("SELECT body FROM note WHERE item = ? AND kind = 'comment' ORDER BY id DESC",
+                                (items[0],)).fetchone()["body"]
+        self.assertIn("ends blocked", asked, "a reap that cannot confirm the stop blocks the bundle instead")
         build.reap(self.db, now=later(bundle["created_at"], build.STALE_SECONDS + 1))
         self.assertEqual((self.statuses(items), self.parked(items)), (["ready", "ready"], [True, True]))
         note = self.db.execute("SELECT body FROM note WHERE item = ? AND kind = 'comment' ORDER BY id DESC",
@@ -1494,6 +1497,63 @@ class CancelParks(Case):
         self.cancel(build.queue(self.db, [item], who="operator")[0]["id"])
         build.queue_again(self.db, [item], who="operator")
         self.assertEqual(self.parked([item]), [False])
+
+    def requeued_bundle(self):
+        """A two-item bundle that ran, ended cancelled and was retried: lead and child queued; (items, lead, child,
+        the run)."""
+        items = [self.item(), self.item()]
+        build.queue(self.db, items, who="operator")
+        bundle = self.claim()
+        build.end(self.db, bundle["id"], "cancelled", "cancelled by operator")
+        build.queue_again(self.db, [items[0]], who="operator")
+        lead, child = (member["id"] for member in build.run(self.db, bundle["id"])["members"])
+        return items, lead, child, bundle
+
+    def test_a_retry_leaves_a_member_cancelled_on_its_own_parked(self):
+        """Review round 2 of sd:9222: cancel the queued child, then the queued lead; Retry of the lead queues the
+        lead alone, and the child's item stays parked. Building the child presses it fresh."""
+        items, lead, child, _ = self.requeued_bundle()
+        self.cancel(child)
+        self.cancel(lead)
+        self.assertEqual(self.parked(items), [True, True])
+        queued = build.queue_again(self.db, [items[0]], who="operator")
+        self.assertEqual([entry["id"] for entry in queued], [lead])
+        self.assertEqual((runner.queue_state(self.db, child)["status"], self.parked(items)),
+                         ("cancelled", [False, True]))
+        fresh = build.queue_again(self.db, [items[1]], who="operator")
+        self.assertEqual([entry["item"] for entry in fresh], [items[1]])
+        self.assertNotIn(fresh[0]["id"], (lead, child))
+        self.assertEqual(self.parked(items), [False, False], "an explicit build of the child unparks it")
+
+    def test_a_later_cancelled_run_does_not_bring_back_a_member_cancelled_on_its_own(self):
+        """The class pass: the child cancelled while queued sits out the lead's next run; that run ends cancelled,
+        and its Retry still leaves the child cancelled and parked."""
+        items, lead, child, _ = self.requeued_bundle()
+        self.cancel(child)
+        again = self.claim()
+        self.assertEqual([member["id"] for member in again["members"] if member["status"] == "running"], [lead])
+        build.end(self.db, again["id"], "cancelled", "cancelled by operator")
+        queued = build.queue_again(self.db, [items[0]], who="operator")
+        self.assertEqual([entry["id"] for entry in queued], [lead])
+        self.assertEqual((runner.queue_state(self.db, child)["status"], self.parked(items)),
+                         ("cancelled", [False, True]))
+
+    def test_a_blocked_member_cleared_on_its_own_stays_out_of_a_later_retry(self):
+        """The class pass, blocked arm: a blocked member's row cleared by Cancel sits out the Retry of the blocked
+        bundle and the Retry of that attempt's cancelled end."""
+        items = [self.item(), self.item()]
+        build.queue(self.db, items, who="operator")
+        bundle = self.claim()
+        build.write(self.db, bundle["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START)
+        build.end(self.db, bundle["id"], "blocked", "a permission denial")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        lead, child = (member["id"] for member in build.run(self.db, bundle["id"])["members"])
+        self.cancel(child)
+        self.assertEqual([entry["id"] for entry in build.queue_again(self.db, [items[0]], who="operator")], [lead])
+        again = self.claim()
+        build.end(self.db, again["id"], "cancelled", "cancelled by operator")
+        self.assertEqual([entry["id"] for entry in build.queue_again(self.db, [items[0]], who="operator")], [lead])
+        self.assertEqual(runner.queue_state(self.db, child)["status"], "cancelled")
 
     def test_a_cancel_of_another_scope_parks_nothing(self):
         item = self.item()

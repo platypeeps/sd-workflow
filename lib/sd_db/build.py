@@ -90,6 +90,9 @@ RETRIES = 1
 PARKED = "Parked: build run {run} ended blocked; Retry on the Builds panel unparks it"
 # The note on an item a cancelled run parked: auto-pickup takes unparked items only (sd:9222).
 CANCEL_PARKED = "Parked: build run {run} was cancelled; Unpark to build it again"
+# The result on a bundle member's row an operator cancelled on its own: it left the bundle, so no Retry of the
+# bundle queues it again or clears its park (review round 2 of sd:9222).
+ALONE = "cancelled on its own by "
 #: The steps a run walks, each written before it starts.
 STEPS = ("claimed", "worktree", "building", "reviewing", "fixing", "enqueuing", "enqueued", "checking", "cleaning")
 #: A draft run's steps (`sd_db.draft`): it claims, then drafts.
@@ -586,7 +589,8 @@ def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
         state = retry_state(connection, run) if run else {"allowed": False, "reason": "it never ran"}
         if not state["allowed"]:
             raise BuildRefused(f"Retry refused: {state['reason']}")
-        members = _members(connection, assignment, current["status"])
+        members = [member for member in _members(connection, assignment, current["status"])
+                   if member["id"] == assignment or not _alone(connection, member["id"])]
         if not members:
             raise BuildRefused(f"Retry refused: build run {run['id']} has no {current['status']} member")
         items = reads.items_by_ids(connection, [current["item"], *(member["item"] for member in members)])
@@ -616,6 +620,12 @@ def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
                                              for row in queued]}
 
 
+def _alone(connection, assignment: int) -> bool:
+    """Whether an operator cancelled this bundle member on its own (`ALONE`)."""
+    row = connection.execute("SELECT result FROM assignment WHERE id = ?", (assignment,)).fetchone()
+    return row is not None and (row["result"] or "").startswith(ALONE)
+
+
 def _done(items: dict, item: int) -> bool:
     return item in items and items[item]["status"] == "done"
 
@@ -635,6 +645,8 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
         for item in items:
             row = connection.execute("SELECT id, parent, status FROM assignment WHERE item = ? AND scope = ? "
                                      "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
+            # A member cancelled on its own left its bundle: building it is a fresh press, not the bundle's Retry.
+            alone = row is not None and row["parent"] is not None and _alone(connection, row["id"])
             lead = row and (row["parent"] or row["id"])
             state = queue_state(connection, lead) if lead else None
             # A bundle whose lane entry failed is the panel's Fix when its check passes (pack sd:8791); a state Fix
@@ -653,7 +665,7 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             # item's own assignment must be in it, or Retry would requeue the lead's items and not this one.
             # A skipped lead of a run still in the lane is no ended bundle: the run holds it no longer (sd:8960).
             if (state and state["status"] in AGAIN and state["run"] is not None
-                    and row["status"] == state["status"]
+                    and row["status"] == state["status"] and not alone
                     and not (state["run"]["outcome"] is None and state["run"]["step"] in LANE_STEPS)
                     and not _done(reads.items_by_ids(connection, [state["item"]]), state["item"])):
                 leads += [] if lead in leads else [lead]

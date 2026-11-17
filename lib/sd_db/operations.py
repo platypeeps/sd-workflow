@@ -598,9 +598,15 @@ def cancel_assignment(connection: sqlite3.Connection, assignment: int, *, expect
             resolve_state(connection, row)
             add_note(connection, current["item"], "comment",
                      f"Running build assignment {assignment} cancel requested by {who}; run "
-                     f"{current['build_run']} stops with its bundle; its items park when it stops", session=who)
+                     f"{current['build_run']} stops with its bundle; its items park when it stops, or, if the "
+                     f"reap cannot confirm the stop, it ends blocked: check the process, then Retry once the lease "
+                     f"is released", session=who)
             return assignment_state(connection, assignment)
-        update_assignment(connection, assignment, status="cancelled", ended=ended)
+        parent = connection.execute("SELECT parent FROM assignment WHERE id = ?", (assignment,)).fetchone()["parent"]
+        # A bundle member cancelled on its own leaves the bundle: no Retry of
+        # it queues the member again or clears its park (sd:9222).
+        update_assignment(connection, assignment, status="cancelled", ended=ended,
+                          **({"result": f"{build.ALONE}{who}"} if current["scope"] == build.SCOPE and parent else {}))
         # A queued build's cancel is a pause: its items are parked, as
         # auto-pickup takes unparked ready items only, and Unpark brings them
         # back. A queued lead takes its queued members with it, so none

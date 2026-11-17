@@ -734,6 +734,7 @@ class BlockedBuildRows(Fixture):
         body = source[source.index("title: `Cancel build run "):source.index("ok: 'Cancel build'")]
         self.assertIn("parks", body)
         self.assertIn("Unpark", body)
+        self.assertIn("ends blocked", body, "a reap that cannot confirm the stop blocks the bundle instead")
 
 class AutoPickup(Fixture):
     """pack sd:6097: the Builds panel shows auto-pickup and its On and Off write it, bound to the value read."""
