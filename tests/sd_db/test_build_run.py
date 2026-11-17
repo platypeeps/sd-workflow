@@ -1062,6 +1062,11 @@ class Supervise(Case):
         """Pack sd:6815: build 268's `pkill -f "sd-check --json"` ended the vault job's queued gate."""
         self.assertIn("never `pkill` or `killall`", build_run.BRIEF)
 
+    def test_the_brief_keeps_test_runs_in_the_foreground(self):
+        """Pack sd:9183: build 1105's suite hit the 120 s Bash default and moved to the background."""
+        self.assertIn("`timeout: 600000`", build_run.BRIEF)
+        self.assertIn("never `run_in_background`", build_run.BRIEF)
+
     def test_a_requeued_bundle_briefs_the_findings_sent_to_its_branch(self):
         """Pack sd:6020: Send to builder writes a finding note and queues the bundle again; the fresh builder's brief
         names the finding and the branch it resumes, and leaves out a note from before the bundle's first run."""

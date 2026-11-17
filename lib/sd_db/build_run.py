@@ -127,6 +127,9 @@ Rules:
   `git commit -m` or `git commit -F <file inside the worktree>`; add new commits and never amend.
 - The dispatcher owns every item's status: never run `sd task status`, never push, never open a pull request.
 - Write a test that fails before each fix, then make it pass; skip no test.
+- Run tests in the foreground, focused on the modules you touch, 10 minutes or less: give each Bash call
+  `timeout: 600000` and never `run_in_background`. Past its timeout (120 s by default) a call moves to
+  the background, and no exit wakes you (sd:9183). The lane runs the full gate.
 - End the commit that delivers a whole item with a `Closes: sd:N` trailer: an item no trailer names
   stays open and is not delivered. Add no attribution lines.
 - Keep every commit line, and every body line, at 72 characters or less outside a code fence:
