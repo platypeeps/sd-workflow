@@ -1404,6 +1404,104 @@ class Park(Case):
                                     self.items[0]), 0)
 
 
+class CancelParks(Case):
+    """sd:9222 (operator ruling 2026-11-17): a cancelled build parks its items, so auto-pickup, which takes unparked
+    ready items only, does not queue them again on its next tick; Unpark makes them eligible again."""
+
+    NOW = "2026-11-17T17:00:00+00:00"
+
+    def parked(self, items):
+        return [item_state(self.db, item)["item"]["parked_at"] is not None for item in items]
+
+    def cancel(self, assignment):
+        state = operations.assignment_state(self.db, assignment)
+        return operations.cancel_assignment(self.db, assignment, expected_revision=state["revision"], who="operator")
+
+    def pickup(self):
+        build.set_pickup(self.db, True, now=self.NOW)
+        return build.pickup(self.db, build.room(self.db, **IDLE), now=self.NOW)
+
+    def test_a_queued_cancel_parks_the_item_and_pickup_skips_it_until_unpark(self):
+        item = self.item(priority=1)
+        assignment = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.cancel(assignment)
+        self.assertEqual((self.statuses([item]), self.parked([item])), (["ready"], [True]))
+        note = self.db.execute("SELECT body FROM note WHERE item = ? AND kind = 'comment' ORDER BY id DESC",
+                               (item,)).fetchone()["body"]
+        self.assertIn("item parked; Unpark to build it again", note)
+        self.assertEqual(self.pickup(), [], "a cancelled build is not picked up again")
+        workflow.edit_item(self.db, item, {"parked_at": None}, who="operator")
+        self.assertEqual(self.pickup(), [item], "Unpark makes it eligible again")
+
+    def test_a_queued_bundle_cancel_cancels_and_parks_every_member(self):
+        """A cancelled bundle queued again by Retry leads its members: cancelling the lead cancels the whole
+        queued bundle and parks each item, so no member builds on alone while its item hides parked."""
+        items = [self.item(), self.item()]
+        build.queue(self.db, items, who="operator")
+        bundle = self.claim()
+        build.end(self.db, bundle["id"], "cancelled", "cancelled by operator")
+        build.queue_again(self.db, [items[0]], who="operator")
+        self.assertEqual(self.parked(items), [False, False], "Retry unparks")
+        self.cancel(bundle["assignment"])
+        self.assertEqual([member["status"] for member in build.run(self.db, bundle["id"])["members"]],
+                         ["cancelled", "cancelled"])
+        self.assertEqual((self.statuses(items), self.parked(items)), (["ready", "ready"], [True, True]))
+        self.assertEqual(self.pickup(), [])
+        self.assertIsNone(self.claim(), "no queued member is left to claim")
+
+    def test_a_running_cancel_parks_its_items_when_the_run_ends_cancelled(self):
+        items = [self.item(), self.item()]
+        build.queue(self.db, items, who="operator")
+        bundle = self.claim()
+        self.cancel(bundle["assignment"])
+        self.assertEqual(self.parked(items), [False, False], "the cancel is asked, not done")
+        build.reap(self.db, now=later(bundle["created_at"], build.STALE_SECONDS + 1))
+        self.assertEqual((self.statuses(items), self.parked(items)), (["ready", "ready"], [True, True]))
+        note = self.db.execute("SELECT body FROM note WHERE item = ? AND kind = 'comment' ORDER BY id DESC",
+                               (items[0],)).fetchone()["body"]
+        self.assertEqual(note, build.CANCEL_PARKED.format(run=bundle["id"]))
+        self.assertEqual(self.pickup(), [])
+
+    def test_a_supervisor_cancelled_end_parks_and_a_done_item_stays_unparked(self):
+        items = [self.item(), self.item()]
+        build.queue(self.db, items, who="operator")
+        bundle = self.claim()
+        transition(self.db, items[1], "done", who="operator")
+        build.end(self.db, bundle["id"], "cancelled", "cancelled by operator")
+        self.assertEqual((self.statuses(items), self.parked(items)), (["ready", "done"], [True, False]))
+
+    def test_a_blocked_end_or_a_retried_loss_parks_nothing_at_the_end(self):
+        """Only a cancel parks at the end: a blocked end parks once its lease is released (pack sd:6132), and a
+        lost run that is retried parks nothing."""
+        items = [self.item(), self.item()]
+        build.queue(self.db, items, who="operator")
+        bundle = self.claim()
+        build.write(self.db, bundle["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START,
+                    builder_pgid=777, builder_start=START)
+        build.end(self.db, bundle["id"], "blocked", "a permission denial")
+        self.assertEqual((self.statuses(items), self.parked(items)), (["blocked", "blocked"], [False, False]))
+        lost = [self.item(repo=B)]
+        build.queue(self.db, lost, who="operator")
+        run = self.claim()
+        settled = build.reap(self.db, now=later(run["created_at"], build.STALE_SECONDS + 1), probe=Probe())
+        self.assertEqual([(row["run"], row["outcome"]) for row in settled if row["run"] == run["id"]],
+                         [(run["id"], "interrupted")])
+        self.assertEqual(self.parked(lost), [False])
+
+    def test_a_press_of_a_parked_item_unparks_it(self):
+        """A press of an item a cancel parked builds it unparked, as Retry does: it would hide while it builds."""
+        item = self.item()
+        self.cancel(build.queue(self.db, [item], who="operator")[0]["id"])
+        build.queue_again(self.db, [item], who="operator")
+        self.assertEqual(self.parked([item]), [False])
+
+    def test_a_cancel_of_another_scope_parks_nothing(self):
+        item = self.item()
+        assignment = create_assignment(self.db, role="author", status="queued", item=item)
+        self.cancel(assignment)
+        self.assertEqual(self.parked([item]), [False])
+
+
 class Race(Case):
     """Race table: a writer runs between the reap's read and its compare-and-set; the reap must do nothing then."""
 

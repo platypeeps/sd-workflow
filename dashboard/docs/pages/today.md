@@ -78,7 +78,8 @@ row's Release post `/api/queue/move`, which runs `sd-ship lane move|hold|release
 Each write carries the revision, head or claim the view showed, and the verb checks it again under the queue's lock,
 so a stale write is refused (409). A failure that is not a refusal answers 502 with an unknown outcome, and the view
 reads the lane again. The line above the table says the outcome in the words Needs you uses (pack sd:7315). The full rules are in `queue_screen`'s docstring.
-A build run's Cancel asks first and posts `/api/assignments/<id>/cancel`; an ended blocked or cancelled bundle's Retry
+A build run's Cancel asks first and posts `/api/assignments/<id>/cancel`; it parks the run's items, so auto-pickup
+skips them until Unpark (sd:9222); an ended blocked or cancelled bundle's Retry
 and Send to builder post `/api/queue/builds/retry` (pack sd:6020).
 Queue's Last 7 days moved to Metrics' Lane times view (pack sd:7233).
 

@@ -688,7 +688,7 @@ class BlockedBuildRows(Fixture):
             self.assertTrue(row["why"], row)
         self.assertTrue(alone["why"].startswith(f"item {lone}'s lane runs on host-b"), alone)
         self.assertEqual((alone["retry"]["allowed"], alone["retry"]["reason"]),
-                         (False, "it never ran; Cancel clears it, or build the item again from Tasks"))
+                         (False, "it never ran; Cancel clears it and parks the item, or build the item again from Tasks"))
         self.assertTrue(all(row["cancel"]["allowed"] for row in rows.values()), rows)
         status, _, body = self.post(f"/api/assignments/{alone['id']}/cancel", {"revision": alone["cancel"]["revision"]})
         self.assertEqual(status, 200, body)

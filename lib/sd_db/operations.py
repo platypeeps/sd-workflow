@@ -579,7 +579,8 @@ def cancel_assignment(connection: sqlite3.Connection, assignment: int, *, expect
         if current["status"] == "running":
             # A running build stops at its supervisor's next beat, or at the
             # reap when no supervisor lives; either ends the whole bundle
-            # `cancelled` and moves its items back to ready (pack sd:6093).
+            # `cancelled` and moves its items back to ready, parked
+            # (pack sd:6093, sd:9222).
             # An ended run not yet released takes the cancel too: its settle
             # ends it cancelled instead of opening a fresh row.
             # The step is checked in the write, so a supervisor's enqueuing
@@ -597,13 +598,31 @@ def cancel_assignment(connection: sqlite3.Connection, assignment: int, *, expect
             resolve_state(connection, row)
             add_note(connection, current["item"], "comment",
                      f"Running build assignment {assignment} cancel requested by {who}; run "
-                     f"{current['build_run']} stops with its bundle", session=who)
+                     f"{current['build_run']} stops with its bundle; its items park when it stops", session=who)
             return assignment_state(connection, assignment)
         update_assignment(connection, assignment, status="cancelled", ended=ended)
+        # A build's cancel is a pause: its items are parked, as auto-pickup
+        # takes unparked ready items only, and Unpark brings them back. A
+        # queued lead takes its queued members with it, so none builds on
+        # alone while its item hides parked (sd:9222).
+        build_scope = current["scope"] == build.SCOPE
+        members = [(row["id"], row["item"]) for row in connection.execute(
+            "SELECT id, item FROM assignment WHERE parent = ? AND status = 'queued' AND scope = ? ORDER BY id",
+            (assignment, build.SCOPE))] if build_scope and current["status"] == "queued" else []
+        for member, _ in members:
+            update_assignment(connection, member, status="cancelled", ended=ended)
         audit = {"assignment": assignment, "old_status": current["status"], "status": "cancelled", "who": who, "at": ended}
+        if members:
+            audit["members"] = [member for member, _ in members]
         row = record_state(connection, "checkpoint", key=f"operations:assignment:{assignment}", body=audit)
         resolve_state(connection, row)
-        if current["item"] is not None:
-            add_note(connection, current["item"], "comment",
-                     f"{current['status'].capitalize()} assignment {assignment} cancelled by {who}; item status unchanged", session=who)
+        cancelled = [(assignment, current["item"], ""),
+                     *((member, item, f" with its bundle lead {assignment}") for member, item in members)]
+        for ident, item, lead in cancelled:
+            if item is None:
+                continue
+            parked = build_scope and build.park(connection, item, ("ready", "blocked"), ended)
+            add_note(connection, item, "comment",
+                     f"{current['status'].capitalize()} assignment {ident} cancelled by {who}{lead}; item status "
+                     f"unchanged" + ("; item parked; Unpark to build it again" if parked else ""), session=who)
         return assignment_state(connection, assignment)

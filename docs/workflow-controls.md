@@ -48,7 +48,7 @@ progress belongs to the database.
 | Start a build: the one verb (sd:9063) | `sd assignments build ID [ID ...]`; a planning item is set ready first; an item whose bundle ended blocked or cancelled is retried, worktree kept; one whose lane entry failed is Fix, the lane's reason its finding; `--finding TEXT` is Send to builder on a retry or Fix, refused on a fresh build; one refusal refuses the selection |
 | Run one build-dispatch tick: reap, lane watch, claim, spawn | `sd assignments dispatch`; the hub's job runs it |
 | Supervise one build run, or list the live sessions | `sd assignments dispatch --supervise RUN`, `sd assignments dispatch --sessions` |
-| Cancel a queued assignment or a running build | Operations, or `sd assignments cancel ID` |
+| Cancel a queued assignment or a running build | Operations, or `sd assignments cancel ID`; a build's items are parked, so auto-pickup skips them until Unpark (sd:9222) |
 
 Capture defaults to Task. Followup, Comment, Question, Decision and Proposal
 require a Related item; the short inline CLI hint follows that selection.

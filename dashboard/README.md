@@ -309,7 +309,8 @@ Every job or service control rechecks the observed state and revision. The last
 request's acceptance is shown separately from the current state; acceptance is
 not proof that a job finished or that an application is healthy.
 Queued assignments can be cancelled without completing their item, with
-`sd assignments cancel`. A blocked assignment can be cancelled, whatever its
+`sd assignments cancel`. A cancelled build parks its items, so auto-pickup
+skips them until Unpark (sd:9222). A blocked assignment can be cancelled, whatever its
 item's status, once no runner attempt holds its lease, its own or its bundle
 lead's. A restore
 blocks starting jobs and starting or restarting services, while supported stop

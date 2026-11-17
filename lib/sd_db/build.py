@@ -88,6 +88,8 @@ STUCK_TICKS = 3
 RETRIES = 1
 # The note on an item a blocked run parked (pack sd:6132).
 PARKED = "Parked: build run {run} ended blocked; Retry on the Builds panel unparks it"
+# The note on an item a cancelled run parked: auto-pickup takes unparked items only (sd:9222).
+CANCEL_PARKED = "Parked: build run {run} was cancelled; Unpark to build it again"
 #: The steps a run walks, each written before it starts.
 STEPS = ("claimed", "worktree", "building", "reviewing", "fixing", "enqueuing", "enqueued", "checking", "cleaning")
 #: A draft run's steps (`sd_db.draft`): it claims, then drafts.
@@ -540,6 +542,9 @@ def queue(connection, items: list[int], *, who: str, expected_revisions: dict | 
             connection.execute("UPDATE assignment SET scope = ?, queued_at = ?, started = NULL WHERE id = ?",
                                (SCOPE, clock(), ident))
             add_note(connection, item, "comment", f"Build assignment {ident} queued by {who}")
+            # A press of an item a cancel parked builds it unparked, as Retry does (sd:9222): auto-pickup never
+            # sees a parked one, so only a press reaches here with one.
+            unpark(connection, item)
             created.append(ident)
         return [queue_state(connection, ident) for ident in created]
 
@@ -1395,7 +1400,7 @@ def end(connection, ident: str, outcome: str, detail: str, *, question: str | No
     """The supervisor ends its own run, its groups confirmed gone; `_settle`'s answer, or None once the run moved.
 
     One compare-and-set from an open outcome, then `_settle` in the same
-    transaction: `cancelled` ends the bundle and moves its items to ready,
+    transaction: `cancelled` ends the bundle and moves its items to ready, parked,
     a `LOSSES` outcome retries once at the `RESUME` step, `blocked` blocks
     the bundle with `detail` (held until a reap reads the supervisor gone),
     and `done` releases it. `question` adds a question note on each item.
@@ -2020,7 +2025,8 @@ def _settle(connection, read: dict, *, block: str | None = None) -> dict | None:
     `RESUME` step, the old `review_round` and `session_id`, no outcome; the
     old row's outcome stays set, so a late old supervisor writes nothing. A
     second loss at the same step blocks the bundle. A run with
-    `cancel_requested` ends cancelled whatever its outcome: no fresh row.
+    `cancel_requested` ends cancelled whatever its outcome: no fresh row,
+    and each item back at ready parked, so auto-pickup leaves it (sd:9222).
 
     `read` is the row the reap decided on; nothing happens unless every
     `REAP_READS` column still holds its value (a cancel since then moves it).
@@ -2055,6 +2061,8 @@ def _settle(connection, read: dict, *, block: str | None = None) -> dict | None:
                 connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
                                    (stamp, row["detail"], member["id"]))
                 _move(connection, member["item"], "ready", f"build run {ident} {row['detail']}; worktree {row['work_path']} kept")
+                # Parked, so auto-pickup does not queue it again on its next tick (sd:9222).
+                park(connection, member["item"], ("ready",), stamp, CANCEL_PARKED.format(run=ident))
         elif row["outcome"] in LOSSES:
             marks = ", ".join("?" for _ in LOSSES)
             losses = connection.execute(f"SELECT COUNT(*) FROM runner_run WHERE assignment = ? AND step IS ? "
@@ -2121,12 +2129,21 @@ def _block(connection, members: list[dict], reason: str, stamp: str) -> None:
 
 def _park(connection, ident: str, lead: int, stamp: str) -> None:
     """Park each item of a blocked run, once the run and its lease are released, as the nightly prune parks an idle
-    one (pack sd:6132, sd:6008): an item the operator moved on, or one parked already, stays as it is."""
+    one (pack sd:6132, sd:6008)."""
     for member in _members(connection, lead, "blocked"):
-        row = connection.execute("SELECT status, parked_at FROM item WHERE id = ?", (member["item"],)).fetchone()
-        if row is not None and row["status"] == "blocked" and row["parked_at"] is None:
-            set_item_fields(connection, member["item"], parked_at=stamp)
-            add_note(connection, member["item"], "comment", PARKED.format(run=ident))
+        park(connection, member["item"], ("blocked",), stamp, PARKED.format(run=ident))
+
+
+def park(connection, item: int, statuses: tuple[str, ...], stamp: str, note: str | None = None) -> bool:
+    """Park `item` while its status is one of `statuses`, with `note` when given; whether it parked. An item the
+    operator moved on, or one parked already, stays as it is. Auto-pickup takes unparked items only (sd:9222)."""
+    row = connection.execute("SELECT status, parked_at FROM item WHERE id = ?", (item,)).fetchone()
+    if row is None or row["status"] not in statuses or row["parked_at"] is not None:
+        return False
+    set_item_fields(connection, item, parked_at=stamp)
+    if note:
+        add_note(connection, item, "comment", note)
+    return True
 
 
 def unpark(connection, item: int) -> None:
