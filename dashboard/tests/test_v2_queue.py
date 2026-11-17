@@ -1963,6 +1963,33 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertIn(f'<i data-acts="{made}"></i>', out["R"]["html"])
         self.assertIn('id="det-title" class="fld" value="Set aside"', out["R"]["details"])
 
+    # Review round 2 of sd:9247, class: parked rows drawn or reached unlike the other rows.
+    def test_a_repo_whose_lane_was_not_read_still_offers_its_parked_box(self):
+        made, answers = self.parked_answers(self.checkout)
+        answers["/api/queue"] = [502, {"error": "down"}]
+        out = self.run_view(self.TILE + " R.html = ELS.queue.html; tile('system', 'parked'); R.kids = kids();", answers=answers)
+        cell = self.repo_detail(out["R"]["html"], "system")[2]
+        self.assertIn("lane not read", cell)
+        self.assertIn('data-tile="parked"', cell)
+        self.assertEqual(out["R"]["kids"], ["parked"])
+
+    def test_a_parked_row_names_its_type_parked(self):
+        made, answers = self.parked_answers(self.checkout)
+        out = self.run_view(self.TILE + " tile('system', 'parked'); R.html = ELS.queue.html;", answers=answers)
+        row = re.search(rf'<tr class="child" data-type="parked" data-item="{made}".*?</td>', out["R"]["html"], re.S).group(0)
+        self.assertTrue(row.endswith("</span>parked</td>"), row)
+
+    def test_opening_a_parked_only_repo_shows_its_parked_rows(self):
+        solo = self.checkout.parent / "solo"
+        made, answers = self.parked_answers(solo)
+        out = self.run_view("open('solo'); R.kids = kids();", answers=answers)
+        self.assertEqual(out["R"]["kids"], ["parked"])
+
+    def test_show_parked_in_the_url_is_ignored(self):
+        made, answers = self.parked_answers(self.checkout)
+        out = self.run_view("open('system'); R.kids = kids();", search="?show=parked", answers=answers)
+        self.assertNotIn("parked", out["R"]["kids"])
+
     def test_a_pr_wait_counts_in_a_review_box_after_blocked_not_in_blocked(self):
         # pack sd:8083 (operator 2026-11-07): "still not seeing a row tile counter in the queue list for waiting on
         # a review". A repo with one PR wait on you shows a review box of 1, lit caution, and blocked 0.
