@@ -688,7 +688,7 @@ class BlockedBuildRows(Fixture):
             self.assertTrue(row["why"], row)
         self.assertTrue(alone["why"].startswith(f"item {lone}'s lane runs on host-b"), alone)
         self.assertEqual((alone["retry"]["allowed"], alone["retry"]["reason"]),
-                         (False, "it never ran; Cancel clears it and parks the item, or build the item again from Tasks"))
+                         (False, "it never ran; Cancel clears it, or build the item again from Tasks"))
         self.assertTrue(all(row["cancel"]["allowed"] for row in rows.values()), rows)
         status, _, body = self.post(f"/api/assignments/{alone['id']}/cancel", {"revision": alone["cancel"]["revision"]})
         self.assertEqual(status, 200, body)
@@ -726,6 +726,14 @@ class BlockedBuildRows(Fixture):
         for action in ("cancel", "retry"):
             self.assertEqual((rows[bad][action]["allowed"], rows[bad][action]["reason"]),
                              (False, "the assignment was not read: database disk image is malformed"), rows[bad])
+
+    def test_the_build_cancel_confirm_says_the_items_park(self):
+        """sd:9222: a cancelled run's items park, so the confirm names Unpark, not a move back to ready alone."""
+        from sd_dashboard import v2
+        source = (Path(v2.__file__).resolve().parent / "static" / "today.js").read_text(encoding="utf-8")
+        body = source[source.index("title: `Cancel build run "):source.index("ok: 'Cancel build'")]
+        self.assertIn("parks", body)
+        self.assertIn("Unpark", body)
 
 class AutoPickup(Fixture):
     """pack sd:6097: the Builds panel shows auto-pickup and its On and Off write it, bound to the value read."""

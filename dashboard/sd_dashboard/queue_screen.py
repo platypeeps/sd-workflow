@@ -508,7 +508,7 @@ def _blocked(connection, row: dict) -> dict:
         lead = runner_state(connection, row["lead"])
         if lead["run"] is None:
             retry = {"assignment": row["lead"], "revision": lead["revision"], "allowed": False,
-                     "reason": "it never ran; Cancel clears it and parks the item, or build the item again from Tasks",
+                     "reason": "it never ran; Cancel clears it, or build the item again from Tasks",
                      "bundle": lead["status"]}
         else:
             retry = retry_state(connection, lead["run"])

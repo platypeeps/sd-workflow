@@ -535,6 +535,11 @@ def queue(connection, items: list[int], *, who: str, expected_revisions: dict | 
                     raise BuildRefused(f"item {item} changed; refresh the selection")
         for item in items:
             _item(connection, item)
+            # Pickup read `eligible` before this transaction: an item a cancel parked since is the operator's pause,
+            # so a stale pickup refuses it and the next tick reads again (review of sd:9222).
+            if who == PICKUP and connection.execute("SELECT parked_at FROM item WHERE id = ?",
+                                                    (item,)).fetchone()["parked_at"] is not None:
+                raise BuildRefused(f"item {item} was parked after auto-pickup read it")
         created = []
         for item in items:
             ident = create_assignment(connection, item=item, role="author", status="queued", lane="parallel",
@@ -542,8 +547,7 @@ def queue(connection, items: list[int], *, who: str, expected_revisions: dict | 
             connection.execute("UPDATE assignment SET scope = ?, queued_at = ?, started = NULL WHERE id = ?",
                                (SCOPE, clock(), ident))
             add_note(connection, item, "comment", f"Build assignment {ident} queued by {who}")
-            # A press of an item a cancel parked builds it unparked, as Retry does (sd:9222): auto-pickup never
-            # sees a parked one, so only a press reaches here with one.
+            # A press of an item a cancel parked builds it unparked, as Retry does (sd:9222); pickup refused one above.
             unpark(connection, item)
             created.append(ident)
         return [queue_state(connection, ident) for ident in created]
@@ -2136,9 +2140,13 @@ def _park(connection, ident: str, lead: int, stamp: str) -> None:
 
 def park(connection, item: int, statuses: tuple[str, ...], stamp: str, note: str | None = None) -> bool:
     """Park `item` while its status is one of `statuses`, with `note` when given; whether it parked. An item the
-    operator moved on, or one parked already, stays as it is. Auto-pickup takes unparked items only (sd:9222)."""
+    operator moved on, one parked already, or one an assignment still owns (another build queued since, sd:8960)
+    stays as it is. Auto-pickup takes unparked items only (sd:9222)."""
     row = connection.execute("SELECT status, parked_at FROM item WHERE id = ?", (item,)).fetchone()
     if row is None or row["status"] not in statuses or row["parked_at"] is not None:
+        return False
+    if connection.execute(f"SELECT 1 FROM assignment WHERE item = ? AND status IN {OWNING} LIMIT 1",
+                          (item,)).fetchone():
         return False
     set_item_fields(connection, item, parked_at=stamp)
     if note:

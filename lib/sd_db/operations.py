@@ -601,14 +601,16 @@ def cancel_assignment(connection: sqlite3.Connection, assignment: int, *, expect
                      f"{current['build_run']} stops with its bundle; its items park when it stops", session=who)
             return assignment_state(connection, assignment)
         update_assignment(connection, assignment, status="cancelled", ended=ended)
-        # A build's cancel is a pause: its items are parked, as auto-pickup
-        # takes unparked ready items only, and Unpark brings them back. A
-        # queued lead takes its queued members with it, so none builds on
-        # alone while its item hides parked (sd:9222).
-        build_scope = current["scope"] == build.SCOPE
+        # A queued build's cancel is a pause: its items are parked, as
+        # auto-pickup takes unparked ready items only, and Unpark brings them
+        # back. A queued lead takes its queued members with it, so none
+        # builds on alone while its item hides parked (sd:9222). A blocked
+        # row is no live build: its cancel parks nothing, as a fresh build
+        # may own the item by now (sd:8960).
+        live = current["scope"] == build.SCOPE and current["status"] == "queued"
         members = [(row["id"], row["item"]) for row in connection.execute(
             "SELECT id, item FROM assignment WHERE parent = ? AND status = 'queued' AND scope = ? ORDER BY id",
-            (assignment, build.SCOPE))] if build_scope and current["status"] == "queued" else []
+            (assignment, build.SCOPE))] if live else []
         for member, _ in members:
             update_assignment(connection, member, status="cancelled", ended=ended)
         audit = {"assignment": assignment, "old_status": current["status"], "status": "cancelled", "who": who, "at": ended}
@@ -621,7 +623,7 @@ def cancel_assignment(connection: sqlite3.Connection, assignment: int, *, expect
         for ident, item, lead in cancelled:
             if item is None:
                 continue
-            parked = build_scope and build.park(connection, item, ("ready", "blocked"), ended)
+            parked = live and build.park(connection, item, ("ready",), ended)
             add_note(connection, item, "comment",
                      f"{current['status'].capitalize()} assignment {ident} cancelled by {who}{lead}; item status "
                      f"unchanged" + ("; item parked; Unpark to build it again" if parked else ""), session=who)

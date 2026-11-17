@@ -1501,6 +1501,49 @@ class CancelParks(Case):
         self.cancel(assignment)
         self.assertEqual(self.parked([item]), [False])
 
+    def test_a_stale_pickup_does_not_undo_a_cancel(self):
+        """Review of sd:9222: pickup reads `eligible` before `queue`'s transaction. An item pressed and cancelled in
+        between is ready and parked with no assignment: the stale pickup queues nothing and leaves it parked."""
+        item = self.item()
+        stale = [{"id": item, "title": "Build me", "repo": A, "priority": None}]
+        self.cancel(build.queue(self.db, [item], who="operator")[0]["id"])
+        with mock.patch.object(build, "eligible", return_value=stale):
+            self.assertEqual(self.pickup(), [])
+        self.assertEqual(self.parked([item]), [True])
+        with self.assertRaisesRegex(build.BuildRefused, "parked"):
+            build.queue(self.db, [item], who=build.PICKUP)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE item = ? AND status = 'queued'", item), 0)
+        build.queue(self.db, [item], who="operator")
+        self.assertEqual(self.parked([item]), [False], "an explicit press still unparks")
+
+    def blocked(self, item):
+        assignment = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'blocked', ended = 'now' WHERE id = ?", (assignment,))
+        return assignment
+
+    def test_a_blocked_cancel_parks_nothing(self):
+        """Review of sd:9222: a blocked row is no live build; its cancel leaves the item as it is."""
+        item = self.item()
+        self.cancel(self.blocked(item))
+        self.assertEqual(self.parked([item]), [False])
+        note = self.db.execute("SELECT body FROM note WHERE item = ? AND kind = 'comment' ORDER BY id DESC",
+                               (item,)).fetchone()["body"]
+        self.assertTrue(note.endswith("item status unchanged"), note)
+
+    def test_clearing_a_skipped_row_never_parks_an_item_another_build_owns(self):
+        """sd:8960 path: a blocked row stays after Ready and Build make a fresh queued one; clearing the old row
+        leaves the building item unparked. A queued cancel while another assignment owns the item parks nothing."""
+        item = self.item()
+        old = self.blocked(item)
+        build.queue(self.db, [item], who="operator")
+        self.cancel(old)
+        self.assertEqual(self.parked([item]), [False])
+        other = self.item()
+        pressed = build.queue(self.db, [other], who="operator")[0]["id"]
+        create_assignment(self.db, role="author", status="queued", item=other)
+        self.cancel(pressed)
+        self.assertEqual(self.parked([other]), [False])
+
 
 class Race(Case):
     """Race table: a writer runs between the reap's read and its compare-and-set; the reap must do nothing then."""
