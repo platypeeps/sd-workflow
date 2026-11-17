@@ -1936,6 +1936,33 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertNotIn("Parked idea", out["R"]["tiled"])
         self.assertRegex(out["R"]["tiled"], r'data-tile-clear="system">2 parked \(\d+ rows\) · Show all</button>')
 
+    def parked_answers(self, repo):
+        from sd_dashboard import tasks_screen
+        if repo != self.checkout:
+            upsert_repo(self.connection, str(repo), remote=f"https://github.com/example/{repo.name}.git", managed=1)
+        made = self.item("Set aside", kind="task", priority=4, repo=str(repo))
+        self.connection.execute("UPDATE item SET parked_at = ? WHERE id = ?", (NOW, made))
+        return made, {"/api/tasks": [200, tasks_screen.document(self.connection, now=NOW)],
+                      f"/api/tasks/{made}": [200, tasks_screen.details(self.connection, made, now=NOW)]}
+
+    def test_a_repo_whose_only_rows_are_parked_still_shows_its_parked_box(self):
+        """Review of sd:9247: a repo with nothing but parked tasks drew no row, so its box was unreachable."""
+        solo = self.checkout.parent / "solo"
+        made, answers = self.parked_answers(solo)
+        out = self.run_view(self.TILE + " R.repos = repos(); tile('solo', 'parked'); R.kids = kids();", answers=answers)
+        self.assertIn("solo:false", out["R"]["repos"])
+        self.assertEqual(out["R"]["kids"], ["parked"])
+
+    def test_a_parked_row_has_its_actions_and_its_details(self):
+        """Review of sd:9247: a parked row was never adopted, so its Act cell was blank and Details found nothing."""
+        made, answers = self.parked_answers(self.checkout)
+        out = self.run_view(self.TILE + " C.rowActions = id => mk`<i data-acts=\"${id}\"></i>`; tile('system', 'parked');"
+                            " R.html = ELS.queue.html;"
+                            f" ELS.queue.listeners.click[0]({{ target: {{ closest: s => s === 'tr[data-id]' ? {{ dataset: {{ id: '{made}' }} }} : null }} }});"
+                            " await flush(); await flush(); R.details = ELS.details.html;", answers=answers)
+        self.assertIn(f'<i data-acts="{made}"></i>', out["R"]["html"])
+        self.assertIn('id="det-title" class="fld" value="Set aside"', out["R"]["details"])
+
     def test_a_pr_wait_counts_in_a_review_box_after_blocked_not_in_blocked(self):
         # pack sd:8083 (operator 2026-11-07): "still not seeing a row tile counter in the queue list for waiting on
         # a review". A repo with one PR wait on you shows a review box of 1, lit caution, and blocked 0.
