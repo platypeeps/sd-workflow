@@ -1538,6 +1538,18 @@ class CancelParks(Case):
         self.assertEqual((runner.queue_state(self.db, child)["status"], self.parked(items)),
                          ("cancelled", [False, True]))
 
+    def test_a_member_cancelled_on_its_own_leaves_the_group_every_reader_reads(self):
+        """Review round 3 of sd:9222: the lead's next run lists the lead alone (`run`, which the supervisor's brief,
+        its delivery, the Builds panel and telemetry read), and no open run of the lead holds the child's item,
+        so building the child presses it fresh while the lead builds."""
+        items, lead, child, _ = self.requeued_bundle()
+        self.cancel(child)
+        again = self.claim()
+        self.assertEqual([member["id"] for member in build.run(self.db, again["id"])["members"]], [lead])
+        self.assertIsNone(build._held(self.db, items[1]))
+        fresh = build.queue_again(self.db, [items[1]], who="operator")
+        self.assertEqual([(entry["item"], entry["status"]) for entry in fresh], [(items[1], "queued")])
+
     def test_a_blocked_member_cleared_on_its_own_stays_out_of_a_later_retry(self):
         """The class pass, blocked arm: a blocked member's row cleared by Cancel sits out the Retry of the blocked
         bundle and the Retry of that attempt's cancelled end."""

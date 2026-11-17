@@ -532,9 +532,14 @@
       // build (sd:3041): cancel is sd assignments cancel, POST /api/assignments/<n>/cancel with the revision the Details read
       // (operations.assignment_state); the runner's cancel went with the runner. No verb reopens a cancelled row: confirm, no Undo.
       { id: 'asg.cancel', on: 'assignment', label: 'Cancel', key: 'x', risk: 'confirm',
-        does: 'Ends this agent run; the task keeps its status.',
+        does: 'Ends this agent run; a queued or running build also parks the task until Unpark.',
         when: o => o.can.allowed || o.can.reason, cli: o => `sd assignments cancel ${o.n}`,
-        consequence: o => `Ends assignment #${o.n} in ${o.repo} as cancelled. The item's status is unchanged.`,
+        // sd:9222: a queued build's cancel parks its item; a running one parks at the run's end, or ends blocked.
+        consequence: o => `Ends assignment #${o.n} in ${o.repo} as cancelled. ` + (o.status === 'queued'
+          ? "A build also parks the item, its status unchanged, so auto-pickup leaves it until Unpark."
+          : o.status === 'running'
+            ? 'The build stops at its next beat and parks its items at ready until Unpark; if the reap cannot confirm the process stopped, it ends blocked instead: check the process, then Retry once the lease is released.'
+            : "The item's status is unchanged."),
         run: o => landing(cancelAsg(o), () => `Cancelled · #${o.n} · sd assignments cancel ${o.n}`) },
       window.commands.showAssignment({ primary: o => o.status !== 'blocked' }),
     );

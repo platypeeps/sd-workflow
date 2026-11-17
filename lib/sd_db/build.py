@@ -93,6 +93,13 @@ CANCEL_PARKED = "Parked: build run {run} was cancelled; Unpark to build it again
 # The result on a bundle member's row an operator cancelled on its own: it left the bundle, so no Retry of the
 # bundle queues it again or clears its park (review round 2 of sd:9222).
 ALONE = "cancelled on its own by "
+
+
+def _in_group(alias: str = "assignment") -> str:
+    """An SQL test that the row under `alias` is still in its bundle: a lead, or a member not cancelled on its own
+    (`ALONE`). Every reader of a bundle by `parent` applies it: Retry, the run's members the supervisor briefs and
+    delivers, and the hold on an item (review rounds 2 and 3 of sd:9222)."""
+    return f"({alias}.parent IS NULL OR COALESCE({alias}.result, '') NOT LIKE '{ALONE}%')"
 #: The steps a run walks, each written before it starts.
 STEPS = ("claimed", "worktree", "building", "reviewing", "fixing", "enqueuing", "enqueued", "checking", "cleaning")
 #: A draft run's steps (`sd_db.draft`): it claims, then drafts.
@@ -589,8 +596,7 @@ def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
         state = retry_state(connection, run) if run else {"allowed": False, "reason": "it never ran"}
         if not state["allowed"]:
             raise BuildRefused(f"Retry refused: {state['reason']}")
-        members = [member for member in _members(connection, assignment, current["status"])
-                   if member["id"] == assignment or not _alone(connection, member["id"])]
+        members = _members(connection, assignment, current["status"])
         if not members:
             raise BuildRefused(f"Retry refused: build run {run['id']} has no {current['status']} member")
         items = reads.items_by_ids(connection, [current["item"], *(member["item"] for member in members)])
@@ -618,6 +624,14 @@ def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
                      f"{'Send to builder' if finding else 'Retry'} of build run {run['id']}")
         return {"run": run["id"], "queued": [{"id": row["id"], "item": row["item"], "status": row["status"]}
                                              for row in queued]}
+
+
+def left(connection, lead: int) -> list[int]:
+    """The items of the members an operator cancelled on their own out of `lead`'s bundle (`ALONE`): an older run's
+    `Closes:` trailer on the branch may still cite one, and the run delivers none of them."""
+    return [row["item"] for row in connection.execute(
+        f"SELECT item FROM assignment WHERE parent = ? AND scope = ? AND NOT {_in_group()} ORDER BY id",
+        (lead, SCOPE))]
 
 
 def _alone(connection, assignment: int) -> bool:
@@ -1015,7 +1029,7 @@ def _holding(item: str) -> str:
     """
     return (f"SELECT runner_run.id, runner_run.outcome FROM assignment holder JOIN runner_run "
             f"ON runner_run.assignment = COALESCE(holder.parent, holder.id) WHERE holder.item = {item} "
-            f"AND holder.scope = '{SCOPE}' AND runner_run.released_at IS NULL AND NOT ({IN_LANE} "
+            f"AND holder.scope = '{SCOPE}' AND {_in_group('holder')} AND runner_run.released_at IS NULL AND NOT ({IN_LANE} "
             f"AND holder.status IS NOT 'done')")
 
 
@@ -1216,7 +1230,7 @@ def _open_run(connection, lead: int, *, repo: str, owner: str, step: str, model:
 
 def _members(connection, lead: int, status: str = "running") -> list[dict]:
     return [dict(row) for row in connection.execute(
-        "SELECT id, item FROM assignment WHERE (id = ? OR parent = ?) AND status = ? AND scope = ? "
+        f"SELECT id, item FROM assignment WHERE (id = ? OR parent = ?) AND status = ? AND scope = ? AND {_in_group()} "
         "ORDER BY id = ? DESC, id", (lead, lead, status, SCOPE, lead))]
 
 
@@ -1229,7 +1243,8 @@ def run(connection, ident: str) -> dict:
     result["budget_minutes"] = connection.execute("SELECT budget_minutes FROM assignment WHERE id = ?",
                                                   (row["assignment"],)).fetchone()[0]
     result["members"] = [dict(member) for member in connection.execute(
-        "SELECT id, item, status FROM assignment WHERE (id = ? OR parent = ?) AND scope = ? ORDER BY id = ? DESC, id",
+        f"SELECT id, item, status FROM assignment WHERE (id = ? OR parent = ?) AND scope = ? AND {_in_group()} "
+        "ORDER BY id = ? DESC, id",
         (row["assignment"], row["assignment"], SCOPE, row["assignment"]))]
     return result
 
