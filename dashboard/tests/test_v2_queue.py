@@ -1973,6 +1973,16 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertIn('data-tile="parked"', cell)
         self.assertEqual(out["R"]["kids"], ["parked"])
 
+    def test_a_parked_task_with_an_open_pr_is_still_in_its_parked_box(self):
+        made, answers = self.parked_answers(self.checkout)
+        lanes = queue_screen.document(self.connection, now=NOW)
+        answers["/api/queue"] = [200, lanes]
+        lanes["prs"] = {"error": "", "rows": [
+            {"item": made, "title": "Waits", "repo": str(self.checkout), "url": "https://github.com/example/system/pull/9",
+             "lane": "awaiting_you", "on": "you", "since": "2026-09-06T11:00:00+00:00", "waited": 3600}]}
+        out = self.run_view(self.TILE + " tile('system', 'parked'); R.kids = kids();", answers=answers)
+        self.assertIn("parked", out["R"]["kids"])
+
     def test_a_parked_row_names_its_type_parked(self):
         made, answers = self.parked_answers(self.checkout)
         out = self.run_view(self.TILE + " tile('system', 'parked'); R.html = ELS.queue.html;", answers=answers)
@@ -2404,7 +2414,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertEqual(on["R"]["ready"], True)
         failed = self.run_view("R.note = ELS['queue-note'].textContent;", search="?show=suggested",
                                answers={"/api/tasks": [500, {"error": "tasks down"}]})
-        self.assertIn("Suggested items' tasks not read", failed["R"]["note"])
+        self.assertIn("Suggested items' and parked tasks not read", failed["R"]["note"])
 
     # pack sd:7271 (#40961): All items adds the repo's other open items, read from /api/tasks (always, pack sd:8127). Each
     # is an item row as a suggested one is, and its act is the one Tasks' list row offers: the move to its next status.

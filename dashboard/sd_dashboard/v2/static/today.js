@@ -560,8 +560,9 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     prs.filter(p => !drawn.has(p)).forEach(p => add(p.repo, prRow(p)));
     SUGG.forEach(r => { if (!waits.has(Number(r.id))) add(r.repo, suggestRow(r)); });
     OPENI.forEach(t => { if (!waits.has(Number(t.id))) add(t.repo_path, openRow(t)); });
-    // sd:9247: each repo's parked tasks, filtered as the tally's count (no idea kind); hidden until their box is pressed.
-    parkedTasks().filter(t => !waits.has(Number(t.id)) && !laned.has(Number(t.id))).forEach(t => add(t.repo_path, openRow(t, 'parked')));
+    // sd:9247: each repo's parked tasks (no idea kind), PR wait or lane entry or not; hidden until their box is pressed.
+    // A task with no repo is no row (pack sd:7731), as in Suggested; the tally counts the same set.
+    parkedTasks().filter(t => t.repo_path).forEach(t => add(t.repo_path, openRow(t, 'parked')));
     B.recent.forEach(r => add(r.repo, endedRun(r)));
     const RANK = { warning: 0, caution: 1, unknown: 2, ok: 3, queued: 4 };
     // pack sd:7679: the busiest repo first, box by box in the boxes' order, each most first; then the name. Unassociated last.
@@ -591,7 +592,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   function pips(g) {
     const pip = (box, n, on, means) => html`<button type="button" class="tile" data-repo="${g.key}" data-tile="${box}" aria-pressed="${String(!!qTile && qTile.repo === g.key && qTile.box === box)}" aria-label="${`Only the ${n} ${box} rows`}"${n ? '' : html` disabled`}><span class="pip${n ? on : ''}" title="${`${n} ${means}`}">${String(n)}</span></button>`;
     if (g.key && (!QV.lanes || QV.lanes.problems.some(p => repoKey(p.repo) === g.key)))
-      return html`<td class="detail"><span class="g-unknown" aria-hidden="true">${GLYPH.unknown}</span> lane not read${g.n.parked ? pip('parked', g.n.parked, ' on', PARKED_MEANS) : ''}</td>`;
+      return html`<td class="detail${g.n.parked ? ' pipe' : ''}"><span class="g-unknown" aria-hidden="true">${GLYPH.unknown}</span> lane not read${g.n.parked ? pip('parked', g.n.parked, ' on', PARKED_MEANS) : ''}</td>`;
     // pack sd:7470: merging is the leftmost box; pack sd:8137: review follows it.
     const { working: w, merging: m, next: n, blocked: b, review: v, suggested: s, parked: pk } = g.n, you = g.rows.filter(c => c.pr === 'you').length;
     // Each box says its count and what it counts, in its title (pack sd:7383); the label above says all six at once.
@@ -611,7 +612,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     if (ACTIVE && ACTIVE.error) unread.push(`Sessions not read: ${ACTIVE.error}`);
     if (qShow.has('suggested') && (DOC.queues || {}).error) unread.push(`Suggested items not read: ${DOC.queues.error}`);
     if (qShow.has('open') && !QV.tasks) unread.push(`Open items not read: ${QV.tasksErr || 'no answer yet'}`);
-    else if (qShow.has('suggested') && !QV.tasks) unread.push(`Suggested items' tasks not read: ${QV.tasksErr || 'no answer yet'}`);
+    else if (qShow.has('suggested') && !QV.tasks) unread.push(`Suggested items' and parked tasks not read: ${QV.tasksErr || 'no answer yet'}`);
     else if (!QV.tasks) unread.push(`Parked tasks not read: ${QV.tasksErr || 'no answer yet'}`);
     // pack sd:7251: a filter counts its rows in every repo, before a repo with no row shown is left out.
     const all = qGroups(), every = all.flatMap(g => g.rows), groups = all.filter(g => g.shown.length || g.rows.some(c => c.type === 'parked' && qMatch(c))), active = every.filter(c => !QSHOW.includes(c.type)).length;
@@ -625,7 +626,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       ({ v, pressed: qShow.has(v), label: n(v) === null ? html`${label}` : html`${label} <span class="n">${String(n(v))}</span>` }))));
     const prs = prTally(every);
     // sd:8953: the parked tasks Tasks reads (parked_at, not a status), less the idea kinds; it opens Tasks' Parked chip.
-    const parked = parkedTasks().length;
+    const parked = parkedTasks().filter(t => t.repo_path).length;
     put($('queue-tally'), html`${tally(every.filter(c => !QSHOW.includes(c.type))).map(([t, n]) => html`<span>${n} ${t}</span>`)}${prs ? html`<span>${prs}</span>` : ''}${parked ? html`<a href="/tasks?parked=1&amp;realm=all">${String(parked)} parked</a>` : ''}`);
     // Auto-pickup (pack sd:6097): its state, and On or Off, bound to the value this read saw. On has no end (pack sd:8930).
     const pk = QV.built && QV.built.pickup;
