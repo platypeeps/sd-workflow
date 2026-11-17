@@ -287,6 +287,23 @@ class Claim(Case):
         folder.mkdir(parents=True, exist_ok=True)
         (folder / "config.json").write_text(json.dumps({"config": {"sd": {"bundle_max": value}}}))
 
+    def repo_cap(self, value):
+        folder = self.root / "config" / "sd-ai-command-pack"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "config.json").write_text(json.dumps({"config": {"sd": {"repo_cap": value}}}))
+
+    def test_a_machine_repo_cap_sets_bundles_per_repo(self):
+        """sd:9172: REPO_CAP was one constant; a machine's sd.repo_cap now sets its own, 1 to 6."""
+        room = {"why": "", "held": set(), "machine": 6, "used": {A: 1}}
+        self.assertEqual(build.repo_cap(), 1)
+        self.assertEqual(build.room_for(room, A), 0)
+        self.repo_cap("3")
+        self.assertEqual(build.repo_cap(), 3)
+        self.assertEqual(build.room_for(room, A), 2)
+        for bad in ("0", "7", "abc", 3):
+            self.repo_cap(bad)
+            self.assertEqual(build.repo_cap(), build.REPO_CAP, f"{bad!r} reads the default")
+
     def test_a_machine_bundle_max_sizes_its_bundles(self):
         """sd:9109: BUNDLE_MAX was one constant; a machine's sd.bundle_max now sets its own bundle size."""
         self.assertEqual(build.bundle_max(), 3)

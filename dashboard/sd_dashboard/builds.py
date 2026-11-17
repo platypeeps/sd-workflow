@@ -148,7 +148,7 @@ def plan(connection, items: list[int], *, now: str, sessions=None, gate=None) ->
                                       for row in chunk]})
     return {"read": now, "bundles": bundles, "refused": refused,
             "room": {"machine": room["machine"], "why": room["why"], "cap": build.MACHINE_CAP,
-                     "repo_cap": build.REPO_CAP},
+                     "repo_cap": build.repo_cap()},
             "budget_minutes": build.BUDGET_MINUTES}
 
 

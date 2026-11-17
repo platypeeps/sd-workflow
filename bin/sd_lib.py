@@ -148,6 +148,9 @@ CORE_CONFIG = {
                    "description": "How many items one build bundle takes when this machine claims it, a mechanical "
                                   "item half of one; the claim gives a child 120 minutes per 3 slots it took, never less. "
                                   "Unset reads 3. It grants nothing."},
+    "repo_cap": {"pattern": "[1-6]",
+                 "description": "How many build bundles may build at once in one repository when this machine "
+                                "claims them, 1 to 6. Unset reads 1 (sd:8158). It grants nothing."},
     "review_slots": {"pattern": "[0-9]+",
                      "description": "How many reviews may run their reviewers at once on this machine; 0 is no cap. "
                                     "Unset reads 2; SD_REVIEW_SLOTS overrides it for one run."},

@@ -665,6 +665,8 @@ The reserved `sd` namespace declares these settings:
 - `sd.bundle_max`: how many items one build bundle takes when this machine claims it, a mechanical item half
   of one. Absence reads 3. The claim fixes a build child's budget at 120 minutes per 3 slots it took, never
   less (sd:9109). It grants nothing.
+- `sd.repo_cap`: how many build bundles may build at once in one repository when this machine claims them,
+  1 to 6. Absence reads 1, the one-bundle-per-repository rule (sd:8158, sd:9172). It grants nothing.
 - `sd.gate_load_max`: the gate queue starts a gate only while load1 is below this; `0` is no load condition.
   Absence is no load condition (sd:2607). `SD_GATE_LOAD_MAX` overrides it for one run. It grants nothing.
 - `sd.gate_settle_seconds`: seconds between two gate starts, and of low load1 while load5 is high; `0` is none.
