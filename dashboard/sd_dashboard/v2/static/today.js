@@ -538,8 +538,10 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     // held, so no runner row. A working, stalled, lost or waiting run keeps its row and its actions.
     // sd:9078: a done or cancelled member waits on nothing, and a member's lane entry covers it as its PR row does.
     const shown = m => waits.has(Number(m.item)) || laned.has(Number(m.item));
-    const inPr = r => r.state === 'merging' && r.items.some(shown)
-      && r.items.filter(m => !['done', 'cancelled'].includes(m.status)).every(shown);
+    // sd:9114: a run whose pull request is a PR row is that row alone, a bundle member with no PR row of its own too.
+    const pulls = new Set(prs.map(p => p.url).filter(Boolean));
+    const inPr = r => r.state === 'merging' && ((r.pull && pulls.has(r.pull)) || (r.items.some(shown)
+      && r.items.filter(m => !['done', 'cancelled'].includes(m.status)).every(shown)));
     B.runs.forEach(r => { r.items.forEach(m => held.add(m.assignment)); if (!inPr(r)) add(r.repo, runRow(r)); });
     ((QV.runner || {}).live || []).filter(a => !held.has(a.id)).forEach(a => add(a.repo, asgRow(a)));
     ((QV.runner || {}).blocked || []).filter(a => !held.has(a.id) && !laned.has(Number(a.item))).forEach(a => add(a.repo, blockedAsg(a)));

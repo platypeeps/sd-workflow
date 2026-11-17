@@ -65,7 +65,8 @@ from .ship import this_host
 from .workflow import WorkflowError
 from .writes import add_note, now, record_cost, record_state
 
-#: A child past this many seconds is ended: TERM to its group, `GRACE_SECONDS`, KILL.
+#: A child past this many seconds is ended: TERM to its group, `GRACE_SECONDS`, KILL. The floor; a supervisor
+#: reads the budget its claim fixed (`build.budget_minutes`, sd:9109).
 TIMEOUT_SECONDS = build.BUDGET_MINUTES * 60
 GRACE_SECONDS = 20
 BEAT_SECONDS = 30
@@ -846,7 +847,7 @@ class Supervisor:
 
     def __init__(self, connection, ident: str, *, tools: Tools, log_root: Path,
                  cited: Callable[[Path, str, str, str], Collection[int] | None], environ: dict | None = None,
-                 beat_seconds: float = BEAT_SECONDS, timeout: float = TIMEOUT_SECONDS, grace: float = GRACE_SECONDS,
+                 beat_seconds: float = BEAT_SECONDS, timeout: float | None = None, grace: float = GRACE_SECONDS,
                  probe=Probe, checked: Callable[[Path, str, str, str, str], list[str]] | None = None,
                  checks: Callable[[Path], list[list[str]]] | None = None,
                  settle_seconds: float = build.STALE_SECONDS):
@@ -858,8 +859,10 @@ class Supervisor:
         self.db: Any = Patient(connection)  # duck-types the connection the writes are annotated with
         self.ident, self.tools, self.probe, self.cited, self.checked = ident, tools, probe, cited, checked
         self.checks = checks
-        self.beat_seconds, self.timeout, self.grace = beat_seconds, timeout, grace
+        self.beat_seconds, self.grace = beat_seconds, grace
         self.row = build.run(self.db, ident)
+        claimed = self.row.get("budget_minutes") or build.BUDGET_MINUTES
+        self.timeout = max(claimed * 60, TIMEOUT_SECONDS) if timeout is None else timeout
         self.log_root, self.logs = log_root, log_dir(log_root, self.row["repo"])
         self.work = Path(self.row["work_path"])
         self.repo = paths.expand(self.row["repo"])

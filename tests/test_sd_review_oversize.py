@@ -359,6 +359,13 @@ class BinaryMaterialTests(ReviewFixture):
         self.assertIn("[binary, not sent] added; old absent; new 2100008 bytes, blob " + blob, shot)
         self.assertLess(len(shot.encode()), 400)
 
+    def test_audio_is_summarized_as_media(self):
+        # sd:9127: a 2.9 MB Ogg music loop was sent as base64 and overran the limit.
+        is_media = sd_review.sd_review_material.is_media
+        for head in (b"OggS\x00\x02", b"fLaC\x00\x00", b"ID3\x04\x00", b"RIFF\x00\x00\x00\x00WAVEfmt "):
+            self.assertTrue(is_media(head + os.urandom(64)), head)
+        self.assertFalse(is_media(b"RIFF\x00\x00\x00\x00AVI LIST"))
+
     def test_text_change_beside_a_binary_is_sent_in_full(self):
         root, base = self.screenshot_branch()
         subject = sd_review.resolve_subject(root, "branch", base=base)
