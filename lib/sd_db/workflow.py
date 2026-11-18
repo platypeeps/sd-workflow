@@ -182,7 +182,9 @@ def hand_idea(row: Any) -> bool:
 
     if row["kind"] not in IDEA_KINDS or row["source"] in (VAULT, WRITING):
         return False
-    return row["kind"] != "idea" or not row["piece"]
+    # `is None`, as `writing.list_pieces` and `_kind_change` read it: an
+    # empty piece is still a piece, and its writing workflow owns the row.
+    return row["kind"] != "idea" or row["piece"] is None
 
 
 class WorkflowError(SdDbError):
