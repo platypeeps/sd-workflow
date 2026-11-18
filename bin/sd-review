@@ -758,9 +758,11 @@ def blocker_checklist(root: pathlib.Path, subject: Subject, database: Any, env: 
 
 
 #: This branch's rebutted findings (pack sd:9270): every accepted adjudication `sd-ship adjudicate` recorded for
-#: the branch, item-backed or no-item, at any head, from `BLOCKER_DAYS` before the base's commit to the head's,
-#: newest first; the newest disposition of a finding wins.
-REBUTTED_LINES, REBUTTED_SUMMARY_CHARS, REBUTTED_REASON_CHARS = 10, 200, 200
+#: the branch, item-backed or no-item, at a head in base..head, from `BLOCKER_DAYS` before the base's commit to the
+#: head's, newest first; the newest
+#: disposition of a finding wins. A repeat's line may sit `REBUTTED_LINE_WINDOW` lines from its rebuttal's: code
+#: above it moves between the heads of one branch, and a defect further off is another defect.
+REBUTTED_LINES, REBUTTED_SUMMARY_CHARS, REBUTTED_REASON_CHARS, REBUTTED_LINE_WINDOW = 10, 200, 200, 10
 REBUTTED_HEADER = "Findings already rebutted on this branch"
 REBUTTED_ROWS = 200
 #: The rows only: a body is ASCII JSON, while a field `json_extract` decodes may not be UTF-8 and failed the whole read.
@@ -779,49 +781,68 @@ def _bounded(value: Any, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 3].rstrip() + "..."
 
 
-def _adjudicated(body: Any) -> list[tuple[Any, Any, Any, Any]]:
-    """(path, summary, disposition, reason) of each finding an accepted adjudication answered; a malformed one has none."""
+def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any]]]:
+    """The receipt head and (path, summary, line, disposition, reason) of each finding an accepted adjudication
+    answered; a malformed one has none."""
     try:
         value = json.loads(body) if isinstance(body, (str, bytes)) else None
     except (ValueError, RecursionError):
-        return []
+        return None, []
     proposal = value.get("proposal") if isinstance(value, dict) and value.get("decision") == "accepted" else None
     rows = proposal.get("findings") if isinstance(proposal, dict) else None
-    return [(raw.get("path"), raw.get("summary"), row.get("response_disposition"), row.get("reason")) for row in rows
-            if isinstance(row, dict) and isinstance(raw := row.get("raw_finding"), dict)] if isinstance(rows, list) else []
+    bindings = proposal.get("bindings") if isinstance(proposal, dict) else None
+    return (bindings.get("head") if isinstance(bindings, dict) else None), [
+        (raw.get("path"), raw.get("summary"), raw.get("line"), row.get("response_disposition"), row.get("reason"))
+        for row in rows if isinstance(row, dict) and isinstance(raw := row.get("raw_finding"), dict)
+    ] if isinstance(rows, list) else []
 
 
-Rebuttals = dict[tuple[str, str], tuple[str, str, str]]
+def _branch_range(root: pathlib.Path, subject: Subject) -> tuple[str, str, frozenset[str]] | None:
+    """The reviewed head, its base and the commits in base..head; None when git cannot say."""
+    head = sd_lib.git_output(["rev-parse", "--verify", "--quiet", "HEAD" if subject.head == "worktree" else subject.head], root)
+    base = sd_lib.git_output(["merge-base", "HEAD", _default_base(root)], root) if subject.scope == "worktree" else subject.base
+    commits = sd_lib.git_output(["rev-list", f"{base}..{head}"], root) if head and base else None
+    return (head, base, frozenset(commits.split())) if head and base and commits is not None else None
 
 
-def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: Mapping[str, str]) -> Rebuttals:
+class Rebuttal(NamedTuple):
+    """One active rebuttal: what a repeat must share with it (`rebuttal_key`, a line), and its prompt line."""
+    path: str
+    summary: str
+    line: int | None
+    place: str
+    text: str
+    reason: str
+
+
+def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: Mapping[str, str]) -> list[Rebuttal]:
     """This branch's rebutted findings, read-only (pack sd:9270): the prompt lists them and the gate matches them.
 
     The read ends at the reviewed head's commit time, so `--explain`, dispatch and a replay ask the same (sd:1397);
-    at the same head the recorded adjudication covers a retry. It starts `BLOCKER_DAYS` before the base's commit,
-    so a reused branch name does not inherit a merged branch's rebuttals. A failed read says so on stderr and
-    reviews without them; a planning subject, a detached HEAD, no GitHub origin and no database have nothing."""
+    at the same head the recorded adjudication covers a retry. A rebuttal counts only from a receipt whose head is
+    in base..head: a reused branch name inherits nothing from a merged or abandoned branch. A failed read says so on
+    stderr and reviews without them; a planning subject, a detached HEAD, no GitHub origin and no database have
+    nothing."""
     origin = sd_lib.github_head(root) if subject.scope != "planning" else None
     branch = sd_lib.git_output(["symbolic-ref", "--quiet", "--short", "HEAD"], root) if origin else None
     if origin is None or not branch:
-        return {}
+        return []
     try:
-        anchor = "HEAD" if subject.head == "worktree" else subject.head
-        stamps, imported = [sd_lib.git_output(["show", "-s", "--format=%ct", ref], root) or ""
-                            for ref in (anchor, subject.base)], sd_lib.import_sd_db()
-        if not all(stamp.isdigit() for stamp in stamps) or imported.module is None:
-            raise ValueError(imported.problem or f"git cannot read the commit times of {anchor} and {subject.base}")
+        span, imported = _branch_range(root, subject), sd_lib.import_sd_db()
+        stamps = [sd_lib.git_output(["show", "-s", "--format=%ct", ref], root) or "" for ref in span[:2]] if span else []
+        if span is None or not all(stamp.isdigit() for stamp in stamps) or imported.module is None:
+            raise ValueError(imported.problem or "git cannot read the reviewed head, its base or their commits")
         window = [time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(int(stamp) - back))
                   for stamp, back in zip(stamps, (0, BLOCKER_DAYS * 86400), strict=True)]
         target = pathlib.Path(database) if database is not None else imported.module.default_path(env.get("HOME"))
         if not target.exists():
-            return {}
+            return []
         with contextlib.closing(imported.module.connect(target, write=False)) as connection:
             rows = connection.execute(REBUTTED_QUERY, (*window, "/".join(origin[:2]), branch, REBUTTED_ROWS)).fetchall()
     except Exception as error:  # a failed read is unknown, not empty: say so, and review without it
         print(f"sd-review: reviewing without the rebutted findings: {type(error).__name__}: {error}", file=sys.stderr)
-        return {}
-    return rebuttals(rows)
+        return []
+    return rebuttals(rows, span[2].__contains__)
 
 
 def _folded(value: Any) -> str:
@@ -831,32 +852,43 @@ def _folded(value: Any) -> str:
 
 
 def rebuttal_key(path: Any, summary: Any) -> tuple[str, str]:
-    """What a repeat of a rebuttal shares with it: the path and the whole summary, folded, the repeat note dropped.
-
-    The line is left out: it drifts across heads as code moves, and the rebuttal answered the claim."""
+    """The path and the whole summary, folded, the repeat note dropped: half of what a repeat shares with a rebuttal."""
     return _folded(path), _folded(str(summary).replace(REPEAT_NOTE, "") if isinstance(summary, str) else summary)
 
 
-def rebuttals(rows: Sequence[Sequence[Any]]) -> Rebuttals:
+def repeats(rebuttal: Rebuttal, path: Any, summary: Any, line: Any) -> bool:
+    """A finding repeats a rebuttal at its file, its summary, and a line within the window; no line matches no line."""
+    line = line if type(line) is int else None
+    near = (rebuttal.line is None and line is None) or (
+        rebuttal.line is not None and line is not None and abs(rebuttal.line - line) <= REBUTTED_LINE_WINDOW)
+    return near and (rebuttal.path, rebuttal.summary) == rebuttal_key(path, summary)
+
+
+def rebuttals(rows: Sequence[Sequence[Any]], on_branch: Callable[[str], bool]) -> list[Rebuttal]:
     """The active rebuttals in adjudication bodies newest first, at most `REBUTTED_LINES`: the newest
     disposition of each finding wins. The prompt lists exactly these, and the gate matches exactly these.
 
-    The lane's own blockers (`LANE_PATHS`) are never rebutted: a later truncated review must still block."""
-    decided: set[tuple[str, str]] = set()
-    active: Rebuttals = {}
-    for path, summary, disposition, reason in (found for (body, *_rest) in rows for found in _adjudicated(body)):
-        key = rebuttal_key(path, summary)
-        if key[1] and key not in decided and str(path).strip() not in LANE_PATHS:
-            decided.add(key)
+    Only a receipt `on_branch` counts. The lane's own blockers (`LANE_PATHS`) are never rebutted: a later
+    truncated review must still block."""
+    decided: list[Rebuttal] = []
+    active: list[Rebuttal] = []
+    for body, *_rest in rows:
+        head, found = _adjudicated(body)
+        for path, summary, line, disposition, reason in found if isinstance(head, str) and on_branch(head) else ():
+            if not rebuttal_key(path, summary)[1] or str(path).strip() in LANE_PATHS or any(
+                    repeats(earlier, path, summary, line) for earlier in decided):
+                continue
+            entry = Rebuttal(*rebuttal_key(path, summary), line if type(line) is int else None, _bounded(path or "?", 120),
+                             _bounded(summary, REBUTTED_SUMMARY_CHARS), _bounded(reason, REBUTTED_REASON_CHARS))
+            decided.append(entry)
             if disposition == "rebutted" and len(active) < REBUTTED_LINES:
-                active[key] = (_bounded(path or "?", 120), _bounded(summary, REBUTTED_SUMMARY_CHARS),
-                               _bounded(reason, REBUTTED_REASON_CHARS))
+                active.append(entry)
     return active
 
 
-def rebuttal_section(seen: Rebuttals) -> str:
+def rebuttal_section(seen: Sequence[Rebuttal]) -> str:
     """The prompt section for `rebuttals`; a static reader cites the lines it read."""
-    lines = "".join(f"\n- {place}: {text} Rebuttal: {reason}" for place, text, reason in seen.values())
+    lines = "".join(f"\n- {entry.place}: {entry.text} Rebuttal: {entry.reason}" for entry in seen)
     return (f"\n\n{REBUTTED_HEADER}, newest first, from its recorded adjudications. Raise one again only with new "
             "evidence that contradicts the rebuttal, given in the finding's evidence field: a check you ran and its "
             "output, or, when you cannot run commands, path:line and a quote of the current code showing the rebuttal "
@@ -1694,11 +1726,11 @@ def run_provider(
 
 
 def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
-            rebutted: frozenset[tuple[str, str]] = frozenset()) -> list[dict[str, Any]]:
+            rebutted: Sequence[Rebuttal] = ()) -> list[dict[str, Any]]:
     """Label each finding `blocking` or `advisory` against the policy floor.
 
     Operator ruling on pack sd:9270: a finding at the floor blocks, cited or not, unless it repeats one
-    already rebutted on this branch (`rebuttal_key`) without evidence; that repeat posts as advisory,
+    already rebutted on this branch (`repeats`) without evidence; that repeat posts as advisory,
     its summary saying why. The lane runs this through `sd-review` too.
     """
 
@@ -1711,7 +1743,7 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
         blocking = rank > 0 and rank >= threshold
         evidence = record.get("evidence")
         if (blocking and not (isinstance(evidence, str) and evidence.strip())
-                and rebuttal_key(record.get("path"), record.get("summary")) in rebutted):
+                and any(repeats(entry, record.get("path"), record.get("summary"), record.get("line")) for entry in rebutted)):
             blocking = False
             record["summary"] = f"{str(record.get('summary') or '').strip()} {REPEAT_NOTE}".strip()
         record["disposition"] = "blocking" if blocking else "advisory"
@@ -2172,7 +2204,7 @@ def review(
             raise UsageError("cannot establish the refreshed target boundary for item authorship")
         authored_subject = subject if target_base == subject.head else subject._replace(base=target_base)
     database = getattr(args, "database", None)
-    rebutted = {} if preflight else rebutted_findings(root, subject, database, env)
+    rebutted = [] if preflight else rebutted_findings(root, subject, database, env)
     checklist = "" if preflight else blocker_checklist(root, subject, database, env) + rebuttal_section(rebutted)
     prompt, prepended, context = ("", False, []) if preflight else prepared_prompt(root, subject, args, previous, env, checklist)
     try:
@@ -2348,7 +2380,7 @@ def review(
         outcomes = [outcome for _measured, attempts in answers for outcome in attempts]
         outcomes = [row._replace(status=FINDINGS if row.findings else CLEAN) if (row.diagnostic or {}).get("coverage") == "partial" and set(row.diagnostic["omitted_paths"]) <= {path["path"] for path in input_manifest.get("paths", ()) if path.get("media")} and any(other.status in (CLEAN, FINDINGS) for other in outcomes) else row for row in outcomes]
         finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)],
-                      frozenset(rebutted))
+                      rebutted)
     finally:
         slot.give_back()  # sd:2523: on every exit; the gate below queues in its own pool
     # Shadow only (sd:2092): Jev's kind for each finding goes to its ledger and
@@ -2490,7 +2522,7 @@ def partial(outcome: Outcome, unread: Sequence[str]) -> Outcome:
 
 
 def finish_review(result: dict[str, Any], outcomes: Sequence[Outcome], reviewed: list[str],
-                  rebutted: frozenset[tuple[str, str]] = frozenset()) -> dict[str, Any]:
+                  rebutted: Sequence[Rebuttal] = ()) -> dict[str, Any]:
     """Keep every distinct finding, once; only complete answers count toward required depth."""
     collected = sd_lib.distinct_findings(dict(finding, backend=outcome.backend) for outcome in outcomes for finding in outcome.findings)
     disposed = dispose(collected, result["severity_floor"], rebutted)
