@@ -5532,6 +5532,62 @@ def thread_lane(run: Any) -> sd_lane.StartedLane:
     return sd_lane.StartedLane(lambda: None if thread.is_alive() else row[0])
 
 
+class LaneParallel(unittest.TestCase):
+    """sd:9323: three lanes at once was one constant; a machine's sd.lane_parallel now sets its own, 1 to 8."""
+
+    def setUp(self) -> None:
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        self.home = pathlib.Path(scratch.name)
+        self.environ = {"HOME": str(self.home)}
+
+    def set(self, value) -> None:
+        folder = self.home / ".config" / "sd-ai-command-pack"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "config.json").write_text(json.dumps({"config": {"sd": {"lane_parallel": value}}}))
+
+    def peak(self, cap: int, lanes: int = 6) -> int:
+        """The most of `lanes` lanes `run_parallel` held running at once under `cap`."""
+        live: set[pathlib.Path] = set()
+        most = [0]
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            live.add(checkout)
+            most[0] = max(most[0], len(live))
+            polls = [0]
+
+            def answer() -> dict | None:
+                polls[0] += 1
+                if polls[0] <= 20:
+                    return None
+                live.discard(checkout)
+                return {"ran": []}
+            return sd_lane.StartedLane(answer)
+        order = [(f"lane{n}", self.home / f"lane{n}") for n in range(lanes)]
+        with mock.patch.object(sd_lane, "START_POLL_SECONDS", 0):
+            rows = sd_lane.run_parallel(order, start, sd_lane.clock() + 60, lambda: None, cap=cap)
+        self.assertEqual(len(rows), lanes)
+        return most[0]
+
+    def test_unset_reads_five_and_runs_a_fourth_and_fifth_lane_but_not_a_sixth(self) -> None:
+        self.assertEqual(sd_lane.lane_parallel(self.environ), 5)
+        self.assertEqual(self.peak(sd_lane.lane_parallel(self.environ)), 5)
+
+    def test_a_set_value_of_two_refuses_a_third_lane(self) -> None:
+        self.set("2")
+        self.assertEqual(sd_lane.lane_parallel(self.environ), 2)
+        self.assertEqual(self.peak(sd_lane.lane_parallel(self.environ)), 2)
+
+    def test_a_bad_value_reads_the_default(self) -> None:
+        for bad in ("0", "9", "abc", 3):
+            with self.subTest(value=bad):
+                self.set(bad)
+                self.assertEqual(sd_lane.lane_parallel(self.environ), sd_lane.MAX_PARALLEL_LANES)
+
+    def test_the_setting_is_a_core_config_key(self) -> None:
+        self.assertEqual(sd_lane.sd_lib.CORE_CONFIG["lane_parallel"]["pattern"], "[1-8]")
+
+
 class HostedParallel(Lane):
     """sd:5774. `lane run --hosted` ran its lanes one after another: a 4-entry lane held every other one 80 minutes."""
 
@@ -5708,6 +5764,15 @@ class HostedParallel(Lane):
         self.assertEqual(self.statuses(), ["pending", "merged"])
         failed = next(row for row in answer["lanes"] if row["path"] == str(self.repo))
         self.assertEqual((failed["error"], failed["code"]), ("the hub went away", sd_lane.HUB_UNAVAILABLE))
+
+    def test_the_hosted_run_reads_the_machine_s_lane_parallel(self) -> None:
+        """sd:9323: the runner's start rule reads sd.lane_parallel, not the constant."""
+        folder = self.tmp / ".config" / "sd-ai-command-pack"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "config.json").write_text(json.dumps({"config": {"sd": {"lane_parallel": "2"}}}))
+        with mock.patch.object(sd_lane, "run_parallel", return_value=[]) as ran:
+            sd_lane.run_hosted(self.environ, self.ship)
+        self.assertEqual(ran.call_args.kwargs["cap"], 2)
 
     def test_a_termed_parent_ends_its_children(self) -> None:
         """An interruption while lanes run stops every lane still running; a child gets TERM, then KILL."""

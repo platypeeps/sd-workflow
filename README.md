@@ -233,6 +233,7 @@ Every waiter starts in the order it queued, a lane gate (any `sd-check` run) or 
 Wrap a plain `make check` in any repository that way, and drop a per-repository `lockf` from lane scripts: the pool orders gates across every repository.
 A waiting gate names who holds each slot and since when.
 `sd.review_slots` is load control too: how many reviews may run their reviewers at once on the machine (unset: 2).
+`sd.lane_parallel` is load control too: how many lanes one hosted lane run runs at once (unset: 5, 1 to 8).
 `sd.repo_cap` and `sd.bundle_max` are load control too: how many bundles build at once in one repository (unset: 1), and how many items one build bundle takes when this machine claims it (unset: 3); the claim gives a build child 120 minutes per 3 slots it took, never less.
 `sd gate post --head SHA` runs the merge gate at SHA and posts `sd/local-gate`, for a merge path that is not `sd-ship merge`.
 `sd gate check` runs the same check at `HEAD` and records a pass that `sd-ship prepare` and the merge gate reuse at that head; it posts nothing.
