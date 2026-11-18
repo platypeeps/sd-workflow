@@ -119,6 +119,22 @@ OUT.opened = []; window.open = (u, t) => OUT.opened.push([u, t]); R.said = cmd.r
         self.assertEqual(out["opened"], [["https://status.example.test/incidents/1", "_blank"]])
 
 
+    def test_each_copy_line_quotes_what_a_feed_or_a_repo_supplies(self):
+        # Bundle review round 2: `open <url>` put a feed's URL into a shell
+        # line unquoted; a sweep found the services and protection lines.
+        status(self.connection, "odd", status="outage", incidents=[
+            {"title": "x", "url": "https://status.example.test/i;$(id)"}])
+        out = self.run_page("""const o = C.get('stat:odd');
+const cli = id => REG.find(c => c.id === id).cli;
+R.open = cli('service status.open')(o);
+R.restart = cli('service.restart')({ facts: { Label: 'a;$(id)' } });
+R.start = cli('service.start')({ facts: { Label: 'a;$(id)' } });
+R.prot = cli('protection.settings')({ slug: 'o/r;$(id)' });""", view="status")
+        self.assertEqual(out["R"], {"open": "open 'https://status.example.test/i;$(id)'",
+                                    "restart": "sd services restart 'a;$(id)'",
+                                    "start": "sd services start 'a;$(id)'",
+                                    "prot": "open 'https://github.com/o/r;$(id)/settings/branches'"})
+
     def test_no_status_read_yet_counts_no_service(self):
         out = self.run_page("R.body = ELS['body-status'].html;", view="status")
         self.assertIn("0 services · 0 outage · 0 degraded · 0 unknown · 0 ok", out["R"]["body"])
@@ -154,6 +170,19 @@ class TheServicesReader(ScreenCase):
         status(self.connection, "claude", read_at=None)
         self.assertEqual([(one["status"], one["why"]) for one in usage_screen.services(self.connection, now=NOW)],
                          [("unknown", "the reading has no read time")])
+
+    def test_ignore_holds_only_for_the_same_incident(self):
+        # Bundle review round 2: the fingerprint read titles only, so an
+        # ignored outage hid a later one with the same title.
+        first = {"title": "API errors", "url": "https://status.example.test/incidents/1",
+                 "started_at": "2026-09-06T10:00:00Z"}
+        status(self.connection, "a", status="outage", incidents=[first])
+        status(self.connection, "b", status="outage", incidents=[{**first, "started_at": "2026-09-06T11:00:00Z"}])
+        status(self.connection, "c", status="outage", incidents=[{**first, "url": "https://status.example.test/incidents/2"}])
+        rows, _ = health_screen._status_rows(usage_screen.services(self.connection, now=NOW), now=NOW)
+        self.assertEqual(len({json.dumps(row["problem"]) for row in rows}), 3)
+        self.assertEqual(rows[0]["problem"], ["outage", "API errors", "https://status.example.test/incidents/1",
+                                              "2026-09-06T10:00:00Z"])
 
     def test_a_status_that_is_not_a_known_word_is_unknown_never_an_error(self):
         # Bundle review round 1: a list or object status raised TypeError

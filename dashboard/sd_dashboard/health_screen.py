@@ -733,7 +733,7 @@ def _security_rows(found: list[dict], *, now: str) -> tuple[list[dict], dict]:
                          "detail": "a public repo with scanning off is a finding", "kind": "Security · scanning off",
                          "facts": {"Repository": repo["repo"], "Setting": "disabled",
                                    "Observed": repo.get("observed_at") or "never"},
-                         "cli": f"open {settings}"})
+                         "cli": f"open {shlex.quote(settings)}"})
         elif not isinstance(part, dict) or not isinstance(part.get("open"), int):
             unread.append(_unread_reason(repo, part))
             skipped.add(repo["repo"])
@@ -1014,8 +1014,10 @@ def _status_rows(found: list[dict], *, now: str) -> tuple[list[dict], dict]:
             "list_head": "Open incidents", "list": [{"text": incident["title"] or "untitled incident", "href": incident["url"]}
                                                     if incident["url"] else incident["title"] or "untitled incident"
                                                     for incident in incidents],
-            # Ignore holds until the status or an incident changes (sd:5470); a new read time is not a new problem.
-            "problem": [status, *(incident["title"] for incident in incidents)],
+            # Ignore holds until the status or an incident changes (sd:5470); a new read time is not a new problem. An
+            # incident is its title, link and start, so a later outage with the same title is a new problem.
+            "problem": [status, *(field for incident in incidents
+                                  for field in (incident["title"], incident["url"], incident["started_at"] or ""))],
         })
     return rows, extra
 

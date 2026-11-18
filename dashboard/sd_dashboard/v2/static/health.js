@@ -422,12 +422,12 @@
     C.register(
       { id: 'service.restart', on: 'service', label: 'Restart', does: 'Restarts the service; open connections drop.', key: 'r', icon: 'rotate-ccw', risk: 'confirm', executes: true,
         primary: o => o.facts.State === 'running', when: can('restart'),
-        cli: o => `sd services restart ${o.facts.Label}`,
+        cli: o => `sd services restart ${shell.shq(o.facts.Label)}`,
         consequence: o => `Stops ${o.facts.Label} and starts it again. Its open connections drop.`,
         run: service('restart') },
       { id: 'service.start', on: 'service', label: 'Start', does: 'Starts the service.', key: 's', icon: 'play', risk: 'confirm', executes: true,
         primary: o => o.facts.State !== 'running', when: can('start'),
-        cli: o => `sd services start ${o.facts.Label}`,
+        cli: o => `sd services start ${shell.shq(o.facts.Label)}`,
         consequence: o => `Starts ${o.facts.Label}.`,
         run: service('start') },
       { id: 'dashboard service.kickstart', on: 'dashboard service', label: 'Kickstart', does: 'The dashboard cannot restart itself; gives you the command to run.', key: 'l', icon: 'rocket', risk: 'safe', executes: false,
@@ -439,7 +439,7 @@
         when: o => !!o.port || 'no port configured: there is nothing to inspect', cli: o => `lsof -nP -iTCP:${o.port || '<port>'} -sTCP:LISTEN`,
         sends: o => `POST /api/actions/run {action: port.lsof, port: ${o.port}}`, run: o => run(o, 'port.lsof', { port: Number(o.port) }) },
       { id: 'protection.settings', on: 'branch protection', label: 'Open branch settings', does: 'Opens the repo\'s branch protection settings on GitHub.', key: 'o', icon: 'settings', risk: 'safe', primary: () => true, executes: false,
-        when: o => !!o.slug || 'no github.com remote: there is no settings page', cli: o => `open https://github.com/${o.slug || '<owner>/<repo>'}/settings/branches`,
+        when: o => !!o.slug || 'no github.com remote: there is no settings page', cli: o => o.slug ? `open ${shell.shq(`https://github.com/${o.slug}/settings/branches`)}` : 'open https://github.com/<owner>/<repo>/settings/branches',
         run: o => { window.open(`https://github.com/${o.slug}/settings/branches`, '_blank', 'noopener'); return 'Opens in a new tab'; } },
       // Re-run collector (commands.js); Health reads again once the run ends.
       window.commands.syncCollector({ reread: () => load(), page: 'Health' }),
@@ -462,7 +462,7 @@
         sends: o => `POST /api/actions/run {action: credentials.signin, probe: ${o.id.replace(/^cred:/, '')}}`, run: o => run(o, 'credentials.signin', { probe: o.id.replace(/^cred:/, '') }) },
       // pack sd:9260: a service's first incident, else its status page, in a new tab. The list's add and remove are Settings'.
       { id: 'service status.open', on: 'service status', label: 'Open status page', does: 'Opens the open incident, or the service\'s status page, in a new tab.', key: 'o', icon: 'arrow-up-right', risk: 'safe', primary: () => true,
-        executes: false, when: o => !!statusHref(o) || 'the reading names no status page', cli: o => `open ${statusHref(o) || '<url>'}`,
+        executes: false, when: o => !!statusHref(o) || 'the reading names no status page', cli: o => `open ${statusHref(o) ? shell.shq(statusHref(o)) : '<url>'}`,
         run: o => { window.open(statusHref(o), '_blank', 'noopener'); return 'Opened in a new tab'; } },
     );
     // Snooze (sd:1896) and Ignore (sd:5470) on every row type; an ok row wants nothing, so it has nothing to snooze.
