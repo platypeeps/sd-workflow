@@ -910,6 +910,20 @@ R.pick = [menu.hidden, btn.attrs['aria-label'], OUT.focus.at(-1)];""")
         self.assertEqual(out["R"]["pick"], [True, "View: List", "button"])
         self.assertIn("view=list", out["urls"][-1])
 
+    def test_two_control_rows_one_text_box_and_the_count_in_row_one(self):
+        """sd:9309 (operator ruling, UI review 2026-11-17): Tasks keeps two control rows, never three. Add or find is the
+        one text box and filters too (sd:5539); the count sits at the right of row 1; Show done folds into Scope."""
+        page = (V2 / "tasks.html").read_text(encoding="utf-8")
+        main = page[page.index('<main id="main">'):page.index("</main>")]
+        self.assertEqual(re.findall(r'class="(?:filters )?(toolbar(?:-2)?)"', main), ["toolbar", "toolbar-2"])
+        self.assertEqual(re.findall(r'<input\b[^>]*\bid="([\w-]+)"', main), ["shift-in"])
+        row1 = main[main.index('id="toolbar"'):main.index('id="filterbar"')]
+        self.assertIn('<span class="count" id="task-count"', row1)
+        out = self.run_page("R.filters = ELS.filters.html; R.count = ELS['task-count'].textContent;")
+        self.assertEqual(out["R"]["count"], "3 tasks")
+        self.assertNotIn("tasks</span>", out["R"]["filters"])
+        self.assertNotIn("Show done", out["R"]["filters"])
+
     def test_the_view_menu_markup_is_a_menu_of_radio_items_and_keeps_the_keys(self):
         page = (V2 / "tasks.html").read_text(encoding="utf-8")
         self.assertIn('<button type="button" class="viewpick-btn" id="view-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="view-menu" aria-label="View: Board">', page)
@@ -1042,10 +1056,10 @@ box('no repo', true); R.two = ELS['view-board'].html; R.after = ELS.filters.html
         self.assertNotIn("Done long ago", board)
         self.assertIn('title="done in the last 7 days"', done)
 
-    def test_the_board_hides_done_until_show_done_and_the_status_filter_is_gone(self):
-        """sd:6233: Tasks has no Status dropdown; the board's Show done checkbox shows its Done column, hidden by default
-        (operator decision, note 30400), and the address keeps it as done=1. The list ignores it and keeps its done rows;
-        the matrix never shows done ones."""
+    def test_the_board_hides_done_until_scope_says_open_and_done_and_the_status_filter_is_gone(self):
+        """sd:6233: Tasks has no Status dropdown; the board's Done column is hidden by default (operator decision, note
+        30400). sd:9309: Scope's Open and done shows it, and the address keeps it as active=done; an older done=1 still
+        opens it. The list keeps its done rows; the matrix never shows done ones."""
         import copy
         import datetime as dt
         read = dt.datetime.fromisoformat(self.doc["read"].replace("Z", "+00:00"))
@@ -1054,7 +1068,7 @@ box('no repo', true); R.two = ELS['view-board'].html; R.after = ELS.filters.html
         saved, self.doc = self.doc, doc
         try:
             out = self.run_page("""R.filters = ELS.filters.html; R.board = ELS['view-board'].html;
-ELS.filters.listeners.change.forEach(f => f({ target: { id: 'f-done', checked: true } })); await flush();
+ELS.filters.listeners.change[0]({ target: { dataset: { pick: 'active' }, value: 'done' } }); await flush();
 R.board2 = ELS['view-board'].html; R.filters2 = ELS.filters.html; R.url = OUT.urls[OUT.urls.length - 1];
 document.dispatchEvent(new CustomEvent('tasks:view', { detail: 'list' })); await flush(); R.listFilters = ELS.filters.html; R.list = ELS['view-list'].html;""")
             linked = self.run_page("R.board = ELS['view-board'].html; R.filters = ELS.filters.html;", search="?done=1")
@@ -1062,19 +1076,19 @@ document.dispatchEvent(new CustomEvent('tasks:view', { detail: 'list' })); await
             self.doc = saved
         R = out["R"]
         self.assertNotIn('id="f-status"', R["filters"])
-        self.assertIn('<label class="chk"><input type="checkbox" id="f-done"> Show done</label>', R["filters"])
+        self.assertNotIn('id="f-done"', R["filters"])
+        self.assertRegex(R["filters"], r'<select id="f-active"[^>]*><option value="" selected>Open</option><option value="done">Open and done</option>')
         self.assertNotIn('aria-label="Done"', R["board"])
         self.assertNotIn("Done yesterday", R["board"])
         self.assertIn("data-nodone", R["board"])
         self.assertIn('aria-label="Done"', R["board2"])
         self.assertIn("Done yesterday", R["board2"])
         self.assertNotIn("data-nodone", R["board2"])
-        self.assertIn('<input type="checkbox" id="f-done" checked>', R["filters2"])
-        self.assertIn("done=1", R["url"])
-        self.assertNotIn('id="f-done"', R["listFilters"])
+        self.assertIn('<option value="done" selected>Open and done</option>', R["filters2"])
+        self.assertIn("active=done", R["url"])
         self.assertIn("Done yesterday", R["list"])
         self.assertIn("Done yesterday", linked["R"]["board"])
-        self.assertIn('<input type="checkbox" id="f-done" checked>', linked["R"]["filters"])
+        self.assertIn('<option value="done" selected>Open and done</option>', linked["R"]["filters"])
 
     def test_the_kind_filter_narrows_the_rows(self):
         out = self.run_page("""ELS.filters.listeners.change[0]({ target: { dataset: { pick: 'kind' }, value: 'work' } });
@@ -1743,6 +1757,22 @@ box.listeners.keydown.forEach(f => f({ key: 'Enter', preventDefault() {}, stopPr
                             "() => [201, { item: { id: 99, title: 'Call the bank' } }]", prelude=prelude, env={"TZ": "America/Denver"})
         self.assertEqual(out["posts"][0][:2], ["/api/items", {"title": "Call the bank", "priority": 3, "due": "2026-11-02"}])
 
+    def test_a_search_a_link_filled_in_files_no_task_until_edited(self):
+        # sd:9309 review: Add or find took a ?q= link's words as typed, so Enter
+        # on an opened link filed a Planning task the operator never wrote.
+        press = "box.listeners.keydown.forEach(f => f({ key: 'Enter', preventDefault() {}, stopPropagation() {} })); await flush();"
+        out = self.run_page("var box = document.getElementById('shift-in');\n" + press + "\nR.kept = box.value;",
+                            "() => [201, { item: { id: 99, title: 'bank' } }]", search="?q=bank")
+        self.assertEqual(out["posts"], [])
+        self.assertEqual(out["R"]["kept"], "bank")
+        out = self.run_page("var box = document.getElementById('shift-in'); box.listeners.focus.forEach(f => f({ target: box }));"
+                            " await flush(); R.preview = document.getElementById('shift-preview').html;", search="?q=bank")
+        self.assertNotIn("Enter adds", out["R"]["preview"])
+        out = self.run_page("var box = document.getElementById('shift-in'); box.value = 'bank call';\n"
+                            "box.listeners.input.forEach(f => f({ target: box })); await flush();\n" + press,
+                            "() => [201, { item: { id: 99, title: 'bank call' } }]", search="?q=bank")
+        self.assertEqual([p[1]["title"] for p in out["posts"]], ["bank call"])
+
     def test_a_capture_lands_in_the_filtered_repo_at_p3_unless_typed(self):
         # sd:3521: the quick add and the shell's capture take the one repo the filter shows, else the selected task's.
         row = self.row("plan")
@@ -1905,8 +1935,9 @@ R.parked = ELS['view-board'].html; R.url = OUT.urls[OUT.urls.length - 1];""")
         self.assertEqual(out["counts"]["personal"], 3)
         self.assertNotIn("Parked by the prune", out["R"]["board"])
         self.assertIn("Plan the review", out["R"]["board"])
-        # sd:5643's Scope keeps Open only and Scheduled only (sd:5649); Parked is the toolbar's segment now.
-        self.assertIn('<select id="f-active" class="fsel" data-pick="active"><option value="" selected>Open and done</option><option value="1">Open only</option>'
+        # sd:5643's Scope keeps Scheduled only (sd:5649); Parked is the toolbar's segment now. On the board, Open and done
+        # is its Done column (sd:9309).
+        self.assertIn('<select id="f-active" class="fsel" data-pick="active"><option value="" selected>Open</option><option value="done">Open and done</option>'
                       '<option value="scheduled">Scheduled only</option></select>', out["R"]["filters"])
         self.assertNotIn('Parked only', out["R"]["filters"])
         self.assertIn('data-v="aside" aria-pressed="false">Parked <span class="n">1</span>', out["R"]["seg"])
@@ -3158,12 +3189,21 @@ class TheFilterAddress(ScreenCase):
             self.assertRegex(out["R"]["filters"], rf'<select id="f-{key}"[^>]*>(?:(?!</select>).)*<option value="{value}" selected>', key)
         self.assertIn('<option value="14">14-29d</option>', out["R"]["filters"])
 
+    def test_a_task_id_matches_that_task_alone_typed_or_linked(self):
+        # Review of sd:9309: #904 also listed #9040 by prefix, while the preview and Enter take #904 alone.
+        self.doc["rows"].append(self.made(9040, "Another row", "ready", "0"))
+        self.assertEqual(self.listed("?view=list&q=%23904")[0], {904})
+        shown, _ = self.listed("?view=list", "const box = document.getElementById('shift-in'); box.value = '#904';\n"
+                               "box.listeners.input[0]({ target: box }); await flush();")
+        self.assertEqual(shown, {904})
+        self.assertEqual(self.listed("?view=list&q=%239040")[0], {9040})
+
     def test_the_text_filter_reads_q_and_the_box_writes_it(self):
         self.assertEqual(self.listed("?view=list&q=BUDGET")[0], {902})
         self.assertEqual(self.listed("?view=list&q=%23904")[0], {904})
         # The v1 capture check opens /tasks?q=<title> in the default view (static/dashboard.js).
         self.assertEqual(self.listed("?q=" + quote("Send the reply"))[0], {901})
-        shown, out = self.listed("?view=list", "const box = document.getElementById('find-in'); box.value = ' Trip ';\n"
+        shown, out = self.listed("?view=list", "const box = document.getElementById('shift-in'); box.value = ' Trip ';\n"
                                  "box.listeners.input[0]({ target: box }); await flush();")
         self.assertEqual(shown, {904})
         self.assertEqual(out["urls"][-1], "view=list&q=trip")
@@ -3203,7 +3243,7 @@ class TheFilterAddress(ScreenCase):
         clear = "ELS.filters.listeners.click[0]({ target: { id: '', closest: s => s === '[data-unfilter-all]' ? {} : null } }); await flush();"
         _, out = self.listed("?view=list&status=ready_to_send&active=1&q=reply",
                              f"R.chips = ELS.filters.html; {unfilter} R.chips2 = ELS.filters.html; R.url2 = OUT.urls[OUT.urls.length - 1];"
-                             f" {clear} R.chips3 = ELS.filters.html; R.url3 = OUT.urls[OUT.urls.length - 1]; R.box = ELS['find-in'].value;")
+                             f" {clear} R.chips3 = ELS.filters.html; R.url3 = OUT.urls[OUT.urls.length - 1]; R.box = ELS['shift-in'].value;")
         def chips(key):
             return re.findall(r'data-unfilter="([\w:]+)"', out["R"][key])
         self.assertEqual(chips("chips"), ["status:ready_to_send", "active:1", "q"])
@@ -3374,8 +3414,18 @@ class TheBadge(BrowserSession):
 
     def test_every_page_shows_the_tasks_badge_read_now(self):
         self.item("Pay the bill", kind="task", due="2026-01-02")
-        sections = lambda: self.request("/ui/sections.js", headers={"Cookie": self.cookie})[2]  # noqa: E731
-        badge = lambda: json.loads(re.search(r"^window\.SHELL_COUNTS = (.*);$", sections(), re.M).group(1))["pages"]["Tasks"]  # noqa: E731
+        badges = self.listening.RequestHandlerClass.badges
+
+        def sections():
+            # sd:9310: the live read runs after the answer, so the second request shows it.
+            self.request("/ui/sections.js", headers={"Cookie": self.cookie})
+            badges.settle()
+            return self.request("/ui/sections.js", headers={"Cookie": self.cookie})[2]
+
+        def badge():
+            found = json.loads(re.search(r"^window\.SHELL_COUNTS = (.*);$", sections(), re.M).group(1))["pages"]["Tasks"]
+            return {key: value for key, value in found.items() if key != "at"}
+
         self.assertEqual(badge(), {"state": "warning", "n": 1, "what": "overdue tasks"})
         self.item("Renew the domain", kind="task", due="2026-01-03")
         self.assertEqual(badge()["n"], 2)
