@@ -35,7 +35,8 @@
   </div>
 
   <div id="state" hidden></div>
-  <!-- The toolbar standard (sd:5281): row 1, add or find and the layouts; row 2, the filters, Open | Parked first (pack sd:7084). -->
+  <!-- The toolbar standard (sd:5281): row 1, add or find (it filters too, sd:5539), the layouts and the count; row 2, the filters,
+       Open | Parked first (pack sd:7084). Two rows, never three (sd:9309). -->
   <div class="toolbar" id="toolbar">
     <div id="viewswitch"></div>
     <div class="shift" id="shift">
@@ -44,7 +45,7 @@
         <svg class="i" aria-hidden="true"><use href="#i-plus"/></svg>
         <input id="shift-in" autocomplete="off" spellcheck="false" placeholder="Add or find a task" aria-describedby="shift-ghost" aria-controls="shift-preview" aria-expanded="false">
         <span class="ghost" id="shift-ghost">p1 due fri #system</span>
-        <button class="help" type="button" aria-label="Help: add or find" data-help="<b>One box adds or finds.</b> <code>p1</code>–<code>p4</code> set priority, <code>due fri</code> or <code>due 2026-10-02</code> a date, <code>#system</code> a repo shown on this page, <code>#1038</code> opens that task. The rest is the title. Enter adds it as a Planning task; Esc clears."><svg class="i" aria-hidden="true"><use href="#i-circle-help"/></svg></button>
+        <button class="help" type="button" aria-label="Help: add or find" data-help="<b>One box adds or finds.</b> The words filter the tasks shown. <code>p1</code>–<code>p4</code> set priority, <code>due fri</code> or <code>due 2026-10-02</code> a date, <code>#system</code> a repo shown on this page, <code>#1038</code> opens that task. The rest is the title. Enter adds it as a Planning task; Esc clears."><svg class="i" aria-hidden="true"><use href="#i-circle-help"/></svg></button>
       </div>
       <div class="preview" id="shift-preview" hidden></div>
     </div>
@@ -61,14 +62,11 @@
       <button class="btn quiet" type="button" id="start-next"><svg class="i" aria-hidden="true"><use href="#i-play"/></svg><span class="txt">Start next</span></button>
       <button class="help" type="button" aria-label="Help: start next" data-help="<b>Start next</b> shows the next ready tasks first, then queues an unattended build of each, as Build does, grouped by repo. It offers at most 6 builders on this machine, and none while the five-minute load is above the gate's cap; a count or load that was not read queues nothing. Fix opens a Claude session instead."><svg class="i" aria-hidden="true"><use href="#i-circle-help"/></svg></button>
     </div>
+    <span class="count" id="task-count" aria-live="polite"></span>
   </div>
   <div class="filters toolbar-2" id="filterbar" role="group" aria-label="Filters">
     <!-- pack sd:7084: the set-aside group leads the filter row, as on every page. -->
     <div class="vseg" id="parked-seg" role="group" aria-label="Tasks shown"></div>
-    <div class="ffind">
-      <label class="label" for="find-in">Text</label>
-      <input id="find-in" type="search" autocomplete="off" spellcheck="false" placeholder="title, #id, repo">
-    </div>
     <div class="fset" id="filters"></div>
   </div>
 

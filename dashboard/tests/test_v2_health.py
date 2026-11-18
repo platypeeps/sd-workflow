@@ -1734,7 +1734,7 @@ class ThePage(Collectors, BrowserSession):
         page = next(page for page in v2.registry.PAGES if page.section == "Health")
         self.assertEqual((page.count, page.live), ("/api/health/summary", False))
         self.request("/api/health/summary", headers={"Cookie": self.cookie})
-        badge = self.listening.RequestHandlerClass.badges.read(None, connected=False)["Health"]
+        badge = self.listening.RequestHandlerClass.badges.read()["Health"]
         self.assertIn(badge["state"], ("ok", "caution", "warning"))
 
     def test_the_rail_opens_health_at_its_page(self):
