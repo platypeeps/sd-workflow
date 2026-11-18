@@ -4228,8 +4228,9 @@ CHILD_STOP_SECONDS = 30
 RESCAN_SECONDS = 30.0
 #: Lane to its runnable entry ids, to the lanes with new work among them (`new_work`).
 Pending = Callable[[dict[pathlib.Path, frozenset[str]]], dict[pathlib.Path, frozenset[str]]]
-#: Why another worker holds the lane of a checkout, or None when its runner lock is free (`lane_held`, sd:9332).
-Held = Callable[[pathlib.Path], str | None]
+#: Whether another worker holds the lane of a checkout, and why, or None when none does (`lane_held`, sd:9332):
+#: `(True, why)` for a live worker, `(False, why)` for a lane whose locks cannot be read.
+Held = Callable[[pathlib.Path], "tuple[bool, str] | None"]
 
 
 @dataclasses.dataclass
@@ -4247,27 +4248,55 @@ class StartedLane:
 
 
 def lane_held(environ: dict[str, str], queues: dict[pathlib.Path, Queue | str],
-              checkout: pathlib.Path) -> str | None:
-    """Why another worker holds `checkout`'s lane, or None: its runner lock, tried once and never waited for (sd:9332).
+              checkout: pathlib.Path) -> tuple[bool, str] | None:
+    """Whether a live worker holds `checkout`'s lane, and why; None when none does (sd:9332). Never waits.
 
-    A handed-off lane child of an earlier run holds its lock to its end. A
-    queue or lock that cannot be read is held too: unknown is not idle, and
-    its worker would refuse the same way. `queues` keeps each lane's queue
-    for the run, so a poll runs no `git`.
+    A worker holds its runner lock until it releases it for `post_merge`,
+    then only its answer file (`answer_files`), until it exits: either one
+    held is `(True, why)`. A queue or lock that cannot be read is `(False,
+    why)`: the run starts no worker there, and counts it toward no cap,
+    since unknown is not a worker. `queues` keeps each lane's queue for the
+    run, so a poll runs no `git`.
     """
     if checkout not in queues:
         try:
             queues[checkout] = queue_for(checkout, environ)
         except (LaneError, sd_lib.ConfigError, OSError) as error:
-            queues[checkout] = f"its runner lock is unknown: {error}"
+            queues[checkout] = f"its lane is unknown, so no worker starts: {error}"
     queue = queues[checkout]
     if isinstance(queue, str):
-        return queue
+        return False, queue
     try:
         with runner_lock(queue) as locked:
-            return None if locked else f"another runner holds {queue.lock_file}"
+            if not locked:
+                return True, f"another runner holds {queue.lock_file}"
+        answer = live_answer(queue.lane / "hosted")
     except OSError as error:
-        return f"its runner lock {queue.lock_file} is unknown: {error}"
+        return False, f"its runner lock {queue.lock_file} is unknown, so no worker starts: {error}"
+    return None if answer is None else (True, f"a lane child still runs, writing {answer}")
+
+
+def live_answer(folder: pathlib.Path) -> pathlib.Path | None:
+    """The answer file in `folder` a live lane child still holds locked, or None (sd:9332).
+
+    The kernel frees the lock when the child's last copy closes, so a dead
+    child's file is free whatever its pid now names. A missing folder holds
+    none; a folder or file that cannot be read raises `OSError`.
+    """
+    if not folder.is_dir():
+        return None
+    for answer in sorted(folder.glob("*.json")):
+        try:
+            handle = os.open(answer, os.O_RDONLY)
+        except FileNotFoundError:  # its run read it and deleted it
+            continue
+        try:
+            fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return answer
+        finally:
+            os.close(handle)
+    return None
 
 
 def inline_lane(run: Callable[[], dict[str, Any]]) -> StartedLane:
@@ -4318,8 +4347,11 @@ def arm_term(delay: float | None, grace: float | None = None) -> None:
 def answer_files(checkout: pathlib.Path, environ: dict[str, str]) -> tuple[Any, Any, pathlib.Path | None]:
     """A lane child's stdout and stderr: named files in its lane folder's `hosted/`, so a hand-off keeps them.
 
-    Files older than `HANDED_OFF_KEEP_SECONDS` there go first. A folder that
-    cannot be made gives unnamed files, as before sd:9332, and no path.
+    The stdout file is `flock`ed before the child inherits it, so the lock
+    lives as long as the child does, past its runner lock's release for
+    `post_merge`: `lane_held` reads it. Files older than
+    `HANDED_OFF_KEEP_SECONDS` there go first. A folder that cannot be made
+    gives unnamed files, as before sd:9332, and no path.
     """
     try:
         folder = lane_dir(checkout, environ) / "hosted"
@@ -4330,7 +4362,9 @@ def answer_files(checkout: pathlib.Path, environ: dict[str, str]) -> tuple[Any, 
                 if old.stat().st_mtime < cutoff:
                     old.unlink()
         stem = folder / f"{time.strftime('%Y%m%dT%H%M%SZ', time.gmtime())}-{secrets.token_hex(4)}"
-        return open(f"{stem}.json", "w+"), open(f"{stem}.err", "w+"), stem  # noqa: SIM115 -- the lane owns them
+        out = open(f"{stem}.json", "w+")  # noqa: SIM115 -- the lane child owns it
+        fcntl.flock(out, fcntl.LOCK_EX | fcntl.LOCK_NB)  # a new file: nobody else holds it
+        return out, open(f"{stem}.err", "w+"), stem  # noqa: SIM115
     except (LaneError, sd_lib.ConfigError, OSError):
         return tempfile.TemporaryFile("w+"), tempfile.TemporaryFile("w+"), None
 
@@ -4347,11 +4381,12 @@ def child_lane(checkout: pathlib.Path, budget: float, argv: list[str] | None = N
     point (`arm_term`). Its answer goes to a file in its lane folder, which
     no pipe limit blocks; the run deletes it once read.
     """
-    out, err, stem = answer_files(checkout, dict(os.environ) if environ is None else environ)
+    environ = dict(os.environ) if environ is None else environ
+    out, err, stem = answer_files(checkout, environ)
     argv = argv or [sys.executable, str(BIN / "sd-ship"), "-C", str(checkout), "lane", "run",
                     "--budget", str(max(0, int(budget)))]
-    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err, env=dict(os.environ),
-                               start_new_session=True)
+    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err, env=dict(environ),
+                               start_new_session=True)  # the environ its answer files were read from
     return StartedLane(functools.partial(child_answer, process, out, err, stem),
                        functools.partial(end_child, process, out, err), process,
                        functools.partial(hand_off_child, process, out, err, stem))
@@ -4387,7 +4422,12 @@ def child_answer(process: subprocess.Popen[bytes], out: Any, err: Any,
 
 
 def hand_off_child(process: subprocess.Popen[bytes], out: Any, err: Any, stem: pathlib.Path | None) -> dict[str, Any]:
-    """The row of a lane child the run leaves running at its budget (sd:9332): its pid, its group, its answer file."""
+    """The row of a lane child the run leaves running at its budget (sd:9332): its pid, its group, its answer file.
+
+    A child that exited since the last look gives its own row instead, and its files go.
+    """
+    if process.poll() is not None:
+        return child_answer(process, out, err, stem) or {}
     out.close()
     err.close()
     where = (f"its answer goes to {stem}.json and its errors to {stem}.err" if stem is not None
@@ -4435,7 +4475,9 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
 
     A lane another worker holds (`held`) starts none: a handed-off child of
     an earlier run, say. It counts toward `cap` and toward the room rule
-    below, as a lane of this run does (sd:9332). A lane starts at once while
+    below, as a lane of this run does (sd:9332). A lane whose locks cannot
+    be read starts none either, with a row that says why, and counts toward
+    nothing: unknown is not a worker. A lane starts at once while
     no lane runs here or elsewhere, as one after another did. Otherwise it
     waits for `room` and for fewer than `cap` lanes running. A lane's
     refusal is its own row. When this run ends early, a TERM among them,
@@ -4459,27 +4501,31 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
 
     def lane_fits() -> bool:
         elsewhere = sum(1 for index, (_, checkout) in enumerate(order)
-                        if index not in running and held(checkout) is not None)
+                        if index not in running and (held(checkout) or (False, ""))[0])
         if len(running) + elsewhere >= cap:
             return False
         return (not running and not elsewhere) or room() is None
 
-    def begin_lane(index: int, ids: frozenset[str]) -> None:
+    def begin_lane(index: int, ids: frozenset[str]) -> bool:
         seen[index] = ids
-        running[index] = start(order[index][1], max(0.0, deadline - clock()))
+        if clock() >= deadline:  # a slow queue read spent it: no child with no budget
+            rows[index].append({"stopped": "the run spent its budget before this lane started; the next run "
+                                           "starts it"})
+            return False
+        running[index] = start(order[index][1], deadline - clock())
+        return True
 
     def start_late_lanes() -> bool:
         found = pending({checkout: seen[index] for index, (_, checkout) in enumerate(order) if index not in running})
         started = False
         for index, (_, checkout) in enumerate(order):
-            if checkout in found and clock() < deadline and lane_fits():
-                begin_lane(index, found[checkout])
-                started = True
+            if checkout in found and held(checkout) is None and lane_fits():
+                started = begin_lane(index, found[checkout]) or started
         return started
     def start_in_order(index: int, checkout: pathlib.Path) -> None:
-        busy = held(checkout)
-        if busy is not None:  # the rescan starts it once its worker ended and it has work
-            rows[index].append({"busy": busy})
+        found = held(checkout)
+        if found is not None:  # the rescan starts it once its worker ended and it has work
+            rows[index].append({"busy" if found[0] else "skipped": found[1]})
             return
         while True:
             collect_ended(running, rows)
