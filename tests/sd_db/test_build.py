@@ -21,7 +21,7 @@ from sd_db import build, draft, operations, recovery, remote, runner, today, wor
 from sd_db.database import connect
 from sd_db.errors import BackupError
 from sd_db.migrate import initialise
-from sd_db.workflow import item_state
+from sd_db.workflow import WorkflowError, item_state
 from sd_db.writes import (
     add_note,
     create_assignment,
@@ -1464,6 +1464,23 @@ class CancelParks(Case):
         self.assertEqual([(row["id"], row["status"]) for row in answer["members"]],
                          [(ident, "cancelled") for ident in members])
 
+    def test_a_running_cancel_answers_the_request_and_refuses_a_repeat(self):
+        """pack sd:9375: the answer still read `running` with no sign of the request, so the operator asked again,
+        and each repeat posted the note again (4 on sd:9264). The answer names the request; a repeat refuses."""
+        items = [self.item(), self.item()]
+        build.queue(self.db, items, who="operator")
+        bundle = self.claim()
+        notes = "SELECT COUNT(*) FROM note WHERE item = ? AND kind = 'comment'"
+        answer = self.cancel(bundle["assignment"])
+        self.assertEqual((answer["status"], answer["cancel_requested"]), ("running", "cancelled by operator"))
+        self.assertIn("cancelled by operator", answer["capabilities"]["cancel"]["reason"])
+        before = self.db.execute(notes, (items[0],)).fetchone()[0]
+        with self.assertRaisesRegex(WorkflowError, "cancelled by operator"):
+            self.cancel(bundle["assignment"])
+        self.assertEqual(self.db.execute(notes, (items[0],)).fetchone()[0], before, "a repeat posts no note")
+        member = build.run(self.db, bundle["id"])["members"][1]["id"]
+        self.assertEqual(operations.assignment_state(self.db, member)["cancel_requested"], "cancelled by operator")
+
     def test_a_running_cancel_parks_its_items_when_the_run_ends_cancelled(self):
         items = [self.item(), self.item()]
         build.queue(self.db, items, who="operator")
@@ -1692,6 +1709,8 @@ class Race(Case):
     def test_cancel_between_read_and_reap_wins(self):
         def cancel():
             state = operations.assignment_state(self.db, self.bundle["assignment"])
+            if state["cancel_requested"]:
+                return  # each `open_runs` read lands the writer; a repeat cancel refuses (pack sd:9375)
             operations.cancel_assignment(self.db, self.bundle["assignment"], expected_revision=state["revision"],
                                          who="operator")
 

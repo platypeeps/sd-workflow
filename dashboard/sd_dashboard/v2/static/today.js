@@ -435,7 +435,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     const s = RUNSTATE[r.state] || 'unknown', id = `run:${r.run}`;
     return ['working', s, html`<tr class="child" data-type="working" data-run="${r.run}" data-id="${id}" aria-selected="${String(row() === id)}">${marker(s, 'working')}
       <td class="what">${names(r)}</td>
-      <td class="detail">${r.teammate ? teamFacts(r) : html`<b>${r.state}</b> · build ${r.run} · ${r.model || 'model not recorded'} · step <b>${r.step}</b> · ${r.quiet == null ? 'no output yet' : `output ${dur(r.quiet)} ago`} · ${usd(r.usd || 0)} so far`}${hostFacts(r)}${r.why ? ` · ${r.why}` : ''}</td>
+      <td class="detail">${r.teammate ? teamFacts(r) : html`<b>${r.state}</b> · build ${r.run} · ${r.model || 'model not recorded'} · step <b>${r.step}</b> · ${r.quiet == null ? 'no output yet' : `output ${dur(r.quiet)} ago`} · ${usd(r.usd || 0)} so far`}${hostFacts(r)}${r.why ? ` · ${r.why}` : ''}${r.cancel_requested ? ` · cancel requested: ${r.cancel_requested}` : ''}</td>
       <td class="num">${dur(r.elapsed)}</td>
       <td class="act"><div class="ctl" role="group" aria-label="Run ${r.run}">${bb('cancel', r, 'Cancel…', `Cancel build run ${r.run}`, r.cancel.allowed ? '' : r.cancel.reason || 'cancel is off')}${prLink(r)}${logBtn(r)}</div></td></tr>`];
   }

@@ -528,7 +528,10 @@ def assignment_state(connection: sqlite3.Connection, assignment: int) -> dict:
                              "AS build_run, "
                              "(SELECT runner_run.step FROM runner_run WHERE runner_run.assignment="
                              "COALESCE(assignment.parent, assignment.id) AND runner_run.released_at IS NULL) "
-                             "AS build_step "
+                             "AS build_step, "
+                             "(SELECT runner_run.cancel_requested FROM runner_run WHERE runner_run.assignment="
+                             "COALESCE(assignment.parent, assignment.id) AND runner_run.released_at IS NULL) "
+                             "AS cancel_requested "
                              "FROM assignment LEFT JOIN item ON item.id=assignment.item WHERE assignment.id=?",
                              (assignment,)).fetchone()
     if row is None:
@@ -540,6 +543,10 @@ def assignment_state(connection: sqlite3.Connection, assignment: int) -> dict:
     # with no way to clear them (pack sd:8606).
     if row["status"] == "queued":
         reason = ""
+    elif row["status"] == "running" and row["scope"] == "build" and row["build_run"] and row["cancel_requested"]:
+        # Asked once is enough: a repeat posted the note again and changed nothing (pack sd:9375).
+        reason = (f"{row['cancel_requested']}; build run {row['build_run']} stops at its supervisor's next "
+                  "beat, or at the reap")
     elif row["status"] == "running" and row["scope"] == "build" and row["build_run"]:
         # From `enqueuing` on the lane may hold the branch: the lane entry is what to cancel (pack sd:6094).
         reason = ("" if row["build_step"] is None or row["build_step"] in build.CANCELLABLE
@@ -554,7 +561,7 @@ def assignment_state(connection: sqlite3.Connection, assignment: int) -> dict:
     else:
         reason = ""
     result = {key: row[key] for key in ("id", "item", "title", "role", "provider", "status", "started", "ended",
-                                        "scope", "build_run")}
+                                        "scope", "build_run", "cancel_requested")}
     result["revision"] = _digest(dict(row))
     result["capabilities"] = {"cancel": {"allowed": not reason, "reason": reason}}
     return result

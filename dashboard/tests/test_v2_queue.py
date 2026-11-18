@@ -1709,6 +1709,16 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
             self.assertIn(text, row)
         self.assertRegex(row, r"due \d\d:\d\d")
 
+    def test_a_run_whose_cancel_was_asked_says_so_in_its_row(self):
+        """pack sd:9375: a cancelled run read `running` until its supervisor's beat, so the operator asked again."""
+        run = {**self.BUILDS["runs"][0], "cancel_requested": "cancelled by operator",
+               "cancel": {**self.BUILDS["runs"][0]["cancel"], "allowed": False, "reason": "asked"}}
+        out = self.run_view("open('alpha'); R.alpha = ELS.queue.html;",
+                            answers={"/api/queue/builds?show=all": [200, {**self.BUILDS, "runs": [run]}]})
+        self.assertIn("· cancel requested: cancelled by operator", out["R"]["alpha"])
+        plain = self.run_view("open('alpha'); R.alpha = ELS.queue.html;")
+        self.assertNotIn("cancel requested", plain["R"]["alpha"])
+
     def test_a_satellite_run_names_its_host_and_log_path_and_copies_no_tail(self):
         """Pack sd:7933: a satellite's run logs on that host; a hub's `tail -f` of its path would follow nothing."""
         run = {**self.BUILDS["runs"][0], "host": "work", "quiet": None, "state": "working"}
