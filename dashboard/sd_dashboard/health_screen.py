@@ -81,7 +81,7 @@ from sd_db import reads, repos
 from sd_db.errors import SdDbError
 
 from . import fleet as fleet_module
-from . import health_collectors, ports_screen, runtime, snooze
+from . import health_collectors, ports_screen, runtime, snooze, usage_screen
 from .protection_screen import APPLICABLE, FLAGS, GAPS, ORDER
 
 __all__ = ["AREAS", "VIEWS", "document", "part", "summary"]
@@ -105,15 +105,19 @@ AREAS = (
     ("doc", "Doctor", "machine-setup.sh doctor · its ok, WARN and FAIL lines", ()),
     ("aws", "AWS", "sd-db credentials (nightly) → heartbeat credentials:nightly · aws ec2 describe-instances and "
      "cloudformation describe-stacks per SD_AWS_READ profile and region", ()),
+    ("stat", "Service status", "agent-meter.py services (every 5 min) → state heartbeat service-status:<name> per "
+     "dashboard.status_services line", ()),
 )
 #: The page's views, by the operator's task (sd:2115): id, name and the areas each reads, in AREAS' order within it.
 #: Machine is this Mac (its disks, services, ports and doctor); Checkouts the local git cleanups; GitHub what the nightly
-#: sync stored; Jobs the heartbeats unattended jobs leave. Each is one request, `/api/health/<view>`.
+#: sync stored; Jobs the heartbeats unattended jobs leave; Status the services the operator depends on (pack sd:9260).
+#: Each is one request, `/api/health/<view>`.
 VIEWS = (
     ("checkouts", "Checkouts", ("wt", "br")),
     ("machine", "Machine", ("disk", "svc", "ports", "ctr", "doc", "aws")),
     ("github", "GitHub", ("prot", "dep", "sec")),
     ("jobs", "Jobs", ("cred", "mir")),
+    ("status", "Status", ("stat",)),
 )
 VIEW_AREAS = {view: keys for view, _, keys in VIEWS}
 VIEW_NAMES = {view: name for view, name, _ in VIEWS}
@@ -729,7 +733,7 @@ def _security_rows(found: list[dict], *, now: str) -> tuple[list[dict], dict]:
                          "detail": "a public repo with scanning off is a finding", "kind": "Security · scanning off",
                          "facts": {"Repository": repo["repo"], "Setting": "disabled",
                                    "Observed": repo.get("observed_at") or "never"},
-                         "cli": f"open {settings}"})
+                         "cli": f"open {shlex.quote(settings)}"})
         elif not isinstance(part, dict) or not isinstance(part.get("open"), int):
             unread.append(_unread_reason(repo, part))
             skipped.add(repo["repo"])
@@ -975,6 +979,49 @@ def _brief_copies_row(read, *, now: str) -> dict:
         return {**row, "state": "ok", "what": "Brief copies off", "detail": "no repository's obsidian channel is on",
                 "facts": facts}
     return {**row, "state": "ok", "what": "Brief copies rendered", "detail": f"recorded {stamp}", "facts": facts}
+
+
+STATUS_CLI = "local-agent-meter/agent-meter.py services"
+
+
+def _status_rows(found: list[dict], *, now: str, removed: bool = False) -> tuple[list[dict], dict]:
+    """One row per watched service (pack sd:9260): its status, its open incidents with their links, how long the oldest
+    has lasted and its read time. Degraded is caution and outage a warning; a read that failed or is older than
+    `usage_screen.STATUS_STALE_MINUTES` is unknown with why. The list's add and remove are Settings' (`extra.settings`)."""
+    extra = {"settings": usage_screen.SERVICES_LIST, "counts": {status: sum(one["status"] == status for one in found)
+                                                                for status in usage_screen.SERVICE_STATE}}
+    if not found and removed:  # rows exist and none answers: each was removed, so none is watched
+        return [], extra
+    if not found:
+        return [{"id": "stat:none", "state": "unknown", "type": "check", "what": "No service status read yet",
+                 "detail": "agent-meter.py services writes one row per dashboard.status_services line every 5 minutes",
+                 "kind": "Service status", "facts": {"Heartbeat": "service-status:<name>"}, "cli": STATUS_CLI}], extra
+    rows = []
+    for one in found:
+        incidents, status = one["incidents"], one["status"]
+        since = usage_screen.lasted(incidents, now)
+        first = incidents[0]["title"] if incidents else ""
+        detail = (one["why"] if status == "unknown" else
+                  f"{first or 'an incident with no title'}{f' · for {since}' if since else ''}"
+                  + (f" · +{len(incidents) - 1} more" if len(incidents) > 1 else "") if incidents else
+                  ", ".join(f"{part['name']} {part['status'].replace('_', ' ')}" for part in one["components"][:3])
+                  or (one["indicator"] if status != "ok" else "") or "no open incident")
+        rows.append({
+            "id": f"stat:{one['name']}", "state": usage_screen.SERVICE_STATE[status], "type": "service status",
+            "what": f"{one['name']}: {status}", "detail": detail, "kind": f"Service status · {one['kind'] or 'unknown kind'}",
+            "facts": {"Service": one["name"], "Status": status, "Kind": one["kind"] or "—",
+                      "Providers": ", ".join(one["providers"]) or "none", "Indicator": one["indicator"] or "—",
+                      **({"Lasted": since} if since else {})},
+            "read_at": one["read_at"], "url": one["url"], "cli": STATUS_CLI,
+            "list_head": "Open incidents", "list": [{"text": incident["title"] or "untitled incident", "href": incident["url"]}
+                                                    if incident["url"] else incident["title"] or "untitled incident"
+                                                    for incident in incidents],
+            # Ignore holds until the status or an incident changes (sd:5470); a new read time is not a new problem. An
+            # incident is its title, link and start, so a later outage with the same title is a new problem.
+            "problem": [status, *(field for incident in incidents
+                                  for field in (incident["title"], incident["url"], incident["started_at"] or ""))],
+        })
+    return rows, extra
 
 
 DOCTOR_CLI = "local-machine-setup/machine-setup.sh doctor"
@@ -1272,6 +1319,8 @@ def _readers(connection: sqlite3.Connection, *, now: str, fleet=None, ports=None
                                  _brief_copies_row(lambda: read_brief_copies(connection), now=now)),
         "doc": lambda: _doctor_rows(read_doctor()),
         "aws": lambda: _aws_rows(read_creds(connection), now=now),
+        "stat": lambda: _status_rows(usage_screen.services(connection, now=now), now=now,
+                                     removed=usage_screen.ever_read(connection, usage_screen.STATUS_PREFIX)),
     }
 
 
@@ -1402,7 +1451,7 @@ def part(connection: sqlite3.Connection, view: str, *, now: str, **seams) -> dic
 #: How long a walker's answer stands for `summary`, which starts a scan in the background past it.
 SUMMARY_FRESH_SECONDS = 60.0
 #: Areas `summary` reads afresh: they read only the database. Every other area shows its last answer.
-CHEAP = ("prot", "dep", "sec", "cred", "mir", "aws")
+CHEAP = ("prot", "dep", "sec", "cred", "mir", "aws", "stat")
 RANK = {"warning": 0, "caution": 1, "unknown": 2, "queued": 3, "ok": 4}
 
 

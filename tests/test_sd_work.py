@@ -132,6 +132,17 @@ class TaskCLI(unittest.TestCase):
         self.assertIn("by stage only", refused.stderr)
         self.assertEqual(json.loads(self.call("task", "show", item, "--json").stdout), before)
 
+    def test_task_status_closes_a_work_idea_and_reopens_it(self):
+        """pack sd:9302: a work idea had no status choice, so `sd task status` could not close it."""
+        item = json.loads(self.call("task", "add", "An idea", "--kind", "work-idea", "--json").stdout)["item"]["id"]
+        closed = json.loads(self.call("task", "status", item, "done", "--reason", "not worth it", "--json").stdout)
+        self.assertEqual(closed["item"]["status"], "done")
+        self.assertIn("not worth it", [n for n in closed["notes"] if n["kind"] == "status_change"][-1]["body"])
+        refused = self.call("task", "status", item, "ready", code=1)
+        self.assertIn("cannot move to ready", refused.stderr)
+        reopened = json.loads(self.call("task", "status", item, "planning", "--json").stdout)
+        self.assertEqual(reopened["item"]["status"], "planning")
+
     def test_task_status_done_on_a_report_names_the_acknowledge_command(self):
         """sd:5065: a report closes by acknowledgement, so the refusal names that command."""
         with database(home=self.home) as connection:
