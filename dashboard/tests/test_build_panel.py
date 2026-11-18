@@ -419,11 +419,24 @@ class BuildsPanel(Fixture):
         self.assertEqual(status, 200, body)
         self.assertEqual(json.loads(body)["recent"][0]["run"], run["id"])
 
+    def test_a_run_parked_after_review_rounds_prefills_send_to_builder(self):
+        """Pack sd:9262: a plain Retry dropped the last round's blockers; the row carries them, plus the class pass,
+        as the Send to builder box's text. Any other ended run prefills nothing."""
+        run = self.claimed([self.ready()])
+        build.end(self.connection, run["id"], "blocked",
+                  "3 review rounds left blockers: demo.sh:231 pin check; a.py:2 b")
+        # The block holds the run until a reap reads its supervisor gone: release it as that reap does.
+        self.connection.execute("UPDATE runner_run SET released_at = ? WHERE id = ?", (clock(), run["id"]))
+        row = self.panel(clock())["recent"][0]
+        self.assertEqual(row["prefill"], "The last review round left these blockers: demo.sh:231 pin check; a.py:2 b\n"
+                         + builds.CLASS_PASS)
+        self.assertLessEqual(len(row["prefill"]), builds.FINDING_MAX)
+
     def test_retry_refuses_a_run_that_did_not_block(self):
         run = self.claimed([self.ready()])
         build.end(self.connection, run["id"], "done", "landed")
         recent = self.panel(clock())["recent"][0]
-        self.assertEqual((recent["outcome"], recent["retry"]["allowed"]), ("done", False))
+        self.assertEqual((recent["outcome"], recent["retry"]["allowed"], recent["prefill"]), ("done", False, ""))
         status, _, body = self.post("/api/queue/builds/retry", {"assignment": run["assignment"],
                                                                "revision": recent["retry"]["revision"]})
         self.assertEqual(status, 400, body)
