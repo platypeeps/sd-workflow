@@ -513,7 +513,8 @@ def lane_rows(lanes: list[dict]) -> list[dict]:
                         "what": f"{lane['repo']} sd:{row['item']} blocked at {where}",
                         "detail": f"{row.get('who') or 'lane'}: {row.get('reason') or row.get('status')}",
                         "source": "lane", "at": row.get("finished"), "item": row["item"], "title": row.get("title") or "",
-                        "repo": lane["repo"], "repo_path": lane["path"], "lane_revision": lane["revision"],
+                        "repo": lane["repo"], "repo_path": lane["path"], "repo_key": lane.get("key"),
+                        "lane_revision": lane["revision"],
                         "expected_head": row.get("expected_head") or "", "runner_merge": lane.get("runner_merge"),
                         "unchanged": row.get("unchanged"), "failure": row.get("failure") or {}})
     return out

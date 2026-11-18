@@ -429,10 +429,14 @@ class TodayDraws(ScreenCase):
     #: The Queue view's first show (pack sd:7234), which folded In motion in; its other reads answer 404 here.
     SHOW = ("document.dispatchEvent(new CustomEvent('shell:view', { detail: { id: 'queue', first: true } }));\n"
             "await flush(); await flush();\n"
-            "const open = k => ELS.queue.listeners.click[0]({ target: { closest: s => s === 'tr.repo' ? { dataset: { repo: k } } : null } });\n"
+            # sd:9258: a row's key is its repo row's path; `open` takes the key or the shown name, `repos` the names.
+            "const keyOf = k => ([...String(ELS.queue.html || '').matchAll(/class=\"pick\" data-open=\"([^\"]*)\">([^<]*)</g)]"
+            ".find(m => m[2] === k) || [0, k])[1];\n"
+            "const open = k => ELS.queue.listeners.click[0]({ target: { closest: s => s === 'tr.repo' ? { dataset: { repo: keyOf(k) } } : null } });\n"
             "const press = v => ELS['queue-filters'].listeners.click[0]({ target: { closest: s => s === 'button[data-f=\"qshow\"]'"
             " ? { dataset: { v } } : null } });\n"
-            "const repos = () => [...ELS.queue.html.matchAll(/<tr class=\"repo\" data-repo=\"([^\"]*)\"/g)].map(m => m[1]);\n")
+            "const repos = () => [...ELS.queue.html.matchAll(/<tr class=\"repo\" data-repo=\"([^\"]*)\"[\\s\\S]*?class=\"pick\""
+            " data-open=\"[^\"]*\">([^<]*)</g)].map(m => m[1] && m[2]);\n")
     AFTER = "\nANSWER = p => p === '/api/now' ? [200, DOC0] : [404, { error: 'not served here' }];\n"
 
     def draw(self, body, search="?show="):

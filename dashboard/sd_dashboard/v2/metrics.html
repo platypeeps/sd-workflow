@@ -57,17 +57,17 @@
         <div class="scroll-x"><table class="tbl" id="months-table" aria-labelledby="months-h"><thead id="months-head"></thead><tbody id="months-body"></tbody></table></div>
         <p class="foot-note" id="months-note"></p></div>
       <div class="cols">
-        <div><p class="sub" id="bills-h">Dollars by bill</p><ul class="hbars" id="bills"></ul>
+        <div><p class="sub" id="bills-h">Dollars by bill</p><div id="state-bills" hidden></div><ul class="hbars" id="bills"></ul>
           <p class="foot-note" id="bills-note"></p></div>
-        <div><p class="sub">Budget used, now</p><ul class="hbars" id="windows"></ul>
+        <div><p class="sub">Budget used, now</p><div id="state-windows" hidden></div><ul class="hbars" id="windows"></ul>
           <p class="foot-note">Caution at 75% of a window; a full window blocks that provider until it resets.</p></div>
       </div>
       <p class="sub gap">Burn against each cap</p>
-      <div class="multi" id="burns"></div>
+      <div id="state-burns" hidden></div><div class="multi" id="burns"></div>
       <p class="sub gap">7-day window, last reading each day</p>
-      <div class="multi" id="trends"></div>
+      <div id="state-trends" hidden></div><div class="multi" id="trends"></div>
       <p class="sub gap">By model</p>
-      <div id="model"></div>
+      <div id="state-model" hidden></div><div id="model"></div>
     </section>
 
     <section class="panel" id="week" aria-labelledby="week-h">

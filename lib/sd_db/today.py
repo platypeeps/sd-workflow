@@ -284,16 +284,21 @@ def closed_by_hand(connection: sqlite3.Connection, *, repos: Iterable[str | None
     return [row for row in _closed(connection, repos, now, hours) if not row["commit"]]
 
 
-def repo_keys(connection: sqlite3.Connection) -> dict[str, str]:
-    """Each registered repository's key by its lower-case GitHub `owner/name`."""
+def repo_paths(connection: sqlite3.Connection) -> dict[str, list[str]]:
+    """Every registered repository's key by its lower-case GitHub `owner/name`; two checkouts can share one."""
     from .repos import parse_remote
 
-    keys = {}
+    paths: dict[str, list[str]] = {}
     for row in connection.execute("SELECT path, remote FROM repo WHERE remote IS NOT NULL"):
         found = parse_remote(row["remote"])
         if found.kind == "github":
-            keys[f"{found.owner}/{found.name}".lower()] = row["path"]
-    return keys
+            paths.setdefault(f"{found.owner}/{found.name}".lower(), []).append(row["path"])
+    return paths
+
+
+def repo_keys(connection: sqlite3.Connection) -> dict[str, str]:
+    """Each registered repository's key by its lower-case GitHub `owner/name`, the last registered of a shared one."""
+    return {slug: found[-1] for slug, found in repo_paths(connection).items()}
 
 
 def issues(connection: sqlite3.Connection, *, repos: Iterable[str | None]) -> list[dict]:
