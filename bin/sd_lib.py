@@ -151,6 +151,10 @@ CORE_CONFIG = {
     "repo_cap": {"pattern": "[1-6]",
                  "description": "How many build bundles may build at once in one repository when this machine "
                                 "claims them, 1 to 6. Unset reads 1 (sd:8158). It grants nothing."},
+    "lane_parallel": {"pattern": "[1-8]",
+                      "description": "How many lanes one hosted lane run runs at once on this machine, 1 to 8. "
+                                     "Unset reads 5 (sd:9323); the gate's slots and load limit still hold lanes "
+                                     "back below it. It grants nothing."},
     "review_slots": {"pattern": "[0-9]+",
                      "description": "How many reviews may run their reviewers at once on this machine; 0 is no cap. "
                                     "Unset reads 2; SD_REVIEW_SLOTS overrides it for one run."},

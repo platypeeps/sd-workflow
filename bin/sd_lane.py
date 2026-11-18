@@ -341,6 +341,8 @@ STALE_HEAD = "stale_head"
 #: A last entry the dashboard's Fix (`sd_db.build.lane_fix`, pack sd:8584) cancelled and handed to a builder: its
 #: worktree is the builder's, so `retry` refuses it.
 HANDED_BACK = "handed_back"
+#: An entry on a build bundle's branch would deliver a member the operator cancelled on its own (sd:9222).
+MEMBER_LEFT = "member_cancelled_alone"
 #: The refusal code of a cancel whose `--expected-claim` no longer holds the item's running entry (sd:3330).
 STALE_CLAIM = "stale_claim"
 #: The refusals of a cancelled entry's retry (sd:3389): its item has a newer entry, or merged at its head.
@@ -785,7 +787,7 @@ def enqueue_entry(worktree: pathlib.Path, item: int, title: str, body_file: path
     body = body_file.read_text(encoding="utf-8")
     closes = tuple(dict.fromkeys(number for number in closes if number != item))
     def checked(connection: Any) -> str | None:
-        check_item(connection, worktree, item, body, claim, closes, title)
+        check_item(connection, worktree, item, body, claim, closes, title, branch)
         return forwarded_to(connection, queue)
     forwarded = on_hub(queue, checked)
     entry = {"id": entry_id(), "repository": queue.repository, "item": item, "branch": branch, "expected_head": head,
@@ -802,13 +804,23 @@ def enqueue_entry(worktree: pathlib.Path, item: int, title: str, body_file: path
         if claim == "deliver":  # an associate-only claim closes nothing (sd:3365)
             commits = unreverted(worktree, head, branch_commits(worktree, base, head))
             parents = branch_parents(worktree, base, head)
-            cited = on_hub(queue, lambda connection: cited_closes(connection, item, body, commits, closes, parents))
+            cited, left = on_hub(queue, lambda connection: (
+                cited_closes(connection, item, body, commits, closes, parents, branch),
+                left_cited(connection, branch, body, commits, parents)))
             entry["closes"] = [*closes, *(row["item"] for row in cited)]
-            if cited:  # listed where a reader sees it (sd:5999 lane review)
-                import sd_ship_body  # noqa: PLC0415
-                entry["cited"] = cited
-                entry["body"] = sd_ship_body.with_cited(
-                    body, [f"- sd:{row['item']}: {row['source']}" for row in cited])  # no repo name (sd:9135)
+            import sd_ship_body  # noqa: PLC0415
+            try:
+                if cited:  # listed where a reader sees it (sd:5999 lane review)
+                    entry["cited"] = cited
+                    entry["body"] = sd_ship_body.with_cited(
+                        body, [f"- sd:{row['item']}: {row['source']}" for row in cited])  # no repo name (sd:9135)
+                if left:  # a citation this bundle's merge leaves open is seen too (sd:9222)
+                    entry["left_open"] = left
+                    entry["body"] = sd_ship_body.with_cited(
+                        entry["body"], [f"- sd:{number}: cancelled on its own out of this build" for number in left],
+                        heading="Left open")
+            except sd_ship_body.Refusal as refused:  # an open fence or comment would hide the section
+                raise LaneError(str(refused), code=refused.workflow["blocker"]["code"]) from None
         on_hub(queue, lambda connection: refuse_teammate(connection, entry))  # the whole set
     require_published(worktree, branch, head, f"{head} names no commit in {worktree}", refuse_before_push,
                       lambda tip: tip_past(worktree, branch, tip, head))
@@ -982,7 +994,7 @@ def branch_parents(worktree: pathlib.Path, base: str, head: str) -> dict[str, tu
 
 
 def cited_closes(connection: Any, item: int, body: str, commits: list[tuple[str, str]],
-                 closes: tuple[int, ...], parents: dict[str, tuple[str, ...]] | None = None
+                 closes: tuple[int, ...], parents: dict[str, tuple[str, ...]] | None = None, branch: str = ""
                  ) -> list[dict[str, Any]]:
     """The open items of `item`'s repository its commits or body cite, beyond `closes` (sd:5999).
 
@@ -990,15 +1002,59 @@ def cited_closes(connection: Any, item: int, body: str, commits: list[tuple[str,
     fix, <repo> sd:N` line (`sd_ship_body.cited_sources`). The merge closes
     each as it closes a later `--item`, and the lane notes each
     (`note_cited`). An item with no repository row adds nothing:
-    `check_item` refuses it first.
+    `check_item` refuses it first. A member cancelled on its own out of
+    the build bundle that published `branch` adds nothing either (sd:9222).
     """
     import sd_ship_body  # noqa: PLC0415
     row = connection.execute("SELECT repo FROM item WHERE id = ?", (item,)).fetchone()
     if row is None or not row["repo"]:
         return []
     sources = sd_ship_body.cited_sources(body, commits, parents)
-    kept = sd_ship_body.open_cited(connection, item, row["repo"], tuple(sources), closes, body)
+    kept = sd_ship_body.open_cited(connection, item, row["repo"], tuple(sources), closes, body, branch)
     return [{"item": number, "source": sources[number]} for number in kept]
+
+
+def left_cited(connection: Any, branch: str, body: str, commits: list[tuple[str, str]],
+               parents: dict[str, tuple[str, ...]] | None = None) -> list[int]:
+    """The items `body` and `commits` cite that the build bundle on `branch` left: each member the operator
+    cancelled on its own (`build.left`). `cited_closes` leaves them open; enqueue lists them (sd:9222)."""
+    import sd_ship_body  # noqa: PLC0415
+    sd_lib.import_sd_db()  # every caller holds an sd_db connection, so this finds it
+    from sd_db import build  # noqa: PLC0415
+    sources = sd_ship_body.cited_sources(body, commits, parents)
+    return sorted(build.left(connection, branch, sources))
+
+
+def refuse_left_members(connection: Any, branch: str, items: tuple[int, ...],
+                        then: str = "nothing was queued") -> None:
+    """Refuse an entry on a build bundle's `branch` that would deliver a member the operator cancelled on its own
+    out of that bundle (`build.left`): as its item or a later `--item` at enqueue, a saved close at retry,
+    which copies them (review round 6 of sd:9222), or one cancelled since, at the run (`left_stop`)."""
+    import sd_ship_body  # noqa: PLC0415
+    try:
+        sd_ship_body.refuse_left(connection, branch, items, then)
+    except sd_ship_body.Refusal as refused:  # the lane's own error, the same words (`sd-ship merge` enforces it)
+        raise LaneError(f"{refused}. Drop it from the entry and enqueue again from the worktree; build it again "
+                        "to deliver it on its own branch.", code=MEMBER_LEFT) from None
+
+
+def left_stop(entry: dict[str, Any], queue: Queue, step: str) -> dict[str, Any] | None:
+    """The fields that end `entry` at `step` when a member it delivers was cancelled on its own since the enqueue
+    (`refuse_left_members`, review round 7 of sd:9222); None when none was. A read with no answer is a hub fault,
+    which the next run retries, never a pass."""
+    then = "the run stopped it before prepare" if step == "prepare" else "the run stopped it before the merge"
+    try:
+        on_hub(queue, lambda connection: refuse_left_members(
+            connection, str(entry.get("branch") or ""), (entry["item"], *(entry.get("closes") or ())), then),
+            write=False)
+    except LaneError as error:
+        fields = {"status": "failed", "step": step, "code": error.code, "reason": str(error)[:REASON_CHARS]}
+        if error.code == MEMBER_LEFT:
+            return fields
+        if error.code == HUB_UNAVAILABLE:
+            return {**fields, "hub_fault": True}
+        raise
+    return None
 
 
 def tip_past(worktree: pathlib.Path, branch: str, tip: str, head: str) -> None:
@@ -1032,7 +1088,7 @@ def check_docs(worktree: pathlib.Path, body: str, base: str) -> None:
 
 
 def check_item(connection: Any, worktree: pathlib.Path, item: int, body: str, claim: str | None,
-               closes: tuple[int, ...] = (), title: str = "") -> None:
+               closes: tuple[int, ...] = (), title: str = "", branch: str = "") -> None:
     """Refuse what prepare refuses on the item before it reviews, so the entry never waits for it (sd:3473).
 
     Each refused in seconds once the entry reached the head of the queue,
@@ -1046,7 +1102,8 @@ def check_item(connection: Any, worktree: pathlib.Path, item: int, body: str, cl
 
     One is the lane's own: a delivering entry whose title or `## Summary`
     headings name an open item of this repository missing from `--item`
-    (`sd_ship_body.refuse_left_open`, sd:5375). Prepare only warns of a
+    (`sd_ship_body.refuse_left_open`, sd:5375), less a member cancelled on
+    its own out of the build bundle that published `branch` (sd:9222). Prepare only warns of a
     title id, and inside the lane no one read the warning.
     """
     require_sd_db()
@@ -1071,11 +1128,12 @@ def check_item(connection: Any, worktree: pathlib.Path, item: int, body: str, cl
         if registered is None or registered != own:
             raise foreign_item(item, registered or info["repo"]["path"], str(own), "prepare")
         sd_ship_body.normalize(body, item)  # a body `Closes:` line, among others (sd:3704)
+        refuse_left_members(connection, branch, (item, *closes))
         # A title closes nothing; the items named with --item do (sd:3704).
         sd_ship_body.refuse_unclosable(connection, item, info["item"]["repo"], closes, claim == "deliver")
         names = (pathlib.Path(info["item"]["repo"]).name, (registered or "").partition("/")[2])
         sd_ship_body.refuse_left_open(connection, item, info["item"]["repo"], names, title, body, closes,
-                                      claim == "deliver")
+                                      claim == "deliver", branch)
     except Refusal as error:
         raise LaneError(f"{error}; nothing was queued", code=error.workflow["blocker"]["code"]) from None
 
@@ -1657,7 +1715,7 @@ def retry(root: pathlib.Path, item: int, environ: dict[str, str], *, manual: boo
     if cancelled and expected_head is None:
         raise LaneError(f"sd:{item}'s last entry is cancelled; retry it only at the head you read, with "
                         "--expected-head <full commit id> as `sd-ship lane list` prints it")
-    if not last.get("branch"):
+    if not isinstance(last.get("branch"), str) or not last["branch"]:
         raise LaneError(f"sd:{item}'s last entry names no branch; queue it with `sd-ship lane enqueue`")
     if not isinstance(last.get("body"), str):
         raise LaneError(f"sd:{item}'s last entry kept no body; enqueue it again with --body-file")
@@ -1667,7 +1725,8 @@ def retry(root: pathlib.Path, item: int, environ: dict[str, str], *, manual: boo
     else:
         worktree_unmoved(last)
     on_hub(queue, lambda connection: check_item(connection, root, item, last["body"], last.get("claim"),
-                                                tuple(last.get("closes") or ()), str(last.get("title") or "")))
+                                                tuple(last.get("closes") or ()), str(last.get("title") or ""),
+                                                last["branch"]))
     worktree, head = pathlib.Path(str(last.get("worktree"))), last["expected_head"]
     if last.get("enqueued_on") == this_host() and worktree.is_dir():
         head = caught_up(worktree, head)
@@ -1981,6 +2040,9 @@ def process(entry: dict[str, Any], queue: Queue, ship: Ship, advance: Callable[[
     worktree, item, logs = pathlib.Path(entry["worktree"]), entry["item"], queue.lane / "logs"
     if not at_head(worktree, entry["expected_head"]):
         return {"status": "skipped", "code": HEAD_MOVED, "reason": "the worktree's HEAD moved from the queued head"}
+    left = left_stop(entry, queue, "prepare")
+    if left is not None:
+        return left
     stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
     shot = draw_shots(worktree, logs / f"shots-{item}-{stamp}")
     if shot.get("shots"):
@@ -1993,6 +2055,9 @@ def process(entry: dict[str, Any], queue: Queue, ship: Ship, advance: Callable[[
         advance()  # the claim still holds, and the lane is still here, before the landing (sd:3482)
     if stopped is not None:
         return {**fields, **stopped}
+    left = left_stop(entry, queue, "merge")  # prepare runs for minutes; a cancel may land in them
+    if left is not None:
+        return {**fields, **left}
     refused = merge_refusal(entry)
     if refused is not None:
         return {**fields, "status": "prepared", **refused}
@@ -4152,7 +4217,7 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
         return inline_lane(lambda: run_lane(checkout, environ, ship, gate, note, clock() + budget))
     order = longest_waiting_first(hosted, environ)
     lanes += run_parallel(order, start or inline, deadline, functools.partial(lane_room, environ),
-                          functools.partial(new_work, environ))
+                          functools.partial(new_work, environ), cap=lane_parallel(environ))
     for path, checkout in hosted:  # after the lanes ran: a slow read never holds a lane back (pack sd:6006)
         for asked in (ask_wait(checkout, path, environ), file_flakes(checkout, path, environ)):
             if asked:
@@ -4199,8 +4264,9 @@ def new_work(environ: dict[str, str],
 
 #: How a hosted run starts one lane: `(checkout, seconds left of the run's budget)` to a started lane (sd:5774).
 Start = Callable[[pathlib.Path, float], "StartedLane"]
-#: The most lanes one hosted run runs at once (sd:5774); the gate's free slots and load limit decide below it.
-MAX_PARALLEL_LANES = 3
+#: The most lanes one hosted run runs at once when `sd.lane_parallel` is unset (sd:5774, sd:9323: 3 became 5);
+#: the gate's free slots and load limit decide below it.
+MAX_PARALLEL_LANES = 5
 #: How often a hosted run looks again for a finished lane or for room to start the next.
 START_POLL_SECONDS = 5.0
 #: How long a TERMed hosted run waits for each lane child it TERMs before it kills it.
@@ -4300,14 +4366,28 @@ def lane_room(environ: dict[str, str]) -> str | None:
     return None
 
 
+def lane_parallel(environ: dict[str, str] | None = None) -> int:
+    """This machine's `sd.lane_parallel`, lanes one hosted run runs at once, 1 to 8; `MAX_PARALLEL_LANES` when unset.
+
+    A value that does not match, or a config that cannot be read, is the
+    default, as `sd.repo_cap` reads (sd:9323): a bad file never stops a run.
+    """
+    try:
+        value = sd_lib.file_setting("lane_parallel", environ)
+    except sd_lib.ConfigError:
+        return MAX_PARALLEL_LANES
+    return int(value) if value else MAX_PARALLEL_LANES
+
+
 def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: float,
-                 room: Callable[[], str | None], pending: Pending = lambda seen: {}) -> list[dict[str, Any]]:
+                 room: Callable[[], str | None], pending: Pending = lambda seen: {},
+                 cap: int = MAX_PARALLEL_LANES) -> list[dict[str, Any]]:
     """Start each lane of `order` in turn, as room allows; each lane run's row, in `order` (sd:5774).
 
     A lane starts at once while no lane runs, as one after another did, or
     once the run's budget is spent, since it then only settles its checkout
     and claims nothing. Otherwise it waits for `room` and for fewer than
-    `MAX_PARALLEL_LANES` running. A lane's refusal is its own row. When this
+    `cap` running (`lane_parallel`). A lane's refusal is its own row. When this
     run ends early, a TERM among them, every lane still running is stopped.
 
     Then, inside the budget, every `RESCAN_SECONDS` and once no lane runs,
@@ -4321,7 +4401,7 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
     seen: dict[int, frozenset[str]] = {}
 
     def lane_fits() -> bool:
-        return len(running) < MAX_PARALLEL_LANES and (not running or clock() >= deadline or room() is None)
+        return len(running) < cap and (not running or clock() >= deadline or room() is None)
 
     def begin_lane(index: int, ids: frozenset[str]) -> None:
         seen[index] = ids

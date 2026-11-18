@@ -2928,6 +2928,44 @@ R.reads = OUT.gets.filter(g => g === '/api/tasks/{port}').length;""", answer)
         self.assertEqual([p[:2] for p in out["posts"]], [[f"/api/assignments/{asg['id']}/cancel", {"revision": asg["revision"]}]])
         self.assertGreaterEqual(out["R"]["reads"], 2, "the Details were not read again after the refusal")
 
+    def test_the_cancel_confirm_promises_a_park_only_for_a_build(self):
+        # Review round 4 of pack sd:9222: only a build's cancel parks; the confirm read the status alone, so a
+        # queued or running assignment of another scope was promised a park that does not happen.
+        port = self.ids["port"]
+        (asg,) = self.details[str(port)]["assignments"]
+        carried = asg.get("scope") == "item"
+        texts = {}
+        for scope in ("item", "build"):
+            for status in ("queued", "running"):
+                asg.update(scope=scope, status=status)
+                out = self.run_page(f"""open({port}); await flush();
+R.text = cmd('asg.cancel').consequence(C.get('asg:{asg['id']}'));""")
+                texts[scope, status] = out["R"]["text"]
+        for status in ("queued", "running"):
+            self.assertNotIn("park", texts["item", status])
+            self.assertIn("The item's status is unchanged.", texts["item", status])
+            self.assertIn("Unpark", texts["build", status])
+        self.assertTrue(carried, "the Details carry each assignment's scope")
+
+    def test_a_queued_lead_cancel_confirm_names_the_members_it_takes(self):
+        # Review round 5 of pack sd:9222: a queued build lead's cancel also cancels and parks each queued member
+        # (`build.queued_members`), so the confirm names them; a member's own cancel names none.
+        lead, member = self.item("Lead"), self.item("Member")
+        head, child = self.assignment(lead), self.assignment(member)
+        self.connection.execute("UPDATE assignment SET scope = 'build', parent = CASE id WHEN ? THEN ? END "
+                                "WHERE id IN (?, ?)", (child, head, head, child))
+        self.connection.commit()
+        self.doc = tasks_screen.document(self.connection, now=NOW)
+        for item in (lead, member):
+            self.details[str(item)] = tasks_screen.details(self.connection, item, now=NOW)
+        out = self.run_page(f"""open({lead}); await flush();
+R.lead = cmd('asg.cancel').consequence(C.get('asg:{head}'));
+open({member}); await flush();
+R.member = cmd('asg.cancel').consequence(C.get('asg:{child}'));""")
+        self.assertIn(f"#{member}", out["R"]["lead"])
+        self.assertIn("1 queued member", out["R"]["lead"])
+        self.assertNotIn("queued member", out["R"]["member"])
+
     def test_a_task_added_under_a_filter_that_hides_it_is_not_selected(self):
         # Selection stays on a visible task: a new task the filters hide is added and named, not selected (review, PR #46).
         new = {**self.row("ask"), "id": 99, "title": "Call the bank", "kind": "task", "repo": None, "repo_path": None}

@@ -323,6 +323,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     dayTrack();
     if (AV.seen) loadActivity();
     spendLine();
+    usageStrip();
     window.snooze.draw($('snoozed'), SNOOZED);
   }
 
@@ -809,7 +810,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     if (!r) return;
     const what = r.items.map(m => `sd:${m.item}`).join(', ');
     if (act === 'cancel' && !(await shell.confirm({ title: `Cancel build run ${r.run} (${what})?`,
-      body: `The supervisor stops the ${r.step} step at its next beat, keeps the worktree, ends the bundle cancelled and moves ${r.items.length > 1 ? 'its items' : 'the item'} back to ready. Nothing is enqueued.`,
+      body: `The supervisor stops the ${r.step} step at its next beat, keeps the worktree, ends the bundle cancelled, and parks ${r.items.length > 1 ? 'its items' : 'the item'} at ready, so auto-pickup leaves ${r.items.length > 1 ? 'them' : 'it'} until Unpark on Tasks; if the reap cannot confirm the process stopped, it ends blocked instead: check the process, then Retry once the lease is released. Nothing is enqueued.`,
       cli: `sd assignments cancel ${r.cancel.assignment} --if-revision ${r.cancel.revision}`, ok: 'Cancel build', keep: 'Keep it running' }))) return;
     let finding = '';
     if (act === 'send') {
@@ -967,6 +968,30 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
         const h = d > 0 ? Math.max(1, Math.round(H * d / top)) : 0;
         return html`<rect x="${i * 6}" y="${H - h}" width="4" height="${h}"><title>${usd(d)}</title></rect>`; })}</svg>
       <a href="/metrics">Metrics</a>`);
+  }
+
+  // The Usage strip (pack sd:9257, usage_screen.strip): one row per provider, and per cswap account for claude, with the
+  // windows its reading has (claude has its seven days only), each with use, reset in this zone with its label, and pace;
+  // its read time; and the flag of the services that name it (Health's Status view). A reading not read, or over 30 minutes
+  // old, is unknown with why and no number. The lists' add and remove are Settings'.
+  const zoned = iso => new Date(iso).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
+  const pace = p => p === null || p === undefined ? '' : Math.abs(p) < 3 ? ' · on pace' : ` · ${Math.abs(p)} pts ${p > 0 ? 'over' : 'under'} pace`;
+  const money = (m, what) => m ? html`<span class="w">${what} <b>${m.unit === 'USD' || !m.unit ? usd(m.amount) : `${m.amount} ${m.unit}`}</b>${m.period ? ` ${m.period}` : ''}</span>` : '';
+  function usageRow(r) {
+    const f = r.service;
+    const flag = f && f.state !== 'ok' ? html`<a class="flag" href="${f.url && f.state !== 'unknown' ? f.url : '/fleet-health#view=status'}"${f.url && f.state !== 'unknown' ? html` target="_blank" rel="noopener noreferrer"` : ''}><span class="g-${f.state}" aria-hidden="true">${GLYPH[f.state]}</span> ${f.name} ${f.status}${f.title ? `: ${f.title}` : ''}</a>` : '';
+    const body = r.state === 'unknown' ? html`<span class="why">Unknown: ${r.why}</span>`
+      : html`${r.windows.map(w => html`<span class="w"><span class="wl">${w.label}</span><svg class="track" viewBox="0 0 100 1" preserveAspectRatio="none" role="img" aria-label="${`${w.label} window ${w.used}% used`}"><rect class="fill${w.used >= 100 ? ' warning' : w.used >= 80 ? ' caution' : ''}" width="${Math.min(100, w.used)}" height="1"/></svg><b>${Math.round(w.used)}%</b>${w.resets_at ? html` · resets <time datetime="${w.resets_at}">${zoned(w.resets_at)}</time>` : ''}${pace(w.pace)}</span>`)}${money(r.balance, 'balance')}${money(r.spend, 'spent')}`;
+    return html`<li data-state="${r.state}"><span class="nm"><span class="g-${r.state}" aria-hidden="true">${GLYPH[r.state]}</span><span class="sr">${r.state} · </span>${r.label}${r.active ? html` <small>active</small>` : ''}</span>
+      <span class="ws">${body}</span>${flag}<span class="age">${r.read_at ? html`read <time class="rel" datetime="${r.read_at}"></time>` : 'not read'}</span></li>`;
+  }
+  function usageStrip() {
+    const U = DOC.usage || { error: 'the document carried no usage', rows: [], nosource: [] };
+    const links = html`<a href="${U.providers || '/settings#f-dashboard.usage_providers'}">Providers in Settings</a> · <a href="/metrics">Spend in Metrics</a>`;
+    if (U.error) return put($('usage'), html`<p class="foot"><span class="lbl">Usage</span> Not read: ${U.error}. Read again tries again. ${links}</p>`);
+    const none = !U.rows.length && !U.nosource.length;
+    put($('usage'), html`${U.rows.length ? html`<ul class="urows">${U.rows.map(usageRow)}</ul>` : ''}
+      <p class="foot"><span class="lbl">Usage</span> ${none ? 'No provider read yet. ' : ''}${U.nosource.length ? `No reader for ${U.nosource.join(', ')}. ` : ''}${U.flags_error ? `Service status not read: ${U.flags_error}. ` : ''}${links}</p>`);
   }
 
   // The badge is the read's own (sd:3446, now_screen._attention): Needs you's broken rows, else its look rows.

@@ -387,11 +387,14 @@ class StatusGuards(WorkflowCase):
 
     def test_a_pieced_idea_keeps_its_writing_workflow(self):
         """pack sd:9302: a writing piece closes through its stages, whatever its source says."""
-        for source in ("writing-piece", "drafts", None):
-            item = create_item(self.db, kind="idea", title="A piece", source=source, external_id=f"piece-{source}")
-            set_item_fields(self.db, item, piece=f"piece-{source}")
+        # An empty piece is not NULL, so `writing.list_pieces` lists it too (review round 1).
+        for source, piece in (("writing-piece", "piece"), ("drafts", "piece"), (None, "piece"), ("drafts", "")):
+            item = create_item(self.db, kind="idea", title="A piece", source=source,
+                               external_id=f"piece-{source}-{piece}")
+            set_item_fields(self.db, item, piece=piece and f"piece-{source}")
             before = item_state(self.db, item)
-            with self.subTest(source=source), self.assertRaisesRegex(TransitionRefused, "task controls"):
+            with self.subTest(source=source, piece=piece), \
+                    self.assertRaisesRegex(TransitionRefused, "task controls"):
                 change_status(self.db, item, "done", who="operator")
             self.assertEqual(allowed_statuses(self.db, item), [])
             self.assertEqual(item_state(self.db, item), before)
@@ -414,6 +417,7 @@ class StatusGuards(WorkflowCase):
                  ({"kind": "idea", "source": "writing-piece", "piece": "p"}, False),
                  ({"kind": "idea", "source": "writing-piece", "piece": None}, False),
                  ({"kind": "idea", "source": "drafts", "piece": "p"}, False),
+                 ({"kind": "idea", "source": "drafts", "piece": ""}, False),
                  ({"kind": "idea", "source": "vault", "piece": None}, False),
                  ({"kind": "work-idea", "source": "vault", "piece": None}, False),
                  ({"kind": "task", "source": None, "piece": None}, False),

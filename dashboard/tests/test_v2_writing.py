@@ -94,6 +94,20 @@ class TheDocument(Pieces):
             with self.subTest(path=path.name), hoa, mock.patch.object(places, "REALMS_CONFIG", path):
                 self.assertEqual({p["realm"] for p in writing_screen.document(self.connection, now=NOW)["pieces"]}, {"hoa"})
 
+    def test_a_piece_with_no_repository_is_listed_with_its_problem(self):
+        # Bundle review round 3: Path(None) raised TypeError and failed the
+        # whole Writing page; its report read is a 404 that says why.
+        loose = self.item("Loose piece", kind="idea")
+        self.connection.execute("UPDATE item SET piece = '2026/loose', stage = 'drafting' WHERE id = ?", (loose,))
+        self.connection.commit()
+        by = {p["id"]: p for p in writing_screen.document(self.connection, now=NOW)["pieces"]}
+        self.assertEqual(set(by), {self.ids["fixture"], self.ids["parked"], loose})
+        self.assertEqual((by[loose]["repo"], by[loose]["realm"], by[loose]["files"]), ("no repository", "personal", {}))
+        self.assertIn("this piece names no repository", by[loose]["problems"])
+        self.assertEqual(by[loose]["mirror"]["folder"], None)
+        self.assertEqual(writing_screen.report(self.connection, f"/api/writing/{loose}/fact-check"),
+                         (404, {"error": f"#{loose}: this piece names no repository"}))
+
     def test_each_piece_carries_its_stage_gates_moves_files_and_draft(self):
         doc = writing_screen.document(self.connection, now=NOW)
         by = {p["id"]: p for p in doc["pieces"]}

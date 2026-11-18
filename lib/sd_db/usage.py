@@ -145,3 +145,31 @@ def text(usage: reads.Usage) -> str:
             f"assignment {row['assignment'] if row['assignment'] is not None else '-'}: {_money(row['usd'])}"
         )
     return "\n".join(lines) + "\n"
+
+
+def _prefix_end(prefix: str) -> str:
+    return prefix[:-1] + chr(ord(prefix[-1]) + 1)
+
+
+def ever_read(connection: sqlite3.Connection, prefix: str) -> bool:
+    """Whether any heartbeat row under `prefix` exists, removed ones too: with none answering, all were removed."""
+    return connection.execute("SELECT 1 FROM state WHERE kind = 'heartbeat' AND key >= ? AND key < ? LIMIT 1",
+                              (prefix, _prefix_end(prefix))).fetchone() is not None
+
+
+def newest_heartbeats(connection: sqlite3.Connection, prefix: str) -> dict[str, tuple[str, object]]:
+    """The newest heartbeat row of each key under `prefix`, by name: `(timestamp, body)`. A removed entry is left out;
+    a body that does not parse is None, which reads unknown."""
+    end = _prefix_end(prefix)
+    found = {}
+    for key, stamp, body in connection.execute(
+            "SELECT key, timestamp, body FROM state WHERE id IN (SELECT MAX(id) FROM state"
+            " WHERE kind = 'heartbeat' AND key >= ? AND key < ? GROUP BY key) ORDER BY key", (prefix, end)):
+        try:
+            body = json.loads(body)
+        except (TypeError, ValueError, RecursionError):
+            body = None
+        if isinstance(body, dict) and body.get("status") == "removed":
+            continue
+        found[key[len(prefix):]] = (stamp, body)
+    return found

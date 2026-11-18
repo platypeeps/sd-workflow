@@ -182,7 +182,9 @@ def hand_idea(row: Any) -> bool:
 
     if row["kind"] not in IDEA_KINDS or row["source"] in (VAULT, WRITING):
         return False
-    return row["kind"] != "idea" or not row["piece"]
+    # `is None`, as `writing.list_pieces` and `_kind_change` read it: an
+    # empty piece is still a piece, and its writing workflow owns the row.
+    return row["kind"] != "idea" or row["piece"] is None
 
 
 class WorkflowError(SdDbError):
@@ -562,7 +564,7 @@ def edit_item(
             raise WorkflowError(f"item {item} is writing piece {row['piece']!r}; its repository holds its file, "
                                 f"so the repository stays")
         values = _fields(connection, changes)
-        if "parked_at" in values and row["piece"]:
+        if "parked_at" in values and row["piece"] is not None:
             raise WorkflowError("a writing piece parks and revives through its own park control, "
                                 "which moves its file")
         values = _park(item, row, values)
