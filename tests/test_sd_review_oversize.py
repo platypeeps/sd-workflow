@@ -366,6 +366,14 @@ class BinaryMaterialTests(ReviewFixture):
             self.assertTrue(is_media(head + os.urandom(64)), head)
         self.assertFalse(is_media(b"RIFF\x00\x00\x00\x00AVI LIST"))
 
+    def test_models_are_summarized_as_media(self):
+        # sd:9417: a game art branch of binary FBX and GLB models was
+        # sent as base64 and refused as oversized.
+        is_media = sd_review.sd_review_material.is_media
+        for head in (b"Kaydara FBX Binary  \x00\x1a\x00", b"glTF\x02\x00\x00\x00"):
+            self.assertTrue(is_media(head + os.urandom(64)), head)
+        self.assertFalse(is_media(b"; FBX 7.4.0 project file\n"))
+
     def test_text_change_beside_a_binary_is_sent_in_full(self):
         root, base = self.screenshot_branch()
         subject = sd_review.resolve_subject(root, "branch", base=base)

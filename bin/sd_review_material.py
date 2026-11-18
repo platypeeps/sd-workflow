@@ -46,7 +46,7 @@ BINARY_MARKER = re.compile(r"(?m)^Binary files .* differ\n?")
 MEDIA, SUMMARY = re.compile(r"(?m)^\[binary, not sent\] "), re.compile(r"(?m)^\[(?:binary, not sent\] |renamed\] .*; unchanged lines not sent$)")  # a patch prefixes content lines
 DELETED = re.compile(r"(?m)^deleted file mode ")  # sd:6088: with -D this header is all a deletion sends
 RENAMED = re.compile(r'(?m)^\[renamed\] ("(?:[^"\\]|\\.)*") -> "(?:[^"\\]|\\.)*"; unchanged lines not sent$')
-MEDIA_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"wOFF", b"wOF2", b"%PDF-", b"OggS", b"fLaC", b"ID3")  # sd:9127: audio
+MEDIA_MAGIC = (b"\x89PNG\r\n\x1a\n", b"\xff\xd8\xff", b"GIF87a", b"GIF89a", b"wOFF", b"wOF2", b"%PDF-", b"OggS", b"fLaC", b"ID3", b"Kaydara FBX Binary  \x00", b"glTF")  # sd:9127: audio; sd:9417: FBX, GLB models
 
 
 def is_media(data: bytes) -> bool:
