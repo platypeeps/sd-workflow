@@ -19,6 +19,10 @@ from .database import transaction
 from .errors import SdDbError
 from .writes import add_note, create_assignment, now, record_cost, transition
 
+# The result on a bundle member's row an operator cancelled on its own: it left the bundle, so no Retry of the
+# bundle queues it again or clears its park (review round 2 of sd:9222).
+ALONE = "cancelled on its own by "
+
 
 class RunnerRefused(SdDbError):
     """An unsafe or stale queue action, with no partial selection written."""
@@ -426,6 +430,11 @@ def requeue(connection, assignment: int, *, expected_revision: str, who) -> dict
             raise RunnerRefused("finite execution authorizations are single-use; create a new command request")
         if current["status"] not in {"blocked", "cancelled"} or (current["run"] and not current["run"]["released_at"]):
             raise RunnerRefused("requeue requires a terminal attempt with its lease released")
+        # Requeue rewrites the result, which holds the ALONE marker: the
+        # member would rejoin its lead's bundle (sd:9269).
+        row = connection.execute("SELECT parent, result FROM assignment WHERE id = ?", (assignment,)).fetchone()
+        if row["parent"] is not None and (row["result"] or "").startswith(ALONE):
+            raise RunnerRefused("this bundle member was cancelled on its own; press Build on its item to build it fresh")
         connection.execute("UPDATE assignment SET status = 'queued', queued_at = ?, started = NULL, ended = NULL, result = ? WHERE id = ?",
                            (now(), f"requeued by {who}", assignment))
         return queue_state(connection, assignment)

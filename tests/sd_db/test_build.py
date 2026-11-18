@@ -1525,6 +1525,17 @@ class CancelParks(Case):
         self.assertNotIn(fresh[0]["id"], (lead, child))
         self.assertEqual(self.parked(items), [False, False], "an explicit build of the child unparks it")
 
+    def test_a_runner_requeue_refuses_a_member_cancelled_on_its_own(self):
+        """sd:9269: `runner.requeue` (the palette's requeue) rewrote the result and dropped the ALONE marker, so
+        the child rejoined its lead's bundle. It refuses instead and names the press that builds it fresh."""
+        items, lead, child, _ = self.requeued_bundle()
+        self.cancel(child)
+        state = runner.queue_state(self.db, child)
+        with self.assertRaisesRegex(runner.RunnerRefused, "cancelled on its own"):
+            runner.requeue(self.db, child, expected_revision=state["revision"], who="palette:1")
+        self.assertEqual(runner.queue_state(self.db, child)["status"], "cancelled")
+        self.assertEqual([member["id"] for member in build.run(self.db, self.claim()["id"])["members"]], [lead])
+
     def test_a_later_cancelled_run_does_not_bring_back_a_member_cancelled_on_its_own(self):
         """The class pass: the child cancelled while queued sits out the lead's next run; that run ends cancelled,
         and its Retry still leaves the child cancelled and parked."""

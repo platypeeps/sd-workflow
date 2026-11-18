@@ -41,6 +41,7 @@ from . import hub, paths, reads
 from .database import served_by, transaction
 from .errors import SdDbError
 from .runner import (
+    ALONE,
     IN_SESSION,
     OWNING,
     RUNNABLE_KINDS,
@@ -90,9 +91,6 @@ RETRIES = 1
 PARKED = "Parked: build run {run} ended blocked; Retry on the Builds panel unparks it"
 # The note on an item a cancelled run parked: auto-pickup takes unparked items only (sd:9222).
 CANCEL_PARKED = "Parked: build run {run} was cancelled; Unpark to build it again"
-# The result on a bundle member's row an operator cancelled on its own: it left the bundle, so no Retry of the
-# bundle queues it again or clears its park (review round 2 of sd:9222).
-ALONE = "cancelled on its own by "
 
 
 def _in_group(alias: str = "assignment") -> str:
