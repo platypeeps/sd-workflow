@@ -155,5 +155,20 @@ class KillpgSurvivesEperm(unittest.TestCase):
                 self.assertIs(_guarded(call, parents), want)
 
 
+class SignalGroupFallsBackToTheLeader(unittest.TestCase):
+    def test_a_refused_group_signal_reaches_the_leader(self):
+        """sd:9332 lane round: `signal_group` swallowed EPERM, so the lane's TERM and KILL went nowhere."""
+        import os
+        import signal
+        import sys
+        from unittest import mock
+        sys.path.insert(0, str(ROOT / "bin"))
+        import sd_lib
+        with mock.patch.object(os, "killpg", side_effect=PermissionError), \
+                mock.patch.object(os, "kill") as kill:
+            sd_lib.signal_group(4242, signal.SIGKILL)
+        kill.assert_called_once_with(4242, signal.SIGKILL)
+
+
 if __name__ == "__main__":
     unittest.main()

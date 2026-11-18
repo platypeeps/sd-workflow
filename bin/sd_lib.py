@@ -3955,8 +3955,14 @@ class ThreadGroups:
 
 
 def signal_group(pid: int, number: int) -> None:
-    with contextlib.suppress(ProcessLookupError, PermissionError):  # already gone
+    """Signal the group `pid` leads; a refusal EPERM (macOS for an exiting group, sd:7900) signals the leader alone (sd:8820)."""
+    try:
         os.killpg(pid, number)
+    except ProcessLookupError:  # already gone
+        pass
+    except PermissionError:
+        with contextlib.suppress(OSError):
+            os.kill(pid, number)
 
 
 def fill_slots(items: Any, slots: int, run: Callable[[Any], Any], counted: Callable[[Any], bool],
