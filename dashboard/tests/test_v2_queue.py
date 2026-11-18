@@ -1425,6 +1425,8 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         answers = {"/api/queue": [200, queue_screen.document(self.connection, now=NOW)],
                    "/api/queue/builds?show=all": [200, self.BUILDS], "/api/queue/runner": [200, self.RUNNER],
                    "/api/queue/move": [200, {"ok": True, "edits": "Edits take effect at the next item boundary."}],
+                   # sd:9258: a tasks read with no task; one not read leaves the parked box unknown, not 0.
+                   "/api/tasks": [200, {"rows": [], "ideas": []}],
                    **(answers or {})}
         after = (f"\nconst QDOCS = {json.dumps(answers)};\n"
                  "ANSWER = (p, b) => p === '/api/now' ? [200, DOC0] : QDOCS[p] || [404, { error: 'no answer' }];\n" + before)
@@ -1967,6 +1969,40 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         out = self.run_view(self.TILE + " R.repos = repos(); tile('solo', 'parked'); R.kids = kids();", answers=answers)
         self.assertIn("solo:false", out["R"]["repos"])
         self.assertEqual(out["R"]["kids"], ["parked"])
+
+    # sd:9258: review round 4 of sd:9247, four advisories.
+    def test_two_checkouts_with_one_name_each_get_their_own_parked_box(self):
+        self.parked_answers(self.checkout)
+        twin = self.checkout.parent / "elsewhere" / self.checkout.name
+        _, answers = self.parked_answers(twin)
+        out = self.run_view("R.html = ELS.queue.html; R.repos = repos();", answers=answers)
+        keys = [r.rsplit(":", 1)[0] for r in out["R"]["repos"]]
+        for path in (self.checkout, twin):
+            self.assertIn(str(path), keys)
+            self.assertIn('title="1 parked:', self.repo_detail(out["R"]["html"], re.escape(str(path)))[2], path)
+
+    def test_a_parked_task_with_no_repo_is_counted_and_never_adopted(self):
+        from sd_dashboard import tasks_screen
+        made = self.item("Loose", kind="task", priority=4)
+        self.connection.execute("UPDATE item SET parked_at = ? WHERE id = ?", (NOW, made))
+        answers = {"/api/tasks": [200, tasks_screen.document(self.connection, now=NOW)]}
+        out = self.run_view(f"R.tally = ELS['queue-tally'].html; R.adopted = OBJ.has('{made}');", answers=answers)
+        self.assertIn('<a href="/tasks?parked=1&amp;realm=all">1 parked</a>', out["R"]["tally"])
+        self.assertFalse(out["R"]["adopted"], "a parked task with no repo has no row, so no row object")
+
+    def test_a_failed_tasks_read_leaves_the_parked_box_unknown_not_zero(self):
+        out = self.run_view("R.html = ELS.queue.html;", answers={"/api/tasks": [502, {"error": "down"}]})
+        _, attrs, body = self.repo_detail(out["R"]["html"], "system")
+        self.assertTrue(attrs.endswith(', parked not read"'), attrs)
+        self.assertNotIn('title="0 parked', body)
+        self.assertRegex(body, r'data-tile="parked"[^>]* disabled><span class="pip" title="parked: tasks not read: down">▨</span>')
+
+    def test_an_open_repo_hides_its_parked_rows_when_the_show_filters_hide_the_rest(self):
+        # beta's one other row is a suggested one, hidden while Suggested is off (?show=).
+        made, answers = self.parked_answers(self.checkout.parent / "beta")
+        out = self.run_view("open('beta'); R.repos = repos(); R.kids = kids();", answers=answers)
+        self.assertIn("beta:true", out["R"]["repos"])
+        self.assertEqual(out["R"]["kids"], [], "parked rows show only when their box is pressed")
 
     def test_a_parked_row_has_its_actions_and_its_details(self):
         """Review of sd:9247: a parked row was never adopted, so its Act cell was blank and Details found nothing."""
