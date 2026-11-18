@@ -101,6 +101,15 @@ class TheRows(ScreenCase):
         rows = self.area()["rows"]
         self.assertEqual([(row["id"], row["state"]) for row in rows], [("stat:none", "unknown")])
 
+    def test_only_removed_services_mean_none_watched_and_no_row(self):
+        # Bundle review round 4: after the last service was removed, the
+        # area showed "No service status read yet" for good.
+        status(self.connection, "claude", timestamp="2026-09-06T11:00:00Z")
+        record_state(self.connection, "heartbeat", key="service-status:claude", timestamp="2026-09-06T11:50:00Z",
+                     body={"status": "removed"})
+        area = self.area()
+        self.assertEqual((area["rows"], area["extra"]["counts"]["unknown"]), ([], 0))
+
 
 class TheView(health_tests.Collectors, ScreenCase):
     run_doc, run_page = health_tests.TheScript.run_doc, health_tests.TheScript.run_page

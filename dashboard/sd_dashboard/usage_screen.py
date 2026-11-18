@@ -141,10 +141,20 @@ def _number(value) -> float | None:
         return None
 
 
+def _end(prefix: str) -> str:
+    return prefix[:-1] + chr(ord(prefix[-1]) + 1)
+
+
+def ever_read(connection: sqlite3.Connection, prefix: str) -> bool:
+    """Whether any heartbeat row under `prefix` exists, removed ones too: with none answering, all were removed."""
+    return connection.execute("SELECT 1 FROM state WHERE kind = 'heartbeat' AND key >= ? AND key < ? LIMIT 1",
+                              (prefix, _end(prefix))).fetchone() is not None
+
+
 def _newest(connection: sqlite3.Connection, prefix: str) -> dict[str, tuple[str, object]]:
     """The newest heartbeat row of each key under `prefix`, by name: `(timestamp, body)`. A removed entry is left out;
     a body that does not parse is None, which reads unknown."""
-    end = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+    end = _end(prefix)
     found = {}
     for key, stamp, body in connection.execute(
             "SELECT key, timestamp, body FROM state WHERE id IN (SELECT MAX(id) FROM state"
