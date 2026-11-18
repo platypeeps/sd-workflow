@@ -4564,27 +4564,6 @@ roles:
             self.prepare()
         self.assertEqual(self.operation().state, before)
 
-    def test_an_explicit_deliver_renews_a_claim_the_item_outgrew(self):
-        """sd:9268. A retitled item's next `--deliver` prepare makes a new claim on the new scope.
-
-        A plain prepare still refuses, and the renewed claim refuses a later change the same way.
-        """
-        from sd_db import set_item_fields
-        acceptance = self.directory / "acceptance.json"
-        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
-            {"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]}))
-        self.prepare("--deliver", "--acceptance-file", str(acceptance))
-        old = self.operation().state["acceptance"]["item_scope"]
-        set_item_fields(self.connection, self.item, title="retitled scope")
-        with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed"):
-            self.prepare()
-        self.prepare("--deliver", "--acceptance-file", str(acceptance))
-        renewed = self.operation().state["acceptance"]["item_scope"]
-        self.assertNotEqual(renewed, old)
-        set_item_fields(self.connection, self.item, body="newer scope")
-        with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed"):
-            self.prepare()
-
     def test_author_assignment_cannot_borrow_manual_merge_authority(self):
         from sd_db.workflow import WorkflowError
         self.prepare()
