@@ -12,7 +12,8 @@ are the same bytes. The Usage area that drew this month moved to Metrics' Spend 
 `service-status:<name>`, the newest row per key being the answer. A row `{"status": "removed"}` means the entry left its
 list, so it is not shown. A reading carries its own `read_at`; one older than `USAGE_STALE_MINUTES` (Usage) or
 `STATUS_STALE_MINUTES` (Health) is unknown, never its last numbers and never 0. A row that does not parse, or names a
-status the job does not write, is unknown too. Nothing here writes.
+status the job does not write, is unknown too. A Settings line with no row yet reads unknown, `NO_READING`, so a
+typo or a job that never ran shows (pack sd:9333). Nothing here writes.
 
 `parse_providers` and `parse_services` are the two lists' grammars, as system's `usage_sources.parse_providers` and
 `service_status.parse_services` read them, so Settings refuses a line the job would refuse.
@@ -48,6 +49,8 @@ RANK = {"warning": 0, "caution": 1, "unknown": 2, "ok": 3}
 PROVIDERS_LIST = "/settings#f-dashboard.usage_providers"
 SERVICES_LIST = "/settings#f-dashboard.status_services"
 USAGE_PREFIX, STATUS_PREFIX = "usage:", "service-status:"
+#: Why a listed entry with no row reads unknown (pack sd:9333): a typo or a job that never ran shows, not vanishes.
+NO_READING = "no reading yet: the job has written no row for it"
 
 
 def document(connection: sqlite3.Connection, *, now: str, month: str | None) -> str:
@@ -145,6 +148,14 @@ ever_read = usage.ever_read
 _newest = usage.newest_heartbeats
 
 
+def _listed(connection: sqlite3.Connection, key: str) -> str:
+    """A Settings list's text as Settings reads it, or "" when it holds none or was not read: then nothing is added."""
+    from . import places, setting_rows
+
+    found, _, problem = setting_rows.text(connection, key, places.REALMS_CONFIG.parent / setting_rows.LISTS[key][0])
+    return "" if problem else found or ""
+
+
 def _age(read_at: datetime | None, now: datetime) -> float | None:
     """Minutes since `read_at`; a time in the future reads as now."""
     return None if read_at is None else max(0.0, (now - read_at).total_seconds() / 60)
@@ -192,6 +203,12 @@ def services(connection: sqlite3.Connection, *, now: str) -> list[dict]:
                                   for one in incidents],
                     "components": [{"name": _text(one.get("name")), "status": _text(one.get("status"))}
                                    for one in components]})
+    read = {one["name"] for one in out}
+    for name, kind, url, providers in parse_services(_listed(connection, "dashboard.status_services"))[0]:
+        if name not in read:
+            out.append({"name": name, "status": "unknown", "why": NO_READING, "read_at": None, "row_at": None,
+                        "kind": kind, "url": url, "providers": providers, "indicator": "", "incidents": [],
+                        "components": []})
     return out
 
 
@@ -330,5 +347,9 @@ def strip(connection: sqlite3.Connection, *, now: str) -> dict:
                 why = "the reading carries no window, balance or spend"
         rows.append(_usage_row(f"usage:{name}", name, status=status, why=why, read_at=read_at, windows=windows,
                                balance=balance, spend=spend, flag=flag))
+    for name in parse_providers(_listed(connection, "dashboard.usage_providers"))[0]:
+        if name not in readings:
+            rows.append(_usage_row(f"usage:{name}", name, status="unknown", why=NO_READING, read_at=None, windows=[],
+                                   balance=None, spend=None, flag=_flag(by_provider.get(name, []))))
     return {"error": "", "rows": rows, "nosource": nosource, "flags_error": flags_error,
             "providers": PROVIDERS_LIST, "services": SERVICES_LIST}
