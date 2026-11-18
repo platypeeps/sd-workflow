@@ -1019,6 +1019,7 @@ def left_cited(connection: Any, branch: str, body: str, commits: list[tuple[str,
     """The items `body` and `commits` cite that the build bundle on `branch` left: each member the operator
     cancelled on its own (`build.left`). `cited_closes` leaves them open; enqueue lists them (sd:9222)."""
     import sd_ship_body  # noqa: PLC0415
+    sd_lib.import_sd_db()  # every caller holds an sd_db connection, so this finds it
     from sd_db import build  # noqa: PLC0415
     sources = sd_ship_body.cited_sources(body, commits, parents)
     return sorted(build.left(connection, branch, sources))
