@@ -329,7 +329,7 @@ def read_report(connection: sqlite3.Connection, item: int, gate: str, limit: int
     for one absent or outside the repository. A non-piece raises WorkflowError; any other read failure raises OSError:
     neither is a missing file."""
     row = connection.execute("SELECT * FROM item WHERE id = ?", (item,)).fetchone()
-    if row is None or row["kind"] != "idea" or not row["piece"]:
+    if row is None or row["kind"] != "idea" or row["piece"] is None:
         raise WorkflowError(f"item {item} is not a writing piece")
     candidate = _path(row["repo"], row["piece"], row["path"]).with_name(REPORTS[gate])
     try:
@@ -363,7 +363,7 @@ def list_pieces(connection: sqlite3.Connection, repo: str | None = None, *, incl
 
 def _piece(connection: sqlite3.Connection, item: int, expected: str | None = None) -> dict:
     state = _checked_state(connection, item, expected)
-    if state["item"]["kind"] != "idea" or not state["item"]["piece"]:
+    if state["item"]["kind"] != "idea" or state["item"]["piece"] is None:
         raise WorkflowError(f"item {item} is not a writing piece")
     return state
 
@@ -647,7 +647,7 @@ def promote(connection: sqlite3.Connection, item: int, *, slug: str | None = Non
             row = _checked_state(connection, item, expected_revision)["item"]
             if row["kind"] != "idea":
                 raise WorkflowError(f"item {item} is not an idea")
-            if row["piece"]:
+            if row["piece"] is not None:
                 raise WorkflowError(f"item {item} is already piece {row['piece']}")
             if row["status"] == "done":
                 raise WorkflowError(f"idea {item} is done; reopen it before promoting it")

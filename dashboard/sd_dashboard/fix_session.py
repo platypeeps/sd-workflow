@@ -194,7 +194,7 @@ def _noted(connection, item: int, who: str, status: int, answer: dict):
 
 def _grillable(row: dict, notes: list[dict], grill: str) -> None:
     """A grill step's item: a piece, and for `apply` no open question and one ruling; else `WorkflowError` saying why."""
-    if row["kind"] != "idea" or not row.get("piece"):
+    if row["kind"] != "idea" or row.get("piece") is None:
         raise workflow.WorkflowError(f"item {row['id']} is not a writing piece; Grill asks about a piece's draft")
     if grill != "apply":
         return
@@ -210,7 +210,7 @@ def _reviewed(connection, row: dict) -> None:
     `WorkflowError` naming its state: missing, unstamped or stale."""
     from sd_db import writing
 
-    if row["kind"] != "idea" or not row.get("piece"):
+    if row["kind"] != "idea" or row.get("piece") is None:
         raise workflow.WorkflowError(f"item {row['id']} is not a writing piece; Apply review applies a piece's review")
     report = writing.piece_state(connection, row["id"])["writing"]["gates"]["companions"].get("adversarial")
     if not report or report["state"] != "current":

@@ -81,7 +81,7 @@ def _status_control(connection, item_id, row, revision, statuses=None):
 def _unpark_control(item_id, row, revision):
     # sd:3007: the nightly prune parks an untouched P4 item; this brings it back. A writing piece revives
     # through its own control in `writing_controls`, which moves its file.
-    if not row["parked_at"] or row["piece"]:
+    if not row["parked_at"] or row["piece"] is not None:
         return Markup("")
     return tag("section", tag("h2", "Parked"),
         tag("p", f"Parked {row['parked_at'][:10]}: this item is off Today and the task lists. "
@@ -224,7 +224,7 @@ def progress_controls(connection, item_id):
 
 
 def writing_controls(connection, row, *, state=None):
-    if row["kind"] != "idea" or not row["piece"]:
+    if row["kind"] != "idea" or row["piece"] is None:
         return Markup("")
     from sd_db import writing
 
