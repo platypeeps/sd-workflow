@@ -4566,6 +4566,35 @@ roles:
         with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed"):
             self.prepare()
 
+    def test_a_lane_prepare_never_renews_a_claim_the_item_outgrew(self):
+        """sd:9335. The lane passes the enqueue's `--deliver` and acceptance text to every prepare, retries
+        included, so a lane prepare after a retitle refuses; a prepare by hand renews and says so."""
+        from sd_db import set_item_fields
+        sd_lane = ship.sd_lane
+        acceptance = self.directory / "acceptance.json"
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        old = self.operation().state["acceptance"]["item_scope"]
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        # The runner's mark on the entry it runs: `running`, its host and pid; it starts sd-ship as its child.
+        entry = {"id": "e1", "position": 1, "item": self.item, "status": "running", "step": "prepare",
+                 "holder": {"host": sd_lane.this_host(), "pid": os.getppid(), "token": "t"}}
+        sd_lane.store(self.connection, ship.slug(REMOTE_URL), entry)
+        self.connection.commit()
+        with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed.*by hand"):
+            self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        self.assertEqual(self.operation().state["acceptance"]["item_scope"], old)
+        sd_lane.store(self.connection, ship.slug(REMOTE_URL), {**entry, "status": "failed"})
+        self.connection.commit()
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        renewed = self.operation().state["acceptance"]["item_scope"]
+        self.assertNotEqual(renewed, old)
+        self.assertIn(f"renews the delivery claim of sd:{self.item}: item scope {old[:12]} is now {renewed[:12]}",
+                      stderr.getvalue())
+
     def test_author_assignment_cannot_borrow_manual_merge_authority(self):
         from sd_db.workflow import WorkflowError
         self.prepare()
