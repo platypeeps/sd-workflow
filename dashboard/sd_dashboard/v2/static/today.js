@@ -82,6 +82,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   function facts(r) {
     const f = { Detail: r.detail, Source: SRC[r.source]?.[0] || r.source, Band: `${STATE[r.band]} · rank ${r.rank}`, Id: r.id };
     if (r.retry) f['Retry line'] = r.retry;
+    if (r.cli) f.Command = r.cli; // sd:9316: Why · next step stays one plain line; its command shows here
     return f;
   }
 
