@@ -894,6 +894,40 @@ class Supervise(Case):
         self.assertIn("3 review rounds left blockers: work.txt:1 a blocker", self.latest()["detail"])
         self.assertEqual(len(self.calls("sd-review")), 3)
 
+    def asked_and_resolved(self, item):
+        """A question on `item` the operator closed with `sd note resolve`: it waits on no one, but it is still
+        the evidence that the builder skipped the item (review round 3 of sd:9219)."""
+        resolve_note(self.db, add_note(self.db, item, "question", "Which option?\nOption: Yes (Recommended)\nOption: No"))
+
+    def test_a_resolved_question_still_skips_the_class_pass(self):
+        """Class pass, instance `blocked_round`: the skipped item is still skipped, so no class pass fixes it."""
+        self.press()
+        self.plan(claude=["pass", "fix1", "fix2", "fix3"], sd_review=["blocking"] * 4)
+        self.asked_and_resolved(self.items[0])
+        self.supervisor().run()
+        self.assertEqual(len(self.calls("sd-review")), 3)
+
+    def test_a_resolved_question_still_keeps_an_older_trailer_from_delivering(self):
+        """Class pass, instance `enqueue` delivery: an older run's `Closes:` trailer cites the item, but this
+        run's builder skipped it with a question since resolved; the merge must not close it."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.asked_and_resolved(self.items[0])
+        ended = self.supervisor().run()
+        self.assertEqual(ended["outcome"], "blocked")
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+
+    def test_a_resolved_question_still_blocks_a_skipped_member(self):
+        """Class pass, instance `build.enqueued`: a member skipped with a question since resolved stays blocked
+        for the operator, not returned to planning as one skipped with no word."""
+        self.press(2)
+        self.write_pr()
+        self.plan(claude=["skip"], sd_review=["clean"])
+        self.asked_and_resolved(self.items[1])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        self.assertEqual(self.statuses(), ["in_progress", "blocked"])
+
     def test_a_fix_then_a_clean_review_enqueues(self):
         self.press()
         self.write_pr()

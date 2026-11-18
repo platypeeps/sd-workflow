@@ -1625,7 +1625,7 @@ class Supervisor:
             # commit on purpose: the run waits on the answers (sd:9219).
             items = [self.lead, *self.others]
             if problem.startswith("the builder left no commit") and all(
-                    build.open_question(self.db, [item], self.row["created_at"]) for item in items):
+                    build.open_question(self.db, [item], self.row["created_at"], pending=True) for item in items):
                 problem = f"{build.ASKED}{', '.join(f'sd:{item}' for item in sorted(items))}"
             return self.finish("blocked", problem) if problem else then
         if verdict["state"] == "denied":

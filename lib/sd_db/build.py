@@ -1327,15 +1327,20 @@ def _contribution_pull(connection, items: list[int]) -> str:
     return ""
 
 
-def open_question(connection, items: list[int], since: str) -> dict | None:
-    """The first `question` note on `items` since `since` that is unresolved and that no `Ruling on note #<n>:`
-    decision answers: one closed with `sd note resolve` asks nothing (review round 2 of sd:9219)."""
+def open_question(connection, items: list[int], since: str, *, pending: bool = False) -> dict | None:
+    """The first `question` note on `items` since `since` that no `Ruling on note #<n>:` decision answers.
+
+    Two readers ask two things (review round 3 of sd:9219). By default it is
+    the evidence that the builder skipped an item, which delivery and the
+    class pass read: `sd note resolve` closes the note, not the skip.
+    `pending` asks whether the question still waits on the operator, as the
+    run's wait and the `ASKED` block read: a resolved one waits on no one."""
     if not items:
         return None
     marks = ", ".join("?" for _ in items)
     row = connection.execute(
         f"SELECT asked.id, asked.item FROM note asked WHERE asked.kind = 'question' AND asked.item IN ({marks}) "
-        f"AND asked.timestamp >= ? AND asked.resolved_at IS NULL AND NOT EXISTS (SELECT 1 FROM note ruling WHERE ruling.item = asked.item "
+        f"AND asked.timestamp >= ? {'AND asked.resolved_at IS NULL' if pending else ''} AND NOT EXISTS (SELECT 1 FROM note ruling WHERE ruling.item = asked.item "
         f"AND ruling.kind = 'decision' AND ruling.body LIKE 'Ruling on note #' || asked.id || ':%') "
         f"ORDER BY asked.id LIMIT 1", (*items, since)).fetchone()
     return dict(row) if row else None
