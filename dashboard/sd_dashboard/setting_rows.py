@@ -39,6 +39,9 @@ LISTS = {
     "dashboard.disk_storage": ("disk.conf", "The storage folders Health's Disk view sizes, "
                                "folder by folder: the place for large uncommitted data. One storage|<path> line each "
                                "(~ and $HOME expand)."),
+    "dashboard.status_services": ("status-services.conf", "The services Health's Status view and the Usage flags watch "
+                                  "(system sd:9259): one <name> <kind> <url> [provider,provider] line each; kinds "
+                                  "statuspage, slack, google-incidents, http."),
 }
 
 

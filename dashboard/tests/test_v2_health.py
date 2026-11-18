@@ -302,9 +302,9 @@ class TheDocument(Collectors, ScreenCase):
         self.assertEqual([(a["id"], a["read"]) for a in areas],
                          [("disk", True), ("cred", True), ("wt", True),
                           ("br", True), ("dep", True), ("sec", True), ("ports", True), ("prot", True), ("svc", True),
-                          ("ctr", True), ("mir", True), ("doc", True), ("aws", True)])
+                          ("ctr", True), ("mir", True), ("doc", True), ("aws", True), ("stat", True)])
         for area in areas:
-            if area["id"] not in ("wt", "br", "ports", "prot", "svc", "ctr", "cred", "dep", "sec", "mir", "doc", "aws"):
+            if area["id"] not in ("wt", "br", "ports", "prot", "svc", "ctr", "cred", "dep", "sec", "mir", "doc", "aws", "stat"):
                 self.assertTrue(area["missing"], f"{area['id']} names nothing it does not read")
             if not area["read"]:
                 self.assertEqual((area["rows"], area["error"], area["source"]), ([], "", None))
@@ -1231,7 +1231,7 @@ class TheDocument(Collectors, ScreenCase):
         doc = self.doc(fleet=slow(fleet_of(TREES)), ports=slow(ports_snapshot),
                        disk=slow(scan_of(DISK)), branches=slow(scan_of(BRANCHES)))
         self.assertEqual([(area["id"], area["error"], bool(area["rows"])) for area in doc["areas"] if area["read"]],
-                         [(key, "", True) for key in ("disk", "cred", "wt", "br", "dep", "sec", "ports", "prot", "svc", "ctr", "mir", "doc", "aws")])
+                         [(key, "", True) for key in ("disk", "cred", "wt", "br", "dep", "sec", "ports", "prot", "svc", "ctr", "mir", "doc", "aws", "stat")])
 
     def test_a_reader_past_the_page_budget_is_its_area_error_and_the_page_does_not_wait(self):
         # The reader answers only once the page has returned, so a page that
@@ -1552,7 +1552,7 @@ class TheViews(Collectors, ScreenCase):
         self.assertEqual(lamps["wt"]["error"], f"being read since {NOW}; read Health again for its answer")
         self.assertEqual(lamps["svc"]["error"], "not read since the dashboard started; the Machine view reads it")
         self.assertEqual(set(found["attention"]), {"state", "n", "what"})
-        self.assertEqual([view["id"] for view in found["views"]], ["checkouts", "machine", "github", "jobs"])
+        self.assertEqual([view["id"] for view in found["views"]], ["checkouts", "machine", "github", "jobs", "status"])
         # A lamp counts the rows that want you; an area not read has no count, so its view has none either.
         prot = next(area for area in health_screen.part(self.connection, "github", now=NOW, **self.seams())["areas"] if area["id"] == "prot")
         wanting = sum(row["state"] in ("warning", "caution", "unknown") for row in prot["rows"])
@@ -1757,7 +1757,7 @@ window.shell.state = (s, at) => { OUT.states.push(s); (OUT.slots = OUT.slots || 
 
 SNOOZED_TYPES = ("check", "doctor check", "storage folder", "build output", "volume", "worktree registrations", "unread registrations",
                  "merged branches", "merged worktrees", "port", "branch protection", "dependabot alerts", "secret scanning", "credential", "service",
-                 "dashboard service", "launch agent", "vault mirror")
+                 "dashboard service", "launch agent", "vault mirror", "service status")
 
 
 def summary_of(doc):
@@ -1853,6 +1853,7 @@ class TheScript(Collectors, ScreenCase):
             ["secret scanning.review", "secret scanning", "safe", "o", False, False],
             ["credential.probe", "credential", "safe", "r", True, False],
             ["credential.signin", "credential", "safe", "i", True, False],
+            ["service status.open", "service status", "safe", "o", False, False],
         ] + [[f"{t}.snooze", t, "undo", "z", None, True] for t in SNOOZED_TYPES]
           + [[f"{t}.ignore", t, "undo", "h", None, True] for t in SNOOZED_TYPES]
           + [["snoozed row.unsnooze", "snoozed row", "undo", "s", None, True],
@@ -1928,7 +1929,7 @@ shellRun(c, o); await flush();""", doc, view="github")
         self.assertEqual(re.findall(r'<section class="area" id="a-(\w+)"', areas), ["wt", "br"])
         self.assertNotIn("<b>Not read here:</b>", areas)
         self.assertIn('data-id="gone:group/alpha"', areas)
-        self.assertIn("4 views · 1 warning row wants you · read", out["R"]["sub"])
+        self.assertIn("5 views · 1 warning row wants you · read", out["R"]["sub"])
         self.assertEqual(out["attention"][-1], {"state": "warning", "n": 1, "what": "findings want you"})
         self.assertIsNone(out["states"][-1])
         jobs = self.run_page("R.areas = BODY().html;", doc, view="jobs")["R"]["areas"]

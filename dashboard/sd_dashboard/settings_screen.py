@@ -152,6 +152,7 @@ def _list(key: str):
         home_map,
         places,
         reports_screen,
+        usage_screen,
     )
 
     return {"dashboard.realms": (places.REALMS_CONFIG, lambda text: places.parse_realms(text)[1]),
@@ -159,7 +160,10 @@ def _list(key: str):
             "dashboard.hoa_thresholds": (hoa_screen.THRESHOLDS, hoa_screen.parse_thresholds),
             "dashboard.home_map": (home_map.state_dir() / "home-map.conf", lambda text: home_map.parse(text)[1]),
             "dashboard.koi_water": (home_map.state_dir() / "koi-water.conf", lambda text: home_koi.parse(text)[1]),
-            "dashboard.disk_storage": (health_collectors._storage_config(), lambda text: health_collectors.parse_storage(text)[1])}[key]
+            "dashboard.disk_storage": (health_collectors._storage_config(), lambda text: health_collectors.parse_storage(text)[1]),
+            # pack sd:9260: system's agent-meter reads it; no old file ever held it.
+            "dashboard.status_services": (places.REALMS_CONFIG.parent / "status-services.conf",
+                                          lambda text: usage_screen.parse_services(text)[1])}[key]
 
 
 def rows(connection) -> dict:
