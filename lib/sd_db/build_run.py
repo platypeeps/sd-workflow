@@ -1303,6 +1303,7 @@ class Supervisor:
         if not delivered and asked:
             return self.finish("blocked", f"every cited item has an open question since the run started: "
                                           f"{', '.join(f'sd:{item}' for item in asked)}")
+        # A member the operator cancelled on its own needs no line: the lane reads it from data (`build.left`).
         if asked:
             # The lane closes every open item a branch trailer cites; a `Refs:` line keeps these open.
             refs = f"Refs: {' '.join(f'sd:{item}' for item in asked)}"

@@ -115,7 +115,7 @@ WHO = {("prepared", None): "operator", ("skipped", None): "builder", ("failed", 
 #: The refusal codes of the verbs the page runs that wrote nothing: a stale check, or a definite answer before the write.
 #: Not `hub_unavailable` (a write may have landed) or `publish_unknown` (origin may have moved): those are unknown.
 REFUSED = ("stale_revision", "stale_head", "stale_claim", "holder_alive", "head_gone", "branch_diverged", "default_branch",
-           "head_moved", "superseded", "already_merged", "handed_back")
+           "head_moved", "superseded", "already_merged", "handed_back", "member_cancelled_alone")
 #: Read again's pull-request check (sd:8375): how many items, how long, and the requests one pull read may spend
 #: (its detail twice, reviews, two comment lists, the timeline and two CI reads, with paging room).
 PR_CHECK_ITEMS = 20
