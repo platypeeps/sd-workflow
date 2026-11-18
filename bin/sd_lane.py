@@ -4522,9 +4522,12 @@ def arm_term(delay: float | None, grace: float | None = None) -> None:
 
         def signal_self(number: int) -> None:
             if leads:
-                os.killpg(os.getpid(), number)
-            else:
-                os.kill(os.getpid(), number)
+                try:
+                    os.killpg(os.getpid(), number)
+                    return
+                except PermissionError:  # a member macOS will not signal: still end this process
+                    pass
+            os.kill(os.getpid(), number)
         if fired:
             signal_self(signal.SIGKILL)
         fired.append(True)
