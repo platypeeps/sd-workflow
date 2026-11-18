@@ -984,11 +984,15 @@ class LineBudgetTests(unittest.TestCase):
         # 4741 -> 4755 is pack sd:9270 bundle review round 3: `bin/sd-review`
         # +14 so a verification keeps a confirmed blocker and read-only
         # readers may cite the lines they read. Measured: 2785 on this tree.
+        #
+        # 4755 -> 4766 is pack sd:9270 bundle review round 4: `bin/sd-review`
+        # +11 for `blocker_key` (path and folded summary) and the rebuttal
+        # and verify prompts. Measured: 2796 on this tree.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4755,
+            4766,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

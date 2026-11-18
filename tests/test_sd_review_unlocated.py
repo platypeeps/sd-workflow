@@ -89,6 +89,19 @@ class AnAnswerThatCitesNothingReviewedIsNotAdvice(ReviewRunFixture):
         self.assertEqual(result["status"], "blocking")
         self.assertEqual(sorted(f["summary"] for f in result["findings"]), ["located advice", "unlocated blocker"])
 
+    def test_a_failed_answers_unlocated_blocker_without_evidence_posts_as_advice(self) -> None:
+        """pack sd:9270 round 4: severity, not `dispose`, keeps an unlocated
+        blocker; with no evidence it posts as advisory with the note."""
+        bare = dict(row("/", "high", "unlocated blocker"))
+        del bare["evidence"]
+        failed = sd_review.Completed(0, json.dumps({"findings": [row("src.py", "low", "located advice"), bare],
+                                                    "extra": 1}), "")
+        result = self.review_with({"codex": failed})
+        kept = {f["summary"]: f["disposition"] for f in result["findings"]}
+        self.assertEqual(kept, {"located advice": "advisory",
+                                f"unlocated blocker {sd_review.NO_CHECK_NOTE}": "advisory"})
+        self.assertEqual(result["status"], "advisory")
+
     def test_a_sighted_answer_keeps_every_finding(self) -> None:
         """Guard: one located finding keeps the answer whole, including a
         finding about a caller outside the diff."""
