@@ -209,6 +209,10 @@ class TheAssets(BrowserSession):
                         "no rule puts .via on its own line outside .active")
 
 
+    def test_a_rows_command_shows_in_details_not_in_its_line(self):
+        """sd:9316: Why · next step is one plain line; a row's `cli` is a Details fact."""
+        self.assertIn("if (r.cli) f.Command = r.cli;", TODAY_JS)
+
     def test_the_queue_table_carries_its_caption(self):
         """pack sd:6975: a table says in one line what it holds; pack sd:7234: the Queue view has one table."""
         section = re.search(r'<section id="view-queue" aria-labelledby="queue-h" hidden>(.*?)</section>',

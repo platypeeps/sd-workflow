@@ -5596,7 +5596,8 @@ class HostedParallel(Lane):
 
     def slots(self, *, free: bool) -> None:
         import sd_gate_slots
-        found = {"slots": 1, "holders": [] if free else [{"slot": 1}], "waiters": []}
+        lanes = [] if free else [{"state": "holding", "slot": 1, "pid": 1, "label": "lane", "cwd": "", "since": ""}]
+        found = {"slots": 1, "holders": [] if free else [{"slot": 1}], "waiters": [], "lane_gates": lanes}
         patcher = mock.patch.object(sd_gate_slots, "machine_snapshot", lambda environ: found)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -5699,6 +5700,19 @@ class HostedParallel(Lane):
         import sd_gate_slots
         with mock.patch.object(sd_gate_slots, "machine_snapshot", lambda environ: "no gate directory"):
             self.assertIn("cannot read the gate slots", sd_lane.lane_room(self.environ))
+
+    def test_builder_gates_leave_room_for_a_second_lane(self) -> None:
+        """Builder test runs hold every slot and queue more: only lane gates count against the slots (sd:9331)."""
+        import sd_gate_slots
+        builders = [{"slot": slot} for slot in (1, 2)]
+        found = {"slots": 2, "holders": builders, "waiters": [{"place": 1}], "lane_gates": []}
+        with mock.patch.object(sd_gate_slots, "machine_snapshot", lambda environ: found), \
+                mock.patch.object(sd_lane, "load_stop", lambda environ: None):
+            self.assertIsNone(sd_lane.lane_room(self.environ))
+            found["lane_gates"] = [{"state": "holding", "slot": 1}, {"state": "waiting", "place": 1}]
+            self.assertIn("2 lane gates", sd_lane.lane_room(self.environ))
+            found["lane_gates"] = [{"state": "unknown", "reason": "cannot read slot.1.lane"}]
+            self.assertIn("cannot read slot.1.lane", sd_lane.lane_room(self.environ))
 
     def hold_elsewhere(self, checkout: pathlib.Path) -> subprocess.Popen[bytes]:
         """A process in a group of its own that holds `checkout`'s runner lock, as a handed-off lane child does."""

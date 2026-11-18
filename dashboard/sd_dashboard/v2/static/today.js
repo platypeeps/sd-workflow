@@ -82,6 +82,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   function facts(r) {
     const f = { Detail: r.detail, Source: SRC[r.source]?.[0] || r.source, Band: `${STATE[r.band]} · rank ${r.rank}`, Id: r.id };
     if (r.retry) f['Retry line'] = r.retry;
+    if (r.cli) f.Command = r.cli; // sd:9316: Why · next step stays one plain line; its command shows here
     return f;
   }
 
@@ -198,7 +199,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // What each lamp counts and what a press does (pack sd:7383): its title, then the lamp's own detail on a second line.
   const HELP = {
     jobs: 'Failed scheduled jobs. Press to list them in Needs you.',
-    lane: 'Lane entries blocked until someone acts; merging, next and flaky heads (a gate that failed, then passed at one head) are counted under it. Press to list them in Needs you.',
+    lane: 'Lane entries stuck until someone acts; merging, next and flaky heads (a gate that failed, then passed at one head) are counted under it. Press to list them in Needs you.',
     reports: 'Open job alerts and reports. Press to list them in Needs you.',
     pulls: 'Pull requests waiting on you. Press to list them in Needs you.',
     mail: 'Mail waiting for you. Press to list it in Needs you.',
@@ -223,7 +224,10 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       // sd:2014: interrupted, unloaded and unknown jobs are rows too; the lamp counts the failed ones and names the rest.
       const failed = rows.filter(r => r.state === 'failed').length, other = rows.length - failed;
       put(val, s === 'jobs' ? html`<b>${failed}</b> failed${other ? html`<small>${other} other</small>` : ''}`
-        : s === 'lane' ? html`<b>${n('lane')}</b> blocked<small>${L.merging ?? 0} merging · ${L.next ?? 0} next${flaky(rows) ? ` · ${flaky(rows)} flaky` : ''}${L.unread ? ` · ${L.unread} not read` : ''}</small>`
+        // sd:9313: the headline is why the lamp is lit (stuck entries, else flaky heads); "blocked" is the Queue's word.
+        : s === 'lane' ? (n('lane') || !flaky(rows)
+          ? html`<b>${n('lane')}</b> stuck<small>${L.merging ?? 0} merging · ${L.next ?? 0} next${flaky(rows) ? ` · ${flaky(rows)} flaky` : ''}${L.unread ? ` · ${L.unread} not read` : ''}</small>`
+          : html`<b>${flaky(rows)}</b> flaky<small>0 stuck · ${L.merging ?? 0} merging · ${L.next ?? 0} next${L.unread ? ` · ${L.unread} not read` : ''}</small>`)
         : s === 'reports' ? html`<b>${rows.length}</b> open${DOC.problems_more ? html`<small>${DOC.problems_more}${DOC.problems_capped ? '+' : ''} more on Reports</small>` : ''}`
         : s === 'pulls' ? html`<b>${rows.length}</b> for you`
         : s === 'mail' ? html`<b>${rows.length}</b> waiting${DOC.mail_more || unread.length ? html`<small>${DOC.mail_more ? `${DOC.mail_more} more in Gmail` : ''}${DOC.mail_more && unread.length ? ' · ' : ''}${unread.length ? `${plural(unread.length, 'repo')} not read` : ''}</small>` : ''}`
@@ -348,7 +352,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // blocked or cancelled bundle's Retry and Send to builder post /api/queue/builds/retry (pack sd:6020). The view reads its
   // three documents when it first shows and on each Today read after; a source that was not read is said under the table.
   const QTYPES = ['working', 'merging', 'next', 'blocked', 'suggested', 'open', 'ended', 'parked'], QSHOW = ['suggested', 'open', 'ended', 'parked'], NEXT = 9;
-  const BOXES = ['merging', 'review', 'working', 'next', 'blocked', 'suggested', 'parked']; // a repo row's boxes, left to right (pack sd:7470, sd:8083, sd:8137, sd:9247)
+  const BOXES = ['merging', 'review', 'working', 'next', 'blocked', 'suggested', 'parked']; // a repo row's boxes, left to right (pack sd:7470, sd:8083, sd:8137, sd:9247); today.html's Detail head names them in this order (sd:9315)
   const QV = { lanes: null, lanesErr: '', built: null, builtErr: '', runner: null, runnerErr: '', tasks: null, tasksErr: '', seen: false, busy: false };
   const QOTHER = new Map(); // the lane entries, selectable as Today's other rows are
   const qShow = new Set();
