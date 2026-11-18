@@ -435,7 +435,12 @@ class Runner(Lane):
         sd_lane.enqueue_entry(self.feature, 3, "fix: three", self.body, self.environ, manual=True, claim="deliver")
         self.answers[(3, "prepare")] = {"ok": False, "phase": "review_blocked", "error": "a blocking finding"}
         sd_lane.run_lane(self.repo, self.environ, self.ship)
-        sd_lane.update(self.store(), lambda rows: rows[-1].update(body=None))
+        # A saved branch that is no text names no branch either (review round 6 of pack sd:9222).
+        kept = self.entries()[-1]["branch"]
+        sd_lane.update(self.store(), lambda rows: rows[-1].update(branch=[kept]))
+        with self.assertRaisesRegex(sd_lane.LaneError, "names no branch"):
+            sd_lane.retry(self.repo, 3, self.environ)
+        sd_lane.update(self.store(), lambda rows: rows[-1].update(branch=kept, body=None))
         with self.assertRaisesRegex(sd_lane.LaneError, "--body-file"):
             sd_lane.retry(self.repo, 3, self.environ)
         self.assertEqual([row["status"] for row in self.entries()], ["merged", "cancelled", "failed"])
@@ -3078,6 +3083,191 @@ class CitedCloses(SharedQueue):
     def test_an_associate_only_claim_closes_nothing_it_cites(self) -> None:
         entry = self.enqueue("Words.\n", f"fix: the slice\n\nCloses: sd:{self.open[0]}", claim="associate-only")
         self.assertEqual(entry["closes"], [])
+
+    def bundle(self, lead: int, *members: int) -> tuple[str, list[int]]:
+        """A build bundle `lead` leads with `members`, queued, and its run; its branch, the lane entry's own record
+        of the bundle, and each assignment, the lead's first (pack sd:9222)."""
+        import sd_db
+        from sd_db import build
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            head, *rest = (sd_db.create_assignment(connection, item=item, role="author", status="queued",
+                                                   lane="parallel") for item in (lead, *members))
+            for ident in (head, *rest):
+                connection.execute("UPDATE assignment SET scope = ?, parent = ? WHERE id = ?",
+                                   (build.SCOPE, None if ident == head else head, ident))
+            connection.execute(
+                "INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, "
+                "created_at, updated_at) VALUES (?, ?, 1, ?, ?, 'fixture', '/w', '/w', ?, ?)",
+                (f"run-{head}", head, str(self.repo), build.branch(head), "2026-11-17T00:00:00+00:00",
+                 "2026-11-17T00:00:00+00:00"))
+            connection.commit()
+            return build.branch(head), [head, *rest]
+        finally:
+            connection.close()
+
+    def cancel_alone(self, assignment: int) -> None:
+        """The operator's Cancel of one bundle member, on its own."""
+        import sd_db
+        from sd_db import operations
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            state = operations.assignment_state(connection, assignment)
+            operations.cancel_assignment(connection, assignment, expected_revision=state["revision"], who="operator")
+        finally:
+            connection.close()
+
+    def cancelled_alone(self, lead: int, alone: int, *others: int) -> str:
+        """A bundle `lead` leads with `alone` and `others`, `alone` cancelled on its own; its branch."""
+        branch, (_, child, *_rest) = self.bundle(lead, alone, *others)
+        self.cancel_alone(child)
+        return branch
+
+    def enqueue_on(self, branch: str, item: int, title: str, body: str, *subjects: str) -> dict:
+        tree, _ = self.committed(branch, *subjects)
+        self.body.write_text(body, encoding="utf-8")
+        return sd_lane.enqueue_entry(tree, item, title, self.body, self.environ, claim="deliver")
+
+    def test_a_member_cancelled_alone_is_no_cited_close_of_its_bundle(self) -> None:
+        """Review round 4 of pack sd:9222: data, not text, keeps the member open. An older run's trailer and a
+        review fix line cite it, with no `Refs:` line, and the bundle's entry still leaves it open."""
+        a, b, *_ = self.open
+        branch = self.cancelled_alone(self.own, a)
+        entry = self.enqueue_on(branch, self.own, "fix: a slice",
+                                f"## Summary\n\nWords.\n\nLane review fix, pack sd:{a}: x.\n",
+                                f"fix(lane): the slice\n\nCloses: sd:{a}\nCloses: sd:{b}")
+        self.assertEqual(entry["closes"], [b])
+
+    def test_a_member_cancelled_alone_is_not_demanded_by_title_or_summary(self) -> None:
+        """Review round 4 of pack sd:9222: a retry reverted the closing commit, yet the title and a Summary
+        heading still name the member; the bundle's entry queues without it."""
+        a = self.open[0]
+        branch = self.cancelled_alone(self.own, a)
+        entry = self.enqueue_on(branch, self.own, f"fix: sd:{self.own} and sd:{a}",
+                                f"## Summary\n\n- pack sd:{self.own}: the lead\n- pack sd:{a}: the member\n",
+                                f"fix(lane): the slice\n\nCloses: sd:{self.own}")
+        self.assertEqual((entry["status"], entry["closes"]), ("pending", []))
+
+    def test_a_retry_that_skips_the_lead_still_leaves_the_lone_member_open(self) -> None:
+        """Review round 5 of pack sd:9222: a retry that delivers no lead (no trailer, or a question holds it)
+        enqueues under a member. The bundle is the entry's branch, not its item: the sibling cancelled alone is
+        neither closed by an old trailer nor demanded by the title."""
+        a, *_, lead = self.open
+        branch = self.cancelled_alone(lead, a, self.own)
+        entry = self.enqueue_on(branch, self.own, f"fix: sd:{self.own} and sd:{a}", "## Summary\n\nWords.\n",
+                                f"fix(lane): the slice\n\nCloses: sd:{self.own}\nCloses: sd:{a}")
+        self.assertEqual((entry["status"], entry["closes"]), ("pending", []))
+
+    def test_a_fresh_build_of_the_lone_member_keeps_it_open_on_the_old_bundle(self) -> None:
+        """Review round 5 of pack sd:9222: the operator presses the detached member again while the old bundle
+        retries. Its newer assignment does not hide the cancel from the old bundle's entry."""
+        import sd_db
+        from sd_db import build
+        a = self.open[0]
+        branch = self.cancelled_alone(self.own, a)
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            fresh = sd_db.create_assignment(connection, item=a, role="author", status="queued", lane="parallel")
+            connection.execute("UPDATE assignment SET scope = ? WHERE id = ?", (build.SCOPE, fresh))
+            connection.commit()
+        finally:
+            connection.close()
+        entry = self.enqueue_on(branch, self.own, "fix: a slice", "## Summary\n\nWords.\n",
+                                f"fix(lane): the slice\n\nCloses: sd:{self.own}\nCloses: sd:{a}")
+        self.assertEqual(entry["closes"], [])
+
+    def test_enqueue_refuses_a_member_cancelled_alone_as_its_item_or_an_extra_item(self) -> None:
+        """Review round 6 of pack sd:9222: an entry on the bundle's branch may not claim, or name with --item,
+        a member the operator cancelled on its own; the refusal names it and queues nothing."""
+        a, b, *_ = self.open
+        branch = self.cancelled_alone(self.own, a)
+        tree, _ = self.committed(branch, f"fix(lane): the slice\n\nCloses: sd:{self.own}")
+        self.body.write_text("## Summary\n\nWords.\n", encoding="utf-8")
+        for item, closes in ((a, ()), (self.own, (b, a))):
+            with self.subTest(item=item):
+                with self.assertRaises(sd_lane.LaneError) as refused:
+                    sd_lane.enqueue_entry(tree, item, "fix: a slice", self.body, self.environ, claim="deliver",
+                                          closes=closes)
+                self.assertEqual(refused.exception.code, "member_cancelled_alone")
+                self.assertIn(f"sd:{a} was cancelled on its own", str(refused.exception))
+        self.assertEqual(self.rows(), [])
+
+    def test_a_dropped_citation_of_a_lone_member_is_listed_in_the_body(self) -> None:
+        """Review round 6 of pack sd:9222: the citation the bundle's entry leaves open is visible, on the entry
+        and in the body a reader sees."""
+        a, b, *_ = self.open
+        branch = self.cancelled_alone(self.own, a)
+        entry = self.enqueue_on(branch, self.own, "fix: a slice", "## Summary\n\nWords.\n",
+                                f"fix(lane): the slice\n\nCloses: sd:{a}\nCloses: sd:{b}")
+        self.assertEqual((entry["closes"], entry["left_open"]), ([b], [a]))
+        self.assertIn(f"## Left open\n\n- sd:{a}: cancelled on its own out of this build\n", entry["body"])
+
+    def test_retry_refuses_a_saved_close_of_a_member_cancelled_since(self) -> None:
+        """Review round 6 of pack sd:9222: retry copied the saved closes and citations, so a member cancelled on
+        its own after the enqueue still closed. It refuses, naming the member: enqueue again reads it afresh."""
+        a = self.open[0]
+        branch, (_, child) = self.bundle(self.own, a)
+        entry = self.enqueue_on(branch, self.own, "fix: a slice", "## Summary\n\nWords.\n",
+                                f"fix(lane): the slice\n\nCloses: sd:{self.own}\nCloses: sd:{a}")
+        self.assertEqual(entry["closes"], [a])
+        self.answers[(self.own, "prepare")] = {"ok": False, "phase": "review_blocked", "error": "a finding"}
+        sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.cancel_alone(child)
+        before = len(self.entries())
+        with self.assertRaises(sd_lane.LaneError) as refused:
+            sd_lane.retry(self.repo, self.own, self.environ)
+        self.assertEqual(refused.exception.code, "member_cancelled_alone")
+        self.assertIn(f"sd:{a} was cancelled on its own", str(refused.exception))
+        self.assertEqual(len(self.entries()), before)
+
+    def test_the_runner_stops_an_entry_whose_member_was_cancelled_after_enqueue(self) -> None:
+        """Review round 7 of pack sd:9222: the runner passed the saved closes to prepare and merge unchecked, so a
+        member cancelled after the enqueue still closed. It checks again before prepare and before merge; the entry
+        fails `member_cancelled_alone`, naming the member, and nothing closes it."""
+        for when in ("before the run", "during prepare"):
+            with self.subTest(when=when):
+                a = self.open[0] if when == "before the run" else self.open[1]
+                branch, (_, child) = self.bundle(self.own, a)
+                entry = self.enqueue_on(branch, self.own, "fix: a slice", "## Summary\n\nWords.\n",
+                                        f"fix(lane): the slice\n\nCloses: sd:{self.own}\nCloses: sd:{a}")
+                self.assertEqual(entry["closes"], [a])
+                self.calls.clear()
+
+                def cancel_in_prepare(argv: list[str], log: pathlib.Path, child: int = child) -> dict:
+                    if "prepare" in argv[2:4]:
+                        self.cancel_alone(child)
+                    return self.ship(argv, log)
+                if when == "before the run":
+                    self.cancel_alone(child)
+                sd_lane.run_lane(self.repo, self.environ, cancel_in_prepare)
+                ended = self.entries()[-1]
+                self.assertEqual((ended["status"], ended["code"]), ("failed", "member_cancelled_alone"), ended)
+                self.assertIn(f"sd:{a} was cancelled on its own", ended["reason"])
+                self.assertNotIn("merge", [call[2] for call in self.calls])
+                self.assertEqual("prepare" in [call[2] for call in self.calls], when == "during prepare")
+
+    def test_a_body_that_leaves_a_fence_or_comment_open_is_refused_before_a_section_goes_in_it(self) -> None:
+        """Review round 8 of pack sd:9222: `## Closed by citation` and `## Left open` went after the body, so an
+        unclosed fence or HTML comment in it hid them from a reader. Both refuse the same way; nothing is queued."""
+        a, b, *_ = self.open
+        for opened in ("```\nsome code\n", "<!-- a note\n"):
+            for cites, section in ((f"Closes: sd:{b}", "Closed by citation"), (f"Closes: sd:{a}", "Left open")):
+                with self.subTest(opened=opened, section=section):
+                    branch = self.cancelled_alone(self.own, a)  # a fresh bundle, so a fresh branch and worktree
+                    with self.assertRaises(sd_lane.LaneError) as refused:
+                        self.enqueue_on(branch, self.own, "fix: a slice", f"## Summary\n\nWords.\n\n{opened}",
+                                        f"fix(lane): the slice\n\n{cites}")
+                    self.assertEqual(refused.exception.code, "body_block_open")
+                    self.assertIn(section, str(refused.exception))
+        self.assertEqual(self.rows(), [])
+
+    def test_a_member_cancelled_alone_still_closes_on_another_branch(self) -> None:
+        """Evidence: the exclusion holds for the entry of the member's own bundle only, read from its branch.
+        An entry on another branch that delivers it, even the same item's, closes it as before."""
+        a = self.open[0]
+        self.cancelled_alone(self.own, a)
+        entry = self.enqueue("## Summary\n\nWords.\n", f"fix(lane): the slice\n\nCloses: sd:{a}")
+        self.assertEqual(entry["closes"], [a])
 
     def test_a_failed_hub_read_queues_and_pushes_nothing(self) -> None:
         """Failures: the cited items' read did not answer; that is no "nothing to close"."""

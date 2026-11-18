@@ -200,6 +200,25 @@ def refuse_teammate_held(connection, items) -> None:
                                       "--end`, then deliver.")
 
 
+#: The refusal code of a delivery that names a build member the operator cancelled on its own (pack sd:9222).
+MEMBER_LEFT = "member_cancelled_alone"
+
+
+def refuse_left(connection, branch: str, items, then: str = "nothing was published") -> None:
+    """Refuse delivering any of `items` that the build bundle on `branch` left: each member the operator cancelled
+    on its own (`build.left`, pack sd:9222). `sd-ship merge` checks right before it publishes, the one point every
+    delivery passes; prepare, and the lane's enqueue, retry and run, refuse earlier with the same rule."""
+    sd_lib.import_sd_db()  # every caller holds an sd_db connection, so this finds it
+    from sd_db import build  # noqa: PLC0415
+    left = sorted(build.left(connection, branch, items))
+    if left:
+        named = ", ".join(f"sd:{number}" for number in left)
+        raise Refusal(f"{named} was cancelled on its own out of the build bundle on {branch}, so this delivery may "
+                      f"not close it; {then}", code=MEMBER_LEFT, boundary="input", state="operator_decision",
+                      next_action="Drop it from the delivery (its --item, or the citation), then deliver again; "
+                                  "build it again to deliver it on its own branch.")
+
+
 def refuse_unclosable(connection, item: int, repo: str, named, deliver: bool) -> None:
     """Refuse a co-delivered item the merge could not close; `repo` is `item`'s registered path.
 
@@ -368,15 +387,24 @@ def cited_ids(body: str, commits, parents=None) -> tuple[int, ...]:
 _TRAILER = re.compile(r"^[A-Za-z][A-Za-z0-9-]*:[ \t]")
 
 
-def with_cited(body: str, lines: list[str]) -> str:
-    """`body` with a `## Closed by citation` section of `lines`, before a closing trailer paragraph (sd:5999).
+def with_cited(body: str, lines: list[str], heading: str = "Closed by citation") -> str:
+    """`body` with a `## <heading>` section of `lines`, before a closing trailer paragraph (sd:5999).
 
     A reader of the pull request sees each close by citation, so a wrong
-    one is one reopen. The trailers stay the body's last paragraph.
+    one is one reopen, and each citation the merge leaves open (`Left
+    open`, sd:9222). The trailers stay the body's last paragraph. A body
+    that leaves a fenced code block or an HTML comment open would hide
+    the section in it, so it refuses `body_block_open` (sd:9222).
     """
     if not lines:
         return body
-    section = "## Closed by citation\n\n" + "\n".join(lines) + "\n"
+    probe = f"{body.rstrip(chr(10))}\n\nprobe"  # a line after the body: quoted means a block is still open
+    if probe.count("\n") + 1 in quoted_lines(probe):
+        raise Refusal(f"the body leaves a fenced code block or an HTML comment open, so its `## {heading}` "
+                      "section would sit inside it, hidden; nothing was queued", code="body_block_open",
+                      boundary="input", state="operator_decision",
+                      next_action="Close the fence or the comment in the body file, then enqueue again.")
+    section = f"## {heading}\n\n" + "\n".join(lines) + "\n"
     text = body.rstrip("\n")
     head, _, last = text.rpartition("\n\n")
     if last and all(_TRAILER.match(line) for line in last.split("\n") if line.strip()):
@@ -384,14 +412,24 @@ def with_cited(body: str, lines: list[str]) -> str:
     return f"{text}\n\n{section}"
 
 
-def open_cited(connection, item: int, repo: str, cited, named, body: str) -> tuple[int, ...]:
+def _left(connection, item: int, body: str, named, numbers, branch: str) -> set[int]:
+    """Of `numbers`, those a delivering merge of `item` leaves open: `item` and `named`, already closed, each a
+    `Refs:` line of `body` names, and each member an operator cancelled on its own out of the build bundle that
+    published `branch`, read from data so no commit, title or body text delivers it (`build.left`, review rounds
+    4 and 5 of pack sd:9222)."""
+    sd_lib.import_sd_db()  # every caller holds an sd_db connection, so this finds it
+    from sd_db import build  # noqa: PLC0415
+    return referenced_ids(body) | {item, *named} | build.left(connection, branch, numbers)
+
+
+def open_cited(connection, item: int, repo: str, cited, named, body: str, branch: str = "") -> tuple[int, ...]:
     """Of `cited`, the items a merge of `item` should close beyond `named`, its later `--item` list (sd:5999).
 
     An item counts when it belongs to `repo`, is a kind a merge closes, and
     is open, as `refuse_left_open` reads them; a `Refs:` line of `body`
-    keeps one open.
+    keeps one open, as does the data `_left` reads.
     """
-    left = referenced_ids(body) | {item, *named}
+    left = _left(connection, item, body, named, cited, branch)
     kept = []
     for number in cited:
         if number in left:
@@ -403,7 +441,8 @@ def open_cited(connection, item: int, repo: str, cited, named, body: str) -> tup
     return tuple(kept)
 
 
-def refuse_left_open(connection, item: int, repo: str, names, title: str, body: str, named, deliver: bool) -> None:
+def refuse_left_open(connection, item: int, repo: str, names, title: str, body: str, named, deliver: bool,
+                     branch: str = "") -> None:
     """Refuse a delivering entry whose title or Summary headings name an open item missing from --item (sd:5375).
 
     The --item list stays the one closing set (operator ruling 2026-10-13,
@@ -417,9 +456,10 @@ def refuse_left_open(connection, item: int, repo: str, names, title: str, body: 
     """
     if not deliver:
         return
-    left = referenced_ids(body) | {item, *named}
+    named_ids = tuple(dict.fromkeys(title_ids(title) + summary_ids(body, names)))
+    left = _left(connection, item, body, named, named_ids, branch)
     missing = []
-    for number in dict.fromkeys(title_ids(title) + summary_ids(body, names)):
+    for number in named_ids:
         if number in left:
             continue
         row = connection.execute("SELECT repo, kind, status FROM item WHERE id = ?", (number,)).fetchone()

@@ -419,11 +419,24 @@ class BuildsPanel(Fixture):
         self.assertEqual(status, 200, body)
         self.assertEqual(json.loads(body)["recent"][0]["run"], run["id"])
 
+    def test_a_run_parked_after_review_rounds_prefills_send_to_builder(self):
+        """Pack sd:9262: a plain Retry dropped the last round's blockers; the row carries them, plus the class pass,
+        as the Send to builder box's text. Any other ended run prefills nothing."""
+        run = self.claimed([self.ready()])
+        build.end(self.connection, run["id"], "blocked",
+                  "3 review rounds left blockers: demo.sh:231 pin check; a.py:2 b")
+        # The block holds the run until a reap reads its supervisor gone: release it as that reap does.
+        self.connection.execute("UPDATE runner_run SET released_at = ? WHERE id = ?", (clock(), run["id"]))
+        row = self.panel(clock())["recent"][0]
+        self.assertEqual(row["prefill"], "The last review round left these blockers: demo.sh:231 pin check; a.py:2 b\n"
+                         + builds.CLASS_PASS)
+        self.assertLessEqual(len(row["prefill"]), builds.FINDING_MAX)
+
     def test_retry_refuses_a_run_that_did_not_block(self):
         run = self.claimed([self.ready()])
         build.end(self.connection, run["id"], "done", "landed")
         recent = self.panel(clock())["recent"][0]
-        self.assertEqual((recent["outcome"], recent["retry"]["allowed"]), ("done", False))
+        self.assertEqual((recent["outcome"], recent["retry"]["allowed"], recent["prefill"]), ("done", False, ""))
         status, _, body = self.post("/api/queue/builds/retry", {"assignment": run["assignment"],
                                                                "revision": recent["retry"]["revision"]})
         self.assertEqual(status, 400, body)
@@ -726,6 +739,25 @@ class BlockedBuildRows(Fixture):
         for action in ("cancel", "retry"):
             self.assertEqual((rows[bad][action]["allowed"], rows[bad][action]["reason"]),
                              (False, "the assignment was not read: database disk image is malformed"), rows[bad])
+
+    def test_the_build_cancel_confirm_says_the_items_park(self):
+        """sd:9222: a cancelled run's items park, so the confirm names Unpark, not a move back to ready alone."""
+        from sd_dashboard import v2
+        source = (Path(v2.__file__).resolve().parent / "static" / "today.js").read_text(encoding="utf-8")
+        body = source[source.index("title: `Cancel build run "):source.index("ok: 'Cancel build'")]
+        self.assertIn("parks", body)
+        self.assertIn("Unpark", body)
+        self.assertIn("ends blocked", body, "a reap that cannot confirm the stop blocks the bundle instead")
+
+    def test_the_item_page_assignment_cancel_says_a_build_parks(self):
+        """Review round 3 of sd:9222: the Details page's assignment Cancel no longer promises an unchanged item
+        for a build: a queued or running one parks it, and a running one may end blocked instead."""
+        from sd_dashboard import v2
+        source = (Path(v2.__file__).resolve().parent / "static" / "task-details.js").read_text(encoding="utf-8")
+        body = source[source.index("id: 'asg.cancel'"):source.index("run: o => landing(cancelAsg(o)")]
+        self.assertNotIn("the task keeps its status.'", body)
+        for words in ("parks", "Unpark", "ends blocked", "unchanged"):
+            self.assertIn(words, body)
 
 class AutoPickup(Fixture):
     """pack sd:6097: the Builds panel shows auto-pickup and its On and Off write it, bound to the value read."""

@@ -810,13 +810,13 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     if (!r) return;
     const what = r.items.map(m => `sd:${m.item}`).join(', ');
     if (act === 'cancel' && !(await shell.confirm({ title: `Cancel build run ${r.run} (${what})?`,
-      body: `The supervisor stops the ${r.step} step at its next beat, keeps the worktree, ends the bundle cancelled and moves ${r.items.length > 1 ? 'its items' : 'the item'} back to ready. Nothing is enqueued.`,
+      body: `The supervisor stops the ${r.step} step at its next beat, keeps the worktree, ends the bundle cancelled, and parks ${r.items.length > 1 ? 'its items' : 'the item'} at ready, so auto-pickup leaves ${r.items.length > 1 ? 'them' : 'it'} until Unpark on Tasks; if the reap cannot confirm the process stopped, it ends blocked instead: check the process, then Retry once the lease is released. Nothing is enqueued.`,
       cli: `sd assignments cancel ${r.cancel.assignment} --if-revision ${r.cancel.revision}`, ok: 'Cancel build', keep: 'Keep it running' }))) return;
     let finding = '';
     if (act === 'send') {
       const { yes, values } = await shell.ask({ title: `Send to builder: run ${r.run} (${what})?`, ok: 'Send', keep: 'Cancel', danger: false,
         body: `The finding goes on ${r.items.length > 1 ? 'each item' : 'the item'} as a note, and the bundle queues again. Its next builder resumes ${r.worktree || 'the same worktree'} on its branch and fixes the finding first.`,
-        fields: [{ name: 'finding', label: 'Finding', required: true, placeholder: 'What the builder should fix' }] });
+        fields: [{ name: 'finding', label: 'Finding', required: true, multiline: true, placeholder: 'What the builder should fix', value: r.prefill || '' }] });
       finding = (values && values.finding || '').trim();
       if (!yes || !finding) return;
     }
