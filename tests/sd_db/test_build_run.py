@@ -46,7 +46,7 @@ from sd_db.database import connect
 from sd_db.migrate import initialise
 from sd_db.ship import this_host
 from sd_db.workflow import item_state
-from sd_db.writes import add_note, create_item, record_state, upsert_repo
+from sd_db.writes import add_note, create_item, record_state, resolve_note, upsert_repo
 
 from . import support
 from .test_build import Probe as GoneProbe
@@ -629,6 +629,18 @@ class Supervise(Case):
         build.reap(self.db, probe=GoneProbe(alive=False, group=False))
         self.assertIsNotNone(build.run(self.db, self.bundle["id"])["released_at"])
         self.assertEqual([item_state(self.db, item)["item"]["parked_at"] for item in self.items], [None, None])
+
+    def test_a_resolved_question_is_not_open(self):
+        """sd:9219 review round 2: a question closed with `sd note resolve` asks nothing, so a run with no
+        commit left no commit: each item gets the followup."""
+        self.press(2)
+        self.plan(claude=["asked"], sd_review=["clean"])
+        for item in self.items:
+            resolve_note(self.db, add_note(self.db, item, "question", "Which?\nOption: Yes (Recommended)\nOption: No"))
+        self.assertIn("left no commit", self.supervisor().run()["blocked"])
+        counts = [self.db.execute("SELECT COUNT(*) FROM note WHERE item = ? AND kind = 'followup'",
+                                  (item,)).fetchone()[0] for item in self.items]
+        self.assertEqual(counts, [1, 1])
 
     def test_a_question_keeps_the_followup_and_park_of_a_block_it_did_not_cause(self):
         """sd:9219 review: every item asked, but the builder left its worktree dirty. The dirty worktree blocks

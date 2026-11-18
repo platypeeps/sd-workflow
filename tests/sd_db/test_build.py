@@ -1389,6 +1389,19 @@ class Park(Case):
         self.assertEqual(self.db.execute(rows, (self.items[0],)).fetchone()[0], "cancelled")
         self.assertEqual(self.db.execute(rows, (self.items[1],)).fetchone()[0], "blocked")
 
+    def test_a_block_that_quotes_the_asked_reason_keeps_its_followups_and_park(self):
+        """sd:9219 review round 2: a review failure whose text quotes `ASKED` is no question block. Each item
+        still gets the followup, and the release parks it."""
+        build.write(self.db, self.bundle["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START,
+                    builder_pgid=777, builder_start=START)
+        quoted = ", ".join(f"sd:{item}" for item in self.items)
+        build.end(self.db, self.bundle["id"], "blocked", f"local review blocking: it says '{build.ASKED}{quoted}'")
+        followups = [self.count("SELECT COUNT(*) FROM note WHERE item = ? AND kind = 'followup'", item)
+                     for item in self.items]
+        self.assertEqual(followups, [1, 1])
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        self.assertEqual(self.parked(), [True, True])
+
     def test_a_run_that_ends_done_parks_nothing(self):
         build.end(self.db, self.bundle["id"], "done", "the lane merged it")
         self.assertEqual(self.parked(), [False, False])
