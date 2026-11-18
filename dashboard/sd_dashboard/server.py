@@ -1260,23 +1260,39 @@ class Dashboard(BaseHTTPRequestHandler):
 
         badges, realms = {}, []
         if self._session(context):
-            # A busy store reads as one that could not open (sd:7842): no live page, so each says unknown.
+            # The badges each page's last read kept; the live pages' reads run after this read (sd:9310).
+            badges = self.badges.read()
+            # A busy store reads as one that could not open (sd:7842): the realms are then empty.
             slot, connection = self.reads.acquire(timeout=READ_WAIT), None
             try:
                 try:
                     connection = sd_db.connect(self.database, write=False) if slot else None
                 except (FileNotFoundError, SdDbError, sqlite3.Error):
-                    # No live page can be read, so each says unknown; the kept ones still show.
                     connection = None
                 # The realm labels are the operator's own (dashboard.realms), so a request without a session gets none.
                 realms = places.realm_places(connection)
-                badges = self.badges.read(self._read(connection, "", {}), connected=connection is not None)
             finally:
                 if connection is not None:
                     connection.close()
                 if slot:
                     self.reads.release()
+            self.badges.refresh_later(self._refresh_badges)
         self._send(200, v2.sections(badges, realms), "text/javascript; charset=utf-8")
+
+    def _refresh_badges(self):
+        """The live pages' rail badges, read on the `Badges` thread (sd:9310). It takes no read slot: `refresh_later`
+        runs one such thread at a time, so it adds one reader at most, and a slow badge read never holds a slot that a
+        page's parser-blocking `/ui/sections.js` waits for."""
+        connection = None
+        try:
+            try:
+                connection = sd_db.connect(self.database, write=False)
+            except (FileNotFoundError, SdDbError, sqlite3.Error):
+                connection = None  # no live page can be read, so each says unknown
+            self.badges.refresh(self._read(connection, "", {}), connected=connection is not None)
+        finally:
+            if connection is not None:
+                connection.close()
 
     def _json(self, status, value):
         # sd:874. `value` is usually a `workflow.item_state` readback, which

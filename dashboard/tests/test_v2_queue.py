@@ -1936,6 +1936,21 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertNotIn("Parked idea", out["R"]["tiled"])
         self.assertRegex(out["R"]["tiled"], r'data-tile-clear="system">2 parked \(\d+ rows\) · Show all</button>')
 
+    def test_each_box_has_a_visible_label_and_an_accessible_name_in_box_order(self):
+        """sd:9315: seven boxes sat under one 'Detail' head; the head now names each, in the order they draw."""
+        out = self.run_view("R.html = ELS.queue.html;")
+        _, _, body = self.repo_detail(out["R"]["html"], "system")
+        boxes = re.findall(r'data-tile="(\w+)"', body)
+        self.assertEqual(len(boxes), 7, boxes)
+        names = re.findall(r'data-tile="(\w+)"[^>]*aria-label="Only the \d+ (\w+) rows"', body)
+        self.assertEqual([b for b, _ in names], boxes, "a box has no accessible name")
+        self.assertTrue(all(b == n for b, n in names), names)
+        head = re.search(r'<table class="ledger active queue".*?<thead>(.*?)</thead>',
+                         (v2.HERE / "today.html").read_text(encoding="utf-8"), re.S).group(1)
+        keys = re.search(r'<span class="keys"[^>]*>(.*?)</span></th>', head, re.S)
+        self.assertIsNotNone(keys, "the Detail head shows no box labels")
+        self.assertEqual(re.findall(r"<span>(\w+)</span>", keys.group(1)), boxes)
+
     def parked_answers(self, repo):
         from sd_dashboard import tasks_screen
         if repo != self.checkout:
@@ -2615,6 +2630,17 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertEqual([p[:2] for p in out["posts"]], [["/api/assignments/7/cancel", {"revision": "a" * 64}],
                                                          ["/api/queue/builds/retry", {"assignment": 5, "revision": "b" * 64,
                                                                                       "finding": "Fix the label"}]])
+
+    def test_send_to_builder_on_a_run_parked_after_review_rounds_prefills_the_finding(self):
+        """pack sd:9262: the box opens with the run's `prefill`, the last round's blockers and the class pass."""
+        builds = json.loads(json.dumps(self.BUILDS))
+        builds["recent"][0]["prefill"] = "a.py:1 the blocker\nClass pass: name it."
+        out = self.run_view("window.shell.ask = a => { OUT.ask = a; return Promise.resolve({ yes: false }); };"
+                            "act('button[data-build]', { build: 'send', run: 'r0' }); await flush(); await flush();",
+                            answers={"/api/queue/builds?show=all": [200, builds]})
+        field = out["ask"]["fields"][0]
+        self.assertEqual((field["value"], field["multiline"]), ("a.py:1 the blocker\nClass pass: name it.", True))
+        self.assertEqual(out["posts"], [])
 
     def test_a_blocked_build_assignment_is_a_blocked_row_with_its_reason_retry_and_cancel(self):
         """system sd:8651: `sd today` listed blocked build assignments the Queue view drew no row for. Each is a blocked
