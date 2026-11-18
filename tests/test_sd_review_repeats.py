@@ -397,7 +397,7 @@ class RebuttalIdentityTests(unittest.TestCase):
         body = adjudicated(("src.py", "Value  is wrong", "rebutted"), line=40)
         for summary in ("value is wrong", " VALUE is\nwrong ", f"Value is wrong {sd_review.REPEAT_NOTE}"):
             with self.subTest(summary=summary):
-                self.assertEqual(gate([row(summary=summary, line=38)], body), ["advisory"])
+                self.assertEqual(gate([row(summary=summary, line=40)], body), ["advisory"])
         self.assertEqual(gate([row(summary="value is wrong", path="other.py")], body), ["blocking"])
 
     def test_the_newest_disposition_of_a_finding_wins(self) -> None:
@@ -427,12 +427,10 @@ class RebuttalIdentityTests(unittest.TestCase):
         self.assertEqual(set(gate(list(parsed.findings), body)), {"blocking"})
         self.assertEqual(sd_review.rebuttal_section(listed(body)), "")
 
-    def test_a_rebuttal_holds_only_near_its_own_line(self) -> None:
-        """Round 8: one rebuttal at line 40 does not hold the same summary back at another line."""
-        window = sd_review.REBUTTED_LINE_WINDOW
+    def test_a_rebuttal_holds_only_at_its_own_line(self) -> None:
+        """Rounds 8 and 11 (operator ruling): a rebuttal at line 40 clears the same summary only at line 40."""
         body = adjudicated(("src.py", "defect", "rebutted"), line=40)
-        for line, status in ((40, "advisory"), (40 + window, "advisory"), (40 - window, "advisory"),
-                             (41 + window, "blocking"), (39 - window, "blocking"), (400, "blocking"),
+        for line, status in ((40, "advisory"), (41, "blocking"), (39, "blocking"), (50, "blocking"), (400, "blocking"),
                              (None, "blocking"), ("40", "blocking"), (True, "blocking")):
             with self.subTest(line=line):
                 self.assertEqual(gate([row(line=line)], body), [status])
@@ -456,15 +454,15 @@ class RebuttalIdentityTests(unittest.TestCase):
             with self.subTest(path=path):
                 self.assertEqual(gate([row(path=path)], body), [status])
 
-    def test_each_finding_takes_the_nearest_recorded_line(self) -> None:
-        """Round 10: one receipt parks `defect` at line 3 and rebuts it at line 8; each finding takes the nearest
-        recorded line, the newest row on a tie, and a parked one is never held back by a rebutted neighbour."""
-        for rows in ((("src.py", "defect", "parked", 3), ("src.py", "defect", "rebutted", 8)),
-                     (("src.py", "defect", "rebutted", 8), ("src.py", "defect", "parked", 3))):
+    def test_a_moved_finding_never_lands_on_a_rebuttal(self) -> None:
+        """Round 11, the reviewer's case: `defect` was parked at line 48 and rebutted at line 35; the code moves
+        and the parked one now sits at 40. It still blocks; only line 35 itself clears."""
+        for rows in ((("src.py", "defect", "parked", 48), ("src.py", "defect", "rebutted", 35)),
+                     (("src.py", "defect", "rebutted", 35), ("src.py", "defect", "parked", 48))):
             with self.subTest(first=rows[0][2]):
                 body = adjudicated(*rows)
-                self.assertEqual(gate([row(line=line) for line in (3, 4, 5, 7, 8, 12, 19)], body),
-                                 ["blocking", "blocking", "blocking", "advisory", "advisory", "advisory", "blocking"])
+                self.assertEqual(gate([row(line=line) for line in (40, 48, 36, 34, 35)], body),
+                                 ["blocking", "blocking", "blocking", "blocking", "advisory"])
         rebutted, parked = (adjudicated(("src.py", "defect", answer, 5)) for answer in ("rebutted", "parked"))
         self.assertEqual(gate([row(line=5)], parked, rebutted), ["blocking"])
         self.assertEqual(gate([row(line=5)], rebutted, parked), ["advisory"])
@@ -544,7 +542,7 @@ class RebuttalScopeTests(RepeatFixture):
     def test_a_review_holds_a_repeat_back_only_near_its_line(self) -> None:
         """Round 8: the receipt's finding sits at bin/tool.py:3; the same summary far off is another defect."""
         self.adjudication(("lane claim", "rebutted", "x"))
-        far = dict(self.repeat("lane claim"), line=3 + sd_review.REBUTTED_LINE_WINDOW + 1)
+        far = dict(self.repeat("lane claim"), line=4)
         self.assertEqual(self.review_answering(far)["lane claim"], ("blocking", "bin/tool.py"))
         self.assertEqual(self.review_answering(self.repeat("lane claim"))["lane claim"], ("advisory", "bin/tool.py"))
 
