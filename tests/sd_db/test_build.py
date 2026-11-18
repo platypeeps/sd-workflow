@@ -1449,6 +1449,21 @@ class CancelParks(Case):
         self.assertEqual(self.pickup(), [])
         self.assertIsNone(self.claim(), "no queued member is left to claim")
 
+    def test_a_queued_lead_cancel_answers_every_row_it_ended(self):
+        """pack sd:9266: `sd assignments cancel` prints the answer, and it named only the lead's row while every
+        queued member ended with it; each member's row is in it too, cancelled."""
+        items = [self.item(), self.item()]
+        build.queue(self.db, items, who="operator")
+        bundle = self.claim()
+        build.end(self.db, bundle["id"], "cancelled", "cancelled by operator")
+        build.queue_again(self.db, [items[0]], who="operator")
+        members = [ident for ident, _ in build.queued_members(self.db, bundle["assignment"])]
+        self.assertTrue(members)
+        answer = self.cancel(bundle["assignment"])
+        self.assertEqual((answer["id"], answer["status"]), (bundle["assignment"], "cancelled"))
+        self.assertEqual([(row["id"], row["status"]) for row in answer["members"]],
+                         [(ident, "cancelled") for ident in members])
+
     def test_a_running_cancel_parks_its_items_when_the_run_ends_cancelled(self):
         items = [self.item(), self.item()]
         build.queue(self.db, items, who="operator")

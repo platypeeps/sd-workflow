@@ -631,4 +631,8 @@ def cancel_assignment(connection: sqlite3.Connection, assignment: int, *, expect
             add_note(connection, item, "comment",
                      f"{current['status'].capitalize()} assignment {ident} cancelled by {who}{lead}; item status "
                      f"unchanged" + ("; item parked; Unpark to build it again" if parked else ""), session=who)
-        return assignment_state(connection, assignment)
+        # Every row it ended, so `sd assignments cancel` prints the members too (pack sd:9266).
+        answer = assignment_state(connection, assignment)
+        if members:
+            answer["members"] = [assignment_state(connection, member) for member, _ in members]
+        return answer
