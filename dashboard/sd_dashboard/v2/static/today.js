@@ -511,9 +511,9 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // sd:7251), so All items alone keeps a repo's first suggested tasks. Its act is Tasks' list row's.
   const OPENS = { blocked: 'caution', in_progress: 'ok' }; // a blocked task is a look, not a lane's needs-you
   // sd:9247: a parked task is the same row under the parked type, which only its box shows.
-  const openRow = (t, type = 'open') => [type, OPENS[t.status] || 'queued', html`<tr class="child" data-type="${type}" data-item="${t.key}" data-id="${t.key}" aria-selected="${String(row() === t.key)}">${marker(OPENS[t.status] || 'queued', type)}
+  const openRow = (t, type = 'open', waits = []) => [type, OPENS[t.status] || 'queued', html`<tr class="child" data-type="${type}" data-item="${t.key}" data-id="${t.key}" aria-selected="${String(row() === t.key)}">${marker(OPENS[t.status] || 'queued', type)}
     <td class="what"><a href="${shell.itemHref(t.id)}">#${t.id} ${t.title}</a></td>
-    <td class="detail">${type === 'parked' ? 'parked · ' : ''}${String(t.status).replace(/_/g, ' ')}${t.p ? ` · P${t.p}` : ''}${runNote(t.id)}</td><td class="num">${t.since ? age(t.since) : ''}</td><td class="act">${shell.commands.rowActions(t.key)}</td></tr>`];
+    <td class="detail">${type === 'parked' ? 'parked · ' : ''}${String(t.status).replace(/_/g, ' ')}${t.p ? ` · P${t.p}` : ''}${runNote(t.id)}${waits.map(w => ` · ${w}`).join('')}</td><td class="num">${t.since ? age(t.since) : ''}</td><td class="act">${shell.commands.rowActions(t.key)}</td></tr>`];
   // pack sd:7699: an idea kind (/api/tasks' `ideas`, reads.IDEA_KINDS) is no Queue row; ideas live on Writing.
   // pack sd:8127: `all` gives them while All items is off too, so its tile counts them; its rows stay hidden.
   function openItems(all) {
@@ -554,12 +554,18 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       && r.items.filter(m => !['done', 'cancelled'].includes(m.status)).every(shown)));
     B.runs.forEach(r => { r.items.forEach(m => held.add(m.assignment)); if (!inPr(r)) add(r.repo, runRow(r)); });
     ((QV.runner || {}).live || []).filter(a => !held.has(a.id)).forEach(a => add(a.repo, asgRow(a)));
-    ((QV.runner || {}).blocked || []).filter(a => !held.has(a.id) && !laned.has(Number(a.item))).forEach(a => add(a.repo, blockedAsg(a)));
+    // pack sd:9425: a parked item is its Parked row alone: a blocked build or lane entry of it is no row and counts in no
+    // box; the Parked row says why it waits instead. A parked task with no repo is no row, so its blocked rows stay.
+    const parked = new Set(parkedTasks().filter(t => t.repo_path).map(t => Number(t.id))), why = new Map();
+    const aside = (item, text) => parked.has(Number(item)) && !!why.set(Number(item), [...(why.get(Number(item)) || []), text]);
+    ((QV.runner || {}).blocked || []).filter(a => !held.has(a.id) && !laned.has(Number(a.item))
+      && !aside(a.item, `blocked build · assignment ${a.id} · ${a.why}`)).forEach(a => add(a.repo, blockedAsg(a)));
     // A prepared entry and its item's PR wait are one row (pack sd:7859): the lane's, leading with the wait.
     const waitOf = new Map(prs.map(p => [Number(p.item), p])), drawn = new Set();
     (QV.lanes ? QV.lanes.lanes : []).forEach(l => { l.rows.forEach(r => {
       const p = r.state === 'blocked' && r.status === 'prepared' ? waitOf.get(Number(r.item)) : undefined;
       if (p) drawn.add(p);
+      if (r.state === 'blocked' && !p && aside(r.item, `lane ${r.status}${r.step ? ` at ${r.step}` : ''} · ${r.reason}`)) return;
       add(l.path, entryRow(l, r, p)); });
       if (G.has(repoKey(l.path))) G.get(repoKey(l.path)).host = l.host; });
     prs.filter(p => !drawn.has(p)).forEach(p => add(p.repo, prRow(p)));
@@ -567,7 +573,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     OPENI.forEach(t => { if (!waits.has(Number(t.id))) add(t.repo_path, openRow(t)); });
     // sd:9247: each repo's parked tasks (no idea kind), PR wait or lane entry or not; hidden until their box is pressed.
     // A task with no repo is no row (pack sd:7731), as in Suggested; the tally counts the same set.
-    parkedTasks().filter(t => t.repo_path).forEach(t => add(t.repo_path, openRow(t, 'parked')));
+    parkedTasks().filter(t => t.repo_path).forEach(t => add(t.repo_path, openRow(t, 'parked', why.get(Number(t.id)))));
     B.recent.forEach(r => add(r.repo, endedRun(r)));
     const RANK = { warning: 0, caution: 1, unknown: 2, ok: 3, queued: 4 };
     // pack sd:7679: the busiest repo first, box by box in the boxes' order, each most first; then the name. Unassociated last.

@@ -1984,6 +1984,29 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         return made, {"/api/tasks": [200, tasks_screen.document(self.connection, now=NOW)],
                       f"/api/tasks/{made}": [200, tasks_screen.details(self.connection, made, now=NOW)]}
 
+    def test_a_parked_item_is_its_parked_row_alone_and_says_why_it_waits(self):
+        """pack sd:9425: a parked item with a blocked build showed under Blocked and under Parked (aura-research
+        sd:6242). Neither its blocked assignment nor its failed lane entry is a row, Blocked counts neither, and the
+        Parked row carries each one's reason."""
+        built, _ = self.parked_answers(self.checkout)  # a blocked build, no lane entry
+        made, answers = self.parked_answers(self.checkout)  # a failed lane entry
+        self.list(self.entries() + [{"item": made, "title": "Set aside", "status": "failed", "step": "prepare",
+                                     "reason": "gate failed", "finished_at": NOW}])
+        asg = {"id": 90, "lead": 90, "item": built, "title": "Set aside", "repo": str(self.checkout),
+               "why": "build run ended", "since": NOW, "retry": {"allowed": True, "reason": ""},
+               "cancel": {"allowed": True, "reason": ""}}
+        answers["/api/queue/runner"] = [200, {**self.RUNNER, "blocked": [asg]}]
+        out = self.run_view(self.TILE + " open('system'); R.html = ELS.queue.html; tile('system', 'parked');"
+                            " R.tiled = ELS.queue.html;", answers=answers)
+        _, attrs, _ = self.repo_detail(out["R"]["html"], "system")
+        self.assertIn(" 2 blocked,", attrs, "the fixture's two blocked rows, not the parked item's")
+        self.assertNotIn('data-asg-row="90"', out["R"]["html"])
+        self.assertNotIn(f'data-id="entry:{self.checkout}:{made}"', out["R"]["html"])
+        def row(item):
+            return out["R"]["tiled"].split(f'data-type="parked" data-item="{item}"')[1].split("</tr>")[0]
+        self.assertIn("blocked build · assignment 90 · build run ended", row(built))
+        self.assertIn("lane failed at prepare · gate failed", row(made))
+
     def test_a_repo_whose_only_rows_are_parked_still_shows_its_parked_box(self):
         """Review of sd:9247: a repo with nothing but parked tasks drew no row, so its box was unreachable."""
         solo = self.checkout.parent / "solo"
