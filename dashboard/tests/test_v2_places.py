@@ -1409,7 +1409,7 @@ for (const v of ['work', 'hoa', 'home', 'personal']) { await realm(v); R[v] = EL
         keeps ?realm=all in the address; a tab picked, Personal too, leaves it."""
         self.doc, self.details = self.realm_doc(), {}
         out = self.run_tasks("""R.cur = window.shell.view.current(); R.list = ELS['view-list'].html; R.sub = ELS.subhead.html;
-const box = document.getElementById('find-in'); box.value = 'the'; box.listeners.input[0]({ target: box }); await flush();
+const box = document.getElementById('shift-in'); box.value = 'the'; box.listeners.input[0]({ target: box }); await flush();
 R.kept = OUT.urls[OUT.urls.length - 1]; box.value = ''; box.listeners.input[0]({ target: box }); await flush();
 await realm('personal'); R.cur2 = window.shell.view.current(); R.list2 = ELS['view-list'].html; R.sub2 = ELS.subhead.html;
 R.left = OUT.urls[OUT.urls.length - 1];""", search="?view=list&realm=all")
