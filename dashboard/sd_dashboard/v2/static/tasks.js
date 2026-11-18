@@ -126,10 +126,12 @@ addEventListener('DOMContentLoaded', () => {
   // build (sd:3977): Base narrows to one vault base's rows; it shows once a row has a base.
   const F = { kind: new Set(), repo: new Set(), p: new Set(), due: new Set(), status: new Set(), age: new Set(), active: new Set() };
   // sd:5649: the list's optional columns the Columns menu shows, kept in the address as ?cols=.
-  // sd:6233: and whether the board shows its Done column, ?done=1; hidden by default (operator decision, note 30400).
-  const SHOW = { cols: new Set(), done: false }, COL_OPTS = [['lead', 'Lead (days)']];
+  // sd:6233: the board shows its Done column only with Scope's Open and done (?active=done, sd:9309; an older ?done=1 too),
+  // hidden by default (operator decision, note 30400).
+  const SHOW = { cols: new Set() }, COL_OPTS = [['lead', 'Lead (days)']];
   const FKEYS = Object.keys(F);
-  const find = document.getElementById('find-in');
+  // sd:9309: the text filter is Add or find's words (the one-bar rule, sd:5539): no second text box.
+  const find = document.getElementById('shift-in');
   let Q = '';
   const on = () => FKEYS.reduce((n, k) => n + F[k].size, 0) + (Q ? 1 : 0);
   const dueBucket = t => t.overdue || (t.due && days(t) < 0) ? 'overdue' : !t.due ? 'none' : withinWeek(t) ? 'week' : 'later';
@@ -151,18 +153,19 @@ addEventListener('DOMContentLoaded', () => {
       combo('age', 'In status', AGES.map(a => [a.key, a.label]), html`<button class="help" type="button" aria-label="Help: in status filter" data-help="Days since the task last changed status, in the buckets the Progress histogram counts. A bar there opens its bucket here.">${ICON('circle-help')}</button>`)}${
       // sd:5643: Scope is one choice: open and done (the default) or open only; sd:5649: or Scheduled only, the repeating
       // tasks' next rows that have not opened yet. Parked left it for the toolbar's Open | Parked (sd:6701).
-      combo('active', 'Scope', [['1', 'Open only'], ['scheduled', 'Scheduled only']], html`<button class="help" type="button" aria-label="Help: scope filter" data-help="<b>Open only</b> hides Done tasks, as the Operations histogram counts only open ones. The nightly prune parks an open P4 task untouched for 30 days, and a planning task that never ran untouched for 90 days; parked tasks show under the toolbar's <b>Parked</b> or <b>All</b>, and <b>Unpark</b> brings one back with its fields and history. Completing a repeating task opens its next row at once; it stays off every other scope, and off Today, until its due date less its lead. <b>Scheduled only</b> lists those rows with the day each opens.">${ICON('circle-help')}</button>`, 'Open and done')}${
+      // sd:9309: the board's Done column folds in as Open and done; the board shows open tasks alone by default.
+      combo('active', 'Scope', view === 'board' ? [['done', 'Open and done'], ['scheduled', 'Scheduled only']] : [['1', 'Open only'], ['scheduled', 'Scheduled only']], html`<button class="help" type="button" aria-label="Help: scope filter" data-help="<b>Open only</b> hides Done tasks, as the Operations histogram counts only open ones. The board shows open tasks; its <b>Open and done</b> adds the Done column. The nightly prune parks an open P4 task untouched for 30 days, and a planning task that never ran untouched for 90 days; parked tasks show under the toolbar's <b>Parked</b> or <b>All</b>, and <b>Unpark</b> brings one back with its fields and history. Completing a repeating task opens its next row at once; it stays off every other scope, and off Today, until its due date less its lead. <b>Scheduled only</b> lists those rows with the day each opens.">${ICON('circle-help')}</button>`, view === 'board' ? 'Open' : 'Open and done')}${
       // sd:5649: the list's optional columns, hidden by default. Not a filter: no chip, and Clear all keeps it.
       view === 'list' && LEAD ? window.shell.list.pick('cols', 'Columns', COL_OPTS, SHOW.cols, { all: 'Default', multi: true }) : ''}${
-      // sd:6233: the board's Done column, off by default. Not a filter either: the list and the matrix ignore it.
-      view === 'board' ? html`<div class="fgroup"><label class="chk"><input type="checkbox" id="f-done"${SHOW.done ? html` checked` : ''}> Show done</label></div>` : ''}${
-      (on() ? window.shell.list.chips(activeFilters(), visible().length, placed().length) : html`<div class="fsum">${ICON('filter')}<span>${placed().length} tasks</span></div>`)}`);
+      (on() ? window.shell.list.chips(activeFilters(), visible().length, placed().length) : '')}`);
+    // sd:9309: the count sits at the right of row 1.
+    document.getElementById('task-count').textContent = on() ? `${visible().length} of ${placed().length} tasks` : `${placed().length} tasks`;
   }
   // Active filters above the list (shell.list, sd:2682): one chip per value, keyed field:value, and one for the text.
   const FNAME = { kind: 'Kind', repo: 'Repo', p: 'Priority', due: 'Due', status: 'Status', age: 'In status', active: 'Scope' };
   const kindWord = v => (v.startsWith('base:') ? `${v.slice(5)} (plugin kind)` : v);
   const fvalue = (k, v) => k === 'kind' ? kindWord(v) : k === 'p' ? (v && v !== 'unset' ? 'P' + v : 'unset') : k === 'due' ? DUE_OPTS.find(o => o[0] === v)?.[1] || v : k === 'status' ? slabel(v)
-    : k === 'age' ? AGES.find(a => a.key === v)?.label || v : k === 'active' ? (v === 'scheduled' ? 'Scheduled only' : 'Open only') : v;
+    : k === 'age' ? AGES.find(a => a.key === v)?.label || v : k === 'active' ? ({ scheduled: 'Scheduled only', done: 'Open and done' }[v] || 'Open only') : v;
   const activeFilters = () => [...FKEYS.flatMap(k => [...F[k]].map(v => ({ key: `${k}:${v}`, label: `${FNAME[k]}: ${fvalue(k, v)}` }))), ...(Q ? [{ key: 'q', label: `Text: ${Q}` }] : [])];
   document.getElementById('filters').addEventListener('click', e => {
     if (e.target.closest('[data-unfilter-all]')) { clearFilters(); return; }
@@ -173,13 +176,11 @@ addEventListener('DOMContentLoaded', () => {
   });
   document.getElementById('filters').addEventListener('change', e => {
     // The redraw replaces the checkbox, so focus goes back to the new one.
-    if (e.target?.id === 'f-done') { SHOW.done = !!e.target.checked; render(); document.getElementById('f-done')?.focus(); return; }
     window.shell.list.pickChange(e, F, () => { L.page = 1; render(); }) || window.shell.list.pickChange(e, SHOW, render);
   });
   function clearFilters() { Object.values(F).forEach(s => s.clear()); Q = ''; find.value = ''; L.page = 1; render(); }
   // The text filter narrows on what a row shows: id, title, repo, status and kind, as v1's ?q= read the visible columns.
-  find.addEventListener('input', () => { Q = find.value.trim().toLowerCase(); L.page = 1; render(); });
-  find.addEventListener('keydown', e => { if (e.key === 'Escape' && find.value) { e.stopPropagation(); find.value = ''; Q = ''; L.page = 1; render(); } });
+  // Add or find's words set it (showPreview, sd:9309): its title words, or #id; p1, due fri and #repo are the add's alone.
   const words = t => `#${t.id} ${t.title} ${t.repo} ${slabel(t.status)} ${t.kind} ${t.stage || ''}`.toLowerCase();
   const passes = t => (!F.kind.size || picked(t)) && work(t) && (!F.repo.size || F.repo.has(t.repo)) && (!F.p.size || F.p.has(t.p ? String(t.p) : 'unset')) && (!F.due.size || F.due.has(dueBucket(t)))
     && (!F.status.size || F.status.has(t.status)) && (!F.age.size || F.age.has(t.age)) && (!F.active.has('1') || t.status !== 'done') && scoped(t) && inPlace(t) && (!Q || words(t).includes(Q));
@@ -229,8 +230,8 @@ addEventListener('DOMContentLoaded', () => {
     const v = visible().filter(recent);
     // build: backlog_items also returns statuses with no column (a message's ready_to_send); they get one lane, which
     // takes no drop and no key, so every row the page counts is on the board (review, PR #46).
-    const other = v.filter(t => !SLABEL[t.status]), cols = STATUSES.filter(([s]) => SHOW.done || s !== 'done');
-    put(document.getElementById('view-board'), html`<div class="board" id="board" role="group" aria-label="Tasks by status"${other.length ? html` data-other` : ''}${SHOW.done ? '' : html` data-nodone`}>${cols.map(([s, name]) => { const i = STATUSES.findIndex(x => x[0] === s);
+    const other = v.filter(t => !SLABEL[t.status]), cols = STATUSES.filter(([s]) => F.active.has('done') || s !== 'done');
+    put(document.getElementById('view-board'), html`<div class="board" id="board" role="group" aria-label="Tasks by status"${other.length ? html` data-other` : ''}${F.active.has('done') ? '' : html` data-nodone`}>${cols.map(([s, name]) => { const i = STATUSES.findIndex(x => x[0] === s);
       const rows = v.filter(t => t.status === s);
       return html`<div class="col" data-drop="status:${s}" role="group" aria-label="${name}">
         <header><span class="label"${s === 'done' ? html` title="${DONE_TIP}"` : ''}>${name}</span><kbd>${i + 1}</kbd><span class="n">${rows.length}</span></header>
@@ -286,7 +287,7 @@ addEventListener('DOMContentLoaded', () => {
     // Lead (days) shows only when the Columns menu picks it and the store has a lead (sd:5649).
     const based = tasks.some(t => t.base), lead = LEAD && SHOW.cols.has('lead');
     const cols = COLS.filter(c => (based || (c[0] !== 'stage' && c[0] !== 'score')) && (lead || c[0] !== 'lead'));
-    put(document.getElementById('view-list'), html`<div class="list-wrap"><table class="list" data-tfilter="page" data-toolbar="filterbar"><caption class="sr">Tasks</caption><thead>${list.sortHead(cols, L)}</thead><tbody>
+    put(document.getElementById('view-list'), html`<div class="list-wrap"><table class="list" data-tfilter="page" data-toolbar="toolbar"><caption class="sr">Tasks</caption><thead>${list.sortHead(cols, L)}</thead><tbody>
       ${(v.length ? v.map(t => { const st = state(t), [dt, dc] = dueText(t); return html`<tr data-key="${t.key}"${t.key === selected ? html` aria-current="true"` : ''}${checked.has(t.key) ? html` data-picked` : ''}><td class="slim"><label class="pick"><input type="checkbox" data-check="${t.key}" aria-label="Select ${label(t)}"${checked.has(t.key) ? html` checked` : ''}><span></span></label></td><td class="g g-${st} slim">${st ? GLYPH[st] : ''}</td><td class="mono id">${label(t)}</td><td class="title"><button type="button" data-open="${t.key}">${t.title}</button>${issueLink(t)}<span class="fold mono">${label(t)} · ${t.repo}</span></td><td class="mono rp"><span title="${t.repo}">${t.repo}</span></td><td class="st">${slabel(t.status)}</td>${based ? html`<td>${t.stage || ''}${t.score != null && t.score !== '' ? html`<span class="fold mono">score ${t.score}</span>` : ''}</td><td class="mono sc">${t.score ?? ''}</td>` : ''}<td class="slim"><span class="pri" data-p="${String(t.p || '')}">${t.p ? 'P' + t.p : 'P–'}</span></td><td class="mono due ${dc}">${shortDue(dt)}${opens(t) ? html`<small class="opens">${opens(t)}</small>` : ''}</td>${lead ? html`<td class="mono lead">${t.recurrence ? String(t.lead ?? 0) : ''}</td>` : ''}<td class="slim">${C.rowActions(t.key)}</td></tr>`; }) : html`<tr><td colspan="${cols.length}" class="empty">None match the filters. <button class="linkbtn" type="button" id="clear-f2">Clear filters</button></td></tr>`)}
     </tbody></table></div>${list.pager(all.length, L, 'tasks')}`);
   }
@@ -529,10 +530,11 @@ addEventListener('DOMContentLoaded', () => {
     // ?parked=1 or all picks Parked or All (sd:6701); sd:5643's ?active=parked is Parked too.
     PARKED = window.shell.aside.mode('parked', q);
     if (F.active.delete('parked')) PARKED = 'aside';
-    [...F.active].forEach(v => { if (!['1', 'scheduled'].includes(v)) F.active.delete(v); });
+    if (q.get('done') === '1') F.active.add('done');
+    [...F.active].forEach(v => { if (!['1', 'scheduled', 'done'].includes(v)) F.active.delete(v); });
     (q.get('cols') || '').split(',').filter(v => COL_OPTS.some(o => o[0] === v)).forEach(v => SHOW.cols.add(v));
-    SHOW.done = q.get('done') === '1';
     find.value = (q.get('q') || '').trim(); Q = find.value.toLowerCase();
+    document.getElementById('shift-ghost').hidden = !!find.value;
     // A page is decimal digits, as on Documents (sd:2427).
     window.shell.list.listParams(q, L, { sorts: Object.keys(SORTS), size: LIST.size });
     if (!/^[1-9]\d*$/.test(q.get('page') || '')) seek = !!selected;
@@ -544,7 +546,6 @@ addEventListener('DOMContentLoaded', () => {
     if (Q) q.set('q', Q);
     const pp = window.shell.aside.param(PARKED); if (pp) q.set('parked', pp);
     if (SHOW.cols.size) q.set('cols', [...SHOW.cols].join(','));
-    if (SHOW.done) q.set('done', '1');
     if (view === 'list') window.shell.list.listQuery(q, L, LIST);
     shell.url(q); // the shell keeps ?row=
     shell.filter(Q); // the shell's bar shows the same text (sd:5539)
@@ -584,6 +585,8 @@ addEventListener('DOMContentLoaded', () => {
   function showPreview() {
     const txt = inp.value, P = parse(txt);
     ghost.hidden = !!txt;
+    const q = (P.find ? `#${P.find}` : P.title).toLowerCase();
+    if (q !== Q) { Q = q; L.page = 1; render(); }
     if (!txt.trim()) { prev.hidden = true; inp.setAttribute('aria-expanded', 'false'); return; }
     const found = P.find ? tasks.filter(t => String(t.id) === P.find) : P.title.length > 2 ? tasks.filter(t => t.title.toLowerCase().includes(P.title.toLowerCase())).slice(0, 3) : [];
     const fr = !P.repo && filterRepo() && [...F.repo][0];

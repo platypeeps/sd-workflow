@@ -1351,7 +1351,10 @@ class EveryToolbarHasOneOrder(unittest.TestCase):
             return 0
         if cls & {"shift", "tgrid", "chips"}:
             return 1
-        return 2 if "tools" in cls else None
+        if "tools" in cls:
+            return 2
+        # sd:5281: a page whose table has no title line puts its count at the right of row 1 (Tasks, sd:9309).
+        return 3 if "count" in cls else None
 
     def test_segments_then_the_filter_then_the_actions_in_every_toolbar(self):
         for page in self.PAGES:
