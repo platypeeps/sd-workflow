@@ -4167,6 +4167,8 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
             lanes.append({"path": path, "settled": settled})
     def inline(checkout: pathlib.Path, budget: float) -> StartedLane:
         return inline_lane(lambda: run_lane(checkout, environ, ship, gate, note, clock() + budget))
+    for path, checkout in hosted:  # before any lane starts: a worker past its hard deadline frees its lane
+        lanes += [{"path": path, **row} for row in end_overdue(environ, checkout)]
     order = longest_waiting_first(hosted, environ)
     lanes += run_parallel(order, start or inline, deadline, functools.partial(lane_room, environ),
                           functools.partial(new_work, environ), functools.partial(lane_held, environ, {}),
@@ -4252,17 +4254,18 @@ class StartedLane:
     """A started lane: `answer()` is its row once it ended, else None; `end()` ends it early (sd:5774).
 
     `hand_off()` is its row when the run's budget ends first and the lane runs
-    on without the run (sd:9332): where its answer goes. None is a lane the
-    run cannot hand off, which it then waits for.
+    on without the run (sd:9332): where its answer goes. None, the default,
+    is a lane the run cannot hand off, which it then waits for: only
+    `child_lane` records a child the next run can end (round 3).
     """
 
     answer: Callable[[], dict[str, Any] | None]
     end: Callable[[], None] = lambda: None
     process: subprocess.Popen[bytes] | None = None
-    hand_off: Callable[[], dict[str, Any] | None] = lambda: {"handed_off": "the lane runs on past the run's budget"}
+    hand_off: Callable[[], dict[str, Any] | None] = lambda: None
 
 
-def lane_held(environ: dict[str, str], queues: dict[pathlib.Path, Queue | str],
+def lane_held(environ: dict[str, str], queues: dict[pathlib.Path, Queue],
               checkout: pathlib.Path) -> tuple[bool, str] | None:
     """Whether a live worker holds `checkout`'s lane, and why; None when none does (sd:9332). Never waits.
 
@@ -4271,16 +4274,15 @@ def lane_held(environ: dict[str, str], queues: dict[pathlib.Path, Queue | str],
     held is `(True, why)`. A queue or lock that cannot be read is `(False,
     why)`: the run starts no worker there, and counts it toward no cap,
     since unknown is not a worker. `queues` keeps each lane's queue for the
-    run, so a poll runs no `git`.
+    run, so a poll runs no `git`; a failed read is read again at the next
+    probe (round 3).
     """
-    if checkout not in queues:
+    queue = queues.get(checkout)
+    if queue is None:
         try:
-            queues[checkout] = queue_for(checkout, environ)
+            queue = queues[checkout] = queue_for(checkout, environ)
         except (LaneError, sd_lib.ConfigError, OSError) as error:
-            queues[checkout] = f"its lane is unknown, so no worker starts: {error}"
-    queue = queues[checkout]
-    if isinstance(queue, str):
-        return False, queue
+            return False, f"its lane is unknown, so no worker starts: {error}"
     try:
         with runner_lock(queue) as locked:
             if not locked:
@@ -4303,18 +4305,97 @@ def live_answer(folder: pathlib.Path) -> pathlib.Path | None:
     """
     if not folder.is_dir():
         return None
-    for answer in sorted(folder.glob("*.json")):
+    return next((answer for answer in sorted(folder.glob("*.json")) if answer_locked(answer)), None)
+
+
+def answer_locked(answer: pathlib.Path) -> bool:
+    """Whether a live lane child still holds `answer` locked; a deleted file holds none (sd:9332)."""
+    try:
+        handle = os.open(answer, os.O_RDONLY)
+    except FileNotFoundError:  # its run read it and deleted it
+        return False
+    try:
+        fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return True
+    finally:
+        os.close(handle)
+    return False
+
+
+#: A recorded lane child's answer file name ends `-pid<pid>-until<epoch>`: its group and its hard deadline.
+RECORD = re.compile(r"-pid(\d+)-until(\d+)$")
+
+
+def child_record(stem: pathlib.Path | None) -> tuple[int, int] | None:
+    """The pid and hard deadline (epoch seconds) an answer file's name records, or None (round 3)."""
+    found = None if stem is None else RECORD.search(pathlib.Path(stem).name.removesuffix(".json"))
+    return None if found is None else (int(found.group(1)), int(found.group(2)))
+
+
+def record_child(stem: pathlib.Path, pid: int, hard: float) -> pathlib.Path | None:
+    """Rename a child's answer files to record its pid and hard deadline; the new stem, or None (round 3).
+
+    The open files are the child's stdout and stderr, so a rename keeps
+    them. A rename that fails puts back the one before it: unrecorded files
+    are a child the run does not hand off.
+    """
+    named = stem.with_name(f"{stem.name}-pid{pid}-until{math.ceil(hard)}")
+    moved: list[str] = []
+    try:
+        for suffix in (".err", ".json"):  # the probed `.json` last
+            os.rename(f"{stem}{suffix}", f"{named}{suffix}")
+            moved.append(suffix)
+    except OSError:
+        for suffix in moved:
+            with contextlib.suppress(OSError):
+                os.rename(f"{named}{suffix}", f"{stem}{suffix}")
+        return None
+    return named
+
+
+def end_overdue(environ: dict[str, str], checkout: pathlib.Path) -> list[dict[str, Any]]:
+    """End each handed-off child of `checkout`'s lane still alive past its hard deadline; a row for each (round 3).
+
+    The child arms its own TERM and KILL with SIGALRM, whose handler a
+    blocking native call delays, so it could hold its lane past them. Its
+    answer file's name records its pid and hard deadline: a run TERMs its
+    group, waits `CHILD_STOP_SECONDS` for the lock to free, then KILLs it,
+    before it starts the lane. A pid that no longer leads its own group is
+    another process now, and is left alone. Its entry is then reclaimed
+    by the lane's next settle, the lock being free and the pid gone (sd:3282).
+    """
+    try:
+        folder = queue_for(checkout, environ).lane / "hosted"
+        answers = sorted(folder.glob("*.json")) if folder.is_dir() else []
+    except (LaneError, sd_lib.ConfigError, OSError):
+        return []
+    rows = []
+    for answer in answers:
+        record = child_record(answer)
         try:
-            handle = os.open(answer, os.O_RDONLY)
-        except FileNotFoundError:  # its run read it and deleted it
+            if record is None or time.time() < record[1] or not answer_locked(answer) or \
+                    os.getpgid(record[0]) != record[0]:
+                continue
+        except OSError:  # gone, or not this user's: nothing to end
             continue
-        try:
-            fcntl.flock(handle, fcntl.LOCK_SH | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return answer
-        finally:
-            os.close(handle)
-    return None
+        rows.append({"ended": f"pid {record[0]} held its lane past its hard deadline: {stop_group(record[0], answer)}",
+                     "answer_file": str(answer)})
+    return rows
+
+
+def stop_group(group: int, answer: pathlib.Path) -> str:
+    """TERM `group`, then KILL it if `answer` is still locked after `CHILD_STOP_SECONDS`; how it ended."""
+    for number in (signal.SIGTERM, signal.SIGKILL):
+        sd_lib.signal_group(group, number)
+        stop = time.monotonic() + CHILD_STOP_SECONDS
+        while answer_locked(answer):
+            if time.monotonic() >= stop:
+                break
+            time.sleep(0.05)
+        else:
+            return "TERMed" if number == signal.SIGTERM else "TERMed, then KILLed"
+    return "TERMed, then KILLed, and its lock is still held"
 
 
 def inline_lane(run: Callable[[], dict[str, Any]]) -> StartedLane:
@@ -4409,6 +4490,8 @@ def child_lane(checkout: pathlib.Path, budget: float, argv: list[str] | None = N
                     "--deadline", repr(until)]
     process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err, env=dict(environ),
                                start_new_session=True)  # the environ its answer files were read from
+    if stem is not None:  # its hard deadline is its own KILL point: past it, the next run ends it (round 3)
+        stem = record_child(stem, process.pid, until + TERM_AFTER_BUDGET_SECONDS + CHILD_STOP_SECONDS) or stem
     return StartedLane(functools.partial(child_answer, process, out, err, stem),
                        functools.partial(end_child, process, out, err), process,
                        functools.partial(hand_off_child, process, out, err, stem))
@@ -4448,12 +4531,13 @@ def hand_off_child(process: subprocess.Popen[bytes], out: Any, err: Any,
     """The row of a lane child the run leaves running at its budget (sd:9332): its pid, its group, its answer file.
 
     A child that exited since the last look gives its own row instead, and its
-    files go. A child with no answer file is None: no lock marks its lane as
-    held once it frees its runner lock, so the run waits for it, as before.
+    files go. A child with no recorded answer file is None: no lock marks its
+    lane as held once it frees its runner lock, and no run could end it past
+    its hard deadline (`end_overdue`), so the run waits for it, as before.
     """
     if process.poll() is not None:
         return child_answer(process, out, err, stem) or {}
-    if stem is None:
+    if child_record(stem) is None:  # nothing would mark its lane, or end it past its deadline
         return None
     out.close()
     err.close()
@@ -4598,27 +4682,35 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
                 if idle and not started:  # a scan read every lane after the last one ended
                     break
                 time.sleep(START_POLL_SECONDS)
-            hand_off_lanes(running, rows)
+            hand_off_lanes(running, rows, deadline + TERM_AFTER_BUDGET_SECONDS - 2 * CHILD_STOP_SECONDS)
         finally:
             stop_lanes(list(running.values()))
     return [{"path": path, **row} for (path, _), runs in zip(order, rows, strict=True) for row in (runs or [{}])]
 
 
-def hand_off_lanes(running: dict[int, StartedLane], rows: list[list[dict[str, Any]]]) -> None:
-    """Hand off each lane in `running` at the budget; wait for each that cannot be (round 2).
+def hand_off_lanes(running: dict[int, StartedLane], rows: list[list[dict[str, Any]]], stop: float) -> None:
+    """Hand off each lane in `running` at the budget; wait for each that cannot be until `stop` (round 2).
 
     One with no answer file holds no lock past its runner lock's release, so
     the next run could start a second worker there: the run waits for it, as
-    every run did before sd:9332, and its own TERM point ends it at the latest.
+    every run did before sd:9332. At `stop`, on `clock`, it ends each one
+    (`stop_lanes`), its TERM and KILL done before the job's own TERM: no
+    lane relies on its own alarm alone (round 3).
     """
     for index, lane in list(running.items()):
         row = lane.hand_off()
         if row is not None:
             rows[index].append(row)
             del running[index]
-    while running:
+    while running and clock() < stop:
         time.sleep(START_POLL_SECONDS)
         collect_ended(running, rows)
+    if running:
+        stop_lanes(list(running.values()))
+        for index in running:
+            rows[index].append({"error": "the run ended this lane before the job's TERM: it had no answer file "
+                                         "to hand it off with"})
+        running.clear()
 
 
 def stop_lanes(lanes: list[StartedLane]) -> None:
@@ -4865,6 +4957,9 @@ def run_budgeted(root: pathlib.Path, environ: dict[str, str], budget: float | No
 
     A hosted run's child may outlive the run, so it TERMs itself (sd:9332).
     """
+    for name, given in (("--budget", budget), ("--deadline", deadline)):
+        if given is not None and not math.isfinite(given):
+            raise LaneError(f"{name} must be a finite number of seconds, not {given}; nothing ran")
     left = budget if deadline is None else deadline - time.time()
     if left is not None:
         arm_term(term_delay(left))

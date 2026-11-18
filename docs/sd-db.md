@@ -220,8 +220,10 @@ A lane whose turn comes after that is still settled in the run, below the cap, s
 launchd runs one instance of a job at a time, so a run that waited for a long lane held every other lane back.
 A handed-off child leads its own process group and TERMs itself at the run's TERM point, 120 min from the run's start.
 The run passes it a wall-clock `--deadline`, so a slow start moves neither its last claim nor that point.
-Its answer goes to `<lane folder>/hosted/<stamp>.json`, which the job log's `handed_off` row names.
-A child whose answer file could not be made is not handed off: the run waits for it, as before.
+Its answer goes to `<lane folder>/hosted/<stamp>-pid<pid>-until<epoch>.json`, which the job log's `handed_off` row names.
+A child whose answer file could not be made is not handed off: the run waits for it, and ends it a minute before the job's TERM.
+The answer file's name records the child's pid and hard deadline, its own KILL point.
+A run that finds a child alive past it TERMs, then KILLs its group before it starts that lane: a blocked call can delay the child's own alarm.
 The next run skips a lane such a child holds, and counts it toward the three lanes and the gate room.
 Unloading the job does not stop a handed-off child: `kill -- -<pid>` with the row's pid does, and the next run reclaims its entry.
 [WORKFLOW.md § Parallel work](../WORKFLOW.md#parallel-work) covers the lane from the ship side.
