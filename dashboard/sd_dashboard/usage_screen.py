@@ -121,6 +121,17 @@ def _word(value, known) -> str:
     return value if isinstance(value, str) and value in known else "unknown"
 
 
+def _text(value) -> str:
+    """A reading's text field as shown: a string, at most 200 characters."""
+    return str(value or "")[:200]
+
+
+def _minutes(value) -> int | None:
+    """A window's length in minutes, or None: a bool, a non-positive value or one past 10 years is none, so no float
+    conversion overflows and no label runs to hundreds of digits."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and 0 < value <= 10 * 525_600 else None
+
+
 def _number(value) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
@@ -176,23 +187,24 @@ def services(connection: sqlite3.Connection, *, now: str) -> list[dict]:
         if not body:
             why = "the row does not parse"
         elif status == "unknown" and not why:
-            why = str(body.get("error") or "the status job could not read it")[:200]
+            why = _text(body.get("error") or "the status job could not read it")
         incidents = [one for one in body.get("incidents") or [] if isinstance(one, dict)] if isinstance(
             body.get("incidents"), list) else []
         components = [one for one in body.get("components") or [] if isinstance(one, dict)] if isinstance(
             body.get("components"), list) else []
-        providers = [p for p in body.get("providers") or [] if isinstance(p, str)] if isinstance(
+        providers = [p for p in body.get("providers") or [] if isinstance(p, str) and NAME.fullmatch(p)] if isinstance(
             body.get("providers"), list) else []
         out.append({"name": name, "status": "unknown" if why else status, "why": why, "read_at": read_at,
-                    "row_at": stamp, "kind": body.get("kind") if isinstance(body.get("kind"), str) else "",
+                    "row_at": stamp, "kind": _text(body.get("kind")) if isinstance(body.get("kind"), str) else "",
                     "url": body.get("url") if isinstance(body.get("url"), str) and _web_url(body["url"]) else "",
-                    "providers": providers, "indicator": body.get("indicator") if isinstance(body.get("indicator"), str) else "",
-                    "incidents": [{"title": str(one.get("title") or "")[:200],
+                    "providers": providers,
+                    "indicator": _text(body.get("indicator")) if isinstance(body.get("indicator"), str) else "",
+                    "incidents": [{"title": _text(one.get("title")),
                                    "url": one["url"] if isinstance(one.get("url"), str) and _web_url(one["url"]) else "",
-                                   "impact": str(one.get("impact") or ""),
+                                   "impact": _text(one.get("impact")),
                                    "started_at": one.get("started_at") if _when(one.get("started_at")) else None}
                                   for one in incidents],
-                    "components": [{"name": str(one.get("name") or ""), "status": str(one.get("status") or "")}
+                    "components": [{"name": _text(one.get("name")), "status": _text(one.get("status"))}
                                    for one in components]})
     return out
 
@@ -215,10 +227,10 @@ def _flag(found: list[dict]) -> dict | None:
 
 
 def _label(window: dict) -> str:
-    minutes = window.get("window_minutes")
-    if isinstance(minutes, int) and not isinstance(minutes, bool) and minutes > 0:
+    minutes = _minutes(window.get("window_minutes"))
+    if minutes:
         return f"{minutes // 1440}d" if minutes % 1440 == 0 else f"{minutes // 60}h" if minutes % 60 == 0 else f"{minutes}m"
-    return str(window.get("name") or "window")
+    return _text(window.get("name") or "window")
 
 
 def _pace(used: float, minutes, resets_at, clock: datetime, expected=None) -> float | None:
@@ -227,8 +239,8 @@ def _pace(used: float, minutes, resets_at, clock: datetime, expected=None) -> fl
     if _number(expected) is not None:
         over = used - float(expected)
         return round(over) if math.isfinite(over) else None
-    reset = _when(resets_at)
-    if reset is None or not isinstance(minutes, int) or isinstance(minutes, bool) or minutes <= 0:
+    reset, minutes = _when(resets_at), _minutes(minutes)
+    if reset is None or minutes is None:
         return None
     left = (reset - clock).total_seconds() / 60
     if not 0 <= left <= minutes:
@@ -248,7 +260,7 @@ def _window(window: dict, clock: datetime, expected=None) -> dict | None:
 def _money(value) -> dict | None:
     if not isinstance(value, dict) or _number(value.get("amount")) is None:
         return None
-    return {"amount": _number(value["amount"]), "unit": str(value.get("unit") or ""), "period": str(value.get("period") or "")}
+    return {"amount": _number(value["amount"]), "unit": _text(value.get("unit")), "period": _text(value.get("period"))}
 
 
 def _usage_row(ident: str, label: str, *, status: str, why: str, read_at, windows: list[dict], balance, spend,
@@ -321,7 +333,7 @@ def strip(connection: sqlite3.Connection, *, now: str) -> dict:
         if not body:
             why = "the row does not parse"
         elif status != "ok":
-            why = str(body.get("error") or "the usage job could not read it")[:200]
+            why = _text(body.get("error") or "the usage job could not read it")
         elif name == "claude" and isinstance(accounts, list) and accounts:
             why = "cswap lists no numbered account"
         elif not read_at:

@@ -171,6 +171,17 @@ class TheServicesReader(ScreenCase):
         self.assertEqual([(one["status"], one["why"]) for one in usage_screen.services(self.connection, now=NOW)],
                          [("unknown", "the reading has no read time")])
 
+    def test_each_text_field_is_capped_at_200_characters(self):
+        # Bundle review round 3: kind, indicator, providers, impact and
+        # components passed through uncapped.
+        long = "x" * 10_000
+        status(self.connection, "s", status="degraded", kind=long, indicator=long, providers=[long, "codex"],
+               incidents=[{"title": long, "impact": long}], components=[{"name": long, "status": long}])
+        [one] = usage_screen.services(self.connection, now=NOW)
+        self.assertEqual((len(one["kind"]), len(one["indicator"]), one["providers"]), (200, 200, ["codex"]))
+        self.assertEqual((len(one["incidents"][0]["title"]), len(one["incidents"][0]["impact"])), (200, 200))
+        self.assertEqual(one["components"], [{"name": "x" * 200, "status": "x" * 200}])
+
     def test_ignore_holds_only_for_the_same_incident(self):
         # Bundle review round 2: the fingerprint read titles only, so an
         # ignored outage hid a later one with the same title.

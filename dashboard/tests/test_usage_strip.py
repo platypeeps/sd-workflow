@@ -87,6 +87,23 @@ class TheStrip(ScreenCase):
         [row] = self.strip()["rows"]
         self.assertEqual(row["windows"][0]["pace"], None)
 
+    def test_a_window_too_long_for_a_float_has_no_pace_and_its_name(self):
+        # Bundle review round 3: 10**400 minutes raised "int too large to
+        # convert to float", which replaced the whole strip.
+        reading(self.connection, "codex", windows=[
+            {"name": "primary", "used_percent": 5, "window_minutes": 10 ** 400, "resets_at": "2026-09-06T15:00:00Z"}])
+        [row] = self.strip()["rows"]
+        self.assertEqual(row["windows"], [{"label": "primary", "used": 5.0, "resets_at": "2026-09-06T15:00:00Z",
+                                           "pace": None}])
+
+    def test_each_text_field_is_capped_at_200_characters(self):
+        long = "x" * 10_000
+        reading(self.connection, "codex", windows=[{"name": long, "used_percent": 5}],
+                balance={"amount": 1, "unit": long, "period": long})
+        [row] = self.strip()["rows"]
+        self.assertEqual((len(row["windows"][0]["label"]), len(row["balance"]["unit"]), len(row["balance"]["period"])),
+                         (200, 200, 200))
+
     def test_a_reading_over_30_minutes_old_is_unknown_and_shows_no_number(self):
         reading(self.connection, "codex", read_at="2026-09-06T11:29:00Z", **CODEX)
         row = self.strip()["rows"][0]
