@@ -727,6 +727,9 @@ METRICS_SHELL = r"""
 window.shell.row = () => null;
 window.shell.pages = { Tasks: '/tasks' };
 OUT.shown = []; window.shell.view = { show: id => { OUT.shown.push(id); return true; }, current: () => 'spend', count() {} };
+// A section's own slot (shell.state(s, 'state-<section>'), sd:9318) is recorded with its id.
+OUT.slots = []; const pageState = window.shell.state;
+window.shell.state = (s, at) => at ? OUT.slots.push([at, s && s.kind]) : pageState(s);
 """
 
 
@@ -1142,6 +1145,21 @@ ELS.month.value = ''; ELS.month.listeners.change[0]({ target: ELS.month }); awai
         week = self.run_page("R.week = ELS['week-body'].html;", doc)["R"]["week"]
         self.assertEqual(len(re.findall(r'<td class="g g-unknown">', week)), len(doc["numbers"]["rows"]))
         self.assertNotIn("$0.00", week)
+
+    def test_while_reading_each_section_shows_loading_and_the_month_reads(self):
+        """sd:9318: no chart section sits empty under its head while Metrics reads, and Month is no blank mask."""
+        hold = ("var HELD = [], F0 = fetch;\n"
+                "fetch = (p, o) => new Promise(done => HELD.push(() => done(F0(p, o))));\n")
+        out = self.run_page("""R.loading = OUT.slots; R.month = ELS.month.value; OUT.slots = [];
+HELD.forEach(f => f()); await flush(); R.after = OUT.slots; R.read = ELS.month.value;""", before=hold)
+        r, sections = out["R"], ["state-bills", "state-windows", "state-burns", "state-trends", "state-model"]
+        self.assertEqual(r["loading"], [[s, "loading"] for s in sections])
+        self.assertRegex(r["month"] or "", r"^\d{4}-\d{2}$")
+        self.assertEqual(r["after"], [[s, None] for s in sections])
+        self.assertEqual(r["read"], "2026-09")
+        page = (V2 / "metrics.html").read_text(encoding="utf-8")
+        for s in sections:
+            self.assertIn(f'<div id="{s}" hidden></div>', page)
 
     def test_the_address_opens_the_page_at_its_month_and_range(self):
         out = self.run_page("", before="location.search = '?range=6mo&month=2026-08';\n")

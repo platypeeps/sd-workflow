@@ -258,7 +258,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
              failed: r.kind === 'job' && !!r.retry, retry: r.retry, job: job && job[1], service: r.service,
              exit: r.exit, revision: r.revision, capability: r.capability, repo: pr ? pr[1] : r.repo, number: pr && +pr[2], seen: r.seen,
              item: r.item, itemKind: r.item_kind, state: r.state, url: r.url, fieldsRead: r.fields_read, until: r.until, login: r.login, claim: r.claim,
-             repoPath: r.repo_path, laneRevision: r.lane_revision, head: r.expected_head, runnerMerge: r.runner_merge, unchanged: r.unchanged, failure: r.failure,
+             repoPath: r.repo_path, repoKey: r.repo_key, laneRevision: r.lane_revision, head: r.expected_head, runnerMerge: r.runner_merge, unchanged: r.unchanged, failure: r.failure,
              members: r.members && r.members.map(m => ({ id: m.id, seen: m.seen, until: m.until, item: m.item })), group: r.id,
              band: r.band, detail: r.detail, source: r.source };
   }
@@ -359,8 +359,10 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   const qShow = new Set();
   let qOpen = null, qSaid = null; // the one open repo; the last write's result
   let qTile = null; // pack sd:8138: the open repo's pressed box, { repo, box }; it holds only while that repo is open
-  // ponytail: the repo's folder name keys its row; two checkouts of one name share a row.
-  const repoKey = p => p ? String(p).replace(/\/+$/, '').split('/').pop() : '';
+  // sd:9258: a repo's row is keyed by the repo row's path, the database key every read names (a lane's `key`, an
+  // item's repo); a path is shortened only for display: its folder name, or the key where two rows share that name.
+  const repoKey = p => p ? String(p) : '';
+  const folder = k => k.replace(/\/+$/, '').split('/').pop();
   const HM = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
   const at = s => s ? HM.format(new Date(s)) : 'not recorded';
   const dur = s => s == null ? 'not recorded' : s < 3600 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m`;
@@ -481,9 +483,10 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     : html`<b>blocked: PR</b> · on ${p.on} · waited ${dur(p.waited)} since ${at(p.since)}${prTags(p)}`;
   const prWaitLink = p => html`<div class="ctl" role="group" aria-label="Pull request of sd:${String(p.item)}"><a class="btn quiet sm" href="${p.url}" target="_blank" rel="noopener noreferrer" aria-label="Open the pull request of sd:${p.item} on GitHub">Open PR</a></div>`;
   // sd:8142: a PR no item links (`item` null) is keyed and linked by its URL, named `owner/repo#N`.
+  // sd:9258: an unlinked pull's link says its GitHub `slug`; its `repo` is the key it groups under.
   const prRow = p => { const s = p.stale ? 'unknown' : p.on === 'you' ? 'warning' : 'queued';
     return ['blocked', s, html`<tr class="child" data-type="blocked" data-pr="${p.item == null ? p.url : String(p.item)}">${marker(s, 'blocked')}
-    <td class="what">${p.item == null ? html`<a href="${p.url}" target="_blank" rel="noopener noreferrer">${p.repo}#${p.url.split('/').pop()} ${p.title}</a>`
+    <td class="what">${p.item == null ? html`<a href="${p.url}" target="_blank" rel="noopener noreferrer">${p.slug || p.repo}#${p.url.split('/').pop()} ${p.title}</a>`
       : html`<a href="${shell.itemHref(p.item)}">#${p.item} ${p.title}</a>`}</td>
     <td class="detail">${prFacts(p)}</td><td class="num">${p.stale ? '' : dur(p.waited)}</td>
     <td class="act">${p.item == null ? '' : prWaitLink(p)}</td></tr>`, p.on]; };
@@ -524,7 +527,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   }
   const parkedTasks = () => { const ideas = new Set((QV.tasks && QV.tasks.ideas) || []);
     return QV.tasks ? QV.tasks.rows.filter(t => t.parked && !ideas.has(t.kind)).map(TD.shape) : []; };
-  const parkedItems = () => new Map(parkedTasks().map(t => [t.key, t]));
+  // sd:9258: a parked task with no repo is no row (pack sd:7731), so no row object; the tally still counts it.
+  const parkedItems = () => new Map(parkedTasks().filter(t => t.repo_path).map(t => [t.key, t]));
   // A task's read row (SROW) holds while it is still an item row at the revision its /api/tasks row has (pack sd:7251): a
   // row read at another revision is dropped, so taskOf acts on the fresh row, not the status it had when it was selected.
   const freshRows = () => [...SROW].filter(([k, t]) => !isItem(k) || (listedTask(k) && listedTask(k).revision !== t.revision)).forEach(([k]) => SROW.delete(k));
@@ -566,13 +570,13 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       const p = r.state === 'blocked' && r.status === 'prepared' ? waitOf.get(Number(r.item)) : undefined;
       if (p) drawn.add(p);
       if (r.state === 'blocked' && !p && aside(r.item, `lane ${r.status}${r.step ? ` at ${r.step}` : ''} · ${r.reason}`)) return;
-      add(l.path, entryRow(l, r, p)); });
-      if (G.has(repoKey(l.path))) G.get(repoKey(l.path)).host = l.host; });
+      add(l.key, entryRow(l, r, p)); });
+      if (G.has(repoKey(l.key))) G.get(repoKey(l.key)).host = l.host; });
     prs.filter(p => !drawn.has(p)).forEach(p => add(p.repo, prRow(p)));
     SUGG.forEach(r => { if (!waits.has(Number(r.id))) add(r.repo, suggestRow(r)); });
     OPENI.forEach(t => { if (!waits.has(Number(t.id))) add(t.repo_path, openRow(t)); });
     // sd:9247: each repo's parked tasks (no idea kind), PR wait or lane entry or not; hidden until their box is pressed.
-    // A task with no repo is no row (pack sd:7731), as in Suggested; the tally counts the same set.
+    // A task with no repo is no row (pack sd:7731), as in Suggested; the tally counts it, as Tasks' Parked chip lists it.
     parkedTasks().filter(t => t.repo_path).forEach(t => add(t.repo_path, openRow(t, 'parked', why.get(Number(t.id)))));
     B.recent.forEach(r => add(r.repo, endedRun(r)));
     const RANK = { warning: 0, caution: 1, unknown: 2, ok: 3, queued: 4 };
@@ -583,7 +587,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       // pack sd:8083: a PR wait counts in review, not blocked, so no row counts twice.
       const n = Object.fromEntries(BOXES.map(t => [t, g.rows.filter(inBox(t)).length]));
       return { ...g, shown, n, s: shown.reduce((w, c) => RANK[c.s] < RANK[w] ? c.s : w, 'queued') };
-    }).sort((a, b) => (a.key === '') - (b.key === '') || busy(a, b) || a.key.localeCompare(b.key));
+    }).sort((a, b) => (a.key === '') - (b.key === '') || busy(a, b) || folder(a.key).localeCompare(folder(b.key)) || a.key.localeCompare(b.key));
   }
   // A box's rows: review holds the PR waits, each other box its type less those (pack sd:8083).
   // sd:8116: a stale PR row (unknown, no one to wait on) shows under its repo and counts in no box.
@@ -602,12 +606,16 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   const PARKED_MEANS = 'parked: tasks set aside (Tasks, Parked); no other box counts them';
   function pips(g) {
     const pip = (box, n, on, means) => html`<button type="button" class="tile" data-repo="${g.key}" data-tile="${box}" aria-pressed="${String(!!qTile && qTile.repo === g.key && qTile.box === box)}" aria-label="${`Only the ${n} ${box} rows`}"${n ? '' : html` disabled`}><span class="pip${n ? on : ''}" title="${`${n} ${means}`}">${String(n)}</span></button>`;
-    if (g.key && (!QV.lanes || QV.lanes.problems.some(p => repoKey(p.repo) === g.key)))
-      return html`<td class="detail${g.n.parked ? ' pipe' : ''}"><span class="g-unknown" aria-hidden="true">${GLYPH.unknown}</span> lane not read${g.n.parked ? pip('parked', g.n.parked, ' on', PARKED_MEANS) : ''}</td>`;
+    // sd:9258: a tasks read that failed counts no parked task: the box says not read, never 0.
+    const unread = !QV.tasks, parkedPip = () => unread
+      ? html`<button type="button" class="tile" data-repo="${g.key}" data-tile="parked" aria-pressed="false" aria-label="Parked tasks not read" disabled><span class="pip" title="${`parked: tasks not read: ${QV.tasksErr || 'no answer yet'}`}">${GLYPH.unknown}</span></button>`
+      : pip('parked', g.n.parked, ' on', PARKED_MEANS);
+    if (g.key && (!QV.lanes || QV.lanes.problems.some(p => repoKey(p.key) === g.key)))
+      return html`<td class="detail${g.n.parked ? ' pipe' : ''}"><span class="g-unknown" aria-hidden="true">${GLYPH.unknown}</span> lane not read${g.n.parked ? parkedPip() : ''}</td>`;
     // pack sd:7470: merging is the leftmost box; pack sd:8137: review follows it.
     const { working: w, merging: m, next: n, blocked: b, review: v, suggested: s, parked: pk } = g.n, you = g.rows.filter(c => c.pr === 'you').length;
     // Each box says its count and what it counts, in its title (pack sd:7383); the label above says all six at once.
-    return html`<td class="detail pipe" aria-label="${m} merging, ${v} review, ${w} working, ${n} next, ${b} blocked, ${s} suggested, ${pk} parked">${pip('merging', m, ' on', 'merging: claimed by the lane runner, being merged')}${pip('review', v, you ? ' caution' : ' on', `review: pull requests waiting on a review, ${you} on you, ${v - you} on reviewers`)}${pip('working', w, ' on', 'working: live sessions, build runs and lane gates now running')}${pip('next', n, ' on', 'next: queued in the lane, not started')}${pip('blocked', b, ' warn', 'blocked: stopped in the lane or a build until someone acts')}${pip('suggested', s, ' on', `suggested: up to ${NEXT} items to do next: ready, due today or overdue, planned or unscheduled`)}${pip('parked', pk, ' on', PARKED_MEANS)}</td>`;
+    return html`<td class="detail pipe" aria-label="${m} merging, ${v} review, ${w} working, ${n} next, ${b} blocked, ${s} suggested, ${unread ? 'parked not read' : `${pk} parked`}">${pip('merging', m, ' on', 'merging: claimed by the lane runner, being merged')}${pip('review', v, you ? ' caution' : ' on', `review: pull requests waiting on a review, ${you} on you, ${v - you} on reviewers`)}${pip('working', w, ' on', 'working: live sessions, build runs and lane gates now running')}${pip('next', n, ' on', 'next: queued in the lane, not started')}${pip('blocked', b, ' warn', 'blocked: stopped in the lane or a build until someone acts')}${pip('suggested', s, ' on', `suggested: up to ${NEXT} items to do next: ready, due today or overdue, planned or unscheduled`)}${parkedPip()}</td>`;
   }
   function queueView() {
     const unread = [];
@@ -637,7 +645,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       ({ v, pressed: qShow.has(v), label: n(v) === null ? html`${label}` : html`${label} <span class="n">${String(n(v))}</span>` }))));
     const prs = prTally(every);
     // sd:8953: the parked tasks Tasks reads (parked_at, not a status), less the idea kinds; it opens Tasks' Parked chip.
-    const parked = parkedTasks().filter(t => t.repo_path).length;
+    const parked = parkedTasks().length;
     put($('queue-tally'), html`${tally(every.filter(c => !QSHOW.includes(c.type))).map(([t, n]) => html`<span>${n} ${t}</span>`)}${prs ? html`<span>${prs}</span>` : ''}${parked ? html`<a href="/tasks?parked=1&amp;realm=all">${String(parked)} parked</a>` : ''}`);
     // Auto-pickup (pack sd:6097): its state, and On or Off, bound to the value this read saw. On has no end (pack sd:8930).
     const pk = QV.built && QV.built.pickup;
@@ -645,12 +653,14 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       : pk.on ? html`Auto-pickup is on: each tick queues ready items into free builder room. <button class="btn quiet sm" type="button" data-pickup="off"${QV.busy ? html` disabled` : ''}>Turn off</button>`
       : html`Auto-pickup is off. <button class="btn quiet sm" type="button" data-pickup="on" aria-label="Turn auto-pickup on"${QV.busy ? html` disabled` : ''}>Turn on</button>`);
     const said = $('queue-said'); said.hidden = !qSaid; said.textContent = qSaid ? qSaid.text : ''; said.setAttribute('role', qSaid && !qSaid.ok ? 'alert' : 'status');
-    const parent = g => { const on = qOpen === g.key, name = g.key || 'Unassociated';
+    const shared = name => groups.filter(x => x.key && folder(x.key) === name).length > 1;
+    const parent = g => { const on = qOpen === g.key, name = !g.key ? 'Unassociated' : shared(folder(g.key)) ? g.key : folder(g.key);
       return html`<tr class="repo" data-repo="${g.key}" aria-expanded="${String(on)}">${marker(g.s, 'repo')}
         <td class="what"><button type="button" class="disc" data-open="${g.key}" aria-expanded="${String(on)}" aria-label="${on ? 'Close' : 'Open'} ${name}">${I('chevron-right')}</button><button type="button" class="pick" data-open="${g.key}">${name}</button>${g.host ? html`<small>lane on ${g.host}</small>` : ''}</td>
         ${pips(g)}<td class="num"></td><td class="act"></td></tr>`; };
     // pack sd:8138: a pressed box shows its rows, hidden by a Show filter or not, under a line that clears it.
-    const kids = g => { if (!qTile || qTile.repo !== g.key) return (g.shown.length ? g.shown : g.rows.filter(c => c.type === 'parked' && qMatch(c))).map(c => c.tr);
+    // An open repo whose only rows are parked shows them; sd:9258: one whose other rows the Show filters hide does not.
+    const kids = g => { if (!qTile || qTile.repo !== g.key) return (g.shown.length || g.rows.some(c => c.type !== 'parked') ? g.shown : g.rows.filter(qMatch)).map(c => c.tr);
       const rows = g.rows.filter(inBox(qTile.box)).filter(qMatch).sort((a, b) => QTYPES.indexOf(a.type) - QTYPES.indexOf(b.type));
       return [html`<tr class="child tiled"><td colspan="5"><button type="button" class="linkbtn" data-tile-clear="${g.key}">${String(rows.length)} ${qTile.box} (${plural(g.rows.length, 'row')}) · Show all</button></td></tr>`, ...rows.map(c => c.tr)]; };
     // A filter shows each repo's matching rows, open or not.
@@ -1203,7 +1213,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
         cli: o => `sd-ship -C ${o.repoPath} lane retry ${o.item} --expected-head ${o.head} --manual`, sends: () => 'POST /api/queue/move {action: approve}',
         when: o => o.runnerMerge === 'manual' || 'this repo merges automatically, so it needs no approval', run: o => lane('approve')(o).then(() => `Approved · sd:${o.item}`) },
       { id: 'today.lane.queue', on: 'lane entry', label: 'Open in Queue', does: 'Opens its repo in the Queue view, where Cancel is.', key: 'q', risk: 'safe', executes: false,
-        cli: o => `sd-ship -C ${o.repoPath} lane list`, run: o => { qOpen = repoKey(o.repoPath); shell.view.show('queue'); queueView(); return 'Queue opens'; } },
+        cli: o => `sd-ship -C ${o.repoPath} lane list`, run: o => { qOpen = repoKey(o.repoKey); shell.view.show('queue'); queueView(); return 'Queue opens'; } },
       // A new brief: Seen is the Today snooze held until the brief changes (sd:5752), the mark the place pages read too.
       { id: 'today.brief.seen', on: 'brief', label: 'Seen', does: 'Hides the brief from Today until its text grows.', key: 's', icon: 'eye', risk: 'safe', bulk: true, primary: () => true,
         cli: () => 'no sd verb: the dashboard writes the snooze (POST /api/snooze)',

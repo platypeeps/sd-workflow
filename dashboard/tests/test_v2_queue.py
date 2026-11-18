@@ -346,6 +346,50 @@ class TheRows(Lane, ScreenCase):
         self.assertEqual((rows[1]["on"], rows[1]["waited"], rows[1]["approximate"], rows[1]["stale"]),
                          ("reviewers", 3600, True, False))
 
+    def test_lanes_problems_and_unlinked_pulls_carry_the_repository_key(self):
+        # sd:9258 round 2: the page grouped by a name it made from a path; each row now names the repo row's path.
+        from sd_db.writes import record_state
+
+        self.connection.execute("UPDATE repo SET remote = ? WHERE path = ?",
+                                ("https://github.com/example/system.git", str(self.checkout)))
+        upsert_repo(self.connection, "~/example.test/gone", remote="https://github.com/example/gone.git", managed=1)
+        url = "https://github.com/example/system/pull/912"
+        record_state(self.connection, "checkpoint", key="contribution:github:" + url, body={"observation": {
+            "operator": {"id": "1", "login": "operator"}, "author": {"id": "1", "login": "operator"},
+            "requested_reviewers": [], "reviews": [], "state": "open", "draft": False, "title": "Unlinked 912",
+            "observed_at": "2026-09-06T11:30:00Z", "repo": "example/System", "events": []}})
+        self.connection.commit()
+        doc = self.doc()
+        self.assertEqual(doc["lanes"][0]["key"], str(self.checkout))
+        self.assertEqual([p["key"] for p in doc["problems"]], ["~/example.test/gone"])
+        self.assertEqual([r["repo"] for r in doc["prs"]["rows"] if r["url"] == url], [str(self.checkout)])
+
+    def unlinked_912(self):
+        from sd_db.writes import record_state
+
+        url = "https://github.com/example/system/pull/912"
+        record_state(self.connection, "checkpoint", key="contribution:github:" + url, body={"observation": {
+            "operator": {"id": "1", "login": "operator"}, "author": {"id": "1", "login": "operator"},
+            "requested_reviewers": [], "reviews": [], "state": "open", "draft": False, "title": "Unlinked 912",
+            "observed_at": "2026-09-06T11:30:00Z", "repo": "example/System", "events": []}})
+        self.connection.commit()
+        return [r for r in self.doc()["prs"]["rows"] if r["url"] == url]
+
+    def test_an_unlinked_pull_keeps_its_slug_beside_the_key(self):
+        # sd:9258 round 3: the link label is the GitHub slug, never the local path it maps to.
+        self.connection.execute("UPDATE repo SET remote = ? WHERE path = ?",
+                                ("https://github.com/example/system.git", str(self.checkout)))
+        self.assertEqual([(r["repo"], r["slug"]) for r in self.unlinked_912()], [(str(self.checkout), "example/System")])
+
+    def test_an_unlinked_pull_two_checkouts_share_stays_under_its_slug(self):
+        # sd:9258 round 3: two registered checkouts of one remote; nothing says which one the pull is for.
+        self.connection.execute("UPDATE repo SET remote = ? WHERE path = ?",
+                                ("https://github.com/example/system.git", str(self.checkout)))
+        upsert_repo(self.connection, "~/example.test/system", remote="git@github.com:example/system.git", managed=0)
+        rows = self.unlinked_912()
+        self.assertEqual([r["repo"] for r in rows], ["example/System"], "the pull went to one checkout unproven")
+        self.assertEqual([r["slug"] for r in rows], ["example/System"])
+
     def test_an_item_in_the_lane_keeps_its_lane_row_not_a_pr_row(self):
         item, _ = self.pr_item(904, ("2026-09-06T10:00:00Z", "awaiting_them"))
         self.list([*self.entries(), {"item": item, "title": "In the lane", "status": "pending", "expected_head": "e" * 40}])
@@ -1347,7 +1391,7 @@ class TheInProcessRead(RealLane):
                 mock.patch.object(queue_screen, "lane_list", return_value={"ok": False, "error": "listed"}) as listing:
             doc = queue_screen.document(self.connection, now=NOW)
         listing.assert_called_once_with(str(self.checkout))
-        self.assertEqual(doc["problems"], [{"repo": str(self.checkout), "error": "listed"}])
+        self.assertEqual(doc["problems"], [{"repo": str(self.checkout), "key": str(self.checkout), "error": "listed"}])
 
     def test_a_failed_read_is_a_named_problem_not_an_empty_lane(self):
         lane_module = queue_screen.pack_module("sd_lane")
@@ -1421,10 +1465,13 @@ class TheView(Lane, ReaderCase):
               "detail": "-", "since": NOW}]
 
     JS = """
-const open = k => ELS.queue.listeners.click[0]({ target: { closest: s => s === 'tr.repo' ? { dataset: { repo: k } } : null } });
+// A repo row by its key or its shown name (sd:9258: the key is the repo row's path; the name is for display).
+const keyOf = k => ([...String(ELS.queue.html || '').matchAll(/class="pick" data-open="([^"]*)">([^<]*)</g)].find(m => m[2] === k) || [0, k])[1];
+const open = k => ELS.queue.listeners.click[0]({ target: { closest: s => s === 'tr.repo' ? { dataset: { repo: keyOf(k) } } : null } });
 const press = v => ELS['queue-filters'].listeners.click[0]({ target: { closest: s => s === 'button[data-f="qshow"]' ? { dataset: { v } } : null } });
 const act = (sel, data) => ELS.queue.listeners.click[0]({ target: { closest: s => s === sel ? { disabled: false, dataset: data } : null } });
-const repos = () => [...ELS.queue.html.matchAll(/<tr class="repo" data-repo="([^"]*)" aria-expanded="(true|false)"/g)].map(m => m[1] + ':' + m[2]);
+const repos = () => [...ELS.queue.html.matchAll(/<tr class="repo" data-repo="[^"]*" aria-expanded="(true|false)">[\\s\\S]*?class="pick" data-open="[^"]*">([^<]*)</g)].map(m => m[2] + ':' + m[1]);
+const keys = () => [...ELS.queue.html.matchAll(/<tr class="repo" data-repo="([^"]*)"/g)].map(m => m[1]);
 const kids = () => [...ELS.queue.html.matchAll(/<tr class="child" data-type="([a-z]+)"/g)].map(m => m[1]);
 OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
 """
@@ -1435,11 +1482,18 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.doc["queues"] = {"rows": self.READY, "suggested": as_suggested(self.READY), "error": ""}
 
     # pack sd:7314: with no `show` key Suggested is on; the view's tests start from every filter off, as `?show=` keeps it.
+    SYSTEM = "~/repos/example/system"
+
     def run_view(self, body, search="?show=", answers=None, before=""):
         answers = {"/api/queue": [200, queue_screen.document(self.connection, now=NOW)],
                    "/api/queue/builds?show=all": [200, self.BUILDS], "/api/queue/runner": [200, self.RUNNER],
                    "/api/queue/move": [200, {"ok": True, "edits": "Edits take effect at the next item boundary."}],
+                   # sd:9258: a tasks read with no task; one not read leaves the parked box unknown, not 0.
+                   "/api/tasks": [200, {"rows": [], "ideas": []}],
                    **(answers or {})}
+        # sd:9258: the fixtures' SYSTEM is the system checkout's repo key, the path the lane fixture registers.
+        answers = json.loads(json.dumps(answers).replace(self.SYSTEM, str(self.checkout)))
+        self.doc = json.loads(json.dumps(self.doc).replace(self.SYSTEM, str(self.checkout)))
         after = (f"\nconst QDOCS = {json.dumps(answers)};\n"
                  "ANSWER = (p, b) => p === '/api/now' ? [200, DOC0] : QDOCS[p] || [404, { error: 'no answer' }];\n" + before)
         start = ("document.dispatchEvent(new CustomEvent('shell:view', { detail: { id: 'queue', first: true } }));\n"
@@ -1511,7 +1565,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertNotIn("Live work", out["R"]["html"])
 
     def test_each_row_carries_its_type_in_words_beside_its_state_glyph(self):
-        out = self.run_view("open('system'); R.html = ELS.queue.html.split('<tr class=\"repo\" data-repo=\"system\"')[1]"
+        out = self.run_view("open('system'); R.html = ELS.queue.html.split('<tr class=\"repo\" data-repo=\"' + keyOf('system') + '\"')[1]"
                             ".split('<tr class=\"repo\"')[0];", search="?show=suggested,ended")
         found = re.findall(r'(?:<tr class="(repo|child)"[^>]*|^ aria-expanded="true")>\s*<td class="mk"><span class="g-(\w+)" aria-hidden="true">(.)</span>'
                            r'<span class="sr">([a-z ]+) · </span>(\w+)</td>', out["R"]["html"])
@@ -1528,7 +1582,9 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
     @staticmethod
     def repo_detail(html, key):
         """The detail cell of repo `key`'s parent row: its extra classes, its other attributes and its contents."""
-        found = re.search(rf'<tr class="repo" data-repo="{key}".*?<td class="detail([^"]*)"([^>]*)>(.*?)</td>', html, re.S)
+        # `key` is the row's key or its shown name (sd:9258).
+        found = re.search(rf'(?:<tr class="repo" data-repo="{key}"|class="pick" data-open="[^"]*">{key}</button>)'
+                          r'.*?<td class="detail([^"]*)"([^>]*)>(.*?)</td>', html, re.S)
         return found.group(1, 2, 3)
 
     BOX = {"merging": "merging: claimed by the lane runner, being merged",
@@ -1582,7 +1638,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
             return {**builds["runs"][0], "run": f"r{n}", "items": [{"item": n, "assignment": n, "status": "running", "title": "More"}],
                     "cancel": {**builds["runs"][0]["cancel"], "assignment": n}}
         out = self.run_view(
-            "const label = () => (ELS.queue.html.match(/data-repo=\"alpha\"[\\s\\S]*?class=\"detail pipe\" aria-label=\"([^\"]*)\"/) || [])[1];"
+            "const label = () => (ELS.queue.html.match(/data-repo=\"\\/repos\\/alpha\"[\\s\\S]*?class=\"detail pipe\" aria-label=\"([^\"]*)\"/) || [])[1];"
             " R.first = label(); window.shell.view.current = () => 'queue';"
             f" QDOCS['/api/queue/builds?show=all'] = [200, {json.dumps({**builds, 'runs': [*builds['runs'], more(70)]})}];"
             " TICKS[0](); await flush(); await flush(); await flush(); R.tick = label();"
@@ -1595,7 +1651,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
     def test_a_lane_that_was_not_read_counts_nothing_and_says_so(self):
         # A failed read is not zero (sd:7272): a repo whose lane was not read says so in place of its boxes.
         lanes = queue_screen.document(self.connection, now=NOW)
-        lanes["problems"] = [{"repo": "/repos/alpha", "error": "no checkout on this machine"}]
+        lanes["problems"] = [{"repo": "/repos/alpha", "key": "/repos/alpha", "error": "no checkout on this machine"}]
         read = self.run_view("R.html = ELS.queue.html;", answers={"/api/queue": [200, lanes]})["R"]["html"]
         self.assertIn('<span class="pip warn" title="2 blocked', self.repo_detail(read, "system")[2])
         self.assertEqual(self.repo_detail(read, "alpha")[1:], ("", '<span class="g-unknown" aria-hidden="true">▨</span> lane not read'))
@@ -1769,7 +1825,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
               "lane": "awaiting_them", "on": "reviewers", "since": NOW, "waited": 60}
         entry = {"state": "merging", "item": 7, "title": "Seven", "step": "prepare", "host": "hub", "claim_age": 30,
                  "lease_until": NOW, "lease_passed": False, "head": "abc1234"}
-        lane = {"path": "/repos/alpha", "host": "hub", "runner_merge": "auto", "rows": [entry]}
+        lane = {"path": "/repos/alpha", "key": "/repos/alpha", "host": "hub", "runner_merge": "auto", "rows": [entry]}
 
         def view(prs=(), lanes=(), runs=(), blocked=(), live=()):
             doc = queue_screen.document(self.connection, now=NOW)
@@ -1880,7 +1936,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         """sd:8116: a draft and an approximate wait say so on the row."""
         lanes = queue_screen.document(self.connection, now=NOW)
         lanes["prs"] = {"error": "", "rows": [
-            {"item": None, "title": "Unlinked", "repo": "example/system", "url": "https://github.com/example/system/pull/5",
+            {"item": None, "title": "Unlinked", "repo": "~/repos/example/system", "url": "https://github.com/example/system/pull/5",
              "lane": "awaiting_you", "on": "you", "since": "2026-09-06T11:00:00+00:00", "waited": 3600,
              "approximate": True, "draft": True, "stale": False}]}
         out = self.run_view("open('system'); R.html = ELS.queue.html;", answers={"/api/queue": [200, lanes]})
@@ -1888,6 +1944,16 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                         out["R"]["html"], re.S)[1]
         self.assertIn("<b>blocked: PR</b> · on you · waited 1h 0m", row)
         self.assertIn(" · draft · approx.", row)
+
+    def test_an_unlinked_pull_request_row_links_under_its_slug_not_its_key(self):
+        # sd:9258 round 3: the row groups under the repo key and its link says the GitHub slug and number.
+        lanes = queue_screen.document(self.connection, now=NOW)
+        lanes["prs"] = {"error": "", "rows": [
+            {"item": None, "title": "Unlinked", "repo": "~/repos/example/system", "slug": "example/system",
+             "url": "https://github.com/example/system/pull/5", "lane": "awaiting_you", "on": "you",
+             "since": "2026-09-06T11:00:00+00:00", "waited": 3600, "approximate": True, "draft": False, "stale": False}]}
+        out = self.run_view("open('system'); R.html = ELS.queue.html;", answers={"/api/queue": [200, lanes]})
+        self.assertIn('rel="noopener noreferrer">example/system#5 Unlinked</a>', out["R"]["html"])
 
     def test_a_stale_pull_request_row_says_so_and_counts_in_no_box(self):
         """sd:8116 (a): a reading over a day old waits on no one: no review or blocked count and no lamp; the row says so."""
@@ -1917,7 +1983,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
              "lane": "awaiting_them", "on": "reviewers", "since": "2026-09-06T10:00:00+00:00", "waited": 7200}]}
         out = self.run_view("R.html = ELS.queue.html; R.tally = ELS['queue-tally'].html;", answers={"/api/queue": [200, lanes]})
         self.assertIn("<span>3 PR review: 1 on you, 2 on reviewers</span>", out["R"]["tally"])
-        system = re.search(r'<tr class="repo" data-repo="system".*?</tr>', out["R"]["html"], re.S).group(0)
+        system = re.search(rf'<tr class="repo" data-repo="{re.escape(str(self.checkout))}".*?</tr>', out["R"]["html"], re.S).group(0)
         self.assertIn('<span class="pip caution" title="3 review: pull requests waiting on a review, 1 on you, 2 on reviewers">3</span>', system)
         self.assertIn('<td class="num"></td>', system, "the review box says it; the num cell repeats nothing")
         out = self.run_view("R.tally = ELS['queue-tally'].html;")
@@ -1958,7 +2024,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertEqual(out["R"]["parked"], ["parked", "parked"])
         self.assertIn("Parked one", out["R"]["tiled"])
         self.assertNotIn("Parked idea", out["R"]["tiled"])
-        self.assertRegex(out["R"]["tiled"], r'data-tile-clear="system">2 parked \(\d+ rows\) · Show all</button>')
+        self.assertRegex(out["R"]["tiled"], rf'data-tile-clear="{re.escape(str(self.checkout))}">2 parked \(\d+ rows\) · Show all</button>')
 
     def test_each_box_has_a_visible_label_and_an_accessible_name_in_box_order(self):
         """sd:9315: seven boxes sat under one 'Detail' head; the head now names each, in the order they draw."""
@@ -2014,6 +2080,105 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         out = self.run_view(self.TILE + " R.repos = repos(); tile('solo', 'parked'); R.kids = kids();", answers=answers)
         self.assertIn("solo:false", out["R"]["repos"])
         self.assertEqual(out["R"]["kids"], ["parked"])
+
+    # sd:9258: review round 4 of sd:9247, four advisories.
+    def test_two_checkouts_with_one_name_each_get_their_own_parked_box(self):
+        self.parked_answers(self.checkout)
+        twin = self.checkout.parent / "elsewhere" / self.checkout.name
+        _, answers = self.parked_answers(twin)
+        out = self.run_view("R.html = ELS.queue.html; R.keys = keys();", answers=answers)
+        keys = out["R"]["keys"]
+        for path in (self.checkout, twin):
+            self.assertIn(str(path), keys)
+            self.assertIn('title="1 parked:', self.repo_detail(out["R"]["html"], re.escape(str(path)))[2], path)
+
+    def test_suggested_caps_each_checkout_not_each_name_before_queue_reads(self):
+        # Lane review of sd:9258: Suggested capped by folder name at the Today read, before Queue's reads split two
+        # checkouts of one name, so nine for one hid the other's only suggestion.
+        twin = self.checkout.parent / "elsewhere" / self.checkout.name
+        _, answers = self.parked_answers(twin)
+        def row(n, repo):
+            return {"id": n, "repo": str(repo), "title": f"Next {n}", "status": "ready", "why": "ready", "due": None,
+                    "priority": 2}
+        self.doc["queues"]["suggested"] = [row(n, self.checkout) for n in range(60, 69)] + [row(99, twin)]
+        out = self.run_view(f"open({json.dumps(str(twin))}); R.twin = kids(); open({json.dumps(str(self.checkout))});"
+                            " R.here = kids();", search="?show=suggested", answers=answers)
+        self.assertEqual(out["R"]["twin"].count("suggested"), 1, "the twin's one suggestion was capped away")
+        self.assertEqual(out["R"]["here"].count("suggested"), 9)
+
+    # sd:9258 round 2: each place that keyed a repo by a name made from its path keys it by the repo row's path.
+    HOMES = (Path("/Users/operator/repos/demo"), Path("/home/operator/repos/demo"))
+
+    def homes(self):
+        for home in self.HOMES:
+            _, answers = self.parked_answers(home)
+        return answers
+
+    def test_two_homes_of_one_path_each_get_their_own_row_and_parked_box(self):
+        out = self.run_view("R.html = ELS.queue.html; R.keys = keys();", answers=self.homes())
+        for home in self.HOMES:
+            self.assertIn(str(home), out["R"]["keys"])
+            self.assertIn('title="1 parked:', self.repo_detail(out["R"]["html"], re.escape(str(home)))[2], home)
+
+    def test_a_lane_not_read_marks_only_its_own_repository(self):
+        answers = self.homes()
+        doc = queue_screen.document(self.connection, now=NOW)
+        doc["problems"] = [p for p in doc["problems"] if p["key"] == str(self.HOMES[0])]
+        answers["/api/queue"] = [200, doc]
+        out = self.run_view("R.html = ELS.queue.html;", answers=answers)
+        self.assertIn("lane not read", self.repo_detail(out["R"]["html"], re.escape(str(self.HOMES[0])))[2])
+        self.assertNotIn("lane not read", self.repo_detail(out["R"]["html"], re.escape(str(self.HOMES[1])))[2])
+
+    def test_suggested_caps_each_repository_key_not_its_home_relative_path(self):
+        answers = self.homes()
+        def row(n, repo):
+            return {"id": n, "repo": str(repo), "title": f"Next {n}", "status": "ready", "why": "ready", "due": None,
+                    "priority": 2}
+        self.doc["queues"]["suggested"] = [row(n, self.HOMES[0]) for n in range(60, 69)] + [row(99, self.HOMES[1])]
+        out = self.run_view(f"open({json.dumps(str(self.HOMES[1]))}); R.twin = kids();", search="?show=suggested",
+                            answers=answers)
+        self.assertEqual(out["R"]["twin"].count("suggested"), 1, "the twin's one suggestion was capped away")
+
+    def test_a_lane_groups_by_its_repository_key_not_its_checkout_path(self):
+        # The checkout is this machine's path; the live item names the repo row's path, as every item read does.
+        _, answers = self.parked_answers(Path("~/example.test/twin/system"))
+        doc = queue_screen.document(self.connection, now=NOW)
+        doc["lanes"][0]["key"] = "~/example.test/system"
+        answers["/api/queue"] = [200, doc]
+        self.doc["active"]["rows"] = [{**self.LIVE, "repo": "~/example.test/system"}]
+        out = self.run_view("open('~/example.test/system'); R.keys = keys(); R.kids = kids();", answers=answers)
+        self.assertNotIn(str(self.checkout), out["R"]["keys"])
+        self.assertIn("working", out["R"]["kids"])
+        self.assertIn("merging", out["R"]["kids"])
+
+    def test_a_shared_folder_name_shows_each_key_and_a_lone_one_its_name(self):
+        out = self.run_view("R.repos = repos();", answers=self.homes())
+        self.assertIn(f"{self.HOMES[0]}:false", out["R"]["repos"])
+        self.assertIn(f"{self.HOMES[1]}:false", out["R"]["repos"])
+        self.assertIn("system:false", out["R"]["repos"])
+
+    def test_a_parked_task_with_no_repo_is_counted_and_never_adopted(self):
+        from sd_dashboard import tasks_screen
+        made = self.item("Loose", kind="task", priority=4)
+        self.connection.execute("UPDATE item SET parked_at = ? WHERE id = ?", (NOW, made))
+        answers = {"/api/tasks": [200, tasks_screen.document(self.connection, now=NOW)]}
+        out = self.run_view(f"R.tally = ELS['queue-tally'].html; R.adopted = OBJ.has('{made}');", answers=answers)
+        self.assertIn('<a href="/tasks?parked=1&amp;realm=all">1 parked</a>', out["R"]["tally"])
+        self.assertFalse(out["R"]["adopted"], "a parked task with no repo has no row, so no row object")
+
+    def test_a_failed_tasks_read_leaves_the_parked_box_unknown_not_zero(self):
+        out = self.run_view("R.html = ELS.queue.html;", answers={"/api/tasks": [502, {"error": "down"}]})
+        _, attrs, body = self.repo_detail(out["R"]["html"], "system")
+        self.assertTrue(attrs.endswith(', parked not read"'), attrs)
+        self.assertNotIn('title="0 parked', body)
+        self.assertRegex(body, r'data-tile="parked"[^>]* disabled><span class="pip" title="parked: tasks not read: down">▨</span>')
+
+    def test_an_open_repo_hides_its_parked_rows_when_the_show_filters_hide_the_rest(self):
+        # beta's one other row is a suggested one, hidden while Suggested is off (?show=).
+        made, answers = self.parked_answers(Path("~/repos/example/beta"))
+        out = self.run_view("open('beta'); R.repos = repos(); R.kids = kids();", answers=answers)
+        self.assertIn("beta:true", out["R"]["repos"])
+        self.assertEqual(out["R"]["kids"], [], "parked rows show only when their box is pressed")
 
     def test_a_parked_row_has_its_actions_and_its_details(self):
         """Review of sd:9247: a parked row was never adopted, so its Act cell was blank and Details found nothing."""
@@ -2075,7 +2240,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         boxes = re.findall(r'<span class="pip([^"]*)" title="([^"]*)">(\d+)</span>', body)
         self.assertEqual([(c, n) for c, _, n in boxes], [("", "0"), (" caution", "1"), ("", "0"), ("", "0"), ("", "0"), ("", "0"), ("", "0")])
         self.assertEqual(boxes[1][1], "1 review: pull requests waiting on a review, 1 on you, 0 on reviewers")
-        solo = re.search(r'<tr class="repo" data-repo="solo".*?</tr>', out["R"]["html"], re.S).group(0)
+        solo = re.search(r'<tr class="repo" data-repo="~/repos/example/solo".*?</tr>', out["R"]["html"], re.S).group(0)
         self.assertIn('<td class="num"></td>', solo, "the box says it; the num cell repeats nothing")
 
     def test_the_review_box_stands_after_merging_and_before_working(self):
@@ -2097,24 +2262,24 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
 
     # pack sd:8138 (operator 2026-11-08): a repo row's count tiles filter its sub-rows.
     TILE = ("const tile = (repo, t, disabled = false) => ELS.queue.listeners.click[0]({ target: { closest: s =>"
-            " s === 'button[data-tile]' ? { disabled, dataset: { repo, tile: t } } : null } });"
+            " s === 'button[data-tile]' ? { disabled, dataset: { repo: keyOf(repo), tile: t } } : null } });"
             " const showAll = repo => ELS.queue.listeners.click[0]({ target: { closest: s =>"
-            " s === 'button[data-tile-clear]' ? { dataset: { tileClear: repo } } : null } });"
-            " const pressed = repo => [...(ELS.queue.html.split(`data-repo=\"${repo}\" aria-expanded`)[1] || '').split('</tr>')[0]"
+            " s === 'button[data-tile-clear]' ? { dataset: { tileClear: keyOf(repo) } } : null } });"
+            " const pressed = repo => [...(ELS.queue.html.split(`data-repo=\"${keyOf(repo)}\" aria-expanded`)[1] || '').split('</tr>')[0]"
             ".matchAll(/data-tile=\"(\\w+)\" aria-pressed=\"(true|false)\"/g)].map(m => m[1] + ':' + m[2]);")
 
     def test_a_tile_click_opens_its_repo_and_shows_only_that_tiles_rows(self):
         out = self.run_view(self.TILE + " tile('system', 'next'); R.repos = repos(); R.kids = kids(); R.html = ELS.queue.html;")
         self.assertIn("system:true", out["R"]["repos"])
         self.assertEqual(out["R"]["kids"], ["next", "next"])
-        self.assertRegex(out["R"]["html"], r'<button type="button" class="linkbtn" data-tile-clear="system">'
+        self.assertRegex(out["R"]["html"], rf'<button type="button" class="linkbtn" data-tile-clear="{re.escape(str(self.checkout))}">'
                                            r'2 next \(\d+ rows\) · Show all</button>')
 
     def test_each_tiles_line_counts_its_own_rows_beside_the_repos(self):
         """sd:8565 fault 5 (#53336): 'Showing blocked: 0 of 180' read as 180 blocked; every tile says '<n> <box> (<N> rows)'."""
         boxes = ["merging", "review", "working", "next", "blocked", "suggested", "parked"]
         out = self.run_view(self.TILE + " R.lines = {}; for (const b of " + json.dumps(boxes) + ") { tile('system', b);"
-                            " const m = ELS.queue.html.match(/data-tile-clear=\"system\">([^<]*)</); R.lines[b] = m ? m[1] : null;"
+                            " const m = ELS.queue.html.match(/data-tile-clear=\"[^\"]*\\/system\">([^<]*)</); R.lines[b] = m ? m[1] : null;"
                             " tile('system', b); }", search="?show=suggested")
         for box in boxes:
             line = out["R"]["lines"][box]
@@ -2149,8 +2314,8 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                             " R.repos = repos();")
         self.assertEqual(out["R"]["after"], out["R"]["before"])
         self.assertIn("alpha:false", out["R"]["repos"])
-        self.assertRegex(out["R"]["before"], r'data-repo="alpha" data-tile="next" aria-pressed="false"[^>]* disabled>')
-        self.assertNotRegex(out["R"]["before"], r'data-repo="alpha" data-tile="working" aria-pressed="false"[^>]* disabled>')
+        self.assertRegex(out["R"]["before"], r'data-repo="/repos/alpha" data-tile="next" aria-pressed="false"[^>]* disabled>')
+        self.assertNotRegex(out["R"]["before"], r'data-repo="/repos/alpha" data-tile="working" aria-pressed="false"[^>]* disabled>')
 
     def test_the_suggested_tile_shows_suggested_rows_with_the_suggested_filter_off(self):
         out = self.run_view(self.TILE + " tile('system', 'suggested'); R.kids = kids(); R.filters = ELS['queue-filters'].html;")
@@ -2165,7 +2330,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
              "lane": "awaiting_you", "on": "you", "since": "2026-09-06T11:00:00+00:00", "waited": 3600}]}
         out = self.run_view(self.TILE + " tile('solo', 'review'); R.html = ELS.queue.html; R.kids = kids();",
                             answers={"/api/queue": [200, lanes]})
-        self.assertRegex(out["R"]["html"], r'data-repo="solo" data-tile="review" aria-pressed="true"[^>]*>'
+        self.assertRegex(out["R"]["html"], r'data-repo="~/repos/example/solo" data-tile="review" aria-pressed="true"[^>]*>'
                                            r'<span class="pip caution" title="1 review:')
         self.assertEqual(out["R"]["kids"], ["blocked"])
         css = (Path(__file__).resolve().parents[1] / "sd_dashboard/v2/static/today.css").read_text()
