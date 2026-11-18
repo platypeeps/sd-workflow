@@ -386,6 +386,14 @@ class RebuttalIdentityTests(unittest.TestCase):
                 self.assertEqual(gate([row()], adjudicated(("src.py", "defect", "rebutted"), decision=decision)),
                                  ["blocking"])
 
+    def test_the_gate_matches_rebuttals_past_the_prompts_cap(self) -> None:
+        bodies = [adjudicated(("src.py", f"claim {index}", "rebutted")) for index in range(sd_review.REBUTTED_LINES + 3)]
+        oldest = f"claim {sd_review.REBUTTED_LINES + 2}"
+        self.assertEqual(gate([row(summary=oldest)], *bodies), ["advisory"])
+        section = sd_review.rebuttal_section(sd_review.rebuttals([(body,) for body in bodies]))
+        self.assertEqual(section.count("\n- "), sd_review.REBUTTED_LINES)
+        self.assertNotIn(oldest, section)
+
     def test_the_lanes_own_blockers_are_never_rebutted(self) -> None:
         parsed = sd_review.oversized_findings()
         body = adjudicated(*((finding["path"], finding["summary"], "rebutted") for finding in parsed.findings))
