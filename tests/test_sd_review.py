@@ -715,8 +715,8 @@ class SubjectTests(ReviewFixture):
 class DispositionTests(unittest.TestCase):
     def test_the_floor_decides_blocking_from_advisory(self) -> None:
         findings = [
-            {"severity": "high", "summary": "a", "evidence": "make test: FAIL"},
-            {"severity": "medium", "summary": "b", "evidence": "make test: FAIL"},
+            {"severity": "high", "summary": "a"},
+            {"severity": "medium", "summary": "b"},
             {"severity": "low", "summary": "c"},
             {"severity": "unspecified", "summary": "d"},
         ]
@@ -864,8 +864,7 @@ class PipelineTests(ReviewFixture):
         root = self.make_repo()
         self.prepare(root)
         payload = json.dumps(
-            {"findings": [{"path": "src.py", "line": 1, "severity": "high", "summary": "bad", "family": "correctness",
-                           "evidence": "python3 src.py: wrong"}]}
+            {"findings": [{"path": "src.py", "line": 1, "severity": "high", "summary": "bad", "family": "correctness"}]}
         )
         runner = FakeRunner({"sd-check": sd_review.Completed(0, "{}", ""), "codex": sd_review.Completed(0, payload, "")})
         result = self.run_review(root, runner)
@@ -1166,8 +1165,7 @@ class PipelineTests(ReviewFixture):
         root = self.make_repo()
         self.prepare(root)
         payload = json.dumps(
-            {"findings": [{"path": "src.py", "line": 1, "severity": "high", "summary": "bad", "family": "correctness",
-                           "evidence": "python3 src.py: wrong"}]}
+            {"findings": [{"path": "src.py", "line": 1, "severity": "high", "summary": "bad", "family": "correctness"}]}
         )
         runner = FakeRunner(
             {"sd-check": sd_review.Completed(0, "{}", ""), "codex": sd_review.Completed(0, payload, "")}
@@ -1890,7 +1888,7 @@ class TheUrlEntryRunsTests(ReviewFixture):
             {
                 "remote": chat_answer(
                     '<think>a</think>{"findings": [{"path": "src.py", "line": 1, '
-                    '"severity": "high", "summary": "wrong", "family": "correctness", "evidence": "ran it: wrong"}]}'
+                    '"severity": "high", "summary": "wrong", "family": "correctness"}]}'
                 )
             }
         )

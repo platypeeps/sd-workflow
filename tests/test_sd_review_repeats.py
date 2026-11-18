@@ -1,10 +1,11 @@
-"""pack sd:9270. Reviewers stop repeating settled findings, and a blocker cites a check it ran.
+"""pack sd:9270. Reviewers stop repeating settled findings; a repeat of a rebuttal cites evidence.
 
 Evidence, 2026-11-17: on system sd:9230 an out-of-threat-model finding came
 back in review round 5 and again in the lane; on a system build branch a
 blocker claimed `ls-tree` reads an id as a glob, and git 2.54 matches it
 literally. So the prompt carries the repository's threat model and this
-branch's rebutted findings, and a blocker without evidence posts as advice.
+branch's rebutted findings. Operator ruling: a first-time blocker blocks,
+cited or not; only an uncited repeat of a rebutted finding posts as advice.
 
 Every `CLAUDE.local.md` here is synthetic, and the adjudication rows go into a
 fixture database under a scratch `HOME`; the operator's files are never read.
@@ -198,17 +199,17 @@ class RebuttedFindingTests(RepeatFixture):
                 contextlib.redirect_stderr(stderr):
             text = sd_review.rebutted_findings(
                 self.root, sd_review.resolve_subject(self.root, "worktree"), None, self.environment())
-        self.assertEqual(text, "")
+        self.assertEqual(text, {})
         self.assertEqual(stderr.getvalue(), "sd-review: reviewing without the rebutted findings: OperationalError: locked\n")
 
     def test_planning_and_a_detached_head_read_nothing(self) -> None:
         with unittest.mock.patch.object(self.library, "connect", side_effect=AssertionError("database read")):
             planning = sd_review.Subject("planning", "HEAD", "worktree", ("docs/work/x/design.md",), 1, "plan")
-            self.assertEqual(sd_review.rebutted_findings(self.root, planning, None, self.environment()), "")
+            self.assertEqual(sd_review.rebutted_findings(self.root, planning, None, self.environment()), {})
             subprocess.run(["git", "checkout", "--quiet", "--detach"], cwd=str(self.root), check=True,
                            env=clean_environment())
             subject = sd_review.resolve_subject(self.root, "worktree")
-            self.assertEqual(sd_review.rebutted_findings(self.root, subject, None, self.environment()), "")
+            self.assertEqual(sd_review.rebutted_findings(self.root, subject, None, self.environment()), {})
 
     def test_a_rebuttal_after_the_head_changes_no_request(self) -> None:
         """`--explain`, dispatch and a replay ask the same (sd:1397): the head's commit time anchors the read."""
@@ -223,30 +224,49 @@ def row(severity: str = "high", **extra: Any) -> dict[str, Any]:
     return {"path": "src.py", "line": 1, "severity": severity, "summary": "defect", "family": "correctness"} | extra
 
 
-class EvidenceTests(unittest.TestCase):
-    def test_a_blocker_without_evidence_posts_as_advisory_and_says_why(self) -> None:
-        for evidence in (None, "", "   \n\t", 0, 7, [], ["cmd"], {}, {"command": "x", "output": "y"}, True):
-            with self.subTest(evidence=evidence):
-                finding = row() if evidence is None else row(evidence=evidence)
-                [record] = sd_review.dispose([finding], "high")
-                self.assertEqual(record["disposition"], "advisory")
-                self.assertEqual(record["summary"], "defect " + sd_review.NO_CHECK_NOTE)
-                self.assertEqual(record["severity"], "high")
+#: Evidence that does not count: absent, empty, blank, or not a string.
+UNCITED = (None, "", "   \n\t", 0, 7, [], ["cmd"], {}, {"command": "x", "output": "y"}, True)
+CITED = ("python3 src.py: Traceback", "src.py:1: x = 1")
 
-    def test_a_blocker_with_evidence_stays_blocking(self) -> None:
-        [record] = sd_review.dispose([row(evidence="git ls-tree HEAD -- '[id]': printed nothing")], "high")
-        self.assertEqual((record["disposition"], record["summary"]), ("blocking", "defect"))
+
+def finding(evidence: Any = None, **extra: Any) -> dict[str, Any]:
+    return row(**extra) if evidence is None else row(evidence=evidence, **extra)
+
+
+class RepeatRuleTests(unittest.TestCase):
+    """Operator ruling on pack sd:9270: evidence is asked only of a repeat of a rebuttal."""
+
+    def setUp(self) -> None:
+        self.REBUTTED = frozenset({sd_review.rebuttal_key("src.py", "defect")})
+
+    def test_an_uncited_first_time_blocker_stays_blocking(self) -> None:
+        for evidence in UNCITED:
+            for rebutted in (frozenset(), frozenset({sd_review.rebuttal_key("src.py", "another claim"),
+                                                     sd_review.rebuttal_key("other.py", "defect")})):
+                with self.subTest(evidence=evidence, rebutted=rebutted):
+                    [record] = sd_review.dispose([finding(evidence)], "high", rebutted)
+                    self.assertEqual((record["disposition"], record["summary"]), ("blocking", "defect"))
+
+    def test_an_uncited_repeat_of_a_rebuttal_is_advisory_and_says_why(self) -> None:
+        for evidence in UNCITED:
+            for summary in ("defect", "  defect\n"):
+                with self.subTest(evidence=evidence, summary=summary):
+                    [record] = sd_review.dispose([finding(evidence, summary=summary)], "high", self.REBUTTED)
+                    self.assertEqual(record["disposition"], "advisory")
+                    self.assertEqual(record["summary"], f"{summary.strip()} {sd_review.REPEAT_NOTE}".lstrip())
+                    self.assertEqual(record["severity"], "high")
+
+    def test_a_cited_repeat_stays_blocking(self) -> None:
+        for evidence in CITED:
+            with self.subTest(evidence=evidence):
+                [record] = sd_review.dispose([finding(evidence)], "high", self.REBUTTED)
+                self.assertEqual((record["disposition"], record["summary"]), ("blocking", "defect"))
 
     def test_the_floor_still_decides_and_advice_is_untouched(self) -> None:
-        disposed = sd_review.dispose([row("medium"), row("low"), row("unspecified")], "high")
+        disposed = sd_review.dispose([row("medium"), row("low"), row("unspecified")], "high", self.REBUTTED)
         self.assertEqual([(r["disposition"], r["summary"]) for r in disposed], [("advisory", "defect")] * 3)
         [medium] = sd_review.dispose([row("medium")], "medium")
-        self.assertEqual((medium["disposition"], medium["summary"]), ("advisory", "defect " + sd_review.NO_CHECK_NOTE))
-
-    def test_the_note_is_added_once(self) -> None:
-        [once] = sd_review.dispose([row()], "high")
-        [twice] = sd_review.dispose([once], "high")
-        self.assertEqual(twice["summary"], once["summary"])
+        self.assertEqual(medium["disposition"], "blocking")
 
     def test_the_lanes_own_blockers_keep_blocking(self) -> None:
         for parsed in (sd_review.oversized_findings(),
@@ -267,104 +287,24 @@ class EvidenceTests(unittest.TestCase):
         nested = sd_review.parse_findings(json.dumps({"findings": [row(evidence={"command": {"argv": ["git"]}})]}))
         assert nested is not None
         self.assertEqual(nested.error, "response violates the findings schema: findings[0].evidence: expected string")
-        self.assertEqual(sd_review.dispose(nested.findings, "high")[0]["disposition"], "advisory")
+        self.assertEqual(sd_review.dispose(nested.findings, "high", self.REBUTTED)[0]["disposition"], "advisory")
 
-    def test_the_schema_asks_for_evidence(self) -> None:
+    def test_the_schema_carries_evidence(self) -> None:
         item = sd_review.CODEX_OUTPUT_SCHEMA["properties"]["findings"]["items"]
         self.assertEqual(item["properties"]["evidence"], {"type": "string"})
         self.assertIn("evidence", item["required"])
         self.assertIn("evidence", sd_review.URL_OUTPUT_CONTRACT)
 
-
-class EvidencePromptTests(RepeatFixture):
-    def test_both_readers_are_asked_for_evidence(self) -> None:
-        prompts, result, _stderr = self.prompts()
-        self.assertEqual(len(prompts), 2)
-        for prompt in prompts:
-            self.assertIn("a check you ran, as the command and the output lines", prompt)
-            # Bundle review round 3: five of six readers cannot run a command.
-            self.assertIn("when you cannot run commands, the exact lines you read, as path:line", prompt)
-            self.assertIn("A high finding with empty evidence is posted as advisory", prompt)
-        self.assertIn("path:line and a quote of the lines you read", sd_review.URL_OUTPUT_CONTRACT)
-        claude = sd_review.claude_argv(self.tmp, "claude")
-        self.assertIn('"evidence"', claude[claude.index("--json-schema") + 1])
-
-    def test_a_review_posts_an_unchecked_blocker_as_advice(self) -> None:
-        for evidence, status in ((None, "advisory"), ("python3 src.py: Traceback", "blocking")):
-            with self.subTest(evidence=evidence):
-                answer = json.dumps({"findings": [row() if evidence is None else row(evidence=evidence)]})
-                runner = FakeRunner({"sd-check": sd_review.Completed(0, "{}", ""),
-                                     "codex": sd_review.Completed(0, answer, "")},
-                                    default=sd_review.Completed(0, json.dumps({"findings": []}), ""))
-                result = sd_review.review(self.root, namespace(), runner, self.environment(), self.chatgpt_home())
-                self.assertEqual(result["status"], status)
-                self.assertEqual(result["findings"][0]["disposition"], status)
-
-
-class RoundThreeTests(ReviewFixture):
-    """Bundle review round 3 of pack sd:9270: read-only readers, verification and dedupe."""
-
-    def commit(self, root: pathlib.Path, path: str, text: str) -> str:
-        (root / path).write_text(text)
-        for argv in (["add", "--", path], ["commit", "-qm", "change\n\nAuthored-with: human"]):
-            subprocess.run(["git", *argv], cwd=root, capture_output=True, check=True, env=clean_environment())
-        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True, env=clean_environment()).strip()
-
-    def branch(self) -> tuple[pathlib.Path, str]:
-        root = self.make_repo()
-        subprocess.run(["git", "checkout", "-qb", "topic"], cwd=root, capture_output=True, check=True,
-                       env=clean_environment())
-        return root, self.commit(root, "src.py", "the_original_defect = True\n")
-
-    def answer(self, *rows: dict[str, Any]) -> sd_review.Completed:
-        return sd_review.Completed(0, json.dumps({"findings": list(rows)}), "")
-
-    def test_a_claude_finding_quoting_the_lines_it_read_stays_blocking(self) -> None:
-        quoted = row(evidence="src.py:1: the_original_defect = True")
-        [record] = sd_review.dispose([dict(quoted, backend="claude")], "high")
-        self.assertEqual((record["disposition"], record["summary"]), ("blocking", "defect"))
-
-    def test_a_verification_cannot_clear_a_confirmed_blocker_by_repeating_it_bare(self) -> None:
-        root, first = self.branch()
-        cited = row(path="src.py", evidence="python3 src.py: wrong")
-        prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": self.answer(cited)}),
-                                 self.environment(), self.chatgpt_home())
-        self.assertEqual(prior["status"], "blocking")
-        report = self.tmp / "prior.json"
-        report.write_text(json.dumps(prior))
-        self.commit(root, "other.py", "unrelated_fix = True\n")
-        # Round 4: the repeat matches on path and folded summary; a new unchecked claim in the same
-        # file is not the confirmed blocker.
-        bare, fresh = row(path="src.py", summary="  DEFECT "), row(path="other.py", summary="new and unchecked")
-        same_file = row(path="src.py", summary="a new unchecked claim")
-        for option in ("verify_report", "resume_report"):
-            with self.subTest(option=option):
-                runner = FakeRunner({"codex": self.answer(bare, fresh, same_file)})
-                args = namespace(scope="branch", **({"base": first} if option == "verify_report" else {}),
-                                 **{option: str(report)})
-                result = sd_review.review(root, args, runner, self.environment(), self.chatgpt_home())
-                self.assertEqual(result["status"], "blocking")
-                self.assertTrue(any("with its path and summary unchanged" in str(call["stdin"]) + " ".join(call["argv"])
-                                    for call in runner.calls))
-                dispositions = {(row["path"], row["summary"]): row["disposition"] for row in result["findings"]
-                                if row["backend"] == "codex"}
-                self.assertEqual(dispositions, {
-                    ("src.py", "DEFECT"): "blocking",
-                    ("other.py", f"new and unchecked {sd_review.NO_CHECK_NOTE}"): "advisory",
-                    ("src.py", f"a new unchecked claim {sd_review.NO_CHECK_NOTE}"): "advisory"})
-        # Fixed: a verifier that does not repeat it clears it.
-        runner = FakeRunner({"codex": self.answer()})
-        result = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)), runner,
-                                  self.environment(), self.chatgpt_home())
-        self.assertNotEqual(result["status"], "blocking")
-
     def test_a_static_reader_may_answer_a_rebuttal_with_the_lines_it_read(self) -> None:
-        # Round 4: the rebuttal section asked for a check only; five of six readers cannot run one.
         body = json.dumps({"proposal": {"findings": [{"raw_finding": row(), "response_disposition": "rebutted",
                                                        "reason": "not reachable"}]}})
-        section = sd_review.rebuttal_section([(body,)])
+        seen = sd_review.rebuttals([(body,)])
+        self.assertEqual(set(seen), set(self.REBUTTED))
+        section = sd_review.rebuttal_section(seen)
         self.assertIn("a check you ran and its output", section)
         self.assertIn("when you cannot run commands, path:line and a quote of the current code", section)
+        self.assertIn("One raised again without it blocks nothing.", section)
+        self.assertEqual(sd_review.rebuttal_section({}), "")
 
     def test_one_finding_from_two_readers_is_one_row_whatever_each_cites(self) -> None:
         bare, cited, other = row(), row(evidence="src.py:1: x = 1"), row(evidence="python3 src.py: wrong")
@@ -372,9 +312,36 @@ class RoundThreeTests(ReviewFixture):
                                                    dict(other, backend="third")])
         self.assertEqual(len(kept), 1)
         self.assertEqual((kept[0]["backend"], kept[0]["evidence"]), ("codex", "src.py:1: x = 1"))
-        self.assertEqual(sd_review.dispose(kept, "high")[0]["disposition"], "blocking")
         two = sd_review.sd_lib.distinct_findings([dict(row(), backend="codex"), dict(row(summary="other"), backend="x")])
         self.assertEqual(len(two), 2)
+
+
+class RepeatReviewTests(RepeatFixture):
+    def test_no_reviewer_is_told_to_cite_every_blocker(self) -> None:
+        prompts, _result, _stderr = self.prompts()
+        self.assertEqual(len(prompts), 2)
+        for text in [*prompts, sd_review.URL_OUTPUT_CONTRACT]:
+            self.assertIn("empty unless you raise again a finding listed as rebutted", text)
+            self.assertNotIn("posted as advisory", text)
+            self.assertNotIn("run a check before", text)
+        claude = sd_review.claude_argv(self.tmp, "claude")
+        self.assertIn('"evidence"', claude[claude.index("--json-schema") + 1])
+
+    def test_a_review_holds_only_an_uncited_repeat_of_a_rebuttal_back(self) -> None:
+        self.adjudication(("lane claim", "rebutted", "git 2.54 matches it literally"))
+        fresh = row(summary="a first-time claim")
+        for evidence, status in ((None, "advisory"), ("bin/tool.py:3: glob = True", "blocking")):
+            with self.subTest(evidence=evidence):
+                repeat = finding(evidence, path="bin/tool.py", line=3, summary="lane claim")
+                runner = FakeRunner({"sd-check": sd_review.Completed(0, "{}", ""),
+                                     "codex": sd_review.Completed(0, json.dumps({"findings": [repeat, fresh]}), "")},
+                                    default=sd_review.Completed(0, json.dumps({"findings": []}), ""))
+                result = sd_review.review(self.root, namespace(), runner, self.environment(), self.chatgpt_home())
+                self.assertEqual(result["status"], "blocking")
+                rows = {r["path"]: (r["disposition"], r["summary"]) for r in result["findings"] if r["backend"] == "codex"}
+                self.assertEqual(rows["src.py"], ("blocking", "a first-time claim"))
+                note = " " + sd_review.REPEAT_NOTE if status == "advisory" else ""
+                self.assertEqual(rows["bin/tool.py"], (status, "lane claim" + note))
 
 
 if __name__ == "__main__":
