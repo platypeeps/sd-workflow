@@ -214,6 +214,9 @@
 /* A repo row's merging · next · blocked boxes (pack sd:7272, the lane ledger's until #1768): a box is lit only when its
  * count is not zero; blocked lights the warning lamp. */
 .queue .pipe { white-space: nowrap; }
+/* sd:9315: the Detail head names the boxes in their order (BOXES in today.js); each box button carries its own name. */
+.queue .keys { display: block; font: 400 var(--text-xs)/1.2 var(--font-data); color: var(--color-muted); }
+.queue .keys span + span::before { content: " · "; }
 .queue .pip { display: inline-block; min-width: 1.6rem; margin-right: var(--space-3xs); padding: 2px var(--space-3xs); text-align: center; border: var(--rule-hair) solid var(--color-rule-2); border-radius: var(--radius-sm); font: 400 var(--text-xs)/1.2 var(--font-data); font-variant-numeric: tabular-nums; color: var(--color-muted); }
 .queue .pip.on { border-color: var(--color-accent); color: var(--color-ink); }
 .queue .pip.warn { background: var(--color-warning-lamp); border-color: transparent; color: var(--color-warning-ink); }

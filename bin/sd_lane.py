@@ -4279,9 +4279,11 @@ def end_child(process: subprocess.Popen[bytes], out: Any, err: Any) -> None:
 
 
 def lane_room(environ: dict[str, str]) -> str | None:
-    """Why a second lane may not start now, or None: a free gate slot nobody waits for, and load under the limit.
+    """Why a second lane may not start now, or None: fewer lane gates than slots, and load under the limit.
 
-    A gate status or load that cannot be read is no room: unknown is not idle.
+    Only lane gates count against the slots: a builder's foreground test run
+    holds a slot too, and 3-5 builders starved every second lane (sd:9331).
+    A gate status, lane gate or load that cannot be read is no room: unknown is not idle.
     """
     loaded = load_stop(environ)
     if loaded is not None:
@@ -4290,9 +4292,12 @@ def lane_room(environ: dict[str, str]) -> str | None:
     found = sd_gate_slots.machine_snapshot(environ)
     if isinstance(found, str):
         return f"cannot read the gate slots ({found})"
-    taken = len(found["holders"]) + len(found["waiters"])
-    if found["slots"] and taken >= found["slots"]:
-        return f"{taken} gates hold or wait for the {found['slots']} slots"
+    lanes = found["lane_gates"]
+    unknown = next((gate["reason"] for gate in lanes if gate["state"] == "unknown"), None)
+    if unknown is not None:
+        return f"cannot read the lane gates ({unknown})"
+    if found["slots"] and len(lanes) >= found["slots"]:
+        return f"{len(lanes)} lane gates hold or wait for the {found['slots']} slots"
     return None
 
 

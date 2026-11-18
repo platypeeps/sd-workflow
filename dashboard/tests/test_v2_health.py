@@ -1740,7 +1740,7 @@ class ThePage(Collectors, BrowserSession):
         page = next(page for page in v2.registry.PAGES if page.section == "Health")
         self.assertEqual((page.count, page.live), ("/api/health/summary", False))
         self.request("/api/health/summary", headers={"Cookie": self.cookie})
-        badge = self.listening.RequestHandlerClass.badges.read(None, connected=False)["Health"]
+        badge = self.listening.RequestHandlerClass.badges.read()["Health"]
         self.assertIn(badge["state"], ("ok", "caution", "warning"))
 
     def test_the_rail_opens_health_at_its_page(self):
@@ -2576,6 +2576,16 @@ ANSWER = path => path === '/api/health/summary' ? [200, SUMMARY_DOC] : new Promi
         counts = out["counts"]
         self.assertEqual((counts["checkouts"], counts["jobs"]), (wanting(doc, "checkouts"), wanting(doc, "jobs")))
         self.assertIsNone(counts["machine"])
+
+    def test_details_say_the_read_is_in_progress_until_it_settles(self):
+        """sd:9312: a read in flight is not a failed read; Details said 'Health could not be read' while it loaded."""
+        out = self.run_page("""R.loading = document.getElementById('details').html || ''; pending[0]([500, { error: 'boom' }]); await flush();
+R.failed = document.getElementById('details').html || '';""", pre="""var pending = [];
+window.shell.reconcile = a => { if (![...a.rows].length) a.clear(); }; // shell.js's: no row shown clears Details
+ANSWER = path => path === '/api/health/summary' ? [200, SUMMARY_DOC] : new Promise(answer => pending.push(answer));""")
+        self.assertIn("Nothing is selected: Health is still being read.", out["R"]["loading"])
+        self.assertNotIn("could not be read", out["R"]["loading"])
+        self.assertIn("Nothing is selected: Health could not be read.", out["R"]["failed"])
 
     def test_a_view_switch_reads_its_part_once(self):
         switch = "shell.view.show('{v}'); await flush();"

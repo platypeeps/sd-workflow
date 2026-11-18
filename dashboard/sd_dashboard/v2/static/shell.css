@@ -194,6 +194,11 @@ body[data-rail="min"] .rail-grip { display: none; }
   text-decoration: none; color: var(--color-ink-2); white-space: nowrap; font-size: var(--text-sm);
 }
 .rail nav a .i { color: var(--color-muted); }
+/* sd:9311: the columns hold the rail's width and the name gives way, so the badge and the g-chord hint stay whole and the
+ * nav never scrolls sideways at any width: an auto column grew to the widest entry's text. */
+.rail nav, .rail nav ul { grid-template-columns: minmax(0, 1fr); }
+.rail nav a .nm { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.rail nav a :is(.i, .count, kbd, .n) { flex: none; }
 .rail nav a kbd { margin-left: auto; font-size: var(--text-2xs); color: var(--color-muted); }
 .rail nav a .count { margin-left: auto; font: 500 var(--text-2xs)/1 var(--font-data); padding: 2px 5px; border-radius: var(--radius-sm); }
 .rail nav a .count.warning { background: var(--color-warning-lamp); color: var(--color-warning-ink); }

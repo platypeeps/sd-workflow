@@ -792,17 +792,41 @@ class Supervise(Case):
         self.assertEqual(build.run(self.db, ended["retry"])["step"], "building")
 
     def test_review_rounds_bound(self):
-        """Failure table, Reviewing: blockers after 3 rounds block the items with the blockers; each fix resumes."""
+        """Failure table, Reviewing: blockers after 3 rounds and one class pass block the items; each fix resumes."""
         self.press()
-        self.plan(claude=["pass", "fix1", "fix2"], sd_review=["blocking", "blocking", "blocking"])
+        self.plan(claude=["pass", "fix1", "fix2", "fix3"], sd_review=["blocking"] * 4)
+        ended = self.supervisor().run()
+        self.assertEqual(ended["outcome"], "blocked")
+        self.assertIn("4 review rounds left blockers: work.txt:1 a blocker", self.latest()["detail"])
+        self.assertEqual(len(self.calls("sd-review")), 4)
+        fixes = [call["argv"] for call in self.calls("claude")][1:]
+        self.assertEqual([argv[argv.index("--resume") + 1] for argv in fixes], ["session-fixture"] * 3)
+        prompts = [argv[argv.index("-p") + 1] for argv in fixes]
+        self.assertIn("- work.txt:1 a blocker", prompts[0], "the fix names each blocker")
+        self.assertNotIn("class pass", prompts[1])
+        self.assertIn("class pass", prompts[2], "sd:9263: the last round is a class pass")
+        self.assertIn("- work.txt:1 a blocker", prompts[2])
+        self.assertEqual(self.statuses(), ["blocked"])
+
+    def test_a_question_on_one_member_keeps_the_class_pass_for_the_other(self):
+        """Review of sd:9263: a question on a skipped member B must not park A, which the class pass can still fix."""
+        self.press(2)
+        self.plan(claude=["pass", "fix1", "fix2", "fix3"], sd_review=["blocking"] * 4)
+        add_note(self.db, self.items[1], "question", "Which option?\nOption: Yes (Recommended)\nOption: No")
+        ended = self.supervisor().run()
+        self.assertEqual(ended["outcome"], "blocked")
+        self.assertIn("4 review rounds left blockers", self.latest()["detail"])
+        self.assertEqual(len(self.calls("sd-review")), 4)
+
+    def test_an_open_question_skips_the_class_pass(self):
+        """sd:9263: no fix round answers a question, so a build that asked one parks at 3 rounds."""
+        self.press()
+        self.plan(claude=["pass", "fix1", "fix2", "fix3"], sd_review=["blocking"] * 4)
+        add_note(self.db, self.items[0], "question", "Which option?\nOption: Yes (Recommended)\nOption: No")
         ended = self.supervisor().run()
         self.assertEqual(ended["outcome"], "blocked")
         self.assertIn("3 review rounds left blockers: work.txt:1 a blocker", self.latest()["detail"])
         self.assertEqual(len(self.calls("sd-review")), 3)
-        fixes = [call["argv"] for call in self.calls("claude")][1:]
-        self.assertEqual([argv[argv.index("--resume") + 1] for argv in fixes], ["session-fixture"] * 2)
-        self.assertIn("- work.txt:1 a blocker", fixes[0][fixes[0].index("-p") + 1], "the fix names each blocker")
-        self.assertEqual(self.statuses(), ["blocked"])
 
     def test_a_fix_then_a_clean_review_enqueues(self):
         self.press()
