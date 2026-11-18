@@ -731,10 +731,18 @@ class Ship(SharedReview):
     def lane_started(self) -> bool:
         """Whether this repository's lane runner started this prepare (sd:9335).
 
-        The runner marks the entry it runs: `running`, with its host and pid
-        in `holder`, and it starts `sd-ship` as its own child. A read that
-        fails is no answer, so it refuses and nothing renews.
+        The runner marks each `sd-ship` it starts at launch
+        (`sd_lane.LANE_CHILD`). A parent pid is no mark: a lane prepare leads
+        its own process group, so a forced runner stop leaves it running
+        under pid 1, and it read as a prepare by hand and renewed.
+
+        A runner started before that mark marks no child: its running entry
+        for this item on this host still counts, whatever its holder's pid,
+        so a prepare by hand while the lane runs the item renews nothing. A
+        read that fails is no answer, so it refuses and nothing renews.
         """
+        if os.environ.get(sd_lane.LANE_CHILD):
+            return True
         from sd_db.errors import SdDbError
         try:
             rows, host = sd_lane.stored(self.connection, self.repository), sd_lane.this_host()
@@ -744,8 +752,7 @@ class Ship(SharedReview):
                           f"nothing is renewed", code="lane_unknown", boundary="database",
                           state="retryable_failure") from None
         return any(row.get("item") == self.args.item and row.get("status") == "running"
-                   and (row.get("holder") or {}).get("host") == host
-                   and (row.get("holder") or {}).get("pid") == os.getppid() for row in rows)
+                   and (row.get("holder") or {}).get("host") == host for row in rows)
 
     def body_input(self, default: str) -> tuple[str, str]:
         """The body to publish and where it came from (sd:1870).

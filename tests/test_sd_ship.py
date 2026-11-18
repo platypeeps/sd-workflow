@@ -396,6 +396,11 @@ class ShipCase(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        # The lane marks the sd-ship it starts (sd:9335); a suite the lane's gate runs inherits that mark.
+        lane = patch.dict(os.environ)
+        lane.start()
+        self.addCleanup(lane.stop)
+        os.environ.pop("SD_LANE_CHILD", None)
         self.directory = pathlib.Path(self.temp.name).resolve()
         # The three repositories come from one template per process, copied;
         # `fixture_template` below builds it the way this setUp used to.
@@ -4624,6 +4629,29 @@ roles:
         self.assertNotEqual(renewed, old)
         self.assertIn(f"renews the delivery claim of sd:{self.item}: item scope {old[:12]} is now {renewed[:12]}",
                       stderr.getvalue())
+
+    def test_an_orphaned_lane_prepare_never_renews(self):
+        """Lead review of sd:9335: a lane prepare leads its own process group, so a forced runner stop leaves it
+        running under pid 1. Its parent no longer matches the entry's holder, and the parent-pid check took it
+        for a prepare by hand and renewed the claim. The lane marks its children at launch; that mark holds."""
+        from sd_db import set_item_fields
+        sd_lane = ship.sd_lane
+        acceptance = self.directory / "acceptance.json"
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        old = self.operation().state["acceptance"]["item_scope"]
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        entry = {"id": "e1", "position": 1, "item": self.item, "status": "running", "step": "prepare",
+                 "holder": {"host": sd_lane.this_host(), "pid": 2 ** 22 + 7, "token": "t"}}
+        for status in ("running", "pending"):  # the runner is gone; the reap may have put the entry back
+            with self.subTest(status=status):
+                sd_lane.store(self.connection, ship.slug(REMOTE_URL), {**entry, "status": status})
+                self.connection.commit()
+                with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}):
+                    with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed.*by hand"):
+                        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+                self.assertEqual(self.operation().state["acceptance"]["item_scope"], old)
 
     def test_a_lane_retry_of_an_entry_older_than_a_renewal_refuses(self):
         """sd:9335 round 5. A retry keeps its entry's acceptance text, and the scope matches once a hand prepare
