@@ -4595,6 +4595,35 @@ roles:
         self.assertIn(f"renews the delivery claim of sd:{self.item}: item scope {old[:12]} is now {renewed[:12]}",
                       stderr.getvalue())
 
+    def test_a_lane_retry_of_an_entry_older_than_a_renewal_refuses(self):
+        """sd:9335 round 5. A retry keeps its entry's acceptance text, and the scope matches once a hand prepare
+        renewed the claim; a lane prepare whose evidence differs from the renewed claim refuses and changes
+        nothing, and one enqueued again with the renewal's evidence passes."""
+        from sd_db import set_item_fields
+        sd_lane = ship.sd_lane
+
+        def evidence(name, text):
+            path = self.directory / name
+            path.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+                {"criterion": "actual scope", "passed": True, "evidence": text}]}))
+            return str(path)
+
+        queued, renewal = evidence("queued.json", "fixture-check-pass"), evidence("renewal.json", "renewed-pass")
+        self.prepare("--deliver", "--acceptance-file", queued)
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--acceptance-file", renewal)
+        before = self.operation().state["acceptance"]
+        entry = {"id": "e1", "position": 1, "item": self.item, "status": "running", "step": "prepare",
+                 "holder": {"host": sd_lane.this_host(), "pid": os.getppid(), "token": "t"}}
+        sd_lane.store(self.connection, ship.slug(REMOTE_URL), entry)
+        self.connection.commit()
+        with self.assertRaisesRegex(ship.Refusal, "renewed by hand.*enqueue again"):
+            self.prepare("--deliver", "--acceptance-file", queued)
+        self.assertEqual(self.operation().state["acceptance"], before)
+        self.prepare("--deliver", "--acceptance-file", renewal)
+        self.assertEqual(self.operation().state["acceptance"]["claim"], before["claim"])
+
     def test_author_assignment_cannot_borrow_manual_merge_authority(self):
         from sd_db.workflow import WorkflowError
         self.prepare()
