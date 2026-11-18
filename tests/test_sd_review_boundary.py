@@ -980,11 +980,15 @@ class LineBudgetTests(unittest.TestCase):
         # rebutted findings in the prompt (read-only, capped, anchored at the
         # head), and the `evidence` field `dispose` needs before a finding
         # blocks. Measured, not carried: `sd-review` is 2771 on this tree.
+        #
+        # 4741 -> 4755 is pack sd:9270 bundle review round 3: `bin/sd-review`
+        # +14 so a verification keeps a confirmed blocker and read-only
+        # readers may cite the lines they read. Measured: 2785 on this tree.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4741,
+            4755,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
