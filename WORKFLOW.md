@@ -665,6 +665,8 @@ The reserved `sd` namespace declares these settings:
 - `sd.bundle_max`: how many items one build bundle takes when this machine claims it, a mechanical item half
   of one. Absence reads 3. The claim fixes a build child's budget at 120 minutes per 3 slots it took, never
   less (sd:9109). It grants nothing.
+- `sd.lane_parallel`: how many lanes one hosted lane run runs at once on this machine, 1 to 8. Absence reads 5
+  (sd:9323); the gate's slots and load limit still hold lanes back below it. It grants nothing.
 - `sd.repo_cap`: how many build bundles may build at once in one repository when this machine claims them,
   1 to 6. Absence reads 1, the one-bundle-per-repository rule (sd:8158, sd:9172). It grants nothing.
 - `sd.gate_load_max`: the gate queue starts a gate only while load1 is below this; `0` is no load condition.

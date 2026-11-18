@@ -372,6 +372,20 @@ class Unparking(BrowserSession):
         self.assertNotEqual(status, 200)
         self.assertIsNotNone(workflow.item_state(self.connection, item)["item"]["parked_at"])
 
+    def test_a_repo_less_empty_piece_still_opens_its_page(self):
+        """Bundle review round 2: since sd:9324 an idea whose piece is '' reaches `writing.piece_state`, whose repo
+        lookup raised before its own error handler, so the page answered 500."""
+        for piece in ("", "2026/loose"):
+            with self.subTest(piece=piece):
+                item = self.item("Loose idea", kind="idea")
+                self.connection.execute("UPDATE item SET piece = ?, stage = 'drafting' WHERE id = ?", (piece, item))
+                self.connection.commit()
+                status, _, page = self.request(f"/item/{item}")
+                self.assertEqual(status, 200)
+                self.assertIn("Writing progress", page)
+                self.assertIn("this piece names no repository", page)
+                self.assertIn("has no registered repository, so it cannot move", page)
+
     def test_the_post_unparks_and_a_stale_revision_writes_nothing(self):
         state = self.parked(kind="task")
         item = state["item"]["id"]

@@ -20,7 +20,6 @@ status the job does not write, is unknown too. Nothing here writes.
 
 from __future__ import annotations
 
-import json
 import math
 import re
 import sqlite3
@@ -111,9 +110,25 @@ def _when(stamp) -> datetime | None:
         return None
     try:
         moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-    except ValueError:
+        return moment.astimezone(timezone.utc) if moment.tzinfo else None
+    except (ValueError, OverflowError):  # a time past the calendar's end, once in UTC
         return None
-    return moment.astimezone(timezone.utc) if moment.tzinfo else None
+
+
+def _word(value, known) -> str:
+    """`value` when it is one of the `known` strings, else unknown: a list or object would not hash."""
+    return value if isinstance(value, str) and value in known else "unknown"
+
+
+def _text(value) -> str:
+    """A reading's text field as shown: a string, at most 200 characters."""
+    return str(value or "")[:200]
+
+
+def _minutes(value) -> int | None:
+    """A window's length in minutes, or None: a bool, a non-positive value or one past 10 years is none, so no float
+    conversion overflows and no label runs to hundreds of digits."""
+    return value if isinstance(value, int) and not isinstance(value, bool) and 0 < value <= 10 * 525_600 else None
 
 
 def _number(value) -> float | None:
@@ -125,22 +140,9 @@ def _number(value) -> float | None:
         return None
 
 
-def _newest(connection: sqlite3.Connection, prefix: str) -> dict[str, tuple[str, object]]:
-    """The newest heartbeat row of each key under `prefix`, by name: `(timestamp, body)`. A removed entry is left out;
-    a body that does not parse is None, which reads unknown."""
-    end = prefix[:-1] + chr(ord(prefix[-1]) + 1)
-    found = {}
-    for key, stamp, body in connection.execute(
-            "SELECT key, timestamp, body FROM state WHERE id IN (SELECT MAX(id) FROM state"
-            " WHERE kind = 'heartbeat' AND key >= ? AND key < ? GROUP BY key) ORDER BY key", (prefix, end)):
-        try:
-            body = json.loads(body)
-        except (TypeError, ValueError, RecursionError):
-            body = None
-        if isinstance(body, dict) and body.get("status") == "removed":
-            continue
-        found[key[len(prefix):]] = (stamp, body)
-    return found
+# The heartbeat reads live in the library: screens issue no SQL (criterion 12).
+ever_read = usage.ever_read
+_newest = usage.newest_heartbeats
 
 
 def _age(read_at: datetime | None, now: datetime) -> float | None:
@@ -166,28 +168,29 @@ def services(connection: sqlite3.Connection, *, now: str) -> list[dict]:
     for name, (stamp, body) in _newest(connection, STATUS_PREFIX).items():
         body = body if isinstance(body, dict) else {}
         read_at = body.get("read_at") if _when(body.get("read_at")) else None
-        status = body.get("status") if body.get("status") in SERVICE_STATE else "unknown"
+        status = _word(body.get("status"), SERVICE_STATE)
         why = (_stale(_age(_when(read_at), clock), STATUS_STALE_MINUTES) if read_at else "the reading has no read time")
         if not body:
             why = "the row does not parse"
         elif status == "unknown" and not why:
-            why = str(body.get("error") or "the status job could not read it")[:200]
+            why = _text(body.get("error") or "the status job could not read it")
         incidents = [one for one in body.get("incidents") or [] if isinstance(one, dict)] if isinstance(
             body.get("incidents"), list) else []
         components = [one for one in body.get("components") or [] if isinstance(one, dict)] if isinstance(
             body.get("components"), list) else []
-        providers = [p for p in body.get("providers") or [] if isinstance(p, str)] if isinstance(
+        providers = [p for p in body.get("providers") or [] if isinstance(p, str) and NAME.fullmatch(p)] if isinstance(
             body.get("providers"), list) else []
         out.append({"name": name, "status": "unknown" if why else status, "why": why, "read_at": read_at,
-                    "row_at": stamp, "kind": body.get("kind") if isinstance(body.get("kind"), str) else "",
+                    "row_at": stamp, "kind": _text(body.get("kind")) if isinstance(body.get("kind"), str) else "",
                     "url": body.get("url") if isinstance(body.get("url"), str) and _web_url(body["url"]) else "",
-                    "providers": providers, "indicator": body.get("indicator") if isinstance(body.get("indicator"), str) else "",
-                    "incidents": [{"title": str(one.get("title") or "")[:200],
+                    "providers": providers,
+                    "indicator": _text(body.get("indicator")) if isinstance(body.get("indicator"), str) else "",
+                    "incidents": [{"title": _text(one.get("title")),
                                    "url": one["url"] if isinstance(one.get("url"), str) and _web_url(one["url"]) else "",
-                                   "impact": str(one.get("impact") or ""),
+                                   "impact": _text(one.get("impact")),
                                    "started_at": one.get("started_at") if _when(one.get("started_at")) else None}
                                   for one in incidents],
-                    "components": [{"name": str(one.get("name") or ""), "status": str(one.get("status") or "")}
+                    "components": [{"name": _text(one.get("name")), "status": _text(one.get("status"))}
                                    for one in components]})
     return out
 
@@ -210,19 +213,20 @@ def _flag(found: list[dict]) -> dict | None:
 
 
 def _label(window: dict) -> str:
-    minutes = window.get("window_minutes")
-    if isinstance(minutes, int) and not isinstance(minutes, bool) and minutes > 0:
+    minutes = _minutes(window.get("window_minutes"))
+    if minutes:
         return f"{minutes // 1440}d" if minutes % 1440 == 0 else f"{minutes // 60}h" if minutes % 60 == 0 else f"{minutes}m"
-    return str(window.get("name") or "window")
+    return _text(window.get("name") or "window")
 
 
 def _pace(used: float, minutes, resets_at, clock: datetime, expected=None) -> float | None:
     """Percentage points used over (+) or under (-) an even pace through the window; None when the window does not say
     where in it the read falls."""
     if _number(expected) is not None:
-        return round(used - float(expected))
-    reset = _when(resets_at)
-    if reset is None or not isinstance(minutes, int) or isinstance(minutes, bool) or minutes <= 0:
+        over = used - float(expected)
+        return round(over) if math.isfinite(over) else None
+    reset, minutes = _when(resets_at), _minutes(minutes)
+    if reset is None or minutes is None:
         return None
     left = (reset - clock).total_seconds() / 60
     if not 0 <= left <= minutes:
@@ -242,7 +246,7 @@ def _window(window: dict, clock: datetime, expected=None) -> dict | None:
 def _money(value) -> dict | None:
     if not isinstance(value, dict) or _number(value.get("amount")) is None:
         return None
-    return {"amount": _number(value["amount"]), "unit": str(value.get("unit") or ""), "period": str(value.get("period") or "")}
+    return {"amount": _number(value["amount"]), "unit": _text(value.get("unit")), "period": _text(value.get("period"))}
 
 
 def _usage_row(ident: str, label: str, *, status: str, why: str, read_at, windows: list[dict], balance, spend,
@@ -282,13 +286,16 @@ def strip(connection: sqlite3.Connection, *, now: str) -> dict:
     rows, nosource = [], []
     for name, (_, body) in readings.items():
         body = body if isinstance(body, dict) else {}
-        status = body.get("status") if body.get("status") in ("ok", "unknown", "no-source") else "unknown"
+        status = _word(body.get("status"), ("ok", "unknown", "no-source"))
         if status == "no-source":
             nosource.append(name)
             continue
         flag = _flag(by_provider.get(name, []))
         accounts = body.get("accounts")
-        if name == "claude" and isinstance(accounts, list) and any(isinstance(one, dict) for one in accounts):
+        # A failed read keeps its status and error: it falls through to one provider row below, as does a list that
+        # renders no account.
+        if name == "claude" and status == "ok" and isinstance(accounts, list) and accounts:
+            before = len(rows)
             for account in accounts:
                 number = account.get("number") if isinstance(account, dict) else None
                 if not isinstance(number, int) or isinstance(number, bool):
@@ -302,7 +309,8 @@ def strip(connection: sqlite3.Connection, *, now: str) -> dict:
                 rows.append(_usage_row(f"usage:claude#{number}", f"claude#{number}", status="ok", why=why, read_at=read_at,
                                        windows=[week] if week else [], balance=None, spend=None, flag=flag,
                                        active=bool(account.get("active"))))
-            continue
+            if len(rows) > before:
+                continue
         read_at = body.get("read_at") if _when(body.get("read_at")) else None
         windows = [one for one in (_window(window, clock) for window in body.get("windows") or []
                                    if isinstance(window, dict)) if one] if isinstance(body.get("windows"), list) else []
@@ -311,7 +319,9 @@ def strip(connection: sqlite3.Connection, *, now: str) -> dict:
         if not body:
             why = "the row does not parse"
         elif status != "ok":
-            why = str(body.get("error") or "the usage job could not read it")[:200]
+            why = _text(body.get("error") or "the usage job could not read it")
+        elif name == "claude" and isinstance(accounts, list) and accounts:
+            why = "cswap lists no numbered account"
         elif not read_at:
             why = "the reading has no read time"
         else:

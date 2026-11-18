@@ -74,6 +74,8 @@ def _canonical(connection: sqlite3.Connection, repo: str) -> str:
 
 def pieces_owner(connection: sqlite3.Connection, repo: str) -> str:
     from .repos import row_for
+    if not repo:
+        raise WorkflowError("this piece names no repository")
     row = row_for(connection, repo)
     if row is None:
         raise WorkflowError(f"repository {repo!r} is not registered")
@@ -137,6 +139,8 @@ def _registered_only(repo: str) -> None:
 
 def _path(repo: str, piece: str, relative: str | None = None) -> Path:
     piece = _key(piece)
+    if not repo:
+        raise WorkflowError("this piece names no repository")
     root = _disk(repo)
     relative = relative or f"content/{piece}/index.md"
     wanted = {f"content/{piece}/index.md", f"content-parked/{piece}/index.md"}
@@ -412,7 +416,11 @@ def _normal(stage: str) -> list[str]:
 def piece_state(connection: sqlite3.Connection, item: int) -> dict:
     state = _piece(connection, item)
     row = state["item"]
-    owner = pieces_owner(connection, row["repo"])
+    # A piece whose repository is gone or never named reads as its problem: the item page must still open.
+    try:
+        owner, unowned = pieces_owner(connection, row["repo"]), ""
+    except WorkflowError as error:
+        owner, unowned = "", str(error)
     try:
         snapshot = _snapshot(row)
         problems = _problems(row, snapshot)
@@ -423,10 +431,12 @@ def piece_state(connection: sqlite3.Connection, item: int) -> dict:
         problems, digest = [str(error)], ""
         document = None
         companions = {}
+    if unowned:
+        problems = [unowned, *problems]
     stages = _normal(row["stage"])
     corrections = [target for target in ("researching", "drafting", "review")
                    if row["stage"] in STAGES and STAGES.index(target) < STAGES.index(row["stage"])]
-    if owner == "retiring" or row["parked_at"]:
+    if owner in ("retiring", "") or row["parked_at"]:
         stages, corrections = [], []
     state["writing"] = {"stage": row["stage"], "available_stages": stages, "correction_stages": corrections,
                         "owner": owner, "parked": row["parked_at"] is not None,

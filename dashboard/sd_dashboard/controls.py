@@ -247,7 +247,9 @@ def writing_controls(connection, row, *, state=None):
             tag("p", tag("a", "Open published document", href=publication["url"], rel="noopener noreferrer")) if publication.get("url") else "",
             tag("p", "Resume from the saved claim; check the destination before repeating an interrupted operation.", class_="hint") if phase != "published" else "",
             tag("code", f"sd writing publication-status --piece {row['piece']} --claim {publication['id']}"), class_="operation-card"))
-    if detail["owner"] != "row":
+    if not detail["owner"]:
+        body.append(tag("p", "This piece has no registered repository, so it cannot move.", class_="hint"))
+    elif detail["owner"] != "row":
         body.append(tag("p", "This collection is read-only until its database migration is verified.", class_="hint"))
     else:
         parked = detail["parked"]

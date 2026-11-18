@@ -8,6 +8,7 @@ is unknown, never its last numbers and never 0. A service whose `providers` name
 
 from __future__ import annotations
 
+import os
 import sqlite3
 import unittest
 from unittest import mock
@@ -61,6 +62,48 @@ class TheStrip(ScreenCase):
         self.assertEqual(rows[0]["windows"], [{"label": "7d", "used": 40.0, "resets_at": "2026-09-08T12:00:00Z", "pace": -10}])
         self.assertEqual((rows[1]["windows"], rows[1]["why"]), ([], "read 2h ago; a reading over 30 min old is unknown"))
 
+    def test_a_failed_claude_read_keeps_its_status_and_shows_its_error(self):
+        # Bundle review round 1: the accounts branch passed status="ok"
+        # and dropped the job's error.
+        reading(self.connection, "claude", status="unknown", error="cswap timed out", **CLAUDE)
+        self.assertEqual([(row["id"], row["state"], row["status"], row["why"]) for row in self.strip()["rows"]],
+                         [("usage:claude", "unknown", "unknown", "cswap timed out")])
+
+    def test_claude_accounts_that_render_no_row_are_one_unknown_row(self):
+        reading(self.connection, "claude", windows=[], accounts=[{}])
+        self.assertEqual([(row["id"], row["state"], row["why"]) for row in self.strip()["rows"]],
+                         [("usage:claude", "unknown", "cswap lists no numbered account")])
+
+    def test_a_time_past_the_calendar_s_end_is_unknown_never_an_error(self):
+        far = "9999-12-31T23:59:59-12:00"
+        reading(self.connection, "codex", read_at=far, windows=[{"used_percent": 5, "window_minutes": 300, "resets_at": far}])
+        status(self.connection, "openai", status="outage", providers=["codex"], incidents=[{"title": "x", "started_at": far}])
+        [row] = self.strip()["rows"]
+        self.assertEqual((row["state"], row["why"]), ("unknown", "the reading has no read time"))
+
+    def test_a_pace_past_the_float_range_is_no_pace_never_an_error(self):
+        reading(self.connection, "claude", windows=[], accounts=[
+            {"number": 1, "pct": 1.7e308, "expectedPct": -1.7e308, "fetchedAt": READ}])
+        [row] = self.strip()["rows"]
+        self.assertEqual(row["windows"][0]["pace"], None)
+
+    def test_a_window_too_long_for_a_float_has_no_pace_and_its_name(self):
+        # Bundle review round 3: 10**400 minutes raised "int too large to
+        # convert to float", which replaced the whole strip.
+        reading(self.connection, "codex", windows=[
+            {"name": "primary", "used_percent": 5, "window_minutes": 10 ** 400, "resets_at": "2026-09-06T15:00:00Z"}])
+        [row] = self.strip()["rows"]
+        self.assertEqual(row["windows"], [{"label": "primary", "used": 5.0, "resets_at": "2026-09-06T15:00:00Z",
+                                           "pace": None}])
+
+    def test_each_text_field_is_capped_at_200_characters(self):
+        long = "x" * 10_000
+        reading(self.connection, "codex", windows=[{"name": long, "used_percent": 5}],
+                balance={"amount": 1, "unit": long, "period": long})
+        [row] = self.strip()["rows"]
+        self.assertEqual((len(row["windows"][0]["label"]), len(row["balance"]["unit"]), len(row["balance"]["period"])),
+                         (200, 200, 200))
+
     def test_a_reading_over_30_minutes_old_is_unknown_and_shows_no_number(self):
         reading(self.connection, "codex", read_at="2026-09-06T11:29:00Z", **CODEX)
         row = self.strip()["rows"][0]
@@ -106,12 +149,17 @@ class TheStripOnToday(ReaderCase):
                incidents=[{"title": "API errors", "url": "https://status.example.test/incidents/9"}])
         reading(self.connection, "gemini", status="no-source")
         self.doc["usage"] = usage_screen.strip(self.connection, now=NOW)
-        out = self.run_page("R.usage = ELS.usage.html;")
+        # The zone and locale are pinned, so the label below is exact.
+        # JavaScriptCore reads the zone from TZ but the locale from the
+        # system's settings, never LANG: the script pins it to en-US.
+        pin = ("\nconst toLocal = Date.prototype.toLocaleString;\n"
+               "Date.prototype.toLocaleString = function (_, options) { return toLocal.call(this, 'en-US', options); };\n")
+        with mock.patch.dict(os.environ, {"TZ": "America/Denver"}):
+            out = self.run_page("R.usage = ELS.usage.html;", after=pin)
         strip = out["R"]["usage"]
         self.assertIn("5h window 62% used", strip)
         self.assertIn('<rect class="fill caution" width="85.5"', strip)
-        self.assertIn('<time datetime="2026-09-06T15:00:00Z">', strip)
-        self.assertRegex(strip, r'<time datetime="2026-09-06T15:00:00Z">[^<]*\b[A-Z]{2,4}[^<]*</time>')
+        self.assertIn('<time datetime="2026-09-06T15:00:00Z">Sun, 09:00 AM MDT</time>', strip)
         self.assertIn("22 pts over pace", strip)
         self.assertIn('href="https://status.example.test/incidents/9"', strip)
         self.assertIn("No reader for gemini.", strip)

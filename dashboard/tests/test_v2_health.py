@@ -687,6 +687,12 @@ class TheDocument(Collectors, ScreenCase):
             "sec:off:/checkouts/delta": ("caution", "group/delta: public, secret scanning off"),
             "sec:unread": ("unknown", "2 managed repos: security not read"),
         })
+        self.assertEqual(rows["sec:off:/checkouts/delta"]["cli"],
+                         "open https://github.com/group/delta/settings/security_analysis")
+        odd = [{**ALERTED[4], "slug": "group/delta;$(id)"}]
+        # Bundle review round 2: a slug reaches the copy line quoted.
+        self.assertEqual(self.area("sec", protection=protection_of(odd))["rows"][0]["cli"],
+                         "open 'https://github.com/group/delta;$(id)/settings/security_analysis'")
         self.assertEqual(rows["sec:/checkouts/alpha"]["cli"],
                          "gh api --paginate 'repos/group/alpha/secret-scanning/alerts?state=open' --jq '.[].html_url'")
         clean = [{**ALERTED[0], "alerts": {"secret_scanning": {"visibility": "public", "setting": "enabled", "open": 0}}},
@@ -2152,7 +2158,7 @@ R.unread = ELS.details.html;""", view="github")
         self.assertIn('<dt>Admins</dt><dd class="c-ok">ok</dd>', details)
         self.assertIn('<dt>Rebase merge</dt><dd class="c-na">—</dd>', details)
         self.assertIn("group/alpha · settings/branches", details)
-        self.assertEqual(out["R"]["cli"], "open https://github.com/group/alpha/settings/branches")
+        self.assertEqual(out["R"]["cli"], "open 'https://github.com/group/alpha/settings/branches'")
         self.assertEqual(out["R"]["off"], "no github.com remote: there is no settings page")
         self.assertEqual(out["R"]["sync"], "sd shadow sync --max-seconds 120")
         self.assertIn("No cell is shown: token does not reach it.", out["R"]["unread"])
@@ -2240,7 +2246,7 @@ for (const id of ['cred:google:a@example.test', 'cred:google:b@example.test']) {
 R.cli = c.cli(o); R.why = c.consequence(o); R.on = c.when(o); R.primary = c.primary(o);
 R.start = cmd('service.start').when(o);
 shellRun(c, o); await flush();""")
-        self.assertEqual(out["R"]["cli"], "sd services restart com.example.alpha")
+        self.assertEqual(out["R"]["cli"], "sd services restart 'com.example.alpha'")
         self.assertEqual(out["R"]["why"], "Stops com.example.alpha and starts it again. Its open connections drop.")
         self.assertEqual((out["R"]["on"], out["R"]["primary"]), (True, True))
         self.assertEqual(out["R"]["start"], "service is already running")
@@ -2257,7 +2263,7 @@ R.cli = cmd('service.start').cli(o); R.restart = cmd('service.restart').when(o);
 R.old = cmd('service.start').when({ ...o, revision: undefined });
 shellRun(cmd('service.start'), o); await flush();""")
         self.assertEqual((out["R"]["start"], out["R"]["primary"]), (True, True))
-        self.assertEqual(out["R"]["cli"], "sd services start com.example.beta")
+        self.assertEqual(out["R"]["cli"], "sd services start 'com.example.beta'")
         self.assertEqual(out["R"]["restart"], "service is already unloaded; use Start to load it")
         self.assertEqual(out["R"]["old"], "the row carries no revision: read Health again")
         self.assertEqual([post[:2] for post in out["posts"]], [["/api/services/com.example.beta/start", {"revision": "2" * 64}]])

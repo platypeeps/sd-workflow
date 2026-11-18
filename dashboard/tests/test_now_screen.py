@@ -252,6 +252,12 @@ class Document(ScreenCase):
         self.assertEqual(now_screen._attention([{"band": "queued"}]), {"state": "ok", "n": 0, "what": "rows"})
         self.assertFalse(hasattr(now_screen, "_waiting"))
 
+    def test_a_usage_strip_that_raises_costs_the_strip_only(self):
+        # Bundle review round 1: a strip failure failed all of /api/now.
+        with patch.object(now_screen.usage_screen, "strip", side_effect=OverflowError("date value out of range")):
+            failed = now_screen.document(self.connection, now=NOW, jobs=self.quiet, fleet=self.fixture_fleet())
+        self.assertEqual((failed["usage"]["error"], failed["usage"]["rows"]), ("date value out of range", []))
+
     def test_an_empty_fleet_and_no_pulls_is_an_empty_list_with_every_source_read(self):
         document = now_screen.document(self.connection, now=NOW, jobs=self.quiet, fleet=self.fixture_fleet())
         self.assertEqual(document["rows"], [])

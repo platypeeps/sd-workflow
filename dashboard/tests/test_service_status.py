@@ -101,6 +101,15 @@ class TheRows(ScreenCase):
         rows = self.area()["rows"]
         self.assertEqual([(row["id"], row["state"]) for row in rows], [("stat:none", "unknown")])
 
+    def test_only_removed_services_mean_none_watched_and_no_row(self):
+        # Bundle review round 4: after the last service was removed, the
+        # area showed "No service status read yet" for good.
+        status(self.connection, "claude", timestamp="2026-09-06T11:00:00Z")
+        record_state(self.connection, "heartbeat", key="service-status:claude", timestamp="2026-09-06T11:50:00Z",
+                     body={"status": "removed"})
+        area = self.area()
+        self.assertEqual((area["rows"], area["extra"]["counts"]["unknown"]), ([], 0))
+
 
 class TheView(health_tests.Collectors, ScreenCase):
     run_doc, run_page = health_tests.TheScript.run_doc, health_tests.TheScript.run_page
@@ -118,6 +127,22 @@ OUT.opened = []; window.open = (u, t) => OUT.opened.push([u, t]); R.said = cmd.r
         self.assertEqual((out["R"]["type"], out["R"]["when"]), ("service status", True))
         self.assertEqual(out["opened"], [["https://status.example.test/incidents/1", "_blank"]])
 
+
+    def test_each_copy_line_quotes_what_a_feed_or_a_repo_supplies(self):
+        # Bundle review round 2: `open <url>` put a feed's URL into a shell
+        # line unquoted; a sweep found the services and protection lines.
+        status(self.connection, "odd", status="outage", incidents=[
+            {"title": "x", "url": "https://status.example.test/i;$(id)"}])
+        out = self.run_page("""const o = C.get('stat:odd');
+const cli = id => REG.find(c => c.id === id).cli;
+R.open = cli('service status.open')(o);
+R.restart = cli('service.restart')({ facts: { Label: 'a;$(id)' } });
+R.start = cli('service.start')({ facts: { Label: 'a;$(id)' } });
+R.prot = cli('protection.settings')({ slug: 'o/r;$(id)' });""", view="status")
+        self.assertEqual(out["R"], {"open": "open 'https://status.example.test/i;$(id)'",
+                                    "restart": "sd services restart 'a;$(id)'",
+                                    "start": "sd services start 'a;$(id)'",
+                                    "prot": "open 'https://github.com/o/r;$(id)/settings/branches'"})
 
     def test_no_status_read_yet_counts_no_service(self):
         out = self.run_page("R.body = ELS['body-status'].html;", view="status")
@@ -154,6 +179,49 @@ class TheServicesReader(ScreenCase):
         status(self.connection, "claude", read_at=None)
         self.assertEqual([(one["status"], one["why"]) for one in usage_screen.services(self.connection, now=NOW)],
                          [("unknown", "the reading has no read time")])
+
+    def test_each_text_field_is_capped_at_200_characters(self):
+        # Bundle review round 3: kind, indicator, providers, impact and
+        # components passed through uncapped.
+        long = "x" * 10_000
+        status(self.connection, "s", status="degraded", kind=long, indicator=long, providers=[long, "codex"],
+               incidents=[{"title": long, "impact": long}], components=[{"name": long, "status": long}])
+        [one] = usage_screen.services(self.connection, now=NOW)
+        self.assertEqual((len(one["kind"]), len(one["indicator"]), one["providers"]), (200, 200, ["codex"]))
+        self.assertEqual((len(one["incidents"][0]["title"]), len(one["incidents"][0]["impact"])), (200, 200))
+        self.assertEqual(one["components"], [{"name": "x" * 200, "status": "x" * 200}])
+
+    def test_ignore_holds_only_for_the_same_incident(self):
+        # Bundle review round 2: the fingerprint read titles only, so an
+        # ignored outage hid a later one with the same title.
+        first = {"title": "API errors", "url": "https://status.example.test/incidents/1",
+                 "started_at": "2026-09-06T10:00:00Z"}
+        status(self.connection, "a", status="outage", incidents=[first])
+        status(self.connection, "b", status="outage", incidents=[{**first, "started_at": "2026-09-06T11:00:00Z"}])
+        status(self.connection, "c", status="outage", incidents=[{**first, "url": "https://status.example.test/incidents/2"}])
+        rows, _ = health_screen._status_rows(usage_screen.services(self.connection, now=NOW), now=NOW)
+        self.assertEqual(len({json.dumps(row["problem"]) for row in rows}), 3)
+        self.assertEqual(rows[0]["problem"], ["outage", "API errors", "https://status.example.test/incidents/1",
+                                              "2026-09-06T10:00:00Z"])
+
+    def test_a_status_that_is_not_a_known_word_is_unknown_never_an_error(self):
+        # Bundle review round 1: a list or object status raised TypeError
+        # in the lookup, which hid the Status view and failed /api/now.
+        for number, odd in enumerate((["ok"], {"ok": 1}, 7, "fine")):
+            status(self.connection, f"s{number}", status=odd)
+        found = usage_screen.services(self.connection, now=NOW)
+        self.assertEqual([(one["name"], one["status"]) for one in found],
+                         [("s0", "unknown"), ("s1", "unknown"), ("s2", "unknown"), ("s3", "unknown")])
+        self.assertEqual({one["why"] for one in found}, {"the status job could not read it"})
+
+    def test_a_time_past_the_calendar_s_end_is_unknown_never_an_error(self):
+        # Bundle review round 1: OverflowError escaped _when.
+        status(self.connection, "s", read_at="9999-12-31T23:59:59-12:00",
+               incidents=[{"title": "x", "started_at": "9999-12-31T23:59:59-12:00"}])
+        self.assertIsNone(usage_screen._when("9999-12-31T23:59:59-12:00"))
+        [one] = usage_screen.services(self.connection, now=NOW)
+        self.assertEqual((one["status"], one["why"], one["incidents"][0]["started_at"]),
+                         ("unknown", "the reading has no read time", None))
 
 
 if __name__ == "__main__":

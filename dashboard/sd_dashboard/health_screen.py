@@ -733,7 +733,7 @@ def _security_rows(found: list[dict], *, now: str) -> tuple[list[dict], dict]:
                          "detail": "a public repo with scanning off is a finding", "kind": "Security · scanning off",
                          "facts": {"Repository": repo["repo"], "Setting": "disabled",
                                    "Observed": repo.get("observed_at") or "never"},
-                         "cli": f"open {settings}"})
+                         "cli": f"open {shlex.quote(settings)}"})
         elif not isinstance(part, dict) or not isinstance(part.get("open"), int):
             unread.append(_unread_reason(repo, part))
             skipped.add(repo["repo"])
@@ -984,12 +984,14 @@ def _brief_copies_row(read, *, now: str) -> dict:
 STATUS_CLI = "local-agent-meter/agent-meter.py services"
 
 
-def _status_rows(found: list[dict], *, now: str) -> tuple[list[dict], dict]:
+def _status_rows(found: list[dict], *, now: str, removed: bool = False) -> tuple[list[dict], dict]:
     """One row per watched service (pack sd:9260): its status, its open incidents with their links, how long the oldest
     has lasted and its read time. Degraded is caution and outage a warning; a read that failed or is older than
     `usage_screen.STATUS_STALE_MINUTES` is unknown with why. The list's add and remove are Settings' (`extra.settings`)."""
     extra = {"settings": usage_screen.SERVICES_LIST, "counts": {status: sum(one["status"] == status for one in found)
                                                                 for status in usage_screen.SERVICE_STATE}}
+    if not found and removed:  # rows exist and none answers: each was removed, so none is watched
+        return [], extra
     if not found:
         return [{"id": "stat:none", "state": "unknown", "type": "check", "what": "No service status read yet",
                  "detail": "agent-meter.py services writes one row per dashboard.status_services line every 5 minutes",
@@ -1014,8 +1016,10 @@ def _status_rows(found: list[dict], *, now: str) -> tuple[list[dict], dict]:
             "list_head": "Open incidents", "list": [{"text": incident["title"] or "untitled incident", "href": incident["url"]}
                                                     if incident["url"] else incident["title"] or "untitled incident"
                                                     for incident in incidents],
-            # Ignore holds until the status or an incident changes (sd:5470); a new read time is not a new problem.
-            "problem": [status, *(incident["title"] for incident in incidents)],
+            # Ignore holds until the status or an incident changes (sd:5470); a new read time is not a new problem. An
+            # incident is its title, link and start, so a later outage with the same title is a new problem.
+            "problem": [status, *(field for incident in incidents
+                                  for field in (incident["title"], incident["url"], incident["started_at"] or ""))],
         })
     return rows, extra
 
@@ -1315,7 +1319,8 @@ def _readers(connection: sqlite3.Connection, *, now: str, fleet=None, ports=None
                                  _brief_copies_row(lambda: read_brief_copies(connection), now=now)),
         "doc": lambda: _doctor_rows(read_doctor()),
         "aws": lambda: _aws_rows(read_creds(connection), now=now),
-        "stat": lambda: _status_rows(usage_screen.services(connection, now=now), now=now),
+        "stat": lambda: _status_rows(usage_screen.services(connection, now=now), now=now,
+                                     removed=usage_screen.ever_read(connection, usage_screen.STATUS_PREFIX)),
     }
 
 

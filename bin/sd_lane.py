@@ -4219,7 +4219,7 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
         return inline_lane(lambda: run_lane(checkout, environ, ship, gate, note, clock() + budget))
     order = longest_waiting_first(hosted, environ)
     lanes += run_parallel(order, start or inline, deadline, functools.partial(lane_room, environ),
-                          functools.partial(new_work, environ))
+                          functools.partial(new_work, environ), cap=lane_parallel(environ))
     for path, checkout in hosted:  # after the lanes ran: a slow read never holds a lane back (pack sd:6006)
         for asked in (ask_wait(checkout, path, environ), file_flakes(checkout, path, environ)):
             if asked:
@@ -4266,8 +4266,9 @@ def new_work(environ: dict[str, str],
 
 #: How a hosted run starts one lane: `(checkout, seconds left of the run's budget)` to a started lane (sd:5774).
 Start = Callable[[pathlib.Path, float], "StartedLane"]
-#: The most lanes one hosted run runs at once (sd:5774); the gate's free slots and load limit decide below it.
-MAX_PARALLEL_LANES = 3
+#: The most lanes one hosted run runs at once when `sd.lane_parallel` is unset (sd:5774, sd:9323: 3 became 5);
+#: the gate's free slots and load limit decide below it.
+MAX_PARALLEL_LANES = 5
 #: How often a hosted run looks again for a finished lane or for room to start the next.
 START_POLL_SECONDS = 5.0
 #: How long a TERMed hosted run waits for each lane child it TERMs before it kills it.
@@ -4367,14 +4368,28 @@ def lane_room(environ: dict[str, str]) -> str | None:
     return None
 
 
+def lane_parallel(environ: dict[str, str] | None = None) -> int:
+    """This machine's `sd.lane_parallel`, lanes one hosted run runs at once, 1 to 8; `MAX_PARALLEL_LANES` when unset.
+
+    A value that does not match, or a config that cannot be read, is the
+    default, as `sd.repo_cap` reads (sd:9323): a bad file never stops a run.
+    """
+    try:
+        value = sd_lib.file_setting("lane_parallel", environ)
+    except sd_lib.ConfigError:
+        return MAX_PARALLEL_LANES
+    return int(value) if value else MAX_PARALLEL_LANES
+
+
 def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: float,
-                 room: Callable[[], str | None], pending: Pending = lambda seen: {}) -> list[dict[str, Any]]:
+                 room: Callable[[], str | None], pending: Pending = lambda seen: {},
+                 cap: int = MAX_PARALLEL_LANES) -> list[dict[str, Any]]:
     """Start each lane of `order` in turn, as room allows; each lane run's row, in `order` (sd:5774).
 
     A lane starts at once while no lane runs, as one after another did, or
     once the run's budget is spent, since it then only settles its checkout
     and claims nothing. Otherwise it waits for `room` and for fewer than
-    `MAX_PARALLEL_LANES` running. A lane's refusal is its own row. When this
+    `cap` running (`lane_parallel`). A lane's refusal is its own row. When this
     run ends early, a TERM among them, every lane still running is stopped.
 
     Then, inside the budget, every `RESCAN_SECONDS` and once no lane runs,
@@ -4388,7 +4403,7 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
     seen: dict[int, frozenset[str]] = {}
 
     def lane_fits() -> bool:
-        return len(running) < MAX_PARALLEL_LANES and (not running or clock() >= deadline or room() is None)
+        return len(running) < cap and (not running or clock() >= deadline or room() is None)
 
     def begin_lane(index: int, ids: frozenset[str]) -> None:
         seen[index] = ids
