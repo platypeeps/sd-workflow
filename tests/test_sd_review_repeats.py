@@ -16,6 +16,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import os
 import pathlib
 import subprocess
 import unittest
@@ -35,7 +36,8 @@ class RepeatFixture(ReviewFixture):
     def setUp(self) -> None:
         super().setUp()
         self.library = sd_review.sd_lib.import_sd_db().module
-        self.root = self.make_repo()
+        with unittest.mock.patch.dict(os.environ, clean_environment(), clear=True):
+            self.root = self.make_repo()
         subprocess.run(["git", "remote", "add", "origin", f"https://github.com/{REPOSITORY}.git"],
                        cwd=str(self.root), check=True, capture_output=True, env=clean_environment())
         # main's tip is the base; `feature` holds two commits, `first` and the reviewed head.
@@ -363,12 +365,13 @@ class RepeatReviewTests(RepeatFixture):
 ON_BRANCH = "c" * 40
 
 
-def adjudicated(*rows: tuple[str, str, str], decision: str = "accepted", line: Any = 1) -> str:
-    """One adjudication body at `ON_BRANCH`: each (path, summary, disposition) a blocking finding's answer."""
+def adjudicated(*rows: tuple[Any, ...], decision: str = "accepted", line: Any = 1) -> str:
+    """One adjudication body at `ON_BRANCH`: each (path, summary, disposition[, line]) a blocking finding's answer."""
     return json.dumps({"decision": decision, "proposal": {"bindings": {"head": ON_BRANCH}, "findings": [
         {"response_disposition": answer, "reason": "a reason",
-         "raw_finding": {"path": path, "line": line, "severity": "high", "summary": summary, "family": "correctness"}}
-        for path, summary, answer in rows]}})
+         "raw_finding": {"path": path, "line": (*rest, line)[0], "severity": "high", "summary": summary,
+                         "family": "correctness"}}
+        for path, summary, answer, *rest in rows]}})
 
 
 def listed(*bodies: str) -> list[Any]:
@@ -443,7 +446,28 @@ class RebuttalIdentityTests(unittest.TestCase):
         rebutted = adjudicated(("src.py", "defect", "rebutted"), line=40)
         parked = adjudicated(("src.py", "defect", "parked"), line=3)
         self.assertEqual(gate([row(line=40), row(line=3)], parked, rebutted), ["advisory", "blocking"])
-        self.assertEqual(len(listed(parked, rebutted)), 1)
+        self.assertEqual(len([entry for entry in listed(parked, rebutted) if entry.listed]), 1)
+
+    def test_the_path_is_compared_exactly(self) -> None:
+        """Round 10: git prints a path one way; another case or spacing names another file."""
+        body = adjudicated(("src/Tool.py", "defect", "rebutted"))
+        for path, status in (("src/Tool.py", "advisory"), ("src/tool.py", "blocking"), ("SRC/Tool.py", "blocking"),
+                             ("src/Tool.py ", "blocking"), (" src/Tool.py", "blocking")):
+            with self.subTest(path=path):
+                self.assertEqual(gate([row(path=path)], body), [status])
+
+    def test_each_finding_takes_the_nearest_recorded_line(self) -> None:
+        """Round 10: one receipt parks `defect` at line 3 and rebuts it at line 8; each finding takes the nearest
+        recorded line, the newest row on a tie, and a parked one is never held back by a rebutted neighbour."""
+        for rows in ((("src.py", "defect", "parked", 3), ("src.py", "defect", "rebutted", 8)),
+                     (("src.py", "defect", "rebutted", 8), ("src.py", "defect", "parked", 3))):
+            with self.subTest(first=rows[0][2]):
+                body = adjudicated(*rows)
+                self.assertEqual(gate([row(line=line) for line in (3, 4, 5, 7, 8, 12, 19)], body),
+                                 ["blocking", "blocking", "blocking", "advisory", "advisory", "advisory", "blocking"])
+        rebutted, parked = (adjudicated(("src.py", "defect", answer, 5)) for answer in ("rebutted", "parked"))
+        self.assertEqual(gate([row(line=5)], parked, rebutted), ["blocking"])
+        self.assertEqual(gate([row(line=5)], rebutted, parked), ["advisory"])
 
 
 class RebuttalScopeTests(RepeatFixture):
@@ -489,23 +513,33 @@ class RebuttalScopeTests(RepeatFixture):
         self.commit("checkout", "--quiet", "-b", "elsewhere", self.base)
         abandoned = self.commit("an abandoned branch of the same name")
         self.commit("checkout", "--quiet", BRANCH)
-        off = {"at the base": self.base, "on another branch": abandoned, "unknown": "a" * 40, "no head": None,
+        off = {"on another branch": abandoned, "unknown": "a" * 40, "no head": None,
                "short": self.head[:12], "not text": [self.head], "a ref": "HEAD"}
         for index, (claim, head) in enumerate(off.items()):
             self.adjudication((claim, "rebutted", "x"), head=head, key=f"off{index}")
+        self.adjudication(("at the base", "rebutted", "x"), head=self.base, key="base")
         self.adjudication(("on this branch", "rebutted", "x"), head=self.first, key="on")
         prompt = self.prompts()[0][0]
         self.assertIn("on this branch", prompt)
+        self.assertIn("at the base", prompt)
         for claim in off:
             self.assertNotIn(f": {claim} Rebuttal", prompt)
-        rows = self.review_answering(*(self.repeat(claim) for claim in [*off, "on this branch"]))
+        rows = self.review_answering(*(self.repeat(claim) for claim in [*off, "on this branch", "at the base"]))
         self.assertEqual({claim: rows[claim][0] for claim in off}, dict.fromkeys(off, "blocking"))
-        self.assertEqual(rows["on this branch"][0], "advisory")
+        self.assertEqual((rows["on this branch"][0], rows["at the base"][0]), ("advisory", "advisory"))
         for scope in ("worktree", "branch"):
             with self.subTest(scope=scope):
                 seen = sd_review.rebutted_findings(self.root, sd_review.resolve_subject(self.root, scope), None,
                                                    self.environment())
-                self.assertEqual([entry.text for entry in seen], ["on this branch"])
+                self.assertEqual([entry.text for entry in seen], ["on this branch", "at the base"])
+
+    def test_a_fix_verification_reads_the_receipts_at_its_base(self) -> None:
+        """Round 10: sd-ship verifies a fix with `--base <the previous reviewed head>`; that head's receipt
+        is the one the reviewer must see."""
+        self.adjudication(("lane claim", "rebutted", "x"), head=self.first)
+        subject = sd_review.resolve_subject(self.root, "branch", base=self.first)
+        seen = sd_review.rebutted_findings(self.root, subject, None, self.environment())
+        self.assertEqual([entry.text for entry in seen], ["lane claim"])
 
     def test_a_review_holds_a_repeat_back_only_near_its_line(self) -> None:
         """Round 8: the receipt's finding sits at bin/tool.py:3; the same summary far off is another defect."""
