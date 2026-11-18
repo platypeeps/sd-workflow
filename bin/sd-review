@@ -758,16 +758,17 @@ def blocker_checklist(root: pathlib.Path, subject: Subject, database: Any, env: 
 
 
 #: This branch's rebutted findings (pack sd:9270): every accepted adjudication `sd-ship adjudicate` recorded for
-#: the branch, item-backed or no-item, at any head, newest first; the newest disposition of a finding wins.
+#: the branch, item-backed or no-item, at any head, from `BLOCKER_DAYS` before the base's commit to the head's,
+#: newest first; the newest disposition of a finding wins.
 REBUTTED_LINES, REBUTTED_SUMMARY_CHARS, REBUTTED_REASON_CHARS = 10, 200, 200
 REBUTTED_HEADER = "Findings already rebutted on this branch"
 REBUTTED_ROWS = 200
 #: The rows only: a body is ASCII JSON, while a field `json_extract` decodes may not be UTF-8 and failed the whole read.
 REBUTTED_QUERY = (
-    "SELECT a.body, a.timestamp FROM state AS a WHERE a.kind = 'checkpoint' AND (a.key LIKE 'ship-adjudication:%' OR"
-    " a.key LIKE 'ship-adjudication-no-item:%') AND lower(json_extract(CASE WHEN json_valid(a.body) THEN"
-    " a.body END, '$.proposal.bindings.repository')) = ?1 AND json_extract(CASE WHEN json_valid(a.body) THEN a.body END,"
-    " '$.proposal.bindings.branch') = ?2 ORDER BY a.id DESC LIMIT ?3")
+    "SELECT a.body FROM state AS a WHERE a.kind = 'checkpoint' AND (a.key LIKE 'ship-adjudication:%' OR a.key LIKE"
+    " 'ship-adjudication-no-item:%') AND a.timestamp < ?1 AND a.timestamp >= ?2 AND lower(json_extract(CASE WHEN"
+    " json_valid(a.body) THEN a.body END, '$.proposal.bindings.repository')) = ?3 AND json_extract(CASE WHEN"
+    " json_valid(a.body) THEN a.body END, '$.proposal.bindings.branch') = ?4 ORDER BY a.id DESC LIMIT ?5")
 
 
 def _bounded(value: Any, limit: int) -> str:
@@ -793,33 +794,34 @@ def _adjudicated(body: Any) -> list[tuple[Any, Any, Any, Any]]:
 Rebuttals = dict[tuple[str, str], tuple[str, str, str]]
 
 
-def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any,
-                      env: Mapping[str, str]) -> tuple[Rebuttals, Rebuttals]:
-    """This branch's rebutted findings, read-only (pack sd:9270): those the prompt lists, and those the gate holds.
+def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: Mapping[str, str]) -> Rebuttals:
+    """This branch's rebutted findings, read-only (pack sd:9270): the prompt lists them and the gate matches them.
 
-    The prompt's end at the reviewed head's commit time, so `--explain`, dispatch and a replay ask the same (sd:1397).
-    The gate's are every one for the branch: a same-head rerun after an adjudication must see it. A failed read says
-    so on stderr and reviews without them; a planning subject, a detached HEAD, no GitHub origin and no database have
-    nothing to read."""
+    The read ends at the reviewed head's commit time, so `--explain`, dispatch and a replay ask the same (sd:1397);
+    at the same head the recorded adjudication covers a retry. It starts `BLOCKER_DAYS` before the base's commit,
+    so a reused branch name does not inherit a merged branch's rebuttals. A failed read says so on stderr and
+    reviews without them; a planning subject, a detached HEAD, no GitHub origin and no database have nothing."""
     origin = sd_lib.github_head(root) if subject.scope != "planning" else None
     branch = sd_lib.git_output(["symbolic-ref", "--quiet", "--short", "HEAD"], root) if origin else None
     if origin is None or not branch:
-        return {}, {}
+        return {}
     try:
         anchor = "HEAD" if subject.head == "worktree" else subject.head
-        stamp, imported = sd_lib.git_output(["show", "-s", "--format=%ct", anchor], root) or "", sd_lib.import_sd_db()
-        if not stamp.isdigit() or imported.module is None:
-            raise ValueError(imported.problem or f"git cannot read the commit time of {anchor}")
+        stamps, imported = [sd_lib.git_output(["show", "-s", "--format=%ct", ref], root) or ""
+                            for ref in (anchor, subject.base)], sd_lib.import_sd_db()
+        if not all(stamp.isdigit() for stamp in stamps) or imported.module is None:
+            raise ValueError(imported.problem or f"git cannot read the commit times of {anchor} and {subject.base}")
+        window = [time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(int(stamp) - back))
+                  for stamp, back in zip(stamps, (0, BLOCKER_DAYS * 86400), strict=True)]
         target = pathlib.Path(database) if database is not None else imported.module.default_path(env.get("HOME"))
         if not target.exists():
-            return {}, {}
+            return {}
         with contextlib.closing(imported.module.connect(target, write=False)) as connection:
-            rows = connection.execute(REBUTTED_QUERY, ("/".join(origin[:2]), branch, REBUTTED_ROWS)).fetchall()
+            rows = connection.execute(REBUTTED_QUERY, (*window, "/".join(origin[:2]), branch, REBUTTED_ROWS)).fetchall()
     except Exception as error:  # a failed read is unknown, not empty: say so, and review without it
         print(f"sd-review: reviewing without the rebutted findings: {type(error).__name__}: {error}", file=sys.stderr)
-        return {}, {}
-    cutoff = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(int(stamp)))
-    return rebuttals([row for row in rows if str(row[1]) < cutoff]), rebuttals(rows)
+        return {}
+    return rebuttals(rows)
 
 
 def _folded(value: Any) -> str:
@@ -836,7 +838,8 @@ def rebuttal_key(path: Any, summary: Any) -> tuple[str, str]:
 
 
 def rebuttals(rows: Sequence[Sequence[Any]]) -> Rebuttals:
-    """The active rebuttals in adjudication bodies newest first: the newest disposition of each finding wins.
+    """The active rebuttals in adjudication bodies newest first, at most `REBUTTED_LINES`: the newest
+    disposition of each finding wins. The prompt lists exactly these, and the gate matches exactly these.
 
     The lane's own blockers (`LANE_PATHS`) are never rebutted: a later truncated review must still block."""
     decided: set[tuple[str, str]] = set()
@@ -845,15 +848,15 @@ def rebuttals(rows: Sequence[Sequence[Any]]) -> Rebuttals:
         key = rebuttal_key(path, summary)
         if key[1] and key not in decided and str(path).strip() not in LANE_PATHS:
             decided.add(key)
-            if disposition == "rebutted":
+            if disposition == "rebutted" and len(active) < REBUTTED_LINES:
                 active[key] = (_bounded(path or "?", 120), _bounded(summary, REBUTTED_SUMMARY_CHARS),
                                _bounded(reason, REBUTTED_REASON_CHARS))
     return active
 
 
 def rebuttal_section(seen: Rebuttals) -> str:
-    """The prompt section for `rebuttals`, at most `REBUTTED_LINES`; a static reader cites the lines it read."""
-    lines = "".join(f"\n- {place}: {text} Rebuttal: {reason}" for place, text, reason in list(seen.values())[:REBUTTED_LINES])
+    """The prompt section for `rebuttals`; a static reader cites the lines it read."""
+    lines = "".join(f"\n- {place}: {text} Rebuttal: {reason}" for place, text, reason in seen.values())
     return (f"\n\n{REBUTTED_HEADER}, newest first, from its recorded adjudications. Raise one again only with new "
             "evidence that contradicts the rebuttal, given in the finding's evidence field: a check you ran and its "
             "output, or, when you cannot run commands, path:line and a quote of the current code showing the rebuttal "
@@ -2169,8 +2172,8 @@ def review(
             raise UsageError("cannot establish the refreshed target boundary for item authorship")
         authored_subject = subject if target_base == subject.head else subject._replace(base=target_base)
     database = getattr(args, "database", None)
-    shown, rebutted = ({}, {}) if preflight else rebutted_findings(root, subject, database, env)
-    checklist = "" if preflight else blocker_checklist(root, subject, database, env) + rebuttal_section(shown)
+    rebutted = {} if preflight else rebutted_findings(root, subject, database, env)
+    checklist = "" if preflight else blocker_checklist(root, subject, database, env) + rebuttal_section(rebutted)
     prompt, prepended, context = ("", False, []) if preflight else prepared_prompt(root, subject, args, previous, env, checklist)
     try:
         _material, inventory = ("", []) if preflight else collect_material(root, subject, prompt)

@@ -199,17 +199,17 @@ class RebuttedFindingTests(RepeatFixture):
                 contextlib.redirect_stderr(stderr):
             text = sd_review.rebutted_findings(
                 self.root, sd_review.resolve_subject(self.root, "worktree"), None, self.environment())
-        self.assertEqual(text, ({}, {}))
+        self.assertEqual(text, {})
         self.assertEqual(stderr.getvalue(), "sd-review: reviewing without the rebutted findings: OperationalError: locked\n")
 
     def test_planning_and_a_detached_head_read_nothing(self) -> None:
         with unittest.mock.patch.object(self.library, "connect", side_effect=AssertionError("database read")):
             planning = sd_review.Subject("planning", "HEAD", "worktree", ("docs/work/x/design.md",), 1, "plan")
-            self.assertEqual(sd_review.rebutted_findings(self.root, planning, None, self.environment()), ({}, {}))
+            self.assertEqual(sd_review.rebutted_findings(self.root, planning, None, self.environment()), {})
             subprocess.run(["git", "checkout", "--quiet", "--detach"], cwd=str(self.root), check=True,
                            env=clean_environment())
             subject = sd_review.resolve_subject(self.root, "worktree")
-            self.assertEqual(sd_review.rebutted_findings(self.root, subject, None, self.environment()), ({}, {}))
+            self.assertEqual(sd_review.rebutted_findings(self.root, subject, None, self.environment()), {})
 
     def test_a_rebuttal_after_the_head_changes_no_request(self) -> None:
         """`--explain`, dispatch and a replay ask the same (sd:1397): the head's commit time anchors the read."""
@@ -386,10 +386,11 @@ class RebuttalIdentityTests(unittest.TestCase):
                 self.assertEqual(gate([row()], adjudicated(("src.py", "defect", "rebutted"), decision=decision)),
                                  ["blocking"])
 
-    def test_the_gate_matches_rebuttals_past_the_prompts_cap(self) -> None:
+    def test_the_gate_matches_only_the_rebuttals_the_prompt_shows(self) -> None:
+        """Round 7: one list feeds both; an 11th rebuttal the reviewer never saw does not downgrade."""
         bodies = [adjudicated(("src.py", f"claim {index}", "rebutted")) for index in range(sd_review.REBUTTED_LINES + 3)]
-        oldest = f"claim {sd_review.REBUTTED_LINES + 2}"
-        self.assertEqual(gate([row(summary=oldest)], *bodies), ["advisory"])
+        oldest, shown = f"claim {sd_review.REBUTTED_LINES + 2}", f"claim {sd_review.REBUTTED_LINES - 1}"
+        self.assertEqual(gate([row(summary=oldest), row(summary=shown)], *bodies), ["blocking", "advisory"])
         section = sd_review.rebuttal_section(sd_review.rebuttals([(body,) for body in bodies]))
         self.assertEqual(section.count("\n- "), sd_review.REBUTTED_LINES)
         self.assertNotIn(oldest, section)
@@ -402,16 +403,37 @@ class RebuttalIdentityTests(unittest.TestCase):
 
 
 class RebuttalScopeTests(RepeatFixture):
-    def test_a_rebuttal_recorded_after_the_heads_commit_still_holds_at_the_gate(self) -> None:
-        """A same-head lane rerun: the rebuttal is newer than the head's commit time."""
-        self.adjudication(("lane claim", "rebutted", "git 2.54 matches it literally"), days=-1)
-        repeat = row(path="bin/tool.py", line=3, summary="lane claim")
+    """Round 7: the gate holds only the rebuttals the reviewer was shown."""
+
+    def review_answering(self, *findings: dict[str, Any]) -> dict[str, tuple[str, str]]:
         runner = FakeRunner({"sd-check": sd_review.Completed(0, "{}", ""),
-                             "codex": sd_review.Completed(0, json.dumps({"findings": [repeat, row()]}), "")},
+                             # A located finding keeps the answer: one citing no reviewed path is voided (sd:1406).
+                             "codex": sd_review.Completed(0, json.dumps({"findings": [*findings, row()]}), "")},
                             default=sd_review.Completed(0, json.dumps({"findings": []}), ""))
         result = sd_review.review(self.root, namespace(), runner, self.environment(), self.chatgpt_home())
-        rows = {r["path"]: r["disposition"] for r in result["findings"] if r["backend"] == "codex"}
-        self.assertEqual(rows, {"bin/tool.py": "advisory", "src.py": "blocking"})
+        return {r["summary"].replace(" " + sd_review.REPEAT_NOTE, ""): (r["disposition"], r["path"])
+                for r in result["findings"] if r["backend"] == "codex"}
+
+    def repeat(self, summary: str) -> dict[str, Any]:
+        return row(path="bin/tool.py", line=3, summary=summary)
+
+    def test_a_rebuttal_recorded_after_the_heads_commit_does_not_downgrade(self) -> None:
+        """At the same head the recorded adjudication covers the retry; at a new head the cutoff includes it."""
+        self.adjudication(("lane claim", "rebutted", "git 2.54 matches it literally"), days=-1)
+        self.assertNotIn(sd_review.REBUTTED_HEADER, self.prompts()[0][0])
+        self.assertEqual(self.review_answering(self.repeat("lane claim"))["lane claim"],
+                         ("blocking", "bin/tool.py"))
+
+    def test_a_rebuttal_older_than_the_bound_does_not_downgrade(self) -> None:
+        """A reused branch name does not inherit a merged branch's rebuttals."""
+        days = sd_review.BLOCKER_DAYS
+        self.adjudication(("an old claim", "rebutted", "x"), days=days + 1, key="old")
+        self.adjudication(("a recent claim", "rebutted", "x"), days=days - 1, key="recent")
+        prompt = self.prompts()[0][0]
+        self.assertIn("a recent claim", prompt)
+        self.assertNotIn("an old claim", prompt)
+        rows = self.review_answering(self.repeat("an old claim"), self.repeat("a recent claim"))
+        self.assertEqual((rows["an old claim"][0], rows["a recent claim"][0]), ("blocking", "advisory"))
 
 
 if __name__ == "__main__":
