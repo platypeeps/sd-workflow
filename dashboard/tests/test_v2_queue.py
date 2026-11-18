@@ -1981,6 +1981,20 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
             self.assertIn(str(path), keys)
             self.assertIn('title="1 parked:', self.repo_detail(out["R"]["html"], re.escape(str(path)))[2], path)
 
+    def test_suggested_caps_each_checkout_not_each_name_before_queue_reads(self):
+        # Lane review of sd:9258: Suggested capped by folder name at the Today read, before Queue's reads split two
+        # checkouts of one name, so nine for one hid the other's only suggestion.
+        twin = self.checkout.parent / "elsewhere" / self.checkout.name
+        _, answers = self.parked_answers(twin)
+        def row(n, repo):
+            return {"id": n, "repo": str(repo), "title": f"Next {n}", "status": "ready", "why": "ready", "due": None,
+                    "priority": 2}
+        self.doc["queues"]["suggested"] = [row(n, self.checkout) for n in range(60, 69)] + [row(99, twin)]
+        out = self.run_view(f"open({json.dumps(str(twin))}); R.twin = kids(); open({json.dumps(str(self.checkout))});"
+                            " R.here = kids();", search="?show=suggested", answers=answers)
+        self.assertEqual(out["R"]["twin"].count("suggested"), 1, "the twin's one suggestion was capped away")
+        self.assertEqual(out["R"]["here"].count("suggested"), 9)
+
     def test_a_parked_task_with_no_repo_is_counted_and_never_adopted(self):
         from sd_dashboard import tasks_screen
         made = self.item("Loose", kind="task", priority=4)

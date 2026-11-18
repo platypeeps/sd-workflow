@@ -360,7 +360,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   let qTile = null; // pack sd:8138: the open repo's pressed box, { repo, box }; it holds only while that repo is open
   // The repo's folder name keys its row; sd:9258: when two checkouts the reads name share that name, each keys by its
   // path, ~/ for a home folder, as the database keeps it. CLASH holds those names, from the checkouts the lanes and the
-  // tasks read name; qGroups and suggested() refresh it.
+  // tasks read name; qGroups refreshes it. Suggested caps each checkout by its path, which no
+  // later read changes, so a cap made before Queue reads holds once the groups split (sd:9258 lane review).
   // ponytail: a home is /Users/<name> or /home/<name>; another home root keys apart from its ~/ form.
   const homed = p => String(p).replace(/\/+$/, '').replace(/^\/(?:Users|home)\/[^/]+\//, '~/');
   let CLASH = new Set();
@@ -513,10 +514,9 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // planned, then unscheduled), less the items live now, at most NEXT per repo, in that order. An item with no repo is
   // no row (pack sd:7731): Suggested draws no Unassociated group; Tasks still lists it.
   function suggested(doc) {
-    clashes();
     const live = new Set(((doc.active || {}).rows || []).map(r => r.item)), counted = {}, found = new Map();
     ((doc.queues || {}).suggested || []).filter(r => r.repo && !live.has(r.id)).forEach(r => {
-      const k = repoKey(r.repo); counted[k] = (counted[k] || 0) + 1; if (counted[k] <= NEXT) found.set(String(r.id), r); });
+      const k = homed(r.repo); counted[k] = (counted[k] || 0) + 1; if (counted[k] <= NEXT) found.set(String(r.id), r); });
     return found;
   }
   // All items (#40961): an open task of a repo, as Tasks reads it, that is no suggested row while Suggested shows (pack
