@@ -1341,7 +1341,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       clear: () => !!(srcFilter || intent) && (clearSource(), true) };
 
     reading = shell.read({
-      source: '/api/now', what: 'The Today rows', adopt, clear, draw,
+      source: '/api/now', what: 'the Today rows', adopt, clear, draw,
       current: row,
       first: () => $('rows').querySelector('tr[data-id]')?.dataset.id,
       // ?row= on a group member opens its group, so the selection is a row on screen.
