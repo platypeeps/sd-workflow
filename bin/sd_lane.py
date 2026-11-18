@@ -341,6 +341,8 @@ STALE_HEAD = "stale_head"
 #: A last entry the dashboard's Fix (`sd_db.build.lane_fix`, pack sd:8584) cancelled and handed to a builder: its
 #: worktree is the builder's, so `retry` refuses it.
 HANDED_BACK = "handed_back"
+#: An entry on a build bundle's branch would deliver a member the operator cancelled on its own (sd:9222).
+MEMBER_LEFT = "member_cancelled_alone"
 #: The refusal code of a cancel whose `--expected-claim` no longer holds the item's running entry (sd:3330).
 STALE_CLAIM = "stale_claim"
 #: The refusals of a cancelled entry's retry (sd:3389): its item has a newer entry, or merged at its head.
@@ -802,14 +804,20 @@ def enqueue_entry(worktree: pathlib.Path, item: int, title: str, body_file: path
         if claim == "deliver":  # an associate-only claim closes nothing (sd:3365)
             commits = unreverted(worktree, head, branch_commits(worktree, base, head))
             parents = branch_parents(worktree, base, head)
-            cited = on_hub(queue, lambda connection: cited_closes(connection, item, body, commits, closes,
-                                                                  parents, branch))
+            cited, left = on_hub(queue, lambda connection: (
+                cited_closes(connection, item, body, commits, closes, parents, branch),
+                left_cited(connection, branch, body, commits, parents)))
             entry["closes"] = [*closes, *(row["item"] for row in cited)]
+            import sd_ship_body  # noqa: PLC0415
             if cited:  # listed where a reader sees it (sd:5999 lane review)
-                import sd_ship_body  # noqa: PLC0415
                 entry["cited"] = cited
                 entry["body"] = sd_ship_body.with_cited(
                     body, [f"- sd:{row['item']}: {row['source']}" for row in cited])  # no repo name (sd:9135)
+            if left:  # a citation this bundle's merge leaves open is seen too (sd:9222)
+                entry["left_open"] = left
+                entry["body"] = sd_ship_body.with_cited(
+                    entry["body"], [f"- sd:{number}: cancelled on its own out of this build" for number in left],
+                    heading="Left open")
         on_hub(queue, lambda connection: refuse_teammate(connection, entry))  # the whole set
     require_published(worktree, branch, head, f"{head} names no commit in {worktree}", refuse_before_push,
                       lambda tip: tip_past(worktree, branch, tip, head))
@@ -1003,6 +1011,29 @@ def cited_closes(connection: Any, item: int, body: str, commits: list[tuple[str,
     return [{"item": number, "source": sources[number]} for number in kept]
 
 
+def left_cited(connection: Any, branch: str, body: str, commits: list[tuple[str, str]],
+               parents: dict[str, tuple[str, ...]] | None = None) -> list[int]:
+    """The items `body` and `commits` cite that the build bundle on `branch` left: each member the operator
+    cancelled on its own (`build.left`). `cited_closes` leaves them open; enqueue lists them (sd:9222)."""
+    import sd_ship_body  # noqa: PLC0415
+    from sd_db import build  # noqa: PLC0415
+    sources = sd_ship_body.cited_sources(body, commits, parents)
+    return sorted(build.left(connection, branch, sources))
+
+
+def refuse_left_members(connection: Any, branch: str, items: tuple[int, ...]) -> None:
+    """Refuse an entry on a build bundle's `branch` that would deliver a member the operator cancelled on its own
+    out of that bundle (`build.left`): as its item or a later `--item` at enqueue, or a saved close at retry,
+    which copies them (review round 6 of sd:9222)."""
+    from sd_db import build  # noqa: PLC0415
+    left = sorted(build.left(connection, branch, items))
+    if left:
+        named = ", ".join(f"sd:{number}" for number in left)
+        raise LaneError(f"{named} was cancelled on its own out of the build bundle on {branch}, so this entry may "
+                        "not deliver it; nothing was queued. Drop it from the entry and enqueue again from the "
+                        "worktree; build it again to deliver it on its own branch.", code=MEMBER_LEFT)
+
+
 def tip_past(worktree: pathlib.Path, branch: str, tip: str, head: str) -> None:
     """Refuse `HEAD_MOVED` for an `origin/<branch>` tip past `head`, unless it is prepare's catch-up of it (sd:5989).
 
@@ -1074,6 +1105,7 @@ def check_item(connection: Any, worktree: pathlib.Path, item: int, body: str, cl
         if registered is None or registered != own:
             raise foreign_item(item, registered or info["repo"]["path"], str(own), "prepare")
         sd_ship_body.normalize(body, item)  # a body `Closes:` line, among others (sd:3704)
+        refuse_left_members(connection, branch, (item, *closes))
         # A title closes nothing; the items named with --item do (sd:3704).
         sd_ship_body.refuse_unclosable(connection, item, info["item"]["repo"], closes, claim == "deliver")
         names = (pathlib.Path(info["item"]["repo"]).name, (registered or "").partition("/")[2])
@@ -1660,7 +1692,7 @@ def retry(root: pathlib.Path, item: int, environ: dict[str, str], *, manual: boo
     if cancelled and expected_head is None:
         raise LaneError(f"sd:{item}'s last entry is cancelled; retry it only at the head you read, with "
                         "--expected-head <full commit id> as `sd-ship lane list` prints it")
-    if not last.get("branch"):
+    if not isinstance(last.get("branch"), str) or not last["branch"]:
         raise LaneError(f"sd:{item}'s last entry names no branch; queue it with `sd-ship lane enqueue`")
     if not isinstance(last.get("body"), str):
         raise LaneError(f"sd:{item}'s last entry kept no body; enqueue it again with --body-file")

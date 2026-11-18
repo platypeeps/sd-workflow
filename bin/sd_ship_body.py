@@ -368,15 +368,16 @@ def cited_ids(body: str, commits, parents=None) -> tuple[int, ...]:
 _TRAILER = re.compile(r"^[A-Za-z][A-Za-z0-9-]*:[ \t]")
 
 
-def with_cited(body: str, lines: list[str]) -> str:
-    """`body` with a `## Closed by citation` section of `lines`, before a closing trailer paragraph (sd:5999).
+def with_cited(body: str, lines: list[str], heading: str = "Closed by citation") -> str:
+    """`body` with a `## <heading>` section of `lines`, before a closing trailer paragraph (sd:5999).
 
     A reader of the pull request sees each close by citation, so a wrong
-    one is one reopen. The trailers stay the body's last paragraph.
+    one is one reopen, and each citation the merge leaves open (`Left
+    open`, sd:9222). The trailers stay the body's last paragraph.
     """
     if not lines:
         return body
-    section = "## Closed by citation\n\n" + "\n".join(lines) + "\n"
+    section = f"## {heading}\n\n" + "\n".join(lines) + "\n"
     text = body.rstrip("\n")
     head, _, last = text.rpartition("\n\n")
     if last and all(_TRAILER.match(line) for line in last.split("\n") if line.strip()):

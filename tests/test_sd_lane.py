@@ -435,7 +435,12 @@ class Runner(Lane):
         sd_lane.enqueue_entry(self.feature, 3, "fix: three", self.body, self.environ, manual=True, claim="deliver")
         self.answers[(3, "prepare")] = {"ok": False, "phase": "review_blocked", "error": "a blocking finding"}
         sd_lane.run_lane(self.repo, self.environ, self.ship)
-        sd_lane.update(self.store(), lambda rows: rows[-1].update(body=None))
+        # A saved branch that is no text names no branch either (review round 6 of pack sd:9222).
+        kept = self.entries()[-1]["branch"]
+        sd_lane.update(self.store(), lambda rows: rows[-1].update(branch=[kept]))
+        with self.assertRaisesRegex(sd_lane.LaneError, "names no branch"):
+            sd_lane.retry(self.repo, 3, self.environ)
+        sd_lane.update(self.store(), lambda rows: rows[-1].update(branch=kept, body=None))
         with self.assertRaisesRegex(sd_lane.LaneError, "--body-file"):
             sd_lane.retry(self.repo, 3, self.environ)
         self.assertEqual([row["status"] for row in self.entries()], ["merged", "cancelled", "failed"])
@@ -3079,16 +3084,16 @@ class CitedCloses(SharedQueue):
         entry = self.enqueue("Words.\n", f"fix: the slice\n\nCloses: sd:{self.open[0]}", claim="associate-only")
         self.assertEqual(entry["closes"], [])
 
-    def cancelled_alone(self, lead: int, alone: int, *others: int) -> str:
-        """A build bundle `lead` leads with members `alone` and `others`, `alone` cancelled on its own by the
-        operator, and the bundle's run; its branch, the lane entry's own record of the bundle (pack sd:9222)."""
+    def bundle(self, lead: int, *members: int) -> tuple[str, list[int]]:
+        """A build bundle `lead` leads with `members`, queued, and its run; its branch, the lane entry's own record
+        of the bundle, and each assignment, the lead's first (pack sd:9222)."""
         import sd_db
-        from sd_db import build, operations
+        from sd_db import build
         connection = sd_db.connect(home=self.tmp)
         try:
-            head, child, *rest = (sd_db.create_assignment(connection, item=item, role="author", status="queued",
-                                                          lane="parallel") for item in (lead, alone, *others))
-            for ident in (head, child, *rest):
+            head, *rest = (sd_db.create_assignment(connection, item=item, role="author", status="queued",
+                                                   lane="parallel") for item in (lead, *members))
+            for ident in (head, *rest):
                 connection.execute("UPDATE assignment SET scope = ?, parent = ? WHERE id = ?",
                                    (build.SCOPE, None if ident == head else head, ident))
             connection.execute(
@@ -3097,11 +3102,26 @@ class CitedCloses(SharedQueue):
                 (f"run-{head}", head, str(self.repo), build.branch(head), "2026-11-17T00:00:00+00:00",
                  "2026-11-17T00:00:00+00:00"))
             connection.commit()
-            state = operations.assignment_state(connection, child)
-            operations.cancel_assignment(connection, child, expected_revision=state["revision"], who="operator")
-            return build.branch(head)
+            return build.branch(head), [head, *rest]
         finally:
             connection.close()
+
+    def cancel_alone(self, assignment: int) -> None:
+        """The operator's Cancel of one bundle member, on its own."""
+        import sd_db
+        from sd_db import operations
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            state = operations.assignment_state(connection, assignment)
+            operations.cancel_assignment(connection, assignment, expected_revision=state["revision"], who="operator")
+        finally:
+            connection.close()
+
+    def cancelled_alone(self, lead: int, alone: int, *others: int) -> str:
+        """A bundle `lead` leads with `alone` and `others`, `alone` cancelled on its own; its branch."""
+        branch, (_, child, *_rest) = self.bundle(lead, alone, *others)
+        self.cancel_alone(child)
+        return branch
 
     def enqueue_on(self, branch: str, item: int, title: str, body: str, *subjects: str) -> dict:
         tree, _ = self.committed(branch, *subjects)
@@ -3155,6 +3175,50 @@ class CitedCloses(SharedQueue):
         entry = self.enqueue_on(branch, self.own, "fix: a slice", "## Summary\n\nWords.\n",
                                 f"fix(lane): the slice\n\nCloses: sd:{self.own}\nCloses: sd:{a}")
         self.assertEqual(entry["closes"], [])
+
+    def test_enqueue_refuses_a_member_cancelled_alone_as_its_item_or_an_extra_item(self) -> None:
+        """Review round 6 of pack sd:9222: an entry on the bundle's branch may not claim, or name with --item,
+        a member the operator cancelled on its own; the refusal names it and queues nothing."""
+        a, b, *_ = self.open
+        branch = self.cancelled_alone(self.own, a)
+        tree, _ = self.committed(branch, f"fix(lane): the slice\n\nCloses: sd:{self.own}")
+        self.body.write_text("## Summary\n\nWords.\n", encoding="utf-8")
+        for item, closes in ((a, ()), (self.own, (b, a))):
+            with self.subTest(item=item):
+                with self.assertRaises(sd_lane.LaneError) as refused:
+                    sd_lane.enqueue_entry(tree, item, "fix: a slice", self.body, self.environ, claim="deliver",
+                                          closes=closes)
+                self.assertEqual(refused.exception.code, "member_cancelled_alone")
+                self.assertIn(f"sd:{a} was cancelled on its own", str(refused.exception))
+        self.assertEqual(self.rows(), [])
+
+    def test_a_dropped_citation_of_a_lone_member_is_listed_in_the_body(self) -> None:
+        """Review round 6 of pack sd:9222: the citation the bundle's entry leaves open is visible, on the entry
+        and in the body a reader sees."""
+        a, b, *_ = self.open
+        branch = self.cancelled_alone(self.own, a)
+        entry = self.enqueue_on(branch, self.own, "fix: a slice", "## Summary\n\nWords.\n",
+                                f"fix(lane): the slice\n\nCloses: sd:{a}\nCloses: sd:{b}")
+        self.assertEqual((entry["closes"], entry["left_open"]), ([b], [a]))
+        self.assertIn(f"## Left open\n\n- sd:{a}: cancelled on its own out of this build\n", entry["body"])
+
+    def test_retry_refuses_a_saved_close_of_a_member_cancelled_since(self) -> None:
+        """Review round 6 of pack sd:9222: retry copied the saved closes and citations, so a member cancelled on
+        its own after the enqueue still closed. It refuses, naming the member: enqueue again reads it afresh."""
+        a = self.open[0]
+        branch, (_, child) = self.bundle(self.own, a)
+        entry = self.enqueue_on(branch, self.own, "fix: a slice", "## Summary\n\nWords.\n",
+                                f"fix(lane): the slice\n\nCloses: sd:{self.own}\nCloses: sd:{a}")
+        self.assertEqual(entry["closes"], [a])
+        self.answers[(self.own, "prepare")] = {"ok": False, "phase": "review_blocked", "error": "a finding"}
+        sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.cancel_alone(child)
+        before = len(self.entries())
+        with self.assertRaises(sd_lane.LaneError) as refused:
+            sd_lane.retry(self.repo, self.own, self.environ)
+        self.assertEqual(refused.exception.code, "member_cancelled_alone")
+        self.assertIn(f"sd:{a} was cancelled on its own", str(refused.exception))
+        self.assertEqual(len(self.entries()), before)
 
     def test_a_member_cancelled_alone_still_closes_on_another_branch(self) -> None:
         """Evidence: the exclusion holds for the entry of the member's own bundle only, read from its branch.
