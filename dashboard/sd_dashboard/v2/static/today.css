@@ -1,5 +1,6 @@
 /* Hallmark · genre: modern-minimal · macrostructure: rail + annunciator + ledger + pane · design-system: design.md · designed-as-app
  * Hallmark · pre-emit critique: P5 H4 E4 S5 R5 V4 · Today v2 (sd:5921): annunciator → day track → Needs you → In motion, from /api/now.
+ * Hallmark · component: evidence strip (Usage, pack sd:9257) · genre: modern-minimal · theme: design.md tokens · critique: P5 H4 E4 S5 R5 V4
  * Page CSS from ui-design products/system/designs/v2/today.html at a3861c9 (a file, since the dashboard CSP refuses inline style).
  * Left out with the sections they styled: Wants you, Briefs and the chat proposal card have no collector in the build yet. */
 
@@ -56,6 +57,37 @@
 .daytrack .spend .spark rect { fill: var(--color-series-1); }
 .daytrack .spend a { color: inherit; text-decoration-color: var(--color-rule); text-underline-offset: 3px; }
 .daytrack .spend a:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
+
+/* The Usage strip (pack sd:9257): Today's evidence strip, one hairline row per provider under the annunciator. A window is a
+ * 100-unit track filled to its use; caution from 80 %, warning at the limit. Unknown rows carry their why, never a bar. */
+.usage { margin: 0 0 var(--space-sm); border: var(--rule-hair) solid var(--color-rule); border-radius: var(--radius-md); background: var(--color-panel); }
+.usage .urows { list-style: none; margin: 0; padding: 0; }
+.usage li { display: grid; grid-template-columns: minmax(7rem, max-content) minmax(0, 1fr) auto auto; align-items: center; gap: var(--space-2xs) var(--space-sm);
+  padding: var(--space-2xs) var(--space-sm); border-bottom: var(--rule-hair) solid var(--color-rule); font-size: var(--text-sm); }
+.usage .nm { font: 500 var(--text-sm)/1.2 var(--font-data); color: var(--color-ink); white-space: nowrap; }
+.usage .nm > span[aria-hidden] { margin-right: var(--space-2xs); }
+.usage .nm small { color: var(--color-muted); font: 400 var(--text-2xs)/1 var(--font-label); letter-spacing: .06em; text-transform: uppercase; }
+.usage .ws { display: flex; flex-wrap: wrap; gap: var(--space-3xs) var(--space-md); min-width: 0; color: var(--color-ink-2); }
+.usage .w { display: inline-flex; flex-wrap: wrap; align-items: center; gap: var(--space-3xs) var(--space-2xs); font-family: var(--font-data); font-size: var(--text-xs); }
+.usage .w b { color: var(--color-ink); font-weight: 500; }
+.usage .wl { font: 600 var(--text-2xs)/1 var(--font-label); letter-spacing: .09em; text-transform: uppercase; color: var(--color-muted); }
+.usage .track { width: 6rem; height: 0.5rem; background: var(--color-well); border-radius: 2px; }
+.usage .fill { fill: var(--color-series-1); }
+.usage .fill.caution { fill: var(--color-caution); }
+.usage .fill.warning { fill: var(--color-warning); }
+.usage .why { color: var(--color-muted); font-size: var(--text-xs); }
+.usage .flag, .usage .foot a { color: inherit; text-decoration-color: var(--color-rule); text-underline-offset: 3px; font-size: var(--text-xs); }
+.usage .age { color: var(--color-muted); font: var(--text-2xs)/1 var(--font-data); white-space: nowrap; justify-self: end; }
+.usage .foot { margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2xs) var(--space-xs); padding: var(--space-2xs) var(--space-sm);
+  color: var(--color-muted); font-size: var(--text-xs); }
+.usage .foot .lbl { font: 600 var(--text-2xs)/1 var(--font-label); letter-spacing: .09em; text-transform: uppercase; color: var(--color-muted); }
+.usage a:hover { text-decoration-color: currentColor; }
+.usage a:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
+@media (pointer: coarse) { .usage a { display: inline-flex; align-items: center; min-height: var(--row-touch); } }
+@media (max-width: 47.99rem) {
+  .usage li { grid-template-columns: minmax(0, 1fr) auto; }
+  .usage .ws, .usage .flag { grid-column: 1 / -1; }
+}
 @media (pointer: coarse) { .daytrack .spend a { display: inline-flex; align-items: center; min-height: var(--row-touch); } }
 
 /* Since yesterday (sd:6002): a few plain lines over the track, the merged items folded under them. */

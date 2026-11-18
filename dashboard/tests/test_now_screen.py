@@ -223,7 +223,7 @@ class Document(ScreenCase):
                                          "attention",
                                          "mail", "mail_more", "mail_unread", "mail_error", "problems", "problems_more",
                                          "problems_capped", "problems_error", "briefs", "briefs_more", "briefs_error", "briefs_skipped",
-                                         "needs", "lane", "track", "spend", "builders", "queues", "digest"})
+                                         "needs", "lane", "track", "spend", "usage", "builders", "queues", "digest"})
         self.assertEqual(document["now"], NOW)
         self.assertEqual([(row["rank"], row["id"], row["band"]) for row in document["rows"]], [
             (2, "pr:example/project#14:2", "look"),

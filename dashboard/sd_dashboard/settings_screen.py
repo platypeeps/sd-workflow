@@ -161,7 +161,9 @@ def _list(key: str):
             "dashboard.home_map": (home_map.state_dir() / "home-map.conf", lambda text: home_map.parse(text)[1]),
             "dashboard.koi_water": (home_map.state_dir() / "koi-water.conf", lambda text: home_koi.parse(text)[1]),
             "dashboard.disk_storage": (health_collectors._storage_config(), lambda text: health_collectors.parse_storage(text)[1]),
-            # pack sd:9260: system's agent-meter reads it; no old file ever held it.
+            # pack sd:9257, sd:9260: system's agent-meter reads these two; no old file ever held them.
+            "dashboard.usage_providers": (places.REALMS_CONFIG.parent / "usage-providers.conf",
+                                          lambda text: usage_screen.parse_providers(text)[1]),
             "dashboard.status_services": (places.REALMS_CONFIG.parent / "status-services.conf",
                                           lambda text: usage_screen.parse_services(text)[1])}[key]
 
