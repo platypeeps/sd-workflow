@@ -119,6 +119,11 @@ OUT.opened = []; window.open = (u, t) => OUT.opened.push([u, t]); R.said = cmd.r
         self.assertEqual(out["opened"], [["https://status.example.test/incidents/1", "_blank"]])
 
 
+    def test_no_status_read_yet_counts_no_service(self):
+        out = self.run_page("R.body = ELS['body-status'].html;", view="status")
+        self.assertIn("0 services · 0 outage · 0 degraded · 0 unknown · 0 ok", out["R"]["body"])
+
+
 class TheSettingsLink(unittest.TestCase):
     """A link to `/settings#f-<key>` focuses that row's field once the rows have drawn (pack sd:9260)."""
 

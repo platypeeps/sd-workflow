@@ -177,7 +177,7 @@
     // Clean all safe (sd:5105) heads Checkouts: one button for every cleanup row there whose own command would run.
     if (a.id === 'wt') return html`<p class="counts">${plural(safe().length, 'cleanup')} ready in Checkouts · ${shell.commands.rowActions('cleanup:safe')}</p>`;
     // Service status (pack sd:9260): its counts, and Settings' status services list for add and remove.
-    if (a.id === 'stat') return html`<p class="counts">${plural(a.rows.length + (a.snoozed || []).length, 'service')} · ${['outage', 'degraded', 'unknown', 'ok'].map(s => `${x.counts?.[s] || 0} ${s}`).join(' · ')} · <a href="${x.settings}">Add or remove services in Settings</a></p>`;
+    if (a.id === 'stat') return html`<p class="counts">${plural(Object.values(x.counts || {}).reduce((n, c) => n + c, 0), 'service')} · ${['outage', 'degraded', 'unknown', 'ok'].map(s => `${x.counts?.[s] || 0} ${s}`).join(' · ')} · <a href="${x.settings}">Add or remove services in Settings</a></p>`;
     if (a.id === 'ctr') return html`<p class="counts">${plural(x.running, 'container')} running · ${x.holding} mount a checkout under ${x.root}</p>`;
     if (a.id === 'ports') return html`<p class="counts">${x.counts.configured} configured ports · ${x.counts.listening} listening · ${x.counts.unknown} unknown</p>${x.warnings.map(warn)}`;
     if (a.id !== 'prot' || !x.columns) return '';
