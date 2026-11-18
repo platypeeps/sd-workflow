@@ -564,7 +564,7 @@ def edit_item(
             raise WorkflowError(f"item {item} is writing piece {row['piece']!r}; its repository holds its file, "
                                 f"so the repository stays")
         values = _fields(connection, changes)
-        if "parked_at" in values and row["piece"]:
+        if "parked_at" in values and row["piece"] is not None:
             raise WorkflowError("a writing piece parks and revives through its own park control, "
                                 "which moves its file")
         values = _park(item, row, values)

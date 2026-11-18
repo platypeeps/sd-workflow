@@ -357,6 +357,21 @@ class Unparking(BrowserSession):
                 self.assertIn(f'name="revision" value="{state["revision"]}"', form.group(1))
         self.assertIsNone(self.unpark_form(self.item("Open", kind="task")))
 
+    def test_an_empty_piece_is_still_a_writing_piece(self):
+        """pack sd:9324: `writing.list_pieces` reads `piece IS NOT NULL`; an idea whose piece is '' is a writing
+        piece, so its page shows the writing controls and no plain Unpark, and the edit that Unpark posts refuses:
+        it would revive the piece without moving its file."""
+        upsert_repo(self.connection, "/repos/system")
+        item = self.parked(kind="idea", repo="/repos/system")["item"]["id"]
+        self.connection.execute("UPDATE item SET piece = '', stage = 'drafting' WHERE id = ?", (item,))
+        self.connection.commit()
+        self.assertIsNone(self.unpark_form(item))
+        self.assertIn("Writing progress", self.request(f"/item/{item}")[2])
+        status, _, _ = self.post(f"/api/items/{item}", {
+            "revision": workflow.item_state(self.connection, item)["revision"], "parked_at": None})
+        self.assertNotEqual(status, 200)
+        self.assertIsNotNone(workflow.item_state(self.connection, item)["item"]["parked_at"])
+
     def test_the_post_unparks_and_a_stale_revision_writes_nothing(self):
         state = self.parked(kind="task")
         item = state["item"]["id"]

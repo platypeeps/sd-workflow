@@ -77,7 +77,7 @@ def artifact(row, *, document=None) -> Markup:
     first and adds only the tags it wrote.
     """
     repo, path = row["repo"], row["path"]
-    if row["kind"] == "idea" and row["piece"]:
+    if row["kind"] == "idea" and row["piece"] is not None:
         if document is not None:
             document = _without_frontmatter(document)
         return (markdown(document) if document is not None else
@@ -137,7 +137,7 @@ def item(connection, item_id: int, *, now: str, parameters) -> str | None:
     if row is None:
         return None
     writing_state = None
-    if row["kind"] == "idea" and row["piece"]:
+    if row["kind"] == "idea" and row["piece"] is not None:
         from sd_db import writing
 
         writing_state = writing.piece_state(connection, item_id)

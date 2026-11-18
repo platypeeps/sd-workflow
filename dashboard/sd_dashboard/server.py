@@ -728,7 +728,7 @@ def action_route(path, payload, *, principal, operations_backend=None, services_
                 return _edit_base_row(connection, number, revision, values)
             # A Studio project's item (sd:6921) moves along its kind's strip; a writing piece never does, whatever names it.
             row = workflow.item_state(connection, number)["item"]
-            if not (row["kind"] == "idea" and row["piece"]):
+            if not (row["kind"] == "idea" and row["piece"] is not None):
                 from . import studio
 
                 project = studio.naming(connection, number)
