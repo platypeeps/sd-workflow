@@ -6074,6 +6074,56 @@ class HostedParallel(Lane):
         self.assertEqual(ended, [self.repo])
         self.assertIn("before the job's TERM", rows[0]["error"])
 
+    def test_a_term_between_the_spawn_and_the_record_leaves_a_record_and_ends_the_child(self) -> None:
+        """Round 4: a TERM after the spawn, before the pid and deadline were in the file's name, left a child
+        the run never ended and no later run could find. The TERM waits for the record; the child then ends."""
+        script = ("import json, os, pathlib, signal, sys\n"
+                  f"sys.path.insert(0, {str(REPO_ROOT / 'bin')!r})\nimport sd_lane\n"
+                  "real = sd_lane.record_child\n"
+                  "def late(stem, pid, hard):\n"
+                  "    pathlib.Path(sys.argv[2]).write_text(str(pid))\n"
+                  "    os.kill(os.getpid(), signal.SIGTERM)  # lands between the spawn and the record\n"
+                  "    return real(stem, pid, hard)\n"
+                  "sd_lane.record_child = late\n"
+                  "start = lambda checkout, budget: sd_lane.child_lane(checkout, budget, environ=dict(os.environ),\n"
+                  "    argv=[sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                  "sd_lane.run_parallel([('pack', pathlib.Path(sys.argv[1]))], start, sd_lane.clock() + 600,\n"
+                  "    lambda: None)\n")
+        pid_file = self.tmp / "child.pid"
+        run = subprocess.run([sys.executable, "-c", script, str(self.repo), str(pid_file)],
+                             env=clean_environment(**self.environ), capture_output=True, text=True, timeout=120)
+        self.assertEqual(run.returncode, -signal.SIGTERM, run.stderr)
+        pid = int(pid_file.read_text())
+        self.addCleanup(end_group, pid)
+        recorded = [path for path in sorted((sd_lane.lane_dir(self.repo, self.environ) / "hosted").glob("*.json"))
+                    if sd_lane.child_record(path)]
+        self.assertEqual([sd_lane.child_record(path)[0] for path in recorded], [pid], run.stderr)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(pid, 0)
+
+    def test_an_unreadable_answer_folder_holds_the_lane_as_unknown(self) -> None:
+        """Round 4: `is_dir` and `glob` read an unreadable `hosted/` as empty, so a held lane read free."""
+        folder = sd_lane.queue_for(self.zeta, self.environ).lane / "hosted"
+        folder.mkdir(parents=True)
+        folder.chmod(0)
+        self.addCleanup(folder.chmod, 0o700)
+        held = sd_lane.lane_held(self.environ, {}, self.zeta)
+        self.assertIsNotNone(held)
+        self.assertFalse(held[0])
+        self.assertIn("answer files", held[1])
+
+    def test_a_past_budget_row_says_settled_only_when_it_settled(self) -> None:
+        """Round 4: the row said `it settled the lane` whatever the settle did."""
+        now = [100.0]
+        cases = (({}, "nothing to settle"), ({"busy": "another runner holds x"}, "settled nothing: another"),
+                 ({"error": "no hub"}, "settle failed: no hub"), ({"reclaimed": [1]}, "it settled the lane"))
+        for settled, said in cases:
+            with self.subTest(settled=settled), mock.patch.object(sd_lane, "clock", lambda: now[0]):
+                [row] = sd_lane.run_parallel([("pack", self.repo)], lambda checkout, budget: sd_lane.StartedLane(
+                    lambda: {}), 50.0, lambda: None, settle=lambda checkout, given=settled: given)
+                self.assertIn(said, row["stopped"])
+                self.assertEqual("settled the lane" in row["stopped"], "reclaimed" in settled)
+
     def test_a_failed_queue_read_is_read_again_at_the_next_probe(self) -> None:
         """Round 3: `lane_held` kept a failed `queue_for` for the whole run, so a passing fault held the lane."""
         real = sd_lane.queue_for
@@ -6256,31 +6306,52 @@ class OwnTerm(unittest.TestCase):
 
 
     def test_a_stopped_lane_child_gets_one_term_then_a_kill(self) -> None:
-        """Round 2: `stop_lanes` TERMed each child, then `end_child` TERMed it again while it unwound."""
+        """Round 2: `stop_lanes` TERMed each child, then `end_child` TERMed it again while it unwound. Round 4:
+        each group gets them, and the KILLs come on one deadline, not 30 s per child in turn."""
         class Child:
-            pid, returncode = 0, None
+            returncode = None
 
-            def __init__(self) -> None:
-                self.sent: list[str] = []
+            def __init__(self, pid: int) -> None:
+                self.pid = pid
 
             def poll(self) -> int | None:
                 return self.returncode
 
-            def terminate(self) -> None:
-                self.sent.append("TERM")
-
-            def kill(self) -> None:
-                self.sent.append("KILL")
-                self.returncode = -signal.SIGKILL
-
             def wait(self, timeout: float | None = None) -> int:
                 if self.returncode is None:
+                    time.sleep(timeout or 0)
                     raise subprocess.TimeoutExpired("child", timeout or 0)
                 return self.returncode
-        children = [Child(), Child()]
-        sd_lane.stop_lanes([sd_lane.StartedLane(lambda: None, functools.partial(
-            sd_lane.end_child, child, io.StringIO(), io.StringIO()), child) for child in children])
-        self.assertEqual([child.sent for child in children], [["TERM", "KILL"], ["TERM", "KILL"]])
+        children = {pid: Child(pid) for pid in (101, 102, 103)}
+        sent: list[tuple[int, int]] = []
+
+        def group(pid: int, number: int) -> None:
+            sent.append((pid, number))
+            if number == signal.SIGKILL:
+                children[pid].returncode = -signal.SIGKILL
+        started = time.monotonic()
+        with mock.patch.object(sd_lane, "end_group", group), mock.patch.object(sd_lane, "CHILD_STOP_SECONDS", 0.3):
+            sd_lane.stop_lanes([sd_lane.StartedLane(lambda: None, functools.partial(
+                sd_lane.end_child, child, io.StringIO(), io.StringIO()), child) for child in children.values()])
+        self.assertLess(time.monotonic() - started, 0.6, "one deadline for all, not one per child")
+        self.assertEqual(sorted(sent), sorted((pid, number) for pid in children
+                                              for number in (signal.SIGTERM, signal.SIGKILL)))
+
+    def test_a_lane_childs_own_child_gets_the_term(self) -> None:
+        """Round 4: `stop_lanes` TERMed only the child's pid, so its own child, an `sd task note` say, ran on."""
+        tmp = pathlib.Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, tmp, True)
+        ready, termed = tmp / "ready", tmp / "termed"
+        grandchild = ("import pathlib, signal, sys, time\n"
+                      "signal.signal(signal.SIGTERM, lambda *_: (pathlib.Path(sys.argv[2]).write_text(''), sys.exit(0)))\n"
+                      "pathlib.Path(sys.argv[1]).write_text('')\ntime.sleep(60)\n")
+        leader = (f"import subprocess, sys, time\nsubprocess.Popen([sys.executable, '-c', {grandchild!r}, "
+                  f"{str(ready)!r}, {str(termed)!r}])\ntime.sleep(60)\n")
+        process = subprocess.Popen([sys.executable, "-c", leader], start_new_session=True, env=clean_environment())
+        self.addCleanup(end_group, process.pid)
+        wait_for(ready)
+        sd_lane.stop_lanes([sd_lane.StartedLane(lambda: None, process=process)])
+        wait_for(termed)
 
     def test_a_second_term_while_the_first_unwinds_cuts_no_cleanup_short(self) -> None:
         """Round 2 class pass: a run waiting for a child it could not hand off is TERMed at the job's limit as

@@ -4163,7 +4163,7 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
         connection.close()  # a lane runs for hours; each reads its host again on its own connection
     for path, checkout in others:
         settled = settle_lane(environ, checkout)
-        if settled:
+        if settled and "busy" not in settled:
             lanes.append({"path": path, "settled": settled})
     def inline(checkout: pathlib.Path, budget: float) -> StartedLane:
         return inline_lane(lambda: run_lane(checkout, environ, ship, gate, note, clock() + budget))
@@ -4183,12 +4183,12 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
 def settle_lane(environ: dict[str, str], checkout: pathlib.Path) -> dict[str, Any]:
     """Import `checkout`'s file queue and reclaim its dead holders under its runner lock, here (sd:3282).
 
-    A runner lock another runner holds settles nothing: that runner does.
+    A runner lock another runner holds settles nothing, `busy`: that runner does.
     """
     try:
         queue = queue_for(checkout, environ)
         with runner_lock(queue) as locked:
-            return settle_checkout(checkout, queue) if locked else {}
+            return settle_checkout(checkout, queue) if locked else {"busy": f"another runner holds {queue.lock_file}"}
     except (LaneError, sd_lib.ConfigError, OSError) as error:
         return refusal(error)
 
@@ -4303,9 +4303,20 @@ def live_answer(folder: pathlib.Path) -> pathlib.Path | None:
     child's file is free whatever its pid now names. A missing folder holds
     none; a folder or file that cannot be read raises `OSError`.
     """
-    if not folder.is_dir():
-        return None
-    return next((answer for answer in sorted(folder.glob("*.json")) if answer_locked(answer)), None)
+    return next((answer for answer in answer_paths(folder) if answer_locked(answer)), None)
+
+
+def answer_paths(folder: pathlib.Path) -> list[pathlib.Path]:
+    """The `.json` answer files in `folder`, sorted; a missing folder has none (round 4).
+
+    `os.scandir` raises any other `OSError`: `Path.is_dir` and `glob` read
+    an unreadable folder as empty, so a held lane read free.
+    """
+    try:
+        with os.scandir(folder) as entries:
+            return sorted(pathlib.Path(entry.path) for entry in entries if entry.name.endswith(".json"))
+    except FileNotFoundError:
+        return []
 
 
 def answer_locked(answer: pathlib.Path) -> bool:
@@ -4366,36 +4377,41 @@ def end_overdue(environ: dict[str, str], checkout: pathlib.Path) -> list[dict[st
     by the lane's next settle, the lock being free and the pid gone (sd:3282).
     """
     try:
-        folder = queue_for(checkout, environ).lane / "hosted"
-        answers = sorted(folder.glob("*.json")) if folder.is_dir() else []
-    except (LaneError, sd_lib.ConfigError, OSError):
+        answers = answer_paths(queue_for(checkout, environ).lane / "hosted")
+    except (LaneError, sd_lib.ConfigError, OSError):  # `lane_held` names it and starts no worker there
         return []
-    rows = []
+    overdue: dict[pathlib.Path, int] = {}
     for answer in answers:
         record = child_record(answer)
         try:
-            if record is None or time.time() < record[1] or not answer_locked(answer) or \
-                    os.getpgid(record[0]) != record[0]:
-                continue
+            if record is not None and time.time() >= record[1] and answer_locked(answer) and \
+                    os.getpgid(record[0]) == record[0]:
+                overdue[answer] = record[0]
         except OSError:  # gone, or not this user's: nothing to end
             continue
-        rows.append({"ended": f"pid {record[0]} held its lane past its hard deadline: {stop_group(record[0], answer)}",
-                     "answer_file": str(answer)})
-    return rows
+    ended = stop_groups(overdue)
+    return [{"ended": f"pid {group} held its lane past its hard deadline: {ended[answer]}", "answer_file": str(answer)}
+            for answer, group in overdue.items()]
 
 
-def stop_group(group: int, answer: pathlib.Path) -> str:
-    """TERM `group`, then KILL it if `answer` is still locked after `CHILD_STOP_SECONDS`; how it ended."""
+def stop_groups(groups: dict[pathlib.Path, int]) -> dict[pathlib.Path, str]:
+    """TERM each group at once, then KILL each whose answer file is still locked after `CHILD_STOP_SECONDS`, one
+    deadline for all (round 4); how each ended."""
+    how = dict.fromkeys(groups, "TERMed")
     for number in (signal.SIGTERM, signal.SIGKILL):
-        sd_lib.signal_group(group, number)
+        locked = [answer for answer in groups if answer_locked(answer)]
+        if number == signal.SIGKILL:
+            for answer in locked:
+                how[answer] = "TERMed, then KILLed"
+        for answer in locked:
+            end_group(groups[answer], number)
         stop = time.monotonic() + CHILD_STOP_SECONDS
-        while answer_locked(answer):
-            if time.monotonic() >= stop:
-                break
+        while any(answer_locked(answer) for answer in locked) and time.monotonic() < stop:
             time.sleep(0.05)
-        else:
-            return "TERMed" if number == signal.SIGTERM else "TERMed, then KILLed"
-    return "TERMed, then KILLed, and its lock is still held"
+    for answer in groups:
+        if answer_locked(answer):
+            how[answer] += ", and its lock is still held"
+    return how
 
 
 def inline_lane(run: Callable[[], dict[str, Any]]) -> StartedLane:
@@ -4435,11 +4451,20 @@ def arm_term(delay: float | None, grace: float | None = None) -> None:
     fired: list[bool] = []
 
     def fire(*_: Any) -> None:
+        # The group it leads, as a hosted run's child does, so its own children end too (round 4);
+        # else only itself: a hand run in a shell's job group must not signal the shell's pipeline.
+        leads = os.getpgrp() == os.getpid()
+
+        def signal_self(number: int) -> None:
+            if leads:
+                os.killpg(os.getpid(), number)
+            else:
+                os.kill(os.getpid(), number)
         if fired:
-            os.kill(os.getpid(), signal.SIGKILL)
+            signal_self(signal.SIGKILL)
         fired.append(True)
         signal.setitimer(signal.ITIMER_REAL, max(after, 0.001))
-        os.kill(os.getpid(), signal.SIGTERM)
+        signal_self(signal.SIGTERM)
     signal.signal(signal.SIGALRM, fire)
     signal.setitimer(signal.ITIMER_REAL, max(delay, 0.001))  # 0 would disarm it
 
@@ -4488,13 +4513,23 @@ def child_lane(checkout: pathlib.Path, budget: float, argv: list[str] | None = N
     out, err, stem = answer_files(checkout, environ)
     argv = argv or [sys.executable, str(BIN / "sd-ship"), "-C", str(checkout), "lane", "run",
                     "--deadline", repr(until)]
-    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err, env=dict(environ),
-                               start_new_session=True)  # the environ its answer files were read from
-    if stem is not None:  # its hard deadline is its own KILL point: past it, the next run ends it (round 3)
-        stem = record_child(stem, process.pid, until + TERM_AFTER_BUDGET_SECONDS + CHILD_STOP_SECONDS) or stem
-    return StartedLane(functools.partial(child_answer, process, out, err, stem),
-                       functools.partial(end_child, process, out, err), process,
-                       functools.partial(hand_off_child, process, out, err, stem))
+    # A TERM from the spawn to the record is held (`spawn_group`), so the child is recorded before the run
+    # unwinds, and then ended here (round 4). The environ is the one its answer files were read from.
+    process = sd_lib.spawn_group(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err, env=dict(environ))
+    lane = StartedLane(lambda: None, process=process)  # until it is recorded: the group, to end on a TERM
+    try:
+        if stem is not None:  # its hard deadline is its own KILL point: past it, the next run ends it (round 3)
+            stem = record_child(stem, process.pid, until + TERM_AFTER_BUDGET_SECONDS + CHILD_STOP_SECONDS) or stem
+        lane = StartedLane(functools.partial(child_answer, process, out, err, stem),
+                           functools.partial(end_child, process, out, err), process,
+                           functools.partial(hand_off_child, process, out, err, stem))
+    finally:
+        try:
+            sd_lib.release_term()
+        except BaseException:
+            stop_lanes([lane])
+            raise
+    return lane
 
 
 def drop_answer(stem: pathlib.Path | None) -> None:
@@ -4548,18 +4583,14 @@ def hand_off_child(process: subprocess.Popen[bytes], out: Any, err: Any,
 
 
 def end_child(process: subprocess.Popen[bytes], out: Any, err: Any) -> None:
-    """KILL a lane child `stop_lanes` TERMed once it outlives `CHILD_STOP_SECONDS`; its answer is not read.
+    """Close a lane child's files once `stop_lanes` ended it, KILLing its group if it still runs; no answer read.
 
     It sends no TERM of its own: a second one while the child unwinds the
     first could cut its groups' end short (sd:9332 round 2).
     """
     with out, err:
-        if process.poll() is not None:
-            return
-        try:
-            process.wait(CHILD_STOP_SECONDS)
-        except subprocess.TimeoutExpired:
-            process.kill()
+        if process.poll() is None:
+            end_group(process.pid, signal.SIGKILL)
             process.wait()
 
 
@@ -4633,10 +4664,7 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
     def begin_lane(index: int, ids: frozenset[str]) -> bool:
         seen[index] = ids
         if clock() >= deadline:  # a slow queue read spent it: it settles here, and claims nothing
-            settled = settle(order[index][1])
-            rows[index].append({"stopped": "the run spent its budget before this lane started; it settled the "
-                                           "lane, and the next run starts it", **({"settled": settled} if settled
-                                                                                    else {})})
+            rows[index].append(settled_row(settle(order[index][1])))
             return False
         running[index] = start(order[index][1], deadline - clock())
         return True
@@ -4688,6 +4716,18 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
     return [{"path": path, **row} for (path, _), runs in zip(order, rows, strict=True) for row in (runs or [{}])]
 
 
+def settled_row(settled: dict[str, Any]) -> dict[str, Any]:
+    """The row of a lane the run settled past its budget, saying what the settle did (round 4)."""
+    if "busy" in settled:
+        what = f"it settled nothing: {settled['busy']}"
+    elif "error" in settled:
+        what = f"its settle failed: {settled['error']}"
+    else:
+        what = "it settled the lane" if settled else "it had nothing to settle"
+    return {"stopped": f"the run spent its budget before this lane started; {what}, and the next run starts it",
+            **({"settled": settled} if settled and "busy" not in settled else {})}
+
+
 def hand_off_lanes(running: dict[int, StartedLane], rows: list[list[dict[str, Any]]], stop: float) -> None:
     """Hand off each lane in `running` at the budget; wait for each that cannot be until `stop` (round 2).
 
@@ -4714,13 +4754,24 @@ def hand_off_lanes(running: dict[int, StartedLane], rows: list[list[dict[str, An
 
 
 def stop_lanes(lanes: list[StartedLane]) -> None:
-    """TERM every lane child once, all at once, as the job's TERM reached its group, then end each (sd:9332).
+    """TERM every lane child's group once, all at once, as the job's TERM reached its group, then end each.
 
-    `end` only waits and KILLs: this is the one TERM a worker gets from its run.
+    This is the one TERM a worker gets from its run (sd:9332 round 2). It
+    goes to the group the child leads, so the child's own children, an `sd
+    task note` say, get it too; so does the KILL of a child still running
+    `CHILD_STOP_SECONDS` after the TERM, one deadline for all (round 4).
+    `end` then closes each.
     """
-    for lane in lanes:
-        if lane.process is not None and lane.process.poll() is None:
-            lane.process.terminate()
+    live = [lane.process for lane in lanes if lane.process is not None and lane.process.poll() is None]
+    for process in live:
+        end_group(process.pid, signal.SIGTERM)
+    by = time.monotonic() + CHILD_STOP_SECONDS
+    for process in live:
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            process.wait(max(0.0, by - time.monotonic()))
+    for process in live:
+        if process.poll() is None:
+            end_group(process.pid, signal.SIGKILL)
     for lane in lanes:
         lane.end()
 
