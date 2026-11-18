@@ -2015,6 +2015,12 @@ def blocker_code(answer: dict[str, Any]) -> str | None:
     return ((answer.get("workflow") or {}).get("blocker") or {}).get("code")
 
 
+def coded(answer: dict[str, Any]) -> dict[str, str]:
+    """`{"code": ...}` from an `sd-ship` answer's blocker, for a failed entry; `{}` when it names none."""
+    code = blocker_code(answer)
+    return {"code": code} if isinstance(code, str) and code else {}
+
+
 def answered_hub_fault(answer: dict[str, Any]) -> bool:
     """Whether `sd-ship` answered with a hub fault, which the next run retries (sd:3239)."""
     return blocker_code(answer) == sd_ship_workflow.HUB_UNAVAILABLE
@@ -2072,11 +2078,10 @@ def process(entry: dict[str, Any], queue: Queue, ship: Ship, advance: Callable[[
     if blocker_code(merged) == LANE_ELSEWHERE:
         return {**fields, "moved": str(merged.get("error") or "the lane moved")[:600]}  # a move, not a failure
     if not (merged.get("ok") and merged.get("phase") == "merged"):
-        # A cancel that lands during the merge refuses it as `left_stop` stops the entry: the code stays (pack sd:9303).
+        # The blocker code stays, as `left_stop`'s does: Queue and Metrics read it (pack sd:9303).
         return {**fields, "status": "failed", "step": "merge", "phase": merged.get("phase"),
                 "reason": str(merged.get("error") or merged.get("code") or "merge did not confirm")[:REASON_CHARS],
-                **({"hub_fault": True} if answered_hub_fault(merged) else {}),
-                **({"code": MEMBER_LEFT} if blocker_code(merged) == MEMBER_LEFT else {})}
+                **({"hub_fault": True} if answered_hub_fault(merged) else {}), **coded(merged)}
     return {**fields, "status": "merged", "merge_commit": merged.get("merge_commit")}
 
 
@@ -2180,7 +2185,7 @@ def prepare_stop(entry: dict[str, Any], worktree: pathlib.Path, prepared: dict[s
             "reason": str(prepared.get("error") or prepared.get("code") or "prepare did not reach ready_to_send")[:REASON_CHARS],
             **({"hub_fault": True} if answered_hub_fault(prepared) else
                {"slot_wait": True} if blocker_code(prepared) == SLOT_WAIT else
-               {"retryable": True} if answered_retryable(prepared) else {})}
+               {"retryable": True} if answered_retryable(prepared) else {}), **coded(prepared)}
 
 
 class SpeculativeGate(threading.Thread):
