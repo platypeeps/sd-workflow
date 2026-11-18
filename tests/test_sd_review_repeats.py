@@ -64,11 +64,12 @@ class RepeatFixture(ReviewFixture):
             self.library.writes.record_state(connection, "checkpoint", key=key, body=body, timestamp=stamp)
 
     def adjudication(self, *rows: tuple[str, str, str], branch: str = BRANCH, repository: str = REPOSITORY,
-                     head: Any = "", days: float = 0.5, prefix: str = "ship-adjudication:", key: str = "k") -> None:
+                     head: Any = "", days: float = 0.5, prefix: str = "ship-adjudication:", key: str = "k",
+                     line: Any = 3) -> None:
         """One `sd-ship adjudicate` record: each (summary, disposition, reason) a blocking finding's answer,
         at the reviewed head unless `head` names another."""
         findings = [{"index": index, "finding_digest": "0" * 64, "response_disposition": answer, "reason": reason,
-                     "raw_finding": {"path": "bin/tool.py", "line": 3, "severity": "high", "summary": summary,
+                     "raw_finding": {"path": "bin/tool.py", "line": line, "severity": "high", "summary": summary,
                                      "family": "correctness", "disposition": "blocking"}}
                     for index, (summary, answer, reason) in enumerate(rows, 1)]
         bindings = {"repository": repository, "branch": branch, "head": head if head != "" else self.head}
@@ -139,14 +140,18 @@ class RebuttedFindingTests(RepeatFixture):
         self.adjudication(("another branch", "rebutted", "x"), branch="topic", key="other-branch")
         self.adjudication(("another repository", "rebutted", "x"), repository="fixture/elsewhere", key="other-repo")
         self.adjudication(("after the head", "rebutted", "x"), days=-1, key="late")
+        self.adjudication(("no line", "rebutted", "x"), line=None, key="no-line")
         prompts, _result, stderr = self.prompts()
         for prompt in prompts:
             self.assertIn(sd_review.REBUTTED_HEADER, prompt)
-            self.assertIn("- bin/tool.py: lane claim one Rebuttal: git 2.54 matches it literally", prompt)
-            self.assertIn("- bin/tool.py: lane claim two Rebuttal: out of the threat model", prompt)
-            self.assertIn("- bin/tool.py: local claim Rebuttal: the test covers it", prompt)
+            self.assertIn("- bin/tool.py:3: lane claim one Rebuttal: git 2.54 matches it literally", prompt)
+            self.assertIn("- bin/tool.py:3: lane claim two Rebuttal: out of the threat model", prompt)
+            self.assertIn("- bin/tool.py:3: local claim Rebuttal: the test covers it", prompt)
             self.assertIn("Raise one again only with new evidence", prompt)
-            for absent in ("a parked risk", "another branch", "another repository", "after the head"):
+            # Round 9: a receipt recorded after the head's commit, as every same-head retry's is, still rebuts.
+            self.assertIn("- bin/tool.py:3: after the head Rebuttal: x", prompt)
+            self.assertIn("- bin/tool.py: no line Rebuttal: x", prompt)
+            for absent in ("a parked risk", "another branch", "another repository"):
                 self.assertNotIn(absent, prompt)
         self.assertEqual(stderr, "")
 
@@ -170,13 +175,13 @@ class RebuttedFindingTests(RepeatFixture):
         self.adjudication((f"claim {total - 1:02d}", "rebutted", "said again"), key="again", days=0.005)
         lines = self.section(self.prompts()[0][0])
         self.assertEqual(len(lines), sd_review.REBUTTED_LINES, lines)
-        self.assertTrue(lines[0].startswith(f"- bin/tool.py: claim {total - 1:02d} Rebuttal: said again"), lines[0])
-        self.assertTrue(lines[1].startswith("- bin/tool.py: long long"), lines[1])
+        self.assertTrue(lines[0].startswith(f"- bin/tool.py:3: claim {total - 1:02d} Rebuttal: said again"), lines[0])
+        self.assertTrue(lines[1].startswith("- bin/tool.py:3: long long"), lines[1])
         self.assertNotIn("TAIL", "\n".join(lines))
         self.assertNotIn("END", "\n".join(lines))
         kept = {line.split(" Rebuttal:")[0] for line in lines}
-        self.assertNotIn("- bin/tool.py: claim 00", kept)
-        self.assertIn(f"- bin/tool.py: claim {total - 2:02d}", kept)
+        self.assertNotIn("- bin/tool.py:3: claim 00", kept)
+        self.assertIn(f"- bin/tool.py:3: claim {total - 2:02d}", kept)
         for line in lines:
             self.assertLessEqual(len(line), 160 + sd_review.REBUTTED_SUMMARY_CHARS + sd_review.REBUTTED_REASON_CHARS)
 
@@ -221,13 +226,14 @@ class RebuttedFindingTests(RepeatFixture):
             subject = sd_review.resolve_subject(self.root, "worktree")
             self.assertEqual(sd_review.rebutted_findings(self.root, subject, None, self.environment()), [])
 
-    def test_a_rebuttal_after_the_head_changes_no_request(self) -> None:
-        """`--explain`, dispatch and a replay ask the same (sd:1397): the head's commit time anchors the read."""
+    def test_the_same_receipts_ask_the_same_request(self) -> None:
+        """`--explain`, dispatch and a replay over the same receipts ask the same (sd:1397); a new receipt is
+        new input, so it may change the request."""
         self.adjudication(("lane claim", "rebutted", "x"))
         first = self.prompts()[1]
+        self.assertEqual(self.prompts()[1]["request_sha256"], first["request_sha256"])
         self.adjudication(("recorded later", "rebutted", "x"), days=-1, key="later")
-        again = self.prompts()[1]
-        self.assertEqual(again["request_sha256"], first["request_sha256"])
+        self.assertNotEqual(self.prompts()[1]["request_sha256"], first["request_sha256"])
 
 
 def row(severity: str = "high", **extra: Any) -> dict[str, Any]:
@@ -455,12 +461,17 @@ class RebuttalScopeTests(RepeatFixture):
     def repeat(self, summary: str) -> dict[str, Any]:
         return row(path="bin/tool.py", line=3, summary=summary)
 
-    def test_a_rebuttal_recorded_after_the_heads_commit_does_not_downgrade(self) -> None:
-        """At the same head the recorded adjudication covers the retry; at a new head the cutoff includes it."""
-        self.adjudication(("lane claim", "rebutted", "git 2.54 matches it literally"), days=-1)
-        self.assertNotIn(sd_review.REBUTTED_HEADER, self.prompts()[0][0])
+    def test_a_receipt_a_minute_after_the_heads_commit_rebuts(self) -> None:
+        """Round 9: rebut, then the lane retries at the same head; the receipt is newer than the head's commit."""
+        self.adjudication(("lane claim", "rebutted", "git 2.54 matches it literally"), days=-1 / 1440)
+        self.assertIn("- bin/tool.py:3: lane claim Rebuttal:", self.prompts()[0][0])
         self.assertEqual(self.review_answering(self.repeat("lane claim"))["lane claim"],
-                         ("blocking", "bin/tool.py"))
+                         ("advisory", "bin/tool.py"))
+        for scope in ("worktree", "branch"):
+            with self.subTest(scope=scope):
+                seen = sd_review.rebutted_findings(self.root, sd_review.resolve_subject(self.root, scope), None,
+                                                   self.environment())
+                self.assertEqual([entry.text for entry in seen], ["lane claim"])
 
     def test_a_rebuttal_older_than_the_bound_does_not_downgrade(self) -> None:
         """A reused branch name does not inherit a merged branch's rebuttals."""

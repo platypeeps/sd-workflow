@@ -758,9 +758,8 @@ def blocker_checklist(root: pathlib.Path, subject: Subject, database: Any, env: 
 
 
 #: This branch's rebutted findings (pack sd:9270): every accepted adjudication `sd-ship adjudicate` recorded for
-#: the branch, item-backed or no-item, at a head in base..head, from `BLOCKER_DAYS` before the base's commit to the
-#: head's, newest first; the newest
-#: disposition of a finding wins. A repeat's line may sit `REBUTTED_LINE_WINDOW` lines from its rebuttal's: code
+#: the branch, item-backed or no-item, at a head in base..head, from `BLOCKER_DAYS` before the base's commit on,
+#: newest first; the newest disposition of a finding wins. A repeat's line may sit `REBUTTED_LINE_WINDOW` lines from its rebuttal's: code
 #: above it moves between the heads of one branch, and a defect further off is another defect.
 REBUTTED_LINES, REBUTTED_SUMMARY_CHARS, REBUTTED_REASON_CHARS, REBUTTED_LINE_WINDOW = 10, 200, 200, 10
 REBUTTED_HEADER = "Findings already rebutted on this branch"
@@ -768,9 +767,9 @@ REBUTTED_ROWS = 200
 #: The rows only: a body is ASCII JSON, while a field `json_extract` decodes may not be UTF-8 and failed the whole read.
 REBUTTED_QUERY = (
     "SELECT a.body FROM state AS a WHERE a.kind = 'checkpoint' AND (a.key LIKE 'ship-adjudication:%' OR a.key LIKE"
-    " 'ship-adjudication-no-item:%') AND a.timestamp < ?1 AND a.timestamp >= ?2 AND lower(json_extract(CASE WHEN"
-    " json_valid(a.body) THEN a.body END, '$.proposal.bindings.repository')) = ?3 AND json_extract(CASE WHEN"
-    " json_valid(a.body) THEN a.body END, '$.proposal.bindings.branch') = ?4 ORDER BY a.id DESC LIMIT ?5")
+    " 'ship-adjudication-no-item:%') AND a.timestamp >= ?1 AND lower(json_extract(CASE WHEN"
+    " json_valid(a.body) THEN a.body END, '$.proposal.bindings.repository')) = ?2 AND json_extract(CASE WHEN"
+    " json_valid(a.body) THEN a.body END, '$.proposal.bindings.branch') = ?3 ORDER BY a.id DESC LIMIT ?4")
 
 
 def _bounded(value: Any, limit: int) -> str:
@@ -818,9 +817,9 @@ class Rebuttal(NamedTuple):
 def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: Mapping[str, str]) -> list[Rebuttal]:
     """This branch's rebutted findings, read-only (pack sd:9270): the prompt lists them and the gate matches them.
 
-    The read ends at the reviewed head's commit time, so `--explain`, dispatch and a replay ask the same (sd:1397);
-    at the same head the recorded adjudication covers a retry. A rebuttal counts only from a receipt whose head is
-    in base..head: a reused branch name inherits nothing from a merged or abandoned branch. A failed read says so on
+    A rebuttal counts only from a receipt whose head is in base..head: a reused branch name inherits nothing from
+    a merged or abandoned branch. No cutoff at the head's commit time: a retry at the same head must read the
+    receipt recorded after it; the same receipts still ask the same request (sd:1397). A failed read says so on
     stderr and reviews without them; a planning subject, a detached HEAD, no GitHub origin and no database have
     nothing."""
     origin = sd_lib.github_head(root) if subject.scope != "planning" else None
@@ -829,16 +828,15 @@ def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: 
         return []
     try:
         span, imported = _branch_range(root, subject), sd_lib.import_sd_db()
-        stamps = [sd_lib.git_output(["show", "-s", "--format=%ct", ref], root) or "" for ref in span[:2]] if span else []
-        if span is None or not all(stamp.isdigit() for stamp in stamps) or imported.module is None:
+        stamp = (sd_lib.git_output(["show", "-s", "--format=%ct", span[1]], root) or "") if span else ""
+        if span is None or not stamp.isdigit() or imported.module is None:
             raise ValueError(imported.problem or "git cannot read the reviewed head, its base or their commits")
-        window = [time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(int(stamp) - back))
-                  for stamp, back in zip(stamps, (0, BLOCKER_DAYS * 86400), strict=True)]
+        since = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(int(stamp) - BLOCKER_DAYS * 86400))
         target = pathlib.Path(database) if database is not None else imported.module.default_path(env.get("HOME"))
         if not target.exists():
             return []
         with contextlib.closing(imported.module.connect(target, write=False)) as connection:
-            rows = connection.execute(REBUTTED_QUERY, (*window, "/".join(origin[:2]), branch, REBUTTED_ROWS)).fetchall()
+            rows = connection.execute(REBUTTED_QUERY, (since, "/".join(origin[:2]), branch, REBUTTED_ROWS)).fetchall()
     except Exception as error:  # a failed read is unknown, not empty: say so, and review without it
         print(f"sd-review: reviewing without the rebutted findings: {type(error).__name__}: {error}", file=sys.stderr)
         return []
@@ -888,7 +886,8 @@ def rebuttals(rows: Sequence[Sequence[Any]], on_branch: Callable[[str], bool]) -
 
 def rebuttal_section(seen: Sequence[Rebuttal]) -> str:
     """The prompt section for `rebuttals`; a static reader cites the lines it read."""
-    lines = "".join(f"\n- {entry.place}: {entry.text} Rebuttal: {entry.reason}" for entry in seen)
+    lines = "".join(f"\n- {entry.place}{'' if entry.line is None else f':{entry.line}'}: {entry.text} Rebuttal: "
+                    f"{entry.reason}" for entry in seen)
     return (f"\n\n{REBUTTED_HEADER}, newest first, from its recorded adjudications. Raise one again only with new "
             "evidence that contradicts the rebuttal, given in the finding's evidence field: a check you ran and its "
             "output, or, when you cannot run commands, path:line and a quote of the current code showing the rebuttal "
