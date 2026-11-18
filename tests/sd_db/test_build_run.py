@@ -808,6 +808,16 @@ class Supervise(Case):
         self.assertIn("- work.txt:1 a blocker", prompts[2])
         self.assertEqual(self.statuses(), ["blocked"])
 
+    def test_a_question_on_one_member_keeps_the_class_pass_for_the_other(self):
+        """Review of sd:9263: a question on a skipped member B must not park A, which the class pass can still fix."""
+        self.press(2)
+        self.plan(claude=["pass", "fix1", "fix2", "fix3"], sd_review=["blocking"] * 4)
+        add_note(self.db, self.items[1], "question", "Which option?\nOption: Yes (Recommended)\nOption: No")
+        ended = self.supervisor().run()
+        self.assertEqual(ended["outcome"], "blocked")
+        self.assertIn("4 review rounds left blockers", self.latest()["detail"])
+        self.assertEqual(len(self.calls("sd-review")), 4)
+
     def test_an_open_question_skips_the_class_pass(self):
         """sd:9263: no fix round answers a question, so a build that asked one parks at 3 rounds."""
         self.press()

@@ -1247,8 +1247,11 @@ class Supervisor:
         rounds = self.fresh()["review_round"] or 0
         if rounds < REVIEW_ROUNDS:
             return self.fix()
-        # One class-pass round past the bound (sd:9263); none when the builder asked a question no fix answers.
-        if rounds == REVIEW_ROUNDS and not build.open_question(self.db, [self.lead, *self.others], self.row["created_at"]):
+        # One class-pass round past the bound (sd:9263). None when every member waits on a question no fix answers;
+        # a question on one member leaves the others to fix, as enqueue delivers them without it.
+        unasked = [item for item in [self.lead, *self.others]
+                   if not build.open_question(self.db, [item], self.row["created_at"])]
+        if rounds == REVIEW_ROUNDS and unasked:
             return self.fix(CLASS_PASS, rounds=rounds)
         return self.finish("blocked", f"{rounds} review rounds left blockers: {self.summary(self.blockers)}")
 
