@@ -200,6 +200,25 @@ def refuse_teammate_held(connection, items) -> None:
                                       "--end`, then deliver.")
 
 
+#: The refusal code of a delivery that names a build member the operator cancelled on its own (pack sd:9222).
+MEMBER_LEFT = "member_cancelled_alone"
+
+
+def refuse_left(connection, branch: str, items, then: str = "nothing was published") -> None:
+    """Refuse delivering any of `items` that the build bundle on `branch` left: each member the operator cancelled
+    on its own (`build.left`, pack sd:9222). `sd-ship merge` checks right before it publishes, the one point every
+    delivery passes; prepare, and the lane's enqueue, retry and run, refuse earlier with the same rule."""
+    sd_lib.import_sd_db()  # every caller holds an sd_db connection, so this finds it
+    from sd_db import build  # noqa: PLC0415
+    left = sorted(build.left(connection, branch, items))
+    if left:
+        named = ", ".join(f"sd:{number}" for number in left)
+        raise Refusal(f"{named} was cancelled on its own out of the build bundle on {branch}, so this delivery may "
+                      f"not close it; {then}", code=MEMBER_LEFT, boundary="input", state="operator_decision",
+                      next_action="Drop it from the delivery (its --item, or the citation), then deliver again; "
+                                  "build it again to deliver it on its own branch.")
+
+
 def refuse_unclosable(connection, item: int, repo: str, named, deliver: bool) -> None:
     """Refuse a co-delivered item the merge could not close; `repo` is `item`'s registered path.
 
@@ -373,10 +392,18 @@ def with_cited(body: str, lines: list[str], heading: str = "Closed by citation")
 
     A reader of the pull request sees each close by citation, so a wrong
     one is one reopen, and each citation the merge leaves open (`Left
-    open`, sd:9222). The trailers stay the body's last paragraph.
+    open`, sd:9222). The trailers stay the body's last paragraph. A body
+    that leaves a fenced code block or an HTML comment open would hide
+    the section in it, so it refuses `body_block_open` (sd:9222).
     """
     if not lines:
         return body
+    probe = f"{body.rstrip(chr(10))}\n\nprobe"  # a line after the body: quoted means a block is still open
+    if probe.count("\n") + 1 in quoted_lines(probe):
+        raise Refusal(f"the body leaves a fenced code block or an HTML comment open, so its `## {heading}` "
+                      "section would sit inside it, hidden; nothing was queued", code="body_block_open",
+                      boundary="input", state="operator_decision",
+                      next_action="Close the fence or the comment in the body file, then enqueue again.")
     section = f"## {heading}\n\n" + "\n".join(lines) + "\n"
     text = body.rstrip("\n")
     head, _, last = text.rpartition("\n\n")

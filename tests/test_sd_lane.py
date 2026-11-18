@@ -3246,6 +3246,21 @@ class CitedCloses(SharedQueue):
                 self.assertNotIn("merge", [call[2] for call in self.calls])
                 self.assertEqual("prepare" in [call[2] for call in self.calls], when == "during prepare")
 
+    def test_a_body_that_leaves_a_fence_or_comment_open_is_refused_before_a_section_goes_in_it(self) -> None:
+        """Review round 8 of pack sd:9222: `## Closed by citation` and `## Left open` went after the body, so an
+        unclosed fence or HTML comment in it hid them from a reader. Both refuse the same way; nothing is queued."""
+        a, b, *_ = self.open
+        for opened in ("```\nsome code\n", "<!-- a note\n"):
+            for cites, section in ((f"Closes: sd:{b}", "Closed by citation"), (f"Closes: sd:{a}", "Left open")):
+                with self.subTest(opened=opened, section=section):
+                    branch = self.cancelled_alone(self.own, a)  # a fresh bundle, so a fresh branch and worktree
+                    with self.assertRaises(sd_lane.LaneError) as refused:
+                        self.enqueue_on(branch, self.own, "fix: a slice", f"## Summary\n\nWords.\n\n{opened}",
+                                        f"fix(lane): the slice\n\n{cites}")
+                    self.assertEqual(refused.exception.code, "body_block_open")
+                    self.assertIn(section, str(refused.exception))
+        self.assertEqual(self.rows(), [])
+
     def test_a_member_cancelled_alone_still_closes_on_another_branch(self) -> None:
         """Evidence: the exclusion holds for the entry of the member's own bundle only, read from its branch.
         An entry on another branch that delivers it, even the same item's, closes it as before."""

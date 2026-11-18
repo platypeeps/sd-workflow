@@ -3513,6 +3513,36 @@ roles:
         self.assertEqual(caught.exception.workflow["blocker"]["code"], "teammate_held")
         self.assertIsNone(getattr(self.remote.pull(number), "merged_head", None))
 
+    def test_the_merge_refuses_a_member_cancelled_alone_after_prepare_before_it_publishes(self):
+        """Review round 8 of pack sd:9222: a prepared pull request left for a hand merge kept its closing set, so a
+        member the operator cancelled on its own after prepare still closed. The merge checks the set against the
+        branch's build bundle right before it publishes; nothing merges."""
+        import sd_db
+        from sd_db import build, operations
+
+        self.task_item("task")
+        other = self.closes_items()[0]
+        branch = _git(self.root, "symbolic-ref", "--short", "HEAD")
+        lead, member = (sd_db.create_assignment(self.connection, item=number, role="author", status="queued",
+                                                lane="parallel") for number in (self.item, other))
+        for ident in (lead, member):
+            self.connection.execute("UPDATE assignment SET scope = ?, parent = ? WHERE id = ?",
+                                    (build.SCOPE, None if ident == lead else lead, ident))
+        self.connection.execute(
+            "INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, created_at, "
+            "updated_at) VALUES ('run-1', ?, 1, ?, ?, 'fixture', '/w', '/w', '2026-11-17T00:00:00+00:00', "
+            "'2026-11-17T00:00:00+00:00')",
+            (lead, self.connection.execute("SELECT repo FROM item WHERE id = ?", (self.item,)).fetchone()[0], branch))
+        self.connection.commit()
+        number = self.unanswered("--deliver", "--title", "A change", *self.also(other)).prepare()["pull_request"]["number"]
+        state = operations.assignment_state(self.connection, member)
+        operations.cancel_assignment(self.connection, member, expected_revision=state["revision"], who="operator")
+        with patch.object(ship.time, "sleep"), self.assertRaises(ship.Refusal) as caught:
+            self.merge()
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "member_cancelled_alone")
+        self.assertIn(f"sd:{other} was cancelled on its own", str(caught.exception))
+        self.assertIsNone(getattr(self.remote.pull(number), "merged_head", None))
+
     def test_a_held_item_refuses_prepare_before_it_commits_or_catches_up(self):
         """pack sd:7221 round 4: the builder may still write its worktree, so prepare writes none of it first."""
         from sd_db import teammate

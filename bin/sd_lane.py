@@ -809,15 +809,18 @@ def enqueue_entry(worktree: pathlib.Path, item: int, title: str, body_file: path
                 left_cited(connection, branch, body, commits, parents)))
             entry["closes"] = [*closes, *(row["item"] for row in cited)]
             import sd_ship_body  # noqa: PLC0415
-            if cited:  # listed where a reader sees it (sd:5999 lane review)
-                entry["cited"] = cited
-                entry["body"] = sd_ship_body.with_cited(
-                    body, [f"- sd:{row['item']}: {row['source']}" for row in cited])  # no repo name (sd:9135)
-            if left:  # a citation this bundle's merge leaves open is seen too (sd:9222)
-                entry["left_open"] = left
-                entry["body"] = sd_ship_body.with_cited(
-                    entry["body"], [f"- sd:{number}: cancelled on its own out of this build" for number in left],
-                    heading="Left open")
+            try:
+                if cited:  # listed where a reader sees it (sd:5999 lane review)
+                    entry["cited"] = cited
+                    entry["body"] = sd_ship_body.with_cited(
+                        body, [f"- sd:{row['item']}: {row['source']}" for row in cited])  # no repo name (sd:9135)
+                if left:  # a citation this bundle's merge leaves open is seen too (sd:9222)
+                    entry["left_open"] = left
+                    entry["body"] = sd_ship_body.with_cited(
+                        entry["body"], [f"- sd:{number}: cancelled on its own out of this build" for number in left],
+                        heading="Left open")
+            except sd_ship_body.Refusal as refused:  # an open fence or comment would hide the section
+                raise LaneError(str(refused), code=refused.workflow["blocker"]["code"]) from None
         on_hub(queue, lambda connection: refuse_teammate(connection, entry))  # the whole set
     require_published(worktree, branch, head, f"{head} names no commit in {worktree}", refuse_before_push,
                       lambda tip: tip_past(worktree, branch, tip, head))
@@ -1026,13 +1029,12 @@ def refuse_left_members(connection: Any, branch: str, items: tuple[int, ...],
     """Refuse an entry on a build bundle's `branch` that would deliver a member the operator cancelled on its own
     out of that bundle (`build.left`): as its item or a later `--item` at enqueue, a saved close at retry,
     which copies them (review round 6 of sd:9222), or one cancelled since, at the run (`left_stop`)."""
-    from sd_db import build  # noqa: PLC0415
-    left = sorted(build.left(connection, branch, items))
-    if left:
-        named = ", ".join(f"sd:{number}" for number in left)
-        raise LaneError(f"{named} was cancelled on its own out of the build bundle on {branch}, so this entry may "
-                        f"not deliver it; {then}. Drop it from the entry and enqueue again from the "
-                        "worktree; build it again to deliver it on its own branch.", code=MEMBER_LEFT)
+    import sd_ship_body  # noqa: PLC0415
+    try:
+        sd_ship_body.refuse_left(connection, branch, items, then)
+    except sd_ship_body.Refusal as refused:  # the lane's own error, the same words (`sd-ship merge` enforces it)
+        raise LaneError(f"{refused}. Drop it from the entry and enqueue again from the worktree; build it again "
+                        "to deliver it on its own branch.", code=MEMBER_LEFT) from None
 
 
 def left_stop(entry: dict[str, Any], queue: Queue, step: str) -> dict[str, Any] | None:
