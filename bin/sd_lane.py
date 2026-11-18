@@ -785,7 +785,7 @@ def enqueue_entry(worktree: pathlib.Path, item: int, title: str, body_file: path
     body = body_file.read_text(encoding="utf-8")
     closes = tuple(dict.fromkeys(number for number in closes if number != item))
     def checked(connection: Any) -> str | None:
-        check_item(connection, worktree, item, body, claim, closes, title)
+        check_item(connection, worktree, item, body, claim, closes, title, branch)
         return forwarded_to(connection, queue)
     forwarded = on_hub(queue, checked)
     entry = {"id": entry_id(), "repository": queue.repository, "item": item, "branch": branch, "expected_head": head,
@@ -802,7 +802,8 @@ def enqueue_entry(worktree: pathlib.Path, item: int, title: str, body_file: path
         if claim == "deliver":  # an associate-only claim closes nothing (sd:3365)
             commits = unreverted(worktree, head, branch_commits(worktree, base, head))
             parents = branch_parents(worktree, base, head)
-            cited = on_hub(queue, lambda connection: cited_closes(connection, item, body, commits, closes, parents))
+            cited = on_hub(queue, lambda connection: cited_closes(connection, item, body, commits, closes,
+                                                                  parents, branch))
             entry["closes"] = [*closes, *(row["item"] for row in cited)]
             if cited:  # listed where a reader sees it (sd:5999 lane review)
                 import sd_ship_body  # noqa: PLC0415
@@ -982,7 +983,7 @@ def branch_parents(worktree: pathlib.Path, base: str, head: str) -> dict[str, tu
 
 
 def cited_closes(connection: Any, item: int, body: str, commits: list[tuple[str, str]],
-                 closes: tuple[int, ...], parents: dict[str, tuple[str, ...]] | None = None
+                 closes: tuple[int, ...], parents: dict[str, tuple[str, ...]] | None = None, branch: str = ""
                  ) -> list[dict[str, Any]]:
     """The open items of `item`'s repository its commits or body cite, beyond `closes` (sd:5999).
 
@@ -990,14 +991,15 @@ def cited_closes(connection: Any, item: int, body: str, commits: list[tuple[str,
     fix, <repo> sd:N` line (`sd_ship_body.cited_sources`). The merge closes
     each as it closes a later `--item`, and the lane notes each
     (`note_cited`). An item with no repository row adds nothing:
-    `check_item` refuses it first.
+    `check_item` refuses it first. A member cancelled on its own out of
+    the build bundle that published `branch` adds nothing either (sd:9222).
     """
     import sd_ship_body  # noqa: PLC0415
     row = connection.execute("SELECT repo FROM item WHERE id = ?", (item,)).fetchone()
     if row is None or not row["repo"]:
         return []
     sources = sd_ship_body.cited_sources(body, commits, parents)
-    kept = sd_ship_body.open_cited(connection, item, row["repo"], tuple(sources), closes, body)
+    kept = sd_ship_body.open_cited(connection, item, row["repo"], tuple(sources), closes, body, branch)
     return [{"item": number, "source": sources[number]} for number in kept]
 
 
@@ -1032,7 +1034,7 @@ def check_docs(worktree: pathlib.Path, body: str, base: str) -> None:
 
 
 def check_item(connection: Any, worktree: pathlib.Path, item: int, body: str, claim: str | None,
-               closes: tuple[int, ...] = (), title: str = "") -> None:
+               closes: tuple[int, ...] = (), title: str = "", branch: str = "") -> None:
     """Refuse what prepare refuses on the item before it reviews, so the entry never waits for it (sd:3473).
 
     Each refused in seconds once the entry reached the head of the queue,
@@ -1046,7 +1048,8 @@ def check_item(connection: Any, worktree: pathlib.Path, item: int, body: str, cl
 
     One is the lane's own: a delivering entry whose title or `## Summary`
     headings name an open item of this repository missing from `--item`
-    (`sd_ship_body.refuse_left_open`, sd:5375). Prepare only warns of a
+    (`sd_ship_body.refuse_left_open`, sd:5375), less a member cancelled on
+    its own out of the build bundle that published `branch` (sd:9222). Prepare only warns of a
     title id, and inside the lane no one read the warning.
     """
     require_sd_db()
@@ -1075,7 +1078,7 @@ def check_item(connection: Any, worktree: pathlib.Path, item: int, body: str, cl
         sd_ship_body.refuse_unclosable(connection, item, info["item"]["repo"], closes, claim == "deliver")
         names = (pathlib.Path(info["item"]["repo"]).name, (registered or "").partition("/")[2])
         sd_ship_body.refuse_left_open(connection, item, info["item"]["repo"], names, title, body, closes,
-                                      claim == "deliver")
+                                      claim == "deliver", branch)
     except Refusal as error:
         raise LaneError(f"{error}; nothing was queued", code=error.workflow["blocker"]["code"]) from None
 
@@ -1667,7 +1670,8 @@ def retry(root: pathlib.Path, item: int, environ: dict[str, str], *, manual: boo
     else:
         worktree_unmoved(last)
     on_hub(queue, lambda connection: check_item(connection, root, item, last["body"], last.get("claim"),
-                                                tuple(last.get("closes") or ()), str(last.get("title") or "")))
+                                                tuple(last.get("closes") or ()), str(last.get("title") or ""),
+                                                last["branch"]))
     worktree, head = pathlib.Path(str(last.get("worktree"))), last["expected_head"]
     if last.get("enqueued_on") == this_host() and worktree.is_dir():
         head = caught_up(worktree, head)

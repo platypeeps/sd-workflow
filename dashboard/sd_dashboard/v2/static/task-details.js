@@ -251,7 +251,7 @@
       Object.values(DET.items).forEach(d => {
         const as = live(String(d.item.id)) ? o => o : o => ({ id: o.id, type: 'not listed', label: `${o.label} (no longer listed)` });
         d.notes.forEach(n => C.put(as({ id: `note:${n.id}`, type: 'note', label: `${n.kind} ${n.id} on #${d.item.id}`, note: n.id, kind: n.kind, resolved: n.resolved, item: d.item.id })));
-        d.assignments.forEach(a => C.put(as({ id: `asg:${a.id}`, type: 'assignment', label: `Assignment #${a.id}`, n: a.id, scope: a.scope, status: a.status, item: d.item.id, repo: d.item.repo, can: a.cancel })));
+        d.assignments.forEach(a => C.put(as({ id: `asg:${a.id}`, type: 'assignment', label: `Assignment #${a.id}`, n: a.id, scope: a.scope, members: a.members || [], status: a.status, item: d.item.id, repo: d.item.repo, can: a.cancel })));
       });
       ISSUE_RUNS.forEach(r => C.put(issueObject(r)));
     }
@@ -537,7 +537,9 @@
         // sd:9222: a queued build's cancel parks its item; a running one parks at the run's end, or ends blocked.
         // Only a build parks, so the text reads the scope as well as the status (review round 4).
         consequence: o => `Ends assignment #${o.n} in ${o.repo} as cancelled. ` + (o.scope === 'build' && o.status === 'queued'
-          ? "It parks the item, its status unchanged, so auto-pickup leaves it until Unpark."
+          ? "It parks the item, its status unchanged, so auto-pickup leaves it until Unpark." + (o.members.length
+            ? ` It also cancels and parks its ${o.members.length} queued member${o.members.length === 1 ? '' : 's'}: ${o.members.map(i => `#${i}`).join(', ')}.`
+            : '')
           : o.scope === 'build' && o.status === 'running'
             ? 'The build stops at its next beat and parks its items at ready until Unpark; if the reap cannot confirm the process stopped, it ends blocked instead: check the process, then Retry once the lease is released.'
             : "The item's status is unchanged."),

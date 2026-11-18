@@ -403,7 +403,7 @@ def details(connection, item: int, *, now: str) -> dict:
 
 
 def _details(connection, item: int, *, now: str) -> dict:
-    from sd_db import operations, progress
+    from sd_db import build, operations, progress
 
     from .places import realms
 
@@ -417,6 +417,9 @@ def _details(connection, item: int, *, now: str) -> dict:
             "scope": assignment["scope"], "status": assignment["status"], "started": assignment["started"], "ended": assignment["ended"],
             "usd": assignment["usd"], "estimated": bool(assignment["estimated"]),
             "revision": held["revision"], "cancel": held["capabilities"]["cancel"],
+            # The items a cancel of this queued build lead also cancels and parks (sd:9222).
+            "members": [item for _, item in build.queued_members(connection, assignment["id"])]
+            if assignment["scope"] == build.SCOPE and assignment["status"] == "queued" else [],
         })
     return {
         "read": now, "item": state["item"], "revision": state["revision"],

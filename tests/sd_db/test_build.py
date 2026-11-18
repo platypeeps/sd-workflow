@@ -1550,6 +1550,31 @@ class CancelParks(Case):
         fresh = build.queue_again(self.db, [items[1]], who="operator")
         self.assertEqual([(entry["item"], entry["status"]) for entry in fresh], [(items[1], "queued")])
 
+    def test_a_past_run_still_lists_the_member_it_built_after_a_lone_cancel(self):
+        """Review round 5 of sd:9222: history keeps the member. Run 1 built the child, so `run` of run 1 (the Builds
+        panel's recent row, the health-failed notes) still lists it after its lone cancel; the next run does not."""
+        items, lead, child, first = self.requeued_bundle()
+        self.cancel(child)
+        again = self.claim()
+        self.assertEqual([member["id"] for member in build.run(self.db, first["id"])["members"]], [lead, child])
+        self.assertEqual([member["id"] for member in build.run(self.db, again["id"])["members"]], [lead])
+
+    def test_an_open_run_drops_a_member_cancelled_alone_while_it_runs_on(self):
+        """The round 5 class pass: a member the open run left out (blocked) and the operator then cancelled alone
+        leaves that run too, so a supervisor resumed at a lane step neither briefs nor delivers it; once the run
+        is released, its history lists the member again."""
+        items = [self.item(), self.item()]
+        build.queue(self.db, items, who="operator")
+        bundle = self.claim()
+        lead, child = (member["id"] for member in build.run(self.db, bundle["id"])["members"])
+        # At a lane step the run stays open and no longer holds a member it left blocked (sd:8960).
+        self.db.execute("UPDATE runner_run SET step = 'enqueued' WHERE id = ?", (bundle["id"],))
+        self.db.execute("UPDATE assignment SET status = 'blocked' WHERE id = ?", (child,))
+        self.cancel(child)
+        self.assertEqual([member["id"] for member in build.run(self.db, bundle["id"])["members"]], [lead])
+        self.db.execute("UPDATE runner_run SET released_at = ? WHERE id = ?", (self.NOW, bundle["id"]))
+        self.assertEqual([member["id"] for member in build.run(self.db, bundle["id"])["members"]], [lead, child])
+
     def test_a_blocked_member_cleared_on_its_own_stays_out_of_a_later_retry(self):
         """The class pass, blocked arm: a blocked member's row cleared by Cancel sits out the Retry of the blocked
         bundle and the Retry of that attempt's cancelled end."""

@@ -614,9 +614,7 @@ def cancel_assignment(connection: sqlite3.Connection, assignment: int, *, expect
         # row is no live build: its cancel parks nothing, as a fresh build
         # may own the item by now (sd:8960).
         live = current["scope"] == build.SCOPE and current["status"] == "queued"
-        members = [(row["id"], row["item"]) for row in connection.execute(
-            "SELECT id, item FROM assignment WHERE parent = ? AND status = 'queued' AND scope = ? ORDER BY id",
-            (assignment, build.SCOPE))] if live else []
+        members = build.queued_members(connection, assignment) if live else []
         for member, _ in members:
             update_assignment(connection, member, status="cancelled", ended=ended)
         audit = {"assignment": assignment, "old_status": current["status"], "status": "cancelled", "who": who, "at": ended}

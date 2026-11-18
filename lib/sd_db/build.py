@@ -97,8 +97,8 @@ ALONE = "cancelled on its own by "
 
 def _in_group(alias: str = "assignment") -> str:
     """An SQL test that the row under `alias` is still in its bundle: a lead, or a member not cancelled on its own
-    (`ALONE`). Every reader of a bundle by `parent` applies it: Retry, the run's members the supervisor briefs and
-    delivers, and the hold on an item (review rounds 2 and 3 of sd:9222)."""
+    (`ALONE`). Every reader of a bundle by `parent` that drives its next run applies it: Retry and settle, the hold
+    on an item, and the run count a claim moves, which `run` reads, so history keeps the member (sd:9222)."""
     return f"({alias}.parent IS NULL OR COALESCE({alias}.result, '') NOT LIKE '{ALONE}%')"
 #: The steps a run walks, each written before it starts.
 STEPS = ("claimed", "worktree", "building", "reviewing", "fixing", "enqueuing", "enqueued", "checking", "cleaning")
@@ -626,20 +626,27 @@ def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
                                              for row in queued]}
 
 
-def left(connection, lead: int, items) -> set[int]:
-    """Of `items`, each whose newest build assignment is a member an operator cancelled on its own (`ALONE`) out of a
-    bundle the item `lead` led. The lane neither closes nor demands one on `lead`'s entry, whatever its commits,
-    title or body say: an older run's `Closes:` trailer may still cite it (review round 4 of sd:9222). A later press
-    of the item makes a newer assignment, so it is delivered again."""
-    found = set()
-    for item in dict.fromkeys(items):
-        row = connection.execute(
-            "SELECT member.result, head.item AS lead FROM assignment AS member "
-            "LEFT JOIN assignment AS head ON head.id = member.parent "
-            "WHERE member.item = ? AND member.scope = ? ORDER BY member.id DESC LIMIT 1", (item, SCOPE)).fetchone()
-        if row is not None and row["lead"] == lead and (row["result"] or "").startswith(ALONE):
-            found.add(item)
-    return found
+def left(connection, branch: str, items) -> set[int]:
+    """Of `items`, each a member an operator cancelled on its own (`ALONE`) out of the build bundle whose run
+    published `branch` (`branch_run`). A lane entry on that branch neither closes nor demands one, whatever its
+    commits, title or body say: an older run's `Closes:` trailer may still cite it (review rounds 4 and 5 of sd:9222).
+    The branch names the bundle whichever member the entry claims first, and a fresh build of the member elsewhere
+    is another bundle and another branch; an entry on any other branch reads nothing here."""
+    run = branch_run(connection, branch) if branch else None
+    if run is None:
+        return set()
+    wanted = set(items)
+    return {row["item"] for row in connection.execute(
+        f"SELECT item FROM assignment WHERE parent = ? AND scope = ? AND NOT {_in_group()}",
+        (run["assignment"], SCOPE)) if row["item"] in wanted}
+
+
+def queued_members(connection, lead: int) -> list[tuple[int, int]]:
+    """`(assignment, item)` of each queued member of a build `lead`: what a cancel of the queued lead cancels and
+    parks with it, and what its confirm names (sd:9222)."""
+    return [(row["id"], row["item"]) for row in connection.execute(
+        "SELECT id, item FROM assignment WHERE parent = ? AND status = 'queued' AND scope = ? ORDER BY id",
+        (lead, SCOPE))]
 
 
 def _alone(connection, assignment: int) -> bool:
@@ -1221,8 +1228,9 @@ def _open_run(connection, lead: int, *, repo: str, owner: str, step: str, model:
     """The lead's next run and its lease, numbered after every run the lead has, and each member's count moved to it."""
     number = connection.execute("SELECT MAX(COALESCE((SELECT MAX(run) FROM runner_run WHERE assignment = ?), 0), "
                                 "run_count) + 1 FROM assignment WHERE id = ?", (lead, lead)).fetchone()[0]
-    connection.execute("UPDATE assignment SET run_count = ? WHERE (id = ? OR parent = ?) AND scope = ?",
-                       (number, lead, lead, SCOPE))
+    # A member cancelled on its own keeps the count of the last run it was in, which `run` reads (sd:9222).
+    connection.execute(f"UPDATE assignment SET run_count = ? WHERE (id = ? OR parent = ?) AND scope = ? "
+                       f"AND {_in_group()}", (number, lead, lead, SCOPE))
     ident = uuid.uuid4().hex
     connection.execute(
         "INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, start_step, "
@@ -1243,7 +1251,10 @@ def _members(connection, lead: int, status: str = "running") -> list[dict]:
 
 
 def run(connection, ident: str) -> dict:
-    """One run with its bundle: the lead first, then the members."""
+    """One run with its bundle: the lead first, then the members it ran with. A member cancelled on its own
+    (`ALONE`) is in no open run, so no supervisor briefs or delivers it, even one resumed at a lane step; a released
+    run up to the last one it was in, its `run_count`, keeps it, so history (the Builds panel, the health-failed
+    notes) lists what that run built (sd:9222)."""
     row = connection.execute("SELECT * FROM runner_run WHERE id = ?", (ident,)).fetchone()
     if row is None:
         raise BuildRefused(f"no build run {ident}")
@@ -1251,9 +1262,9 @@ def run(connection, ident: str) -> dict:
     result["budget_minutes"] = connection.execute("SELECT budget_minutes FROM assignment WHERE id = ?",
                                                   (row["assignment"],)).fetchone()[0]
     result["members"] = [dict(member) for member in connection.execute(
-        f"SELECT id, item, status FROM assignment WHERE (id = ? OR parent = ?) AND scope = ? AND {_in_group()} "
-        "ORDER BY id = ? DESC, id",
-        (row["assignment"], row["assignment"], SCOPE, row["assignment"]))]
+        f"SELECT id, item, status FROM assignment WHERE (id = ? OR parent = ?) AND scope = ? "
+        f"AND ({_in_group()} OR (run_count >= ? AND ? IS NOT NULL)) ORDER BY id = ? DESC, id",
+        (row["assignment"], row["assignment"], SCOPE, row["run"], row["released_at"], row["assignment"]))]
     return result
 
 
