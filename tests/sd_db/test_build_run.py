@@ -584,7 +584,8 @@ class Supervise(Case):
         head = enqueue[enqueue.index("--expected-head") + 1]
         body = Path(enqueue[enqueue.index("--body-file") + 1]).read_text(encoding="utf-8")
         self.db.execute("UPDATE item SET status = 'in_progress' WHERE id = ?", (self.items[1],))
-        cited = LANE.cited_closes(self.db, self.items[0], body, LANE.branch_commits(work, "main", head), ())
+        cited = LANE.cited_closes(self.db, self.items[0], body, LANE.branch_commits(work, "main", head), (),
+                                  branch=build.branch(self.bundle["assignment"]))
         self.assertEqual([row["item"] for row in cited], [])
 
     def test_the_lane_entry_is_found_by_any_delivered_member(self):
@@ -878,6 +879,42 @@ class Supervise(Case):
         self.assertEqual(self.calls("sd-ship"), [])
         self.assertEqual(self.remote_branches(), "main")
         self.assertTrue(Path(self.bundle["work_path"]).is_dir(), "the worktree is kept")
+
+    def test_a_member_cancelled_on_its_own_is_neither_briefed_nor_delivered(self):
+        """Review round 3 of sd:9222: run 1 commits `Closes:` for both items and ends cancelled; Retry queues both;
+        the operator cancels the child, then the lead; Retry of the lead runs again on the same branch. The brief
+        lists the lead alone, the enqueue delivers the lead alone, and run 1's trailer does not close the child."""
+        self.press(2)
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["cancel"])
+        self.assertEqual(self.supervisor().run()["outcome"], "cancelled")
+        build.queue_again(self.db, [self.items[0]], who="operator")
+        lead, child = (member["id"] for member in build.run(self.db, self.bundle["id"])["members"])
+        for assignment in (child, lead):
+            state = operations.assignment_state(self.db, assignment)
+            operations.cancel_assignment(self.db, assignment, expected_revision=state["revision"], who="operator")
+        self.assertEqual([entry["id"] for entry in build.queue_again(self.db, [self.items[0]], who="operator")],
+                         [lead])
+        again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                            root=self.root / "worktrees")
+        assert again is not None
+        self.bundle = again
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        prompt = self.calls("claude")[-1]["argv"]
+        prompt = prompt[prompt.index("-p") + 1]
+        self.assertIn(f"- sd:{self.items[0]}", prompt)
+        self.assertNotIn(f"- sd:{self.items[1]}", prompt, "the brief lists no member cancelled on its own")
+        enqueue = next(call["argv"] for call in self.calls("sd-ship") if "enqueue" in call["argv"])
+        self.assertEqual([enqueue[n + 1] for n, arg in enumerate(enqueue) if arg == "--item"], [str(self.items[0])])
+        work = Path(self.bundle["work_path"])
+        head = enqueue[enqueue.index("--expected-head") + 1]
+        body = Path(enqueue[enqueue.index("--body-file") + 1]).read_text(encoding="utf-8")
+        self.assertNotIn("Refs:", body, "data keeps the child open, not a body line the lane may not read")
+        self.db.execute("UPDATE item SET status = 'in_progress' WHERE id = ?", (self.items[1],))
+        cited = LANE.cited_closes(self.db, self.items[0], body, LANE.branch_commits(work, "main", head), (),
+                                  branch=build.branch(self.bundle["assignment"]))
+        self.assertEqual([row["item"] for row in cited], [], "run 1's trailer must not close the child")
 
     def test_cancel_kills_the_active_group(self):
         """Failure table, Cancel: a cancel during building kills the builder's group at the next beat."""

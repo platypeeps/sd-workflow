@@ -1957,9 +1957,12 @@ class Ship(SharedReview):
         self.check_held(named)
 
     def check_held(self, named: tuple[int, ...]) -> None:
-        """Refuse delivering the item or any of `named` while an open teammate run holds it (pack sd:7221)."""
+        """Refuse delivering the item or any of `named` while an open teammate run holds it (pack sd:7221), or once
+        the operator cancelled it on its own out of this branch's build bundle (pack sd:9222). The merge's call right
+        before it publishes is the one every delivery passes."""
         if not self.args.no_item:
             sd_ship_body.refuse_teammate_held(self.connection, (self.args.item, *named))
+            sd_ship_body.refuse_left(self.connection, self.branch, (self.args.item, *named))
 
     def title_left_open(self, title: str, closing: list[int], deliver: bool) -> list[str]:
         """One warning when a delivering title names items this merge leaves open (sd:3704)."""

@@ -88,6 +88,18 @@ STUCK_TICKS = 3
 RETRIES = 1
 # The note on an item a blocked run parked (pack sd:6132).
 PARKED = "Parked: build run {run} ended blocked; Retry on the Builds panel unparks it"
+# The note on an item a cancelled run parked: auto-pickup takes unparked items only (sd:9222).
+CANCEL_PARKED = "Parked: build run {run} was cancelled; Unpark to build it again"
+# The result on a bundle member's row an operator cancelled on its own: it left the bundle, so no Retry of the
+# bundle queues it again or clears its park (review round 2 of sd:9222).
+ALONE = "cancelled on its own by "
+
+
+def _in_group(alias: str = "assignment") -> str:
+    """An SQL test that the row under `alias` is still in its bundle: a lead, or a member not cancelled on its own
+    (`ALONE`). Every reader of a bundle by `parent` that drives its next run applies it: Retry and settle, the hold
+    on an item, and the run count a claim moves, which `run` reads, so history keeps the member (sd:9222)."""
+    return f"({alias}.parent IS NULL OR COALESCE({alias}.result, '') NOT LIKE '{ALONE}%')"
 #: The steps a run walks, each written before it starts.
 STEPS = ("claimed", "worktree", "building", "reviewing", "fixing", "enqueuing", "enqueued", "checking", "cleaning")
 #: A draft run's steps (`sd_db.draft`): it claims, then drafts.
@@ -533,6 +545,11 @@ def queue(connection, items: list[int], *, who: str, expected_revisions: dict | 
                     raise BuildRefused(f"item {item} changed; refresh the selection")
         for item in items:
             _item(connection, item)
+            # Pickup read `eligible` before this transaction: an item a cancel parked since is the operator's pause,
+            # so a stale pickup refuses it and the next tick reads again (review of sd:9222).
+            if who == PICKUP and connection.execute("SELECT parked_at FROM item WHERE id = ?",
+                                                    (item,)).fetchone()["parked_at"] is not None:
+                raise BuildRefused(f"item {item} was parked after auto-pickup read it")
         created = []
         for item in items:
             ident = create_assignment(connection, item=item, role="author", status="queued", lane="parallel",
@@ -540,6 +557,8 @@ def queue(connection, items: list[int], *, who: str, expected_revisions: dict | 
             connection.execute("UPDATE assignment SET scope = ?, queued_at = ?, started = NULL WHERE id = ?",
                                (SCOPE, clock(), ident))
             add_note(connection, item, "comment", f"Build assignment {ident} queued by {who}")
+            # A press of an item a cancel parked builds it unparked, as Retry does (sd:9222); pickup refused one above.
+            unpark(connection, item)
             created.append(ident)
         return [queue_state(connection, ident) for ident in created]
 
@@ -607,6 +626,35 @@ def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
                                              for row in queued]}
 
 
+def left(connection, branch: str, items) -> set[int]:
+    """Of `items`, each a member an operator cancelled on its own (`ALONE`) out of the build bundle whose run
+    published `branch` (`branch_run`). A lane entry on that branch neither closes nor demands one, whatever its
+    commits, title or body say: an older run's `Closes:` trailer may still cite it (review rounds 4 and 5 of sd:9222).
+    The branch names the bundle whichever member the entry claims first, and a fresh build of the member elsewhere
+    is another bundle and another branch; an entry on any other branch reads nothing here."""
+    run = branch_run(connection, branch) if branch else None
+    if run is None:
+        return set()
+    wanted = set(items)
+    return {row["item"] for row in connection.execute(
+        f"SELECT item FROM assignment WHERE parent = ? AND scope = ? AND NOT {_in_group()}",
+        (run["assignment"], SCOPE)) if row["item"] in wanted}
+
+
+def queued_members(connection, lead: int) -> list[tuple[int, int]]:
+    """`(assignment, item)` of each queued member of a build `lead`: what a cancel of the queued lead cancels and
+    parks with it, and what its confirm names (sd:9222)."""
+    return [(row["id"], row["item"]) for row in connection.execute(
+        "SELECT id, item FROM assignment WHERE parent = ? AND status = 'queued' AND scope = ? ORDER BY id",
+        (lead, SCOPE))]
+
+
+def _alone(connection, assignment: int) -> bool:
+    """Whether an operator cancelled this bundle member on its own (`ALONE`)."""
+    row = connection.execute("SELECT result FROM assignment WHERE id = ?", (assignment,)).fetchone()
+    return row is not None and (row["result"] or "").startswith(ALONE)
+
+
 def _done(items: dict, item: int) -> bool:
     return item in items and items[item]["status"] == "done"
 
@@ -626,6 +674,8 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
         for item in items:
             row = connection.execute("SELECT id, parent, status FROM assignment WHERE item = ? AND scope = ? "
                                      "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
+            # A member cancelled on its own left its bundle: building it is a fresh press, not the bundle's Retry.
+            alone = row is not None and row["parent"] is not None and _alone(connection, row["id"])
             lead = row and (row["parent"] or row["id"])
             state = queue_state(connection, lead) if lead else None
             # A bundle whose lane entry failed is the panel's Fix when its check passes (pack sd:8791); a state Fix
@@ -644,7 +694,7 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             # item's own assignment must be in it, or Retry would requeue the lead's items and not this one.
             # A skipped lead of a run still in the lane is no ended bundle: the run holds it no longer (sd:8960).
             if (state and state["status"] in AGAIN and state["run"] is not None
-                    and row["status"] == state["status"]
+                    and row["status"] == state["status"] and not alone
                     and not (state["run"]["outcome"] is None and state["run"]["step"] in LANE_STEPS)
                     and not _done(reads.items_by_ids(connection, [state["item"]]), state["item"])):
                 leads += [] if lead in leads else [lead]
@@ -994,7 +1044,7 @@ def _holding(item: str) -> str:
     """
     return (f"SELECT runner_run.id, runner_run.outcome FROM assignment holder JOIN runner_run "
             f"ON runner_run.assignment = COALESCE(holder.parent, holder.id) WHERE holder.item = {item} "
-            f"AND holder.scope = '{SCOPE}' AND runner_run.released_at IS NULL AND NOT ({IN_LANE} "
+            f"AND holder.scope = '{SCOPE}' AND {_in_group('holder')} AND runner_run.released_at IS NULL AND NOT ({IN_LANE} "
             f"AND holder.status IS NOT 'done')")
 
 
@@ -1178,8 +1228,9 @@ def _open_run(connection, lead: int, *, repo: str, owner: str, step: str, model:
     """The lead's next run and its lease, numbered after every run the lead has, and each member's count moved to it."""
     number = connection.execute("SELECT MAX(COALESCE((SELECT MAX(run) FROM runner_run WHERE assignment = ?), 0), "
                                 "run_count) + 1 FROM assignment WHERE id = ?", (lead, lead)).fetchone()[0]
-    connection.execute("UPDATE assignment SET run_count = ? WHERE (id = ? OR parent = ?) AND scope = ?",
-                       (number, lead, lead, SCOPE))
+    # A member cancelled on its own keeps the count of the last run it was in, which `run` reads (sd:9222).
+    connection.execute(f"UPDATE assignment SET run_count = ? WHERE (id = ? OR parent = ?) AND scope = ? "
+                       f"AND {_in_group()}", (number, lead, lead, SCOPE))
     ident = uuid.uuid4().hex
     connection.execute(
         "INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, start_step, "
@@ -1195,12 +1246,15 @@ def _open_run(connection, lead: int, *, repo: str, owner: str, step: str, model:
 
 def _members(connection, lead: int, status: str = "running") -> list[dict]:
     return [dict(row) for row in connection.execute(
-        "SELECT id, item FROM assignment WHERE (id = ? OR parent = ?) AND status = ? AND scope = ? "
+        f"SELECT id, item FROM assignment WHERE (id = ? OR parent = ?) AND status = ? AND scope = ? AND {_in_group()} "
         "ORDER BY id = ? DESC, id", (lead, lead, status, SCOPE, lead))]
 
 
 def run(connection, ident: str) -> dict:
-    """One run with its bundle: the lead first, then the members."""
+    """One run with its bundle: the lead first, then the members it ran with. A member cancelled on its own
+    (`ALONE`) is in no open run, so no supervisor briefs or delivers it, even one resumed at a lane step; a released
+    run up to the last one it was in, its `run_count`, keeps it, so history (the Builds panel, the health-failed
+    notes) lists what that run built (sd:9222)."""
     row = connection.execute("SELECT * FROM runner_run WHERE id = ?", (ident,)).fetchone()
     if row is None:
         raise BuildRefused(f"no build run {ident}")
@@ -1208,8 +1262,9 @@ def run(connection, ident: str) -> dict:
     result["budget_minutes"] = connection.execute("SELECT budget_minutes FROM assignment WHERE id = ?",
                                                   (row["assignment"],)).fetchone()[0]
     result["members"] = [dict(member) for member in connection.execute(
-        "SELECT id, item, status FROM assignment WHERE (id = ? OR parent = ?) AND scope = ? ORDER BY id = ? DESC, id",
-        (row["assignment"], row["assignment"], SCOPE, row["assignment"]))]
+        f"SELECT id, item, status FROM assignment WHERE (id = ? OR parent = ?) AND scope = ? "
+        f"AND ({_in_group()} OR (run_count >= ? AND ? IS NOT NULL)) ORDER BY id = ? DESC, id",
+        (row["assignment"], row["assignment"], SCOPE, row["run"], row["released_at"], row["assignment"]))]
     return result
 
 
@@ -1395,7 +1450,7 @@ def end(connection, ident: str, outcome: str, detail: str, *, question: str | No
     """The supervisor ends its own run, its groups confirmed gone; `_settle`'s answer, or None once the run moved.
 
     One compare-and-set from an open outcome, then `_settle` in the same
-    transaction: `cancelled` ends the bundle and moves its items to ready,
+    transaction: `cancelled` ends the bundle and moves its items to ready, parked,
     a `LOSSES` outcome retries once at the `RESUME` step, `blocked` blocks
     the bundle with `detail` (held until a reap reads the supervisor gone),
     and `done` releases it. `question` adds a question note on each item.
@@ -2020,7 +2075,8 @@ def _settle(connection, read: dict, *, block: str | None = None) -> dict | None:
     `RESUME` step, the old `review_round` and `session_id`, no outcome; the
     old row's outcome stays set, so a late old supervisor writes nothing. A
     second loss at the same step blocks the bundle. A run with
-    `cancel_requested` ends cancelled whatever its outcome: no fresh row.
+    `cancel_requested` ends cancelled whatever its outcome: no fresh row,
+    and each item back at ready parked, so auto-pickup leaves it (sd:9222).
 
     `read` is the row the reap decided on; nothing happens unless every
     `REAP_READS` column still holds its value (a cancel since then moves it).
@@ -2055,6 +2111,8 @@ def _settle(connection, read: dict, *, block: str | None = None) -> dict | None:
                 connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
                                    (stamp, row["detail"], member["id"]))
                 _move(connection, member["item"], "ready", f"build run {ident} {row['detail']}; worktree {row['work_path']} kept")
+                # Parked, so auto-pickup does not queue it again on its next tick (sd:9222).
+                park(connection, member["item"], ("ready",), stamp, CANCEL_PARKED.format(run=ident))
         elif row["outcome"] in LOSSES:
             marks = ", ".join("?" for _ in LOSSES)
             losses = connection.execute(f"SELECT COUNT(*) FROM runner_run WHERE assignment = ? AND step IS ? "
@@ -2121,12 +2179,25 @@ def _block(connection, members: list[dict], reason: str, stamp: str) -> None:
 
 def _park(connection, ident: str, lead: int, stamp: str) -> None:
     """Park each item of a blocked run, once the run and its lease are released, as the nightly prune parks an idle
-    one (pack sd:6132, sd:6008): an item the operator moved on, or one parked already, stays as it is."""
+    one (pack sd:6132, sd:6008)."""
     for member in _members(connection, lead, "blocked"):
-        row = connection.execute("SELECT status, parked_at FROM item WHERE id = ?", (member["item"],)).fetchone()
-        if row is not None and row["status"] == "blocked" and row["parked_at"] is None:
-            set_item_fields(connection, member["item"], parked_at=stamp)
-            add_note(connection, member["item"], "comment", PARKED.format(run=ident))
+        park(connection, member["item"], ("blocked",), stamp, PARKED.format(run=ident))
+
+
+def park(connection, item: int, statuses: tuple[str, ...], stamp: str, note: str | None = None) -> bool:
+    """Park `item` while its status is one of `statuses`, with `note` when given; whether it parked. An item the
+    operator moved on, one parked already, or one an assignment still owns (another build queued since, sd:8960)
+    stays as it is. Auto-pickup takes unparked items only (sd:9222)."""
+    row = connection.execute("SELECT status, parked_at FROM item WHERE id = ?", (item,)).fetchone()
+    if row is None or row["status"] not in statuses or row["parked_at"] is not None:
+        return False
+    if connection.execute(f"SELECT 1 FROM assignment WHERE item = ? AND status IN {OWNING} LIMIT 1",
+                          (item,)).fetchone():
+        return False
+    set_item_fields(connection, item, parked_at=stamp)
+    if note:
+        add_note(connection, item, "comment", note)
+    return True
 
 
 def unpark(connection, item: int) -> None:
