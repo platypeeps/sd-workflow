@@ -10,12 +10,14 @@ from __future__ import annotations
 import calendar
 import contextlib
 import fcntl
+import functools
 import importlib.util
 import io
 import json
 import math
 import os
 import pathlib
+import shutil
 import signal
 import sqlite3
 import subprocess
@@ -102,6 +104,20 @@ def end_group(group: int) -> None:
     """Kill a group a failed test left running; one already gone is fine."""
     with contextlib.suppress(OSError):
         os.killpg(group, signal.SIGKILL)
+
+
+#: A lane worker that holds a runner lock (`argv[1]`), marks `argv[2]` once held, and runs until killed (sd:9332).
+HOLDER = ("import fcntl, pathlib, sys, time; handle = open(sys.argv[1], 'a'); fcntl.flock(handle, fcntl.LOCK_EX); "
+          "pathlib.Path(sys.argv[2]).write_text('held')\nwhile True: time.sleep(60)")
+
+
+def wait_for(mark: pathlib.Path) -> None:
+    """Wait for a child's mark file, bounded: a loaded machine starts python slowly."""
+    for _ in range(600):
+        if mark.exists():
+            return
+        time.sleep(0.05)
+    raise AssertionError(f"{mark} never appeared")
 
 
 class Lane(unittest.TestCase):
@@ -5778,6 +5794,19 @@ class LaneParallel(unittest.TestCase):
         self.assertEqual(sd_lane.sd_lib.CORE_CONFIG["lane_parallel"]["pattern"], "[1-8]")
 
 
+def poll_nap(now: list[float], step: float = 60.0) -> Any:
+    """A `time.sleep` that moves a fake run clock by `step` on each lane poll only; any other sleep, a write
+    retry under load say, sleeps for real: it moved the clock past the budget once in five runs (round 2)."""
+    real = time.sleep
+
+    def nap(seconds: float) -> None:
+        if seconds == sd_lane.START_POLL_SECONDS:
+            now[0] += step
+        else:
+            real(seconds)
+    return nap
+
+
 class HostedParallel(Lane):
     """sd:5774. `lane run --hosted` ran its lanes one after another: a 4-entry lane held every other one 80 minutes."""
 
@@ -5931,19 +5960,207 @@ class HostedParallel(Lane):
             found["lane_gates"] = [{"state": "unknown", "reason": "cannot read slot.1.lane"}]
             self.assertIn("cannot read slot.1.lane", sd_lane.lane_room(self.environ))
 
-    def test_a_lane_waiting_past_the_budget_settles_and_claims_nothing(self) -> None:
-        """The budget ends while the second lane waits for room: it starts, claims nothing, and its entry stays."""
-        self.slots(free=False)
+    def hold_elsewhere(self, checkout: pathlib.Path) -> subprocess.Popen[bytes]:
+        """A process in a group of its own that holds `checkout`'s runner lock, as a handed-off lane child does."""
+        lock = sd_lane.queue_for(checkout, self.environ).lock_file
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        ready = self.tmp / f"held-{checkout.name}"
+        holder = subprocess.Popen([sys.executable, "-c", HOLDER, str(lock), str(ready)], start_new_session=True)
+        self.addCleanup(holder.wait)
+        self.addCleanup(end_group, holder.pid)  # first: cleanups run last-added first
+        wait_for(ready)
+        return holder
+
+    def test_a_lane_still_running_at_the_budget_is_handed_off_and_the_run_returns(self) -> None:
+        """sd:9332. The run waited past its budget for a lane, up to 80 minutes, and launchd started no next run."""
+        now = [0.0]
+        ended: list[pathlib.Path] = []
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            now[0] = 100.0  # the budget ends while the lane runs
+            lane = sd_lane.StartedLane(lambda: None, lambda: ended.append(checkout))
+            lane.hand_off = lambda: {"handed_off": "pid 1"}
+            return lane
+        rows: list[dict] = []
+        with mock.patch.object(sd_lane, "clock", lambda: now[0]):
+            worker = threading.Thread(target=lambda: rows.extend(
+                sd_lane.run_parallel([("a", self.repo)], start, 50.0, lambda: None)), daemon=True)
+            worker.start()
+            worker.join(20)
+        self.assertFalse(worker.is_alive(), "the run waited for a lane past its budget")
+        self.assertEqual((rows, ended), ([{"path": "a", "handed_off": "pid 1"}], []))
+
+    def test_a_lane_in_another_repo_starts_while_a_handed_off_child_holds_one(self) -> None:
+        """sd:9332. Run one hands off its pack child at the budget and returns; run two merges zeta meanwhile."""
+        lock = sd_lane.queue_for(self.repo, self.environ).lock_file
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        ready = self.tmp / "ready"
+        now = [0.0]
+        children: list[sd_lane.StartedLane] = []
+
+        def first(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            child = sd_lane.child_lane(checkout, budget, argv=[sys.executable, "-c", HOLDER, str(lock), str(ready)],
+                                       environ=clean_environment(**self.environ))
+            self.addCleanup(child.process.wait)
+            self.addCleanup(end_group, child.process.pid)
+            children.append(child)
+            wait_for(ready)
+            now[0] = sd_lane.RUN_BUDGET_SECONDS  # the budget ends while the child holds the lane
+            return child
+        with mock.patch.object(sd_lane, "clock", lambda: now[0]):
+            [row] = sd_lane.run_parallel([("pack", self.repo)], first, sd_lane.RUN_BUDGET_SECONDS, lambda: None)
+        self.assertIn("handed_off", row)
+        [child] = children
+        self.assertIsNone(child.process.poll(), "a handed-off child runs on")
+        self.assertEqual(os.getpgid(child.process.pid), child.process.pid, "a group of its own: the job's TERM "
+                                                                           "and KILL miss it")
+        self.assertTrue(pathlib.Path(row["answer_file"]).is_file(), row)
+        answer = sd_lane.run_hosted(self.environ, self.ship, start=self.threaded(self.ship))
+        self.assertEqual(self.statuses(), ["pending", "merged"], answer)
+        self.assertIsNone(child.process.poll(), "the next run left the held lane alone")
+
+    def test_the_2026_11_17_run_shape_starts_the_other_lanes_at_the_next_tick(self) -> None:
+        """sd:9332. A run began 22:45; one lane ran to 00:45 and the rest sat pending, since launchd starts
+        no tick while a run lives. The run now returns at its budget, and the next tick merges zeta, whose
+        turn came after the budget."""
+        now = [0.0]
+        done = threading.Event()
+        self.addCleanup(done.set)
+        starts: list[pathlib.Path] = []
+
+        def first(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            starts.append(checkout)
+            now[0] = 2 * sd_lane.RUN_BUDGET_SECONDS  # the long lane outlives the budget by far
+            lane = sd_lane.StartedLane(lambda: {"ran": []} if done.is_set() else None)
+            lane.hand_off = lambda: {"handed_off": "pid 1"}
+            return lane
+        rows: dict = {}
+        with mock.patch.object(sd_lane, "clock", lambda: now[0]):
+            worker = threading.Thread(target=lambda: rows.update(sd_lane.run_hosted(self.environ, self.ship,
+                                                                                    start=first)), daemon=True)
+            worker.start()
+            worker.join(20)
+        self.assertFalse(worker.is_alive(), "the run waited for a lane past its budget")
+        self.assertEqual(starts, [self.repo], rows)
+        answer = sd_lane.run_hosted(self.environ, self.ship, start=self.threaded(self.ship))
+        self.assertEqual(sd_lane.read_queue(sd_lane.queue_for(self.zeta, self.environ))[0]["status"], "merged",
+                         answer)
+
+    def test_a_lane_another_worker_holds_starts_no_second_worker(self) -> None:
+        """sd:9332. A held lane got a child that answered busy; it starts none now, and no rescan starts one."""
+        self.hold_elsewhere(self.repo)
+        starts: list[pathlib.Path] = []
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            starts.append(checkout)
+            return self.threaded(self.ship)(checkout, budget)
+        with mock.patch.object(sd_lane, "RESCAN_SECONDS", 0.01, create=True):
+            answer = sd_lane.run_hosted(self.environ, self.ship, start=start)
+        self.assertEqual((starts, self.statuses()), ([self.zeta], ["pending", "merged"]), answer)
+        pack = [row for row in answer["lanes"] if row["path"] == str(self.repo)]
+        self.assertEqual(len(pack), 1, answer)
+        self.assertIn("another runner holds", pack[0]["busy"])
+
+    def test_a_lane_held_elsewhere_counts_toward_the_gate_room_and_the_cap(self) -> None:
+        """sd:9332. With no lane of its own running, a run started its first lane at once, past full gate slots."""
+        self.hold_elsewhere(self.repo)
         now = [0.0]
 
-        def ship(argv: list[str], log: pathlib.Path) -> dict:
-            now[0] += sd_lane.RUN_BUDGET_SECONDS + 1
-            return self.ship(argv, log)
+        nap = poll_nap(now)  # each poll moves the run's clock, not the wall's
+        starts: list[pathlib.Path] = []
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            starts.append(checkout)
+            return sd_lane.StartedLane(lambda: {"ran": []})
+        for free, cap in ((False, 3), (True, 1)):
+            with self.subTest(free_slots=free, cap=cap):
+                self.slots(free=free)
+                starts.clear()
+                now[0] = 0.0
+                with mock.patch.object(sd_lane, "clock", lambda: now[0]), mock.patch.object(sd_lane.time, "sleep", nap), \
+                        mock.patch.object(sd_lane, "MAX_PARALLEL_LANES", cap):
+                    answer = sd_lane.run_hosted(self.environ, self.ship, start=start)
+                self.assertEqual(starts, [], answer)
+                zeta = next(row for row in answer["lanes"] if row["path"] == str(self.zeta))
+                self.assertIn("budget", zeta["stopped"])
+
+    def test_a_lane_waiting_past_the_budget_starts_no_worker(self) -> None:
+        """sd:9332. The budget ends while the second lane waits for room: it starts no worker, and the next run
+        takes its entry; a worker started there only settled its checkout."""
+        self.slots(free=False)
+        now = [0.0]
+        starts: list[tuple[pathlib.Path, float]] = []
+        polls = [0]
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            starts.append((checkout, budget))
+            if checkout == self.repo:
+                now[0] = sd_lane.RUN_BUDGET_SECONDS + 1  # the run spends its budget inside the first lane
+
+            def answer() -> dict | None:
+                polls[0] += 1
+                return {"ran": []} if len(starts) > 1 or polls[0] > 50 else None
+            return sd_lane.StartedLane(answer)
         with mock.patch.object(sd_lane, "clock", lambda: now[0]):
-            answer = sd_lane.run_hosted(self.environ, ship, start=self.threaded(ship))
-        self.assertEqual(self.statuses(), ["merged", "pending"])
+            answer = sd_lane.run_hosted(self.environ, self.ship, start=start)
+        self.assertEqual([checkout for checkout, _ in starts], [self.repo], answer)
+        self.assertEqual(self.statuses(), ["pending", "pending"])
         later = next(row for row in answer["lanes"] if row["path"] == str(self.zeta))
         self.assertIn("budget", later["stopped"])
+
+    def test_the_budget_exactly_reached_starts_no_lane_and_a_hair_before_starts_one(self) -> None:
+        """Clock edge: `clock() == deadline` is a spent budget, in the run and in the lane's own claim."""
+        starts: list[pathlib.Path] = []
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            starts.append(checkout)
+            return sd_lane.StartedLane(lambda: {"ran": []})
+        for deadline, started in ((100.0, []), (math.nextafter(100.0, math.inf), [self.repo])):
+            with self.subTest(deadline=deadline):
+                starts.clear()
+                with mock.patch.object(sd_lane, "clock", lambda: 100.0):
+                    rows = sd_lane.run_parallel([("pack", self.repo)], start, deadline, lambda: None)
+                self.assertEqual(starts, started, rows)
+        with mock.patch.object(sd_lane, "clock", lambda: 100.0):
+            answer = sd_lane.run_lane(self.repo, self.environ, self.ship, deadline=100.0)
+        self.assertEqual((answer["ran"], self.calls), ([], []))
+        self.assertIn("budget", answer["stopped"])
+
+    def test_a_lease_that_passed_while_a_handed_off_child_holds_the_lane_reclaims_nothing(self) -> None:
+        """Clock edge: a handed-off child's lease passes mid-run; the next run neither reclaims nor starts it."""
+        sd_lane.claim_entry(sd_lane.queue_for(self.repo, self.environ), "handed-off")
+        sd_lane.update(sd_lane.queue_for(self.repo, self.environ),
+                       lambda rows: rows[0].update(lease_until="2020-01-01T00:00:00Z"))
+        self.hold_elsewhere(self.repo)
+        starts: list[pathlib.Path] = []
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            starts.append(checkout)
+            return self.threaded(self.ship)(checkout, budget)
+        answer = sd_lane.run_hosted(self.environ, self.ship, start=start)
+        self.assertEqual((starts, self.statuses()), ([self.zeta], ["running", "merged"]), answer)
+        self.assertNotIn("reclaimed", json.dumps(answer))
+
+    def test_a_run_termed_inside_its_budget_terms_every_child_at_once(self) -> None:
+        """Clock edge: a TERM before the budget ends every lane child, each in a group of its own, TERM first."""
+        children: list[sd_lane.StartedLane] = []
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            child = sd_lane.child_lane(checkout, budget, argv=[sys.executable, "-c", "import time; time.sleep(60)"],
+                                       environ=self.environ)
+            self.addCleanup(child.process.wait)
+            self.addCleanup(end_group, child.process.pid)
+            children.append(child)
+
+            def answer() -> dict | None:
+                if len(children) == 2:
+                    raise KeyboardInterrupt  # as `term_ends_group` raises on the job's TERM
+                return None
+            return sd_lane.StartedLane(answer, child.end, child.process)
+        order = [("pack", self.repo), ("zeta", self.zeta)]
+        with self.assertRaises(KeyboardInterrupt):
+            sd_lane.run_parallel(order, start, sd_lane.clock() + 600, lambda: None)
+        self.assertEqual([child.process.returncode for child in children], [-signal.SIGTERM, -signal.SIGTERM])
 
     def test_a_busy_lane_is_skipped_and_the_other_runs(self) -> None:
         lock = sd_lane.queue_for(self.zeta, self.environ).lock_file
@@ -5992,20 +6209,427 @@ class HostedParallel(Lane):
         with self.assertRaises(KeyboardInterrupt):
             sd_lane.run_parallel(order, hanging, sd_lane.clock() + 60, lambda: None)
         self.assertEqual(stopped, [self.repo, self.zeta])
-        child = sd_lane.child_lane(self.repo, 60, argv=[sys.executable, "-c", "import time; time.sleep(60)"])
-        child.end()
-        self.assertIsNotNone(child.process.returncode)
+        child = sd_lane.child_lane(self.repo, 60, argv=[sys.executable, "-c", "import time; time.sleep(60)"],
+                                   environ=self.environ)
+        sd_lane.stop_lanes([child])  # its one TERM; `end` alone only waits, then KILLs (round 3)
+        self.assertEqual(child.process.returncode, -signal.SIGTERM)
 
     def test_a_worker_child_runs_the_lane_and_answers_its_row(self) -> None:
-        """The CLI's lane: `sd-ship -C <checkout> lane run --budget`, whose answer is the row; no answer is an error."""
-        with mock.patch.dict(os.environ, self.environ):
-            child = sd_lane.child_lane(self.zeta, 0)
-            child.process.wait(120)
-            row = child.answer()
-            self.assertEqual((row["ran"], "budget" in row["stopped"]), ([], True), row)
-            broken = sd_lane.child_lane(self.zeta, 0, argv=[sys.executable, "-c", "print('half')"])
-            broken.process.wait(60)
+        """The CLI's lane: `sd-ship -C <checkout> lane run --deadline`, whose answer is the row; no answer is an error."""
+        environ = clean_environment(**self.environ)
+        child = sd_lane.child_lane(self.zeta, 0, environ=environ)
+        child.process.wait(120)
+        row = child.answer()
+        self.assertEqual((row["ran"], "budget" in row["stopped"]), ([], True), row)
+        broken = sd_lane.child_lane(self.zeta, 0, argv=[sys.executable, "-c", "print('half')"], environ=environ)
+        broken.process.wait(60)
         self.assertIn("exited 0 without an answer: half", broken.answer()["error"])
+
+    def test_a_lane_child_runs_with_the_environ_its_answer_files_were_read_from(self) -> None:
+        """Round 1: the child ran under `os.environ` while its files came from `environ`; two lane roots."""
+        environ = clean_environment(**self.environ, SD_TEST_MARK="given")
+        child = sd_lane.child_lane(self.zeta, 0, environ=environ, argv=[
+            sys.executable, "-c", "import json, os; print(json.dumps({'mark': os.environ.get('SD_TEST_MARK')}))"])
+        child.process.wait(60)
+        self.assertEqual(child.answer(), {"mark": "given"})
+
+    def test_a_handed_off_child_past_its_runner_lock_still_holds_its_lane(self) -> None:
+        """Round 1: a child releases its runner lock for `post_merge`; the next tick started a second worker
+        there. Its answer file's lock lives as long as it does, and counts toward the cap."""
+        child = sd_lane.child_lane(self.repo, 60, argv=[sys.executable, "-c", "import time\nwhile True: time.sleep(60)"],
+                                   environ=clean_environment(**self.environ))
+        self.addCleanup(child.process.wait)
+        self.addCleanup(end_group, child.process.pid)
+        self.assertIn("handed_off", child.hand_off())
+        starts: list[pathlib.Path] = []
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            starts.append(checkout)
+            return sd_lane.StartedLane(lambda: {"ran": []})
+        now = [0.0]
+
+        nap = poll_nap(now)  # each poll moves the run's clock, not the wall's
+        with mock.patch.object(sd_lane, "clock", lambda: now[0]), mock.patch.object(sd_lane.time, "sleep", nap), \
+                mock.patch.object(sd_lane, "MAX_PARALLEL_LANES", 1):
+            answer = sd_lane.run_hosted(self.environ, self.ship, start=start)
+        self.assertEqual(starts, [], answer)
+        pack = next(row for row in answer["lanes"] if row["path"] == str(self.repo))
+        self.assertIn("a lane child still runs", pack["busy"])
+        child.process.kill()
+        child.process.wait(60)
+        self.assertIsNone(sd_lane.lane_held(self.environ, {}, self.repo), "a dead child's file holds nothing")
+
+    def test_a_child_that_ended_before_its_hand_off_gives_its_own_row(self) -> None:
+        """Round 1: a child that exited between the last look and the hand-off got a `handed_off` row."""
+        child = sd_lane.child_lane(self.zeta, 0, argv=[sys.executable, "-c", "print('{\"ran\": []}')"],
+                                   environ=clean_environment(**self.environ))
+        child.process.wait(60)
+        self.assertEqual(child.hand_off(), {"ran": []})
+        self.assertEqual(list((sd_lane.lane_dir(self.zeta, self.environ) / "hosted").iterdir()), [])
+
+    def test_a_lane_whose_lock_cannot_be_read_is_skipped_and_counts_toward_nothing(self) -> None:
+        """Round 1: an unreadable lock counted as a worker elsewhere; with full gate slots no lane started
+        for the whole budget. It is skipped with its reason, and the other lane starts at once."""
+        sd_lane.queue_for(self.repo, self.environ).lock_file.mkdir(parents=True)  # open() fails on it
+        self.slots(free=False)
+        starts: list[pathlib.Path] = []
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            starts.append(checkout)
+            return sd_lane.StartedLane(lambda: {"ran": []})
+        now = [0.0]
+
+        nap = poll_nap(now)  # each poll moves the run's clock, not the wall's
+        with mock.patch.object(sd_lane, "clock", lambda: now[0]), mock.patch.object(sd_lane.time, "sleep", nap):
+            answer = sd_lane.run_hosted(self.environ, self.ship, start=start)
+        self.assertEqual(starts, [self.zeta], answer)
+        pack = next(row for row in answer["lanes"] if row["path"] == str(self.repo))
+        self.assertIn("unknown", pack["skipped"])
+
+    def test_a_queue_read_that_spends_the_budget_starts_no_child(self) -> None:
+        """Round 1: the deadline was read before the slow `pending` read; the child then started with 0 s."""
+        now = [0.0]
+        starts: list[pathlib.Path] = []
+
+        def slow(seen: dict) -> dict:
+            now[0] = 100.0
+            return {}
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            starts.append(checkout)
+            return sd_lane.StartedLane(lambda: {"ran": []})
+        with mock.patch.object(sd_lane, "clock", lambda: now[0]):
+            [row] = sd_lane.run_parallel([("pack", self.repo)], start, 50.0, lambda: None, slow)
+        self.assertEqual(starts, [])
+        self.assertIn("budget", row["stopped"])
+
+    def test_a_worker_past_its_hard_deadline_is_ended_by_the_next_run(self) -> None:
+        """Round 3: a child's own TERM and KILL run on SIGALRM, which a blocking native call delays; one that
+        ignores SIGALRM and SIGTERM held its lane for good. The next run KILLs it, then starts the lane."""
+        ready = self.tmp / "deaf"
+        code = ("import pathlib, signal, sys, time\nsignal.signal(signal.SIGALRM, signal.SIG_IGN)\n"
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\npathlib.Path(sys.argv[1]).write_text('')\n"
+                "time.sleep(60)\n")
+        spent = -(sd_lane.TERM_AFTER_BUDGET_SECONDS + sd_lane.CHILD_STOP_SECONDS + 5)  # its hard deadline passed
+        child = sd_lane.child_lane(self.repo, spent, argv=[sys.executable, "-c", code, str(ready)],
+                                   environ=clean_environment(**self.environ))
+        self.addCleanup(child.process.wait)
+        self.addCleanup(end_group, child.process.pid)
+        wait_for(ready)
+        self.assertIn("handed_off", child.hand_off())
+        starts: list[pathlib.Path] = []
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            starts.append(checkout)
+            return sd_lane.StartedLane(lambda: {"ran": []})
+        with mock.patch.object(sd_lane, "CHILD_STOP_SECONDS", 0.5):
+            answer = sd_lane.run_hosted(self.environ, self.ship, start=start)
+        self.assertEqual(child.process.wait(10), -signal.SIGKILL)
+        self.assertIn(self.repo, starts, answer)
+        ended = next(row for row in answer["lanes"] if "ended" in row)
+        self.assertIn("TERMed, then KILLed", ended["ended"])
+
+    def test_a_worker_inside_its_hard_deadline_is_left_alone(self) -> None:
+        """Round 3, the other side of the edge: a live handed-off child inside its deadline is not ended."""
+        child = sd_lane.child_lane(self.repo, 60, argv=[sys.executable, "-c", "import time; time.sleep(60)"],
+                                   environ=clean_environment(**self.environ))
+        self.addCleanup(child.process.wait)
+        self.addCleanup(end_group, child.process.pid)
+        self.assertIn("handed_off", child.hand_off())
+        self.assertEqual(sd_lane.end_overdue(self.environ, self.repo), [])
+        self.assertIsNone(child.process.poll())
+
+    def test_a_waited_lane_is_ended_before_the_jobs_term_not_left_to_its_own_alarm(self) -> None:
+        """Round 3: a lane the run could not hand off was waited for until its own alarm, which may never fire;
+        the job's TERM then KILLed the run 10 s later and left the child running, unrecorded."""
+        now, ended, rows = [0.0], [], []
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            now[0] = 50.0 + sd_lane.TERM_AFTER_BUDGET_SECONDS - 2 * sd_lane.CHILD_STOP_SECONDS
+            return sd_lane.StartedLane(lambda: None, lambda: ended.append(checkout))
+        with mock.patch.object(sd_lane, "clock", lambda: now[0]):
+            worker = threading.Thread(target=lambda: rows.extend(
+                sd_lane.run_parallel([("a", self.repo)], start, 50.0, lambda: None)), daemon=True)
+            worker.start()
+            worker.join(20)
+        self.assertFalse(worker.is_alive(), "the run waited past its stop point")
+        self.assertEqual(ended, [self.repo])
+        self.assertIn("before the job's TERM", rows[0]["error"])
+
+    def test_a_failed_queue_read_is_read_again_at_the_next_probe(self) -> None:
+        """Round 3: `lane_held` kept a failed `queue_for` for the whole run, so a passing fault held the lane."""
+        real = sd_lane.queue_for
+        queues: dict = {}
+        with mock.patch.object(sd_lane, "queue_for", side_effect=[sd_lane.LaneError("blip"), real(self.repo,
+                                                                                                  self.environ)]):
+            first = sd_lane.lane_held(self.environ, queues, self.repo)
+            second = sd_lane.lane_held(self.environ, queues, self.repo)
+        self.assertEqual(first, (False, "its lane is unknown, so no worker starts: blip"))
+        self.assertIsNone(second)
+
+    def test_only_child_lane_claims_a_hand_off(self) -> None:
+        """Round 3: any started lane defaulted to a `handed_off` row."""
+        self.assertIsNone(sd_lane.StartedLane(lambda: None).hand_off())
+
+    def test_a_lane_whose_turn_comes_after_the_budget_still_settles_below_the_cap(self) -> None:
+        """Round 2: past the budget the lane got no worker, so its dead holder was never reclaimed (sd:3282).
+        It settles in the run while the cap has room, and not past the cap."""
+        queue = sd_lane.queue_for(self.zeta, self.environ)
+        runner = subprocess.Popen([sys.executable, "-c", ""], env=clean_environment())
+        runner.wait()
+        now = [0.0]
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            now[0] = sd_lane.RUN_BUDGET_SECONDS + 1  # the first lane spends the budget
+            return sd_lane.StartedLane(lambda: None, hand_off=lambda: {"handed_off": "pid 1"})
+        self.slots(free=False)
+        for cap, status in ((1, "running"), (3, "pending")):
+            with self.subTest(cap=cap):
+                now[0] = 0.0
+                sd_lane.update(queue, lambda rows: rows[0].update(
+                    status="running", step="prepare",
+                    holder={"host": sd_lane.this_host(), "pid": runner.pid, "token": "t"}))
+                with mock.patch.object(sd_lane, "clock", lambda: now[0]), \
+                        mock.patch.object(sd_lane, "MAX_PARALLEL_LANES", cap):
+                    answer = sd_lane.run_hosted(self.environ, self.ship, start=start)
+                zeta = next(row for row in answer["lanes"] if row["path"] == str(self.zeta))
+                self.assertEqual(sd_lane.read_queue(queue)[0]["status"], status, answer)
+                self.assertIn("budget", zeta["stopped"])
+                self.assertEqual("reclaimed" in zeta.get("settled", {}), status == "pending", answer)
+
+    def test_a_lane_with_no_answer_file_is_waited_for_not_handed_off(self) -> None:
+        """Round 2: a child whose answer file could not be made was handed off, and once it freed its runner
+        lock for `post_merge` nothing marked its lane as held. The run waits for it."""
+        lanes = self.tmp / "not-a-folder"
+        lanes.write_text("", encoding="utf-8")
+        child = sd_lane.child_lane(self.zeta, 60, argv=[sys.executable, "-c", "import time; time.sleep(60)"],
+                                   environ=clean_environment(**{**self.environ, sd_lane.ROOT_VARIABLE: str(lanes)}))
+        self.addCleanup(child.answer)  # closes its unnamed files once it ended
+        self.addCleanup(child.process.wait)
+        self.addCleanup(end_group, child.process.pid)
+        self.assertIsNone(child.hand_off())
+        now, polls = [0.0], [0]
+
+        def answer() -> dict | None:
+            polls[0] += 1
+            return {"ran": ["waited"]} if polls[0] > 3 else None
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            now[0] = 100.0
+            return sd_lane.StartedLane(answer, hand_off=lambda: None)
+        with mock.patch.object(sd_lane, "clock", lambda: now[0]):
+            [row] = sd_lane.run_parallel([("zeta", self.zeta)], start, 50.0, lambda: None)
+        self.assertEqual(row, {"path": "zeta", "ran": ["waited"]})
+
+    def test_an_answer_file_that_cannot_be_read_is_named_as_such(self) -> None:
+        """Round 2: an unreadable answer file was reported as an unknown runner lock."""
+        folder = sd_lane.queue_for(self.zeta, self.environ).lane / "hosted"
+        folder.mkdir(parents=True)
+        shut = folder / "shut.json"
+        shut.write_text("{}", encoding="utf-8")
+        shut.chmod(0)
+        self.addCleanup(shut.chmod, 0o600)
+        held = sd_lane.lane_held(self.environ, {}, self.zeta)
+        self.assertIsNotNone(held)
+        self.assertFalse(held[0])
+        self.assertIn("answer files", held[1])
+        self.assertNotIn("runner lock", held[1])
+
+
+    def test_a_read_answer_leaves_no_file_and_a_week_old_one_goes(self) -> None:
+        """sd:9332. A child's answer files sit in its lane folder's `hosted/`: deleted once read, kept a week when
+        handed off; a folder that cannot be made gives unnamed files."""
+        folder = sd_lane.lane_dir(self.zeta, self.environ) / "hosted"
+        folder.mkdir(parents=True)
+        old, kept = folder / "old.json", folder / "kept.json"
+        for path in (old, kept):
+            path.write_text("{}", encoding="utf-8")
+        week = time.time() - sd_lane.HANDED_OFF_KEEP_SECONDS - 60
+        os.utime(old, (week, week))
+        child = sd_lane.child_lane(self.zeta, 0, argv=[sys.executable, "-c", "print('{\"ran\": []}')"],
+                                   environ=self.environ)
+        child.process.wait(60)
+        self.assertEqual(child.answer(), {"ran": []})
+        self.assertEqual(sorted(path.name for path in folder.iterdir()), ["kept.json"])
+        lanes = self.tmp / "not-a-folder"
+        lanes.write_text("", encoding="utf-8")
+        out, err, stem = sd_lane.answer_files(self.zeta, {**self.environ, sd_lane.ROOT_VARIABLE: str(lanes)})
+        with out, err:
+            self.assertIsNone(stem)
+
+
+#: A lane child that arms its own TERM (`argv[2]` s) and KILL (`argv[3]` s later), notes when, and sleeps (sd:9332).
+ARMED = """import pathlib, signal, sys, time
+sys.path.insert(0, {bin!r})
+import sd_lane
+if sys.argv[1] == "ignore":
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+pathlib.Path(sys.argv[4]).write_text(str(time.monotonic()))
+sd_lane.arm_term(float(sys.argv[2]), grace=float(sys.argv[3]))
+time.sleep(60)
+"""
+
+
+class OwnTerm(unittest.TestCase):
+    """sd:9332. A handed-off lane child is out of the job's group, so it TERMs itself at the run's TERM point."""
+
+    def armed(self, mode: str, delay: float, grace: float) -> tuple[int, float]:
+        """The child's exit code and how long it lived after it armed."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        mark = pathlib.Path(tmp.name) / "armed"
+        child = subprocess.Popen([sys.executable, "-c", ARMED.format(bin=str(REPO_ROOT / "bin")), mode, str(delay),
+                                  str(grace), str(mark)], start_new_session=True, env=clean_environment())
+        self.addCleanup(end_group, child.pid)
+        code = child.wait(60)
+        return code, time.monotonic() - float(mark.read_text())
+
+    def test_a_lane_child_terms_itself_at_its_term_point(self) -> None:
+        code, lived = self.armed("default", 0.5, 30)
+        self.assertEqual(code, -signal.SIGTERM)
+        self.assertGreaterEqual(lived, 0.5)
+        self.assertLess(lived, 20, "the TERM came at its point, not at the KILL")
+
+    def test_a_child_that_outlives_its_term_is_killed_after_the_grace(self) -> None:
+        code, lived = self.armed("ignore", 0.3, 0.5)
+        self.assertEqual(code, -signal.SIGKILL)
+        self.assertGreaterEqual(lived, 0.8)
+
+    def test_a_childs_term_point_is_the_runs_term_point(self) -> None:
+        """Property over start times: a child started `t` into the run, with what `child_lane` passes, TERMs at
+        the job's limit or up to a second before it, never after."""
+        budget = sd_lane.RUN_BUDGET_SECONDS
+        tail = sd_lane.TERM_AFTER_BUDGET_SECONDS
+        for started in (0.0, 5e-324, 0.5, 1.0, budget / 2, budget - 1.0, math.nextafter(budget, 0.0), budget,
+                        budget + 1.0, budget + tail - 1.0):  # round 2: a child that starts late keeps the point
+            with self.subTest(started=started):
+                term = started + sd_lane.term_delay(budget - started)  # `--deadline` less the child's clock
+                self.assertAlmostEqual(term, sd_lane.JOB_SECONDS, places=6)
+        for started in (float(sd_lane.JOB_SECONDS), sd_lane.JOB_SECONDS + 60.0):
+            with self.subTest(started=started):
+                self.assertEqual(sd_lane.term_delay(budget - started), 0.0, "past the TERM point: TERM now")
+
+    def test_term_delay_over_extreme_budgets(self) -> None:
+        """Property: an unknown budget is 0, a negative one moves the TERM earlier down to 0; one past an interval
+        timer has no TERM point."""
+        tail = sd_lane.TERM_AFTER_BUDGET_SECONDS
+        cases = ((0.0, tail), (-0.0, tail), (-1.0, tail - 1), (float(-tail), 0.0), (-tail - 1e-9, 0.0),
+                 (-1e308, 0.0), (-math.inf, 0.0), (math.nan, tail), (5e-324, tail),
+                 (1.0, tail + 1), (float(sd_lane.RUN_BUDGET_SECONDS), sd_lane.JOB_SECONDS),
+                 (float(sd_lane.TERM_MAX_SECONDS - tail), float(sd_lane.TERM_MAX_SECONDS)),
+                 (float(sd_lane.TERM_MAX_SECONDS), None), (1e308, None), (math.inf, None))
+        for budget, delay in cases:
+            with self.subTest(budget=budget):
+                self.assertEqual(sd_lane.term_delay(budget), delay)
+        self.assertEqual(tail, sd_lane.ENTRY_SECONDS + sd_lane.POST_MERGE_SECONDS + 5 * 60)
+
+    def test_lane_run_with_a_budget_arms_its_term_and_without_one_arms_none(self) -> None:
+        import argparse  # noqa: PLC0415
+        parser = argparse.ArgumentParser()
+        sd_lane.add_lane_verbs(parser.add_subparsers(dest="command"))
+        for argv, armed in ((["run", "--budget", "7"], [7 + sd_lane.TERM_AFTER_BUDGET_SECONDS]), (["run"], [])):
+            with self.subTest(argv=argv):
+                calls: list[float | None] = []
+                with contextlib.chdir(REPO_ROOT), mock.patch.object(sd_lane, "arm_term", calls.append), \
+                        mock.patch.object(sd_lane, "run_lane", lambda *args, **kwargs: {"ran": []}), \
+                        contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(sd_lane.lane_main(parser.parse_args(["lane", *argv])), 0)
+                self.assertEqual(calls, armed)
+
+
+    def test_a_stopped_lane_child_gets_one_term_then_a_kill(self) -> None:
+        """Round 2: `stop_lanes` TERMed each child, then `end_child` TERMed it again while it unwound."""
+        class Child:
+            pid, returncode = 0, None
+
+            def __init__(self) -> None:
+                self.sent: list[str] = []
+
+            def poll(self) -> int | None:
+                return self.returncode
+
+            def terminate(self) -> None:
+                self.sent.append("TERM")
+
+            def kill(self) -> None:
+                self.sent.append("KILL")
+                self.returncode = -signal.SIGKILL
+
+            def wait(self, timeout: float | None = None) -> int:
+                if self.returncode is None:
+                    raise subprocess.TimeoutExpired("child", timeout or 0)
+                return self.returncode
+        children = [Child(), Child()]
+        sd_lane.stop_lanes([sd_lane.StartedLane(lambda: None, functools.partial(
+            sd_lane.end_child, child, io.StringIO(), io.StringIO()), child) for child in children])
+        self.assertEqual([child.sent for child in children], [["TERM", "KILL"], ["TERM", "KILL"]])
+
+    def test_a_second_term_while_the_first_unwinds_cuts_no_cleanup_short(self) -> None:
+        """Round 2 class pass: a run waiting for a child it could not hand off is TERMed at the job's limit as
+        the child's own TERM fires; the child's `term_ends_group` ignores the second while it cleans up."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ready, done = pathlib.Path(tmp.name) / "ready", pathlib.Path(tmp.name) / "done"
+        code = (f"import pathlib, sys, time\nsys.path.insert(0, {str(REPO_ROOT / 'bin')!r})\nimport sd_lib\n"
+                f"with sd_lib.term_ends_group():\n    try:\n        pathlib.Path({str(ready)!r}).write_text('')\n"
+                f"        time.sleep(60)\n    finally:\n        time.sleep(0.5)\n"
+                f"        pathlib.Path({str(done)!r}).write_text('')\n")
+        child = subprocess.Popen([sys.executable, "-c", code], start_new_session=True, env=clean_environment())
+        self.addCleanup(end_group, child.pid)
+        for _ in range(1000):  # bounded: the child has installed its handler
+            if ready.exists():
+                break
+            time.sleep(0.01)
+        child.terminate()
+        time.sleep(0.1)
+        child.terminate()
+        self.assertEqual(child.wait(60), -signal.SIGTERM)
+        self.assertTrue(done.exists(), "the second TERM cut the cleanup short")
+
+    def test_lane_run_refuses_a_budget_or_deadline_that_is_not_finite(self) -> None:
+        """Round 3: NaN or inf reached `run_lane`, which then claimed with no deadline it could keep."""
+        import argparse  # noqa: PLC0415
+        parser = argparse.ArgumentParser()
+        sd_lane.add_lane_verbs(parser.add_subparsers(dest="command"))
+        for flag in ("--budget", "--deadline"):
+            for value in ("nan", "inf", "-inf"):
+                with self.subTest(flag=flag, value=value):
+                    ran = mock.Mock(return_value={"ran": []})
+                    out = io.StringIO()
+                    with contextlib.chdir(REPO_ROOT), mock.patch.object(sd_lane, "arm_term", ran), \
+                            mock.patch.object(sd_lane, "run_lane", ran), contextlib.redirect_stdout(out):
+                        code = sd_lane.lane_main(parser.parse_args(["lane", "run", f"{flag}={value}"]))
+                    self.assertEqual((code, ran.call_count), (3, 0))
+                    self.assertIn("finite", out.getvalue())
+
+    def test_a_slow_child_start_shifts_neither_its_last_claim_nor_its_term_point(self) -> None:
+        """Round 2: the child counted its budget from its own start; 30 s of start-up moved both 30 s later."""
+        import argparse  # noqa: PLC0415
+        started: list[list[str]] = []
+        real = subprocess.Popen
+
+        def popen(argv: list[str], **kwargs: Any) -> Any:
+            if "lane" not in argv:  # the git the lane folder reads
+                return real(argv, **kwargs)
+            started.append(argv)
+            return mock.Mock(pid=0)
+        environ = clean_environment(SD_LANE_ROOT=tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, environ["SD_LANE_ROOT"], True)
+        with mock.patch.object(sd_lane.time, "time", lambda: 1000.0), \
+                mock.patch.object(sd_lane.subprocess, "Popen", popen):
+            sd_lane.child_lane(REPO_ROOT, 60.0, environ=environ)
+        argv = started[0][started[0].index("lane") + 1:]
+        parser = argparse.ArgumentParser()
+        sd_lane.add_lane_verbs(parser.add_subparsers(dest="command"))
+        armed: list[float | None] = []
+        deadlines: list[float] = []
+        with contextlib.chdir(REPO_ROOT), mock.patch.object(sd_lane, "arm_term", armed.append), \
+                mock.patch.object(sd_lane.time, "time", lambda: 1030.0), \
+                mock.patch.object(sd_lane, "clock", lambda: 5.0), \
+                mock.patch.object(sd_lane, "run_lane", lambda *args, **kwargs: deadlines.append(kwargs["deadline"])
+                                  or {"ran": []}), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sd_lane.lane_main(parser.parse_args(["lane", *argv])), 0)
+        self.assertEqual((armed, deadlines), ([30.0 + sd_lane.TERM_AFTER_BUDGET_SECONDS], [35.0]), argv)
 
 
 class Bounds(unittest.TestCase):
@@ -6062,6 +6686,22 @@ class Bounds(unittest.TestCase):
         self.assertEqual(cancelled, [True])
         self.assertLess(time.monotonic() - started, sd_lane.CANCEL_SECONDS)
         self.assertNotEqual(answers[0][0], 0)
+
+    def test_a_gate_a_termed_run_signalled_gets_one_term_then_a_kill(self) -> None:
+        """sd:9332 round 2: `term_gate` TERMed the gate's group, then `cancel_gate` TERMed it again."""
+        stop, sent = threading.Event(), []
+
+        def record(group: int, number: int) -> None:
+            sent.append(number)
+            if number == signal.SIGKILL:
+                stop.set()
+        gate = sd_lane.SpeculativeGate(lambda: stop.wait(10), "twice")
+        gate.start()
+        gate.started(4242)
+        with mock.patch.object(sd_lane, "end_group", record), mock.patch.object(sd_lane, "CANCEL_SECONDS", 0.05):
+            gate.signal_gate(signal.SIGTERM)  # as `run_lane`'s `term_gate` does as the TERM lands
+            self.assertTrue(gate.cancel_gate())
+        self.assertEqual(sent, [signal.SIGTERM, signal.SIGKILL])
 
     def test_a_gate_cancelled_before_it_starts_counts_as_ended(self) -> None:
         """sd:5776: a SIGTERM can land between the runner holding the gate and its start; `join` would raise."""
