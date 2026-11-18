@@ -974,11 +974,17 @@ class LineBudgetTests(unittest.TestCase):
         #
         # 4937 -> 4619 is sd:8972: the Jev tier reading and its hint-blind
         # twin are deleted, `bin/sd_jev.py` keeps the shadow stages' helpers.
+        #
+        # 4619 -> 4741 is pack sd:9270, under the operator's 4900 ceiling:
+        # `bin/sd-review` +122 for the threat-model paragraph, this branch's
+        # rebutted findings in the prompt (read-only, capped, anchored at the
+        # head), and the `evidence` field `dispose` needs before a finding
+        # blocks. Measured, not carried: `sd-review` is 2771 on this tree.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4619,
+            4741,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

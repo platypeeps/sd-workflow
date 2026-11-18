@@ -26,7 +26,8 @@ from tests.test_sd_review import (
 
 def finding(severity: str = "high") -> str:
     return json.dumps({"findings": [{"path": "src.py", "line": 1,
-                                    "severity": severity, "summary": "defect", "family": "correctness"}]})
+                                    "severity": severity, "summary": "defect", "family": "correctness",
+                                    "evidence": "python3 src.py: defect"}]})
 
 
 class ReviewRunFixture(ReviewFixture):
@@ -175,7 +176,7 @@ class FallbackTests(ReviewRunFixture):
 
     def test_invalid_review_evidence_survives_a_clean_fallback(self) -> None:
         root = self.prepare()
-        for payload in (finding("HIGH"), '{"findings":[{"severity":"high","summary":"blocker with missing location"}]}', json.dumps({"findings":
+        for payload in (finding("HIGH"), '{"findings":[{"severity":"high","summary":"blocker with missing location","evidence":"ran: x"}]}', json.dumps({"findings":
                 json.loads(finding("low"))["findings"] * 50 + json.loads(finding())["findings"]})):
             with self.subTest(payload=payload[:100]):
                 result = self.run_review(root, FakeRunner({"codex": sd_review.Completed(0, payload, "")}))
