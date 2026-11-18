@@ -18,9 +18,10 @@
 .decisions .asked-at { display: block; margin-top: var(--space-2xs); white-space: normal; font: 400 var(--text-xs)/1.3 var(--font-data); color: var(--color-muted); }
 .decisions .act { width: 1%; text-align: left; padding-right: 0; }
 .decisions .choices { display: flex; flex-direction: column; align-items: stretch; gap: var(--space-2xs); width: 18rem; max-width: 100%; }
-/* sd:9319: an option is the fact being chosen, not a label, so it wraps as a ledger title may; the ellipsis cut it. */
-.decisions .choices .btn { justify-content: flex-start; min-width: 0; white-space: normal; text-align: left; padding-block: var(--space-2xs); line-height: 1.3; }
-.decisions .choices .btn span { min-width: 0; overflow-wrap: anywhere; }
+/* sd:9319: an option is the fact being chosen, not a label, so its text wraps as a ledger title may; the ellipsis cut it.
+ * The .btn stays one nowrap flex line (sd:5729): only the span inside it wraps. */
+.decisions .choices .btn { justify-content: flex-start; min-width: 0; text-align: left; padding-block: var(--space-2xs); line-height: 1.3; }
+.decisions .choices .btn span { min-width: 0; white-space: normal; overflow-wrap: anywhere; }
 .decisions tr[aria-busy="true"] .btn { cursor: progress; }
 .decisions .ruled, .decisions .refused { margin: 0; white-space: normal; font: 400 var(--text-xs)/1.35 var(--font-data); color: var(--color-ink-2); }
 .decisions .refused { margin-top: var(--space-2xs); color: var(--color-warning); }

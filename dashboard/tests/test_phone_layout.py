@@ -71,8 +71,10 @@ class TheWords(unittest.TestCase):
     def test_a_long_option_wraps_in_its_answer_button(self):
         """sd:9319: Decide cut each option at the button's edge; the option is the fact, so it wraps."""
         choice = [body for sels, body in rules(DECISIONS_CSS) if any(".choices .btn" in sel for sel in sels)]
-        self.assertTrue(any("white-space: normal" in body for body in choice), "the answer button never wraps")
-        self.assertTrue(any("overflow-wrap: anywhere" in body for body in choice), "a long word runs past the button")
+        # The .btn itself stays one nowrap line (sd:5729, test_v2_shell_shared); its span wraps.
+        label = [body for sels, body in rules(DECISIONS_CSS) if ".decisions .choices .btn span" in sels]
+        self.assertTrue(any("white-space: normal" in body for body in label), "the answer button never wraps")
+        self.assertTrue(any("overflow-wrap: anywhere" in body for body in label), "a long word runs past the button")
         self.assertFalse([body for body in choice if "nowrap" in body or "ellipsis" in body], "an option is still cut")
 
 
