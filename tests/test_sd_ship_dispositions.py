@@ -41,7 +41,6 @@ class DispositionTests(unittest.TestCase):
                         "path": "src.py",
                         "line": 1,
                         "severity": "high",
-                        "evidence": "python3 src.py: wrong",
                         "family": "correctness",
                         "summary": "fixture disputed finding",
                     }
