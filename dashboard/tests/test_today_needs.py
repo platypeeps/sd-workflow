@@ -22,7 +22,7 @@ SERVER_LANES = now_screen._lanes
 
 
 def lane(repo="system", rows=(), revision="r1"):
-    return {"repo": repo, "path": f"/repos/{repo}", "revision": revision, "runner_merge": "auto", "rows": list(rows)}
+    return {"repo": repo, "path": f"/repos/{repo}", "key": f"~/repos/{repo}", "revision": revision, "runner_merge": "auto", "rows": list(rows)}
 
 
 def blocked(item, *, head="a" * 40, reason="sd-check: a suite failed", step="prepare"):

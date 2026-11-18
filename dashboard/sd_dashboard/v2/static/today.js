@@ -258,7 +258,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
              failed: r.kind === 'job' && !!r.retry, retry: r.retry, job: job && job[1], service: r.service,
              exit: r.exit, revision: r.revision, capability: r.capability, repo: pr ? pr[1] : r.repo, number: pr && +pr[2], seen: r.seen,
              item: r.item, itemKind: r.item_kind, state: r.state, url: r.url, fieldsRead: r.fields_read, until: r.until, login: r.login, claim: r.claim,
-             repoPath: r.repo_path, laneRevision: r.lane_revision, head: r.expected_head, runnerMerge: r.runner_merge, unchanged: r.unchanged, failure: r.failure,
+             repoPath: r.repo_path, repoKey: r.repo_key, laneRevision: r.lane_revision, head: r.expected_head, runnerMerge: r.runner_merge, unchanged: r.unchanged, failure: r.failure,
              members: r.members && r.members.map(m => ({ id: m.id, seen: m.seen, until: m.until, item: m.item })), group: r.id,
              band: r.band, detail: r.detail, source: r.source };
   }
@@ -358,21 +358,10 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   const qShow = new Set();
   let qOpen = null, qSaid = null; // the one open repo; the last write's result
   let qTile = null; // pack sd:8138: the open repo's pressed box, { repo, box }; it holds only while that repo is open
-  // The repo's folder name keys its row; sd:9258: when two checkouts the reads name share that name, each keys by its
-  // path, ~/ for a home folder, as the database keeps it. CLASH holds those names, from the checkouts the lanes and the
-  // tasks read name; qGroups refreshes it. Suggested caps each checkout by its path, which no
-  // later read changes, so a cap made before Queue reads holds once the groups split (sd:9258 lane review).
-  // ponytail: a home is /Users/<name> or /home/<name>; another home root keys apart from its ~/ form.
-  const homed = p => String(p).replace(/\/+$/, '').replace(/^\/(?:Users|home)\/[^/]+\//, '~/');
-  let CLASH = new Set();
-  const repoKey = p => { if (!p) return ''; const full = homed(p), name = full.split('/').pop(); return CLASH.has(name) ? full : name; };
-  function clashes() {
-    const paths = new Set([...(QV.lanes ? QV.lanes.lanes.map(l => l.path).concat(QV.lanes.problems.map(x => x.repo)) : []),
-      ...(QV.tasks ? QV.tasks.rows.map(t => t.repo_path) : [])]
-      .filter(Boolean).map(homed)), seen = new Set();
-    CLASH = new Set();
-    paths.forEach(p => { const name = p.split('/').pop(); if (seen.has(name)) CLASH.add(name); seen.add(name); });
-  }
+  // sd:9258: a repo's row is keyed by the repo row's path, the database key every read names (a lane's `key`, an
+  // item's repo); a path is shortened only for display: its folder name, or the key where two rows share that name.
+  const repoKey = p => p ? String(p) : '';
+  const folder = k => k.replace(/\/+$/, '').split('/').pop();
   const HM = new Intl.DateTimeFormat(undefined, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
   const at = s => s ? HM.format(new Date(s)) : 'not recorded';
   const dur = s => s == null ? 'not recorded' : s < 3600 ? `${Math.floor(s / 60)}m ${s % 60}s` : `${Math.floor(s / 3600)}h ${Math.floor(s % 3600 / 60)}m`;
@@ -516,7 +505,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   function suggested(doc) {
     const live = new Set(((doc.active || {}).rows || []).map(r => r.item)), counted = {}, found = new Map();
     ((doc.queues || {}).suggested || []).filter(r => r.repo && !live.has(r.id)).forEach(r => {
-      const k = homed(r.repo); counted[k] = (counted[k] || 0) + 1; if (counted[k] <= NEXT) found.set(String(r.id), r); });
+      const k = repoKey(r.repo); counted[k] = (counted[k] || 0) + 1; if (counted[k] <= NEXT) found.set(String(r.id), r); });
     return found;
   }
   // All items (#40961): an open task of a repo, as Tasks reads it, that is no suggested row while Suggested shows (pack
@@ -543,7 +532,6 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   const freshRows = () => [...SROW].filter(([k, t]) => !isItem(k) || (listedTask(k) && listedTask(k).revision !== t.revision)).forEach(([k]) => SROW.delete(k));
   // Each repo's children, from the four reads, each with the rows the filters show; queueView draws a repo that shows one.
   function qGroups() {
-    clashes();
     const G = new Map(), add = (repo, [type, s, tr, pr]) => {
       const k = repoKey(repo);
       if (!G.has(k)) G.set(k, { key: k, host: '', rows: [] });
@@ -574,8 +562,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     (QV.lanes ? QV.lanes.lanes : []).forEach(l => { l.rows.forEach(r => {
       const p = r.state === 'blocked' && r.status === 'prepared' ? waitOf.get(Number(r.item)) : undefined;
       if (p) drawn.add(p);
-      add(l.path, entryRow(l, r, p)); });
-      if (G.has(repoKey(l.path))) G.get(repoKey(l.path)).host = l.host; });
+      add(l.key, entryRow(l, r, p)); });
+      if (G.has(repoKey(l.key))) G.get(repoKey(l.key)).host = l.host; });
     prs.filter(p => !drawn.has(p)).forEach(p => add(p.repo, prRow(p)));
     SUGG.forEach(r => { if (!waits.has(Number(r.id))) add(r.repo, suggestRow(r)); });
     OPENI.forEach(t => { if (!waits.has(Number(t.id))) add(t.repo_path, openRow(t)); });
@@ -591,7 +579,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       // pack sd:8083: a PR wait counts in review, not blocked, so no row counts twice.
       const n = Object.fromEntries(BOXES.map(t => [t, g.rows.filter(inBox(t)).length]));
       return { ...g, shown, n, s: shown.reduce((w, c) => RANK[c.s] < RANK[w] ? c.s : w, 'queued') };
-    }).sort((a, b) => (a.key === '') - (b.key === '') || busy(a, b) || a.key.localeCompare(b.key));
+    }).sort((a, b) => (a.key === '') - (b.key === '') || busy(a, b) || folder(a.key).localeCompare(folder(b.key)) || a.key.localeCompare(b.key));
   }
   // A box's rows: review holds the PR waits, each other box its type less those (pack sd:8083).
   // sd:8116: a stale PR row (unknown, no one to wait on) shows under its repo and counts in no box.
@@ -614,7 +602,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     const unread = !QV.tasks, parkedPip = () => unread
       ? html`<button type="button" class="tile" data-repo="${g.key}" data-tile="parked" aria-pressed="false" aria-label="Parked tasks not read" disabled><span class="pip" title="${`parked: tasks not read: ${QV.tasksErr || 'no answer yet'}`}">${GLYPH.unknown}</span></button>`
       : pip('parked', g.n.parked, ' on', PARKED_MEANS);
-    if (g.key && (!QV.lanes || QV.lanes.problems.some(p => repoKey(p.repo) === g.key)))
+    if (g.key && (!QV.lanes || QV.lanes.problems.some(p => repoKey(p.key) === g.key)))
       return html`<td class="detail${g.n.parked ? ' pipe' : ''}"><span class="g-unknown" aria-hidden="true">${GLYPH.unknown}</span> lane not read${g.n.parked ? parkedPip() : ''}</td>`;
     // pack sd:7470: merging is the leftmost box; pack sd:8137: review follows it.
     const { working: w, merging: m, next: n, blocked: b, review: v, suggested: s, parked: pk } = g.n, you = g.rows.filter(c => c.pr === 'you').length;
@@ -657,7 +645,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       : pk.on ? html`Auto-pickup is on: each tick queues ready items into free builder room. <button class="btn quiet sm" type="button" data-pickup="off"${QV.busy ? html` disabled` : ''}>Turn off</button>`
       : html`Auto-pickup is off. <button class="btn quiet sm" type="button" data-pickup="on" aria-label="Turn auto-pickup on"${QV.busy ? html` disabled` : ''}>Turn on</button>`);
     const said = $('queue-said'); said.hidden = !qSaid; said.textContent = qSaid ? qSaid.text : ''; said.setAttribute('role', qSaid && !qSaid.ok ? 'alert' : 'status');
-    const parent = g => { const on = qOpen === g.key, name = g.key || 'Unassociated';
+    const shared = name => groups.filter(x => x.key && folder(x.key) === name).length > 1;
+    const parent = g => { const on = qOpen === g.key, name = !g.key ? 'Unassociated' : shared(folder(g.key)) ? g.key : folder(g.key);
       return html`<tr class="repo" data-repo="${g.key}" aria-expanded="${String(on)}">${marker(g.s, 'repo')}
         <td class="what"><button type="button" class="disc" data-open="${g.key}" aria-expanded="${String(on)}" aria-label="${on ? 'Close' : 'Open'} ${name}">${I('chevron-right')}</button><button type="button" class="pick" data-open="${g.key}">${name}</button>${g.host ? html`<small>lane on ${g.host}</small>` : ''}</td>
         ${pips(g)}<td class="num"></td><td class="act"></td></tr>`; };
@@ -1192,7 +1181,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
         cli: o => `sd-ship -C ${o.repoPath} lane retry ${o.item} --expected-head ${o.head} --manual`, sends: () => 'POST /api/queue/move {action: approve}',
         when: o => o.runnerMerge === 'manual' || 'this repo merges automatically, so it needs no approval', run: o => lane('approve')(o).then(() => `Approved · sd:${o.item}`) },
       { id: 'today.lane.queue', on: 'lane entry', label: 'Open in Queue', does: 'Opens its repo in the Queue view, where Cancel is.', key: 'q', risk: 'safe', executes: false,
-        cli: o => `sd-ship -C ${o.repoPath} lane list`, run: o => { qOpen = repoKey(o.repoPath); shell.view.show('queue'); queueView(); return 'Queue opens'; } },
+        cli: o => `sd-ship -C ${o.repoPath} lane list`, run: o => { qOpen = repoKey(o.repoKey); shell.view.show('queue'); queueView(); return 'Queue opens'; } },
       // A new brief: Seen is the Today snooze held until the brief changes (sd:5752), the mark the place pages read too.
       { id: 'today.brief.seen', on: 'brief', label: 'Seen', does: 'Hides the brief from Today until its text grows.', key: 's', icon: 'eye', risk: 'safe', bulk: true, primary: () => true,
         cli: () => 'no sd verb: the dashboard writes the snooze (POST /api/snooze)',

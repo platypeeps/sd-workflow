@@ -538,7 +538,7 @@ def pr_rows(connection, lanes: list[dict], clock: float) -> dict:
     A read that failed is its `error` and no rows, never an empty answer; an item it skipped is named in `error`
     beside the other rows (sd:7863).
     """
-    from sd_db import contributions
+    from sd_db import contributions, today
 
     laned = {row.get("item") for lane in lanes for row in lane["rows"]
              if row.get("state") in LANED and not (row.get("state") == "blocked" and row.get("status") == "prepared")}
@@ -549,11 +549,14 @@ def pr_rows(connection, lanes: list[dict], clock: float) -> dict:
         # sd:8142: and every open pull no item links that names the operator, either way.
         loose = contributions.unlinked_pr_waits(connection, now=time.strftime("%Y-%m-%dT%H:%M:%S+00:00",
                                                                              time.gmtime(clock)))
+        # sd:9258: an unlinked pull names its GitHub `owner/name`; a registered one's row carries its repository's key.
+        keys = today.repo_keys(connection)
     except READ_FAILURES as error:
         return {"rows": [], "error": f"pull-request waits were not read: {type(error).__name__}: {error}"}
     return {"rows": [{key: wait[key] for key in PR_FIELDS} for wait in waits
                      if (wait["open"] or wait["stale"]) and wait["status"] != "done" and wait["item"] not in laned]
-                    + [{key: wait[key] for key in PR_FIELDS} for wait in loose],
+                    + [{**{key: wait[key] for key in PR_FIELDS}, "repo": keys.get(str(wait["repo"]).lower(), wait["repo"])}
+                       for wait in loose],
             "error": f"pull-request waits skipped {'; '.join(skipped)}" if skipped else ""}
 
 
@@ -572,7 +575,10 @@ def document(connection, *, now: str = "") -> dict:
     managed = {os.path.expanduser(row["path"]): row for row in repos.registered(connection) if row["managed"]}
     here = [path for path in managed if os.path.isdir(path)]
     # A checkout missing here leaves its lane unread: `sd-ship -C` needs one. Named, never dropped.
-    problems = [{"repo": path, "error": "no checkout on this machine"} for path in managed if path not in here]
+    # sd:9258: `key` is the repository row's path, the one key the page groups by; `repo` and `path` are this
+    # machine's checkout, for display and `sd-ship -C`.
+    problems = [{"repo": path, "key": managed[path]["path"], "error": "no checkout on this machine"}
+                for path in managed if path not in here]
     with ThreadPoolExecutor(max_workers=READERS) as pool:
         # The two probes run beside the reads; the request's connection stays on this thread.
         gates, probe = pool.submit(_gates), pool.submit(retry_help)
@@ -583,7 +589,8 @@ def document(connection, *, now: str = "") -> dict:
     lanes, root = [], None
     for path, answer in answers.items():
         if not answer.get("ok") or not isinstance(answer.get("queue"), str):
-            problems.append({"repo": path, "error": answer.get("error") or "lane list named no queue"})
+            problems.append({"repo": path, "key": managed[path]["path"],
+                             "error": answer.get("error") or "lane list named no queue"})
             continue
         lane = Path(answer["queue"]).parent.parent
         root = root or lane.parent.parent
@@ -593,7 +600,7 @@ def document(connection, *, now: str = "") -> dict:
         for row in shown:
             if row["state"] == "blocked" and row["status"] == "failed":
                 row["fix"] = lane_fix_state(connection, row["branch"])
-        lanes.append({"repo": Path(path).name, "path": path, "realm": realm_of(path, "lane", rules, hoa), "lane": str(lane),
+        lanes.append({"repo": Path(path).name, "path": path, "key": managed[path]["path"], "realm": realm_of(path, "lane", rules, hoa), "lane": str(lane),
                       "revision": revision(entries),
                       "runner_merge": repos.policy_merge(managed[path]["declarations"]), "host": managed[path]["lane_host"] or "hub",
                       "rows": shown})
