@@ -125,6 +125,10 @@ FAKE = textwrap.dedent('''
             time.sleep(3)
         if mode == "silent":
             sys.exit(0)
+        if mode == "asked":  # skipped every item with a question: a passing reply, no commit (sd:9219)
+            line({"type": "result", "subtype": "success", "is_error": False, "permission_denials": [],
+                  "session_id": session, "result": "skipped (asked)"})
+            sys.exit(0)
         if mode == "deny":  # denied a call, the builder stopped with its work unfinished
             line({"type": "result", "subtype": "success", "is_error": False, "session_id": session,
                   "result": "denied", "permission_denials": [{"tool_name": "Bash",
@@ -605,6 +609,38 @@ class Supervise(Case):
         ended = self.supervisor(cited=lambda *_: None).run()
         self.assertEqual((ended["outcome"], self.latest()["outcome"]), (None, None))
         self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+
+    def test_a_builder_that_skips_every_item_with_a_question_waits_on_the_operator(self):
+        """sd:9219: no commit, and every item has a question since the run started. The run says so, not
+        'left no commit'; no item gets a requeue followup, and its release parks none."""
+        self.press(2)
+        self.plan(claude=["asked"], sd_review=["clean"])
+        for item in self.items:
+            add_note(self.db, item, "question", "Which option?\nOption: Yes (Recommended)\nOption: No")
+        ended = self.supervisor().run()
+        self.assertEqual(ended["outcome"], "blocked")
+        self.assertNotIn("left no commit", ended["blocked"])
+        self.assertIn(f"every item has an open question: sd:{self.items[0]}, sd:{self.items[1]}", ended["blocked"])
+        marks = ", ".join("?" for _ in self.items)
+        followups = f"SELECT COUNT(*) FROM note WHERE item IN ({marks}) AND kind = 'followup'"
+        self.assertEqual(self.db.execute(followups, self.items).fetchone()[0], 0)
+        build.reap(self.db, probe=GoneProbe(alive=False, group=False))
+        self.assertIsNotNone(build.run(self.db, self.bundle["id"])["released_at"])
+        self.assertEqual([item_state(self.db, item)["item"]["parked_at"] for item in self.items], [None, None])
+
+    def test_a_builder_that_skips_one_item_with_a_question_blocks_the_other(self):
+        """sd:9219, the other side: no commit, one item asked. The run still left no commit; only the item with
+        no question gets the followup and the park."""
+        self.press(2)
+        self.plan(claude=["asked"], sd_review=["clean"])
+        add_note(self.db, self.items[0], "question", "Which option?\nOption: Yes (Recommended)\nOption: No")
+        self.assertIn("left no commit", self.supervisor().run()["blocked"])
+        counts = [self.db.execute("SELECT COUNT(*) FROM note WHERE item = ? AND kind = 'followup'",
+                                  (item,)).fetchone()[0] for item in self.items]
+        self.assertEqual(counts, [0, 1])
+        build.reap(self.db, probe=GoneProbe(alive=False, group=False))
+        parked = [item_state(self.db, item)["item"]["parked_at"] is not None for item in self.items]
+        self.assertEqual(parked, [False, True])
 
     def test_a_branch_that_delivers_nothing_blocks(self):
         self.press()

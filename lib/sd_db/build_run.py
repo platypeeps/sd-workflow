@@ -1621,6 +1621,12 @@ class Supervisor:
                                                      f"Build run {self.ident} report:\n{final['result'][:8000]}"
                                                      f"{denied}"))
             problem = self.unfinished()
+            # A builder that skipped every item with a question left no
+            # commit on purpose: the run waits on the answers (sd:9219).
+            items = [self.lead, *self.others]
+            if problem.startswith("the builder left no commit") and all(
+                    build.open_question(self.db, [item], self.row["created_at"]) for item in items):
+                problem = f"every item has an open question: {', '.join(f'sd:{item}' for item in items)}"
             return self.finish("blocked", problem) if problem else then
         if verdict["state"] == "denied":
             # The first denial at a step is a loss: `_settle` requeues it once, the call in its brief (pack

@@ -2099,7 +2099,7 @@ def _settle(connection, read: dict, *, block: str | None = None) -> dict | None:
                       f"cancel; log {row['log_path'] or 'none'}, worktree {row['work_path']}")
             connection.execute("UPDATE runner_run SET outcome = 'blocked', detail = ?, updated_at = ? WHERE id = ?",
                                (reason, stamp, ident))
-            _block(connection, members, reason, stamp)
+            _block(connection, members, reason, stamp, since=row["created_at"])
             return {"run": ident, "outcome": "blocked", "retry": None, "blocked": block}
         connection.execute("UPDATE runner_run SET released_at = ?, updated_at = ? WHERE id = ?", (stamp, stamp, ident))
         connection.execute("UPDATE runner_lease SET released_at = ? WHERE run = ? AND released_at IS NULL", (stamp, ident))
@@ -2166,20 +2166,26 @@ def _health_unknown(connection, row, members: list[dict], stamp: str) -> str:
     return retry
 
 
-def _block(connection, members: list[dict], reason: str, stamp: str) -> None:
+def _block(connection, members: list[dict], reason: str, stamp: str, *, since: str | None = None) -> None:
+    """Block each member with a followup; one with an open question since `since` gets none: the question asks
+    the operator already (sd:9219)."""
     for member in members:
         connection.execute("UPDATE assignment SET status = 'blocked', ended = ?, result = ? WHERE id = ?",
                            (stamp, reason, member["id"]))
         _move(connection, member["item"], "blocked", reason)
-        add_note(connection, member["item"], "followup",
-                 f"Build blocked: {reason}. Look at the log and the worktree, then requeue or cancel.")
+        if since is None or not open_question(connection, [member["item"]], since):
+            add_note(connection, member["item"], "followup",
+                     f"Build blocked: {reason}. Look at the log and the worktree, then requeue or cancel.")
 
 
 def _park(connection, ident: str, lead: int, stamp: str) -> None:
     """Park each item of a blocked run, once the run and its lease are released, as the nightly prune parks an idle
-    one (pack sd:6132, sd:6008)."""
+    one (pack sd:6132, sd:6008). One with an open question since the run started stays unparked: it waits on the
+    operator's answer, and a park would hide it (sd:9219)."""
+    since = connection.execute("SELECT created_at FROM runner_run WHERE id = ?", (ident,)).fetchone()["created_at"]
     for member in _members(connection, lead, "blocked"):
-        park(connection, member["item"], ("blocked",), stamp, PARKED.format(run=ident))
+        if not open_question(connection, [member["item"]], since):
+            park(connection, member["item"], ("blocked",), stamp, PARKED.format(run=ident))
 
 
 def park(connection, item: int, statuses: tuple[str, ...], stamp: str, note: str | None = None) -> bool:
