@@ -31,7 +31,8 @@ def answer(*rows: dict) -> sd_review.Completed:
 
 
 def row(path: str, severity: str = "unspecified", summary: str = "a finding") -> dict:
-    return {"path": path, "line": None, "severity": severity, "summary": summary, "family": "verification"}
+    return {"path": path, "line": None, "severity": severity, "summary": summary, "family": "verification",
+            "evidence": "python3 src.py: failed"}
 
 
 BLIND_AT_ROOT = answer(row("/", summary="The diff could not be accessed."))

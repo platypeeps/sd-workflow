@@ -967,7 +967,7 @@ roles:
         """The fixture's reviewer answers one high finding from now on: (program, payload)."""
         program = self.programs / "review-fixture"
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "family": "correctness", "summary": "value is wrong"}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "evidence": "python3 src.py: wrong", "family": "correctness", "summary": "value is wrong"}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         return program, payload
 
@@ -2396,11 +2396,30 @@ roles:
         self.assertEqual(result["copilot_review"]["reason"], "automatic Copilot review excludes drafts")
         self.assertEqual(self.double.copilot_requests, [])
 
+    def test_the_lane_posts_a_blocker_without_a_cited_check_as_advice(self):
+        """pack sd:9270: the lane's review is `sd-review`, so its `dispose` decides here too.
+
+        A high finding with no evidence passes prepare as advice and says why;
+        the same finding citing a check it ran refuses as before.
+        """
+        program, payload = self.blocking_review()
+        del payload["structured_output"]["findings"][0]["evidence"]
+        program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
+        self.prepare()
+        report = self.operation().state["passes"][-1]["report"]
+        self.assertEqual(report["status"], "advisory")
+        self.assertEqual({row["disposition"] for row in report["findings"]}, {"advisory"})
+        self.assertTrue(all(row["summary"] == "value is wrong [downgraded: no check cited]" for row in report["findings"]))
+        _git(self.root, "commit", "--allow-empty", "-qm", "next head\n\nAuthored-with: human")
+        self.blocking_review()
+        with self.assertRaisesRegex(ship.Refusal, "local review blocking"):
+            self.prepare()
+
     def test_failing_local_review_prevents_automatic_copilot_dispatch(self):
         self.enable_automatic_copilot()
         provider = self.programs / "review-fixture"
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [{
-            "path": "src.py", "line": 1, "severity": "high",
+            "path": "src.py", "line": 1, "severity": "high", "evidence": "python3 src.py: wrong",
             "family": "correctness", "summary": "value is wrong",
         }]}}
         provider.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
@@ -4184,7 +4203,7 @@ roles:
         answered "there is no durable pull-request receipt to observe"."""
         program = self.programs / "review-fixture"
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "family": "correctness", "summary": "sd2021 finding"}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "evidence": "python3 src.py: wrong", "family": "correctness", "summary": "sd2021 finding"}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         with self.assertRaises(ship.Refusal):
             self.prepare()
@@ -4684,7 +4703,7 @@ roles:
         program = self.programs / "review-fixture"
         long = "the value is wrong " * 40
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "family": "correctness", "summary": long}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "evidence": "python3 src.py: wrong", "family": "correctness", "summary": long}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         head = _git(self.root, "rev-parse", "HEAD")
         for attempt in ("review", "reuse"):
@@ -4704,7 +4723,7 @@ roles:
     def test_fix_verifications_keep_prior_findings_and_refuse_a_pass_past_the_cap(self):
         program = self.programs / "review-fixture"
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "family": "correctness", "summary": "value is wrong"}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "evidence": "python3 src.py: wrong", "family": "correctness", "summary": "value is wrong"}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         with self.assertRaisesRegex(ship.Refusal, "local review blocking"):
             self.prepare()
@@ -4743,7 +4762,7 @@ roles:
         """
         program = self.programs / "review-fixture"
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "family": "correctness", "summary": "value is wrong"}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "evidence": "python3 src.py: wrong", "family": "correctness", "summary": "value is wrong"}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         with self.assertRaisesRegex(ship.Refusal, "local review blocking"):
             self.prepare()
@@ -4784,7 +4803,7 @@ roles:
         _git(self.root, "commit", "-m", "change\n\nAuthored-with: human")
         program = self.programs / "review-fixture"
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "family": "correctness", "summary": "value is wrong"}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "evidence": "python3 src.py: wrong", "family": "correctness", "summary": "value is wrong"}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         with self.assertRaisesRegex(ship.Refusal, "local review blocking"):
             self.prepare()
@@ -4851,7 +4870,7 @@ roles:
         """sd:2600: a restart is for an orphaned review, not a way to drop live findings."""
         program = self.programs / "review-fixture"
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "family": "correctness", "summary": "value is wrong"}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "evidence": "python3 src.py: wrong", "family": "correctness", "summary": "value is wrong"}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         with self.assertRaisesRegex(ship.Refusal, "local review blocking"):
             self.prepare()
@@ -5496,7 +5515,7 @@ roles:
         for index in range(CAP):
             if blockers:
                 payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-                    {"path": "src.py", "line": 1, "severity": "high", "family": "correctness",
+                    {"path": "src.py", "line": 1, "severity": "high", "evidence": "python3 src.py: wrong", "family": "correctness",
                      "summary": f"unresolved from pass {index + 1}"}]}}
                 provider.write_text("#!/usr/bin/env python3\nprint(" + repr(json.dumps(payload)) + ")\n")
                 if index:
@@ -6198,7 +6217,7 @@ roles:
         _, _, prior = self.spent_reviews()
         operation = self.operation()
         prior[0]["report"]["findings"] = [{"path": "src.py", "line": 1, "summary": "x" * (sd_review.MAX_OUTPUT_BYTES - 10000),
-                                             "disposition": "blocking", "severity": "high", "family": "correctness"}]
+                                             "disposition": "blocking", "severity": "high", "evidence": "python3 src.py: wrong", "family": "correctness"}]
         operation.save(passes=prior, review_preflight_error={"stage": "planning", "kind": "old"})
         head = _git(self.root, "rev-parse", "HEAD")
         operation = self.operation("prepare", "--additional-review-for", head, "--request-reason", "fixture")
@@ -6262,7 +6281,7 @@ roles:
                 if any(str(a).endswith("/sd-check") for a in command):
                     return sd_review.Completed(0, "{}", "")
                 payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-                    {"path": "src.py", "line": 1, "severity": "high", "family": "correctness", "summary": "captured timeout blocker"}]}}
+                    {"path": "src.py", "line": 1, "severity": "high", "evidence": "python3 src.py: wrong", "family": "correctness", "summary": "captured timeout blocker"}]}}
                 return sd_review.Completed(0, json.dumps(payload), "")
             report = sd_review.review(root, args, canned, self.environment)
             raise ship.ReviewTimeout({"kind": "watchdog_expired", "allowed_seconds": kwargs["timeout"], "captured_report": report})
