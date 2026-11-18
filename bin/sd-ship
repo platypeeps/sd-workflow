@@ -680,11 +680,18 @@ class Ship(SharedReview):
                       code="delivery_claim_required", boundary="input", state="operator_decision",
                       next_action="Rerun prepare with --deliver or --associate-only.")
 
-    def assert_scope(self) -> None:
+    def assert_scope(self, claim: dict | None = None) -> None:
+        """Refuse a delivery claim made for another version of the item.
+
+        `claim`, a new `--deliver` claim this prepare made from the item as
+        it reads now, stands in for the stored one: an explicit `--deliver`
+        renews a claim the item outgrew (sd:9268). Every later check reads
+        the stored claim, so a change after the renewal still refuses.
+        """
         if not self.args.no_item and self.state.get("deliver"):
             item = self.store.identity(self.connection, self.args.item)["item"]
             scope = digest({key: item[key] for key in ("title", "body", "path")})
-            if self.state.get("acceptance", {}).get("item_scope") != scope:
+            if (claim or self.state.get("acceptance") or {}).get("item_scope") != scope:
                 raise Refusal("item acceptance scope changed after the delivery claim")
 
     def body_input(self, default: str) -> tuple[str, str]:
@@ -1476,7 +1483,7 @@ class Ship(SharedReview):
             self.assert_title_matches(title)
             if not self.args.no_item and self.state.get("deliver") != deliver:
                 raise Refusal("existing PR delivery claim differs; reconcile the prepared scope first")
-        self.assert_scope()
+        self.assert_scope(claim if self.args.deliver else None)
         closing: dict | None = None
         closing_warnings: list[str] = []
         if not self.args.no_item:
