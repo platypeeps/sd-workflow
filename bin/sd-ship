@@ -683,52 +683,16 @@ class Ship(SharedReview):
     def assert_scope(self, claim: dict | None = None) -> None:
         """Refuse a delivery claim made for another version of the item.
 
-        `claim`, a claim `renewal` let stand, replaces the stored one here
-        (sd:9268). Every later check reads the stored claim, so a change
-        after the renewal still refuses.
+        `claim`, a new `--deliver` claim this prepare made from the item as
+        it reads now, stands in for the stored one: an explicit `--deliver`
+        renews a claim the item outgrew (sd:9268). Every later check reads
+        the stored claim, so a change after the renewal still refuses.
         """
         if not self.args.no_item and self.state.get("deliver"):
             item = self.store.identity(self.connection, self.args.item)["item"]
             scope = digest({key: item[key] for key in ("title", "body", "path")})
             if (claim or self.state.get("acceptance") or {}).get("item_scope") != scope:
-                raise Refusal(f"item acceptance scope changed after the delivery claim; a lane prepare "
-                              f"does not renew it: run `sd-ship prepare --item {self.args.item} --deliver` "
-                              f"by hand, with --acceptance-file for a work item, then enqueue again")
-
-    def renewal(self, claim: dict | None) -> tuple[dict | None, str | None]:
-        """The new `--deliver` claim that renews a stored one the item outgrew, and the line saying so.
-
-        (None, None) when nothing renews. Only a prepare the lane did not
-        start renews (sd:9335): the lane passes the enqueue's `--deliver` and
-        acceptance text to every prepare, retries included, so its claim may
-        predate the change. A lane prepare then refuses in `assert_scope`.
-        """
-        old = (self.state.get("acceptance") or {}).get("item_scope")
-        if not (self.args.deliver and claim and self.state.get("deliver")) or old == claim["item_scope"]:
-            return None, None
-        if self.lane_started():
-            return None, None
-        return claim, (f"--deliver renews the delivery claim of sd:{self.args.item}: item scope "
-                       f"{str(old)[:12]} is now {claim['item_scope'][:12]}")
-
-    def lane_started(self) -> bool:
-        """Whether this repository's lane runner started this prepare (sd:9335).
-
-        The runner marks the entry it runs: `running`, with its host and pid
-        in `holder`, and it starts `sd-ship` as its own child. A read that
-        fails is no answer, so it refuses and nothing renews.
-        """
-        from sd_db.errors import SdDbError
-        try:
-            rows, host = sd_lane.stored(self.connection, self.repository), sd_lane.this_host()
-        except (SdDbError, sqlite3.Error, ValueError, sd_lane.LaneError) as error:
-            raise Refusal(f"item acceptance scope changed after the delivery claim, and the lane queue could "
-                          f"not be read ({error}), so whether the lane started this prepare is unknown; "
-                          f"nothing is renewed", code="lane_unknown", boundary="database",
-                          state="retryable_failure") from None
-        return any(row.get("item") == self.args.item and row.get("status") == "running"
-                   and (row.get("holder") or {}).get("host") == host
-                   and (row.get("holder") or {}).get("pid") == os.getppid() for row in rows)
+                raise Refusal("item acceptance scope changed after the delivery claim")
 
     def body_input(self, default: str) -> tuple[str, str]:
         """The body to publish and where it came from (sd:1870).
@@ -1519,13 +1483,9 @@ class Ship(SharedReview):
             self.assert_title_matches(title)
             if not self.args.no_item and self.state.get("deliver") != deliver:
                 raise Refusal("existing PR delivery claim differs; reconcile the prepared scope first")
-        renewed, renewal_line = self.renewal(claim)
-        self.assert_scope(renewed)
+        self.assert_scope(claim if self.args.deliver else None)
         closing: dict | None = None
         closing_warnings: list[str] = []
-        if renewal_line:
-            print(f"sd-ship: {renewal_line}", file=sys.stderr)
-            closing_warnings.append(renewal_line)
         if not self.args.no_item:
             # The items named with --item after the first: the confirmation on this head (sd:3704).
             named = tuple(dict.fromkeys(self.args.closes))
