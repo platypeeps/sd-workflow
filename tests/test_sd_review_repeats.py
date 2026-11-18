@@ -333,21 +333,38 @@ class RoundThreeTests(ReviewFixture):
         report = self.tmp / "prior.json"
         report.write_text(json.dumps(prior))
         self.commit(root, "other.py", "unrelated_fix = True\n")
-        bare, fresh = row(path="src.py", summary="still wrong"), row(path="other.py", summary="new and unchecked")
+        # Round 4: the repeat matches on path and folded summary; a new unchecked claim in the same
+        # file is not the confirmed blocker.
+        bare, fresh = row(path="src.py", summary="  DEFECT "), row(path="other.py", summary="new and unchecked")
+        same_file = row(path="src.py", summary="a new unchecked claim")
         for option in ("verify_report", "resume_report"):
             with self.subTest(option=option):
-                runner = FakeRunner({"codex": self.answer(bare, fresh)})
+                runner = FakeRunner({"codex": self.answer(bare, fresh, same_file)})
                 args = namespace(scope="branch", **({"base": first} if option == "verify_report" else {}),
                                  **{option: str(report)})
                 result = sd_review.review(root, args, runner, self.environment(), self.chatgpt_home())
                 self.assertEqual(result["status"], "blocking")
-                dispositions = {row["path"]: row["disposition"] for row in result["findings"] if row["backend"] == "codex"}
-                self.assertEqual(dispositions, {"src.py": "blocking", "other.py": "advisory"})
+                self.assertTrue(any("with its path and summary unchanged" in str(call["stdin"]) + " ".join(call["argv"])
+                                    for call in runner.calls))
+                dispositions = {(row["path"], row["summary"]): row["disposition"] for row in result["findings"]
+                                if row["backend"] == "codex"}
+                self.assertEqual(dispositions, {
+                    ("src.py", "DEFECT"): "blocking",
+                    ("other.py", f"new and unchecked {sd_review.NO_CHECK_NOTE}"): "advisory",
+                    ("src.py", f"a new unchecked claim {sd_review.NO_CHECK_NOTE}"): "advisory"})
         # Fixed: a verifier that does not repeat it clears it.
         runner = FakeRunner({"codex": self.answer()})
         result = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)), runner,
                                   self.environment(), self.chatgpt_home())
         self.assertNotEqual(result["status"], "blocking")
+
+    def test_a_static_reader_may_answer_a_rebuttal_with_the_lines_it_read(self) -> None:
+        # Round 4: the rebuttal section asked for a check only; five of six readers cannot run one.
+        body = json.dumps({"proposal": {"findings": [{"raw_finding": row(), "response_disposition": "rebutted",
+                                                       "reason": "not reachable"}]}})
+        section = sd_review.rebuttal_section([(body,)])
+        self.assertIn("a check you ran and its output", section)
+        self.assertIn("when you cannot run commands, path:line and a quote of the current code", section)
 
     def test_one_finding_from_two_readers_is_one_row_whatever_each_cites(self) -> None:
         bare, cited, other = row(), row(evidence="src.py:1: x = 1"), row(evidence="python3 src.py: wrong")

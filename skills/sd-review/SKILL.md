@@ -68,7 +68,8 @@ Do not substitute another diff or copy a cap into this procedure.
    An exhausted chain with insufficient completed coverage fails.
 3. Disposition findings locally against the repository's severity floor; unset, it is `high`.
    A finding at the floor blocks only with `evidence`: the check its reviewer ran, or the `path:line` and quote a read-only reviewer read; one without posts as advisory, marked `[downgraded: no check cited]`.
-   In a verification, a repeat of a blocker the prior report confirmed stays blocking without fresh evidence; a blocker the verifier drops is fixed.
+   In a verification, a repeat of a blocker the prior report confirmed (same path, same summary up to case and spacing) stays blocking without fresh evidence; a blocker the verifier drops is fixed.
+   A failed reader's unlocated finding at the floor is kept; without evidence it posts as advisory.
    Preserve each provider's findings and attempt outcome.
    A completed adverse review counts; it does not trigger replacement.
    A clean fallback cannot erase earlier findings.
@@ -170,7 +171,7 @@ Do not truncate input or count the advisory plan as completed review coverage.
 The ordinary review prompt includes this checkout's `CLAUDE.local.md` block through `local_conventions` (R10-D7).
 The receipt reports `local_block_prepended`.
 A `threat-model:` line there gets its own paragraph: a finding outside it is advisory at most.
-The prompt also lists this branch's rebutted findings from `sd-ship adjudicate`, newest first, capped; a reviewer raises one again only with new evidence.
+The prompt also lists this branch's rebutted findings from `sd-ship adjudicate`, newest first, capped; a reviewer raises one again only with new evidence in either form: a check run, or `path:line` and a quote of the changed code.
 Synthetic provider preflight excludes that block.
 When findings contradict a convention, check the supplied wording before assigning blame.
 Use `sd-rules --for <path>` for applicable repository rules.
