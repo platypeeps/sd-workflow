@@ -549,14 +549,15 @@ def pr_rows(connection, lanes: list[dict], clock: float) -> dict:
         # sd:8142: and every open pull no item links that names the operator, either way.
         loose = contributions.unlinked_pr_waits(connection, now=time.strftime("%Y-%m-%dT%H:%M:%S+00:00",
                                                                              time.gmtime(clock)))
-        # sd:9258: an unlinked pull names its GitHub `owner/name`; a registered one's row carries its repository's key.
-        keys = today.repo_keys(connection)
+        # sd:9258: an unlinked pull names its GitHub `owner/name`; its row carries the key of the one checkout of
+        # that remote, and keeps the slug where none or several are registered: nothing says which one it is for.
+        keys = {slug: found[0] for slug, found in today.repo_paths(connection).items() if len(found) == 1}
     except READ_FAILURES as error:
         return {"rows": [], "error": f"pull-request waits were not read: {type(error).__name__}: {error}"}
     return {"rows": [{key: wait[key] for key in PR_FIELDS} for wait in waits
                      if (wait["open"] or wait["stale"]) and wait["status"] != "done" and wait["item"] not in laned]
-                    + [{**{key: wait[key] for key in PR_FIELDS}, "repo": keys.get(str(wait["repo"]).lower(), wait["repo"])}
-                       for wait in loose],
+                    + [{**{key: wait[key] for key in PR_FIELDS}, "repo": keys.get(str(wait["repo"]).lower(), wait["repo"]),
+                        "slug": wait["repo"]} for wait in loose],
             "error": f"pull-request waits skipped {'; '.join(skipped)}" if skipped else ""}
 
 

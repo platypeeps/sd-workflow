@@ -364,6 +364,32 @@ class TheRows(Lane, ScreenCase):
         self.assertEqual([p["key"] for p in doc["problems"]], ["~/example.test/gone"])
         self.assertEqual([r["repo"] for r in doc["prs"]["rows"] if r["url"] == url], [str(self.checkout)])
 
+    def unlinked_912(self):
+        from sd_db.writes import record_state
+
+        url = "https://github.com/example/system/pull/912"
+        record_state(self.connection, "checkpoint", key="contribution:github:" + url, body={"observation": {
+            "operator": {"id": "1", "login": "operator"}, "author": {"id": "1", "login": "operator"},
+            "requested_reviewers": [], "reviews": [], "state": "open", "draft": False, "title": "Unlinked 912",
+            "observed_at": "2026-09-06T11:30:00Z", "repo": "example/System", "events": []}})
+        self.connection.commit()
+        return [r for r in self.doc()["prs"]["rows"] if r["url"] == url]
+
+    def test_an_unlinked_pull_keeps_its_slug_beside_the_key(self):
+        # sd:9258 round 3: the link label is the GitHub slug, never the local path it maps to.
+        self.connection.execute("UPDATE repo SET remote = ? WHERE path = ?",
+                                ("https://github.com/example/system.git", str(self.checkout)))
+        self.assertEqual([(r["repo"], r["slug"]) for r in self.unlinked_912()], [(str(self.checkout), "example/System")])
+
+    def test_an_unlinked_pull_two_checkouts_share_stays_under_its_slug(self):
+        # sd:9258 round 3: two registered checkouts of one remote; nothing says which one the pull is for.
+        self.connection.execute("UPDATE repo SET remote = ? WHERE path = ?",
+                                ("https://github.com/example/system.git", str(self.checkout)))
+        upsert_repo(self.connection, "~/example.test/system", remote="git@github.com:example/system.git", managed=0)
+        rows = self.unlinked_912()
+        self.assertEqual([r["repo"] for r in rows], ["example/System"], "the pull went to one checkout unproven")
+        self.assertEqual([r["slug"] for r in rows], ["example/System"])
+
     def test_an_item_in_the_lane_keeps_its_lane_row_not_a_pr_row(self):
         item, _ = self.pr_item(904, ("2026-09-06T10:00:00Z", "awaiting_them"))
         self.list([*self.entries(), {"item": item, "title": "In the lane", "status": "pending", "expected_head": "e" * 40}])
@@ -1902,6 +1928,16 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                         out["R"]["html"], re.S)[1]
         self.assertIn("<b>blocked: PR</b> · on you · waited 1h 0m", row)
         self.assertIn(" · draft · approx.", row)
+
+    def test_an_unlinked_pull_request_row_links_under_its_slug_not_its_key(self):
+        # sd:9258 round 3: the row groups under the repo key and its link says the GitHub slug and number.
+        lanes = queue_screen.document(self.connection, now=NOW)
+        lanes["prs"] = {"error": "", "rows": [
+            {"item": None, "title": "Unlinked", "repo": "~/repos/example/system", "slug": "example/system",
+             "url": "https://github.com/example/system/pull/5", "lane": "awaiting_you", "on": "you",
+             "since": "2026-09-06T11:00:00+00:00", "waited": 3600, "approximate": True, "draft": False, "stale": False}]}
+        out = self.run_view("open('system'); R.html = ELS.queue.html;", answers={"/api/queue": [200, lanes]})
+        self.assertIn('rel="noopener noreferrer">example/system#5 Unlinked</a>', out["R"]["html"])
 
     def test_a_stale_pull_request_row_says_so_and_counts_in_no_box(self):
         """sd:8116 (a): a reading over a day old waits on no one: no review or blocked count and no lamp; the row says so."""

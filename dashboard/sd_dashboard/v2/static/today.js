@@ -482,9 +482,10 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     : html`<b>blocked: PR</b> · on ${p.on} · waited ${dur(p.waited)} since ${at(p.since)}${prTags(p)}`;
   const prWaitLink = p => html`<div class="ctl" role="group" aria-label="Pull request of sd:${String(p.item)}"><a class="btn quiet sm" href="${p.url}" target="_blank" rel="noopener noreferrer" aria-label="Open the pull request of sd:${p.item} on GitHub">Open PR</a></div>`;
   // sd:8142: a PR no item links (`item` null) is keyed and linked by its URL, named `owner/repo#N`.
+  // sd:9258: an unlinked pull's link says its GitHub `slug`; its `repo` is the key it groups under.
   const prRow = p => { const s = p.stale ? 'unknown' : p.on === 'you' ? 'warning' : 'queued';
     return ['blocked', s, html`<tr class="child" data-type="blocked" data-pr="${p.item == null ? p.url : String(p.item)}">${marker(s, 'blocked')}
-    <td class="what">${p.item == null ? html`<a href="${p.url}" target="_blank" rel="noopener noreferrer">${p.repo}#${p.url.split('/').pop()} ${p.title}</a>`
+    <td class="what">${p.item == null ? html`<a href="${p.url}" target="_blank" rel="noopener noreferrer">${p.slug || p.repo}#${p.url.split('/').pop()} ${p.title}</a>`
       : html`<a href="${shell.itemHref(p.item)}">#${p.item} ${p.title}</a>`}</td>
     <td class="detail">${prFacts(p)}</td><td class="num">${p.stale ? '' : dur(p.waited)}</td>
     <td class="act">${p.item == null ? '' : prWaitLink(p)}</td></tr>`, p.on]; };
