@@ -811,7 +811,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     if (act === 'send') {
       const { yes, values } = await shell.ask({ title: `Send to builder: run ${r.run} (${what})?`, ok: 'Send', keep: 'Cancel', danger: false,
         body: `The finding goes on ${r.items.length > 1 ? 'each item' : 'the item'} as a note, and the bundle queues again. Its next builder resumes ${r.worktree || 'the same worktree'} on its branch and fixes the finding first.`,
-        fields: [{ name: 'finding', label: 'Finding', required: true, placeholder: 'What the builder should fix' }] });
+        fields: [{ name: 'finding', label: 'Finding', required: true, multiline: true, placeholder: 'What the builder should fix', value: r.prefill || '' }] });
       finding = (values && values.finding || '').trim();
       if (!yes || !finding) return;
     }
