@@ -132,7 +132,8 @@ addEventListener('DOMContentLoaded', () => {
   const FKEYS = Object.keys(F);
   // sd:9309: the text filter is Add or find's words (the one-bar rule, sd:5539): no second text box.
   const find = document.getElementById('shift-in');
-  let Q = '';
+  // A ?q= link's words search; Enter files them only once the operator edits the field (sd:9309 review).
+  let Q = '', linked = '';
   const on = () => FKEYS.reduce((n, k) => n + F[k].size, 0) + (Q ? 1 : 0);
   const dueBucket = t => t.overdue || (t.due && days(t) < 0) ? 'overdue' : !t.due ? 'none' : withinWeek(t) ? 'week' : 'later';
   const DUE_OPTS = [['overdue', 'overdue'], ['week', '≤ 7 days'], ['later', 'later'], ['none', 'no due']];
@@ -535,7 +536,7 @@ addEventListener('DOMContentLoaded', () => {
     if (q.get('done') === '1') F.active.add('done');
     [...F.active].forEach(v => { if (!['1', 'scheduled', 'done'].includes(v)) F.active.delete(v); });
     (q.get('cols') || '').split(',').filter(v => COL_OPTS.some(o => o[0] === v)).forEach(v => SHOW.cols.add(v));
-    find.value = (q.get('q') || '').trim(); Q = find.value.toLowerCase();
+    find.value = (q.get('q') || '').trim(); Q = find.value.toLowerCase(); linked = find.value;
     document.getElementById('shift-ghost').hidden = !!find.value;
     // A page is decimal digits, as on Documents (sd:2427).
     window.shell.list.listParams(q, L, { sorts: Object.keys(SORTS), size: LIST.size });
@@ -593,13 +594,13 @@ addEventListener('DOMContentLoaded', () => {
     const found = P.find ? tasks.filter(t => String(t.id) === P.find) : P.title.length > 2 ? tasks.filter(t => t.title.toLowerCase().includes(P.title.toLowerCase())).slice(0, 3) : [];
     const fr = !P.repo && filterRepo() && [...F.repo][0];
     const chips = [P.p ? `P${P.p}` : 'P3 (default)', P.due && `due ${fmt(P.due)}`, P.repo && `#${P.repo}${repoFor(P.repo) ? '' : ' (not shown here)'}`, fr && `#${fr} (filter)`].filter(Boolean);
-    put(prev, html`${(P.find ? '' : html`<div class="as"><span class="label">Enter adds</span>${ICON('plus')}<span>${P.title || '(title needed)'}</span></div>
+    put(prev, html`${(P.find || (linked && txt.trim() === linked) ? '' : html`<div class="as"><span class="label">Enter adds</span>${ICON('plus')}<span>${P.title || '(title needed)'}</span></div>
       <div class="chips">${chips.map(c => html`<span class="chip" aria-pressed="true">${c}</span>`)}<span class="chip">planning</span></div>`) }${
       (found.length ? html`<p class="hint">${P.find ? 'Enter opens' : 'Matching'}</p><div class="suggest">${found.map(t => html`<button type="button" data-open-find="${t.key}">${ICON('search')}<span>${label(t)} · ${t.title}</span></button>`)}</div>` : P.find ? html`<p class="hint">No task #${P.find} here.</p>` : '') }${
       html`<p class="hint">Enter commits · Esc clears</p>`}`);
     prev.hidden = false; inp.setAttribute('aria-expanded', 'true');
   }
-  inp.addEventListener('input', showPreview);
+  inp.addEventListener('input', () => { linked = ''; showPreview(); });
   inp.addEventListener('focus', showPreview);
   inp.addEventListener('keydown', e => {
     if (e.key === 'Escape') { if (inp.value) { e.stopPropagation(); inp.value = ''; showPreview(); } return; }
@@ -607,7 +608,7 @@ addEventListener('DOMContentLoaded', () => {
     e.preventDefault();
     const P = parse(inp.value);
     if (P.find) { const t = tasks.find(x => String(x.id) === P.find); if (t) { inp.value = ''; showPreview(); select(t.key, true); } return; }
-    if (!P.title) return;
+    if (!P.title || (linked && inp.value.trim() === linked)) return;
     if (P.repo && !repoFor(P.repo)) { toast(`Not added: no repo #${P.repo} is shown on this page.`); return; }
     // build: files it with POST /api/items (workflow.capture_task, sd task add). No verb deletes a task, so no Undo.
     const where = P.repo ? repoFor(P.repo) : filterRepo();

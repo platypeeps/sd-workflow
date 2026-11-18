@@ -1757,6 +1757,22 @@ box.listeners.keydown.forEach(f => f({ key: 'Enter', preventDefault() {}, stopPr
                             "() => [201, { item: { id: 99, title: 'Call the bank' } }]", prelude=prelude, env={"TZ": "America/Denver"})
         self.assertEqual(out["posts"][0][:2], ["/api/items", {"title": "Call the bank", "priority": 3, "due": "2026-11-02"}])
 
+    def test_a_search_a_link_filled_in_files_no_task_until_edited(self):
+        # sd:9309 review: Add or find took a ?q= link's words as typed, so Enter
+        # on an opened link filed a Planning task the operator never wrote.
+        press = "box.listeners.keydown.forEach(f => f({ key: 'Enter', preventDefault() {}, stopPropagation() {} })); await flush();"
+        out = self.run_page("var box = document.getElementById('shift-in');\n" + press + "\nR.kept = box.value;",
+                            "() => [201, { item: { id: 99, title: 'bank' } }]", search="?q=bank")
+        self.assertEqual(out["posts"], [])
+        self.assertEqual(out["R"]["kept"], "bank")
+        out = self.run_page("var box = document.getElementById('shift-in'); box.listeners.focus.forEach(f => f({ target: box }));"
+                            " await flush(); R.preview = document.getElementById('shift-preview').html;", search="?q=bank")
+        self.assertNotIn("Enter adds", out["R"]["preview"])
+        out = self.run_page("var box = document.getElementById('shift-in'); box.value = 'bank call';\n"
+                            "box.listeners.input.forEach(f => f({ target: box })); await flush();\n" + press,
+                            "() => [201, { item: { id: 99, title: 'bank call' } }]", search="?q=bank")
+        self.assertEqual([p[1]["title"] for p in out["posts"]], ["bank call"])
+
     def test_a_capture_lands_in_the_filtered_repo_at_p3_unless_typed(self):
         # sd:3521: the quick add and the shell's capture take the one repo the filter shows, else the selected task's.
         row = self.row("plan")
