@@ -6200,6 +6200,28 @@ class OwnTerm(unittest.TestCase):
             sd_lane.end_child, child, io.StringIO(), io.StringIO()), child) for child in children])
         self.assertEqual([child.sent for child in children], [["TERM", "KILL"], ["TERM", "KILL"]])
 
+    def test_a_second_term_while_the_first_unwinds_cuts_no_cleanup_short(self) -> None:
+        """Round 2 class pass: a run waiting for a child it could not hand off is TERMed at the job's limit as
+        the child's own TERM fires; the child's `term_ends_group` ignores the second while it cleans up."""
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        ready, done = pathlib.Path(tmp.name) / "ready", pathlib.Path(tmp.name) / "done"
+        code = (f"import pathlib, sys, time\nsys.path.insert(0, {str(REPO_ROOT / 'bin')!r})\nimport sd_lib\n"
+                f"with sd_lib.term_ends_group():\n    try:\n        pathlib.Path({str(ready)!r}).write_text('')\n"
+                f"        time.sleep(60)\n    finally:\n        time.sleep(0.5)\n"
+                f"        pathlib.Path({str(done)!r}).write_text('')\n")
+        child = subprocess.Popen([sys.executable, "-c", code], start_new_session=True, env=clean_environment())
+        self.addCleanup(end_group, child.pid)
+        for _ in range(1000):  # bounded: the child has installed its handler
+            if ready.exists():
+                break
+            time.sleep(0.01)
+        child.terminate()
+        time.sleep(0.1)
+        child.terminate()
+        self.assertEqual(child.wait(60), -signal.SIGTERM)
+        self.assertTrue(done.exists(), "the second TERM cut the cleanup short")
+
     def test_a_slow_child_start_shifts_neither_its_last_claim_nor_its_term_point(self) -> None:
         """Round 2: the child counted its budget from its own start; 30 s of start-up moved both 30 s later."""
         import argparse  # noqa: PLC0415
