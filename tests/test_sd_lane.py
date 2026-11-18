@@ -6352,6 +6352,7 @@ class OwnTerm(unittest.TestCase):
         wait_for(ready)
         sd_lane.stop_lanes([sd_lane.StartedLane(lambda: None, process=process)])
         wait_for(termed)
+        self.assertTrue(termed.exists(), "the leader's own child never got the TERM")
 
     def test_a_second_term_while_the_first_unwinds_cuts_no_cleanup_short(self) -> None:
         """Round 2 class pass: a run waiting for a child it could not hand off is TERMed at the job's limit as
