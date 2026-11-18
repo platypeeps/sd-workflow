@@ -68,6 +68,13 @@ class TheWords(unittest.TestCase):
                 bodies = [body for sels, body in rules(css) if selector in sels]
                 self.assertTrue(any("overflow-wrap: anywhere" in body for body in bodies), f"{selector} in {name}")
 
+    def test_a_long_option_wraps_in_its_answer_button(self):
+        """sd:9319: Decide cut each option at the button's edge; the option is the fact, so it wraps."""
+        choice = [body for sels, body in rules(DECISIONS_CSS) if any(".choices .btn" in sel for sel in sels)]
+        self.assertTrue(any("white-space: normal" in body for body in choice), "the answer button never wraps")
+        self.assertTrue(any("overflow-wrap: anywhere" in body for body in choice), "a long word runs past the button")
+        self.assertFalse([body for body in choice if "nowrap" in body or "ellipsis" in body], "an option is still cut")
+
 
 def selectors(css: str, prop: str) -> set[str]:
     """Every selector in `css` whose rule sets `prop`."""
