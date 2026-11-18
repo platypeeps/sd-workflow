@@ -6303,42 +6303,6 @@ class HostedParallel(Lane):
         self.assertEqual(starts, [])
         self.assertIn("budget", row["stopped"])
 
-    def test_a_worker_past_its_hard_deadline_is_ended_by_the_next_run(self) -> None:
-        """Round 3: a child's own TERM and KILL run on SIGALRM, which a blocking native call delays; one that
-        ignores SIGALRM and SIGTERM held its lane for good. The next run KILLs it, then starts the lane."""
-        ready = self.tmp / "deaf"
-        code = ("import pathlib, signal, sys, time\nsignal.signal(signal.SIGALRM, signal.SIG_IGN)\n"
-                "signal.signal(signal.SIGTERM, signal.SIG_IGN)\npathlib.Path(sys.argv[1]).write_text('')\n"
-                "time.sleep(60)\n")
-        spent = -(sd_lane.TERM_AFTER_BUDGET_SECONDS + sd_lane.CHILD_STOP_SECONDS + 5)  # its hard deadline passed
-        child = sd_lane.child_lane(self.repo, spent, argv=[sys.executable, "-c", code, str(ready)],
-                                   environ=clean_environment(**self.environ))
-        self.addCleanup(child.process.wait)
-        self.addCleanup(end_group, child.process.pid)
-        wait_for(ready)
-        self.assertIn("handed_off", child.hand_off())
-        starts: list[pathlib.Path] = []
-
-        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
-            starts.append(checkout)
-            return sd_lane.StartedLane(lambda: {"ran": []})
-        with mock.patch.object(sd_lane, "CHILD_STOP_SECONDS", 0.5):
-            answer = sd_lane.run_hosted(self.environ, self.ship, start=start)
-        self.assertEqual(child.process.wait(10), -signal.SIGKILL)
-        self.assertIn(self.repo, starts, answer)
-        ended = next(row for row in answer["lanes"] if "ended" in row)
-        self.assertIn("TERMed, then KILLed", ended["ended"])
-
-    def test_a_worker_inside_its_hard_deadline_is_left_alone(self) -> None:
-        """Round 3, the other side of the edge: a live handed-off child inside its deadline is not ended."""
-        child = sd_lane.child_lane(self.repo, 60, argv=[sys.executable, "-c", "import time; time.sleep(60)"],
-                                   environ=clean_environment(**self.environ))
-        self.addCleanup(child.process.wait)
-        self.addCleanup(end_group, child.process.pid)
-        self.assertIn("handed_off", child.hand_off())
-        self.assertEqual(sd_lane.end_overdue(self.environ, self.repo), [])
-        self.assertIsNone(child.process.poll())
-
     def test_a_waited_lane_is_ended_before_the_jobs_term_not_left_to_its_own_alarm(self) -> None:
         """Round 3: a lane the run could not hand off was waited for until its own alarm, which may never fire;
         the job's TERM then KILLed the run 10 s later and left the child running, unrecorded."""

@@ -4232,8 +4232,6 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
             lanes.append({"path": path, "settled": settled})
     def inline(checkout: pathlib.Path, budget: float) -> StartedLane:
         return inline_lane(lambda: run_lane(checkout, environ, ship, gate, note, clock() + budget))
-    for path, checkout in hosted:  # before any lane starts: a worker past its hard deadline frees its lane
-        lanes += [{"path": path, **row} for row in end_overdue(environ, checkout)]
     order = longest_waiting_first(hosted, environ)
     lanes += run_parallel(order, start or inline, deadline, functools.partial(lane_room, environ),
                           functools.partial(new_work, environ), functools.partial(lane_held, environ, {}),
@@ -4419,50 +4417,6 @@ def record_child(stem: pathlib.Path, pid: int, hard: float) -> pathlib.Path | No
     return named
 
 
-def end_overdue(environ: dict[str, str], checkout: pathlib.Path) -> list[dict[str, Any]]:
-    """End each handed-off child of `checkout`'s lane still alive past its hard deadline; a row for each (round 3).
-
-    The child arms its own TERM and KILL with SIGALRM, whose handler a
-    blocking native call delays, so it could hold its lane past them. Its
-    answer file's name records its pid and hard deadline: a run TERMs its
-    group, waits `CHILD_STOP_SECONDS` for the lock to free, then KILLs it,
-    before it starts the lane. A pid that no longer leads its own group is
-    another process now, and is left alone. Its entry is then reclaimed
-    by the lane's next settle, the lock being free and the pid gone (sd:3282).
-    """
-    try:
-        folder = queue_for(checkout, environ).lane / "hosted"
-        answers = sorted(folder.glob("*.json")) if folder.is_dir() else []
-    except (LaneError, sd_lib.ConfigError, OSError):
-        return []
-    rows = []
-    for answer in answers:
-        record = child_record(answer)
-        try:
-            if record is None or time.time() < record[1] or not answer_locked(answer) or \
-                    os.getpgid(record[0]) != record[0]:
-                continue
-        except OSError:  # gone, or not this user's: nothing to end
-            continue
-        rows.append({"ended": f"pid {record[0]} held its lane past its hard deadline: {stop_group(record[0], answer)}",
-                     "answer_file": str(answer)})
-    return rows
-
-
-def stop_group(group: int, answer: pathlib.Path) -> str:
-    """TERM `group`, then KILL it if `answer` is still locked after `CHILD_STOP_SECONDS`; how it ended."""
-    for number in (signal.SIGTERM, signal.SIGKILL):
-        sd_lib.signal_group(group, number)
-        stop = time.monotonic() + CHILD_STOP_SECONDS
-        while answer_locked(answer):
-            if time.monotonic() >= stop:
-                break
-            time.sleep(0.05)
-        else:
-            return "TERMed" if number == signal.SIGTERM else "TERMed, then KILLed"
-    return "TERMed, then KILLed, and its lock is still held"
-
-
 def inline_lane(run: Callable[[], dict[str, Any]]) -> StartedLane:
     """A lane run here, to its end, when it starts: the hosted run as it was before sd:5774."""
     try:
@@ -4555,7 +4509,7 @@ def child_lane(checkout: pathlib.Path, budget: float, argv: list[str] | None = N
                     "--deadline", repr(until)]
     process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err, env=dict(environ),
                                start_new_session=True)  # the environ its answer files were read from
-    if stem is not None:  # its hard deadline is its own KILL point: past it, the next run ends it (round 3)
+    if stem is not None:  # its pid and hard deadline, its own KILL point, for whoever must end it (round 3)
         stem = record_child(stem, process.pid, until + TERM_AFTER_BUDGET_SECONDS + CHILD_STOP_SECONDS) or stem
     return StartedLane(functools.partial(child_answer, process, out, err, stem),
                        functools.partial(end_child, process, out, err), process,
@@ -4597,12 +4551,12 @@ def hand_off_child(process: subprocess.Popen[bytes], out: Any, err: Any,
 
     A child that exited since the last look gives its own row instead, and its
     files go. A child with no recorded answer file is None: no lock marks its
-    lane as held once it frees its runner lock, and no run could end it past
-    its hard deadline (`end_overdue`), so the run waits for it, as before.
+    lane as held once it frees its runner lock, so the run waits for it, as
+    before.
     """
     if process.poll() is not None:
         return child_answer(process, out, err, stem) or {}
-    if child_record(stem) is None:  # nothing would mark its lane, or end it past its deadline
+    if child_record(stem) is None:  # nothing would mark its lane
         return None
     out.close()
     err.close()

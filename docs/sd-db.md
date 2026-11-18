@@ -223,7 +223,6 @@ The run passes it a wall-clock `--deadline`, so a slow start moves neither its l
 Its answer goes to `<lane folder>/hosted/<stamp>-pid<pid>-until<epoch>.json`, which the job log's `handed_off` row names.
 A child whose answer file could not be made is not handed off: the run waits for it, and ends it a minute before the job's TERM.
 The answer file's name records the child's pid and hard deadline, its own KILL point.
-A run that finds a child alive past it TERMs, then KILLs its group before it starts that lane: a blocked call can delay the child's own alarm.
 The next run skips a lane such a child holds, and counts it toward `sd.lane_parallel` and the gate room.
 Unloading the job does not stop a handed-off child: `kill -- -<pid>` with the row's pid does, and the next run reclaims its entry.
 [WORKFLOW.md § Parallel work](../WORKFLOW.md#parallel-work) covers the lane from the ship side.
