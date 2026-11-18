@@ -562,7 +562,15 @@ def assignment_state(connection: sqlite3.Connection, assignment: int) -> dict:
         reason = ""
     result = {key: row[key] for key in ("id", "item", "title", "role", "provider", "status", "started", "ended",
                                         "scope", "build_run", "cancel_requested")}
-    result["revision"] = _digest(dict(row))
+    # A queued build lead's cancel parks by `build.parks`, and its confirm names which items park (pack sd:9290):
+    # each one's outcome is in the revision, so a park or unpark between preview and confirm refuses.
+    parking = []
+    if row["scope"] == build.SCOPE and row["status"] == "queued":
+        members = build.queued_members(connection, assignment)
+        ending = (assignment, *(member for member, _ in members))
+        parking = [[ident, one, build.parks(connection, one, ("ready",), ending)]
+                   for ident, one in ((assignment, row["item"]), *members) if one is not None]
+    result["revision"] = _digest({**dict(row), **({"parking": parking} if parking else {})})
     result["capabilities"] = {"cancel": {"allowed": not reason, "reason": reason}}
     return result
 

@@ -1464,6 +1464,29 @@ class CancelParks(Case):
         self.assertEqual([(row["id"], row["status"]) for row in answer["members"]],
                          [(ident, "cancelled") for ident in members])
 
+    def test_a_park_or_unpark_after_the_preview_refuses_the_queued_lead_cancel(self):
+        """Lead review of pack sd:9290: the confirm names which items park from the assignment's revision, which
+        hashed the lead's row alone, so a park or unpark of a member between preview and confirm went through
+        and broke the promise. The revision covers each item's park state."""
+        from sd_db.workflow import StaleItem
+        for change in ("park a member", "unpark the lead's item"):
+            with self.subTest(change=change):
+                items = [self.item(), self.item()]
+                build.queue(self.db, items, who="operator")
+                bundle = self.claim()
+                build.end(self.db, bundle["id"], "cancelled", "cancelled by operator")
+                build.queue_again(self.db, [items[0]], who="operator")
+                if change == "unpark the lead's item":
+                    workflow.edit_item(self.db, items[0], {"parked_at": self.NOW}, who="operator")
+                shown = operations.assignment_state(self.db, bundle["assignment"])["revision"]
+                target = items[1] if change == "park a member" else items[0]
+                workflow.edit_item(self.db, target, {"parked_at": self.NOW if change == "park a member" else None},
+                                   who="operator")
+                with self.assertRaises(StaleItem):
+                    operations.cancel_assignment(self.db, bundle["assignment"], expected_revision=shown, who="operator")
+                self.assertEqual(operations.assignment_state(self.db, bundle["assignment"])["status"], "queued")
+                self.cancel(bundle["assignment"])  # a fresh read passes, and frees the claim for the next case
+
     def test_a_running_cancel_answers_the_request_and_refuses_a_repeat(self):
         """pack sd:9375: the answer still read `running` with no sign of the request, so the operator asked again,
         and each repeat posted the note again (4 on sd:9264). The answer names the request; a repeat refuses."""
