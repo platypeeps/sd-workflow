@@ -67,7 +67,8 @@ Do not substitute another diff or copy a cap into this procedure.
    Rate limits, missing executables, authentication failures, failed runs, and timeouts can advance that chain.
    An exhausted chain with insufficient completed coverage fails.
 3. Disposition findings locally against the repository's severity floor; unset, it is `high`.
-   A finding at the floor blocks only with `evidence`, the check its reviewer ran; one without posts as advisory, marked `[downgraded: no check cited]`.
+   A finding at the floor blocks only with `evidence`: the check its reviewer ran, or the `path:line` and quote a read-only reviewer read; one without posts as advisory, marked `[downgraded: no check cited]`.
+   In a verification, a repeat of a blocker the prior report confirmed stays blocking without fresh evidence; a blocker the verifier drops is fixed.
    Preserve each provider's findings and attempt outcome.
    A completed adverse review counts; it does not trigger replacement.
    A clean fallback cannot erase earlier findings.

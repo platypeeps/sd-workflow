@@ -220,7 +220,7 @@ class RebuttedFindingTests(RepeatFixture):
 
 
 def row(severity: str = "high", **extra: Any) -> dict[str, Any]:
-    return {"path": "src.py", "line": 1, "severity": severity, "summary": "defect", "family": "correctness", **extra}
+    return {"path": "src.py", "line": 1, "severity": severity, "summary": "defect", "family": "correctness"} | extra
 
 
 class EvidenceTests(unittest.TestCase):
@@ -281,8 +281,11 @@ class EvidencePromptTests(RepeatFixture):
         prompts, result, _stderr = self.prompts()
         self.assertEqual(len(prompts), 2)
         for prompt in prompts:
-            self.assertIn("evidence is the check you ran for this finding", prompt)
+            self.assertIn("a check you ran, as the command and the output lines", prompt)
+            # Bundle review round 3: five of six readers cannot run a command.
+            self.assertIn("when you cannot run commands, the exact lines you read, as path:line", prompt)
             self.assertIn("A high finding with empty evidence is posted as advisory", prompt)
+        self.assertIn("path:line and a quote of the lines you read", sd_review.URL_OUTPUT_CONTRACT)
         claude = sd_review.claude_argv(self.tmp, "claude")
         self.assertIn('"evidence"', claude[claude.index("--json-schema") + 1])
 
@@ -296,6 +299,65 @@ class EvidencePromptTests(RepeatFixture):
                 result = sd_review.review(self.root, namespace(), runner, self.environment(), self.chatgpt_home())
                 self.assertEqual(result["status"], status)
                 self.assertEqual(result["findings"][0]["disposition"], status)
+
+
+class RoundThreeTests(ReviewFixture):
+    """Bundle review round 3 of pack sd:9270: read-only readers, verification and dedupe."""
+
+    def commit(self, root: pathlib.Path, path: str, text: str) -> str:
+        (root / path).write_text(text)
+        for argv in (["add", "--", path], ["commit", "-qm", "change\n\nAuthored-with: human"]):
+            subprocess.run(["git", *argv], cwd=root, capture_output=True, check=True, env=clean_environment())
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=root, text=True, env=clean_environment()).strip()
+
+    def branch(self) -> tuple[pathlib.Path, str]:
+        root = self.make_repo()
+        subprocess.run(["git", "checkout", "-qb", "topic"], cwd=root, capture_output=True, check=True,
+                       env=clean_environment())
+        return root, self.commit(root, "src.py", "the_original_defect = True\n")
+
+    def answer(self, *rows: dict[str, Any]) -> sd_review.Completed:
+        return sd_review.Completed(0, json.dumps({"findings": list(rows)}), "")
+
+    def test_a_claude_finding_quoting_the_lines_it_read_stays_blocking(self) -> None:
+        quoted = row(evidence="src.py:1: the_original_defect = True")
+        [record] = sd_review.dispose([dict(quoted, backend="claude")], "high")
+        self.assertEqual((record["disposition"], record["summary"]), ("blocking", "defect"))
+
+    def test_a_verification_cannot_clear_a_confirmed_blocker_by_repeating_it_bare(self) -> None:
+        root, first = self.branch()
+        cited = row(path="src.py", evidence="python3 src.py: wrong")
+        prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": self.answer(cited)}),
+                                 self.environment(), self.chatgpt_home())
+        self.assertEqual(prior["status"], "blocking")
+        report = self.tmp / "prior.json"
+        report.write_text(json.dumps(prior))
+        self.commit(root, "other.py", "unrelated_fix = True\n")
+        bare, fresh = row(path="src.py", summary="still wrong"), row(path="other.py", summary="new and unchecked")
+        for option in ("verify_report", "resume_report"):
+            with self.subTest(option=option):
+                runner = FakeRunner({"codex": self.answer(bare, fresh)})
+                args = namespace(scope="branch", **({"base": first} if option == "verify_report" else {}),
+                                 **{option: str(report)})
+                result = sd_review.review(root, args, runner, self.environment(), self.chatgpt_home())
+                self.assertEqual(result["status"], "blocking")
+                dispositions = {row["path"]: row["disposition"] for row in result["findings"] if row["backend"] == "codex"}
+                self.assertEqual(dispositions, {"src.py": "blocking", "other.py": "advisory"})
+        # Fixed: a verifier that does not repeat it clears it.
+        runner = FakeRunner({"codex": self.answer()})
+        result = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)), runner,
+                                  self.environment(), self.chatgpt_home())
+        self.assertNotEqual(result["status"], "blocking")
+
+    def test_one_finding_from_two_readers_is_one_row_whatever_each_cites(self) -> None:
+        bare, cited, other = row(), row(evidence="src.py:1: x = 1"), row(evidence="python3 src.py: wrong")
+        kept = sd_review.sd_lib.distinct_findings([dict(bare, backend="codex"), dict(cited, backend="second"),
+                                                   dict(other, backend="third")])
+        self.assertEqual(len(kept), 1)
+        self.assertEqual((kept[0]["backend"], kept[0]["evidence"]), ("codex", "src.py:1: x = 1"))
+        self.assertEqual(sd_review.dispose(kept, "high")[0]["disposition"], "blocking")
+        two = sd_review.sd_lib.distinct_findings([dict(row(), backend="codex"), dict(row(summary="other"), backend="x")])
+        self.assertEqual(len(two), 2)
 
 
 if __name__ == "__main__":

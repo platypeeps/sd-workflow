@@ -891,10 +891,12 @@ def build_prompt(subject: Subject, challenge: bool, conventions: str) -> str:
         "speculative ones. path is the repository-relative file, "
         "line is the line in the new version or null, family is one short category "
         "word such as security, correctness, testing, or maintainability. evidence is "
-        "the check you ran for this finding: the command and the output lines that show "
-        "the defect. A high finding with empty evidence is posted as advisory and blocks "
-        "nothing, so run a check before you rate a finding high; never cite a check you "
-        "did not run, and leave evidence empty for a finding you did not check. Respond "
+        "what shows the defect, in one of two forms: a check you ran, as the command and "
+        "the output lines; or, when you cannot run commands, the exact lines you read, as "
+        "path:line and a short quote from the checkout or the patch. A high finding with "
+        "empty evidence is posted as advisory and blocks nothing; never cite a check you "
+        "did not run or a line you did not read, and leave evidence empty for a finding "
+        "you did not check. Respond "
         "only with JSON matching the output schema; an empty findings array means clean."
     )
 
@@ -920,7 +922,8 @@ URL_OUTPUT_CONTRACT = (
     f"other key: {', '.join(FINDING_PROPERTIES)}. severity is one of "
     f"{', '.join(s for s in SEVERITIES if s != 'unspecified')}; put any severity "
     "note in summary, never in a new key. path, summary and family are nonempty strings; line is an integer "
-    "or null; evidence is a string, empty when you ran no check. "
+    "or null; evidence is a string: the check you ran, or path:line and a quote of the lines you read; "
+    "empty when you have neither. "
     'Example: {"findings": [{"path": "src/example.rs", "line": 12, "severity": "high", '
     '"summary": "When X happens, Y fails, so Z breaks.", "family": "correctness", '
     '"evidence": "cargo test x: assertion failed at src/example.rs:12"}]}'
@@ -1664,12 +1667,16 @@ def run_provider(
 # Disposition -- local, and only local
 
 
-def dispose(findings: Sequence[Mapping[str, Any]], floor: str) -> list[dict[str, Any]]:
+def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
+            confirmed: frozenset[str] = frozenset()) -> list[dict[str, Any]]:
     """Label each finding `blocking` or `advisory` against the policy floor.
 
-    A finding at the floor blocks only when it cites a check the reviewer ran (pack sd:9270): a build-1137
-    blocker claimed `ls-tree` reads an id as a glob, and git 2.54 matches it literally. One without
-    evidence is posted as advisory, its summary saying why. The lane runs this through `sd-review` too.
+    A finding at the floor blocks only with evidence (pack sd:9270): a check the reviewer ran, or the
+    `path:line` and quote it read, since five of six readers cannot run a command. A build-1137 blocker
+    claimed `ls-tree` reads an id as a glob, and git 2.54 matches it literally. One without evidence is
+    posted as advisory, its summary saying why, unless it repeats a blocker the prior report confirmed:
+    `confirmed` holds those paths, so a verification cannot clear a blocker by repeating it bare.
+    The match is by path, the conservative side. The lane runs this through `sd-review` too.
     """
 
     threshold = BLOCKING_ORDER[floor]
@@ -1680,7 +1687,7 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str) -> list[dict[str,
         record = dict(finding)
         blocking = rank > 0 and rank >= threshold
         evidence = record.get("evidence")
-        if blocking and not (isinstance(evidence, str) and evidence.strip()):
+        if blocking and not (isinstance(evidence, str) and evidence.strip()) and record.get("path") not in confirmed:
             blocking = False
             summary = str(record.get("summary") or "")
             record["summary"] = summary if summary.endswith(NO_CHECK_NOTE) else f"{summary} {NO_CHECK_NOTE}".strip()
@@ -2316,7 +2323,8 @@ def review(
         result["codex_skill_suppression"] = next((row for row in measures if row["state"] != SKILLS_SUPPRESSED), measures[-1]) if measures else skills
         outcomes = [outcome for _measured, attempts in answers for outcome in attempts]
         outcomes = [row._replace(status=FINDINGS if row.findings else CLEAN) if (row.diagnostic or {}).get("coverage") == "partial" and set(row.diagnostic["omitted_paths"]) <= {path["path"] for path in input_manifest.get("paths", ()) if path.get("media")} and any(other.status in (CLEAN, FINDINGS) for other in outcomes) else row for row in outcomes]
-        finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)])
+        finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)],
+                      confirmed_paths(previous))
     finally:
         slot.give_back()  # sd:2523: on every exit; the gate below queues in its own pool
     # Shadow only (sd:2092): Jev's kind for each finding goes to its ledger and
@@ -2457,10 +2465,16 @@ def partial(outcome: Outcome, unread: Sequence[str]) -> Outcome:
                             diagnostic=dict(outcome.diagnostic or {}, coverage="partial", omitted_paths=list(unread)))
 
 
-def finish_review(result: dict[str, Any], outcomes: Sequence[Outcome], reviewed: list[str]) -> dict[str, Any]:
+def confirmed_paths(previous: Mapping[str, Any] | None) -> frozenset[str]:
+    """The paths of the blockers a prior report confirmed: a repeat of one stays blocking (pack sd:9270)."""
+    return frozenset(row["path"] for row in previous["findings"] if row.get("disposition") == "blocking") if previous else frozenset()
+
+
+def finish_review(result: dict[str, Any], outcomes: Sequence[Outcome], reviewed: list[str],
+                  confirmed: frozenset[str] = frozenset()) -> dict[str, Any]:
     """Keep every distinct finding, once; only complete answers count toward required depth."""
     collected = sd_lib.distinct_findings(dict(finding, backend=outcome.backend) for outcome in outcomes for finding in outcome.findings)
-    disposed = dispose(collected, result["severity_floor"])
+    disposed = dispose(collected, result["severity_floor"], confirmed)
     incomplete = len(reviewed) < result["requested_reviews"]
     remaining = [outcome.backend for outcome in outcomes if outcome.status not in (CLEAN, FINDINGS)] if incomplete else []
     if any(record.get("disposition") == "blocking" for record in disposed):
