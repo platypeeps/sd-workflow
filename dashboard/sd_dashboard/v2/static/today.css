@@ -62,13 +62,13 @@
  * 100-unit track filled to its use; caution from 80 %, warning at the limit. Unknown rows carry their why, never a bar. */
 .usage { margin: 0 0 var(--space-sm); border: var(--rule-hair) solid var(--color-rule); border-radius: var(--radius-md); background: var(--color-panel); }
 .usage .urows { list-style: none; margin: 0; padding: 0; }
-.usage li { display: grid; grid-template-columns: minmax(7rem, max-content) minmax(0, 1fr) auto auto; align-items: center; gap: var(--space-2xs) var(--space-sm);
+.usage li { display: grid; grid-template-columns: minmax(7rem, max-content) minmax(0, 1fr) auto; align-items: center; gap: var(--space-2xs) var(--space-sm);
   padding: var(--space-2xs) var(--space-sm); border-bottom: var(--rule-hair) solid var(--color-rule); font-size: var(--text-sm); }
 .usage .nm { font: 500 var(--text-sm)/1.2 var(--font-data); color: var(--color-ink); white-space: nowrap; }
 .usage .nm > span[aria-hidden] { margin-right: var(--space-2xs); }
 .usage .nm small { color: var(--color-muted); font: 400 var(--text-2xs)/1 var(--font-label); letter-spacing: .06em; text-transform: uppercase; }
 .usage .ws { display: flex; flex-wrap: wrap; gap: var(--space-3xs) var(--space-md); min-width: 0; color: var(--color-ink-2); }
-.usage .w { display: inline-flex; flex-wrap: wrap; align-items: center; gap: var(--space-3xs) var(--space-2xs); font-family: var(--font-data); font-size: var(--text-xs); }
+.usage .w { display: inline-flex; flex-wrap: nowrap; white-space: nowrap; align-items: center; gap: var(--space-3xs) var(--space-2xs); font-family: var(--font-data); font-size: var(--text-xs); }
 .usage .w b { color: var(--color-ink); font-weight: 500; }
 .usage .wl { font: 600 var(--text-2xs)/1 var(--font-label); letter-spacing: .09em; text-transform: uppercase; color: var(--color-muted); }
 .usage .track { width: 6rem; height: 0.5rem; background: var(--color-well); border-radius: 2px; }
@@ -76,6 +76,10 @@
 .usage .fill.caution { fill: var(--color-caution); }
 .usage .fill.warning { fill: var(--color-warning); }
 .usage .why { color: var(--color-muted); font-size: var(--text-xs); }
+/* A service flag sits under its row's windows, so a long incident title never crowds them. */
+.usage .nm, .usage .ws { grid-row: 1; }
+.usage .age { grid-row: 1; grid-column: 3; }
+.usage .flag { grid-row: 2; grid-column: 2 / -1; }
 .usage .flag, .usage .foot a { color: inherit; text-decoration-color: var(--color-rule); text-underline-offset: 3px; font-size: var(--text-xs); }
 .usage .age { color: var(--color-muted); font: var(--text-2xs)/1 var(--font-data); white-space: nowrap; justify-self: end; }
 .usage .foot { margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2xs) var(--space-xs); padding: var(--space-2xs) var(--space-sm);
@@ -86,7 +90,10 @@
 @media (pointer: coarse) { .usage a { display: inline-flex; align-items: center; min-height: var(--row-touch); } }
 @media (max-width: 47.99rem) {
   .usage li { grid-template-columns: minmax(0, 1fr) auto; }
-  .usage .ws, .usage .flag { grid-column: 1 / -1; }
+  .usage .age { grid-column: 2; }
+  .usage .ws { grid-row: 2; grid-column: 1 / -1; }
+  .usage .flag { grid-row: 3; grid-column: 1 / -1; }
+  .usage .w { flex-wrap: wrap; white-space: normal; }
 }
 @media (pointer: coarse) { .daytrack .spend a { display: inline-flex; align-items: center; min-height: var(--row-touch); } }
 
