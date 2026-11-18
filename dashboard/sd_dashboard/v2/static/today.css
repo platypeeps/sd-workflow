@@ -62,11 +62,11 @@
  * 100-unit track filled to its use; caution from 80 %, warning at the limit. Unknown rows carry their why, never a bar. */
 .usage { margin: 0 0 var(--space-sm); border: var(--rule-hair) solid var(--color-rule); border-radius: var(--radius-md); background: var(--color-panel); }
 .usage .urows { list-style: none; margin: 0; padding: 0; }
-.usage li { display: grid; grid-template-columns: minmax(7rem, fit-content(16rem)) minmax(0, 1fr) auto; align-items: center; gap: var(--space-2xs) var(--space-sm);
+.usage li { display: grid; grid-template-columns: minmax(7rem, max-content) minmax(0, 1fr) auto; align-items: center; gap: var(--space-2xs) var(--space-sm);
   padding: var(--space-2xs) var(--space-sm); border-bottom: var(--rule-hair) solid var(--color-rule); font-size: var(--text-sm); }
 /* A long provider name, incident title or error wraps inside its cell, never past the screen's edge. */
 .usage .nm, .usage .why, .usage .flag { min-width: 0; overflow-wrap: anywhere; }
-.usage .nm { font: 500 var(--text-sm)/1.2 var(--font-data); color: var(--color-ink); }
+.usage .nm { font: 500 var(--text-sm)/1.2 var(--font-data); color: var(--color-ink); max-width: 16rem; }
 .usage .nm > span[aria-hidden] { margin-right: var(--space-2xs); }
 .usage .nm small { color: var(--color-muted); font: 400 var(--text-2xs)/1 var(--font-label); letter-spacing: .06em; text-transform: uppercase; }
 .usage .ws { display: flex; flex-wrap: wrap; gap: var(--space-3xs) var(--space-md); min-width: 0; color: var(--color-ink-2); }
@@ -92,6 +92,7 @@
 @media (pointer: coarse) { .usage a { display: inline-flex; align-items: center; min-height: var(--row-touch); } }
 @media (max-width: 47.99rem) {
   .usage li { grid-template-columns: minmax(0, 1fr) auto; }
+  .usage .nm { max-width: none; }
   .usage .age { grid-column: 2; }
   .usage .ws { grid-row: 2; grid-column: 1 / -1; }
   .usage .flag { grid-row: 3; grid-column: 1 / -1; }
