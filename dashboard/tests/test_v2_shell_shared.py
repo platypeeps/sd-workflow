@@ -1511,6 +1511,18 @@ class TheRailWidth(unittest.TestCase):
             raise AssertionError(result.stderr)
         return json.loads(result.stdout)
 
+    def test_the_nav_never_scrolls_sideways_at_any_width(self):
+        # sd:9311: at the default 216 px the nav's auto column grew to its widest entry (182 px in 168), so a sideways
+        # scrollbar showed and cut the g-chord hints and the badges. Headless Chrome at 176, 216, 288 and 384 px: the
+        # columns below held the width (scrollWidth == clientWidth) and the name gave way.
+        css = re.sub(r"/\*.*?\*/", "", SHELL_CSS, flags=re.S)
+        rule = lambda sel: " ".join(re.findall(r"(?:^|\})\s*" + re.escape(sel) + r"(?:\s*,[^{]*)?\s*\{([^}]*)\}", css))  # noqa: E731
+        self.assertIn("grid-template-columns: minmax(0, 1fr)", rule(".rail nav, .rail nav ul"))
+        name = rule(".rail nav a .nm")
+        for want in ("min-width: 0", "overflow: hidden", "text-overflow: ellipsis"):
+            self.assertIn(want, name)
+        self.assertIn("flex: none", rule(".rail nav a :is(.i, .count, kbd, .n)"))
+
     def test_a_width_is_clamped_set_on_the_root_and_kept(self):
         out = self.run_width("R.set = setWidth(250.4); R.low = railWidth(20); R.high = railWidth('900'); R.junk = railWidth('wide');")
         self.assertEqual(out["R"], {"set": 250, "low": 176, "high": 384, "junk": None})
