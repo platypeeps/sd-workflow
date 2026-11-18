@@ -6,6 +6,8 @@
  * error (fields off with the reason, a reading that failed) · empty (no task selected, no record) */
 .tag { display: inline-block; padding: 0 4px; border: var(--rule-hair) dashed var(--color-rule); border-radius: var(--radius-sm); font: 500 var(--text-2xs)/1.4 var(--font-label); letter-spacing: 0.06em; text-transform: uppercase; color: var(--color-muted); }
 .tag.real { border-style: solid; color: var(--color-ink-2); }
+/* The heading clamps to three lines (sd:9317): a long title pushed the fields below the fold; the Title field holds it whole. */
+.details h2 { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden; }
 /* A base row's body (sd:3977): its Markdown as stored, wrapped, in the page's reading face. */
 .details pre.body { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--font-ui); font-size: var(--text-sm); color: var(--color-ink); max-width: 72ch; }
 .details .foot { margin-top: var(--space-lg); padding-top: var(--space-sm); border-top: var(--rule-hair) solid var(--color-rule-2); font-size: var(--text-xs); color: var(--color-muted); }
