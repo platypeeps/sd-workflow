@@ -68,6 +68,7 @@ Do not substitute another diff or copy a cap into this procedure.
    An exhausted chain with insufficient completed coverage fails.
 3. Disposition findings locally against the repository's severity floor; unset, it is `high`.
    A finding at the floor blocks, cited or not; only a repeat of a finding rebutted on this branch needs `evidence` (a check run, or `path:line` and a quote of the current code), and one without posts as advisory, marked `[downgraded: repeats a rebutted finding, no evidence cited]`.
+   A repeat shares the rebuttal's path and whole summary, case and spacing folded, line aside; the newest accepted disposition of a finding on the branch wins, at any time, and the lane's own blockers are never rebutted.
    Preserve each provider's findings and attempt outcome.
    A completed adverse review counts; it does not trigger replacement.
    A clean fallback cannot erase earlier findings.
