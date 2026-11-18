@@ -3336,8 +3336,18 @@ class TheBadge(BrowserSession):
 
     def test_every_page_shows_the_tasks_badge_read_now(self):
         self.item("Pay the bill", kind="task", due="2026-01-02")
-        sections = lambda: self.request("/ui/sections.js", headers={"Cookie": self.cookie})[2]  # noqa: E731
-        badge = lambda: json.loads(re.search(r"^window\.SHELL_COUNTS = (.*);$", sections(), re.M).group(1))["pages"]["Tasks"]  # noqa: E731
+        badges = self.listening.RequestHandlerClass.badges
+
+        def sections():
+            # sd:9310: the live read runs after the answer, so the second request shows it.
+            self.request("/ui/sections.js", headers={"Cookie": self.cookie})
+            badges.settle()
+            return self.request("/ui/sections.js", headers={"Cookie": self.cookie})[2]
+
+        def badge():
+            found = json.loads(re.search(r"^window\.SHELL_COUNTS = (.*);$", sections(), re.M).group(1))["pages"]["Tasks"]
+            return {key: value for key, value in found.items() if key != "at"}
+
         self.assertEqual(badge(), {"state": "warning", "n": 1, "what": "overdue tasks"})
         self.item("Renew the domain", kind="task", due="2026-01-03")
         self.assertEqual(badge()["n"], 2)

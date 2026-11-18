@@ -88,7 +88,7 @@ ASSETS = _enumerate()
 
 
 def sections(badges: dict | None = None, realms: list | None = None) -> bytes:
-    """`/ui/sections.js`: the rail's section map, as `SHELL_COUNTS` each page's badge from `Badges.read`, and as
+    """`/ui/sections.js`: the rail's section map, as `SHELL_COUNTS` each page's kept badge from `Badges.read`, and as
     `SHELL_REALMS` the realms the dashboard.realms row names (sd:5064), each `{id, label, place}`, which Tasks and Writing
     draw as views; `place` is the icon of a realm with a report family of its id, which the rail lists as a place (sd:5663)."""
     lines = ["// The rail's section map, written by sd_dashboard/v2/__init__.py from the page registry in sd_dashboard/v2/pages/ (sd:2418),",
@@ -115,9 +115,10 @@ def _attention(document) -> dict | None:
 class Badges:
     """Each page's rail badge (sd:3446), one per server.
 
-    A page names the read whose document carries its `attention` (`Page.count`). A `live` page's read runs again on
-    each `/ui/sections.js` request; every other page shows what its last read carried, kept here with that read's
-    time, so the rail never waits on the network, launchd or a slow file walk. A failed or shapeless read leaves
+    A page names the read whose document carries its `attention` (`Page.count`). Every page shows what its last read
+    carried, kept here with that read's time, so the rail never waits on the network, launchd, a slow file walk or a
+    live read (sd:9310): a `live` page's read runs again after each `/ui/sections.js` request, on a thread of its own
+    (`refresh_later`), and the next request shows it; every other page's read is the page's own. A failed or shapeless read leaves
     `unknown`, never the value before it, and a read that started earlier never replaces one that started later: each
     read takes a ticket as it starts, since two reads can start in one second. The values live in memory: a restarted
     server shows no such badge until the page is read again.
@@ -127,6 +128,7 @@ class Badges:
         self._last: dict[str, tuple[int, dict]] = {}
         self._lock = threading.Lock()
         self._tickets = itertools.count(1)
+        self._worker: threading.Thread | None = None
 
     def ticket(self) -> int:
         """The order of a read that starts now."""
@@ -145,27 +147,45 @@ class Badges:
             if self._last.get(page.section, (0, None))[0] < ticket:
                 self._last[page.section] = (ticket, {**found, "at": now})
 
-    def read(self, read, connected: bool = True) -> dict:
-        """Section -> badge: a live page's from a read made now, every other page's last one. With no database
-        (`connected` false) a live page is unknown and its read does not run."""
+    def read(self) -> dict:
+        """Section -> badge: each page's last one, the live pages' from the last `refresh`. Runs no read."""
         with self._lock:
-            found = {section: dict(value) for section, (_, value) in self._last.items()}
+            return {section: dict(value) for section, (_, value) in self._last.items()}
+
+    def refresh(self, read, connected: bool = True) -> None:
+        """Run each live page's read now and keep its badge with `read.now`. With no database (`connected` false) a
+        live page is unknown and its read does not run."""
+        ticket = self.ticket()
         for entry in registry.PAGES:
             if not (entry.count and entry.live):
                 continue
-            if not connected:
-                found[entry.section] = {"state": "unknown", "n": 0, "what": f"{entry.section} not read"}
-                continue
-            try:
-                route = api(entry.count)[1]
-                answer = route.read(replace(read, path=entry.count))
-                status, document = answer if isinstance(answer, tuple) else (200, answer)
-                badge = _attention(document) if status == 200 else None
-            except Exception as problem:  # noqa: BLE001 - one page's failed count must not take the rail's map with it
-                print(f"rail badge for {entry.section} failed: {problem!r}", file=sys.stderr)
-                badge = None
-            found[entry.section] = badge or {"state": "unknown", "n": 0, "what": f"{entry.section} not read"}
-        return found
+            badge = None
+            if connected:
+                try:
+                    route = api(entry.count)[1]
+                    answer = route.read(replace(read, path=entry.count))
+                    status, document = answer if isinstance(answer, tuple) else (200, answer)
+                    badge = _attention(document) if status == 200 else None
+                except Exception as problem:  # noqa: BLE001 - one page's failed count must not take the others with it
+                    print(f"rail badge for {entry.section} failed: {problem!r}", file=sys.stderr)
+            found = badge or {"state": "unknown", "n": 0, "what": f"{entry.section} not read"}
+            with self._lock:
+                if self._last.get(entry.section, (0, None))[0] < ticket:
+                    self._last[entry.section] = (ticket, {**found, "at": read.now})
+
+    def refresh_later(self, run) -> None:
+        """Start `run`, which calls `refresh`, on a thread, unless the one started before is still running."""
+        with self._lock:
+            if self._worker is not None and self._worker.is_alive():
+                return
+            self._worker = threading.Thread(target=run, name="rail-badges", daemon=True)
+            self._worker.start()
+
+    def settle(self, timeout: float = 30.0) -> None:
+        """Wait for the running refresh, if any (tests)."""
+        worker = self._worker
+        if worker is not None:
+            worker.join(timeout)
 
 
 def _stylesheet(name: str, body: bytes, versions: dict[str, str]) -> bytes:

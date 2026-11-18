@@ -84,8 +84,8 @@ class Page:
     classic: dict[str, str] = field(default_factory=dict)
     takes: tuple[Old, ...] = ()
     #: The rail badge (sd:3446): the path of the read whose document carries the page's `attention`, `{state, n, what}`,
-    #: the one place its rule lives. `live` runs that read on each `/ui/sections.js` request, for a page that reads the
-    #: database alone; any other page shows what its own last read carried (`v2.Badges`). Empty: the page has no badge.
+    #: the one place its rule lives. `live` runs that read after each `/ui/sections.js` request, off the request (sd:9310),
+    #: for a page that reads the database alone; any other page shows what its own last read carried (`v2.Badges`). Empty: the page has no badge.
     count: str = ""
     live: bool = False
     name: str = ""

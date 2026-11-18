@@ -1,9 +1,9 @@
 """Every rail badge on every page (sd:3446).
 
 What this slice promises: `/ui/sections.js` is written on each request, unversioned and never cached, and carries each
-page's badge as `SHELL_COUNTS`, from the one rule the page's server read holds (`Page.count`). A `live` page's read runs
-again on each request; any other page shows what its own last read carried, with that read's time, so the rail never
-waits on the network. A failed or shapeless read is `unknown`, an older read never replaces a newer one, and a request
+page's badge as `SHELL_COUNTS`, from the one rule the page's server read holds (`Page.count`). Every page shows what its
+last read carried, with that read's time, so the rail never waits on a read (sd:9310): a `live` page's read runs again
+after each request, off it, and any other page's read is the page's own. A failed or shapeless read is `unknown`, an older read never replaces a newer one, and a request
 without a session gets the map and no badge. The pages' own rules are each page's test; this one names no real page.
 """
 
@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -34,8 +36,11 @@ class Stand:
         self.live = {"attention": {"state": "caution", "n": 2, "what": "rows to watch"}}
         self.kept = {"attention": {"state": "warning", "n": 1, "what": "rows broken"}}
         self.calls = []
+        self.gate = None  # an Event the live read waits on, when set
 
     def read_live(self, read):
+        if self.gate is not None:
+            self.gate.wait(10)
         self.calls.append(("live", read.path))
         if isinstance(self.live, Exception):
             raise self.live
@@ -73,29 +78,35 @@ class TheBadges(unittest.TestCase):
         self.addCleanup(patcher.stop)
         self.badges = v2.Badges()
 
-    def test_a_live_page_reads_on_each_request_and_a_kept_page_never(self):
-        found = self.badges.read(Read(now="2026-10-13T12:00:00Z"))
-        self.assertEqual(found["Live"], {"state": "caution", "n": 2, "what": "rows to watch"})
+    def test_a_live_page_reads_on_each_refresh_and_a_kept_page_never(self):
+        self.badges.refresh(Read(now="2026-10-13T12:00:00Z"))
+        found = self.badges.read()
+        self.assertEqual(found["Live"], {"state": "caution", "n": 2, "what": "rows to watch", "at": "2026-10-13T12:00:00Z"})
         self.assertNotIn("Kept", found)
         self.stand.live = {"attention": {"state": "ok", "n": 0, "what": "rows to watch"}}
-        self.assertEqual(self.badges.read(Read(now="2026-10-13T12:00:01Z"))["Live"]["state"], "ok")
+        self.badges.refresh(Read(now="2026-10-13T12:00:01Z"))
+        self.assertEqual(self.badges.read()["Live"]["state"], "ok")
         self.assertEqual(self.stand.calls, [("live", "/api/example-live")] * 2)
+
+    def test_reading_runs_no_read(self):
+        # sd:9310: the rail's script answers from what is kept; a live read runs on a refresh alone.
+        self.assertEqual((self.badges.read(), self.stand.calls), ({}, []))
 
     def test_a_kept_page_shows_its_last_read_with_its_time(self):
         self.badges.remember("/api/example-kept", self.stand.kept, "2026-10-13T12:00:00Z")
-        self.assertEqual(self.badges.read(Read())["Kept"],
+        self.assertEqual(self.badges.read()["Kept"],
                          {"state": "warning", "n": 1, "what": "rows broken", "at": "2026-10-13T12:00:00Z"})
 
     def test_a_read_another_page_counts_is_kept_for_that_page_alone(self):
         # Evidence: the badge goes to the page that names the path, never to the page whose read ran first.
         for path in ("/api/example-live", "/api/tasks", "/api/example-kept/1", "/api/example"):
             self.badges.remember(path, self.stand.kept, "2026-10-13T12:00:00Z")
-        self.assertNotIn("Kept", self.badges.read(Read()))
+        self.assertNotIn("Kept", self.badges.read())
 
     def test_a_failed_or_shapeless_read_is_unknown_and_not_the_value_before_it(self):
         self.badges.remember("/api/example-kept", self.stand.kept, "2026-10-13T12:00:00Z")
         self.badges.remember("/api/example-kept", None, "2026-10-13T12:01:00Z")
-        self.assertEqual(self.badges.read(Read())["Kept"],
+        self.assertEqual(self.badges.read()["Kept"],
                          {"state": "unknown", "n": 0, "what": "Kept read failed", "at": "2026-10-13T12:01:00Z"})
         for shapeless in ({}, {"attention": None}, {"attention": {"state": "loud", "n": 1, "what": "x"}},
                           {"attention": {"state": "caution", "n": -1, "what": "x"}},
@@ -103,17 +114,17 @@ class TheBadges(unittest.TestCase):
                           {"attention": {"state": "caution", "n": 1, "what": "x", "extra": 1}}, [1]):
             self.badges.remember("/api/example-kept", self.stand.kept, "2026-10-13T12:02:00Z")
             self.badges.remember("/api/example-kept", shapeless, "2026-10-13T12:03:00Z")
-            self.assertEqual(self.badges.read(Read())["Kept"]["state"], "unknown", shapeless)
+            self.assertEqual(self.badges.read()["Kept"]["state"], "unknown", shapeless)
 
     def test_an_older_read_never_replaces_a_newer_one(self):
         # Steps: two reads of one page start in one second and finish out of order; the badge keeps the one started later.
         older, newer = self.badges.ticket(), self.badges.ticket()
         self.badges.remember("/api/example-kept", self.stand.kept, "2026-10-13T12:05:00Z", newer)
         self.badges.remember("/api/example-kept", {"attention": {"state": "ok", "n": 0, "what": "x"}}, "2026-10-13T12:05:00Z", older)
-        self.assertEqual(self.badges.read(Read())["Kept"]["state"], "warning")
+        self.assertEqual(self.badges.read()["Kept"]["state"], "warning")
         # A read with no ticket starts and ends now, so it is the newest.
         self.badges.remember("/api/example-kept", None, "2026-10-13T12:05:00Z")
-        self.assertEqual(self.badges.read(Read())["Kept"]["state"], "unknown")
+        self.assertEqual(self.badges.read()["Kept"]["state"], "unknown")
 
     def test_a_live_read_that_fails_is_unknown_and_the_rest_still_show(self):
         self.badges.remember("/api/example-kept", self.stand.kept, "2026-10-13T12:00:00Z")
@@ -121,21 +132,23 @@ class TheBadges(unittest.TestCase):
                         {"attention": {"state": "caution", "n": "2", "what": "x"}}):
             self.stand.live = failure
             with patch("sys.stderr"):
-                found = self.badges.read(Read())
-            self.assertEqual(found["Live"], {"state": "unknown", "n": 0, "what": "Live not read"}, failure)
+                self.badges.refresh(Read(now="2026-10-13T12:00:00Z"))
+            found = self.badges.read()
+            self.assertEqual(found["Live"], {"state": "unknown", "n": 0, "what": "Live not read", "at": "2026-10-13T12:00:00Z"}, failure)
             self.assertEqual(found["Kept"]["state"], "warning")
 
     def test_with_no_database_a_live_page_is_unknown_and_not_read(self):
         self.badges.remember("/api/example-kept", self.stand.kept, "2026-10-13T12:00:00Z")
         with patch("sys.stderr") as stderr:
-            found = self.badges.read(Read(), connected=False)
-        self.assertEqual(found["Live"], {"state": "unknown", "n": 0, "what": "Live not read"})
+            self.badges.refresh(Read(now="2026-10-13T12:00:00Z"), connected=False)
+        found = self.badges.read()
+        self.assertEqual(found["Live"], {"state": "unknown", "n": 0, "what": "Live not read", "at": "2026-10-13T12:00:00Z"})
         self.assertEqual(found["Kept"]["state"], "warning")
         self.assertEqual((self.stand.calls, stderr.write.call_count), ([], 0))
 
     def test_each_server_keeps_its_own(self):
         self.badges.remember("/api/example-kept", self.stand.kept, "2026-10-13T12:00:00Z")
-        self.assertNotIn("Kept", v2.Badges().read(Read()))
+        self.assertNotIn("Kept", v2.Badges().read())
 
 
 class TheScript(BrowserSession):
@@ -150,6 +163,8 @@ class TheScript(BrowserSession):
         return self.request(path, headers={"Cookie": self.cookie} if cookie else {})
 
     def test_it_is_written_per_request_and_never_cached(self):
+        self.get("/ui/sections.js")
+        self.listening.RequestHandlerClass.badges.settle()
         status, headers, body = self.get("/ui/sections.js")
         self.assertEqual((status, headers["Content-Type"], headers["Cache-Control"]),
                          (200, "text/javascript; charset=utf-8", "no-store"))
@@ -160,6 +175,19 @@ class TheScript(BrowserSession):
         self.assertNotIn("sections.js", v2.VERSIONS)
         status, headers, _ = self.get("/ui/sections.js?v=0123456789abcdef")
         self.assertEqual((status, headers["Cache-Control"]), (200, "no-store"))
+
+    def test_it_answers_before_a_slow_live_read_ends(self):
+        # sd:9310: the script is parser-blocking, so a live read made for it held every page's first paint 15 s.
+        release = self.stand.gate = threading.Event()
+        self.addCleanup(release.set)
+        started = time.monotonic()
+        body = self.get("/ui/sections.js")[2]
+        self.assertLess(time.monotonic() - started, 5, "sections.js waited on a live read")
+        self.assertNotIn("Live", counts(body))
+        release.set()
+        self.listening.RequestHandlerClass.badges.settle()
+        live = counts(self.get("/ui/sections.js")[2])["Live"]
+        self.assertEqual({key: live[key] for key in ("state", "n")}, {"state": "caution", "n": 2})
 
     def test_without_a_session_it_carries_the_map_and_no_badge(self):
         status, _, body = self.get("/ui/sections.js", cookie=False)
