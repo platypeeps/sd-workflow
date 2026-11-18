@@ -181,9 +181,11 @@ addEventListener('DOMContentLoaded', () => {
   function clearFilters() { Object.values(F).forEach(s => s.clear()); Q = ''; find.value = ''; L.page = 1; render(); }
   // The text filter narrows on what a row shows: id, title, repo, status and kind, as v1's ?q= read the visible columns.
   // Add or find's words set it (showPreview, sd:9309): its title words, or #id; p1, due fri and #repo are the add's alone.
+  // A #id names one task, as the preview and Enter take it: #904 never lists #9040 (review of sd:9309).
+  const matches = t => { const id = Q.match(/^#(\d+)$/); return id ? String(t.id) === id[1] : words(t).includes(Q); };
   const words = t => `#${t.id} ${t.title} ${t.repo} ${slabel(t.status)} ${t.kind} ${t.stage || ''}`.toLowerCase();
   const passes = t => (!F.kind.size || picked(t)) && work(t) && (!F.repo.size || F.repo.has(t.repo)) && (!F.p.size || F.p.has(t.p ? String(t.p) : 'unset')) && (!F.due.size || F.due.has(dueBucket(t)))
-    && (!F.status.size || F.status.has(t.status)) && (!F.age.size || F.age.has(t.age)) && (!F.active.has('1') || t.status !== 'done') && scoped(t) && inPlace(t) && (!Q || words(t).includes(Q));
+    && (!F.status.size || F.status.has(t.status)) && (!F.age.size || F.age.has(t.age)) && (!F.active.has('1') || t.status !== 'done') && scoped(t) && inPlace(t) && (!Q || matches(t));
   const visible = () => tasks.filter(passes);
 
 

@@ -3135,6 +3135,15 @@ class TheFilterAddress(ScreenCase):
             self.assertRegex(out["R"]["filters"], rf'<select id="f-{key}"[^>]*>(?:(?!</select>).)*<option value="{value}" selected>', key)
         self.assertIn('<option value="14">14-29d</option>', out["R"]["filters"])
 
+    def test_a_task_id_matches_that_task_alone_typed_or_linked(self):
+        # Review of sd:9309: #904 also listed #9040 by prefix, while the preview and Enter take #904 alone.
+        self.doc["rows"].append(self.made(9040, "Another row", "ready", "0"))
+        self.assertEqual(self.listed("?view=list&q=%23904")[0], {904})
+        shown, _ = self.listed("?view=list", "const box = document.getElementById('shift-in'); box.value = '#904';\n"
+                               "box.listeners.input[0]({ target: box }); await flush();")
+        self.assertEqual(shown, {904})
+        self.assertEqual(self.listed("?view=list&q=%239040")[0], {9040})
+
     def test_the_text_filter_reads_q_and_the_box_writes_it(self):
         self.assertEqual(self.listed("?view=list&q=BUDGET")[0], {902})
         self.assertEqual(self.listed("?view=list&q=%23904")[0], {904})
