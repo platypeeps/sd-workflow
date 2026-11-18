@@ -1021,17 +1021,37 @@ def left_cited(connection: Any, branch: str, body: str, commits: list[tuple[str,
     return sorted(build.left(connection, branch, sources))
 
 
-def refuse_left_members(connection: Any, branch: str, items: tuple[int, ...]) -> None:
+def refuse_left_members(connection: Any, branch: str, items: tuple[int, ...],
+                        then: str = "nothing was queued") -> None:
     """Refuse an entry on a build bundle's `branch` that would deliver a member the operator cancelled on its own
-    out of that bundle (`build.left`): as its item or a later `--item` at enqueue, or a saved close at retry,
-    which copies them (review round 6 of sd:9222)."""
+    out of that bundle (`build.left`): as its item or a later `--item` at enqueue, a saved close at retry,
+    which copies them (review round 6 of sd:9222), or one cancelled since, at the run (`left_stop`)."""
     from sd_db import build  # noqa: PLC0415
     left = sorted(build.left(connection, branch, items))
     if left:
         named = ", ".join(f"sd:{number}" for number in left)
         raise LaneError(f"{named} was cancelled on its own out of the build bundle on {branch}, so this entry may "
-                        "not deliver it; nothing was queued. Drop it from the entry and enqueue again from the "
+                        f"not deliver it; {then}. Drop it from the entry and enqueue again from the "
                         "worktree; build it again to deliver it on its own branch.", code=MEMBER_LEFT)
+
+
+def left_stop(entry: dict[str, Any], queue: Queue, step: str) -> dict[str, Any] | None:
+    """The fields that end `entry` at `step` when a member it delivers was cancelled on its own since the enqueue
+    (`refuse_left_members`, review round 7 of sd:9222); None when none was. A read with no answer is a hub fault,
+    which the next run retries, never a pass."""
+    then = "the run stopped it before prepare" if step == "prepare" else "the run stopped it before the merge"
+    try:
+        on_hub(queue, lambda connection: refuse_left_members(
+            connection, str(entry.get("branch") or ""), (entry["item"], *(entry.get("closes") or ())), then),
+            write=False)
+    except LaneError as error:
+        fields = {"status": "failed", "step": step, "code": error.code, "reason": str(error)[:REASON_CHARS]}
+        if error.code == MEMBER_LEFT:
+            return fields
+        if error.code == HUB_UNAVAILABLE:
+            return {**fields, "hub_fault": True}
+        raise
+    return None
 
 
 def tip_past(worktree: pathlib.Path, branch: str, tip: str, head: str) -> None:
@@ -2017,6 +2037,9 @@ def process(entry: dict[str, Any], queue: Queue, ship: Ship, advance: Callable[[
     worktree, item, logs = pathlib.Path(entry["worktree"]), entry["item"], queue.lane / "logs"
     if not at_head(worktree, entry["expected_head"]):
         return {"status": "skipped", "code": HEAD_MOVED, "reason": "the worktree's HEAD moved from the queued head"}
+    left = left_stop(entry, queue, "prepare")
+    if left is not None:
+        return left
     stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
     shot = draw_shots(worktree, logs / f"shots-{item}-{stamp}")
     if shot.get("shots"):
@@ -2029,6 +2052,9 @@ def process(entry: dict[str, Any], queue: Queue, ship: Ship, advance: Callable[[
         advance()  # the claim still holds, and the lane is still here, before the landing (sd:3482)
     if stopped is not None:
         return {**fields, **stopped}
+    left = left_stop(entry, queue, "merge")  # prepare runs for minutes; a cancel may land in them
+    if left is not None:
+        return {**fields, **left}
     refused = merge_refusal(entry)
     if refused is not None:
         return {**fields, "status": "prepared", **refused}

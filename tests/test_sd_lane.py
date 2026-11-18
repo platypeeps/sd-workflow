@@ -3220,6 +3220,32 @@ class CitedCloses(SharedQueue):
         self.assertIn(f"sd:{a} was cancelled on its own", str(refused.exception))
         self.assertEqual(len(self.entries()), before)
 
+    def test_the_runner_stops_an_entry_whose_member_was_cancelled_after_enqueue(self) -> None:
+        """Review round 7 of pack sd:9222: the runner passed the saved closes to prepare and merge unchecked, so a
+        member cancelled after the enqueue still closed. It checks again before prepare and before merge; the entry
+        fails `member_cancelled_alone`, naming the member, and nothing closes it."""
+        for when in ("before the run", "during prepare"):
+            with self.subTest(when=when):
+                a = self.open[0] if when == "before the run" else self.open[1]
+                branch, (_, child) = self.bundle(self.own, a)
+                entry = self.enqueue_on(branch, self.own, "fix: a slice", "## Summary\n\nWords.\n",
+                                        f"fix(lane): the slice\n\nCloses: sd:{self.own}\nCloses: sd:{a}")
+                self.assertEqual(entry["closes"], [a])
+                self.calls.clear()
+
+                def cancel_in_prepare(argv: list[str], log: pathlib.Path, child: int = child) -> dict:
+                    if "prepare" in argv[2:4]:
+                        self.cancel_alone(child)
+                    return self.ship(argv, log)
+                if when == "before the run":
+                    self.cancel_alone(child)
+                sd_lane.run_lane(self.repo, self.environ, cancel_in_prepare)
+                ended = self.entries()[-1]
+                self.assertEqual((ended["status"], ended["code"]), ("failed", "member_cancelled_alone"), ended)
+                self.assertIn(f"sd:{a} was cancelled on its own", ended["reason"])
+                self.assertNotIn("merge", [call[2] for call in self.calls])
+                self.assertEqual("prepare" in [call[2] for call in self.calls], when == "during prepare")
+
     def test_a_member_cancelled_alone_still_closes_on_another_branch(self) -> None:
         """Evidence: the exclusion holds for the entry of the member's own bundle only, read from its branch.
         An entry on another branch that delivers it, even the same item's, closes it as before."""
