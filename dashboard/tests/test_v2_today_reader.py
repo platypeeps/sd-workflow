@@ -124,6 +124,11 @@ R.obj = [C.get('job:nightly-sync:7').type, C.get('job:nightly-sync:7').label]; R
         self.assertEqual(out["R"]["obj"], ["not listed", "nightly-sync failed with exit 7 (no longer listed)"])
         self.assertEqual(out["R"]["kept"], "repo")
 
+    def test_the_loading_line_names_the_today_rows_in_lower_case(self):
+        """sd:9314: the loading line read 'Reading The Today rows'."""
+        out = self.run_page("")
+        self.assertEqual(out["states"][0]["text"], "Reading the Today rows. Rows appear when the read finishes.")
+
     def test_a_failed_read_clears_the_rows_and_retires_their_objects(self):
         out = self.run_page("""ANSWER = () => [500, { error: 'fleet collection was stopped at its budget' }]; refresh(); await flush();
 R.rows = ELS.rows.html; R.sub = ELS.subhead.textContent; R.type = C.get('job:nightly-sync:7').type; R.row = location.search;""")
