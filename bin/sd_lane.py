@@ -2069,9 +2069,11 @@ def process(entry: dict[str, Any], queue: Queue, ship: Ship, advance: Callable[[
     if blocker_code(merged) == LANE_ELSEWHERE:
         return {**fields, "moved": str(merged.get("error") or "the lane moved")[:600]}  # a move, not a failure
     if not (merged.get("ok") and merged.get("phase") == "merged"):
+        # A cancel that lands during the merge refuses it as `left_stop` stops the entry: the code stays (pack sd:9303).
         return {**fields, "status": "failed", "step": "merge", "phase": merged.get("phase"),
                 "reason": str(merged.get("error") or merged.get("code") or "merge did not confirm")[:REASON_CHARS],
-                **({"hub_fault": True} if answered_hub_fault(merged) else {})}
+                **({"hub_fault": True} if answered_hub_fault(merged) else {}),
+                **({"code": MEMBER_LEFT} if blocker_code(merged) == MEMBER_LEFT else {})}
     return {**fields, "status": "merged", "merge_commit": merged.get("merge_commit")}
 
 

@@ -599,6 +599,12 @@ class TheRows(Lane, ScreenCase):
         self.assertEqual((merge["log"], merge["failure"]), (f"{self.lane}/logs/merge-14.log", {}))
         self.assertIsNone(self.failed(step="merge")["log"])
 
+    def test_a_merge_failure_names_the_code_the_lane_recorded(self):
+        """pack sd:9303: a merge refused as `member_cancelled_alone` read as a generic merge failure: the page
+        reads prepare's log alone. The entry's own code answers where no log does."""
+        merge = self.failed(step="merge", merge_log=f"{self.lane}/logs/merge-14.log", code="member_cancelled_alone")
+        self.assertEqual(merge["failure"], {"code": "member_cancelled_alone"})
+
     def test_a_failed_entry_says_whether_its_worktree_still_holds_the_head_it_failed_at(self):
         self.assertIs(self.failed()["unchanged"], True)
         # Another host's worktree is not read here: unknown, not unchanged.

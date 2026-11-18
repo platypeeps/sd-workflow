@@ -6110,6 +6110,16 @@ class FailureNotes(SharedQueue):
         self.assertEqual(self.lane_notes(), [(1, "Lane failed in merge at head-1: the merge was refused; "
                                                  f"full text: {entry['merge_log']}")])
 
+    def test_a_merge_refused_for_a_member_cancelled_alone_keeps_its_code(self) -> None:
+        """pack sd:9303: a cancel that lands during the merge makes `sd-ship merge` refuse `member_cancelled_alone`;
+        the lane dropped the code, so Queue showed a generic merge failure. The entry keeps it, as `left_stop`'s does."""
+        sd_lane.enqueue_entry(self.feature, 1, "fix: one", self.body, self.environ, manual=True, claim="deliver")
+        self.answers[(1, "merge")] = {"ok": False, "phase": "merging", "error": "sd:2 was cancelled on its own",
+                                      "workflow": {"blocker": {"code": "member_cancelled_alone", "retryable": False}}}
+        sd_lane.run_lane(self.repo, self.environ, self.ship)
+        [entry] = self.entries()
+        self.assertEqual((entry["status"], entry["step"], entry.get("code")), ("failed", "merge", "member_cancelled_alone"))
+
     def test_an_exception_in_the_merge_step_notes_merge(self) -> None:
         """pack sd:5968: a raise after `advance` names merge in the note and the finish record, not prepare."""
         for error in (OSError("the merge log did not write"), sd_lane.LaneError("the merge read failed")):
