@@ -258,7 +258,8 @@ class StatusGuards(WorkflowCase):
             self.assertEqual(item_state(self.db, item), before)
 
     def test_other_kinds_cannot_bypass_their_specialized_workflow(self):
-        item = create_item(self.db, kind="idea", title="Writing")
+        item = create_item(self.db, kind="idea", title="Writing", source="writing-piece", external_id="writing")
+        set_item_fields(self.db, item, piece="writing")
         with self.assertRaises(TransitionRefused):
             change_status(self.db, item, "ready", who="operator")
         self.assertEqual(allowed_statuses(self.db, item), [])
@@ -346,13 +347,80 @@ class StatusGuards(WorkflowCase):
                 self.assertEqual(finished["item"]["status"], "done")
 
     def test_kinds_with_their_own_workflow_still_refuse_status_controls(self):
-        for kind in ("idea", "work-idea", "personal-idea", "report"):
+        for kind in ("report",):
             item = create_item(self.db, kind=kind, title=f"A {kind} item")
             before = item_state(self.db, item)
             with self.subTest(kind=kind), self.assertRaisesRegex(TransitionRefused, "task controls"):
                 change_status(self.db, item, "done", who="operator")
             self.assertEqual(allowed_statuses(self.db, item), [])
             self.assertEqual(item_state(self.db, item), before)
+
+    #: The three idea groups a person closes by hand (pack sd:9302): kind, source.
+    HAND_IDEAS = (("work-idea", None), ("work-idea", "drafts"), ("personal-idea", "drafts"),
+                  ("idea", "drafts"), ("idea", None))
+
+    def test_a_hand_idea_closes_with_a_reason_and_reopens_to_planning(self):
+        """pack sd:9302: these ideas had no status choice, so nothing could close them."""
+        for kind, source in self.HAND_IDEAS:
+            with self.subTest(kind=kind, source=source):
+                item = create_item(self.db, kind=kind, title=f"A {kind} item", source=source)
+                self.assertEqual(allowed_statuses(self.db, item), ["planning", "done"])
+                closed = change_status(self.db, item, "done", who="operator", reason="not doing it")
+                self.assertEqual(closed["item"]["status"], "done")
+                history = [n for n in closed["notes"] if n["kind"] == "status_change"]
+                self.assertIn("planning -> done by operator", history[-1]["body"])
+                self.assertIn("not doing it", history[-1]["body"])
+                self.assertEqual(allowed_statuses(self.db, item), ["planning", "done"])
+                reopened = change_status(self.db, item, "planning", who="operator")
+                self.assertEqual(reopened["item"]["status"], "planning")
+
+    def test_a_hand_idea_refuses_the_build_statuses(self):
+        """pack sd:9302: an idea is kept or closed; ready, in progress and blocked are build states."""
+        for kind, source in self.HAND_IDEAS:
+            item = create_item(self.db, kind=kind, title=f"A {kind} item", source=source)
+            before = item_state(self.db, item)
+            for target in ("ready", "in_progress", "blocked", "ready_to_send"):
+                with self.subTest(kind=kind, source=source, target=target), \
+                        self.assertRaisesRegex(TransitionRefused, "task controls"):
+                    change_status(self.db, item, target, who="operator")
+            self.assertEqual(item_state(self.db, item), before)
+
+    def test_a_pieced_idea_keeps_its_writing_workflow(self):
+        """pack sd:9302: a writing piece closes through its stages, whatever its source says."""
+        for source in ("writing-piece", "drafts", None):
+            item = create_item(self.db, kind="idea", title="A piece", source=source, external_id=f"piece-{source}")
+            set_item_fields(self.db, item, piece=f"piece-{source}")
+            before = item_state(self.db, item)
+            with self.subTest(source=source), self.assertRaisesRegex(TransitionRefused, "task controls"):
+                change_status(self.db, item, "done", who="operator")
+            self.assertEqual(allowed_statuses(self.db, item), [])
+            self.assertEqual(item_state(self.db, item), before)
+
+    def test_a_hand_idea_with_an_active_assignment_refuses(self):
+        item = create_item(self.db, kind="work-idea", title="Held idea")
+        create_assignment(self.db, item=item, role="author", status="running")
+        with self.assertRaisesRegex(TransitionRefused, "assignment"):
+            change_status(self.db, item, "done", who="operator")
+        self.assertEqual(allowed_statuses(self.db, item), [])
+
+    def test_the_hand_idea_rule(self):
+        """pack sd:9302: one rule, read by the library and the dashboard."""
+        from sd_db.workflow import hand_idea
+
+        cases = (({"kind": "work-idea", "source": None, "piece": None}, True),
+                 ({"kind": "personal-idea", "source": "drafts", "piece": None}, True),
+                 ({"kind": "idea", "source": "drafts", "piece": None}, True),
+                 ({"kind": "idea", "source": None, "piece": None}, True),
+                 ({"kind": "idea", "source": "writing-piece", "piece": "p"}, False),
+                 ({"kind": "idea", "source": "writing-piece", "piece": None}, False),
+                 ({"kind": "idea", "source": "drafts", "piece": "p"}, False),
+                 ({"kind": "idea", "source": "vault", "piece": None}, False),
+                 ({"kind": "work-idea", "source": "vault", "piece": None}, False),
+                 ({"kind": "task", "source": None, "piece": None}, False),
+                 ({"kind": "report", "source": None, "piece": None}, False))
+        for row, expected in cases:
+            with self.subTest(row=row):
+                self.assertIs(hand_idea(row), expected)
 
     def test_a_report_refusal_names_acknowledgement_as_the_way_out(self):
         """sd:5065: the library names the action; the CLI and dashboard render it."""

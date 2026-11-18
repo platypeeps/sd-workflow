@@ -571,7 +571,12 @@ A to-do is a task in a repository; the catalogue files a skill review as a `task
 
 `task` and `followup` items (`workflow.TASK_STATUS_KINDS`) share the five `TASK_STATUSES`:
 `planning`, `ready`, `in_progress`, `blocked` and `done`.
-`work` keeps its delivery rules; `idea`, `work-idea`, `personal-idea` and `report` keep their own workflows.
+`work-idea`, `personal-idea` and an `idea` that is no writing piece and no vault row (`workflow.hand_idea`) take two:
+`planning` and `done` (`workflow.IDEA_STATUSES`, pack sd:9302).
+A person closes one with an optional reason, and reopens it to `planning`, from the item screen or `sd task status`.
+`ready`, `in_progress` and `blocked` are build states, and no runner builds an idea.
+`work` keeps its delivery rules, and `report` closes by acknowledgement.
+A writing piece moves through its stages, and a vault row by stage only (sd:3972).
 
 `workflow.edit_item` is the verb a person uses to change a row's kind.
 The target must be in the store's CHECK (`workflow.schema_kinds`) and in `workflow.HAND_KINDS`, the four `sd task add --kind` files.

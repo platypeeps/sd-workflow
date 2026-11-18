@@ -98,6 +98,13 @@ def item_controls(connection, item_id):
 
 
 def _item_controls(connection, item_id, row, revision):
+    if workflow.hand_idea(row):
+        # pack sd:9302: the status control alone. `edit_item` takes no idea's
+        # details (`DETAIL_KINDS`), so a details form would offer a refused save.
+        return tag("section", tag("h2", "Manage this item"),
+            tag("div", _status_control(connection, item_id, row, revision),
+                tag("p", "An idea can close here, or reopen to planning.", class_="hint")),
+            class_="control-panel")
     if row["kind"] not in ("task", "work", *workflow.TASK_STATUS_KINDS):
         return Markup("")
     if row["kind"] == "work":

@@ -19,7 +19,7 @@ from . import repos
 from .assets import item_asset
 from .database import transaction
 from .errors import SdDbError
-from .reads import item_by_id, item_notes
+from .reads import IDEA_KINDS, item_by_id, item_notes
 from .recurrence import (
     ANCHORS,
     MAX_LEAD_DAYS,
@@ -156,10 +156,33 @@ TASK_STATUSES = ("planning", "ready", "in_progress", "blocked", "done")
 #: it is a hand-filed item worked in its own right, and before that the task
 #: controls offered it no status, so it could not be closed. `personal`
 #: joined then too and left with its kind (sd:7004). `work` has its own
-#: delivery rules; `idea`, `work-idea`,
-#: `personal-idea` and `report` keep their own workflows and get no status
-#: choices here.
+#: delivery rules, and `report` closes by acknowledgement. The ideas
+#: `hand_idea` names take `IDEA_STATUSES`; a writing piece and a vault
+#: row keep their own workflows and get no status choices here.
 TASK_STATUS_KINDS = ("task", "followup")
+
+#: The status choices of a `hand_idea` row (pack sd:9302): kept or closed.
+#: `ready`, `in_progress` and `blocked` are build states, and no runner
+#: builds an idea (`runner.RUNNABLE_KINDS`).
+IDEA_STATUSES = ("planning", "done")
+
+
+def hand_idea(row: Any) -> bool:
+    """Whether `row` is an idea a person closes and reopens by hand (pack sd:9302).
+
+    `work-idea` and `personal-idea` rows, and an `idea` that is no writing
+    piece and no vault row. A writing piece -- a `piece`, or the
+    `writing-piece` source -- closes through its stages, and a vault row
+    moves by stage only (sd:3972). The library's status choices and the
+    dashboard's item panel both read this rule.
+    """
+    # Read when the rule runs: `writing` and `sources` import this module.
+    from .sources.vault import SOURCE as VAULT
+    from .writing import SOURCE as WRITING
+
+    if row["kind"] not in IDEA_KINDS or row["source"] in (VAULT, WRITING):
+        return False
+    return row["kind"] != "idea" or not row["piece"]
 
 
 class WorkflowError(SdDbError):
@@ -633,15 +656,16 @@ def allowed_statuses(connection: sqlite3.Connection, item: int, *, state: dict |
     in the same snapshot, so a caller listing many items reads each history
     once (sd:2380); it must be this item's.
 
-    A `TASK_STATUS_KINDS` item gets `TASK_STATUSES`; work that is not done
-    gets every status but `done`; every other kind, and any item with a
-    queued or running assignment, gets none. A vault base row is an `idea`,
-    so it gets none: it moves by stage only (sd:3972).
+    A `TASK_STATUS_KINDS` item gets `TASK_STATUSES`; a `hand_idea` row gets
+    `IDEA_STATUSES`; work that is not done gets every status but `done`;
+    every other kind, and any item with a queued or running assignment,
+    gets none. A vault base row is an `idea` that is no `hand_idea`, so it
+    gets none: it moves by stage only (sd:3972).
 
     The dashboard item screen offers exactly these choices, but only on the
-    panels it renders: `task` and `TASK_STATUS_KINDS` items always, a `work`
-    item only while `progress.work_controls` gives no reason, and no other
-    kind. `edit_item` accepts a followup's details since sd:809, and since sd:816 the screen renders the matching
+    panels it renders: `task`, `TASK_STATUS_KINDS` and `hand_idea` items
+    always, a `work` item only while `progress.work_controls` gives no
+    reason, and no other kind. `edit_item` accepts a followup's details since sd:809, and since sd:816 the screen renders the matching
     form instead of a hint naming the CLI's `sd task edit`.
     """
     if state is not None and state["item"]["id"] != item:
@@ -655,6 +679,8 @@ def allowed_statuses(connection: sqlite3.Connection, item: int, *, state: dict |
         return []
     if row["kind"] in TASK_STATUS_KINDS:
         return list(TASK_STATUSES)
+    if hand_idea(row):
+        return list(IDEA_STATUSES)
     if row["kind"] == "work":
         if row["status"] == "done":
             return []
@@ -700,7 +726,7 @@ def change_status(
     connection: sqlite3.Connection, item: int, target: str, *, who: str,
     reason: str | None = None, expected_revision: str | None = None, session: str | None = None,
 ) -> dict:
-    """Move a task, followup or active work item without bypassing delivery authority.
+    """Move a task, followup, hand idea or active work item without bypassing delivery authority.
 
     `session` is the status note's session, `who` when not given (pack sd:6046).
     """
