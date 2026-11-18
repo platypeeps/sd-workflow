@@ -111,9 +111,14 @@ def _when(stamp) -> datetime | None:
         return None
     try:
         moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
-    except ValueError:
+        return moment.astimezone(timezone.utc) if moment.tzinfo else None
+    except (ValueError, OverflowError):  # a time past the calendar's end, once in UTC
         return None
-    return moment.astimezone(timezone.utc) if moment.tzinfo else None
+
+
+def _word(value, known) -> str:
+    """`value` when it is one of the `known` strings, else unknown: a list or object would not hash."""
+    return value if isinstance(value, str) and value in known else "unknown"
 
 
 def _number(value) -> float | None:
@@ -166,7 +171,7 @@ def services(connection: sqlite3.Connection, *, now: str) -> list[dict]:
     for name, (stamp, body) in _newest(connection, STATUS_PREFIX).items():
         body = body if isinstance(body, dict) else {}
         read_at = body.get("read_at") if _when(body.get("read_at")) else None
-        status = body.get("status") if body.get("status") in SERVICE_STATE else "unknown"
+        status = _word(body.get("status"), SERVICE_STATE)
         why = (_stale(_age(_when(read_at), clock), STATUS_STALE_MINUTES) if read_at else "the reading has no read time")
         if not body:
             why = "the row does not parse"
@@ -220,7 +225,8 @@ def _pace(used: float, minutes, resets_at, clock: datetime, expected=None) -> fl
     """Percentage points used over (+) or under (-) an even pace through the window; None when the window does not say
     where in it the read falls."""
     if _number(expected) is not None:
-        return round(used - float(expected))
+        over = used - float(expected)
+        return round(over) if math.isfinite(over) else None
     reset = _when(resets_at)
     if reset is None or not isinstance(minutes, int) or isinstance(minutes, bool) or minutes <= 0:
         return None
@@ -282,13 +288,16 @@ def strip(connection: sqlite3.Connection, *, now: str) -> dict:
     rows, nosource = [], []
     for name, (_, body) in readings.items():
         body = body if isinstance(body, dict) else {}
-        status = body.get("status") if body.get("status") in ("ok", "unknown", "no-source") else "unknown"
+        status = _word(body.get("status"), ("ok", "unknown", "no-source"))
         if status == "no-source":
             nosource.append(name)
             continue
         flag = _flag(by_provider.get(name, []))
         accounts = body.get("accounts")
-        if name == "claude" and isinstance(accounts, list) and any(isinstance(one, dict) for one in accounts):
+        # A failed read keeps its status and error: it falls through to one provider row below, as does a list that
+        # renders no account.
+        if name == "claude" and status == "ok" and isinstance(accounts, list) and accounts:
+            before = len(rows)
             for account in accounts:
                 number = account.get("number") if isinstance(account, dict) else None
                 if not isinstance(number, int) or isinstance(number, bool):
@@ -302,7 +311,8 @@ def strip(connection: sqlite3.Connection, *, now: str) -> dict:
                 rows.append(_usage_row(f"usage:claude#{number}", f"claude#{number}", status="ok", why=why, read_at=read_at,
                                        windows=[week] if week else [], balance=None, spend=None, flag=flag,
                                        active=bool(account.get("active"))))
-            continue
+            if len(rows) > before:
+                continue
         read_at = body.get("read_at") if _when(body.get("read_at")) else None
         windows = [one for one in (_window(window, clock) for window in body.get("windows") or []
                                    if isinstance(window, dict)) if one] if isinstance(body.get("windows"), list) else []
@@ -312,6 +322,8 @@ def strip(connection: sqlite3.Connection, *, now: str) -> dict:
             why = "the row does not parse"
         elif status != "ok":
             why = str(body.get("error") or "the usage job could not read it")[:200]
+        elif name == "claude" and isinstance(accounts, list) and accounts:
+            why = "cswap lists no numbered account"
         elif not read_at:
             why = "the reading has no read time"
         else:

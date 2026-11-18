@@ -155,6 +155,25 @@ class TheServicesReader(ScreenCase):
         self.assertEqual([(one["status"], one["why"]) for one in usage_screen.services(self.connection, now=NOW)],
                          [("unknown", "the reading has no read time")])
 
+    def test_a_status_that_is_not_a_known_word_is_unknown_never_an_error(self):
+        # Bundle review round 1: a list or object status raised TypeError
+        # in the lookup, which hid the Status view and failed /api/now.
+        for number, odd in enumerate((["ok"], {"ok": 1}, 7, "fine")):
+            status(self.connection, f"s{number}", status=odd)
+        found = usage_screen.services(self.connection, now=NOW)
+        self.assertEqual([(one["name"], one["status"]) for one in found],
+                         [("s0", "unknown"), ("s1", "unknown"), ("s2", "unknown"), ("s3", "unknown")])
+        self.assertEqual({one["why"] for one in found}, {"the status job could not read it"})
+
+    def test_a_time_past_the_calendar_s_end_is_unknown_never_an_error(self):
+        # Bundle review round 1: OverflowError escaped _when.
+        status(self.connection, "s", read_at="9999-12-31T23:59:59-12:00",
+               incidents=[{"title": "x", "started_at": "9999-12-31T23:59:59-12:00"}])
+        self.assertIsNone(usage_screen._when("9999-12-31T23:59:59-12:00"))
+        [one] = usage_screen.services(self.connection, now=NOW)
+        self.assertEqual((one["status"], one["why"], one["incidents"][0]["started_at"]),
+                         ("unknown", "the reading has no read time", None))
+
 
 if __name__ == "__main__":
     unittest.main()

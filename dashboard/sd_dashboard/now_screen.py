@@ -1089,9 +1089,18 @@ def document(connection: sqlite3.Connection, *, now: str, fleet=None, jobs=None,
             "track": track(connection, now, rows=rows, briefs=reported["briefs"], active=active, lane=summary),
             "digest": digest(connection, now, rows=rows, lanes=queue.get("lanes") or [],
                              unread=digest_unread(sources, queue)),
-            "spend": spend(connection, now), "usage": usage_screen.strip(connection, now=now),
+            "spend": spend(connection, now), "usage": _usage(connection, now),
             "builders": builders(connection, now), "queues": queues(connection, now),
             "attention": _attention(listed), **mail, **reported}
+
+
+def _usage(connection: sqlite3.Connection, now: str) -> dict:
+    """The Usage strip, or its reason: a strip that fails costs the strip only, never /api/now (pack sd:9257)."""
+    try:
+        return usage_screen.strip(connection, now=now)
+    except Exception as failure:  # noqa: BLE001 - odd heartbeat input must not fail the whole read
+        return {"error": str(failure) or type(failure).__name__, "rows": [], "nosource": [], "flags_error": "",
+                "providers": usage_screen.PROVIDERS_LIST, "services": usage_screen.SERVICES_LIST}
 
 
 def _attention(rows: list[dict]) -> dict:
