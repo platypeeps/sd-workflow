@@ -124,6 +124,11 @@ R.obj = [C.get('job:nightly-sync:7').type, C.get('job:nightly-sync:7').label]; R
         self.assertEqual(out["R"]["obj"], ["not listed", "nightly-sync failed with exit 7 (no longer listed)"])
         self.assertEqual(out["R"]["kept"], "repo")
 
+    def test_the_loading_line_names_the_today_rows_in_lower_case(self):
+        """sd:9314: the loading line read 'Reading The Today rows'."""
+        out = self.run_page("")
+        self.assertEqual(out["states"][0]["text"], "Reading the Today rows. Rows appear when the read finishes.")
+
     def test_a_failed_read_clears_the_rows_and_retires_their_objects(self):
         out = self.run_page("""ANSWER = () => [500, { error: 'fleet collection was stopped at its budget' }]; refresh(); await flush();
 R.rows = ELS.rows.html; R.sub = ELS.subhead.textContent; R.type = C.get('job:nightly-sync:7').type; R.row = location.search;""")
@@ -528,7 +533,7 @@ class TheTimeline(ReaderCase):
 
 HELP = {
     "jobs": "Failed scheduled jobs. Press to list them in Needs you.",
-    "lane": "Lane entries blocked until someone acts; merging, next and flaky heads (a gate that failed, then passed at one"
+    "lane": "Lane entries stuck until someone acts; merging, next and flaky heads (a gate that failed, then passed at one"
             " head) are counted under it. Press to list them in Needs you.",
     "reports": "Open job alerts and reports. Press to list them in Needs you.",
     "pulls": "Pull requests waiting on you. Press to list them in Needs you.",
@@ -584,7 +589,7 @@ refresh(); await flush();
 R.lane = [lane.dataset.state, lane.title, val.html]; const ses = ELS['lamp-sessions']; R.ses = [ses.dataset.state, ses.title];""")
         state, title, text = out["R"]["lane"]
         self.assertEqual((state, title), ("unknown", HELP["lane"] + "\npack: sd-ship gave no answer"))
-        self.assertIn("<b>1</b> blocked", text)
+        self.assertIn("<b>1</b> stuck", text)
         self.assertEqual(out["R"]["ses"], ["unknown", HELP["sessions"] + "\nherdr: herdr did not answer"])
 
 
@@ -1215,8 +1220,10 @@ document.querySelectorAll = sel => sel === '.cell[data-src]' ? [lane] : [];
 refresh(); await flush(); R.lane = [lane.dataset.state, val.html];""")
         state, text = out["R"]["lane"]
         self.assertEqual(state, "caution")
-        self.assertIn("<b>0</b> blocked", text)
-        self.assertIn("2 flaky", text)
+        # sd:9313: the headline is the reason the lamp is lit, and "blocked" is the Queue's word, not the lamp's.
+        self.assertTrue(text.startswith("<b>2</b> flaky"), text)
+        self.assertIn("0 stuck", text)
+        self.assertNotIn("blocked", text)
 
     def test_snooze_all_writes_one_snooze_per_head(self):
         out = self.run_page("""REG.find(c => c.id === 'today.flaky.snooze').run(C.get('group:flaky')); await flush();""")

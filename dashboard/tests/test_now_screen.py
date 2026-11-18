@@ -118,7 +118,9 @@ class Ranking(ScreenCase):
             (now_screen.DIRTY, "dirty:dirty-pin:1", "dirty"),
         ])
         self.assertEqual(rows[0]["what"], "system pinned 3 behind origin/main")
-        self.assertIn("to refresh now: local-repo-sync/repo-sync.sh refresh", rows[0]["detail"])
+        # sd:9316: the detail is one plain line; the command goes to Details as `cli`.
+        self.assertEqual(rows[0]["detail"], "merged commits on origin/main are not live here until the next refresh")
+        self.assertEqual(rows[0]["cli"], "local-repo-sync/repo-sync.sh refresh")
         self.assertEqual(now_screen.band(now_screen.PINNED), "look")
 
     def test_a_pinned_count_that_is_not_a_number_darkens_the_repos_source(self):
@@ -162,7 +164,8 @@ class Ranking(ScreenCase):
         self.assertEqual(rows[0]["id"], "worktrees:2")
         self.assertEqual(rows[0]["what"], "2 abandoned worktrees")
         self.assertEqual(rows[0]["source"], "sessions")
-        self.assertIn("git worktree prune", rows[0]["detail"])
+        self.assertEqual(rows[0]["detail"], "worktrees whose folders are gone")
+        self.assertEqual(rows[0]["cli"], "git worktree prune")
 
     def test_merge_sorts_on_rank_then_id_so_ties_are_stable(self):
         rows = [{"rank": 4, "id": "b"}, {"rank": 0, "id": "z"}, {"rank": 4, "id": "a"}, {"rank": 2, "id": "m"}]
@@ -237,7 +240,8 @@ class Document(ScreenCase):
         self.assertEqual(document["attention"], {"state": "caution", "n": 3, "what": "rows to look at"})
         for row in document["rows"]:
             # `seen` is the snooze's fingerprint; the `problem` it reads stays on the server (sd:1896).
-            self.assertEqual(set(row), {"rank", "band", "kind", "id", "what", "detail", "source", "seen"})
+            # sd:9316: a row with a command carries it as `cli`, for Details.
+            self.assertEqual(set(row) - {"cli"}, {"rank", "band", "kind", "id", "what", "detail", "source", "seen"})
 
     def test_the_badge_counts_broken_rows_else_look_rows(self):
         # sd:5781: the decisions that wait count on Decide's badge (pages/decide.py), not here. sd:5921: a report is a look
@@ -517,7 +521,8 @@ class FailedJobs(ScreenCase):
         # Retry is what the Operations Jobs area sends: a kickstart updates the
         # launchd record Now reads, and a hand-run of cron-jobs.sh does not.
         self.assertEqual(row["retry"], "launchctl kickstart fixture/nightly-sync")
-        self.assertEqual(row["detail"], f"log 2026-09-27 02:15 · retry: {row['retry']} · triage: unclear, no rule matched exit 7")
+        self.assertEqual(row["detail"], "log 2026-09-27 02:15 · triage: unclear, no rule matched exit 7")
+        self.assertNotIn("cli", row, "the retry line is Details' own fact")
         self.assertEqual(now_screen.FAILED, 1)
         self.assertEqual(document["sources"], {"repos": "", "sessions": "", "prs": "", "jobs": "", "lane": ""})
 
@@ -539,16 +544,18 @@ class FailedJobs(ScreenCase):
         by_id = {row["id"]: row for row in rows}
         stopped = by_id["job:stopped:interrupted9"]
         self.assertEqual(stopped["what"], "stopped was interrupted by SIGKILL (9)")
-        self.assertEqual(stopped["detail"], "log 2026-09-27 03:00 · retry: launchctl kickstart fixture/stopped")
+        self.assertEqual(stopped["detail"], "log 2026-09-27 03:00")
         self.assertEqual(stopped["retry"], "launchctl kickstart fixture/stopped")
         parked = by_id["job:parked:unloaded"]
         self.assertEqual(parked["what"], "parked is installed but not loaded")
-        self.assertIn("local-cron-jobs/cron-jobs.sh install parked", parked["detail"])
+        self.assertEqual(parked["detail"], "launchd will not run it until it is loaded")
+        self.assertEqual(parked["cli"], "local-cron-jobs/cron-jobs.sh install parked")
         # Operations refuses a retry for an unloaded or unknown job, so neither row offers one.
         self.assertNotIn("retry", parked)
         odd = by_id["job:odd:unknown"]
         self.assertEqual(odd["what"], "odd: launchd state unknown")
-        self.assertIn("launchctl print fixture/odd", odd["detail"])
+        self.assertEqual(odd["detail"], "launchctl gave no state Operations recognises")
+        self.assertEqual(odd["cli"], "launchctl print fixture/odd")
         self.assertNotIn("retry", odd)
         self.assertEqual(now_screen.ATTENTION, 2)
 
@@ -557,7 +564,7 @@ class FailedJobs(ScreenCase):
         rows = now_screen.document(self.connection, now=NOW, fleet=self.fleet, jobs=jobs)["rows"]
         self.assertEqual(rows[0]["id"], "job:crashy:signal11")
         self.assertEqual(rows[0]["what"], "crashy failed with SIGSEGV (11)")
-        self.assertTrue(rows[0]["detail"].startswith("no log file · retry: "), rows[0]["detail"])
+        self.assertEqual(rows[0]["detail"], "no log file · triage: " + ", ".join(rows[0]["triage"][k] for k in ("class", "why")))
 
     def test_a_signal_is_named_even_when_launchd_also_reports_exit_zero(self):
         jobs = JobsBackend(self.tmp.name, jobs=[("crashy", "failed", 0, 11)])
@@ -572,8 +579,7 @@ class FailedJobs(ScreenCase):
         jobs = NoRoot(self.tmp.name, jobs=[("nightly-sync", "failed", 7, None)])
         document = now_screen.document(self.connection, now=NOW, fleet=self.fleet, jobs=jobs)
         self.assertEqual(document["sources"]["jobs"], "")
-        self.assertEqual(document["rows"][0]["detail"], "log unknown · retry: launchctl kickstart fixture/nightly-sync"
-                         " · triage: unclear, no rule matched exit 7")
+        self.assertEqual(document["rows"][0]["detail"], "log unknown · triage: unclear, no rule matched exit 7")
 
     def test_an_unreadable_log_is_one_rows_detail_not_a_dark_source(self):
         jobs = JobsBackend(self.tmp.name, jobs=[("nightly-sync", "failed", 7, None)])
@@ -588,7 +594,7 @@ class FailedJobs(ScreenCase):
         with patch.object(Path, "stat", refusing):
             document = now_screen.document(self.connection, now=NOW, fleet=self.fleet, jobs=jobs)
         self.assertEqual(document["sources"]["jobs"], "")
-        self.assertTrue(document["rows"][0]["detail"].startswith("log unreadable · retry: "), document["rows"][0]["detail"])
+        self.assertTrue(document["rows"][0]["detail"].startswith("log unreadable · triage: "), document["rows"][0]["detail"])
 
     def test_a_retryable_row_carries_the_revision_retry_job_checks_and_its_capability(self):
         """sd:3386: Today's Retry posts the row's revision; it is the job's, so a job that changed since the read refuses."""

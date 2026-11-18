@@ -244,8 +244,9 @@
     if (!VIEW) return;
     put($(`body-${VIEW}`), html`${DOC ? filters() : ''}${DOC && showing === 'ignored' ? ignored() : areas()}`);
     // The selection is always a row the viewer can see: the first visible one, or none with the reason.
+    // sd:9312: S[VIEW] is undefined until the view's first read settles, null after a failed one.
     shell.reconcile({ rows: document.querySelectorAll('.ledger tbody tr[data-id]'), current: selected, select: id => select(id, false),
-      clear: () => { selected = null; put($('details'), html`<p class="why">${!DOC ? 'Nothing is selected: Health could not be read.' : showing === 'ignored' ? 'Nothing is selected: an ignored row has Unignore only. Show findings to pick a row.' : !ROWS.some(scoped) ? (ROWS.length ? 'Nothing is selected: every row here is of a repo that is not managed. Repos all lists them.' : 'Nothing is selected: no area raised a row.') : filtering() ? 'No row matches the filter, so nothing is selected.' : 'Nothing is selected: no row here wants you. Press ok or queued in State to list those rows.'}</p>`); } });
+      clear: () => { selected = null; put($('details'), html`<p class="why">${!DOC ? (S[VIEW] === undefined ? 'Nothing is selected: Health is still being read.' : 'Nothing is selected: Health could not be read.') : showing === 'ignored' ? 'Nothing is selected: an ignored row has Unignore only. Show findings to pick a row.' : !ROWS.some(scoped) ? (ROWS.length ? 'Nothing is selected: every row here is of a repo that is not managed. Repos all lists them.' : 'Nothing is selected: no area raised a row.') : filtering() ? 'No row matches the filter, so nothing is selected.' : 'Nothing is selected: no row here wants you. Press ok or queued in State to list those rows.'}</p>`); } });
     writeURL();
   }
   // Clear all returns State to its start, the problem states, not to no State pressed: the page's home is what wants you.
