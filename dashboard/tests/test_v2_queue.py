@@ -1936,6 +1936,21 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertNotIn("Parked idea", out["R"]["tiled"])
         self.assertRegex(out["R"]["tiled"], r'data-tile-clear="system">2 parked \(\d+ rows\) · Show all</button>')
 
+    def test_each_box_has_a_visible_label_and_an_accessible_name_in_box_order(self):
+        """sd:9315: seven boxes sat under one 'Detail' head; the head now names each, in the order they draw."""
+        out = self.run_view("R.html = ELS.queue.html;")
+        _, _, body = self.repo_detail(out["R"]["html"], "system")
+        boxes = re.findall(r'data-tile="(\w+)"', body)
+        self.assertEqual(len(boxes), 7, boxes)
+        names = re.findall(r'data-tile="(\w+)"[^>]*aria-label="Only the \d+ (\w+) rows"', body)
+        self.assertEqual([b for b, _ in names], boxes, "a box has no accessible name")
+        self.assertTrue(all(b == n for b, n in names), names)
+        head = re.search(r'<table class="ledger active queue".*?<thead>(.*?)</thead>',
+                         (v2.HERE / "today.html").read_text(encoding="utf-8"), re.S).group(1)
+        keys = re.search(r'<span class="keys"[^>]*>(.*?)</span></th>', head, re.S)
+        self.assertIsNotNone(keys, "the Detail head shows no box labels")
+        self.assertEqual(re.findall(r"<span>(\w+)</span>", keys.group(1)), boxes)
+
     def parked_answers(self, repo):
         from sd_dashboard import tasks_screen
         if repo != self.checkout:
