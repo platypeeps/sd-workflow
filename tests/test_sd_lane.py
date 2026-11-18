@@ -5548,6 +5548,19 @@ def thread_lane(run: Any) -> sd_lane.StartedLane:
     return sd_lane.StartedLane(lambda: None if thread.is_alive() else row[0])
 
 
+def poll_nap(now: list[float], step: float = 60.0) -> Any:
+    """A `time.sleep` that moves a fake run clock by `step` on each lane poll only; any other sleep, a write
+    retry under load say, sleeps for real: it moved the clock past the budget once in five runs (round 2)."""
+    real = time.sleep
+
+    def nap(seconds: float) -> None:
+        if seconds == sd_lane.START_POLL_SECONDS:
+            now[0] += step
+        else:
+            real(seconds)
+    return nap
+
+
 class HostedParallel(Lane):
     """sd:5774. `lane run --hosted` ran its lanes one after another: a 4-entry lane held every other one 80 minutes."""
 
@@ -5766,8 +5779,7 @@ class HostedParallel(Lane):
         self.hold_elsewhere(self.repo)
         now = [0.0]
 
-        def nap(seconds: float) -> None:  # each poll moves the run's clock, not the wall's
-            now[0] += 60
+        nap = poll_nap(now)  # each poll moves the run's clock, not the wall's
         starts: list[pathlib.Path] = []
 
         def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
@@ -5940,8 +5952,7 @@ class HostedParallel(Lane):
             return sd_lane.StartedLane(lambda: {"ran": []})
         now = [0.0]
 
-        def nap(seconds: float) -> None:
-            now[0] += 60
+        nap = poll_nap(now)  # each poll moves the run's clock, not the wall's
         with mock.patch.object(sd_lane, "clock", lambda: now[0]), mock.patch.object(sd_lane.time, "sleep", nap), \
                 mock.patch.object(sd_lane, "MAX_PARALLEL_LANES", 1):
             answer = sd_lane.run_hosted(self.environ, self.ship, start=start)
@@ -5972,8 +5983,7 @@ class HostedParallel(Lane):
             return sd_lane.StartedLane(lambda: {"ran": []})
         now = [0.0]
 
-        def nap(seconds: float) -> None:
-            now[0] += 60
+        nap = poll_nap(now)  # each poll moves the run's clock, not the wall's
         with mock.patch.object(sd_lane, "clock", lambda: now[0]), mock.patch.object(sd_lane.time, "sleep", nap):
             answer = sd_lane.run_hosted(self.environ, self.ship, start=start)
         self.assertEqual(starts, [self.zeta], answer)
@@ -6274,6 +6284,22 @@ class Bounds(unittest.TestCase):
         self.assertEqual(cancelled, [True])
         self.assertLess(time.monotonic() - started, sd_lane.CANCEL_SECONDS)
         self.assertNotEqual(answers[0][0], 0)
+
+    def test_a_gate_a_termed_run_signalled_gets_one_term_then_a_kill(self) -> None:
+        """sd:9332 round 2: `term_gate` TERMed the gate's group, then `cancel_gate` TERMed it again."""
+        stop, sent = threading.Event(), []
+
+        def record(group: int, number: int) -> None:
+            sent.append(number)
+            if number == signal.SIGKILL:
+                stop.set()
+        gate = sd_lane.SpeculativeGate(lambda: stop.wait(10), "twice")
+        gate.start()
+        gate.started(4242)
+        with mock.patch.object(sd_lane, "end_group", record), mock.patch.object(sd_lane, "CANCEL_SECONDS", 0.05):
+            gate.signal_gate(signal.SIGTERM)  # as `run_lane`'s `term_gate` does as the TERM lands
+            self.assertTrue(gate.cancel_gate())
+        self.assertEqual(sent, [signal.SIGTERM, signal.SIGKILL])
 
     def test_a_gate_cancelled_before_it_starts_counts_as_ended(self) -> None:
         """sd:5776: a SIGTERM can land between the runner holding the gate and its start; `join` would raise."""

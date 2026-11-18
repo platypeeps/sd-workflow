@@ -2156,9 +2156,15 @@ class SpeculativeGate(threading.Thread):
                 end_group(self.group, number)
 
     def cancel_gate(self) -> bool:
-        """End the gate's group, SIGTERM then SIGKILL, each followed by `CANCEL_SECONDS`; whether the gate ended."""
+        """End the gate's group, SIGTERM then SIGKILL, each followed by `CANCEL_SECONDS`; whether the gate ended.
+
+        A gate a TERMed run already signalled (`term_gate`) gets no second
+        TERM while it unwinds the first, only the KILL (sd:9332 round 2).
+        """
+        termed = self.cancelled
         for number in (signal.SIGTERM, signal.SIGKILL):
-            self.signal_gate(number)
+            if number == signal.SIGKILL or not termed:
+                self.signal_gate(number)
             with contextlib.suppress(RuntimeError):  # not started yet: `started` ends a group that starts later
                 self.join(CANCEL_SECONDS)
             if not self.is_alive():
