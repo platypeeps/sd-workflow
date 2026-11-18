@@ -175,7 +175,8 @@ def backbone_rows(repos: list[dict]) -> list[dict]:
                 "kind": "pinned",
                 "id": f"pinned:{name}:{behind}",
                 "what": f"{name} pinned {behind} behind {target}",
-                "detail": f"merged commits on {target} are not live here until the next refresh · to refresh now: {REFRESH}",
+                "detail": f"merged commits on {target} are not live here until the next refresh",
+                "cli": REFRESH,
                 "source": "repos",
             })
         if ahead:
@@ -260,8 +261,8 @@ def session_rows(trees: list[dict]) -> list[dict]:
         "kind": "worktree",
         "id": f"worktrees:{count}",
         "what": f"{count} abandoned {plural(count, 'worktree', 'worktrees')}",
-        "detail": "worktrees whose folders are gone; "
-                  "`git worktree prune` clears them",
+        "detail": "worktrees whose folders are gone",
+        "cli": "git worktree prune",
         "source": "sessions",
     }]
 
@@ -302,8 +303,9 @@ def job_rows(jobs: list[dict], cron_root: Path | None) -> list[dict]:
     exit code otherwise, as the other ids key on the fact that changed. The
     log time is when the last run wrote its log; a job with no log file, an
     unreadable one, or a backend with no `cron_root` says so rather than
-    guess, and still gets its row. The retry line is in the detail, where
-    the page shows it, and in `retry`, for a script that acts on it. Only a
+    guess, and still gets its row. The retry line is in `retry`, which
+    Details shows and a script acts on; the detail is one plain line, and a
+    row's other command is its `cli`, also for Details (sd:9316). Only a
     failed or interrupted job has one: Operations refuses retry for the rest.
     `state` is the job's own, for a page that words the rows by it. A
     failed job also carries `triage`, `job_failures.classify`'s label, at the
@@ -328,7 +330,7 @@ def job_rows(jobs: list[dict], cron_root: Path | None) -> list[dict]:
         if state in ("failed", "interrupted"):
             logged = _log_time(log)
             retry = f"launchctl kickstart {service}" if service else "retry from Operations Jobs"
-            row.update(detail=f"{logged} · retry: {retry}", retry=retry, job=name, exit=code, at=_log_at(log),
+            row.update(detail=logged, retry=retry, job=name, exit=code, at=_log_at(log),
                        revision=job.get("revision"), capability=(job.get("capabilities") or {}).get("retry"))
         if state == "failed":
             # launchd can report `last exit code = 0` beside a terminating signal;
@@ -346,12 +348,12 @@ def job_rows(jobs: list[dict], cron_root: Path | None) -> list[dict]:
             row["problem"] = [row["what"]]
         elif state == "unloaded":
             row.update(id=f"job:{name}:unloaded", what=f"{name} is installed but not loaded",
-                       detail=f"launchd will not run it until it is loaded · load: local-cron-jobs/cron-jobs.sh install {name}")
+                       detail="launchd will not run it until it is loaded", cli=f"local-cron-jobs/cron-jobs.sh install {name}")
         else:
             # The inventory carries no observation reason; Operations Jobs shows it, and launchctl prints the record.
             check = f"launchctl print {service}" if service else "launchctl print <service>"
             row.update(id=f"job:{name}:unknown", what=f"{name}: launchd state unknown",
-                       detail=f"launchctl gave no state Operations recognises · check: {check}")
+                       detail="launchctl gave no state Operations recognises", cli=check)
         out.append(row)
     return out
 
