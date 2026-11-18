@@ -1260,9 +1260,8 @@ class Dashboard(BaseHTTPRequestHandler):
 
         badges, realms = {}, []
         if self._session(context):
-            # The badges each page's last read kept; the live pages' reads run after the answer (sd:9310).
+            # The badges each page's last read kept; the live pages' reads run after this read (sd:9310).
             badges = self.badges.read()
-            self.badges.refresh_later(self._refresh_badges)
             # A busy store reads as one that could not open (sd:7842): the realms are then empty.
             slot, connection = self.reads.acquire(timeout=READ_WAIT), None
             try:
@@ -1277,22 +1276,23 @@ class Dashboard(BaseHTTPRequestHandler):
                     connection.close()
                 if slot:
                     self.reads.release()
+            self.badges.refresh_later(self._refresh_badges)
         self._send(200, v2.sections(badges, realms), "text/javascript; charset=utf-8")
 
     def _refresh_badges(self):
-        """The live pages' rail badges, read on the `Badges` thread with a read slot of their own (sd:9310)."""
-        slot, connection = self.reads.acquire(timeout=READ_WAIT), None
+        """The live pages' rail badges, read on the `Badges` thread (sd:9310). It takes no read slot: `refresh_later`
+        runs one such thread at a time, so it adds one reader at most, and a slow badge read never holds a slot that a
+        page's parser-blocking `/ui/sections.js` waits for."""
+        connection = None
         try:
             try:
-                connection = sd_db.connect(self.database, write=False) if slot else None
+                connection = sd_db.connect(self.database, write=False)
             except (FileNotFoundError, SdDbError, sqlite3.Error):
                 connection = None  # no live page can be read, so each says unknown
             self.badges.refresh(self._read(connection, "", {}), connected=connection is not None)
         finally:
             if connection is not None:
                 connection.close()
-            if slot:
-                self.reads.release()
 
     def _json(self, status, value):
         # sd:874. `value` is usually a `workflow.item_state` readback, which

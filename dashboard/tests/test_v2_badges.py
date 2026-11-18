@@ -37,10 +37,12 @@ class Stand:
         self.kept = {"attention": {"state": "warning", "n": 1, "what": "rows broken"}}
         self.calls = []
         self.gate = None  # an Event the live read waits on, when set
+        self.entered = threading.Event()  # set as a live read starts
 
     def read_live(self, read):
+        self.entered.set()
         if self.gate is not None:
-            self.gate.wait(10)
+            self.gate.wait(30)
         self.calls.append(("live", read.path))
         if isinstance(self.live, Exception):
             raise self.live
@@ -188,6 +190,21 @@ class TheScript(BrowserSession):
         self.listening.RequestHandlerClass.badges.settle()
         live = counts(self.get("/ui/sections.js")[2])["Live"]
         self.assertEqual({key: live[key] for key in ("state", "n")}, {"state": "caution", "n": 2})
+
+    def test_a_slow_badge_read_holds_no_read_slot_the_script_waits_for(self):
+        # Review of sd:9310: the badge thread took the last read slot, so the next page's script waited out READ_WAIT
+        # behind a slow live read, and lost its realms when the wait ran out.
+        release = self.stand.gate = threading.Event()
+        self.addCleanup(release.set)
+        handler = self.listening.RequestHandlerClass
+        with patch.object(handler, "reads", threading.BoundedSemaphore(1)), patch("sd_dashboard.server.READ_WAIT", 8.0):
+            self.get("/ui/sections.js")
+            self.assertTrue(self.stand.entered.wait(5), "the live read did not start")
+            started = time.monotonic()
+            self.assertEqual(self.get("/ui/sections.js")[0], 200)
+            self.assertLess(time.monotonic() - started, 5, "sections.js waited on the badge thread's read slot")
+            release.set()
+            handler.badges.settle()
 
     def test_without_a_session_it_carries_the_map_and_no_badge(self):
         status, _, body = self.get("/ui/sections.js", cookie=False)
