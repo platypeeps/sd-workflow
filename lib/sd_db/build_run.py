@@ -158,6 +158,16 @@ FIX = """The review of branch {branch} found these blockers. Fix each one fail-f
 {blockers}
 """
 
+# sd:9263: the round after the last, once. The Review rounds rule's class pass, sent instead of another single-finding fix.
+CLASS_PASS = """The review of branch {branch} still found blockers after {rounds} rounds. This is the last round
+before the build parks, so do one class pass, not another single-finding fix: name the class these blockers
+share, enumerate every instance of it from the code, not from the findings, and fix each one fail-first as a
+new commit in {worktree}. Add each instance to the failure table in the body at {body}. Never push. Your
+final message is your report: the class, each instance and its test.
+
+{blockers}
+"""
+
 DRAFT = """You are the headless lead, run by the build dispatcher (pack sd:6361). Draft the spec for one
 captured item. You hold the read tools only: read the repository in the current directory, its CLAUDE.md
 and AGENTS.md, and the code the item touches. You write nothing; the dispatcher writes your reply.
@@ -1235,9 +1245,15 @@ class Supervisor:
         # Once per child that blocked: a fault after this write re-walks the held review, which is the same review.
         self.once(f"round:{(self.last or {}).get('pid')}", self.count_round)
         rounds = self.fresh()["review_round"] or 0
-        if rounds >= REVIEW_ROUNDS:
-            return self.finish("blocked", f"{rounds} review rounds left blockers: {self.summary(self.blockers)}")
-        return self.fix()
+        if rounds < REVIEW_ROUNDS:
+            return self.fix()
+        # One class-pass round past the bound (sd:9263). None when every member waits on a question no fix answers;
+        # a question on one member leaves the others to fix, as enqueue delivers them without it.
+        unasked = [item for item in [self.lead, *self.others]
+                   if not build.open_question(self.db, [item], self.row["created_at"])]
+        if rounds == REVIEW_ROUNDS and unasked:
+            return self.fix(CLASS_PASS, rounds=rounds)
+        return self.finish("blocked", f"{rounds} review rounds left blockers: {self.summary(self.blockers)}")
 
     def count_round(self) -> None:
         if not build.write(self.db, self.ident, review_round=(self.fresh()["review_round"] or 0) + 1):
@@ -1247,12 +1263,12 @@ class Supervisor:
         """What this round's fix child starts as: a round's count moves only between two fixes."""
         return f"fix:{self.fresh()['review_round'] or 0}"
 
-    def fix(self) -> str | dict:
+    def fix(self, brief: str = FIX, **extra: object) -> str | dict:
         self.enter("fixing")
         session = self.fresh()["session_id"]
         if not session:
             return self.finish("blocked", "no builder session recorded to resume for the fix")
-        prompt = FIX.format(blockers=self.summary(self.blockers, limit=None), **self.brief())
+        prompt = brief.format(blockers=self.summary(self.blockers, limit=None), **self.brief(), **extra)
         return self.claude(prompt, session=session, then="reviewing", role=self.fix_role())
 
     def enqueuing(self) -> str | dict:

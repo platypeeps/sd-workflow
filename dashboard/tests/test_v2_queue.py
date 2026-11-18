@@ -2639,6 +2639,17 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                                                          ["/api/queue/builds/retry", {"assignment": 5, "revision": "b" * 64,
                                                                                       "finding": "Fix the label"}]])
 
+    def test_send_to_builder_on_a_run_parked_after_review_rounds_prefills_the_finding(self):
+        """pack sd:9262: the box opens with the run's `prefill`, the last round's blockers and the class pass."""
+        builds = json.loads(json.dumps(self.BUILDS))
+        builds["recent"][0]["prefill"] = "a.py:1 the blocker\nClass pass: name it."
+        out = self.run_view("window.shell.ask = a => { OUT.ask = a; return Promise.resolve({ yes: false }); };"
+                            "act('button[data-build]', { build: 'send', run: 'r0' }); await flush(); await flush();",
+                            answers={"/api/queue/builds?show=all": [200, builds]})
+        field = out["ask"]["fields"][0]
+        self.assertEqual((field["value"], field["multiline"]), ("a.py:1 the blocker\nClass pass: name it.", True))
+        self.assertEqual(out["posts"], [])
+
     def test_a_blocked_build_assignment_is_a_blocked_row_with_its_reason_retry_and_cancel(self):
         """system sd:8651: `sd today` listed blocked build assignments the Queue view drew no row for. Each is a blocked
         row with its reason; Retry posts its bundle lead's retry, Cancel asks first, and an off control says why."""

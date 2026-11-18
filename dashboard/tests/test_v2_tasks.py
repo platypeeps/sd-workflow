@@ -3064,6 +3064,18 @@ R.work = five('{port}'); R.done = five('{ask}');""")
         self.assertIn("overflow-x: auto;", wrap.group(1))
         self.assertIn("position: relative;", wrap.group(1), "the wrap does not contain the table's absolutely placed labels")
 
+    def test_the_details_heading_takes_at_most_three_lines(self):
+        # sd:9317: the Details h2 printed the whole title (#7331 ran six lines at 1440) and pushed the fields below the
+        # fold; the Title field holds the full text, so the heading clamps to three lines and keeps its wrap.
+        css = (V2 / "static" / "task-details.css").read_text(encoding="utf-8")
+        rule = re.search(r"^\.details h2 \{([^}]*)\}", css, re.M)
+        self.assertIsNotNone(rule, "task-details.css sets no .details h2 rule")
+        for decl in ("display: -webkit-box;", "-webkit-box-orient: vertical;", "-webkit-line-clamp: 3;", "line-clamp: 3;",
+                     "overflow: hidden;"):
+            self.assertIn(decl, rule.group(1))
+        shell = (V2 / "static" / "shell.css").read_text(encoding="utf-8")
+        self.assertRegex(shell, r"\.details h2, [^{]*\{[^}]*overflow-wrap: anywhere;", "the heading lost its wrap")
+
     def test_the_list_fits_its_column_beside_the_docked_pane(self):
         # sd:4037: with a base's Stage and Score the list scrolled sideways 305 px in its 729 px column at 1440 and 1024.
         # The design source's folds (design.md, sd:2249): the wrap is a container whose narrow width drops the row's
