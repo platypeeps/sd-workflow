@@ -4682,6 +4682,69 @@ roles:
         self.prepare("--deliver", "--acceptance-file", renewal)
         self.assertEqual(self.operation().state["acceptance"]["claim"], before["claim"])
 
+    def test_a_lane_retry_after_only_the_waiver_note_changed_says_so(self):
+        """Lead review of sd:9335: after a renewal by hand, an edit of the decision note that waived a row, its
+        `Waive:` line kept, made the lane's claim differ from the stored one, and the refusal said to enqueue
+        again with the renewal's file: this entry's file. It names the note and says to refresh by hand."""
+        from sd_db import set_item_fields
+        from sd_db.writes import set_note_body
+        note = self.decision("Ruling: no rig here.\nWaive: runs offline")
+        acceptance = str(self.waiver_file(self.waived_row("runs offline", note)))
+        self.prepare("--deliver", "--acceptance-file", acceptance)
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--acceptance-file", acceptance)
+        before = self.operation().state["acceptance"]
+        set_note_body(self.connection, note, "Ruling: no rig here, still.\nWaive: runs offline")
+        with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}):
+            with self.assertRaisesRegex(ship.Refusal, rf"only decision note #{note} changed.*by hand") as caught:
+                self.prepare("--deliver", "--acceptance-file", acceptance)
+        self.assertNotIn("enqueue again", str(caught.exception))
+        self.assertEqual(self.operation().state["acceptance"], before)
+        self.prepare("--deliver", "--acceptance-file", acceptance)  # the refresh by hand
+        with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}):
+            self.prepare("--deliver", "--acceptance-file", acceptance)  # the retried entry, same file
+        self.assertIn("still.", self.operation().state["acceptance"]["claim"]["criteria"][1]["waived"]["note"]["body"])
+
+    def test_a_scope_change_before_the_merge_says_nothing_merged(self):
+        """Lead review of sd:9335: `merge` refused a scope change with the prepare step's words, "a lane prepare
+        does not renew it"; it says nothing merged and to renew by hand, then merge."""
+        from sd_db import set_item_fields
+        acceptance = self.directory / "acceptance.json"
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        set_item_fields(self.connection, self.item, title="retitled before the merge")
+        with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed.*nothing merged.*then merge") as caught:
+            self.merge()
+        self.assertNotIn("lane prepare", str(caught.exception))
+        self.assertFalse(any(call.method == "PUT" for call in self.remote.calls))
+
+    def test_a_scope_change_after_the_merge_gives_the_merged_advice(self):
+        """Lead review of sd:9335: once the merge landed, the refusal still said to prepare again, which a merged
+        pull request cannot do. It names the merge and the hand delivery, and a hand delivery settles it."""
+        from sd_db import set_item_fields
+        from sd_db.progress import deliver_work
+        acceptance = self.directory / "acceptance.json"
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        settle = ship.Ship.settle_closes
+
+        def retitled(operation, *args, **kwargs):
+            set_item_fields(self.connection, self.item, title="retitled during the merge")
+            return settle(operation, *args, **kwargs)
+
+        with patch.object(ship.Ship, "settle_closes", retitled), patch.object(ship.time, "sleep"):
+            with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed.*merged at.*deliver the item by hand") \
+                    as caught:
+                self.merge()
+        self.assertNotIn("sd-ship prepare", str(caught.exception))
+        commit = self.operation().state["merge_commit"]
+        deliver_work(self.connection, self.item, commit, who="operator", verification_root=self.root)
+        with patch.object(ship.time, "sleep"):
+            self.assertFalse(self.merge()["delivery_pending"])
+
     def test_author_assignment_cannot_borrow_manual_merge_authority(self):
         from sd_db.workflow import WorkflowError
         self.prepare()

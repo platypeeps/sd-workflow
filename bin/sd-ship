@@ -478,6 +478,25 @@ def without_closes(message: str) -> str:
 ANCESTOR_CLEARANCE = "an ancestor of the merge head"
 
 
+def edited_waivers(claim: object, stored: object) -> list[int]:
+    """The decision notes whose edit alone tells `claim` from `stored`, or [] when anything else differs.
+
+    `waiver` keeps each note's body and session in the claim, so an edit
+    that keeps the `Waive:` line still changes the claim (sd:9335).
+    """
+    def bare(value: object) -> object:
+        if not isinstance(value, dict) or not isinstance(value.get("criteria"), list):
+            return value
+        rows = [{**row, "waived": {k: v for k, v in row["waived"].items() if k != "note"}}
+                if isinstance(row, dict) and isinstance(row.get("waived"), dict) else row for row in value["criteria"]]
+        return {**value, "criteria": rows}
+
+    if claim == stored or bare(claim) != bare(stored):
+        return []
+    return sorted({row["waived"]["decision"] for row, old in zip(claim["criteria"], stored["criteria"], strict=True)
+                   if isinstance(row.get("waived"), dict) and row != old})
+
+
 def acceptance_row_answered(row: object) -> bool:
     """An acceptance row that names its criterion and evidence and either passed or says it was waived (sd:3704).
 
@@ -680,20 +699,31 @@ class Ship(SharedReview):
                       code="delivery_claim_required", boundary="input", state="operator_decision",
                       next_action="Rerun prepare with --deliver or --associate-only.")
 
-    def assert_scope(self, claim: dict | None = None) -> None:
+    def assert_scope(self, claim: dict | None = None, *, merging: bool = False, merged: str | None = None) -> None:
         """Refuse a delivery claim made for another version of the item.
 
         `claim`, a claim `renewal` let stand, replaces the stored one here
         (sd:9268). Every later check reads the stored claim, so a change
-        after the renewal still refuses.
+        after the renewal still refuses. The advice is the phase's: before a
+        merge a prepare by hand renews the claim; once `merged` landed no
+        prepare can, so the item is delivered by hand.
         """
         if not self.args.no_item and self.state.get("deliver"):
             item = self.store.identity(self.connection, self.args.item)["item"]
             scope = digest({key: item[key] for key in ("title", "body", "path")})
-            if (claim or self.state.get("acceptance") or {}).get("item_scope") != scope:
-                raise Refusal(f"item acceptance scope changed after the delivery claim; a lane prepare "
-                              f"does not renew it: run `sd-ship prepare --item {self.args.item} --deliver` "
-                              f"by hand, with --acceptance-file for a work item, then enqueue again")
+            if (claim or self.state.get("acceptance") or {}).get("item_scope") == scope:
+                return
+            renew = (f"`sd-ship prepare --item {self.args.item} --deliver` by hand, with --acceptance-file "
+                     f"for a work item")
+            if merged:
+                advice = (f"the pull request merged at {merged[:12]}, so no prepare renews it and the delivery "
+                          f"is not recorded: check the merged change against the item as it reads now, then "
+                          f"{self.by_hand(merged)}")
+            elif merging:
+                advice = f"nothing merged: renew it with {renew}, then merge or enqueue again"
+            else:
+                advice = f"a lane prepare does not renew it: run {renew}, then enqueue again"
+            raise Refusal(f"item acceptance scope changed after the delivery claim; {advice}")
 
     def renewal(self, claim: dict | None) -> tuple[dict | None, dict | None, str | None]:
         """The claim to save, the one `assert_scope` reads in place of the stored one, and the line saying so.
@@ -716,6 +746,16 @@ class Ship(SharedReview):
             return claim, None, None
         if self.lane_started():
             if stored.get("renewed") and not changed and claim.get("claim") != stored.get("claim"):
+                if notes := edited_waivers(claim.get("claim"), stored.get("claim")):
+                    named = ", ".join(f"#{note}" for note in notes)
+                    raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and since then only "
+                                  f"decision note {named} changed; its `Waive:` line still holds, so this entry's "
+                                  f"acceptance file stands: refresh the claim by hand with `sd-ship prepare --item "
+                                  f"{self.args.item} --deliver --acceptance-file FILE`, the same file, then "
+                                  f"`sd-ship lane retry`", code="delivery_claim_renewed", boundary="input",
+                                  state="operator_decision",
+                                  next_action="Rerun prepare --deliver by hand with the same acceptance file, "
+                                              "then retry the lane entry.")
                 raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this lane entry "
                               f"carries other acceptance evidence, as a retry of an entry enqueued before "
                               f"the renewal does; enqueue again with the renewal's acceptance file",
@@ -2357,7 +2397,7 @@ class Ship(SharedReview):
         # instead of failing to match "guest" and passing (sd:930).
         if sd_lib.written_mode(self.root) == "guest":
             raise Refusal("guest mode has no merge authority")
-        self.assert_scope()
+        self.assert_scope(merging=True)
         self.api.ci = sd_lib.repo_ci(self.connection, self.root)
         # Under `repo.ci = local` no remote check is coming, and `gh pr checks
         # --watch` fails on a pull request that has none; the local gate
@@ -2801,7 +2841,9 @@ class Ship(SharedReview):
         self.settle_closes(held, commit, evidence)
         if not self.args.no_item and self.state.get("deliver"):
             from sd_db.errors import SdDbError
-            self.assert_scope()
+            # A hand delivery at this commit is the operator's answer to a scope change after the merge.
+            if not self.delivered_at(commit):
+                self.assert_scope(merged=commit)
             try:
                 self.record_delivery(commit, f"origin/{reference['base']}")
             except (SdDbError, sqlite3.Error, ValueError) as error:
