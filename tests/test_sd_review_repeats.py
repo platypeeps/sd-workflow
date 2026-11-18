@@ -173,9 +173,9 @@ class RebuttedFindingTests(RepeatFixture):
     def test_malformed_rows_are_skipped_not_fatal(self) -> None:
         self.write_row("ship-adjudication:text", "not json at all")
         self.write_row("ship-adjudication:list", ["a", "b"])
-        self.write_row("ship-adjudication:object", {"proposal": {"bindings": {"repository": REPOSITORY, "branch": "main"},
+        self.write_row("ship-adjudication:object", {"decision": "accepted", "proposal": {"bindings": {"repository": REPOSITORY, "branch": "main"},
                                                                  "findings": {"index": 1}}})
-        self.write_row("ship-adjudication:rows", {"proposal": {
+        self.write_row("ship-adjudication:rows", {"decision": "accepted", "proposal": {
             "bindings": {"repository": REPOSITORY.upper(), "branch": "main"},
             "findings": [7, "x", None, {"response_disposition": "rebutted"},
                          {"response_disposition": "rebutted", "reason": {"a": [1, {"b": 2}]},
@@ -199,17 +199,17 @@ class RebuttedFindingTests(RepeatFixture):
                 contextlib.redirect_stderr(stderr):
             text = sd_review.rebutted_findings(
                 self.root, sd_review.resolve_subject(self.root, "worktree"), None, self.environment())
-        self.assertEqual(text, {})
+        self.assertEqual(text, ({}, {}))
         self.assertEqual(stderr.getvalue(), "sd-review: reviewing without the rebutted findings: OperationalError: locked\n")
 
     def test_planning_and_a_detached_head_read_nothing(self) -> None:
         with unittest.mock.patch.object(self.library, "connect", side_effect=AssertionError("database read")):
             planning = sd_review.Subject("planning", "HEAD", "worktree", ("docs/work/x/design.md",), 1, "plan")
-            self.assertEqual(sd_review.rebutted_findings(self.root, planning, None, self.environment()), {})
+            self.assertEqual(sd_review.rebutted_findings(self.root, planning, None, self.environment()), ({}, {}))
             subprocess.run(["git", "checkout", "--quiet", "--detach"], cwd=str(self.root), check=True,
                            env=clean_environment())
             subject = sd_review.resolve_subject(self.root, "worktree")
-            self.assertEqual(sd_review.rebutted_findings(self.root, subject, None, self.environment()), {})
+            self.assertEqual(sd_review.rebutted_findings(self.root, subject, None, self.environment()), ({}, {}))
 
     def test_a_rebuttal_after_the_head_changes_no_request(self) -> None:
         """`--explain`, dispatch and a replay ask the same (sd:1397): the head's commit time anchors the read."""
@@ -296,8 +296,7 @@ class RepeatRuleTests(unittest.TestCase):
         self.assertIn("evidence", sd_review.URL_OUTPUT_CONTRACT)
 
     def test_a_static_reader_may_answer_a_rebuttal_with_the_lines_it_read(self) -> None:
-        body = json.dumps({"proposal": {"findings": [{"raw_finding": row(), "response_disposition": "rebutted",
-                                                       "reason": "not reachable"}]}})
+        body = adjudicated(("src.py", "defect", "rebutted"))
         seen = sd_review.rebuttals([(body,)])
         self.assertEqual(set(seen), set(self.REBUTTED))
         section = sd_review.rebuttal_section(seen)
@@ -342,6 +341,77 @@ class RepeatReviewTests(RepeatFixture):
                 self.assertEqual(rows["src.py"], ("blocking", "a first-time claim"))
                 note = " " + sd_review.REPEAT_NOTE if status == "advisory" else ""
                 self.assertEqual(rows["bin/tool.py"], (status, "lane claim" + note))
+
+
+def adjudicated(*rows: tuple[str, str, str], decision: str = "accepted", line: int = 1) -> str:
+    """One adjudication body: each (path, summary, disposition) a blocking finding's answer."""
+    return json.dumps({"decision": decision, "proposal": {"findings": [
+        {"response_disposition": answer, "reason": "a reason",
+         "raw_finding": {"path": path, "line": line, "severity": "high", "summary": summary, "family": "correctness"}}
+        for path, summary, answer in rows]}})
+
+
+def gate(findings: list[dict[str, Any]], *bodies: str) -> list[str]:
+    """The disposition of each finding against the rebuttals in `bodies`, newest first."""
+    rebutted = frozenset(sd_review.rebuttals([(body,) for body in bodies]))
+    return [record["disposition"] for record in sd_review.dispose(findings, "high", rebutted)]
+
+
+class RebuttalIdentityTests(unittest.TestCase):
+    """Bundle round 6 of pack sd:9270: which rebuttal a finding repeats, and which one still holds."""
+
+    def test_the_key_is_the_whole_summary_folded_not_its_display_cut(self) -> None:
+        shared = "x" * (sd_review.REBUTTED_SUMMARY_CHARS - 3)
+        body = adjudicated(("src.py", shared + " first defect", "rebutted"))
+        self.assertEqual(gate([row(summary=shared + " second defect")], body), ["blocking"])
+        self.assertEqual(gate([row(summary=shared + " first defect")], body), ["advisory"])
+
+    def test_case_spacing_line_and_the_repeat_note_do_not_change_the_key(self) -> None:
+        # Lines drift across heads as code moves, so the line is not part of the identity.
+        body = adjudicated(("src.py", "Value  is wrong", "rebutted"), line=40)
+        for summary in ("value is wrong", " VALUE is\nwrong ", f"Value is wrong {sd_review.REPEAT_NOTE}"):
+            with self.subTest(summary=summary):
+                self.assertEqual(gate([row(summary=summary, line=3)], body), ["advisory"])
+        self.assertEqual(gate([row(summary="value is wrong", path="other.py")], body), ["blocking"])
+
+    def test_the_newest_disposition_of_a_finding_wins(self) -> None:
+        rebutted = adjudicated(("src.py", "defect", "rebutted"))
+        parked = adjudicated(("src.py", "defect", "parked"))
+        self.assertEqual(gate([row()], parked, rebutted), ["blocking"])
+        self.assertEqual(gate([row()], rebutted, parked), ["advisory"])
+
+    def test_only_an_accepted_adjudication_rebuts(self) -> None:
+        for decision in ("rejected", "", "proposed"):
+            with self.subTest(decision=decision):
+                self.assertEqual(gate([row()], adjudicated(("src.py", "defect", "rebutted"), decision=decision)),
+                                 ["blocking"])
+
+    def test_the_gate_matches_rebuttals_past_the_prompts_cap(self) -> None:
+        bodies = [adjudicated(("src.py", f"claim {index}", "rebutted")) for index in range(sd_review.REBUTTED_LINES + 3)]
+        oldest = f"claim {sd_review.REBUTTED_LINES + 2}"
+        self.assertEqual(gate([row(summary=oldest)], *bodies), ["advisory"])
+        section = sd_review.rebuttal_section(sd_review.rebuttals([(body,) for body in bodies]))
+        self.assertEqual(section.count("\n- "), sd_review.REBUTTED_LINES)
+        self.assertNotIn(oldest, section)
+
+    def test_the_lanes_own_blockers_are_never_rebutted(self) -> None:
+        parsed = sd_review.oversized_findings()
+        body = adjudicated(*((finding["path"], finding["summary"], "rebutted") for finding in parsed.findings))
+        self.assertEqual(set(gate(list(parsed.findings), body)), {"blocking"})
+        self.assertEqual(sd_review.rebuttal_section(sd_review.rebuttals([(body,)])), "")
+
+
+class RebuttalScopeTests(RepeatFixture):
+    def test_a_rebuttal_recorded_after_the_heads_commit_still_holds_at_the_gate(self) -> None:
+        """A same-head lane rerun: the rebuttal is newer than the head's commit time."""
+        self.adjudication(("lane claim", "rebutted", "git 2.54 matches it literally"), days=-1)
+        repeat = row(path="bin/tool.py", line=3, summary="lane claim")
+        runner = FakeRunner({"sd-check": sd_review.Completed(0, "{}", ""),
+                             "codex": sd_review.Completed(0, json.dumps({"findings": [repeat, row()]}), "")},
+                            default=sd_review.Completed(0, json.dumps({"findings": []}), ""))
+        result = sd_review.review(self.root, namespace(), runner, self.environment(), self.chatgpt_home())
+        rows = {r["path"]: r["disposition"] for r in result["findings"] if r["backend"] == "codex"}
+        self.assertEqual(rows, {"bin/tool.py": "advisory", "src.py": "blocking"})
 
 
 if __name__ == "__main__":
