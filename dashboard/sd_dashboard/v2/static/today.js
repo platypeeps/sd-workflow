@@ -351,7 +351,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // blocked or cancelled bundle's Retry and Send to builder post /api/queue/builds/retry (pack sd:6020). The view reads its
   // three documents when it first shows and on each Today read after; a source that was not read is said under the table.
   const QTYPES = ['working', 'merging', 'next', 'blocked', 'suggested', 'open', 'ended', 'parked'], QSHOW = ['suggested', 'open', 'ended', 'parked'], NEXT = 9;
-  const BOXES = ['merging', 'review', 'working', 'next', 'blocked', 'suggested', 'parked']; // a repo row's boxes, left to right (pack sd:7470, sd:8083, sd:8137, sd:9247)
+  const BOXES = ['merging', 'review', 'working', 'next', 'blocked', 'suggested', 'parked']; // a repo row's boxes, left to right (pack sd:7470, sd:8083, sd:8137, sd:9247); today.html's Detail head names them in this order (sd:9315)
   const QV = { lanes: null, lanesErr: '', built: null, builtErr: '', runner: null, runnerErr: '', tasks: null, tasksErr: '', seen: false, busy: false };
   const QOTHER = new Map(); // the lane entries, selectable as Today's other rows are
   const qShow = new Set();
