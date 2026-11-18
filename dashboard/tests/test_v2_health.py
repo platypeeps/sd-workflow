@@ -2570,6 +2570,16 @@ ANSWER = path => path === '/api/health/summary' ? [200, SUMMARY_DOC] : new Promi
         self.assertEqual((counts["checkouts"], counts["jobs"]), (wanting(doc, "checkouts"), wanting(doc, "jobs")))
         self.assertIsNone(counts["machine"])
 
+    def test_details_say_the_read_is_in_progress_until_it_settles(self):
+        """sd:9312: a read in flight is not a failed read; Details said 'Health could not be read' while it loaded."""
+        out = self.run_page("""R.loading = document.getElementById('details').html || ''; pending[0]([500, { error: 'boom' }]); await flush();
+R.failed = document.getElementById('details').html || '';""", pre="""var pending = [];
+window.shell.reconcile = a => { if (![...a.rows].length) a.clear(); }; // shell.js's: no row shown clears Details
+ANSWER = path => path === '/api/health/summary' ? [200, SUMMARY_DOC] : new Promise(answer => pending.push(answer));""")
+        self.assertIn("Nothing is selected: Health is still being read.", out["R"]["loading"])
+        self.assertNotIn("could not be read", out["R"]["loading"])
+        self.assertIn("Nothing is selected: Health could not be read.", out["R"]["failed"])
+
     def test_a_view_switch_reads_its_part_once(self):
         switch = "shell.view.show('{v}'); await flush();"
         out = self.run_page("OUT.gets = [];" + switch.format(v="machine") + "R.areas = BODY().html;"
