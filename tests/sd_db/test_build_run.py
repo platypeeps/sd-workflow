@@ -125,7 +125,9 @@ FAKE = textwrap.dedent('''
             time.sleep(3)
         if mode == "silent":
             sys.exit(0)
-        if mode == "asked":  # skipped every item with a question: a passing reply, no commit (sd:9219)
+        if mode == "asked-dirty":  # asked, then left an uncommitted file: a block the question did not cause
+            Path("stray.txt").write_text("stray")
+        if mode.startswith("asked"):  # skipped every item with a question: a passing reply, no commit (sd:9219)
             line({"type": "result", "subtype": "success", "is_error": False, "permission_denials": [],
                   "session_id": session, "result": "skipped (asked)"})
             sys.exit(0)
@@ -628,19 +630,34 @@ class Supervise(Case):
         self.assertIsNotNone(build.run(self.db, self.bundle["id"])["released_at"])
         self.assertEqual([item_state(self.db, item)["item"]["parked_at"] for item in self.items], [None, None])
 
+    def test_a_question_keeps_the_followup_and_park_of_a_block_it_did_not_cause(self):
+        """sd:9219 review: every item asked, but the builder left its worktree dirty. The dirty worktree blocks
+        the run, so each item still gets the followup, and the release parks it."""
+        self.press(2)
+        self.plan(claude=["asked-dirty"], sd_review=["clean"])
+        for item in self.items:
+            add_note(self.db, item, "question", "Which option?\nOption: Yes (Recommended)\nOption: No")
+        self.assertIn("dirty", self.supervisor().run()["blocked"])
+        counts = [self.db.execute("SELECT COUNT(*) FROM note WHERE item = ? AND kind = 'followup'",
+                                  (item,)).fetchone()[0] for item in self.items]
+        self.assertEqual(counts, [1, 1])
+        build.reap(self.db, probe=GoneProbe(alive=False, group=False))
+        parked = [item_state(self.db, item)["item"]["parked_at"] is not None for item in self.items]
+        self.assertEqual(parked, [True, True])
+
     def test_a_builder_that_skips_one_item_with_a_question_blocks_the_other(self):
-        """sd:9219, the other side: no commit, one item asked. The run still left no commit; only the item with
-        no question gets the followup and the park."""
+        """sd:9219, the other side: no commit, one item asked. The run left no commit, a block the question did
+        not cause, so each item gets the followup and the park."""
         self.press(2)
         self.plan(claude=["asked"], sd_review=["clean"])
         add_note(self.db, self.items[0], "question", "Which option?\nOption: Yes (Recommended)\nOption: No")
         self.assertIn("left no commit", self.supervisor().run()["blocked"])
         counts = [self.db.execute("SELECT COUNT(*) FROM note WHERE item = ? AND kind = 'followup'",
                                   (item,)).fetchone()[0] for item in self.items]
-        self.assertEqual(counts, [0, 1])
+        self.assertEqual(counts, [1, 1])
         build.reap(self.db, probe=GoneProbe(alive=False, group=False))
         parked = [item_state(self.db, item)["item"]["parked_at"] is not None for item in self.items]
-        self.assertEqual(parked, [False, True])
+        self.assertEqual(parked, [True, True])
 
     def test_a_branch_that_delivers_nothing_blocks(self):
         self.press()

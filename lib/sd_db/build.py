@@ -98,6 +98,9 @@ def _in_group(alias: str = "assignment") -> str:
     (`ALONE`). Every reader of a bundle by `parent` that drives its next run applies it: Retry and settle, the hold
     on an item, and the run count a claim moves, which `run` reads, so history keeps the member (sd:9222)."""
     return f"({alias}.parent IS NULL OR COALESCE({alias}.result, '') NOT LIKE '{ALONE}%')"
+#: The block of a run whose builder skipped every item with an open question and left no commit: no
+#: followup, no park, as the questions ask the operator already (sd:9219).
+ASKED = "every item has an open question: "
 #: The steps a run walks, each written before it starts.
 STEPS = ("claimed", "worktree", "building", "reviewing", "fixing", "enqueuing", "enqueued", "checking", "cleaning")
 #: A draft run's steps (`sd_db.draft`): it claims, then drafts.
@@ -2099,7 +2102,7 @@ def _settle(connection, read: dict, *, block: str | None = None) -> dict | None:
                       f"cancel; log {row['log_path'] or 'none'}, worktree {row['work_path']}")
             connection.execute("UPDATE runner_run SET outcome = 'blocked', detail = ?, updated_at = ? WHERE id = ?",
                                (reason, stamp, ident))
-            _block(connection, members, reason, stamp, since=row["created_at"])
+            _block(connection, members, reason, stamp, followup=ASKED not in block)
             return {"run": ident, "outcome": "blocked", "retry": None, "blocked": block}
         connection.execute("UPDATE runner_run SET released_at = ?, updated_at = ? WHERE id = ?", (stamp, stamp, ident))
         connection.execute("UPDATE runner_lease SET released_at = ? WHERE run = ? AND released_at IS NULL", (stamp, ident))
@@ -2166,26 +2169,27 @@ def _health_unknown(connection, row, members: list[dict], stamp: str) -> str:
     return retry
 
 
-def _block(connection, members: list[dict], reason: str, stamp: str, *, since: str | None = None) -> None:
-    """Block each member with a followup; one with an open question since `since` gets none: the question asks
-    the operator already (sd:9219)."""
+def _block(connection, members: list[dict], reason: str, stamp: str, *, followup: bool = True) -> None:
+    """Block each member, with a followup unless `followup` is False: a run blocked by its questions (`ASKED`)
+    asks the operator in them already (sd:9219)."""
     for member in members:
         connection.execute("UPDATE assignment SET status = 'blocked', ended = ?, result = ? WHERE id = ?",
                            (stamp, reason, member["id"]))
         _move(connection, member["item"], "blocked", reason)
-        if since is None or not open_question(connection, [member["item"]], since):
+        if followup:
             add_note(connection, member["item"], "followup",
                      f"Build blocked: {reason}. Look at the log and the worktree, then requeue or cancel.")
 
 
 def _park(connection, ident: str, lead: int, stamp: str) -> None:
     """Park each item of a blocked run, once the run and its lease are released, as the nightly prune parks an idle
-    one (pack sd:6132, sd:6008). One with an open question since the run started stays unparked: it waits on the
-    operator's answer, and a park would hide it (sd:9219)."""
-    since = connection.execute("SELECT created_at FROM runner_run WHERE id = ?", (ident,)).fetchone()["created_at"]
+    one (pack sd:6132, sd:6008). A run blocked by its questions (`ASKED`) parks none: its items wait on the
+    operator's answers, and a park would hide them (sd:9219)."""
+    detail = connection.execute("SELECT detail FROM runner_run WHERE id = ?", (ident,)).fetchone()["detail"] or ""
+    if ASKED in detail:
+        return
     for member in _members(connection, lead, "blocked"):
-        if not open_question(connection, [member["item"]], since):
-            park(connection, member["item"], ("blocked",), stamp, PARKED.format(run=ident))
+        park(connection, member["item"], ("blocked",), stamp, PARKED.format(run=ident))
 
 
 def park(connection, item: int, statuses: tuple[str, ...], stamp: str, note: str | None = None) -> bool:
