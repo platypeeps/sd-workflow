@@ -827,6 +827,14 @@ class TheMove(Lane, BrowserSession):
             status, _, answer = self.move("requeue", item=1, head="1" * 40)
         self.assertEqual((status, answer), (400, {"error": refusal}))
 
+    def test_a_requeue_of_an_entry_that_closes_a_member_cancelled_alone_is_refused_not_unknown(self):
+        """Review round 7 of pack sd:9222: `lane retry` refuses a saved close of a member cancelled on its own
+        before any write (exit 3, `member_cancelled_alone`); the page shows that refusal, not a 502 unknown."""
+        refusal = "sd:3 was cancelled on its own out of the build bundle on build/sd-1, so this entry may not deliver it"
+        with mock.patch.dict(os.environ, {"QUEUE_REFUSE": refusal, "QUEUE_CODE": "member_cancelled_alone"}):
+            status, _, answer = self.move("requeue", item=1, head="1" * 40)
+        self.assertEqual((status, answer), (400, {"error": refusal}))
+
     def test_a_requeue_whose_publish_is_unknown_is_an_unknown_outcome(self):
         # `publish_unknown` also follows a push that may have landed on origin; the page cannot tell which.
         with mock.patch.dict(os.environ, {"QUEUE_REFUSE": "origin did not answer; nothing was queued",
