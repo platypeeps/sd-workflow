@@ -2937,7 +2937,7 @@ R.reads = OUT.gets.filter(g => g === '/api/tasks/{port}').length;""", answer)
         texts = {}
         for scope in ("item", "build"):
             for status in ("queued", "running"):
-                asg.update(scope=scope, status=status)
+                asg.update(scope=scope, status=status, parks=[port])  # a ready item the cancel parks (pack sd:9290)
                 out = self.run_page(f"""open({port}); await flush();
 R.text = cmd('asg.cancel').consequence(C.get('asg:{asg['id']}'));""")
                 texts[scope, status] = out["R"]["text"]
@@ -2965,6 +2965,28 @@ R.member = cmd('asg.cancel').consequence(C.get('asg:{child}'));""")
         self.assertIn(f"#{member}", out["R"]["lead"])
         self.assertIn("1 queued member", out["R"]["lead"])
         self.assertNotIn("queued member", out["R"]["member"])
+
+    def test_a_queued_lead_cancel_confirm_promises_a_park_only_where_one_happens(self):
+        # pack sd:9290: the cancel parks an item only when it is ready, unparked, and no other assignment owns it
+        # (`build.park`); the confirm promised every member a park. It names the ones that park, from the same rule.
+        lead, ready, moving, owned = (self.item(title, status=status) for title, status in (
+            ("Lead", "ready"), ("Ready", "ready"), ("Moving", "in_progress"), ("Owned", "ready")))
+        head = self.assignment(lead)
+        members = [self.assignment(item) for item in (ready, moving, owned)]
+        self.assignment(owned, status="running")
+        self.connection.execute(f"UPDATE assignment SET scope = 'build', parent = ? WHERE id IN ({', '.join('?' * 3)})",
+                                (head, *members))
+        self.connection.execute("UPDATE assignment SET scope = 'build' WHERE id = ?", (head,))
+        self.connection.commit()
+        self.doc = tasks_screen.document(self.connection, now=NOW)
+        self.details[str(lead)] = tasks_screen.details(self.connection, lead, now=NOW)
+        out = self.run_page(f"""open({lead}); await flush();
+R.lead = cmd('asg.cancel').consequence(C.get('asg:{head}'));""")
+        text = out["R"]["lead"]
+        self.assertIn("It parks the item,", text)
+        self.assertIn(f"It also cancels its 3 queued members: #{ready}, #{moving}, #{owned}.", text)
+        self.assertIn(f"It parks #{ready}.", text)
+        self.assertIn(f"#{moving}, #{owned} stay unparked", text)
 
     def test_a_task_added_under_a_filter_that_hides_it_is_not_selected(self):
         # Selection stays on a visible task: a new task the filters hide is added and named, not selected (review, PR #46).
