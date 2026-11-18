@@ -258,7 +258,7 @@ def _left_out(row, *, now: str) -> str | None:
     cutoff = (datetime.fromisoformat(now.replace("Z", "+00:00")) - timedelta(days=7)).strftime("%Y-%m-%d")
     if row["status"] == "done" and not (row["status_since"] and row["status_since"] >= cutoff):
         return "done before the week"
-    if row["parked_at"] and row["piece"]:
+    if row["parked_at"] and row["piece"] is not None:
         return "a parked writing piece, which revives through its own workflow"
     return None
 
@@ -474,7 +474,7 @@ def _published(connection, state) -> list[dict]:
                     "links": [link("notion-row", str(experiments["url"]))]})
     # A publication claim belongs to a writing piece; `writing.piece_state` reads them. A read that fails says so.
     item = state["item"]
-    if item["kind"] == "idea" and item["piece"]:
+    if item["kind"] == "idea" and item["piece"] is not None:
         from sd_db import writing as pieces
 
         try:

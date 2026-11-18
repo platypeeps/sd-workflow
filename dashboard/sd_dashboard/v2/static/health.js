@@ -1,5 +1,5 @@
 // Health v2 (sd:2115): the page script. It loads before shell.js, which reads what it declares.
-// Views: one at a time, Checkouts, Machine, GitHub and Jobs, each its own reader of /api/health/<view> (health_screen.part),
+// Views: one at a time, Checkouts, Machine, GitHub, Jobs and Status (pack sd:9260), each its own reader of /api/health/<view> (health_screen.part),
 // started the first time the view opens; PAGE_VIEWS declares them to the shell's view switch, which owns #view=<id>. The
 // lamps, the badge and each view's count are /api/health/summary, read at start and again after a view's read; it waits on
 // no walker, so the strip draws before any view's rows. State starts on the states that want something (warning, caution,
@@ -37,12 +37,14 @@
     ctr: ['box', '<b>Running containers.</b> Each running Docker container, read with Ports: its image, status, project and folder, and the repo folders it mounts. A Docker that was not read is unknown, never empty. Start and stop them from the terminal.'],
     svc: ['activity', '<b>Background services that stay running.</b> Restart and Start act on the row as shown. The dashboard checks that it serves the newest code; it cannot restart itself, so a stale dashboard gives you the command to run. A one-off or scheduled job shows only when its last run failed, as a warning with no controls.'],
     mir: ['book-open', '<b>The vault copy of your records.</b> When it last updated. Read-only: this page writes no vault note.'],
+    stat: ['siren', '<b>The services you depend on.</b> One row per line of Settings\' status services list, read every 5 minutes: degraded is caution, an outage a warning. A status read over 15 minutes ago, or not read, is unknown. Each service\'s providers flag their row in Today\'s Usage strip.'],
     prot: ['lock', '<b>What each default branch enforces.</b> One column per registered repo, one line per check: a filled cell is a gap, a short mark passes, an empty cell does not apply. <b>Unknown is not protected</b>: a hatched column was not read and shows no cells. Every column opens its repo; the table below carries the same cells.'],
   };
   // Protection has no lamp: the annunciator holds 2 to 8 (the design's rule), and its matrix is Health's evidence strip.
   // Services (sd:3707) and Containers (sd:5840) are further areas past a full strip: no lamp, their chip and section only
   // (design.md, lamp: false).
-  const NO_LAMP = new Set(['prot', 'svc', 'ctr']);
+  // Service status (pack sd:9260) is one more: its view's rail count and the rail badge carry it.
+  const NO_LAMP = new Set(['prot', 'svc', 'ctr', 'stat']);
   const PH = 10; // one matrix line in the SVG's own units
   const I = n => html`<svg class="i" aria-hidden="true"><use href="#i-${n}"/></svg>`;
   const $ = id => document.getElementById(id);
@@ -53,6 +55,7 @@
     { id: 'machine', label: 'Machine', api: '/api/health/machine', areas: ['disk', 'svc', 'ports', 'ctr', 'doc', 'aws'] },
     { id: 'github', label: 'GitHub', api: '/api/health/github', areas: ['prot', 'dep', 'sec'] },
     { id: 'jobs', label: 'Jobs', api: '/api/health/jobs', areas: ['cred', 'mir'] },
+    { id: 'status', label: 'Status', api: '/api/health/status', areas: ['stat'] },
   ];
   // The shell's Shapeshift bar is the text filter (sd:5539): it matches a row's repo, path and branch in every view.
   window.PAGE_FILTER = Object.fromEntries(window.PAGE_VIEWS.map(v => [v.id, 'repo, path and branch']));
@@ -74,6 +77,9 @@
   const listed = () => (showing === 'ignored' ? IGNORED : ROWS).filter(scoped);
   const viewOf = area => PAGE_VIEWS.find(v => v.areas.includes(area))?.id;
 
+  // A clock time in the viewer's zone, with its label (pack sd:9260): Thu 14:05 MST.
+  const zoned = iso => new Date(iso).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
+  const clockCell = iso => html`<time datetime="${iso}">${zoned(iso)}</time>`;
   // The design's size wording, from a count of KiB.
   const size = kb => kb >= 1024 ** 3 ? `${(kb / 1024 ** 3).toFixed(2)} TiB` : kb >= 1024 ** 2 ? `${(kb / 1024 ** 2).toFixed(1)} GiB` : `${Math.round(kb / 1024)} MiB`;
   // A lamp's value is the summary's phrases (health_screen._lamp): `b` bold, then `t`.
@@ -144,7 +150,7 @@
         <thead><tr><th scope="col"><span class="sr">State</span></th><th scope="col">Finding</th><th scope="col">Fix</th></tr></thead>
         <tbody>${rows.map((r, i) => html`<tr data-id="${r.id}" aria-selected="${r.id === selected ? 'true' : 'false'}"${i > 0 && rows[i - 1].state !== r.state ? html` class="band-start"` : ''}>
           <td class="g g-${r.state}"><span aria-hidden="true">${GLYPH[r.state]}</span><span class="sr">${r.state}</span></td>
-          <td class="what"><button type="button">${r.what}</button><span class="detail">${r.detail}</span></td>
+          <td class="what"><button type="button">${r.what}</button><span class="detail">${r.detail}${r.read_at ? html` · read ${clockCell(r.read_at)}` : ''}</span></td>
           <td class="fix">${shell.commands.rowActions(r.id)}</td></tr>`)}</tbody></table>` : ''}
       ${a.read && !a.error && quiet(a) && !filtering() ? html`<p class="quiet">${rows.length ? '' : 'Nothing wants you here. '}${plural(quiet(a), 'ok or queued row')} not shown: press ok or queued in State to list ${quiet(a) === 1 ? 'it' : 'them'}.</p>` : ''}
     </section>`; })}`;
@@ -170,6 +176,8 @@
     if (a.id === 'disk') return x.volumes?.length ? html`<div class="bars" role="group" aria-label="Volume use: ${x.volumes.map(v => `${v.name} ${v.capacity}%`).join(', ')}">${x.volumes.map(v => html`<span class="name" title="${v.mount}">${v.name}</span><svg aria-hidden="true"><rect class="track" x="0.5" y="0.5" width="99%" height="11" rx="2"/><rect class="fill" x="0.5" y="0.5" width="${(v.used_kb / v.size_kb * 100 || 0).toFixed(1)}%" height="11" rx="2"/></svg><span class="v">${v.capacity}% · ${size(v.avail_kb)} free</span>`)}</div>` : '';
     // Clean all safe (sd:5105) heads Checkouts: one button for every cleanup row there whose own command would run.
     if (a.id === 'wt') return html`<p class="counts">${plural(safe().length, 'cleanup')} ready in Checkouts · ${shell.commands.rowActions('cleanup:safe')}</p>`;
+    // Service status (pack sd:9260): its counts, and Settings' status services list for add and remove.
+    if (a.id === 'stat') return html`<p class="counts">${plural(Object.values(x.counts || {}).reduce((n, c) => n + c, 0), 'service')} · ${['outage', 'degraded', 'unknown', 'ok'].map(s => `${x.counts?.[s] || 0} ${s}`).join(' · ')} · <a href="${x.settings}">Add or remove services in Settings</a></p>`;
     if (a.id === 'ctr') return html`<p class="counts">${plural(x.running, 'container')} running · ${x.holding} mount a checkout under ${x.root}</p>`;
     if (a.id === 'ports') return html`<p class="counts">${x.counts.configured} configured ports · ${x.counts.listening} listening · ${x.counts.unknown} unknown</p>${x.warnings.map(warn)}`;
     if (a.id !== 'prot' || !x.columns) return '';
@@ -203,9 +211,10 @@
     const a = AREAS.find(x => x.id === r.area);
     put($('details'), html`<p class="kind"><span class="g-${r.state}" aria-hidden="true">${GLYPH[r.state]}</span> ${r.kind} · ${r.state}</p>
       <h2>${r.what}</h2>
-      <dl>${Object.entries(r.facts || {}).map(([k, v]) => html`<dt>${k}</dt><dd>${v}</dd>`)}<dt>Source</dt><dd>${a.source}</dd><dt>Read</dt><dd><time class="rel" data-long datetime="${a.at || DOC.read}"></time></dd></dl>
+      <dl>${Object.entries(r.facts || {}).map(([k, v]) => html`<dt>${k}</dt><dd>${v}</dd>`)}<dt>Source</dt><dd>${a.source}</dd><dt>Read</dt><dd>${r.read_at ? html`${clockCell(r.read_at)} · <time class="rel" datetime="${r.read_at}"></time>` : html`<time class="rel" data-long datetime="${a.at || DOC.read}"></time>`}</dd></dl>
       ${r.type === 'branch protection' ? (r.status === 'unknown' ? html`<h3>Checks</h3><p class="why">No cell is shown: ${r.reason}.</p>`
         : html`<h3>Checks</h3>${r.sentence ? html`<p class="why">${r.sentence}</p>` : ''}<dl class="checks">${r.cells.map(c => html`<dt>${c[0]}</dt><dd class="c-${c[1]}">${cellText(c)}</dd>`)}</dl>`) : ''}
+      ${r.type === 'service status' && r.url ? html`<p><a class="ext" href="${r.url}" target="_blank" rel="noopener noreferrer">Status page${I('arrow-up-right')}</a></p>` : ''}
       ${r.slug ? html`<p><a class="ext" href="https://github.com/${r.slug}/settings/branches" target="_blank" rel="noopener noreferrer">${r.slug} · settings/branches${I('arrow-up-right')}</a></p>` : ''}
       ${r.list?.length ? html`<h3>${r.list_head || 'Rows behind it'}</h3><ul class="list">${r.list.map(x => html`<li>${x.href ? html`<a class="ext" href="${x.href}" target="_blank" rel="noopener noreferrer">${x.text}${I('arrow-up-right')}</a>` : x.text ?? x}</li>`)}</ul>` : ''}
       <h3>Fix</h3>${shell.commands.bar(r.id)}
@@ -358,6 +367,7 @@
     if (e.status >= 400 && e.status < 500) throw e;
     return `Not known what changed · ${o.facts.Label}: ${e.message}. Health was read again; check the row before you act again.`;
   });
+  const statusHref = o => (o.list || []).find(x => x.href)?.href || o.url || '';
   const can = action => o => revised(o) === true ? (o.can[action].allowed || o.can[action].reason) : revised(o);
   window.PAGE_COMMANDS = [
     { label: 'Read Health again', icon: 'rotate-ccw', run: () => load() },
@@ -413,12 +423,12 @@
     C.register(
       { id: 'service.restart', on: 'service', label: 'Restart', does: 'Restarts the service; open connections drop.', key: 'r', icon: 'rotate-ccw', risk: 'confirm', executes: true,
         primary: o => o.facts.State === 'running', when: can('restart'),
-        cli: o => `sd services restart ${o.facts.Label}`,
+        cli: o => `sd services restart ${shell.shq(o.facts.Label)}`,
         consequence: o => `Stops ${o.facts.Label} and starts it again. Its open connections drop.`,
         run: service('restart') },
       { id: 'service.start', on: 'service', label: 'Start', does: 'Starts the service.', key: 's', icon: 'play', risk: 'confirm', executes: true,
         primary: o => o.facts.State !== 'running', when: can('start'),
-        cli: o => `sd services start ${o.facts.Label}`,
+        cli: o => `sd services start ${shell.shq(o.facts.Label)}`,
         consequence: o => `Starts ${o.facts.Label}.`,
         run: service('start') },
       { id: 'dashboard service.kickstart', on: 'dashboard service', label: 'Kickstart', does: 'The dashboard cannot restart itself; gives you the command to run.', key: 'l', icon: 'rocket', risk: 'safe', executes: false,
@@ -430,7 +440,7 @@
         when: o => !!o.port || 'no port configured: there is nothing to inspect', cli: o => `lsof -nP -iTCP:${o.port || '<port>'} -sTCP:LISTEN`,
         sends: o => `POST /api/actions/run {action: port.lsof, port: ${o.port}}`, run: o => run(o, 'port.lsof', { port: Number(o.port) }) },
       { id: 'protection.settings', on: 'branch protection', label: 'Open branch settings', does: 'Opens the repo\'s branch protection settings on GitHub.', key: 'o', icon: 'settings', risk: 'safe', primary: () => true, executes: false,
-        when: o => !!o.slug || 'no github.com remote: there is no settings page', cli: o => `open https://github.com/${o.slug || '<owner>/<repo>'}/settings/branches`,
+        when: o => !!o.slug || 'no github.com remote: there is no settings page', cli: o => o.slug ? `open ${shell.shq(`https://github.com/${o.slug}/settings/branches`)}` : 'open https://github.com/<owner>/<repo>/settings/branches',
         run: o => { window.open(`https://github.com/${o.slug}/settings/branches`, '_blank', 'noopener'); return 'Opens in a new tab'; } },
       // Re-run collector (commands.js); Health reads again once the run ends.
       window.commands.syncCollector({ reread: () => load(), page: 'Health' }),
@@ -451,11 +461,15 @@
       { id: 'credential.signin', on: 'credential', label: 'Sign in', does: 'Shows this login\'s URL to copy into the right browser profile.', key: 'i', icon: 'log-in', risk: 'safe', executes: true,
         primary: o => o.state !== 'ok', when: o => !!o.signin || 'this credential has no sign-in', cli: o => o.signin || o.cli,
         sends: o => `POST /api/actions/run {action: credentials.signin, probe: ${o.id.replace(/^cred:/, '')}}`, run: o => run(o, 'credentials.signin', { probe: o.id.replace(/^cred:/, '') }) },
+      // pack sd:9260: a service's first incident, else its status page, in a new tab. The list's add and remove are Settings'.
+      { id: 'service status.open', on: 'service status', label: 'Open status page', does: 'Opens the open incident, or the service\'s status page, in a new tab.', key: 'o', icon: 'arrow-up-right', risk: 'safe', primary: () => true,
+        executes: false, when: o => !!statusHref(o) || 'the reading names no status page', cli: o => `open ${statusHref(o) ? shell.shq(statusHref(o)) : '<url>'}`,
+        run: o => { window.open(statusHref(o), '_blank', 'noopener'); return 'Opened in a new tab'; } },
     );
     // Snooze (sd:1896) and Ignore (sd:5470) on every row type; an ok row wants nothing, so it has nothing to snooze.
     window.snooze.register(C, { page: 'health', ignore: true, reread: () => load(), off: o => o.state === 'ok' && 'an ok row has nothing to snooze',
       types: ['check', 'doctor check', 'storage folder', 'build output', 'volume', 'worktree registrations', 'unread registrations', 'merged branches', 'merged worktrees', 'port',
-        'branch protection', 'dependabot alerts', 'secret scanning', 'credential', 'service', 'dashboard service', 'launch agent', 'vault mirror'] });
+        'branch protection', 'dependabot alerts', 'secret scanning', 'credential', 'service', 'dashboard service', 'launch agent', 'vault mirror', 'service status'] });
 
     const u = new URLSearchParams(location.search);
     // No ?state= is the start; an empty one is no State pressed, as is an old ?show=all link (sd:7207).

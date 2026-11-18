@@ -771,8 +771,9 @@ class TaskDeliveryCLITests(unittest.TestCase):
 
     def test_the_other_kinds_are_not_called_work_items_either(self) -> None:
         """The two branches sd:772 adds beside the followup one. A repo-less
-        kind with no task statuses is not told to close without the flag, and
-        a kind with a checkout but no task closure is told only tasks take it."""
+        idea closes by hand since pack sd:9302, so it is told to close without
+        the flag, and a kind with a checkout but no task closure is told only
+        tasks take it."""
         import sd_db
         import sd_db.writes
 
@@ -782,7 +783,7 @@ class TaskDeliveryCLITests(unittest.TestCase):
         refused = case.call("task", "status", idea, "done", "--delivered-by", "0" * 40,
                             code=1)
         self.assertIn(f"work-idea item {idea} belongs to no checkout, so --delivered-by "
-                      "has nothing to verify\n", refused.stderr)
+                      "has nothing to verify; close it without --delivered-by\n", refused.stderr)
 
         root = self.repository(case)
         report = json.loads(case.call("task", "add", "--priority", "3", "A report", "--json",

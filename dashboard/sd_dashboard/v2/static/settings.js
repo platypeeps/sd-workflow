@@ -96,5 +96,7 @@ function sections(S) {
            () => S.post('/api/settings/list', { key, text, before: shown.digest }));
     });
   }
-  read();
+  // A link to one row, as Health's and Today's to the status services and usage providers lists (pack sd:9260),
+  // names its field: the rows draw after the read, so the browser's own jump to the anchor finds nothing.
+  read().then(() => location.hash && document.getElementById(decodeURIComponent(location.hash.slice(1)))?.focus());
 }

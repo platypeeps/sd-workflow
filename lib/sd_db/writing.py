@@ -74,6 +74,8 @@ def _canonical(connection: sqlite3.Connection, repo: str) -> str:
 
 def pieces_owner(connection: sqlite3.Connection, repo: str) -> str:
     from .repos import row_for
+    if not repo:
+        raise WorkflowError("this piece names no repository")
     row = row_for(connection, repo)
     if row is None:
         raise WorkflowError(f"repository {repo!r} is not registered")
@@ -137,6 +139,8 @@ def _registered_only(repo: str) -> None:
 
 def _path(repo: str, piece: str, relative: str | None = None) -> Path:
     piece = _key(piece)
+    if not repo:
+        raise WorkflowError("this piece names no repository")
     root = _disk(repo)
     relative = relative or f"content/{piece}/index.md"
     wanted = {f"content/{piece}/index.md", f"content-parked/{piece}/index.md"}
@@ -329,7 +333,7 @@ def read_report(connection: sqlite3.Connection, item: int, gate: str, limit: int
     for one absent or outside the repository. A non-piece raises WorkflowError; any other read failure raises OSError:
     neither is a missing file."""
     row = connection.execute("SELECT * FROM item WHERE id = ?", (item,)).fetchone()
-    if row is None or row["kind"] != "idea" or not row["piece"]:
+    if row is None or row["kind"] != "idea" or row["piece"] is None:
         raise WorkflowError(f"item {item} is not a writing piece")
     candidate = _path(row["repo"], row["piece"], row["path"]).with_name(REPORTS[gate])
     try:
@@ -363,7 +367,7 @@ def list_pieces(connection: sqlite3.Connection, repo: str | None = None, *, incl
 
 def _piece(connection: sqlite3.Connection, item: int, expected: str | None = None) -> dict:
     state = _checked_state(connection, item, expected)
-    if state["item"]["kind"] != "idea" or not state["item"]["piece"]:
+    if state["item"]["kind"] != "idea" or state["item"]["piece"] is None:
         raise WorkflowError(f"item {item} is not a writing piece")
     return state
 
@@ -412,7 +416,11 @@ def _normal(stage: str) -> list[str]:
 def piece_state(connection: sqlite3.Connection, item: int) -> dict:
     state = _piece(connection, item)
     row = state["item"]
-    owner = pieces_owner(connection, row["repo"])
+    # A piece whose repository is gone or never named reads as its problem: the item page must still open.
+    try:
+        owner, unowned = pieces_owner(connection, row["repo"]), ""
+    except WorkflowError as error:
+        owner, unowned = "", str(error)
     try:
         snapshot = _snapshot(row)
         problems = _problems(row, snapshot)
@@ -423,10 +431,12 @@ def piece_state(connection: sqlite3.Connection, item: int) -> dict:
         problems, digest = [str(error)], ""
         document = None
         companions = {}
+    if unowned:
+        problems = [unowned, *problems]
     stages = _normal(row["stage"])
     corrections = [target for target in ("researching", "drafting", "review")
                    if row["stage"] in STAGES and STAGES.index(target) < STAGES.index(row["stage"])]
-    if owner == "retiring" or row["parked_at"]:
+    if owner in ("retiring", "") or row["parked_at"]:
         stages, corrections = [], []
     state["writing"] = {"stage": row["stage"], "available_stages": stages, "correction_stages": corrections,
                         "owner": owner, "parked": row["parked_at"] is not None,
@@ -647,7 +657,7 @@ def promote(connection: sqlite3.Connection, item: int, *, slug: str | None = Non
             row = _checked_state(connection, item, expected_revision)["item"]
             if row["kind"] != "idea":
                 raise WorkflowError(f"item {item} is not an idea")
-            if row["piece"]:
+            if row["piece"] is not None:
                 raise WorkflowError(f"item {item} is already piece {row['piece']}")
             if row["status"] == "done":
                 raise WorkflowError(f"idea {item} is done; reopen it before promoting it")
