@@ -93,9 +93,12 @@ def library():
     return imported.module
 
 
-def connect(sd_db, *, write: bool = False):
+def connect(sd_db, *, write: bool = False, keep: tuple[type[BaseException], ...] = ()):
+    """`sd_db.connect`, every error a `RowsRefusal`; one of `keep` keeps its type, for a caller that skips it."""
     try:
         return sd_db.connect(write=write)
+    except keep:
+        raise
     except Exception as error:
         raise RowsRefusal(str(error)) from None
 
