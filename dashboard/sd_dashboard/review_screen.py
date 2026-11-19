@@ -33,7 +33,6 @@ import json
 import os
 import re
 import sqlite3
-from pathlib import Path
 
 from sd_db import reads, workflow
 
@@ -122,13 +121,9 @@ def sweeps(connection, cron_root) -> dict:
     """The advisory sweep by week (sd:9505): `state` and `reason` as `management_screen.job_log` gives them, and `weeks`."""
     from .management_screen import job_log
 
-    log = job_log(cron_root, SWEEP_JOB)
-    if log["state"] == "read":
-        from .management_screen import log_tail
-
-        text = log_tail(Path(cron_root) / "logs" / f"{SWEEP_JOB}.log", SWEEP_LOG_BYTES)[1].decode("utf-8", "replace")
-    else:
-        text = ""
+    # One read: a second open of a log rotated in between raised past job_log's error handling (sd:9505 review).
+    log = job_log(cron_root, SWEEP_JOB, SWEEP_LOG_BYTES)
+    text = log["text"]
     weeks: dict[str, dict] = {}
 
     def week(date):

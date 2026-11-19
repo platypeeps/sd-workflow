@@ -911,6 +911,21 @@ class TheAdvisorySweep(ScreenCase):
                           for w in found],
                          [("2026-11-29", 1, 5, 1, None, 0, 1), ("2026-11-22", 2, 100, 10, 92, 1, 1)])
 
+    def test_a_log_rotated_away_after_its_first_read_breaks_no_page(self):
+        # sd:9505 review: the log was opened twice, the second open outside job_log's error handling, so a rotation
+        # between them raised FileNotFoundError through the whole Scoring read. One read: whatever it finds stands.
+        from sd_dashboard import management_screen
+
+        (self.cron / "logs" / f"{review_screen.SWEEP_JOB}.log").write_text(SWEEP_LOG, encoding="utf-8")
+        self.file("advisory-sweep:2026-11-18:alpha", "done")
+        real = management_screen.log_tail
+        with mock.patch.object(management_screen, "log_tail",
+                               side_effect=[real(self.cron / "logs" / f"{review_screen.SWEEP_JOB}.log", 1 << 20),
+                                            FileNotFoundError(2, "rotated")]):
+            found = review_screen.sweeps(self.connection, self.cron)
+        self.assertEqual(found["state"], "read")
+        self.assertEqual([(w["week"], w["packets"], w["fixed"]) for w in found["weeks"]][-1], ("2026-11-22", 100, 1))
+
     def test_no_log_still_lists_the_filed_items_and_says_why(self):
         self.file("advisory-sweep:2026-11-18:alpha", "done")
         found = review_screen.sweeps(self.connection, self.cron)
