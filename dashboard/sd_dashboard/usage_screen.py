@@ -180,11 +180,15 @@ def services(connection: sqlite3.Connection, *, now: str) -> list[dict]:
         body = body if isinstance(body, dict) else {}
         read_at = body.get("read_at") if _when(body.get("read_at")) else None
         status = _word(body.get("status"), SERVICE_STATE)
-        why = (_stale(_age(_when(read_at), clock), STATUS_STALE_MINUTES) if read_at else "the reading has no read time")
+        # The order `strip` checks: a failed read says its error before a missing or old read time (pack sd:9380).
         if not body:
             why = "the row does not parse"
-        elif status == "unknown" and not why:
+        elif status == "unknown":
             why = _text(body.get("error") or "the status job could not read it")
+        elif not read_at:
+            why = "the reading has no read time"
+        else:
+            why = _stale(_age(_when(read_at), clock), STATUS_STALE_MINUTES)
         incidents = [one for one in body.get("incidents") or [] if isinstance(one, dict)] if isinstance(
             body.get("incidents"), list) else []
         components = [one for one in body.get("components") or [] if isinstance(one, dict)] if isinstance(
@@ -318,8 +322,10 @@ def strip(connection: sqlite3.Connection, *, now: str) -> dict:
                 if not isinstance(number, int) or isinstance(number, bool):
                     continue
                 read_at = account.get("fetchedAt") if _when(account.get("fetchedAt")) else None
+                # Pace is where the window stood at the read, not at render (pack sd:9380).
                 week = _window({"used_percent": account.get("pct"), "window_minutes": 10080,
-                                "resets_at": account.get("resetsAt")}, clock, account.get("expectedPct"))
+                                "resets_at": account.get("resetsAt")}, _when(read_at) or clock,
+                               account.get("expectedPct"))
                 why = (_stale(_age(_when(read_at), clock), USAGE_STALE_MINUTES) if read_at else "cswap has no fetch time")
                 if not why and week is None:
                     why = "cswap has no seven-day share"
@@ -329,7 +335,7 @@ def strip(connection: sqlite3.Connection, *, now: str) -> dict:
             if len(rows) > before:
                 continue
         read_at = body.get("read_at") if _when(body.get("read_at")) else None
-        windows = [one for one in (_window(window, clock) for window in body.get("windows") or []
+        windows = [one for one in (_window(window, _when(read_at) or clock) for window in body.get("windows") or []
                                    if isinstance(window, dict)) if one] if isinstance(body.get("windows"), list) else []
         balance, spend = _money(body.get("balance")), _money(body.get("spend"))
         why = ""

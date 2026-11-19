@@ -1160,6 +1160,16 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
         return run(connection, ident)
 
 
+def queued_fresh(connection, repo: str) -> list[dict]:
+    """`repo`'s queued fresh builds (no parent, never run), as `{id, title, priority}` in queue order: the rows a
+    claim bundles with a new press, for the Build dialog's plan (pack sd:9484)."""
+    return [dict(row) for row in connection.execute(
+        "SELECT item.id, item.title, item.priority FROM assignment JOIN item ON item.id = assignment.item "
+        "WHERE assignment.status = 'queued' AND assignment.scope = ? AND assignment.parent IS NULL "
+        "AND assignment.run_count = 0 AND item.repo = ? ORDER BY assignment.queued_at, assignment.id",
+        (SCOPE, repo))]
+
+
 def _bundle(connection, rows: list) -> list:
     """The queued rows of one repository a claim takes, best first.
 

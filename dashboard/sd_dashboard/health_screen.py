@@ -1016,10 +1016,12 @@ def _status_rows(found: list[dict], *, now: str, removed: bool = False) -> tuple
             "list_head": "Open incidents", "list": [{"text": incident["title"] or "untitled incident", "href": incident["url"]}
                                                     if incident["url"] else incident["title"] or "untitled incident"
                                                     for incident in incidents],
-            # Ignore holds until the status or an incident changes (sd:5470); a new read time is not a new problem. An
-            # incident is its title, link and start, so a later outage with the same title is a new problem.
+            # Ignore holds until the status, an incident or a component changes (sd:5470, pack sd:9380); a new read time
+            # is not a new problem. An incident is its title, link and start, so a later outage with the same title is a
+            # new problem; a component is its name and status, so a later component failure is one too.
             "problem": [status, *(field for incident in incidents
-                                  for field in (incident["title"], incident["url"], incident["started_at"] or ""))],
+                                  for field in (incident["title"], incident["url"], incident["started_at"] or "")),
+                        *(field for part in one["components"] for field in (part["name"], part["status"]))],
         })
     return rows, extra
 

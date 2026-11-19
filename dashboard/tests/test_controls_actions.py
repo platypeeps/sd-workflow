@@ -600,6 +600,15 @@ class IdeaClose(BrowserSession):
                 self.assertIsNone(self.details_form(item))
                 self.assertIn(f'action="/api/items/{item}/status"', self.render(f"/item/{item}"))
 
+    def test_a_reclassified_idea_shows_its_current_status_selected(self):
+        # pack sd:9380: an idea reclassified from a task at ready showed planning selected, so one press wrote planning.
+        item = self.item("A reclassified idea", kind="work-idea", source="drafts")
+        self.connection.execute("UPDATE item SET status = 'ready' WHERE id = ?", (item,))
+        self.connection.commit()
+        options = Fields(self.status_form(item)).options["status"]
+        self.assertEqual([(entry["attributes"]["value"], "selected" in entry["attributes"]) for entry in options],
+                         [("ready", True), ("planning", False), ("done", False)])
+
     def test_the_rendered_form_closes_with_a_reason_and_reopens(self):
         for kind, source in self.HAND_IDEAS:
             item = self.item(f"A {kind} item", kind=kind, source=source)
