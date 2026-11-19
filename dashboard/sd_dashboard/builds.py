@@ -144,11 +144,7 @@ def plan(connection, items: list[int], *, now: str, sessions=None, gate=None) ->
     for repo, rows in groups.items():
         # The claim bundles the repository's queued fresh builds with these, best first (pack sd:9484): show them
         # where it puts them. ponytail: a queued retry claims alone and is not shown; a press queues after now.
-        queued = [dict(row) for row in connection.execute(
-            "SELECT item.id, item.title, item.priority FROM assignment JOIN item ON item.id = assignment.item "
-            "WHERE assignment.status = 'queued' AND assignment.scope = ? AND assignment.parent IS NULL "
-            "AND assignment.run_count = 0 AND item.repo = ? ORDER BY assignment.queued_at, assignment.id",
-            (build.SCOPE, repo))]
+        queued = build.queued_fresh(connection, repo)
         lane = rows[0]["lane_host"]
         rows = sorted([*({**row, "queued": True} for row in queued), *({**row, "queued": False} for row in rows)],
                       key=lambda row: (row["priority"] is None, row["priority"] or 0))
