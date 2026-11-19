@@ -35,6 +35,11 @@ before its SIGKILL. The KILL then reaches every group in either read:
   same group. Its leader has the start read then, or it had no leader
   then and has none now. A group whose leader start differs is a
   reused number and gets no signal.
+- The first read is a `Below`: the groups and the root's own start.
+  The fresh walk runs only while the root's leader keeps that start;
+  a reaped or reused root walks nothing.
+- A group that registers after its end began gets the same order:
+  read, TERM, its own full grace, SIGKILL (`end_late_group`).
 
 The first read catches a session whose parent ends on the SIGTERM:
 after that it hangs off pid 1, and no walk finds it. The second read
@@ -66,7 +71,7 @@ main. "n/a" means main does not have that code.
 | 3 `ThreadGroups.end_groups` KILL (sd-review threads) | registered groups signalled | a session below a thread's group survives | the same read before TERM and KILL | test_thread_groups_kill_ends_the_sessions_below |
 | 4 `sd-ship` `review_process` KILL | review group signalled | `sd-review`'s own sessions survive | the same read before TERM and KILL | test_a_killed_review_ends_the_sessions_below_it |
 | 5 `end_child` KILL (hosted run, `CHILD_STOP_SECONDS`) | lane child process killed | its ship and gate sessions survive | read below the unreaped child before TERM and KILL | test_a_killed_lane_child_leaves_no_session_below |
-| 6 cron `JOB_TIMEOUT`: TERM to the job group, KILL after `CRON_JOBS_TIMEOUT_GRACE` (10 s) | lane child and hosted run | the child's unwind (5 s per group, then up to 10 s per gate after its TERM) can outlast the grace; the cron KILL then leaves the gate's sessions | a gate's wait after TERM counts from its first TERM, sent as the TERM lands; the unwind then ends in about `GROUP_CLEANUP_SECONDS` | test_a_termed_run_ends_inside_the_cron_grace |
+| 6 cron `JOB_TIMEOUT`: TERM to the job group, KILL after `CRON_JOBS_TIMEOUT_GRACE` (10 s) | lane child and hosted run | the child's unwind (5 s per group, then up to 10 s per gate after its TERM) can outlast the grace; the cron KILL then leaves the gate's sessions | the lane-run job's grace rises to 30 s (system sd:9571); `CANCEL_SECONDS` stays 10 s | none: system side |
 | 6 residual | none | an outside KILL that lands before the unwind ends (grace below 6 s, a stalled `ps`) leaves sessions with no record | recovery: lane-run cron grace 30 s (system sd:9571); no group record (ruling, sd:9392 note 63749) | none: system side |
 | 7 hand run, SIGHUP (pack sd:9568) | none | a terminal close killed `sd-ship lane run` with no unwind | `term_ends_group` owns SIGHUP while it is default and unwinds as for TERM; `nohup` keeps it ignored | test_a_sighup_ends_the_group_as_a_sigterm_does, test_an_ignored_sighup_stays_ignored |
 | self-KILL (`arm_term`) | n/a | not on main | none | none |
@@ -74,7 +79,7 @@ main. "n/a" means main does not have that code.
 | advisory 4667: post-budget settle skips `release_chain`/`post_merge` | n/a | main runs both after every run that does not raise | none | none |
 | advisory 4402: `stop_groups` calls `answer_locked` unguarded | n/a | neither is on main | none | none |
 | advisory 4456: `arm_term` tests group, not session | n/a | not on main | none | none |
-| advisory 4474: pid identity read after the descendant read | read below | a reaped pid may be another process | the walk starts at an unreaped child or at group members; a group from the first read is signalled only when its leader start matches | test_a_reused_group_number_is_not_signalled |
+| advisory 4474: pid identity read after the descendant read | read below | a reaped pid may be another process | the walk starts only at a root whose leader keeps the start read before its TERM; a group from the first read is signalled only when its leader start matches | test_a_reused_group_number_is_not_signalled, test_a_reused_root_with_another_start_roots_no_walk |
 | advisory 4336: `lane_held` hold on doubt | n/a | not on main | none | none |
 | advisory 5551: tests patch `time.sleep` process-wide | n/a | main's lane tests patch `sd_lane.time` only | none | none |
 | reads | none | `ps` fails or times out | unknown: the KILL still reaches the target's own group, groups from no read are signalled, and stderr says so | test_an_unread_table_still_kills_the_leaders_group |
@@ -103,6 +108,35 @@ Rule 3 says TERM first, then read. The read stays before the TERM: a
 leader that dies on the TERM at once hangs its session off pid 1
 before any later read. `test_end_groups_kills_what_a_term_quitter_left`
 uses such a leader and fails with the read after the TERM.
+
+### Round 3: walks and TERMs anchored to a read
+
+Lead review of eb9b1374a. Rule A: no fresh walk from a root that may
+be reaped or reused; only a root whose leader keeps the start read
+before its TERM roots one. Rule B: a read precedes every TERM, and a
+group that registers late gets its full grace from its own TERM.
+Both rules hold in `kill_below` and `end_late_group`, which every
+path below calls.
+
+| Step | State moved | Failure | Recovery | Test |
+| --- | --- | --- | --- | --- |
+| `end_group`, A | leader group | the TERM wait may reap the leader; the KILL walked from its pid | walk only while the leader keeps its start | test_a_reused_root_with_another_start_roots_no_walk |
+| `end_group`, B | leader group | none: its read precedes its TERM | none needed | test_end_group_kills_a_session_its_leader_left |
+| `review_process`, A | review group | `communicate` may reap the leader; the KILL walked from its pid | the same start check | test_a_reused_root_with_another_start_roots_no_walk |
+| `review_process`, B | review group | none: its read precedes its TERM | none needed | test_a_killed_review_ends_the_sessions_below_it |
+| `end_groups`, A | registered groups | the KILL walked from each pid, matched or not | the same start check, on the shared read | test_a_reused_root_with_another_start_roots_no_walk |
+| `end_groups`, B | registered groups | none: one read precedes the TERMs | none needed | test_end_groups_reads_the_table_once_for_every_group |
+| `signal_gate`, B | gate group | only a TERM read; a SIGKILL with no TERM had none | each group's first signal, either one, reads first | test_a_gate_kill_ends_the_sessions_below_its_group |
+| `kill_left`, A | gate groups | walked from `below_of` after `started(None)`, which may be reaped | one read per group; each walk start-checked | test_a_reused_root_with_another_start_roots_no_walk |
+| `cancel_gate`, B | gate group | its TERM wait counted from the first TERM, so a late group lost grace | each wait is `CANCEL_SECONDS` (10 s) again; a late group's grace runs in `end_late_group` | test_a_gate_registered_late_gets_the_full_term_grace |
+| `started()`, B | late gate group | TERMed with no read; a leader that quit left its session | `end_late_group`: read, TERM, grace, SIGKILL; not recorded, so no signal cuts it | test_a_gate_registered_after_the_cancel_still_kills_the_detached_check |
+| `group_hook`, B | late thread group | TERMed with no read and never KILLed | `end_late_group` | test_a_group_registered_after_the_end_began_has_its_session_killed |
+| `end_child`, A | lane child | none: a reaped child roots no walk; an unreaped one is start-checked | none needed | test_a_lane_child_that_ends_on_term_still_has_what_it_left_killed |
+| `end_late_group`, A | late group | its wait must not reap the leader | `waitid` with WNOWAIT leaves the reap to `Popen` | the two late-group tests |
+
+`end_late_group` runs in the thread that registered the group, and
+blocks it up to `GROUP_CLEANUP_SECONDS`. That thread's run is ending
+anyway; the gate's `cancel_gate` waits on it within its two bounds.
 
 ## Acceptance criteria
 
