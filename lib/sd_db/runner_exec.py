@@ -681,6 +681,9 @@ def execute_immediate(connection, note, *, home=None):
         held = runner.queue_state(connection, target["assignment"])
         if held["item"] != value["item"] or held["revision"] != target["revision"] or (held["run"]["id"] if held["run"] else None) != target["run"]:
             raise workflow.StaleItem("the exact target attempt changed; reconcile or create a new request")
+        # Refused before the dispatch marker: reconcile then closes the request unrun (sd:9269 review).
+        if why := runner.requeue_refusal(held):
+            raise workflow.WorkflowError(why)
         with open_output(value) as output:
             output.write((json.dumps({"event": "dispatch", "target": target, "operation": value["operation"]}) + "\n").encode())
             os.fsync(output.fileno())
