@@ -808,6 +808,11 @@ R.icon = btn.html;""")
                                            "the piece files own this piece; the dashboard moves it after the writing cutover",
                                            "not parked", "parked; revive first", True])
 
+    def test_a_piece_with_no_registered_repository_says_so(self):
+        """pack sd:9380: owner '' means the repository is missing or not registered, not the writing cutover."""
+        out = self.run_page("R.off = cmd('piece.stage').when(C.get('14'));", prelude="DOC.pieces.find(p => p.id === 14).owner = '';\n")
+        self.assertEqual(out["R"]["off"], "The piece's repository is missing or not registered.")
+
     def test_park_posts_its_route_and_undo_revives_with_the_revision_park_returned(self):
         out = self.run_page("shellRun(cmd('piece.park'), C.get('12')); await flush(); lastUndo().undo(); await flush();")
         self.assertEqual(out["posts"], [["/api/items/12/park", {"revision": f"{12:064x}"}, 64], ["/api/items/12/revive", {"revision": "f" * 64}, 64]])

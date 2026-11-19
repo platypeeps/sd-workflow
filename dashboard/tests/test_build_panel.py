@@ -107,6 +107,18 @@ class BuildRoutes(Fixture):
         self.assertEqual([row["id"] for row in out["refused"]], [planning])
         self.assertEqual((out["room"]["machine"], out["room"]["why"], out["bundles"][0]["room"]), (6, "", build.REPO_CAP))
 
+    def test_the_plan_bundles_the_repository_s_queued_builds_as_the_claim_does(self):
+        """Pack sd:9484: the claim bundles a repository's queued fresh builds with the pressed ones, so the plan
+        shows them in that bundle, marked queued, and no press sends them again."""
+        earlier = self.ready()
+        build.queue(self.connection, [earlier], who="operator")
+        pressed = [self.ready() for _ in range(3)]
+        out = builds.plan(self.connection, pressed, now=NOW,
+                          sessions=lambda connection, *, now: {"sessions": [], "builders": {"running": 0, "why": ""}},
+                          gate=lambda: {"load": [1.0, 1.0, 1.0], "load_max": 40.0})
+        self.assertEqual([[(row["id"], row["queued"]) for row in bundle["items"]] for bundle in out["bundles"]],
+                         [[(earlier, True), (pressed[0], False), (pressed[1], False)], [(pressed[2], False)]])
+
     def test_the_plan_shows_each_items_wait_before_the_press(self):
         """Pack sd:8964: a readied item that waited on outside work showed nothing of it in the Build dialog.
         Each item carries its parked_at and the reason of its latest move to planning or blocked that gave one."""
@@ -342,6 +354,16 @@ class BuildsPanel(Fixture):
         row = self.panel()["runs"][0]
         self.assertEqual(row["state"], "waiting")
         self.assertIn("question note", row["why"])
+
+    def test_a_resolved_question_leaves_a_run_working(self):
+        """Class pass of sd:9219, instance `_waiting`: a question closed with `sd note resolve` asks the operator
+        nothing, so the run does not wait on them."""
+        item = self.ready()
+        run = self.claimed([item])
+        build.write(self.connection, run["id"], heartbeat_at="2099-01-02T00:59:30Z")
+        note = self.note(item, "Which option?", kind="question")
+        self.connection.execute("UPDATE note SET resolved_at = ? WHERE id = ?", ("2099-01-02T01:00:00Z", note))
+        self.assertEqual(self.panel()["runs"][0]["state"], "working")
 
     def test_an_unmanaged_run_past_enqueuing_says_to_close_its_draft(self):
         """sd:7909: `sd-ship lane cancel` refuses an unmanaged repository, so the row names the draft instead."""

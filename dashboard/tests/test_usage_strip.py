@@ -50,8 +50,9 @@ class TheStrip(ScreenCase):
         reading(self.connection, "codex", **CODEX)
         row = self.strip()["rows"][0]
         self.assertEqual((row["id"], row["state"], row["read_at"]), ("usage:codex", "caution", READ))
-        # 3 of 5 hours left at 12:00 is 40 % through: 62 used is 22 over; 4 of 7 days left is 43 % through: 86 is 43 over.
-        self.assertEqual(row["windows"], [{"label": "5h", "used": 62.0, "resets_at": "2026-09-06T15:00:00Z", "pace": 22},
+        # pack sd:9380: pace is at the read time, 11:50, not the render time. 190 of 300 minutes left is 37 % through:
+        # 62 used is 25 over (at 12:00 it would read 22); 4 days 10 minutes of 7 days left is 43 % through: 86 is 43 over.
+        self.assertEqual(row["windows"], [{"label": "5h", "used": 62.0, "resets_at": "2026-09-06T15:00:00Z", "pace": 25},
                                           {"label": "7d", "used": 85.5, "resets_at": "2026-09-10T12:00:00Z", "pace": 43}])
 
     def test_claude_is_a_row_per_cswap_account_with_its_seven_days_only(self):
@@ -61,6 +62,12 @@ class TheStrip(ScreenCase):
                          [("claude#1", "ok", True), ("claude#2", "unknown", False)])
         self.assertEqual(rows[0]["windows"], [{"label": "7d", "used": 40.0, "resets_at": "2026-09-08T12:00:00Z", "pace": -10}])
         self.assertEqual((rows[1]["windows"], rows[1]["why"]), ([], "read 2h ago; a reading over 30 min old is unknown"))
+
+    def test_a_claude_account_with_no_expected_share_paces_at_its_fetch_time(self):
+        # pack sd:9380: 11:40 is 92.66 % through a week resetting at 00:00, so 90.3 used is 2 under; at 12:00 it is 3.
+        account = {"number": 1, "pct": 90.3, "resetsAt": "2026-09-07T00:00:00Z", "fetchedAt": "2026-09-06T11:40:00Z"}
+        reading(self.connection, "claude", windows=[], accounts=[account])
+        self.assertEqual(self.strip()["rows"][0]["windows"][0]["pace"], -2)
 
     def test_a_failed_claude_read_keeps_its_status_and_shows_its_error(self):
         # Bundle review round 1: the accounts branch passed status="ok"
@@ -167,7 +174,7 @@ class TheStripOnToday(ReaderCase):
         self.assertIn("5h window 62% used", strip)
         self.assertIn('<rect class="fill caution" width="85.5"', strip)
         self.assertIn('<time datetime="2026-09-06T15:00:00Z">Sun, 09:00 AM MDT</time>', strip)
-        self.assertIn("22 pts over pace", strip)
+        self.assertIn("25 pts over pace", strip)
         self.assertIn('href="https://status.example.test/incidents/9"', strip)
         self.assertIn("No reader for gemini.", strip)
         self.assertIn('href="/settings#f-dashboard.usage_providers"', strip)

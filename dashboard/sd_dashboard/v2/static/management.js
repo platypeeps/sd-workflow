@@ -618,7 +618,8 @@ document.getElementById('view-repos').addEventListener('click', e => {
 // what the write answered; `inverse` reverses this write, once. A landed write rereads (shell.read's barrier); a 409 loads
 // again, since the row it named has moved and nothing landed.
 function landing(promise, msg, inverse) {
-  const stale = err => { if (err.stale) load(); throw err; };
+  // A 409, or a write with no answer (no status: it may have landed, pack sd:9485), loads again; the latter is unknown.
+  const stale = err => { if (err && !err.status) err.unknown = true; if (err && (err.stale || err.unknown)) load(); throw err; };
   return promise.then(v => {
     let spent = false;
     const undo = inverse && (() => { if (spent) return Promise.resolve(false); spent = true; return inverse(v).catch(stale); });

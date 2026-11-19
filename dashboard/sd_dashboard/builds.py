@@ -142,17 +142,24 @@ def plan(connection, items: list[int], *, now: str, sessions=None, gate=None) ->
         groups.setdefault(row["repo"], []).append(row)
     bundles = []
     for repo, rows in groups.items():
+        # The claim bundles the repository's queued fresh builds with these, best first (pack sd:9484): show them
+        # where it puts them. ponytail: a queued retry claims alone and is not shown; a press queues after now.
+        queued = build.queued_fresh(connection, repo)
+        lane = rows[0]["lane_host"]
+        rows = sorted([*({**row, "queued": True} for row in queued), *({**row, "queued": False} for row in rows)],
+                      key=lambda row: (row["priority"] is None, row["priority"] or 0))
         while rows:
             size = build.bundled(connection, [row["id"] for row in rows])
             chunk, rows = rows[:size], rows[size:]
-            host = build.lane_of(connection, chunk[0]["lane_host"]) or ""
+            host = build.lane_of(connection, lane) or ""
             bundles.append({"repo": repo, "name": Path(repo).name, "host": host,
                             "beat": build.dispatcher_beat(connection, host) if host else None,
                             "room": 0 if host else build.room_for(room, repo),
                             "model": build._model(connection, [row["id"] for row in chunk]),
                             "branch": "build/sd-<lead assignment>",
-                            "items": [{"id": row["id"], "title": row["title"], "revision": revisions[row["id"]],
-                                       **waits[row["id"]]}
+                            "items": [{"id": row["id"], "title": row["title"], "queued": True} if row["queued"] else
+                                      {"id": row["id"], "title": row["title"], "queued": False,
+                                       "revision": revisions[row["id"]], **waits[row["id"]]}
                                       for row in chunk]})
     return {"read": now, "bundles": bundles, "refused": refused,
             "room": {"machine": room["machine"], "why": room["why"], "cap": build.MACHINE_CAP,
@@ -274,7 +281,7 @@ def _waiting(connection, run: dict, items: list[int]) -> str:
     """Why a run waits on the operator: it is held (`blocked`, `abandoned`), or an open question note asks."""
     if run["outcome"] in ("blocked", "abandoned"):
         return run["detail"] or f"the run ended {run['outcome']}"
-    asked = build.open_question(connection, items, run["created_at"])
+    asked = build.open_question(connection, items, run["created_at"], pending=True)
     return f"question note #{asked['id']} on sd:{asked['item']}" if asked else ""
 
 

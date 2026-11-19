@@ -41,6 +41,7 @@ from . import hub, paths, reads
 from .database import served_by, transaction
 from .errors import SdDbError
 from .runner import (
+    ALONE,
     IN_SESSION,
     OWNING,
     RUNNABLE_KINDS,
@@ -90,9 +91,6 @@ RETRIES = 1
 PARKED = "Parked: build run {run} ended blocked; Retry on the Builds panel unparks it"
 # The note on an item a cancelled run parked: auto-pickup takes unparked items only (sd:9222).
 CANCEL_PARKED = "Parked: build run {run} was cancelled; Unpark to build it again"
-# The result on a bundle member's row an operator cancelled on its own: it left the bundle, so no Retry of the
-# bundle queues it again or clears its park (review round 2 of sd:9222).
-ALONE = "cancelled on its own by "
 
 
 def _in_group(alias: str = "assignment") -> str:
@@ -100,6 +98,9 @@ def _in_group(alias: str = "assignment") -> str:
     (`ALONE`). Every reader of a bundle by `parent` that drives its next run applies it: Retry and settle, the hold
     on an item, and the run count a claim moves, which `run` reads, so history keeps the member (sd:9222)."""
     return f"({alias}.parent IS NULL OR COALESCE({alias}.result, '') NOT LIKE '{ALONE}%')"
+#: The block of a run whose builder skipped every item with an open question and left no commit: no
+#: followup, no park, as the questions ask the operator already (sd:9219).
+ASKED = "every item has an open question: "
 #: The steps a run walks, each written before it starts.
 STEPS = ("claimed", "worktree", "building", "reviewing", "fixing", "enqueuing", "enqueued", "checking", "cleaning")
 #: A draft run's steps (`sd_db.draft`): it claims, then drafts.
@@ -1160,6 +1161,16 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
         return run(connection, ident)
 
 
+def queued_fresh(connection, repo: str) -> list[dict]:
+    """`repo`'s queued fresh builds (no parent, never run), as `{id, title, priority}` in queue order: the rows a
+    claim bundles with a new press, for the Build dialog's plan (pack sd:9484)."""
+    return [dict(row) for row in connection.execute(
+        "SELECT item.id, item.title, item.priority FROM assignment JOIN item ON item.id = assignment.item "
+        "WHERE assignment.status = 'queued' AND assignment.scope = ? AND assignment.parent IS NULL "
+        "AND assignment.run_count = 0 AND item.repo = ? ORDER BY assignment.queued_at, assignment.id",
+        (SCOPE, repo))]
+
+
 def _bundle(connection, rows: list) -> list:
     """The queued rows of one repository a claim takes, best first.
 
@@ -1326,14 +1337,20 @@ def _contribution_pull(connection, items: list[int]) -> str:
     return ""
 
 
-def open_question(connection, items: list[int], since: str) -> dict | None:
-    """The first `question` note on `items` since `since` that no `Ruling on note #<n>:` decision answers."""
+def open_question(connection, items: list[int], since: str, *, pending: bool = False) -> dict | None:
+    """The first `question` note on `items` since `since` that no `Ruling on note #<n>:` decision answers.
+
+    Two readers ask two things (review round 3 of sd:9219). By default it is
+    the evidence that the builder skipped an item, which delivery and the
+    class pass read: `sd note resolve` closes the note, not the skip.
+    `pending` asks whether the question still waits on the operator, as the
+    run's wait and the `ASKED` block read: a resolved one waits on no one."""
     if not items:
         return None
     marks = ", ".join("?" for _ in items)
     row = connection.execute(
         f"SELECT asked.id, asked.item FROM note asked WHERE asked.kind = 'question' AND asked.item IN ({marks}) "
-        f"AND asked.timestamp >= ? AND NOT EXISTS (SELECT 1 FROM note ruling WHERE ruling.item = asked.item "
+        f"AND asked.timestamp >= ? {'AND asked.resolved_at IS NULL' if pending else ''} AND NOT EXISTS (SELECT 1 FROM note ruling WHERE ruling.item = asked.item "
         f"AND ruling.kind = 'decision' AND ruling.body LIKE 'Ruling on note #' || asked.id || ':%') "
         f"ORDER BY asked.id LIMIT 1", (*items, since)).fetchone()
     return dict(row) if row else None
@@ -2097,11 +2114,10 @@ def _settle(connection, read: dict, *, block: str | None = None) -> dict | None:
             # A process may live: the run stays unreleased and keeps its
             # lease, so it still counts in `room`, until `_release` finds
             # every group gone.
-            reason = (f"build run {ident} ended at step {row['step']}: {block}; check the group, then requeue or "
-                      f"cancel; log {row['log_path'] or 'none'}, worktree {row['work_path']}")
+            reason = _blocked(row, block)
             connection.execute("UPDATE runner_run SET outcome = 'blocked', detail = ?, updated_at = ? WHERE id = ?",
                                (reason, stamp, ident))
-            _block(connection, members, reason, stamp)
+            _block(connection, members, reason, stamp, followup=not asked(row, reason))
             return {"run": ident, "outcome": "blocked", "retry": None, "blocked": block}
         connection.execute("UPDATE runner_run SET released_at = ?, updated_at = ? WHERE id = ?", (stamp, stamp, ident))
         connection.execute("UPDATE runner_lease SET released_at = ? WHERE run = ? AND released_at IS NULL", (stamp, ident))
@@ -2168,18 +2184,39 @@ def _health_unknown(connection, row, members: list[dict], stamp: str) -> str:
     return retry
 
 
-def _block(connection, members: list[dict], reason: str, stamp: str) -> None:
+def _blocked(row, block: str) -> str:
+    """The reason a blocked run `row` records for its `block`."""
+    return (f"build run {row['id']} ended at step {row['step']}: {block}; check the group, then requeue or "
+            f"cancel; log {row['log_path'] or 'none'}, worktree {row['work_path']}")
+
+
+def asked(row, reason: str) -> bool:
+    """Whether `reason` is, whole, run `row`'s reason for an `ASKED` block, its list `sd:N, sd:N` read from the
+    reason itself. The recorded reason alone decides: members and notes move after the run ends (class pass of
+    sd:9219), and a reason that only quotes `ASKED`, such as a review finding, is another block."""
+    head, tail = _blocked(row, ASKED + "\0").split("\0")
+    return re.fullmatch(re.escape(head) + r"sd:\d+(, sd:\d+)*" + re.escape(tail), reason) is not None
+
+
+def _block(connection, members: list[dict], reason: str, stamp: str, *, followup: bool = True) -> None:
+    """Block each member, with a followup unless `followup` is False: a run blocked by its questions (`ASKED`)
+    asks the operator in them already (sd:9219)."""
     for member in members:
         connection.execute("UPDATE assignment SET status = 'blocked', ended = ?, result = ? WHERE id = ?",
                            (stamp, reason, member["id"]))
         _move(connection, member["item"], "blocked", reason)
-        add_note(connection, member["item"], "followup",
-                 f"Build blocked: {reason}. Look at the log and the worktree, then requeue or cancel.")
+        if followup:
+            add_note(connection, member["item"], "followup",
+                     f"Build blocked: {reason}. Look at the log and the worktree, then requeue or cancel.")
 
 
 def _park(connection, ident: str, lead: int, stamp: str) -> None:
     """Park each item of a blocked run, once the run and its lease are released, as the nightly prune parks an idle
-    one (pack sd:6132, sd:6008)."""
+    one (pack sd:6132, sd:6008). A run blocked by its questions (`ASKED`) parks none: its items wait on the
+    operator's answers, and a park would hide them (sd:9219)."""
+    row = connection.execute("SELECT * FROM runner_run WHERE id = ?", (ident,)).fetchone()
+    if asked(row, row["detail"] or ""):
+        return
     for member in _members(connection, lead, "blocked"):
         park(connection, member["item"], ("blocked",), stamp, PARKED.format(run=ident))
 

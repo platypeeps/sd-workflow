@@ -198,14 +198,14 @@
       catch (err) { toast(`Build plan not read: ${err.message}`); return; }
       const room = P.room.why ? `No builder starts now: ${P.room.why}. The press still queues; a claim waits for room.`
         : `${P.room.machine} of ${P.room.cap} builders free now · at most ${P.room.repo_cap} per repository`;
-      const items = P.bundles.flatMap(b => b.items), ok = !P.refused.length && items.length;
+      const items = P.bundles.flatMap(b => b.items).filter(r => !r.queued), ok = !P.refused.length && items.length;
       put(dlg, html`<form method="dialog" class="date-form">
         <h2 id="build-h">Build ${plural(rows.length, 'task')}</h2>${window.shell.closeX}
         <p class="why">${room}</p>
         ${P.refused.length ? html`<p class="why">▲ Nothing can be queued while one item is refused:</p>
           <ul class="start-list">${P.refused.map(r => html`<li><code>#${String(r.id)}</code> ${r.why}</li>`)}</ul>` : ''}
         ${P.bundles.map(b => html`<section class="build-bundle" aria-label="Bundle in ${b.name}"><h3>${b.name} <small>${b.model} · branch ${b.branch} · ${b.host ? `runs on ${b.host}, whose dispatcher beat ${b.beat} s ago` : b.room ? `${b.room} may start now` : 'waits for room'}</small></h3>
-          <ol class="start-list">${b.items.map(r => html`<li><code>#${String(r.id)}</code> ${r.title}${wait(r)}</li>`)}</ol></section>`)}
+          <ol class="start-list">${b.items.map(r => html`<li><code>#${String(r.id)}</code> ${r.title}${r.queued ? html` <small class="why">already queued</small>` : wait(r)}</li>`)}</ol></section>`)}
         <p class="why">One run per bundle, ${String(P.budget_minutes)} min each. The items lock until each run ends; Cancel on Queue › Builds stops one.</p>
         <div class="actions">
           ${ok ? html`<button class="btn" value="build" type="submit">Build</button>` : ''}
