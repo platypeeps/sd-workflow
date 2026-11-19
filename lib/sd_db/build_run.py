@@ -1571,22 +1571,29 @@ class Supervisor:
 
     def findings(self, items: list[int]) -> str:
         """The Send to builder notes on `items` since the lead's first run, up to this run (pack sd:6020), then the
-        review blockers a plain Retry noted (`build.REVIEWED`, pack sd:9498), each under its own source; "" for none.
+        review blockers the latest plain Retry noted (`build.REVIEWED`, pack sd:9498, sd:9593), each under its own
+        source; "" for none.
 
         A bundle queued again keeps its lead, so this run resumes the branch an earlier run left. Only a Send to
         builder note is the operator's; a REVIEWED note is the reviewer's text, and the brief says so.
         """
         first = self.db.execute("SELECT MIN(created_at) FROM runner_run WHERE assignment = ?",
                                 (self.row["assignment"],)).fetchone()[0]
+        # Only the latest park's blockers (pack sd:9593): a Retry takes a released run, so the run before this one
+        # was released before its Retry noted them.
+        prior = self.db.execute("SELECT COALESCE(released_at, created_at) FROM runner_run WHERE assignment = ? "
+                                "AND created_at <= ? AND id != ? ORDER BY created_at DESC LIMIT 1",
+                                (self.row["assignment"], self.row["created_at"], self.ident)).fetchone()
 
-        def listed(prefix: str) -> str:
+        def listed(prefix: str, since: str) -> str:
             notes = self.db.execute(
                 f"SELECT item, body FROM note WHERE item IN ({', '.join('?' for _ in items)}) AND body LIKE ? "
                 f"AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp, id",
-                (*items, prefix + "%", first, self.row["created_at"])).fetchall()
+                (*items, prefix + "%", since, self.row["created_at"])).fetchall()
             return "\n".join(f"- sd:{note['item']}: {note['body'][len(prefix):].strip()}" for note in notes)
 
-        sent, reviewed = listed(build.FINDING), listed(build.REVIEWED)
+        sent = listed(build.FINDING, first)
+        reviewed = listed(build.REVIEWED, prior[0]) if prior else ""
         if not sent and not reviewed:
             return ""
         out = f"\nThe worktree already holds the commits of an earlier run on {self.row['branch']}: build on them.\n"

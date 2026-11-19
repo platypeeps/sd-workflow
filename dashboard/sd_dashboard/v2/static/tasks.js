@@ -134,7 +134,9 @@ addEventListener('DOMContentLoaded', () => {
   const find = document.getElementById('shift-in');
   // A ?q= link's words search; Enter files them only once the operator edits the field (sd:9309 review).
   let Q = '', linked = '', PQ = null;
-  const on = () => FKEYS.reduce((n, k) => n + F[k].size, 0) + (Q ? 1 : 0);
+  // Pack sd:9593: a lone priority word (PQ) is the text filter too: it counts, takes the text chip and stays in ?q=.
+  const on = () => FKEYS.reduce((n, k) => n + F[k].size, 0) + (Q || PQ !== null ? 1 : 0);
+  const typed = () => Q || (PQ !== null ? `p${PQ}` : '');
   const dueBucket = t => t.overdue || (t.due && days(t) < 0) ? 'overdue' : !t.due ? 'none' : withinWeek(t) ? 'week' : 'later';
   const DUE_OPTS = [['overdue', 'overdue'], ['week', '≤ 7 days'], ['later', 'later'], ['none', 'no due']];
   function renderFilters() {
@@ -168,7 +170,7 @@ addEventListener('DOMContentLoaded', () => {
   const kindWord = v => (v.startsWith('base:') ? `${v.slice(5)} (plugin kind)` : v);
   const fvalue = (k, v) => k === 'kind' ? kindWord(v) : k === 'p' ? (v && v !== 'unset' ? 'P' + v : 'unset') : k === 'due' ? DUE_OPTS.find(o => o[0] === v)?.[1] || v : k === 'status' ? slabel(v)
     : k === 'age' ? AGES.find(a => a.key === v)?.label || v : k === 'active' ? ({ scheduled: 'Scheduled only', done: 'Open and done' }[v] || 'Open only') : v;
-  const activeFilters = () => [...FKEYS.flatMap(k => [...F[k]].map(v => ({ key: `${k}:${v}`, label: `${FNAME[k]}: ${fvalue(k, v)}` }))), ...(Q ? [{ key: 'q', label: `Text: ${Q}` }] : [])];
+  const activeFilters = () => [...FKEYS.flatMap(k => [...F[k]].map(v => ({ key: `${k}:${v}`, label: `${FNAME[k]}: ${fvalue(k, v)}` }))), ...(typed() ? [{ key: 'q', label: `Text: ${typed()}` }] : [])];
   document.getElementById('filters').addEventListener('click', e => {
     if (e.target.closest('[data-unfilter-all]')) { clearFilters(); return; }
     const u = e.target.closest('[data-unfilter]'); if (!u) return;
@@ -550,6 +552,8 @@ addEventListener('DOMContentLoaded', () => {
     (q.get('cols') || '').split(',').filter(v => COL_OPTS.some(o => o[0] === v)).forEach(v => SHOW.cols.add(v));
     // Pack sd:9340: words typed before the read landed stay; Q already follows them.
     if (!find.value) { find.value = (q.get('q') || '').trim(); Q = find.value.toLowerCase(); linked = find.value; }
+    // Pack sd:9593: an address's lone priority word is the priority PQ the box set, not words to search.
+    if (linked && /^p[1-4]$/i.test(linked)) { PQ = +linked.slice(1); Q = ''; linked = ''; }
     document.getElementById('shift-ghost').hidden = !!find.value;
     // A page is decimal digits, as on Documents (sd:2427).
     window.shell.list.listParams(q, L, { sorts: Object.keys(SORTS), size: LIST.size });
@@ -559,12 +563,12 @@ addEventListener('DOMContentLoaded', () => {
     const q = new URLSearchParams(); q.set('view', view);
     if (place() === 'all') q.set('realm', 'all');
     FKEYS.forEach(key => { if (F[key].size) q.set(key, [...F[key]].join(',')); });
-    if (Q) q.set('q', Q);
+    if (typed()) q.set('q', typed());
     const pp = window.shell.aside.param(PARKED); if (pp) q.set('parked', pp);
     if (SHOW.cols.size) q.set('cols', [...SHOW.cols].join(','));
     if (view === 'list') window.shell.list.listQuery(q, L, LIST);
     shell.url(q); // the shell keeps ?row=
-    shell.filter(Q); // the shell's bar shows the same text (sd:5539)
+    shell.filter(typed()); // the shell's bar shows the same text (sd:5539)
   }
 
   // ---------- Shapeshift: add or find ----------
