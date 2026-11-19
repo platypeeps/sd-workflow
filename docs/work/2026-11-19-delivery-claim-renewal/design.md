@@ -1,0 +1,78 @@
+---
+title: A hand prepare renews a delivery claim the item outgrew
+created: 2026-11-19
+item: sd:9268
+branch: build/sd-9268-renewal
+---
+
+# Design — delivery-claim-renewal
+
+## Problem
+
+A delivery claim records the item's scope (title, body, path) and the
+acceptance evidence. When the item changed after the claim, merge
+refused, and no command renewed the claim. A lane prepare passes the
+enqueue's evidence on every retry, so it must never renew one.
+
+## Approach
+
+A prepare by hand with `--deliver` renews the claim: it saves the new
+scope and evidence. A lane prepare never renews (sd:9335). Once a pull
+request exists, prepare saves its title, body, claim and closing set as
+`pending`; `ready_to_send` publishes them.
+
+The review class: what counts as the evidence a delivery stands on,
+and when a stored claim, body or flag goes stale. Two rules answer it.
+
+- Evidence is a row's criterion, evidence, result and waiver
+  (`evidence_of`). A comment or a waiving note's body proves nothing.
+  A renewal whose rows prove nothing new refuses.
+- A `pending` set is stale for merge. Merge refuses `prepare_required`
+  while one waits, in every mode (`merge_scope`).
+
+Rejected: check the closing head for `--no-item` merges. It covers one
+mode; a pending body can wait in any mode.
+
+## Non-goals
+
+- The sticky `renewed` mark (pack sd:9580). The operator ruled it
+  ships after this item merges (note #64736). A patch waits at
+  `/Volumes/local/repo-storage/sd-workflow/patches/`.
+- Renewal from phase `merge_dispatch`: prepare routes it to reconcile.
+
+## Failure table
+
+Each row names a write or read of the claim, the evidence, the body or
+the `renewed` mark in `bin/sd-ship`. Tests are in
+`tests/test_sd_ship.py` unless named otherwise.
+
+| Step | State moved | Failure | Recovery | Test |
+| --- | --- | --- | --- | --- |
+| first prepare save | title, body, claim, closing set, active | lint, review, push or Copilot fails | no `pull_request` saved, so merge refuses; prepare again | `test_a_first_prepare_whose_copilot_request_fails_records_no_pull_request` |
+| reprepare save | the same fields as `pending` | a later step fails | merge refuses `prepare_required`; the next prepare overwrites `pending` | `test_a_failed_renewal_never_squashes_its_unpublished_body` |
+| renewal claim | new scope and evidence in `pending` | the evidence is the old claim's, a comment apart | refuses before any save | `test_a_renewal_whose_rows_differ_only_outside_the_evidence_refuses` |
+| renewal by the lane | none | a retry carries pre-change evidence | the lane never renews; `assert_scope` refuses | `test_a_lane_prepare_never_renews_a_claim_the_item_outgrew`, `test_an_orphaned_lane_prepare_never_renews` |
+| rebase closing set | `closing.head` moves to the rebased head | a later step fails | in `pending` while a PR exists; merge refuses a stale head | `test_a_closing_set_read_at_another_head_refuses_the_merge`, `test_a_reconcile_after_a_failed_renewal_reads_the_published_closing_set` |
+| guest body strip | body without `Work:` in `pending` | a later step fails | guest mode has no merge authority | `test_written_guest_mode_has_no_merge_authority` |
+| push | active `head`, remote branch | Copilot or a later step fails after the push | merge refuses `prepare_required`, `--no-item` too | `test_a_reprepare_that_does_not_publish_its_body_merges_nothing` (`tests/test_sd_ship_no_item_publication.py`) |
+| create pull request | `create_dispatched`, then the PR | the answer is lost | the retry reuses the one open PR | `test_lost_create_response_finds_one_matching_pr` |
+| publish | `ready_to_send` promotes `pending` in one save | the process stops before it | as the push row | `test_a_failed_copilot_request_never_publishes_a_renewal` |
+| merge dispatch | `merge_message` from the published body | the answer is lost | reconcile reads the PR; no second merge | `test_lost_merge_response_reconciles_without_a_second_merge` |
+| merge read of scope | none | the item changed after the claim | refuses; nothing merged; renew by hand | `test_a_scope_change_before_the_merge_says_nothing_merged` |
+| reconcile read of scope | `merged`, the closing set | the item changed after the merge | refuses; the advice delivers by hand | `test_a_scope_change_after_the_merge_gives_the_merged_advice` |
+| lane retry after a renewal | none | old items or evidence | refuses `delivery_claim_renewed` | `test_a_lane_retry_of_an_entry_older_than_a_renewal_refuses`, `test_a_lane_retry_with_the_items_a_renewal_dropped_refuses` |
+| `renewed` mark | kept on every later claim | a new enqueue with new evidence refuses too | a prepare by hand; the fix is pack sd:9580 | `test_a_lane_retry_of_an_entry_older_than_a_renewal_refuses` |
+
+## Acceptance criteria
+
+- [ ] `tests.test_sd_ship` renewal, scope, closing and Copilot groups
+  pass with 0 failures.
+- [ ] `tests.test_sd_ship_no_item_publication` passes with 0 failures.
+
+## Risks
+
+- A merge after any failed reprepare now refuses until a prepare
+  publishes. That is the intent: the published body may not describe
+  the pushed head.
+- The evidence tie is the row content, not a timestamp: lane entry
+  times come from more than one machine's clock.
