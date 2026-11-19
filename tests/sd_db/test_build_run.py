@@ -1087,6 +1087,25 @@ class Supervise(Case):
         self.assertIn("leak guard refuses these commits", found[0])
         self.assertIn("path withheld", found[0])
 
+    def test_a_slow_leak_guard_adds_nothing(self):
+        """Pack sd:9483: a guard scan past its timeout raised and ended the supervisor; the push still checks."""
+        system = self.root / "system"
+        guard = system / "local-leak-guard" / "leak-guard.sh"
+        guard.parent.mkdir(parents=True)
+        guard.write_text("exit 1\n")
+        (self.repo / ".git" / "hooks" / "pre-push").write_text("#!/bin/sh\n# installed by local-leak-guard\n")
+        head = support.git(self.repo, "rev-parse", "HEAD")
+        environ = {**os.environ, "SYSTEM_TOOLS_ROOT": str(system)}
+        real = subprocess.run
+
+        def run(argv, *args, **kwargs):
+            if argv[:2] == ["sh", str(guard)]:
+                raise subprocess.TimeoutExpired(argv, 60)
+            return real(argv, *args, **kwargs)
+        with mock.patch.object(subprocess, "run", side_effect=run):
+            self.assertEqual(ADAPTER.enqueue_refusals(self.repo, "origin/main", head, "fix: x", "",
+                                                      environ=environ), [])
+
     def test_a_failed_build_is_pushed_once(self):
         """Pack sd:6946: the tick pushes a blocked run once on ntfy; a failed send is tried again."""
         self.press()

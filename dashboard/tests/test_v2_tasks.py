@@ -3232,6 +3232,57 @@ class TheFilterAddress(ScreenCase):
         self.assertEqual(shown, {904})
         self.assertEqual(self.listed("?view=list&q=%239040")[0], {9040})
 
+    def test_focus_keeps_a_linked_query_whole_until_edited(self):
+        # Pack sd:9340 (1): focus re-parsed ?q=p1 bug, dropped p1 and searched "bug", listing #906 the link never named.
+        self.doc["rows"] += [self.made(905, "Fix p1 bug", "ready", "0"), self.made(906, "Bug hunt", "ready", "0")]
+        focus = "const box = document.getElementById('shift-in'); box.listeners.focus.forEach(f => f({ target: box })); await flush();"
+        shown, out = self.listed("?view=list&q=p1%20bug", focus)
+        self.assertEqual(shown, {905})
+        self.assertIn("q=p1%20bug", out["urls"][-1])
+
+    def test_a_query_typed_before_the_read_lands_is_kept(self):
+        # Pack sd:9340 (2): the first draw's readFilterURL set the box from the address over what the operator typed.
+        # FAIL_TASKS is read as /api/tasks is asked, after the page wired its box and before the answer lands: type there.
+        typed = ("var TYPED = false; Object.defineProperty(globalThis, 'FAIL_TASKS', { get() { if (!TYPED) { TYPED = true;"
+                 " const box = document.getElementById('shift-in'); box.value = 'trip';"
+                 " box.listeners.input.forEach(f => f({ target: box })); } return undefined; } });\n")
+        out = self.run_page("R.box = document.getElementById('shift-in').value; R.list = ELS['view-list'].html;",
+                            prelude=typed, search="?view=list&q=budget")
+        self.assertEqual(out["R"]["box"], "trip")
+        self.assertEqual(keys(out["R"]["list"]), {904})
+
+    def test_every_way_the_box_is_set_agrees_with_the_filter_and_the_ghost(self):
+        # Pack sd:9340 (3): Clear all and the text chip emptied the box but left the ghost hidden; a refused add put the
+        # words back while the filter and the ghost said the box was empty.
+        clear = "ELS.filters.listeners.click[0]({ target: { id: '', closest: s => s === '[data-unfilter-all]' ? {} : null } }); await flush();"
+        chip = "ELS.filters.listeners.click[0]({ target: { closest: s => s === '[data-unfilter]' ? { dataset: { unfilter: 'q' } } : null } }); await flush();"
+        for press in (clear, chip):
+            out = self.run_page(press + " R.ghost = ELS['shift-ghost'].hidden;", search="?view=list&q=trip")
+            self.assertFalse(out["R"]["ghost"], press)
+        add = ("const box = document.getElementById('shift-in'); box.value = 'Call the bank'; box.listeners.input[0]({ target: box });"
+               " box.listeners.keydown.forEach(f => f({ key: 'Enter', preventDefault() {}, stopPropagation() {} })); await flush();"
+               " R.box = box.value; R.ghost = ELS['shift-ghost'].hidden; R.url = OUT.urls[OUT.urls.length - 1];")
+        out = self.run_page(add, "() => [400, { error: 'refused' }]", search="?view=list")
+        self.assertEqual((out["R"]["box"], out["R"]["ghost"]), ("Call the bank", True))
+        self.assertIn("q=call%20the%20bank", out["R"]["url"])
+
+    def test_scope_translates_between_the_board_and_the_list(self):
+        # Pack sd:9340 (4): the board's Open and done showed twice on the list, and the list's Open only left a chip
+        # the board had no use for.
+        to = lambda v: f"document.dispatchEvent(new CustomEvent('tasks:view', {{ detail: '{v}' }})); await flush(); R.f = ELS.filters.html;"  # noqa: E731
+        out = self.run_page(to("list"), search="?view=board&active=done")
+        self.assertEqual(len(re.findall(r"<option[^>]*>Open and done</option>", out["R"]["f"])), 1)
+        self.assertNotIn('data-unfilter="active:', out["R"]["f"])
+        out = self.run_page(to("board"), search="?view=list&active=1")
+        self.assertNotIn('data-unfilter="active:', out["R"]["f"])
+
+    def test_the_count_counts_what_the_layout_shows(self):
+        # Pack sd:9340 (5): the board hides its Done column by default, yet the count took #903 in.
+        out = self.run_page("R.n = ELS['task-count'].textContent;", search="?view=board")
+        self.assertEqual(out["R"]["n"], "3 tasks")
+        out = self.run_page("R.n = ELS['task-count'].textContent;", search="?view=list")
+        self.assertEqual(out["R"]["n"], "4 tasks")
+
     def test_the_text_filter_reads_q_and_the_box_writes_it(self):
         self.assertEqual(self.listed("?view=list&q=BUDGET")[0], {902})
         self.assertEqual(self.listed("?view=list&q=%23904")[0], {904})
@@ -3451,7 +3502,9 @@ class TheBadge(BrowserSession):
         badges = self.listening.RequestHandlerClass.badges
 
         def sections():
-            # sd:9310: the live read runs after the answer, so the second request shows it.
+            # sd:9310: the live read runs after the answer, so the second request shows it. Pack sd:9340: settle first,
+            # or the last call's refresh, still running from before the new row, makes refresh_later start none.
+            badges.settle()
             self.request("/ui/sections.js", headers={"Cookie": self.cookie})
             badges.settle()
             return self.request("/ui/sections.js", headers={"Cookie": self.cookie})[2]
