@@ -1579,21 +1579,19 @@ class Supervisor:
         """
         first = self.db.execute("SELECT MIN(created_at) FROM runner_run WHERE assignment = ?",
                                 (self.row["assignment"],)).fetchone()[0]
-        # Only the latest park's blockers (pack sd:9593): a Retry takes a released run, so the run before this one
-        # was released before its Retry noted them.
-        prior = self.db.execute("SELECT COALESCE(released_at, created_at) FROM runner_run WHERE assignment = ? "
-                                "AND created_at <= ? AND id != ? ORDER BY created_at DESC LIMIT 1",
-                                (self.row["assignment"], self.row["created_at"], self.ident)).fetchone()
 
-        def listed(prefix: str, since: str) -> str:
+        def listed(prefix: str, *, latest: bool = False) -> str:
             notes = self.db.execute(
                 f"SELECT item, body FROM note WHERE item IN ({', '.join('?' for _ in items)}) AND body LIKE ? "
                 f"AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp, id",
-                (*items, prefix + "%", since, self.row["created_at"])).fetchall()
+                (*items, prefix + "%", first, self.row["created_at"])).fetchall()
+            # Only the latest park's blockers (pack sd:9593): one Retry notes the same text on each member, so the
+            # newest note's text names them, whatever runs a recovery started since.
+            if latest and notes:
+                notes = list({note["item"]: note for note in notes if note["body"] == notes[-1]["body"]}.values())
             return "\n".join(f"- sd:{note['item']}: {note['body'][len(prefix):].strip()}" for note in notes)
 
-        sent = listed(build.FINDING, first)
-        reviewed = listed(build.REVIEWED, prior[0]) if prior else ""
+        sent, reviewed = listed(build.FINDING), listed(build.REVIEWED, latest=True)
         if not sent and not reviewed:
             return ""
         out = f"\nThe worktree already holds the commits of an earlier run on {self.row['branch']}: build on them.\n"
