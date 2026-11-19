@@ -13,10 +13,12 @@ import os
 import re
 import sqlite3
 import subprocess
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from sd_dashboard import now_screen, setting_rows, settings_screen, usage_screen
+from sd_dashboard import now_screen, places, setting_rows, settings_screen, usage_screen
 from sd_db.writes import record_state, set_setting
 from support import NOW, ScreenCase
 from test_service_status import status
@@ -230,6 +232,21 @@ class TheStripInTheUsageDropdown(ScreenCase):
         self.assertIn("Not read: database is locked", out["R"]["body"])
         self.assertEqual(out["R"]["state"], "unknown")
 
+    def test_no_reading_is_unknown_never_ok(self):
+        # Pack sd:9597: a strip with no rows, or only providers with no reader, reduced to ok.
+        for answer in ({"rows": [], "nosource": []}, {"rows": [], "nosource": ["gemini"]}):
+            with self.subTest(answer=answer):
+                out = run_usage("R.state = usageWorst(ANSWER);", answer=answer)
+                self.assertEqual(out["R"]["state"], "unknown")
+
+    def test_long_labels_units_names_and_errors_wrap_inside_the_menu(self):
+        # Pack sd:9597: a window label, a money unit, a footer provider name or a read error ran past the menu's edge.
+        css = re.sub(r"/\*.*?\*/", "", (V2 / "static" / "shell.css").read_text(encoding="utf-8"), flags=re.S)
+        wrapped = {part.strip() for selector, body in re.findall(r"([^{}]+)\{([^{}]*)\}", css)
+                   if re.search(r"overflow-wrap:\s*anywhere", body) for part in selector.split(",")}
+        for selector in (".ustrip .wl", ".ustrip .w", ".ustrip .foot"):
+            self.assertIn(selector, wrapped)
+
     def test_the_menu_anchors_to_the_page_head_and_stays_inside_the_gutters(self):
         """Lead review of 8f483c6: on Contributions at 375 px the action slot wraps left, and a menu anchored to the
         slot's right end ran past the screen's left edge. The menu anchors to the page head, which spans the gutters."""
@@ -260,6 +277,12 @@ class TheStripInTheUsageDropdown(ScreenCase):
 
 class TheStripRoute(BrowserSession):
     def test_the_strip_route_answers_the_strip_and_refuses_a_query(self):
+        # Pack sd:9597: the lists fell back to the machine's config files, so its providers became rows here.
+        config = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (config / "usage-providers.conf").write_text("example-provider\n", encoding="utf-8")
+        self.enterContext(mock.patch.object(places, "REALMS_CONFIG", config / "realms.conf"))
+        set_setting(self.connection, "dashboard.usage_providers", "codex\n")
+        set_setting(self.connection, "dashboard.status_services", "# none\n")
         reading(self.connection, "codex", **CODEX)
         status_code, _, body = self.request("/api/usage/strip", headers={"Cookie": self.cookie})
         self.assertEqual(status_code, 200, body)
