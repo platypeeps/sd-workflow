@@ -595,8 +595,17 @@ def queue_lock(path: pathlib.Path) -> Iterator[None]:
 
 
 @contextlib.contextmanager
-def runner_lock(queue: Queue) -> Iterator[bool]:
-    """This machine's runner lock for the repository, never waited for: True when held, False when busy."""
+def runner_lock(queue: Queue, root: pathlib.Path | None = None) -> Iterator[bool]:
+    """This machine's runner lock for the repository, never waited for: True when held, False when busy.
+
+    A lane worker names its `root`: it then takes over the lock its hosted
+    run took for it (`handed_lock`, sd:9332).
+    """
+    handed = None if root is None else handed_lock(queue, root)
+    if handed is not None:
+        with handed:
+            yield True
+        return
     queue.lock_file.parent.mkdir(parents=True, exist_ok=True)
     with open(queue.lock_file, "a", encoding="utf-8") as handle:
         try:
@@ -605,6 +614,38 @@ def runner_lock(queue: Queue) -> Iterator[bool]:
             yield False
             return
         yield True
+
+
+#: Runner locks a hosted run in this process took for the lanes it starts, by checkout, each with its lock
+#: file, until that lane's worker takes it over (`runner_lock`) or the lane ends (sd:9332).
+HANDED: dict[str, tuple[str, Any]] = {}
+#: How a lane child learns of the runner lock its run passed it: `<fd>:<lock file>`.
+HANDED_ENV = "SD_LANE_HANDED_LOCK"
+
+
+def handed_lock(queue: Queue, root: pathlib.Path) -> Any:
+    """The open, locked runner lock file a hosted run took for this worker, or None (sd:9332).
+
+    In the run's process it is in `HANDED`; in a lane child, its fd is named
+    by `HANDED_ENV`. A file that is not `queue`'s lock file now is not taken.
+    """
+    path, handle = HANDED.pop(str(root), (None, None))
+    if handle is None:
+        fd, _, path = os.environ.pop(HANDED_ENV, "").partition(":")
+        if not fd.isdigit():
+            return None
+        try:
+            handle = os.fdopen(int(fd), "a", encoding="utf-8")
+        except OSError:
+            return None
+    try:
+        same = path == str(queue.lock_file) and os.fstat(handle.fileno()).st_ino == os.stat(path).st_ino
+    except OSError:
+        same = False
+    if not same:
+        handle.close()
+        return None
+    return handle
 
 
 def lane_git(worktree: pathlib.Path, *args: str) -> str | None:
@@ -3935,7 +3976,7 @@ def run_lane(root: pathlib.Path, environ: dict[str, str], ship: Ship = default_s
     refuse_elsewhere(root, environ)
     queue = queue_for(root, environ)
     own_lock = queue.lock_file
-    with runner_lock(queue) as locked:
+    with runner_lock(queue, root) as locked:
         if not locked:
             return {"ran": [], "busy": f"another runner holds {own_lock}"}
         try:
@@ -4217,8 +4258,7 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
         return inline_lane(lambda: run_lane(checkout, environ, ship, gate, note, clock() + budget))
     order = longest_waiting_first(hosted, environ)
     lanes += run_parallel(order, start or inline, deadline, functools.partial(lane_room, environ),
-                          functools.partial(new_work, environ), functools.partial(lane_held, environ, {}),
-                          cap=lane_parallel(environ))
+                          functools.partial(new_work, environ), MachineLocks(environ), cap=lane_parallel(environ))
     for path, checkout in hosted:  # after the lanes ran: a slow read never holds a lane back (pack sd:6006)
         for asked in (ask_wait(checkout, path, environ), file_flakes(checkout, path, environ)):
             if asked:
@@ -4276,8 +4316,6 @@ CHILD_STOP_SECONDS = 30
 RESCAN_SECONDS = 30.0
 #: Lane to its runnable entry ids, to the lanes with new work among them (`new_work`).
 Pending = Callable[[dict[pathlib.Path, frozenset[str]]], dict[pathlib.Path, frozenset[str]]]
-#: Whether a worker outside this run holds a lane's runner lock (`lane_held`).
-Held = Callable[[pathlib.Path], bool]
 
 
 @dataclasses.dataclass
@@ -4309,7 +4347,16 @@ def child_lane(checkout: pathlib.Path, budget: float, argv: list[str] | None = N
     out, err = tempfile.TemporaryFile("w+"), tempfile.TemporaryFile("w+")
     argv = argv or [sys.executable, str(BIN / "sd-ship"), "-C", str(checkout), "lane", "run",
                     "--budget", str(max(0, int(budget)))]
-    process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err, env=dict(os.environ))
+    environ = dict(os.environ)
+    path, handed = HANDED.pop(str(checkout), (None, None))
+    if handed is not None:  # the child takes over the runner lock its run took (sd:9332)
+        environ[HANDED_ENV] = f"{handed.fileno()}:{path}"
+    try:
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=out, stderr=err, env=environ,
+                                   pass_fds=() if handed is None else (handed.fileno(),))
+    finally:
+        if handed is not None:
+            handed.close()  # the child's copy holds it now; a child that never started frees it
     return StartedLane(functools.partial(child_answer, process, out, err), functools.partial(end_child, process, out, err),
                        process)
 
@@ -4382,28 +4429,89 @@ def lane_parallel(environ: dict[str, str] | None = None) -> int:
     return int(value) if value else MAX_PARALLEL_LANES
 
 
-def lane_held(environ: dict[str, str], queues: dict[pathlib.Path, Queue], checkout: pathlib.Path) -> bool:
-    """Whether a worker outside this run holds `checkout`'s runner lock; never waits (sd:9332).
+class MachineLocks:
+    """How two lane-run jobs on one machine share one lane cap (sd:9332).
 
-    A second lane-run job runs beside the first, so a lane the other run's
-    worker holds counts toward this run's cap. A queue or lock that cannot
-    be read is not held: unknown is not a worker, and a worker started
-    there refuses with its own reason, as before. `queues` keeps each
-    lane's queue for the run, so a poll runs no `git`.
+    `start_lock` is a host-wide lock, held only while a run counts the
+    lanes held, decides, and takes the chosen lane's runner lock; its
+    worker takes that lock over (`runner_lock`). So no run reads a lane
+    free that another has chosen but not yet started. A lane whose queue
+    or lock cannot be read is not held, as before: a worker started there
+    refuses with its own reason. A failed queue read is kept for the run,
+    as a queue read is, so a poll runs no `git`.
     """
-    try:
-        queue = queues.get(checkout)
+
+    def __init__(self, environ: dict[str, str]) -> None:
+        self.environ = environ
+        self.queues: dict[pathlib.Path, Queue | None] = {}
+        self.mine: set[str] = set()
+
+    def lane_queue(self, checkout: pathlib.Path) -> Queue | None:
+        if checkout not in self.queues:
+            try:
+                self.queues[checkout] = queue_for(checkout, self.environ)
+            except (LaneError, sd_lib.ConfigError, OSError):
+                self.queues[checkout] = None
+        return self.queues[checkout]
+
+    @contextlib.contextmanager
+    def start_lock(self) -> Iterator[None]:
+        path = lane_root(self.environ) / "hosted-start.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as handle:
+            fcntl.flock(handle, fcntl.LOCK_EX)  # held for a count and one lock: never long
+            yield
+
+    def held_elsewhere(self, checkout: pathlib.Path) -> bool:
+        queue = self.lane_queue(checkout)
+        if queue is None or str(checkout) in self.mine:
+            return False
+        try:
+            with runner_lock(queue) as locked:
+                return not locked
+        except OSError:
+            return False
+
+    def take_lane(self, checkout: pathlib.Path) -> bool:
+        queue = self.lane_queue(checkout)
         if queue is None:
-            queue = queues[checkout] = queue_for(checkout, environ)
-        with runner_lock(queue) as locked:
-            return not locked
-    except (LaneError, sd_lib.ConfigError, OSError):
-        return False
+            return True
+        try:
+            queue.lock_file.parent.mkdir(parents=True, exist_ok=True)
+            handle = open(queue.lock_file, "a", encoding="utf-8")  # noqa: SIM115 -- its worker closes it
+        except OSError:
+            return True
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            handle.close()
+            return False
+        except OSError:
+            handle.close()
+            return True
+        HANDED[str(checkout)] = (str(queue.lock_file), handle)
+        self.mine.add(str(checkout))
+        return True
+
+    def release_lane(self, checkout: pathlib.Path) -> None:
+        self.mine.discard(str(checkout))
+        _, handle = HANDED.pop(str(checkout), (None, None))
+        if handle is not None:  # a worker that never took it over
+            handle.close()
+
+
+def lock_steps(locks: MachineLocks | None) -> tuple[Callable[[], contextlib.AbstractContextManager[Any]],
+                                                    Callable[[pathlib.Path], bool], Callable[[pathlib.Path], bool],
+                                                    Callable[[pathlib.Path], None]]:
+    """`run_parallel`'s start lock, held probe, take and release: a run alone has no lock, and no lane held."""
+    if locks is None:
+        return contextlib.nullcontext, lambda checkout: False, lambda checkout: True, lambda checkout: None
+    return locks.start_lock, locks.held_elsewhere, locks.take_lane, locks.release_lane
 
 
 def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: float,
                  room: Callable[[], str | None], pending: Pending = lambda seen: {},
-                 held: Held = lambda checkout: False, cap: int = MAX_PARALLEL_LANES) -> list[dict[str, Any]]:
+                 locks: MachineLocks | None = None, cap: int = MAX_PARALLEL_LANES) -> list[dict[str, Any]]:
     """Start each lane of `order` in turn, as room allows; each lane run's row, in `order` (sd:5774).
 
     A lane starts at once while no lane runs, as one after another did, or
@@ -4412,10 +4520,11 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
     `cap` running (`lane_parallel`). A lane's refusal is its own row. When this
     run ends early, a TERM among them, every lane still running is stopped.
 
-    A lane a worker outside this run holds (`held`), the other lane-run
-    job's say, starts no worker here and counts toward `cap` and the room
-    rule inside the budget, as a lane of this run does: two runs share one
-    cap (sd:9332).
+    With `locks`, a lane a worker outside this run holds, the other
+    lane-run job's say, starts no worker here and counts toward `cap` and
+    the room rule inside the budget, as a lane of this run does: two runs
+    share one cap (sd:9332). The count, the choice and the chosen lane's
+    runner lock happen under one host lock (`MachineLocks.start_lock`).
 
     Then, inside the budget, every `RESCAN_SECONDS` and once no lane runs,
     `pending` names each idle lane with an entry its last worker did not
@@ -4426,6 +4535,7 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
     rows: list[list[dict[str, Any]]] = [[] for _ in order]
     running: dict[int, StartedLane] = {}
     seen: dict[int, frozenset[str]] = {}
+    start_lock, held, take, release = lock_steps(locks)
 
     def lane_fits() -> bool:
         if len(running) >= cap:
@@ -4435,12 +4545,24 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
         others = sum(1 for index, (_, checkout) in enumerate(order) if index not in running and held(checkout))
         return len(running) + others < cap and ((not running and not others) or room() is None)
 
-    def held_elsewhere(index: int) -> bool:
-        if not held(order[index][1]):
-            return False
-        seen[index] = frozenset()  # a later scan starts it once that worker is done
+    def claim_lane(index: int) -> bool | None:
+        """Under the host lock: True once this run holds the lane's lock, False when another worker does,
+        None when there is no room yet."""
+        checkout = order[index][1]
+        with start_lock():
+            if not held(checkout) and lane_fits() and take(checkout):
+                return True
+            if not held(checkout):
+                return None
+        seen.setdefault(index, frozenset())  # a later scan starts it once that worker is done
         rows[index].append({"ran": [], "busy": "another runner holds the lane; it counts toward the cap"})
-        return True
+        return False
+
+    def collect_and_release() -> None:
+        before = set(running)
+        collect_ended(running, rows)
+        for index in before - set(running):
+            release(order[index][1])
 
     def begin_lane(index: int, ids: frozenset[str]) -> None:
         seen[index] = ids
@@ -4450,25 +4572,25 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
         found = pending({checkout: seen[index] for index, (_, checkout) in enumerate(order) if index not in running})
         started = False
         for index, (_, checkout) in enumerate(order):
-            if checkout in found and lane_fits():
+            if checkout in found and index not in running and claim_lane(index):
                 begin_lane(index, found[checkout])
                 started = True
         return started
     with sd_lib.term_ends_group():
         try:
             for index, (_, checkout) in enumerate(order):
-                if held_elsewhere(index):
-                    continue
+                ids = pending({checkout: frozenset()}).get(checkout, frozenset())  # before this run locks it
                 while True:
-                    collect_ended(running, rows)
-                    if lane_fits():
+                    collect_and_release()
+                    took = claim_lane(index)
+                    if took is not None:
                         break
                     time.sleep(START_POLL_SECONDS)
-                if not held_elsewhere(index):  # taken while this run waited
-                    begin_lane(index, pending({checkout: frozenset()}).get(checkout, frozenset()))
+                if took:
+                    begin_lane(index, ids)
             scanned = -math.inf
             while True:
-                collect_ended(running, rows)
+                collect_and_release()
                 idle, started = not running, False
                 if clock() < deadline and (idle or time.monotonic() - scanned >= RESCAN_SECONDS):
                     scanned = time.monotonic()
@@ -4479,6 +4601,8 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
         finally:
             for lane in running.values():
                 lane.end()
+            for _, checkout in order:
+                release(checkout)
     return [{"path": path, **row} for (path, _), runs in zip(order, rows, strict=True) for row in (runs or [{}])]
 
 

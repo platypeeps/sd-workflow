@@ -16,6 +16,7 @@ import json
 import math
 import os
 import pathlib
+import select
 import signal
 import sqlite3
 import subprocess
@@ -5980,8 +5981,9 @@ class HostedParallel(Lane):
         holder = subprocess.Popen([sys.executable, "-c", holds, str(lock)], stdout=subprocess.PIPE)
         self.addCleanup(holder.wait)
         self.addCleanup(holder.kill)  # first: cleanups run last-added first
-        self.assertEqual(holder.stdout.readline(), b"held\n")  # run A's worker, still on pack's long entry
         self.addCleanup(holder.stdout.close)
+        ready, _, _ = select.select([holder.stdout], [], [], 30)  # a helper that hangs fails here, bounded
+        self.assertEqual(holder.stdout.readline() if ready else b"", b"held\n", "the lock holder never took it")
         folder = self.tmp / ".config" / "sd-ai-command-pack"
         folder.mkdir(parents=True, exist_ok=True)
         real_sleep = time.sleep
@@ -6009,6 +6011,48 @@ class HostedParallel(Lane):
                 self.assertEqual(self.statuses(), ["pending", zeta], f"two runs over cap {cap}: {answer}")
                 self.assertNotIn(self.repo, starts, "a second worker for the lane run A holds")
 
+    def test_two_runs_choosing_at_once_never_pass_the_cap(self) -> None:
+        """sd:9332 lead review: run A chose pack, but its worker had not locked pack yet, so run B read pack
+        free and started a second lane over a cap of 1. A run now takes the lane's lock under the host's
+        start lock before its worker starts, and run B reads pack held."""
+        folder = self.tmp / ".config" / "sd-ai-command-pack"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "config.json").write_text(json.dumps({"config": {"sd": {"lane_parallel": "1"}}}))
+        chosen, go = threading.Event(), threading.Event()
+        self.addCleanup(go.set)
+        main, real_sleep, now = threading.current_thread(), time.sleep, [0.0]
+        b_starts: list[tuple[pathlib.Path, float]] = []
+
+        def nap(seconds: float) -> None:  # run B's polls move the clock a minute; run A's sleep for real
+            if seconds == sd_lane.START_POLL_SECONDS and threading.current_thread() is main:
+                now[0] += 60.0
+            else:
+                real_sleep(seconds)
+
+        def start_a(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            if checkout != self.repo:
+                return self.threaded(self.ship)(checkout, budget)
+            chosen.set()
+            go.wait(20)  # run A's worker is slow to start: it holds no lock of its own yet
+            return thread_lane(lambda: sd_lane.run_lane(checkout, self.environ, self.ship, deadline=math.inf))
+
+        def start_b(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            b_starts.append((checkout, budget))
+            return self.threaded(self.ship)(checkout, budget)
+        rows: dict = {}
+        with mock.patch.object(sd_lane, "clock", lambda: now[0]), mock.patch.object(sd_lane.time, "sleep", nap):
+            run_a = threading.Thread(target=lambda: rows.update(sd_lane.run_hosted(self.environ, self.ship,
+                                                                                   start=start_a)), daemon=True)
+            run_a.start()
+            self.assertTrue(chosen.wait(20), "run A never chose pack")
+            answer = sd_lane.run_hosted(self.environ, self.ship, start=start_b)
+            go.set()
+            run_a.join(60)
+        self.assertFalse(run_a.is_alive(), "run A never ended")
+        self.assertEqual([checkout for checkout, budget in b_starts if budget > 0], [],
+                         f"run B started a lane inside its budget beside run A's, over a cap of 1: {answer}")
+        self.assertEqual(self.statuses(), ["merged", "pending"], (rows, answer))
+
     def test_the_hosted_run_reads_the_machine_s_lane_parallel(self) -> None:
         """sd:9323: the runner's start rule reads sd.lane_parallel, not the constant."""
         folder = self.tmp / ".config" / "sd-ai-command-pack"
@@ -6035,6 +6079,24 @@ class HostedParallel(Lane):
         child = sd_lane.child_lane(self.repo, 60, argv=[sys.executable, "-c", "import time; time.sleep(60)"])
         child.end()
         self.assertIsNotNone(child.process.returncode)
+
+    def test_a_lane_child_takes_over_the_lock_its_run_took(self) -> None:
+        """sd:9332 lead review: a run takes the lane's runner lock before its child starts; the child holds
+        it from then on, and once the child exits the lane is free."""
+        locks = sd_lane.MachineLocks(self.environ)
+        self.assertTrue(locks.take_lane(self.repo))
+        code = ("import json, pathlib, sys\nsys.path.insert(0, sys.argv[1])\nimport sd_lane\n"
+                "environ = json.loads(sys.argv[3])\nroot = pathlib.Path(sys.argv[2])\n"
+                "with sd_lane.runner_lock(sd_lane.queue_for(root, environ), root) as held:\n"
+                "    print(json.dumps({'held': held, 'busy_outside': sd_lane.MachineLocks(environ).held_elsewhere(root)}))\n")
+        with mock.patch.dict(os.environ, self.environ):
+            child = sd_lane.child_lane(self.repo, 60, argv=[sys.executable, "-c", code, str(REPO_ROOT / "bin"),
+                                                            str(self.repo), json.dumps(self.environ)])
+        self.assertEqual(child.process.wait(60), 0)
+        self.assertNotIn(str(self.repo), sd_lane.HANDED, "the run kept its copy of the lock")
+        self.assertEqual(child.answer(), {"held": True, "busy_outside": True})
+        locks.release_lane(self.repo)
+        self.assertFalse(sd_lane.MachineLocks(self.environ).held_elsewhere(self.repo), "the lane stayed locked")
 
     def test_a_worker_child_runs_the_lane_and_answers_its_row(self) -> None:
         """The CLI's lane: `sd-ship -C <checkout> lane run --budget`, whose answer is the row; no answer is an error."""
