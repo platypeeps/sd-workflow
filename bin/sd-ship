@@ -512,6 +512,8 @@ def acceptance_row_answered(row: object) -> bool:
 
 
 class Ship(SharedReview):
+    #: True while a prepare publishes a pending claim (`claimed`, sd:9268).
+    publishing = False
     #: What the last `merge_ownership` read found: the authority record when
     #: the repository row overrode co-ownership, `None` when ownership alone
     #: answered. A per-process value on purpose. It reaches the receipt at
@@ -708,10 +710,10 @@ class Ship(SharedReview):
         merge a prepare by hand renews the claim; once `merged` landed no
         prepare can, so the item is delivered by hand.
         """
-        if not self.args.no_item and self.state.get("deliver"):
+        if not self.args.no_item and self.claimed("deliver"):
             item = self.store.identity(self.connection, self.args.item)["item"]
             scope = digest({key: item[key] for key in ("title", "body", "path")})
-            if (claim or self.state.get("acceptance") or {}).get("item_scope") == scope:
+            if (claim or self.claimed("acceptance") or {}).get("item_scope") == scope:
                 return
             renew = f"`{self.renew_command()}` by hand, with --acceptance-file for a work item"
             if merged:
@@ -732,10 +734,28 @@ class Ship(SharedReview):
     def renew_command(self) -> str:
         """The prepare that renews this receipt's claim: every item of its closing set, or a prepare run as
         printed would close none of them (sd:9335)."""
-        stored = (self.state.get("closing") or {}).get("items")
+        stored = (self.claimed("closing") or {}).get("items")
         bundle = stored if stored is not None else getattr(self.args, "closes", None) or ()
         items = " ".join(f"--item {number}" for number in dict.fromkeys((self.args.item, *bundle)))
-        return f"sd-ship prepare {items} --deliver"
+        if self.branch == self.checkout_branch:
+            return f"sd-ship prepare {items} --deliver"
+        # A merge with --branch runs in another checkout: the prepare runs in the branch's (sd:9268 review).
+        found = [block.removeprefix("worktree ").split("\n")[0] for block in
+                 git(self.root, "worktree", "list", "--porcelain").split("\n\n")
+                 if f"\nbranch refs/heads/{self.branch}" in f"\n{block}"]
+        where = shlex.quote(found[0]) if found else f"<a checkout of {self.branch}>"
+        return f"sd-ship -C {where} prepare {items} --deliver"
+
+    def claimed(self, key: str):
+        """The receipt's `deliver`, `acceptance` or `closing`: the published one, or, while this prepare
+        publishes, the pending one it saved (sd:9268)."""
+        pending = self.state.get("pending") if self.publishing else None
+        return pending.get(key) if pending else self.state.get(key)
+
+    def promoted(self) -> dict:
+        """The fields `ready_to_send` saves: the pending claim, now published, and no pending one."""
+        pending, publishing, self.publishing = self.state.get("pending"), self.publishing, False
+        return {**(pending if publishing and pending else {}), **({"pending": None} if pending else {})}
 
     def renewal(self, claim: dict | None) -> tuple[dict | None, dict | None, str | None]:
         """The claim to save, the one `assert_scope` reads in place of the stored one, and the line saying so.
@@ -1627,17 +1647,20 @@ class Ship(SharedReview):
             self.save(repository=self.repository, branch=self.branch, item=self.args.item, phase="new")
         self.persist_copilot_direction()
         fields = {} if self.args.no_item else {"deliver": deliver, "acceptance": claim, "closing": closing}
-        # A claim or closing set saved here is not the prepared pull request's until this prepare finishes:
-        # until `ready_to_send` clears it, merge refuses, so a renewal whose lint, review or push fails never
-        # authorizes the old pull request with the new scope (sd:9268 lane review).
-        if any(self.state.get(key) != value for key, value in fields.items()):
-            fields["unpublished"] = True
+        # Once a pull request is published, its claim and closing set stay in force until this prepare
+        # publishes again: the new ones wait as `pending`, which only `ready_to_send` promotes, so merge,
+        # reconcile and every other reader see the published scope after a renewal whose lint, review or
+        # push fails (sd:9268 lane review). This prepare reads the pending ones (`claimed`).
+        if fields and self.state.get("pull_request"):
+            fields, self.publishing = {"pending": fields}, True
         self.save(title=title, body=body, base=base, invoker=self.invoker(), **fields)
         pushed_from = head
         if rebase:
             head = self.rebase_branch(base, head)
             self.assert_current_base(base, head)
-            if closing is not None:
+            if closing is not None and self.publishing:
+                self.save(pending={**self.state["pending"], "closing": {**closing, "head": head}})
+            elif closing is not None:
                 self.save(closing={**closing, "head": head})
         # Rules 5 and 8 read the pull request body, and the body is built by
         # now. Without it the rules report themselves not run and CI is the
@@ -1719,7 +1742,7 @@ class Ship(SharedReview):
                      "url": f"https://github.com/{self.repository}/pull/{number}"}
         if str(pull.get("html_url", "")).lower() != reference["url"]:
             raise Refusal("GitHub pull-request URL does not match the prepared repository")
-        self.save(pull_request=reference, phase="ready_to_send", unpublished=False)
+        self.save(pull_request=reference, phase="ready_to_send", **self.promoted())
         copilot = self.prepare_copilot_review(number, pull, head, mode)
         if copilot.get("warning"):
             self.save(warnings=list(self.state.get("warnings") or []) + [copilot["warning"]])
@@ -2057,7 +2080,7 @@ class Ship(SharedReview):
         body = ""
         if not self.args.no_item:
             body += f"{sd_lib.ITEM_TRAILER} sd:{self.args.item}\n"
-            delivered = ([self.args.item] if self.state.get("deliver") else []) + list(self.co_delivered())
+            delivered = ([self.args.item] if self.claimed("deliver") else []) + list(self.co_delivered())
             # Each co-delivered item, from a later `--item`, gets the
             # `Delivers:` its close and every git reader require (sd:3704).
             for number in delivered:
@@ -2085,10 +2108,10 @@ class Ship(SharedReview):
         """
         if self.args.no_item:
             return ()
-        stored = self.state.get("closing")
+        stored = self.claimed("closing")
         if stored is not None:
             return tuple(stored["items"])
-        return self.closing(sd_ship_body.title_ids(self.state.get("title") or ""), bool(self.state.get("deliver")))
+        return self.closing(sd_ship_body.title_ids(self.state.get("title") or ""), bool(self.claimed("deliver")))
 
     def check_closes(self, named: tuple[int, ...], deliver: bool) -> None:
         """Refuse a co-delivered item the merge could not close, before anything is published (`sd_ship_body.refuse_unclosable`)."""
@@ -2120,18 +2143,9 @@ class Ship(SharedReview):
         A receipt with no set was prepared before sd:3704; it merges only from
         `merge_dispatch`, which prepare routes to reconcile and cannot
         refresh. Either way the items are checked again, as prepare did.
-
-        A claim or closing set a prepare saved and did not publish refuses
-        too: the prepared pull request and its review predate it (sd:9268).
         """
         if self.args.no_item:
             return
-        if self.state.get("unpublished"):
-            raise Refusal(f"the last prepare of sd:{self.args.item} saved a new delivery claim or closing set and "
-                          f"did not finish, so the prepared pull request does not carry it; nothing merged: run "
-                          f"prepare again until it passes, then merge", code="prepare_required",
-                          state="operator_decision",
-                          next_action="Rerun sd-ship prepare with the same items until it passes, then merge.")
         stored = self.state.get("closing")
         if (stored is None and self.state.get("phase") != "merge_dispatch") or (
                 stored is not None and stored.get("head") != head):

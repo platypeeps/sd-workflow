@@ -4746,8 +4746,8 @@ roles:
 
     def test_a_renewal_whose_prepare_fails_never_authorizes_the_old_pull_request(self):
         """Lane review of sd:9268: a renewal saves its claim and closing set before lint, review and publication;
-        when lint then failed, merge ran on the old pull request with the new claim. Until a prepare finishes,
-        merge refuses; once one does, it merges."""
+        when lint then failed, merge ran on the old pull request with the new claim. The old pull request's own
+        claim stays in force, so merge refuses its scope; once a prepare finishes, it merges the new set."""
         from sd_db import set_item_fields
         self.task_item("task")
         kept, dropped = self.closes_items()[:2]
@@ -4756,14 +4756,69 @@ roles:
         with patch.object(ship.sd_ship_body, "docs_lint", side_effect=ship.Refusal("docs lint failed")):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "docs lint"):
                 self.prepare("--deliver", "--item", str(kept))
-        with self.assertRaisesRegex(ship.Refusal, "did not finish") as caught:
+        self.assertEqual(self.operation().state["closing"]["items"], [kept, dropped])
+        with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed.*nothing merged"):
             self.merge()
-        self.assertEqual(caught.exception.workflow["blocker"]["code"], "prepare_required")
         self.assertFalse(any(call.method == "PUT" for call in self.remote.calls))
         with contextlib.redirect_stderr(io.StringIO()):
             self.prepare("--deliver", "--item", str(kept))
         with patch.object(ship.time, "sleep"):
             self.assertFalse(self.merge()["delivery_pending"])
+        self.assertEqual((self.status_of(kept), self.status_of(dropped)), ("done", "planning"))
+
+    def reconciled_closing(self, passes: bool) -> tuple[list, int, int]:
+        """The closing set a reconcile settles for a pull request merged on GitHub after a renewal by hand that
+        dropped one item, whose prepare `passes` or fails at lint."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        kept, dropped = self.closes_items()[:2]
+        self.prepare("--deliver", "--item", str(kept), "--item", str(dropped))
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        lint = (contextlib.nullcontext() if passes else
+                patch.object(ship.sd_ship_body, "docs_lint", side_effect=ship.Refusal("docs lint failed")))
+        with lint, contextlib.redirect_stderr(io.StringIO()), contextlib.suppress(ship.Refusal):
+            self.prepare("--deliver", "--item", str(kept))
+        self.remote.merge(self.operation().state["pull_request"]["number"])
+        read, settle = [], ship.Ship.settle_closes
+
+        def reading(operation, *args, **kwargs):
+            read.append(list(operation.co_delivered()))
+            return settle(operation, *args, **kwargs)
+
+        with patch.object(ship.Ship, "settle_closes", reading), patch.object(ship.time, "sleep"), \
+                contextlib.suppress(ship.Refusal):
+            self.operation("reconcile").reconcile()
+        return read, kept, dropped
+
+    def test_a_reconcile_after_a_failed_renewal_reads_the_published_closing_set(self):
+        """Review of sd:9268: the merge guard was read only by `merge`, so a reconcile of a pull request merged on
+        GitHub recorded the failed renewal's closing set. It reads the published one, the old pull request's."""
+        read, kept, dropped = self.reconciled_closing(passes=False)
+        self.assertEqual(read, [[kept, dropped]])
+
+    def test_a_reconcile_after_a_renewal_that_passed_reads_its_new_closing_set(self):
+        read, kept, _ = self.reconciled_closing(passes=True)
+        self.assertEqual(read, [[kept]])
+
+    def test_a_renewal_hint_from_another_checkout_names_the_branchs_checkout(self):
+        """Review of sd:9268: `merge --branch X` from another checkout printed a bare prepare, which would run in
+        that checkout. The hint names the branch's checkout with -C, and it parses."""
+        from sd_db import set_item_fields
+        acceptance = self.directory / "acceptance.json"
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        set_item_fields(self.connection, self.item, title="retitled before the merge")
+        lane = self.directory / "lane-checkout"
+        _git(self.root, "worktree", "add", "-q", "-b", "lane-side", str(lane))
+        head = _git(self.root, "rev-parse", "HEAD")
+        args = ship.parser().parse_args(["merge", "--item", str(self.item), "--json", "--manual",
+                                         "--expected-head", head, "--branch", "topic"])
+        with self.assertRaisesRegex(ship.Refusal, "nothing merged") as caught:
+            ship.Ship(lane, self.connection, self.database, args).merge()
+        command = shlex.split(re.search(r"`(sd-ship [^`]*)`", str(caught.exception))[1])
+        self.assertEqual(command[1:3], ["-C", str(self.root)])
+        self.assertEqual(ship.parser().parse_args(command[1:]).command, "prepare")
 
     def test_a_renewal_command_names_every_item_of_the_bundle(self):
         """Re-review of sd:9335: the printed renewal named the claimed item alone, and a prepare run as printed
