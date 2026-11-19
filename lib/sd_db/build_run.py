@@ -155,7 +155,8 @@ Your final message is your report: the commits, the tests run with their result 
 """
 
 FIX = """The review of branch {branch} found these blockers. Fix each one fail-first as a new commit in
-{worktree}, then update the body at {body}. Never push. Your final message is your report.
+{worktree}, with a `Refs: sd:N` trailer for the item it fixes, then update the body at {body}. Never
+push. Your final message is your report.
 
 {blockers}
 """
@@ -166,7 +167,8 @@ before the build parks, so do one class pass, not another single-finding fix: na
 share, enumerate every instance of it from the code, not from the findings, and fix each one fail-first as a
 new commit in {worktree}. Fix the class within this change's own scope: a new reader, audit or entry kind
 becomes its own item, not a commit here (sd:9584). Add each instance to the failure table in the body at
-{body}. Never push. Your final message is your report: the class, each instance and its test.
+{body}. Give each commit a `Refs: sd:N` trailer for the item it fixes. Never push. Your final message is
+your report: the class, each instance and its test.
 
 {blockers}
 """
@@ -1579,29 +1581,49 @@ class Supervisor:
         if not left:
             return ""
         named = ", ".join(f"sd:{item}" for item in left)
-        return (f"\n{named} left this bundle at a Retry. Revert every commit since {self.base()} whose message\n"
-                f"names it, in one `revert(...)` commit: `git revert --no-commit <sha>...`, then commit with one\n"
-                f"`This reverts commit <sha>.` line per commit. Build none of it.\n")
+        return (f"\n{named} left this bundle at a Retry. Revert every commit since {self.base()} whose `Closes:` or\n"
+                f"`Refs:` trailer names it, in one `revert(...)` commit: `git revert --no-commit <sha>...`, then commit\n"
+                f"with one `This reverts commit <sha>.` line per commit. A commit whose trailers also name a kept\n"
+                f"item, or name no item, is reverted too, and its kept part committed again with that item's trailer.\n"
+                f"Give every new commit a `Closes:` or `Refs: sd:N` trailer for its item. Build none of {named}.\n")
 
     def unreverted(self, head: str) -> list[str]:
-        """A refusal per commit since the base that names an item a subset Retry left out and no later commit
-        reverts (`This reverts commit <sha>.`); the builder reverts it before review (pack sd:9581).
-        ponytail: a commit is the item's when its message names sd:N; a fix commit naming none stays."""
-        left = build.left_out(self.db, self.row["assignment"])
+        """A refusal per commit in effect since the base that may hold work of an item a subset Retry left out;
+        the builder reverts it before review (pack sd:9581). A commit belongs to the items its `Closes:` and
+        `Refs:` trailers name, never to a mention elsewhere in its message. In effect: not reverted by a commit
+        in effect, so a revert of the revert restores it. A merge is skipped; a revert answers for no item."""
+        left = set(build.left_out(self.db, self.row["assignment"]))
         if not left:
             return []
-        log = _read([*self.tools.git, "-C", str(self.work), "log", "--format=%H%x00%B%x1e",
-                     f"{self.base()}..{head}"], env=self.env)
+        log = _read([*self.tools.git, "-C", str(self.work), "log", "--reverse", "--no-merges",
+                     "--format=%H%x00%B%x1e", f"{self.base()}..{head}"], env=self.env)
         commits = [entry.strip("\n").split("\x00", 1) for entry in log.split("\x1e") if "\x00" in entry]
-        reverted = {sha for _, message in commits for sha in re.findall(r"This reverts commit ([0-9a-f]{40})", message)}
+        reverts = {sha: set(re.findall(r"^This reverts commit ([0-9a-f]{40})", message, re.M))
+                   for sha, message in commits}
+        undone: set[str] = set()
+        # Newest first: a commit in effect undoes what it reverts, and an undone revert undoes nothing.
+        for sha, _ in reversed(commits):
+            if sha not in undone:
+                undone |= reverts[sha]
         refused = []
         for sha, message in commits:
-            if sha in reverted or "This reverts commit " in message:
+            if sha in undone or reverts[sha]:
                 continue
-            for item in left:
-                if re.search(rf"\bsd:{item}\b", message):
-                    refused.append(f"the branch still holds {sha[:12]}, a commit of sd:{item}, which left the "
-                                   f"bundle at a Retry: revert it in one `revert(...)` commit")
+            named = {int(item) for line in re.findall(r"^(?:Closes|Refs):(.*)$", message, re.M)
+                     for item in re.findall(r"\bsd:(\d+)\b", line)}
+            out = sorted(named & left)
+            if not named:
+                refused.append(f"{sha[:12]} names no item in a `Closes:` or `Refs:` trailer, so it may hold work of "
+                               f"{', '.join(f'sd:{item}' for item in sorted(left))}, which left the bundle at a "
+                               f"Retry: revert it, and commit a kept item's part again with its trailer")
+            elif out and named - left:
+                refused.append(f"{sha[:12]} carries trailers of kept and left-out items "
+                               f"({', '.join(f'sd:{item}' for item in out)}): revert it, and commit the kept part "
+                               f"again with its item's trailer")
+            elif out:
+                refused.append(f"the branch still holds {sha[:12]}, a commit of "
+                               f"{', '.join(f'sd:{item}' for item in out)}, which left the bundle at a Retry: "
+                               f"revert it in one `revert(...)` commit")
         return refused
 
     def findings(self, items: list[int]) -> str:
