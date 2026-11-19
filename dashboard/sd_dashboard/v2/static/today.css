@@ -58,45 +58,6 @@
 .daytrack .spend a { color: inherit; text-decoration-color: var(--color-rule); text-underline-offset: 3px; }
 .daytrack .spend a:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
 
-/* The Usage strip (pack sd:9257): Today's evidence strip, one hairline row per provider under the annunciator. A window is a
- * 100-unit track filled to its use; caution from 80 %, warning at the limit. Unknown rows carry their why, never a bar. */
-.usage { margin: 0 0 var(--space-sm); border: var(--rule-hair) solid var(--color-rule); border-radius: var(--radius-md); background: var(--color-panel); }
-.usage .urows { list-style: none; margin: 0; padding: 0; }
-.usage li { display: grid; grid-template-columns: minmax(7rem, max-content) minmax(0, 1fr) auto; align-items: center; gap: var(--space-2xs) var(--space-sm);
-  padding: var(--space-2xs) var(--space-sm); border-bottom: var(--rule-hair) solid var(--color-rule); font-size: var(--text-sm); }
-/* A long provider name, incident title or error wraps inside its cell, never past the screen's edge. */
-.usage .nm, .usage .why, .usage .flag { min-width: 0; overflow-wrap: anywhere; }
-.usage .nm { font: 500 var(--text-sm)/1.2 var(--font-data); color: var(--color-ink); max-width: 16rem; }
-.usage .nm > span[aria-hidden] { margin-right: var(--space-2xs); }
-.usage .nm small { color: var(--color-muted); font: 400 var(--text-2xs)/1 var(--font-label); letter-spacing: .06em; text-transform: uppercase; }
-.usage .ws { display: flex; flex-wrap: wrap; gap: var(--space-3xs) var(--space-md); min-width: 0; color: var(--color-ink-2); }
-.usage .w { display: inline-flex; flex-wrap: wrap; min-width: 0; align-items: center; gap: var(--space-3xs) var(--space-2xs); font-family: var(--font-data); font-size: var(--text-xs); }
-.usage .w b { color: var(--color-ink); font-weight: 500; }
-.usage .wl { font: 600 var(--text-2xs)/1 var(--font-label); letter-spacing: .09em; text-transform: uppercase; color: var(--color-muted); }
-.usage .track { width: 6rem; height: 0.5rem; background: var(--color-well); border-radius: 2px; }
-.usage .fill { fill: var(--color-series-1); }
-.usage .fill.caution { fill: var(--color-caution); }
-.usage .fill.warning { fill: var(--color-warning); }
-.usage .why { color: var(--color-muted); font-size: var(--text-xs); }
-/* A service flag sits under its row's windows, so a long incident title never crowds them. */
-.usage .nm, .usage .ws { grid-row: 1; }
-.usage .age { grid-row: 1; grid-column: 3; }
-.usage .flag { grid-row: 2; grid-column: 2 / -1; }
-.usage .flag, .usage .foot a { color: inherit; text-decoration-color: var(--color-rule); text-underline-offset: 3px; font-size: var(--text-xs); }
-.usage .age { color: var(--color-muted); font: var(--text-2xs)/1 var(--font-data); white-space: nowrap; justify-self: end; }
-.usage .foot { margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2xs) var(--space-xs); padding: var(--space-2xs) var(--space-sm);
-  color: var(--color-muted); font-size: var(--text-xs); }
-.usage .foot .lbl { font: 600 var(--text-2xs)/1 var(--font-label); letter-spacing: .09em; text-transform: uppercase; color: var(--color-muted); }
-.usage a:hover { text-decoration-color: currentColor; }
-.usage a:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
-@media (pointer: coarse) { .usage a { display: inline-flex; align-items: center; min-height: var(--row-touch); } }
-@media (max-width: 47.99rem) {
-  .usage li { grid-template-columns: minmax(0, 1fr) auto; }
-  .usage .nm { max-width: none; }
-  .usage .age { grid-column: 2; }
-  .usage .ws { grid-row: 2; grid-column: 1 / -1; }
-  .usage .flag { grid-row: 3; grid-column: 1 / -1; }
-}
 @media (pointer: coarse) { .daytrack .spend a { display: inline-flex; align-items: center; min-height: var(--row-touch); } }
 
 /* Since yesterday (sd:6002): a few plain lines over the track, the merged items folded under them. */
@@ -214,10 +175,14 @@
 /* A repo row's merging · next · blocked boxes (pack sd:7272, the lane ledger's until #1768): a box is lit only when its
  * count is not zero; blocked lights the warning lamp. */
 .queue .pipe { white-space: nowrap; }
-/* sd:9315: the Detail head names the boxes in their order (BOXES in today.js); each box button carries its own name. */
-.queue .keys { display: block; font: 400 var(--text-xs)/1.2 var(--font-data); color: var(--color-muted); }
-.queue .keys span + span::before { content: " · "; }
-.queue .pip { display: inline-block; min-width: 1.6rem; margin-right: var(--space-3xs); padding: 2px var(--space-3xs); text-align: center; border: var(--rule-hair) solid var(--color-rule-2); border-radius: var(--radius-sm); font: 400 var(--text-xs)/1.2 var(--font-data); font-variant-numeric: tabular-nums; color: var(--color-muted); }
+/* sd:9315: the Detail head names the boxes in their order (BOXES in today.js); each box button carries its own name.
+ * pack sd:9569: each label is three letters as wide as its box and sits over it, so the head is no wider than the boxes
+ * and leaves What its room; the full name is the label's title and the box's own. A count wider than the box (a fourth
+ * digit) overflows its box, never moves the next one. */
+.queue { --q-tile: 2.25rem; }
+.queue .keys { display: block; margin-top: var(--space-3xs); white-space: nowrap; }
+.queue .keys > abbr { display: inline-block; width: var(--q-tile); margin-right: var(--space-3xs); text-align: center; text-decoration: none; cursor: help; }
+.queue .pip { display: inline-block; box-sizing: border-box; width: var(--q-tile); margin-right: var(--space-3xs); padding: 2px 0; text-align: center; border: var(--rule-hair) solid var(--color-rule-2); border-radius: var(--radius-sm); font: 400 var(--text-xs)/1.2 var(--font-data); font-variant-numeric: tabular-nums; color: var(--color-muted); }
 .queue .pip.on { border-color: var(--color-accent); color: var(--color-ink); }
 .queue .pip.warn { background: var(--color-warning-lamp); border-color: transparent; color: var(--color-warning-ink); }
 .queue .pip.caution { background: var(--color-caution-lamp); border-color: transparent; color: var(--color-caution-lamp-ink); }
