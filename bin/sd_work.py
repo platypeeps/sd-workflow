@@ -284,14 +284,22 @@ def _edit_changes(args: argparse.Namespace) -> dict[str, Any]:
         changes["recurrence_lead"] = args.recur_lead
     # `edit_item` refuses a writing piece and a done item, and leaves a parked
     # item's first stamp alone (sd:3007, sd:5905).
-    if args.unpark:
-        changes["parked_at"] = None
-    if args.park:
-        changes["parked_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+    changes.update(_park_changes(args))
     if not changes and not getattr(args, "experiment", None):
         raise WorkRefusal(f"edit requires a field to change; name one, such as "
                           f"`sd task edit {args.item} --due YYYY-MM-DD`; `sd task edit --help` lists them")
     return changes
+
+
+def _park_changes(args: argparse.Namespace) -> dict:
+    """`--park` or `--unpark` as a `parked_at` change; `--reason` needs `--park` (sd:9520)."""
+    if getattr(args, "reason", None) is not None and not args.park:
+        raise WorkRefusal("--reason needs --park")
+    if args.unpark:
+        return {"parked_at": None}
+    if args.park:
+        return {"parked_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")}
+    return {}
 
 
 def _edit(workflow: Any, args: argparse.Namespace, connection: Any, who: str,
@@ -302,8 +310,10 @@ def _edit(workflow: Any, args: argparse.Namespace, connection: Any, who: str,
         _kinds(workflow)
     moved = "repo" in changes
     before = workflow.item_state(connection, args.item)["item"] if args.park else None
+    # Passed only when given, so an edit without one calls as before.
+    reason = {"park_reason": args.reason} if args.reason is not None else {}
     result = workflow.edit_item(
-        connection, args.item, changes, who=who, expected_revision=revision)
+        connection, args.item, changes, who=who, expected_revision=revision, **reason)
     if before and before["parked_at"] and not args.json:
         # `edit_item` keeps a parked item's first stamp (sd:5905).
         print(f"already parked since {before['parked_at']}; not parked again")
@@ -1713,6 +1723,9 @@ def register(groups: Any, store: Any) -> None:
                       help="park an open item now, as the nightly prune parks an untouched P4 "
                            "one: it leaves Today and the backlog; a writing piece parks with "
                            "`sd writing park`")
+    edit.add_argument("--reason", metavar="TEXT",
+                      help="with --park: one line kept in the park note as "
+                           "`Parked by WHO: TEXT`")
     park.add_argument("--unpark", action="store_true",
                       help="bring back a parked item; a writing piece "
                            "revives with `sd writing park --revive`")

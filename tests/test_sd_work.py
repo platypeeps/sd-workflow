@@ -855,6 +855,16 @@ class TaskCLI(unittest.TestCase):
         self.assertIn("is done", self.call("task", "edit", done, "--park", code=1).stderr)
         self.assertIn("--park", self.call("task", "edit", "--help").stdout)
 
+    def test_edit_park_reason_lands_in_the_audit_note(self):
+        """sd:9520. `--reason` rides on `--park` alone."""
+        item = json.loads(self.call("task", "add", "--priority", "3", "Not now", "--json").stdout)["item"]["id"]
+        self.assertIn("--reason needs --park",
+                      self.call("task", "edit", item, "--priority", "2", "--reason", "why", code=1).stderr)
+        parked = json.loads(self.call("task", "edit", item, "--park", "--reason", "stale",
+                                      "--json").stdout)
+        self.assertEqual(parked["notes"][-1]["body"], f"Parked by {getpass.getuser()}: stale")
+        self.assertIn("--reason", self.call("task", "edit", "--help").stdout)
+
     def test_edit_moves_a_followup_and_changes_its_details(self):
         """sd:809. `edit_item` edits a followup's title, body, priority, due
         date and repository, as it does a task's. Before sd:809 it refused
@@ -1722,7 +1732,7 @@ class FieldEditsFold(unittest.TestCase):
         audit = workflow.is_audit_note
         for body in ("Updated priority by operator", "Updated due, title by dashboard",
                      "Changed kind task -> followup by operator\nUpdated repo by operator", "Unparked by operator",
-                     "Parked by operator"):
+                     "Parked by operator", "Parked by night-triage: untouched 30 days"):
             self.assertTrue(audit({"kind": "comment", "body": body}), body)
         for note in ({"kind": "comment", "body": "Updated priority by hand, a person wrote this"},
                      {"kind": "decision", "body": "Updated priority by operator"},

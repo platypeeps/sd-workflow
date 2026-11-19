@@ -704,6 +704,27 @@ class Parking(WorkflowCase):
         self.assertEqual(parked["notes"][-1]["body"], "Parked by operator")
         self.assertTrue(is_audit_note(parked["notes"][-1]))
 
+    def test_a_park_reason_rides_in_the_audit_line(self):
+        """sd:9520: a job proves a park was its own by the reason it gave."""
+        item = create_item(self.db, kind="task", title="Later")
+        parked = edit_item(self.db, item, {"parked_at": "2026-10-23T18:00:00Z"}, who="night-triage",
+                           park_reason="untouched 30 days")
+        self.assertEqual(parked["notes"][-1]["body"], "Parked by night-triage: untouched 30 days")
+        self.assertTrue(is_audit_note(parked["notes"][-1]))
+        again = edit_item(self.db, item, {"parked_at": "2026-10-24T18:00:00Z"}, who="operator",
+                          park_reason="second")
+        self.assertEqual(again["revision"], parked["revision"])
+
+    def test_a_park_reason_without_a_park_or_on_two_lines_is_refused(self):
+        state = item_state(self.db, create_item(self.db, kind="task", title="Later"))
+        item = state["item"]["id"]
+        for changes, reason in (({"priority": 2}, "why"), ({"parked_at": None}, "why"),
+                                ({"parked_at": "2026-10-23T18:00:00Z"}, "one\ntwo"),
+                                ({"parked_at": "2026-10-23T18:00:00Z"}, "  ")):
+            with self.subTest(changes=changes, reason=reason), self.assertRaisesRegex(WorkflowError, "reason"):
+                edit_item(self.db, item, changes, who="operator", park_reason=reason)
+        self.assertEqual(item_state(self.db, item), state)
+
     def test_a_value_that_is_not_an_aware_timestamp_is_refused(self):
         state = item_state(self.db, create_item(self.db, kind="task", title="Later"))
         for value in ("2026-10-10", "2026-10-10T08:00:00", "soon", True, 1):
