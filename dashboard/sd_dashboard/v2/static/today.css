@@ -180,6 +180,8 @@
  * and leaves What its room; the full name is the label's title and the box's own. A count wider than the box (a fourth
  * digit) overflows its box, never moves the next one. */
 .queue { --q-tile: 2.25rem; }
+/* pack sd:9654: on touch, shell.css widens each td button to --row-touch; labels and boxes widen together. */
+@media (pointer: coarse) { .queue { --q-tile: var(--row-touch); } }
 .queue .keys { display: block; margin-top: var(--space-3xs); white-space: nowrap; }
 .queue .keys > abbr { display: inline-block; width: var(--q-tile); margin-right: var(--space-3xs); text-align: center; text-decoration: none; cursor: help; }
 .queue .pip { display: inline-block; box-sizing: border-box; width: var(--q-tile); margin-right: var(--space-3xs); padding: 2px 0; text-align: center; border: var(--rule-hair) solid var(--color-rule-2); border-radius: var(--radius-sm); font: 400 var(--text-xs)/1.2 var(--font-data); font-variant-numeric: tabular-nums; color: var(--color-muted); }

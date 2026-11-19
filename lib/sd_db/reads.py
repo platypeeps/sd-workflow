@@ -1681,3 +1681,13 @@ def launch_notes(connection: sqlite3.Connection, prefix: str) -> list[sqlite3.Ro
 
 
 __all__ += ["build_runs", "item_lane_entries", "lane_delivered", "lane_entries", "launch_notes", "stale_lane_ended"]
+
+
+def ref_items(connection: sqlite3.Connection, prefix: str) -> list[sqlite3.Row]:
+    """The `external_id` and `status` of each `task-ref` item whose ref starts with `prefix` (sd:9505, the sweep)."""
+    return connection.execute(
+        "SELECT external_id, status FROM item WHERE source IS 'task-ref' AND substr(external_id, 1, ?) IS ?"
+        " ORDER BY id", (len(prefix), prefix)).fetchall()
+
+
+__all__ += ["ref_items"]

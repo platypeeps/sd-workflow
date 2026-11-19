@@ -722,6 +722,29 @@ class Supervise(Case):
         self.assertIsNotNone(leader.returncode, "the supervisor reaps the leader it read as gone")
         self.assertTrue(group_gone(leader.pid))
 
+    def test_a_group_whose_leader_dies_between_two_reads_stays_ours(self):
+        """Gate flake at 257aeff94: the check's leader exited after `alive` and was reaped before `started`, so
+        `ours` dropped its group, and the `sleep` it left ran on beside the retry. A leader gone at a second read
+        frees no number while the group has a member: the group stays ours."""
+        self.press()
+
+        class ReapedAtTheStart(build.Probe):
+            lives = [True, False]
+
+            @staticmethod
+            def group(pgid):
+                return True
+
+            @classmethod
+            def alive(cls, pid):
+                return cls.lives.pop(0)
+
+            @staticmethod
+            def started(pid):
+                return None
+
+        self.assertTrue(self.supervisor(probe=ReapedAtTheStart).ours(4242, "Thu Nov 19 13:16:42 2026"))
+
     def test_an_unread_ps_does_not_fail_an_end_once_the_group_is_gone(self):
         """Review of b34af431e: an unread `ps` set a flag no later read cleared, so a run whose group read
         ESRCH ended a survivor, managed builds too. Its known groups' ESRCH is True, as `kill_group` reads it."""

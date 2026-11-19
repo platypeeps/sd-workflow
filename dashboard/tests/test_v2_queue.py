@@ -643,6 +643,12 @@ class TheRows(Lane, ScreenCase):
         self.assertEqual((merge["log"], merge["failure"]), (f"{self.lane}/logs/merge-14.log", {}))
         self.assertIsNone(self.failed(step="merge")["log"])
 
+    def test_a_merge_failure_names_the_code_the_lane_recorded(self):
+        """pack sd:9303: a merge refused as `member_cancelled_alone` read as a generic merge failure: the page
+        reads prepare's log alone. The entry's own code answers where no log does."""
+        merge = self.failed(step="merge", merge_log=f"{self.lane}/logs/merge-14.log", code="member_cancelled_alone")
+        self.assertEqual(merge["failure"], {"code": "member_cancelled_alone"})
+
     def test_a_failed_entry_says_whether_its_worktree_still_holds_the_head_it_failed_at(self):
         self.assertIs(self.failed()["unchanged"], True)
         # Another host's worktree is not read here: unknown, not unchanged.
@@ -1759,6 +1765,16 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
             self.assertIn(text, row)
         self.assertRegex(row, r"due \d\d:\d\d")
 
+    def test_a_run_whose_cancel_was_asked_says_so_in_its_row(self):
+        """pack sd:9375: a cancelled run read `running` until its supervisor's beat, so the operator asked again."""
+        run = {**self.BUILDS["runs"][0], "cancel_requested": "cancelled by operator",
+               "cancel": {**self.BUILDS["runs"][0]["cancel"], "allowed": False, "reason": "asked"}}
+        out = self.run_view("open('alpha'); R.alpha = ELS.queue.html;",
+                            answers={"/api/queue/builds?show=all": [200, {**self.BUILDS, "runs": [run]}]})
+        self.assertIn("· cancel requested: cancelled by operator", out["R"]["alpha"])
+        plain = self.run_view("open('alpha'); R.alpha = ELS.queue.html;")
+        self.assertNotIn("cancel requested", plain["R"]["alpha"])
+
     def test_a_satellite_run_names_its_host_and_log_path_and_copies_no_tail(self):
         """Pack sd:7933: a satellite's run logs on that host; a hub's `tail -f` of its path would follow nothing."""
         run = {**self.BUILDS["runs"][0], "host": "work", "quiet": None, "state": "working"}
@@ -2045,6 +2061,16 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertEqual(label.get("margin-right"), box.get("margin-right"))
         self.assertNotIn("min-width", box, "a box that grows with its count leaves its label behind")
 
+    def test_on_touch_the_labels_widen_with_the_boxes(self):
+        """pack sd:9654: on touch, shell.css widens each td button to --row-touch; the 2.25rem labels fell behind."""
+        shell = (v2.HERE / "static" / "shell.css").read_text(encoding="utf-8")
+        self.assertRegex(shell, r"td > button:not\([^)]*\)[^{]*\{[^}]*min-width: var\(--row-touch\)",
+                         "the touch rule this test guards against changed; recheck the queue boxes")
+        css = (v2.HERE / "static" / "today.css").read_text(encoding="utf-8")
+        coarse = re.search(r"@media \(pointer: coarse\) \{\s*\.queue \{([^}]*)\}", css)
+        self.assertIsNotNone(coarse, "on touch each box is 2.75rem wide and its label stays 2.25rem")
+        self.assertIn("--q-tile: var(--row-touch);", coarse.group(1))
+
     def parked_answers(self, repo):
         from sd_dashboard import tasks_screen
         if repo != self.checkout:
@@ -2053,6 +2079,50 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.connection.execute("UPDATE item SET parked_at = ? WHERE id = ?", (NOW, made))
         return made, {"/api/tasks": [200, tasks_screen.document(self.connection, now=NOW)],
                       f"/api/tasks/{made}": [200, tasks_screen.details(self.connection, made, now=NOW)]}
+
+    def test_a_parked_item_is_its_parked_row_alone_and_says_why_it_waits(self):
+        """pack sd:9425: a parked item with a blocked build showed under Blocked and under Parked (aura-research
+        sd:6242). Neither its blocked assignment nor its failed lane entry is a row, Blocked counts neither, and the
+        Parked row carries each one's reason."""
+        built, _ = self.parked_answers(self.checkout)  # a blocked build, no lane entry
+        made, answers = self.parked_answers(self.checkout)  # a failed lane entry
+        self.list(self.entries() + [{"item": made, "title": "Set aside", "status": "failed", "step": "prepare",
+                                     "reason": "gate failed", "finished_at": NOW}])
+        asg = {"id": 90, "lead": 90, "item": built, "title": "Set aside", "repo": str(self.checkout),
+               "why": "build run ended", "since": NOW, "retry": {"allowed": True, "reason": ""},
+               "cancel": {"allowed": True, "reason": ""}}
+        answers["/api/queue/runner"] = [200, {**self.RUNNER, "blocked": [asg]}]
+        out = self.run_view(self.TILE + " open('system'); R.html = ELS.queue.html; tile('system', 'parked');"
+                            " R.tiled = ELS.queue.html;", answers=answers)
+        _, attrs, _ = self.repo_detail(out["R"]["html"], "system")
+        self.assertIn(" 2 blocked,", attrs, "the fixture's two blocked rows, not the parked item's")
+        self.assertNotIn('data-asg-row="90"', out["R"]["html"])
+        self.assertNotIn(f'data-id="entry:{self.checkout}:{made}"', out["R"]["html"])
+        def row(item):
+            return out["R"]["tiled"].split(f'data-type="parked" data-item="{item}"')[1].split("</tr>")[0]
+        self.assertIn("blocked build · assignment 90 · build run ended", row(built))
+        self.assertIn("lane failed at prepare · gate failed", row(made))
+
+    def test_a_parked_items_blocked_rows_keep_their_controls_on_its_parked_row(self):
+        """Re-review of pack sd:9425: the Parked row took the blocked rows' reasons and dropped their controls, so a
+        parked item's failed lane entry or blocked build could not be retried, approved, fixed or cancelled."""
+        built, _ = self.parked_answers(self.checkout)
+        made, answers = self.parked_answers(self.checkout)
+        self.list(self.entries() + [{"item": made, "title": "Set aside", "status": "failed", "step": "prepare",
+                                     "reason": "gate failed", "finished_at": NOW}])
+        asg = {"id": 90, "lead": 90, "item": built, "title": "Set aside", "repo": str(self.checkout),
+               "why": "build run ended", "since": NOW, "retry": {"allowed": True, "reason": ""},
+               "cancel": {"allowed": True, "reason": ""}}
+        answers["/api/queue/runner"] = [200, {**self.RUNNER, "blocked": [asg]}]
+        out = self.run_view(self.TILE + " C.rowActions = id => mk`<i data-acts=\"${id}\"></i>`; open('system');"
+                            " tile('system', 'parked'); R.tiled = ELS.queue.html;", answers=answers)
+        def row(item):
+            return out["R"]["tiled"].split(f'data-type="parked" data-item="{item}"')[1].split("</tr>")[0]
+        self.assertIn(f'data-act="retry" data-item="{made}" data-repo="{self.checkout}"', row(made))
+        self.assertIn('data-asg="retry" data-id="90"', row(built))
+        self.assertIn('data-asg="cancel" data-id="90"', row(built))
+        # Re-review of sd:9425: the entry's own actions, its Details among them, stay with it.
+        self.assertIn(f'data-acts="entry:{self.checkout}:{made}"', row(made))
 
     def test_a_repo_whose_only_rows_are_parked_still_shows_its_parked_box(self):
         """Review of sd:9247: a repo with nothing but parked tasks drew no row, so its box was unreachable."""
