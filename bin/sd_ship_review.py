@@ -1605,7 +1605,8 @@ def failed_outcomes(report: dict, limit: int = 600) -> str:
 
     "0/1 completed" alone sent the operator to the receipt to learn that kimi
     spent its whole max_tokens reasoning. sd-review writes each detail from
-    counts and its own sentences, never model text; bounded all the same.
+    counts and its own sentences, never model text but a voided finding's
+    path and summary prefix (sd:9536); bounded all the same.
     Each failed reviewer gets an equal share of `limit` under its name, so a
     long first detail cannot push the second out of the refusal (sd:1819).
     The name is bounded apart from the cause, so a long name cannot erase it.
