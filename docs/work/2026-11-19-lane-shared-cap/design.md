@@ -35,8 +35,8 @@ Admission, one step per lane, in `run_parallel`:
    waiting lock.
 2. Take the lane's claim, `<lane root>/hosted-<key>.lock`, one per
    checkout, with `LOCK_NB`; a claim not taken is a busy row.
-3. Count the other lanes' claims another run holds (a claim that
-   cannot be read counts as held). Decide: this run's running lanes
+3. Count every claim in the lane root another run holds, for this
+   run's lanes or not (a claim that cannot be read counts as held). Decide: this run's running lanes
    plus those below the cap and, inside the budget while anything
    runs, gate room (`lane_room`, the gate's queue lock read with
    `LOCK_NB`). No room releases the claim.
@@ -88,9 +88,11 @@ Classes from the blocking rounds, with every instance in the code:
 - Unknown read as an answer: the claim probe, the claim take, the
   room read and the queue read; rows 4-7.
 - A wait without a bound: the first pass and the rescan; rows 8-10.
-- A count that ends before its worker: post-merge, a dead run and a
-  worker that outlives its run; rows 11-13.
-- Seen ids: the first pass, a busy worker and the rescan; rows 14-16.
+- A count that ends before its worker, or misses one: post-merge, a
+  dead run, a worker that outlives its run and a lane not in this
+  run's list; rows 11-13 and 23.
+- Seen ids: the first pass, a busy worker, the rescan and a busy
+  claim; rows 14-16 and 24.
 - Past the budget: the cap and the room; rows 17-18.
 - Probe side effects: runner-lock probes and a probe that a forked
   child keeps; rows 19-20.
@@ -120,6 +122,8 @@ Classes from the blocking rounds, with every instance in the code:
 | 20 | 2 | a probe's flock lives on in a child forked meanwhile, so the take after it failed (found in this round, flaky under threaded lanes) | the chosen lane is taken first, never probed | test_a_probe_s_lock_left_in_a_forked_child_does_not_make_the_chosen_lane_busy |
 | 21 | 2-4 | the start raises after the claim | the run's finally releases every claim | test_a_start_that_raises_after_the_claim_frees_the_claim |
 | 22 | any | a hung lock-holder helper hung the two-run test (round 48d7c28c4 :5982) | the helper's line is read under a 30 s select | test_a_second_run_counts_the_lanes_the_first_holds_toward_the_cap |
+| 23 | 3 | the cap counted only claims for this run's own lanes, so a lane its host read dropped, or one moved here, went uncounted while the other run held it (lead review 1b5580736 :4515, sd:9611) | count every live claim in the lane root | test_a_claim_for_a_lane_this_run_does_not_list_counts_toward_the_cap |
+| 24 | 2 | a lane the other run claimed kept no seen ids, so every rescan wrote another busy row, about 80 a budget (advisory 1b5580736 :4537) | a busy claim records the lane's pending ids as seen; only a new entry tries it again | test_a_lane_the_other_run_claimed_gets_one_busy_row_across_rescans |
 
 Rows removed with the hand-off: the fd passed to a child, a child
 that never starts, an fd that names another file, the env var seen

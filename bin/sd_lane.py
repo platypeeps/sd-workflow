@@ -4387,7 +4387,9 @@ class MachineLocks:
     A run claims each lane it starts: a flock on `hosted-<key>.lock` in the
     lane root, one per checkout, that the run holds from its choice until
     that lane's worker ended, post-merge included (`release_lane`). The
-    other run reads a held claim as a lane running toward the cap. The
+    other run counts every held claim in the lane root toward the cap,
+    for a lane of its own or not: a lane its host read dropped, or one
+    moved to this machine, still runs there (sd:9611). The
     host-wide `start_lock` is held while a run counts claims, decides and
     takes one, so no run reads free a lane another just chose. Under it run
     only flocks that never wait and the room read: no `git`, no hub read.
@@ -4411,15 +4413,19 @@ class MachineLocks:
             fcntl.flock(handle, fcntl.LOCK_EX)  # its holders wait on nothing under it: never long
             yield
 
-    def held_elsewhere(self, checkout: pathlib.Path) -> bool:
-        if str(checkout) in self.mine:
-            return False
-        try:
-            with open(self.claim_file(checkout), "a", encoding="utf-8") as handle:
-                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            return True  # held, or unknown: held
-        return False
+    def claims_elsewhere(self) -> int:
+        """How many lane claims in the lane root another run holds, whatever its lanes."""
+        mine = {self.claim_file(pathlib.Path(checkout)) for checkout in self.mine}
+        held = 0
+        for claim in self.root.glob("hosted-" + "?" * 16 + ".lock"):  # not `hosted-start.lock`
+            if claim in mine:
+                continue
+            try:
+                with open(claim, "a", encoding="utf-8") as handle:
+                    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                held += 1  # held, or unknown: held
+        return held
 
     def take_lane(self, checkout: pathlib.Path) -> bool:
         try:
@@ -4441,12 +4447,12 @@ class MachineLocks:
 
 
 def lock_steps(locks: MachineLocks | None) -> tuple[Callable[[], contextlib.AbstractContextManager[Any]],
-                                                    Callable[[pathlib.Path], bool], Callable[[pathlib.Path], bool],
+                                                    Callable[[], int], Callable[[pathlib.Path], bool],
                                                     Callable[[pathlib.Path], None]]:
-    """`run_parallel`'s start lock, held probe, take and release: a run alone has no lock, and no lane held."""
+    """`run_parallel`'s start lock, claim count, take and release: a run alone has no lock, and no lane held."""
     if locks is None:
-        return contextlib.nullcontext, lambda checkout: False, lambda checkout: True, lambda checkout: None
-    return locks.start_lock, locks.held_elsewhere, locks.take_lane, locks.release_lane
+        return contextlib.nullcontext, lambda: 0, lambda checkout: True, lambda checkout: None
+    return locks.start_lock, locks.claims_elsewhere, locks.take_lane, locks.release_lane
 
 
 def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: float,
@@ -4489,7 +4495,7 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
 @dataclasses.dataclass
 class ParallelRun:
     """`run_parallel`'s state: each lane's rows, the lanes running, the ids each worker saw, the lanes a scan
-    found new work in that wait for room, and the run's start lock, claim probe, take and release."""
+    found new work in that wait for room, and the run's start lock, claim count, take and release."""
 
     order: list[tuple[str, pathlib.Path]]
     start: Start
@@ -4498,7 +4504,7 @@ class ParallelRun:
     pending: Pending
     cap: int
     start_lock: Callable[[], contextlib.AbstractContextManager[Any]]
-    held: Callable[[pathlib.Path], bool]
+    held: Callable[[], int]
     take: Callable[[pathlib.Path], bool]
     release: Callable[[pathlib.Path], None]
     rows: list[list[dict[str, Any]]] = dataclasses.field(default_factory=list)
@@ -4512,8 +4518,7 @@ class ParallelRun:
     def no_room(self) -> str | None:
         """Why the next lane may not start now, or None. Past the budget only the cap counts: a worker then
         claims nothing, so an owed release or post-merge waits for no gate room, as before sd:9332."""
-        others = sum(1 for index, (_, checkout) in enumerate(self.order)
-                     if index not in self.running and self.held(checkout))
+        others = self.held()
         if len(self.running) + others >= self.cap:
             return f"{len(self.running)} of this run's lanes and {others} of another's fill the cap of {self.cap}"
         return None if clock() >= self.deadline or (not self.running and not others) else self.room()
@@ -4534,6 +4539,9 @@ class ParallelRun:
                 self.release(checkout)  # taken to count only: no room
         if not busy and (clock() < self.deadline or self.running):
             return None
+        if busy:  # its pending ids count as seen: only a new entry tries it again, not every rescan
+            self.seen[index] = self.seen.get(index, frozenset()) | self.pending({checkout: frozenset()}).get(
+                checkout, frozenset())
         self.seen.setdefault(index, frozenset())  # a later scan starts it once that worker is done
         self.rows[index].append({"ran": [], "busy": "another run claimed the lane, or its claim cannot be read or "
                                  "taken; it counts toward the cap" if busy
