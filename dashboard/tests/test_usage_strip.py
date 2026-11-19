@@ -251,6 +251,13 @@ class TheStripInTheUsageDropdown(ScreenCase):
         self.assertRegex(menu, r"\bright:\s*0\b")
         self.assertRegex(menu, r"\bwidth:\s*min\(48rem, calc\(100vw - 2 \* var\(--space-md\)\), 100%\)")
 
+    def test_the_kiosk_gives_the_usage_summary_read_again_s_touch_size(self):
+        """Lead review of 8f483c6: Home's kiosk enlarged #read-again to 4rem but left the Usage summary beside it small."""
+        css = re.sub(r"/\*.*?\*/", "", (V2 / "static" / "home.css").read_text(encoding="utf-8"), flags=re.S)
+        [selector] = [found for found in re.findall(r"([^{}]+)\{[^{}]*min-height:\s*4rem", css)
+                      if "html[data-kiosk] #read-again" in found]
+        self.assertIn("html[data-kiosk] #usage-sum", [part.strip() for part in selector.split(",")])
+
 class TheStripRoute(BrowserSession):
     def test_the_strip_route_answers_the_strip_and_refuses_a_query(self):
         reading(self.connection, "codex", **CODEX)
