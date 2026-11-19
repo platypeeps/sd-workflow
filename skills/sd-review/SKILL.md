@@ -67,6 +67,8 @@ Do not substitute another diff or copy a cap into this procedure.
    Rate limits, missing executables, authentication failures, failed runs, and timeouts can advance that chain.
    An exhausted chain with insufficient completed coverage fails.
 3. Disposition findings locally against the repository's severity floor; unset, it is `high`.
+   A finding at the floor blocks, cited or not; only a repeat of a finding rebutted on this branch needs `evidence` (a check run, or `path:line` and a quote of the current code), and one without posts as advisory, marked `[downgraded: repeats a rebutted finding, no evidence cited]`.
+   A finding takes the newest recorded disposition at its exact path, whole summary (case and spacing folded) and exact line; it posts as advisory only when that one is a listed rebuttal whose file is unchanged since its receipt's head (a failed diff counts as a change), so a finding that moved or whose file changed blocks again, and the lane's own blockers are never rebutted. The prompt lists the rebuttals recorded from 14 days before the base's commit on, at a receipt head that is the base or in base..head, at most 10, each with its line; a reused branch name inherits none, and a retry at the same head reads the receipt recorded after it.
    Preserve each provider's findings and attempt outcome.
    A completed adverse review counts; it does not trigger replacement.
    A clean fallback cannot erase earlier findings.
@@ -167,6 +169,8 @@ Do not truncate input or count the advisory plan as completed review coverage.
 
 The ordinary review prompt includes this checkout's `CLAUDE.local.md` block through `local_conventions` (R10-D7).
 The receipt reports `local_block_prepended`.
+A `threat-model:` line there gets its own paragraph: a finding outside it is advisory at most.
+The prompt also lists this branch's rebutted findings from `sd-ship adjudicate`, newest first, capped; a reviewer raises one again only with new evidence in either form: a check run, or `path:line` and a quote of the current code.
 Synthetic provider preflight excludes that block.
 When findings contradict a convention, check the supplied wording before assigning blame.
 Use `sd-rules --for <path>` for applicable repository rules.
