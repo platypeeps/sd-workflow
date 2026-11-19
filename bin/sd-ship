@@ -491,7 +491,8 @@ def edited_waivers(claim: object, stored: object) -> list[int]:
                 if isinstance(row, dict) and isinstance(row.get("waived"), dict) else row for row in value["criteria"]]
         return {**value, "criteria": rows}
 
-    if claim == stored or bare(claim) != bare(stored):
+    # Equal bare claims that differ raw are both dicts with a criteria list: only `bare` rewrites one.
+    if claim == stored or bare(claim) != bare(stored) or not isinstance(claim, dict) or not isinstance(stored, dict):
         return []
     return sorted({row["waived"]["decision"] for row, old in zip(claim["criteria"], stored["criteria"], strict=True)
                    if isinstance(row.get("waived"), dict) and row != old})
