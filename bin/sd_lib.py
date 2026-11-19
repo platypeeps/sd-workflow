@@ -3797,8 +3797,7 @@ def end_group(process: subprocess.Popen, *, drain: bool = False) -> tuple[str, s
     The grace after SIGTERM lasts until the group is empty, not until the leader alone exits, and
     leaves an unreaped leader unreaped, so its number stays its own for the SIGKILL: a TERM-deaf
     worker forked on the TERM holds no witness (pack sd:9600). A leader reaped before the call gets
-    the SIGKILL only while a witness holds its number, or when no read came before the TERM. The
-    SIGKILL step runs whatever interrupts the reads or the grace (`escalate`).
+    the SIGKILL only while a witness holds its number. The SIGKILL step runs whatever interrupts the reads or the grace (`escalate`).
     """
     import signal  # noqa: PLC0415 - only the group helpers need it
 
@@ -3819,7 +3818,7 @@ def end_group(process: subprocess.Popen, *, drain: bool = False) -> tuple[str, s
     def kill_group(earlier: Table | None) -> None:
         table, interrupted = read_after()
         held = kill_below(process.pid, earlier, table)
-        if process.returncode is None or held:  # an unreaped leader's number is its own; else a witness or no read
+        if process.returncode is None or held:  # an unreaped leader's number is its own; else a witness says so
             send_group(signal.SIGKILL)
         with contextlib.suppress(subprocess.TimeoutExpired):
             process.wait(timeout=GROUP_CLEANUP_SECONDS)
@@ -4196,9 +4195,9 @@ def kill_below(root: int, earlier: Table | None, table: Table | None, *, process
     is a process, the same while its pid and start match. A `table` that
     could not be read leaves the witness to `os.getpgid` and walks
     nothing; an `earlier` of None, no read before the TERM, signals
-    nothing below and returns True, so the caller falls back to the
-    group KILL (pack sd:9600). Stderr says so for either: unknown is
-    not none. Each surviving witnessed group below also roots a walk
+    nothing and holds no root: a reaped leader's number may be another
+    group's by then, so only an unreaped leader's group is killed
+    (pack sd:9600). Stderr says so for either: unknown is not none. Each surviving witnessed group below also roots a walk
     in `table`: a detached gate whose parent ended may have started a
     session since (pack sd:9600). The line
     never raises: under SIGHUP the terminal may be gone. An empty
@@ -4212,7 +4211,7 @@ def kill_below(root: int, earlier: Table | None, table: Table | None, *, process
         with contextlib.suppress(OSError, ValueError):  # EIO on a revoked terminal, a closed stream
             print(f"sd: cannot read the process table; groups below {root} may still run", file=sys.stderr)
         if earlier is None:
-            return True
+            return False
     holds_witness = witnessed(earlier, table)
     if process:
         root_held = table is not None and root in earlier and root in table and table[root][2] == earlier[root][2]

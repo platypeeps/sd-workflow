@@ -2601,9 +2601,9 @@ class KillReachTests(unittest.TestCase):
             self.addCleanup(end_session, deaf)
             self.assertTrue(gone(deaf), "the TERM-deaf replacement outlived end_group")
 
-    def test_an_unread_table_before_the_term_still_kills_a_reaped_leaders_group(self) -> None:
-        """pack sd:9600, sd_lib.py:3821: a `ps` that failed before the TERM, with the leader reaped,
-        skipped the group SIGKILL, so TERM-resistant workers kept the gate slot."""
+    def test_an_unread_table_before_the_term_kills_no_reaped_leaders_number(self) -> None:
+        """pack sd:9600 review: with no read before the TERM and the leader reaped, the fallback SIGKILL
+        went to the bare number, which another group may hold by then."""
         process = unittest.mock.Mock(pid=4242, returncode=0, stdin=None, stdout=None, stderr=None)
         with unittest.mock.patch.object(sd_lib, "process_table", return_value=None), \
                 unittest.mock.patch.object(sd_lib, "group_alive", return_value=True), \
@@ -2611,7 +2611,29 @@ class KillReachTests(unittest.TestCase):
                 unittest.mock.patch("sys.stderr", new_callable=io.StringIO), \
                 unittest.mock.patch.object(os, "killpg") as killpg:
             sd_lib.end_group(process)
-        self.assertIn(unittest.mock.call(4242, signal.SIGKILL), killpg.call_args_list)
+        self.assertNotIn(unittest.mock.call(4242, signal.SIGKILL), killpg.call_args_list)
+
+    def test_an_unread_table_still_kills_a_timed_out_leaders_term_deaf_worker(self) -> None:
+        """pack sd:9600, sd_lib.py:3821: a `ps` that failed before the TERM, with the leader reaped in the
+        grace, skipped the group SIGKILL; the leader now stays unreaped, so its number is its own."""
+        with tempfile.TemporaryDirectory() as scratch:
+            mark = pathlib.Path(scratch) / "worker.pid"
+            worker = ("import os, pathlib, signal, sys, time\n"
+                      "if os.fork() == 0:\n"
+                      "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                      "    pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+                      "    time.sleep(30)\n"
+                      "    os._exit(0)\n"
+                      "time.sleep(60)\n")
+            leader = sd_lib.spawn_group([sys.executable, "-c", worker, str(mark)])
+            sd_lib.release_term()
+            self.addCleanup(end_session, leader.pid)
+            deaf = wait_for_pid(mark)
+            with unittest.mock.patch.object(sd_lib, "process_table", return_value=None), \
+                    unittest.mock.patch.object(sd_lib, "GROUP_CLEANUP_SECONDS", 0.5), \
+                    unittest.mock.patch("sys.stderr", new_callable=io.StringIO):
+                sd_lib.end_group(leader)
+            self.assertTrue(gone(deaf), "the TERM-deaf worker outlived end_group with no table read")
 
     def test_a_session_a_surviving_detached_gate_started_is_killed(self) -> None:
         """pack sd:9600, sd_lib.py:4214: the second walk ran from the root alone; a detached gate whose

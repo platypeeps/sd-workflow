@@ -6505,7 +6505,8 @@ class ReviewWatchdogTests(unittest.TestCase):
         with patch.object(ship.subprocess, "Popen", return_value=process), patch.object(ship.os, "killpg", side_effect=PermissionError("fixture refusal")):
             with self.assertRaises(ship.ReviewTimeout) as raised:
                 ship.review_process(self.root, ["fixture"], timeout=.01)
-        self.assertEqual(process.communicate.call_count, 3)
+        # The run and the drain after the KILL; the grace reaps nothing, so it drains nothing (pack sd:9600).
+        self.assertEqual(process.communicate.call_count, 2)
         self.assertFalse(raised.exception.diagnostic["cleanup"]["leader_reaped"])
         self.assertIn("failed", raised.exception.diagnostic["cleanup"]["kill"])
 
@@ -6523,6 +6524,42 @@ class ReviewWatchdogTests(unittest.TestCase):
                 ship.review_process(self.root, ["fixture"], timeout=1)
         self.assertNotIn(unittest.mock.call(4242, ship.signal.SIGKILL), killpg.call_args_list)
         self.assertEqual(raised.exception.diagnostic["cleanup"]["kill"], "absent")
+
+    def test_a_term_deaf_replacement_in_a_timed_out_review_is_killed(self):
+        """pack sd:9600 review, sd-ship:320: the grace's drain reaped the leader; a worker forked a
+        TERM-deaf child on the TERM and exited, so the child held the group with no witness and
+        the group SIGKILL was skipped as absent. The child closes the pipes, so the drain reaps."""
+        mark = self.root / "worker.pid"
+        deaf = self.root / "worker.pid.deaf"
+        script = ("import os,pathlib,signal,sys,time\nmark=pathlib.Path(sys.argv[1])\nif os.fork()==0:\n"
+                  " def replace(*_):\n  if os.fork()==0:\n   signal.signal(signal.SIGTERM, signal.SIG_IGN)\n   os.close(1)\n   os.close(2)\n"
+                  "   pathlib.Path(str(mark)+'.deaf').write_text(str(os.getpid()))\n   time.sleep(30)\n  os._exit(0)\n"
+                  " signal.signal(signal.SIGTERM, replace)\n mark.write_text(str(os.getpid()))\n"
+                  " while True: time.sleep(1)\nwhile True: time.sleep(1)\n")
+        def stop_deaf():
+            try:
+                os.kill(int(deaf.read_text()), ship.signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+        self.addCleanup(stop_deaf)
+        original_communicate = subprocess.Popen.communicate
+        def after_ready(process, *args, **kwargs):
+            deadline = time.monotonic() + 5
+            while not (mark.exists() and mark.read_text()) and time.monotonic() < deadline:
+                time.sleep(.005)
+            return original_communicate(process, *args, **kwargs)
+        with patch.object(subprocess.Popen, "communicate", after_ready), patch.object(ship, "REVIEW_CLEANUP_SECONDS", .5):
+            with self.assertRaises(ship.ReviewTimeout) as raised:
+                ship.review_process(self.root, [sys.executable, "-c", script, str(mark)], timeout=.3)
+        self.assertEqual(raised.exception.diagnostic["cleanup"]["kill"], "sent")
+        for _ in range(60):
+            try:
+                os.kill(int(deaf.read_text()), 0)
+            except ProcessLookupError:
+                break
+            time.sleep(.05)
+        else:
+            self.fail("the TERM-deaf replacement outlived the review's SIGKILL")
 
     def test_an_interrupted_review_read_still_kills(self):
         """pack sd:9392 round 5, R2: a KeyboardInterrupt in the read before the TERM left the review group
