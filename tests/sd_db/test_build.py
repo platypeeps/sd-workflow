@@ -932,10 +932,12 @@ class Reap(Case):
                                                                                self.bundle["id"]))
         build.retry(self.db, self.bundle["assignment"], who="operator")
         notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
-        sent = [note for note in notes if note.startswith(build.FINDING)]
-        self.assertEqual([note.split("\n")[0] for note in sent],
-                         [build.FINDING + "The last review round left these blockers: a.py:2 pin check"], notes)
-        self.assertEqual(sent[0].split("\n")[1:], [build.REVIEW_CLASS_PASS])
+        reviewed = [note for note in notes if note.startswith(build.REVIEWED)]
+        self.assertEqual([note.split("\n")[0] for note in reviewed],
+                         [build.REVIEWED + "The last review round left these blockers: a.py:2 pin check"], notes)
+        self.assertEqual(reviewed[0].split("\n")[1:], [build.REVIEW_CLASS_PASS])
+        self.assertFalse([note for note in notes if note.startswith(build.FINDING)],
+                         "lead review of sd:9498: reviewer text is no operator instruction")
         self.assertTrue(any(note.endswith(f"Retry of build run {self.bundle['id']}") for note in notes), notes)
 
     def test_a_plain_retry_of_another_blocked_run_sends_no_finding(self):
@@ -945,7 +947,7 @@ class Reap(Case):
                                                                                self.bundle["id"]))
         build.retry(self.db, self.bundle["assignment"], who="operator")
         notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
-        self.assertFalse([note for note in notes if note.startswith(build.FINDING)], notes)
+        self.assertFalse([note for note in notes if note.startswith((build.FINDING, build.REVIEWED))], notes)
 
     def test_build_again_on_a_done_member_of_a_blocked_bundle_queues_it_fresh(self):
         """pack sd:8785 review: a bundle ends mixed (`enqueued` marks a delivered member done, blocks the rest).

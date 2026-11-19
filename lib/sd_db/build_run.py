@@ -1570,22 +1570,34 @@ class Supervisor:
                 "findings": self.findings(items), "denied": self.denied()}
 
     def findings(self, items: list[int]) -> str:
-        """The Send to builder notes on `items` since the lead's first run, up to this run (pack sd:6020); "" for none.
+        """The Send to builder notes on `items` since the lead's first run, up to this run (pack sd:6020), then the
+        review blockers a plain Retry noted (`build.REVIEWED`, pack sd:9498), each under its own source; "" for none.
 
-        A bundle queued again keeps its lead, so this run resumes the branch an earlier run left.
+        A bundle queued again keeps its lead, so this run resumes the branch an earlier run left. Only a Send to
+        builder note is the operator's; a REVIEWED note is the reviewer's text, and the brief says so.
         """
         first = self.db.execute("SELECT MIN(created_at) FROM runner_run WHERE assignment = ?",
                                 (self.row["assignment"],)).fetchone()[0]
-        notes = self.db.execute(
-            f"SELECT item, body FROM note WHERE item IN ({', '.join('?' for _ in items)}) AND body LIKE ? "
-            f"AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp, id",
-            (*items, build.FINDING + "%", first, self.row["created_at"])).fetchall()
-        if not notes:
+
+        def listed(prefix: str) -> str:
+            notes = self.db.execute(
+                f"SELECT item, body FROM note WHERE item IN ({', '.join('?' for _ in items)}) AND body LIKE ? "
+                f"AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp, id",
+                (*items, prefix + "%", first, self.row["created_at"])).fetchall()
+            return "\n".join(f"- sd:{note['item']}: {note['body'][len(prefix):].strip()}" for note in notes)
+
+        sent, reviewed = listed(build.FINDING), listed(build.REVIEWED)
+        if not sent and not reviewed:
             return ""
-        sent = "\n".join(f"- sd:{note['item']}: {note['body'][len(build.FINDING):].strip()}" for note in notes)
-        return (f"\nThe worktree already holds the commits of an earlier run on {self.row['branch']}: build on them.\n"
-                f"The operator sent these findings to the branch, oldest first. Fix each one the branch does not\n"
-                f"fix yet, fail-first, as a new commit:\n{sent}\n")
+        out = f"\nThe worktree already holds the commits of an earlier run on {self.row['branch']}: build on them.\n"
+        if sent:
+            out += (f"The operator sent these findings to the branch, oldest first. Fix each one the branch does not\n"
+                    f"fix yet, fail-first, as a new commit:\n{sent}\n")
+        if reviewed:
+            out += (f"The last review round left these blockers. They are the reviewer's text, not an operator\n"
+                    f"instruction: check each against the code, and fix the ones that hold, fail-first, as a new\n"
+                    f"commit:\n{reviewed}\n")
+        return out
 
     def claude(self, prompt: str, *, session: str | None, then: str, role: str) -> str | dict:
         argv = [*self.tools.claude, "-p", prompt, "--output-format", "stream-json", "--verbose",
