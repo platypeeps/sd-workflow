@@ -140,6 +140,11 @@ class PeerRefused(remote.RemoteError):
 Fenced = hub.Fenced
 
 
+def fenced_by(found: hub.Role) -> Fenced:
+    """The `Fenced` a session raises on a refusing role, its `state` and `cause` the role's (pack sd:9543)."""
+    return Fenced(f"refused: this machine is not the hub: {found.reason}", state=found.state, cause=found.cause)
+
+
 #: The PRAGMAs a session may run, from a grep for `PRAGMA` across
 #: `local-sd-db/sd_db`, `local-sd-runner` and `local-project-dashboard`
 #: (2026-10-04, step 7's review); the command pack's `bin/` names none.
@@ -447,7 +452,7 @@ class Session(socketserver.BaseRequestHandler):
             # trusts this answer and asks Tailscale nothing under it (sd:7042).
             fenced = self.server.fence(within=FENCE_SECONDS / 2)  # type: ignore[attr-defined]
             if fenced is not None:
-                raise Fenced(f"refused: this machine is not the hub: {fenced}")
+                raise fenced_by(fenced)
         owners = self.server.owners  # type: ignore[attr-defined]
         with owners.lock(rid):
             if not owners.admit(rid, self.number):
@@ -524,7 +529,7 @@ class Session(socketserver.BaseRequestHandler):
                     # the frame's own check; asked afresh it held the write lock (sd:7042).
                     fenced = self.server.fence()  # type: ignore[attr-defined]
                     if fenced is not None:
-                        raise Fenced(f"refused: this machine is not the hub: {fenced}")
+                        raise fenced_by(fenced)
                 # A transaction that changed nothing gets no row: committed
                 # or not, it wrote nothing, so `absent` and its "run the verb
                 # again" stay true, and a quiet tick adds no row to the hub.
@@ -650,7 +655,7 @@ class Session(socketserver.BaseRequestHandler):
                         # Every frame, open or not: a demoted hub writes nothing and serves no stale read.
                         fenced = server.fence()
                         if fenced is not None:
-                            raise Fenced(f"refused: this machine is not the hub: {fenced}")
+                            raise fenced_by(fenced)
                     if connection is None:
                         if op != "open":
                             raise remote.RemoteError(f"the first frame must be open, not {op!r}")
@@ -849,12 +854,12 @@ class Server(socketserver.ThreadingTCPServer):
         self.fenced = hub.Held()
         super().__init__((LOOPBACK if node is None else str(node.address), port), Session)
 
-    def fence(self, *, within: float | None = None) -> str | None:
-        """Why this machine no longer holds the hub role, or `None`: asked again past
-        `within` seconds, `FENCE_SECONDS` by default, or once the wall clock jumped (a
-        sleep). Unknown refuses. A frame with a held answer waits on no ask (sd:7042)."""
+    def fence(self, *, within: float | None = None) -> hub.Role | None:
+        """The refusing role when this machine no longer holds the hub role, or `None`: asked
+        again past `within` seconds, `FENCE_SECONDS` by default, or once the wall clock jumped
+        (a sleep). Unknown refuses. A frame with a held answer waits on no ask (sd:7042)."""
         found = self.fenced.get(lambda: hub.role_at(self.database), FENCE_SECONDS if within is None else within)
-        return found.reason if found.refuses else None
+        return found if found.refuses else None
 
     def admit(self, peer, frame: dict, session: int = 0) -> None:
         """Refuse a session before anything opens, and before any SQL runs."""

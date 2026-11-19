@@ -189,10 +189,12 @@ def services(connection: sqlite3.Connection, *, now: str) -> list[dict]:
             why = "the reading has no read time"
         else:
             why = _stale(_age(_when(read_at), clock), STATUS_STALE_MINUTES)
+        # An unknown reading shows none of its incidents or components: a stale row's last outage may have ended
+        # (pack sd:9498).
         incidents = [one for one in body.get("incidents") or [] if isinstance(one, dict)] if isinstance(
-            body.get("incidents"), list) else []
+            body.get("incidents"), list) and not why else []
         components = [one for one in body.get("components") or [] if isinstance(one, dict)] if isinstance(
-            body.get("components"), list) else []
+            body.get("components"), list) and not why else []
         providers = [p for p in body.get("providers") or [] if isinstance(p, str) and NAME.fullmatch(p)] if isinstance(
             body.get("providers"), list) else []
         out.append({"name": name, "status": "unknown" if why else status, "why": why, "read_at": read_at,
