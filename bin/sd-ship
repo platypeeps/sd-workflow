@@ -520,6 +520,22 @@ def edited_waivers(claim: object, stored: object) -> list[int]:
                    if isinstance(row.get("waived"), dict) and row != old})
 
 
+def stale_criteria(claim: object, stored: object) -> list[str]:
+    """The criteria of `claim` when not one of its rows differs from `stored`'s, or [] (sd:9268 review).
+
+    A renewal binds the item's new scope to its evidence, so evidence the old
+    claim already held proves only the old requirements. A claim with no rows,
+    such as a task's merge alone, has no evidence to go stale.
+    """
+    if not isinstance(claim, dict) or not isinstance(stored, dict):
+        return []
+    rows, old = claim.get("criteria") or [], stored.get("criteria") or []
+    seen = {json.dumps(row, sort_keys=True) for row in old}
+    if any(json.dumps(row, sort_keys=True) not in seen for row in rows):
+        return []
+    return [str(row.get("criterion")) for row in rows if isinstance(row, dict)]
+
+
 def acceptance_row_answered(row: object) -> bool:
     """An acceptance row that names its criterion and evidence and either passed or says it was waived (sd:3704).
 
@@ -805,7 +821,7 @@ class Ship(SharedReview):
             return claim, None, None
         if self.lane_started():
             items = list(self.closing(tuple(dict.fromkeys(self.args.closes)), self.args.deliver))
-            other_items = items != (self.state.get("closing") or {}).get("items")
+            other_items = set(items) != set((self.state.get("closing") or {}).get("items") or [])
             if stored.get("renewed") and not changed and other_items:
                 raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this lane entry "
                               f"names other items, as a retry of an entry enqueued before the renewal does; "
@@ -835,8 +851,19 @@ class Ship(SharedReview):
         claim = {**claim, "renewed": True}
         if not changed:
             return claim, None, None
+        self.refuse_stale_evidence(claim, stored)
         return claim, claim, (f"--deliver renews the delivery claim of sd:{self.args.item}: item scope "
                               f"{str(stored.get('item_scope'))[:12]} is now {claim['item_scope'][:12]}")
+
+    def refuse_stale_evidence(self, claim: dict, stored: dict) -> None:
+        """Refuse a renewal whose evidence is the old claim's (`stale_criteria`), before anything is saved."""
+        if stale := stale_criteria(claim.get("claim"), stored.get("claim")):
+            raise Refusal(f"sd:{self.args.item} changed since its delivery claim, and the acceptance file is the "
+                          f"old claim's evidence, so it proves the old requirements; no criterion has a fresh "
+                          f"row: {'; '.join(stale)}", code="delivery_evidence_stale", boundary="input",
+                          state="operator_decision",
+                          next_action="Check each criterion against the item as it reads now, write the new "
+                                      "evidence to the acceptance file, then prepare --deliver again.")
 
     def lane_started(self) -> bool:
         """Whether this repository's lane runner started this prepare (sd:9335).

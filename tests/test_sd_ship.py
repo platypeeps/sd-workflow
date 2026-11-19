@@ -4594,6 +4594,8 @@ roles:
         set_item_fields(self.connection, self.item, title="retitled scope")
         with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed"):
             self.prepare()
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "rechecked on the new scope"}]}))
         self.prepare("--deliver", "--acceptance-file", str(acceptance))
         renewed = self.operation().state["acceptance"]["item_scope"]
         self.assertNotEqual(renewed, old)
@@ -4622,6 +4624,8 @@ roles:
         self.assertEqual(self.operation().state["acceptance"]["item_scope"], old)
         sd_lane.store(self.connection, ship.slug(REMOTE_URL), {**entry, "status": "failed"})
         self.connection.commit()
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "rechecked on the new scope"}]}))
         stderr = io.StringIO()
         with contextlib.redirect_stderr(stderr):
             self.prepare("--deliver", "--acceptance-file", str(acceptance))
@@ -4692,6 +4696,8 @@ roles:
         acceptance = str(self.waiver_file(self.waived_row("runs offline", note)))
         self.prepare("--deliver", "--acceptance-file", acceptance)
         set_item_fields(self.connection, self.item, title="retitled scope")
+        acceptance = str(self.waiver_file({"criterion": "rechecked", "passed": True, "evidence": "new scope"},
+                                          self.waived_row("runs offline", note)))
         with contextlib.redirect_stderr(io.StringIO()):
             self.prepare("--deliver", "--acceptance-file", acceptance)
         before = self.operation().state["acceptance"]
@@ -4707,7 +4713,7 @@ roles:
         self.prepare("--deliver", "--acceptance-file", acceptance)  # the refresh by hand
         with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}):
             self.prepare("--deliver", "--acceptance-file", acceptance)  # the retried entry, same file
-        self.assertIn("still.", self.operation().state["acceptance"]["claim"]["criteria"][1]["waived"]["note"]["body"])
+        self.assertIn("still.", self.operation().state["acceptance"]["claim"]["criteria"][2]["waived"]["note"]["body"])
 
     def test_a_scope_change_before_the_merge_says_nothing_merged(self):
         """Lead review of sd:9335: `merge` refused a scope change with the prepare step's words, "a lane prepare
@@ -4743,6 +4749,55 @@ roles:
             with contextlib.redirect_stderr(io.StringIO()):
                 self.prepare("--deliver", "--item", str(kept))  # an entry with the renewal's items proceeds
         self.assertEqual(self.operation().state["closing"]["items"], [kept])
+
+    def test_a_lane_retry_with_the_renewals_items_in_another_order_proceeds(self):
+        """Lead review of sd:9268: the lane compared the closing lists in order, so a retry naming the renewal's
+        items in another order refused. A closing set is a set."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        first, second, third = self.closes_items()[:3]
+        self.prepare("--deliver", "--item", str(first), "--item", str(second), "--item", str(third))
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--item", str(first), "--item", str(second))
+        with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}), contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--item", str(second), "--item", str(first))
+        self.assertEqual(sorted(self.operation().state["closing"]["items"]), sorted([first, second]))
+
+    def test_a_renewal_with_the_old_claims_evidence_refuses(self):
+        """Lead review of sd:9268: a renewal by hand took the old acceptance file as evidence for the changed
+        requirements. It refuses, names each criterion, and saves nothing; fresh evidence renews."""
+        from sd_db import set_item_fields
+        acceptance = self.directory / "acceptance.json"
+        rows = [{"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"},
+                {"criterion": "second criterion", "passed": True, "evidence": "second-check-pass"}]
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": rows}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        old = self.operation().state["acceptance"]
+        set_item_fields(self.connection, self.item, body="changed requirements")
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": rows[::-1]}))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(
+                ship.Refusal, "no criterion has a fresh row: second criterion; actual scope") as caught:
+            self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "delivery_evidence_stale")
+        self.assertEqual(self.operation().state["acceptance"], old)
+        self.assertIsNone(self.operation().state.get("pending"))
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {**rows[0], "evidence": "checked against the changed requirements"}, rows[1]]}))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        self.assertNotEqual(self.operation().state["acceptance"]["item_scope"], old["item_scope"])
+
+    def test_a_renewal_whose_claim_has_no_evidence_still_renews(self):
+        """A task's claim is the verified merge alone, so its renewal has no evidence to go stale."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        self.prepare("--deliver")
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            self.prepare("--deliver")
+        self.assertIn("renews the delivery claim", stderr.getvalue())
 
     def test_a_renewal_whose_prepare_fails_never_authorizes_the_old_pull_request(self):
         """Lane review of sd:9268: a renewal saves its claim and closing set before lint, review and publication;
