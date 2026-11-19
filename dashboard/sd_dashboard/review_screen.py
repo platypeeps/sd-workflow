@@ -147,9 +147,7 @@ def sweeps(connection, cron_root) -> dict:
         caps = SWEEP_CAP.findall(block)
         if caps:
             row["skipped"] = (row["skipped"] or 0) + int(caps[-1][1]) - int(caps[-1][0])
-    for found in connection.execute(
-            "SELECT external_id, status FROM item WHERE source IS 'task-ref' AND substr(external_id, 1, ?) IS ?",
-            (len(SWEEP_REF), SWEEP_REF)):
+    for found in reads.ref_items(connection, SWEEP_REF):
         date = found["external_id"][len(SWEEP_REF):].partition(":")[0]
         if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
             week(date)["fixed" if found["status"] == "done" else "unfixed"] += 1
