@@ -79,6 +79,31 @@ main. "n/a" means main does not have that code.
 | advisory 5551: tests patch `time.sleep` process-wide | n/a | main's lane tests patch `sd_lane.time` only | none | none |
 | reads | none | `ps` fails or times out | unknown: the KILL still reaches the target's own group, groups from no read are signalled, and stderr says so | test_an_unread_table_still_kills_the_leaders_group |
 
+### Class pass: unwind steps that skip the captured SIGKILL
+
+Lead review of 5541a2221. Each kill path, read from the code. Rule 1:
+groups read before the TERM always get the start-checked SIGKILL pass,
+whether or not the parent ended on its own. Rule 2: no diagnostic
+write in a kill path raises. Rule 3: one table read per unwind,
+shared by every group.
+
+| Step | State moved | Failure | Recovery | Test |
+| --- | --- | --- | --- | --- |
+| `end_group` | leader group | none: its loop always runs the SIGKILL step, and `kill_below` runs whenever the first read found a group | none needed | test_end_group_kills_a_session_its_leader_left |
+| `review_process` | review group | none: its loop always runs the SIGKILL step | none needed | test_a_killed_review_ends_the_sessions_below_it |
+| `ThreadGroups.end_groups`, rule 1 | registered groups | a group whose leader ended on the TERM left the set, so only groups still registered were killed | every live group's read sessions get the pass at the deadline | test_end_groups_kills_what_a_term_quitter_left |
+| `ThreadGroups.end_groups`, rule 3 | none | one read per group, up to 3 s each, before any TERM | one read before the TERMs, one before the KILLs, shared | test_end_groups_reads_the_table_once_for_every_group |
+| `cancel_gate`, rule 1 | gate group | a gate that ended on the TERM returned True with no SIGKILL pass | `kill_left` runs on that return | test_a_gate_that_ends_on_term_still_kills_what_it_left |
+| `signal_gate` SIGKILL, rule 1 | gate group | `started(None)` cleared `group` before the SIGKILL, which then skipped the pass | the pass uses the group the read was under | test_a_gate_kill_after_its_group_cleared_still_kills_what_was_read |
+| `end_child`, rule 1 | lane child | a child that ended on the TERM returned after `wait` with no pass | the pass runs on the first read only; the reaped pid roots no walk | test_a_lane_child_that_ends_on_term_still_has_what_it_left_killed |
+| `kill_below` stderr line, rule 2 | none | EIO or a closed stream raised before the leader's SIGKILL | the write suppresses OSError and ValueError | test_a_diagnostic_that_cannot_be_written_stops_no_kill |
+| `signal_gate` read, rule 3 | none | one read per gate before its TERM, at most `DEPTH` (2) gates | kept: one bounded read per group is what rule 1 needs | none |
+
+Rule 3 says TERM first, then read. The read stays before the TERM: a
+leader that dies on the TERM at once hangs its session off pid 1
+before any later read. `test_end_groups_kills_what_a_term_quitter_left`
+uses such a leader and fails with the read after the TERM.
+
 ## Acceptance criteria
 
 - [ ] Each test named above failed on d623828d1 and passes on the head.
