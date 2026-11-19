@@ -2549,6 +2549,17 @@ class KillReachTests(unittest.TestCase):
             groups.end_groups()
         self.assertEqual([pid for pid, number in sent if number == signal.SIGKILL], [], sent)
 
+    def test_a_reused_child_pid_roots_no_walk(self) -> None:
+        """Round 5, R1, `end_child`: a reaped child's pid, now another process, rooted the walk, and an
+        earlier group below it whose members were all gone was signalled."""
+        earlier = {100: (1, 100, "Thu Jan  1 00:00:00 1970"), 200: (100, 200, "Thu Jan  1 00:00:01 1970")}
+        now = {100: (1, 100, "Fri Jan  2 00:00:00 1970"), 300: (100, 300, "Fri Jan  2 00:00:01 1970"),
+               201: (1, 200, "Fri Jan  2 00:00:02 1970")}
+        with unittest.mock.patch.object(os, "killpg") as killpg:
+            held = sd_lib.kill_below(100, earlier, now, process=True)
+        self.assertFalse(held)
+        self.assertEqual(killpg.call_args_list, [])
+
     def test_a_reaped_leaders_reused_number_gets_no_sigkill(self) -> None:
         """Round 5, R1, `end_group`: the SIGKILL went to the reaped leader's bare number, which another
         group held by then."""

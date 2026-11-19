@@ -146,6 +146,47 @@ A worker that stays in its group now holds `end_group` for the full
 `GROUP_CLEANUP_SECONDS` before its SIGKILL. That is the grace the
 rule asks for.
 
+### Round 5: a witness names the group; the SIGKILL step always runs
+
+Lead review of 086f5a4c3. R1: a group number in the later read is the
+same group only while it holds a witness, a member whose pid, start
+and group the earlier read saw too. A number with none gets no signal
+and roots no walk; the earlier read's witnessed groups get the
+SIGKILL. A number that is still a caller's unreaped child is its own.
+R2: once a TERM is out, the SIGKILL step runs in a `finally`
+(`escalate`), using the earlier read when the later one was
+interrupted, then re-raises. `still_below` and the dict-shaped earlier
+read are deleted; the earlier read is the whole table.
+
+| Path | Rule | Failure | Recovery | Test |
+| --- | --- | --- | --- | --- |
+| `end_group` | R1 | a reaped leader's bare number got the SIGKILL and the walk | KILL and walk only while unreaped or witnessed | test_a_reaped_leaders_reused_number_gets_no_sigkill |
+| `end_group` | R2 | an interrupt in a read or the grace skipped the SIGKILL | `escalate` | test_an_interrupted_read_in_end_group_still_kills, test_an_interrupted_grace_in_end_group_still_kills |
+| `end_groups` | R1 | a group that left the set rooted a walk by number | `kill_below` walks only witnessed roots; `left` groups are registered, so unreaped | test_a_reused_number_without_a_witness_is_not_signalled |
+| `end_groups` | R2 | an interrupt in either shared read skipped the SIGKILL | `escalate` | test_an_interrupted_read_in_end_groups_still_kills |
+| `end_late_group` | R1 | the earlier groups below were signalled by number | witnessed only; `pid` is the caller's unreaped child | test_a_reused_group_number_is_not_signalled |
+| `end_late_group` | R2 | an interrupt in either read skipped the SIGKILL | `escalate` | test_an_interrupted_read_in_end_late_group_still_kills |
+| `review_process` | R1 | a reaped leader's bare number got the SIGKILL | KILL only while unreaped or witnessed, else `absent` | test_a_reaped_reviews_reused_number_gets_no_sigkill |
+| `review_process` | R2 | an interrupt in the read skipped the SIGKILL | `escalate` | test_an_interrupted_review_read_still_kills |
+| `signal_gate` | R1 | the bare number of a cleared group was signalled | `self.group` is registered, so unreaped; the rest goes through `kill_left` | test_a_gate_kill_after_its_group_cleared_still_kills_what_was_read |
+| `signal_gate` | R2 | an interrupt in `kill_left` skipped the group's SIGKILL | `try`/`finally` | test_an_interrupted_gate_cancel_still_kills (read) |
+| `cancel_gate` | R1 | as `signal_gate` and `kill_left` | the same | shares their tests |
+| `cancel_gate` | R2 | an interrupt in the TERM wait skipped the SIGKILL | `finally` sends it | test_an_interrupted_gate_cancel_still_kills (wait) |
+| `kill_left` | R1 | earlier groups were signalled by number | one later read, witnessed groups only | test_a_reused_group_number_is_not_signalled |
+| `kill_left` | R2 | an interrupt in its read skipped every SIGKILL | `read_after`, then re-raise | shares `read_after`: the read=2 subtests |
+| `end_child` | R1 | a reaped child's pid rooted a walk | root is the same pid and start; earlier groups witnessed | test_a_reused_child_pid_roots_no_walk |
+| `end_child` | R2 | an interrupt in the read skipped the KILL | `escalate`; `process.kill` while unreaped | test_an_interrupted_lane_child_end_still_kills |
+| `ThreadGroups` hook | R1 | a late group goes through `end_late_group` | the same | test_a_group_registered_after_the_end_began_has_its_session_killed |
+| `ThreadGroups` hook | R2 | the same | the same | shares the `end_late_group` test |
+| `SpeculativeGate.started` | R1 | a late gate goes through `end_late_group` | the same | test_a_gate_registered_after_the_cancel_still_kills_the_detached_check |
+| `SpeculativeGate.started` | R2 | the same | the same | shares the `end_late_group` test |
+
+With no later read, `os.getpgid` of the earlier members stands in for
+the witness, without the start; the walk then runs from nothing new.
+That is a fallback under an interrupt, not a pass: stderr says the
+table was not read. The late-grace test now waits 3 s with the group
+registered 1.5 s in and a 2 s handler, so it holds on a loaded box.
+
 ## Acceptance criteria
 
 - [ ] Each test named above failed on d623828d1 and passes on the head.
