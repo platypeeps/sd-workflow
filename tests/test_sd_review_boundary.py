@@ -983,11 +983,31 @@ class LineBudgetTests(unittest.TestCase):
         # rebuttal blocks nothing: same path, whole summary and exact line,
         # the newest record there a listed rebuttal whose file is unchanged
         # since its receipt. Measured: `sd-review` is 2847 here.
+        #
+        # 4817 -> 4836 is pack sd:9536, under the operator's 4900 ceiling:
+        # `bin/sd-review` +19 for `tracked`, so a finding on a file the
+        # reviewed head holds outside the diff is located, and a voided
+        # finding's path and summary prefix in the note. Measured:
+        # `sd-review` is 2866 here.
+        #
+        # 4836 -> 4846 is the sd:9536 lead review: `bin/sd-review` +10 so a
+        # path git cannot take is not held rather than raising, and
+        # `for_note` escapes, bounds and caps the model text in the note.
+        # Measured: `sd-review` is 2876 here.
+        #
+        # 4846 -> 4848 is the sd:9536 re-review: `bin/sd-review` +2 so only
+        # a reader of the checkout may cite a file the head holds. Measured:
+        # `sd-review` is 2878 here.
+        #
+        # 4848 -> 4852 is the second sd:9536 re-review: `bin/sd-review` +4
+        # for `reads_checkout`, the one fact that sets the launch directory
+        # and lets a reader cite the head's files, and the planning rule.
+        # Measured: `sd-review` is 2882 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4817,
+            4852,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
