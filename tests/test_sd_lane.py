@@ -6480,6 +6480,93 @@ class HostedParallel(Lane):
                                         locks=sd_lane.MachineLocks(self.environ), cap=2)
         self.assertEqual((started, polls[0]), ([], 0), rows)
 
+    def set_zeta(self, **fields: Any) -> None:
+        """zeta's one entry as `fields` leave it, its recovery fields reset first."""
+        def change(rows: list[dict]) -> None:
+            for row in rows:
+                for name in ("holder", "post_merge", "release", "held"):
+                    row.pop(name, None)
+                row.update(fields)
+        sd_lane.update(sd_lane.queue_for(self.zeta, self.environ), change)
+
+    def test_a_lane_with_only_recovery_work_has_new_work_once_a_run(self) -> None:
+        """sd:9332 lead review of 6300d9049 :4629: `new_work` read runnable entries only, so a lane whose only work
+        was a dead holder, an owed post-merge or an unfinished release chain had none, and an idle run whose
+        first pass met no room skipped it, tick after tick. Recovery is work, once a run: its ids then count
+        as seen."""
+        dead = subprocess.Popen([sys.executable, "-c", ""])
+        dead.wait()
+        ran = {"ran": "make post-merge ran", "at": "2026-11-19T00:00:00Z"}
+        for name, fields in (
+                ("dead holder", {"status": "running", "holder": {"host": sd_lane.this_host(), "pid": dead.pid,
+                                                                 "token": "t"}}),
+                ("owed post-merge", {"status": "merged", "post_merge": "owed"}),
+                ("unfinished release chain", {"status": "merged", "post_merge": ran, "release": {"step": "version"}})):
+            with self.subTest(name):
+                self.set_zeta(**fields)
+                found = sd_lane.new_work(self.environ, {self.zeta: frozenset()})
+                self.assertIn(self.zeta, found)
+                self.assertEqual(sd_lane.new_work(self.environ, {self.zeta: found[self.zeta]}), {})
+
+    def test_a_bare_owed_release_is_work_only_where_the_repository_runs_chains(self) -> None:
+        """sd:9332 class pass: a merge marks `release: owed` in every repository, and only one with a release
+        policy turns it into a chain; counted everywhere, every lane would always have work."""
+        self.set_zeta(status="merged", post_merge={"ran": "no post-merge rule", "at": "2026-11-19T00:00:00Z"},
+                      release="owed")
+        self.assertEqual(sd_lane.new_work(self.environ, {self.zeta: frozenset()}), {})
+        sd_lane.add_entry(sd_lane.queue_for(self.zeta, self.environ),
+                          {"id": "e9", "item": 9, "status": "merged", "release": {"step": "done"}})
+        self.assertIn(self.zeta, sd_lane.new_work(self.environ, {self.zeta: frozenset()}))
+
+    def test_new_work_probes_no_runner_lock(self) -> None:
+        """sd:9332 lead review advisory :4603: `new_work` probed each lane's runner lock with LOCK_NB every
+        poll, and the other run's worker starting meanwhile answered busy. It reads the hub alone now."""
+        def probed(queue: Any) -> Any:
+            raise AssertionError("new_work probed a runner lock")
+        with mock.patch.object(sd_lane, "runner_lock", probed):
+            self.assertIn(self.zeta, sd_lane.new_work(self.environ, {self.zeta: frozenset()}))
+
+    def test_an_idle_run_waits_for_room_for_a_lane_with_only_recovery_work(self) -> None:
+        """sd:9332 lead review of 6300d9049 :4629: the reviewer's check printed "first-pass workers for a lane
+        with only recovery work: 0". The run waits for room for it, starts it once, and ends."""
+        self.set_zeta(status="merged", post_merge="owed")
+        self.hold_outside(self.repo)
+        calls, polls, started = [0], [0], list[pathlib.Path]()
+
+        def room() -> str | None:
+            calls[0] += 1
+            return None if calls[0] > 2 else "the gate's slots are full"
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            started.append(checkout)
+            return sd_lane.StartedLane(lambda: {"ran": []})
+        with mock.patch.object(sd_lane.time, "sleep", self.bounded_nap(polls)):
+            rows = sd_lane.run_parallel([("zeta", self.zeta)], start, sd_lane.clock() + 600, room,
+                                        functools.partial(sd_lane.new_work, self.environ),
+                                        locks=sd_lane.MachineLocks(self.environ), cap=2)
+        self.assertEqual(started, [self.zeta], rows)
+
+    def test_a_scan_starts_an_idle_lane_whose_worker_left_recovery_work(self) -> None:
+        """sd:9332 class pass on the rescan: a lane whose worker ended with its post-merge still owed (the
+        target did not start) got no second worker from a scan, while the run's other lane ran on."""
+        polls, started, done = [0], list[pathlib.Path](), threading.Event()
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            started.append(checkout)
+            if checkout == self.repo:
+                return sd_lane.StartedLane(lambda: {"ran": []} if done.is_set() else None)
+            if started.count(self.zeta) == 1:
+                self.set_zeta(status="merged", post_merge="owed")
+            else:
+                done.set()
+            return sd_lane.StartedLane(lambda: {"ran": []})
+        with mock.patch.object(sd_lane, "RESCAN_SECONDS", 0.0), \
+                mock.patch.object(sd_lane.time, "sleep", self.bounded_nap(polls, lambda: polls[0] < 20 or done.set())):
+            rows = sd_lane.run_parallel([("pack", self.repo), ("zeta", self.zeta)], start, sd_lane.clock() + 600,
+                                        lambda: None, functools.partial(sd_lane.new_work, self.environ),
+                                        locks=sd_lane.MachineLocks(self.environ), cap=3)
+        self.assertEqual(started, [self.repo, self.zeta, self.zeta], rows)
+
     def test_the_hosted_run_reads_the_machine_s_lane_parallel(self) -> None:
         """sd:9323: the runner's start rule reads sd.lane_parallel, not the constant."""
         folder = self.tmp / ".config" / "sd-ai-command-pack"

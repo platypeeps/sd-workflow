@@ -4270,13 +4270,34 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
     return {"lanes": lanes}
 
 
+def work_ids(entries: list[dict[str, Any]]) -> frozenset[str]:
+    """A lane's work: its runnable entries' ids, and `recover:<id>` for each entry only a run settles (sd:9332).
+
+    Recovery is a running entry whose holder on this machine died
+    (`reclaim_dead`), an owed `make post-merge` (`owes_post_merge`) and an
+    unfinished release chain. A bare `release: owed` counts only in a
+    repository whose entries show a chain: without a `release` policy it
+    stays owed for ever, and every lane would always have work.
+    """
+    host, chains = this_host(), any(isinstance(row.get("release"), dict) for row in entries)
+
+    def recovers(row: dict[str, Any]) -> bool:
+        holder, release = row.get("holder") or {}, row.get("release")
+        return ((row.get("status") == "running" and holder.get("host") == host and not runner_alive(holder.get("pid")))
+                or owes_post_merge(row) or (row.get("status") == "merged" and chains and release == RELEASE_OWED)
+                or (isinstance(release, dict) and release.get("step") not in sd_release.FINAL))
+    return frozenset([str(row["id"]) for row in entries if runnable(row)]
+                     + [f"recover:{row['id']}" for row in entries if recovers(row)])
+
+
 def new_work(environ: dict[str, str],
              seen: dict[pathlib.Path, frozenset[str]]) -> dict[pathlib.Path, frozenset[str]]:
-    """Each lane of `seen` with a runnable entry not in its set and its runner lock free: its runnable ids (sd:5809).
+    """Each lane of `seen` with work (`work_ids`) not in its set: its work ids (sd:5809, sd:9332).
 
-    One hub transaction reads every lane. A lane whose queue cannot be read,
-    or whose runner lock another runner holds, is left out: unknown is no
-    new work, and that runner drains the lane itself.
+    One hub transaction reads every lane. A lane whose queue cannot be read
+    is left out: unknown is no new work. No runner lock is probed: a probe's
+    flock made the other run's starting worker answer busy, and a lane
+    another runner holds answers busy itself, its ids kept as seen.
     """
     queues: dict[pathlib.Path, Queue] = {}
     for checkout in seen:
@@ -4287,24 +4308,13 @@ def new_work(environ: dict[str, str],
     if not queues:
         return {}
 
-    def runnable_by_lane(connection: Any) -> dict[pathlib.Path, frozenset[str]]:
-        return {checkout: frozenset(str(row["id"]) for row in stored(connection, queue.repository) if runnable(row))
-                for checkout, queue in queues.items()}
+    def work_by_lane(connection: Any) -> dict[pathlib.Path, frozenset[str]]:
+        return {checkout: work_ids(stored(connection, queue.repository)) for checkout, queue in queues.items()}
     try:
-        ids = on_hub(next(iter(queues.values())), runnable_by_lane, write=False)
+        ids = on_hub(next(iter(queues.values())), work_by_lane, write=False)
     except LaneError:
         return {}
-    found: dict[pathlib.Path, frozenset[str]] = {}
-    for checkout, runnable_ids in ids.items():
-        if not runnable_ids - seen[checkout]:
-            continue
-        try:
-            with runner_lock(queues[checkout]) as locked:
-                if locked:
-                    found[checkout] = runnable_ids
-        except OSError:
-            continue
-    return found
+    return {checkout: work for checkout, work in ids.items() if work - seen[checkout]}
 
 
 #: How a hosted run starts one lane: `(checkout, seconds left of the run's budget)` to a started lane (sd:5774).
@@ -4318,7 +4328,7 @@ START_POLL_SECONDS = 5.0
 CHILD_STOP_SECONDS = 30
 #: How often a hosted run reads its idle lanes' queues for new work while a lane runs (sd:5809); one hub read each.
 RESCAN_SECONDS = 30.0
-#: Lane to its runnable entry ids, to the lanes with new work among them (`new_work`).
+#: Lane to its work ids seen, to the lanes with new work among them, recovery included (`new_work`).
 Pending = Callable[[dict[pathlib.Path, frozenset[str]]], dict[pathlib.Path, frozenset[str]]]
 
 
@@ -4621,14 +4631,17 @@ class ParallelRun:
 
     def first_pass(self) -> None:
         for index, (_, checkout) in enumerate(self.order):
+            read = -math.inf
             while True:
                 self.collect_and_release()
                 took = self.claim_lane(index)
                 if took is not None:
                     break
-                if not self.running and not self.pending({checkout: frozenset()}).get(checkout):
-                    self.seen[index] = frozenset()  # idle, and nothing to wait for: a scan starts it on new work
-                    break
+                if not self.running and time.monotonic() - read >= RESCAN_SECONDS:  # one hub read a rescan
+                    read = time.monotonic()
+                    if not self.pending({checkout: frozenset()}).get(checkout):
+                        self.seen[index] = frozenset()  # idle, nothing to wait for: a scan starts it on new work
+                        break
                 time.sleep(START_POLL_SECONDS)
             if took:
                 self.begin_lane(index)
