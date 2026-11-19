@@ -1125,6 +1125,21 @@ class Supervise(Case):
         prompt = self.calls("claude")[-1]["argv"]
         self.assertNotIn(f"- sd:{self.items[2]}", prompt[prompt.index("-p") + 1])
 
+    def test_the_build_press_takes_a_held_bundles_items_fresh(self):
+        """Row 12: the held bundle's refusal says Build; the dashboard's Build dialog checks each item (`_item`) and
+        its press calls `queue`, not `queue_again`, so both take the blocked items and build them on a new branch."""
+        self.assert_split_first(self.left_out_of_a_retry())
+        held = self.bundle["branch"]
+        self.release_all()
+        for item in self.items[:2]:
+            build._item(self.db, item)
+        queued = build.queue(self.db, self.items[:2], who="dashboard")
+        self.assertEqual(sorted(row["item"] for row in queued), sorted(self.items[:2]))
+        again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                            root=self.root / "worktrees")
+        assert again is not None
+        self.assertNotEqual(again["branch"], held)
+
     def test_a_subset_retry_with_no_earlier_work_builds_on(self):
         """Row 5, the guard: a bundle cancelled before any build holds no earlier commit, so the kept items build."""
         supervisor = self.left_out_of_a_retry(run=False)

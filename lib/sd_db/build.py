@@ -439,7 +439,7 @@ def _item(connection, item: int, *, lead: int | None = None) -> dict:
     if row["kind"] not in RUNNABLE_KINDS:
         raise BuildRefused(f"item {item} is a {row['kind']} item; a build takes only "
                            f"{', '.join(RUNNABLE_KINDS[:-1])} and {RUNNABLE_KINDS[-1]} items")
-    if row["status"] != "ready":
+    if row["status"] != "ready" and not (row["status"] == "blocked" and split_held(connection, item)):
         raise BuildRefused(f"item {item} is {row['status']}; a build takes a ready item")
     refused = _repo_refusal(row, connection)
     if refused:
@@ -571,6 +571,8 @@ def queue(connection, items: list[int], *, who: str, expected_revisions: dict | 
                 raise BuildRefused(f"item {item} was parked after auto-pickup read it")
         created = []
         for item in items:
+            if reads.items_by_ids(connection, [item])[item]["status"] == "blocked":  # a split-held bundle's item
+                transition(connection, item, "ready", who=who, reason="its bundle's branch is held after a split")
             ident = create_assignment(connection, item=item, role="author", status="queued", lane="parallel",
                                       budget_minutes=BUDGET_MINUTES)
             connection.execute("UPDATE assignment SET scope = ?, queued_at = ?, started = NULL WHERE id = ?",
@@ -725,6 +727,15 @@ def split(connection, lead: int) -> str:
     return "clear" if any(run["base_head"] for run in runs) else "unread"
 
 
+def split_held(connection, item: int) -> bool:
+    """Whether `item`'s latest build bundle is held after a split (`split`): Build takes it fresh, blocked as it is,
+    on a new branch; Retry refuses that bundle (pack sd:9581)."""
+    row = connection.execute("SELECT id, parent, status FROM assignment WHERE item = ? AND scope = ? "
+                             "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
+    return (row is not None and row["status"] in AGAIN and not _alone(connection, row["id"])
+            and split(connection, row["parent"] or row["id"]) == "held")
+
+
 def queued_members(connection, lead: int) -> list[tuple[int, int]]:
     """`(assignment, item)` of each queued member of a build `lead`: what a cancel of the queued lead cancels and
     parks with it, and what its confirm names (sd:9222)."""
@@ -754,7 +765,7 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
         raise BuildRefused("select one or more distinct items")
     finding = finding.strip()
     with transaction(connection):
-        leads, fixes, fresh, held = [], [], [], []
+        leads, fixes, fresh = [], [], []
         named: dict[int, set[int]] = {}
         for item in items:
             row = connection.execute("SELECT id, parent, status FROM assignment WHERE item = ? AND scope = ? "
@@ -778,8 +789,7 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             # (`enqueued` marks a delivered member done): `retry` takes only members in the lead's status, so the
             # item's own assignment must be in it, or Retry would requeue the lead's items and not this one.
             # A skipped lead of a run still in the lane is no ended bundle: the run holds it no longer (sd:8960).
-            if state and state["run"] is not None and not alone and split(connection, lead) == "held":
-                held.append(item)  # its branch may hold a left item's work: a fresh press, new branch
+            if split_held(connection, item):  # its branch may hold a left item's work: a fresh press, new branch
                 fresh.append(item)
                 continue
             if (state and state["status"] in AGAIN and state["run"] is not None
@@ -802,10 +812,6 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                              finding or f"the lane entry failed; fix what it names: {run['detail']}"[:2000], who=who)
             queued += [{"id": member["id"], "item": member["item"], "status": "queued"}
                        for member in _members(connection, run["assignment"], "queued") if member["item"] in fixed]
-        for item in held:
-            if reads.items_by_ids(connection, [item])[item]["status"] == "blocked":
-                transition(connection, item, "ready", who=who, reason="its bundle's branch is held after a split")
-            unpark(connection, item)
         if fresh:
             from .workflow import change_status, item_state
             for item in fresh:
