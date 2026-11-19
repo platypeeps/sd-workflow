@@ -136,7 +136,8 @@ CONFLICT_REBUILDS = 2
 OPUS, SONNET = "opus", "sonnet"
 #: The fields a supervisor may write on its own open run.
 RUN_FIELDS = frozenset({"step", "heartbeat_at", "supervisor_pid", "supervisor_pgid", "supervisor_start", "session_id",
-                        "log_path", "builder_pgid", "builder_start", "review_round", "final", "detail", "model"})
+                        "log_path", "builder_pgid", "builder_start", "review_round", "final", "detail", "model",
+                        "base_head"})
 #: Every run column a reap decides on. Its compare-and-set, and the settle after it, match them all against the
 #: row the reap read, so a writer between the read and the write (a beat, a registration, `enqueued`, a cancel)
 #: makes the reap do nothing that tick.
@@ -689,12 +690,26 @@ def left(connection, branch: str, items) -> set[int]:
         (run["assignment"], SCOPE)) if row["item"] in wanted}
 
 
-def left_out(connection, lead: int) -> list[tuple[int, str]]:
-    """`(item, when)` of each member of build `lead` a subset Retry left out (`LEFT_OUT`), `when` its Retry: a
-    commit the branch made before then may hold that item's work (pack sd:9581)."""
-    return [(row["item"], row["ended"]) for row in connection.execute(
-        "SELECT item, ended FROM assignment WHERE parent = ? AND scope = ? AND result LIKE ? ORDER BY id",
-        (lead, SCOPE, f"{ALONE}%: {LEFT_OUT}%"))]
+def left_out(connection, lead: int) -> list[tuple[int, int]]:
+    """`(item, run)` of each member of build `lead` a subset Retry left out (`LEFT_OUT`), `run` the number of the
+    run that Retry retried: what the branch and worktree held when the next run started may hold that item's
+    work (pack sd:9581)."""
+    left = []
+    for row in connection.execute(
+            "SELECT item, result FROM assignment WHERE parent = ? AND scope = ? AND result LIKE ? ORDER BY id",
+            (lead, SCOPE, f"{ALONE}%: {LEFT_OUT}%")):
+        retried = connection.execute("SELECT run FROM runner_run WHERE id = ?",
+                                     (row["result"].rsplit(LEFT_OUT, 1)[1],)).fetchone()
+        left.append((row["item"], retried["run"] if retried else 0))
+    return left
+
+
+def runs_after(connection, lead: int, run: int) -> list[dict]:
+    """The runs of build `lead` numbered after `run`, oldest first, with the head each started from (`base_head`)
+    and the last step it entered."""
+    return [dict(row) for row in connection.execute(
+        "SELECT id, run, step, base_head FROM runner_run WHERE assignment = ? AND run > ? ORDER BY run",
+        (lead, run))]
 
 
 def queued_members(connection, lead: int) -> list[tuple[int, int]]:

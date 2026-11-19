@@ -53,7 +53,6 @@ import threading
 import time
 from collections.abc import Collection
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -1154,24 +1153,41 @@ class Supervisor:
         return self.split_first() or "building"
 
     def split_first(self) -> dict | None:
-        """The blocked end of a run whose branch holds a commit made before a subset Retry left a member out; None
-        when it holds none (pack sd:9581). No message, trailer, revert or merge says which change is whose, so
-        any such commit, reverted or not, may carry the left item's work, and the operator splits the branch.
-        Every run checks it, so a later Retry cannot ship the work either.
-        ponytail: commit times against the hub's clock; a satellite clock seconds off moves the edge."""
+        """The blocked end of a run whose branch or worktree still holds what it held when a subset Retry left a
+        member out; None when it holds none of it (pack sd:9581). No message, trailer, revert or merge says which
+        change is whose, so the operator splits the branch. No builder runs between that Retry and the next run's
+        start, so that run's start is the Retry's state: each run records its start head (`base_head`), and the
+        commits up to the first one after the Retry are read by id, never by a commit time a satellite clock wrote.
+        Until a run after the Retry got past this check, a worktree not clean blocks too: a cancelled builder's
+        uncommitted work is no commit. Every run checks, so a later Retry cannot ship the work either.
+        ponytail: a left item's change in `git stash`, shared across worktrees, goes unread; no builder stashes."""
         left = build.left_out(self.db, self.row["assignment"])
         if not left:
             return None
-        since = max(datetime.fromisoformat(when.replace("Z", "+00:00")).timestamp() for _, when in left)
-        times = _read([*self.tools.git, "-C", str(self.work), "log", "--format=%ct", f"{self.base()}..HEAD"],
-                      env=self.env).split()
-        earlier = sum(1 for stamp in times if int(stamp) <= since)
-        if not earlier:
+        head = self.head()
+        if self.fresh()["base_head"] is None and not build.write(self.db, self.ident, base_head=head):
+            raise Lost
+        runs = build.runs_after(self.db, self.row["assignment"], max(run for _, run in left))
+        first = next(run["base_head"] for run in runs if run["base_head"])
+        base = self.base()
+
+        def commits(tip: str) -> set[str]:
+            return set(_read([*self.tools.git, "-C", str(self.work), "rev-list", f"{base}..{tip}"],
+                             env=self.env).split())
+
+        held = commits(head) & commits(first)
+        passed = any(run["step"] not in ("claimed", "worktree") for run in runs if run["id"] != self.ident)
+        dirty = "" if passed else _read([*self.tools.git, "-C", str(self.work), "-c", "core.quotePath=false",
+                                         "status", "--porcelain", "--untracked-files=all"], env=self.env).strip()
+        if not held and not dirty:
             return None
         named = ", ".join(f"sd:{item}" for item, _ in left)
-        return self.finish("blocked", f"{named} left the bundle at a Retry, and {self.row['branch']} holds {earlier} "
-                                      f"commit(s) made before it, which may carry that work: rebuild the branch from "
-                                      f"{self.base()} with only the kept items' commits, or build them fresh")
+        what = [f"{len(held)} commit(s)"] if held else []
+        what += ["uncommitted changes"] if dirty else []
+        return self.finish("blocked", f"{named} left the bundle at a Retry, and {self.row['branch']} still holds "
+                                      f"{' and '.join(what)} from before it, which may carry that work: rebuild the "
+                                      f"branch from {base} with only the kept items' work (WORKFLOW.md, Parallel "
+                                      f"work), or build them fresh")
 
     def building(self) -> str | dict:
         self.enter("building", log_path=str(self.log))
