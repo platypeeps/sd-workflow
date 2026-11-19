@@ -14,7 +14,7 @@ import unittest
 from unittest import mock
 
 from sd_dashboard import setting_rows, settings_screen, usage_screen
-from sd_db.writes import record_state
+from sd_db.writes import record_state, set_setting
 from support import NOW, ScreenCase
 from test_service_status import status
 from test_v2_today_reader import ReaderCase
@@ -131,6 +131,13 @@ class TheStrip(ScreenCase):
         flag = self.strip()["rows"][0]["service"]
         self.assertEqual(flag, {"name": "openai", "status": "outage", "state": "warning", "why": "", "title": "API errors",
                                 "url": "https://status.example.test/incidents/9"})
+
+    def test_a_listed_provider_with_no_row_is_unknown_no_reading_yet(self):
+        # pack sd:9333: a typo or a missing job showed nothing at all.
+        set_setting(self.connection, "dashboard.usage_providers", "codex\nopnerouter\n")
+        reading(self.connection, "codex", **CODEX)
+        self.assertEqual([(row["id"], row["state"], row["why"], row["windows"]) for row in self.strip()["rows"]][1:],
+                         [("usage:opnerouter", "unknown", "no reading yet: the job has written no row for it", [])])
 
     def test_a_store_that_does_not_answer_is_its_reason_never_an_empty_strip(self):
         with mock.patch.object(usage_screen, "_newest", side_effect=sqlite3.OperationalError("database is locked")):

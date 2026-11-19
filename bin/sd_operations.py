@@ -367,9 +367,13 @@ def enqueue_refusals(worktree: Path, base: str, head: str, title: str, body: str
         guarded = False
     guard = system_checkout(environ) / "local-leak-guard" / "leak-guard.sh"
     if guarded and guard.is_file():
-        done = subprocess.run(["sh", str(guard), "check", "--range", f"refs/remotes/origin/{branch}..{head}"],
-                              cwd=worktree, capture_output=True, text=True, timeout=60, env=environ, check=False)
-        if done.returncode == 1:
+        try:
+            done = subprocess.run(["sh", str(guard), "check", "--range", f"refs/remotes/origin/{branch}..{head}"],
+                                  cwd=worktree, capture_output=True, text=True, timeout=60, env=environ,
+                                  check=False)
+        except (OSError, subprocess.TimeoutExpired):  # pack sd:9483: no answer adds nothing
+            done = None
+        if done is not None and done.returncode == 1:
             found.append("the pre-push leak guard refuses these commits; replace each private value with a "
                          "synthetic one (operator, example.test):\n" + done.stderr.strip()[-1500:])
     return found

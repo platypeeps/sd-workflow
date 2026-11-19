@@ -14,7 +14,7 @@ import unittest
 
 import test_v2_health as health_tests
 from sd_dashboard import health_screen, setting_rows, settings_screen, usage_screen
-from sd_db.writes import record_state
+from sd_db.writes import record_state, set_setting
 from support import NOW, ScreenCase
 from test_v2_health import PROTECTION, TREES, fleet_of, ports_snapshot, protection_of
 from test_v2_settings import MARKUP_JS, PAGE_JS
@@ -100,6 +100,17 @@ class TheRows(ScreenCase):
     def test_no_row_yet_is_one_unknown_row_not_a_clean_area(self):
         rows = self.area()["rows"]
         self.assertEqual([(row["id"], row["state"]) for row in rows], [("stat:none", "unknown")])
+
+    def test_a_listed_service_with_no_row_is_unknown_no_reading_yet(self):
+        # pack sd:9333: a typo or a missing job showed nothing at all.
+        set_setting(self.connection, "dashboard.status_services",
+                    "github statuspage https://status.example.test\nopnai statuspage https://other.example.test codex\n")
+        status(self.connection, "github", status="ok")
+        rows = {row["id"]: row for row in self.area()["rows"]}
+        self.assertEqual((rows["stat:opnai"]["state"], rows["stat:opnai"]["detail"], rows["stat:opnai"]["url"],
+                          rows["stat:opnai"]["facts"]["Providers"]),
+                         ("unknown", "no reading yet: the job has written no row for it", "https://other.example.test", "codex"))
+        self.assertEqual(rows["stat:github"]["state"], "ok")
 
     def test_only_removed_services_mean_none_watched_and_no_row(self):
         # Bundle review round 4: after the last service was removed, the

@@ -295,7 +295,12 @@ window.PAGE_VIEWS = [{ id: 'spend', label: 'Spend' }, { id: 'providers', label: 
     const read = sm.months.filter(m => m.rows), empty = sm.months.length - read.length;
     $('months-note').textContent = `Total ${money(read.reduce((n, m) => n + m.spent, 0))} over ${span()}${empty ? `; ${plural(empty, 'month')} with no ledger row` : ''}. ▨ marks a bill that spends a vendor window, not a zero.`;
   }
+  // sd:9318: until the first read answers, each chart section says it is reading in its own slot, not a head over
+  // empty space; draw() empties the slots, whatever the read gave.
+  const SLOTS = ['bills', 'windows', 'burns', 'trends', 'model'];
+  const slots = s => SLOTS.forEach(k => window.shell.state(s && { ...s, text: `Reading ${s.what}.`, source: '/api/metrics' }, `state-${k}`));
   function draw() {
+    slots(null);
     lamps(); spend(); months(); trends(); tables(); age();
     put($('model'), unreadBlock('model'));
     ci();
@@ -377,7 +382,7 @@ window.PAGE_VIEWS = [{ id: 'spend', label: 'Spend' }, { id: 'providers', label: 
 
   // ---------- Reader (read.js) ----------
   let reader = null;
-  const load = () => reader.load();
+  const load = () => { if (!DOC) slots({ kind: 'loading', what: 'the Metrics readings' }); return reader.load(); };
   // Read again (sd:5638): the shell's head button reads the Metrics readings again.
   window.PAGE_AGAIN = { title: 'Read the Metrics readings again', run: load };
   const spec = {
@@ -455,6 +460,8 @@ window.PAGE_VIEWS = [{ id: 'spend', label: 'Spend' }, { id: 'providers', label: 
       if (v === month) return;
       month = v; S.url(query()); load();
     });
+    // sd:9318: an empty month field draws the browser's blank mask; it names this month until the read names its own.
+    $('month').value = month || new Date().toISOString().slice(0, 7);
     ranges();
     document.addEventListener('shell:open', e => { if (EV[e.detail]) show(e.detail, true); });
     load();
