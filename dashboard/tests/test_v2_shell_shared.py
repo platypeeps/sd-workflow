@@ -2207,7 +2207,8 @@ const { html, put } = window.markup;
 const ICON = n => html`<svg class="i" aria-hidden="true"><use href="#i-${n}"/></svg>`;
 var OUT = { toasts: [], gets: [], error: null }, R = {}, WIN = [], ELS = {}, location = { hash: "" };
 const toast = m => OUT.toasts.push(m), flush = async () => { for (let i = 0; i < 50; i++) await null; };
-const getJSON = async path => { OUT.gets.push(path); return { error: '', rows: [], nosource: [] }; };
+var ANSWER = { error: '', rows: [], nosource: [] };
+const getJSON = async path => { OUT.gets.push(path); return typeof ANSWER === 'function' ? ANSWER() : ANSWER; };
 function addEventListener(t, f) { WIN.push([t, f]); }
 function El(id) { const e = { id, html: '', attrs: {}, dataset: {}, listeners: {}, setAttribute(k, v) { e.attrs[k] = v; }, removeAttribute(k) { delete e.attrs[k]; },
   addEventListener(t, f) { (e.listeners[t] = e.listeners[t] || []).push(f); }, append(f) { e.html += f.parsed; }, replaceChildren(f) { e.html = f ? f.parsed : ''; } }; return e; }
@@ -2274,6 +2275,16 @@ R.menu = ELS['usage-menu'].html;""")
         self.assertIn('<div class="fpick-menu ustrip" id="usage-menu" role="group" aria-label="Usage">', head)
         self.assertEqual((out["R"]["gets"], out["gets"]), (1, ["/api/usage/strip", "/api/usage/strip"]))
         self.assertIn("Providers in Settings", out["R"]["menu"])
+
+    def test_a_malformed_usage_answer_is_unknown_with_its_reason(self):
+        """Lead review of 8f483c6: a 200 without rows ({} from getJSON) left "Reading usage…" and no state."""
+        for answer in ("{}", "{ rows: null }", "{ rows: [{ state: 'ok' }], nosource: [] }"):
+            with self.subTest(answer=answer):
+                out = self.run_again(f"ANSWER = {answer};\nSHELL_AGAIN\nloaded(); await flush();"
+                                     " R.menu = ELS['usage-menu'].html; R.state = ELS['usage-sum'].dataset.state;")
+                self.assertIn("Not read: ", out["R"]["menu"])
+                self.assertNotIn("Reading usage", out["R"]["menu"])
+                self.assertEqual(out["R"]["state"], "unknown")
 
     def test_a_page_without_read_again_still_gets_the_usage_dropdown(self):
         """Settings has no Read again (AGAIN_ALLOWED in test_v2_registry); the dropdown is on every page all the same."""

@@ -1935,24 +1935,27 @@
   function usageBody(U) {
     const links = html`<a href="${U.providers || '/settings#f-dashboard.usage_providers'}">Providers in Settings</a> · <a href="/metrics">Spend in Metrics</a>`;
     if (U.error) return html`<p class="foot">Not read: ${U.error}. Opening it again tries again. ${links}</p>`;
-    const none = !U.rows.length && !U.nosource.length;
+    const nosource = U.nosource || [], none = !U.rows.length && !nosource.length;
     return html`${U.rows.length ? html`<ul class="urows">${U.rows.map(usageRow)}</ul>` : ''}
-      <p class="foot">${none ? 'No provider read yet. ' : ''}${U.nosource.length ? `No reader for ${U.nosource.join(', ')}. ` : ''}${U.flags_error ? `Service status not read: ${U.flags_error}. ` : ''}${links}</p>`;
+      <p class="foot">${none ? 'No provider read yet. ' : ''}${nosource.length ? `No reader for ${nosource.join(', ')}. ` : ''}${U.flags_error ? `Service status not read: ${U.flags_error}. ` : ''}${links}</p>`;
   }
   const usageWorst = U => U.error ? 'unknown' : (U.rows || []).flatMap(r => [r.state, r.service && r.service.state])
     .reduce((worst, s) => URANK.indexOf(s) > URANK.indexOf(worst) ? s : worst, U.flags_error ? 'unknown' : 'ok');
   const usageSum = state => html`${ICON('gauge')}<span>Usage</span>${state ? html`<span class="g-${state}" aria-hidden="true">${UGLYPH[state]}</span><span class="sr"> ${state}</span>` : ''}`;
   const usageDrop = html`<details class="usage-drop" id="usage-drop"><summary class="btn quiet sm" id="usage-sum">${usageSum('')}</summary><div class="fpick-menu ustrip" id="usage-menu" role="group" aria-label="Usage"><p class="foot">Reading usage…</p></div></details>`;
-  // Wires the drawn dropdown: of overlapping reads only the newest draws.
+  // Wires the drawn dropdown: of overlapping reads only the newest draws. A failed read, an answer without rows and a
+  // row that does not render all draw "Not read: why", unknown.
   function usageWire() {
     const d = document.getElementById('usage-drop'), menu = document.getElementById('usage-menu'), sum = document.getElementById('usage-sum');
     let n = 0;
     const read = () => {
       const k = ++n;
-      getJSON('/api/usage/strip').catch(e => ({ error: e && e.message || String(e), rows: [], nosource: [] })).then(U => {
+      getJSON('/api/usage/strip').then(U => {
+        if (!U || !Array.isArray(U.rows)) throw new Error('the answer held no provider rows');
+        return [usageBody(U), usageWorst(U)];
+      }).catch(e => [usageBody({ error: e && e.message || String(e) }), 'unknown']).then(([body, state]) => {
         if (k !== n) return;
-        const state = usageWorst(U);
-        put(menu, usageBody(U)); put(sum, usageSum(state)); sum.dataset.state = state;
+        put(menu, body); put(sum, usageSum(state)); sum.dataset.state = state;
       });
     };
     d.addEventListener('toggle', () => { if (d.open) read(); });
