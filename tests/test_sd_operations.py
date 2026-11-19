@@ -24,6 +24,8 @@ with patch.object(sys, "path", [str(ROOT / "bin"), *sys.path]):
     cli = importlib.import_module("sd_operations")
 #: The wrapper itself, before a test patches it: a tick's outage must pass through it (pack sd:9541).
 CONNECT = cli.sd_handoff_rows.connect
+#: What a first skipped tick adds to its reason (pack sd:9541): the streak's count and its first time.
+FIRST = " (skipped tick 1 in a row since 2026-11-19T00:00:00Z; tick 3 fails)"
 
 
 class OperationsCLI(unittest.TestCase):
@@ -48,9 +50,9 @@ class OperationsCLI(unittest.TestCase):
         self.connect = Mock(return_value=self.connection)
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
-        # pack sd:9541: a tick's unreachable count; no test reads or clears this machine's own.
-        self.stamp = Path(scratch.name) / "sd" / "dispatch-unreachable"
-        for patcher in (patch.object(cli, "unreachable_stamp", return_value=self.stamp, create=True),
+        # pack sd:9541: a tick's skip count; no test reads or clears this machine's own.
+        self.stamp = Path(scratch.name) / "sd" / "dispatch-skipped"
+        for patcher in (patch.object(cli, "skip_stamp", return_value=self.stamp, create=True),
                         patch.object(cli, "utc_now", return_value="2026-11-19T00:00:00Z", create=True),
                         patch.dict(sys.modules, {"sd_db.operations": self.service, "sd_db.services": self.launchd}),
                         patch.object(sd_db, "operations", self.service, create=True),
@@ -329,7 +331,7 @@ class OperationsCLI(unittest.TestCase):
         run.dispatch.side_effect = sqlite3.OperationalError("database is locked")
         code, output = self.tick(run)
         # pack sd:9541: the lock met the tick's work, so the skip says it began.
-        self.assertEqual((code, output), (0, "skipped (partial): database is locked\n"))
+        self.assertEqual((code, output), (0, f"skipped (partial): database is locked{FIRST}\n"))
         self.connection.close.assert_called_once()
 
     def test_a_build_mismatch_skips_the_tick_without_a_follow(self):
@@ -350,7 +352,7 @@ class OperationsCLI(unittest.TestCase):
             code, output = self.tick(run)
         follow.assert_not_called()
         run.dispatch.assert_not_called()
-        self.assertEqual((code, output), (0, "skipped: sd_db build mismatch; the follow job follows\n"))
+        self.assertEqual((code, output), (0, f"skipped: sd_db build mismatch; the follow job follows{FIRST}\n"))
 
     def outcome(self, run, error, where, *flags):
         """The tick's exit, as `bin/sd` gives it: a refusal is 1. `error` raises at the connect, through the real
@@ -374,8 +376,7 @@ class OperationsCLI(unittest.TestCase):
         from sd_db import remote
         unreachable = remote.HubUnreachable("hub.example.test", 8769, "timed out")
         behind = remote.BuildMismatch("package", "1.0", "1.1")  # this satellite is older: its follow job catches up
-        streak = f"{unreachable} (unreachable tick 1 in a row since 2026-11-19T00:00:00Z; tick 3 fails)"
-        return ((unreachable, streak), (behind, "sd_db build mismatch; the follow job follows"))
+        return ((unreachable, f"{unreachable}{FIRST}"), (behind, f"sd_db build mismatch; the follow job follows{FIRST}"))
 
     def test_a_hub_outage_skips_the_tick_with_exit_0(self):
         """pack sd:9541: a satellite tick exited 1 when the hub timed out, or between a hub refresh and the follow;
@@ -433,8 +434,9 @@ class OperationsCLI(unittest.TestCase):
             self.assertEqual(getattr(error, "upgrade", None), upgrade)
             for where, label in (("connect", "skipped"), ("tick", "skipped (partial)")):
                 with self.subTest(upgrade=upgrade, where=where):
+                    self.stamp.unlink(missing_ok=True)  # each case is a first skip
                     expected = ((1, str(error)) if upgrade == "hub"
-                                else (0, f"{label}: sd_db build mismatch; the follow job follows\n"))
+                                else (0, f"{label}: sd_db build mismatch; the follow job follows{FIRST}\n"))
                     self.assertEqual(self.outcome(self.builds(), error, where), expected)
 
     def unreachable(self, where="connect"):
@@ -445,11 +447,10 @@ class OperationsCLI(unittest.TestCase):
         """pack sd:9541 review: every unreachable tick exited 0, so a lasting outage or a wrong port never alerted.
         The first two in a row skip; the third, and each after it, exits 1 with the hub's own error."""
         error = "the sd hub at hub.example.test:8769 is unreachable: timed out"
-        self.assertEqual(self.unreachable(), (0, f"skipped: {error} (unreachable tick 1 in a row since "
-                                                 "2026-11-19T00:00:00Z; tick 3 fails)\n"))
+        self.assertEqual(self.unreachable(), (0, f"skipped: {error}{FIRST}\n"))
         code, output = self.unreachable()
         self.assertEqual(code, 0)
-        self.assertIn("unreachable tick 2 in a row since 2026-11-19T00:00:00Z", output)
+        self.assertIn("skipped tick 2 in a row since 2026-11-19T00:00:00Z", output)
         self.assertEqual(self.unreachable(), (1, error))
         self.assertEqual(self.unreachable(), (1, error))
         self.assertEqual(json.loads(self.stamp.read_text()), {"first": "2026-11-19T00:00:00Z", "count": 4})
@@ -461,23 +462,51 @@ class OperationsCLI(unittest.TestCase):
         self.assertEqual([self.unreachable("tick")[0], self.unreachable("tick")[0]], [0, 0])
         self.assertEqual(self.unreachable("tick"), (1, error))
 
-    def test_a_completed_tick_ends_the_unreachable_streak(self):
-        """pack sd:9541 review: only a tick that ran to its end with no outage removes the stamp; a tick that
-        connected and then met a lock leaves it, so the next outage counts on."""
+    def test_a_completed_tick_ends_the_skip_streak(self):
+        """pack sd:9541 review: only a tick that ran to its end removes the stamp; two skips of any kind, then a
+        whole tick, and the next skip starts at one."""
         self.unreachable()
         run = self.builds()
         self.connect.side_effect = None
         run.dispatch.side_effect = sqlite3.OperationalError("database is locked")
         self.assertEqual(self.tick(run)[0], 0)
-        self.assertEqual(json.loads(self.stamp.read_text())["count"], 1)
-        self.unreachable()
+        self.assertEqual(json.loads(self.stamp.read_text())["count"], 2)
         self.connect.side_effect = None
         code, _ = self.tick(self.builds())
         self.assertEqual(code, 0)
         self.assertFalse(self.stamp.exists())
         code, output = self.unreachable()
         self.assertEqual(code, 0)
-        self.assertIn("unreachable tick 1 in a row", output)
+        self.assertIn("skipped tick 1 in a row", output)
+
+    def test_three_ticks_past_the_deadline_in_a_row_exit_1(self):
+        """pack sd:9541 review: a hub that takes the connect and then hangs trips the tick's deadline before its own
+        answer timeout, and that skip counted nothing, so it never alerted. Every skip counts in one streak."""
+        codes = []
+        for _ in range(3):
+            run = self.builds()
+            run.dispatch.side_effect = lambda connection, **kwargs: time.sleep(5)
+            with patch.object(cli, "TICK_SECONDS", 0.2, create=True):
+                try:
+                    codes.append(self.tick(run))
+                except cli.WorkRefusal as refusal:
+                    codes.append((1, str(refusal)))
+        self.assertEqual([code for code, _ in codes], [0, 0, 1])
+        self.assertEqual(codes[2][1], "the tick ran past 0.2 s")
+
+    def test_three_mixed_skips_in_a_row_exit_1_with_the_last_remedy(self):
+        """pack sd:9541 review: an outage, a lock and a mismatch in a row are one streak; the third fails with the
+        mismatch's own text, which names `repo-sync.sh follow`, so a broken follow job alerts."""
+        from sd_db import remote
+        mismatch = remote.BuildMismatch("build", "80a4eacae0c346b5", "c3866a94f3d93ddf")
+        self.assertEqual(self.unreachable()[0], 0)
+        run = self.builds()
+        self.connect.side_effect = None
+        run.dispatch.side_effect = sqlite3.OperationalError("database is locked")
+        self.assertEqual(self.tick(run)[0], 0)
+        code, output = self.outcome(self.builds(), mismatch, "connect")
+        self.assertEqual((code, output), (1, str(mismatch)))
+        self.assertIn("repo-sync.sh follow", output)
 
     def test_a_corrupt_stamp_starts_a_streak_never_a_pass(self):
         """pack sd:9541 review: a stamp that does not parse is one failure, rewritten whole; it is never healthy."""
@@ -487,7 +516,7 @@ class OperationsCLI(unittest.TestCase):
                 self.stamp.write_text(garbage)
                 code, output = self.unreachable()
                 self.assertEqual(code, 0)
-                self.assertIn("unreachable tick 1 in a row", output)
+                self.assertIn("skipped tick 1 in a row", output)
                 self.assertEqual(json.loads(self.stamp.read_text())["count"], 1)
 
     def test_an_unwritten_stamp_exits_1(self):
@@ -510,7 +539,7 @@ class OperationsCLI(unittest.TestCase):
         with patch.object(cli, "TICK_SECONDS", 0.2, create=True), patch.object(cli.os, "replace", slow):
             code, output = self.unreachable("tick")
         self.assertEqual(code, 0)
-        self.assertIn("unreachable tick 1 in a row", output)
+        self.assertIn("skipped tick 1 in a row", output)
         self.assertEqual(json.loads(self.stamp.read_text())["count"], 1)
 
     def test_a_clock_jump_does_not_reset_the_streak(self):
@@ -546,7 +575,7 @@ class OperationsCLI(unittest.TestCase):
             code, output = self.tick(run)
         self.assertLess(time.monotonic() - started, 2)
         # pack sd:9541: the deadline met the tick's work, so the skip says it began.
-        self.assertEqual((code, output), (0, "skipped (partial): the tick ran past 0.2 s\n"))
+        self.assertEqual((code, output), (0, f"skipped (partial): the tick ran past 0.2 s{FIRST}\n"))
         self.connection.close.assert_called_once()
 
     def test_a_deadline_before_the_connect_is_a_plain_skip(self):
@@ -559,7 +588,7 @@ class OperationsCLI(unittest.TestCase):
                 patch.object(cli, "log_root", return_value=Path("/bulk")), \
                 patch.object(cli, "writable", return_value=True):
             code, output = self.call("assignments", "dispatch", "--json")
-        self.assertEqual((code, json.loads(output)), (0, {"skipped": "the tick ran past 0.2 s", "partial": False}))
+        self.assertEqual((code, json.loads(output)), (0, {"skipped": f"the tick ran past 0.2 s{FIRST}", "partial": False}))
         self.connect.assert_not_called()
 
     def test_a_hung_bulk_root_probe_claims_within_its_bound_and_skips_the_archive(self):

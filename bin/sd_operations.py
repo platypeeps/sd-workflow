@@ -444,30 +444,32 @@ def hub_outages() -> tuple[type[BaseException], ...]:
     return remote.HubUnreachable, remote.BuildMismatch
 
 
-#: Unreachable ticks in a row that skip; the next fails, so a lasting outage or a wrong port alerts (pack sd:9541).
-UNREACHABLE_SKIPS = 2
+#: Skipped ticks in a row that exit 0, of any kind; the next fails, so a lasting outage, a hub that hangs, a held
+#: lock or a broken follow job alerts (pack sd:9541).
+SKIPS = 2
 
 
-def unreachable_stamp() -> Path:
-    """`$XDG_STATE_HOME/sd/dispatch-unreachable`: the first failure's time and the count of unreachable ticks in a
-    row, beside the tick's other local state. A tick that runs to its end removes it."""
+def skip_stamp() -> Path:
+    """`$XDG_STATE_HOME/sd/dispatch-skipped`: the first skip's time and the count of skipped ticks in a row, beside
+    the tick's other local state. Only a tick that runs to its end removes it."""
     state = os.environ.get("XDG_STATE_HOME") or os.path.join(os.environ.get("HOME") or os.path.expanduser("~"),
                                                              ".local/state")
-    return Path(state) / "sd" / "dispatch-unreachable"
+    return Path(state) / "sd" / "dispatch-skipped"
 
 
 def utc_now() -> str:
-    """Now in UTC, as the stamp records a streak's first failure."""
+    """Now in UTC, as the stamp records a streak's first skip."""
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
-def unreachable_streak(error: BaseException) -> str:
-    """Count one more unreachable tick: its `skipped` reason while the streak is short, else `error` as a refusal.
+def counted(reason: str, failure: str) -> str:
+    """Count one more skipped tick: `reason` with the streak while it is short, else `failure`, the latest skip's
+    own text with its remedy, as a refusal.
 
     A stamp that does not read or parse starts a new streak at one; it never reads as healthy. A count that cannot
     be written is unknown, so the tick refuses. Only the count ends the skips: a clock jump moves no tick.
     """
-    stamp = unreachable_stamp()
+    stamp = skip_stamp()
     try:
         held = json.loads(stamp.read_text(encoding="utf-8"))
         count, first = held["count"], held["first"]
@@ -482,41 +484,40 @@ def unreachable_streak(error: BaseException) -> str:
         written.write_text(json.dumps({"first": first, "count": count}), encoding="utf-8")
         os.replace(written, stamp)
     except OSError as failed:
-        raise WorkRefusal(f"{error}; the unreachable count was not recorded in {stamp}: {failed}") from error
-    if count > UNREACHABLE_SKIPS:
-        raise WorkRefusal(str(error)) from error
-    return f"{error} (unreachable tick {count} in a row since {first}; tick {UNREACHABLE_SKIPS + 1} fails)"
+        raise WorkRefusal(f"{failure}; the skip count was not recorded in {stamp}: {failed}") from None
+    if count > SKIPS:
+        raise WorkRefusal(failure)
+    return f"{reason} (skipped tick {count} in a row since {first}; tick {SKIPS + 1} fails)"
 
 
-def reachable() -> None:
-    """The tick ran to its end with no outage: the unreachable streak ends. A stamp that stays only makes the next outage alert sooner."""
+def end_skips() -> None:
+    """The tick ran to its end: the skip streak ends. A stamp that stays only makes the next skip alert sooner."""
     try:
-        unreachable_stamp().unlink(missing_ok=True)
+        skip_stamp().unlink(missing_ok=True)
     except OSError:
         pass
 
 
-def outage(error: BaseException) -> str:
-    """The `skipped` reason for one of `hub_outages`.
+def outage(error: BaseException) -> tuple[str, str]:
+    """The `skipped` reason for one of `hub_outages`, and the text the streak's failing tick refuses with.
 
-    An unreachable hub skips `UNREACHABLE_SKIPS` ticks in a row (`unreachable_streak`). A mismatch skips, and the
-    follow job follows (pack sd:8685): every hub refresh differs only in its build digest, `upgrade` `both`. One
-    whose `upgrade` names the hub needs `repo-sync.sh refresh` there, which no follow job runs, so it refuses with
-    its own remedy (pack sd:9541).
+    A mismatch skips, and the follow job follows (pack sd:8685): every hub refresh differs only in its build digest,
+    `upgrade` `both`; its own text names the remedy. One whose `upgrade` names the hub needs `repo-sync.sh refresh`
+    there, which no follow job runs, so it refuses at once (pack sd:9541).
     """
     sd_handoff_rows.library()
     from sd_db import remote  # noqa: PLC0415 - after the helper
-    if isinstance(error, remote.HubUnreachable):
-        return unreachable_streak(error)
     if not isinstance(error, remote.BuildMismatch):
-        return str(error)
+        return str(error), str(error)
     if getattr(error, "upgrade", None) == "hub":
         raise WorkRefusal(str(error)) from error
-    return "sd_db build mismatch; the follow job follows"
+    return "sd_db build mismatch; the follow job follows", str(error)
 
 
-def say_skipped(args: argparse.Namespace, reason: str, partial: bool) -> None:
-    """A skipped tick's one line: JSON under `--json` (pack sd:9541), `skipped (partial)` once the tick had begun."""
+def say_skipped(args: argparse.Namespace, skip: tuple[str, str], partial: bool) -> None:
+    """A skipped tick's one line, once `counted`: JSON under `--json` (pack sd:9541), `skipped (partial)` once the
+    tick had begun."""
+    reason = counted(*skip)
     if args.json:
         print(json.dumps({"skipped": reason, "partial": partial}, ensure_ascii=False))
     else:
@@ -557,18 +558,17 @@ def dispatch_builds(args: argparse.Namespace) -> int:
     signal.setitimer(signal.ITIMER_REAL, TICK_SECONDS)
     unstarted: dict[str, str] = {}
     began: list[bool] = []  # the tick's flag: it connected, so work it began may have committed (pack sd:9541)
-    skipped: str | None = None
+    skipped: tuple[str, str] | None = None  # the reason, and the text the streak's third skip refuses with
     try:
         result = tick(sd_db, build, build_run, root, why, unstarted, archive=not skip, began=began)
     except Overdue:
-        skipped = f"the tick ran past {TICK_SECONDS:g} s"
+        skipped = (f"the tick ran past {TICK_SECONDS:g} s",) * 2
     except hub_outages() as error:
-        signal.setitimer(signal.ITIMER_REAL, 0)  # the deadline must not cut the count's write short (pack sd:9541)
         skipped = outage(error)
     except sqlite3.OperationalError as error:
         if "locked" not in str(error) and "busy" not in str(error):
             raise WorkRefusal(str(error)) from error
-        skipped = str(error)
+        skipped = (str(error),) * 2
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         # The copier dies with this process: it keeps the rest of the tick's budget, as before sd:8275 (sd:8339).
@@ -628,7 +628,7 @@ def tick(sd_db: Any, build: Any, build_run: Any, root: Path | None, why: str, un
         raise WorkRefusal(str(error)) from error
     finally:
         connection.close()
-    reachable()  # the whole tick ran: a connect alone is no pass, as a hub may drop each request after it
+    end_skips()  # the whole tick ran: a connect alone is no pass, as a hub may drop each request after it
     return result
 
 
