@@ -1,4 +1,4 @@
-"""`/api/usage`, Today's Usage strip (pack sd:9257) and Health's Service status rows (pack sd:9260).
+"""`/api/usage`, the Usage dropdown's strip (pack sd:9257, sd:9569) and Health's Service status rows (pack sd:9260).
 
 `document` is `/api/usage`: the month as `sd usage --json` prints it, as the same bytes. Requirement 6 says the four
 numbers, the item screen and `sd usage` cannot disagree, so it serves `usage.json_text` of `usage.read`, the read `sd
@@ -189,10 +189,12 @@ def services(connection: sqlite3.Connection, *, now: str) -> list[dict]:
             why = "the reading has no read time"
         else:
             why = _stale(_age(_when(read_at), clock), STATUS_STALE_MINUTES)
+        # An unknown reading shows none of its incidents or components: a stale row's last outage may have ended
+        # (pack sd:9498).
         incidents = [one for one in body.get("incidents") or [] if isinstance(one, dict)] if isinstance(
-            body.get("incidents"), list) else []
+            body.get("incidents"), list) and not why else []
         components = [one for one in body.get("components") or [] if isinstance(one, dict)] if isinstance(
-            body.get("components"), list) else []
+            body.get("components"), list) and not why else []
         providers = [p for p in body.get("providers") or [] if isinstance(p, str) and NAME.fullmatch(p)] if isinstance(
             body.get("providers"), list) else []
         out.append({"name": name, "status": "unknown" if why else status, "why": why, "read_at": read_at,
@@ -282,7 +284,7 @@ def _usage_row(ident: str, label: str, *, status: str, why: str, read_at, window
 
 
 def strip(connection: sqlite3.Connection, *, now: str) -> dict:
-    """Today's Usage strip (pack sd:9257): one row per provider, and per cswap account for claude (`claude#N`).
+    """The Usage dropdown's strip (pack sd:9569): one row per provider, and per cswap account for claude (`claude#N`).
 
     A row shows the windows its reading has (claude has its seven days only: cswap has no five hours), each with its
     use, reset and pace, or its balance or spend; its read time; and the flag of the services that name its provider

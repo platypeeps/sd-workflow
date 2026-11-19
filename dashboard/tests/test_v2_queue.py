@@ -2039,7 +2039,27 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                          (v2.HERE / "today.html").read_text(encoding="utf-8"), re.S).group(1)
         keys = re.search(r'<span class="keys"[^>]*>(.*?)</span></th>', head, re.S)
         self.assertIsNotNone(keys, "the Detail head shows no box labels")
-        self.assertEqual(re.findall(r"<span>(\w+)</span>", keys.group(1)), boxes)
+        self.assertEqual(re.findall(r'<abbr title="(\w+)">', keys.group(1)), boxes)
+
+    def test_the_box_labels_are_as_narrow_as_the_boxes_and_sit_over_them(self):
+        """pack sd:9569: the labels ran wider than the seven boxes under them, sat over no box and squeezed What."""
+        head = (v2.HERE / "today.html").read_text(encoding="utf-8")
+        keys = re.search(r'<span class="keys"[^>]*>(.*?)</span></th>', head, re.S).group(1)
+        shown = re.findall(r'<abbr title="\w+">([^<]*)</abbr>', keys)
+        self.assertEqual(len(shown), 7, keys)
+        self.assertTrue(all(len(label) <= 3 for label in shown), shown)
+        self.assertNotRegex(keys, r">\s+<", "a space between two labels moves every later label off its box")
+        css = (v2.HERE / "static" / "today.css").read_text(encoding="utf-8")
+
+        def rule(selector):
+            found = re.search(r"^" + re.escape(selector) + r" \{([^}]*)\}", css, re.M)
+            self.assertIsNotNone(found, f"today.css has no {selector} rule")
+            return dict(re.findall(r"([\w-]+):\s*([^;]+);", found.group(1)))
+
+        label, box = rule(".queue .keys > abbr"), rule(".queue .pip")
+        self.assertEqual((label.get("width"), box.get("width")), ("var(--q-tile)", "var(--q-tile)"))
+        self.assertEqual(label.get("margin-right"), box.get("margin-right"))
+        self.assertNotIn("min-width", box, "a box that grows with its count leaves its label behind")
 
     def parked_answers(self, repo):
         from sd_dashboard import tasks_screen
