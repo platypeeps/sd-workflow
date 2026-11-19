@@ -989,11 +989,16 @@ class LineBudgetTests(unittest.TestCase):
         # reviewed head holds outside the diff is located, and a voided
         # finding's path and summary prefix in the note. Measured:
         # `sd-review` is 2866 here.
+        #
+        # 4836 -> 4846 is the sd:9536 lead review: `bin/sd-review` +10 so a
+        # path git cannot take is not held rather than raising, and
+        # `for_note` escapes, bounds and caps the model text in the note.
+        # Measured: `sd-review` is 2876 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4836,
+            4846,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

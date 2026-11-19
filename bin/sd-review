@@ -2501,12 +2501,21 @@ def head_holds(root: pathlib.Path, ref: str) -> Callable[[str], bool]:
 
     A docs change drew findings on the files it contradicts, and both lane
     passes were voided. Spellings are those `reviewed_paths` accepts; a
-    directory, a path outside the repository or a failed git read is not held."""
+    directory, a path outside the repository or a failed git read is not held,
+    nor one git cannot take (a NUL, a lone surrogate, over 1024 characters)."""
     prefixes = (f"{pathlib.Path(root).as_posix()}/", f"{pathlib.Path(root).resolve().as_posix()}/", "./")
     def file_at_head(path: str) -> bool:
         name = next((path[len(prefix):] for prefix in prefixes if path.startswith(prefix)), path)
-        return bool(name) and not name.startswith(("/", "../")) and sd_lib.git_output(["cat-file", "-t", f"{ref}:{name}"], root) == "blob"
+        if not name or len(name) > 1024 or "\0" in name or name.startswith(("/", "../")) or not name.isprintable():
+            return False
+        return sd_lib.git_output(["cat-file", "-t", f"{ref}:{name}"], root) == "blob"
     return file_at_head
+
+
+def for_note(text: Any, limit: int = 120) -> str:
+    """Model text bound for a note: one line, escaped where not printable, `limit` characters."""
+    line = " ".join(str(text or "").split())
+    return "".join(ch if ch.isprintable() else ch.encode("unicode_escape").decode() for ch in line)[:limit]
 
 
 def unlocated(outcome: Outcome, cited: frozenset[str], floor: str, held: Callable[[str], bool] = lambda path: False) -> Outcome:
@@ -2519,7 +2528,7 @@ def unlocated(outcome: Outcome, cited: frozenset[str], floor: str, held: Callabl
     counted toward depth, its findings dropped. A completed answer with one
     located finding is kept whole. A failed answer keeps its located findings
     and every blocker, located or not; its unlocated advice is dropped. The
-    note names each dropped path and its summary's first 120 characters.
+    note names the first five dropped paths and summaries, each `for_note`.
     """
     completed = outcome.status in (CLEAN, FINDINGS)
     located = [row["path"].strip() in cited or held(row["path"].strip()) for row in outcome.findings]
@@ -2527,11 +2536,12 @@ def unlocated(outcome: Outcome, cited: frozenset[str], floor: str, held: Callabl
         return outcome
     keep = [not completed and (here or dispose([row], floor)[0]["disposition"] == "blocking")
             for row, here in zip(outcome.findings, located, strict=True)]
-    dropped = [{"path": row["path"], "summary": " ".join(str(row.get("summary") or "").split())[:120]}
+    dropped = [{"path": for_note(row["path"]), "summary": for_note(row.get("summary"))}
                for row, kept in zip(outcome.findings, keep, strict=True) if not kept]
     if not dropped:
         return outcome
-    named = "; ".join(f"{row['path']!r}: {row['summary']}" for row in dropped)
+    named = "; ".join([f"'{row['path']}': {row['summary']}" for row in dropped[:5]]
+                      + ([f"+{len(dropped) - 5} more"] if len(dropped) > 5 else []))
     note = f"{outcome.backend} cited no reviewed path in {len(dropped)} finding(s); they are not a review of this subject: {named}"
     return outcome._replace(status=UNAVAILABLE if completed else outcome.status,
                             findings=tuple(row for row, kept in zip(outcome.findings, keep, strict=True) if kept),

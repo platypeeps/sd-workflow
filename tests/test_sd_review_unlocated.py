@@ -177,3 +177,32 @@ class AFileTheRepositoryHoldsIsLocated(ReviewRunFixture):
         self.assertEqual(outcome["diagnostic"]["unlocated"],
                          [{"path": "/", "summary": " ".join(long.split())[:120]},
                           {"path": "missing.md", "summary": "line one line two"}])
+
+    def test_a_path_git_cannot_take_is_not_located_and_never_raises(self) -> None:
+        """Lead review of 4032cdd34: a NUL or a lone surrogate raised in the
+        git check before any fallback ran; an overlong path is refused too."""
+        held = sd_review.head_holds(self.make_repo(), "HEAD")
+        for path in ("README.md\x00", "README\ud800.md", "a/" * 600 + "README.md"):
+            with self.subTest(path=path[:20]):
+                self.assertFalse(held(path))
+        result = self.review(answer(row("README.md\x00"), row("\ud800")))
+        self.assertEqual((result["outcomes"][0]["status"], result["reviewed_by"]), ("unavailable", ["second"]))
+
+    def test_the_note_escapes_control_characters_and_lone_surrogates(self) -> None:
+        result = self.review(answer(row("/", summary="red \x1b[31mtext\x07 and \ud800 end"), row("\x1b]0;x\ud800")))
+        detail, shown = result["outcomes"][0]["detail"], result["outcomes"][0]["diagnostic"]["unlocated"]
+        self.assertIn("red \\x1b[31mtext\\x07 and \\ud800 end", detail)
+        self.assertIn("'\\x1b]0;x\\ud800'", detail)
+        self.assertEqual([row["path"] for row in shown], ["/", "\\x1b]0;x\\ud800"])
+        for text in (detail, json.dumps(shown, ensure_ascii=False)):
+            self.assertFalse(any(not ch.isprintable() for ch in text), text)
+
+    def test_the_note_bounds_each_path_and_the_list(self) -> None:
+        long = "p" * 300
+        result = self.review(answer(*(row(f"{n}{long}", summary=f"finding {n}") for n in range(7))))
+        detail = result["outcomes"][0]["detail"]
+        self.assertIn(f"'0{'p' * 119}': finding 0", detail)
+        self.assertNotIn("p" * 120, detail)
+        self.assertIn("finding 4; +2 more", detail)
+        self.assertNotIn("finding 5", detail)
+        self.assertEqual(result["outcomes"][0]["diagnostic"]["unlocated_findings"], 7)
