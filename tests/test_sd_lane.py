@@ -26,7 +26,7 @@ import tempfile
 import threading
 import time
 import unittest
-from typing import Any
+from typing import Any, Callable
 from unittest import mock
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -5710,14 +5710,6 @@ class HostedOrder(Lane):
         self.assertIn("build mismatch", answer["skipped"])
 
 
-def read_locks(environ: dict[str, str], *checkouts: pathlib.Path) -> sd_lane.MachineLocks:
-    """A run's `MachineLocks` with each checkout's queue read, as its first start lock reads them."""
-    locks = sd_lane.MachineLocks(environ)
-    with locks.start_lock(checkouts):
-        pass
-    return locks
-
-
 def thread_lane(run: Any) -> sd_lane.StartedLane:
     """A lane run on a thread, so a suite's stub ships reach it; `run_hosted` runs a `child_lane` from the CLI."""
     row: list[dict] = []
@@ -5984,7 +5976,7 @@ class HostedParallel(Lane):
         """sd:9332. A run held pack's lane past its budget, and launchd started no tick: a second lane-run job
         now runs beside it. Run B starts zeta under sd.lane_parallel 2, starts nothing under 1, and never a
         second worker for pack: the two runs share one cap."""
-        lock = sd_lane.queue_for(self.repo, self.environ).lock_file
+        lock = sd_lane.MachineLocks(self.environ).claim_file(self.repo)  # run A's claim on pack
         lock.parent.mkdir(parents=True, exist_ok=True)
         holds = ("import fcntl, sys, time; handle = open(sys.argv[1], 'a'); fcntl.flock(handle, fcntl.LOCK_EX); "
                  "print('held', flush=True); time.sleep(600)")
@@ -6064,12 +6056,11 @@ class HostedParallel(Lane):
         self.assertEqual(self.statuses(), ["merged", "pending"], (rows, answer))
 
     def hold_outside(self, checkout: pathlib.Path) -> None:
-        """Another run's worker holds `checkout`'s runner lock until the test ends."""
-        lock = sd_lane.queue_for(checkout, self.environ).lock_file
-        lock.parent.mkdir(parents=True, exist_ok=True)
-        handle = open(lock, "a", encoding="utf-8")  # noqa: SIM115 -- closed by the cleanup
-        self.addCleanup(handle.close)
-        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        """The other lane-run job claimed `checkout` until the test ends."""
+        other = sd_lane.MachineLocks(self.environ)
+        with other.start_lock():
+            self.assertTrue(other.take_lane(checkout))
+        self.addCleanup(other.release_lane, checkout)
 
     def test_past_the_budget_a_run_starts_no_lane_over_the_shared_cap(self) -> None:
         """sd:9332 lead review: past its budget a run started a zero-budget worker beside the other run's lane,
@@ -6089,7 +6080,7 @@ class HostedParallel(Lane):
     def test_a_held_gate_admission_lock_stops_no_run_under_the_start_lock(self) -> None:
         """sd:9332 lead review: the room read took the gate's admission lock blocking, under the host's start
         lock, so a stalled gate stopped both lane-run jobs. It reads the gate without waiting; a lock it
-        cannot take is no room, and the run starts nothing and ends."""
+        cannot take is no room, so the run starts nothing inside its budget, then zeta with no budget."""
         import sd_gate_slots
         self.hold_outside(self.repo)
         where = sd_gate_slots.directory(self.environ)
@@ -6097,11 +6088,11 @@ class HostedParallel(Lane):
         admission = open(where / sd_gate_slots.QUEUE_LOCK, "a", encoding="utf-8")  # noqa: SIM115 -- cleanup
         fcntl.flock(admission, fcntl.LOCK_EX)
         self.addCleanup(admission.close)
-        started: list[pathlib.Path] = []
+        started: list[tuple[pathlib.Path, float]] = []
         now = [sd_lane.clock()]
 
         def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
-            started.append(checkout)
+            started.append((checkout, budget))
             return sd_lane.StartedLane(lambda: {"ran": []}, lambda: None)
         rows: list = []
 
@@ -6121,21 +6112,7 @@ class HostedParallel(Lane):
             admission.close()  # a run stuck on it ends now
             worker.join(30)
         self.assertFalse(alive, "the run waited on the gate's admission lock")
-        self.assertEqual(started, [], rows)
-
-    def test_a_lane_child_drops_the_handed_lock_from_its_environment(self) -> None:
-        """sd:9332 lead review: `lane run` copied the environment with the handed lock's fd in it, so a
-        post-merge command read a lock fd that is not its own."""
-        seen: list[dict] = []
-        import argparse
-        parser = argparse.ArgumentParser()
-        sd_lane.add_lane_verbs(parser.add_subparsers(dest="command"))
-        with contextlib.chdir(self.repo), mock.patch.dict(os.environ, {**self.environ, sd_lane.HANDED_ENV: "99:x"}), \
-                mock.patch.object(sd_lane, "run_lane", lambda root, environ, **_: seen.append(dict(environ)) or {}), \
-                contextlib.redirect_stdout(io.StringIO()):
-            self.assertEqual(sd_lane.lane_main(parser.parse_args(["lane", "run"])), 0)
-        self.assertEqual(len(seen), 1)
-        self.assertFalse(sd_lane.HANDED_ENV in seen[0], "post-merge would read the handed lock's fd")
+        self.assertEqual(started, [(self.zeta, 0.0)], rows)
 
     def test_no_queue_lookup_runs_under_the_start_lock(self) -> None:
         """sd:9332 lead review: a lane's queue lookup runs git; under the host-wide start lock it held both
@@ -6159,34 +6136,238 @@ class HostedParallel(Lane):
                                  lambda: None, locks=sd_lane.MachineLocks(self.environ), cap=2)
         self.assertEqual(under, [], "a queue lookup ran under the start lock")
 
-    def test_a_lane_whose_queue_cannot_be_read_counts_as_held_and_is_read_again(self) -> None:
-        """sd:9332 lead review, hold on doubt: a failed queue lookup was kept for the run and read as a free
-        lane, so it started a worker and did not count toward the cap. It now counts as held this pass, and
-        the next pass reads it again."""
-        real, failures = sd_lane.queue_for, [1, 1]  # zeta's read fails at both claims of the first run
+    def bounded_nap(self, polls: list[int], then: Callable[[], None] = lambda: None) -> Callable[[float], None]:
+        """A `time.sleep` that counts the run's polls and fails a run that polls on past 50: a wait without end."""
+        def nap(seconds: float) -> None:
+            polls[0] += 1
+            then()
+            if polls[0] > 50:
+                raise AssertionError("the run kept polling: a wait without end")
+        return nap
+
+    def test_a_lane_whose_queue_cannot_be_read_takes_no_cap_slot_and_says_why(self) -> None:
+        """sd:9332 advisory 911a76c89 :4475: a lane whose queue lookup fails every pass was counted as held, so
+        it took a cap slot for the whole run and its row hid the error. The start rule reads no queue now: the
+        lane's worker starts, refuses with its own reason, and the next lane runs under a cap of 1."""
+        real = sd_lane.queue_for
 
         def queue_for(root: pathlib.Path, environ: dict[str, str]) -> Any:
-            if root == self.zeta and failures:
-                failures.pop()
-                raise sd_lane.LaneError("git gave no answer")
+            if root == self.zeta:
+                raise sd_lane.LaneError("the origin names no GitHub repository")
             return real(root, environ)
         started: list[pathlib.Path] = []
 
         def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
             started.append(checkout)
-            return sd_lane.StartedLane(lambda: {"ran": []}, lambda: None)
-
-        def pending(seen: dict[pathlib.Path, frozenset[str]]) -> dict[pathlib.Path, frozenset[str]]:
-            return {checkout: frozenset({"2"}) for checkout in seen if checkout == self.zeta and "2" not in seen[checkout]}
+            return sd_lane.inline_lane(lambda: sd_lane.run_lane(checkout, self.environ, self.ship,
+                                                                deadline=sd_lane.clock() + budget))
         with mock.patch.object(sd_lane, "queue_for", queue_for):
             rows = sd_lane.run_parallel([("zeta", self.zeta), ("pack", self.repo)], start, sd_lane.clock() - 1,
+                                        lambda: None, locks=sd_lane.MachineLocks(self.environ), cap=1)
+        self.assertEqual(started, [self.zeta, self.repo], rows)
+        self.assertIn("no GitHub repository", rows[0].get("error", ""), rows)
+
+    def test_a_lane_in_post_merge_still_counts_toward_the_shared_cap(self) -> None:
+        """sd:9332 advisory 911a76c89 :4550: a worker frees its runner lock before post-merge (sd:3566), so the
+        other run read the lane free while post-merge ran and started over a cap of 1. A run holds its lane's
+        claim until the worker ends, post-merge included."""
+        started_b: list[pathlib.Path] = []
+        rows_b: list = []
+
+        def start_b(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            started_b.append(checkout)
+            return sd_lane.StartedLane(lambda: {"ran": []})
+
+        def post_merge(root: pathlib.Path, queue: Any, environ: dict[str, str], answer: dict) -> dict:
+            rows_b.extend(sd_lane.run_parallel([("pack", self.repo), ("zeta", self.zeta)], start_b,
+                                               sd_lane.clock() - 1, lambda: None,
+                                               locks=sd_lane.MachineLocks(self.environ), cap=1))
+            return answer
+
+        def start_a(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            return sd_lane.inline_lane(lambda: sd_lane.run_lane(checkout, self.environ, self.ship,
+                                                                deadline=sd_lane.clock() + budget))
+        with mock.patch.object(sd_lane, "post_merge", post_merge):
+            sd_lane.run_parallel([("pack", self.repo)], start_a, sd_lane.clock() + 600, lambda: None,
+                                 locks=sd_lane.MachineLocks(self.environ), cap=1)
+        self.assertEqual(rows_b and started_b, [], f"run B started beside run A's post-merge: {rows_b}")
+
+    def test_past_the_budget_a_lane_starts_beside_the_run_s_own_lane_without_gate_room(self) -> None:
+        """sd:9332 advisories b6202f00b :4314 and 911a76c89 :4409: past the budget a run waited for gate room
+        while its own long lane ran, so an owed release or post-merge waited for that lane's end. Past the
+        budget only the cap counts, as on main before sd:9332; the room is not read there at all."""
+        events: list[str] = []
+        polls = [0]
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            name = "pack" if checkout == self.repo else "zeta"
+            events.append(f"start {name}")
+            if name == "zeta":
+                return sd_lane.StartedLane(lambda: {"ran": []})
+
+            def answer() -> dict | None:
+                if "start zeta" in events or polls[0] >= 3:
+                    events.append("end pack")
+                    return {"ran": []}
+                return None
+            return sd_lane.StartedLane(answer)
+        with mock.patch.object(sd_lane.time, "sleep", self.bounded_nap(polls)):
+            rows = sd_lane.run_parallel([("pack", self.repo), ("zeta", self.zeta)], start, sd_lane.clock() - 1,
+                                        lambda: "the gate's slots are full",
+                                        locks=sd_lane.MachineLocks(self.environ), cap=2)
+        self.assertEqual(events[:2], ["start pack", "start zeta"], rows)
+
+    def test_a_lane_whose_lock_cannot_be_taken_after_a_free_probe_gets_a_busy_row(self) -> None:
+        """sd:9332 review 911a76c89 :4565: the probe read the lane free, then taking its lock failed; the claim
+        answered 'wait' with no deadline check, so the run polled forever. A failed take is a busy row."""
+        polls: list[int] = [0]
+        started: list[pathlib.Path] = []
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            started.append(checkout)
+            return sd_lane.StartedLane(lambda: {"ran": []})
+        with mock.patch.object(sd_lane.MachineLocks, "take_lane", lambda locks, checkout: False), \
+                mock.patch.object(sd_lane.time, "sleep", self.bounded_nap(polls)):
+            rows = sd_lane.run_parallel([("pack", self.repo)], start, sd_lane.clock() + 600, lambda: None,
+                                        locks=sd_lane.MachineLocks(self.environ), cap=1)
+        self.assertEqual(started, [], rows)
+        self.assertIn("busy", rows[0], rows)
+
+    def test_an_entry_enqueued_while_a_lane_waits_for_room_starts_no_second_worker(self) -> None:
+        """sd:9332 advisory b6202f00b :4589: the first pass read a lane's ids before it waited for room, so an
+        entry enqueued in the wait, which its worker saw and left pending, started a second worker at the
+        rescan. The ids are read once the lane is claimed, just before its worker starts."""
+        ids = {self.repo: frozenset(), self.zeta: frozenset({"6"})}
+        polls = [0]
+        starts: list[pathlib.Path] = []
+
+        def arrives() -> None:
+            ids[self.zeta] = frozenset({"6", "7"})  # enqueued while zeta waits for pack
+
+        def pending(seen: dict[pathlib.Path, frozenset[str]]) -> dict[pathlib.Path, frozenset[str]]:
+            return {checkout: ids[checkout] for checkout in seen if ids[checkout] - seen[checkout]}
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            starts.append(checkout)
+            if checkout == self.repo:
+                return sd_lane.StartedLane(lambda: {"ran": []} if polls[0] >= 2 else None)
+            return sd_lane.StartedLane(lambda: {"ran": []})  # it saw 6 and 7, and left them pending
+        with mock.patch.object(sd_lane.time, "sleep", self.bounded_nap(polls, arrives)):
+            rows = sd_lane.run_parallel([("pack", self.repo), ("zeta", self.zeta)], start, sd_lane.clock() + 600,
                                         lambda: None, pending, locks=sd_lane.MachineLocks(self.environ), cap=1)
-            self.assertEqual(started, [], f"a lane of unknown queue started, or the cap let a second one: {rows}")
-            self.assertIn("cannot be read", rows[0].get("busy", ""), rows)
-            failures.append(1)  # one run, inside its budget: the next pass reads zeta again and starts it
-            rows = sd_lane.run_parallel([("zeta", self.zeta), ("pack", self.repo)], start, sd_lane.clock() + 60,
-                                        lambda: None, pending, locks=sd_lane.MachineLocks(self.environ), cap=1)
-        self.assertEqual(started, [self.repo, self.zeta], rows)
+        self.assertEqual(starts, [self.repo, self.zeta], rows)
+
+    def test_an_idle_run_waits_inside_its_budget_for_room_for_a_lane_with_new_work(self) -> None:
+        """sd:9332 advisory b6202f00b :4605: an idle run's rescan found new work while the other run's lane
+        filled the gate; the claim said 'wait', and the run ended without a row. It now waits, inside its
+        budget, as the first pass does, and starts the lane once there is room."""
+        self.hold_outside(self.repo)
+        calls = [0]
+
+        def room() -> str | None:
+            calls[0] += 1
+            return "the gate's slots are full" if calls[0] in (2, 3) else None
+        ids = {self.repo: frozenset(), self.zeta: frozenset({"2"})}
+        polls = [0]
+        starts: list[pathlib.Path] = []
+
+        def pending(seen: dict[pathlib.Path, frozenset[str]]) -> dict[pathlib.Path, frozenset[str]]:
+            return {checkout: ids[checkout] for checkout in seen if ids[checkout] - seen[checkout]}
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            starts.append(checkout)
+            ids[self.zeta] = frozenset({"2", "8"})  # 8 arrives once the first worker started
+            return sd_lane.StartedLane(lambda: {"ran": []})
+        with mock.patch.object(sd_lane.time, "sleep", self.bounded_nap(polls)):
+            rows = sd_lane.run_parallel([("pack", self.repo), ("zeta", self.zeta)], start, sd_lane.clock() + 600,
+                                        room, pending, locks=sd_lane.MachineLocks(self.environ), cap=2)
+        self.assertEqual(starts, [self.zeta, self.zeta], rows)
+
+    def test_a_run_waiting_for_the_cap_takes_no_lane_s_runner_lock(self) -> None:
+        """sd:9332 advisories 48d7c28c4 :4398 and b6202f00b :4472: the cap probe took each free lane's runner
+        lock every poll, so a worker starting then, `other_lanes_idle` or a manual `lane run` read that lane
+        busy. The cap reads only the runs' own claims, never a runner lock."""
+        real, probed = sd_lane.runner_lock, []
+
+        def runner_lock(queue: Any, *args: Any) -> Any:
+            probed.append(queue.lock_file)
+            return real(queue, *args)
+        polls = [0]
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            return sd_lane.StartedLane(lambda: {"ran": []} if polls[0] >= 3 else None)
+        with mock.patch.object(sd_lane, "runner_lock", runner_lock), \
+                mock.patch.object(sd_lane.time, "sleep", self.bounded_nap(polls)):
+            rows = sd_lane.run_parallel([("pack", self.repo), ("zeta", self.zeta)], start, sd_lane.clock() + 600,
+                                        lambda: None, locks=sd_lane.MachineLocks(self.environ), cap=1)
+        self.assertEqual(probed, [], rows)
+
+    def test_a_worker_that_found_its_lane_busy_starts_again_once_new_work_is_read(self) -> None:
+        """sd:9332 advisory 48d7c28c4 :4398: a worker that met its runner lock held for an instant answered
+        busy, but its ids stayed seen, so its entries sat for the rest of the run. A busy answer forgets
+        them, and the rescan starts the lane again."""
+        starts: list[pathlib.Path] = []
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            starts.append(checkout)
+            row = {"ran": [], "busy": "another runner holds the lock"} if len(starts) == 1 else {"ran": []}
+            return sd_lane.StartedLane(lambda: row)
+
+        def pending(seen: dict[pathlib.Path, frozenset[str]]) -> dict[pathlib.Path, frozenset[str]]:
+            return {checkout: frozenset({"2"}) for checkout in seen if "2" not in seen[checkout]}
+        polls = [0]
+        with mock.patch.object(sd_lane.time, "sleep", self.bounded_nap(polls)):
+            rows = sd_lane.run_parallel([("zeta", self.zeta)], start, sd_lane.clock() + 600, lambda: None, pending,
+                                        locks=sd_lane.MachineLocks(self.environ), cap=1)
+        self.assertEqual(starts, [self.zeta, self.zeta], rows)
+
+    def test_a_probe_s_lock_left_in_a_forked_child_does_not_make_the_chosen_lane_busy(self) -> None:
+        """sd:9332, found in this suite: a probe's flock lives on in a child forked while the probe held it,
+        until that child execs, so the take just after the probe found the lane held: a busy row for a free
+        lane, flaky under threaded lanes. The chosen lane is taken first and never probed."""
+        real, kept = sd_lane.MachineLocks.held_elsewhere, []
+
+        def leaky(locks: sd_lane.MachineLocks, checkout: pathlib.Path) -> bool:
+            answer = real(locks, checkout)
+            handle = open(locks.claim_file(checkout), "a", encoding="utf-8")  # noqa: SIM115 -- the cleanup
+            self.addCleanup(handle.close)
+            with contextlib.suppress(OSError):
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)  # the forked child's copy of the probe
+                kept.append(checkout)
+            return answer
+        started: list[pathlib.Path] = []
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            started.append(checkout)
+            return sd_lane.StartedLane(lambda: {"ran": []})
+        with mock.patch.object(sd_lane.MachineLocks, "held_elsewhere", leaky):
+            rows = sd_lane.run_parallel([("zeta", self.zeta)], start, sd_lane.clock() + 600, lambda: None,
+                                        locks=sd_lane.MachineLocks(self.environ), cap=1)
+        self.assertEqual(started, [self.zeta], (rows, kept))
+
+    def test_a_start_that_raises_after_the_claim_frees_the_claim(self) -> None:
+        """sd:9332 failure table, steps: the run claimed the lane, then its worker failed to start; the
+        run's finally releases the claim, so the other run reads the lane free."""
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            raise OSError("no such sd-ship")
+        with self.assertRaises(OSError):
+            sd_lane.run_parallel([("zeta", self.zeta)], start, sd_lane.clock() + 600, lambda: None,
+                                 locks=sd_lane.MachineLocks(self.environ), cap=1)
+        other = sd_lane.MachineLocks(self.environ)
+        with other.start_lock():
+            self.assertFalse(other.held_elsewhere(self.zeta), "the claim outlived the run's start")
+
+    def test_a_claim_that_cannot_be_read_counts_as_held(self) -> None:
+        """sd:9332 failure table, hold on doubt: a claim file that cannot be opened is a held lane, toward
+        the cap and as a busy row, never a free one."""
+        locks = sd_lane.MachineLocks(self.environ)
+        locks.claim_file(self.repo).mkdir(parents=True)  # open() of it raises IsADirectoryError
+        self.assertTrue(locks.held_elsewhere(self.repo))
+        rows = sd_lane.run_parallel([("pack", self.repo), ("zeta", self.zeta)],
+                                    lambda checkout, budget: sd_lane.StartedLane(lambda: {"ran": []}),
+                                    sd_lane.clock() - 1, lambda: None, locks=locks, cap=1)
+        self.assertIn("busy", rows[0], rows)
+        self.assertIn("fill the cap of 1", rows[1].get("busy", ""), rows)
 
     def test_the_hosted_run_reads_the_machine_s_lane_parallel(self) -> None:
         """sd:9323: the runner's start rule reads sd.lane_parallel, not the constant."""
@@ -6214,49 +6395,6 @@ class HostedParallel(Lane):
         child = sd_lane.child_lane(self.repo, 60, argv=[sys.executable, "-c", "import time; time.sleep(60)"])
         child.end()
         self.assertIsNotNone(child.process.returncode)
-
-    def test_a_lane_child_takes_over_the_lock_its_run_took(self) -> None:
-        """sd:9332 lead review: a run takes the lane's runner lock before its child starts; the child holds
-        it from then on, and once the child exits the lane is free."""
-        locks = read_locks(self.environ, self.repo)
-        self.assertTrue(locks.take_lane(self.repo))
-        code = ("import json, pathlib, sys\nsys.path.insert(0, sys.argv[1])\nimport sd_lane\n"
-                "environ = json.loads(sys.argv[3])\nroot = pathlib.Path(sys.argv[2])\n"
-                "outside = sd_lane.MachineLocks(environ)\nwith outside.start_lock([root]):\n    pass\n"
-                "with sd_lane.runner_lock(sd_lane.queue_for(root, environ), root) as held:\n"
-                "    print(json.dumps({'held': held, 'busy_outside': outside.held_elsewhere(root)}))\n")
-        with mock.patch.dict(os.environ, self.environ):
-            child = sd_lane.child_lane(self.repo, 60, argv=[sys.executable, "-c", code, str(REPO_ROOT / "bin"),
-                                                            str(self.repo), json.dumps(self.environ)])
-        self.assertEqual(child.process.wait(60), 0)
-        self.assertNotIn(str(self.repo), sd_lane.HANDED, "the run kept its copy of the lock")
-        self.assertEqual(child.answer(), {"held": True, "busy_outside": True})
-        locks.release_lane(self.repo)
-        self.assertFalse(read_locks(self.environ, self.repo).held_elsewhere(self.repo), "the lane stayed locked")
-
-    def test_a_lane_child_that_never_starts_frees_the_lock_its_run_took(self) -> None:
-        """sd:9332 failure table: the run took the lane's lock, then its child failed to start; the lane is
-        free again, not held by the run until it ends."""
-        locks = read_locks(self.environ, self.repo)
-        self.assertTrue(locks.take_lane(self.repo))
-        with self.assertRaises(OSError):
-            sd_lane.child_lane(self.repo, 60, argv=[str(self.tmp / "no-such-sd-ship")])
-        self.assertNotIn(str(self.repo), sd_lane.HANDED)
-        self.assertFalse(read_locks(self.environ, self.repo).held_elsewhere(self.repo), "the lane stayed locked")
-
-    def test_a_handed_fd_for_another_file_is_not_taken_for_the_lock(self) -> None:
-        """sd:9332 failure table: the fd a child is handed names no longer the lane's lock file; the child
-        closes it and takes the lane's lock itself."""
-        queue = sd_lane.queue_for(self.repo, self.environ)
-        other = os.open(self.tmp / "other.lock", os.O_WRONLY | os.O_CREAT | os.O_APPEND)
-        with mock.patch.dict(os.environ, {sd_lane.HANDED_ENV: f"{other}:{queue.lock_file}"}):
-            with sd_lane.runner_lock(queue, self.repo) as held:
-                self.assertTrue(held)
-                self.assertTrue(read_locks(self.environ, self.repo).held_elsewhere(self.repo))
-            self.assertNotIn(sd_lane.HANDED_ENV, os.environ)
-        with self.assertRaises(OSError):  # the child closed the fd it would not take
-            os.fstat(other)
-        self.assertFalse(read_locks(self.environ, self.repo).held_elsewhere(self.repo))
 
     def test_a_worker_child_runs_the_lane_and_answers_its_row(self) -> None:
         """The CLI's lane: `sd-ship -C <checkout> lane run --budget`, whose answer is the row; no answer is an error."""
