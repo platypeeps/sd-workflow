@@ -926,6 +926,18 @@ class TheAdvisorySweep(ScreenCase):
         self.assertIn("batches", found)
         self.assertEqual(found["sweeps"]["state"], "none")
 
+    def test_the_served_review_api_reads_the_sweep_log_with_no_jobs_backend(self):
+        # sd:9505 lane review: the server passes no jobs backend, so the read falls back to launchd's, as every
+        # sibling page does, and reads the log; without the fallback it read no logs folder at all.
+        from sd_dashboard.v2.pages import decide
+        from sd_db import operations
+
+        (self.cron / "logs" / f"{review_screen.SWEEP_JOB}.log").write_text(SWEEP_LOG, encoding="utf-8")
+        read = mock.Mock(connection=self.connection, jobs=None)
+        with mock.patch.object(operations, "LaunchdBackend", return_value=mock.Mock(cron_root=self.cron)):
+            found = decide._read(read)
+        self.assertEqual(found["sweeps"]["state"], "read")
+
 
 class TheSweepPanel(unittest.TestCase):
     """sd:9505: Scoring's Advisory sweep panel draws one row per week from `/api/review`'s `sweeps`."""
