@@ -6,7 +6,9 @@ tests, and a mocked `git rev-parse` would have agreed with every wrong answer.
 
 from __future__ import annotations
 
+import contextlib
 import datetime
+import io
 import json
 import os
 import pathlib
@@ -2206,6 +2208,89 @@ class RunGroupTimeoutTests(unittest.TestCase):
                 cwd=pathlib.Path("."), env={"PATH": "/usr/bin:/bin"}, timeout=2)
         self.assertLess(time.monotonic() - started, 2 + 3 * sd_lib.GROUP_CLEANUP_SECONDS)
         self.assertEqual(raised.exception.stdout, "before the hang\n")
+
+
+#: A leader that ignores SIGTERM and starts `sleep 60` in a session of its own; it writes that pid to argv[1].
+SESSION_LEADER = (
+    "import pathlib, signal, subprocess, sys, time\n"
+    "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+    "below = subprocess.Popen(['sleep', '60'], start_new_session=True)\n"
+    "pathlib.Path(sys.argv[1]).write_text(str(below.pid))\n"
+    "time.sleep(60)\n")
+
+
+def wait_for_pid(path: pathlib.Path) -> int:
+    for _ in range(400):  # bounded: a leader that never writes fails on the read
+        if path.exists() and path.read_text():
+            break
+        time.sleep(0.05)
+    return int(path.read_text())
+
+
+def gone(pid: int, seconds: float = 3) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def end_session(pid: int) -> None:
+    with contextlib.suppress(OSError):
+        os.killpg(pid, signal.SIGKILL)
+
+
+class KillReachTests(unittest.TestCase):
+    """pack sd:9392: a SIGKILL of a group reaches each session below it, which a SIGTERM's unwind would have ended."""
+
+    def start(self, scratch: str) -> tuple[subprocess.Popen, int]:
+        mark = pathlib.Path(scratch) / "below.pid"
+        leader = sd_lib.spawn_group([sys.executable, "-c", SESSION_LEADER, str(mark)])
+        sd_lib.release_term()
+        below = wait_for_pid(mark)
+        self.addCleanup(end_session, below)
+        self.addCleanup(end_session, leader.pid)
+        return leader, below
+
+    def test_end_group_kills_a_session_its_leader_left(self) -> None:
+        """Failure table row 1: the KILL reached the leader's group only; the session below ran on with ppid 1."""
+        with tempfile.TemporaryDirectory() as scratch:
+            leader, below = self.start(scratch)
+            sd_lib.end_group(leader)
+            self.assertTrue(gone(below), "the session below the leader outlived end_group's SIGKILL")
+
+    def test_thread_groups_kill_ends_the_sessions_below(self) -> None:
+        """Failure table row 3: `ThreadGroups.end_groups` SIGKILLed the registered group only."""
+        with tempfile.TemporaryDirectory() as scratch:
+            leader, below = self.start(scratch)
+            groups = sd_lib.ThreadGroups()
+            groups.group_hook()(leader.pid)
+            with unittest.mock.patch.object(sd_lib, "GROUP_CLEANUP_SECONDS", 0.5):
+                groups.end_groups()
+            leader.wait(5)
+            self.assertTrue(gone(below), "the session below the thread's group outlived end_groups's SIGKILL")
+
+    def test_a_reused_group_number_is_not_signalled(self) -> None:
+        """Advisory 4474: a group from the first read whose leader now has another start is another process."""
+        with tempfile.TemporaryDirectory() as scratch:
+            leader, below = self.start(scratch)
+            with unittest.mock.patch.object(sd_lib, "groups_below", return_value={}), \
+                    unittest.mock.patch.object(os, "killpg") as killpg:
+                sd_lib.kill_below(leader.pid, {below: "Thu Jan  1 00:00:00 1970"})
+            self.assertNotIn(unittest.mock.call(below, signal.SIGKILL), killpg.call_args_list)
+
+    def test_an_unread_table_still_kills_the_leaders_group(self) -> None:
+        """Reads row: a `ps` that fails is unknown; the leader's own group is still killed, and stderr says so."""
+        with tempfile.TemporaryDirectory() as scratch:
+            leader, _ = self.start(scratch)
+            with unittest.mock.patch.object(sd_lib, "process_table", return_value=None), \
+                    unittest.mock.patch("sys.stderr", new_callable=io.StringIO) as said:
+                sd_lib.end_group(leader)
+            self.assertIsNotNone(leader.returncode)
+            self.assertIn("cannot read the process table", said.getvalue())
 
 
 class TermEndsGroupTests(unittest.TestCase):
