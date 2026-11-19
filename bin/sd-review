@@ -2382,9 +2382,11 @@ def review(
         def read_one(provider: sd_registry.Provider) -> tuple[dict[str, Any] | None, list[Outcome]]:
             """One reader's attempts, in its own thread (sd:7519); its skill state measured against its own binary."""
             measured = codex_skill_state(provider, root, runner, env, auth_home) if provider.reader == "codex-json" and auth["ok"] else None
-            unread = omitted if provider.url or provider.reader in MATERIAL_READERS else ()
+            material = bool(provider.url) or provider.reader in MATERIAL_READERS
+            unread = omitted if material else ()
+            # sd:9536: only a reader of the checkout saw the head's other files; one given the material cites only it.
             return measured, _attempts(provider, lambda: partial(unlocated(run_provider(provider, root, subject, prompt, runner, env, phase,
-                codex_auth_home, client, ledger, measured or skills), cited, result["severity_floor"], held), unread))
+                codex_auth_home, client, ledger, measured or skills), cited, result["severity_floor"], *(() if material else (held,))), unread))
         answers = sd_lib.fill_slots(chosen, depth, read_one, lambda answer: any(row.status in (CLEAN, FINDINGS) for row in answer[1]), READER_GROUPS)
         # The result key carries the first binary that ignored the key, else the last measured; each outcome its own.
         measures = [measured for measured, _attempts_made in answers if measured is not None]
@@ -2522,8 +2524,8 @@ def unlocated(outcome: Outcome, cited: frozenset[str], floor: str, held: Callabl
     """sd:1406. A finding that cites no path this run reviewed is not advice.
 
     Measured blind answers put nothing, `/`, or prose where a path belongs; a
-    sighted one cites a subject path or a file the head holds (sd:9536). The
-    check reads structure, not prose.
+    sighted one cites a subject path, or a file the head holds when it reads
+    the checkout itself (sd:9536). The check reads structure, not prose.
     A completed answer with no located finding is voided: `unavailable`, not
     counted toward depth, its findings dropped. A completed answer with one
     located finding is kept whole. A failed answer keeps its located findings

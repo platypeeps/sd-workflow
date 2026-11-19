@@ -994,11 +994,15 @@ class LineBudgetTests(unittest.TestCase):
         # path git cannot take is not held rather than raising, and
         # `for_note` escapes, bounds and caps the model text in the note.
         # Measured: `sd-review` is 2876 here.
+        #
+        # 4846 -> 4848 is the sd:9536 re-review: `bin/sd-review` +2 so only
+        # a reader of the checkout may cite a file the head holds. Measured:
+        # `sd-review` is 2878 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4846,
+            4848,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

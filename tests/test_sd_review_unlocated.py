@@ -26,7 +26,7 @@ import subprocess
 from unittest import mock
 
 from tests.clean_env import clean_environment
-from tests.test_sd_review import FakeRunner, sd_review
+from tests.test_sd_review import FIXTURE_REGISTRY, FakeRunner, sd_review
 from tests.test_sd_review_fallbacks import ReviewRunFixture
 
 CHECK = {"sd-check": sd_review.Completed(0, "{}", "")}
@@ -206,3 +206,18 @@ class AFileTheRepositoryHoldsIsLocated(ReviewRunFixture):
         self.assertIn("finding 4; +2 more", detail)
         self.assertNotIn("finding 5", detail)
         self.assertEqual(result["outcomes"][0]["diagnostic"]["unlocated_findings"], 7)
+
+    def test_a_reader_given_only_the_material_cannot_cite_past_it(self) -> None:
+        """Lead re-review of 872ec2f72: a reader that gets only the supplied
+        material never saw README.md, so citing it is not located; the
+        checkout reader's case is test_a_tracked_file_outside_the_diff_is_located."""
+        registry = self.registry_home / ".local/share/sd/providers.yaml"
+        registry.write_text(FIXTURE_REGISTRY.replace("roles: [reviewer], reader: codex-json",
+                                                     "roles: [reviewer], reader: claude-json", 1))
+        claude = sd_review.Completed(0, json.dumps({"type": "result", "subtype": "success", "structured_output": {
+            "findings": [row("README.md", "low", "README contradicts src.py")]}}), "")
+        result = self.review(claude)
+        self.assertEqual(result["outcomes"][0]["backend"], "codex")
+        self.assertEqual(result["outcomes"][0]["status"], "unavailable")
+        self.assertIn("'README.md': README contradicts src.py", result["outcomes"][0]["detail"])
+        self.assertEqual((result["status"], result["reviewed_by"]), ("clean", ["second"]))
