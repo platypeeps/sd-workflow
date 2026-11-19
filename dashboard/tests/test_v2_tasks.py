@@ -2750,6 +2750,18 @@ shellRun(cmd('item.status.ready'), C.get('{ask}')); await flush(); undo(); await
         self.assertEqual([p[0] for p in out["posts"]], [f"/api/items/{plan}/status", f"/api/items/{ask}/status"], "Undo wrote over the other writer's change")
         self.assertEqual(out["toasts"][-1], [f"Status → In progress not undone · #{plan} Plan the review: it changed after this write, and Undo would overwrite that change", False])
 
+    def test_an_undo_with_no_answer_reads_again_and_says_its_outcome_is_not_known(self):
+        # pack sd:9485: the inverse re-read only on a 409, and an undo that got no answer toasted 'not undone'.
+        plan = self.ids["plan"]
+        answer = f"""(path, body) => {{ if (body.status === 'ready') throw new Error('offline');
+  return [200, {{ item: {{ id: {plan}, status: body.status, priority: 2, due: '2026-09-09', recurrence: null }}, notes: [], revision: 'b'.repeat(64) }}]; }}"""
+        out = self.run_page(f"""shellRun(cmd('item.status.in_progress'), C.get('{plan}')); await flush(); const undo = lastUndo().undo;
+await flush(); R.before = OUT.gets.length; undo(); await flush(); R.after = OUT.gets.length;""", answer)
+        self.assertEqual([p[1]["status"] for p in out["posts"]], ["in_progress", "ready"])
+        self.assertGreater(out["R"]["after"], out["R"]["before"], "the rows were not read again")
+        self.assertEqual(out["toasts"][-1], [f"Status → In progress undo outcome not known · #{plan} Plan the review: no answer"
+                                             " (offline), so whether it changed is not known; the rows were read again", False])
+
     def test_an_edit_undo_refuses_a_row_another_writer_changed_after_its_write(self):
         plan, ask = self.ids["plan"], self.ids["ask"]
         answer = f"""(path, body) => path === '/api/items/{plan}/status' ? [409, {{ error: 'The item changed. Reload it.' }}]
