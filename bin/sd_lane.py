@@ -4270,34 +4270,57 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
     return {"lanes": lanes}
 
 
-def work_ids(entries: list[dict[str, Any]]) -> frozenset[str]:
-    """A lane's work: its runnable entries' ids, and `recover:<id>` for each entry only a run settles (sd:9332).
+def work_ids(entries: list[dict[str, Any]], releases: Callable[[], bool]) -> frozenset[str]:
+    """A lane's work in its entries: runnable ids, and `recover:<id>` for each entry only a run settles.
 
-    Recovery is a running entry whose holder on this machine died
-    (`reclaim_dead`), an owed `make post-merge` (`owes_post_merge`) and an
-    unfinished release chain. A bare `release: owed` counts only in a
-    repository whose entries show a chain: without a `release` policy it
-    stays owed for ever, and every lane would always have work.
+    Read from `run_lane`, step by step (sd:9332): `claim_entry` claims a
+    runnable entry; `reclaim_dead` settles a running entry whose holder on
+    this machine died (`resume_stopped`, and the note after it, ride on that
+    one); `release_chain` starts each `release: owed` mark and advances an
+    unfinished chain, but only where the policy declares `release`
+    (`releases`), else the marks stay for ever; `post_merge` runs each owed
+    target (`owes_post_merge`). `releases` is read only for a lane with a mark.
     """
-    host, chains = this_host(), any(isinstance(row.get("release"), dict) for row in entries)
+    host = this_host()
 
-    def recovers(row: dict[str, Any]) -> bool:
-        holder, release = row.get("holder") or {}, row.get("release")
-        return ((row.get("status") == "running" and holder.get("host") == host and not runner_alive(holder.get("pid")))
-                or owes_post_merge(row) or (row.get("status") == "merged" and chains and release == RELEASE_OWED)
+    def dead(row: dict[str, Any]) -> bool:
+        holder = row.get("holder") or {}
+        return row.get("status") == "running" and holder.get("host") == host and not runner_alive(holder.get("pid"))
+
+    def owes_release(row: dict[str, Any]) -> bool:
+        release = row.get("release")
+        return ((row.get("status") == "merged" and release == RELEASE_OWED)
                 or (isinstance(release, dict) and release.get("step") not in sd_release.FINAL))
-    return frozenset([str(row["id"]) for row in entries if runnable(row)]
-                     + [f"recover:{row['id']}" for row in entries if recovers(row)])
+    marked = [row for row in entries if owes_release(row)]
+    released = [f"recover:{row['id']}" for row in marked] if marked and releases() else []
+    return frozenset([str(row["id"]) for row in entries if runnable(row)] + released
+                     + [f"recover:{row['id']}" for row in entries if dead(row) or owes_post_merge(row)])
+
+
+def declares_release(root: pathlib.Path, environ: dict[str, str]) -> bool:
+    """Whether `root`'s policy declares `release`, read as `release_chain` reads it; a failed read is True."""
+    try:
+        policy = sd_lib.repo_declaration(root, "policy", environ)
+    except Exception:  # noqa: BLE001 -- unknown is not "no release": the run tries, once
+        return True
+    return isinstance((policy or {}).get("release"), dict)
+
+
+#: The work id of a queue file an earlier version left, which `import_file_queue` imports.
+QUEUE_FILE_WORK = "recover:queue-file"
 
 
 def new_work(environ: dict[str, str],
              seen: dict[pathlib.Path, frozenset[str]]) -> dict[pathlib.Path, frozenset[str]]:
-    """Each lane of `seen` with work (`work_ids`) not in its set: its work ids (sd:5809, sd:9332).
+    """Each lane of `seen` with work not in its set: its work ids (sd:5809, sd:9332).
 
-    One hub transaction reads every lane. A lane whose queue cannot be read
-    is left out: unknown is no new work. No runner lock is probed: a probe's
-    flock made the other run's starting worker answer busy, and a lane
-    another runner holds answers busy itself, its ids kept as seen.
+    The work is `work_ids` of its entries, and an earlier version's queue
+    file, which only a run imports. One hub transaction reads every lane. A
+    lane whose queue cannot be read is left out: unknown is no new work.
+    No runner lock is probed: a probe's flock made the other run's starting
+    worker answer busy, and a lane another runner holds answers busy itself,
+    its ids kept as seen. Not work, as a run leaves them: an imported body
+    copy no row names, and a hub-stop record no running entry holds.
     """
     queues: dict[pathlib.Path, Queue] = {}
     for checkout in seen:
@@ -4308,13 +4331,20 @@ def new_work(environ: dict[str, str],
     if not queues:
         return {}
 
-    def work_by_lane(connection: Any) -> dict[pathlib.Path, frozenset[str]]:
-        return {checkout: work_ids(stored(connection, queue.repository)) for checkout, queue in queues.items()}
+    def entries_by_lane(connection: Any) -> dict[pathlib.Path, list[dict[str, Any]]]:
+        return {checkout: stored(connection, queue.repository) for checkout, queue in queues.items()}
     try:
-        ids = on_hub(next(iter(queues.values())), work_by_lane, write=False)
+        entries = on_hub(next(iter(queues.values())), entries_by_lane, write=False)
     except LaneError:
         return {}
-    return {checkout: work for checkout, work in ids.items() if work - seen[checkout]}
+    found: dict[pathlib.Path, frozenset[str]] = {}
+    for checkout, rows in entries.items():  # the policy is read after the hub transaction, on its own connection
+        work = work_ids(rows, functools.partial(declares_release, checkout, environ))
+        if queue_path(checkout, environ).exists():
+            work |= {QUEUE_FILE_WORK}
+        if work - seen[checkout]:
+            found[checkout] = work
+    return found
 
 
 #: How a hosted run starts one lane: `(checkout, seconds left of the run's budget)` to a started lane (sd:5774).

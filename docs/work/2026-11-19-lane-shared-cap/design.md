@@ -91,7 +91,9 @@ Classes from the blocking rounds, with every instance in the code:
   rescan; rows 8-10 and 25-26.
 - An "is there work" read that misses recovery: every `pending` call
   (first pass, claim's busy branch, begin, rescan) reads `new_work`,
-  which reads `work_ids`; rows 27-29.
+  which reads `work_ids` and the queue file; rows 27-36, enumerated
+  from `run_lane`: `settle_checkout`, `next_claim`, `release_chain`
+  and `post_merge`.
 - A count that ends before its worker, or misses one: post-merge, a
   dead run, a worker that outlives its run and a lane not in this
   run's list; rows 11-13 and 23.
@@ -130,10 +132,16 @@ Classes from the blocking rounds, with every instance in the code:
 | 24 | 2 | a lane the other run claimed kept no seen ids, so every rescan wrote another busy row, about 80 a budget (advisory 1b5580736 :4537) | a busy claim records the lane's pending ids as seen; only a new entry tries it again | test_a_lane_the_other_run_claimed_gets_one_busy_row_across_rescans |
 | 25 | 3 | rescans only added to the lanes waiting for room, so a lane whose only new entry was held, cancelled or drained kept an idle run, and its launchd label, to the deadline (lane review 08130e1f :4592, sd:9611) | each scan rebuilds the waiting lanes | test_a_waiting_lane_whose_new_entry_went_away_lets_an_idle_run_end |
 | 26 | 3 | an idle run's first pass waited for room for a lane with nothing pending while the other run filled the gate (class pass on :4592) | an idle run moves on; a scan starts the lane once work arrives | test_an_idle_run_waits_for_no_room_for_a_lane_with_nothing_pending |
-| 27 | 3 | `new_work` read runnable entries only, so the first pass skipped a lane whose only work was a dead holder, an owed post-merge or an unfinished release chain, tick after tick (lead review 6300d9049 :4629) | recovery counts as work, once a run (`work_ids`) | test_a_lane_with_only_recovery_work_has_new_work_once_a_run, test_an_idle_run_waits_for_room_for_a_lane_with_only_recovery_work |
+| 27 | 3 | `new_work` read runnable entries only, so the first pass skipped a lane whose only work a worker settles, tick after tick (lead review 6300d9049 :4629); rows 31-36 list each state | each state `run_lane` acts on is work, once a run (`work_ids`) | test_each_state_a_worker_acts_on_is_new_work_once_a_run, test_an_idle_run_waits_for_room_for_a_lane_with_only_recovery_work |
 | 28 | 3 | the rescan read the same runnable-only ids, so a lane whose worker left its post-merge owed got no second worker (class pass on :4629) | the scan reads `work_ids` too | test_a_scan_starts_an_idle_lane_whose_worker_left_recovery_work |
-| 29 | 3 | a bare `release: owed` stays owed for ever where no policy declares `release`; counted as work, every lane would always have work (class pass) | it counts only in a repository whose entries show a chain | test_a_bare_owed_release_is_work_only_where_the_repository_runs_chains |
+| 29 | 3 | an owed release counted only beside an earlier chain, so a repository's first one, left by a worker that died first, waited for a later merge (lead review 74dc3f8e4 :4282) | the policy decides, read as `release_chain` reads it; a failed read counts | test_an_owed_release_is_work_only_where_the_policy_declares_release |
 | 30 | 3 | `new_work` probed each lane's runner lock every 5 s poll, and the other run's starting worker answered busy (advisory :4603) | no probe; a lane another runner holds answers busy and keeps its ids seen; the first pass reads the hub once a rescan | test_new_work_probes_no_runner_lock |
+| 31 | 3 | state: a runnable entry (`claim_entry`) | work | test_each_state_a_worker_acts_on_is_new_work_once_a_run [runnable] |
+| 32 | 3 | state: a running entry whose holder on this machine died (`reclaim_dead`; `resume_stopped` and the note after it ride on it) | work | same test [dead holder] |
+| 33 | 3 | state: an owed `make post-merge` (`owes_post_merge`) | work | same test [owed post-merge] |
+| 34 | 3 | state: `release: owed` or an unfinished chain where the policy declares `release` (`release_chain`) | work | same test [first owed release], [unfinished release chain] |
+| 35 | 3 | state: an earlier version's queue file, which only a run imports (`import_file_queue`; lead review 74dc3f8e4 :4282) | work | test_a_queue_file_an_earlier_version_left_is_new_work_once_a_run |
+| 36 | 3 | states a worker leaves or only tidies: a held entry, a live holder, another host's holder past its lease (`claim_entry` refuses), a hub-stop record no running entry holds and a body copy no row names (deleted, nothing reads them) | no work: counted, each would start a worker every run for ever, or for nothing | test_what_a_worker_leaves_alone_or_only_tidies_is_no_work |
 
 Rows removed with the hand-off: the fd passed to a child, a child
 that never starts, an fd that names another file, the env var seen

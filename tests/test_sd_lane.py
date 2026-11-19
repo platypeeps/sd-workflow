@@ -6489,34 +6489,74 @@ class HostedParallel(Lane):
                 row.update(fields)
         sd_lane.update(sd_lane.queue_for(self.zeta, self.environ), change)
 
-    def test_a_lane_with_only_recovery_work_has_new_work_once_a_run(self) -> None:
-        """sd:9332 lead review of 6300d9049 :4629: `new_work` read runnable entries only, so a lane whose only work
-        was a dead holder, an owed post-merge or an unfinished release chain had none, and an idle run whose
-        first pass met no room skipped it, tick after tick. Recovery is work, once a run: its ids then count
-        as seen."""
+    def releasing(self, policy: Any = None) -> Any:
+        """zeta's policy as `release_chain` reads it: a `release` block by default, or what `policy` is."""
+        def declaration(root: Any, kind: str, environ: Any = None) -> Any:
+            if isinstance(policy, Exception):
+                raise policy
+            return {"release": {}} if policy is None else policy
+        return mock.patch.object(sd_lane.sd_lib, "repo_declaration", declaration)
+
+    def test_each_state_a_worker_acts_on_is_new_work_once_a_run(self) -> None:
+        """sd:9332 lead reviews of 6300d9049 :4629 and 74dc3f8e4 :4282: `new_work` read runnable entries only,
+        so an idle run whose first pass met no room skipped a lane whose only work a worker settles, tick
+        after tick. Each state `run_lane` acts on is work, once a run: its ids then count as seen."""
         dead = subprocess.Popen([sys.executable, "-c", ""])
         dead.wait()
         ran = {"ran": "make post-merge ran", "at": "2026-11-19T00:00:00Z"}
         for name, fields in (
+                ("runnable", {"status": "pending"}),
                 ("dead holder", {"status": "running", "holder": {"host": sd_lane.this_host(), "pid": dead.pid,
                                                                  "token": "t"}}),
                 ("owed post-merge", {"status": "merged", "post_merge": "owed"}),
+                ("first owed release", {"status": "merged", "post_merge": ran, "release": "owed"}),
                 ("unfinished release chain", {"status": "merged", "post_merge": ran, "release": {"step": "version"}})):
-            with self.subTest(name):
+            with self.subTest(name), self.releasing():
                 self.set_zeta(**fields)
                 found = sd_lane.new_work(self.environ, {self.zeta: frozenset()})
                 self.assertIn(self.zeta, found)
                 self.assertEqual(sd_lane.new_work(self.environ, {self.zeta: found[self.zeta]}), {})
 
-    def test_a_bare_owed_release_is_work_only_where_the_repository_runs_chains(self) -> None:
-        """sd:9332 class pass: a merge marks `release: owed` in every repository, and only one with a release
-        policy turns it into a chain; counted everywhere, every lane would always have work."""
+    def test_an_owed_release_is_work_only_where_the_policy_declares_release(self) -> None:
+        """sd:9332 lead review of 74dc3f8e4 :4282: an owed release counted only beside an earlier chain, so a
+        repository's first one, left by a worker that died first, waited for a later merge. The policy
+        decides, read as `release_chain` reads it; without `release` the marks stay owed for ever."""
         self.set_zeta(status="merged", post_merge={"ran": "no post-merge rule", "at": "2026-11-19T00:00:00Z"},
                       release="owed")
-        self.assertEqual(sd_lane.new_work(self.environ, {self.zeta: frozenset()}), {})
-        sd_lane.add_entry(sd_lane.queue_for(self.zeta, self.environ),
-                          {"id": "e9", "item": 9, "status": "merged", "release": {"step": "done"}})
-        self.assertIn(self.zeta, sd_lane.new_work(self.environ, {self.zeta: frozenset()}))
+        for policy, expected in (({}, False), ({"release": {}}, True),
+                                 (sd_lane.sd_lib.DatabaseUnreadable("the hub went away"), True)):
+            with self.subTest(policy=policy), self.releasing(policy):
+                self.assertEqual(self.zeta in sd_lane.new_work(self.environ, {self.zeta: frozenset()}), expected)
+
+    def test_a_queue_file_an_earlier_version_left_is_new_work_once_a_run(self) -> None:
+        """sd:9332 lead review of 74dc3f8e4 :4282: a lane whose entries were still in an earlier version's
+        queue file had none in the hub, so no run started the worker that imports them."""
+        self.set_zeta(status="merged", post_merge={"ran": "no post-merge rule", "at": "2026-11-19T00:00:00Z"})
+        path = sd_lane.queue_path(self.zeta, self.environ)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"entries": [{"id": "old", "item": 7, "status": "pending"}]}), encoding="utf-8")
+        found = sd_lane.new_work(self.environ, {self.zeta: frozenset()})
+        self.assertIn(self.zeta, found)
+        self.assertEqual(sd_lane.new_work(self.environ, {self.zeta: found[self.zeta]}), {})
+
+    def test_what_a_worker_leaves_alone_or_only_tidies_is_no_work(self) -> None:
+        """sd:9332 class pass: a held entry, a live holder, another host's holder past its lease, a hub-stop
+        record no running entry holds and a body copy no row names start no worker; each would be work for
+        ever, or a worker leaves it as it found it."""
+        queue = sd_lane.queue_for(self.zeta, self.environ)
+        queue.lock_file.parent.mkdir(parents=True, exist_ok=True)
+        sd_lane.hub_stop_path(queue, "gone").write_text("{}", encoding="utf-8")
+        (queue.lane / "bodies").mkdir(parents=True, exist_ok=True)
+        (queue.lane / "bodies" / "kept.md").write_text("Item: sd:2\n", encoding="utf-8")
+        for name, fields in (
+                ("held", {"status": "pending", "held": True}),
+                ("live holder", {"status": "running", "holder": {"host": sd_lane.this_host(), "pid": os.getpid(),
+                                                                 "token": "t"}}),
+                ("another host's holder", {"status": "running", "lease_until": "2026-01-01T00:00:00Z",
+                                           "holder": {"host": "other.example.test", "pid": 1, "token": "t"}})):
+            with self.subTest(name), self.releasing():
+                self.set_zeta(**fields)
+                self.assertEqual(sd_lane.new_work(self.environ, {self.zeta: frozenset()}), {})
 
     def test_new_work_probes_no_runner_lock(self) -> None:
         """sd:9332 lead review advisory :4603: `new_work` probed each lane's runner lock with LOCK_NB every
