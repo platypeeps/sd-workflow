@@ -1943,8 +1943,8 @@
     .reduce((worst, s) => URANK.indexOf(s) > URANK.indexOf(worst) ? s : worst, U.flags_error ? 'unknown' : 'ok');
   const usageSum = state => html`${ICON('gauge')}<span>Usage</span>${state ? html`<span class="g-${state}" aria-hidden="true">${UGLYPH[state]}</span><span class="sr"> ${state}</span>` : ''}`;
   const usageDrop = html`<details class="usage-drop" id="usage-drop"><summary class="btn quiet sm" id="usage-sum">${usageSum('')}</summary><div class="fpick-menu ustrip" id="usage-menu" role="group" aria-label="Usage"><p class="foot">Reading usage…</p></div></details>`;
-  // Wires the drawn dropdown: of overlapping reads only the newest draws. A failed read, an answer without rows and a
-  // row that does not render all draw "Not read: why", unknown.
+  // Wires the drawn dropdown and returns its read, which Read again calls too: of overlapping reads only the newest
+  // draws. A failed read, an answer without rows and a row that does not render all draw "Not read: why", unknown.
   function usageWire() {
     const d = document.getElementById('usage-drop'), menu = document.getElementById('usage-menu'), sum = document.getElementById('usage-sum');
     let n = 0;
@@ -1961,6 +1961,7 @@
     d.addEventListener('toggle', () => { if (d.open) read(); });
     if (location.hash === '#usage') d.open = true; // screenshot hook, as #menu and #chat are; opening reads
     else read();
+    return read;
   }
   // usage:end
   // again:start
@@ -1969,17 +1970,18 @@
   // for it, the same label and icon on every page, in the page's [data-again] element or at the end of its head, once every
   // page's DOMContentLoaded ran (a window listener added last). It is busy while a run is pending; a run that throws says so.
   // It collects nothing: a page whose collector can run again keeps that as its own action. test_v2_registry holds every page to it.
-  // pack sd:9569: the Usage dropdown (usage:start) sits before it in one .head-acts group, on a page without Read again too.
+  // pack sd:9569: the Usage dropdown (usage:start) sits before it in one .head-acts group, on a page without Read again
+  // too; Read again reads Usage again as well.
   function again() {
     const a = window.PAGE_AGAIN, at = document.querySelector('[data-again]') || main.querySelector('.head, .home-head');
     if (!at || document.getElementById('head-acts')) return;
     put(at, html`<div class="head-acts" id="head-acts">${usageDrop}${a ? html`<button class="btn quiet sm" type="button" id="read-again" title="${a.title || 'Read this page again'}">${ICON('rotate-ccw')}<span>Read again</span></button>` : ''}</div>`, 'append');
-    usageWire();
+    const usageRead = usageWire();
     if (!a) return;
     const b = document.getElementById('read-again');
     let runs = 0;
     b.addEventListener('click', () => {
-      b.setAttribute('aria-busy', 'true'); runs++;
+      b.setAttribute('aria-busy', 'true'); runs++; usageRead();
       Promise.resolve().then(() => window.PAGE_AGAIN.run())
         .catch(e => toast(`Not read again: ${e && e.message || e}`))
         .finally(() => { if (!--runs) b.removeAttribute('aria-busy'); });

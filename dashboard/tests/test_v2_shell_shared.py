@@ -2286,6 +2286,14 @@ R.menu = ELS['usage-menu'].html;""")
                 self.assertNotIn("Reading usage", out["R"]["menu"])
                 self.assertEqual(out["R"]["state"], "unknown")
 
+    def test_read_again_reads_usage_again(self):
+        """Lead review of 8f483c6: Read again redrew the page but left the Usage summary at its load-time state."""
+        out = self.run_again("""window.PAGE_AGAIN = { run() {} };
+SHELL_AGAIN
+loaded(); await flush(); R.before = OUT.gets.length; click(); await flush(); R.after = OUT.gets.length;""")
+        self.assertEqual((out["R"]["before"], out["R"]["after"]), (1, 2))
+        self.assertEqual(out["gets"], ["/api/usage/strip", "/api/usage/strip"])
+
     def test_a_page_without_read_again_still_gets_the_usage_dropdown(self):
         """Settings has no Read again (AGAIN_ALLOWED in test_v2_registry); the dropdown is on every page all the same."""
         out = self.run_again("SHELL_AGAIN\nloaded(); R.head = HEAD.html;")
