@@ -119,6 +119,8 @@ REVIEW_PARKED = re.compile(r"\d+ review rounds left blockers: (.+?)(?:; check th
 #: The Review rounds rule's class pass, the second line of a review-parked run's finding (pack sd:9262).
 REVIEW_CLASS_PASS = ("Class pass: name the class these blockers share, enumerate every instance from the code, not "
                      "the findings, and fix each fail-first.")
+#: The result a member left out of a subset Retry ends with, after `ALONE` (pack sd:9581).
+LEFT_OUT = "left out of a Retry of build run "
 #: The bundle statuses Retry and Send to builder take: each keeps its worktree.
 AGAIN = ("blocked", "cancelled")
 #: A lane entry that failed only because prepare's merge of origin/<base> conflicted goes back to its builder on
@@ -639,7 +641,7 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
             stamp = clock()
             for member in [member for member in members if member["item"] not in only]:
                 connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
-                                   (stamp, f"{ALONE}{who}: left out of a Retry of build run {run['id']}",
+                                   (stamp, f"{ALONE}{who}: {LEFT_OUT}{run['id']}",
                                     member["id"]))
                 if member["item"] in items and items[member["item"]]["status"] == "blocked":
                     transition(connection, member["item"], "ready", who=who,
@@ -685,6 +687,14 @@ def left(connection, branch: str, items) -> set[int]:
     return {row["item"] for row in connection.execute(
         f"SELECT item FROM assignment WHERE parent = ? AND scope = ? AND NOT {_in_group()}",
         (run["assignment"], SCOPE)) if row["item"] in wanted}
+
+
+def left_out(connection, lead: int) -> list[int]:
+    """The items of build `lead`'s members a subset Retry left out (`LEFT_OUT`): the worktree it resumes still
+    holds their commits, which the next run reverts before its branch is reviewed (pack sd:9581)."""
+    return [row["item"] for row in connection.execute(
+        "SELECT item FROM assignment WHERE parent = ? AND scope = ? AND result LIKE ? ORDER BY id",
+        (lead, SCOPE, f"{ALONE}%: {LEFT_OUT}%"))]
 
 
 def queued_members(connection, lead: int) -> list[tuple[int, int]]:

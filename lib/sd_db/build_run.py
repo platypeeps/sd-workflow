@@ -1235,13 +1235,14 @@ class Supervisor:
         return bool(said) and said[-1] == GATE_NOT_STARTED
 
     def prechecked(self, head: str) -> list[str]:
+        left = self.unreverted(head)
         if self.checked is None:
-            return []
+            return left
         try:
             title, body = (path.read_text(encoding="utf-8") if path.exists() else "" for path in (self.title, self.body))
         except ValueError:  # not UTF-8: the builder rewrites it, as for any other refusal
             return [f"the title at {self.title} or the body at {self.body} is not UTF-8 text"]
-        return self.checked(self.work, self.base(), head, title.strip(), body)
+        return left + self.checked(self.work, self.base(), head, title.strip(), body)
 
     def blocked_round(self, blockers: list[dict]) -> str | dict:
         self.blockers = blockers
@@ -1570,7 +1571,38 @@ class Supervisor:
             f"SELECT id, title FROM item WHERE id IN ({', '.join('?' for _ in items)})", items)}
         return {"worktree": self.work, "branch": self.row["branch"], "title": self.title, "body": self.body,
                 "title_max": TITLE_MAX, "items": "\n".join(f"- sd:{item} {titles.get(item, '')}" for item in items),
-                "findings": self.findings(items), "denied": self.denied()}
+                "findings": self.findings(items) + self.left_brief(), "denied": self.denied()}
+
+    def left_brief(self) -> str:
+        """What a subset Retry left out: its commits stay in the resumed worktree until reverted (pack sd:9581)."""
+        left = build.left_out(self.db, self.row["assignment"])
+        if not left:
+            return ""
+        named = ", ".join(f"sd:{item}" for item in left)
+        return (f"\n{named} left this bundle at a Retry. Revert every commit since {self.base()} whose message\n"
+                f"names it, in one `revert(...)` commit: `git revert --no-commit <sha>...`, then commit with one\n"
+                f"`This reverts commit <sha>.` line per commit. Build none of it.\n")
+
+    def unreverted(self, head: str) -> list[str]:
+        """A refusal per commit since the base that names an item a subset Retry left out and no later commit
+        reverts (`This reverts commit <sha>.`); the builder reverts it before review (pack sd:9581).
+        ponytail: a commit is the item's when its message names sd:N; a fix commit naming none stays."""
+        left = build.left_out(self.db, self.row["assignment"])
+        if not left:
+            return []
+        log = _read([*self.tools.git, "-C", str(self.work), "log", "--format=%H%x00%B%x1e",
+                     f"{self.base()}..{head}"], env=self.env)
+        commits = [entry.strip("\n").split("\x00", 1) for entry in log.split("\x1e") if "\x00" in entry]
+        reverted = {sha for _, message in commits for sha in re.findall(r"This reverts commit ([0-9a-f]{40})", message)}
+        refused = []
+        for sha, message in commits:
+            if sha in reverted or "This reverts commit " in message:
+                continue
+            for item in left:
+                if re.search(rf"\bsd:{item}\b", message):
+                    refused.append(f"the branch still holds {sha[:12]}, a commit of sd:{item}, which left the "
+                                   f"bundle at a Retry: revert it in one `revert(...)` commit")
+        return refused
 
     def findings(self, items: list[int]) -> str:
         """The Send to builder notes on `items` since the lead's first run, up to this run (pack sd:6020), then the

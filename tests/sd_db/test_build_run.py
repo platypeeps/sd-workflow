@@ -1021,6 +1021,42 @@ class Supervise(Case):
                                   branch=build.branch(self.bundle["assignment"]))
         self.assertEqual([row["item"] for row in cited], [], "run 1's trailer must not close the child")
 
+    def left_out_of_a_retry(self):
+        """Run 1 commits for three items and ends cancelled; a Retry names the first two, so the third leaves the
+        bundle; the next run is claimed. Its worktree still holds the third item's commit: (that commit)."""
+        self.press(3)
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["cancel"])
+        self.assertEqual(self.supervisor().run()["outcome"], "cancelled")
+        work = Path(self.bundle["work_path"])
+        commit = support.git(work, "rev-parse", "HEAD").strip()
+        self.assertEqual(sorted(entry["item"] for entry in build.queue_again(self.db, self.items[:2], who="operator")),
+                         sorted(self.items[:2]))
+        again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                            root=self.root / "worktrees")
+        assert again is not None
+        self.bundle = again
+        return commit
+
+    def test_a_subset_retry_reverts_the_left_items_commits_before_review(self):
+        """Review of pack sd:9581: a subset Retry kept the left item's commits on the branch it publishes. The
+        brief asks the builder to revert them, and a branch that still holds one goes back to it before review."""
+        commit = self.left_out_of_a_retry()
+        self.plan(claude=["pass", "fix1"], sd_review=["clean"])
+        ended = self.supervisor().run()
+        prompts = [call["argv"][call["argv"].index("-p") + 1] for call in self.calls("claude")][1:]
+        self.assertIn(f"sd:{self.items[2]} left this bundle", prompts[0])
+        self.assertIn(f"still holds {commit[:12]}, a commit of sd:{self.items[2]}", prompts[1])
+        self.assertEqual(ended["outcome"], "blocked")
+
+    def test_a_reverted_left_item_lets_the_branch_go_on(self):
+        """Review of pack sd:9581: once one commit reverts the left item's commits, the run goes on to enqueue."""
+        commit = self.left_out_of_a_retry()
+        work = Path(self.bundle["work_path"])
+        support.git(work, "-c", "commit.gpgsign=false", "revert", "--no-edit", commit)
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+
     def test_cancel_kills_the_active_group(self):
         """Failure table, Cancel: a cancel during building kills the builder's group at the next beat."""
         self.press()
