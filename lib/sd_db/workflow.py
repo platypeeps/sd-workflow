@@ -535,9 +535,13 @@ def capture_task(
 
 def edit_item(
     connection: sqlite3.Connection, item: int, changes: dict, *,
-    who: str, expected_revision: str | None = None,
+    who: str, expected_revision: str | None = None, park_reason: str | None = None,
 ) -> dict:
     """Edit user fields without exposing status or internal source metadata.
+
+    `park_reason` rides on a park alone, one line, and the audit note
+    reads `Parked by {who}: {reason}`, so a job can prove a park was its
+    own (sd:9520); a park the item already had writes nothing.
 
     `kind` is the one field a row outside `DETAIL_KINDS` may have edited,
     alone or with `repo` cleared, since a repository-less kind needs that in
@@ -550,6 +554,12 @@ def edit_item(
     which holds its file.
     """
     who = _text(who, "who")
+    if park_reason is not None:
+        park_reason = _text(park_reason, "park reason")
+        if "\n" in park_reason or "\r" in park_reason:
+            raise WorkflowError("a park reason is one line")
+        if not isinstance(changes, dict) or changes.get("parked_at") is None:
+            raise WorkflowError("a park reason needs a park")
     with transaction(connection):
         state = _checked_state(connection, item, expected_revision)
         row = state["item"]
@@ -592,7 +602,8 @@ def edit_item(
             if "kind" in changed:
                 lines.append(f"Changed kind {row['kind']} -> {changed['kind']} by {who}")
             if "parked_at" in changed:
-                lines.append(f"{'Unparked' if changed['parked_at'] is None else 'Parked'} by {who}")
+                lines.append(f"{'Unparked' if changed['parked_at'] is None else 'Parked'} by {who}"
+                             + (f": {park_reason}" if park_reason else ""))
             # `fields` carries `area` alone here (`_area`), so the note names the area.
             fields = sorted({"area" if key == "fields" else key for key in changed} - {"kind", "parked_at"})
             if fields:
@@ -642,7 +653,8 @@ def _park(item: int, row: Any, values: dict) -> dict:
 
 #: One line of the audit comment `edit_item` writes. The name is one token: a
 #: person's comment that starts "Updated priority by hand, ..." is not one.
-AUDIT_LINE = re.compile(r"(?:Updated [a-z_]+(?:, [a-z_]+)*|Changed kind \S+ -> \S+|Unparked|Parked) by \S+")
+AUDIT_LINE = re.compile(
+    r"(?:Updated [a-z_]+(?:, [a-z_]+)*|Changed kind \S+ -> \S+|Unparked) by \S+|Parked by \S+(?:: .+)?")
 
 
 def is_audit_note(note: Any) -> bool:

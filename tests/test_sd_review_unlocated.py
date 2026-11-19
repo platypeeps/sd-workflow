@@ -13,13 +13,27 @@ findings names a path the run reviewed is voided: it no longer counts toward
 depth, and its findings are dropped. A completed answer with one located
 finding is kept whole. A failed answer keeps its located findings and every
 blocker; only its unlocated advice is dropped.
+
+sd:9536. A file the repository holds at the reviewed head is located too:
+a docs-only change drew a finding on the file it contradicts, and both
+lane passes were voided. The note names each voided path and summary.
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
+from unittest import mock
 
-from tests.test_sd_review import FakeRunner, sd_review
+from tests.clean_env import clean_environment
+from tests.test_sd_review import (
+    FIXTURE_REGISTRY,
+    FakeClient,
+    FakeRunner,
+    chat_answer,
+    namespace,
+    sd_review,
+)
 from tests.test_sd_review_fallbacks import ReviewRunFixture
 
 CHECK = {"sd-check": sd_review.Completed(0, "{}", "")}
@@ -113,3 +127,137 @@ class AnAnswerThatCitesNothingReviewedIsNotAdvice(ReviewRunFixture):
         cited = sd_review.reviewed_paths(self.prepare(), sd_review.Subject(
             "worktree", "HEAD", "worktree", ("src.py",), 1, ""), None)
         self.assertIs(sd_review.unlocated(outcome, cited, "medium"), outcome)
+
+
+class AFileTheRepositoryHoldsIsLocated(ReviewRunFixture):
+    """sd:9536. A finding on a tracked file outside the diff is advice."""
+
+    reviewing_depth = 1
+
+    def review(self, codex: sd_review.Completed | None, client: FakeClient | None = None, **options) -> dict:
+        root = self.make_repo(f"repo-{len(list(self.tmp.iterdir()))}")
+        (root / "src.py").write_text("the_review_subject = 123\n")
+        self.stub_policy({"default_tier": "cheap"})
+        if options.get("scope") == "branch":
+            for argv in (["checkout", "-b", "change"], ["add", "src.py"], ["commit", "-m", "change"]):
+                subprocess.run(["git", *argv], cwd=root, check=True, capture_output=True, env=clean_environment())
+        (root / "loose.md").write_text("in the working tree only\n")
+        if client is not None:
+            self.local_block(root)
+            (root / "CLAUDE.local.md").write_text((root / "CLAUDE.local.md").read_text().replace(
+                "codex@codex", "codex@codex.example.test"))
+            result = sd_review.review(root, namespace(**options), FakeRunner(CHECK, default=CLEAN),
+                                      self.environment(REMOTE_KEY="fixture"), self.chatgpt_home(), client=client)
+        else:
+            result = self.run_review(root, FakeRunner({**CHECK, "codex": codex}, default=CLEAN), **options)
+        self.assertNotIn("README.md", result["subject"]["paths"], "the premise: README.md is outside the diff")
+        return result
+
+    def test_a_tracked_file_outside_the_diff_is_located(self) -> None:
+        for scope in ("worktree", "branch"):
+            for path in ("README.md", "./README.md", "{root}/README.md"):
+                with self.subTest(scope=scope, path=path):
+                    spelled = path.format(root=self.tmp / f"repo-{len(list(self.tmp.iterdir()))}")
+                    result = self.review(answer(row(spelled, "low", "README contradicts src.py")), scope=scope)
+                    self.assertEqual(result["status"], "advisory")
+                    self.assertEqual(result["reviewed_by"], ["codex"])
+                    self.assertEqual([f["summary"] for f in result["findings"]], ["README contradicts src.py"])
+
+    def test_a_path_the_head_does_not_hold_is_still_voided(self) -> None:
+        """Blind answers stay voided (sd:1406): nothing, the root, prose, a
+        missing file, a directory, a path above the repository, or a file
+        only the working tree holds on a committed subject."""
+        for path in ("", "/", "the diff", "missing.md", ".git", "../README.md", "/etc/hosts"):
+            with self.subTest(path=path):
+                result = self.review(answer(row(path)))
+                self.assertEqual(result["reviewed_by"], ["second"])
+                self.assertEqual(result["outcomes"][0]["status"], "unavailable")
+        result = self.review(answer(row("loose.md")), scope="branch")
+        self.assertEqual(result["outcomes"][0]["status"], "unavailable")
+
+    def test_a_failed_git_read_is_not_located(self) -> None:
+        with mock.patch.object(sd_review.sd_lib, "git_output", return_value=None):
+            self.assertFalse(sd_review.head_holds(self.make_repo(), "HEAD")("README.md"))
+
+    def test_the_note_names_each_voided_path_and_summary(self) -> None:
+        long = "The diff could not be accessed. " + "x" * 200
+        result = self.review(answer(row("/", summary=long), row("missing.md", summary="line one\nline two")))
+        outcome = result["outcomes"][0]
+        self.assertEqual(outcome["status"], "unavailable")
+        self.assertIn("'/': The diff could not be accessed. x", outcome["detail"])
+        self.assertIn("'missing.md': line one line two", outcome["detail"])
+        self.assertNotIn("x" * 120, outcome["detail"])
+        self.assertEqual(outcome["diagnostic"]["unlocated_findings"], 2)
+        self.assertEqual(outcome["diagnostic"]["unlocated"],
+                         [{"path": "/", "summary": " ".join(long.split())[:120]},
+                          {"path": "missing.md", "summary": "line one line two"}])
+
+    def test_a_path_git_cannot_take_is_not_located_and_never_raises(self) -> None:
+        """Lead review of 4032cdd34: a NUL or a lone surrogate raised in the
+        git check before any fallback ran; an overlong path is refused too."""
+        held = sd_review.head_holds(self.make_repo(), "HEAD")
+        for path in ("README.md\x00", "README\ud800.md", "a/" * 600 + "README.md"):
+            with self.subTest(path=path[:20]):
+                self.assertFalse(held(path))
+        result = self.review(answer(row("README.md\x00"), row("\ud800")))
+        self.assertEqual((result["outcomes"][0]["status"], result["reviewed_by"]), ("unavailable", ["second"]))
+
+    def test_the_note_escapes_control_characters_and_lone_surrogates(self) -> None:
+        result = self.review(answer(row("/", summary="red \x1b[31mtext\x07 and \ud800 end"), row("\x1b]0;x\ud800")))
+        detail, shown = result["outcomes"][0]["detail"], result["outcomes"][0]["diagnostic"]["unlocated"]
+        self.assertIn("red \\x1b[31mtext\\x07 and \\ud800 end", detail)
+        self.assertIn("'\\x1b]0;x\\ud800'", detail)
+        self.assertEqual([row["path"] for row in shown], ["/", "\\x1b]0;x\\ud800"])
+        for text in (detail, json.dumps(shown, ensure_ascii=False)):
+            self.assertFalse(any(not ch.isprintable() for ch in text), text)
+
+    def test_the_note_bounds_each_path_and_the_list(self) -> None:
+        long = "p" * 300
+        result = self.review(answer(*(row(f"{n}{long}", summary=f"finding {n}") for n in range(7))))
+        detail = result["outcomes"][0]["detail"]
+        self.assertIn(f"'0{'p' * 119}': finding 0", detail)
+        self.assertNotIn("p" * 120, detail)
+        self.assertIn("finding 4; +2 more", detail)
+        self.assertNotIn("finding 5", detail)
+        self.assertEqual(result["outcomes"][0]["diagnostic"]["unlocated_findings"], 7)
+
+    def test_a_claude_reader_in_the_checkout_may_cite_a_file_it_can_read(self) -> None:
+        """Re-review of 6bb31d81d: claude-json gets the material and also runs
+        in the checkout with Read, Grep and Glob, so it can see README.md."""
+        registry = self.registry_home / ".local/share/sd/providers.yaml"
+        registry.write_text(FIXTURE_REGISTRY.replace("roles: [reviewer], reader: codex-json",
+                                                     "roles: [reviewer], reader: claude-json", 1))
+        claude = sd_review.Completed(0, json.dumps({"type": "result", "subtype": "success", "structured_output": {
+            "findings": [row("README.md", "low", "README contradicts src.py")]}}), "")
+        result = self.review(claude)
+        self.assertEqual((result["status"], result["reviewed_by"]), ("advisory", ["codex"]))
+        self.assertEqual([f["path"] for f in result["findings"]], ["README.md"])
+
+    def test_a_url_reader_sees_only_the_material(self) -> None:
+        """A URL entry gets the supplied material alone: README.md is not its to cite."""
+        registry = self.registry_home / ".local/share/sd/providers.yaml"
+        registry.write_text(FIXTURE_REGISTRY.replace('codex:  { start: "codex exec", vendor: openai, bill: first,',
+                                                     'codex:  { url: "https://codex.example.test/v1", model: fixture, '
+                                                     'vendor: openai, bill: first, env: [REMOTE_KEY],', 1))
+        client = FakeClient({"codex": chat_answer(json.dumps({"findings": [row("README.md", "low")]}))})
+        result = self.review(None, client=client)
+        self.assertEqual(len(client.sent), 1, "the premise: the URL reader answered")
+        self.assertEqual(result["outcomes"][0]["status"], "unavailable")
+        self.assertIn("'README.md': a finding", result["outcomes"][0]["detail"])
+        self.assertEqual(result["reviewed_by"], ["second"])
+
+    def test_only_a_reader_launched_in_the_checkout_reads_it(self) -> None:
+        def entry(**fields) -> sd_review.sd_registry.Provider:
+            return sd_review.sd_registry.Provider(name="p", vendor="v", bill="b", **fields)
+        self.assertEqual([sd_review.reads_checkout(entry(start="x", reader=reader)) for reader in sd_review.READERS],
+                         [reader != "opencode-json" for reader in sd_review.READERS])
+        self.assertFalse(sd_review.reads_checkout(entry(url="https://remote.example.test/v1", model="m")))
+
+    def test_a_planning_review_cites_only_its_own_plan(self) -> None:
+        """Another item's plan is a file the head holds; on a planning review
+        it is not this subject, so the old rule stands."""
+        subject = sd_review.Subject("planning", "HEAD", "worktree", ("src.py",), 1, "the plan")
+        with mock.patch.object(sd_review, "resolve_subject", return_value=subject):
+            result = self.review(answer(row("README.md", "low")), scope="planning")
+        self.assertEqual(result["outcomes"][0]["status"], "unavailable")
+        self.assertEqual(result["reviewed_by"], ["second"])

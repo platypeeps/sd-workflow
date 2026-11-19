@@ -19,6 +19,10 @@ from .database import transaction
 from .errors import SdDbError
 from .writes import add_note, create_assignment, now, record_cost, transition
 
+# The result on a bundle member's row an operator cancelled on its own: it left the bundle, so no Retry of the
+# bundle queues it again or clears its park (review round 2 of sd:9222).
+ALONE = "cancelled on its own by "
+
 
 class RunnerRefused(SdDbError):
     """An unsafe or stale queue action, with no partial selection written."""
@@ -417,15 +421,27 @@ def request_cancel(connection, assignment: int, *, expected_revision: str, who) 
         return queue_state(connection, assignment)
 
 
+def requeue_refusal(current: dict) -> str:
+    """Why `requeue` refuses the assignment `queue_state` read as `current`; "" when it takes it. The palette
+    asks before it writes its dispatch marker: a refusal after it leaves an execution reconcile cannot close."""
+    if current["role"] == "exec":
+        return "finite execution authorizations are single-use; create a new command request"
+    if current["status"] not in {"blocked", "cancelled"} or (current["run"] and not current["run"]["released_at"]):
+        return "requeue requires a terminal attempt with its lease released"
+    # Requeue rewrites the result, which holds the ALONE marker: the
+    # member would rejoin its lead's bundle (sd:9269).
+    if current["parent"] is not None and (current["result"] or "").startswith(ALONE):
+        return "this bundle member was cancelled on its own; press Build on its item to build it fresh"
+    return ""
+
+
 def requeue(connection, assignment: int, *, expected_revision: str, who) -> dict:
     with transaction(connection):
         current = queue_state(connection, assignment)
         if current["revision"] != expected_revision:
             raise RunnerRefused("assignment changed; refresh before requeuing")
-        if current["role"] == "exec":
-            raise RunnerRefused("finite execution authorizations are single-use; create a new command request")
-        if current["status"] not in {"blocked", "cancelled"} or (current["run"] and not current["run"]["released_at"]):
-            raise RunnerRefused("requeue requires a terminal attempt with its lease released")
+        if why := requeue_refusal(current):
+            raise RunnerRefused(why)
         connection.execute("UPDATE assignment SET status = 'queued', queued_at = ?, started = NULL, ended = NULL, result = ? WHERE id = ?",
                            (now(), f"requeued by {who}", assignment))
         return queue_state(connection, assignment)
