@@ -1079,6 +1079,18 @@ class Dashboard(BaseHTTPRequestHandler):
                     except SdDbError as error:
                         return self._json(400, {"error": str(error)})
                     return self._send(200, body.encode("utf-8"), "application/json; charset=utf-8")
+                if path == "/api/usage/strip":
+                    from .usage_screen import strip
+
+                    # The shell's Usage dropdown on every page (pack sd:9569; Today's /api/now carried it until then).
+                    if not self._session(context):
+                        return self._json(403, {"error": f"Reload the page to read Usage: {SESSION_ENDED}"})
+                    if split.query:
+                        return self._json(400, {"error": "The Usage strip does not accept query parameters."})
+                    try:
+                        return self._json(200, strip(connection, now=self.clock()))
+                    except Exception as failure:  # noqa: BLE001 - odd heartbeat input says why in the dropdown, as /api/now did
+                        return self._json(500, {"error": str(failure) or type(failure).__name__})
                 if path == "/api/capture-repos" and not split.query:
                     from sd_db import repos
 

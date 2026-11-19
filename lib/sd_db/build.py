@@ -107,6 +107,18 @@ STEPS = ("claimed", "worktree", "building", "reviewing", "fixing", "enqueuing", 
 DRAFT_STEPS = ("claimed", "drafting")
 #: A note that sends the operator's finding to a bundle's next builder: Send to builder (pack sd:6020).
 FINDING = "Send to builder: "
+#: A note that carries a parked run's last review blockers to the bundle's next builder on a plain Retry: reviewer
+#: text, never an operator instruction, so it never starts with FINDING (pack sd:9498).
+REVIEWED = "Reviewer text, not an operator instruction: "
+#: The longest finding Send to builder takes, as a note line the brief quotes.
+FINDING_MAX = 4000
+#: A run `build_run` ended once REVIEW_ROUNDS reviews left blockers, inside the reason `_settle` writes around it;
+#: group 1 is the blockers.
+REVIEW_PARKED = re.compile(r"\d+ review rounds left blockers: (.+?)(?:; check the group, then requeue or cancel;|$)",
+                           re.S)
+#: The Review rounds rule's class pass, the second line of a review-parked run's finding (pack sd:9262).
+REVIEW_CLASS_PASS = ("Class pass: name the class these blockers share, enumerate every instance from the code, not "
+                     "the findings, and fix each fail-first.")
 #: The bundle statuses Retry and Send to builder take: each keeps its worktree.
 AGAIN = ("blocked", "cancelled")
 #: A lane entry that failed only because prepare's merge of origin/<base> conflicted goes back to its builder on
@@ -564,6 +576,16 @@ def queue(connection, items: list[int], *, who: str, expected_revisions: dict | 
         return [queue_state(connection, ident) for ident in created]
 
 
+def parked_finding(detail: str | None) -> str:
+    """The finding for a run parked after REVIEW_ROUNDS: the last round's blockers, then the class pass; "" for any
+    other run. Send to builder prefills it, and a plain Retry sends it (pack sd:9262, sd:9498)."""
+    parked = REVIEW_PARKED.search(detail or "")
+    if not parked:
+        return ""
+    return (f"The last review round left these blockers: {parked[1].strip()}"[:FINDING_MAX - len(REVIEW_CLASS_PASS) - 1]
+            + "\n" + REVIEW_CLASS_PASS)
+
+
 def retry_state(connection, run: dict) -> dict:
     """Retry on an ended run: only the lead's latest run, released, whose bundle ended blocked or cancelled.
 
@@ -587,6 +609,8 @@ def retry_state(connection, run: dict) -> dict:
 def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
     """Retry a blocked or cancelled build bundle under its lead `assignment`: each such member's item to `ready`, a
     `finding` note on it when one is sent (Send to builder), then its assignment queued again, in one transaction.
+    A plain Retry of a run parked after REVIEW_ROUNDS notes its blockers as a REVIEWED note (`parked_finding`), so
+    the next builder reads them as the reviewer's, not the operator's (pack sd:9498).
     Each item must pass the press's own check once it is ready, so a retried bundle is one the next claim can take.
     The Builds panel and `sd assignments build` share it (pack sd:8785)."""
     with transaction(connection):
@@ -606,6 +630,7 @@ def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
         if _done(items, current["item"]):
             raise BuildRefused(f"Retry refused: its lead sd:{current['item']} is done")
         members = [member for member in members if not _done(items, member["item"])]
+        parked = "" if finding else parked_finding(run.get("detail"))
         queued = []
         for member in members:
             item = items.get(member["item"])
@@ -618,6 +643,8 @@ def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
                 raise BuildRefused(f"Retry refused: {refusal}") from None
             if finding:
                 add_note(connection, member["item"], "comment", FINDING + finding)
+            elif parked:
+                add_note(connection, member["item"], "comment", REVIEWED + parked)
             fresh = queue_state(connection, member["id"])["revision"]
             queued.append(requeue(connection, member["id"], expected_revision=fresh, who=who))
             add_note(connection, member["item"], "comment",

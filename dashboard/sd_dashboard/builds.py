@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import functools
 import os
-import re
 import sqlite3
 import subprocess
 from datetime import datetime
@@ -48,14 +47,9 @@ QUIET_SECONDS = 15 * 60
 ENDED_MAX = 500
 KICKSTART_SECONDS = 5
 #: The longest finding Send to builder takes, as a note line the brief quotes.
-FINDING_MAX = 4000
-#: A run `build_run` ended once REVIEW_ROUNDS reviews left blockers, inside the reason `build._settle` writes
-#: around it; group 1 is the blockers.
-REVIEW_PARKED = re.compile(r"\d+ review rounds left blockers: (.+?)(?:; check the group, then requeue or cancel;|$)",
-                           re.S)
+FINDING_MAX = build.FINDING_MAX
 #: The Review rounds rule's class pass, the second line of a review-parked run's Send to builder text (pack sd:9262).
-CLASS_PASS = ("Class pass: name the class these blockers share, enumerate every instance from the code, not the "
-              "findings, and fix each fail-first.")
+CLASS_PASS = build.REVIEW_CLASS_PASS
 #: The steps a builder writes its log in; a quiet log elsewhere (a review, the lane) is not a stall.
 LOGGING = ("building", "fixing")
 
@@ -285,16 +279,6 @@ def _waiting(connection, run: dict, items: list[int]) -> str:
     return f"question note #{asked['id']} on sd:{asked['item']}" if asked else ""
 
 
-def _prefill(detail: str | None) -> str:
-    """Send to builder's text for a run parked after REVIEW_ROUNDS: the last round's blockers, then the class pass;
-    "" for any other run, whose box opens empty (pack sd:9262)."""
-    parked = REVIEW_PARKED.search(detail or "")
-    if not parked:
-        return ""
-    return f"The last review round left these blockers: {parked[1].strip()}"[:FINDING_MAX - len(CLASS_PASS) - 1] \
-        + "\n" + CLASS_PASS
-
-
 def _log_quiet(path: str | None, now: str) -> int | None:
     """Seconds since the run's log last grew, or None when it has none or it is not read."""
     if not path:
@@ -422,7 +406,7 @@ def panel(connection, *, now: str, show: str = "active") -> dict:
                            "ended": row["released_at"], "step": row["step"] or "claimed", "model": row["model"] or "",
                            "usd": round(build.run_spent(connection, row["id"]), 2), "log": row["log_path"] or "",
                            "worktree": row["work_path"] or "", "retry": build.retry_state(connection, row),
-                           "prefill": _prefill(row["detail"])})
+                           "prefill": build.parked_finding(row["detail"])})
     except (SdDbError, sqlite3.Error, ValueError, TypeError, KeyError) as failure:
         return {"runs": [], "recent": [], "error": str(failure) or "the build runs could not be read", "read": now,
                 "show": show}
