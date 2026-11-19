@@ -133,7 +133,7 @@ addEventListener('DOMContentLoaded', () => {
   // sd:9309: the text filter is Add or find's words (the one-bar rule, sd:5539): no second text box.
   const find = document.getElementById('shift-in');
   // A ?q= link's words search; Enter files them only once the operator edits the field (sd:9309 review).
-  let Q = '', linked = '';
+  let Q = '', linked = '', PQ = null;
   const on = () => FKEYS.reduce((n, k) => n + F[k].size, 0) + (Q ? 1 : 0);
   const dueBucket = t => t.overdue || (t.due && days(t) < 0) ? 'overdue' : !t.due ? 'none' : withinWeek(t) ? 'week' : 'later';
   const DUE_OPTS = [['overdue', 'overdue'], ['week', '≤ 7 days'], ['later', 'later'], ['none', 'no due']];
@@ -184,13 +184,14 @@ addEventListener('DOMContentLoaded', () => {
   function emptyBox() { find.value = ''; linked = ''; showPreview(); }
   function clearFilters() { Object.values(F).forEach(s => s.clear()); emptyBox(); L.page = 1; render(); }
   // The text filter narrows on what a row shows: id, title, repo, status and kind, as v1's ?q= read the visible columns.
-  // Add or find's words set it (showPreview, sd:9309): its title words, or #id; p1, due fri and #repo are the add's alone,
-  // unless they are all the box holds: then it is the text as typed (sd:9498).
+  // Add or find's words set it (showPreview, sd:9309): its title words, or #id; p1, due fri and #repo are the add's alone.
+  // A box of one priority word alone sets PQ instead, which narrows to that priority (sd:9498).
   // A #id names one task, as the preview and Enter take it: #904 never lists #9040 (review of sd:9309).
   const matches = t => { const id = Q.match(/^#(\d+)$/); return id ? String(t.id) === id[1] : words(t).includes(Q); };
   const words = t => `#${t.id} ${t.title} ${t.repo} ${slabel(t.status)} ${t.kind} ${t.stage || ''}`.toLowerCase();
   const passes = t => (!F.kind.size || picked(t)) && work(t) && (!F.repo.size || F.repo.has(t.repo)) && (!F.p.size || F.p.has(t.p ? String(t.p) : 'unset')) && (!F.due.size || F.due.has(dueBucket(t)))
-    && (!F.status.size || F.status.has(t.status)) && (!F.age.size || F.age.has(t.age)) && (!F.active.has('1') || t.status !== 'done') && scoped(t) && inPlace(t) && (!Q || matches(t));
+    && (!F.status.size || F.status.has(t.status)) && (!F.age.size || F.age.has(t.age)) && (!F.active.has('1') || t.status !== 'done') && scoped(t) && inPlace(t) && (!Q || matches(t))
+    && (PQ === null || String(t.p) === String(PQ));
   const visible = () => tasks.filter(passes);
 
 
@@ -601,10 +602,11 @@ addEventListener('DOMContentLoaded', () => {
     const txt = inp.value, P = parse(txt);
     ghost.hidden = !!txt;
     // Pack sd:9340: a ?q= link searches its words whole until edited; before the first draw only Q changes.
-    // Pack sd:9498: words that are only the add's (P1, due fri, #repo) leave no title; then the filter reads the box as
-    // typed, so P1 alone does not list every task.
-    const q = linked && txt.trim() === linked ? linked.toLowerCase() : (P.find ? `#${P.find}` : P.title || txt.trim()).toLowerCase();
-    if (q !== Q) { Q = q; L.page = 1; if (drawn) render(); }
+    // Pack sd:9498: a box holding one priority word alone (P1) narrows to that priority, not to every task; any other
+    // box with no title (#repo, due fri, mid-typing) filters on nothing, as before.
+    const pq = !(linked && txt.trim() === linked) && /^p[1-4]$/i.test(txt.trim()) ? P.p : null;
+    const q = linked && txt.trim() === linked ? linked.toLowerCase() : (P.find ? `#${P.find}` : P.title).toLowerCase();
+    if (q !== Q || pq !== PQ) { Q = q; PQ = pq; L.page = 1; if (drawn) render(); }
     if (!txt.trim()) { prev.hidden = true; inp.setAttribute('aria-expanded', 'false'); return; }
     const found = P.find ? tasks.filter(t => String(t.id) === P.find) : P.title.length > 2 ? tasks.filter(t => t.title.toLowerCase().includes(P.title.toLowerCase())).slice(0, 3) : [];
     const fr = !P.repo && filterRepo() && [...F.repo][0];

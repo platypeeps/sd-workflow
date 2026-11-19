@@ -3242,10 +3242,16 @@ class TheFilterAddress(ScreenCase):
         self.assertEqual(shown, {905})
         self.assertIn("q=p1%20bug", out["urls"][-1])
 
-    def test_a_box_of_add_words_alone_filters_on_its_text(self):
-        # Pack sd:9498: P1 parsed to no title, so the text filter was empty and listed every task.
-        self.doc["rows"] += [self.made(905, "Fix p1 bug", "ready", "0"), self.made(906, "Bug hunt", "ready", "0")]
-        for typed, want in (("P1", {905}), ("p1 bug", {905, 906})):
+    def test_a_box_of_one_priority_word_alone_narrows_to_that_priority(self):
+        # Pack sd:9498: P1 parsed to no title, so the text filter was empty and listed every task. Lead review: the
+        # box's literal text emptied the list for #repo or due fri mid-typing; only a lone priority word narrows.
+        for row in self.doc["rows"]:
+            row["priority"] = 1 if row["id"] == 902 else 3
+        everything, _ = self.listed("?view=list")
+        ones = {902}
+        self.assertTrue(ones < everything, everything)
+        for typed, want in (("P1", ones), ("p1", ones), ("#sd-workflow", everything), ("due fri", everything),
+                            ("p2 due mon #sd-workflow", everything)):
             with self.subTest(typed=typed):
                 shown, _ = self.listed("?view=list", "const box = document.getElementById('shift-in'); "
                                        f"box.value = '{typed}';\nbox.listeners.input[0]({{ target: box }}); await flush();")
