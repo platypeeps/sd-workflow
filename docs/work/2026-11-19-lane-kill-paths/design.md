@@ -69,8 +69,8 @@ main. "n/a" means main does not have that code.
 | 4 `sd-ship` `review_process` KILL | review group signalled | `sd-review`'s own sessions survive | the same read before TERM and KILL | test_a_killed_review_ends_the_sessions_below_it |
 | 5 `end_child` KILL (hosted run, `CHILD_STOP_SECONDS`) | lane child process killed | its ship and gate sessions survive | read below the unreaped child before TERM and KILL | test_a_killed_lane_child_leaves_no_session_below |
 | 6 cron `JOB_TIMEOUT`: TERM to the job group, KILL after `CRON_JOBS_TIMEOUT_GRACE` (10 s) | lane child and hosted run | the child's unwind (5 s per group, then up to 10 s per gate after its TERM) can outlast the grace; the cron KILL then leaves the gate's sessions | a gate's wait after TERM counts from its first TERM, sent as the TERM lands; the unwind then ends in about `GROUP_CLEANUP_SECONDS` | test_a_termed_run_ends_inside_the_cron_grace |
-| 6 residual | none | open: an outside KILL that lands before the unwind ends (grace below 6 s, a stalled `ps`) leaves sessions with no record | needs a decision: record groups beside the runner lock (a new file), or raise the lane job's grace in the system repo | none |
-| 7 hand run, SIGHUP | none | open: a terminal close kills `sd-ship lane run` with no unwind | proposed: `term_ends_group` handles HUP as TERM; filed | none |
+| 6 residual | none | open: an outside KILL that lands before the unwind ends (grace below 6 s, a stalled `ps`) leaves sessions with no record | needs a decision, asked on the item: raise the lane job's grace in the system repo (recommended), or record groups beside the runner lock (a new file) | none |
+| 7 hand run, SIGHUP | none | open: a terminal close kills `sd-ship lane run` with no unwind | proposed: `term_ends_group` handles HUP as TERM; filed as pack sd:9568 | none |
 | self-KILL (`arm_term`) | n/a | not on main | none | none |
 | `end_overdue` | n/a | not on main | none | none |
 | advisory 4667: post-budget settle skips `release_chain`/`post_merge` | n/a | main runs both after every run that does not raise | none | none |
