@@ -4476,7 +4476,9 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
     Then, inside the budget, every `RESCAN_SECONDS` and once no lane runs,
     `pending` names each idle lane with an entry its last worker did not
     see at its start; such a lane starts again on the same terms, and an
-    idle run waits for room for it as the first pass does (sd:5809). A
+    idle run waits for room for it as the first pass does (sd:5809), each
+    scan naming anew the lanes it waits for. An idle run waits for room
+    for no lane with nothing pending. A
     lane's ids are read once it is claimed, just before its worker starts.
     An entry a worker left pending, or saw while it answered busy, starts
     none, so the run ends once a scan read after the last lane ended
@@ -4560,11 +4562,14 @@ class ParallelRun:
         self.running[index] = self.start(checkout, max(0.0, self.deadline - clock()))
 
     def first_pass(self) -> None:
-        for index in range(len(self.order)):
+        for index, (_, checkout) in enumerate(self.order):
             while True:
                 self.collect_and_release()
                 took = self.claim_lane(index)
                 if took is not None:
+                    break
+                if not self.running and not self.pending({checkout: frozenset()}).get(checkout):
+                    self.seen[index] = frozenset()  # idle, and nothing to wait for: a scan starts it on new work
                     break
                 time.sleep(START_POLL_SECONDS)
             if took:
@@ -4590,9 +4595,9 @@ class ParallelRun:
                 scanned = time.monotonic()
                 idle_lanes = {checkout: self.seen[index] for index, (_, checkout) in enumerate(self.order)
                               if index not in self.running}
-                found = self.pending(idle_lanes)
-                self.late.update(index for index, (_, checkout) in enumerate(self.order) if checkout in found
-                                 and index not in self.running)
+                found = self.pending(idle_lanes)  # rebuilt each scan: a lane whose new entry went away waits no more
+                self.late = {index for index, (_, checkout) in enumerate(self.order) if checkout in found
+                             and index not in self.running}
             started = self.start_late_lanes()
             if idle and not started and not self.late:  # a scan read every lane after the last one ended
                 return

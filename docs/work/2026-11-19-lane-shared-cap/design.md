@@ -87,7 +87,8 @@ Classes from the blocking rounds, with every instance in the code:
   the room read; rows 1-3.
 - Unknown read as an answer: the claim probe, the claim take, the
   room read and the queue read; rows 4-7.
-- A wait without a bound: the first pass and the rescan; rows 8-10.
+- A wait without a bound, or for nothing: the first pass and the
+  rescan; rows 8-10 and 25-26.
 - A count that ends before its worker, or misses one: post-merge, a
   dead run, a worker that outlives its run and a lane not in this
   run's list; rows 11-13 and 23.
@@ -124,6 +125,8 @@ Classes from the blocking rounds, with every instance in the code:
 | 22 | any | a hung lock-holder helper hung the two-run test (round 48d7c28c4 :5982) | the helper's line is read under a 30 s select | test_a_second_run_counts_the_lanes_the_first_holds_toward_the_cap |
 | 23 | 3 | the cap counted only claims for this run's own lanes, so a lane its host read dropped, or one moved here, went uncounted while the other run held it (lead review 1b5580736 :4515, sd:9611) | count every live claim in the lane root | test_a_claim_for_a_lane_this_run_does_not_list_counts_toward_the_cap |
 | 24 | 2 | a lane the other run claimed kept no seen ids, so every rescan wrote another busy row, about 80 a budget (advisory 1b5580736 :4537) | a busy claim records the lane's pending ids as seen; only a new entry tries it again | test_a_lane_the_other_run_claimed_gets_one_busy_row_across_rescans |
+| 25 | 3 | rescans only added to the lanes waiting for room, so a lane whose only new entry was held, cancelled or drained kept an idle run, and its launchd label, to the deadline (lane review 08130e1f :4592, sd:9611) | each scan rebuilds the waiting lanes | test_a_waiting_lane_whose_new_entry_went_away_lets_an_idle_run_end |
+| 26 | 3 | an idle run's first pass waited for room for a lane with nothing pending while the other run filled the gate (class pass on :4592) | an idle run moves on; a scan starts the lane once work arrives | test_an_idle_run_waits_for_no_room_for_a_lane_with_nothing_pending |
 
 Rows removed with the hand-off: the fd passed to a child, a child
 that never starts, an fd that names another file, the env var seen

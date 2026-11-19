@@ -6080,7 +6080,7 @@ class HostedParallel(Lane):
     def test_a_held_gate_admission_lock_stops_no_run_under_the_start_lock(self) -> None:
         """sd:9332 lead review: the room read took the gate's admission lock blocking, under the host's start
         lock, so a stalled gate stopped both lane-run jobs. It reads the gate without waiting; a lock it
-        cannot take is no room, so the run starts nothing inside its budget, then zeta with no budget."""
+        cannot take is no room, so the idle run, with nothing pending, starts nothing and ends."""
         import sd_gate_slots
         self.hold_outside(self.repo)
         where = sd_gate_slots.directory(self.environ)
@@ -6112,7 +6112,7 @@ class HostedParallel(Lane):
             admission.close()  # a run stuck on it ends now
             worker.join(30)
         self.assertFalse(alive, "the run waited on the gate's admission lock")
-        self.assertEqual(started, [(self.zeta, 0.0)], rows)
+        self.assertEqual(started, [], rows)
 
     def test_no_queue_lookup_runs_under_the_start_lock(self) -> None:
         """sd:9332 lead review: a lane's queue lookup runs git; under the host-wide start lock it held both
@@ -6404,6 +6404,55 @@ class HostedParallel(Lane):
                                         lambda: None, pending, locks=sd_lane.MachineLocks(self.environ), cap=2)
         self.assertGreaterEqual(polls[0], 3, "fewer than 3 rescans ran")
         self.assertEqual(len([row for row in rows if row["path"] == "zeta" and "busy" in row]), 1, rows)
+
+    def test_a_waiting_lane_whose_new_entry_went_away_lets_an_idle_run_end(self) -> None:
+        """sd:9332 lane review 08130e1f :4592, sd:9611: rescans only added to the lanes waiting for room, so a
+        lane whose only new entry was then held, cancelled or drained kept an idle run alive to its deadline,
+        and launchd started no tick meanwhile. Each scan rebuilds the waiting lanes; the run ends."""
+        self.hold_outside(self.repo)  # the other run's lane: an idle run reads the room
+        calls = [0]
+
+        def room() -> str | None:
+            calls[0] += 1
+            return None if calls[0] == 1 else "the gate's slots are full"
+        ids = {self.zeta: frozenset({"1"})}
+        polls = [0]
+        starts: list[pathlib.Path] = []
+
+        def gone() -> None:
+            ids[self.zeta] = frozenset({"1"})  # entry 9 was cancelled after the first poll
+
+        def pending(seen: dict[pathlib.Path, frozenset[str]]) -> dict[pathlib.Path, frozenset[str]]:
+            return {checkout: ids[checkout] for checkout in seen if checkout in ids and ids[checkout] - seen[checkout]}
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            starts.append(checkout)
+            ids[self.zeta] = frozenset({"1", "9"})  # 9 arrives once the worker started
+            return sd_lane.StartedLane(lambda: {"ran": []})
+        with mock.patch.object(sd_lane, "RESCAN_SECONDS", 0.0), \
+                mock.patch.object(sd_lane.time, "sleep", self.bounded_nap(polls, gone)):
+            rows = sd_lane.run_parallel([("zeta", self.zeta)], start, sd_lane.clock() + 600, room, pending,
+                                        locks=sd_lane.MachineLocks(self.environ), cap=2)
+        self.assertEqual(starts, [self.zeta], rows)
+        self.assertLessEqual(polls[0], 1, "the idle run waited for a lane with nothing new")
+
+    def test_an_idle_run_waits_for_no_room_for_a_lane_with_nothing_pending(self) -> None:
+        """sd:9332 class pass on 08130e1f :4592: the first pass of an idle run waited for room for a lane
+        with nothing pending while the other run's lanes filled the gate, so it held its launchd label to
+        the deadline for no work; main started such a lane at once. It moves on; a scan starts the lane
+        once work arrives."""
+        self.hold_outside(self.repo)
+        polls = [0]
+        started: list[pathlib.Path] = []
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            started.append(checkout)
+            return sd_lane.StartedLane(lambda: {"ran": []})
+        with mock.patch.object(sd_lane.time, "sleep", self.bounded_nap(polls)):
+            rows = sd_lane.run_parallel([("zeta", self.zeta)], start, sd_lane.clock() + 600,
+                                        lambda: "the gate's slots are full",
+                                        locks=sd_lane.MachineLocks(self.environ), cap=2)
+        self.assertEqual((started, polls[0]), ([], 0), rows)
 
     def test_the_hosted_run_reads_the_machine_s_lane_parallel(self) -> None:
         """sd:9323: the runner's start rule reads sd.lane_parallel, not the constant."""
