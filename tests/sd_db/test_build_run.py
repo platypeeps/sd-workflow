@@ -1140,6 +1140,36 @@ class Supervise(Case):
         assert again is not None
         self.assertNotEqual(again["branch"], held)
 
+    def blocked_elsewhere(self, index):
+        """A bundle of three ends cancelled; its item `index` is then built on its own, and that newer build blocks."""
+        self.press(3)
+        item = self.items[index]
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["cancel"])
+        self.assertEqual(self.supervisor().run()["outcome"], "cancelled")
+        self.release_all()
+        self.db.execute("UPDATE item SET status = 'ready' WHERE id = ?", (item,))
+        newer = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'blocked' WHERE id = ?", (newer,))
+        self.db.execute("UPDATE item SET status = 'blocked' WHERE id = ?", (item,))
+        return newer
+
+    def test_a_subset_retry_leaves_a_left_items_newer_block_alone(self):
+        """Round 8 class pass, row 13: a left-out member whose item a newer build owns keeps that build's state; the
+        Retry ends the old membership only, never the newer block, and parks nothing."""
+        self.blocked_elsewhere(2)
+        build.retry(self.db, self.bundle["assignment"], who="operator", only=self.items[:2])
+        row = self.db.execute("SELECT status, parked_at FROM item WHERE id = ?", (self.items[2],)).fetchone()
+        self.assertEqual((row["status"], row["parked_at"]), ("blocked", None))
+
+    def test_a_subset_retry_refuses_a_kept_item_a_newer_build_owns(self):
+        """Row 14: a kept member whose item a newer build owns would be queued twice; the Retry refuses."""
+        newer = self.blocked_elsewhere(1)
+        with self.assertRaisesRegex(build.BuildRefused, f"assignment {newer}"):
+            build.retry(self.db, self.bundle["assignment"], who="operator", only=self.items[:2])
+        self.assertEqual(self.db.execute("SELECT status FROM item WHERE id = ?", (self.items[1],)).fetchone()[0],
+                         "blocked")
+
     def test_a_subset_retry_with_no_earlier_work_builds_on(self):
         """Row 5, the guard: a bundle cancelled before any build holds no earlier commit, so the kept items build."""
         supervisor = self.left_out_of_a_retry(run=False)

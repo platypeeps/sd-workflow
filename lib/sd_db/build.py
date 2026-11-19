@@ -649,9 +649,12 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
                                    f"whose worktree holds its work")
             stamp = clock()
             for member in [member for member in members if member["item"] not in only]:
+                owns = _current(connection, member)  # read before this row's own write below
                 connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
                                    (stamp, f"{ALONE}{who}: {LEFT_OUT}{run['id']}",
                                     member["id"]))
+                if not owns:  # a newer build owns the item: its state is that build's, not this bundle's
+                    continue
                 if member["item"] in items and items[member["item"]]["status"] == "blocked":
                     transition(connection, member["item"], "ready", who=who,
                                reason=f"left out of a Retry of build run {run['id']}")
@@ -659,6 +662,11 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
                      f"Build assignment {member['id']} left its bundle: a Retry of build run {run['id']} by {who} "
                      f"named other items; item parked; Build it to build it fresh")
             members = [member for member in members if member["item"] in only]
+        newer = [member for member in members if not _current(connection, member)]
+        if newer:
+            owner = connection.execute("SELECT id FROM assignment WHERE item = ? AND scope = ? ORDER BY id DESC "
+                                       "LIMIT 1", (newer[0]["item"], SCOPE)).fetchone()["id"]
+            raise BuildRefused(f"Retry refused: sd:{newer[0]['item']} has a newer build, assignment {owner}")
         parked = "" if finding else parked_finding(run.get("detail"))
         queued = []
         for member in members:
@@ -725,6 +733,14 @@ def split(connection, lead: int) -> str:
     if any(SPLIT in (run["detail"] or "") for run in runs):
         return "held"
     return "clear" if any(run["base_head"] for run in runs) else "unread"
+
+
+def _current(connection, member: dict) -> bool:
+    """Whether bundle `member` is its item's latest build assignment: only then may this bundle write the item's
+    status or parking; a newer build owns them otherwise (pack sd:9581)."""
+    latest = connection.execute("SELECT id FROM assignment WHERE item = ? AND scope = ? ORDER BY id DESC LIMIT 1",
+                                (member["item"], SCOPE)).fetchone()
+    return latest is not None and latest["id"] == member["id"]
 
 
 def split_held(connection, item: int) -> bool:
