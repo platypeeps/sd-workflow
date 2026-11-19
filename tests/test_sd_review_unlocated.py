@@ -13,12 +13,19 @@ findings names a path the run reviewed is voided: it no longer counts toward
 depth, and its findings are dropped. A completed answer with one located
 finding is kept whole. A failed answer keeps its located findings and every
 blocker; only its unlocated advice is dropped.
+
+sd:9536. A file the repository holds at the reviewed head is located too:
+a docs-only change drew a finding on the file it contradicts, and both
+lane passes were voided. The note names each voided path and summary.
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
+from unittest import mock
 
+from tests.clean_env import clean_environment
 from tests.test_sd_review import FakeRunner, sd_review
 from tests.test_sd_review_fallbacks import ReviewRunFixture
 
@@ -113,3 +120,60 @@ class AnAnswerThatCitesNothingReviewedIsNotAdvice(ReviewRunFixture):
         cited = sd_review.reviewed_paths(self.prepare(), sd_review.Subject(
             "worktree", "HEAD", "worktree", ("src.py",), 1, ""), None)
         self.assertIs(sd_review.unlocated(outcome, cited, "medium"), outcome)
+
+
+class AFileTheRepositoryHoldsIsLocated(ReviewRunFixture):
+    """sd:9536. A finding on a tracked file outside the diff is advice."""
+
+    reviewing_depth = 1
+
+    def review(self, codex: sd_review.Completed, **options) -> dict:
+        root = self.make_repo(f"repo-{len(list(self.tmp.iterdir()))}")
+        (root / "src.py").write_text("the_review_subject = 123\n")
+        self.stub_policy({"default_tier": "cheap"})
+        if options.get("scope") == "branch":
+            for argv in (["checkout", "-b", "change"], ["add", "src.py"], ["commit", "-m", "change"]):
+                subprocess.run(["git", *argv], cwd=root, check=True, capture_output=True, env=clean_environment())
+        (root / "loose.md").write_text("in the working tree only\n")
+        result = self.run_review(root, FakeRunner({**CHECK, "codex": codex}, default=CLEAN), **options)
+        self.assertNotIn("README.md", result["subject"]["paths"], "the premise: README.md is outside the diff")
+        return result
+
+    def test_a_tracked_file_outside_the_diff_is_located(self) -> None:
+        for scope in ("worktree", "branch"):
+            for path in ("README.md", "./README.md", "{root}/README.md"):
+                with self.subTest(scope=scope, path=path):
+                    spelled = path.format(root=self.tmp / f"repo-{len(list(self.tmp.iterdir()))}")
+                    result = self.review(answer(row(spelled, "low", "README contradicts src.py")), scope=scope)
+                    self.assertEqual(result["status"], "advisory")
+                    self.assertEqual(result["reviewed_by"], ["codex"])
+                    self.assertEqual([f["summary"] for f in result["findings"]], ["README contradicts src.py"])
+
+    def test_a_path_the_head_does_not_hold_is_still_voided(self) -> None:
+        """Blind answers stay voided (sd:1406): nothing, the root, prose, a
+        missing file, a directory, a path above the repository, or a file
+        only the working tree holds on a committed subject."""
+        for path in ("", "/", "the diff", "missing.md", ".git", "../README.md", "/etc/hosts"):
+            with self.subTest(path=path):
+                result = self.review(answer(row(path)))
+                self.assertEqual(result["reviewed_by"], ["second"])
+                self.assertEqual(result["outcomes"][0]["status"], "unavailable")
+        result = self.review(answer(row("loose.md")), scope="branch")
+        self.assertEqual(result["outcomes"][0]["status"], "unavailable")
+
+    def test_a_failed_git_read_is_not_located(self) -> None:
+        with mock.patch.object(sd_review.sd_lib, "git_output", return_value=None):
+            self.assertFalse(sd_review.head_holds(self.make_repo(), "HEAD")("README.md"))
+
+    def test_the_note_names_each_voided_path_and_summary(self) -> None:
+        long = "The diff could not be accessed. " + "x" * 200
+        result = self.review(answer(row("/", summary=long), row("missing.md", summary="line one\nline two")))
+        outcome = result["outcomes"][0]
+        self.assertEqual(outcome["status"], "unavailable")
+        self.assertIn("'/': The diff could not be accessed. x", outcome["detail"])
+        self.assertIn("'missing.md': line one line two", outcome["detail"])
+        self.assertNotIn("x" * 120, outcome["detail"])
+        self.assertEqual(outcome["diagnostic"]["unlocated_findings"], 2)
+        self.assertEqual(outcome["diagnostic"]["unlocated"],
+                         [{"path": "/", "summary": " ".join(long.split())[:120]},
+                          {"path": "missing.md", "summary": "line one line two"}])

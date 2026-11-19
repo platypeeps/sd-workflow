@@ -983,11 +983,17 @@ class LineBudgetTests(unittest.TestCase):
         # rebuttal blocks nothing: same path, whole summary and exact line,
         # the newest record there a listed rebuttal whose file is unchanged
         # since its receipt. Measured: `sd-review` is 2847 here.
+        #
+        # 4817 -> 4836 is pack sd:9536, under the operator's 4900 ceiling:
+        # `bin/sd-review` +19 for `tracked`, so a finding on a file the
+        # reviewed head holds outside the diff is located, and a voided
+        # finding's path and summary prefix in the note. Measured:
+        # `sd-review` is 2866 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4817,
+            4836,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

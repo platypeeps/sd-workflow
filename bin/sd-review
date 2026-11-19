@@ -2377,13 +2377,14 @@ def review(
 
     try:
         cited, omitted = reviewed_paths(root, subject, previous), tuple(input_manifest.get("omitted_paths", ()))
+        held = head_holds(root, "HEAD" if subject.head == "worktree" else subject.head)
 
         def read_one(provider: sd_registry.Provider) -> tuple[dict[str, Any] | None, list[Outcome]]:
             """One reader's attempts, in its own thread (sd:7519); its skill state measured against its own binary."""
             measured = codex_skill_state(provider, root, runner, env, auth_home) if provider.reader == "codex-json" and auth["ok"] else None
             unread = omitted if provider.url or provider.reader in MATERIAL_READERS else ()
             return measured, _attempts(provider, lambda: partial(unlocated(run_provider(provider, root, subject, prompt, runner, env, phase,
-                codex_auth_home, client, ledger, measured or skills), cited, result["severity_floor"]), unread))
+                codex_auth_home, client, ledger, measured or skills), cited, result["severity_floor"], held), unread))
         answers = sd_lib.fill_slots(chosen, depth, read_one, lambda answer: any(row.status in (CLEAN, FINDINGS) for row in answer[1]), READER_GROUPS)
         # The result key carries the first binary that ignored the key, else the last measured; each outcome its own.
         measures = [measured for measured, _attempts_made in answers if measured is not None]
@@ -2495,29 +2496,47 @@ def reviewed_paths(root: pathlib.Path, subject: Subject, previous: Mapping[str, 
                      | {f"./{name}" for name in names} | LANE_PATHS)
 
 
-def unlocated(outcome: Outcome, cited: frozenset[str], floor: str) -> Outcome:
+def head_holds(root: pathlib.Path, ref: str) -> Callable[[str], bool]:
+    """sd:9536. Whether a cited path is a file the repository holds at `ref`.
+
+    A docs change drew findings on the files it contradicts, and both lane
+    passes were voided. Spellings are those `reviewed_paths` accepts; a
+    directory, a path outside the repository or a failed git read is not held."""
+    prefixes = (f"{pathlib.Path(root).as_posix()}/", f"{pathlib.Path(root).resolve().as_posix()}/", "./")
+    def file_at_head(path: str) -> bool:
+        name = next((path[len(prefix):] for prefix in prefixes if path.startswith(prefix)), path)
+        return bool(name) and not name.startswith(("/", "../")) and sd_lib.git_output(["cat-file", "-t", f"{ref}:{name}"], root) == "blob"
+    return file_at_head
+
+
+def unlocated(outcome: Outcome, cited: frozenset[str], floor: str, held: Callable[[str], bool] = lambda path: False) -> Outcome:
     """sd:1406. A finding that cites no path this run reviewed is not advice.
 
     Measured blind answers put nothing, `/`, or prose where a path belongs; a
-    sighted one cites a subject path. The check reads structure, not prose.
+    sighted one cites a subject path or a file the head holds (sd:9536). The
+    check reads structure, not prose.
     A completed answer with no located finding is voided: `unavailable`, not
     counted toward depth, its findings dropped. A completed answer with one
     located finding is kept whole. A failed answer keeps its located findings
-    and every blocker, located or not; its unlocated advice is dropped.
+    and every blocker, located or not; its unlocated advice is dropped. The
+    note names each dropped path and its summary's first 120 characters.
     """
     completed = outcome.status in (CLEAN, FINDINGS)
-    located = [row["path"].strip() in cited for row in outcome.findings]
+    located = [row["path"].strip() in cited or held(row["path"].strip()) for row in outcome.findings]
     if completed and any(located) or all(located):
         return outcome
-    kept = () if completed else tuple(row for row, here in zip(outcome.findings, located, strict=True)
-                                      if here or dispose([row], floor)[0]["disposition"] == "blocking")
-    count = len(outcome.findings) - len(kept)
-    if not count:
+    keep = [not completed and (here or dispose([row], floor)[0]["disposition"] == "blocking")
+            for row, here in zip(outcome.findings, located, strict=True)]
+    dropped = [{"path": row["path"], "summary": " ".join(str(row.get("summary") or "").split())[:120]}
+               for row, kept in zip(outcome.findings, keep, strict=True) if not kept]
+    if not dropped:
         return outcome
-    note = f"{outcome.backend} cited no reviewed path in {count} finding(s); they are not a review of this subject"
-    return outcome._replace(status=UNAVAILABLE if completed else outcome.status, findings=kept,
+    named = "; ".join(f"{row['path']!r}: {row['summary']}" for row in dropped)
+    note = f"{outcome.backend} cited no reviewed path in {len(dropped)} finding(s); they are not a review of this subject: {named}"
+    return outcome._replace(status=UNAVAILABLE if completed else outcome.status,
+                            findings=tuple(row for row, kept in zip(outcome.findings, keep, strict=True) if kept),
                             detail=note if completed else f"{outcome.detail}; {note}",
-                            diagnostic=dict(outcome.diagnostic or {}, unlocated_findings=count))
+                            diagnostic=dict(outcome.diagnostic or {}, unlocated_findings=len(dropped), unlocated=dropped))
 
 
 def partial(outcome: Outcome, unread: Sequence[str]) -> Outcome:
