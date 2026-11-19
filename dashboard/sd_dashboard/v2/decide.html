@@ -13,7 +13,8 @@
   write. Scoring bands its rows by batch, a fold each, under which the batch's purpose, rubric and feeds show (sd:5759);
   each row carries its question, context, recommendation, option buttons and a checkbox (sd:5123, sd:5497); a blind or
   sealed batch's recommendation shows only once its question is ruled. The bar over the table labels every selected row.
-  The page has no Details pane.
+  The page has no Details pane. Advisory sweep (sd:9505): /api/review's sweeps, one row per week of the weekly
+  advisory sweep: its RESULT counts and cap shortfall from the job's log, and its filed items done of all it filed.
   Writes: /api/review/rule (a label, one per question, from a row or the bar) and /api/review/withdraw (its Undo, or a
   reviewed row's Withdraw label), each sd_db.review, the code sd-db review runs;
   a comment (n) posts the shell capture's note route on the batch as "On note #N: ...". Download reads
@@ -92,6 +93,17 @@
       <table class="ledger review" aria-labelledby="led-h">
         <thead><tr><th scope="col" class="pk"><span class="sr">Select</span></th><th scope="col" class="g"><span class="sr">State</span></th><th scope="col">Question</th><th scope="col">Asked</th></tr></thead>
         <tbody id="rows"></tbody>
+      </table>
+    </section>
+    <section aria-labelledby="sweep-h">
+      <div class="sec-head">
+        <h2 id="sweep-h">Advisory sweep <button class="help" type="button" aria-label="Help: Advisory sweep" data-help="&lt;b&gt;The weekly sweep of review advisories that merged open.&lt;/b&gt; Each week: the advisories graded, the real ones still open, the items filed, the advisories the cap of 100 left out, and how many filed items are done.">
+          <svg class="i" aria-hidden="true"><use href="#i-circle-help"/></svg></button></h2>
+        <p class="tally" id="sweep-tally"></p>
+      </div>
+      <table class="ledger sweep" aria-labelledby="sweep-h">
+        <thead><tr><th scope="col">Week to</th><th scope="col">Graded</th><th scope="col">Open</th><th scope="col">Filed</th><th scope="col">Over cap</th><th scope="col">Fixed</th></tr></thead>
+        <tbody id="sweeps"><tr class="empty"><td colspan="6">Reading the sweep…</td></tr></tbody>
       </table>
     </section>
   </div>

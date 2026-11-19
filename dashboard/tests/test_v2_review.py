@@ -846,3 +846,95 @@ class TheBulkView(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+SWEEP_LOG = """[advisory-sweep-weekly] 2026-11-18T15:40:37-0700 starting (cwd: /home/operator)
+The script sampled 100 of 192 advisories, so 92 were not triaged this week.
+
+RESULT: 100 packets, 14 open, 10 filed
+[advisory-sweep-weekly] 2026-11-18T15:44:05-0700 done
+[advisory-sweep-weekly] 2026-11-22T05:30:00-0700 starting (cwd: /home/operator)
+none
+RESULT: 0 packets, 0 open, 0 filed
+[advisory-sweep-weekly] 2026-11-22T05:31:00-0700 done
+[advisory-sweep-weekly] 2026-11-29T05:30:00-0700 starting (cwd: /home/operator)
+RESULT: failed, the packet file is missing
+[advisory-sweep-weekly] 2026-11-29T05:31:00-0700 FAILED
+"""
+
+
+class TheAdvisorySweep(ScreenCase):
+    """sd:9505: the weekly advisory sweep's RESULT, its cap shortfall and its filed items, one row per week."""
+
+    def setUp(self):
+        super().setUp()
+        self.cron = Path(self.tmp.name) / "cron"
+        (self.cron / "logs").mkdir(parents=True)
+
+    def file(self, ref, status="planning"):
+        found = self.item("Open review advisories", source="task-ref", external_id=ref)
+        # The status alone is what the panel reads; how an item reached it is the workflow's business.
+        self.connection.execute("UPDATE item SET status = ? WHERE id = ?", (status, found))
+
+    def test_each_week_carries_its_result_cap_shortfall_and_filed_items(self):
+        (self.cron / "logs" / f"{review_screen.SWEEP_JOB}.log").write_text(SWEEP_LOG, encoding="utf-8")
+        self.file("advisory-sweep:2026-11-18:alpha", "done")
+        self.file("advisory-sweep:2026-11-18:beta")
+        self.file("advisory-sweep:2026-11-18:gamma", "in_progress")
+        self.file("advisory-sweep:2026-12-06:alpha")
+        self.item("Not the sweep's", source="task-ref", external_id="review:nightly:x")
+        found = review_screen.sweeps(self.connection, self.cron)
+        self.assertEqual(found["state"], "read")
+        self.assertEqual(found["weeks"], [
+            {"week": "2026-12-06", "runs": 0, "packets": None, "open": None, "filed": None, "skipped": None,
+             "fixed": 0, "unfixed": 1},
+            {"week": "2026-11-29", "runs": 1, "packets": None, "open": None, "filed": None, "skipped": None,
+             "fixed": 0, "unfixed": 0},
+            {"week": "2026-11-22", "runs": 1, "packets": 0, "open": 0, "filed": 0, "skipped": None,
+             "fixed": 0, "unfixed": 0},
+            {"week": "2026-11-18", "runs": 1, "packets": 100, "open": 14, "filed": 10, "skipped": 92,
+             "fixed": 1, "unfixed": 2}])
+
+    def test_no_log_still_lists_the_filed_items_and_says_why(self):
+        self.file("advisory-sweep:2026-11-18:alpha", "done")
+        found = review_screen.sweeps(self.connection, self.cron)
+        self.assertEqual(found["state"], "none")
+        self.assertIn("no log", found["reason"])
+        self.assertEqual([(w["week"], w["fixed"], w["packets"]) for w in found["weeks"]], [("2026-11-18", 1, None)])
+
+    def test_the_review_api_sends_the_sweep_beside_the_queue(self):
+        from sd_dashboard.v2.pages import decide
+
+        read = mock.Mock(connection=self.connection, jobs=mock.Mock(cron_root=self.cron))
+        found = decide._read(read)
+        self.assertIn("batches", found)
+        self.assertEqual(found["sweeps"]["state"], "none")
+
+
+class TheSweepPanel(unittest.TestCase):
+    """sd:9505: Scoring's Advisory sweep panel draws one row per week from `/api/review`'s `sweeps`."""
+
+    run_page = TheScript.run_page
+
+    def test_each_week_is_a_row_and_an_unknown_count_is_a_dash(self):
+        doc = doc_with(1)
+        doc["sweeps"] = {"state": "read", "reason": "", "weeks": [
+            {"week": "2026-11-29", "runs": 1, "packets": None, "open": None, "filed": None, "skipped": None,
+             "fixed": 0, "unfixed": 0},
+            {"week": "2026-11-18", "runs": 1, "packets": 100, "open": 14, "filed": 10, "skipped": 92,
+             "fixed": 3, "unfixed": 7}]}
+        out = self.run_page("R.rows = ELS.sweeps.html; R.tally = ELS['sweep-tally'].textContent;",
+                            "(path, body) => [200, DOC]", doc=doc)
+        rows = out["R"]["rows"]
+        self.assertEqual(rows.count("<tr>"), 2)
+        self.assertIn("<td>2026-11-18</td><td>100</td><td>14</td><td>10</td><td>92</td><td>3 of 10</td>", rows)
+        self.assertIn("<td>2026-11-29</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>", rows)
+        self.assertEqual(out["R"]["tally"], "2 weeks")
+
+    def test_an_unread_log_says_why_and_no_week_is_an_empty_row(self):
+        doc = doc_with(1)
+        doc["sweeps"] = {"state": "none", "reason": "no log: the job has not run <b>", "weeks": []}
+        out = self.run_page("R.rows = ELS.sweeps.html; R.tally = ELS['sweep-tally'].textContent;",
+                            "(path, body) => [200, DOC]", doc=doc)
+        self.assertIn('<tr class="empty"><td colspan="6">No sweep has run yet.</td></tr>', out["R"]["rows"])
+        self.assertEqual(out["R"]["tally"], "0 weeks · log: no log: the job has not run <b>")

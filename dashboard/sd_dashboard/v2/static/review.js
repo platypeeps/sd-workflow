@@ -180,7 +180,19 @@
       <button class="btn quiet sm" type="button" id="accept-rec"${recs ? '' : html` disabled`}>Accept recommendation <span class="n">${recs}</span></button>` : ''}`);
   }
 
-  function draw() { lamps(); rows(); progress(); }
+  // The weekly advisory sweep (sd:9505): one row per week from `sweeps`, newest first. A count the log does not hold is
+  // a dash, never a zero; Fixed is the week's filed items done, of all it filed. The tally says why a log did not read.
+  function sweeps() {
+    const s = DOC && DOC.sweeps, weeks = s ? s.weeks : [], n = v => (v === null || v === undefined ? '—' : v);
+    const why = !s ? 'not read' : s.state === 'read' ? '' : `log: ${s.reason}`;
+    $('sweep-tally').textContent = `${plural(weeks.length, 'week')}${why ? ` · ${why}` : ''}`;
+    const fixed = w => (w.fixed + w.unfixed ? `${w.fixed} of ${w.fixed + w.unfixed}` : '—');
+    put($('sweeps'), weeks.length
+      ? html`${weeks.map(w => html`<tr><td>${w.week}</td><td>${n(w.packets)}</td><td>${n(w.open)}</td><td>${n(w.filed)}</td><td>${n(w.skipped)}</td><td>${fixed(w)}</td></tr>`)}`
+      : html`<tr class="empty"><td colspan="6">${s ? 'No sweep has run yet.' : 'The sweep was not read.'}</td></tr>`);
+  }
+
+  function draw() { lamps(); rows(); progress(); sweeps(); }
 
   // ---------- Selection ----------
   function select(note) {

@@ -39,7 +39,9 @@ def _reverse(payload, principal):
 def _read(read):
     from ... import review_screen
 
-    return review_screen.document(read.connection)
+    # The weekly advisory sweep (sd:9505) rides on Scoring's read, not the badge's: only the page reads its log.
+    return {**review_screen.document(read.connection),
+            "sweeps": review_screen.sweeps(read.connection, getattr(read.jobs, "cron_root", None))}
 
 
 def _export(read):
