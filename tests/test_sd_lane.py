@@ -5969,6 +5969,46 @@ class HostedParallel(Lane):
         failed = next(row for row in answer["lanes"] if row["path"] == str(self.repo))
         self.assertEqual((failed["error"], failed["code"]), ("the hub went away", sd_lane.HUB_UNAVAILABLE))
 
+    def test_a_second_run_counts_the_lanes_the_first_holds_toward_the_cap(self) -> None:
+        """sd:9332. A run held pack's lane past its budget, and launchd started no tick: a second lane-run job
+        now runs beside it. Run B starts zeta under sd.lane_parallel 2, starts nothing under 1, and never a
+        second worker for pack: the two runs share one cap."""
+        lock = sd_lane.queue_for(self.repo, self.environ).lock_file
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        holds = ("import fcntl, sys, time; handle = open(sys.argv[1], 'a'); fcntl.flock(handle, fcntl.LOCK_EX); "
+                 "print('held', flush=True); time.sleep(600)")
+        holder = subprocess.Popen([sys.executable, "-c", holds, str(lock)], stdout=subprocess.PIPE)
+        self.addCleanup(holder.wait)
+        self.addCleanup(holder.kill)  # first: cleanups run last-added first
+        self.assertEqual(holder.stdout.readline(), b"held\n")  # run A's worker, still on pack's long entry
+        self.addCleanup(holder.stdout.close)
+        folder = self.tmp / ".config" / "sd-ai-command-pack"
+        folder.mkdir(parents=True, exist_ok=True)
+        real_sleep = time.sleep
+        now = [0.0]
+        starts: list[pathlib.Path] = []
+
+        def nap(seconds: float) -> None:
+            """A poll before run B starts a lane moves its clock a minute; any other sleep is real, so a
+            started lane claims inside the budget."""
+            if seconds == sd_lane.START_POLL_SECONDS and not starts:
+                now[0] += 60.0
+            else:
+                real_sleep(seconds)
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            starts.append(checkout)
+            return self.threaded(self.ship)(checkout, budget)
+        for cap, zeta in ((1, "pending"), (2, "merged")):
+            with self.subTest(cap=cap):
+                (folder / "config.json").write_text(json.dumps({"config": {"sd": {"lane_parallel": str(cap)}}}))
+                now[0] = 0.0
+                starts.clear()
+                with mock.patch.object(sd_lane, "clock", lambda: now[0]), mock.patch.object(sd_lane.time, "sleep", nap):
+                    answer = sd_lane.run_hosted(self.environ, self.ship, start=start)
+                self.assertEqual(self.statuses(), ["pending", zeta], f"two runs over cap {cap}: {answer}")
+                self.assertNotIn(self.repo, starts, "a second worker for the lane run A holds")
+
     def test_the_hosted_run_reads_the_machine_s_lane_parallel(self) -> None:
         """sd:9323: the runner's start rule reads sd.lane_parallel, not the constant."""
         folder = self.tmp / ".config" / "sd-ai-command-pack"

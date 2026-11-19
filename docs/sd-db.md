@@ -215,6 +215,8 @@ The machine that hosts a repository gates and merges it, and no request crosses 
 Schedule `sd-ship lane run --hosted` on every machine: it runs each lane the machine hosts.
 Each lane runs in its own child; up to three run at once while the gate has a free slot and load is under its limit.
 A lane that gets work while the run lasts starts then, on the same terms, not at the next scheduled run.
+Two lane-run jobs may run at once: launchd starts no tick of a job while its run lives, and one long lane keeps a run alive up to 120 min (sd:9332).
+A lane the other run's worker holds starts no worker, and counts toward `sd.lane_parallel` and the gate room, so the two runs share one cap.
 [WORKFLOW.md § Parallel work](../WORKFLOW.md#parallel-work) covers the lane from the ship side.
 
 ## Channels

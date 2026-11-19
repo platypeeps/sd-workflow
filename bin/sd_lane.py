@@ -4217,7 +4217,8 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
         return inline_lane(lambda: run_lane(checkout, environ, ship, gate, note, clock() + budget))
     order = longest_waiting_first(hosted, environ)
     lanes += run_parallel(order, start or inline, deadline, functools.partial(lane_room, environ),
-                          functools.partial(new_work, environ), cap=lane_parallel(environ))
+                          functools.partial(new_work, environ), functools.partial(lane_held, environ, {}),
+                          cap=lane_parallel(environ))
     for path, checkout in hosted:  # after the lanes ran: a slow read never holds a lane back (pack sd:6006)
         for asked in (ask_wait(checkout, path, environ), file_flakes(checkout, path, environ)):
             if asked:
@@ -4275,6 +4276,8 @@ CHILD_STOP_SECONDS = 30
 RESCAN_SECONDS = 30.0
 #: Lane to its runnable entry ids, to the lanes with new work among them (`new_work`).
 Pending = Callable[[dict[pathlib.Path, frozenset[str]]], dict[pathlib.Path, frozenset[str]]]
+#: Whether a worker outside this run holds a lane's runner lock (`lane_held`).
+Held = Callable[[pathlib.Path], bool]
 
 
 @dataclasses.dataclass
@@ -4379,9 +4382,28 @@ def lane_parallel(environ: dict[str, str] | None = None) -> int:
     return int(value) if value else MAX_PARALLEL_LANES
 
 
+def lane_held(environ: dict[str, str], queues: dict[pathlib.Path, Queue], checkout: pathlib.Path) -> bool:
+    """Whether a worker outside this run holds `checkout`'s runner lock; never waits (sd:9332).
+
+    A second lane-run job runs beside the first, so a lane the other run's
+    worker holds counts toward this run's cap. A queue or lock that cannot
+    be read is not held: unknown is not a worker, and a worker started
+    there refuses with its own reason, as before. `queues` keeps each
+    lane's queue for the run, so a poll runs no `git`.
+    """
+    try:
+        queue = queues.get(checkout)
+        if queue is None:
+            queue = queues[checkout] = queue_for(checkout, environ)
+        with runner_lock(queue) as locked:
+            return not locked
+    except (LaneError, sd_lib.ConfigError, OSError):
+        return False
+
+
 def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: float,
                  room: Callable[[], str | None], pending: Pending = lambda seen: {},
-                 cap: int = MAX_PARALLEL_LANES) -> list[dict[str, Any]]:
+                 held: Held = lambda checkout: False, cap: int = MAX_PARALLEL_LANES) -> list[dict[str, Any]]:
     """Start each lane of `order` in turn, as room allows; each lane run's row, in `order` (sd:5774).
 
     A lane starts at once while no lane runs, as one after another did, or
@@ -4389,6 +4411,11 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
     and claims nothing. Otherwise it waits for `room` and for fewer than
     `cap` running (`lane_parallel`). A lane's refusal is its own row. When this
     run ends early, a TERM among them, every lane still running is stopped.
+
+    A lane a worker outside this run holds (`held`), the other lane-run
+    job's say, starts no worker here and counts toward `cap` and the room
+    rule inside the budget, as a lane of this run does: two runs share one
+    cap (sd:9332).
 
     Then, inside the budget, every `RESCAN_SECONDS` and once no lane runs,
     `pending` names each idle lane with an entry its last worker did not
@@ -4401,7 +4428,19 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
     seen: dict[int, frozenset[str]] = {}
 
     def lane_fits() -> bool:
-        return len(running) < cap and (not running or clock() >= deadline or room() is None)
+        if len(running) >= cap:
+            return False
+        if clock() >= deadline:  # it only settles
+            return True
+        others = sum(1 for index, (_, checkout) in enumerate(order) if index not in running and held(checkout))
+        return len(running) + others < cap and ((not running and not others) or room() is None)
+
+    def held_elsewhere(index: int) -> bool:
+        if not held(order[index][1]):
+            return False
+        seen[index] = frozenset()  # a later scan starts it once that worker is done
+        rows[index].append({"ran": [], "busy": "another runner holds the lane; it counts toward the cap"})
+        return True
 
     def begin_lane(index: int, ids: frozenset[str]) -> None:
         seen[index] = ids
@@ -4418,12 +4457,15 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
     with sd_lib.term_ends_group():
         try:
             for index, (_, checkout) in enumerate(order):
+                if held_elsewhere(index):
+                    continue
                 while True:
                     collect_ended(running, rows)
                     if lane_fits():
                         break
                     time.sleep(START_POLL_SECONDS)
-                begin_lane(index, pending({checkout: frozenset()}).get(checkout, frozenset()))
+                if not held_elsewhere(index):  # taken while this run waited
+                    begin_lane(index, pending({checkout: frozenset()}).get(checkout, frozenset()))
             scanned = -math.inf
             while True:
                 collect_ended(running, rows)
