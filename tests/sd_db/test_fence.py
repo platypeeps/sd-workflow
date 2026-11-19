@@ -388,6 +388,21 @@ class TheLiveServer(StubCase):
         self.assertEqual(answers[1:], [None], "a fenced server answered a second frame")
         self.assertEqual(self.rows(), 0)
 
+    def test_the_fence_state_crosses_the_wire(self):
+        """pack sd:9543: a satellite tells a fence that could not answer from a demotion by `state`."""
+        self.enterContext(mock.patch.object(serve, "FENCE_SECONDS", 0.0))
+        for dnsname, state in (("", "unknown"), ("old-hub.example.test.", "elsewhere")):
+            with self.subTest(state=state):
+                self.rename(dnsname)
+                hub._name_failed = None
+                answers = self.session(remote.request("close"))
+                self.assertFalse(answers[0]["ok"], answers)
+                rebuilt = remote.rebuild_error(answers[0]["error"])
+                if not isinstance(rebuilt, hub.Fenced):
+                    self.fail(f"rebuilt as {rebuilt!r}")
+                self.assertEqual(rebuilt.state, state, answers[0]["error"])
+                self.assertIn("this machine is not the hub", str(rebuilt))
+
     def test_a_partition_after_start_refuses_the_next_frame(self):
         """Third review: the old hub keeps its cached name while cut from the control plane."""
         self.enterContext(mock.patch.object(serve, "FENCE_SECONDS", 0.0))
@@ -440,7 +455,7 @@ class TheLiveServer(StubCase):
         self.assertEqual(self.asked().count(["status", "--json"]), 1)
         # A sleep: the wall clock moves an hour, the monotonic clock does not.
         clock["time"] += 3600
-        self.assertIn(f"sd.hub_name names {HUB_NAME}", self.server.fence() or "")
+        self.assertIn(f"sd.hub_name names {HUB_NAME}", getattr(self.server.fence(), "reason", ""))
         clock["monotonic"] += serve.FENCE_SECONDS + 1
         clock["time"] += serve.FENCE_SECONDS + 1
         self.rename(HUB_NAME + ".")
@@ -449,7 +464,7 @@ class TheLiveServer(StubCase):
     def test_a_frame_reads_the_hub_name_after_tailscale_answers(self):
         """pack sd:7120: the serve fence's answer ages from its oldest input, so the name is read after the call."""
         set_during(self, self.path, "old-hub.example.test")
-        self.assertIn("sd.hub_name names old-hub.example.test", self.server.fence() or "")
+        self.assertIn("sd.hub_name names old-hub.example.test", getattr(self.server.fence(), "reason", ""))
 
     def test_a_commit_past_the_window_asks_again(self):
         """codex pass: a frame passed on a cached answer, then the hub was renamed; the commit asks again
@@ -652,6 +667,18 @@ class TheVerb(StubCase):
         self.assertEqual(done.returncode, 1, done.stderr)
         self.assertIn("sd-db: fence: elsewhere: this machine is a satellite of hub.example.test", done.stdout)
         self.assertEqual(self.asked(), [])
+
+
+class TheOldPeer(unittest.TestCase):
+    def test_a_fence_from_a_hub_older_than_the_field_has_no_state(self):
+        """pack sd:9543: an older hub sends no `state`; the rebuilt `Fenced` reads `None`, which no caller skips."""
+        old = {"module": "sd_db.hub", "name": "Fenced", "args": ["refused: this machine is not the hub: x"],
+               "text": "refused: this machine is not the hub: x"}
+        rebuilt = remote.rebuild_error(old)
+        if not isinstance(rebuilt, hub.Fenced):
+            self.fail(f"rebuilt as {rebuilt!r}")
+        self.assertIsNone(rebuilt.state)
+        self.assertEqual(str(rebuilt), old["text"])
 
 
 class TheName(StubCase):

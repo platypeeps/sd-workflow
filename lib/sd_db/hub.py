@@ -476,6 +476,17 @@ class Fenced(remote.RemoteError):
     sd:5986).
     """
 
+    #: The fence's `Role.state` where this was raised, kept on the wire by
+    #: `remote.describe_error`: `elsewhere` lasts (a demotion); `unknown`
+    #: is a fence that could not answer, such as Tailscale naming no node
+    #: (pack sd:9543). `None` from a hub older than the field, which a
+    #: rebuilt error leaves at this class default: read it as lasting.
+    state: str | None = None
+
+    def __init__(self, text: str, *, state: str | None = None) -> None:
+        super().__init__(text)
+        self.state = state
+
 
 def write_role(path: Path, *, within: float | None = None) -> Role:
     """`role` of the database at `path`, read from that file and held `within` seconds, `FENCE_SECONDS` by default.
@@ -646,7 +657,8 @@ def _fenced(connection: sqlite3.Connection, run, *args):
         if connection.in_transaction:
             # Nothing a fenced transaction wrote may commit.
             sqlite3.Connection.execute(connection, "ROLLBACK")
-        raise Fenced(refusal) from error
+        # `_ask` denies on `elsewhere` alone.
+        raise Fenced(refusal, state="elsewhere") from error
 
 
 def _batched(connection: sqlite3.Connection, run, *args):
