@@ -6138,6 +6138,8 @@ class HostedParallel(Lane):
             admission.close()  # a run stuck on it ends now
             worker.join(30)
         self.assertFalse(alive, "the run waited on the gate's admission lock")
+        self.assertEqual(len(rows), 2, "the run never returned its rows")  # sd:9611: not vacuous
+        self.assertIn("another run claimed the lane", rows[0].get("busy", ""), rows)
         self.assertEqual(started, [], rows)
 
     def test_no_queue_lookup_runs_under_the_start_lock(self) -> None:
@@ -6216,7 +6218,9 @@ class HostedParallel(Lane):
         with mock.patch.object(sd_lane, "post_merge", post_merge):
             sd_lane.run_parallel([("pack", self.repo)], start_a, sd_lane.clock() + 600, lambda: None,
                                  locks=sd_lane.MachineLocks(self.environ), cap=1)
-        self.assertEqual(rows_b and started_b, [], f"run B started beside run A's post-merge: {rows_b}")
+        self.assertEqual(len(rows_b), 2, "run A's post-merge never ran run B")  # sd:9611: not vacuous
+        self.assertTrue(all(row.get("busy") for row in rows_b), rows_b)
+        self.assertEqual(started_b, [], f"run B started beside run A's post-merge: {rows_b}")
 
     def test_past_the_budget_a_lane_starts_beside_the_run_s_own_lane_without_gate_room(self) -> None:
         """sd:9332 advisories b6202f00b :4314 and 911a76c89 :4409: past the budget a run waited for gate room

@@ -155,6 +155,7 @@ Classes from the blocking rounds, with every instance in the code:
 | 46 | 3 | a lane waiting for room got a busy row as the run's last lane ended, the waiting set emptied, and the idle run ended with no scan read after that lane ended (lead review ec5ef47ae :4695, sd:9611) | inside the budget an idle run ends only on a pass that scanned | test_a_run_that_goes_idle_reads_a_last_scan_before_it_ends |
 | 47 | 2 | the busy-claim branch read `pending`, which took the runner lock, so a worker starting then answered busy (lead review ef961a008 :4543, sd:9611) | fixed at 74dc3f8e4 (row 30); the busy branch reads no `pending` now (row 45) | test_new_work_probes_no_runner_lock |
 | 48 | 3 | every merge leaves `release: owed`, which a repository with no release policy keeps for ever, so each scan read that policy for nearly every lane (lead review d2c34d435 :4349, sd:9611) | the hosted run keeps each lane's declaration for the run; a failed read is work and is not kept | test_the_hosted_run_reads_each_lane_s_policy_once_a_run |
+| 49 | tests | two tests passed when their run or callback never ran (lead reviews ef961a008 :842, ec5ef47ae :6141, :6219, sd:9611) | each asserts the run's rows | test_a_held_gate_admission_lock_stops_no_run_under_the_start_lock, test_a_lane_in_post_merge_still_counts_toward_the_shared_cap; each fails on a copy that skips the run |
 
 Rows removed with the hand-off: the fd passed to a child, a child
 that never starts, an fd that names another file, the env var seen
