@@ -1,0 +1,204 @@
+---
+title: Every lane KILL path ends the groups below its target
+created: 2026-11-19
+item: sd:9392
+branch: fix/sd-9392-kill-paths
+---
+
+# Design — lane-kill-paths
+
+## Problem
+
+`sd-ship prepare` and `merge` run in a session of their own
+(`sd_lib.run_group`), and so do their review, `sd-check` and the
+speculative gate. A SIGTERM unwinds through `term_ends_group`, and each
+layer ends the layer below it. A SIGKILL unwinds nothing. Each KILL
+path on `origin/main` (d623828d1) signals one group or one process, so
+every session below its target runs on with ppid 1. The next lane run
+then reclaims the entry while the old prepare still runs.
+
+The sd:9332 branch fixed parts of this, but none of it landed: its
+`arm_term`, `end_overdue`, `stop_groups`, `lane_held` and `.left`
+records are not on main. This page starts from main's code.
+
+## Approach
+
+Read the groups below a target before its SIGTERM, and read them again
+before its SIGKILL. The KILL then reaches every group in either read:
+
+- `sd_lib.groups_below(root)`: one bounded `ps -A` read. It walks
+  parent links from every member of group `root`, or from the process
+  `root` when that is an unreaped child. It returns each group found,
+  apart from `root`'s and this process's own, with its leader's start.
+- `sd_lib.kill_below(root, earlier)`: a fresh read, then SIGKILL to
+  each group it finds and each group of `earlier` that is still the
+  same group. Its leader has the start read then, or it had no leader
+  then and has none now. A group whose leader start differs is a
+  reused number and gets no signal.
+- A group's number is not reused while any process has it. So the
+  fresh walk starts at every member of the root group, leader or not;
+  an empty group walks nothing and is not signalled again.
+- The TERM grace lasts until the group is empty or the grace ends,
+  never until the leader alone exits (`wait_empty`).
+- A group that registers after its end began gets the same order:
+  read, TERM, its own full grace, SIGKILL (`end_late_group`).
+- A signal that lands in the read before a TERM still sends that
+  TERM, then re-raises (`read_or_term`).
+
+The first read catches a session whose parent ends on the SIGTERM:
+after that it hangs off pid 1, and no walk finds it. The second read
+catches a session started during the grace.
+
+The SIGTERM path stays as it is. Each layer still ends its own groups
+first (sd:2978). Only the SIGKILL reaches further.
+
+Rejected: record each ship group's pgid beside the runner lock (the
+item's first idea). It is a new state file. It is only needed when an
+outside SIGKILL lands before the pack's own unwind ends; see row 6.
+
+## Non-goals
+
+- A record of groups for a later run to end. Row 6's residual is
+  the lane-run job's 30 s cron grace, system sd:9571.
+- `sd_opencode` and `sd_db.build` kills. `build.kill_group` already
+  reads the groups below its target.
+
+## Failure table
+
+Rows are KILL paths on main, then the sd:9332 advisories read against
+main. "n/a" means main does not have that code.
+
+| Step | State moved | Failure | Recovery | Test |
+| --- | --- | --- | --- | --- |
+| 1 `sd_lib.end_group` KILL (run_group: prepare, merge, post-merge refresh) | leader group signalled | a session the leader started survives a KILL of the leader's group | read below before TERM and before KILL; KILL both | test_end_group_kills_a_session_its_leader_left |
+| 2 `SpeculativeGate.cancel_gate` KILL | gate group signalled | the gate's `sd-check` sessions survive | read below at the first TERM; KILL them with the group | test_a_gate_kill_ends_the_sessions_below_its_group |
+| 3 `ThreadGroups.end_groups` KILL (sd-review threads) | registered groups signalled | a session below a thread's group survives | the same read before TERM and KILL | test_thread_groups_kill_ends_the_sessions_below |
+| 4 `sd-ship` `review_process` KILL | review group signalled | `sd-review`'s own sessions survive | the same read before TERM and KILL | test_a_killed_review_ends_the_sessions_below_it |
+| 5 `end_child` KILL (hosted run, `CHILD_STOP_SECONDS`) | lane child process killed | its ship and gate sessions survive | read below the unreaped child before TERM and KILL | test_a_killed_lane_child_leaves_no_session_below |
+| 6 cron `JOB_TIMEOUT`: TERM to the job group, KILL after `CRON_JOBS_TIMEOUT_GRACE` (10 s) | lane child and hosted run | the child's unwind (5 s per group, then up to 10 s per gate after its TERM) can outlast the grace; the cron KILL then leaves the gate's sessions | the lane-run job's grace rises to 30 s (system sd:9571); `CANCEL_SECONDS` stays 10 s | none: system side |
+| 6 residual | none | an outside KILL that lands before the unwind ends (grace below 6 s, a stalled `ps`) leaves sessions with no record | recovery: lane-run cron grace 30 s (system sd:9571); no group record (ruling, sd:9392 note 63749) | none: system side |
+| 7 hand run, SIGHUP (pack sd:9568) | none | a terminal close killed `sd-ship lane run` with no unwind | `term_ends_group` owns SIGHUP while it is default and unwinds as for TERM; `nohup` keeps it ignored | test_a_sighup_ends_the_group_as_a_sigterm_does, test_an_ignored_sighup_stays_ignored |
+| self-KILL (`arm_term`) | n/a | not on main | none | none |
+| `end_overdue` | n/a | not on main | none | none |
+| advisory 4667: post-budget settle skips `release_chain`/`post_merge` | n/a | main runs both after every run that does not raise | none | none |
+| advisory 4402: `stop_groups` calls `answer_locked` unguarded | n/a | neither is on main | none | none |
+| advisory 4456: `arm_term` tests group, not session | n/a | not on main | none | none |
+| advisory 4474: pid identity read after the descendant read | read below | a reaped pid may be another process | the walk starts at the root group's members, which hold its number; a group from the first read is signalled only when its leader start matches | test_a_reused_group_number_is_not_signalled |
+| advisory 4336: `lane_held` hold on doubt | n/a | not on main | none | none |
+| advisory 5551: tests patch `time.sleep` process-wide | n/a | main's lane tests patch `sd_lane.time` only | none | none |
+| reads | none | `ps` fails or times out | unknown: the KILL still reaches the target's own group, groups from no read are signalled, and stderr says so | test_an_unread_table_still_kills_the_leaders_group |
+
+### Class pass: unwind steps that skip the captured SIGKILL
+
+Lead review of 5541a2221. Each kill path, read from the code. Rule 1:
+groups read before the TERM always get the start-checked SIGKILL pass,
+whether or not the parent ended on its own. Rule 2: no diagnostic
+write in a kill path raises. Rule 3: one table read per unwind,
+shared by every group.
+
+| Step | State moved | Failure | Recovery | Test |
+| --- | --- | --- | --- | --- |
+| `end_group` | leader group | none: its loop always runs the SIGKILL step, and `kill_below` runs whenever the first read found a group | none needed | test_end_group_kills_a_session_its_leader_left |
+| `review_process` | review group | none: its loop always runs the SIGKILL step | none needed | test_a_killed_review_ends_the_sessions_below_it |
+| `ThreadGroups.end_groups`, rule 1 | registered groups | a group whose leader ended on the TERM left the set, so only groups still registered were killed | every live group's read sessions get the pass at the deadline | test_end_groups_kills_what_a_term_quitter_left |
+| `ThreadGroups.end_groups`, rule 3 | none | one read per group, up to 3 s each, before any TERM | one read before the TERMs, one before the KILLs, shared | test_end_groups_reads_the_table_once_for_every_group |
+| `cancel_gate`, rule 1 | gate group | a gate that ended on the TERM returned True with no SIGKILL pass | `kill_left` runs on that return | test_a_gate_that_ends_on_term_still_kills_what_it_left |
+| `signal_gate` SIGKILL, rule 1 | gate group | `started(None)` cleared `group` before the SIGKILL, which then skipped the pass | the pass uses the group the read was under | test_a_gate_kill_after_its_group_cleared_still_kills_what_was_read |
+| `end_child`, rule 1 | lane child | a child that ended on the TERM returned after `wait` with no pass | the pass runs on the first read only; the reaped pid roots no walk | test_a_lane_child_that_ends_on_term_still_has_what_it_left_killed |
+| `kill_below` stderr line, rule 2 | none | EIO or a closed stream raised before the leader's SIGKILL | the write suppresses OSError and ValueError | test_a_diagnostic_that_cannot_be_written_stops_no_kill |
+| `signal_gate` read, rule 3 | none | one read per gate before its TERM, at most `DEPTH` (2) gates | kept: one bounded read per group is what rule 1 needs | none |
+
+Rule 3 says TERM first, then read. The read stays before the TERM: a
+leader that dies on the TERM at once hangs its session off pid 1
+before any later read. `test_end_groups_kills_what_a_term_quitter_left`
+uses such a leader and fails with the read after the TERM.
+
+### Round 4: members anchor the group
+
+Lead review of 93b5e7f4a. Round 3 read "leader gone" as "group
+gone"; its leader-start anchor (`Below`, `read_below`, `walk_from`) is
+deleted. The rule: a group is live while the table shows a member;
+live means not reused. Walks start at every live member. The TERM
+grace waits for the group to empty. An empty group gets no signal;
+only the start-checked groups of the earlier read get the SIGKILL. A
+signal in the pre-TERM read still TERMs the group.
+
+| Step | State moved | Failure | Recovery | Test |
+| --- | --- | --- | --- | --- |
+| `end_group` grace | leader group | `wait` returned when the leader exited; the SIGKILL hit workers in their TERM handler | `wait_empty` after the leader is reaped | test_end_group_waits_for_the_workers_not_the_leader |
+| `end_group` walk | leader group | a reaped leader had no start, so no walk; a worker's new session ran on | walk from the members | test_a_leaderless_groups_worker_session_is_killed |
+| `end_group` read | none | a signal in the read left the group unTERMed | `read_or_term` | test_a_signal_during_the_read_in_end_group_still_terms |
+| `end_late_group` grace | late group | KILL once `waitid` saw the leader exit | `wait_empty` with the zombie leader left out | test_a_late_group_waits_for_its_workers_not_its_leader |
+| `end_late_group` read | none | the same read window | `read_or_term` | shares the helper's test above |
+| `end_groups` read | registered groups | a signal in the shared read TERMed no group | `read_or_term` TERMs every live group | test_a_signal_during_end_groups_read_still_terms_the_groups |
+| `end_groups` grace | registered groups | none: a group leaves the set as its own `run_group` ends it, whose `end_group` waits | none needed | test_end_groups_kills_what_a_term_quitter_left |
+| `review_process` grace | review group | `communicate` returned when the leader and pipes closed | `wait_empty` until the term bound | shares `wait_empty`; ReviewWatchdogTests still pass |
+| `review_process` read | none | the same read window | `read_or_term` | shares the helper |
+| `signal_gate` read | gate group | the same read window | `read_or_term` sends `number` | shares the helper |
+| `kill_left`, `signal_gate` walk | gate groups | walked only while the leader kept its start | members anchor the walk | test_a_gate_kill_after_its_group_cleared_still_kills_what_was_read |
+| `cancel_gate` | gate group | none: its join waits on `run_group`, whose `end_group` waits for the group | none needed | test_a_gate_registered_late_gets_the_full_term_grace |
+| `started()` | late gate group | the `end_late_group` rows | the same | test_a_gate_registered_after_the_cancel_still_kills_the_detached_check |
+| `group_hook` | late thread group | the `end_late_group` rows | the same | test_a_group_registered_after_the_end_began_has_its_session_killed |
+| `end_child` read | lane child | a signal in the read left the child unTERMed | `read_or_term` | shares the helper |
+| `end_child` walk | lane child | none: a process, not a group; an unreaped child walks, a reaped one does not | none needed | test_a_lane_child_that_ends_on_term_still_has_what_it_left_killed |
+
+A worker that stays in its group now holds `end_group` for the full
+`GROUP_CLEANUP_SECONDS` before its SIGKILL. That is the grace the
+rule asks for.
+
+### Round 5: a witness names the group; the SIGKILL step always runs
+
+Lead review of 086f5a4c3. R1: a group number in the later read is the
+same group only while it holds a witness, a member whose pid, start
+and group the earlier read saw too. A number with none gets no signal
+and roots no walk; the earlier read's witnessed groups get the
+SIGKILL. A number that is still a caller's unreaped child is its own.
+R2: once a TERM is out, the SIGKILL step runs in a `finally`
+(`escalate`), using the earlier read when the later one was
+interrupted, then re-raises. `still_below` and the dict-shaped earlier
+read are deleted; the earlier read is the whole table.
+
+| Path | Rule | Failure | Recovery | Test |
+| --- | --- | --- | --- | --- |
+| `end_group` | R1 | a reaped leader's bare number got the SIGKILL and the walk | KILL and walk only while unreaped or witnessed | test_a_reaped_leaders_reused_number_gets_no_sigkill |
+| `end_group` | R2 | an interrupt in a read or the grace skipped the SIGKILL | `escalate` | test_an_interrupted_read_in_end_group_still_kills, test_an_interrupted_grace_in_end_group_still_kills |
+| `end_groups` | R1 | a group that left the set rooted a walk by number | `kill_below` walks only witnessed roots; `left` groups are registered, so unreaped | test_a_reused_number_without_a_witness_is_not_signalled |
+| `end_groups` | R2 | an interrupt in either shared read skipped the SIGKILL | `escalate` | test_an_interrupted_read_in_end_groups_still_kills |
+| `end_late_group` | R1 | the earlier groups below were signalled by number | witnessed only; `pid` is the caller's unreaped child | test_a_reused_group_number_is_not_signalled |
+| `end_late_group` | R2 | an interrupt in either read skipped the SIGKILL | `escalate` | test_an_interrupted_read_in_end_late_group_still_kills |
+| `review_process` | R1 | a reaped leader's bare number got the SIGKILL | KILL only while unreaped or witnessed, else `absent` | test_a_reaped_reviews_reused_number_gets_no_sigkill |
+| `review_process` | R2 | an interrupt in the read skipped the SIGKILL | `escalate` | test_an_interrupted_review_read_still_kills |
+| `signal_gate` | R1 | the bare number of a cleared group was signalled | `self.group` is registered, so unreaped; the rest goes through `kill_left` | test_a_gate_kill_after_its_group_cleared_still_kills_what_was_read |
+| `signal_gate` | R2 | an interrupt in `kill_left` skipped the group's SIGKILL | `try`/`finally` | test_an_interrupted_gate_cancel_still_kills (read) |
+| `cancel_gate` | R1 | as `signal_gate` and `kill_left` | the same | shares their tests |
+| `cancel_gate` | R2 | an interrupt in the TERM wait skipped the SIGKILL | `finally` sends it | test_an_interrupted_gate_cancel_still_kills (wait) |
+| `kill_left` | R1 | earlier groups were signalled by number | one later read, witnessed groups only | test_a_reused_group_number_is_not_signalled |
+| `kill_left` | R2 | an interrupt in its read skipped every SIGKILL | `read_after`, then re-raise | shares `read_after`: the read=2 subtests |
+| `end_child` | R1 | a reaped child's pid rooted a walk | root is the same pid and start; earlier groups witnessed | test_a_reused_child_pid_roots_no_walk |
+| `end_child` | R2 | an interrupt in the read skipped the KILL | `escalate`; `process.kill` while unreaped | test_an_interrupted_lane_child_end_still_kills |
+| `ThreadGroups` hook | R1 | a late group goes through `end_late_group` | the same | test_a_group_registered_after_the_end_began_has_its_session_killed |
+| `ThreadGroups` hook | R2 | the same | the same | shares the `end_late_group` test |
+| `SpeculativeGate.started` | R1 | a late gate goes through `end_late_group` | the same | test_a_gate_registered_after_the_cancel_still_kills_the_detached_check |
+| `SpeculativeGate.started` | R2 | the same | the same | shares the `end_late_group` test |
+
+With no later read, `os.getpgid` of the earlier members stands in for
+the witness, without the start; the walk then runs from nothing new.
+That is a fallback under an interrupt, not a pass: stderr says the
+table was not read. The late-grace test now waits 3 s with the group
+registered 1.5 s in and a 2 s handler, so it holds on a loaded box.
+
+## Acceptance criteria
+
+- [ ] Each test named above failed on d623828d1 and passes on the head.
+- [ ] `tests/test_sd_lib.py`, `tests/test_process_groups.py` and the
+      touched `tests/test_sd_lane.py` classes pass with 0 failures.
+
+## Risks
+
+- A daemon that a group starts on purpose, and that has not yet left
+  its parent, dies with the group's KILL. A daemon that forked away
+  hangs off pid 1 and no read finds it. Accepted: a KILL means the
+  owner gave up on the whole tree.
+- `ps` costs about 20-50 ms per read, twice per KILL path. Accepted.
+- Evidence: each signal is tied to its subject by the leader's start
+  time read in the same `ps` call; a mismatch signals nothing.
