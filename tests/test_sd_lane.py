@@ -33,6 +33,9 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "bin"))
 
 import sd_lane  # noqa: E402
+
+#: `time.sleep` before any suite patches it: `bounded_nap` passes other modules' sleeps to it.
+REAL_SLEEP = time.sleep
 import sd_ship_body  # noqa: E402
 
 from tests.clean_env import clean_environment  # noqa: E402
@@ -6165,8 +6168,14 @@ class HostedParallel(Lane):
         self.assertEqual(under, [], "a queue lookup ran under the start lock")
 
     def bounded_nap(self, polls: list[int], then: Callable[[], None] = lambda: None) -> Callable[[float], None]:
-        """A `time.sleep` that counts the run's polls and fails a run that polls on past 50: a wait without end."""
+        """A `time.sleep` that counts the run's polls and fails a run that polls on past 50: a wait without end.
+
+        Only `sd_lane`'s own sleeps count: the patch replaces `time.sleep` for every module, and under load
+        `subprocess` polls a slow `git` with it, which spent the budget inside a queue lookup (sd:9332)."""
         def nap(seconds: float) -> None:
+            if sys._getframe(1).f_globals.get("__name__") != sd_lane.__name__:
+                REAL_SLEEP(seconds)
+                return
             polls[0] += 1
             then()
             if polls[0] > 50:
@@ -6684,6 +6693,36 @@ class HostedParallel(Lane):
                                         lambda: None, functools.partial(sd_lane.new_work, self.environ),
                                         locks=sd_lane.MachineLocks(self.environ), cap=3)
         self.assertEqual(started, [self.repo, self.zeta, self.zeta], rows)
+
+    def test_a_run_s_poll_budget_counts_only_the_lane_runner_s_sleeps(self) -> None:
+        """sd:9332 gate: under load `subprocess` waits for a slow `git` with `time.sleep`, which the suite's
+        patch replaced for every module, so a queue lookup spent the poll budget and its AssertionError,
+        contained as an unread lane, restarted lanes until the rescan's own poll failed."""
+        polls = [0]
+        with mock.patch.object(sd_lane.time, "sleep", self.bounded_nap(polls)):
+            for _ in range(60):
+                time.sleep(0)  # a sleep of this module, as `subprocess` sleeps
+        self.assertEqual(polls, [0])
+
+    def test_a_lane_whose_reads_flap_starts_again_at_most_once_for_them(self) -> None:
+        """sd:9332 gate: a queue lookup that failed now and then made the lane's work `UNREADABLE_WORK` on
+        one read and its ids on the next. Each start replaced the seen ids with the start's own read, so
+        each flip read as new work and the run restarted the lane until its deadline. Seen ids only grow
+        in a run, and take the ids the scan found: each flip starts the lane once."""
+        reads, polls, started = [0], [0], list[pathlib.Path]()
+
+        def pending(seen: dict[pathlib.Path, frozenset[str]]) -> dict[pathlib.Path, frozenset[str]]:
+            reads[0] += 1
+            ids = frozenset({sd_lane.UNREADABLE_WORK}) if reads[0] % 2 else frozenset({"1"})
+            return {checkout: ids for checkout in seen if checkout == self.repo and ids - seen[checkout]}
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            started.append(checkout)
+            return sd_lane.StartedLane(lambda: {"ran": []})
+        with mock.patch.object(sd_lane.time, "sleep", self.bounded_nap(polls)):
+            rows = sd_lane.run_parallel([("pack", self.repo)], start, sd_lane.clock() + 600, lambda: None, pending,
+                                        locks=sd_lane.MachineLocks(self.environ), cap=2)
+        self.assertEqual(started, [self.repo, self.repo], rows)
 
     def test_a_lane_whose_queue_or_hub_cannot_be_read_is_work_once_a_run(self) -> None:
         """sd:9611, lead review of ec5ef47ae :4672: `new_work` left out a lane whose queue lookup or hub read

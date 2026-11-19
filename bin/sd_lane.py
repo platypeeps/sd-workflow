@@ -4654,6 +4654,7 @@ class ParallelRun:
     seen: dict[int, frozenset[str]] = dataclasses.field(default_factory=dict)
     late: set[int] = dataclasses.field(default_factory=set)
     elsewhere: set[int] = dataclasses.field(default_factory=set)
+    found: dict[int, frozenset[str]] = dataclasses.field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.rows = [[] for _ in self.order]
@@ -4700,8 +4701,11 @@ class ParallelRun:
             self.release(self.order[index][1])  # a busy worker's ids stay seen: the next run retries it
 
     def begin_lane(self, index: int) -> None:
+        """Start the lane; its seen ids only grow in a run, and take what the scan found, so a read that flips
+        between unknown and its ids starts the lane again once, not on every flip (sd:9332)."""
         checkout = self.order[index][1]
-        self.seen[index] = self.pending({checkout: frozenset()}).get(checkout, frozenset())  # after any wait
+        read = self.pending({checkout: frozenset()}).get(checkout, frozenset())  # after any wait
+        self.seen[index] = self.seen.get(index, frozenset()) | self.found.pop(index, frozenset()) | read
         self.running[index] = self.start(checkout, max(0.0, self.deadline - clock()))
 
     def first_pass(self) -> None:
@@ -4746,6 +4750,7 @@ class ParallelRun:
                 found = self.pending(idle_lanes)  # rebuilt each scan: a lane whose new entry went away waits no more
                 self.late = {index for index, (_, checkout) in enumerate(self.order) if checkout in found
                              and index not in self.running}
+                self.found = {index: found[self.order[index][1]] for index in self.late}
             started = self.start_late_lanes()
             if idle and not started and not self.late and (scanning or clock() >= self.deadline):
                 return  # a scan read every lane after the last one ended; a late busy row is none (sd:9611)
