@@ -79,6 +79,7 @@ class TheWriteFence(FenceCase):
         connection = self.open()
         with self.assertRaises(hub.Fenced) as caught:
             create_item(connection, kind="work", title="stale")
+        self.assertEqual(caught.exception.state, "elsewhere", "pack sd:9543: a demotion lasts")
         text = str(caught.exception)
         self.assertIn(f"this machine is not the hub, so it writes nothing to {self.path}", text)
         self.assertIn(f"sd.hub_name names {HUB_NAME}, and this node is old-hub.example.test", text)
