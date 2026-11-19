@@ -201,6 +201,23 @@ class NoItemPublication(unittest.TestCase):
                 self.assertEqual(self.invoke("prepare", "--body-file", str(body))["normalized"], [f"{trailer}: sd:9"])
                 self.assertNotIn("sd:9", self.remote.pull_requests[1].body)
 
+    def test_a_reprepare_that_does_not_publish_its_body_merges_nothing(self):
+        """Lead review of sd:9268 at 50b91b935: a prepare after the pull request exists saves its body as
+        pending, and a failure before `ready_to_send` left it there; merge squashed the reviewed head with the
+        previous prepare's body. While a prepare's pending set is unpublished, merge refuses; once a prepare
+        finishes, it merges with the new body."""
+        self.prepare()
+        body = self.directory / "body.md"
+        body.write_text("The newer description.\n")
+        with patch.object(ship.Ship, "prepare_copilot_review", side_effect=ship.Refusal("copilot step failed")):
+            self.invoke("prepare", "--body-file", str(body), code=3)
+        refused = self.merge(code=3)
+        self.assertEqual(refused["workflow"]["blocker"]["code"], "prepare_required", refused)
+        self.assertFalse([call for call in self.remote.calls if call.method == "PUT"])
+        self.invoke("prepare", "--body-file", str(body))
+        self.assertEqual(self.merge()["phase"], "merged")
+        self.assertIn("The newer description.", receipts.read(self.connection, self.key)[1]["merge_message"])
+
     def accepted_blocker(self):
         revision, state = receipts.read(self.connection, self.key)
         state["passes"][0].update(report=review_fixture.NoItemContracts.report(self, blocking=True), exit_code=1)

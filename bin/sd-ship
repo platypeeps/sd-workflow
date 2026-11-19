@@ -811,6 +811,21 @@ class Ship(SharedReview):
         pending = self.state.get("pending") if self.publishing else None
         return pending.get(key) if pending else self.state.get(key)
 
+    def merge_scope(self) -> None:
+        """`assert_scope` for a merge, then refuse one while a prepare's `pending` set waits.
+
+        That prepare saved a new title, body or claim, may have pushed a newer
+        head, and did not publish them, so the published ones may not describe
+        the head merge would land, in any mode, `--no-item` too (sd:9268
+        review). Reconcile reads the published ones.
+        """
+        self.assert_scope(merging=True)
+        if self.state.get("pending"):
+            raise Refusal("the last prepare saved a new title, body or delivery claim and did not publish them; "
+                          "nothing merged: prepare again, then merge", code="prepare_required",
+                          state="operator_decision",
+                          next_action="Run sd-ship prepare again with the same identity, then merge.")
+
     def promoted(self) -> dict:
         """The fields `ready_to_send` saves: the pending claim, now published, and no pending one."""
         pending, publishing, self.publishing = self.state.get("pending"), self.publishing, False
@@ -2526,7 +2541,7 @@ class Ship(SharedReview):
         # instead of failing to match "guest" and passing (sd:930).
         if sd_lib.written_mode(self.root) == "guest":
             raise Refusal("guest mode has no merge authority")
-        self.assert_scope(merging=True)
+        self.merge_scope()
         self.api.ci = sd_lib.repo_ci(self.connection, self.root)
         # Under `repo.ci = local` no remote check is coming, and `gh pr checks
         # --watch` fails on a pull request that has none; the local gate

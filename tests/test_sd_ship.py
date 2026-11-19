@@ -4946,9 +4946,11 @@ roles:
         self.assertEqual(command[1:3], ["-C", str(self.root)])
         self.assertEqual(ship.parser().parse_args(command[1:]).command, "prepare")
 
-    def test_a_failed_renewal_leaves_the_published_body_for_the_merge(self):
+    def test_a_failed_renewal_never_squashes_its_unpublished_body(self):
         """Lead review of sd:9268: a renewal saved its body to the receipt before lint; when lint failed, merge
-        squashed that unlinted body. The published body and title stay in force until a prepare publishes."""
+        squashed that unlinted body. It waits as pending, and merge refuses while it does (review of
+        50b91b935): a prepare that saved one and did not publish it may have pushed a head the published body
+        does not describe. A prepare that publishes, then merge, squashes the body it published."""
         from sd_db import set_item_fields
         self.task_item("task")
         published = self.directory / "published.md"
@@ -4962,6 +4964,12 @@ roles:
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "docs lint"):
                 self.prepare("--deliver", "--body-file", str(unlinted))
         set_item_fields(self.connection, self.item, title=title)
+        with self.assertRaisesRegex(ship.Refusal, "did not publish them; nothing merged") as caught:
+            self.merge()
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "prepare_required")
+        self.assertFalse(any(call.method == "PUT" for call in self.remote.calls))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--body-file", str(published))
         with patch.object(ship.time, "sleep"):
             self.merge()
         message = [call.body["commit_message"] for call in self.remote.calls if call.method == "PUT"][-1]
