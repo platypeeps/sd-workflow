@@ -6098,6 +6098,16 @@ class HostedParallel(Lane):
         locks.release_lane(self.repo)
         self.assertFalse(sd_lane.MachineLocks(self.environ).held_elsewhere(self.repo), "the lane stayed locked")
 
+    def test_a_lane_child_that_never_starts_frees_the_lock_its_run_took(self) -> None:
+        """sd:9332 failure table: the run took the lane's lock, then its child failed to start; the lane is
+        free again, not held by the run until it ends."""
+        locks = sd_lane.MachineLocks(self.environ)
+        self.assertTrue(locks.take_lane(self.repo))
+        with self.assertRaises(OSError):
+            sd_lane.child_lane(self.repo, 60, argv=[str(self.tmp / "no-such-sd-ship")])
+        self.assertNotIn(str(self.repo), sd_lane.HANDED)
+        self.assertFalse(sd_lane.MachineLocks(self.environ).held_elsewhere(self.repo), "the lane stayed locked")
+
     def test_a_worker_child_runs_the_lane_and_answers_its_row(self) -> None:
         """The CLI's lane: `sd-ship -C <checkout> lane run --budget`, whose answer is the row; no answer is an error."""
         with mock.patch.dict(os.environ, self.environ):
