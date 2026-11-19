@@ -874,6 +874,12 @@ class Supervise(Case):
         self.assertIn("- work.txt:1 a blocker", prompts[2])
         self.assertEqual(self.statuses(), ["blocked"])
 
+    def test_review_rounds_rule_reaches_the_builder(self):
+        """Pack sd:9584: the brief asks for a failure table on a parser or event matching; the class pass keeps scope."""
+        self.assertIn("a parser, a journal or event matching", build_run.BRIEF)
+        self.assertIn("within this change's own scope", build_run.CLASS_PASS)
+        self.assertIn("becomes its own item", build_run.CLASS_PASS)
+
     def test_a_question_on_one_member_keeps_the_class_pass_for_the_other(self):
         """Review of sd:9263: a question on a skipped member B must not park A, which the class pass can still fix."""
         self.press(2)

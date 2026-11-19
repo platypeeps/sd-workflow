@@ -138,6 +138,8 @@ Rules:
 - Write the pull-request body, with `## Summary` and `## Test plan`, to {body}; quote each fail-first line.
   The body is public, so it names no local path (the worktree, a home directory): use repo-relative paths.
   The body carries no `Closes:` line: enqueue takes items by `--item` and refuses one (sd:3704).
+- A change that moves state in steps, or adds a parser, a journal or event matching, carries a failure
+  table in the body before review: step, state moved, failure, recovery, test (sd:9584).
 - Fence each failure table and any other line over 72 characters in the body in a code block.
 - Use synthetic names in tests and commits (`operator`, `example.test`), never a real person, host or path:
   the pre-push leak guard refuses them.
@@ -162,8 +164,9 @@ FIX = """The review of branch {branch} found these blockers. Fix each one fail-f
 CLASS_PASS = """The review of branch {branch} still found blockers after {rounds} rounds. This is the last round
 before the build parks, so do one class pass, not another single-finding fix: name the class these blockers
 share, enumerate every instance of it from the code, not from the findings, and fix each one fail-first as a
-new commit in {worktree}. Add each instance to the failure table in the body at {body}. Never push. Your
-final message is your report: the class, each instance and its test.
+new commit in {worktree}. Fix the class within this change's own scope: a new reader, audit or entry kind
+becomes its own item, not a commit here (sd:9584). Add each instance to the failure table in the body at
+{body}. Never push. Your final message is your report: the class, each instance and its test.
 
 {blockers}
 """
