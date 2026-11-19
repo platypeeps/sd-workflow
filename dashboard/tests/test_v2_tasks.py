@@ -2388,6 +2388,18 @@ if (D) { D.returnValue = 'build'; D.onclose(); await flush(); }"""
                          [["/api/tasks/build", {"items": [plan], "revisions": {str(plan): "c" * 64}}]])
         self.assertEqual(out["toasts"][-1][0], f"Queued #{plan} for build · the dispatcher was started")
 
+    def test_build_shows_an_already_queued_bundle_member_and_sends_only_the_pressed(self):
+        """Pack sd:9484. The plan lists the repository's queued builds the claim bundles in; the press skips them."""
+        plan = self.ids["plan"]
+        planned = self.build_plan(plan)
+        planned["bundles"][0]["items"].insert(0, {"id": 77, "title": "Earlier build", "queued": True})
+        queued = f"[200, {{ queued: [{{ id: 9, item: {plan}, status: 'queued' }}], kickstart: {{ ok: true, why: '' }} }}]"
+        answer = (f"(path, body) => path.startsWith('/api/tasks/build/plan') ? [200, {json.dumps(planned)}] : "
+                  f"path === '/api/tasks/build' ? {queued} : [404, {{ error: 'no answer' }}]")
+        out = self.run_page(self.BUILD.replace("ITEM", str(plan)), answer)
+        self.assertIn('<code>#77</code> Earlier build <small class="why">already queued</small>', out["R"]["shown"])
+        self.assertEqual([post[1]["items"] for post in out["posts"]], [[plan]])
+
     def test_build_names_the_satellite_that_runs_a_bundle(self):
         """Pack sd:7933. A bundle whose lane runs on a satellite names that host, not the hub's room."""
         plan = self.ids["plan"]
