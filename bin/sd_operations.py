@@ -450,7 +450,7 @@ UNREACHABLE_SKIPS = 2
 
 def unreachable_stamp() -> Path:
     """`$XDG_STATE_HOME/sd/dispatch-unreachable`: the first failure's time and the count of unreachable ticks in a
-    row, beside the tick's other local state. A tick that connects removes it."""
+    row, beside the tick's other local state. A tick that runs to its end removes it."""
     state = os.environ.get("XDG_STATE_HOME") or os.path.join(os.environ.get("HOME") or os.path.expanduser("~"),
                                                              ".local/state")
     return Path(state) / "sd" / "dispatch-unreachable"
@@ -489,7 +489,7 @@ def unreachable_streak(error: BaseException) -> str:
 
 
 def reachable() -> None:
-    """The tick connected: the unreachable streak ends. A stamp that stays only makes the next outage alert sooner."""
+    """The tick ran to its end with no outage: the unreachable streak ends. A stamp that stays only makes the next outage alert sooner."""
     try:
         unreachable_stamp().unlink(missing_ok=True)
     except OSError:
@@ -563,6 +563,7 @@ def dispatch_builds(args: argparse.Namespace) -> int:
     except Overdue:
         skipped = f"the tick ran past {TICK_SECONDS:g} s"
     except hub_outages() as error:
+        signal.setitimer(signal.ITIMER_REAL, 0)  # the deadline must not cut the count's write short (pack sd:9541)
         skipped = outage(error)
     except sqlite3.OperationalError as error:
         if "locked" not in str(error) and "busy" not in str(error):
@@ -596,7 +597,6 @@ def tick(sd_db: Any, build: Any, build_run: Any, root: Path | None, why: str, un
     outages = hub_outages()  # they keep their types, so `dispatch_builds` skips them
     load, load_cap = gate_load()
     connection = sd_handoff_rows.connect(sd_db, write=True, keep=outages)
-    reachable()
     if began is not None:
         began.append(True)
     try:
@@ -628,6 +628,7 @@ def tick(sd_db: Any, build: Any, build_run: Any, root: Path | None, why: str, un
         raise WorkRefusal(str(error)) from error
     finally:
         connection.close()
+    reachable()  # the whole tick ran: a connect alone is no pass, as a hub may drop each request after it
     return result
 
 

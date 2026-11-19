@@ -384,6 +384,7 @@ class OperationsCLI(unittest.TestCase):
         for error, reason in self.outages():
             for where, label in (("connect", "skipped"), ("tick", "skipped (partial)")):
                 with self.subTest(error=type(error).__name__, where=where):
+                    self.stamp.unlink(missing_ok=True)  # each case is a first outage
                     run = self.builds()
                     code, output = self.outcome(run, error, where)
                     if where == "connect":
@@ -395,6 +396,7 @@ class OperationsCLI(unittest.TestCase):
         for error, reason in self.outages():
             for where, partial in (("connect", False), ("tick", True)):
                 with self.subTest(error=type(error).__name__, where=where):
+                    self.stamp.unlink(missing_ok=True)  # each case is a first outage
                     code, output = self.outcome(self.builds(), error, where, "--json")
                     self.assertEqual((code, json.loads(output)), (0, {"skipped": reason, "partial": partial}))
 
@@ -451,14 +453,23 @@ class OperationsCLI(unittest.TestCase):
         self.assertEqual(self.unreachable(), (1, error))
         self.assertEqual(self.unreachable(), (1, error))
         self.assertEqual(json.loads(self.stamp.read_text()), {"first": "2026-11-19T00:00:00Z", "count": 4})
-        # One mid-tick: that tick reached the hub first, so the streak starts again.
-        code, output = self.unreachable("tick")
-        self.assertEqual(code, 0)
-        self.assertIn("unreachable tick 1 in a row", output)
 
-    def test_a_connect_ends_the_unreachable_streak(self):
-        """pack sd:9541 review: a tick that reaches the hub removes the stamp, so the next outage starts at one."""
+    def test_a_hub_that_drops_every_tick_mid_way_still_alerts(self):
+        """pack sd:9541 review: the stamp was cleared at the connect, so a hub that took the connect and dropped
+        each request after it never alerted. A connect is not a pass: mid-tick outages count in the same streak."""
+        error = "the sd hub at hub.example.test:8769 is unreachable: timed out"
+        self.assertEqual([self.unreachable("tick")[0], self.unreachable("tick")[0]], [0, 0])
+        self.assertEqual(self.unreachable("tick"), (1, error))
+
+    def test_a_completed_tick_ends_the_unreachable_streak(self):
+        """pack sd:9541 review: only a tick that ran to its end with no outage removes the stamp; a tick that
+        connected and then met a lock leaves it, so the next outage counts on."""
         self.unreachable()
+        run = self.builds()
+        self.connect.side_effect = None
+        run.dispatch.side_effect = sqlite3.OperationalError("database is locked")
+        self.assertEqual(self.tick(run)[0], 0)
+        self.assertEqual(json.loads(self.stamp.read_text())["count"], 1)
         self.unreachable()
         self.connect.side_effect = None
         code, _ = self.tick(self.builds())
@@ -487,6 +498,20 @@ class OperationsCLI(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("is unreachable: timed out", output)
         self.assertIn("was not recorded", output)
+
+    def test_an_outage_at_the_deadline_is_handled_whole(self):
+        """pack sd:9541 review: the tick's alarm stayed armed while the stamp was written, so the deadline could
+        escape the skip as a traceback. The alarm ends before the outage is counted."""
+        real = os.replace
+
+        def slow(source, target):
+            time.sleep(0.5)
+            real(source, target)
+        with patch.object(cli, "TICK_SECONDS", 0.2, create=True), patch.object(cli.os, "replace", slow):
+            code, output = self.unreachable("tick")
+        self.assertEqual(code, 0)
+        self.assertIn("unreachable tick 1 in a row", output)
+        self.assertEqual(json.loads(self.stamp.read_text())["count"], 1)
 
     def test_a_clock_jump_does_not_reset_the_streak(self):
         """pack sd:9541 review: the count, not the clock, ends the skips: a stamp whose first failure is in the
