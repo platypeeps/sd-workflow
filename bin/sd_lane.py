@@ -4280,11 +4280,14 @@ def work_ids(entries: list[dict[str, Any]], releases: Callable[[], bool]) -> fro
     unfinished chain, but only where the policy declares `release`
     (`releases`), else the marks stay for ever; `post_merge` runs each owed
     target (`owes_post_merge`). `releases` is read only for a lane with a mark.
+    Each stored field is narrowed before use; a row `new_work` cannot read
+    raises, and `new_work` contains it.
     """
     host = this_host()
 
     def dead(row: dict[str, Any]) -> bool:
-        holder = row.get("holder") or {}
+        holder = row.get("holder")
+        holder = holder if isinstance(holder, dict) else {}
         return row.get("status") == "running" and holder.get("host") == host and not runner_alive(holder.get("pid"))
 
     def owes_release(row: dict[str, Any]) -> bool:
@@ -4315,6 +4318,8 @@ def declares_release(root: pathlib.Path, environ: dict[str, str]) -> bool:
 
 #: The work id of a queue file an earlier version left, which `import_file_queue` imports.
 QUEUE_FILE_WORK = "recover:queue-file"
+#: The work id of a lane whose stored entries `new_work` cannot read: its worker reads them and says what it met.
+UNREADABLE_WORK = "recover:unreadable"
 
 
 def new_work(environ: dict[str, str],
@@ -4326,7 +4331,10 @@ def new_work(environ: dict[str, str],
     lane whose queue cannot be read is left out: unknown is no new work.
     No runner lock is probed: a probe's flock made the other run's starting
     worker answer busy, and a lane another runner holds answers busy itself,
-    its ids kept as seen. Not work, as a run leaves them: an imported body
+    its ids kept as seen. A lane whose entries cannot be read as entries
+    has work (`UNREADABLE_WORK`), never an error for the run: on main its
+    worker met the row and the other lanes ran on. Not work, as a run
+    leaves them: an imported body
     copy no row names, and a hub-stop record no running entry holds.
     """
     queues: dict[pathlib.Path, Queue] = {}
@@ -4338,17 +4346,28 @@ def new_work(environ: dict[str, str],
     if not queues:
         return {}
 
-    def entries_by_lane(connection: Any) -> dict[pathlib.Path, list[dict[str, Any]]]:
-        return {checkout: stored(connection, queue.repository) for checkout, queue in queues.items()}
+    def entries_by_lane(connection: Any) -> dict[pathlib.Path, list[dict[str, Any]] | None]:
+        read: dict[pathlib.Path, list[dict[str, Any]] | None] = {}
+        for checkout, queue in queues.items():
+            try:
+                read[checkout] = stored(connection, queue.repository)
+            except (ValueError, TypeError, AttributeError, KeyError):  # a stored body that is no entry
+                read[checkout] = None
+        return read
     try:
         entries = on_hub(next(iter(queues.values())), entries_by_lane, write=False)
     except LaneError:
         return {}
     found: dict[pathlib.Path, frozenset[str]] = {}
     for checkout, rows in entries.items():  # the policy is read after the hub transaction, on its own connection
-        work = work_ids(rows, functools.partial(declares_release, checkout, environ))
-        if queue_path(checkout, environ).exists():
-            work |= {QUEUE_FILE_WORK}
+        try:
+            if rows is None:
+                raise ValueError("a stored entry is not an object")
+            work = work_ids(rows, functools.partial(declares_release, checkout, environ))
+            if queue_path(checkout, environ).exists():
+                work |= {QUEUE_FILE_WORK}
+        except Exception:  # noqa: BLE001 -- one lane's bad row stays its own: its worker meets it and says so
+            work = frozenset({UNREADABLE_WORK})
         if work - seen[checkout]:
             found[checkout] = work
     return found
@@ -4738,9 +4757,9 @@ def longest_waiting_first(hosted: list[tuple[str, pathlib.Path]],
     def oldest(lane: tuple[str, pathlib.Path]) -> str:
         try:
             rows = read_queue(queue_for(lane[1], environ))
-        except (LaneError, sd_lib.ConfigError, OSError):
+            return min((str(row.get("enqueued_at") or "~") for row in rows if runnable(row)), default="~")
+        except Exception:  # noqa: BLE001 -- unread, or a stored body that is no entry: its own worker says which
             return "~"  # after every stamp
-        return min((str(row.get("enqueued_at") or "~") for row in rows if runnable(row)), default="~")
     return sorted(hosted, key=oldest)
 
 

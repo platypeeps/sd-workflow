@@ -6541,6 +6541,67 @@ class HostedParallel(Lane):
                                                                 lambda *args, value=policy: value):
                 self.assertEqual(self.zeta in sd_lane.new_work(self.environ, {self.zeta: frozenset()}), expected)
 
+    def test_bad_stored_json_on_the_admission_path_stays_its_own_lane_s(self) -> None:
+        """sd:9332 lead review of d2c34d435 :4288: a running entry whose `holder` was a list, string or number
+        raised AttributeError in `work_ids`, the error left the run, and its finally TERMed every lane; a
+        stored body that was no object did the same, in `new_work` and in `longest_waiting_first`. Each
+        stored read on the admission path is narrowed or contained: the bad lane has work, once a run, and
+        the other lane still starts."""
+        import sd_db
+        queue = sd_lane.queue_for(self.zeta, self.environ)
+
+        def raw(body: Any) -> Callable[[], None]:
+            connection = sd_db.connect(home=self.tmp)
+            try:
+                connection.execute("INSERT INTO state(kind, key, timestamp, body) VALUES ('checkpoint', ?, ?, ?)",
+                                   (f"{sd_lane.KEY_PREFIX}{queue.repository}:bad", "2026-11-19T00:00:00Z",
+                                    json.dumps(body)))
+            finally:
+                connection.close()
+
+            def drop() -> None:
+                connection = sd_db.connect(home=self.tmp)
+                try:
+                    connection.execute("DELETE FROM state WHERE key = ?", (f"{sd_lane.KEY_PREFIX}{queue.repository}:bad",))
+                finally:
+                    connection.close()
+            return drop
+        ran = {"ran": "no post-merge rule", "at": "2026-11-19T00:00:00Z"}
+        for value in (["x"], "x", 7):
+            for field in ("holder", "release", "post_merge", "policy", "body"):
+                with self.subTest(field=field, value=value), self.releasing(value if field == "policy" else None):
+                    drop = lambda: None  # noqa: E731
+                    if field == "holder":
+                        self.set_zeta(status="running", holder=value)
+                    elif field in ("release", "post_merge"):
+                        self.set_zeta(**{"status": "merged", "post_merge": ran, "release": "owed", field: value})
+                    elif field == "policy":
+                        self.set_zeta(status="merged", post_merge=ran, release="owed")
+                    else:
+                        self.set_zeta(status="merged", post_merge=ran)
+                        drop = raw(value)
+                    try:
+                        order = sd_lane.longest_waiting_first([("zeta", self.zeta), ("pack", self.repo)],
+                                                              self.environ)
+                        started: list[pathlib.Path] = []
+
+                        def start(checkout: pathlib.Path, budget: float, into: list = started) -> sd_lane.StartedLane:
+                            into.append(checkout)
+                            return sd_lane.StartedLane(lambda: {"ran": []})
+                        with mock.patch.object(sd_lane.time, "sleep", self.bounded_nap([0])):
+                            rows = sd_lane.run_parallel([("zeta", self.zeta), ("pack", self.repo)], start,
+                                                        sd_lane.clock() + 600, lambda: None,
+                                                        functools.partial(sd_lane.new_work, self.environ),
+                                                        locks=sd_lane.MachineLocks(self.environ), cap=3)
+                        found = sd_lane.new_work(self.environ, {self.zeta: frozenset()})
+                        again = sd_lane.new_work(self.environ, {self.zeta: found.get(self.zeta, frozenset())})
+                    finally:
+                        drop()
+                    self.assertEqual((order[0][1], started), (self.repo, [self.zeta, self.repo]), rows)
+                    if field in ("policy", "body", "post_merge"):  # unknown, or the owed release beside it
+                        self.assertIn(self.zeta, found)
+                    self.assertEqual(again, {})  # once a run
+
     def test_a_queue_file_an_earlier_version_left_is_new_work_once_a_run(self) -> None:
         """sd:9332 lead review of 74dc3f8e4 :4282: a lane whose entries were still in an earlier version's
         queue file had none in the hub, so no run started the worker that imports them."""

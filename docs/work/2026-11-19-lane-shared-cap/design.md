@@ -143,6 +143,12 @@ Classes from the blocking rounds, with every instance in the code:
 | 35 | 3 | state: an earlier version's queue file, which only a run imports (`import_file_queue`; lead review 74dc3f8e4 :4282) | work | test_a_queue_file_an_earlier_version_left_is_new_work_once_a_run |
 | 36 | 3 | states a worker leaves or only tidies: a held entry, a live holder, another host's holder past its lease (`claim_entry` refuses), a hub-stop record no running entry holds and a body copy no row names (deleted, nothing reads them) | no work: counted, each would start a worker every run for ever, or for nothing | test_what_a_worker_leaves_alone_or_only_tidies_is_no_work |
 | 37 | 3 | a stored policy that was a non-empty array, string or number raised in the scan, and the hosted run crashed (lead review ec5ef47ae :4306) | a policy that is not an object counts as a failed read: work, once a run; None and a non-object `release` are no release, as `release_chain` reads them | test_a_malformed_policy_counts_as_work_and_never_raises |
+| 38 | 3 | stored read: a running entry's `holder` that is not an object raised in `work_ids`, the run's finally TERMed every lane (lead review d2c34d435 :4288) | narrowed to no holder | test_bad_stored_json_on_the_admission_path_stays_its_own_lane_s [holder] |
+| 39 | 3 | stored read: `release` and `post_merge` that are not objects (`work_ids`, `owes_post_merge`) | already narrowed: compared, then `isinstance` | same test [release], [post_merge] |
+| 40 | 3 | stored read: the policy (`declares_release`) | row 37 | same test [policy] |
+| 41 | 3 | stored read: an entry body that is no object, in `new_work`'s `stored` | that lane has work, once a run (`UNREADABLE_WORK`); its worker meets the row | same test [body] |
+| 42 | 3 | stored read: the same body in `longest_waiting_first`, before any lane starts | the lane keeps its path order after the rest | same test [body] |
+| 43 | 3 | any other error from one lane's `work_ids`, policy read or queue-file check | contained in `new_work`: that lane has work, the run goes on | same test, every case |
 
 Rows removed with the hand-off: the fd passed to a child, a child
 that never starts, an fd that names another file, the env var seen
