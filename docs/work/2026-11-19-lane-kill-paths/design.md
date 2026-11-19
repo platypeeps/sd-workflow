@@ -49,8 +49,8 @@ outside SIGKILL lands before the pack's own unwind ends; see row 6.
 
 ## Non-goals
 
-- A record of groups for a later run to end. Row 6's residual asks
-  the operator.
+- A record of groups for a later run to end. Row 6's residual is
+  the lane-run job's 30 s cron grace, system sd:9571.
 - `sd_opencode` and `sd_db.build` kills. `build.kill_group` already
   reads the groups below its target.
 
@@ -67,7 +67,7 @@ main. "n/a" means main does not have that code.
 | 4 `sd-ship` `review_process` KILL | review group signalled | `sd-review`'s own sessions survive | the same read before TERM and KILL | test_a_killed_review_ends_the_sessions_below_it |
 | 5 `end_child` KILL (hosted run, `CHILD_STOP_SECONDS`) | lane child process killed | its ship and gate sessions survive | read below the unreaped child before TERM and KILL | test_a_killed_lane_child_leaves_no_session_below |
 | 6 cron `JOB_TIMEOUT`: TERM to the job group, KILL after `CRON_JOBS_TIMEOUT_GRACE` (10 s) | lane child and hosted run | the child's unwind (5 s per group, then up to 10 s per gate after its TERM) can outlast the grace; the cron KILL then leaves the gate's sessions | a gate's wait after TERM counts from its first TERM, sent as the TERM lands; the unwind then ends in about `GROUP_CLEANUP_SECONDS` | test_a_termed_run_ends_inside_the_cron_grace |
-| 6 residual | none | open: an outside KILL that lands before the unwind ends (grace below 6 s, a stalled `ps`) leaves sessions with no record | needs a decision, asked on the item: raise the lane job's grace in the system repo (recommended), or record groups beside the runner lock (a new file) | none |
+| 6 residual | none | an outside KILL that lands before the unwind ends (grace below 6 s, a stalled `ps`) leaves sessions with no record | recovery: lane-run cron grace 30 s (system sd:9571); no group record (ruling, sd:9392 note 63749) | none: system side |
 | 7 hand run, SIGHUP (pack sd:9568) | none | a terminal close killed `sd-ship lane run` with no unwind | `term_ends_group` owns SIGHUP while it is default and unwinds as for TERM; `nohup` keeps it ignored | test_a_sighup_ends_the_group_as_a_sigterm_does, test_an_ignored_sighup_stays_ignored |
 | self-KILL (`arm_term`) | n/a | not on main | none | none |
 | `end_overdue` | n/a | not on main | none | none |
