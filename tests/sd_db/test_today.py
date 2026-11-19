@@ -297,7 +297,7 @@ class TheSections(TodayCase):
         """A review batch filed by the review store itself, so the marker is the one it writes."""
         return review.file(self.connection, {
             "schema": 1, "queue": "labels", "batch": name, "title": f"Label {name}", "repo": repo,
-            "source": "example.test@1a2b3c4", "mode": "open",
+            "source": "example.test@1a2b3c4", "mode": "open", "context": {"purpose": "Fixture batch.", "rubric": ["Pick the option that fits."], "feeds": "This test."},
             "questions": [{"subject": f"example.test/{name}/{number}", "text": "Which tier fits?",
                            "options": ["cheap", "deep"]} for number in range(questions)]}, who="tester")["item"]
 

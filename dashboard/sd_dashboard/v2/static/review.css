@@ -34,6 +34,7 @@ annunciator-strip:has(> .annunciator[hidden]) { display: none; }
 .review .brief dt { color: var(--color-muted); }
 .review .brief dd { margin: 0; min-width: 0; color: var(--color-ink); overflow-wrap: anywhere; }
 .review .brief ul { margin: 0; padding-left: var(--space-md); }
+.review .nobrief { display: block; color: var(--color-muted); }
 .review tr.band:has(.tfold[aria-expanded="false"]) .brief { display: none; }
 /* The bar over the table: the pick count, Select all and Clear, then the labels for the picked rows. It stays in reach while
  * the ledger scrolls. */

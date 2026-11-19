@@ -877,6 +877,12 @@ def _file_done(connection, document: dict) -> tuple[dict, str]:
             "schema": review.SCHEMA, "queue": QUEUE, "batch": name if number == 1 else f"{name}-{number}",
             "title": f"Adversarial review of {kind} {label}: pick the recommendations to file as tasks",
             "repo": repo, "source": f"local-adversarial-gate; brief {stem}", "mode": "open",
+            "context": {"purpose": f"Pick which recommendations of the adversarial review of {kind} {label[:200]} "
+                                   f"become tasks.",
+                        "rubric": ["Approve: the finding holds and is worth a task.",
+                                   "Reject: it does not hold, or it is not worth the work."],
+                        "feeds": f"An approval files the finding as a task in its repo; brief {stem[:200]} lists "
+                                 f"every finding."},
             "questions": [_question(one, one["subject"], stem) for one in asked]}, who=WHO)
         # A subject the queue rejected in the last 90 days is dropped, not asked again.
         dropped = {entry["subject"]: entry["reason"] for entry in filed["dropped"]}

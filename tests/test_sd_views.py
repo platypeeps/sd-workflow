@@ -238,7 +238,7 @@ class SdToday(Zone):
         fill(self.connection)
         review.file(self.connection, {
             "schema": 1, "queue": "labels", "batch": "B1", "title": "Label B1", "source": "example.test@1a2b3c4",
-            "mode": "open", "questions": [{"subject": f"example.test/{number}", "text": "Which tier fits?",
+            "mode": "open", "context": {"purpose": "Fixture batch.", "rubric": ["Pick the option that fits."], "feeds": "This test."}, "questions": [{"subject": f"example.test/{number}", "text": "Which tier fits?",
                                            "options": ["cheap", "deep"]} for number in range(2)]}, who="tester")
         found = today.sections(self.connection, now=NOW, gate=GATE)
         lines = sd_views.render_sections(found, now=MOMENT, width=100).splitlines()

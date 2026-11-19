@@ -472,7 +472,7 @@ class TaskCLI(unittest.TestCase):
         with database(home=self.home) as connection:
             item = review.file(connection, {
                 "schema": 1, "queue": "nightly", "batch": "2026-10-18", "title": "Nightly review 2026-10-18",
-                "source": "system@6c4317b", "mode": "open",
+                "source": "system@6c4317b", "mode": "open", "context": {"purpose": "Fixture batch.", "rubric": ["Pick the option that fits."], "feeds": "This test."},
                 "questions": [{"subject": "cap-retries", "text": "Suggestion: cap retries.",
                                "options": ["Approve", "Reject"]}]}, who="fixture")["item"]
             connection.commit()
@@ -507,7 +507,7 @@ class TaskCLI(unittest.TestCase):
         with database(home=self.home) as connection:
             item = review.file(connection, {
                 "schema": 1, "queue": "nightly", "batch": "2026-10-18", "title": "Nightly review 2026-10-18",
-                "source": "system@6c4317b", "mode": "open",
+                "source": "system@6c4317b", "mode": "open", "context": {"purpose": "Fixture batch.", "rubric": ["Pick the option that fits."], "feeds": "This test."},
                 "questions": [{"subject": f"cap-{number}", "text": f"Suggestion: cap {number}.",
                                "options": ["Approve", "Reject"]} for number in range(3)]}, who="fixture")["item"]
             connection.commit()

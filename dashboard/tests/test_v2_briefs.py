@@ -1049,7 +1049,7 @@ def adversarial(case, questions=3, task=12):
     """An adversarial review's batch of Approve-or-Reject recommendations and the brief that names it (sd:5064)."""
     batch = review.file(case.connection, {
         "schema": 1, "queue": "adversarial", "batch": f"task-{task}-101500", "title": f"Adversarial review of task {task}",
-        "repo": REPO, "source": "local-adversarial-gate", "mode": "open",
+        "repo": REPO, "source": "local-adversarial-gate", "mode": "open", "context": {"purpose": "Fixture batch.", "rubric": ["Pick the option that fits."], "feeds": "This test."},
         "questions": [{"subject": f"task {task}: hypothesis {n}", "text": f"Fix hypothesis {n} of task {task}\n\nWhy it matters.",
                        "options": ["Approve", "Reject"]} for n in range(1, questions + 1)]}, who="test")["item"]
     stem = f"2026-09-06 - Adversarial review · task {task} · 101500Z"

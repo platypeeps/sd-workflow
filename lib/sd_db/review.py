@@ -16,8 +16,9 @@ provenance. No table is new:
   line per choice), plus one `Subject:` line and up to five `Evidence:` lines.
   The batch's questions are the header's count of question notes after it;
   a question added by hand later is not one of them.
-- The batch's optional **context** (purpose, rubric, what the labels feed)
-  rides the header as `Purpose:`, `Rubric:` and `Feeds:` lines. A question's
+- The batch's **context** (purpose, rubric, what the labels feed) rides the
+  header as `Purpose:`, `Rubric:` and `Feeds:` lines. A new batch files with
+  all three or not at all (pack sd:9479); one filed before reads None. A question's
   optional **recommendation** rides its note as two more evidence lines,
   `Evidence: Recommended: <option>` and `Evidence: Recommended because:
   <reason>`, so a reader older than system sd:5759 files it under evidence,
@@ -205,6 +206,20 @@ def _context(found: Any) -> dict:
     return {"purpose": line("purpose", found["purpose"]) if "purpose" in found else None,
             "rubric": [line("rubric", entry) for entry in rubric],
             "feeds": line("feeds", found["feeds"]) if "feeds" in found else None}
+
+
+#: What a batch's context holds, for the refusal of one that lacks part of it (pack sd:9479).
+CONTEXT_FORMAT = ('"context": {"purpose": TEXT, "rubric": [LINE, ...], "feeds": TEXT}: why the batch exists, '
+                  f'how to label it in 1 to {RUBRIC_LINES} lines, and what the labels decide and when')
+
+
+def _require_context(found: dict) -> None:
+    """Refuse a batch without its Purpose, a Rubric line and its Feeds (pack sd:9479): a page of bare questions."""
+    context = found["context"] or {}
+    tags = [tag for key, tag in CONTEXT_TAGS.items() if not context.get(key)]
+    if tags:
+        named = tags[0] if len(tags) == 1 else f"{', '.join(tags[:-1])} or {tags[-1]}"
+        raise ReviewError(f"a batch needs its context, and this one has no {named} line; give {CONTEXT_FORMAT}")
 
 
 def _checked(batch: Any) -> dict:
@@ -478,11 +493,15 @@ def file(connection: sqlite3.Connection, batch: Any, *, who: str, now: str | Non
         held = writes.item_by_external(connection, REF_SOURCE, ref)
         if held is not None:
             filed = read(connection, held["id"])
-            if filed["header"]["digest"] != digest:
+            # A batch filed before its context was required finds itself again once its filer adds one (pack sd:9479).
+            bare = {key: value for key, value in batch.items() if key != "context"}
+            before = {_digest(bare), _digest({**bare, "context": None})} if filed["header"]["context"] is None else set()
+            if filed["header"]["digest"] != digest and filed["header"]["digest"] not in before:
                 raise ReviewError(f"{ref} is filed as sd:{held['id']} with other content: "
                                   f"{_difference(filed, found)}")
             return {"item": held["id"], "ref": ref, "created": False, "filed": len(filed["questions"]),
                     "dropped": []}
+        _require_context(found)
         rejected = _rejected(connection, found["queue"], since) if suppress else {}
         kept = [question for question in found["questions"] if question["subject"] not in rejected]
         dropped = [{"subject": question["subject"], "reason": rejected[question["subject"]]}
@@ -782,8 +801,14 @@ def from_kev(text: str, *, batch: str, mode: str, source: str) -> dict:
         raise ReviewError("the Kev file holds no line")
     if len(questions) > LIMIT:
         raise ReviewError(f"{len(questions)} lines; a batch holds at most {LIMIT}, so split the file")
+    # A Kev file holds no context; this one says what Kev's tools read back (pack sd:9479).
+    context = {"purpose": f"Label each line of {source[:200]} as its own instructions ask.",
+               "rubric": ["Pick the option whose description fits the document.",
+                          f"{DROP}: the line cannot be labelled as asked."],
+               "feeds": "Kev's reviews.jsonl: `sd-db review export N --format reviews` writes each labelled line "
+                        "as accept, relabel or drop."}
     found = {"schema": SCHEMA, "queue": KEV_QUEUE, "batch": _name(batch, "batch"), "title": f"Label: {batch}",
-             "source": source, "mode": mode, "questions": questions}
+             "source": source, "mode": mode, "context": context, "questions": questions}
     _checked(found)
     return found
 

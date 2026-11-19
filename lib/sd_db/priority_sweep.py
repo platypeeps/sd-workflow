@@ -115,7 +115,11 @@ def sweep(connection: sqlite3.Connection, *, who: str, now: datetime) -> dict:
             "schema": review.SCHEMA, "queue": QUEUE, "batch": now.strftime("%Y-%m-%d-%H%M%S"), "title": f"Priority for unranked items, {day}",
             "source": "sd-db review priorities (sd:6726)", "mode": "open", "limit": review.LIMIT,
             "context": {"purpose": f"Rank each open work item filed without a priority; one still unranked "
-                                   f"{CLOSE_DAYS} days after filing closes."},
+                                   f"{CLOSE_DAYS} days after filing closes.",
+                        "rubric": ["P1 is the most urgent rank, P4 the least.",
+                                   f"The sweep proposes P2 for a due date within {DUE_SOON_DAYS} days or a followup, "
+                                   "else P3."],
+                        "feeds": "The next nightly sweep sets each ruled item's priority, while it still has none."},
             "questions": questions[:review.LIMIT]}, who=who, now=now.isoformat(), suppress=False)
     return {"ranked": ranked, "batches_closed": batches, "closed": closed, "held": held,
             "asked": filed and filed["filed"] or 0, "batch": filed and filed["item"]}
