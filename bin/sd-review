@@ -806,8 +806,9 @@ def _branch_range(root: pathlib.Path, subject: Subject) -> tuple[str, str, froze
 
 
 class Rebuttal(NamedTuple):
-    """One recorded disposition: the path as recorded, the folded summary, the line, whether the prompt lists it
-    as a rebuttal, and its prompt line."""
+    """One recorded disposition: its receipt's head, the path as recorded, the folded summary, the line, whether
+    the prompt lists it as a rebuttal, and its prompt line."""
+    head: str
     path: Any
     summary: str
     line: int | None
@@ -844,7 +845,15 @@ def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: 
     except Exception as error:  # a failed read is unknown, not empty: say so, and review without it
         print(f"sd-review: reviewing without the rebutted findings: {type(error).__name__}: {error}", file=sys.stderr)
         return []
-    return rebuttals(rows, span[2].__contains__)
+
+    def unchanged(receipt: str, path: Any) -> bool:
+        """No change to `path` since the receipt's head, the worktree included at worktree scope; hold on doubt:
+        a failed diff is a change."""
+        reads = [["diff", "--quiet", receipt, span[0]]] if subject.scope != "worktree" else [
+            ["diff", "--quiet", receipt], ["ls-files", "--others", "--exclude-standard"]]
+        return isinstance(path, str) and all(sd_lib.git_output(["--literal-pathspecs", *args, "--", path], root) == ""
+                                             for args in reads)
+    return rebuttals(rows, span[2].__contains__, unchanged)
 
 
 def _folded(value: Any) -> str:
@@ -864,13 +873,15 @@ def recorded_at(records: Sequence[Rebuttal], path: Any, summary: Any, line: Any)
     return next((record for record in records if (record.path, record.summary, record.line) == place), None)
 
 
-def rebuttals(rows: Sequence[Sequence[Any]], on_branch: Callable[[str], bool]) -> list[Rebuttal]:
+def rebuttals(rows: Sequence[Sequence[Any]], on_branch: Callable[[str], bool],
+              unchanged: Callable[[str, Any], bool]) -> list[Rebuttal]:
     """Every disposition in adjudication bodies newest first, from receipts `on_branch`. A rebuttal is listed when
-    it is the newest record at its place, up to `REBUTTED_LINES`; the prompt shows exactly those, and the gate
-    holds back a finding only when the newest record at its exact place is one of them.
+    it is the newest record at its place and its file is `unchanged` since its receipt, up to `REBUTTED_LINES`;
+    the prompt shows exactly those, and the gate holds back a finding only when the newest record at its exact
+    place is one of them.
 
     The lane's own blockers (`LANE_PATHS`) are never recorded: a later truncated review must still block."""
-    records = [Rebuttal(path, summary_key(summary), line if type(line) is int else None, disposition == "rebutted",
+    records = [Rebuttal(head, path, summary_key(summary), line if type(line) is int else None, disposition == "rebutted",
                         _bounded(path or "?", 120), _bounded(summary, REBUTTED_SUMMARY_CHARS),
                         _bounded(reason, REBUTTED_REASON_CHARS))
                for body, *_rest in rows for head, found in [_adjudicated(body)]
@@ -879,8 +890,9 @@ def rebuttals(rows: Sequence[Sequence[Any]], on_branch: Callable[[str], bool]) -
                if summary_key(summary) and str(path).strip() not in LANE_PATHS]
     shown = 0
     for index, record in enumerate(records):
-        own = record.listed and shown < REBUTTED_LINES and recorded_at(records, record.path, record.summary,
-                                                                       record.line) is record
+        own = (record.listed and shown < REBUTTED_LINES and recorded_at(records, record.path, record.summary,
+                                                                        record.line) is record
+               and unchanged(record.head, record.path))
         shown += own
         records[index] = record._replace(listed=own)
     return records
@@ -1274,8 +1286,6 @@ def _finding_error(raw: Any) -> str:
         return "severity: invalid enum value"
     if raw["line"] is not None and (not isinstance(raw["line"], int) or isinstance(raw["line"], bool)):
         return "line: expected integer or null"
-    if not isinstance(raw.get("evidence", ""), str):
-        return "evidence: expected string"
     return ""
 
 

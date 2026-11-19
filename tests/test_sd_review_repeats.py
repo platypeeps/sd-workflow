@@ -205,7 +205,8 @@ class RebuttedFindingTests(RepeatFixture):
         lines = self.section(prompts[0])
         # A lone surrogate is replaced, not a failed read; a nested value is its JSON text, on one line.
         self.assertIn("- bin/tool.py: a well-formed claim ? Rebuttal: fine", lines)
-        self.assertIn('- ["x"]: {"nested": {"deeper": [1, 2, 3]}} Rebuttal: {"a": [1, {"b": 2}]}', lines)
+        # Round 12: a path that is not text cannot be diffed, so it is never listed (hold on doubt).
+        self.assertNotIn('- ["x"]: {"nested": {"deeper": [1, 2, 3]}} Rebuttal: {"a": [1, {"b": 2}]}', lines)
         self.assertLessEqual(len(lines), sd_review.REBUTTED_LINES)
         self.assertEqual(stderr, "")
 
@@ -304,8 +305,16 @@ class RepeatRuleTests(unittest.TestCase):
         self.assertEqual(len(long.findings[0]["evidence"]), sd_review.EVIDENCE_CHARS)
         nested = sd_review.parse_findings(json.dumps({"findings": [row(evidence={"command": {"argv": ["git"]}})]}))
         assert nested is not None
-        self.assertEqual(nested.error, "response violates the findings schema: findings[0].evidence: expected string")
         self.assertEqual(sd_review.dispose(nested.findings, "high", self.REBUTTED)[0]["disposition"], "advisory")
+
+    def test_null_or_odd_evidence_is_empty_never_an_error(self) -> None:
+        """Round 12: a reader that sends `"evidence": null`, or another type, cites nothing and breaks nothing."""
+        for evidence in (None, 0, 7, True, [], ["cmd"], {}, {"command": {"argv": ["git"]}}):
+            with self.subTest(evidence=evidence):
+                parsed = sd_review.parse_findings(json.dumps({"findings": [row(evidence=evidence)]}))
+                assert parsed is not None
+                self.assertEqual(parsed.error, "")
+                self.assertNotIn("evidence", parsed.findings[0])
 
     def test_the_schema_carries_evidence(self) -> None:
         item = sd_review.CODEX_OUTPUT_SCHEMA["properties"]["findings"]["items"]
@@ -376,7 +385,7 @@ def adjudicated(*rows: tuple[Any, ...], decision: str = "accepted", line: Any = 
 
 def listed(*bodies: str) -> list[Any]:
     """The rebuttals in `bodies`, newest first, as the prompt lists them."""
-    return sd_review.rebuttals([(body,) for body in bodies], {ON_BRANCH}.__contains__)
+    return sd_review.rebuttals([(body,) for body in bodies], {ON_BRANCH}.__contains__, lambda _head, _path: True)
 
 
 def gate(findings: list[dict[str, Any]], *bodies: str) -> list[str]:
@@ -545,6 +554,36 @@ class RebuttalScopeTests(RepeatFixture):
         far = dict(self.repeat("lane claim"), line=4)
         self.assertEqual(self.review_answering(far)["lane claim"], ("blocking", "bin/tool.py"))
         self.assertEqual(self.review_answering(self.repeat("lane claim"))["lane claim"], ("advisory", "bin/tool.py"))
+
+    def test_a_rebuttal_holds_only_while_its_file_is_unchanged(self) -> None:
+        """Round 12, hold on doubt: a change to the rebutted file since the receipt's head, committed or not,
+        or a diff git cannot run, makes the repeat block; a change to another file does not."""
+        self.adjudication(("lane claim", "rebutted", "x"), head=self.first)
+        (self.root / "other.py").write_text("y = 2\n", encoding="utf-8")
+        self.commit("add", "other.py")
+        self.commit("another file")
+        self.assertEqual(self.review_answering(self.repeat("lane claim"))["lane claim"][0], "advisory")
+        (self.root / "bin").mkdir()
+        (self.root / "bin/tool.py").write_text("check = False\n", encoding="utf-8")
+        self.assertEqual(self.review_answering(self.repeat("lane claim"))["lane claim"][0], "blocking")
+        self.assertNotIn("lane claim Rebuttal", self.prompts()[0][0])
+        self.commit("add", "bin/tool.py")
+        self.commit("the cited check is gone")
+        for scope in ("worktree", "branch"):
+            with self.subTest(scope=scope):
+                seen = sd_review.rebutted_findings(self.root, sd_review.resolve_subject(self.root, scope), None,
+                                                   self.environment())
+                self.assertEqual([entry.text for entry in seen if entry.listed], [])
+
+    def test_a_diff_git_cannot_run_holds_the_rebuttal_back(self) -> None:
+        self.adjudication(("lane claim", "rebutted", "x"))
+        real = sd_review.sd_lib.git_output
+        with unittest.mock.patch.object(
+                sd_review.sd_lib, "git_output",
+                side_effect=lambda args, root: None if "diff" in args else real(args, root)):
+            seen = sd_review.rebutted_findings(self.root, sd_review.resolve_subject(self.root, "worktree"), None,
+                                               self.environment())
+        self.assertEqual([(entry.text, entry.listed) for entry in seen], [("lane claim", False)])
 
     def test_a_branch_git_cannot_list_is_unknown_not_empty(self) -> None:
         self.adjudication(("lane claim", "rebutted", "x"))
