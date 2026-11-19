@@ -300,16 +300,8 @@ def review_process(root: pathlib.Path, argv: list[str], *, timeout: float) -> su
             if isinstance(interruption, subprocess.TimeoutExpired):
                 output, errors = interruption.output or b"", interruption.stderr or b""
             cleanup: dict = {}
-            # The SIGKILL reaches each session below the group too, read before
-            # the SIGTERM and again before the SIGKILL (pack sd:9392).
-            below = sd_lib.read_or_term(  # a signal in the read still TERMs the group
-                lambda: sd_lib.groups_below(process.pid) if sd_lib.group_alive(process.pid) else {},
-                lambda: sd_lib.signal_group(process.pid, signal.SIGTERM))
-            for name, number, bound in (("term", signal.SIGTERM, REVIEW_CLEANUP_SECONDS), ("kill", signal.SIGKILL, REVIEW_DRAIN_SECONDS)):
-                # poll() may already have reaped the leader. Its descendants
-                # still own the group and pipes, so the signal is unconditional.
-                if number == signal.SIGKILL:
-                    sd_lib.kill_below(process.pid, below)
+
+            def send_review(name: str, number: int) -> None:
                 try:
                     os.killpg(process.pid, number)
                     cleanup[name] = "sent"
@@ -317,11 +309,14 @@ def review_process(root: pathlib.Path, argv: list[str], *, timeout: float) -> su
                     cleanup[name] = "absent"
                 except OSError as error:
                     cleanup[name] = f"failed: {error}"
+
+            def drain_review(bound: float, *, empty: bool = False) -> None:
+                nonlocal output, errors
                 try:
                     deadline = time.monotonic() + bound
                     output, errors = process.communicate(timeout=bound)
                     cleanup["drained"] = True
-                    if number == signal.SIGTERM:  # the grace lasts until the group is empty (pack sd:9392)
+                    if empty:  # the grace lasts until the group is empty (pack sd:9392)
                         sd_lib.wait_empty(process.pid, deadline)
                 except subprocess.TimeoutExpired as error:
                     output, errors = error.output or output, error.stderr or errors
@@ -329,6 +324,23 @@ def review_process(root: pathlib.Path, argv: list[str], *, timeout: float) -> su
                 except (OSError, subprocess.SubprocessError) as error:
                     cleanup["drained"] = False
                     cleanup["drain_error"] = str(error)[:REVIEW_DIAGNOSTIC_BYTES]
+
+            def kill_review(earlier: sd_lib.Table | None) -> None:
+                # The SIGKILL reaches each witnessed session below the group,
+                # read before the SIGTERM and again now (pack sd:9392). A
+                # reaped leader's number is signalled only while a member
+                # read before the TERM still holds it.
+                table, interrupted = sd_lib.read_after()
+                held = sd_lib.kill_below(process.pid, earlier, table)
+                if process.returncode is None or held:
+                    send_review("kill", signal.SIGKILL)
+                else:
+                    cleanup["kill"] = "absent"
+                drain_review(REVIEW_DRAIN_SECONDS)
+                if interrupted is not None:
+                    raise interrupted
+            sd_lib.escalate(lambda: sd_lib.process_table() if sd_lib.group_alive(process.pid) else {},
+                            lambda: send_review("term", signal.SIGTERM), lambda: drain_review(REVIEW_CLEANUP_SECONDS, empty=True), kill_review)
             cleanup["leader_reaped"] = process.poll() is not None
             if not isinstance(interruption, subprocess.TimeoutExpired):
                 raise

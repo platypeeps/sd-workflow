@@ -112,6 +112,18 @@ QUITTER_CHILD = ('CHILD = "import os, pathlib, subprocess, sys, time; '
                  'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)"')
 
 
+def interrupt_first(real: Any) -> Any:
+    """A stand-in for `real` whose first call raises KeyboardInterrupt and whose later calls pass through."""
+    calls = [0]
+
+    def read() -> Any:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise KeyboardInterrupt
+        return real()
+    return read
+
+
 def end_group(group: int) -> None:
     """Kill a group a failed test left running; one already gone is fine."""
     with contextlib.suppress(OSError):
@@ -6124,11 +6136,11 @@ class Bounds(unittest.TestCase):
         """Class pass, rule 1: the gate's `run_group` ended between the TERM wait and the SIGKILL and cleared
         `group`, so the SIGKILL step skipped the sessions read below it at the TERM."""
         gate = sd_lane.SpeculativeGate(lambda: None, "cleared")
-        read = {424242: "start"}
+        read = {424242: (4242, 424242, "start")}
         gate.below, gate.group = {4242: read}, None
         with mock.patch.object(sd_lane.sd_lib, "kill_below") as kill:
             gate.signal_gate(signal.SIGKILL)
-        kill.assert_called_once_with(4242, read)
+        kill.assert_called_once_with(4242, read, mock.ANY)
 
     def test_a_lane_child_that_ends_on_term_still_has_what_it_left_killed(self) -> None:
         """Class pass, rule 1: the lane child ended on the TERM, so `end_child` returned after `wait` and
@@ -6179,19 +6191,59 @@ class Bounds(unittest.TestCase):
         self.addCleanup(scratch.cleanup)
         mark = pathlib.Path(scratch.name) / "child.pid"
         code = ("import pathlib, signal, sys, time; "
-                "signal.signal(signal.SIGTERM, lambda *_: (time.sleep(0.8), sys.exit(3))); "
+                "signal.signal(signal.SIGTERM, lambda *_: (time.sleep(2), sys.exit(3))); "
                 "pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(60)")
         began = time.monotonic()
 
-        def until() -> None:  # registers 0.6 s into the 1 s wait, once the child's handler is in
+        def until() -> None:  # registers 1.5 s into the 3 s wait, once the child's handler is in
             for _ in range(400):
                 if mark.exists():
                     break
                 time.sleep(0.01)
-            time.sleep(max(0.0, began + 0.6 - time.monotonic()))
-        with mock.patch.object(sd_lane, "CANCEL_SECONDS", 1):
+            time.sleep(max(0.0, began + 1.5 - time.monotonic()))
+        with mock.patch.object(sd_lane, "CANCEL_SECONDS", 3):
             _, answers = self.late_gate([sys.executable, "-c", code, str(mark)], until)
         self.assertEqual(answers[0][0], 3, "the late group was KILLed inside its TERM grace")
+
+    def deaf_gate(self) -> tuple[Any, int]:
+        """A started gate whose `sd-check` stand-in ignores TERM, and that stand-in's pid."""
+        argv, mark = self.deaf_child()
+        gate = sd_lane.SpeculativeGate(lambda: sd_lane.gate_run()(argv, dict(os.environ), pathlib.Path.cwd(), 120),
+                                       "deaf")
+        gate.start()
+        self.below_of(mark)
+        child = int(mark.read_text())
+        self.addCleanup(end_group, child)
+        self.addCleanup(gate.join, 30)
+        return gate, child
+
+    def test_an_interrupted_gate_cancel_still_kills(self) -> None:
+        """Round 5, R2: a KeyboardInterrupt in `signal_gate`'s read or in the TERM wait left the TERMed
+        gate group with no SIGKILL."""
+        for where in ("read", "wait"):
+            with self.subTest(where=where):
+                gate, child = self.deaf_gate()
+                if where == "read":
+                    patch = mock.patch.object(sd_lane.sd_lib, "process_table",
+                                              side_effect=interrupt_first(sd_lane.sd_lib.process_table))
+                else:
+                    patch = mock.patch.object(gate, "join", side_effect=[KeyboardInterrupt, None, None])
+                with patch, self.assertRaises(KeyboardInterrupt):
+                    gate.cancel_gate()
+                self.assert_gone(child, "the TERM-deaf gate child after an interrupted cancel")
+
+    def test_an_interrupted_lane_child_end_still_kills(self) -> None:
+        """Round 5, R2, `end_child`: a KeyboardInterrupt in the read before the TERM left the child TERMed
+        and never KILLed."""
+        argv, mark = self.deaf_child()
+        lane = sd_lane.child_lane(pathlib.Path.cwd(), 0, argv)
+        self.below_of(mark)
+        with mock.patch.object(sd_lane.sd_lib, "process_table", side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            lane.end()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            lane.process.wait(5)
+        self.assertEqual(lane.process.returncode, -signal.SIGKILL)
 
     def below_of(self, mark: pathlib.Path) -> int:
         below = pathlib.Path(f"{mark}.below")

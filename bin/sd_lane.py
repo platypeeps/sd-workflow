@@ -2194,7 +2194,7 @@ class SpeculativeGate(threading.Thread):
         self.why = "the run stopped, so it ended this gate (sd:3361)"
         self.cancelled = False
         self.group: int | None = None
-        self.below: dict[int, dict[int, str] | None] = {}  # each group's read before its first signal (pack sd:9392)
+        self.below: dict[int, sd_lib.Table | None] = {}  # each group's read before its first signal (pack sd:9392)
         self.guard = threading.RLock()  # `signal_gate` may run in a SIGTERM handler while this thread holds it
 
     def started(self, group: int | None) -> None:
@@ -2221,33 +2221,48 @@ class SpeculativeGate(threading.Thread):
         with self.guard:
             self.cancelled = True
             if (group := self.group) is not None and group not in self.below:
-                self.below[group] = sd_lib.read_or_term(lambda: sd_lib.groups_below(group),
-                                                      lambda: end_group(group, number))
-            if number == signal.SIGKILL:  # a cleared group leaves what was read (rule 1)
-                self.kill_left()
-            if self.group is not None:
-                end_group(self.group, number)
+                self.below[group] = sd_lib.read_or_term(sd_lib.process_table, lambda: end_group(group, number))
+            try:
+                if number == signal.SIGKILL:  # a cleared group leaves what was read (rule 1)
+                    self.kill_left()
+            finally:
+                if self.group is not None:  # registered, so unreaped: the number is its own
+                    end_group(self.group, number)
 
     def cancel_gate(self) -> bool:
         """End the gate's group, SIGTERM then SIGKILL, each followed by up to `CANCEL_SECONDS`; whether it ended.
 
         A gate that ended on the SIGTERM still has the sessions read below
-        it then killed: its leader's exit left them to no one (`kill_left`)."""
-        for number in (signal.SIGTERM, signal.SIGKILL):
-            self.signal_gate(number)
+        it then killed: its leader's exit left them to no one (`kill_left`).
+        Once the TERM is out, the SIGKILL step runs whatever interrupts the
+        read or the wait, then the interruption goes on (pack sd:9392)."""
+        ended = False
+        try:
+            self.signal_gate(signal.SIGTERM)
             with contextlib.suppress(RuntimeError):  # not started yet: `started` ends a group that starts later
                 self.join(CANCEL_SECONDS)
-            if not self.is_alive():
-                if number == signal.SIGTERM:
-                    self.kill_left()
-                return True
-        return False
+            ended = not self.is_alive()
+        finally:
+            if ended:
+                self.kill_left()
+            else:
+                self.signal_gate(signal.SIGKILL)
+        if ended:
+            return True
+        with contextlib.suppress(RuntimeError):
+            self.join(CANCEL_SECONDS)
+        return not self.is_alive()
 
     def kill_left(self) -> None:
         """SIGKILL each session read below the gate's groups before their first signal that is still that session."""
         with self.guard:
+            if not self.below:
+                return
+            table, interrupted = sd_lib.read_after()
             for group, below in self.below.items():
-                sd_lib.kill_below(group, below)
+                sd_lib.kill_below(group, below, table)
+            if interrupted is not None:
+                raise interrupted
 
 
 end_group = sd_lib.signal_group
@@ -4366,23 +4381,25 @@ def end_child(process: subprocess.Popen[bytes], out: Any, err: Any) -> None:
     The KILL reaches each session below the child too, read before the TERM
     and again before the KILL, while the child is unreaped (pack sd:9392):
     its `sd-ship` and gate groups ran on with ppid 1. A child that ended on
-    the TERM still has the sessions read before it killed; its reaped pid
-    roots no new walk, since it may be another process's now.
+    the TERM still has the witnessed sessions read before it killed; its
+    reaped pid roots no new walk. The KILL step runs whatever interrupts.
     """
     with out, err:
         if process.poll() is not None:
             return
-        below = sd_lib.read_or_term(lambda: sd_lib.groups_below(process.pid, process=True), process.terminate)
-        process.terminate()
-        try:
-            process.wait(CHILD_STOP_SECONDS)
-        except subprocess.TimeoutExpired:
-            sd_lib.kill_below(process.pid, below, process=True)
-            process.kill()
-            process.wait()
-        else:
-            sd_lib.kill_below(None, below)
+        def kill_child(earlier: sd_lib.Table | None) -> None:
+            table, interrupted = sd_lib.read_after()
+            sd_lib.kill_below(process.pid, earlier, table, process=True)
+            if process.returncode is None:  # unreaped: the pid is still the child
+                process.kill()
+                process.wait()
+            if interrupted is not None:
+                raise interrupted
 
+        def child_grace() -> None:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(CHILD_STOP_SECONDS)
+        sd_lib.escalate(sd_lib.process_table, process.terminate, child_grace, kill_child)
 
 def lane_room(environ: dict[str, str]) -> str | None:
     """Why a second lane may not start now, or None: fewer lane gates than slots, and load under the limit.
