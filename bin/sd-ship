@@ -329,7 +329,8 @@ def review_process(root: pathlib.Path, argv: list[str], *, timeout: float) -> su
                 # The SIGKILL reaches each witnessed session below the group,
                 # read before the SIGTERM and again now (pack sd:9392). A
                 # reaped leader's number is signalled only while a member
-                # read before the TERM still holds it.
+                # read before the TERM still holds it, or no read came
+                # before the TERM (pack sd:9600).
                 table, interrupted = sd_lib.read_after()
                 held = sd_lib.kill_below(process.pid, earlier, table)
                 if process.returncode is None or held:
