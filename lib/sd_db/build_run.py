@@ -1153,41 +1153,30 @@ class Supervisor:
         return self.split_first() or "building"
 
     def split_first(self) -> dict | None:
-        """The blocked end of a run whose branch or worktree still holds what it held when a subset Retry left a
-        member out; None when it holds none of it (pack sd:9581). No message, trailer, revert or merge says which
-        change is whose, so the operator splits the branch. No builder runs between that Retry and the next run's
-        start, so that run's start is the Retry's state: each run records its start head (`base_head`), and the
-        commits up to the first one after the Retry are read by id, never by a commit time a satellite clock wrote.
-        Until a run after the Retry got past this check, a worktree not clean blocks too: a cancelled builder's
-        uncommitted work is no commit. Every run checks, so a later Retry cannot ship the work either.
+        """The blocked end of a run whose bundle a subset Retry left a member out of while its branch or worktree
+        held earlier work; None when it held none (pack sd:9581). No message, trailer, revert or merge says which
+        change is whose, and a rebase gives a change new ids, so only the first run after the Retry reads the
+        branch: no builder ran since, so its start is the Retry's state. Commits past the base or a worktree not
+        clean hold the bundle for good (`build.split`); Build then takes its items fresh on a new branch, which
+        also never pushes over a tip an unmanaged bundle published. A clean start records its head (`base_head`).
         ponytail: a left item's change in `git stash`, shared across worktrees, goes unread; no builder stashes."""
-        left = build.left_out(self.db, self.row["assignment"])
-        if not left:
+        state = build.split(self.db, self.row["assignment"])
+        if state in ("", "clear"):
             return None
-        head = self.head()
-        if self.fresh()["base_head"] is None and not build.write(self.db, self.ident, base_head=head):
-            raise Lost
-        runs = build.runs_after(self.db, self.row["assignment"], max(run for _, run in left))
-        first = next(run["base_head"] for run in runs if run["base_head"])
-        base = self.base()
-
-        def commits(tip: str) -> set[str]:
-            return set(_read([*self.tools.git, "-C", str(self.work), "rev-list", f"{base}..{tip}"],
-                             env=self.env).split())
-
-        held = commits(head) & commits(first)
-        passed = any(run["step"] not in ("claimed", "worktree") for run in runs if run["id"] != self.ident)
-        dirty = "" if passed else _read([*self.tools.git, "-C", str(self.work), "-c", "core.quotePath=false",
-                                         "status", "--porcelain", "--untracked-files=all"], env=self.env).strip()
-        if not held and not dirty:
-            return None
-        named = ", ".join(f"sd:{item}" for item, _ in left)
-        what = [f"{len(held)} commit(s)"] if held else []
-        what += ["uncommitted changes"] if dirty else []
-        return self.finish("blocked", f"{named} left the bundle at a Retry, and {self.row['branch']} still holds "
-                                      f"{' and '.join(what)} from before it, which may carry that work: rebuild the "
-                                      f"branch from {base} with only the kept items' work (WORKFLOW.md, Parallel "
-                                      f"work), or build them fresh")
+        named = ", ".join(f"sd:{item}" for item, _ in build.left_out(self.db, self.row["assignment"]))
+        if state == "unread":
+            base, head = self.base(), self.head()
+            commits = _read([*self.tools.git, "-C", str(self.work), "rev-list", f"{base}..{head}"],
+                            env=self.env).split()
+            dirty = _read([*self.tools.git, "-C", str(self.work), "-c", "core.quotePath=false", "status",
+                           "--porcelain", "--untracked-files=all"], env=self.env).strip()
+            if not commits and not dirty:
+                if not build.write(self.db, self.ident, base_head=head):
+                    raise Lost
+                return None
+        return self.finish("blocked", f"{named} {build.SPLIT}{self.row['branch']} held work from before it, which "
+                                      f"may carry that work: Build the kept items to build them fresh on a new "
+                                      f"branch (WORKFLOW.md, Parallel work)")
 
     def building(self) -> str | dict:
         self.enter("building", log_path=str(self.log))

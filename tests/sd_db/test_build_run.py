@@ -1089,73 +1089,41 @@ class Supervise(Case):
             support.git(work, "branch", "-q", "-D", "side")
         self.assert_split_first(self.left_out_of_a_retry(merge))
 
-    def test_a_later_retry_of_the_blocked_split_still_blocks(self):
-        """Row 6: every run checks, so a plain Retry of the blocked run cannot ship the earlier work either."""
-        self.assert_split_first(self.left_out_of_a_retry())
+    def release_all(self):
         self.db.execute("UPDATE runner_run SET released_at = COALESCE(released_at, ?)", ("2026-01-01T00:00:00Z",))
         self.db.execute("UPDATE runner_lease SET released_at = COALESCE(released_at, ?)", ("2026-01-01T00:00:00Z",))
-        build.queue_again(self.db, [self.items[0]], who="operator")
-        again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
-                            root=self.root / "worktrees")
-        assert again is not None
-        self.bundle = again
-        self.assert_split_first(self.supervisor())
 
-    def test_an_earlier_commit_with_a_clock_ahead_still_blocks(self):
-        """Round 5 class pass, row 7: a satellite clock ahead of the hub dated run 1's commit after the Retry; the
-        guard reads the commits the branch held when the Retry took effect, by id, not by time."""
-        def ahead(work, commit):
-            support.git(work, "reset", "-q", "--hard", "origin/main")
-            (work / "ahead.txt").write_text("the left item's work\n")
-            support.git(work, "add", "ahead.txt")
-            subprocess.run(["git", "-C", str(work), "-c", "commit.gpgsign=false", "commit", "-qm", "fix: ahead"],
-                           check=True, capture_output=True,
-                           env={**os.environ, "GIT_COMMITTER_DATE": "2099-01-01T00:00:00Z",
-                                "GIT_AUTHOR_DATE": "2099-01-01T00:00:00Z"})
-        self.assert_split_first(self.left_out_of_a_retry(ahead))
-
-    def left_dirty(self, state):
-        """Row 8: a cancelled builder left `state` work (staged, unstaged or untracked) and no commit; the next
-        builder would commit it, so a worktree not clean at the first run after the Retry blocks too."""
-        def dirty(work, commit):
-            support.git(work, "reset", "-q", "--hard", "origin/main")
-            if state == "untracked":
-                (work / "left.txt").write_text("the left item's work\n")
-                return
-            tracked = support.git(work, "ls-files").split()[0]
-            (work / tracked).write_text("the left item's work\n")
-            if state == "staged":
-                support.git(work, "add", tracked)
-        self.assert_split_first(self.left_out_of_a_retry(dirty))
-
-    def test_earlier_staged_work_blocks(self):
-        self.left_dirty("staged")
-
-    def test_earlier_unstaged_work_blocks(self):
-        self.left_dirty("unstaged")
-
-    def test_earlier_untracked_work_blocks(self):
-        self.left_dirty("untracked")
-
-    def test_a_branch_the_lead_rebuilt_after_the_split_builds_on(self):
-        """Row 9, the guard: the lead rebuilt the branch from main with only the kept items' commits (WORKFLOW.md
-        recipe), so no commit or change the branch held at the Retry is left, and the next Retry builds."""
+    def test_a_rebased_branch_after_a_split_cannot_be_retried(self):
+        """Round 6, row 10: a rebase onto newer main gives the earlier commits new ids and keeps their changes, so
+        no git state proves a split; once the guard found earlier work, Retry of that bundle refuses."""
         self.assert_split_first(self.left_out_of_a_retry())
         work = Path(self.bundle["work_path"])
+        old = support.git(work, "rev-parse", "HEAD")
         support.git(work, "reset", "-q", "--hard", "origin/main")
-        (work / "kept.txt").write_text("kept\n")
-        support.git(work, "add", "kept.txt")
-        support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", f"fix: kept\n\nCloses: sd:{self.items[0]}")
-        self.db.execute("UPDATE runner_run SET released_at = COALESCE(released_at, ?)", ("2026-01-01T00:00:00Z",))
-        self.db.execute("UPDATE runner_lease SET released_at = COALESCE(released_at, ?)", ("2026-01-01T00:00:00Z",))
-        build.queue_again(self.db, [self.items[0]], who="operator")
+        support.git(work, "-c", "commit.gpgsign=false", "cherry-pick", "--allow-empty", f"origin/main..{old}")
+        self.release_all()
+        with self.assertRaisesRegex(build.BuildRefused, "fresh"):
+            build.retry(self.db, self.bundle["assignment"], who="operator")
+
+    def test_a_retry_after_a_split_builds_the_kept_items_fresh(self):
+        """Row 11: the kept items build on a new branch from main, never the held branch, whose tip may also be
+        published (an unmanaged bundle parked after its push), so a rebuilt head would not push."""
+        self.assert_split_first(self.left_out_of_a_retry())
+        held = (self.bundle["branch"], self.bundle["work_path"])
+        self.release_all()
+        queued = build.queue_again(self.db, self.items[:2], who="operator")
+        self.assertEqual(sorted(entry["item"] for entry in queued), sorted(self.items[:2]))
         again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
                             root=self.root / "worktrees")
         assert again is not None
+        self.assertNotEqual((again["branch"], again["work_path"]), held)
         self.bundle = again
+        self.write_pr()
         self.plan(claude=["pass"], sd_review=["clean"])
         ended = self.supervisor().run()
         self.assertEqual(ended.get("step"), "enqueued", ended)
+        prompt = self.calls("claude")[-1]["argv"]
+        self.assertNotIn(f"- sd:{self.items[2]}", prompt[prompt.index("-p") + 1])
 
     def test_a_subset_retry_with_no_earlier_work_builds_on(self):
         """Row 5, the guard: a bundle cancelled before any build holds no earlier commit, so the kept items build."""

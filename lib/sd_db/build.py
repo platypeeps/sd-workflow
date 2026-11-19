@@ -121,6 +121,9 @@ REVIEW_CLASS_PASS = ("Class pass: name the class these blockers share, enumerate
                      "the findings, and fix each fail-first.")
 #: The result a member left out of a subset Retry ends with, after `ALONE` (pack sd:9581).
 LEFT_OUT = "left out of a Retry of build run "
+#: The words of a run's blocked end when its branch held work from before a subset Retry: that bundle is held for
+#: good, and its items build fresh on a new branch (pack sd:9581).
+SPLIT = "left the bundle at a Retry, and "
 #: The bundle statuses Retry and Send to builder take: each keeps its worktree.
 AGAIN = ("blocked", "cancelled")
 #: A lane entry that failed only because prepare's merge of origin/<base> conflicted goes back to its builder on
@@ -605,6 +608,9 @@ def retry_state(connection, run: dict) -> dict:
         reason = "the run still holds its lease"
     elif current["status"] not in AGAIN:
         reason = f"the bundle ended {current['status']}; Retry takes a blocked or cancelled one"
+    elif split(connection, run["assignment"]) == "held":
+        reason = ("its branch holds work from before a subset Retry; Build its items to build them fresh on a "
+                  "new branch")
     return {"assignment": run["assignment"], "revision": current["revision"], "allowed": not reason, "reason": reason,
             "bundle": current["status"]}
 
@@ -704,12 +710,19 @@ def left_out(connection, lead: int) -> list[tuple[int, int]]:
     return left
 
 
-def runs_after(connection, lead: int, run: int) -> list[dict]:
-    """The runs of build `lead` numbered after `run`, oldest first, with the head each started from (`base_head`)
-    and the last step it entered."""
-    return [dict(row) for row in connection.execute(
-        "SELECT id, run, step, base_head FROM runner_run WHERE assignment = ? AND run > ? ORDER BY run",
-        (lead, run))]
+def split(connection, lead: int) -> str:
+    """Where build `lead` stands after its latest subset Retry (pack sd:9581): "" when none left a member out;
+    "unread" until a run after it checked its branch; "clear" once one found no earlier work there (it recorded
+    its start head, `base_head`); "held" once one found some (its detail carries SPLIT). Held is for good: a rebase
+    or rebuild gives the earlier changes new ids, so no later git state proves them gone."""
+    left = left_out(connection, lead)
+    if not left:
+        return ""
+    runs = connection.execute("SELECT detail, base_head FROM runner_run WHERE assignment = ? AND run > ?",
+                              (lead, max(run for _, run in left))).fetchall()
+    if any(SPLIT in (run["detail"] or "") for run in runs):
+        return "held"
+    return "clear" if any(run["base_head"] for run in runs) else "unread"
 
 
 def queued_members(connection, lead: int) -> list[tuple[int, int]]:
@@ -741,7 +754,7 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
         raise BuildRefused("select one or more distinct items")
     finding = finding.strip()
     with transaction(connection):
-        leads, fixes, fresh = [], [], []
+        leads, fixes, fresh, held = [], [], [], []
         named: dict[int, set[int]] = {}
         for item in items:
             row = connection.execute("SELECT id, parent, status FROM assignment WHERE item = ? AND scope = ? "
@@ -765,6 +778,10 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             # (`enqueued` marks a delivered member done): `retry` takes only members in the lead's status, so the
             # item's own assignment must be in it, or Retry would requeue the lead's items and not this one.
             # A skipped lead of a run still in the lane is no ended bundle: the run holds it no longer (sd:8960).
+            if state and state["run"] is not None and not alone and split(connection, lead) == "held":
+                held.append(item)  # its branch may hold a left item's work: a fresh press, new branch
+                fresh.append(item)
+                continue
             if (state and state["status"] in AGAIN and state["run"] is not None
                     and row["status"] == state["status"] and not alone
                     and not (state["run"]["outcome"] is None and state["run"]["step"] in LANE_STEPS)
@@ -785,6 +802,10 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                              finding or f"the lane entry failed; fix what it names: {run['detail']}"[:2000], who=who)
             queued += [{"id": member["id"], "item": member["item"], "status": "queued"}
                        for member in _members(connection, run["assignment"], "queued") if member["item"] in fixed]
+        for item in held:
+            if reads.items_by_ids(connection, [item])[item]["status"] == "blocked":
+                transition(connection, item, "ready", who=who, reason="its bundle's branch is held after a split")
+            unpark(connection, item)
         if fresh:
             from .workflow import change_status, item_state
             for item in fresh:

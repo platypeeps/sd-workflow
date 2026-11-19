@@ -378,11 +378,11 @@ Workers:
   and one serial lane lands about 3 at a time: the rest only queue and go stale against main (sd:5617).
   A repository's later items wait, and the next bundle takes them (sd:8158).
   A bundle in the lane frees its repository's slot: the lane stays serial, so the next bundle builds while it lands (sd:8277).
-- **Split a parked bundle by hand.** A Retry naming two or more of its items, the lead among them, retries those alone;
-  each item left out leaves the bundle, parked (pack sd:9581). The next run blocks while the branch or worktree still holds
-  what it held at that Retry: no commit message proves which change is whose. In the worktree, keep the old head on a
-  side branch, reset the build branch to `origin/main`, cherry-pick the kept items' commits (or all of them, then revert
-  the left item's changes in one `revert(...)` commit), check the diff by hand, and Retry. Build the left item fresh.
+- **Split a parked bundle by Retry, then build fresh.** A Retry naming two or more of its items, the lead among them,
+  retries those alone; each item left out leaves the bundle, parked (pack sd:9581). The next run blocks if its branch or
+  worktree holds any earlier work: no commit message proves which change is whose, and a rebase gives a change new ids.
+  That bundle stays held: Retry refuses it, and Build takes its items fresh on a new branch from `origin/main`.
+  Its old branch and worktree keep the earlier work for reference; remove them by hand once the items land.
 - **Start no builder while load5 is above 40.**
 - **A writer runs alone in its checkout.** Any agent or session that changes files works in its own git worktree or clone.
   Never start a second writer in a checkout that already has one.
