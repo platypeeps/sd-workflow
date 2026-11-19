@@ -274,8 +274,10 @@ JOB_SECONDS = 120 * 60
 #: The longest entry seen, claim to end: a gate that timed out at one hour took 61 to 64 minutes (sd:3481).
 ENTRY_SECONDS = 65 * 60
 #: How long a stopped run waits for its cancelled speculative gate, once after
-#: SIGTERM and once after SIGKILL (sd:3361).
-CANCEL_SECONDS = 10
+#: SIGTERM and once after SIGKILL (sd:3361). The wait after SIGTERM counts from
+#: the first, which a run's TERM sends as it lands; prepare's group then takes
+#: as long, so a TERMed run ends inside cron's 10 s KILL grace (pack sd:9392).
+CANCEL_SECONDS = sd_lib.GROUP_CLEANUP_SECONDS
 #: How many entries ahead of their turn the runner gates, one gate each, on the landings predicted before them.
 DEPTH = 2
 #: The lines a gate writes when it ends: the pack's test runner, `make`'s own
@@ -2194,6 +2196,8 @@ class SpeculativeGate(threading.Thread):
         self.why = "the run stopped, so it ended this gate (sd:3361)"
         self.cancelled = False
         self.group: int | None = None
+        self.below: dict[int, str] | None = None  # the groups below `group` at its first TERM (pack sd:9392)
+        self.termed_at: float | None = None
         self.guard = threading.RLock()  # `signal_gate` may run in a SIGTERM handler while this thread holds it
 
     def started(self, group: int | None) -> None:
@@ -2203,18 +2207,34 @@ class SpeculativeGate(threading.Thread):
                 end_group(group, signal.SIGTERM)
 
     def signal_gate(self, number: int) -> None:
-        """Mark the gate cancelled and send `number` to its group, if one runs."""
+        """Mark the gate cancelled and send `number` to its group, if one runs.
+
+        Its first SIGTERM reads the groups below first, and its SIGKILL
+        reaches them and any started since (`sd_lib.kill_below`, pack sd:9392).
+        """
         with self.guard:
             self.cancelled = True
+            if number == signal.SIGTERM and self.termed_at is None:
+                self.termed_at = time.monotonic()
             if self.group is not None:
+                if number == signal.SIGTERM and self.below is None:
+                    self.below = sd_lib.groups_below(self.group) or {}
+                if number == signal.SIGKILL:
+                    sd_lib.kill_below(self.group, self.below)
                 end_group(self.group, number)
 
     def cancel_gate(self) -> bool:
-        """End the gate's group, SIGTERM then SIGKILL, each followed by `CANCEL_SECONDS`; whether the gate ended."""
+        """End the gate's group, SIGTERM then SIGKILL, each followed by up to `CANCEL_SECONDS`; whether it ended.
+
+        The wait after SIGTERM counts from the first SIGTERM, which a run's
+        TERM sends as it lands (pack sd:9392)."""
         for number in (signal.SIGTERM, signal.SIGKILL):
             self.signal_gate(number)
+            bound = CANCEL_SECONDS
+            if number == signal.SIGTERM and self.termed_at is not None:
+                bound = max(0.0, self.termed_at + CANCEL_SECONDS - time.monotonic())
             with contextlib.suppress(RuntimeError):  # not started yet: `started` ends a group that starts later
-                self.join(CANCEL_SECONDS)
+                self.join(bound)
             if not self.is_alive():
                 return True
         return False
@@ -4331,14 +4351,21 @@ def child_answer(process: subprocess.Popen[bytes], out: Any, err: Any) -> dict[s
 
 
 def end_child(process: subprocess.Popen[bytes], out: Any, err: Any) -> None:
-    """TERM a lane child still running, then KILL it after `CHILD_STOP_SECONDS`; its answer is not read."""
+    """TERM a lane child still running, then KILL it after `CHILD_STOP_SECONDS`; its answer is not read.
+
+    The KILL reaches each session below the child too, read before the TERM
+    and again before the KILL, while the child is unreaped (pack sd:9392):
+    its `sd-ship` and gate groups ran on with ppid 1.
+    """
     with out, err:
         if process.poll() is not None:
             return
+        below = sd_lib.groups_below(process.pid, process=True)
         process.terminate()
         try:
             process.wait(CHILD_STOP_SECONDS)
         except subprocess.TimeoutExpired:
+            sd_lib.kill_below(process.pid, below, process=True)
             process.kill()
             process.wait()
 

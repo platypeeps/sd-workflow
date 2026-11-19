@@ -98,6 +98,17 @@ with mock.patch.object(sd_lane, "end_group", noted), \\
 """
 
 
+#: `TERMED_RUNNER`'s child line, and one whose child ignores TERM and starts a session below it (pack sd:9392).
+TERMED_CHILD = ('CHILD = "import os, pathlib, sys, time; pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); '
+                'time.sleep(60)"')
+DEAF_CHILD = ('CHILD = "import os, pathlib, signal, subprocess, sys, time; '
+              'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+              "below = subprocess.Popen(['sleep', '60'], start_new_session=True); "
+              "pathlib.Path(sys.argv[1] + '.below').write_text(str(below.pid)); "
+              'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)"')
+assert TERMED_CHILD in TERMED_RUNNER
+
+
 def end_group(group: int) -> None:
     """Kill a group a failed test left running; one already gone is fine."""
     with contextlib.suppress(OSError):
@@ -1557,6 +1568,48 @@ class Speculation(Trees):
         self.assert_termed_run(["second"])
         [speculation] = [entry["speculation"] for entry in self.entries() if "speculation" in entry]
         self.assertEqual((speculation["after"], speculation["status"]), (1, "cancelled"))
+
+    def test_a_termed_run_ends_inside_the_cron_grace(self) -> None:
+        """pack sd:9392, failure table rows 2 and 6. Cron's JOB_TIMEOUT TERMs the job's group and KILLs it
+        `CRON_JOBS_TIMEOUT_GRACE` (10 s) later. A prepare and a gate that ignore TERM held the unwind past
+        that: prepare's 5 s, then the gate's 10 s. The KILL then left the gate's group and the session below
+        it running with ppid 1."""
+        self.queue_both()
+        marks = self.tmp / "marks"
+        marks.mkdir()
+        script = self.tmp / "runner.py"
+        script.write_text(TERMED_RUNNER.format(bin=str(REPO_ROOT / "bin")).replace(TERMED_CHILD, DEAF_CHILD),
+                          encoding="utf-8")
+        runner = subprocess.Popen([sys.executable, str(script), str(self.repo), json.dumps(self.environ), str(marks),
+                                   "1"], env=dict(os.environ), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                                  text=True, start_new_session=True)
+        self.addCleanup(end_group, runner.pid)
+        pids: dict[str, int] = {}
+        for name in ("gate-second.pid", "gate-second.pid.below", "prepare.pid", "prepare.pid.below"):
+            for _ in range(1200):  # bounded: a runner that never gets there fails on the read below
+                if ((marks / name).exists() and (marks / name).read_text()) or runner.poll() is not None:
+                    break
+                time.sleep(0.05)
+            if not ((marks / name).exists() and (marks / name).read_text()):
+                self.fail(f"no {name}: {runner.stderr.read() if runner.poll() is not None else ''}")
+            pids[name] = int((marks / name).read_text())
+            self.addCleanup(end_group, pids[name])
+        time.sleep(0.5)  # each deaf child has installed its handler
+        os.killpg(runner.pid, signal.SIGTERM)  # what cron-jobs.sh sends at JOB_TIMEOUT
+        try:
+            runner.wait(10)
+        except subprocess.TimeoutExpired:
+            os.killpg(runner.pid, signal.SIGKILL)  # the grace passed
+            runner.wait(10)
+        for name, pid in pids.items():
+            for _ in range(60):
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail(f"{name} outlived the job's TERM and its KILL 10 s later")
 
     def test_an_interruption_while_the_gate_starts_still_ends_it(self) -> None:
         """sd:5776, the step between the gate's start and the runner holding it: the run's cleanup ends it."""
@@ -6086,6 +6139,55 @@ class Bounds(unittest.TestCase):
             self.assertTrue(gate.cancel_gate())
         self.assertLess(time.monotonic() - started, 10)
         self.assertEqual(answers[0][0], -signal.SIGKILL)
+
+    def deaf_child(self) -> tuple[list[str], pathlib.Path]:
+        """argv for a child that ignores TERM and starts `sleep 60` in a session below it, and its pid file."""
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        mark = pathlib.Path(scratch.name) / "child.pid"
+        code = DEAF_CHILD.removeprefix("CHILD = ").strip('"')
+        return [sys.executable, "-c", code, str(mark)], mark
+
+    def below_of(self, mark: pathlib.Path) -> int:
+        below = pathlib.Path(f"{mark}.below")
+        for _ in range(400):  # bounded: a child that never writes fails on the read
+            if mark.exists() and mark.read_text():
+                break
+            time.sleep(0.05)
+        time.sleep(0.3)  # the child has installed its handler
+        self.addCleanup(end_group, int(below.read_text()))
+        return int(below.read_text())
+
+    def assert_gone(self, pid: int, what: str) -> None:
+        for _ in range(60):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        self.fail(f"{what} ran on with ppid 1")
+
+    def test_a_gate_kill_ends_the_sessions_below_its_group(self) -> None:
+        """pack sd:9392, failure table row 2: `cancel_gate`'s SIGKILL reached the gate's group only."""
+        argv, mark = self.deaf_child()
+        gate = sd_lane.SpeculativeGate(lambda: sd_lane.gate_run()(argv, dict(os.environ), pathlib.Path.cwd(), 120),
+                                       "deaf")
+        gate.start()
+        below = self.below_of(mark)
+        with mock.patch.object(sd_lane, "CANCEL_SECONDS", 1):
+            self.assertTrue(gate.cancel_gate())
+        self.assert_gone(below, "the session below the gate's group")
+
+    def test_a_killed_lane_child_leaves_no_session_below(self) -> None:
+        """pack sd:9392, failure table row 5: `end_child` KILLed the lane child alone after
+        `CHILD_STOP_SECONDS`; the ship session it led ran on and held its gate slot."""
+        argv, mark = self.deaf_child()
+        lane = sd_lane.child_lane(pathlib.Path.cwd(), 0, argv)
+        below = self.below_of(mark)
+        with mock.patch.object(sd_lane, "CHILD_STOP_SECONDS", 0.5):
+            lane.end()
+        self.assertIsNotNone(lane.process.poll())
+        self.assert_gone(below, "the session below the lane child")
 
     def test_a_drained_run_waits_for_its_speculative_gate_only_until_its_deadline(self) -> None:
         """pack sd:7412, failure table row 4: a run that ran out of entries joined its speculative gate with no
