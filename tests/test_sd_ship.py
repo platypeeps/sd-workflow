@@ -4744,6 +4744,27 @@ roles:
                 self.prepare("--deliver", "--item", str(kept))  # an entry with the renewal's items proceeds
         self.assertEqual(self.operation().state["closing"]["items"], [kept])
 
+    def test_a_renewal_whose_prepare_fails_never_authorizes_the_old_pull_request(self):
+        """Lane review of sd:9268: a renewal saves its claim and closing set before lint, review and publication;
+        when lint then failed, merge ran on the old pull request with the new claim. Until a prepare finishes,
+        merge refuses; once one does, it merges."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        kept, dropped = self.closes_items()[:2]
+        self.prepare("--deliver", "--item", str(kept), "--item", str(dropped))
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with patch.object(ship.sd_ship_body, "docs_lint", side_effect=ship.Refusal("docs lint failed")):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "docs lint"):
+                self.prepare("--deliver", "--item", str(kept))
+        with self.assertRaisesRegex(ship.Refusal, "did not finish") as caught:
+            self.merge()
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "prepare_required")
+        self.assertFalse(any(call.method == "PUT" for call in self.remote.calls))
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--item", str(kept))
+        with patch.object(ship.time, "sleep"):
+            self.assertFalse(self.merge()["delivery_pending"])
+
     def test_a_renewal_command_names_every_item_of_the_bundle(self):
         """Re-review of sd:9335: the printed renewal named the claimed item alone, and a prepare run as printed
         empties the closing set. It names every --item; run as printed, it renews and keeps the bundle."""

@@ -1627,6 +1627,11 @@ class Ship(SharedReview):
             self.save(repository=self.repository, branch=self.branch, item=self.args.item, phase="new")
         self.persist_copilot_direction()
         fields = {} if self.args.no_item else {"deliver": deliver, "acceptance": claim, "closing": closing}
+        # A claim or closing set saved here is not the prepared pull request's until this prepare finishes:
+        # until `ready_to_send` clears it, merge refuses, so a renewal whose lint, review or push fails never
+        # authorizes the old pull request with the new scope (sd:9268 lane review).
+        if any(self.state.get(key) != value for key, value in fields.items()):
+            fields["unpublished"] = True
         self.save(title=title, body=body, base=base, invoker=self.invoker(), **fields)
         pushed_from = head
         if rebase:
@@ -1714,7 +1719,7 @@ class Ship(SharedReview):
                      "url": f"https://github.com/{self.repository}/pull/{number}"}
         if str(pull.get("html_url", "")).lower() != reference["url"]:
             raise Refusal("GitHub pull-request URL does not match the prepared repository")
-        self.save(pull_request=reference, phase="ready_to_send")
+        self.save(pull_request=reference, phase="ready_to_send", unpublished=False)
         copilot = self.prepare_copilot_review(number, pull, head, mode)
         if copilot.get("warning"):
             self.save(warnings=list(self.state.get("warnings") or []) + [copilot["warning"]])
@@ -2115,9 +2120,18 @@ class Ship(SharedReview):
         A receipt with no set was prepared before sd:3704; it merges only from
         `merge_dispatch`, which prepare routes to reconcile and cannot
         refresh. Either way the items are checked again, as prepare did.
+
+        A claim or closing set a prepare saved and did not publish refuses
+        too: the prepared pull request and its review predate it (sd:9268).
         """
         if self.args.no_item:
             return
+        if self.state.get("unpublished"):
+            raise Refusal(f"the last prepare of sd:{self.args.item} saved a new delivery claim or closing set and "
+                          f"did not finish, so the prepared pull request does not carry it; nothing merged: run "
+                          f"prepare again until it passes, then merge", code="prepare_required",
+                          state="operator_decision",
+                          next_action="Rerun sd-ship prepare with the same items until it passes, then merge.")
         stored = self.state.get("closing")
         if (stored is None and self.state.get("phase") != "merge_dispatch") or (
                 stored is not None and stored.get("head") != head):
