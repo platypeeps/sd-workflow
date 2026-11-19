@@ -14,12 +14,14 @@ import json
 import os
 import pathlib
 import re
+import selectors
 import shlex
 import signal
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -60,7 +62,7 @@ BIN = pathlib.Path(__file__).resolve().parent
 #: When this process started, for the invoker a receipt names (sd:2078).
 PROCESS_STARTED = datetime.now(timezone.utc).isoformat()
 REVIEW_SETUP_SECONDS = 3600
-#: How long a group sent TERM may take to empty before KILL; its pipes drain after (pack sd:9600).
+#: How long a group sent TERM may take to empty before KILL; its pipes are read meanwhile (pack sd:9600).
 REVIEW_CLEANUP_SECONDS = 5
 #: How long to wait for the pipes to close once KILL is sent. Nothing in the group
 #: outlives KILL, so only a descendant outside it reaches this bound (sd:2609).
@@ -310,25 +312,57 @@ def review_process(root: pathlib.Path, argv: list[str], *, timeout: float) -> su
                 except OSError as error:
                     cleanup[name] = f"failed: {error}"
 
+            grace_read = [b"", b""]  # what the grace read from stdout and stderr
+
+            def read_pipes(stop: threading.Event) -> None:
+                # Raw reads, as `communicate` makes, so its later drain resumes where these end.
+                try:
+                    with selectors.DefaultSelector() as selector:
+                        for index, stream in enumerate((process.stdout, process.stderr)):
+                            if stream is not None and not stream.closed:
+                                selector.register(stream.fileno(), selectors.EVENT_READ, index)
+                        while selector.get_map() and not stop.is_set():
+                            for key, _ in selector.select(.05):
+                                data = os.read(key.fd, 32768)
+                                if data:
+                                    grace_read[key.data] += data
+                                else:
+                                    selector.unregister(key.fd)
+                except (OSError, TypeError, ValueError):
+                    pass
+
             def review_grace() -> None:
                 # The grace lasts until the group is empty (pack sd:9392) and reaps
                 # nothing: an unreaped leader keeps its number its own for the
                 # SIGKILL, which a TERM-deaf worker forked on the TERM holds with no
-                # witness (pack sd:9600). The drain comes after the KILL.
-                sd_lib.wait_empty(process.pid, time.monotonic() + REVIEW_CLEANUP_SECONDS,
-                                  leader=process.pid if process.returncode is None else None)
+                # witness (pack sd:9600). A thread reads both pipes meanwhile, so a
+                # TERM handler writing a large report does not block on a full pipe.
+                stop = threading.Event()
+                reader = threading.Thread(target=read_pipes, args=(stop,), name="sd-review-grace", daemon=True)
+                reader.start()
+                try:
+                    sd_lib.wait_empty(process.pid, time.monotonic() + REVIEW_CLEANUP_SECONDS,
+                                      leader=process.pid if process.returncode is None else None)
+                finally:
+                    stop.set()
+                    reader.join()  # each pass is bounded by its .05 s select
 
             def drain_review(bound: float) -> None:
+                # `communicate` returns what it read before the timeout and after the
+                # grace; the grace's reads go between the two.
                 nonlocal output, errors
+                full_output, full_errors = output, errors
                 try:
-                    output, errors = process.communicate(timeout=bound)
+                    full_output, full_errors = process.communicate(timeout=bound)
                     cleanup["drained"] = True
                 except subprocess.TimeoutExpired as error:
-                    output, errors = error.output or output, error.stderr or errors
+                    full_output, full_errors = error.output or output, error.stderr or errors
                     cleanup["drained"] = False
                 except (OSError, subprocess.SubprocessError) as error:
                     cleanup["drained"] = False
                     cleanup["drain_error"] = str(error)[:REVIEW_DIAGNOSTIC_BYTES]
+                output = full_output[:len(output)] + grace_read[0] + full_output[len(output):]
+                errors = full_errors[:len(errors)] + grace_read[1] + full_errors[len(errors):]
 
             def kill_review(earlier: sd_lib.Table | None) -> None:
                 # The SIGKILL reaches each witnessed session below the group,

@@ -6561,6 +6561,30 @@ class ReviewWatchdogTests(unittest.TestCase):
         else:
             self.fail("the TERM-deaf replacement outlived the review's SIGKILL")
 
+    def test_a_review_writing_a_large_report_on_term_finishes_in_the_grace(self):
+        """pack sd:9600 review, sd-ship:318: the grace stopped reading the pipes, so a TERM handler
+        writing 1 MiB blocked at the pipe's 64 KiB, never reached its cleanup and lost its report."""
+        ready = self.root / "ready"
+        cleaned = self.root / "cleaned"
+        script = ("import os,pathlib,signal,sys,time\n"
+                  "def finish(*_):\n"
+                  " sys.stdout.buffer.write(b'x' * 1048576)\n sys.stdout.buffer.flush()\n"
+                  f" pathlib.Path({str(cleaned)!r}).write_text('done')\n os._exit(0)\n"
+                  "signal.signal(signal.SIGTERM, finish)\n"
+                  f"pathlib.Path({str(ready)!r}).write_text(str(os.getpid()))\n"
+                  "while True: time.sleep(1)\n")
+        original_communicate = subprocess.Popen.communicate
+        def after_ready(process, *args, **kwargs):
+            deadline = time.monotonic() + 5
+            while not ready.exists() and time.monotonic() < deadline:
+                time.sleep(.005)
+            return original_communicate(process, *args, **kwargs)
+        with patch.object(subprocess.Popen, "communicate", after_ready), patch.object(ship, "REVIEW_CLEANUP_SECONDS", 3):
+            with self.assertRaises(ship.ReviewTimeout) as raised:
+                ship.review_process(self.root, [sys.executable, "-c", script], timeout=.3)
+        self.assertTrue(cleaned.exists(), "the TERM handler never reached its cleanup")
+        self.assertEqual(raised.exception.diagnostic["stdout"]["bytes"], 1048576)
+
     def test_an_interrupted_review_read_still_kills(self):
         """pack sd:9392 round 5, R2: a KeyboardInterrupt in the read before the TERM left the review group
         TERMed and never KILLed."""
