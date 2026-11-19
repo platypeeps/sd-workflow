@@ -3257,6 +3257,22 @@ class TheFilterAddress(ScreenCase):
                                        f"box.value = '{typed}';\nbox.listeners.input[0]({{ target: box }}); await flush();")
                 self.assertEqual(shown, want)
 
+    def test_a_lone_priority_word_counts_as_a_filter_and_keeps_its_address(self):
+        # Pack sd:9593: PQ narrowed the rows, but the count read the total, no chip or Clear all showed, and the address lost it.
+        for row in self.doc["rows"]:
+            row["priority"] = 1 if row["id"] == 902 else 3
+        everything, _ = self.listed("?view=list")
+        shown, out = self.listed("?view=list", "const box = document.getElementById('shift-in'); box.value = 'P1';\n"
+                                 "box.listeners.input[0]({ target: box }); await flush();"
+                                 " R.count = ELS['task-count'].textContent; R.url = OUT.urls[OUT.urls.length - 1];")
+        self.assertEqual(shown, {902})
+        self.assertEqual(out["R"]["count"], f"1 of {len(everything)} tasks")
+        self.assertIn('data-unfilter="q"', out["R"]["filters"])
+        self.assertIn("data-unfilter-all", out["R"]["filters"])
+        self.assertIn("q=p1", out["R"]["url"])
+        reread, _ = self.listed("?view=list&q=p1")
+        self.assertEqual(reread, {902})
+
     def test_a_query_typed_before_the_read_lands_is_kept(self):
         # Pack sd:9340 (2): the first draw's readFilterURL set the box from the address over what the operator typed.
         # FAIL_TASKS is read as /api/tasks is asked, after the page wired its box and before the answer lands: type there.
