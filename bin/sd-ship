@@ -831,6 +831,7 @@ class Ship(SharedReview):
         """
         if os.environ.get(sd_lane.LANE_CHILD):
             return True
+        sd_lib.import_sd_db()  # the gateway first, as for every sd_db import here
         from sd_db.errors import SdDbError
         try:
             rows, host = sd_lane.stored(self.connection, self.repository), sd_lane.this_host()
