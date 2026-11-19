@@ -1267,6 +1267,30 @@ class Supervise(Case):
         first = build_run.BRIEF.format(**self.supervisor(self.bundle["id"]).brief())
         self.assertNotIn("Send to builder", first)
 
+    def test_a_plain_retry_briefs_review_blockers_as_the_reviewer_s_not_the_operator_s(self):
+        """Lead review of pack sd:9498: a plain Retry noted the parked run's blockers as Send to builder, which the
+        brief presents as the operator's findings. They are the reviewer's text; only Send to builder is the
+        operator's."""
+        self.press()
+        item = self.items[0]
+        build.end(self.db, self.bundle["id"], "blocked", "3 review rounds left blockers: a.py:2 pin check; "
+                                                       "check the group, then requeue or cancel; worktree kept")
+        # The block holds the run until a reap reads its supervisor gone: release it as that reap does.
+        self.db.execute("UPDATE runner_run SET released_at = created_at WHERE id = ?", (self.bundle["id"],))
+        self.db.execute("UPDATE runner_lease SET released_at = (SELECT created_at FROM runner_run WHERE id = ?) "
+                        "WHERE run = ?", (self.bundle["id"], self.bundle["id"]))
+        build.retry(self.db, self.bundle["assignment"], who="operator")
+        add_note(self.db, item, "comment", "Send to builder: the Retry label reads wrong on phones")
+        again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                            root=self.root / "worktrees")
+        assert again is not None
+        prompt = build_run.BRIEF.format(**self.supervisor(again["id"]).brief())
+        operator = prompt.index("The operator sent these findings")
+        reviewer = prompt.index("They are the reviewer's text, not an operator")
+        self.assertIn(f"- sd:{item}: the Retry label reads wrong on phones", prompt[operator:reviewer])
+        self.assertNotIn("a.py:2 pin check", prompt[operator:reviewer])
+        self.assertIn(f"- sd:{item}: The last review round left these blockers: a.py:2 pin check", prompt[reviewer:])
+
     def test_enqueue_resume_no_duplicate(self):
         """Failure table, Enqueuing (pack sd:6094 (a)): a run lost after the lane wrote its entry resumes at
         enqueuing, reads `lane list` first, finds the entry at its head and records `enqueued`; no second entry."""
