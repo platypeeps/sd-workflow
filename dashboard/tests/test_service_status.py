@@ -241,12 +241,22 @@ class TheServicesReader(ScreenCase):
 
     def test_a_time_past_the_calendar_s_end_is_unknown_never_an_error(self):
         # Bundle review round 1: OverflowError escaped _when.
-        status(self.connection, "s", read_at="9999-12-31T23:59:59-12:00",
-               incidents=[{"title": "x", "started_at": "9999-12-31T23:59:59-12:00"}])
+        status(self.connection, "s", read_at="9999-12-31T23:59:59-12:00")
+        status(self.connection, "t", status="outage", incidents=[{"title": "x", "started_at": "9999-12-31T23:59:59-12:00"}])
         self.assertIsNone(usage_screen._when("9999-12-31T23:59:59-12:00"))
-        [one] = usage_screen.services(self.connection, now=NOW)
-        self.assertEqual((one["status"], one["why"], one["incidents"][0]["started_at"]),
-                         ("unknown", "the reading has no read time", None))
+        found = {one["name"]: one for one in usage_screen.services(self.connection, now=NOW)}
+        self.assertEqual((found["s"]["status"], found["s"]["why"]), ("unknown", "the reading has no read time"))
+        self.assertIsNone(found["t"]["incidents"][0]["started_at"])
+
+    def test_an_unknown_reading_keeps_no_incident_or_component(self):
+        # pack sd:9498: a stale row kept its last incidents, so an outage that has since ended still showed open.
+        stale = {"title": "API errors", "started_at": "2026-09-06T10:00:00Z"}
+        status(self.connection, "stale", status="outage", read_at="2026-09-06T11:00:00Z", incidents=[stale],
+               components=[{"name": "API", "status": "major_outage"}])
+        status(self.connection, "failed", status="unknown", error="HTTP 503", incidents=[stale])
+        found = usage_screen.services(self.connection, now=NOW)
+        self.assertEqual([(one["name"], one["status"], one["incidents"], one["components"]) for one in found],
+                         [("failed", "unknown", [], []), ("stale", "unknown", [], [])])
 
 
 if __name__ == "__main__":
