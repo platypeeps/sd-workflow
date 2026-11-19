@@ -520,18 +520,35 @@ def edited_waivers(claim: object, stored: object) -> list[int]:
                    if isinstance(row.get("waived"), dict) and row != old})
 
 
+def evidence_of(row: object) -> str:
+    """What an acceptance row proves, as one string: its criterion, evidence, result and waiver.
+
+    Any other field, such as a comment, and the waiving note's body, which
+    the claim copies from the database, prove nothing (sd:9268 review).
+    """
+    if not isinstance(row, dict):
+        return json.dumps(row, sort_keys=True)
+    waived = row.get("waived")
+    if isinstance(waived, dict):
+        reason = waived.get("reason")
+        waived = {"reason": reason.strip() if isinstance(reason, str) else reason, "decision": waived.get("decision")}
+    return json.dumps({"criterion": row.get("criterion"), "evidence": row.get("evidence"),
+                       "passed": row.get("passed"), "waived": waived}, sort_keys=True)
+
+
 def stale_criteria(claim: object, stored: object) -> list[str]:
-    """The criteria of `claim` when not one of its rows differs from `stored`'s, or [] (sd:9268 review).
+    """The criteria of `claim` when not one of its rows proves anything `stored`'s did not, or [] (sd:9268 review).
 
     A renewal binds the item's new scope to its evidence, so evidence the old
-    claim already held proves only the old requirements. A claim with no rows,
-    such as a task's merge alone, has no evidence to go stale.
+    claim already held proves only the old requirements; rows that differ
+    outside `evidence_of` hold the same evidence. A claim with no rows, such
+    as a task's merge alone, has no evidence to go stale.
     """
     if not isinstance(claim, dict) or not isinstance(stored, dict):
         return []
     rows, old = claim.get("criteria") or [], stored.get("criteria") or []
-    seen = {json.dumps(row, sort_keys=True) for row in old}
-    if any(json.dumps(row, sort_keys=True) not in seen for row in rows):
+    seen = {evidence_of(row) for row in old}
+    if any(evidence_of(row) not in seen for row in rows):
         return []
     return [str(row.get("criterion")) for row in rows if isinstance(row, dict)]
 

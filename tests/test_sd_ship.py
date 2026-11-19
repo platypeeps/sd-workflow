@@ -4788,6 +4788,25 @@ roles:
             self.prepare("--deliver", "--acceptance-file", str(acceptance))
         self.assertNotEqual(self.operation().state["acceptance"]["item_scope"], old["item_scope"])
 
+    def test_a_renewal_whose_rows_differ_only_outside_the_evidence_refuses(self):
+        """Lead review of sd:9268 at 50b91b935: a renewal took any change of a row as fresh evidence, so an
+        added `comment` field passed the old evidence off as new. Only a row's criterion, evidence, result or
+        waiver counts; the same rows with other fields refuse."""
+        from sd_db import set_item_fields
+        acceptance = self.directory / "acceptance.json"
+        rows = [{"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": rows}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        old = self.operation().state["acceptance"]
+        set_item_fields(self.connection, self.item, body="changed requirements")
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "note": "rechecked",
+                                          "criteria": [{**rows[0], "comment": "unchanged"}]}))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(
+                ship.Refusal, "no criterion has a fresh row: actual scope") as caught:
+            self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "delivery_evidence_stale")
+        self.assertEqual(self.operation().state["acceptance"], old)
+
     def test_a_renewal_whose_claim_has_no_evidence_still_renews(self):
         """A task's claim is the verified merge alone, so its renewal has no evidence to go stale."""
         from sd_db import set_item_fields
