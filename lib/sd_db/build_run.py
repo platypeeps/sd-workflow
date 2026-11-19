@@ -1941,7 +1941,14 @@ class Supervisor:
         if self.probe.group(group) is not True:
             return False
         leader = self.probe.alive(group)
-        return leader is False or (leader is True and bool(start) and self.probe.started(group) == start)
+        if leader is False:
+            return True
+        if leader is not True or not start:
+            return False
+        began = self.probe.started(group)
+        # A leader reaped between the two reads answers no start and reads gone at a second look: the group still
+        # has a member, so it is the one recorded (a gate flake left a check's `sleep` beside the retry).
+        return began == start or (began is None and self.probe.alive(group) is False)
 
 
 class DraftSupervisor(Supervisor):
