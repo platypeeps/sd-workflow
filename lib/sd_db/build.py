@@ -2107,7 +2107,7 @@ def _settle(connection, read: dict, *, block: str | None = None) -> dict | None:
             reason = _blocked(row, block)
             connection.execute("UPDATE runner_run SET outcome = 'blocked', detail = ?, updated_at = ? WHERE id = ?",
                                (reason, stamp, ident))
-            _block(connection, members, reason, stamp, followup=not asked(row, reason, members))
+            _block(connection, members, reason, stamp, followup=not asked(row, reason))
             return {"run": ident, "outcome": "blocked", "retry": None, "blocked": block}
         connection.execute("UPDATE runner_run SET released_at = ?, updated_at = ? WHERE id = ?", (stamp, stamp, ident))
         connection.execute("UPDATE runner_lease SET released_at = ? WHERE run = ? AND released_at IS NULL", (stamp, ident))
@@ -2180,11 +2180,12 @@ def _blocked(row, block: str) -> str:
             f"cancel; log {row['log_path'] or 'none'}, worktree {row['work_path']}")
 
 
-def asked(row, reason: str, members: list[dict]) -> bool:
-    """Whether `reason` is, whole, run `row`'s reason for the `ASKED` block of exactly `members`: one that only
-    quotes it, such as a review finding, is another block (review round 2 of sd:9219)."""
-    items = sorted(member["item"] for member in members)
-    return bool(items) and reason == _blocked(row, ASKED + ", ".join(f"sd:{item}" for item in items))
+def asked(row, reason: str) -> bool:
+    """Whether `reason` is, whole, run `row`'s reason for an `ASKED` block, its list `sd:N, sd:N` read from the
+    reason itself. The recorded reason alone decides: members and notes move after the run ends (class pass of
+    sd:9219), and a reason that only quotes `ASKED`, such as a review finding, is another block."""
+    head, tail = _blocked(row, ASKED + "\0").split("\0")
+    return re.fullmatch(re.escape(head) + r"sd:\d+(, sd:\d+)*" + re.escape(tail), reason) is not None
 
 
 def _block(connection, members: list[dict], reason: str, stamp: str, *, followup: bool = True) -> None:
@@ -2204,10 +2205,9 @@ def _park(connection, ident: str, lead: int, stamp: str) -> None:
     one (pack sd:6132, sd:6008). A run blocked by its questions (`ASKED`) parks none: its items wait on the
     operator's answers, and a park would hide them (sd:9219)."""
     row = connection.execute("SELECT * FROM runner_run WHERE id = ?", (ident,)).fetchone()
-    members = _members(connection, lead, "blocked")
-    if asked(row, row["detail"] or "", members):
+    if asked(row, row["detail"] or ""):
         return
-    for member in members:
+    for member in _members(connection, lead, "blocked"):
         park(connection, member["item"], ("blocked",), stamp, PARKED.format(run=ident))
 
 

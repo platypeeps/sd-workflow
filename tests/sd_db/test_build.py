@@ -1402,6 +1402,43 @@ class Park(Case):
         build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
         self.assertEqual(self.parked(), [True, True])
 
+    def asked_block(self):
+        """End the run blocked on the questions of every item, its lease held until the reap."""
+        build.write(self.db, self.bundle["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START,
+                    builder_pgid=777, builder_start=START)
+        build.end(self.db, self.bundle["id"], "blocked", build.ASKED + ", ".join(f"sd:{i}" for i in self.items))
+
+    def followups(self):
+        return [self.count("SELECT COUNT(*) FROM note WHERE item = ? AND kind = 'followup'", item)
+                for item in self.items]
+
+    def test_a_question_block_parks_none_after_a_member_moves_to_planning(self):
+        """sd:9219 review round 4, `_park`: one item moved to planning before the release, and `_release`
+        cancelled its assignment. The recorded reason alone decides the block, so the other item stays
+        unparked with its question visible."""
+        self.asked_block()
+        workflow.change_status(self.db, self.items[0], "planning", who="operator")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        self.assertIsNotNone(build.run(self.db, self.bundle["id"])["released_at"])
+        self.assertEqual((self.parked(), self.followups()), ([False, False], [0, 0]))
+
+    def test_a_question_block_drops_the_followup_of_a_member_left_after_one_leaves(self):
+        """sd:9219 class pass, `_settle`: a member left the run (blocked out of it) before it ended on the
+        questions of both. The recorded reason, not the members, decides: no followup on the one left."""
+        child = build.run(self.db, self.bundle["id"])["members"][1]["id"]
+        self.db.execute("UPDATE assignment SET status = 'blocked' WHERE id = ?", (child,))
+        self.asked_block()
+        self.assertEqual(self.followups()[0], 0)
+
+    def test_asked_reads_the_recorded_reason_only(self):
+        """sd:9219 class pass, `asked`: true only for the whole ASKED reason of a list of `sd:N`."""
+        row = build.run(self.db, self.bundle["id"])
+        self.assertTrue(build.asked(row, build._blocked(row, build.ASKED + "sd:4, sd:12")))
+        self.assertTrue(build.asked(row, build._blocked(row, build.ASKED + "sd:4")))
+        for tail in ("", "sd:4,sd:5", "sd:4, and more", "sd:4; sd:5", "sd:x", "sd:4, "):
+            self.assertFalse(build.asked(row, build._blocked(row, build.ASKED + tail)), tail)
+        self.assertFalse(build.asked(row, "quoted: " + build._blocked(row, build.ASKED + "sd:4")))
+
     def test_a_run_that_ends_done_parks_nothing(self):
         build.end(self.db, self.bundle["id"], "done", "the lane merged it")
         self.assertEqual(self.parked(), [False, False])
