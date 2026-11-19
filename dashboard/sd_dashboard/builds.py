@@ -281,7 +281,7 @@ def _waiting(connection, run: dict, items: list[int]) -> str:
     """Why a run waits on the operator: it is held (`blocked`, `abandoned`), or an open question note asks."""
     if run["outcome"] in ("blocked", "abandoned"):
         return run["detail"] or f"the run ended {run['outcome']}"
-    asked = build.open_question(connection, items, run["created_at"])
+    asked = build.open_question(connection, items, run["created_at"], pending=True)
     return f"question note #{asked['id']} on sd:{asked['item']}" if asked else ""
 
 

@@ -46,7 +46,7 @@ from sd_db.database import connect
 from sd_db.migrate import initialise
 from sd_db.ship import this_host
 from sd_db.workflow import item_state
-from sd_db.writes import add_note, create_item, record_state, upsert_repo
+from sd_db.writes import add_note, create_item, record_state, resolve_note, upsert_repo
 
 from . import support
 from .test_build import Probe as GoneProbe
@@ -124,6 +124,12 @@ FAKE = textwrap.dedent('''
         if mode == "slow":
             time.sleep(3)
         if mode == "silent":
+            sys.exit(0)
+        if mode == "asked-dirty":  # asked, then left an uncommitted file: a block the question did not cause
+            Path("stray.txt").write_text("stray")
+        if mode.startswith("asked"):  # skipped every item with a question: a passing reply, no commit (sd:9219)
+            line({"type": "result", "subtype": "success", "is_error": False, "permission_denials": [],
+                  "session_id": session, "result": "skipped (asked)"})
             sys.exit(0)
         if mode == "deny":  # denied a call, the builder stopped with its work unfinished
             line({"type": "result", "subtype": "success", "is_error": False, "session_id": session,
@@ -606,6 +612,65 @@ class Supervise(Case):
         self.assertEqual((ended["outcome"], self.latest()["outcome"]), (None, None))
         self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
 
+    def test_a_builder_that_skips_every_item_with_a_question_waits_on_the_operator(self):
+        """sd:9219: no commit, and every item has a question since the run started. The run says so, not
+        'left no commit'; no item gets a requeue followup, and its release parks none."""
+        self.press(2)
+        self.plan(claude=["asked"], sd_review=["clean"])
+        for item in self.items:
+            add_note(self.db, item, "question", "Which option?\nOption: Yes (Recommended)\nOption: No")
+        ended = self.supervisor().run()
+        self.assertEqual(ended["outcome"], "blocked")
+        self.assertNotIn("left no commit", ended["blocked"])
+        self.assertIn(f"every item has an open question: sd:{self.items[0]}, sd:{self.items[1]}", ended["blocked"])
+        marks = ", ".join("?" for _ in self.items)
+        followups = f"SELECT COUNT(*) FROM note WHERE item IN ({marks}) AND kind = 'followup'"
+        self.assertEqual(self.db.execute(followups, self.items).fetchone()[0], 0)
+        build.reap(self.db, probe=GoneProbe(alive=False, group=False))
+        self.assertIsNotNone(build.run(self.db, self.bundle["id"])["released_at"])
+        self.assertEqual([item_state(self.db, item)["item"]["parked_at"] for item in self.items], [None, None])
+
+    def test_a_resolved_question_is_not_open(self):
+        """sd:9219 review round 2: a question closed with `sd note resolve` asks nothing, so a run with no
+        commit left no commit: each item gets the followup."""
+        self.press(2)
+        self.plan(claude=["asked"], sd_review=["clean"])
+        for item in self.items:
+            resolve_note(self.db, add_note(self.db, item, "question", "Which?\nOption: Yes (Recommended)\nOption: No"))
+        self.assertIn("left no commit", self.supervisor().run()["blocked"])
+        counts = [self.db.execute("SELECT COUNT(*) FROM note WHERE item = ? AND kind = 'followup'",
+                                  (item,)).fetchone()[0] for item in self.items]
+        self.assertEqual(counts, [1, 1])
+
+    def test_a_question_keeps_the_followup_and_park_of_a_block_it_did_not_cause(self):
+        """sd:9219 review: every item asked, but the builder left its worktree dirty. The dirty worktree blocks
+        the run, so each item still gets the followup, and the release parks it."""
+        self.press(2)
+        self.plan(claude=["asked-dirty"], sd_review=["clean"])
+        for item in self.items:
+            add_note(self.db, item, "question", "Which option?\nOption: Yes (Recommended)\nOption: No")
+        self.assertIn("dirty", self.supervisor().run()["blocked"])
+        counts = [self.db.execute("SELECT COUNT(*) FROM note WHERE item = ? AND kind = 'followup'",
+                                  (item,)).fetchone()[0] for item in self.items]
+        self.assertEqual(counts, [1, 1])
+        build.reap(self.db, probe=GoneProbe(alive=False, group=False))
+        parked = [item_state(self.db, item)["item"]["parked_at"] is not None for item in self.items]
+        self.assertEqual(parked, [True, True])
+
+    def test_a_builder_that_skips_one_item_with_a_question_blocks_the_other(self):
+        """sd:9219, the other side: no commit, one item asked. The run left no commit, a block the question did
+        not cause, so each item gets the followup and the park."""
+        self.press(2)
+        self.plan(claude=["asked"], sd_review=["clean"])
+        add_note(self.db, self.items[0], "question", "Which option?\nOption: Yes (Recommended)\nOption: No")
+        self.assertIn("left no commit", self.supervisor().run()["blocked"])
+        counts = [self.db.execute("SELECT COUNT(*) FROM note WHERE item = ? AND kind = 'followup'",
+                                  (item,)).fetchone()[0] for item in self.items]
+        self.assertEqual(counts, [1, 1])
+        build.reap(self.db, probe=GoneProbe(alive=False, group=False))
+        parked = [item_state(self.db, item)["item"]["parked_at"] is not None for item in self.items]
+        self.assertEqual(parked, [True, True])
+
     def test_a_branch_that_delivers_nothing_blocks(self):
         self.press()
         self.write_pr()
@@ -828,6 +893,40 @@ class Supervise(Case):
         self.assertEqual(ended["outcome"], "blocked")
         self.assertIn("3 review rounds left blockers: work.txt:1 a blocker", self.latest()["detail"])
         self.assertEqual(len(self.calls("sd-review")), 3)
+
+    def asked_and_resolved(self, item):
+        """A question on `item` the operator closed with `sd note resolve`: it waits on no one, but it is still
+        the evidence that the builder skipped the item (review round 3 of sd:9219)."""
+        resolve_note(self.db, add_note(self.db, item, "question", "Which option?\nOption: Yes (Recommended)\nOption: No"))
+
+    def test_a_resolved_question_still_skips_the_class_pass(self):
+        """Class pass, instance `blocked_round`: the skipped item is still skipped, so no class pass fixes it."""
+        self.press()
+        self.plan(claude=["pass", "fix1", "fix2", "fix3"], sd_review=["blocking"] * 4)
+        self.asked_and_resolved(self.items[0])
+        self.supervisor().run()
+        self.assertEqual(len(self.calls("sd-review")), 3)
+
+    def test_a_resolved_question_still_keeps_an_older_trailer_from_delivering(self):
+        """Class pass, instance `enqueue` delivery: an older run's `Closes:` trailer cites the item, but this
+        run's builder skipped it with a question since resolved; the merge must not close it."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.asked_and_resolved(self.items[0])
+        ended = self.supervisor().run()
+        self.assertEqual(ended["outcome"], "blocked")
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+
+    def test_a_resolved_question_still_blocks_a_skipped_member(self):
+        """Class pass, instance `build.enqueued`: a member skipped with a question since resolved stays blocked
+        for the operator, not returned to planning as one skipped with no word."""
+        self.press(2)
+        self.write_pr()
+        self.plan(claude=["skip"], sd_review=["clean"])
+        self.asked_and_resolved(self.items[1])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        self.assertEqual(self.statuses(), ["in_progress", "blocked"])
 
     def test_a_fix_then_a_clean_review_enqueues(self):
         self.press()
