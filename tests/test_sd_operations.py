@@ -322,7 +322,8 @@ class OperationsCLI(unittest.TestCase):
         run = self.builds()
         run.dispatch.side_effect = sqlite3.OperationalError("database is locked")
         code, output = self.tick(run)
-        self.assertEqual((code, output), (0, "skipped: database is locked\n"))
+        # pack sd:9541: the lock met the tick's work, so the skip says it began.
+        self.assertEqual((code, output), (0, "skipped (partial): database is locked\n"))
         self.connection.close.assert_called_once()
 
     def test_a_build_mismatch_skips_the_tick_without_a_follow(self):
@@ -357,7 +358,8 @@ class OperationsCLI(unittest.TestCase):
         try:
             with patch.object(cli, "gate_load", return_value=(1.0, 40.0)), \
                     patch.object(cli, "interactive_builders", return_value=([], "")), \
-                    patch.object(cli, "log_root", return_value=Path("/bulk")):
+                    patch.object(cli, "log_root", return_value=Path("/bulk")), \
+                    patch.object(cli, "writable", return_value=True):
                 return self.call("assignments", "dispatch", *flags)
         except (cli.WorkRefusal, cli.sd_handoff_rows.RowsRefusal) as refusal:
             return 1, str(refusal)
@@ -403,10 +405,11 @@ class OperationsCLI(unittest.TestCase):
                 with self.subTest(error=str(error)[:40], where=where):
                     self.assertEqual(self.outcome(self.builds(), error, where), (1, str(error)))
 
-    def test_a_mismatch_no_follow_fixes_still_exits_1_with_its_remedy(self):
-        """pack sd:9541 lane review: only a satellite behind the hub skips; its follow job catches up. A hub behind,
-        an unordered build digest, or a mismatch that names no side needs the operator: it exits 1 with its remedy,
-        read from `upgrade`, never the text. Each is rebuilt as the satellite gets it from the hub."""
+    def test_only_a_hub_behind_exits_1_with_its_remedy(self):
+        """pack sd:9541 review: a mismatch whose `upgrade` names the hub needs `repo-sync.sh refresh` there, which no
+        follow job runs: it exits 1 with its remedy. `satellite`, `both` (every hub refresh: the package version is
+        fixed, so only the digests differ) and no `upgrade` skip, as sd:8685 decided; a lasting one is the follow
+        job's alert. Read from `upgrade`, never the text; each is rebuilt as the satellite gets it from the hub."""
         from sd_db import remote
 
         def wired(field, satellite, hub, *, upgrade=True):
@@ -421,8 +424,8 @@ class OperationsCLI(unittest.TestCase):
             self.assertEqual(getattr(error, "upgrade", None), upgrade)
             for where, label in (("connect", "skipped"), ("tick", "skipped (partial)")):
                 with self.subTest(upgrade=upgrade, where=where):
-                    expected = ((0, f"{label}: sd_db build mismatch; the follow job follows\n") if upgrade == "satellite"
-                                else (1, str(error)))
+                    expected = ((1, str(error)) if upgrade == "hub"
+                                else (0, f"{label}: sd_db build mismatch; the follow job follows\n"))
                     self.assertEqual(self.outcome(self.builds(), error, where), expected)
 
     def test_another_hub_error_still_exits_1(self):
@@ -450,8 +453,22 @@ class OperationsCLI(unittest.TestCase):
         with patch.object(cli, "TICK_SECONDS", 0.2, create=True):
             code, output = self.tick(run)
         self.assertLess(time.monotonic() - started, 2)
-        self.assertEqual((code, output), (0, "skipped: the tick ran past 0.2 s\n"))
+        # pack sd:9541: the deadline met the tick's work, so the skip says it began.
+        self.assertEqual((code, output), (0, "skipped (partial): the tick ran past 0.2 s\n"))
         self.connection.close.assert_called_once()
+
+    def test_a_deadline_before_the_connect_is_a_plain_skip(self):
+        """pack sd:9541: `partial` is the tick's own flag, set once it connected: a slow load read began nothing."""
+        run = self.builds()
+        run.dispatch.side_effect = AssertionError("the tick never connected")
+        with patch.object(cli, "TICK_SECONDS", 0.2, create=True), \
+                patch.object(cli, "gate_load", side_effect=lambda: time.sleep(5)), \
+                patch.object(cli, "interactive_builders", return_value=([], "")), \
+                patch.object(cli, "log_root", return_value=Path("/bulk")), \
+                patch.object(cli, "writable", return_value=True):
+            code, output = self.call("assignments", "dispatch", "--json")
+        self.assertEqual((code, json.loads(output)), (0, {"skipped": "the tick ran past 0.2 s", "partial": False}))
+        self.connect.assert_not_called()
 
     def test_a_hung_bulk_root_probe_claims_within_its_bound_and_skips_the_archive(self):
         """pack sd:6749: a stat on a hung bulk volume blocked the tick before its alarm was set. pack sd:8845: a live

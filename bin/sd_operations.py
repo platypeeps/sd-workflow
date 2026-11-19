@@ -444,29 +444,20 @@ def hub_outages() -> tuple[type[BaseException], ...]:
     return remote.HubUnreachable, remote.BuildMismatch
 
 
-class MidTick(Exception):
-    """One of `hub_outages` after the tick's connect: work the tick began may have committed (pack sd:9541)."""
+def outage(error: BaseException) -> str:
+    """The `skipped` reason for one of `hub_outages`.
 
-    def __init__(self, error: BaseException) -> None:
-        super().__init__(str(error))
-        self.error = error
-
-
-def outage(error: BaseException) -> tuple[str, bool]:
-    """The `skipped` reason for one of `hub_outages`, and whether the tick had begun.
-
-    A mismatch skips only when its `upgrade` names this satellite: the follow job catches up (pack sd:8685). A hub
-    behind, an unordered build or no `upgrade` needs the operator, so it refuses with its own remedy (pack sd:9541).
+    A mismatch skips, and the follow job follows (pack sd:8685): every hub refresh differs only in its build digest,
+    `upgrade` `both`. One whose `upgrade` names the hub needs `repo-sync.sh refresh` there, which no follow job runs,
+    so it refuses with its own remedy (pack sd:9541).
     """
     sd_handoff_rows.library()
     from sd_db import remote  # noqa: PLC0415 - after the helper
-    partial = isinstance(error, MidTick)
-    cause = error.error if isinstance(error, MidTick) else error
-    if not isinstance(cause, remote.BuildMismatch):
-        return str(cause), partial
-    if getattr(cause, "upgrade", None) != "satellite":
-        raise WorkRefusal(str(cause)) from cause
-    return "sd_db build mismatch; the follow job follows", partial
+    if not isinstance(error, remote.BuildMismatch):
+        return str(error)
+    if getattr(error, "upgrade", None) == "hub":
+        raise WorkRefusal(str(error)) from error
+    return "sd_db build mismatch; the follow job follows"
 
 
 def say_skipped(args: argparse.Namespace, reason: str, partial: bool) -> None:
@@ -510,23 +501,24 @@ def dispatch_builds(args: argparse.Namespace) -> int:
     armed = time.monotonic()
     signal.setitimer(signal.ITIMER_REAL, TICK_SECONDS)
     unstarted: dict[str, str] = {}
-    skipped: tuple[str, bool] | None = None  # the reason, and whether the tick had begun
+    began: list[bool] = []  # the tick's flag: it connected, so work it began may have committed (pack sd:9541)
+    skipped: str | None = None
     try:
-        result = tick(sd_db, build, build_run, root, why, unstarted, archive=not skip)
+        result = tick(sd_db, build, build_run, root, why, unstarted, archive=not skip, began=began)
     except Overdue:
-        skipped = f"the tick ran past {TICK_SECONDS:g} s", False
-    except hub_outages() + (MidTick,) as error:
+        skipped = f"the tick ran past {TICK_SECONDS:g} s"
+    except hub_outages() as error:
         skipped = outage(error)
     except sqlite3.OperationalError as error:
         if "locked" not in str(error) and "busy" not in str(error):
             raise WorkRefusal(str(error)) from error
-        skipped = str(error), False
+        skipped = str(error)
     finally:
         signal.setitimer(signal.ITIMER_REAL, 0)
         # The copier dies with this process: it keeps the rest of the tick's budget, as before sd:8275 (sd:8339).
         build_run.archive_wait(TICK_SECONDS - (time.monotonic() - armed))
     if skipped is not None:
-        say_skipped(args, *skipped)
+        say_skipped(args, skipped, bool(began))
         return 0
     if skip:
         result["archive_skipped"] = skip
@@ -541,13 +533,16 @@ def dispatch_builds(args: argparse.Namespace) -> int:
 
 
 def tick(sd_db: Any, build: Any, build_run: Any, root: Path | None, why: str, unstarted: dict[str, str], *,
-         archive: bool = True) -> dict:
+         archive: bool = True, began: list[bool] | None = None) -> dict:
     """`dispatch_builds`' tick in the database; each run whose supervisor could not start goes in `unstarted`.
 
-    `archive` False: the bulk root did not take a write, so no ended run's files move to it this tick."""
-    outages = hub_outages()  # kept at the connect, a `MidTick` after it: `dispatch_builds` skips both
+    `archive` False: the bulk root did not take a write, so no ended run's files move to it this tick. `began` gets
+    True once the tick connected, so a later skip says it was partial (pack sd:9541)."""
+    outages = hub_outages()  # they keep their types, so `dispatch_builds` skips them
     load, load_cap = gate_load()
     connection = sd_handoff_rows.connect(sd_db, write=True, keep=outages)
+    if began is not None:
+        began.append(True)
     try:
         def spawn(ident: str) -> None:
             if root is None:
@@ -571,8 +566,8 @@ def tick(sd_db: Any, build: Any, build_run: Any, root: Path | None, why: str, un
         result["pushed"] = push_failures(connection)
         if root is not None and not why and archive:  # the bulk root answered the probe
             result["logs_moved"] = build_run.archive(connection, build_run.local_root(), root)
-    except outages as error:
-        raise MidTick(error) from error
+    except outages:
+        raise
     except (sd_db.SdDbError, ValueError, OSError) as error:
         raise WorkRefusal(str(error)) from error
     finally:
