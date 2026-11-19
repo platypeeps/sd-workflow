@@ -2208,7 +2208,7 @@ const ICON = n => html`<svg class="i" aria-hidden="true"><use href="#i-${n}"/></
 var OUT = { toasts: [], gets: [], error: null }, R = {}, WIN = [], ELS = {}, location = { hash: "" };
 const toast = m => OUT.toasts.push(m), flush = async () => { for (let i = 0; i < 50; i++) await null; };
 var ANSWER = { error: '', rows: [], nosource: [] };
-const getJSON = async path => { OUT.gets.push(path); return typeof ANSWER === 'function' ? ANSWER() : ANSWER; };
+const getJSON = async path => { OUT.gets.push(path); if (typeof ANSWER === 'string') throw new Error(ANSWER); return typeof ANSWER === 'function' ? ANSWER() : ANSWER; };
 function addEventListener(t, f) { WIN.push([t, f]); }
 function El(id) { const e = { id, html: '', attrs: {}, dataset: {}, listeners: {}, setAttribute(k, v) { e.attrs[k] = v; }, removeAttribute(k) { delete e.attrs[k]; },
   addEventListener(t, f) { (e.listeners[t] = e.listeners[t] || []).push(f); }, append(f) { e.html += f.parsed; }, replaceChildren(f) { e.html = f ? f.parsed : ''; } }; return e; }
@@ -2301,6 +2301,31 @@ loaded(); await flush(); R.before = OUT.gets.length; click(); await flush(); R.a
         self.assertNotIn('id="read-again"', out["R"]["head"])
         slot = self.run_again("window.PAGE_AGAIN = { run() {} };\nSHELL_AGAIN\nloaded(); R.slot = SLOT.html;", slot=True)
         self.assertIn('id="usage-drop"', slot["R"]["slot"])
+
+    def test_service_status_sits_beside_usage_only_while_a_service_is_down(self):
+        """pack sd:9656: a Service status dropdown beside Usage, hidden while every watched service is ok, unknown
+        or not read; shown, with its worst state, while one is degraded or out. A later read that finds none hides it."""
+        out = self.run_again("""window.PAGE_AGAIN = { run() {} };
+ANSWER = { rows: [{ id: 'usage:codex', label: 'codex', state: 'ok', windows: [], service: null }], nosource: [], down: [] };
+SHELL_AGAIN
+loaded(); await flush(); R.head = HEAD.html; const s = ELS['status-drop']; R.quiet = s.hidden;
+ANSWER = { rows: [], nosource: [], down: [
+  { name: 'openai', status: 'outage', state: 'warning', title: 'API errors', url: 'https://status.example.test/i/9', lasted: '1h' },
+  { name: 'github', status: 'degraded', state: 'caution', title: '', url: 'https://status.example.test', lasted: '' }] };
+click(); await flush(); R.loud = s.hidden; R.state = ELS['status-sum'].dataset.state; R.menu = ELS['status-menu'].html;
+s.open = true; ANSWER = 'not read'; click(); await flush(); R.failed = [s.hidden, s.open];""")
+        head = out["R"]["head"]
+        self.assertRegex(head, r'id="usage-drop">.*</details><details class="usage-drop" id="status-drop" hidden>'
+                               r'<summary class="btn quiet sm" id="status-sum">.*<span>Service status</span>')
+        self.assertLess(head.index('id="status-drop"'), head.index('id="read-again"'))
+        self.assertEqual((out["R"]["quiet"], out["R"]["loud"], out["R"]["state"]), (True, False, "warning"))
+        menu = out["R"]["menu"]
+        self.assertIn('href="https://status.example.test/i/9"', menu)
+        self.assertIn("openai outage: API errors", menu)
+        self.assertIn("for 1h", menu)
+        self.assertIn("github degraded", menu)
+        self.assertIn('href="/fleet-health#view=status"', menu)
+        self.assertEqual(out["R"]["failed"], [True, False])
 
     def test_a_run_that_fails_says_so_and_ends_busy(self):
         out = self.run_again("""window.PAGE_AGAIN = { run: () => Promise.reject(new Error('no answer')) };
