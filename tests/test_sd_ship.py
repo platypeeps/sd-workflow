@@ -6843,6 +6843,38 @@ class ReviewWatchdogTests(unittest.TestCase):
         self.assertEqual(raised.exception.diagnostic["cleanup"], {"term": "sent", "kill": "sent", "drained": True, "leader_reaped": True})
         self.assertLess(time.monotonic() - started, 8, "the drain ends at the close, not at its bound")
 
+    def test_a_killed_review_ends_the_sessions_below_it(self):
+        """pack sd:9392, failure table row 4: the KILL reached the review's group only; a session sd-review
+        started, such as its codex run, ran on with ppid 1."""
+        below = self.root / "below.pid"
+        script = ("import pathlib,signal,subprocess,time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                  "child = subprocess.Popen(['sleep', '60'], start_new_session=True, stdout=subprocess.DEVNULL, "
+                  "stderr=subprocess.DEVNULL)\n"
+                  f"pathlib.Path({str(below)!r}).write_text(str(child.pid))\nwhile True: time.sleep(1)\n")
+        original_communicate = subprocess.Popen.communicate
+        def after_ready(process, *args, **kwargs):
+            deadline = time.monotonic() + 5
+            while not (below.exists() and below.read_text()) and time.monotonic() < deadline:
+                time.sleep(.005)
+            return original_communicate(process, *args, **kwargs)
+        def stop_below():
+            try:
+                os.killpg(int(below.read_text()), ship.signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+        self.addCleanup(stop_below)
+        with patch.object(subprocess.Popen, "communicate", after_ready), patch.object(ship, "REVIEW_CLEANUP_SECONDS", .05):
+            with self.assertRaises(ship.ReviewTimeout):
+                ship.review_process(self.root, [sys.executable, "-c", script], timeout=.3)
+        for _ in range(60):
+            try:
+                os.kill(int(below.read_text()), 0)
+            except ProcessLookupError:
+                break
+            time.sleep(.05)
+        else:
+            self.fail("the session below the review outlived its SIGKILL")
+
     def test_exited_leader_cannot_leave_inherited_pipes_and_a_live_grandchild(self):
         diagnostic = self.expired_group(leader_exits=True)
         self.assertEqual(diagnostic["cleanup"]["kill"], "sent")
@@ -6859,6 +6891,34 @@ class ReviewWatchdogTests(unittest.TestCase):
         self.assertFalse(raised.exception.diagnostic["cleanup"]["leader_reaped"])
         self.assertIn("failed", raised.exception.diagnostic["cleanup"]["kill"])
 
+
+    def test_a_reaped_reviews_reused_number_gets_no_sigkill(self):
+        """pack sd:9392 round 5, R1: the SIGKILL went to the reaped leader's bare number, which another
+        group held by then."""
+        process = unittest.mock.Mock(pid=4242, returncode=0)
+        process.communicate.side_effect = [subprocess.TimeoutExpired([], 1), (b"", b""), (b"", b"")]
+        reads = iter([{4242: (1, 4242, "Thu Jan  1 00:00:00 1970")}, {5000: (1, 4242, "Fri Jan  2 00:00:00 1970")}])
+        with patch.object(ship.subprocess, "Popen", return_value=process), \
+                patch.object(ship.sd_lib, "process_table", side_effect=lambda: next(reads)), \
+                patch.object(ship.sd_lib, "wait_empty"), patch.object(ship.os, "killpg") as killpg:
+            with self.assertRaises(ship.ReviewTimeout) as raised:
+                ship.review_process(self.root, ["fixture"], timeout=1)
+        self.assertNotIn(unittest.mock.call(4242, ship.signal.SIGKILL), killpg.call_args_list)
+        self.assertEqual(raised.exception.diagnostic["cleanup"]["kill"], "absent")
+
+    def test_an_interrupted_review_read_still_kills(self):
+        """pack sd:9392 round 5, R2: a KeyboardInterrupt in the read before the TERM left the review group
+        TERMed and never KILLed."""
+        process = unittest.mock.Mock(pid=4242, returncode=None)
+        process.communicate.side_effect = [subprocess.TimeoutExpired([], 1), (b"", b"")]
+        with patch.object(ship.subprocess, "Popen", return_value=process), \
+                patch.object(ship.sd_lib, "process_table", side_effect=KeyboardInterrupt), \
+                patch.object(ship.os, "killpg") as killpg:
+            with self.assertRaises(KeyboardInterrupt):
+                ship.review_process(self.root, ["fixture"], timeout=1)
+        sent = [call for call in killpg.call_args_list if call.args[1] != 0]
+        self.assertEqual(sent, [unittest.mock.call(4242, ship.signal.SIGTERM),
+                                unittest.mock.call(4242, ship.signal.SIGKILL)])
 
     def test_initial_timeout_output_survives_both_failed_cleanup_drains(self):
         body = b'{"findings":[{"summary":"preserved blocker"}]}'
@@ -6975,13 +7035,16 @@ class ReviewWatchdogTests(unittest.TestCase):
         self.assertEqual(self.expired(body)["captured_report"], json.loads(body))
 
     def test_interrupt_also_cleans_the_owned_group(self):
-        process = unittest.mock.Mock(pid=123)
+        # An interrupted `communicate` reaped nothing, so the number is still the leader's (pack sd:9392).
+        process = unittest.mock.Mock(pid=123, returncode=None)
         process.communicate.side_effect = [KeyboardInterrupt(), (b"", b""), (b"", b"")]
         process.poll.return_value = 0
         with patch.object(ship.subprocess, "Popen", return_value=process), patch.object(ship.os, "killpg") as stop:
             with self.assertRaises(KeyboardInterrupt):
                 ship.review_process(self.root, ["fixture"], timeout=1)
-        self.assertEqual([row.args[1] for row in stop.call_args_list], [ship.signal.SIGTERM, ship.signal.SIGKILL])
+        # Signal 0 is the probe that reads whether the group lives (pack sd:9392), not a signal sent.
+        self.assertEqual([row.args[1] for row in stop.call_args_list if row.args[1]],
+                         [ship.signal.SIGTERM, ship.signal.SIGKILL])
 
     def test_untrusted_timing_values_cannot_disable_the_watchdog(self):
         valid = {"setup_seconds": 3600, "phase_seconds": 1800, "execution_seconds": 9000,
