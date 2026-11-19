@@ -4471,10 +4471,10 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
     `pending` names each idle lane with an entry its last worker did not
     see at its start; such a lane starts again on the same terms, and an
     idle run waits for room for it as the first pass does (sd:5809). A
-    lane's ids are read once it is claimed, just before its worker starts,
-    and a worker that answers busy saw none. An entry a worker left
-    pending starts none, so the run ends once a scan read after the last
-    lane ended finds no new work.
+    lane's ids are read once it is claimed, just before its worker starts.
+    An entry a worker left pending, or saw while it answered busy, starts
+    none, so the run ends once a scan read after the last lane ended
+    finds no new work.
     """
     run = ParallelRun(order, start, deadline, room, pending, cap, *lock_steps(locks))
     with sd_lib.term_ends_group():
@@ -4544,9 +4544,7 @@ class ParallelRun:
         before = set(self.running)
         collect_ended(self.running, self.rows)
         for index in before - set(self.running):
-            self.release(self.order[index][1])
-            if "busy" in self.rows[index][-1]:
-                self.seen[index] = frozenset()  # its worker ran nothing: a scan reads the lane again
+            self.release(self.order[index][1])  # a busy worker's ids stay seen: the next run retries it
 
     def begin_lane(self, index: int) -> None:
         checkout = self.order[index][1]

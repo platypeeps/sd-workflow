@@ -6302,16 +6302,16 @@ class HostedParallel(Lane):
                                         lambda: None, locks=sd_lane.MachineLocks(self.environ), cap=1)
         self.assertEqual(probed, [], rows)
 
-    def test_a_worker_that_found_its_lane_busy_starts_again_once_new_work_is_read(self) -> None:
-        """sd:9332 advisory 48d7c28c4 :4398: a worker that met its runner lock held for an instant answered
-        busy, but its ids stayed seen, so its entries sat for the rest of the run. A busy answer forgets
-        them, and the rescan starts the lane again."""
+    def test_a_lane_whose_worker_answers_busy_starts_once_and_the_run_ends(self) -> None:
+        """sd:9332 lane review 1c8fb401b :4549: a busy answer cleared the lane's seen ids, so while a manual
+        `lane run` or repo-sync held its lock the run started it again every poll, about 480 workers in a
+        40-min budget, and never ended early. A busy worker's ids stay seen, as on main; the next scheduled
+        run retries the lane."""
         starts: list[pathlib.Path] = []
 
         def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
             starts.append(checkout)
-            row = {"ran": [], "busy": "another runner holds the lock"} if len(starts) == 1 else {"ran": []}
-            return sd_lane.StartedLane(lambda: row)
+            return sd_lane.StartedLane(lambda: {"ran": [], "busy": "another runner holds the lock"})
 
         def pending(seen: dict[pathlib.Path, frozenset[str]]) -> dict[pathlib.Path, frozenset[str]]:
             return {checkout: frozenset({"2"}) for checkout in seen if "2" not in seen[checkout]}
@@ -6319,7 +6319,8 @@ class HostedParallel(Lane):
         with mock.patch.object(sd_lane.time, "sleep", self.bounded_nap(polls)):
             rows = sd_lane.run_parallel([("zeta", self.zeta)], start, sd_lane.clock() + 600, lambda: None, pending,
                                         locks=sd_lane.MachineLocks(self.environ), cap=1)
-        self.assertEqual(starts, [self.zeta, self.zeta], rows)
+        self.assertEqual(starts, [self.zeta], rows)
+        self.assertEqual(polls[0], 0, "the run waited instead of ending once nothing new remained")
 
     def test_a_probe_s_lock_left_in_a_forked_child_does_not_make_the_chosen_lane_busy(self) -> None:
         """sd:9332, found in this suite: a probe's flock lives on in a child forked while the probe held it,
