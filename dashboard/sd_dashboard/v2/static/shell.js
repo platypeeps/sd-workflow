@@ -1939,8 +1939,10 @@
     return html`${U.rows.length ? html`<ul class="urows">${U.rows.map(usageRow)}</ul>` : ''}
       <p class="foot">${none ? 'No provider read yet. ' : ''}${nosource.length ? `No reader for ${nosource.join(', ')}. ` : ''}${U.flags_error ? `Service status not read: ${U.flags_error}. ` : ''}${links}</p>`;
   }
+  // Pack sd:9597: no row, or a provider with no reader, is no reading: unknown, never ok.
   const usageWorst = U => U.error ? 'unknown' : (U.rows || []).flatMap(r => [r.state, r.service && r.service.state])
-    .reduce((worst, s) => URANK.indexOf(s) > URANK.indexOf(worst) ? s : worst, U.flags_error ? 'unknown' : 'ok');
+    .reduce((worst, s) => URANK.indexOf(s) > URANK.indexOf(worst) ? s : worst,
+      U.flags_error || !(U.rows || []).length || (U.nosource || []).length ? 'unknown' : 'ok');
   const usageSum = state => html`${ICON('gauge')}<span>Usage</span>${state ? html`<span class="g-${state}" aria-hidden="true">${UGLYPH[state]}</span><span class="sr"> ${state}</span>` : ''}`;
   const usageDrop = html`<details class="usage-drop" id="usage-drop"><summary class="btn quiet sm" id="usage-sum">${usageSum('')}</summary><div class="fpick-menu ustrip" id="usage-menu" role="group" aria-label="Usage"><p class="foot">Reading usage…</p></div></details>`;
   // Wires the drawn dropdown and returns its read, which Read again calls too: of overlapping reads only the newest
