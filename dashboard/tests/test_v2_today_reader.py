@@ -265,6 +265,11 @@ function decline(c, o) {
 }
 """
 
+    def test_open_in_queue_opens_the_lane_by_its_repository_key(self):
+        # sd:9258 round 2: it opened the folder name made from the checkout path, not the key Queue groups by.
+        out = self.run_page(self.DECLINE + f"R.key = C.get('{self.ENTRY}').repoKey;")
+        self.assertEqual(out["R"]["key"], "~/repos/system")
+
     def test_approve_asks_first_and_posts_nothing_until_it_is_confirmed(self):
         out = self.run_page(self.DECLINE + f"""const o = C.get('{self.ENTRY}');
 decline(cmd('today.lane.approve'), o); await flush(); R.said = (cmd('today.lane.approve').consequence || (() => null))(o);""")

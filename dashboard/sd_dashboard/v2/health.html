@@ -3,7 +3,7 @@
   Health (sd:2115), at /fleet-health: /health is the service's own check (runtime.py reads it). Built from the design source's
   products/system/designs/v2/health.{html,css,js} at d82daa1, with design.md and commands.md.
   Data: /api/health/summary (every lamp and the badge, waiting on no walker) and /api/health/<view> (one view's areas,
-  health_screen.part: Checkouts, Machine, GitHub, Jobs), each read the first time its view opens and on Refresh. Every fix is a CLI line for Copy. The two writes are
+  health_screen.part: Checkouts, Machine, GitHub, Jobs, Status), each read the first time its view opens and on Refresh. Every fix is a CLI line for Copy. The two writes are
   Re-run collector: POST /api/shadow/sync starts the server's shadow sync, as Contributions' does (sd:2894), and
   Snooze (sd:1896): /ui/snooze.js; a row's Snooze or Unsnooze posts /api/snooze, and Health reads again; Ignore and
   Unignore (sd:5470) post the same route with no end.
@@ -43,6 +43,7 @@
     <section id="view-machine" aria-label="Machine" hidden><div id="state-machine" hidden></div><div id="body-machine"></div></section>
     <section id="view-github" aria-label="GitHub" hidden><div id="state-github" hidden></div><div id="body-github"></div></section>
     <section id="view-jobs" aria-label="Jobs" hidden><div id="state-jobs" hidden></div><div id="body-jobs"></div></section>
+    <section id="view-status" aria-label="Status" hidden><div id="state-status" hidden></div><div id="body-status"></div></section>
     <div id="snoozed"></div>
   </main>
   <div class="details" id="details"><p class="why">Reading the fleet…</p></div>

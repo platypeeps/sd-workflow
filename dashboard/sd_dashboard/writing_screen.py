@@ -163,7 +163,7 @@ def document(connection, *, now):
         live = next((claim for claim in reversed(claims) if _text(claim["url"])), None)
         pieces.append({
             "id": row["id"], "title": row["title"], "stage": row["stage"], "parked": state["parked"], "piece": row["piece"],
-            "repo": Path(row["repo"]).name, "realm": realm_of(row["repo"], row["kind"], rules, hoa), "folder": "content-parked" if (row["path"] or "").startswith("content-parked/") else "content",
+            "repo": Path(row["repo"]).name if row["repo"] else "no repository", "realm": realm_of(row["repo"], row["kind"], rules, hoa), "folder": "content-parked" if (row["path"] or "").startswith("content-parked/") else "content",
             "updated": row["updated_at"], "revision": full["revision"],
             "gates_ok": gates["ok"], "problems": gates["problems"], "owner": state["owner"],
             "ready_recorded": bool(row["ready_digest"]) and row["ready_digest"] == gates["digest"],
@@ -182,8 +182,8 @@ def document(connection, *, now):
 def _mirror(row, parked: bool, kept: tuple, unread: str) -> dict:
     """The piece's `mirror`: `piece_mirror` with the Drive folder its stage mirrors to, None for none (parked, or a
     stage before review), and what was not read; unknown (`folder` None, `unread` the reason) when the queue was not."""
-    if unread:
-        return {"folder": None, "copies": {}, "unread": unread}
+    if unread or not row["repo"]:
+        return {"folder": None, "copies": {}, "unread": unread or "this piece names no repository"}
     queue, receipts, folders = kept
     try:
         fields = json.loads(row["fields"] or "{}")

@@ -158,9 +158,10 @@ addEventListener('DOMContentLoaded', () => {
       combo('active', 'Scope', view === 'board' ? [['done', 'Open and done'], ['scheduled', 'Scheduled only']] : [['1', 'Open only'], ['scheduled', 'Scheduled only']], html`<button class="help" type="button" aria-label="Help: scope filter" data-help="<b>Open only</b> hides Done tasks, as the Operations histogram counts only open ones. The board shows open tasks; its <b>Open and done</b> adds the Done column. The nightly prune parks an open P4 task untouched for 30 days, and a planning task that never ran untouched for 90 days; parked tasks show under the toolbar's <b>Parked</b> or <b>All</b>, and <b>Unpark</b> brings one back with its fields and history. Completing a repeating task opens its next row at once; it stays off every other scope, and off Today, until its due date less its lead. <b>Scheduled only</b> lists those rows with the day each opens.">${ICON('circle-help')}</button>`, view === 'board' ? 'Open' : 'Open and done')}${
       // sd:5649: the list's optional columns, hidden by default. Not a filter: no chip, and Clear all keeps it.
       view === 'list' && LEAD ? window.shell.list.pick('cols', 'Columns', COL_OPTS, SHOW.cols, { all: 'Default', multi: true }) : ''}${
-      (on() ? window.shell.list.chips(activeFilters(), visible().length, placed().length) : '')}`);
-    // sd:9309: the count sits at the right of row 1.
-    document.getElementById('task-count').textContent = on() ? `${visible().length} of ${placed().length} tasks` : `${placed().length} tasks`;
+      (on() ? window.shell.list.chips(activeFilters(), laid(visible()).length, laid(placed()).length) : '')}`);
+    // sd:9309: the count sits at the right of row 1. Pack sd:9340: it counts the rows the layout shows.
+    const n = laid(visible()).length, of = laid(placed()).length;
+    document.getElementById('task-count').textContent = on() ? `${n} of ${of} tasks` : `${of} tasks`;
   }
   // Active filters above the list (shell.list, sd:2682): one chip per value, keyed field:value, and one for the text.
   const FNAME = { kind: 'Kind', repo: 'Repo', p: 'Priority', due: 'Due', status: 'Status', age: 'In status', active: 'Scope' };
@@ -172,14 +173,16 @@ addEventListener('DOMContentLoaded', () => {
     if (e.target.closest('[data-unfilter-all]')) { clearFilters(); return; }
     const u = e.target.closest('[data-unfilter]'); if (!u) return;
     const [k, v] = u.dataset.unfilter.split(/:(.*)/);
-    if (k === 'q') { Q = ''; find.value = ''; } else F[k].delete(v);
+    if (k === 'q') emptyBox(); else F[k].delete(v);
     L.page = 1; render();
   });
   document.getElementById('filters').addEventListener('change', e => {
     // The redraw replaces the checkbox, so focus goes back to the new one.
     window.shell.list.pickChange(e, F, () => { L.page = 1; render(); }) || window.shell.list.pickChange(e, SHOW, render);
   });
-  function clearFilters() { Object.values(F).forEach(s => s.clear()); Q = ''; find.value = ''; L.page = 1; render(); }
+  // Pack sd:9340: the box, Q and the ghost change together, through showPreview.
+  function emptyBox() { find.value = ''; linked = ''; showPreview(); }
+  function clearFilters() { Object.values(F).forEach(s => s.clear()); emptyBox(); L.page = 1; render(); }
   // The text filter narrows on what a row shows: id, title, repo, status and kind, as v1's ?q= read the visible columns.
   // Add or find's words set it (showPreview, sd:9309): its title words, or #id; p1, due fri and #repo are the add's alone.
   // A #id names one task, as the preview and Enter take it: #904 never lists #9040 (review of sd:9309).
@@ -229,6 +232,10 @@ addEventListener('DOMContentLoaded', () => {
   // A done item with no known time stays: unknown is not old. sd:6233: the column shows only with Show done.
   const DONE_DAYS = 7, DONE_TIP = `done in the last ${DONE_DAYS} days`;
   const recent = t => t.status !== 'done' || !t.since || !READ || Date.parse(READ) - Date.parse(t.since) <= DONE_DAYS * 864e5;
+  // The rows the current layout draws (pack sd:9340): the board leaves out old done rows, and its Done column unless Scope
+  // shows it; the matrix leaves out every done row.
+  const laid = rows => view === 'board' ? rows.filter(t => recent(t) && (F.active.has('done') || t.status !== 'done'))
+    : view === 'matrix' ? rows.filter(t => t.status !== 'done') : rows;
   function renderBoard() {
     const v = visible().filter(recent);
     // build: backlog_items also returns statuses with no column (a message's ready_to_send); they get one lane, which
@@ -514,6 +521,9 @@ addEventListener('DOMContentLoaded', () => {
     { list: ['list-todo', 'List'], board: ['kanban', 'Board'], matrix: ['grid-2x2', 'Matrix'] }, setView);
   function setView(v) {
     view = v;
+    // Pack sd:9340: Scope's default is Open on the board and Open and done elsewhere, so the value that names the other
+    // layout's default goes.
+    F.active.delete(v === 'board' ? '1' : 'done');
     pickView(v);
     ['board', 'matrix', 'list'].forEach(x => { const el = document.getElementById('view-' + x); el.hidden = x !== v; if (x !== v) el.replaceChildren(); });
     subhead();
@@ -536,7 +546,8 @@ addEventListener('DOMContentLoaded', () => {
     if (q.get('done') === '1') F.active.add('done');
     [...F.active].forEach(v => { if (!['1', 'scheduled', 'done'].includes(v)) F.active.delete(v); });
     (q.get('cols') || '').split(',').filter(v => COL_OPTS.some(o => o[0] === v)).forEach(v => SHOW.cols.add(v));
-    find.value = (q.get('q') || '').trim(); Q = find.value.toLowerCase(); linked = find.value;
+    // Pack sd:9340: words typed before the read landed stay; Q already follows them.
+    if (!find.value) { find.value = (q.get('q') || '').trim(); Q = find.value.toLowerCase(); linked = find.value; }
     document.getElementById('shift-ghost').hidden = !!find.value;
     // A page is decimal digits, as on Documents (sd:2427).
     window.shell.list.listParams(q, L, { sorts: Object.keys(SORTS), size: LIST.size });
@@ -588,8 +599,9 @@ addEventListener('DOMContentLoaded', () => {
   function showPreview() {
     const txt = inp.value, P = parse(txt);
     ghost.hidden = !!txt;
-    const q = (P.find ? `#${P.find}` : P.title).toLowerCase();
-    if (q !== Q) { Q = q; L.page = 1; render(); }
+    // Pack sd:9340: a ?q= link searches its words whole until edited; before the first draw only Q changes.
+    const q = linked && txt.trim() === linked ? linked.toLowerCase() : (P.find ? `#${P.find}` : P.title).toLowerCase();
+    if (q !== Q) { Q = q; L.page = 1; if (drawn) render(); }
     if (!txt.trim()) { prev.hidden = true; inp.setAttribute('aria-expanded', 'false'); return; }
     const found = P.find ? tasks.filter(t => String(t.id) === P.find) : P.title.length > 2 ? tasks.filter(t => t.title.toLowerCase().includes(P.title.toLowerCase())).slice(0, 3) : [];
     const fr = !P.repo && filterRepo() && [...F.repo][0];
@@ -619,7 +631,7 @@ addEventListener('DOMContentLoaded', () => {
       if (!t || !passes(t)) { toast(`Added #${out.item.id} to Planning · the filters hide it; Clear all shows it`); return; }
       select(key, false); landed(key); toast(`Added #${out.item.id} to Planning`); }),
       // A refusal gives the text back as typed, unless the operator has typed the next one meanwhile.
-      err => { if (!inp.value) inp.value = typed; toast(`Not added: ${err.message}`); });
+      err => { if (!inp.value) { inp.value = typed; showPreview(); } toast(`Not added: ${err.message}`); });
   });
   prev.addEventListener('click', e => { const b = e.target.closest('[data-open-find]'); if (b) { inp.value = ''; showPreview(); select(b.dataset.openFind, true); } });
   document.addEventListener('click', e => { if (!e.target.closest('#shift')) { prev.hidden = true; inp.setAttribute('aria-expanded', 'false'); } });

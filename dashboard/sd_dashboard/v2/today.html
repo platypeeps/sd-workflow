@@ -8,6 +8,8 @@
   one lane per Activity kind (merges, runs, reviews, commands, from /api/activity?range=7d, read when the view first
   shows), over the last 24 hours or 7 days as its range tiles pick; a table of the marks and a key to Tasks.
   Under it the spend line (sd:6031): spent in the last 24 hours and each of the last 7, from the cost table; Metrics has the rest.
+  Under the annunciator the Usage strip (pack sd:9257, usage_screen.strip): each provider's windows, reset, pace and read
+  time, flagged by the services Health's Status view watches; a reading over 30 minutes old is unknown, never 0.
   The annunciator: Jobs, Lane, Reports, Pulls, Mail and Repos filter Needs you to their rows; Sessions and Gate open the
   Queue view. Each number counts the rows its filter shows.
   Needs you: the document's `needs`, every fact that asks for an act, ranked in the bands, with group rows for the work items
@@ -58,6 +60,9 @@
       <li><a class="cell" href="#view=queue" id="lamp-sessions" data-state="unknown"><span class="lbl">Sessions<svg class="i" aria-hidden="true"><use href="#i-bot"/></svg></span><span class="val">reading…</span></a></li>
       <li><a class="cell" href="#view=queue" id="lamp-gate" data-state="unknown"><span class="lbl">Gate<svg class="i" aria-hidden="true"><use href="#i-gauge"/></svg></span><span class="val">reading…</span></a></li>
     </ul></annunciator-strip>
+
+    <!-- pack sd:9257: the Usage strip, the page's evidence strip, from /api/now's usage (usage_screen.strip). -->
+    <section class="usage" aria-labelledby="usage-h"><h2 class="sr" id="usage-h">Usage</h2><div id="usage"><p class="foot">Reading usage…</p></div></section>
 
     <!-- The toolbar standard (sd:5281): the shell's Shapeshift bar (sd:5539) over every view; its text filters Needs you. -->
     <div class="toolbar" id="toolbar" data-shift></div>

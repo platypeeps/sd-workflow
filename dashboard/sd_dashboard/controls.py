@@ -81,7 +81,7 @@ def _status_control(connection, item_id, row, revision, statuses=None):
 def _unpark_control(item_id, row, revision):
     # sd:3007: the nightly prune parks an untouched P4 item; this brings it back. A writing piece revives
     # through its own control in `writing_controls`, which moves its file.
-    if not row["parked_at"] or row["piece"]:
+    if not row["parked_at"] or row["piece"] is not None:
         return Markup("")
     return tag("section", tag("h2", "Parked"),
         tag("p", f"Parked {row['parked_at'][:10]}: this item is off Today and the task lists. "
@@ -98,6 +98,13 @@ def item_controls(connection, item_id):
 
 
 def _item_controls(connection, item_id, row, revision):
+    if workflow.hand_idea(row):
+        # pack sd:9302: the status control alone. `edit_item` takes no idea's
+        # details (`DETAIL_KINDS`), so a details form would offer a refused save.
+        return tag("section", tag("h2", "Manage this item"),
+            tag("div", _status_control(connection, item_id, row, revision),
+                tag("p", "An idea can close here, or reopen to planning.", class_="hint")),
+            class_="control-panel")
     if row["kind"] not in ("task", "work", *workflow.TASK_STATUS_KINDS):
         return Markup("")
     if row["kind"] == "work":
@@ -217,7 +224,7 @@ def progress_controls(connection, item_id):
 
 
 def writing_controls(connection, row, *, state=None):
-    if row["kind"] != "idea" or not row["piece"]:
+    if row["kind"] != "idea" or row["piece"] is None:
         return Markup("")
     from sd_db import writing
 
@@ -240,7 +247,9 @@ def writing_controls(connection, row, *, state=None):
             tag("p", tag("a", "Open published document", href=publication["url"], rel="noopener noreferrer")) if publication.get("url") else "",
             tag("p", "Resume from the saved claim; check the destination before repeating an interrupted operation.", class_="hint") if phase != "published" else "",
             tag("code", f"sd writing publication-status --piece {row['piece']} --claim {publication['id']}"), class_="operation-card"))
-    if detail["owner"] != "row":
+    if not detail["owner"]:
+        body.append(tag("p", "This piece has no registered repository, so it cannot move.", class_="hint"))
+    elif detail["owner"] != "row":
         body.append(tag("p", "This collection is read-only until its database migration is verified.", class_="hint"))
     else:
         parked = detail["parked"]

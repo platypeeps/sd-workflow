@@ -15,7 +15,7 @@ from sd_db import (
     skills_catalog,
     workflow,
 )
-from sd_db.writes import add_note, upsert_repo
+from sd_db.writes import add_note, set_item_fields, upsert_repo
 
 from .test_capture_screen import Fields
 from .test_workflow_actions import BrowserSession
@@ -573,9 +573,59 @@ class ItemStatusOnly(BrowserSession):
         self.assertNotIn("done", workflow.allowed_statuses(self.connection, work))
 
     def test_kinds_with_their_own_workflow_still_render_no_item_controls(self):
-        for kind in ("idea", "work-idea", "personal-idea", "report"):
+        for kind in ("report",):
             with self.subTest(kind=kind):
                 self.assertEqual(self.panel(self.item(f"A {kind} item", kind=kind)), "")
+
+
+class IdeaClose(BrowserSession):
+    """pack sd:9302 -- a hand idea gets the status control alone: planning and done.
+
+    A writing piece closes through its stages and a vault row moves by stage
+    only (sd:3972), so neither gets one.
+    """
+
+    #: The three groups, as kind and source: work-idea, personal-idea and an idea with no piece.
+    HAND_IDEAS = (("work-idea", None), ("work-idea", "drafts"), ("personal-idea", "drafts"), ("idea", "drafts"))
+    panel, status_form, details_form = ItemStatusOnly.panel, ItemStatusOnly.status_form, ItemStatusOnly.details_form
+
+    def test_each_hand_idea_renders_a_close_control_and_no_details_form(self):
+        for kind, source in self.HAND_IDEAS:
+            with self.subTest(kind=kind, source=source):
+                item = self.item(f"A {kind} item", kind=kind, source=source)
+                self.assertIsNotNone(self.status_form(item), "no status form for a hand idea")
+                options = Fields(self.status_form(item)).options["status"]
+                self.assertEqual([entry["attributes"]["value"] for entry in options], ["planning", "done"])
+                self.assertIn('name="reason"', self.status_form(item))
+                self.assertIsNone(self.details_form(item))
+                self.assertIn(f'action="/api/items/{item}/status"', self.render(f"/item/{item}"))
+
+    def test_the_rendered_form_closes_with_a_reason_and_reopens(self):
+        for kind, source in self.HAND_IDEAS:
+            item = self.item(f"A {kind} item", kind=kind, source=source)
+            for target, reason in (("done", "not doing it"), ("planning", "")):
+                with self.subTest(kind=kind, source=source, target=target):
+                    self.assertIsNotNone(self.status_form(item), "no status form for a hand idea")
+                    revision = Fields(self.status_form(item)).fields["revision"]["value"]
+                    status, _, state = self.post(f"/api/items/{item}/status",
+                                                 {"revision": revision, "status": target, "reason": reason})
+                    self.assertEqual((status, state["item"]["status"]), (200, target))
+            history = [n["body"] for n in workflow.item_state(self.connection, item)["notes"]
+                       if n["kind"] == "status_change"]
+            self.assertIn("not doing it", history[-2] if len(history) > 2 else "")
+
+    def test_a_writing_piece_and_a_vault_idea_render_no_close_control(self):
+        piece = self.item("A piece", kind="idea", source="writing-piece", external_id="a-piece")
+        set_item_fields(self.connection, piece, piece="a-piece")
+        vault = self.item("A vault idea", kind="idea", source="vault",
+                          external_id="topic:System/Databases/Topics/A vault idea.md",
+                          stage="active", fields={"kind": "topic"})
+        self.connection.commit()
+        for item in (piece, vault):
+            with self.subTest(item=item):
+                self.assertEqual(self.panel(item), "")
+        # The piece's page reads its writing checkout; the panel above is what that page renders.
+        self.assertNotIn(f'action="/api/items/{vault}/status"', self.render(f"/item/{vault}"))
 
 
 class HostileItemStorage(BrowserSession):

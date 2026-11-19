@@ -719,8 +719,10 @@ def _status_reason(workflow: Any, connection: Any, args: argparse.Namespace) -> 
         # checkout can verify a commit for. Pointing at `sd work deliver`
         # sent the caller to a verb that refuses the same row. The close hint
         # is given only where the installed library says the kind can close:
-        # a build older than `TASK_STATUS_KINDS` refuses `done` for these.
-        closes = kind in getattr(workflow, "TASK_STATUS_KINDS", ("task",))
+        # a build older than `TASK_STATUS_KINDS` refuses `done` for these,
+        # and one older than `hand_idea` refuses it for an idea (pack sd:9302).
+        closes = (kind in getattr(workflow, "TASK_STATUS_KINDS", ("task",))
+                  or getattr(workflow, "hand_idea", lambda _row: False)(row))
         raise WorkRefusal(
             f"{kind} item {args.item} belongs to no checkout, so --delivered-by has "
             "nothing to verify" + ("; close it without --delivered-by" if closes else ""))
