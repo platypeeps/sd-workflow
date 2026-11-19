@@ -2289,7 +2289,7 @@ class KillReachTests(unittest.TestCase):
             leader, below = self.start(scratch)
             with unittest.mock.patch.object(sd_lib, "groups_below", return_value={}), \
                     unittest.mock.patch.object(os, "killpg") as killpg:
-                sd_lib.kill_below(leader.pid, {below: "Thu Jan  1 00:00:00 1970"})
+                sd_lib.kill_below(leader.pid, sd_lib.Below("", {below: "Thu Jan  1 00:00:00 1970"}))
             self.assertNotIn(unittest.mock.call(below, signal.SIGKILL), killpg.call_args_list)
 
     def test_an_unread_table_still_kills_the_leaders_group(self) -> None:
@@ -2348,6 +2348,40 @@ class KillReachTests(unittest.TestCase):
             groups.end_groups()
         self.assertEqual(events[:4], ["read"] + [f"signal {int(signal.SIGTERM)}"] * 3)
         self.assertEqual(events.count("read"), 2, events)  # one before the TERMs, one before the KILLs
+
+
+    def test_a_reused_root_with_another_start_roots_no_walk(self) -> None:
+        """Round 3, rule A: the KILL's fresh walk started at a group whose leader had another start than at
+        the read before the TERM, so a reused number's sessions below were signalled."""
+        groups = sd_lib.ThreadGroups()
+        groups.group_hook()(4242)
+        reads = iter([{4242: (1, 4242, "Thu Jan  1 00:00:00 1970")},
+                      {4242: (1, 4242, "Fri Jan  2 00:00:00 1970"), 4343: (4242, 4343, "Fri Jan  2 00:00:01 1970")}])
+        sent: list[tuple[int, int]] = []
+        with unittest.mock.patch.object(sd_lib, "process_table", side_effect=lambda: next(reads)), \
+                unittest.mock.patch.object(sd_lib, "signal_group",
+                                           side_effect=lambda pid, number: sent.append((pid, number))), \
+                unittest.mock.patch.object(sd_lib, "GROUP_CLEANUP_SECONDS", 0.1):
+            groups.end_groups()
+        self.assertNotIn(4343, [pid for pid, _ in sent], sent)
+
+    def test_a_group_registered_after_the_end_began_has_its_session_killed(self) -> None:
+        """Round 3, rule B: a group that registered after `end_groups` was TERMed with no read before it;
+        its leader quit on the TERM, and the session it left ran on with ppid 1."""
+        with tempfile.TemporaryDirectory() as scratch:
+            mark = pathlib.Path(scratch) / "below.pid"
+            groups = sd_lib.ThreadGroups()
+            groups.end_groups()  # the end began; no group was live
+            release = sd_lib.release_term
+
+            def late() -> None:  # the group registers once its leader has started the session below it
+                release()
+                self.addCleanup(end_session, wait_for_pid(mark))
+                time.sleep(0.3)
+            with unittest.mock.patch.object(sd_lib, "release_term", late):
+                sd_lib.run_group([sys.executable, "-c", TERM_QUITTER, str(mark)], cwd=pathlib.Path("."),
+                                 env=dict(os.environ), timeout=60, started=groups.group_hook())
+            self.assertTrue(gone(int(mark.read_text())), "the session below a late group outlived its end")
 
 
 class TermEndsGroupTests(unittest.TestCase):

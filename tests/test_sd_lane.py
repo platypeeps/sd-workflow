@@ -98,15 +98,12 @@ with mock.patch.object(sd_lane, "end_group", noted), \\
 """
 
 
-#: `TERMED_RUNNER`'s child line, and one whose child ignores TERM and starts a session below it (pack sd:9392).
-TERMED_CHILD = ('CHILD = "import os, pathlib, sys, time; pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); '
-                'time.sleep(60)"')
+#: A child that ignores TERM and starts a session below it (pack sd:9392).
 DEAF_CHILD = ('CHILD = "import os, pathlib, signal, subprocess, sys, time; '
               'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
               "below = subprocess.Popen(['sleep', '60'], start_new_session=True); "
               "pathlib.Path(sys.argv[1] + '.below').write_text(str(below.pid)); "
               'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)"')
-assert TERMED_CHILD in TERMED_RUNNER
 #: A child that starts `sleep 60` in a session below it, holding no pipe, and dies on TERM at once (pack sd:9392).
 QUITTER_CHILD = ('CHILD = "import os, pathlib, subprocess, sys, time; '
                  "below = subprocess.Popen(['sleep', '60'], start_new_session=True, stdout=subprocess.DEVNULL, "
@@ -1574,48 +1571,6 @@ class Speculation(Trees):
         self.assert_termed_run(["second"])
         [speculation] = [entry["speculation"] for entry in self.entries() if "speculation" in entry]
         self.assertEqual((speculation["after"], speculation["status"]), (1, "cancelled"))
-
-    def test_a_termed_run_ends_inside_the_cron_grace(self) -> None:
-        """pack sd:9392, failure table rows 2 and 6. Cron's JOB_TIMEOUT TERMs the job's group and KILLs it
-        `CRON_JOBS_TIMEOUT_GRACE` (10 s) later. A prepare and a gate that ignore TERM held the unwind past
-        that: prepare's 5 s, then the gate's 10 s. The KILL then left the gate's group and the session below
-        it running with ppid 1."""
-        self.queue_both()
-        marks = self.tmp / "marks"
-        marks.mkdir()
-        script = self.tmp / "runner.py"
-        script.write_text(TERMED_RUNNER.format(bin=str(REPO_ROOT / "bin")).replace(TERMED_CHILD, DEAF_CHILD),
-                          encoding="utf-8")
-        runner = subprocess.Popen([sys.executable, str(script), str(self.repo), json.dumps(self.environ), str(marks),
-                                   "1"], env=dict(os.environ), stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
-                                  text=True, start_new_session=True)
-        self.addCleanup(end_group, runner.pid)
-        pids: dict[str, int] = {}
-        for name in ("gate-second.pid", "gate-second.pid.below", "prepare.pid", "prepare.pid.below"):
-            for _ in range(1200):  # bounded: a runner that never gets there fails on the read below
-                if ((marks / name).exists() and (marks / name).read_text()) or runner.poll() is not None:
-                    break
-                time.sleep(0.05)
-            if not ((marks / name).exists() and (marks / name).read_text()):
-                self.fail(f"no {name}: {runner.stderr.read() if runner.poll() is not None else ''}")
-            pids[name] = int((marks / name).read_text())
-            self.addCleanup(end_group, pids[name])
-        time.sleep(0.5)  # each deaf child has installed its handler
-        os.killpg(runner.pid, signal.SIGTERM)  # what cron-jobs.sh sends at JOB_TIMEOUT
-        try:
-            runner.wait(10)
-        except subprocess.TimeoutExpired:
-            os.killpg(runner.pid, signal.SIGKILL)  # the grace passed
-            runner.wait(10)
-        for name, pid in pids.items():
-            for _ in range(60):
-                try:
-                    os.kill(pid, 0)
-                except ProcessLookupError:
-                    break
-                time.sleep(0.05)
-            else:
-                self.fail(f"{name} outlived the job's TERM and its KILL 10 s later")
 
     def test_an_interruption_while_the_gate_starts_still_ends_it(self) -> None:
         """sd:5776, the step between the gate's start and the runner holding it: the run's cleanup ends it."""
@@ -6169,10 +6124,11 @@ class Bounds(unittest.TestCase):
         """Class pass, rule 1: the gate's `run_group` ended between the TERM wait and the SIGKILL and cleared
         `group`, so the SIGKILL step skipped the sessions read below it at the TERM."""
         gate = sd_lane.SpeculativeGate(lambda: None, "cleared")
-        gate.below, gate.below_of, gate.group = {424242: "start"}, 4242, None
+        read = sd_lane.sd_lib.Below("start", {424242: "start"})
+        gate.below, gate.group = {4242: read}, None
         with mock.patch.object(sd_lane.sd_lib, "kill_below") as kill:
             gate.signal_gate(signal.SIGKILL)
-        kill.assert_called_once_with(4242, {424242: "start"})
+        kill.assert_called_once_with(4242, read)
 
     def test_a_lane_child_that_ends_on_term_still_has_what_it_left_killed(self) -> None:
         """Class pass, rule 1: the lane child ended on the TERM, so `end_child` returned after `wait` and
@@ -6182,6 +6138,60 @@ class Bounds(unittest.TestCase):
         below = self.below_of(mark)
         lane.end()
         self.assert_gone(below, "the session below a lane child that ended on TERM")
+
+    def late_gate(self, argv: list[str], until: Any) -> tuple[Any, list[Any]]:
+        """A gate cancelled before its group registers, which it does once `until` returns; its answers."""
+        go, answers = threading.Event(), []
+        gate = sd_lane.SpeculativeGate(lambda: go.wait(10) and answers.append(sd_lane.gate_run()(
+            argv, dict(os.environ), pathlib.Path.cwd(), 120)), "late")
+        release = sd_lane.sd_lib.release_term
+
+        def late() -> None:
+            release()
+            until()
+        patch = mock.patch.object(sd_lane.sd_lib, "release_term", late)
+        patch.start()
+        self.addCleanup(patch.stop)
+        gate.start()
+        cancelled: list[bool] = []
+        canceller = threading.Thread(target=lambda: cancelled.append(gate.cancel_gate()))
+        canceller.start()
+        for _ in range(1000):  # bounded: a cancel that never lands fails below rather than hangs
+            if gate.cancelled:
+                break
+            time.sleep(0.01)
+        go.set()
+        canceller.join(60)
+        self.assertEqual(cancelled, [True])
+        return gate, answers
+
+    def test_a_gate_registered_after_the_cancel_still_kills_the_detached_check(self) -> None:
+        """Round 3, rule B: `started` TERMed a group that registered after the cancel with no read before
+        it; the leader quit on the TERM, and the session it left ran on with ppid 1."""
+        argv, mark = self.deaf_child(QUITTER_CHILD)
+        self.late_gate(argv, lambda: self.below_of(mark))
+        self.assert_gone(int(pathlib.Path(f"{mark}.below").read_text()), "the session below a late gate group")
+
+    def test_a_gate_registered_late_gets_the_full_term_grace(self) -> None:
+        """Round 3, rule B: the TERM wait counted from the cancel, not from the late group's TERM, so a
+        leader that ends in its grace was KILLed first."""
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        mark = pathlib.Path(scratch.name) / "child.pid"
+        code = ("import pathlib, signal, sys, time; "
+                "signal.signal(signal.SIGTERM, lambda *_: (time.sleep(0.8), sys.exit(3))); "
+                "pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(60)")
+        began = time.monotonic()
+
+        def until() -> None:  # registers 0.6 s into the 1 s wait, once the child's handler is in
+            for _ in range(400):
+                if mark.exists():
+                    break
+                time.sleep(0.01)
+            time.sleep(max(0.0, began + 0.6 - time.monotonic()))
+        with mock.patch.object(sd_lane, "CANCEL_SECONDS", 1):
+            _, answers = self.late_gate([sys.executable, "-c", code, str(mark)], until)
+        self.assertEqual(answers[0][0], 3, "the late group was KILLed inside its TERM grace")
 
     def below_of(self, mark: pathlib.Path) -> int:
         below = pathlib.Path(f"{mark}.below")

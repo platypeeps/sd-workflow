@@ -302,7 +302,7 @@ def review_process(root: pathlib.Path, argv: list[str], *, timeout: float) -> su
             cleanup: dict = {}
             # The SIGKILL reaches each session below the group too, read before
             # the SIGTERM and again before the SIGKILL (pack sd:9392).
-            below = sd_lib.groups_below(process.pid) if sd_lib.group_alive(process.pid) else {}
+            below = sd_lib.read_below(process.pid) if sd_lib.group_alive(process.pid) else sd_lib.NOTHING_BELOW
             for name, number, bound in (("term", signal.SIGTERM, REVIEW_CLEANUP_SECONDS), ("kill", signal.SIGKILL, REVIEW_DRAIN_SECONDS)):
                 # poll() may already have reaped the leader. Its descendants
                 # still own the group and pipes, so the signal is unconditional.

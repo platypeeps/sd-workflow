@@ -3797,9 +3797,9 @@ def end_group(process: subprocess.Popen, *, drain: bool = False) -> tuple[str, s
     """
     import signal  # noqa: PLC0415 - only the group helpers need it
 
-    earlier = groups_below(process.pid) if group_alive(process.pid) else {}  # before the TERM (sd:9392)
+    earlier = read_below(process.pid) if group_alive(process.pid) else NOTHING_BELOW  # before the TERM (sd:9392)
     for number in (signal.SIGTERM, signal.SIGKILL):
-        if number == signal.SIGKILL and (earlier or group_alive(process.pid)):
+        if number == signal.SIGKILL and (earlier is None or earlier.groups or group_alive(process.pid)):
             kill_below(process.pid, earlier)
         try:
             os.killpg(process.pid, number)
@@ -3911,7 +3911,8 @@ class ThreadGroups:
     Only the main thread runs a signal handler, so `term_ends_group` in a
     worker installs none: a group a thread started outlived a killed parent,
     the orphan sd:3203 fixed for one thread. `end_groups` runs as `first` in
-    the main thread's handler. A group that registers after it began is ended then.
+    the main thread's handler. A group that registers after it began is ended
+    then, by `end_late_group`: its read and its grace start with its own TERM.
     """
 
     def __init__(self) -> None:
@@ -3924,8 +3925,7 @@ class ThreadGroups:
 
     def group_hook(self) -> Callable[[int | None], None]:
         """`run_group`'s `started`: the group's id once it runs, then None as `run_group` ends it."""
-        import signal  # noqa: PLC0415 - only the group helpers need it
-        import threading  # noqa: PLC0415
+        import threading  # noqa: PLC0415 - only the group helpers need it
 
         mine: list[int] = []
 
@@ -3939,7 +3939,7 @@ class ThreadGroups:
                 self._holders.add(threading.current_thread())
                 ending = self._ending
             if ending:
-                signal_group(pid, signal.SIGTERM)
+                end_late_group(pid)
         return heard_group
 
     def reopen_groups(self) -> None:
@@ -3979,7 +3979,7 @@ class ThreadGroups:
         with self._lock:
             self._ending, live = True, set(self._live)
         table = process_table()  # one read for every group, before the TERM (pack sd:9392)
-        earlier = {pid: groups_below(pid, table=table) if table is not None else None for pid in live}
+        earlier = {pid: read_below(pid, table=table) if table is not None else None for pid in live}
         for pid in live:
             signal_group(pid, signal.SIGTERM)
         deadline, left = time.monotonic() + GROUP_CLEANUP_SECONDS, live
@@ -4018,6 +4018,54 @@ def process_table() -> dict[int, tuple[int, int, str]] | None:
         if len(fields) >= 3 and all(field.isdigit() for field in fields[:3]):
             table[int(fields[0])] = (int(fields[1]), int(fields[2]), " ".join(fields[3:]))
     return table
+
+
+class Below(NamedTuple):
+    """One read of the groups below a root, taken before its SIGTERM (pack sd:9392).
+
+    `start` is the root's own start then, "" when it had no entry; a later
+    walk from the root runs only while its leader still has that start, so
+    a reaped root whose number another process took roots no walk.
+    """
+    start: str
+    groups: dict[int, str]
+
+
+#: The read for a group with no member before its TERM: nothing below it, and no walk later.
+NOTHING_BELOW = Below("", {})
+
+
+def read_below(root: int, *, process: bool = False,
+               table: dict[int, tuple[int, int, str]] | None = None) -> Below | None:
+    """`groups_below(root)` with the root's start, for `kill_below`; None when the table cannot be read."""
+    table = process_table() if table is None else table
+    if table is None:
+        return None
+    return Below(table[root][2] if root in table else "", groups_below(root, process=process, table=table) or {})
+
+
+def end_late_group(pid: int) -> None:
+    """End group `pid`, which registered after its end began, as `end_group` would (pack sd:9392).
+
+    Its read below comes before its SIGTERM, and its grace of
+    `GROUP_CLEANUP_SECONDS` counts from that SIGTERM. `pid` is the caller's
+    unreaped child: `waitid` with WNOWAIT sees it exit and leaves the
+    reaping to its `Popen`, so the pid stays its own for the SIGKILL.
+    """
+    import signal  # noqa: PLC0415 - only the group helpers need it
+
+    earlier = read_below(pid)
+    signal_group(pid, signal.SIGTERM)
+    deadline = time.monotonic() + GROUP_CLEANUP_SECONDS
+    while time.monotonic() < deadline:
+        try:
+            if os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                break
+        except ChildProcessError:  # not a child of this process, or reaped: no wait is possible
+            break
+        time.sleep(0.05)
+    kill_below(pid, earlier)
+    signal_group(pid, signal.SIGKILL)
 
 
 def group_alive(pgid: int) -> bool:
@@ -4061,7 +4109,7 @@ def groups_below(root: int, *, process: bool = False,
     return found
 
 
-def kill_below(root: int | None, earlier: dict[int, str] | None, *, process: bool = False,
+def kill_below(root: int | None, earlier: Below | None, *, process: bool = False,
                table: dict[int, tuple[int, int, str]] | None | object = ...) -> None:
     """SIGKILL each group below `root` now (`groups_below`), and each group of `earlier` that is still that group.
 
@@ -4072,25 +4120,41 @@ def kill_below(root: int | None, earlier: dict[int, str] | None, *, process: boo
     members and its leader is gone or has the start read then; a leader
     with another start is a reused number. A table that cannot be read
     signals no group from it, and stderr says so: unknown is not none. The
-    line never raises: under SIGHUP the terminal may be gone. A `root` of
-    None walks nothing: its process was reaped, so its pid may be another's.
+    line never raises: under SIGHUP the terminal may be gone. The walk
+    from `root` runs only while its leader has the start `earlier` read: a
+    reaped root may be another process's now, so a root of None, one with
+    no start then, or one with another start now walks nothing. An
+    `earlier` of None, a read that failed, signals nothing and says so.
     `table` is a read the caller shares across groups; by default one is read here.
     """
     import signal  # noqa: PLC0415 - only the group helpers need it
 
+    if earlier is not None and not earlier.groups and not (root is not None and earlier.start):
+        return  # nothing was below, and no root to walk from
     if table is ...:
         table = process_table()
-    if table is None or not isinstance(table, dict):
+    if earlier is None or table is None or not isinstance(table, dict):
         with contextlib.suppress(OSError, ValueError):  # EIO on a revoked terminal, a closed stream
-            print(f"sd: cannot read the process table; groups below {root} may still run", file=sys.stderr)
+            print(f"sd: cannot read the process table; groups below {root or 'a reaped process'} may still run",
+                  file=sys.stderr)
         return
-    groups = {} if root is None else dict(groups_below(root, process=process, table=table) or {})
-    members = {group for _, group, _ in table.values()}
-    for group, start in (earlier or {}).items():
-        if group in members and (group not in table or table[group][2] == start):
-            groups[group] = start
-    for group in groups:
+    for group in {**walk_from(root, earlier, process, table), **still_below(earlier, table)}:
         signal_group(group, signal.SIGKILL)
+
+
+def walk_from(root: int | None, earlier: Below, process: bool,
+              table: dict[int, tuple[int, int, str]]) -> dict[int, str]:
+    """`groups_below(root)` now, or none when `root`'s leader lacks the start `earlier` read (pack sd:9392)."""
+    if root is None or not earlier.start or root not in table or table[root][2] != earlier.start:
+        return {}
+    return groups_below(root, process=process, table=table) or {}
+
+
+def still_below(earlier: Below, table: dict[int, tuple[int, int, str]]) -> dict[int, str]:
+    """Each group `earlier` read that still has members, and whose leader is gone or has the start read then."""
+    members = {group for _, group, _ in table.values()}
+    return {group: start for group, start in earlier.groups.items()
+            if group in members and (group not in table or table[group][2] == start)}
 
 
 def fill_slots(items: Any, slots: int, run: Callable[[Any], Any], counted: Callable[[Any], bool],
