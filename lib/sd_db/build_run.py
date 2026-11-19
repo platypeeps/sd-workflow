@@ -53,6 +53,7 @@ import threading
 import time
 from collections.abc import Collection
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -155,8 +156,7 @@ Your final message is your report: the commits, the tests run with their result 
 """
 
 FIX = """The review of branch {branch} found these blockers. Fix each one fail-first as a new commit in
-{worktree}, with a `Refs: sd:N` trailer for the item it fixes, then update the body at {body}. Never
-push. Your final message is your report.
+{worktree}, then update the body at {body}. Never push. Your final message is your report.
 
 {blockers}
 """
@@ -167,8 +167,7 @@ before the build parks, so do one class pass, not another single-finding fix: na
 share, enumerate every instance of it from the code, not from the findings, and fix each one fail-first as a
 new commit in {worktree}. Fix the class within this change's own scope: a new reader, audit or entry kind
 becomes its own item, not a commit here (sd:9584). Add each instance to the failure table in the body at
-{body}. Give each commit a `Refs: sd:N` trailer for the item it fixes. Never push. Your final message is
-your report: the class, each instance and its test.
+{body}. Never push. Your final message is your report: the class, each instance and its test.
 
 {blockers}
 """
@@ -1141,7 +1140,7 @@ class Supervisor:
             current = _read([*self.tools.git, "-C", str(self.work), "branch", "--show-current"], env=self.env).strip()
             if current != branch:
                 return self.finish("blocked", f"worktree {self.work} is on {current or 'no branch'}, not {branch}")
-            return "building"
+            return self.split_first() or "building"
         if self.child([*self.tools.git, "-C", str(self.repo), "fetch", "-q", "origin"], cwd=self.repo,
                       name="worktree") != 0:
             return self.finish("blocked", f"git fetch in {self.repo} failed; see {self.out('worktree')}")
@@ -1152,7 +1151,27 @@ class Supervisor:
             argv = ["worktree", "add", "-b", branch, str(self.work), self.base()]
         if self.child([*self.tools.git, "-C", str(self.repo), *argv], cwd=self.repo, name="worktree") != 0:
             return self.finish("blocked", f"git worktree add {self.work} failed; see {self.out('worktree')}")
-        return "building"
+        return self.split_first() or "building"
+
+    def split_first(self) -> dict | None:
+        """The blocked end of a run whose branch holds a commit made before a subset Retry left a member out; None
+        when it holds none (pack sd:9581). No message, trailer, revert or merge says which change is whose, so
+        any such commit, reverted or not, may carry the left item's work, and the operator splits the branch.
+        Every run checks it, so a later Retry cannot ship the work either.
+        ponytail: commit times against the hub's clock; a satellite clock seconds off moves the edge."""
+        left = build.left_out(self.db, self.row["assignment"])
+        if not left:
+            return None
+        since = max(datetime.fromisoformat(when.replace("Z", "+00:00")).timestamp() for _, when in left)
+        times = _read([*self.tools.git, "-C", str(self.work), "log", "--format=%ct", f"{self.base()}..HEAD"],
+                      env=self.env).split()
+        earlier = sum(1 for stamp in times if int(stamp) <= since)
+        if not earlier:
+            return None
+        named = ", ".join(f"sd:{item}" for item, _ in left)
+        return self.finish("blocked", f"{named} left the bundle at a Retry, and {self.row['branch']} holds {earlier} "
+                                      f"commit(s) made before it, which may carry that work: rebuild the branch from "
+                                      f"{self.base()} with only the kept items' commits, or build them fresh")
 
     def building(self) -> str | dict:
         self.enter("building", log_path=str(self.log))
@@ -1237,14 +1256,13 @@ class Supervisor:
         return bool(said) and said[-1] == GATE_NOT_STARTED
 
     def prechecked(self, head: str) -> list[str]:
-        left = self.unreverted(head)
         if self.checked is None:
-            return left
+            return []
         try:
             title, body = (path.read_text(encoding="utf-8") if path.exists() else "" for path in (self.title, self.body))
         except ValueError:  # not UTF-8: the builder rewrites it, as for any other refusal
             return [f"the title at {self.title} or the body at {self.body} is not UTF-8 text"]
-        return left + self.checked(self.work, self.base(), head, title.strip(), body)
+        return self.checked(self.work, self.base(), head, title.strip(), body)
 
     def blocked_round(self, blockers: list[dict]) -> str | dict:
         self.blockers = blockers
@@ -1573,58 +1591,7 @@ class Supervisor:
             f"SELECT id, title FROM item WHERE id IN ({', '.join('?' for _ in items)})", items)}
         return {"worktree": self.work, "branch": self.row["branch"], "title": self.title, "body": self.body,
                 "title_max": TITLE_MAX, "items": "\n".join(f"- sd:{item} {titles.get(item, '')}" for item in items),
-                "findings": self.findings(items) + self.left_brief(), "denied": self.denied()}
-
-    def left_brief(self) -> str:
-        """What a subset Retry left out: its commits stay in the resumed worktree until reverted (pack sd:9581)."""
-        left = build.left_out(self.db, self.row["assignment"])
-        if not left:
-            return ""
-        named = ", ".join(f"sd:{item}" for item in left)
-        return (f"\n{named} left this bundle at a Retry. Revert every commit since {self.base()} whose `Closes:` or\n"
-                f"`Refs:` trailer names it, in one `revert(...)` commit: `git revert --no-commit <sha>...`, then commit\n"
-                f"with one `This reverts commit <sha>.` line per commit. A commit whose trailers also name a kept\n"
-                f"item, or name no item, is reverted too, and its kept part committed again with that item's trailer.\n"
-                f"Give every new commit a `Closes:` or `Refs: sd:N` trailer for its item. Build none of {named}.\n")
-
-    def unreverted(self, head: str) -> list[str]:
-        """A refusal per commit in effect since the base that may hold work of an item a subset Retry left out;
-        the builder reverts it before review (pack sd:9581). A commit belongs to the items its `Closes:` and
-        `Refs:` trailers name, never to a mention elsewhere in its message. In effect: not reverted by a commit
-        in effect, so a revert of the revert restores it. A merge is skipped; a revert answers for no item."""
-        left = set(build.left_out(self.db, self.row["assignment"]))
-        if not left:
-            return []
-        log = _read([*self.tools.git, "-C", str(self.work), "log", "--reverse", "--no-merges",
-                     "--format=%H%x00%B%x1e", f"{self.base()}..{head}"], env=self.env)
-        commits = [entry.strip("\n").split("\x00", 1) for entry in log.split("\x1e") if "\x00" in entry]
-        reverts = {sha: set(re.findall(r"^This reverts commit ([0-9a-f]{40})", message, re.M))
-                   for sha, message in commits}
-        undone: set[str] = set()
-        # Newest first: a commit in effect undoes what it reverts, and an undone revert undoes nothing.
-        for sha, _ in reversed(commits):
-            if sha not in undone:
-                undone |= reverts[sha]
-        refused = []
-        for sha, message in commits:
-            if sha in undone or reverts[sha]:
-                continue
-            named = {int(item) for line in re.findall(r"^(?:Closes|Refs):(.*)$", message, re.M)
-                     for item in re.findall(r"\bsd:(\d+)\b", line)}
-            out = sorted(named & left)
-            if not named:
-                refused.append(f"{sha[:12]} names no item in a `Closes:` or `Refs:` trailer, so it may hold work of "
-                               f"{', '.join(f'sd:{item}' for item in sorted(left))}, which left the bundle at a "
-                               f"Retry: revert it, and commit a kept item's part again with its trailer")
-            elif out and named - left:
-                refused.append(f"{sha[:12]} carries trailers of kept and left-out items "
-                               f"({', '.join(f'sd:{item}' for item in out)}): revert it, and commit the kept part "
-                               f"again with its item's trailer")
-            elif out:
-                refused.append(f"the branch still holds {sha[:12]}, a commit of "
-                               f"{', '.join(f'sd:{item}' for item in out)}, which left the bundle at a Retry: "
-                               f"revert it in one `revert(...)` commit")
-        return refused
+                "findings": self.findings(items), "denied": self.denied()}
 
     def findings(self, items: list[int]) -> str:
         """The Send to builder notes on `items` since the lead's first run, up to this run (pack sd:6020), then the

@@ -879,8 +879,6 @@ class Supervise(Case):
         self.assertIn("a parser, a journal or event matching", build_run.BRIEF)
         self.assertIn("within this change's own scope", build_run.CLASS_PASS)
         self.assertIn("becomes its own item", build_run.CLASS_PASS)
-        for prompt in (build_run.FIX, build_run.CLASS_PASS):  # review of pack sd:9581: a fix names its item
-            self.assertIn("`Refs: sd:N` trailer for the item it fixes", prompt)
 
     def test_a_question_on_one_member_keeps_the_class_pass_for_the_other(self):
         """Review of sd:9263: a question on a skipped member B must not park A, which the class pass can still fix."""
@@ -1023,88 +1021,92 @@ class Supervise(Case):
                                   branch=build.branch(self.bundle["assignment"]))
         self.assertEqual([row["item"] for row in cited], [], "run 1's trailer must not close the child")
 
-    def left_out_of_a_retry(self):
-        """Run 1 commits for three items and ends cancelled; a Retry names the first two, so the third leaves the
-        bundle; the next run is claimed. Its worktree still holds the third item's commit: (that commit)."""
+    def left_out_of_a_retry(self, prepare=None, *, run=True):
+        """A three-item bundle ends cancelled, `run` once its builder committed for all three, else before any
+        build; `prepare(worktree, commit)` then shapes the branch as a builder might; a Retry names the first two,
+        so the third leaves the bundle; the next run is claimed. (The next run's supervisor.)"""
         self.press(3)
         self.write_pr()
-        self.plan(claude=["pass"], sd_review=["cancel"])
-        self.assertEqual(self.supervisor().run()["outcome"], "cancelled")
+        if run:
+            self.plan(claude=["pass"], sd_review=["cancel"])
+            self.assertEqual(self.supervisor().run()["outcome"], "cancelled")
+        else:
+            build.end(self.db, self.bundle["id"], "cancelled", "cancelled by operator")
         work = Path(self.bundle["work_path"])
-        commit = support.git(work, "rev-parse", "HEAD").strip()
+        if prepare:
+            prepare(work, support.git(work, "rev-parse", "HEAD").strip())
         self.assertEqual(sorted(entry["item"] for entry in build.queue_again(self.db, self.items[:2], who="operator")),
                          sorted(self.items[:2]))
         again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
                             root=self.root / "worktrees")
         assert again is not None
         self.bundle = again
-        return commit
-
-    def test_a_subset_retry_reverts_the_left_items_commits_before_review(self):
-        """Review of pack sd:9581: a subset Retry kept the left item's commits on the branch it publishes. The
-        brief asks the builder to revert them, and a branch that still holds one goes back to it before review."""
-        commit = self.left_out_of_a_retry()
-        self.plan(claude=["pass", "fix1"], sd_review=["clean"])
-        ended = self.supervisor().run()
-        prompts = [call["argv"][call["argv"].index("-p") + 1] for call in self.calls("claude")][1:]
-        self.assertIn(f"sd:{self.items[2]} left this bundle", prompts[0])
-        self.assertIn(f"{commit[:12]} carries trailers of kept and left-out items", prompts[1])
-        self.assertEqual(ended["outcome"], "blocked")
-
-    def test_a_reverted_left_item_lets_the_branch_go_on(self):
-        """Review of pack sd:9581: once one commit reverts the left item's commits, the run goes on to enqueue."""
-        commit = self.left_out_of_a_retry()
-        work = Path(self.bundle["work_path"])
-        support.git(work, "-c", "commit.gpgsign=false", "revert", "--no-edit", commit)
         self.plan(claude=["pass"], sd_review=["clean"])
-        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        return self.supervisor()
 
-    def left_refusals(self, *messages, revert=True):
-        """After `left_out_of_a_retry`, revert run 1's commit when `revert`, add one commit per message (each with a
-        file of its own), and return what the supervisor's pre-review check refuses at the head."""
-        commit = self.left_out_of_a_retry()
-        work = Path(self.bundle["work_path"])
-        if revert:
+    def assert_split_first(self, supervisor):
+        """The run blocks at its worktree step, before a builder starts, and names the left item."""
+        builders = len(self.calls("claude"))
+        ended = supervisor.run()
+        self.assertEqual((ended["outcome"], len(self.calls("claude"))), ("blocked", builders), ended)
+        detail = build.run(self.db, self.bundle["id"])["detail"]
+        self.assertIn(f"sd:{self.items[2]} left the bundle at a Retry", detail)
+
+    def test_a_subset_retry_on_a_branch_with_earlier_work_blocks_before_the_builder(self):
+        """Pack sd:9581 class pass, row 1: run 1's commit closes all three items; no commit message can say which
+        change is whose, so the run blocks for the operator's split instead of shipping the left item's work."""
+        self.assert_split_first(self.left_out_of_a_retry())
+
+    def test_a_reverted_earlier_commit_still_blocks(self):
+        """Row 2: a revert message proved nothing about what it removed (a conflict may keep a change)."""
+        def revert(work, commit):
             support.git(work, "-c", "commit.gpgsign=false", "revert", "--no-edit", commit)
-        for n, message in enumerate(messages):
-            (work / f"extra{n}.txt").write_text(message)
-            support.git(work, "add", f"extra{n}.txt")
-            support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", message)
-        head = support.git(work, "rev-parse", "HEAD").strip()
-        return commit, self.supervisor().unreverted(head)
+        self.assert_split_first(self.left_out_of_a_retry(revert))
 
-    def test_a_left_out_retry_refuses_a_commit_no_trailer_attributes(self):
-        """Class pass of pack sd:9581, row 1: an untagged review fix of the left item stays after its delivery commit
-        is reverted. A commit with no `Closes:` or `Refs:` trailer goes back to the builder."""
-        _, refused = self.left_refusals("fix: tidy the parser")
-        self.assertEqual(len(refused), 1, refused)
-        self.assertIn("names no item in a `Closes:` or `Refs:` trailer", refused[0])
+    def test_an_earlier_commit_naming_a_kept_item_in_its_body_still_blocks(self):
+        """Row 3: a body `Refs:` paragraph is no trailer, and no trailer binds the content anyway."""
+        def refs(work, commit):
+            support.git(work, "-c", "commit.gpgsign=false", "revert", "--no-edit", commit)
+            (work / "dropped.txt").write_text("the left item's work\n")
+            support.git(work, "add", "dropped.txt")
+            support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm",
+                        f"fix: tidy\n\nRefs: sd:{self.items[0]}\n\nThen the left item's file.")
+        self.assert_split_first(self.left_out_of_a_retry(refs))
 
-    def test_a_left_out_retry_follows_a_revert_of_a_revert(self):
-        """Class pass of pack sd:9581, row 2: reverting the revert restores the left item's commit; it is refused."""
-        commit = self.left_out_of_a_retry()
-        work = Path(self.bundle["work_path"])
-        support.git(work, "-c", "commit.gpgsign=false", "revert", "--no-edit", commit)
-        support.git(work, "-c", "commit.gpgsign=false", "revert", "--no-edit", "HEAD")
-        refused = self.supervisor().unreverted(support.git(work, "rev-parse", "HEAD").strip())
-        self.assertEqual(len(refused), 1, refused)
-        self.assertIn(commit[:12], refused[0])
+    def test_an_earlier_merge_resolution_still_blocks(self):
+        """Row 4: a merge commit's own resolution carried work that a `--no-merges` read never saw."""
+        def merge(work, commit):
+            support.git(work, "-c", "commit.gpgsign=false", "revert", "--no-edit", commit)
+            support.git(work, "checkout", "-q", "-b", "side", "origin/main")
+            (work / "side.txt").write_text("kept\n")
+            support.git(work, "add", "side.txt")
+            support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", f"fix: kept\n\nCloses: sd:{self.items[0]}")
+            support.git(work, "checkout", "-q", "-")
+            support.git(work, "-c", "commit.gpgsign=false", "merge", "-q", "--no-ff", "--no-commit", "side")
+            (work / "dropped.txt").write_text("the left item's work\n")
+            support.git(work, "add", "dropped.txt")
+            support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", "chore: merge side")
+            support.git(work, "branch", "-q", "-D", "side")
+        self.assert_split_first(self.left_out_of_a_retry(merge))
 
-    def test_a_left_out_retry_reads_trailers_not_mentions(self):
-        """Class pass of pack sd:9581, row 3: a kept item's commit that mentions the left item outside its trailers
-        is the kept item's; the brief says to revert by trailer, and a mixed trailer is refused."""
-        _, refused = self.left_refusals("fix: kept\n\nSee sd:3.\n\nCloses: sd:1")
-        self.assertEqual(refused, [])
-        self.assertEqual(self.items[2], 3)
-        brief = self.supervisor().left_brief()
-        self.assertIn("whose `Closes:` or\n`Refs:` trailer names it", brief)
+    def test_a_later_retry_of_the_blocked_split_still_blocks(self):
+        """Row 6: every run checks, so a plain Retry of the blocked run cannot ship the earlier work either."""
+        self.assert_split_first(self.left_out_of_a_retry())
+        self.db.execute("UPDATE runner_run SET released_at = COALESCE(released_at, ?)", ("2026-01-01T00:00:00Z",))
+        self.db.execute("UPDATE runner_lease SET released_at = COALESCE(released_at, ?)", ("2026-01-01T00:00:00Z",))
+        build.queue_again(self.db, [self.items[0]], who="operator")
+        again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                            root=self.root / "worktrees")
+        assert again is not None
+        self.bundle = again
+        self.assert_split_first(self.supervisor())
 
-    def test_a_left_out_retry_refuses_a_commit_whose_trailers_mix_kept_and_left_items(self):
-        """Class pass of pack sd:9581, row 4: run 1's one commit closes all three items: reverting it drops kept work
-        too, so the builder reverts it and commits the kept part again."""
-        commit, refused = self.left_refusals(revert=False)
-        self.assertEqual(len(refused), 1, refused)
-        self.assertIn(f"{commit[:12]} carries trailers of kept and left-out items", refused[0])
+    def test_a_subset_retry_with_no_earlier_work_builds_on(self):
+        """Row 5, the guard: a bundle cancelled before any build holds no earlier commit, so the kept items build."""
+        supervisor = self.left_out_of_a_retry(run=False)
+        self.assertEqual(supervisor.run()["step"], "enqueued")
+        prompt = self.calls("claude")[-1]["argv"]
+        self.assertNotIn(f"- sd:{self.items[2]}", prompt[prompt.index("-p") + 1])
 
     def test_cancel_kills_the_active_group(self):
         """Failure table, Cancel: a cancel during building kills the builder's group at the next beat."""

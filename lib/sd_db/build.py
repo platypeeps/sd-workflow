@@ -689,11 +689,11 @@ def left(connection, branch: str, items) -> set[int]:
         (run["assignment"], SCOPE)) if row["item"] in wanted}
 
 
-def left_out(connection, lead: int) -> list[int]:
-    """The items of build `lead`'s members a subset Retry left out (`LEFT_OUT`): the worktree it resumes still
-    holds their commits, which the next run reverts before its branch is reviewed (pack sd:9581)."""
-    return [row["item"] for row in connection.execute(
-        "SELECT item FROM assignment WHERE parent = ? AND scope = ? AND result LIKE ? ORDER BY id",
+def left_out(connection, lead: int) -> list[tuple[int, str]]:
+    """`(item, when)` of each member of build `lead` a subset Retry left out (`LEFT_OUT`), `when` its Retry: a
+    commit the branch made before then may hold that item's work (pack sd:9581)."""
+    return [(row["item"], row["ended"]) for row in connection.execute(
+        "SELECT item, ended FROM assignment WHERE parent = ? AND scope = ? AND result LIKE ? ORDER BY id",
         (lead, SCOPE, f"{ALONE}%: {LEFT_OUT}%"))]
 
 
