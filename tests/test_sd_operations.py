@@ -46,7 +46,13 @@ class OperationsCLI(unittest.TestCase):
             "id": "user:com.example.server", "label": "com.example.server",
             "state": "running", "revision": "current-service"}
         self.connect = Mock(return_value=self.connection)
-        for patcher in (patch.dict(sys.modules, {"sd_db.operations": self.service, "sd_db.services": self.launchd}),
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        # pack sd:9541: a tick's unreachable count; no test reads or clears this machine's own.
+        self.stamp = Path(scratch.name) / "sd" / "dispatch-unreachable"
+        for patcher in (patch.object(cli, "unreachable_stamp", return_value=self.stamp, create=True),
+                        patch.object(cli, "utc_now", return_value="2026-11-19T00:00:00Z", create=True),
+                        patch.dict(sys.modules, {"sd_db.operations": self.service, "sd_db.services": self.launchd}),
                         patch.object(sd_db, "operations", self.service, create=True),
                         patch.object(sd_db, "services", self.launchd, create=True),
                         patch.object(cli.sd_handoff_rows, "library", return_value=sd_db),
@@ -368,7 +374,8 @@ class OperationsCLI(unittest.TestCase):
         from sd_db import remote
         unreachable = remote.HubUnreachable("hub.example.test", 8769, "timed out")
         behind = remote.BuildMismatch("package", "1.0", "1.1")  # this satellite is older: its follow job catches up
-        return ((unreachable, str(unreachable)), (behind, "sd_db build mismatch; the follow job follows"))
+        streak = f"{unreachable} (unreachable tick 1 in a row since 2026-11-19T00:00:00Z; tick 3 fails)"
+        return ((unreachable, streak), (behind, "sd_db build mismatch; the follow job follows"))
 
     def test_a_hub_outage_skips_the_tick_with_exit_0(self):
         """pack sd:9541: a satellite tick exited 1 when the hub timed out, or between a hub refresh and the follow;
@@ -427,6 +434,66 @@ class OperationsCLI(unittest.TestCase):
                     expected = ((1, str(error)) if upgrade == "hub"
                                 else (0, f"{label}: sd_db build mismatch; the follow job follows\n"))
                     self.assertEqual(self.outcome(self.builds(), error, where), expected)
+
+    def unreachable(self, where="connect"):
+        from sd_db import remote
+        return self.outcome(self.builds(), remote.HubUnreachable("hub.example.test", 8769, "timed out"), where)
+
+    def test_the_third_unreachable_tick_in_a_row_exits_1(self):
+        """pack sd:9541 review: every unreachable tick exited 0, so a lasting outage or a wrong port never alerted.
+        The first two in a row skip; the third, and each after it, exits 1 with the hub's own error."""
+        error = "the sd hub at hub.example.test:8769 is unreachable: timed out"
+        self.assertEqual(self.unreachable(), (0, f"skipped: {error} (unreachable tick 1 in a row since "
+                                                 "2026-11-19T00:00:00Z; tick 3 fails)\n"))
+        code, output = self.unreachable()
+        self.assertEqual(code, 0)
+        self.assertIn("unreachable tick 2 in a row since 2026-11-19T00:00:00Z", output)
+        self.assertEqual(self.unreachable(), (1, error))
+        self.assertEqual(self.unreachable(), (1, error))
+        self.assertEqual(json.loads(self.stamp.read_text()), {"first": "2026-11-19T00:00:00Z", "count": 4})
+        # One mid-tick: that tick reached the hub first, so the streak starts again.
+        code, output = self.unreachable("tick")
+        self.assertEqual(code, 0)
+        self.assertIn("unreachable tick 1 in a row", output)
+
+    def test_a_connect_ends_the_unreachable_streak(self):
+        """pack sd:9541 review: a tick that reaches the hub removes the stamp, so the next outage starts at one."""
+        self.unreachable()
+        self.unreachable()
+        self.connect.side_effect = None
+        code, _ = self.tick(self.builds())
+        self.assertEqual(code, 0)
+        self.assertFalse(self.stamp.exists())
+        code, output = self.unreachable()
+        self.assertEqual(code, 0)
+        self.assertIn("unreachable tick 1 in a row", output)
+
+    def test_a_corrupt_stamp_starts_a_streak_never_a_pass(self):
+        """pack sd:9541 review: a stamp that does not parse is one failure, rewritten whole; it is never healthy."""
+        for garbage in ("not json", '{"count": "two"}', '{"count": -3}', "[]"):
+            with self.subTest(garbage=garbage):
+                self.stamp.parent.mkdir(parents=True, exist_ok=True)
+                self.stamp.write_text(garbage)
+                code, output = self.unreachable()
+                self.assertEqual(code, 0)
+                self.assertIn("unreachable tick 1 in a row", output)
+                self.assertEqual(json.loads(self.stamp.read_text())["count"], 1)
+
+    def test_an_unwritten_stamp_exits_1(self):
+        """pack sd:9541 review: a count that was not recorded is unknown, so the tick fails rather than skip."""
+        self.stamp.parent.parent.mkdir(parents=True, exist_ok=True)
+        self.stamp.parent.write_text("a file where the folder goes")
+        code, output = self.unreachable()
+        self.assertEqual(code, 1)
+        self.assertIn("is unreachable: timed out", output)
+        self.assertIn("was not recorded", output)
+
+    def test_a_clock_jump_does_not_reset_the_streak(self):
+        """pack sd:9541 review: the count, not the clock, ends the skips: a stamp whose first failure is in the
+        future (the clock went back) still makes the third tick fail."""
+        self.stamp.parent.mkdir(parents=True, exist_ok=True)
+        self.stamp.write_text(json.dumps({"first": "2099-01-01T00:00:00Z", "count": 2}))
+        self.assertEqual(self.unreachable()[0], 1)
 
     def test_another_hub_error_still_exits_1(self):
         """pack sd:9541: only the outages skip; a lost commit answer or a broken wire stays a refusal."""

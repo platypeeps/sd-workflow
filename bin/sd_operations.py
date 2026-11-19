@@ -444,15 +444,70 @@ def hub_outages() -> tuple[type[BaseException], ...]:
     return remote.HubUnreachable, remote.BuildMismatch
 
 
+#: Unreachable ticks in a row that skip; the next fails, so a lasting outage or a wrong port alerts (pack sd:9541).
+UNREACHABLE_SKIPS = 2
+
+
+def unreachable_stamp() -> Path:
+    """`$XDG_STATE_HOME/sd/dispatch-unreachable`: the first failure's time and the count of unreachable ticks in a
+    row, beside the tick's other local state. A tick that connects removes it."""
+    state = os.environ.get("XDG_STATE_HOME") or os.path.join(os.environ.get("HOME") or os.path.expanduser("~"),
+                                                             ".local/state")
+    return Path(state) / "sd" / "dispatch-unreachable"
+
+
+def utc_now() -> str:
+    """Now in UTC, as the stamp records a streak's first failure."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def unreachable_streak(error: BaseException) -> str:
+    """Count one more unreachable tick: its `skipped` reason while the streak is short, else `error` as a refusal.
+
+    A stamp that does not read or parse starts a new streak at one; it never reads as healthy. A count that cannot
+    be written is unknown, so the tick refuses. Only the count ends the skips: a clock jump moves no tick.
+    """
+    stamp = unreachable_stamp()
+    try:
+        held = json.loads(stamp.read_text(encoding="utf-8"))
+        count, first = held["count"], held["first"]
+        if not (isinstance(count, int) and count > 0 and isinstance(first, str)):
+            raise ValueError(stamp)
+    except (OSError, ValueError, KeyError, TypeError):  # absent, unreadable or corrupt: a new streak
+        count, first = 0, utc_now()
+    count += 1
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        written = stamp.with_name(stamp.name + ".tmp")
+        written.write_text(json.dumps({"first": first, "count": count}), encoding="utf-8")
+        os.replace(written, stamp)
+    except OSError as failed:
+        raise WorkRefusal(f"{error}; the unreachable count was not recorded in {stamp}: {failed}") from error
+    if count > UNREACHABLE_SKIPS:
+        raise WorkRefusal(str(error)) from error
+    return f"{error} (unreachable tick {count} in a row since {first}; tick {UNREACHABLE_SKIPS + 1} fails)"
+
+
+def reachable() -> None:
+    """The tick connected: the unreachable streak ends. A stamp that stays only makes the next outage alert sooner."""
+    try:
+        unreachable_stamp().unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def outage(error: BaseException) -> str:
     """The `skipped` reason for one of `hub_outages`.
 
-    A mismatch skips, and the follow job follows (pack sd:8685): every hub refresh differs only in its build digest,
-    `upgrade` `both`. One whose `upgrade` names the hub needs `repo-sync.sh refresh` there, which no follow job runs,
-    so it refuses with its own remedy (pack sd:9541).
+    An unreachable hub skips `UNREACHABLE_SKIPS` ticks in a row (`unreachable_streak`). A mismatch skips, and the
+    follow job follows (pack sd:8685): every hub refresh differs only in its build digest, `upgrade` `both`. One
+    whose `upgrade` names the hub needs `repo-sync.sh refresh` there, which no follow job runs, so it refuses with
+    its own remedy (pack sd:9541).
     """
     sd_handoff_rows.library()
     from sd_db import remote  # noqa: PLC0415 - after the helper
+    if isinstance(error, remote.HubUnreachable):
+        return unreachable_streak(error)
     if not isinstance(error, remote.BuildMismatch):
         return str(error)
     if getattr(error, "upgrade", None) == "hub":
@@ -541,6 +596,7 @@ def tick(sd_db: Any, build: Any, build_run: Any, root: Path | None, why: str, un
     outages = hub_outages()  # they keep their types, so `dispatch_builds` skips them
     load, load_cap = gate_load()
     connection = sd_handoff_rows.connect(sd_db, write=True, keep=outages)
+    reachable()
     if began is not None:
         began.append(True)
     try:
