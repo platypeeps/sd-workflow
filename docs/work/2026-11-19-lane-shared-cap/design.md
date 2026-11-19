@@ -142,6 +142,7 @@ Classes from the blocking rounds, with every instance in the code:
 | 34 | 3 | state: `release: owed` or an unfinished chain where the policy declares `release` (`release_chain`) | work | same test [first owed release], [unfinished release chain] |
 | 35 | 3 | state: an earlier version's queue file, which only a run imports (`import_file_queue`; lead review 74dc3f8e4 :4282) | work | test_a_queue_file_an_earlier_version_left_is_new_work_once_a_run |
 | 36 | 3 | states a worker leaves or only tidies: a held entry, a live holder, another host's holder past its lease (`claim_entry` refuses), a hub-stop record no running entry holds and a body copy no row names (deleted, nothing reads them) | no work: counted, each would start a worker every run for ever, or for nothing | test_what_a_worker_leaves_alone_or_only_tidies_is_no_work |
+| 37 | 3 | a stored policy that was a non-empty array, string or number raised in the scan, and the hosted run crashed (lead review ec5ef47ae :4306) | a policy that is not an object counts as a failed read: work, once a run; None and a non-object `release` are no release, as `release_chain` reads them | test_a_malformed_policy_counts_as_work_and_never_raises |
 
 Rows removed with the hand-off: the fd passed to a child, a child
 that never starts, an fd that names another file, the env var seen

@@ -6528,6 +6528,19 @@ class HostedParallel(Lane):
             with self.subTest(policy=policy), self.releasing(policy):
                 self.assertEqual(self.zeta in sd_lane.new_work(self.environ, {self.zeta: frozenset()}), expected)
 
+    def test_a_malformed_policy_counts_as_work_and_never_raises(self) -> None:
+        """sd:9332 lead review of ec5ef47ae :4306: a stored policy that was a non-empty array, string or number
+        raised AttributeError in the scan, and the hosted run crashed. A policy that is not an object counts
+        as a failed read does: work, once a run. None is the reader's "declares none", and a `release` that
+        is not an object is no release to `release_chain`: neither is work."""
+        self.set_zeta(status="merged", post_merge={"ran": "no post-merge rule", "at": "2026-11-19T00:00:00Z"},
+                      release="owed")
+        for policy, expected in ((["release"], True), ("release", True), (7, True), (None, False),
+                                 ({"release": ["version"]}, False), ({"release": "yes"}, False)):
+            with self.subTest(policy=policy), mock.patch.object(sd_lane.sd_lib, "repo_declaration",
+                                                                lambda *args, value=policy: value):
+                self.assertEqual(self.zeta in sd_lane.new_work(self.environ, {self.zeta: frozenset()}), expected)
+
     def test_a_queue_file_an_earlier_version_left_is_new_work_once_a_run(self) -> None:
         """sd:9332 lead review of 74dc3f8e4 :4282: a lane whose entries were still in an earlier version's
         queue file had none in the hub, so no run started the worker that imports them."""

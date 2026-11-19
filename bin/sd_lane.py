@@ -4298,12 +4298,19 @@ def work_ids(entries: list[dict[str, Any]], releases: Callable[[], bool]) -> fro
 
 
 def declares_release(root: pathlib.Path, environ: dict[str, str]) -> bool:
-    """Whether `root`'s policy declares `release`, read as `release_chain` reads it; a failed read is True."""
+    """Whether `root`'s policy declares `release`, read as `release_chain` reads it.
+
+    A failed read, or a policy that is not an object, is True: unknown is not
+    "no release", and the run tries, once. None is the reader's "declares
+    none", and a `release` that is not an object is none to `release_chain`.
+    """
     try:
         policy = sd_lib.repo_declaration(root, "policy", environ)
-    except Exception:  # noqa: BLE001 -- unknown is not "no release": the run tries, once
+    except Exception:  # noqa: BLE001 -- unknown is not "no release"
         return True
-    return isinstance((policy or {}).get("release"), dict)
+    if policy is None:
+        return False
+    return not isinstance(policy, dict) or isinstance(policy.get("release"), dict)
 
 
 #: The work id of a queue file an earlier version left, which `import_file_queue` imports.
