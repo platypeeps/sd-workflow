@@ -444,8 +444,8 @@ def hub_outages() -> tuple[type[BaseException], ...]:
     return remote.HubUnreachable, remote.BuildMismatch
 
 
-#: Skipped ticks in a row that exit 0, of any kind; the next fails, so a lasting outage, a hub that hangs, a held
-#: lock or a broken follow job alerts (pack sd:9541).
+#: Skipped ticks in a row that exit 0, a mismatch aside; the next fails, so a lasting outage, a hub that hangs or
+#: a held lock alerts (pack sd:9541).
 SKIPS = 2
 
 
@@ -498,12 +498,13 @@ def end_skips() -> None:
         pass
 
 
-def outage(error: BaseException) -> tuple[str, str]:
+def outage(error: BaseException) -> tuple[str, str | None]:
     """The `skipped` reason for one of `hub_outages`, and the text the streak's failing tick refuses with.
 
-    A mismatch skips, and the follow job follows (pack sd:8685): every hub refresh differs only in its build digest,
-    `upgrade` `both`; its own text names the remedy. One whose `upgrade` names the hub needs `repo-sync.sh refresh`
-    there, which no follow job runs, so it refuses at once (pack sd:9541).
+    A mismatch skips uncounted, None: the follow job follows (pack sd:8685), and a satellite stays mismatched for
+    minutes after every pack merge, so a count would alert on each; a stuck follow alerts in its own report. Every
+    hub refresh differs only in its build digest, `upgrade` `both`. One whose `upgrade` names the hub needs
+    `repo-sync.sh refresh` there, which no follow job runs, so it refuses at once (pack sd:9541).
     """
     sd_handoff_rows.library()
     from sd_db import remote  # noqa: PLC0415 - after the helper
@@ -511,13 +512,13 @@ def outage(error: BaseException) -> tuple[str, str]:
         return str(error), str(error)
     if getattr(error, "upgrade", None) == "hub":
         raise WorkRefusal(str(error)) from error
-    return "sd_db build mismatch; the follow job follows", str(error)
+    return "sd_db build mismatch; the follow job follows", None
 
 
-def say_skipped(args: argparse.Namespace, skip: tuple[str, str], partial: bool) -> None:
-    """A skipped tick's one line, once `counted`: JSON under `--json` (pack sd:9541), `skipped (partial)` once the
-    tick had begun."""
-    reason = counted(*skip)
+def say_skipped(args: argparse.Namespace, skip: tuple[str, str | None], partial: bool) -> None:
+    """A skipped tick's one line, once `counted` unless its failure text is None: JSON under `--json` (pack
+    sd:9541), `skipped (partial)` once the tick had begun."""
+    reason = skip[0] if skip[1] is None else counted(skip[0], skip[1])
     if args.json:
         print(json.dumps({"skipped": reason, "partial": partial}, ensure_ascii=False))
     else:
@@ -558,7 +559,7 @@ def dispatch_builds(args: argparse.Namespace) -> int:
     signal.setitimer(signal.ITIMER_REAL, TICK_SECONDS)
     unstarted: dict[str, str] = {}
     began: list[bool] = []  # the tick's flag: it connected, so work it began may have committed (pack sd:9541)
-    skipped: tuple[str, str] | None = None  # the reason, and the text the streak's third skip refuses with
+    skipped: tuple[str, str | None] | None = None  # the reason, and the text the streak's third skip refuses with
     try:
         result = tick(sd_db, build, build_run, root, why, unstarted, archive=not skip, began=began)
     except Overdue:
@@ -596,7 +597,8 @@ def tick(sd_db: Any, build: Any, build_run: Any, root: Path | None, why: str, un
     True once the tick connected, so a later skip says it was partial (pack sd:9541)."""
     outages = hub_outages()  # they keep their types, so `dispatch_builds` skips them
     load, load_cap = gate_load()
-    connection = sd_handoff_rows.connect(sd_db, write=True, keep=outages)
+    # A lock while the database opens is the locked-database skip, so it keeps its type too (pack sd:9541).
+    connection = sd_handoff_rows.connect(sd_db, write=True, keep=(*outages, sqlite3.OperationalError))
     if began is not None:
         began.append(True)
     try:

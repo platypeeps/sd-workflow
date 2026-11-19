@@ -278,8 +278,8 @@ class OperationsCLI(unittest.TestCase):
         run.archive.assert_not_called()  # no bulk root: an ended run's logs stay local
         self.assertIn("claimed 1, drafted 0, spawned 1", output)
         from sd_db import remote
-        outages = (remote.HubUnreachable, remote.BuildMismatch)  # pack sd:9541
-        self.connect.assert_called_with(sd_db, write=True, keep=outages)
+        kept = (remote.HubUnreachable, remote.BuildMismatch, sqlite3.OperationalError)  # pack sd:9541
+        self.connect.assert_called_with(sd_db, write=True, keep=kept)
         self.connection.close.assert_called_once()
 
     def test_a_spawn_runs_the_supervise_verb_the_real_parser_reads(self):
@@ -352,7 +352,7 @@ class OperationsCLI(unittest.TestCase):
             code, output = self.tick(run)
         follow.assert_not_called()
         run.dispatch.assert_not_called()
-        self.assertEqual((code, output), (0, f"skipped: sd_db build mismatch; the follow job follows{FIRST}\n"))
+        self.assertEqual((code, output), (0, "skipped: sd_db build mismatch; the follow job follows\n"))
 
     def outcome(self, run, error, where, *flags):
         """The tick's exit, as `bin/sd` gives it: a refusal is 1. `error` raises at the connect, through the real
@@ -376,7 +376,7 @@ class OperationsCLI(unittest.TestCase):
         from sd_db import remote
         unreachable = remote.HubUnreachable("hub.example.test", 8769, "timed out")
         behind = remote.BuildMismatch("package", "1.0", "1.1")  # this satellite is older: its follow job catches up
-        return ((unreachable, f"{unreachable}{FIRST}"), (behind, f"sd_db build mismatch; the follow job follows{FIRST}"))
+        return ((unreachable, f"{unreachable}{FIRST}"), (behind, "sd_db build mismatch; the follow job follows"))
 
     def test_a_hub_outage_skips_the_tick_with_exit_0(self):
         """pack sd:9541: a satellite tick exited 1 when the hub timed out, or between a hub refresh and the follow;
@@ -436,7 +436,7 @@ class OperationsCLI(unittest.TestCase):
                 with self.subTest(upgrade=upgrade, where=where):
                     self.stamp.unlink(missing_ok=True)  # each case is a first skip
                     expected = ((1, str(error)) if upgrade == "hub"
-                                else (0, f"{label}: sd_db build mismatch; the follow job follows{FIRST}\n"))
+                                else (0, f"{label}: sd_db build mismatch; the follow job follows\n"))
                     self.assertEqual(self.outcome(self.builds(), error, where), expected)
 
     def unreachable(self, where="connect"):
@@ -494,19 +494,44 @@ class OperationsCLI(unittest.TestCase):
         self.assertEqual([code for code, _ in codes], [0, 0, 1])
         self.assertEqual(codes[2][1], "the tick ran past 0.2 s")
 
-    def test_three_mixed_skips_in_a_row_exit_1_with_the_last_remedy(self):
-        """pack sd:9541 review: an outage, a lock and a mismatch in a row are one streak; the third fails with the
-        mismatch's own text, which names `repo-sync.sh follow`, so a broken follow job alerts."""
+    def test_three_mixed_skips_in_a_row_exit_1_with_the_last_reason(self):
+        """pack sd:9541 review: an outage, a lock mid-tick and a lock at the open are one streak; the third fails
+        with its own text. A mismatch between them neither counts nor resets."""
         from sd_db import remote
-        mismatch = remote.BuildMismatch("build", "80a4eacae0c346b5", "c3866a94f3d93ddf")
         self.assertEqual(self.unreachable()[0], 0)
         run = self.builds()
         self.connect.side_effect = None
         run.dispatch.side_effect = sqlite3.OperationalError("database is locked")
         self.assertEqual(self.tick(run)[0], 0)
-        code, output = self.outcome(self.builds(), mismatch, "connect")
-        self.assertEqual((code, output), (1, str(mismatch)))
-        self.assertIn("repo-sync.sh follow", output)
+        mismatch = remote.BuildMismatch("build", "80a4eacae0c346b5", "c3866a94f3d93ddf")
+        self.assertEqual(self.outcome(self.builds(), mismatch, "connect")[0], 0)
+        self.assertEqual(json.loads(self.stamp.read_text())["count"], 2)
+        locked = sqlite3.OperationalError("database is locked")
+        self.assertEqual(self.outcome(self.builds(), locked, "connect"), (1, "database is locked"))
+
+    def test_a_lock_at_the_open_is_a_counted_skip(self):
+        """pack sd:9541 review: a lock while the database opens (its version check or WAL setup) came wrapped as a
+        refusal and exited 1 at once; it is the same locked-database skip as one mid-tick."""
+        locked = sqlite3.OperationalError("database is locked")
+        self.assertEqual(self.outcome(self.builds(), locked, "connect"),
+                         (0, f"skipped: database is locked{FIRST}\n"))
+        other = sqlite3.OperationalError("disk I/O error")
+        self.assertEqual(self.outcome(self.builds(), other, "connect"), (1, "disk I/O error"))
+
+    def test_a_mismatch_tick_neither_counts_nor_resets(self):
+        """pack sd:9541 review: a satellite stays mismatched 5-9 min after every pack merge, so a counted mismatch
+        alerted on each merge. Five in a row exit 0, and a streak already begun keeps its count (pack sd:8685)."""
+        from sd_db import remote
+        mismatch = remote.BuildMismatch("build", "80a4eacae0c346b5", "c3866a94f3d93ddf")
+        for where in ("connect", "tick"):
+            for _ in range(5):
+                with self.subTest(where=where):
+                    self.assertEqual(self.outcome(self.builds(), mismatch, where)[0], 0)
+                    self.assertFalse(self.stamp.exists())
+        self.assertEqual(self.unreachable()[0], 0)
+        for _ in range(5):
+            self.assertEqual(self.outcome(self.builds(), mismatch, "connect")[0], 0)
+        self.assertEqual(json.loads(self.stamp.read_text())["count"], 1)
 
     def test_a_corrupt_stamp_starts_a_streak_never_a_pass(self):
         """pack sd:9541 review: a stamp that does not parse is one failure, rewritten whole; it is never healthy."""
