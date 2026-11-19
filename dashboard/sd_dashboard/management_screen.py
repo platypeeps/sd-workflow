@@ -462,11 +462,11 @@ def last_run(cron_root, name: str) -> dict:
     return out | {"state": "finished", "started": started, "ended": ended, "exit": int(code)}
 
 
-def job_log(cron_root, name: str) -> dict:
+def job_log(cron_root, name: str, limit: int = LOG_BYTES) -> dict:
     """The end of the job's log, `<cron_root>/logs/<job>.log`, the file `cron-jobs.sh` appends every run to.
 
     `state` is `read`, `none` (no log yet) or `unread`, with `reason` for the
-    last two. `text` is the last `LOG_BYTES` at most, from the first whole
+    last two. `text` is the last `limit` bytes at most, from the first whole
     line in them; `cut` says the log is longer. The file is opened without
     blocking and checked to be a regular file before any read, as a pin file
     is (sd:2911): a FIFO in its place would hang `/api/management`.
@@ -477,7 +477,7 @@ def job_log(cron_root, name: str) -> dict:
     if not isinstance(name, str) or not operations.JOB_NAME.fullmatch(name):
         return out | {"reason": "the job name is not one a log file can have"}
     try:
-        _, raw, start = log_tail(Path(cron_root) / "logs" / f"{name}.log", LOG_BYTES)
+        _, raw, start = log_tail(Path(cron_root) / "logs" / f"{name}.log", limit)
     except FileNotFoundError:
         return out | {"state": "none", "reason": "no log: the job has not run through the cron-jobs wrapper"}
     except OSError as error:

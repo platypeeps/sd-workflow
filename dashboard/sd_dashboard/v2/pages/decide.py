@@ -37,9 +37,15 @@ def _reverse(payload, principal):
 
 
 def _read(read):
+    from sd_db import operations
+
     from ... import review_screen
 
-    return review_screen.document(read.connection)
+    # The weekly advisory sweep (sd:9505) rides on Scoring's read, not the badge's: only the page reads its log.
+    # The server passes no jobs backend; launchd's names the logs folder, as on every sibling page.
+    jobs = read.jobs or operations.LaunchdBackend()
+    return {**review_screen.document(read.connection),
+            "sweeps": review_screen.sweeps(read.connection, getattr(jobs, "cron_root", None))}
 
 
 def _export(read):
