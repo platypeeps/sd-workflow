@@ -740,9 +740,12 @@ class Ship(SharedReview):
         if self.branch == self.checkout_branch:
             return f"sd-ship prepare {items} --deliver"
         # A merge with --branch runs in another checkout: the prepare runs in the branch's (sd:9268 review).
-        found = [block.removeprefix("worktree ").split("\n")[0] for block in
-                 git(self.root, "worktree", "list", "--porcelain").split("\n\n")
-                 if f"\nbranch refs/heads/{self.branch}" in f"\n{block}"]
+        try:
+            blocks = git(self.root, "worktree", "list", "--porcelain").split("\n\n")
+        except (Refusal, OSError):
+            blocks = []  # a hint, never the refusal: no checkout read names none
+        found = [block.splitlines()[0].removeprefix("worktree ") for block in blocks
+                 if f"branch refs/heads/{self.branch}" in block.splitlines()]
         where = shlex.quote(found[0]) if found else f"<a checkout of {self.branch}>"
         return f"sd-ship -C {where} prepare {items} --deliver"
 
@@ -1646,14 +1649,17 @@ class Ship(SharedReview):
         if not self.state:
             self.save(repository=self.repository, branch=self.branch, item=self.args.item, phase="new")
         self.persist_copilot_direction()
-        fields = {} if self.args.no_item else {"deliver": deliver, "acceptance": claim, "closing": closing}
-        # Once a pull request is published, its claim and closing set stay in force until this prepare
-        # publishes again: the new ones wait as `pending`, which only `ready_to_send` promotes, so merge,
-        # reconcile and every other reader see the published scope after a renewal whose lint, review or
-        # push fails (sd:9268 lane review). This prepare reads the pending ones (`claimed`).
-        if fields and self.state.get("pull_request"):
+        fields = {"title": title, "body": body,
+                  **({} if self.args.no_item else {"deliver": deliver, "acceptance": claim, "closing": closing})}
+        # Once a pull request is published, what merge squashes and closes with stays in force until this
+        # prepare publishes again: its title, body, claim and closing set wait as `pending`, which only
+        # `ready_to_send` promotes, so merge, reconcile and every other reader see the published ones after
+        # a prepare whose lint, review or push fails (sd:9268 lane review). This prepare reads the pending
+        # ones (`claimed`). The base stays active: this prepare's review reads it, and merge refuses one
+        # the repository's default branch no longer is.
+        if self.state.get("pull_request"):
             fields, self.publishing = {"pending": fields}, True
-        self.save(title=title, body=body, base=base, invoker=self.invoker(), **fields)
+        self.save(base=base, invoker=self.invoker(), **fields)
         pushed_from = head
         if rebase:
             head = self.rebase_branch(base, head)
@@ -1688,7 +1694,8 @@ class Ship(SharedReview):
         if mode == "guest":
             if not self.args.no_item and not local_work:
                 body = body.replace(f"\n\n{sd_lib.WORK_TRAILER} sd:{self.args.item}\n", "")
-                self.save(body=body)
+                self.save(**({"pending": {**self.state["pending"], "body": body}} if self.publishing
+                             else {"body": body}))
             if self.planning_artifacts(f"origin/{base}", head):
                 raise Refusal("guest destination cannot receive local planning artifacts")
         self.check_review(head)

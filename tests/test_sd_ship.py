@@ -4820,6 +4820,63 @@ roles:
         self.assertEqual(command[1:3], ["-C", str(self.root)])
         self.assertEqual(ship.parser().parse_args(command[1:]).command, "prepare")
 
+    def test_a_failed_renewal_leaves_the_published_body_for_the_merge(self):
+        """Lead review of sd:9268: a renewal saved its body to the receipt before lint; when lint failed, merge
+        squashed that unlinted body. The published body and title stay in force until a prepare publishes."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        published = self.directory / "published.md"
+        published.write_text("The published body.\n")
+        self.prepare("--deliver", "--body-file", str(published))
+        title = self.connection.execute("SELECT title FROM item WHERE id = ?", (self.item,)).fetchone()[0]
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        unlinted = self.directory / "unlinted.md"
+        unlinted.write_text("The unlinted body.\n")
+        with patch.object(ship.sd_ship_body, "docs_lint", side_effect=ship.Refusal("docs lint failed")):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "docs lint"):
+                self.prepare("--deliver", "--body-file", str(unlinted))
+        set_item_fields(self.connection, self.item, title=title)
+        with patch.object(ship.time, "sleep"):
+            self.merge()
+        message = [call.body["commit_message"] for call in self.remote.calls if call.method == "PUT"][-1]
+        self.assertIn("The published body.", message)
+        self.assertNotIn("unlinted", message)
+
+    def renewal_hint(self, lane_branch: str, then=None, **patches) -> str:
+        """The renewal a scope refusal prints when `merge --branch topic` runs from a checkout on `lane_branch`,
+        after `then` moves the fixture's checkouts."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        self.prepare("--deliver")
+        set_item_fields(self.connection, self.item, title="retitled before the merge")
+        if then:
+            then()
+        lane = self.directory / "lane-checkout"
+        _git(self.root, "worktree", "add", "-q", "-b", lane_branch, str(lane))
+        args = ship.parser().parse_args(["merge", "--item", str(self.item), "--json", "--manual", "--expected-head",
+                                         _git(self.root, "rev-parse", "HEAD"), "--branch", "topic"])
+        with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed.*nothing merged") as caught:
+            with patch.multiple(ship, **patches) if patches else contextlib.nullcontext():
+                ship.Ship(lane, self.connection, self.database, args).merge()
+        return re.search(r"`(sd-ship [^`]*)`", str(caught.exception))[1]
+
+    def test_a_renewal_hint_matches_the_branch_line_exactly(self):
+        """Lead review of sd:9268: the checkout lookup matched `branch refs/heads/topic` as a substring, so a
+        worktree on `topic-2` named the wrong checkout. Only the whole line matches."""
+        hint = self.renewal_hint("lane-side", then=lambda: _git(self.root, "checkout", "-q", "-b", "topic-2"))
+        self.assertIn("-C <a checkout of topic> prepare", hint)
+
+    def test_a_worktree_read_that_fails_keeps_the_scope_refusal(self):
+        """Lead review of sd:9268: a failed `git worktree list` must not replace the scope refusal."""
+        real = ship.git
+
+        def failing(root, *args):
+            if args[:2] == ("worktree", "list"):
+                raise ship.Refusal("git worktree list failed")
+            return real(root, *args)
+
+        self.assertIn("-C <a checkout of topic> prepare", self.renewal_hint("lane-side", git=failing))
+
     def test_a_renewal_command_names_every_item_of_the_bundle(self):
         """Re-review of sd:9335: the printed renewal named the claimed item alone, and a prepare run as printed
         empties the closing set. It names every --item; run as printed, it renews and keeps the bundle."""
