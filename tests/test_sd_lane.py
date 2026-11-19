@@ -6108,6 +6108,20 @@ class HostedParallel(Lane):
         self.assertNotIn(str(self.repo), sd_lane.HANDED)
         self.assertFalse(sd_lane.MachineLocks(self.environ).held_elsewhere(self.repo), "the lane stayed locked")
 
+    def test_a_handed_fd_for_another_file_is_not_taken_for_the_lock(self) -> None:
+        """sd:9332 failure table: the fd a child is handed names no longer the lane's lock file; the child
+        closes it and takes the lane's lock itself."""
+        queue = sd_lane.queue_for(self.repo, self.environ)
+        other = os.open(self.tmp / "other.lock", os.O_WRONLY | os.O_CREAT | os.O_APPEND)
+        with mock.patch.dict(os.environ, {sd_lane.HANDED_ENV: f"{other}:{queue.lock_file}"}):
+            with sd_lane.runner_lock(queue, self.repo) as held:
+                self.assertTrue(held)
+                self.assertTrue(sd_lane.MachineLocks(self.environ).held_elsewhere(self.repo))
+            self.assertNotIn(sd_lane.HANDED_ENV, os.environ)
+        with self.assertRaises(OSError):  # the child closed the fd it would not take
+            os.fstat(other)
+        self.assertFalse(sd_lane.MachineLocks(self.environ).held_elsewhere(self.repo))
+
     def test_a_worker_child_runs_the_lane_and_answers_its_row(self) -> None:
         """The CLI's lane: `sd-ship -C <checkout> lane run --budget`, whose answer is the row; no answer is an error."""
         with mock.patch.dict(os.environ, self.environ):
