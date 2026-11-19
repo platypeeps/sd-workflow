@@ -3698,24 +3698,38 @@ class GroupTimeout(Exception):
 
 
 class _Terminated(BaseException):
-    """SIGTERM, raised while `term_ends_group` holds it for a group that must end first."""
+    """SIGTERM or SIGHUP, raised while `term_ends_group` holds it for a group that must end first."""
+
+    def __init__(self, number: int = 15) -> None:
+        super().__init__(number)
+        self.number = number  # the signal that arrived, which ends this process after the unwind
 
 
-#: A SIGTERM `_raise_terminated` holds while the main thread spawns a group (`spawn_group`, sd:5792).
-_TERM_HELD = {"spawning": False, "pending": False}
-
-
-def _raise_terminated(number: int, frame: object, first: Callable[[], None] | None = None) -> None:
+def _ending_signals() -> tuple[int, ...]:
+    """The signals `term_ends_group` unwinds on: SIGTERM, and SIGHUP from a closed terminal (pack sd:9568)."""
     import signal  # noqa: PLC0415 - only the group helpers need it
 
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)  # a second SIGTERM must not cut the group's end short
+    return (signal.SIGTERM, signal.SIGHUP)
+
+
+#: A SIGTERM `_raise_terminated` holds while the main thread spawns a group (`spawn_group`, sd:5792);
+#: `pending` is the held signal's number, or 0.
+_TERM_HELD = {"spawning": False, "pending": 0}
+
+
+def _raise_terminated(number: int, frame: object, first: Callable[[], None] | None = None,
+                      owned: tuple[int, ...] = ()) -> None:
+    import signal  # noqa: PLC0415 - only the group helpers need it
+
+    for each in owned or (signal.SIGTERM,):  # a second signal must not cut the group's end short
+        signal.signal(each, signal.SIG_IGN)
     if first is not None:
         with contextlib.suppress(Exception):  # the block still unwinds, and this process still ends
             first()
     if _TERM_HELD["spawning"]:
-        _TERM_HELD["pending"] = True
+        _TERM_HELD["pending"] = number
         return
-    raise _Terminated
+    raise _Terminated(number)
 
 
 def _main_thread() -> bool:
@@ -3751,8 +3765,8 @@ def release_term() -> None:
         return
     _TERM_HELD["spawning"] = False
     if _TERM_HELD["pending"]:
-        _TERM_HELD["pending"] = False
-        raise _Terminated
+        number, _TERM_HELD["pending"] = int(_TERM_HELD["pending"]), 0
+        raise _Terminated(number)
 
 
 def _drained(process: subprocess.Popen) -> tuple[str, str]:
@@ -3823,24 +3837,33 @@ def term_ends_group(first: Callable[[], None] | None = None) -> Iterator[None]:
     passes `_Terminated` on, so the outer block's own cleanup runs too. `first`
     runs as SIGTERM arrives, before anything unwinds: the lane runner TERMs its
     speculative gate there, which a group ending first would leave running (sd:5776).
+
+    SIGHUP takes the same path, and ends this process as SIGHUP: a closed
+    terminal ended a hand-run `sd-ship lane run` with no unwind, and its
+    groups ran on with ppid 1 (pack sd:9568). Each signal is owned only
+    while it has the default disposition, so `nohup` keeps SIGHUP ignored.
+    SIGINT needs nothing here: its KeyboardInterrupt already unwinds.
     """
     import signal  # noqa: PLC0415 - only the group helpers need it
     import threading  # noqa: PLC0415
 
-    owns_term = (threading.current_thread() is threading.main_thread()
-                 and signal.getsignal(signal.SIGTERM) is signal.SIG_DFL)
-    if owns_term:
-        signal.signal(signal.SIGTERM, functools.partial(_raise_terminated, first=first))
+    owned = tuple(number for number in _ending_signals()
+                  if threading.current_thread() is threading.main_thread()
+                  and signal.getsignal(number) is signal.SIG_DFL)
+    handler = functools.partial(_raise_terminated, first=first, owned=owned)
+    for number in owned:
+        signal.signal(number, handler)
     try:
         yield
-    except _Terminated:
-        if owns_term:
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
-            os.kill(os.getpid(), signal.SIGTERM)
+    except _Terminated as ended:
+        if ended.number in owned:
+            for number in owned:
+                signal.signal(number, signal.SIG_DFL)
+            os.kill(os.getpid(), ended.number)
         raise
     finally:
-        if owns_term:
-            signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        for number in owned:
+            signal.signal(number, signal.SIG_DFL)
 
 
 def run_group(argv: list[str], *, cwd: pathlib.Path, env: dict[str, str], timeout: float,

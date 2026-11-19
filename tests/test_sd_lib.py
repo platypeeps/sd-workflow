@@ -2328,6 +2328,39 @@ class TermEndsGroupTests(unittest.TestCase):
             self.assertEqual(child.returncode, -signal.SIGTERM, errors)
             self.assertEqual(said.read_text().splitlines(), ["ready", "first", "inner cleanup", "outer cleanup"])
 
+    def test_a_sighup_ends_the_group_as_a_sigterm_does(self) -> None:
+        """pack sd:9568, failure table row 7 of sd:9392: a closed terminal sends SIGHUP, whose default
+        action ended `sd-ship lane run` with no unwind, so the group `run_group` led ran on with ppid 1."""
+        with tempfile.TemporaryDirectory() as scratch:
+            mark = pathlib.Path(scratch) / "group.pid"
+            script = (
+                "import sys\n"
+                f"sys.path.insert(0, {str(REPO_ROOT / 'bin')!r})\n"
+                "import pathlib, sd_lib\n"
+                "with sd_lib.term_ends_group():\n"
+                f"    sd_lib.run_group(['sleep', '60'], cwd=pathlib.Path('.'), env={{'PATH': '/usr/bin:/bin'}},\n"
+                f"                     timeout=60, started=lambda pid: pid and pathlib.Path({str(mark)!r}).write_text(str(pid)))\n")
+            child = subprocess.Popen([sys.executable, "-c", script], stderr=subprocess.PIPE, text=True)
+            group = wait_for_pid(mark)
+            self.addCleanup(end_session, group)
+            child.send_signal(signal.SIGHUP)
+            _, errors = child.communicate(timeout=30)
+            self.assertEqual(child.returncode, -signal.SIGHUP, errors)
+            self.assertTrue(gone(group), "the group run_group led outlived the SIGHUP")
+
+    def test_an_ignored_sighup_stays_ignored(self) -> None:
+        """pack sd:9568: under `nohup` the caller ignores SIGHUP; the block keeps that, as it keeps a TERM handler."""
+        script = (
+            "import signal, sys\n"
+            f"sys.path.insert(0, {str(REPO_ROOT / 'bin')!r})\n"
+            "import sd_lib\n"
+            "signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+            "with sd_lib.term_ends_group():\n"
+            "    print(signal.getsignal(signal.SIGHUP) is signal.SIG_IGN)\n"
+            "print(signal.getsignal(signal.SIGHUP) is signal.SIG_IGN)\n")
+        done = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=30, check=False)
+        self.assertEqual(done.stdout.split(), ["True", "True"], done.stderr)
+
 
 class SiblingTests(unittest.TestCase):
     """`sibling` loads a suffixless `bin/` tool that a caller shares."""
