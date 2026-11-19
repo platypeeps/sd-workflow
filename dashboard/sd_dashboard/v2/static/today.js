@@ -409,7 +409,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     : r.shots_warning ? html` · screenshots not drawn: ${r.shots_warning}` : '';
   // `p`, a prepared entry's pull-request wait (pack sd:7859): in a manual-merge repo the lane stops prepared and the PR
   // waits on a person's review, so the row leads with that wait and keeps its Retry and Approve.
-  // A blocked entry's Retry, Approve and Fix, on its own row or on its parked item's Parked row (pack sd:9425).
+  // A blocked entry's Retry, Approve and Fix, on its own row or, with its Details, on its item's Parked row (pack sd:9425).
   const unblock = (l, r) => { const e = { ...r, lane: l.path }; return html`${again(e, l.runner_merge === 'manual')}${mendBtn(e)}`; };
   function entryRow(l, r, p) {
     const [s0, type, facts] = ENTRY[r.state](r), last = l.rows.filter(x => x.state === 'next').length, e = { ...r, lane: l.path };
@@ -576,7 +576,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     (QV.lanes ? QV.lanes.lanes : []).forEach(l => { l.rows.forEach(r => {
       const p = r.state === 'blocked' && r.status === 'prepared' ? waitOf.get(Number(r.item)) : undefined;
       if (p) drawn.add(p);
-      if (r.state === 'blocked' && !p && aside(r.item, `lane ${r.status}${r.step ? ` at ${r.step}` : ''} · ${r.reason}`, unblock(l, r))) return;
+      if (r.state === 'blocked' && !p && aside(r.item, `lane ${r.status}${r.step ? ` at ${r.step}` : ''} · ${r.reason}`, html`${unblock(l, r)}${shell.commands.rowActions(entryId(l, r))}`)) return;
       add(l.key, entryRow(l, r, p)); });
       if (G.has(repoKey(l.key))) G.get(repoKey(l.key)).host = l.host; });
     prs.filter(p => !drawn.has(p)).forEach(p => add(p.repo, prRow(p)));

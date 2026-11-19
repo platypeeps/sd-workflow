@@ -2084,13 +2084,15 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                "why": "build run ended", "since": NOW, "retry": {"allowed": True, "reason": ""},
                "cancel": {"allowed": True, "reason": ""}}
         answers["/api/queue/runner"] = [200, {**self.RUNNER, "blocked": [asg]}]
-        out = self.run_view(self.TILE + " open('system'); tile('system', 'parked'); R.tiled = ELS.queue.html;",
-                            answers=answers)
+        out = self.run_view(self.TILE + " C.rowActions = id => mk`<i data-acts=\"${id}\"></i>`; open('system');"
+                            " tile('system', 'parked'); R.tiled = ELS.queue.html;", answers=answers)
         def row(item):
             return out["R"]["tiled"].split(f'data-type="parked" data-item="{item}"')[1].split("</tr>")[0]
         self.assertIn(f'data-act="retry" data-item="{made}" data-repo="{self.checkout}"', row(made))
         self.assertIn('data-asg="retry" data-id="90"', row(built))
         self.assertIn('data-asg="cancel" data-id="90"', row(built))
+        # Re-review of sd:9425: the entry's own actions, its Details among them, stay with it.
+        self.assertIn(f'data-acts="entry:{self.checkout}:{made}"', row(made))
 
     def test_a_repo_whose_only_rows_are_parked_still_shows_its_parked_box(self):
         """Review of sd:9247: a repo with nothing but parked tasks drew no row, so its box was unreachable."""
