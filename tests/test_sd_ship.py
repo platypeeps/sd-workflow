@@ -4799,6 +4799,10 @@ roles:
 
         self.copilot_refusal_keeps_the_published_scope(patch.object(ship.GitHub, "pages", pages))
 
+    def test_a_malformed_copilot_receipt_never_publishes_a_renewal(self):
+        self.copilot_refusal_keeps_the_published_scope(patch.object(
+            ship.Ship, "copilot_entries", side_effect=ship.Refusal("copilot review receipt is malformed")))
+
     def test_a_copilot_limit_never_publishes_a_renewal(self):
         self.copilot_refusal_keeps_the_published_scope(patch.object(
             ship.Ship, "require_copilot_capacity", side_effect=ship.Refusal("copilot review limit")))
