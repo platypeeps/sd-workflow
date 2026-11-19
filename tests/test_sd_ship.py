@@ -4701,6 +4701,9 @@ roles:
                 self.prepare("--deliver", "--acceptance-file", acceptance)
         self.assertNotIn("enqueue again", str(caught.exception))
         self.assertEqual(self.operation().state["acceptance"], before)
+        # Re-review of sd:9335: the printed retry named no item, which `lane retry` requires.
+        retry = re.search(r"`(sd-ship lane retry[^`]*)`", str(caught.exception))[1]
+        self.assertEqual(ship.parser().parse_args(shlex.split(retry)[1:]).item, self.item)
         self.prepare("--deliver", "--acceptance-file", acceptance)  # the refresh by hand
         with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}):
             self.prepare("--deliver", "--acceptance-file", acceptance)  # the retried entry, same file
@@ -4719,6 +4722,27 @@ roles:
             self.merge()
         self.assertNotIn("lane prepare", str(caught.exception))
         self.assertFalse(any(call.method == "PUT" for call in self.remote.calls))
+
+    def test_a_lane_retry_with_the_items_a_renewal_dropped_refuses(self):
+        """Re-review of sd:9335: a lane retry carries its enqueue's --item args, so with the renewal's evidence it
+        overwrote the closing set a renewal by hand had narrowed, and closed the item the operator dropped. A lane
+        prepare against a renewed claim proceeds only when its evidence and its items both match."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        kept, dropped = self.closes_items()[:2]
+        self.prepare("--deliver", "--item", str(kept), "--item", str(dropped))
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--item", str(kept))  # the renewal by hand drops one
+        with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}):
+            with self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other items") as caught:
+                self.prepare("--deliver", "--item", str(kept), "--item", str(dropped))
+            self.assertEqual(caught.exception.workflow["blocker"]["code"], "delivery_claim_renewed")
+            self.assertIn(f"`sd-ship prepare --item {self.item} --item {kept} --deliver`", str(caught.exception))
+            self.assertEqual(self.operation().state["closing"]["items"], [kept])
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.prepare("--deliver", "--item", str(kept))  # an entry with the renewal's items proceeds
+        self.assertEqual(self.operation().state["closing"]["items"], [kept])
 
     def test_a_renewal_command_names_every_item_of_the_bundle(self):
         """Re-review of sd:9335: the printed renewal named the claimed item alone, and a prepare run as printed

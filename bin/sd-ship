@@ -746,9 +746,10 @@ class Ship(SharedReview):
         predate the change. A lane prepare then refuses in `assert_scope`.
 
         A renewed claim keeps `renewed`. A retry of an entry enqueued before
-        the renewal carries the old evidence, and the scope now matches, so
-        a lane prepare whose evidence differs from a renewed claim refuses
-        before anything is saved; enqueue again with the renewal's evidence.
+        the renewal carries the old evidence and the old --item args, and
+        the scope now matches, so a lane prepare whose evidence or items
+        differ from a renewed claim refuses before anything is saved:
+        a retry with the old items would close one the renewal dropped.
         """
         stored = self.state.get("acceptance") or {}
         if not (self.args.deliver and claim and self.state.get("deliver")):
@@ -757,6 +758,16 @@ class Ship(SharedReview):
         if not (changed or stored.get("renewed")):
             return claim, None, None
         if self.lane_started():
+            items = list(self.closing(tuple(dict.fromkeys(self.args.closes)), self.args.deliver))
+            other_items = items != (self.state.get("closing") or {}).get("items")
+            if stored.get("renewed") and not changed and other_items:
+                raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this lane entry "
+                              f"names other items, as a retry of an entry enqueued before the renewal does; "
+                              f"the renewal stands as `{self.renew_command()}`: enqueue again with those "
+                              f"items and its acceptance file", code="delivery_claim_renewed", boundary="input",
+                              state="operator_decision",
+                              next_action="Enqueue the item again with the items and acceptance file the "
+                                          "renewal used.")
             if stored.get("renewed") and not changed and claim.get("claim") != stored.get("claim"):
                 if notes := edited_waivers(claim.get("claim"), stored.get("claim")):
                     named = ", ".join(f"#{note}" for note in notes)
@@ -764,7 +775,8 @@ class Ship(SharedReview):
                                   f"decision note {named} changed; its `Waive:` line still holds, so this entry's "
                                   f"acceptance file stands: refresh the claim by hand with `{self.renew_command()} "
                                   f"--acceptance-file FILE`, the same file, then "
-                                  f"`sd-ship lane retry`", code="delivery_claim_renewed", boundary="input",
+                                  f"`sd-ship lane retry {self.args.item}`", code="delivery_claim_renewed",
+                                  boundary="input",
                                   state="operator_decision",
                                   next_action="Rerun prepare --deliver by hand with the same acceptance file, "
                                               "then retry the lane entry.")
