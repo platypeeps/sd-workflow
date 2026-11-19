@@ -4720,6 +4720,61 @@ roles:
         self.assertNotIn("lane prepare", str(caught.exception))
         self.assertFalse(any(call.method == "PUT" for call in self.remote.calls))
 
+    def test_a_renewal_command_names_every_item_of_the_bundle(self):
+        """Re-review of sd:9335: the printed renewal named the claimed item alone, and a prepare run as printed
+        empties the closing set. It names every --item; run as printed, it renews and keeps the bundle."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        others = list(self.closes_items()[:2])
+        bundle = [arg for number in others for arg in ("--item", str(number))]
+        self.prepare("--deliver", *bundle)
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        for step in ("lane prepare", "merge"):
+            with self.subTest(step=step), patch.dict(os.environ, {"SD_LANE_CHILD": "1"}):
+                with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed") as caught:
+                    self.prepare("--deliver", *bundle) if step == "lane prepare" else self.merge()
+                command = re.search(r"`(sd-ship prepare [^`]*)`", str(caught.exception))[1]
+                self.assertEqual(shlex.split(command)[2:], ["--item", str(self.item), *bundle, "--deliver"])
+        args = ship.parser().parse_args([*shlex.split(command)[1:], "--json"])
+        with contextlib.redirect_stderr(io.StringIO()):
+            ship.Ship(self.root, self.connection, self.database, args).prepare()
+        self.assertEqual(self.operation().state["closing"]["items"], others)
+
+    def test_a_scope_change_after_a_merge_that_did_not_land_gives_advice_that_works(self):
+        """Re-review of sd:9335: after a merge was dispatched and did not land, merge advised a prepare, which
+        routes that phase to reconcile and refuses. It names the phase and the way that works; followed, the
+        merge gets past the refusal."""
+        from sd_db import set_item_fields
+        acceptance = self.directory / "acceptance.json"
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        title = self.connection.execute("SELECT title FROM item WHERE id = ?", (self.item,)).fetchone()[0]
+        operation = self.operation()
+        operation.state["phase"] = "merge_dispatch"
+        operation.save()
+        set_item_fields(self.connection, self.item, title="retitled while the merge was out")
+        with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed.*merge_dispatch.*title, body and path") \
+                as caught:
+            self.merge()
+        self.assertNotIn("sd-ship prepare", str(caught.exception))
+        set_item_fields(self.connection, self.item, title=title)
+        with patch.object(ship.time, "sleep"):
+            self.assertFalse(self.merge()["delivery_pending"])
+
+    def test_a_lane_queue_that_does_not_read_is_the_named_cause(self):
+        """Re-review of sd:9335: the refusal led with a scope change, which a renewed claim with an unchanged
+        scope also reaches; the cause is the queue read, and it says so first."""
+        from sd_db import set_item_fields
+        acceptance = self.directory / "acceptance.json"
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with patch.object(ship.sd_lane, "stored", side_effect=sqlite3.OperationalError("database is locked")):
+            with self.assertRaisesRegex(ship.Refusal, r"^the lane queue could not be read \(database is locked\)"):
+                self.prepare("--deliver", "--acceptance-file", str(acceptance))
+
     def test_a_scope_change_after_the_merge_gives_the_merged_advice(self):
         """Lead review of sd:9335: once the merge landed, the refusal still said to prepare again, which a merged
         pull request cannot do. It names the merge and the hand delivery, and a hand delivery settles it."""

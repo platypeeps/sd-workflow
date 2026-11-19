@@ -713,17 +713,29 @@ class Ship(SharedReview):
             scope = digest({key: item[key] for key in ("title", "body", "path")})
             if (claim or self.state.get("acceptance") or {}).get("item_scope") == scope:
                 return
-            renew = (f"`sd-ship prepare --item {self.args.item} --deliver` by hand, with --acceptance-file "
-                     f"for a work item")
+            renew = f"`{self.renew_command()}` by hand, with --acceptance-file for a work item"
             if merged:
                 advice = (f"the pull request merged at {merged[:12]}, so no prepare renews it and the delivery "
                           f"is not recorded: check the merged change against the item as it reads now, then "
                           f"{self.by_hand(merged)}")
+            elif merging and self.state.get("phase") == "merge_dispatch":
+                # Prepare routes this phase to reconcile, which refuses an unmerged pull request: no command renews.
+                advice = ("a merge was dispatched and did not land (phase merge_dispatch), and no prepare renews "
+                          "the claim from that phase: renew by hand by setting the item's title, body and path "
+                          "back to what they read when the claim was made, then merge again")
             elif merging:
                 advice = f"nothing merged: renew it with {renew}, then merge or enqueue again"
             else:
                 advice = f"a lane prepare does not renew it: run {renew}, then enqueue again"
             raise Refusal(f"item acceptance scope changed after the delivery claim; {advice}")
+
+    def renew_command(self) -> str:
+        """The prepare that renews this receipt's claim: every item of its closing set, or a prepare run as
+        printed would close none of them (sd:9335)."""
+        stored = (self.state.get("closing") or {}).get("items")
+        bundle = stored if stored is not None else getattr(self.args, "closes", None) or ()
+        items = " ".join(f"--item {number}" for number in dict.fromkeys((self.args.item, *bundle)))
+        return f"sd-ship prepare {items} --deliver"
 
     def renewal(self, claim: dict | None) -> tuple[dict | None, dict | None, str | None]:
         """The claim to save, the one `assert_scope` reads in place of the stored one, and the line saying so.
@@ -750,8 +762,8 @@ class Ship(SharedReview):
                     named = ", ".join(f"#{note}" for note in notes)
                     raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and since then only "
                                   f"decision note {named} changed; its `Waive:` line still holds, so this entry's "
-                                  f"acceptance file stands: refresh the claim by hand with `sd-ship prepare --item "
-                                  f"{self.args.item} --deliver --acceptance-file FILE`, the same file, then "
+                                  f"acceptance file stands: refresh the claim by hand with `{self.renew_command()} "
+                                  f"--acceptance-file FILE`, the same file, then "
                                   f"`sd-ship lane retry`", code="delivery_claim_renewed", boundary="input",
                                   state="operator_decision",
                                   next_action="Rerun prepare --deliver by hand with the same acceptance file, "
@@ -787,9 +799,9 @@ class Ship(SharedReview):
         try:
             rows, host = sd_lane.stored(self.connection, self.repository), sd_lane.this_host()
         except (SdDbError, sqlite3.Error, ValueError, sd_lane.LaneError) as error:
-            raise Refusal(f"item acceptance scope changed after the delivery claim, and the lane queue could "
-                          f"not be read ({error}), so whether the lane started this prepare is unknown; "
-                          f"nothing is renewed", code="lane_unknown", boundary="database",
+            raise Refusal(f"the lane queue could not be read ({error}), so whether the lane started this "
+                          f"prepare is unknown, and sd:{self.args.item}'s delivery claim is not renewed; prepare "
+                          f"again once the queue reads", code="lane_unknown", boundary="database",
                           state="retryable_failure") from None
         return any(row.get("item") == self.args.item and row.get("status") == "running"
                    and (row.get("holder") or {}).get("host") == host for row in rows)
