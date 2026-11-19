@@ -184,7 +184,8 @@ addEventListener('DOMContentLoaded', () => {
   function emptyBox() { find.value = ''; linked = ''; showPreview(); }
   function clearFilters() { Object.values(F).forEach(s => s.clear()); emptyBox(); L.page = 1; render(); }
   // The text filter narrows on what a row shows: id, title, repo, status and kind, as v1's ?q= read the visible columns.
-  // Add or find's words set it (showPreview, sd:9309): its title words, or #id; p1, due fri and #repo are the add's alone.
+  // Add or find's words set it (showPreview, sd:9309): its title words, or #id; p1, due fri and #repo are the add's alone,
+  // unless they are all the box holds: then it is the text as typed (sd:9498).
   // A #id names one task, as the preview and Enter take it: #904 never lists #9040 (review of sd:9309).
   const matches = t => { const id = Q.match(/^#(\d+)$/); return id ? String(t.id) === id[1] : words(t).includes(Q); };
   const words = t => `#${t.id} ${t.title} ${t.repo} ${slabel(t.status)} ${t.kind} ${t.stage || ''}`.toLowerCase();
@@ -600,7 +601,9 @@ addEventListener('DOMContentLoaded', () => {
     const txt = inp.value, P = parse(txt);
     ghost.hidden = !!txt;
     // Pack sd:9340: a ?q= link searches its words whole until edited; before the first draw only Q changes.
-    const q = linked && txt.trim() === linked ? linked.toLowerCase() : (P.find ? `#${P.find}` : P.title).toLowerCase();
+    // Pack sd:9498: words that are only the add's (P1, due fri, #repo) leave no title; then the filter reads the box as
+    // typed, so P1 alone does not list every task.
+    const q = linked && txt.trim() === linked ? linked.toLowerCase() : (P.find ? `#${P.find}` : P.title || txt.trim()).toLowerCase();
     if (q !== Q) { Q = q; L.page = 1; if (drawn) render(); }
     if (!txt.trim()) { prev.hidden = true; inp.setAttribute('aria-expanded', 'false'); return; }
     const found = P.find ? tasks.filter(t => String(t.id) === P.find) : P.title.length > 2 ? tasks.filter(t => t.title.toLowerCase().includes(P.title.toLowerCase())).slice(0, 3) : [];
