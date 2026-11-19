@@ -17,6 +17,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 import unittest.mock
@@ -2219,6 +2220,15 @@ SESSION_LEADER = (
     "time.sleep(60)\n")
 
 
+#: A leader that starts `sleep 60` in a session of its own, writes its pid to argv[1], and dies on SIGTERM at once.
+TERM_QUITTER = (
+    "import pathlib, subprocess, sys, time\n"
+    "below = subprocess.Popen(['sleep', '60'], start_new_session=True, stdout=subprocess.DEVNULL,\n"
+    "                         stderr=subprocess.DEVNULL)\n"
+    "pathlib.Path(sys.argv[1]).write_text(str(below.pid))\n"
+    "time.sleep(60)\n")
+
+
 def wait_for_pid(path: pathlib.Path) -> int:
     for _ in range(400):  # bounded: a leader that never writes fails on the read
         if path.exists() and path.read_text():
@@ -2291,6 +2301,53 @@ class KillReachTests(unittest.TestCase):
                 sd_lib.end_group(leader)
             self.assertIsNotNone(leader.returncode)
             self.assertIn("cannot read the process table", said.getvalue())
+
+    def test_a_diagnostic_that_cannot_be_written_stops_no_kill(self) -> None:
+        """Class pass, rule 2: under SIGHUP the terminal is gone, so the stderr line raised EIO before the
+        leader's SIGKILL, and end_group raised with the leader still running."""
+        class Revoked(io.StringIO):
+            def write(self, text: str) -> int:
+                raise OSError(5, "Input/output error")
+        with tempfile.TemporaryDirectory() as scratch:
+            leader, _ = self.start(scratch)
+            with unittest.mock.patch.object(sd_lib, "process_table", return_value=None), \
+                    unittest.mock.patch("sys.stderr", new=Revoked()):
+                sd_lib.end_group(leader)
+            self.assertIsNotNone(leader.returncode)
+
+    def test_end_groups_kills_what_a_term_quitter_left(self) -> None:
+        """Class pass, rule 1: the leader ended on TERM, so its group left the set; `end_groups` killed
+        only groups still registered, and the session it left ran on with ppid 1."""
+        with tempfile.TemporaryDirectory() as scratch:
+            mark = pathlib.Path(scratch) / "below.pid"
+            groups = sd_lib.ThreadGroups()
+            thread = threading.Thread(target=lambda: sd_lib.run_group(
+                [sys.executable, "-c", TERM_QUITTER, str(mark)], cwd=pathlib.Path("."), env=dict(os.environ),
+                timeout=60, started=groups.group_hook()), daemon=True)
+            thread.start()
+            below = wait_for_pid(mark)
+            self.addCleanup(end_session, below)
+            time.sleep(0.3)  # the leader has installed its handler
+            groups.end_groups()
+            thread.join(30)
+            self.assertTrue(gone(below), "the session below a leader that ended on TERM outlived end_groups")
+
+    def test_end_groups_reads_the_table_once_for_every_group(self) -> None:
+        """Class pass, rule 3: `end_groups` read the table once per group, up to 3 s each, before any TERM.
+
+        One shared read now comes first, then every TERM: a read after the TERM misses a leader that dies on
+        it at once (the test above), so rule 1 needs the read first; the TERMs wait on one bounded read only."""
+        events: list[str] = []
+        groups = sd_lib.ThreadGroups()
+        for pid in (999991, 999992, 999993):
+            groups.group_hook()(pid)
+        with unittest.mock.patch.object(sd_lib, "process_table", side_effect=lambda: events.append("read") or {}), \
+                unittest.mock.patch.object(sd_lib, "signal_group",
+                                           side_effect=lambda pid, number: events.append(f"signal {number}")), \
+                unittest.mock.patch.object(sd_lib, "GROUP_CLEANUP_SECONDS", 0.1):
+            groups.end_groups()
+        self.assertEqual(events[:4], ["read"] + [f"signal {int(signal.SIGTERM)}"] * 3)
+        self.assertEqual(events.count("read"), 2, events)  # one before the TERMs, one before the KILLs
 
 
 class TermEndsGroupTests(unittest.TestCase):

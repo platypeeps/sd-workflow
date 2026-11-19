@@ -3969,13 +3969,17 @@ class ThreadGroups:
         """SIGTERM each live group, then SIGKILL one still registered after `GROUP_CLEANUP_SECONDS`.
 
         A group leaves the set when its own `run_group` starts ending it, so
-        what is left at the deadline is a group nothing else will end. Its
-        SIGKILL reaches the sessions below it too (`kill_below`, pack sd:9392)."""
+        what is left at the deadline is a group nothing else will end. The
+        sessions read below each group before the TERM are killed at the
+        deadline, whether or not the group ended (`kill_below`, pack sd:9392):
+        a leader that ended on the TERM left its session to no one. One table
+        read serves every group, before the TERMs and again before the KILLs."""
         import signal  # noqa: PLC0415 - only the group helpers need it
 
         with self._lock:
             self._ending, live = True, set(self._live)
-        earlier = {pid: groups_below(pid) for pid in live}  # before the TERM (pack sd:9392)
+        table = process_table()  # one read for every group, before the TERM (pack sd:9392)
+        earlier = {pid: groups_below(pid, table=table) if table is not None else None for pid in live}
         for pid in live:
             signal_group(pid, signal.SIGTERM)
         deadline, left = time.monotonic() + GROUP_CLEANUP_SECONDS, live
@@ -3983,8 +3987,10 @@ class ThreadGroups:
             time.sleep(0.05)
             with self._lock:
                 left = live & self._live
+        now = process_table() if live else None  # one read for every group's SIGKILL
+        for pid in live:  # a group that left the set leaves what it captured to no one else
+            kill_below(pid, earlier[pid], table=now)
         for pid in left:
-            kill_below(pid, earlier[pid])
             signal_group(pid, signal.SIGKILL)
 
 
@@ -4055,7 +4061,8 @@ def groups_below(root: int, *, process: bool = False,
     return found
 
 
-def kill_below(root: int, earlier: dict[int, str] | None, *, process: bool = False) -> None:
+def kill_below(root: int | None, earlier: dict[int, str] | None, *, process: bool = False,
+               table: dict[int, tuple[int, int, str]] | None | object = ...) -> None:
     """SIGKILL each group below `root` now (`groups_below`), and each group of `earlier` that is still that group.
 
     pack sd:9392. A SIGKILL unwinds nothing, so a session a killed leader
@@ -4064,15 +4071,20 @@ def kill_below(root: int, earlier: dict[int, str] | None, *, process: bool = Fal
     and no walk finds it. Such a group is signalled only while it has
     members and its leader is gone or has the start read then; a leader
     with another start is a reused number. A table that cannot be read
-    signals no group from it, and stderr says so: unknown is not none.
+    signals no group from it, and stderr says so: unknown is not none. The
+    line never raises: under SIGHUP the terminal may be gone. A `root` of
+    None walks nothing: its process was reaped, so its pid may be another's.
+    `table` is a read the caller shares across groups; by default one is read here.
     """
     import signal  # noqa: PLC0415 - only the group helpers need it
 
-    table = process_table()
-    if table is None:
-        print(f"sd: cannot read the process table; groups below {root} may still run", file=sys.stderr)
+    if table is ...:
+        table = process_table()
+    if table is None or not isinstance(table, dict):
+        with contextlib.suppress(OSError, ValueError):  # EIO on a revoked terminal, a closed stream
+            print(f"sd: cannot read the process table; groups below {root} may still run", file=sys.stderr)
         return
-    groups = dict(groups_below(root, process=process, table=table) or {})
+    groups = {} if root is None else dict(groups_below(root, process=process, table=table) or {})
     members = {group for _, group, _ in table.values()}
     for group, start in (earlier or {}).items():
         if group in members and (group not in table or table[group][2] == start):
