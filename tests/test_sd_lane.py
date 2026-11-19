@@ -6681,6 +6681,140 @@ class HostedParallel(Lane):
                                         locks=sd_lane.MachineLocks(self.environ), cap=3)
         self.assertEqual(started, [self.repo, self.zeta, self.zeta], rows)
 
+    def test_a_lane_whose_queue_or_hub_cannot_be_read_is_work_once_a_run(self) -> None:
+        """sd:9611, lead review of ec5ef47ae :4672: `new_work` left out a lane whose queue lookup or hub read
+        failed, so an idle run's first pass with no room skipped it with an empty row, and its worker never
+        said why. Unknown is work, once a run: the worker starts and its refusal is the lane's row."""
+        real = sd_lane.queue_for
+
+        def no_queue(root: pathlib.Path, environ: dict[str, str]) -> Any:
+            if root == self.zeta:
+                raise sd_lane.LaneError("the origin names no GitHub repository")
+            return real(root, environ)
+
+        def hub_down(queue: Any, work: Any, **kwargs: Any) -> Any:
+            raise sd_lane.LaneError("The hub database did not answer", code=sd_lane.HUB_UNAVAILABLE)
+        for name, patch in (("queue lookup", mock.patch.object(sd_lane, "queue_for", no_queue)),
+                            ("hub read", mock.patch.object(sd_lane, "on_hub", hub_down))):
+            with self.subTest(name), patch:
+                found = sd_lane.new_work(self.environ, {self.zeta: frozenset()})
+                self.assertIn(self.zeta, found)
+                self.assertEqual(sd_lane.new_work(self.environ, {self.zeta: found[self.zeta]}), {})
+        self.hold_outside(self.repo)  # the other run's lane: an idle run reads the room
+        calls, polls, started = [0], [0], list[pathlib.Path]()
+
+        def room() -> str | None:
+            calls[0] += 1
+            return None if calls[0] > 2 else "the gate's slots are full"
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            started.append(checkout)
+            return sd_lane.inline_lane(lambda: sd_lane.run_lane(checkout, self.environ, self.ship,
+                                                                deadline=sd_lane.clock() + budget))
+        with mock.patch.object(sd_lane, "queue_for", no_queue), \
+                mock.patch.object(sd_lane.time, "sleep", self.bounded_nap(polls)):
+            rows = sd_lane.run_parallel([("zeta", self.zeta)], start, sd_lane.clock() + 600, room,
+                                        functools.partial(sd_lane.new_work, self.environ),
+                                        locks=sd_lane.MachineLocks(self.environ), cap=2)
+        self.assertEqual(started, [self.zeta], rows)
+        self.assertIn("no GitHub repository", rows[0].get("error", ""), rows)
+
+    def test_a_lane_the_other_run_frees_starts_again_while_this_run_lasts(self) -> None:
+        """sd:9611, lead review of ec5ef47ae :4643: a busy claim marked the lane's pending ids seen, so once
+        the other run freed the lane with an entry still pending, as its earlier budget ends, this run never
+        started it, though its own lane ran on. A lane held elsewhere keeps its seen ids; each scan tries
+        its claim, silently while held, and starts it once free."""
+        other = sd_lane.MachineLocks(self.environ)
+        with other.start_lock():
+            self.assertTrue(other.take_lane(self.zeta))
+        self.addCleanup(other.release_lane, self.zeta)
+        polls, started = [0], list[pathlib.Path]()
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            started.append(checkout)
+            if checkout == self.repo:  # pack runs until zeta started, or 20 polls
+                return sd_lane.StartedLane(lambda: {"ran": []} if self.zeta in started or polls[0] >= 20 else None)
+            return sd_lane.StartedLane(lambda: {"ran": []})
+
+        def pending(seen: dict[pathlib.Path, frozenset[str]]) -> dict[pathlib.Path, frozenset[str]]:
+            ids = {self.repo: frozenset({"1"}), self.zeta: frozenset({"2"})}
+            return {checkout: ids[checkout] for checkout in seen if ids[checkout] - seen[checkout]}
+
+        def frees() -> None:
+            if polls[0] == 3:
+                other.release_lane(self.zeta)  # the other run's worker ended, entry 2 still pending
+        with mock.patch.object(sd_lane, "RESCAN_SECONDS", 0.0), \
+                mock.patch.object(sd_lane.time, "sleep", self.bounded_nap(polls, frees)):
+            rows = sd_lane.run_parallel([("pack", self.repo), ("zeta", self.zeta)], start, sd_lane.clock() + 600,
+                                        lambda: None, pending, locks=sd_lane.MachineLocks(self.environ), cap=2)
+        self.assertEqual(started, [self.repo, self.zeta], rows)
+        self.assertEqual(len([row for row in rows if row["path"] == "zeta" and "busy" in row]), 1, rows)
+
+    def test_a_run_that_goes_idle_reads_a_last_scan_before_it_ends(self) -> None:
+        """sd:9611, lead review of ec5ef47ae :4695: a lane waiting for room when the run's last lane ended
+        got a busy row, which emptied the waiting lanes, and the idle run ended with no scan read after that
+        lane ended: an entry enqueued while it ran waited for the next tick. The run ends only on a scan."""
+        other = sd_lane.MachineLocks(self.environ)
+        self.addCleanup(other.release_lane, self.zeta)
+        polls, started, pack_runs = [0], list[pathlib.Path](), [False]
+        ids = {self.repo: frozenset({"1"}), self.zeta: frozenset({"2"})}
+
+        def room() -> str | None:
+            return "the gate's slots are full" if pack_runs[0] and self.zeta in started else None
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            started.append(checkout)
+            if checkout == self.zeta:
+                ids[self.zeta] = frozenset({"2", "3"})  # 3 arrives once zeta's worker started
+                return sd_lane.StartedLane(lambda: {"ran": []})
+            if started.count(self.repo) > 1:
+                return sd_lane.StartedLane(lambda: {"ran": []})
+            pack_runs[0] = True
+
+            def answer() -> dict | None:
+                if polls[0] < 2:
+                    return None
+                pack_runs[0] = False
+                ids[self.repo] = frozenset({"1", "5"})  # 5 was enqueued while pack's worker ran
+                return {"ran": []}
+            return sd_lane.StartedLane(answer)
+
+        def pending(seen: dict[pathlib.Path, frozenset[str]]) -> dict[pathlib.Path, frozenset[str]]:
+            return {checkout: ids[checkout] for checkout in seen if ids[checkout] - seen[checkout]}
+
+        def takes() -> None:
+            if polls[0] == 2:
+                with other.start_lock():
+                    self.assertTrue(other.take_lane(self.zeta))  # the other run claims zeta meanwhile
+        with mock.patch.object(sd_lane.time, "sleep", self.bounded_nap(polls, takes)):
+            rows = sd_lane.run_parallel([("pack", self.repo), ("zeta", self.zeta)], start, sd_lane.clock() + 600,
+                                        room, pending, locks=sd_lane.MachineLocks(self.environ), cap=3)
+        self.assertEqual(started, [self.repo, self.zeta, self.repo], rows)
+
+    def test_the_hosted_run_reads_each_lane_s_policy_once_a_run(self) -> None:
+        """sd:9611, lead review of d2c34d435 :4349: every merge leaves `release: owed`, and a repository with
+        no release policy keeps the mark for ever, so each scan read that policy for nearly every lane. A
+        run reads it once; a failed read is not kept, so the next scan reads it again."""
+        self.set_zeta(status="merged", post_merge={"ran": "no post-merge rule", "at": "2026-11-19T00:00:00Z"},
+                      release="owed")
+        with mock.patch.object(sd_lane, "run_parallel", return_value=[]) as ran:
+            sd_lane.run_hosted(self.environ, self.ship)
+        pending = ran.call_args.args[4]
+        answers: list[Any] = [sd_lane.sd_lib.DatabaseUnreadable("the hub went away"), {}]
+        reads: list[pathlib.Path] = []
+
+        def declaration(root: Any, kind: str, environ: Any = None) -> Any:
+            reads.append(root)
+            answer = answers.pop(0) if answers else {}
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+        with mock.patch.object(sd_lane.sd_lib, "repo_declaration", declaration):
+            self.assertIn(self.zeta, pending({self.zeta: frozenset()}))  # a failed read is work
+            for _ in range(3):
+                self.assertEqual(pending({self.zeta: frozenset()}), {})
+        self.assertEqual(len(reads), 2, reads)
+
     def test_the_hosted_run_reads_the_machine_s_lane_parallel(self) -> None:
         """sd:9323: the runner's start rule reads sd.lane_parallel, not the constant."""
         folder = self.tmp / ".config" / "sd-ai-command-pack"

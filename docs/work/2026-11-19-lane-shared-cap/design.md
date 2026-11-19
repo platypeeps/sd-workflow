@@ -86,9 +86,10 @@ Classes from the blocking rounds, with every instance in the code:
 - Work under the start lock: the claim take, the claim probes and
   the room read; rows 1-3.
 - Unknown read as an answer: the claim probe, the claim take, the
-  room read and the queue read; rows 4-7.
+  room read, the queue read, and `new_work`'s queue lookup and hub
+  read; rows 4-7 and 44.
 - A wait without a bound, or for nothing: the first pass and the
-  rescan; rows 8-10 and 25-26.
+  rescan; rows 8-10, 25-26 and 46 (an end with no last scan).
 - An "is there work" read that misses recovery: every `pending` call
   (first pass, claim's busy branch, begin, rescan) reads `new_work`,
   which reads `work_ids` and the queue file; rows 27-36, enumerated
@@ -98,7 +99,7 @@ Classes from the blocking rounds, with every instance in the code:
   dead run, a worker that outlives its run and a lane not in this
   run's list; rows 11-13 and 23.
 - Seen ids: the first pass, a busy worker, the rescan and a busy
-  claim; rows 14-16 and 24.
+  claim; rows 14-16, 24 and 45.
 - Past the budget: the cap and the room; rows 17-18.
 - Probe side effects: runner-lock probes and a probe that a forked
   child keeps; rows 19-20.
@@ -149,6 +150,11 @@ Classes from the blocking rounds, with every instance in the code:
 | 41 | 3 | stored read: an entry body that is no object, in `new_work`'s `stored` | that lane has work, once a run (`UNREADABLE_WORK`); its worker meets the row | same test [body] |
 | 42 | 3 | stored read: the same body in `longest_waiting_first`, before any lane starts | the lane keeps its path order after the rest | same test [body] |
 | 43 | 3 | any other error from one lane's `work_ids`, policy read or queue-file check | contained in `new_work`: that lane has work, the run goes on | same test, every case |
+| 44 | 3 | the first pass's idle check read a lane whose queue lookup or hub read failed as nothing pending: it skipped the lane with an empty row, and its worker's refusal never showed (lead review ec5ef47ae :4672, sd:9611) | unknown is work, once a run (`UNREADABLE_WORK`): the worker starts and its refusal is the row; a hub fault in a rescan starts each idle lane once | test_a_lane_whose_queue_or_hub_cannot_be_read_is_work_once_a_run |
+| 45 | 2 | a busy claim marked the lane's pending ids seen, so once the other run freed it with an entry left pending, this run never started it while its own lanes ran (lead review ec5ef47ae :4643, sd:9611) | the lane keeps its seen ids and joins `elsewhere`: each scan tries its claim, writes no second busy row, and starts it once free | test_a_lane_the_other_run_frees_starts_again_while_this_run_lasts, test_a_lane_the_other_run_claimed_gets_one_busy_row_across_rescans |
+| 46 | 3 | a lane waiting for room got a busy row as the run's last lane ended, the waiting set emptied, and the idle run ended with no scan read after that lane ended (lead review ec5ef47ae :4695, sd:9611) | inside the budget an idle run ends only on a pass that scanned | test_a_run_that_goes_idle_reads_a_last_scan_before_it_ends |
+| 47 | 2 | the busy-claim branch read `pending`, which took the runner lock, so a worker starting then answered busy (lead review ef961a008 :4543, sd:9611) | fixed at 74dc3f8e4 (row 30); the busy branch reads no `pending` now (row 45) | test_new_work_probes_no_runner_lock |
+| 48 | 3 | every merge leaves `release: owed`, which a repository with no release policy keeps for ever, so each scan read that policy for nearly every lane (lead review d2c34d435 :4349, sd:9611) | the hosted run keeps each lane's declaration for the run; a failed read is work and is not kept | test_the_hosted_run_reads_each_lane_s_policy_once_a_run |
 
 Rows removed with the hand-off: the fd passed to a child, a child
 that never starts, an fd that names another file, the env var seen

@@ -4262,7 +4262,8 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
         return inline_lane(lambda: run_lane(checkout, environ, ship, gate, note, clock() + budget))
     order = longest_waiting_first(hosted, environ)
     lanes += run_parallel(order, start or inline, deadline, functools.partial(lane_room, environ),
-                          functools.partial(new_work, environ), MachineLocks(environ), cap=lane_parallel(environ))
+                          functools.partial(new_work, environ, policies={}),
+                          MachineLocks(environ), cap=lane_parallel(environ))
     for path, checkout in hosted:  # after the lanes ran: a slow read never holds a lane back (pack sd:6006)
         for asked in (ask_wait(checkout, path, environ), file_flakes(checkout, path, environ)):
             if asked:
@@ -4303,14 +4304,12 @@ def work_ids(entries: list[dict[str, Any]], releases: Callable[[], bool]) -> fro
 def declares_release(root: pathlib.Path, environ: dict[str, str]) -> bool:
     """Whether `root`'s policy declares `release`, read as `release_chain` reads it.
 
-    A failed read, or a policy that is not an object, is True: unknown is not
-    "no release", and the run tries, once. None is the reader's "declares
-    none", and a `release` that is not an object is none to `release_chain`.
+    A failed read raises: `new_work` counts it as work, unknown is not "no
+    release", and keeps no answer. A policy that is not an object is True,
+    the run tries, once. None is the reader's "declares none", and a
+    `release` that is not an object is none to `release_chain`.
     """
-    try:
-        policy = sd_lib.repo_declaration(root, "policy", environ)
-    except Exception:  # noqa: BLE001 -- unknown is not "no release"
-        return True
+    policy = sd_lib.repo_declaration(root, "policy", environ)
     if policy is None:
         return False
     return not isinstance(policy, dict) or isinstance(policy.get("release"), dict)
@@ -4318,33 +4317,35 @@ def declares_release(root: pathlib.Path, environ: dict[str, str]) -> bool:
 
 #: The work id of a queue file an earlier version left, which `import_file_queue` imports.
 QUEUE_FILE_WORK = "recover:queue-file"
-#: The work id of a lane whose stored entries `new_work` cannot read: its worker reads them and says what it met.
+#: The work id of a lane whose queue, hub read or entries `new_work` cannot read: its worker says what it met.
 UNREADABLE_WORK = "recover:unreadable"
 
 
-def new_work(environ: dict[str, str],
-             seen: dict[pathlib.Path, frozenset[str]]) -> dict[pathlib.Path, frozenset[str]]:
+def new_work(environ: dict[str, str], seen: dict[pathlib.Path, frozenset[str]],
+             policies: dict[pathlib.Path, bool] | None = None) -> dict[pathlib.Path, frozenset[str]]:
     """Each lane of `seen` with work not in its set: its work ids (sd:5809, sd:9332).
 
     The work is `work_ids` of its entries, and an earlier version's queue
-    file, which only a run imports. One hub transaction reads every lane. A
-    lane whose queue cannot be read is left out: unknown is no new work.
+    file, which only a run imports. One hub transaction reads every lane.
     No runner lock is probed: a probe's flock made the other run's starting
     worker answer busy, and a lane another runner holds answers busy itself,
-    its ids kept as seen. A lane whose entries cannot be read as entries
-    has work (`UNREADABLE_WORK`), never an error for the run: on main its
-    worker met the row and the other lanes ran on. Not work, as a run
-    leaves them: an imported body
-    copy no row names, and a hub-stop record no running entry holds.
+    its ids kept as seen. A lane whose queue lookup fails, whose hub read
+    fails, or whose entries cannot be read as entries has work
+    (`UNREADABLE_WORK`), once a run, never an error for the run: unknown is
+    not "nothing pending", and its worker says what it met, as on main
+    (sd:9611). Not work, as a run leaves them: an imported body copy no
+    row names, and a hub-stop record no running entry holds. `policies`
+    keeps each lane's release declaration for the run (`declares_release`):
+    every merge leaves a mark, and a repository with none keeps it for ever;
+    a failed read is not kept.
     """
     queues: dict[pathlib.Path, Queue] = {}
+    unread: set[pathlib.Path] = set()
     for checkout in seen:
         try:
             queues[checkout] = queue_for(checkout, environ)
-        except (LaneError, sd_lib.ConfigError, OSError):
-            continue
-    if not queues:
-        return {}
+        except Exception:  # noqa: BLE001 -- unknown is work: the lane's worker refuses with its own reason
+            unread.add(checkout)
 
     def entries_by_lane(connection: Any) -> dict[pathlib.Path, list[dict[str, Any]] | None]:
         read: dict[pathlib.Path, list[dict[str, Any]] | None] = {}
@@ -4354,16 +4355,28 @@ def new_work(environ: dict[str, str],
             except (ValueError, TypeError, AttributeError, KeyError):  # a stored body that is no entry
                 read[checkout] = None
         return read
+    entries: dict[pathlib.Path, list[dict[str, Any]] | None] = {}
     try:
-        entries = on_hub(next(iter(queues.values())), entries_by_lane, write=False)
+        if queues:
+            entries = on_hub(next(iter(queues.values())), entries_by_lane, write=False)
     except LaneError:
-        return {}
+        entries = dict.fromkeys(queues)  # the hub's answer is unknown for every lane
+    entries.update(dict.fromkeys(unread))
+    kept: dict[pathlib.Path, bool] = {} if policies is None else policies
+
+    def releases(checkout: pathlib.Path) -> bool:
+        if checkout not in kept:
+            try:
+                kept[checkout] = declares_release(checkout, environ)
+            except Exception:  # noqa: BLE001 -- unknown is not "no release"; kept for no scan after
+                return True
+        return kept[checkout]
     found: dict[pathlib.Path, frozenset[str]] = {}
     for checkout, rows in entries.items():  # the policy is read after the hub transaction, on its own connection
         try:
             if rows is None:
-                raise ValueError("a stored entry is not an object")
-            work = work_ids(rows, functools.partial(declares_release, checkout, environ))
+                raise ValueError("a lane's queue or its stored entries could not be read")
+            work = work_ids(rows, functools.partial(releases, checkout))
             if queue_path(checkout, environ).exists():
                 work |= {QUEUE_FILE_WORK}
         except Exception:  # noqa: BLE001 -- one lane's bad row stays its own: its worker meets it and says so
@@ -4595,7 +4608,10 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
     rule, as a lane of this run does: two runs share one cap (sd:9332).
     Past the budget only the cap counts, and the run waits only for its
     own lanes, which end in time; with the cap full of the other run's,
-    the lane gets a busy row and the next run settles it.
+    the lane gets a busy row and the next run settles it. A lane the other
+    run claimed gets one busy row a run and keeps its seen ids: each scan
+    tries its claim, and once the other run freed it an entry left pending
+    starts here (sd:9611).
 
     Then, inside the budget, every `RESCAN_SECONDS` and once no lane runs,
     `pending` names each idle lane with an entry its last worker did not
@@ -4637,6 +4653,7 @@ class ParallelRun:
     running: dict[int, StartedLane] = dataclasses.field(default_factory=dict)
     seen: dict[int, frozenset[str]] = dataclasses.field(default_factory=dict)
     late: set[int] = dataclasses.field(default_factory=set)
+    elsewhere: set[int] = dataclasses.field(default_factory=set)
 
     def __post_init__(self) -> None:
         self.rows = [[] for _ in self.order]
@@ -4651,24 +4668,26 @@ class ParallelRun:
 
     def claim_lane(self, index: int) -> bool | None:
         """Under the host lock: True once this run claimed the lane. False, with a busy row, when the other run
-        claimed it, its claim cannot be read or taken, or past the budget the cap is full and no lane of this
-        run runs (the next run settles it). None to wait: inside the budget for room, past it for this run's
-        own lanes, which end in time."""
+        claimed it, its claim cannot be read or taken (one row a run while it stays so, `elsewhere`), or past
+        the budget the cap is full and no lane of this run runs (the next run settles it). None to wait:
+        inside the budget for room, past it for this run's own lanes, which end in time."""
         checkout = self.order[index][1]
         with self.start_lock():
             # taken, not probed first: a probe's flock lives on in a child forked meanwhile, until it execs
             busy = not self.take(checkout)  # held, or not taken: held this pass, never waited on
             why = None if busy else self.no_room()
             if not busy and why is None:
+                self.elsewhere.discard(index)
                 return True
             if not busy:
                 self.release(checkout)  # taken to count only: no room
         if not busy and (clock() < self.deadline or self.running):
             return None
-        if busy:  # its pending ids count as seen: only a new entry tries it again, not every rescan
-            self.seen[index] = self.seen.get(index, frozenset()) | self.pending({checkout: frozenset()}).get(
-                checkout, frozenset())
         self.seen.setdefault(index, frozenset())  # a later scan starts it once that worker is done
+        if busy and index in self.elsewhere:  # one busy row a run: each scan tries it again, silently
+            return False
+        if busy:  # its seen ids stay: once the other run frees it, an entry it left starts here (sd:9611)
+            self.elsewhere.add(index)
         self.rows[index].append({"ran": [], "busy": "another run claimed the lane, or its claim cannot be read or "
                                  "taken; it counts toward the cap" if busy
                                  else f"no room past the budget ({why}); the next run settles it"})
@@ -4718,7 +4737,9 @@ class ParallelRun:
         while True:
             self.collect_and_release()
             idle = not self.running
-            if clock() < self.deadline and ((idle and not self.late) or time.monotonic() - scanned >= RESCAN_SECONDS):
+            scanning = clock() < self.deadline and ((idle and not self.late)
+                                                    or time.monotonic() - scanned >= RESCAN_SECONDS)
+            if scanning:
                 scanned = time.monotonic()
                 idle_lanes = {checkout: self.seen[index] for index, (_, checkout) in enumerate(self.order)
                               if index not in self.running}
@@ -4726,8 +4747,8 @@ class ParallelRun:
                 self.late = {index for index, (_, checkout) in enumerate(self.order) if checkout in found
                              and index not in self.running}
             started = self.start_late_lanes()
-            if idle and not started and not self.late:  # a scan read every lane after the last one ended
-                return
+            if idle and not started and not self.late and (scanning or clock() >= self.deadline):
+                return  # a scan read every lane after the last one ended; a late busy row is none (sd:9611)
             time.sleep(START_POLL_SECONDS)
 
     def end(self) -> None:
