@@ -112,8 +112,9 @@ html, body { overflow-x: clip; }
 .ustrip .urows { list-style: none; margin: 0; padding: 0; }
 .ustrip li { display: grid; grid-template-columns: minmax(7rem, max-content) minmax(0, 1fr) auto; align-items: center; gap: var(--space-2xs) var(--space-sm);
   padding: var(--space-2xs) var(--space-sm); border-bottom: var(--rule-hair) solid var(--color-rule); font-size: var(--text-sm); }
-/* A long provider name, incident title or error wraps inside its cell, never past the screen's edge. */
-.ustrip .nm, .ustrip .why, .ustrip .flag { min-width: 0; overflow-wrap: anywhere; }
+/* A long provider name, window label, unit, incident title, footer name or error wraps inside its cell, never past
+ * the screen's edge (pack sd:9597). */
+.ustrip .nm, .ustrip .why, .ustrip .flag, .ustrip .w, .ustrip .wl, .ustrip .foot { min-width: 0; overflow-wrap: anywhere; }
 .ustrip .nm { font: 500 var(--text-sm)/1.2 var(--font-data); color: var(--color-ink); max-width: 16rem; }
 .ustrip .nm > span[aria-hidden] { margin-right: var(--space-2xs); }
 .ustrip .nm small { color: var(--color-muted); font: 400 var(--text-2xs)/1 var(--font-label); letter-spacing: .06em; text-transform: uppercase; }

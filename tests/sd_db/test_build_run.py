@@ -1291,6 +1291,68 @@ class Supervise(Case):
         self.assertNotIn("a.py:2 pin check", prompt[operator:reviewer])
         self.assertIn(f"- sd:{item}: The last review round left these blockers: a.py:2 pin check", prompt[reviewer:])
 
+    def test_a_second_retry_briefs_only_the_latest_park_s_blockers(self):
+        """Pack sd:9593: the brief replayed the REVIEWED notes of every earlier Retry under "the last review round"."""
+        self.press()
+        item = self.items[0]
+
+        def park_and_retry(run: dict, blockers: str) -> dict:
+            build.end(self.db, run["id"], "blocked", f"3 review rounds left blockers: {blockers}; "
+                                                     "check the group, then requeue or cancel; worktree kept")
+            self.db.execute("UPDATE runner_run SET released_at = created_at WHERE id = ?", (run["id"],))
+            self.db.execute("UPDATE runner_lease SET released_at = (SELECT created_at FROM runner_run WHERE id = ?) "
+                            "WHERE run = ?", (run["id"], run["id"]))
+            build.retry(self.db, run["assignment"], who="operator")
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+            assert again is not None
+            return again
+
+        second = park_and_retry(self.bundle, "a.py:2 old pin check")
+        # The first round's run, its Retry note, then the second run, each a second apart.
+        self.db.execute("UPDATE runner_run SET created_at = '2000-01-01T00:00:00+00:00' WHERE id = ?",
+                        (self.bundle["id"],))
+        self.db.execute("UPDATE note SET timestamp = '2000-01-01T00:00:01+00:00' WHERE body LIKE '%old pin check%'")
+        self.db.execute("UPDATE runner_run SET created_at = '2000-01-01T00:00:02+00:00' WHERE id = ?", (second["id"],))
+        third = park_and_retry(second, "b.py:3 new pin check")
+        prompt = build_run.BRIEF.format(**self.supervisor(third["id"]).brief())
+        self.assertIn(f"- sd:{item}: The last review round left these blockers: b.py:3 new pin check", prompt)
+        self.assertNotIn("old pin check", prompt)
+
+    def test_a_run_recovered_after_a_retry_keeps_that_retry_s_blockers(self):
+        """Review of sd:9593: a run that replaces a Retry's lost run, with no Retry between, briefed no blockers: its
+        cutoff was the lost run's release, after the Retry's notes."""
+        self.press()
+        item = self.items[0]
+
+        def release(run: dict) -> None:
+            self.db.execute("UPDATE runner_run SET released_at = created_at WHERE id = ?", (run["id"],))
+            self.db.execute("UPDATE runner_lease SET released_at = (SELECT created_at FROM runner_run WHERE id = ?) "
+                            "WHERE run = ?", (run["id"], run["id"]))
+
+        def claim() -> dict:
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+            assert again is not None
+            return again
+
+        build.end(self.db, self.bundle["id"], "blocked", "3 review rounds left blockers: c.py:4 pin check; "
+                                                       "check the group, then requeue or cancel; worktree kept")
+        release(self.bundle)
+        build.retry(self.db, self.bundle["assignment"], who="operator")
+        lost = claim()
+        # The Retry, then the lost run, each a second apart; the run that replaces it reads after both.
+        self.db.execute("UPDATE runner_run SET created_at = '2000-01-01T00:00:00+00:00' WHERE id = ?",
+                        (self.bundle["id"],))
+        self.db.execute("UPDATE note SET timestamp = '2000-01-01T00:00:01+00:00' WHERE body LIKE '%c.py:4%'")
+        self.db.execute("UPDATE runner_run SET created_at = '2000-01-01T00:00:02+00:00' WHERE id = ?", (lost["id"],))
+        build.end(self.db, lost["id"], "cancelled", "the supervisor was lost before a builder session started")
+        release(lost)
+        lead = self.bundle["assignment"]
+        runner.requeue(self.db, lead, expected_revision=runner.queue_state(self.db, lead)["revision"], who="recovery")
+        prompt = build_run.BRIEF.format(**self.supervisor(claim()["id"]).brief())
+        self.assertIn(f"- sd:{item}: The last review round left these blockers: c.py:4 pin check", prompt)
+
     def test_enqueue_resume_no_duplicate(self):
         """Failure table, Enqueuing (pack sd:6094 (a)): a run lost after the lane wrote its entry resumes at
         enqueuing, reads `lane list` first, finds the entry at its head and records `enqueued`; no second entry."""
