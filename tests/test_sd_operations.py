@@ -22,6 +22,8 @@ from tests.clean_env import clean_environment
 ROOT = Path(__file__).resolve().parents[1]
 with patch.object(sys, "path", [str(ROOT / "bin"), *sys.path]):
     cli = importlib.import_module("sd_operations")
+#: The wrapper itself, before a test patches it: a tick's outage must pass through it (pack sd:9541).
+CONNECT = cli.sd_handoff_rows.connect
 
 
 class OperationsCLI(unittest.TestCase):
@@ -267,7 +269,9 @@ class OperationsCLI(unittest.TestCase):
         self.assertIn("bulk_storage_root is unset", kwargs["why"])
         run.archive.assert_not_called()  # no bulk root: an ended run's logs stay local
         self.assertIn("claimed 1, drafted 0, spawned 1", output)
-        self.connect.assert_called_with(sd_db, write=True)
+        from sd_db import hub, remote
+        outages = (remote.HubUnreachable, remote.BuildMismatch, hub.Fenced)  # pack sd:9541
+        self.connect.assert_called_with(sd_db, write=True, keep=outages)
         self.connection.close.assert_called_once()
 
     def test_a_spawn_runs_the_supervise_verb_the_real_parser_reads(self):
@@ -340,6 +344,56 @@ class OperationsCLI(unittest.TestCase):
         follow.assert_not_called()
         run.dispatch.assert_not_called()
         self.assertEqual((code, output), (0, "skipped: sd_db build mismatch; the follow job follows\n"))
+
+    def outcome(self, run, *, at_connect=None):
+        """The tick's exit, as `bin/sd` gives it: a refusal is 1. `at_connect` raises through the real wrapper."""
+        if at_connect is not None:
+            fake = types.SimpleNamespace(connect=Mock(side_effect=at_connect))
+            self.connect.side_effect = lambda _sd_db, **kwargs: CONNECT(fake, **kwargs)
+        try:
+            return self.tick(run)
+        except (cli.WorkRefusal, cli.sd_handoff_rows.RowsRefusal) as refusal:
+            return 1, str(refusal)
+
+    def test_a_hub_outage_skips_the_tick_with_exit_0(self):
+        """pack sd:9541: a satellite tick exited 1 when the hub timed out, when the hub's Tailscale named no node, or
+        between a hub refresh and the follow; the next tick was clean. Each skips with one line, at the connect or
+        mid-tick, as the hub's error arrives over the wire."""
+        from sd_db import hub, remote
+        unreachable = remote.HubUnreachable("hub.example.test", 8769, "timed out")
+        fenced = remote.rebuild_error(remote.describe_error(hub.Fenced(
+            "refused: this machine is not the hub: Tailscale does not name this node, so it cannot match "
+            "hub.example.test: this node is not connected to the Tailscale control plane")))
+        mismatch = remote.BuildMismatch("build", "80a4eacae0c346b5", "c3866a94f3d93ddf")
+        for error, line in ((unreachable, f"skipped: {unreachable}"), (fenced, f"skipped: {fenced}"),
+                            (mismatch, "skipped: sd_db build mismatch; the follow job follows")):
+            for where in ("connect", "tick"):
+                with self.subTest(error=type(error).__name__, where=where):
+                    run = self.builds()
+                    if where == "tick":
+                        self.connect.side_effect = None
+                        run.dispatch.side_effect = error
+                        code, output = self.outcome(run)
+                    else:
+                        code, output = self.outcome(run, at_connect=error)
+                        run.dispatch.assert_not_called()
+                    self.assertEqual((code, output), (0, line + "\n"))
+
+    def test_another_hub_error_still_exits_1(self):
+        """pack sd:9541: only the outages skip; a lost commit answer or a broken wire stays a refusal."""
+        from sd_db import remote
+        broken = remote.RemoteError("the wire broke")
+        lost = remote.UnknownOutcome("r-1", "the hub stayed unreachable")
+        for error, where in ((broken, "connect"), (lost, "tick")):
+            with self.subTest(error=type(error).__name__, where=where):
+                run = self.builds()
+                if where == "tick":
+                    self.connect.side_effect = None
+                    run.dispatch.side_effect = error
+                    code, output = self.outcome(run)
+                else:
+                    code, output = self.outcome(run, at_connect=error)
+                self.assertEqual((code, output), (1, str(error)))
 
     def test_the_load_read_does_not_follow_either(self):
         """pack sd:8685: `sd gate status`, the tick's child, carries the marker that keeps the refusal."""

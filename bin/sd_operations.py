@@ -435,6 +435,19 @@ def tools(build_run: Any) -> Any:
                            lint=[str(BIN / "sd-docs-lint")])
 
 
+def hub_outages() -> tuple[type[BaseException], ...]:
+    """The hub's brief outages a tick skips with exit 0, as a locked database (pack sd:9541): the hub timed out, its
+    Tailscale named no node (`Fenced`), or a hub refresh is ahead of this satellite's follow."""
+    from sd_db import hub, remote  # noqa: PLC0415 - the copy build_modules imported
+    return remote.HubUnreachable, remote.BuildMismatch, hub.Fenced
+
+
+def outage(error: BaseException) -> str:
+    """The `skipped` reason for one of `hub_outages`; a mismatch's remedy is the follow job's (pack sd:8685)."""
+    from sd_db import remote  # noqa: PLC0415 - the copy build_modules imported
+    return "sd_db build mismatch; the follow job follows" if isinstance(error, remote.BuildMismatch) else str(error)
+
+
 class Overdue(BaseException):
     """The tick ran past `TICK_SECONDS`: a BaseException, so no broad `except Exception` in the tick holds it."""
 
@@ -446,7 +459,7 @@ def dispatch_builds(args: argparse.Namespace) -> int:
     # waits on: the tick keeps the refusal, as a lane runner does, and that job follows (pack sd:8685).
     sd_lib.on_mismatch = None
     sd_db, build, build_run = build_modules()
-    from sd_db import hub, remote  # noqa: PLC0415 - the copy build_modules imported
+    from sd_db import hub  # noqa: PLC0415 - the copy build_modules imported
     hub.on_mismatch = None
     why = skip = ""
     try:
@@ -473,9 +486,9 @@ def dispatch_builds(args: argparse.Namespace) -> int:
     except Overdue:
         result = None
         print(f"skipped: the tick ran past {TICK_SECONDS:g} s")
-    except remote.BuildMismatch:
+    except hub_outages() as error:
         result = None
-        print("skipped: sd_db build mismatch; the follow job follows")
+        print(f"skipped: {outage(error)}")
     except sqlite3.OperationalError as error:
         if "locked" not in str(error) and "busy" not in str(error):
             raise WorkRefusal(str(error)) from error
@@ -504,8 +517,9 @@ def tick(sd_db: Any, build: Any, build_run: Any, root: Path | None, why: str, un
     """`dispatch_builds`' tick in the database; each run whose supervisor could not start goes in `unstarted`.
 
     `archive` False: the bulk root did not take a write, so no ended run's files move to it this tick."""
+    outages = hub_outages()  # they keep their types, so `dispatch_builds` skips them
     load, load_cap = gate_load()
-    connection = sd_handoff_rows.connect(sd_db, write=True)
+    connection = sd_handoff_rows.connect(sd_db, write=True, keep=outages)
     try:
         def spawn(ident: str) -> None:
             if root is None:
@@ -529,6 +543,8 @@ def tick(sd_db: Any, build: Any, build_run: Any, root: Path | None, why: str, un
         result["pushed"] = push_failures(connection)
         if root is not None and not why and archive:  # the bulk root answered the probe
             result["logs_moved"] = build_run.archive(connection, build_run.local_root(), root)
+    except outages:
+        raise
     except (sd_db.SdDbError, ValueError, OSError) as error:
         raise WorkRefusal(str(error)) from error
     finally:
