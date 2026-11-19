@@ -257,7 +257,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 import sd_lib
 import sd_release
@@ -4437,10 +4437,11 @@ class MachineLocks:
     `start_lock` is a host-wide lock, held only while a run counts the
     lanes held, decides, and takes the chosen lane's runner lock; its
     worker takes that lock over (`runner_lock`). So no run reads a lane
-    free that another has chosen but not yet started. A lane whose queue
-    or lock cannot be read is not held, as before: a worker started there
-    refuses with its own reason. A failed queue read is kept for the run,
-    as a queue read is, so a poll runs no `git`.
+    free that another has chosen but not yet started. Each lane's queue is
+    read before the lock is taken, so under it only lock probes and the
+    room read run, never `git`. Hold on doubt: a lane whose queue or lock
+    cannot be read counts as held, toward the cap, and starts no worker;
+    a failed queue read is not kept, so the next pass reads it again.
     """
 
     def __init__(self, environ: dict[str, str]) -> None:
@@ -4449,15 +4450,17 @@ class MachineLocks:
         self.mine: set[str] = set()
 
     def lane_queue(self, checkout: pathlib.Path) -> Queue | None:
-        if checkout not in self.queues:
-            try:
-                self.queues[checkout] = queue_for(checkout, self.environ)
-            except (LaneError, sd_lib.ConfigError, OSError):
-                self.queues[checkout] = None
-        return self.queues[checkout]
+        """The queue `start_lock` read for `checkout`, or None: never read here, under the lock."""
+        return self.queues.get(checkout)
 
     @contextlib.contextmanager
-    def start_lock(self) -> Iterator[None]:
+    def start_lock(self, checkouts: Iterable[pathlib.Path]) -> Iterator[None]:
+        for checkout in checkouts:  # before the lock: `queue_for` runs git
+            if checkout not in self.queues:
+                try:
+                    self.queues[checkout] = queue_for(checkout, self.environ)
+                except (LaneError, sd_lib.ConfigError, OSError):
+                    pass  # unknown: held this pass, read again the next
         path = lane_root(self.environ) / "hosted-start.lock"
         path.parent.mkdir(parents=True, exist_ok=True)
         with open(path, "a", encoding="utf-8") as handle:
@@ -4465,32 +4468,31 @@ class MachineLocks:
             yield
 
     def held_elsewhere(self, checkout: pathlib.Path) -> bool:
-        queue = self.lane_queue(checkout)
-        if queue is None or str(checkout) in self.mine:
+        if str(checkout) in self.mine:
             return False
+        queue = self.lane_queue(checkout)
+        if queue is None:
+            return True  # unknown is held
         try:
             with runner_lock(queue) as locked:
                 return not locked
         except OSError:
-            return False
+            return True  # unknown is held
 
     def take_lane(self, checkout: pathlib.Path) -> bool:
         queue = self.lane_queue(checkout)
         if queue is None:
-            return True
+            return False
         try:
             queue.lock_file.parent.mkdir(parents=True, exist_ok=True)
             handle = open(queue.lock_file, "a", encoding="utf-8")  # noqa: SIM115 -- its worker closes it
         except OSError:
-            return True
+            return False
         try:
             fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            handle.close()
-            return False
         except OSError:
             handle.close()
-            return True
+            return False
         HANDED[str(checkout)] = (str(queue.lock_file), handle)
         self.mine.add(str(checkout))
         return True
@@ -4504,12 +4506,14 @@ class MachineLocks:
             handle.close()
 
 
-def lock_steps(locks: MachineLocks | None) -> tuple[Callable[[], contextlib.AbstractContextManager[Any]],
+def lock_steps(locks: MachineLocks | None) -> tuple[Callable[[Iterable[pathlib.Path]],
+                                                             contextlib.AbstractContextManager[Any]],
                                                     Callable[[pathlib.Path], bool], Callable[[pathlib.Path], bool],
                                                     Callable[[pathlib.Path], None]]:
     """`run_parallel`'s start lock, held probe, take and release: a run alone has no lock, and no lane held."""
     if locks is None:
-        return contextlib.nullcontext, lambda checkout: False, lambda checkout: True, lambda checkout: None
+        return (lambda checkouts: contextlib.nullcontext(), lambda checkout: False, lambda checkout: True,
+                lambda checkout: None)
     return locks.start_lock, locks.held_elsewhere, locks.take_lane, locks.release_lane
 
 
@@ -4553,7 +4557,7 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
         when past the budget no lane of this run runs and there is still no room (the next run settles it);
         None to wait for room."""
         checkout = order[index][1]
-        with start_lock():
+        with start_lock([lane for _, lane in order]):
             busy = held(checkout)
             why = None if busy else no_room()
             if not busy and why is None and take(checkout):
@@ -4561,7 +4565,8 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
         if not busy and (why is None or clock() < deadline or running):
             return None  # past the budget, only this run's own lanes are waited for: they end in time
         seen.setdefault(index, frozenset())  # a later scan starts it once that worker is done
-        rows[index].append({"ran": [], "busy": "another runner holds the lane; it counts toward the cap" if busy
+        rows[index].append({"ran": [], "busy": "another runner holds the lane, or its queue or lock cannot be read; "
+                            "it counts toward the cap" if busy
                             else f"no room past the budget ({why}); the next run settles it"})
         return False
 

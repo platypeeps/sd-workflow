@@ -5710,6 +5710,14 @@ class HostedOrder(Lane):
         self.assertIn("build mismatch", answer["skipped"])
 
 
+def read_locks(environ: dict[str, str], *checkouts: pathlib.Path) -> sd_lane.MachineLocks:
+    """A run's `MachineLocks` with each checkout's queue read, as its first start lock reads them."""
+    locks = sd_lane.MachineLocks(environ)
+    with locks.start_lock(checkouts):
+        pass
+    return locks
+
+
 def thread_lane(run: Any) -> sd_lane.StartedLane:
     """A lane run on a thread, so a suite's stub ships reach it; `run_hosted` runs a `child_lane` from the CLI."""
     row: list[dict] = []
@@ -6129,6 +6137,57 @@ class HostedParallel(Lane):
         self.assertEqual(len(seen), 1)
         self.assertFalse(sd_lane.HANDED_ENV in seen[0], "post-merge would read the handed lock's fd")
 
+    def test_no_queue_lookup_runs_under_the_start_lock(self) -> None:
+        """sd:9332 lead review: a lane's queue lookup runs git; under the host-wide start lock it held both
+        lane-run jobs on a slow git. Each queue is read before the lock; under it only lock probes run."""
+        start_lock = sd_lane.lane_root(self.environ) / "hosted-start.lock"
+        real, under = sd_lane.queue_for, []
+
+        def queue_for(root: pathlib.Path, environ: dict[str, str]) -> Any:
+            if start_lock.exists():
+                with open(start_lock, "a", encoding="utf-8") as probe:
+                    try:
+                        fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        under.append(root)
+            return real(root, environ)
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            return sd_lane.StartedLane(lambda: {"ran": []}, lambda: None)
+        with mock.patch.object(sd_lane, "queue_for", queue_for):
+            sd_lane.run_parallel([("pack", self.repo), ("zeta", self.zeta)], start, sd_lane.clock() + 60,
+                                 lambda: None, locks=sd_lane.MachineLocks(self.environ), cap=2)
+        self.assertEqual(under, [], "a queue lookup ran under the start lock")
+
+    def test_a_lane_whose_queue_cannot_be_read_counts_as_held_and_is_read_again(self) -> None:
+        """sd:9332 lead review, hold on doubt: a failed queue lookup was kept for the run and read as a free
+        lane, so it started a worker and did not count toward the cap. It now counts as held this pass, and
+        the next pass reads it again."""
+        real, failures = sd_lane.queue_for, [1, 1]  # zeta's read fails at both claims of the first run
+
+        def queue_for(root: pathlib.Path, environ: dict[str, str]) -> Any:
+            if root == self.zeta and failures:
+                failures.pop()
+                raise sd_lane.LaneError("git gave no answer")
+            return real(root, environ)
+        started: list[pathlib.Path] = []
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            started.append(checkout)
+            return sd_lane.StartedLane(lambda: {"ran": []}, lambda: None)
+
+        def pending(seen: dict[pathlib.Path, frozenset[str]]) -> dict[pathlib.Path, frozenset[str]]:
+            return {checkout: frozenset({"2"}) for checkout in seen if checkout == self.zeta and "2" not in seen[checkout]}
+        with mock.patch.object(sd_lane, "queue_for", queue_for):
+            rows = sd_lane.run_parallel([("zeta", self.zeta), ("pack", self.repo)], start, sd_lane.clock() - 1,
+                                        lambda: None, pending, locks=sd_lane.MachineLocks(self.environ), cap=1)
+            self.assertEqual(started, [], f"a lane of unknown queue started, or the cap let a second one: {rows}")
+            self.assertIn("cannot be read", rows[0].get("busy", ""), rows)
+            failures.append(1)  # one run, inside its budget: the next pass reads zeta again and starts it
+            rows = sd_lane.run_parallel([("zeta", self.zeta), ("pack", self.repo)], start, sd_lane.clock() + 60,
+                                        lambda: None, pending, locks=sd_lane.MachineLocks(self.environ), cap=1)
+        self.assertEqual(started, [self.repo, self.zeta], rows)
+
     def test_the_hosted_run_reads_the_machine_s_lane_parallel(self) -> None:
         """sd:9323: the runner's start rule reads sd.lane_parallel, not the constant."""
         folder = self.tmp / ".config" / "sd-ai-command-pack"
@@ -6159,12 +6218,13 @@ class HostedParallel(Lane):
     def test_a_lane_child_takes_over_the_lock_its_run_took(self) -> None:
         """sd:9332 lead review: a run takes the lane's runner lock before its child starts; the child holds
         it from then on, and once the child exits the lane is free."""
-        locks = sd_lane.MachineLocks(self.environ)
+        locks = read_locks(self.environ, self.repo)
         self.assertTrue(locks.take_lane(self.repo))
         code = ("import json, pathlib, sys\nsys.path.insert(0, sys.argv[1])\nimport sd_lane\n"
                 "environ = json.loads(sys.argv[3])\nroot = pathlib.Path(sys.argv[2])\n"
+                "outside = sd_lane.MachineLocks(environ)\nwith outside.start_lock([root]):\n    pass\n"
                 "with sd_lane.runner_lock(sd_lane.queue_for(root, environ), root) as held:\n"
-                "    print(json.dumps({'held': held, 'busy_outside': sd_lane.MachineLocks(environ).held_elsewhere(root)}))\n")
+                "    print(json.dumps({'held': held, 'busy_outside': outside.held_elsewhere(root)}))\n")
         with mock.patch.dict(os.environ, self.environ):
             child = sd_lane.child_lane(self.repo, 60, argv=[sys.executable, "-c", code, str(REPO_ROOT / "bin"),
                                                             str(self.repo), json.dumps(self.environ)])
@@ -6172,17 +6232,17 @@ class HostedParallel(Lane):
         self.assertNotIn(str(self.repo), sd_lane.HANDED, "the run kept its copy of the lock")
         self.assertEqual(child.answer(), {"held": True, "busy_outside": True})
         locks.release_lane(self.repo)
-        self.assertFalse(sd_lane.MachineLocks(self.environ).held_elsewhere(self.repo), "the lane stayed locked")
+        self.assertFalse(read_locks(self.environ, self.repo).held_elsewhere(self.repo), "the lane stayed locked")
 
     def test_a_lane_child_that_never_starts_frees_the_lock_its_run_took(self) -> None:
         """sd:9332 failure table: the run took the lane's lock, then its child failed to start; the lane is
         free again, not held by the run until it ends."""
-        locks = sd_lane.MachineLocks(self.environ)
+        locks = read_locks(self.environ, self.repo)
         self.assertTrue(locks.take_lane(self.repo))
         with self.assertRaises(OSError):
             sd_lane.child_lane(self.repo, 60, argv=[str(self.tmp / "no-such-sd-ship")])
         self.assertNotIn(str(self.repo), sd_lane.HANDED)
-        self.assertFalse(sd_lane.MachineLocks(self.environ).held_elsewhere(self.repo), "the lane stayed locked")
+        self.assertFalse(read_locks(self.environ, self.repo).held_elsewhere(self.repo), "the lane stayed locked")
 
     def test_a_handed_fd_for_another_file_is_not_taken_for_the_lock(self) -> None:
         """sd:9332 failure table: the fd a child is handed names no longer the lane's lock file; the child
@@ -6192,11 +6252,11 @@ class HostedParallel(Lane):
         with mock.patch.dict(os.environ, {sd_lane.HANDED_ENV: f"{other}:{queue.lock_file}"}):
             with sd_lane.runner_lock(queue, self.repo) as held:
                 self.assertTrue(held)
-                self.assertTrue(sd_lane.MachineLocks(self.environ).held_elsewhere(self.repo))
+                self.assertTrue(read_locks(self.environ, self.repo).held_elsewhere(self.repo))
             self.assertNotIn(sd_lane.HANDED_ENV, os.environ)
         with self.assertRaises(OSError):  # the child closed the fd it would not take
             os.fstat(other)
-        self.assertFalse(sd_lane.MachineLocks(self.environ).held_elsewhere(self.repo))
+        self.assertFalse(read_locks(self.environ, self.repo).held_elsewhere(self.repo))
 
     def test_a_worker_child_runs_the_lane_and_answers_its_row(self) -> None:
         """The CLI's lane: `sd-ship -C <checkout> lane run --budget`, whose answer is the row; no answer is an error."""
