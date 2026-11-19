@@ -1731,6 +1731,16 @@ C.run(cmd('sddb.run'), pending[0]); await flush(); R.toast = lastToast().msg; aw
         self.assertIn("not read", cell)
         self.assertNotIn('data-set="github_issues"', cell)
 
+    def test_an_undo_with_no_answer_reads_again_and_says_its_outcome_is_not_known(self):
+        """pack sd:9485: the inverse loaded again only on a 409, and an undo with no answer toasted 'not undone'."""
+        path = self.ids["checkout"]
+        out = self.run_page("""propose('github_issues', 'ask'); C.run(cmd('sddb.run'), pending[0]); await flush();
+R.before = OUT.gets.length; await lastToast().undo(); await flush(); R.after = OUT.gets.length;""",
+                            search=f"?repo={path}",
+                            answer="(p, b) => { if (b.value === 'off') throw new Error('offline'); return [200, {}]; }")
+        self.assertGreater(out["R"]["after"], out["R"]["before"], "the page was not read again")
+        self.assertEqual(out["toasts"][-1], ["Run undo outcome not known · GitHub issues: off → ask: offline", False])
+
     def test_the_repo_page_shows_the_issues_scope_and_the_toggle_runs_the_verb_and_undoes(self):
         """pack sd:7672: all or mine, written through `sd-db repo issues-scope`; an unread setting shows no toggle."""
         path = self.ids["checkout"]

@@ -323,13 +323,15 @@ addEventListener('DOMContentLoaded', () => {
   // text, and offers Undo only for what landed, for a bulk group too. A landed write rereads (the reader's write barrier); a
   // refused one loads the document again, so a retry sends the revision the read brought. Undo is spent once and reverses
   // this write only.
+  // A 409, or a write with no answer (no status: it may have landed, pack sd:9485), loads again; the latter is unknown.
+  const again = err => { if (err && !err.status) err.unknown = true; if (err && (err.stale || err.unknown)) load(); throw err; };
   function landing(promise, text, inverse) {
     return promise.then(v => {
       let spent = false;
       const undo = inverse && (() => { if (spent) return Promise.resolve(false); spent = true;
-        return inverse(v).then(() => true, err => { if (err.stale) load(); throw err; }); });
+        return inverse(v).then(() => true, again); });
       return { text: text(v), undo };
-    }, err => { if (err.stale) load(); throw err; });
+    }, again);
   }
   // The command's undo: the shell passes what the run answered.
   const undoOf = (o, r) => r && r.undo ? r.undo() : false;

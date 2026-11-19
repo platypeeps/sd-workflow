@@ -73,7 +73,10 @@ addEventListener('DOMContentLoaded', () => {
 
   // ---------- Stage rules: sd_db.writing._normal and change_stage ----------
   // build: the dashboard's stage and park routes require row ownership (require_row), so a file-owned piece moves nowhere here.
-  const owned = p => p.owner === 'row' || (p.owner === 'retiring' ? 'writing cutover is in progress' : 'the piece files own this piece; the dashboard moves it after the writing cutover');
+  // An empty owner is a repository missing or not registered (sd_db.writing.piece_state), not a file-owned piece.
+  const owned = p => p.owner === 'row' || (p.owner === 'retiring' ? 'writing cutover is in progress'
+    : !p.owner ? "the piece's repository is missing or not registered"
+      : 'the piece files own this piece; the dashboard moves it after the writing cutover');
   function legal(p, to) {
     if (p.stage === to) return { ok: false, same: true, reason: 'Already here.' };
     if (p.parked) return { ok: false, reason: 'Parked. Revive it first; a parked piece keeps its stage.' };
