@@ -39,7 +39,7 @@ LISTS = {
     "dashboard.disk_storage": ("disk.conf", "The storage folders Health's Disk view sizes, "
                                "folder by folder: the place for large uncommitted data. One storage|<path> line each "
                                "(~ and $HOME expand)."),
-    "dashboard.usage_providers": ("usage-providers.conf", "The providers Today's Usage strip reads (system sd:9256): "
+    "dashboard.usage_providers": ("usage-providers.conf", "The providers the Usage dropdown reads (system sd:9256): "
                                   "one name per line, # comments. claude reads cswap's accounts and codex its session "
                                   "logs; a name with no reader in system's usage_sources.py reads unknown."),
     "dashboard.status_services": ("status-services.conf", "The services Health's Status view and the Usage flags watch "

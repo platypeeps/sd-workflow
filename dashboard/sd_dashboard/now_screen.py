@@ -93,7 +93,6 @@ from . import (
     snooze,
     today_mail,
     today_reports,
-    usage_screen,
 )
 from . import fleet as fleet_module
 from .operations_screen import _signal_name
@@ -1009,8 +1008,6 @@ def document(connection: sqlite3.Connection, *, now: str, fleet=None, jobs=None,
     Lane and Gate lamps read (`lane_summary`); `lanes` is the seam for Queue's document, `queue_screen.document` by
     default, and a lane read that failed is a dark `lane` row, as a dark collector is.
     `spend` is the spend line (sd:6031, `spend`): the last 24 hours and the 7-day trend from the cost table.
-    `usage` is the Usage strip (pack sd:9257, `usage_screen.strip`): each provider's windows, reset, pace and read time,
-    and its services' flag, from system's agent-meter heartbeat rows.
     `queues` is the Queues panel (pack sd:6946, `queues`): ready items, build queue and merge lane in one list.
     `builders` is the builder runs Details read (sd:6003, `builders`): each open build run's items, stage, start and ETA.
     `digest` is Since yesterday (sd:6002, `digest`): merged per repo, failed with why and fix, questions waiting.
@@ -1092,18 +1089,9 @@ def document(connection: sqlite3.Connection, *, now: str, fleet=None, jobs=None,
             "track": track(connection, now, rows=rows, briefs=reported["briefs"], active=active, lane=summary),
             "digest": digest(connection, now, rows=rows, lanes=queue.get("lanes") or [],
                              unread=digest_unread(sources, queue)),
-            "spend": spend(connection, now), "usage": _usage(connection, now),
+            "spend": spend(connection, now),
             "builders": builders(connection, now), "queues": queues(connection, now),
             "attention": _attention(listed), **mail, **reported}
-
-
-def _usage(connection: sqlite3.Connection, now: str) -> dict:
-    """The Usage strip, or its reason: a strip that fails costs the strip only, never /api/now (pack sd:9257)."""
-    try:
-        return usage_screen.strip(connection, now=now)
-    except Exception as failure:  # noqa: BLE001 - odd heartbeat input must not fail the whole read
-        return {"error": str(failure) or type(failure).__name__, "rows": [], "nosource": [], "flags_error": "",
-                "providers": usage_screen.PROVIDERS_LIST, "services": usage_screen.SERVICES_LIST}
 
 
 def _attention(rows: list[dict]) -> dict:
