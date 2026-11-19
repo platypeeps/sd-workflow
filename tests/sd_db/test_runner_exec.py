@@ -276,6 +276,25 @@ class Palette(PaletteFixture):
         self.assertEqual(result["exit_code"], 0)
 
     @hub_only
+    def test_a_refused_requeue_is_rejected_before_dispatch_and_reconciles_closed(self):
+        """sd:9269 review: requeue refuses a member cancelled on its own, but the palette wrote its dispatch
+        marker first, so reconcile could never close the execution. The refusal now comes before dispatch."""
+        self.entries["requeue"] = {"argv": ["sd", "runner", "requeue", "{assignment}"], "screens": ["item"],
+                                  "mutates": True, "scope": "supervisor", "operation": "requeue", "placeholders": {"assignment": "assignment"}}
+        self.write()
+        lead = create_assignment(self.db, item=self.item, role="author", status="cancelled")
+        child = create_assignment(self.db, item=self.item, role="author", status="cancelled", parent=lead)
+        self.db.execute("UPDATE assignment SET result = ? WHERE id = ?", (runner.ALONE + "operator", child))
+        state = runner.queue_state(self.db, child)
+        value = self.prepare(command="requeue", values={"assignment": child},
+            target={"assignment": child, "revision": state["revision"], "run": None})["execution"]
+        with self.assertRaisesRegex(workflow.WorkflowError, "cancelled on its own"):
+            runner_exec.execute_immediate(self.db, value["note"])
+        self.assertFalse(Path(value["output_path"]).exists(), "no dispatch marker")
+        self.assertEqual(runner_exec.reconcile(self.db, value["note"])["exit_code"], 125)
+        self.assertEqual(runner.queue_state(self.db, child)["status"], "cancelled")
+
+    @hub_only
     def test_output_collision_and_changed_catalog_never_launch(self):
         value = self.prepare()["execution"]
         with runner_exec.open_output(value) as output: output.write(b"prior evidence")
