@@ -191,6 +191,20 @@ class TheServicesReader(ScreenCase):
         self.assertEqual([(one["status"], one["why"]) for one in usage_screen.services(self.connection, now=NOW)],
                          [("unknown", "the reading has no read time")])
 
+    def test_a_failed_read_with_no_read_time_shows_its_error(self):
+        # pack sd:9380: an HTTP 503 has no read time; the error says why, as the Usage strip says it.
+        status(self.connection, "slack", read_at=None, status="unknown", error="HTTP 503")
+        self.assertEqual([(one["status"], one["why"]) for one in usage_screen.services(self.connection, now=NOW)],
+                         [("unknown", "HTTP 503")])
+
+    def test_ignore_holds_only_for_the_same_components(self):
+        # pack sd:9380: a degraded service with no incident fingerprinted its status alone, so an ignored
+        # degradation hid a later component failure.
+        status(self.connection, "a", status="degraded", components=[{"name": "API", "status": "degraded_performance"}])
+        status(self.connection, "b", status="degraded", components=[{"name": "Login", "status": "major_outage"}])
+        rows, _ = health_screen._status_rows(usage_screen.services(self.connection, now=NOW), now=NOW)
+        self.assertNotEqual(rows[0]["problem"], rows[1]["problem"])
+
     def test_each_text_field_is_capped_at_200_characters(self):
         # Bundle review round 3: kind, indicator, providers, impact and
         # components passed through uncapped.
