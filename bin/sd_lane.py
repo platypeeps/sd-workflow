@@ -4398,13 +4398,15 @@ def lane_room(environ: dict[str, str]) -> str | None:
 
     Only lane gates count against the slots: a builder's foreground test run
     holds a slot too, and 3-5 builders starved every second lane (sd:9331).
-    A gate status, lane gate or load that cannot be read is no room: unknown is not idle.
+    A gate status, lane gate or load that cannot be read is no room: unknown is not idle. The gate's
+    queue lock is not waited for: this runs under the hosted start lock, and a stalled gate would stop
+    every lane-run job (sd:9332).
     """
     loaded = load_stop(environ)
     if loaded is not None:
         return loaded
     import sd_gate_slots  # noqa: PLC0415 -- stdlib only, and only the hosted run reads it
-    found = sd_gate_slots.machine_snapshot(environ)
+    found = sd_gate_slots.machine_snapshot(environ, wait=False)
     if isinstance(found, str):
         return f"cannot read the gate slots ({found})"
     lanes = found["lane_gates"]
@@ -4494,6 +4496,8 @@ class MachineLocks:
         return True
 
     def release_lane(self, checkout: pathlib.Path) -> None:
+        if str(checkout) not in self.mine:
+            return  # this run took no lock there
         self.mine.discard(str(checkout))
         _, handle = HANDED.pop(str(checkout), (None, None))
         if handle is not None:  # a worker that never took it over
@@ -4537,25 +4541,28 @@ def run_parallel(order: list[tuple[str, pathlib.Path]], start: Start, deadline: 
     seen: dict[int, frozenset[str]] = {}
     start_lock, held, take, release = lock_steps(locks)
 
-    def lane_fits() -> bool:
-        if len(running) >= cap:
-            return False
-        if clock() >= deadline:  # it only settles
-            return True
+    def no_room() -> str | None:
+        """Why the next lane may not start now, or None; the same rule past the budget as before it."""
         others = sum(1 for index, (_, checkout) in enumerate(order) if index not in running and held(checkout))
-        return len(running) + others < cap and ((not running and not others) or room() is None)
+        if len(running) + others >= cap:
+            return f"{len(running)} of this run's lanes and {others} of another's fill the cap of {cap}"
+        return None if not running and not others else room()
 
     def claim_lane(index: int) -> bool | None:
-        """Under the host lock: True once this run holds the lane's lock, False when another worker does,
-        None when there is no room yet."""
+        """Under the host lock: True once this run holds the lane's lock; False when another worker does, or
+        when past the budget no lane of this run runs and there is still no room (the next run settles it);
+        None to wait for room."""
         checkout = order[index][1]
         with start_lock():
-            if not held(checkout) and lane_fits() and take(checkout):
+            busy = held(checkout)
+            why = None if busy else no_room()
+            if not busy and why is None and take(checkout):
                 return True
-            if not held(checkout):
-                return None
+        if not busy and (why is None or clock() < deadline or running):
+            return None  # past the budget, only this run's own lanes are waited for: they end in time
         seen.setdefault(index, frozenset())  # a later scan starts it once that worker is done
-        rows[index].append({"ran": [], "busy": "another runner holds the lane; it counts toward the cap"})
+        rows[index].append({"ran": [], "busy": "another runner holds the lane; it counts toward the cap" if busy
+                            else f"no room past the budget ({why}); the next run settles it"})
         return False
 
     def collect_and_release() -> None:
@@ -4782,6 +4789,7 @@ def add_lane_verbs(commands: Any) -> None:
 def lane_main(args: Any) -> int:
     """The `sd-ship lane` verbs; prints JSON and exits 0, or 3 with the refusal."""
     environ = dict(os.environ)
+    environ.pop(HANDED_ENV, None)  # the lock its run handed it, for `runner_lock` alone: no step reads it (sd:9332)
     try:
         if args.lane_command == "watch" and not getattr(args, "items", None):
             return watch(lane_root(environ), once=args.once)

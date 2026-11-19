@@ -10,6 +10,7 @@ from __future__ import annotations
 import calendar
 import contextlib
 import fcntl
+import functools
 import importlib.util
 import io
 import json
@@ -5816,7 +5817,8 @@ class HostedParallel(Lane):
         import sd_gate_slots
         lanes = [] if free else [{"state": "holding", "slot": 1, "pid": 1, "label": "lane", "cwd": "", "since": ""}]
         found = {"slots": 1, "holders": [] if free else [{"slot": 1}], "waiters": [], "lane_gates": lanes}
-        patcher = mock.patch.object(sd_gate_slots, "machine_snapshot", lambda environ: found)
+        self.real_snapshot = getattr(self, "real_snapshot", sd_gate_slots.machine_snapshot)
+        patcher = mock.patch.object(sd_gate_slots, "machine_snapshot", lambda environ, **_: found)
         patcher.start()
         self.addCleanup(patcher.stop)
 
@@ -5916,7 +5918,7 @@ class HostedParallel(Lane):
         self.assertEqual(seen, ["start 1", "end 1", "start 2", "end 2"])
         self.assertEqual(self.statuses(), ["merged", "merged"])
         import sd_gate_slots
-        with mock.patch.object(sd_gate_slots, "machine_snapshot", lambda environ: "no gate directory"):
+        with mock.patch.object(sd_gate_slots, "machine_snapshot", lambda environ, **_: "no gate directory"):
             self.assertIn("cannot read the gate slots", sd_lane.lane_room(self.environ))
 
     def test_builder_gates_leave_room_for_a_second_lane(self) -> None:
@@ -5924,7 +5926,7 @@ class HostedParallel(Lane):
         import sd_gate_slots
         builders = [{"slot": slot} for slot in (1, 2)]
         found = {"slots": 2, "holders": builders, "waiters": [{"place": 1}], "lane_gates": []}
-        with mock.patch.object(sd_gate_slots, "machine_snapshot", lambda environ: found), \
+        with mock.patch.object(sd_gate_slots, "machine_snapshot", lambda environ, **_: found), \
                 mock.patch.object(sd_lane, "load_stop", lambda environ: None):
             self.assertIsNone(sd_lane.lane_room(self.environ))
             found["lane_gates"] = [{"state": "holding", "slot": 1}, {"state": "waiting", "place": 1}]
@@ -6052,6 +6054,80 @@ class HostedParallel(Lane):
         self.assertEqual([checkout for checkout, budget in b_starts if budget > 0], [],
                          f"run B started a lane inside its budget beside run A's, over a cap of 1: {answer}")
         self.assertEqual(self.statuses(), ["merged", "pending"], (rows, answer))
+
+    def hold_outside(self, checkout: pathlib.Path) -> None:
+        """Another run's worker holds `checkout`'s runner lock until the test ends."""
+        lock = sd_lane.queue_for(checkout, self.environ).lock_file
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        handle = open(lock, "a", encoding="utf-8")  # noqa: SIM115 -- closed by the cleanup
+        self.addCleanup(handle.close)
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+    def test_past_the_budget_a_run_starts_no_lane_over_the_shared_cap(self) -> None:
+        """sd:9332 lead review: past its budget a run started a zero-budget worker beside the other run's lane,
+        over a cap of 1; that worker can still resume an owed release or post-merge. The cap holds past the
+        budget as before it; the lane waits for the next run."""
+        self.hold_outside(self.repo)
+        started: list[pathlib.Path] = []
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            started.append(checkout)
+            return sd_lane.StartedLane(lambda: {"ran": []}, lambda: None)
+        rows = sd_lane.run_parallel([("pack", self.repo), ("zeta", self.zeta)], start, sd_lane.clock() - 1,
+                                    lambda: None, locks=sd_lane.MachineLocks(self.environ), cap=1)
+        self.assertEqual(started, [], rows)
+        self.assertIn("no room", rows[1].get("busy", ""), rows)
+
+    def test_a_held_gate_admission_lock_stops_no_run_under_the_start_lock(self) -> None:
+        """sd:9332 lead review: the room read took the gate's admission lock blocking, under the host's start
+        lock, so a stalled gate stopped both lane-run jobs. It reads the gate without waiting; a lock it
+        cannot take is no room, and the run starts nothing and ends."""
+        import sd_gate_slots
+        self.hold_outside(self.repo)
+        where = sd_gate_slots.directory(self.environ)
+        where.mkdir(parents=True, exist_ok=True)
+        admission = open(where / sd_gate_slots.QUEUE_LOCK, "a", encoding="utf-8")  # noqa: SIM115 -- cleanup
+        fcntl.flock(admission, fcntl.LOCK_EX)
+        self.addCleanup(admission.close)
+        started: list[pathlib.Path] = []
+        now = [sd_lane.clock()]
+
+        def start(checkout: pathlib.Path, budget: float) -> sd_lane.StartedLane:
+            started.append(checkout)
+            return sd_lane.StartedLane(lambda: {"ran": []}, lambda: None)
+        rows: list = []
+
+        def run() -> None:
+            rows.extend(sd_lane.run_parallel([("pack", self.repo), ("zeta", self.zeta)], start, now[0] + 600,
+                                             functools.partial(sd_lane.lane_room, self.environ),
+                                             locks=sd_lane.MachineLocks(self.environ), cap=2))
+
+        def nap(seconds: float) -> None:
+            now[0] += 60.0
+        with mock.patch.object(sd_gate_slots, "machine_snapshot", self.real_snapshot), \
+                mock.patch.object(sd_lane, "clock", lambda: now[0]), mock.patch.object(sd_lane.time, "sleep", nap):
+            worker = threading.Thread(target=run, daemon=True)
+            worker.start()
+            worker.join(10)
+            alive = worker.is_alive()
+            admission.close()  # a run stuck on it ends now
+            worker.join(30)
+        self.assertFalse(alive, "the run waited on the gate's admission lock")
+        self.assertEqual(started, [], rows)
+
+    def test_a_lane_child_drops_the_handed_lock_from_its_environment(self) -> None:
+        """sd:9332 lead review: `lane run` copied the environment with the handed lock's fd in it, so a
+        post-merge command read a lock fd that is not its own."""
+        seen: list[dict] = []
+        import argparse
+        parser = argparse.ArgumentParser()
+        sd_lane.add_lane_verbs(parser.add_subparsers(dest="command"))
+        with contextlib.chdir(self.repo), mock.patch.dict(os.environ, {**self.environ, sd_lane.HANDED_ENV: "99:x"}), \
+                mock.patch.object(sd_lane, "run_lane", lambda root, environ, **_: seen.append(dict(environ)) or {}), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(sd_lane.lane_main(parser.parse_args(["lane", "run"])), 0)
+        self.assertEqual(len(seen), 1)
+        self.assertFalse(sd_lane.HANDED_ENV in seen[0], "post-merge would read the handed lock's fd")
 
     def test_the_hosted_run_reads_the_machine_s_lane_parallel(self) -> None:
         """sd:9323: the runner's start rule reads sd.lane_parallel, not the constant."""

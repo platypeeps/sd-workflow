@@ -295,10 +295,11 @@ class Queue:
         self.tickets = where / QUEUE_DIR
 
     @contextlib.contextmanager
-    def admission_lock(self) -> Iterator[None]:
+    def admission_lock(self, *, wait: bool = True) -> Iterator[None]:
+        """`queue.lock`; with `wait` false, BlockingIOError while another holds it."""
         fd = os.open(self.where / QUEUE_LOCK, os.O_RDWR | os.O_CREAT, 0o644)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            fcntl.flock(fd, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
             yield
         finally:
             os.close(fd)
@@ -914,13 +915,14 @@ def held_by(queue: Queue) -> str:
 
 
 def snapshot(where: pathlib.Path, slots: int, rule: LoadRule, *,
-             loadavg: Callable[[], Sequence[float]] = os.getloadavg, wall: Callable[[], float] = time.time) -> dict:
+             loadavg: Callable[[], Sequence[float]] = os.getloadavg, wall: Callable[[], float] = time.time,
+             wait: bool = True) -> dict:
     """Who holds a slot (`read_holders`), who waits and in which place, the lane gates among them (sd:5078),
-    and the load rule; read under `queue.lock`."""
+    and the load rule; read under `queue.lock`, or BlockingIOError while another holds it and `wait` is false."""
     queue = Queue(where)
     holders, waiters, lanes, state = [], [], [], {}
     if where.is_dir():
-        with queue.admission_lock():
+        with queue.admission_lock(wait=wait):
             state = queue.state()
             holders = read_holders(where)
             live = queue.waiters(prune=False)
@@ -941,16 +943,19 @@ def snapshot(where: pathlib.Path, slots: int, rule: LoadRule, *,
             "last_admitted": utc_stamp(last) if isinstance(last, (int, float)) else None, "now": utc_stamp(wall())}
 
 
-def machine_snapshot(environ: Mapping[str, str]) -> dict | str:
+def machine_snapshot(environ: Mapping[str, str], *, wait: bool = True) -> dict | str:
     """`snapshot` with the machine's slots and load rule, as `sd gate status` reads them, or why it could not be read.
 
-    For `sd today` and `sd-status`: a failed read is unknown, never an idle gate.
+    For `sd today` and `sd-status`: a failed read is unknown, never an idle gate. With `wait` false, a
+    queue lock another holds is such a failure: the hosted run reads it under its start lock (sd:9332).
     """
     try:
         settings = machine_settings(environ)
         slots, _ = configured(environ, settings["gate_slots"])
         rule = load_rule(environ, settings["gate_load_max"], settings["gate_settle_seconds"])
-        return snapshot(directory(environ), slots, rule)
+        return snapshot(directory(environ), slots, rule, wait=wait)
+    except BlockingIOError:
+        return "the gate queue lock is held; not waiting for it"
     except (OSError, ValueError) as error:
         return str(error)
 
