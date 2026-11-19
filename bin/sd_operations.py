@@ -436,12 +436,12 @@ def tools(build_run: Any) -> Any:
 
 
 def hub_outages() -> tuple[type[BaseException], ...]:
-    """The hub's brief outages a tick skips with exit 0, as a locked database (pack sd:9541): the hub timed out, or a
-    hub refresh is ahead of this satellite's follow (`outage` refuses any other mismatch). Not `Fenced`: no field
-    tells the hub's Tailscale outage from a demotion, which lasts."""
+    """The hub's brief outages a tick skips with exit 0, as a locked database (pack sd:9541): the hub timed out, a
+    hub refresh is ahead of this satellite's follow (`outage` refuses any other mismatch), or Tailscale names no
+    hub node (`outage` refuses any other `Fenced`, such as a demotion, which lasts: pack sd:9574)."""
     sd_handoff_rows.library()
-    from sd_db import remote  # noqa: PLC0415 - after the helper
-    return remote.HubUnreachable, remote.BuildMismatch
+    from sd_db import hub, remote  # noqa: PLC0415 - after the helper
+    return remote.HubUnreachable, remote.BuildMismatch, hub.Fenced
 
 
 #: Skipped ticks in a row that exit 0, a mismatch aside; the next fails, so a lasting outage, a hub that hangs or
@@ -501,13 +501,16 @@ def end_skips() -> None:
 def outage(error: BaseException) -> tuple[str, str | None]:
     """The `skipped` reason for one of `hub_outages`, and the text the streak's failing tick refuses with.
 
+    A `Fenced` counts only when Tailscale named no node (`cause` `tailscale`); any other refuses at once.
     A mismatch skips uncounted, None: the follow job follows (pack sd:8685), and a satellite stays mismatched for
     minutes after every pack merge, so a count would alert on each; a stuck follow alerts in its own report. Every
     hub refresh differs only in its build digest, `upgrade` `both`. One whose `upgrade` names the hub needs
     `repo-sync.sh refresh` there, which no follow job runs, so it refuses at once (pack sd:9541).
     """
     sd_handoff_rows.library()
-    from sd_db import remote  # noqa: PLC0415 - after the helper
+    from sd_db import hub, remote  # noqa: PLC0415 - after the helper
+    if isinstance(error, hub.Fenced) and getattr(error, "cause", None) != "tailscale":
+        raise WorkRefusal(str(error)) from error  # a demotion, or a hub too old to say: lasting (pack sd:9543)
     if not isinstance(error, remote.BuildMismatch):
         return str(error), str(error)
     if getattr(error, "upgrade", None) == "hub":
