@@ -2073,6 +2073,25 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertIn("blocked build · assignment 90 · build run ended", row(built))
         self.assertIn("lane failed at prepare · gate failed", row(made))
 
+    def test_a_parked_items_blocked_rows_keep_their_controls_on_its_parked_row(self):
+        """Re-review of pack sd:9425: the Parked row took the blocked rows' reasons and dropped their controls, so a
+        parked item's failed lane entry or blocked build could not be retried, approved, fixed or cancelled."""
+        built, _ = self.parked_answers(self.checkout)
+        made, answers = self.parked_answers(self.checkout)
+        self.list(self.entries() + [{"item": made, "title": "Set aside", "status": "failed", "step": "prepare",
+                                     "reason": "gate failed", "finished_at": NOW}])
+        asg = {"id": 90, "lead": 90, "item": built, "title": "Set aside", "repo": str(self.checkout),
+               "why": "build run ended", "since": NOW, "retry": {"allowed": True, "reason": ""},
+               "cancel": {"allowed": True, "reason": ""}}
+        answers["/api/queue/runner"] = [200, {**self.RUNNER, "blocked": [asg]}]
+        out = self.run_view(self.TILE + " open('system'); tile('system', 'parked'); R.tiled = ELS.queue.html;",
+                            answers=answers)
+        def row(item):
+            return out["R"]["tiled"].split(f'data-type="parked" data-item="{item}"')[1].split("</tr>")[0]
+        self.assertIn(f'data-act="retry" data-item="{made}" data-repo="{self.checkout}"', row(made))
+        self.assertIn('data-asg="retry" data-id="90"', row(built))
+        self.assertIn('data-asg="cancel" data-id="90"', row(built))
+
     def test_a_repo_whose_only_rows_are_parked_still_shows_its_parked_box(self):
         """Review of sd:9247: a repo with nothing but parked tasks drew no row, so its box was unreachable."""
         solo = self.checkout.parent / "solo"
