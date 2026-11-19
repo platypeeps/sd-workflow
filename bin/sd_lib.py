@@ -3979,9 +3979,9 @@ def process_table() -> dict[int, tuple[int, int, str]] | None:
     try:
         listed = subprocess.run(["ps", "-A", "-o", "pid=,ppid=,pgid=,lstart="], capture_output=True, text=True,
                                 timeout=PS_SECONDS, check=False, stdin=subprocess.DEVNULL)
-    except (OSError, subprocess.SubprocessError):
+    except Exception:  # noqa: BLE001 - any read that fails, a caller's stubbed Popen too, is unknown
         return None
-    if listed.returncode != 0:
+    if listed.returncode != 0 or not isinstance(listed.stdout, str):
         return None
     table: dict[int, tuple[int, int, str]] = {}
     for line in listed.stdout.splitlines():

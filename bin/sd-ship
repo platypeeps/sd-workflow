@@ -300,9 +300,14 @@ def review_process(root: pathlib.Path, argv: list[str], *, timeout: float) -> su
             if isinstance(interruption, subprocess.TimeoutExpired):
                 output, errors = interruption.output or b"", interruption.stderr or b""
             cleanup: dict = {}
+            # The SIGKILL reaches each session below the group too, read before
+            # the SIGTERM and again before the SIGKILL (pack sd:9392).
+            below = sd_lib.groups_below(process.pid) if sd_lib.group_alive(process.pid) else {}
             for name, number, bound in (("term", signal.SIGTERM, REVIEW_CLEANUP_SECONDS), ("kill", signal.SIGKILL, REVIEW_DRAIN_SECONDS)):
                 # poll() may already have reaped the leader. Its descendants
                 # still own the group and pipes, so the signal is unconditional.
+                if number == signal.SIGKILL:
+                    sd_lib.kill_below(process.pid, below)
                 try:
                     os.killpg(process.pid, number)
                     cleanup[name] = "sent"
