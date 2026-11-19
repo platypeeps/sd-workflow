@@ -26,7 +26,14 @@ import subprocess
 from unittest import mock
 
 from tests.clean_env import clean_environment
-from tests.test_sd_review import FIXTURE_REGISTRY, FakeRunner, sd_review
+from tests.test_sd_review import (
+    FIXTURE_REGISTRY,
+    FakeClient,
+    FakeRunner,
+    chat_answer,
+    namespace,
+    sd_review,
+)
 from tests.test_sd_review_fallbacks import ReviewRunFixture
 
 CHECK = {"sd-check": sd_review.Completed(0, "{}", "")}
@@ -127,7 +134,7 @@ class AFileTheRepositoryHoldsIsLocated(ReviewRunFixture):
 
     reviewing_depth = 1
 
-    def review(self, codex: sd_review.Completed, **options) -> dict:
+    def review(self, codex: sd_review.Completed | None, client: FakeClient | None = None, **options) -> dict:
         root = self.make_repo(f"repo-{len(list(self.tmp.iterdir()))}")
         (root / "src.py").write_text("the_review_subject = 123\n")
         self.stub_policy({"default_tier": "cheap"})
@@ -135,7 +142,14 @@ class AFileTheRepositoryHoldsIsLocated(ReviewRunFixture):
             for argv in (["checkout", "-b", "change"], ["add", "src.py"], ["commit", "-m", "change"]):
                 subprocess.run(["git", *argv], cwd=root, check=True, capture_output=True, env=clean_environment())
         (root / "loose.md").write_text("in the working tree only\n")
-        result = self.run_review(root, FakeRunner({**CHECK, "codex": codex}, default=CLEAN), **options)
+        if client is not None:
+            self.local_block(root)
+            (root / "CLAUDE.local.md").write_text((root / "CLAUDE.local.md").read_text().replace(
+                "codex@codex", "codex@codex.example.test"))
+            result = sd_review.review(root, namespace(**options), FakeRunner(CHECK, default=CLEAN),
+                                      self.environment(REMOTE_KEY="fixture"), self.chatgpt_home(), client=client)
+        else:
+            result = self.run_review(root, FakeRunner({**CHECK, "codex": codex}, default=CLEAN), **options)
         self.assertNotIn("README.md", result["subject"]["paths"], "the premise: README.md is outside the diff")
         return result
 
@@ -207,17 +221,43 @@ class AFileTheRepositoryHoldsIsLocated(ReviewRunFixture):
         self.assertNotIn("finding 5", detail)
         self.assertEqual(result["outcomes"][0]["diagnostic"]["unlocated_findings"], 7)
 
-    def test_a_reader_given_only_the_material_cannot_cite_past_it(self) -> None:
-        """Lead re-review of 872ec2f72: a reader that gets only the supplied
-        material never saw README.md, so citing it is not located; the
-        checkout reader's case is test_a_tracked_file_outside_the_diff_is_located."""
+    def test_a_claude_reader_in_the_checkout_may_cite_a_file_it_can_read(self) -> None:
+        """Re-review of 6bb31d81d: claude-json gets the material and also runs
+        in the checkout with Read, Grep and Glob, so it can see README.md."""
         registry = self.registry_home / ".local/share/sd/providers.yaml"
         registry.write_text(FIXTURE_REGISTRY.replace("roles: [reviewer], reader: codex-json",
                                                      "roles: [reviewer], reader: claude-json", 1))
         claude = sd_review.Completed(0, json.dumps({"type": "result", "subtype": "success", "structured_output": {
             "findings": [row("README.md", "low", "README contradicts src.py")]}}), "")
         result = self.review(claude)
-        self.assertEqual(result["outcomes"][0]["backend"], "codex")
+        self.assertEqual((result["status"], result["reviewed_by"]), ("advisory", ["codex"]))
+        self.assertEqual([f["path"] for f in result["findings"]], ["README.md"])
+
+    def test_a_url_reader_sees_only_the_material(self) -> None:
+        """A URL entry gets the supplied material alone: README.md is not its to cite."""
+        registry = self.registry_home / ".local/share/sd/providers.yaml"
+        registry.write_text(FIXTURE_REGISTRY.replace('codex:  { start: "codex exec", vendor: openai, bill: first,',
+                                                     'codex:  { url: "https://codex.example.test/v1", model: fixture, '
+                                                     'vendor: openai, bill: first, env: [REMOTE_KEY],', 1))
+        client = FakeClient({"codex": chat_answer(json.dumps({"findings": [row("README.md", "low")]}))})
+        result = self.review(None, client=client)
+        self.assertEqual(len(client.sent), 1, "the premise: the URL reader answered")
         self.assertEqual(result["outcomes"][0]["status"], "unavailable")
-        self.assertIn("'README.md': README contradicts src.py", result["outcomes"][0]["detail"])
-        self.assertEqual((result["status"], result["reviewed_by"]), ("clean", ["second"]))
+        self.assertIn("'README.md': a finding", result["outcomes"][0]["detail"])
+        self.assertEqual(result["reviewed_by"], ["second"])
+
+    def test_only_a_reader_launched_in_the_checkout_reads_it(self) -> None:
+        def entry(**fields) -> sd_review.sd_registry.Provider:
+            return sd_review.sd_registry.Provider(name="p", vendor="v", bill="b", **fields)
+        self.assertEqual([sd_review.reads_checkout(entry(start="x", reader=reader)) for reader in sd_review.READERS],
+                         [reader != "opencode-json" for reader in sd_review.READERS])
+        self.assertFalse(sd_review.reads_checkout(entry(url="https://remote.example.test/v1", model="m")))
+
+    def test_a_planning_review_cites_only_its_own_plan(self) -> None:
+        """Another item's plan is a file the head holds; on a planning review
+        it is not this subject, so the old rule stands."""
+        subject = sd_review.Subject("planning", "HEAD", "worktree", ("src.py",), 1, "the plan")
+        with mock.patch.object(sd_review, "resolve_subject", return_value=subject):
+            result = self.review(answer(row("README.md", "low")), scope="planning")
+        self.assertEqual(result["outcomes"][0]["status"], "unavailable")
+        self.assertEqual(result["reviewed_by"], ["second"])

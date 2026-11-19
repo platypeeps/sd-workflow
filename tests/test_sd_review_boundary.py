@@ -998,11 +998,16 @@ class LineBudgetTests(unittest.TestCase):
         # 4846 -> 4848 is the sd:9536 re-review: `bin/sd-review` +2 so only
         # a reader of the checkout may cite a file the head holds. Measured:
         # `sd-review` is 2878 here.
+        #
+        # 4848 -> 4852 is the second sd:9536 re-review: `bin/sd-review` +4
+        # for `reads_checkout`, the one fact that sets the launch directory
+        # and lets a reader cite the head's files, and the planning rule.
+        # Measured: `sd-review` is 2882 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4848,
+            4852,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

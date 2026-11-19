@@ -1598,6 +1598,11 @@ def _url_attempt(provider: sd_registry.Provider, subject: Subject, request_promp
                             cost=cost if any(value is not None for value in cost.values()) else None)
 
 
+def reads_checkout(provider: sd_registry.Provider) -> bool:
+    """Whether the reader launches in the checkout with file tools (sd:9536); a URL entry and opencode do not."""
+    return not provider.url and provider.reader != "opencode-json"
+
+
 def run_provider(
     provider: sd_registry.Provider,
     root: pathlib.Path,
@@ -1672,7 +1677,7 @@ def run_provider(
     with tempfile.TemporaryDirectory(prefix="sd-review-") as raw_dir:
         workdir = pathlib.Path(raw_dir)
         argv = provider_argv(provider, root, workdir)
-        launch_cwd = root
+        launch_cwd = root if reads_checkout(provider) else workdir
         # Denies opencode resolved beside the map: accepted, and named in the
         # outcome so the receipt says what this run ran under (sd:3498), with
         # the binary's version (sd:3499).
@@ -1707,7 +1712,6 @@ def run_provider(
                                                     accepted=accepted, seen=seen)
             if breach:
                 return _outcome(provider.name, REFUSED, breach)
-            launch_cwd = workdir
         filename, content = ((CODEX_SCHEMA_FILE, json.dumps(CODEX_OUTPUT_SCHEMA)) if codex else
                              ("review-subject.md", request_prompt))
         (workdir / filename).write_text(content, encoding="utf-8")
@@ -2382,11 +2386,11 @@ def review(
         def read_one(provider: sd_registry.Provider) -> tuple[dict[str, Any] | None, list[Outcome]]:
             """One reader's attempts, in its own thread (sd:7519); its skill state measured against its own binary."""
             measured = codex_skill_state(provider, root, runner, env, auth_home) if provider.reader == "codex-json" and auth["ok"] else None
-            material = bool(provider.url) or provider.reader in MATERIAL_READERS
-            unread = omitted if material else ()
-            # sd:9536: only a reader of the checkout saw the head's other files; one given the material cites only it.
+            unread = omitted if provider.url or provider.reader in MATERIAL_READERS else ()
+            # sd:9536: a reader in the checkout may cite the head's other files; a planning review cites only its plan.
+            looks = (held,) if reads_checkout(provider) and subject.scope != "planning" else ()
             return measured, _attempts(provider, lambda: partial(unlocated(run_provider(provider, root, subject, prompt, runner, env, phase,
-                codex_auth_home, client, ledger, measured or skills), cited, result["severity_floor"], *(() if material else (held,))), unread))
+                codex_auth_home, client, ledger, measured or skills), cited, result["severity_floor"], *looks), unread))
         answers = sd_lib.fill_slots(chosen, depth, read_one, lambda answer: any(row.status in (CLEAN, FINDINGS) for row in answer[1]), READER_GROUPS)
         # The result key carries the first binary that ignored the key, else the last measured; each outcome its own.
         measures = [measured for measured, _attempts_made in answers if measured is not None]
@@ -2524,8 +2528,8 @@ def unlocated(outcome: Outcome, cited: frozenset[str], floor: str, held: Callabl
     """sd:1406. A finding that cites no path this run reviewed is not advice.
 
     Measured blind answers put nothing, `/`, or prose where a path belongs; a
-    sighted one cites a subject path, or a file the head holds when it reads
-    the checkout itself (sd:9536). The check reads structure, not prose.
+    sighted one cites a subject path, or a file the head holds when it runs
+    in the checkout (sd:9536). The check reads structure, not prose.
     A completed answer with no located finding is voided: `unavailable`, not
     counted toward depth, its findings dropped. A completed answer with one
     located finding is kept whole. A failed answer keeps its located findings
