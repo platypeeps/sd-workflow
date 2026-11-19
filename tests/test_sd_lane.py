@@ -6124,7 +6124,7 @@ class Bounds(unittest.TestCase):
         """Class pass, rule 1: the gate's `run_group` ended between the TERM wait and the SIGKILL and cleared
         `group`, so the SIGKILL step skipped the sessions read below it at the TERM."""
         gate = sd_lane.SpeculativeGate(lambda: None, "cleared")
-        read = sd_lane.sd_lib.Below("start", {424242: "start"})
+        read = {424242: "start"}
         gate.below, gate.group = {4242: read}, None
         with mock.patch.object(sd_lane.sd_lib, "kill_below") as kill:
             gate.signal_gate(signal.SIGKILL)

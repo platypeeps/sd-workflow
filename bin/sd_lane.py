@@ -2194,7 +2194,7 @@ class SpeculativeGate(threading.Thread):
         self.why = "the run stopped, so it ended this gate (sd:3361)"
         self.cancelled = False
         self.group: int | None = None
-        self.below: dict[int, sd_lib.Below | None] = {}  # each group's read before its first signal (pack sd:9392)
+        self.below: dict[int, dict[int, str] | None] = {}  # each group's read before its first signal (pack sd:9392)
         self.guard = threading.RLock()  # `signal_gate` may run in a SIGTERM handler while this thread holds it
 
     def started(self, group: int | None) -> None:
@@ -2214,13 +2214,15 @@ class SpeculativeGate(threading.Thread):
         """Mark the gate cancelled and send `number` to its group, if one runs.
 
         Each group's first signal reads the groups below it first, and the
-        SIGKILL reaches what each read found, and what a walk from a group
-        whose leader keeps its start finds (`sd_lib.kill_below`, pack sd:9392).
+        SIGKILL reaches what each read found, and what a walk from each
+        group's members finds now (`sd_lib.kill_below`, pack sd:9392). A
+        signal that lands in the read still sends `number` to the group.
         """
         with self.guard:
             self.cancelled = True
-            if self.group is not None and self.group not in self.below:
-                self.below[self.group] = sd_lib.read_below(self.group)
+            if (group := self.group) is not None and group not in self.below:
+                self.below[group] = sd_lib.read_or_term(lambda: sd_lib.groups_below(group),
+                                                      lambda: end_group(group, number))
             if number == signal.SIGKILL:  # a cleared group leaves what was read (rule 1)
                 self.kill_left()
             if self.group is not None:
@@ -4370,7 +4372,7 @@ def end_child(process: subprocess.Popen[bytes], out: Any, err: Any) -> None:
     with out, err:
         if process.poll() is not None:
             return
-        below = sd_lib.read_below(process.pid, process=True)
+        below = sd_lib.read_or_term(lambda: sd_lib.groups_below(process.pid, process=True), process.terminate)
         process.terminate()
         try:
             process.wait(CHILD_STOP_SECONDS)

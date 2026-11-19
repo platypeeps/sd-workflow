@@ -302,7 +302,9 @@ def review_process(root: pathlib.Path, argv: list[str], *, timeout: float) -> su
             cleanup: dict = {}
             # The SIGKILL reaches each session below the group too, read before
             # the SIGTERM and again before the SIGKILL (pack sd:9392).
-            below = sd_lib.read_below(process.pid) if sd_lib.group_alive(process.pid) else sd_lib.NOTHING_BELOW
+            below = sd_lib.read_or_term(  # a signal in the read still TERMs the group
+                lambda: sd_lib.groups_below(process.pid) if sd_lib.group_alive(process.pid) else {},
+                lambda: sd_lib.signal_group(process.pid, signal.SIGTERM))
             for name, number, bound in (("term", signal.SIGTERM, REVIEW_CLEANUP_SECONDS), ("kill", signal.SIGKILL, REVIEW_DRAIN_SECONDS)):
                 # poll() may already have reaped the leader. Its descendants
                 # still own the group and pipes, so the signal is unconditional.
@@ -316,8 +318,11 @@ def review_process(root: pathlib.Path, argv: list[str], *, timeout: float) -> su
                 except OSError as error:
                     cleanup[name] = f"failed: {error}"
                 try:
+                    deadline = time.monotonic() + bound
                     output, errors = process.communicate(timeout=bound)
                     cleanup["drained"] = True
+                    if number == signal.SIGTERM:  # the grace lasts until the group is empty (pack sd:9392)
+                        sd_lib.wait_empty(process.pid, deadline)
                 except subprocess.TimeoutExpired as error:
                     output, errors = error.output or output, error.stderr or errors
                     cleanup["drained"] = False
