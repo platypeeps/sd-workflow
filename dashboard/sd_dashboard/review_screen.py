@@ -21,13 +21,14 @@ and the CLI verb share one path (operator ruling Q3); the page adds no store and
   can rule the chosen ones Approve through `/api/review/rule`. A repository is sent by name, never by its local path.
 - `sweeps` is `/api/review`'s `sweeps` (sd:9505): the weekly advisory sweep, one row per week, newest first: the
   RESULT line and the cap's `sampled N of M` from the job's log, and its filed items (`advisory-sweep:<date>:<repo>`
-  refs) done and not done. A week with no RESULT keeps None, never zero; a log that does not read keeps the items.
+  refs) done and not done, each keyed on its week's ending Sunday, the day the job runs. A week with no RESULT keeps None, never zero; a log that does not read keeps the items.
 - `export` is `/api/review/<item>/export`: `review.export` without a key, the lines `sd-db review export` writes.
   A blind or sealed batch exports only once no question is open, so the page never shows a subject while labelling.
 """
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
@@ -131,6 +132,16 @@ def sweeps(connection, cron_root) -> dict:
     weeks: dict[str, dict] = {}
 
     def week(date):
+        # One sweep week ends on the Sunday the job runs (05:30): a run or a ref dated Monday to Sunday keys on that
+        # Sunday, so a rerun by hand mid-week and the Sunday run are one row (sd:9505 review). A date that is no
+        # calendar date keys nowhere: its run or item is left out, not the page.
+        try:
+            day = datetime.date.fromisoformat(date) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date) else None
+        except ValueError:
+            day = None
+        if day is None:
+            return None
+        date = (day + datetime.timedelta(days=(6 - day.weekday()) % 7)).isoformat()
         return weeks.setdefault(date, {"week": date, "runs": 0, "packets": None, "open": None, "filed": None,
                                        "skipped": None, "fixed": 0, "unfixed": 0})
 
@@ -138,6 +149,8 @@ def sweeps(connection, cron_root) -> dict:
     for n, start in enumerate(starts):
         block = text[start.end():starts[n + 1].start() if n + 1 < len(starts) else len(text)]
         row = week(start[1])
+        if row is None:
+            continue
         row["runs"] += 1
         results = SWEEP_RESULT.findall(block)
         if results:
@@ -148,9 +161,9 @@ def sweeps(connection, cron_root) -> dict:
         if caps:
             row["skipped"] = (row["skipped"] or 0) + int(caps[-1][1]) - int(caps[-1][0])
     for found in reads.ref_items(connection, SWEEP_REF):
-        date = found["external_id"][len(SWEEP_REF):].partition(":")[0]
-        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date):
-            week(date)["fixed" if found["status"] == "done" else "unfixed"] += 1
+        row = week(found["external_id"][len(SWEEP_REF):].partition(":")[0])
+        if row is not None:
+            row["fixed" if found["status"] == "done" else "unfixed"] += 1
     return {"state": log["state"], "reason": log["reason"],
             "weeks": sorted(weeks.values(), key=lambda row: row["week"], reverse=True)}
 

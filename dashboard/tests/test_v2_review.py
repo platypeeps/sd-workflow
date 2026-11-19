@@ -890,17 +890,33 @@ class TheAdvisorySweep(ScreenCase):
              "fixed": 0, "unfixed": 1},
             {"week": "2026-11-29", "runs": 1, "packets": None, "open": None, "filed": None, "skipped": None,
              "fixed": 0, "unfixed": 0},
-            {"week": "2026-11-22", "runs": 1, "packets": 0, "open": 0, "filed": 0, "skipped": None,
-             "fixed": 0, "unfixed": 0},
-            {"week": "2026-11-18", "runs": 1, "packets": 100, "open": 14, "filed": 10, "skipped": 92,
+            {"week": "2026-11-22", "runs": 2, "packets": 100, "open": 14, "filed": 10, "skipped": 92,
              "fixed": 1, "unfixed": 2}])
+
+    def test_runs_and_items_of_one_sweep_week_are_one_row_keyed_on_its_sunday(self):
+        # sd:9505 review: a Wednesday run by hand, a Sunday run and a Tuesday item are one sweep week, the one ending
+        # Sunday 2026-11-22, the day the job runs; the Monday after starts the next week.
+        log = SWEEP_LOG.split("[advisory-sweep-weekly] 2026-11-29")[0] + (
+            "[advisory-sweep-weekly] 2026-11-23T09:00:00-0700 starting (cwd: /home/operator)\n"
+            "RESULT: 5 packets, 1 open, 1 filed\n")
+        (self.cron / "logs" / f"{review_screen.SWEEP_JOB}.log").write_text(log, encoding="utf-8")
+        self.file("advisory-sweep:2026-11-17:alpha", "done")
+        self.file("advisory-sweep:2026-11-22:beta")
+        self.file("advisory-sweep:2026-11-23:gamma")
+        # Not calendar dates: each is left out, and the page still reads.
+        self.file("advisory-sweep:2026-13-45:delta")
+        self.file("advisory-sweep:20261124:epsilon")
+        found = review_screen.sweeps(self.connection, self.cron)["weeks"]
+        self.assertEqual([(w["week"], w["runs"], w["packets"], w["filed"], w["skipped"], w["fixed"], w["unfixed"])
+                          for w in found],
+                         [("2026-11-29", 1, 5, 1, None, 0, 1), ("2026-11-22", 2, 100, 10, 92, 1, 1)])
 
     def test_no_log_still_lists_the_filed_items_and_says_why(self):
         self.file("advisory-sweep:2026-11-18:alpha", "done")
         found = review_screen.sweeps(self.connection, self.cron)
         self.assertEqual(found["state"], "none")
         self.assertIn("no log", found["reason"])
-        self.assertEqual([(w["week"], w["fixed"], w["packets"]) for w in found["weeks"]], [("2026-11-18", 1, None)])
+        self.assertEqual([(w["week"], w["fixed"], w["packets"]) for w in found["weeks"]], [("2026-11-22", 1, None)])
 
     def test_the_review_api_sends_the_sweep_beside_the_queue(self):
         from sd_dashboard.v2.pages import decide
