@@ -343,9 +343,6 @@ STALE_HEAD = "stale_head"
 HANDED_BACK = "handed_back"
 #: An entry on a build bundle's branch would deliver a member the operator cancelled on its own (sd:9222).
 MEMBER_LEFT = "member_cancelled_alone"
-#: Set on every `sd-ship` the runner starts: a lane prepare never renews a delivery claim, even once a forced
-#: runner stop leaves it running under another parent (sd:9335).
-LANE_CHILD = "SD_LANE_CHILD"
 #: The refusal code of a cancel whose `--expected-claim` no longer holds the item's running entry (sd:3330).
 STALE_CLAIM = "stale_claim"
 #: The refusals of a cancelled entry's retry (sd:3389): its item has a newer entry, or merged at its head.
@@ -1931,7 +1928,7 @@ def ship_process(argv: list[str], log: pathlib.Path, timeout: int) -> dict[str, 
     log.parent.mkdir(parents=True, exist_ok=True)
     try:
         done = sd_lib.run_group([sys.executable, str(BIN / "sd-ship"), *argv], cwd=pathlib.Path("."),
-                                env={**os.environ, LANE_CHILD: "1"}, timeout=timeout)
+                                env=dict(os.environ), timeout=timeout)
         out, err = done.stdout, done.stderr
     except sd_lib.GroupTimeout as error:
         out, err = error.stdout, f"timed out after {timeout} s\n{error.stderr}"

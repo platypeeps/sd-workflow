@@ -5574,19 +5574,6 @@ class ShipProcess(Lane):
         self.assertEqual((answer["ok"], answer["entries"]), (True, []))
         self.assertTrue(log.read_text(encoding="utf-8").startswith(f"$ sd-ship -C {self.repo} lane list\n{{"))
 
-    def test_every_sd_ship_it_starts_carries_the_lane_mark(self) -> None:
-        """Lead review of sd:9335: `sd-ship` told a lane prepare from one by hand by its parent pid, which a
-        forced runner stop changes. The runner marks each child at launch instead."""
-        from unittest import mock
-        seen = {}
-
-        def run_group(argv, cwd, env, timeout):
-            seen.update(env)
-            return mock.Mock(stdout="{}", stderr="")
-        with mock.patch.object(sd_lane.sd_lib, "run_group", run_group):
-            sd_lane.ship_process(["prepare", "--json"], self.tmp / "logs/step.log", 120)
-        self.assertEqual(seen.get("SD_LANE_CHILD"), "1")
-
     def test_the_timeout_ends_what_sd_ship_started(self) -> None:
         """sd:3480. The timeout killed `sd-ship` alone; its gate's children ran on and held the gate slot."""
         fake, child = self.tmp / "bin", self.tmp / "child.pid"
@@ -6399,8 +6386,9 @@ class FailureNotes(SharedQueue):
 
     def test_a_failed_step_keeps_the_blocker_code_sd_ship_answered(self) -> None:
         """Lead review of sd:9303: the prepare step dropped its blocker code as the merge step did, so Queue and
-        Metrics read a prepare refusal, such as a renewed claim, from its text alone. Each step keeps the code."""
-        for step, code in (("prepare", "delivery_claim_renewed"), ("merge", "ci_not_passing")):
+        Metrics read a prepare refusal, such as a missing delivery claim, from its text alone. Each step keeps
+        the code."""
+        for step, code in (("prepare", "delivery_claim_required"), ("merge", "ci_not_passing")):
             with self.subTest(step=step):
                 self.answers.clear()
                 sd_lane.enqueue_entry(self.feature, 1, "fix: one", self.body, self.environ, manual=True, claim="deliver")
