@@ -606,13 +606,15 @@ def retry_state(connection, run: dict) -> dict:
             "bundle": current["status"]}
 
 
-def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
+def retry(connection, assignment: int, *, who: str, finding: str = "", only: Collection[int] | None = None) -> dict:
     """Retry a blocked or cancelled build bundle under its lead `assignment`: each such member's item to `ready`, a
     `finding` note on it when one is sent (Send to builder), then its assignment queued again, in one transaction.
     A plain Retry of a run parked after REVIEW_ROUNDS notes its blockers as a REVIEWED note (`parked_finding`), so
     the next builder reads them as the reviewer's, not the operator's (pack sd:9498).
     Each item must pass the press's own check once it is ready, so a retried bundle is one the next claim can take.
-    The Builds panel and `sd assignments build` share it (pack sd:8785)."""
+    The Builds panel and `sd assignments build` share it (pack sd:8785).
+    `only`, the items a retry names, retries those alone: it must name the lead, whose worktree holds the work,
+    and each member it leaves out leaves the bundle (`ALONE`), its item ready and parked (pack sd:9581)."""
     with transaction(connection):
         current = queue_state(connection, assignment)
         if current["scope"] != SCOPE:
@@ -630,6 +632,22 @@ def retry(connection, assignment: int, *, who: str, finding: str = "") -> dict:
         if _done(items, current["item"]):
             raise BuildRefused(f"Retry refused: its lead sd:{current['item']} is done")
         members = [member for member in members if not _done(items, member["item"])]
+        if only is not None and {member["item"] for member in members} - set(only):
+            if current["item"] not in only:
+                raise BuildRefused(f"Retry refused: a retry of part of the bundle names its lead sd:{current['item']}, "
+                                   f"whose worktree holds its work")
+            stamp = clock()
+            for member in [member for member in members if member["item"] not in only]:
+                connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
+                                   (stamp, f"{ALONE}{who}: left out of a Retry of build run {run['id']}",
+                                    member["id"]))
+                if member["item"] in items and items[member["item"]]["status"] == "blocked":
+                    transition(connection, member["item"], "ready", who=who,
+                               reason=f"left out of a Retry of build run {run['id']}")
+                park(connection, member["item"], ("ready",), stamp,
+                     f"Build assignment {member['id']} left its bundle: a Retry of build run {run['id']} by {who} "
+                     f"named other items; item parked; Build it to build it fresh")
+            members = [member for member in members if member["item"] in only]
         parked = "" if finding else parked_finding(run.get("detail"))
         queued = []
         for member in members:
@@ -699,6 +717,7 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
     finding = finding.strip()
     with transaction(connection):
         leads, fixes, fresh = [], [], []
+        named: dict[int, set[int]] = {}
         for item in items:
             row = connection.execute("SELECT id, parent, status FROM assignment WHERE item = ? AND scope = ? "
                                      "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
@@ -726,12 +745,16 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                     and not (state["run"]["outcome"] is None and state["run"]["step"] in LANE_STEPS)
                     and not _done(reads.items_by_ids(connection, [state["item"]]), state["item"])):
                 leads += [] if lead in leads else [lead]
+                named.setdefault(lead, set()).add(item)
             else:
                 fresh.append(item)
         if finding and fresh:
             raise BuildRefused(f"--finding goes to a Retry or a Fix; {', '.join(f'sd:{item}' for item in fresh)} "
                                "would be a fresh build, with no builder to send it to")
-        queued = [entry for lead in leads for entry in retry(connection, lead, who=who, finding=finding)["queued"]]
+        # One named item is the row's Retry of its whole bundle; two or more name the part to retry (pack sd:9581).
+        queued = [entry for lead in leads for entry in retry(
+            connection, lead, who=who, finding=finding,
+            only=named[lead] if len(named[lead]) > 1 else None)["queued"]]
         for run in fixes:
             fixed = lane_fix(connection, run["id"],
                              finding or f"the lane entry failed; fix what it names: {run['detail']}"[:2000], who=who)
