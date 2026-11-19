@@ -107,6 +107,12 @@ DEAF_CHILD = ('CHILD = "import os, pathlib, signal, subprocess, sys, time; '
               "pathlib.Path(sys.argv[1] + '.below').write_text(str(below.pid)); "
               'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)"')
 assert TERMED_CHILD in TERMED_RUNNER
+#: A child that starts `sleep 60` in a session below it, holding no pipe, and dies on TERM at once (pack sd:9392).
+QUITTER_CHILD = ('CHILD = "import os, pathlib, subprocess, sys, time; '
+                 "below = subprocess.Popen(['sleep', '60'], start_new_session=True, stdout=subprocess.DEVNULL, "
+                 "stderr=subprocess.DEVNULL); "
+                 "pathlib.Path(sys.argv[1] + '.below').write_text(str(below.pid)); "
+                 'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)"')
 
 
 def end_group(group: int) -> None:
@@ -6140,13 +6146,42 @@ class Bounds(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 10)
         self.assertEqual(answers[0][0], -signal.SIGKILL)
 
-    def deaf_child(self) -> tuple[list[str], pathlib.Path]:
+    def deaf_child(self, line: str = DEAF_CHILD) -> tuple[list[str], pathlib.Path]:
         """argv for a child that ignores TERM and starts `sleep 60` in a session below it, and its pid file."""
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
         mark = pathlib.Path(scratch.name) / "child.pid"
-        code = DEAF_CHILD.removeprefix("CHILD = ").strip('"')
+        code = line.removeprefix("CHILD = ").strip('"')
         return [sys.executable, "-c", code, str(mark)], mark
+
+    def test_a_gate_that_ends_on_term_still_kills_what_it_left(self) -> None:
+        """Class pass, rule 1: the gate's leader ended on the TERM, so `cancel_gate` returned at once and
+        never killed the session read below it before the TERM."""
+        argv, mark = self.deaf_child(QUITTER_CHILD)
+        gate = sd_lane.SpeculativeGate(lambda: sd_lane.gate_run()(argv, dict(os.environ), pathlib.Path.cwd(), 120),
+                                       "quits")
+        gate.start()
+        below = self.below_of(mark)
+        self.assertTrue(gate.cancel_gate())
+        self.assert_gone(below, "the session below a gate that ended on TERM")
+
+    def test_a_gate_kill_after_its_group_cleared_still_kills_what_was_read(self) -> None:
+        """Class pass, rule 1: the gate's `run_group` ended between the TERM wait and the SIGKILL and cleared
+        `group`, so the SIGKILL step skipped the sessions read below it at the TERM."""
+        gate = sd_lane.SpeculativeGate(lambda: None, "cleared")
+        gate.below, gate.below_of, gate.group = {424242: "start"}, 4242, None
+        with mock.patch.object(sd_lane.sd_lib, "kill_below") as kill:
+            gate.signal_gate(signal.SIGKILL)
+        kill.assert_called_once_with(4242, {424242: "start"})
+
+    def test_a_lane_child_that_ends_on_term_still_has_what_it_left_killed(self) -> None:
+        """Class pass, rule 1: the lane child ended on the TERM, so `end_child` returned after `wait` and
+        never killed the session read below it before the TERM."""
+        argv, mark = self.deaf_child(QUITTER_CHILD)
+        lane = sd_lane.child_lane(pathlib.Path.cwd(), 0, argv)
+        below = self.below_of(mark)
+        lane.end()
+        self.assert_gone(below, "the session below a lane child that ended on TERM")
 
     def below_of(self, mark: pathlib.Path) -> int:
         below = pathlib.Path(f"{mark}.below")

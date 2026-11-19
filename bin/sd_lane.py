@@ -2197,6 +2197,7 @@ class SpeculativeGate(threading.Thread):
         self.cancelled = False
         self.group: int | None = None
         self.below: dict[int, str] | None = None  # the groups below `group` at its first TERM (pack sd:9392)
+        self.below_of: int | None = None  # the group `below` was read under, kept after `started(None)`
         self.termed_at: float | None = None
         self.guard = threading.RLock()  # `signal_gate` may run in a SIGTERM handler while this thread holds it
 
@@ -2216,18 +2217,21 @@ class SpeculativeGate(threading.Thread):
             self.cancelled = True
             if number == signal.SIGTERM and self.termed_at is None:
                 self.termed_at = time.monotonic()
+            if self.group is not None and number == signal.SIGTERM and self.below is None:
+                self.below, self.below_of = sd_lib.groups_below(self.group) or {}, self.group
+            root = self.group if self.group is not None else self.below_of
+            if number == signal.SIGKILL and root is not None:  # a cleared group leaves what was read (rule 1)
+                sd_lib.kill_below(root, self.below)
             if self.group is not None:
-                if number == signal.SIGTERM and self.below is None:
-                    self.below = sd_lib.groups_below(self.group) or {}
-                if number == signal.SIGKILL:
-                    sd_lib.kill_below(self.group, self.below)
                 end_group(self.group, number)
 
     def cancel_gate(self) -> bool:
         """End the gate's group, SIGTERM then SIGKILL, each followed by up to `CANCEL_SECONDS`; whether it ended.
 
         The wait after SIGTERM counts from the first SIGTERM, which a run's
-        TERM sends as it lands (pack sd:9392)."""
+        TERM sends as it lands (pack sd:9392). A gate that ended on the
+        SIGTERM still has the sessions read below it then killed: its
+        leader's exit left them to no one (`kill_left`)."""
         for number in (signal.SIGTERM, signal.SIGKILL):
             self.signal_gate(number)
             bound = CANCEL_SECONDS
@@ -2236,8 +2240,16 @@ class SpeculativeGate(threading.Thread):
             with contextlib.suppress(RuntimeError):  # not started yet: `started` ends a group that starts later
                 self.join(bound)
             if not self.is_alive():
+                if number == signal.SIGTERM:
+                    self.kill_left()
                 return True
         return False
+
+    def kill_left(self) -> None:
+        """SIGKILL each session read below the gate's group at its first TERM that is still that session."""
+        with self.guard:
+            if self.below and self.below_of is not None:
+                sd_lib.kill_below(self.below_of, self.below)
 
 
 end_group = sd_lib.signal_group
@@ -4355,7 +4367,9 @@ def end_child(process: subprocess.Popen[bytes], out: Any, err: Any) -> None:
 
     The KILL reaches each session below the child too, read before the TERM
     and again before the KILL, while the child is unreaped (pack sd:9392):
-    its `sd-ship` and gate groups ran on with ppid 1.
+    its `sd-ship` and gate groups ran on with ppid 1. A child that ended on
+    the TERM still has the sessions read before it killed; its reaped pid
+    roots no new walk, since it may be another process's now.
     """
     with out, err:
         if process.poll() is not None:
@@ -4368,6 +4382,9 @@ def end_child(process: subprocess.Popen[bytes], out: Any, err: Any) -> None:
             sd_lib.kill_below(process.pid, below, process=True)
             process.kill()
             process.wait()
+        else:
+            if below:
+                sd_lib.kill_below(None, below)
 
 
 def lane_room(environ: dict[str, str]) -> str | None:
