@@ -3932,7 +3932,9 @@ class ThreadGroups:
     def __init__(self) -> None:
         import threading  # noqa: PLC0415 - only the group helpers need it
 
-        self._lock = threading.Lock()
+        # Reentrant: `end_groups` runs in the main thread's SIGTERM handler, which may interrupt any
+        # block below that holds it on that thread (pack sd:9600).
+        self._lock = threading.RLock()
         self._live: set[int] = set()
         self._holders: set[threading.Thread] = set()
         self._ending = False
@@ -4208,7 +4210,9 @@ def kill_below(root: int, earlier: Table | None, table: Table | None, *, process
     if earlier is not None and not earlier:
         return False
     if earlier is None or table is None:
-        with contextlib.suppress(OSError, ValueError):  # EIO on a revoked terminal, a closed stream
+        # EIO on a revoked terminal, a closed stream; RuntimeError for a handler's write re-entering the
+        # stderr writer the main thread was in (pack sd:9600).
+        with contextlib.suppress(OSError, ValueError, RuntimeError):
             print(f"sd: cannot read the process table; groups below {root} may still run", file=sys.stderr)
         if earlier is None:
             return False

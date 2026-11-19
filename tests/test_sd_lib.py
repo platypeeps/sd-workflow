@@ -2644,6 +2644,58 @@ class KillReachTests(unittest.TestCase):
             sd_lib.kill_below(100, earlier, now)
         self.assertEqual(sorted(call.args[0] for call in killpg.call_args_list), [200, 300])
 
+    def test_a_sigterm_handler_reentering_the_groups_lock_does_not_deadlock(self) -> None:
+        """pack sd:9600 class pass: `term_ends_group` runs `end_groups` in the handler, on the main
+        thread; it took `_lock` again where the interrupted code held it, and waited forever. Every
+        `with self._lock` in `ThreadGroups` runs on that thread: the hook, `reopen_groups`,
+        `holding_threads` and `end_groups`' snapshot, grace and KILL."""
+        groups = sd_lib.ThreadGroups()
+
+        def reenter() -> None:
+            with groups._lock:  # where any of those blocks holds it
+                groups.end_groups()
+        thread = threading.Thread(target=reenter, daemon=True)
+        thread.start()
+        thread.join(5)
+        self.assertFalse(thread.is_alive(), "end_groups waited on the lock its own thread held")
+
+    def test_a_sigterm_in_end_groups_kill_loop_finishes_the_kills(self) -> None:
+        """pack sd:9600 class pass, sd_lib.py:4016: a SIGTERM while the KILL loop held `_lock` ran
+        `end_groups` again on the same thread, which waited on that lock."""
+        groups = sd_lib.ThreadGroups()
+        hook = groups.group_hook()
+        hook(4242)
+        sent: list[tuple[int, int]] = []
+
+        def record(pid: int, number: int) -> None:
+            sent.append((pid, number))
+            if number == signal.SIGKILL and len([n for _, n in sent if n == signal.SIGKILL]) == 1:
+                groups.end_groups()  # the handler's `first`, on this thread
+        table = {4242: (1, 4242, "Thu Jan  1 00:00:00 1970")}
+
+        def run() -> None:
+            with unittest.mock.patch.object(sd_lib, "process_table", return_value=table), \
+                    unittest.mock.patch.object(sd_lib, "signal_group", side_effect=record), \
+                    unittest.mock.patch.object(sd_lib, "GROUP_CLEANUP_SECONDS", 0.1):
+                groups.end_groups()
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(10)
+        self.assertFalse(thread.is_alive(), "the handler's end_groups deadlocked the KILL loop")
+
+    def test_a_reentrant_stderr_write_stops_no_kill(self) -> None:
+        """pack sd:9600 class pass: the handler's diagnostic line re-entered the stderr writer the main
+        thread was in, which raises RuntimeError, and the SIGKILLs below never went out."""
+        class Busy(io.StringIO):
+            def write(self, text: str) -> int:
+                raise RuntimeError("reentrant call inside <_io.BufferedWriter name='<stderr>'>")
+        earlier = {100: (1, 100, "Thu Jan  1 00:00:00 1970"), 200: (100, 200, "Thu Jan  1 00:00:01 1970")}
+        with unittest.mock.patch.object(sd_lib, "_group_of", side_effect=lambda pid: pid), \
+                unittest.mock.patch("sys.stderr", new=Busy()), \
+                unittest.mock.patch.object(os, "killpg") as killpg:
+            sd_lib.kill_below(100, earlier, None)
+        self.assertIn(unittest.mock.call(200, signal.SIGKILL), killpg.call_args_list)
+
     def test_a_group_that_left_the_set_during_the_kill_read_gets_no_sigkill(self) -> None:
         """pack sd:9600, sd_lib.py:4014: the set was read before the up to 3 s KILL read; a group whose
         run_group ended it and reaped its leader in that read still had its bare number signalled."""
