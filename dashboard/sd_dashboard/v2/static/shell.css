@@ -95,7 +95,10 @@ html, body { overflow-x: clip; }
  * Unknown rows carry their why, never a bar.
  * Hallmark · component: usage dropdown · genre: modern-minimal · theme: design.md instrument panel
  * states: default · hover · focus · open (accent ring) · loading (Reading usage…) · error (Not read: why) · state glyph */
-.head, .home-head, [data-again] { position: relative; }
+/* The menu anchors to the page head, never to a page's [data-again] slot or .head-acts: on a phone those wrap to the
+ * head's left, and a menu as wide as the screen anchored to their right end ran past its left edge. The head spans the
+ * gutters, so 100% keeps the menu inside them. */
+.head, .home-head { position: relative; }
 .head-acts { display: inline-flex; flex-wrap: wrap; align-items: center; gap: var(--space-xs); align-self: end; margin-left: auto; }
 /* The title block gives way first, so the group keeps the head's right end beside it on a desktop. */
 .head > div:first-child { flex: 1 1 20rem; min-width: 0; }
@@ -105,7 +108,7 @@ html, body { overflow-x: clip; }
 .usage-drop > summary [aria-hidden] { font: 400 var(--text-xs)/1 var(--font-data); }
 .usage-drop[open] > summary { border-color: var(--color-accent); background: var(--color-accent-bg); }
 .usage-drop > summary:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 1px; }
-.usage-drop > .ustrip { left: auto; right: 0; width: min(48rem, calc(100vw - 2 * var(--space-md))); max-width: none; max-height: min(70vh, 36rem); padding: 0; display: block; }
+.usage-drop > .ustrip { left: auto; right: 0; width: min(48rem, calc(100vw - 2 * var(--space-md)), 100%); max-width: none; max-height: min(70vh, 36rem); padding: 0; display: block; }
 .ustrip .urows { list-style: none; margin: 0; padding: 0; }
 .ustrip li { display: grid; grid-template-columns: minmax(7rem, max-content) minmax(0, 1fr) auto; align-items: center; gap: var(--space-2xs) var(--space-sm);
   padding: var(--space-2xs) var(--space-sm); border-bottom: var(--rule-hair) solid var(--color-rule); font-size: var(--text-sm); }

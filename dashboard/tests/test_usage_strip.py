@@ -230,6 +230,27 @@ class TheStripInTheUsageDropdown(ScreenCase):
         self.assertIn("Not read: database is locked", out["R"]["body"])
         self.assertEqual(out["R"]["state"], "unknown")
 
+    def test_the_menu_anchors_to_the_page_head_and_stays_inside_the_gutters(self):
+        """Lead review of 8f483c6: on Contributions at 375 px the action slot wraps left, and a menu anchored to the
+        slot's right end ran past the screen's left edge. The menu anchors to the page head, which spans the gutters."""
+        static = V2 / "static"
+        rule = re.compile(r"([^{}]+)\{([^{}]*)\}")
+
+        def rules(name):
+            return rule.findall(re.sub(r"/\*.*?\*/", "", (static / name).read_text(encoding="utf-8"), flags=re.S))
+
+        placed = re.compile(r"\bposition:\s*(relative|absolute|fixed|sticky)")
+        for name in ("shell.css", "contributions.css", "home.css", "notes.css"):
+            for selector, body in rules(name):
+                if placed.search(body):
+                    for slot in ("[data-again]", ".head-acts", ".tools", ".datebar"):
+                        self.assertNotIn(slot, selector, f"{name}: {selector.strip()} makes the slot the menu's anchor")
+        shell = {selector.strip(): body for selector, body in rules("shell.css")}
+        self.assertRegex(shell[".head, .home-head"], r"position:\s*relative")
+        menu = shell[".usage-drop > .ustrip"]
+        self.assertRegex(menu, r"\bright:\s*0\b")
+        self.assertRegex(menu, r"\bwidth:\s*min\(48rem, calc\(100vw - 2 \* var\(--space-md\)\), 100%\)")
+
 class TheStripRoute(BrowserSession):
     def test_the_strip_route_answers_the_strip_and_refuses_a_query(self):
         reading(self.connection, "codex", **CODEX)
