@@ -4766,6 +4766,54 @@ roles:
             self.assertFalse(self.merge()["delivery_pending"])
         self.assertEqual((self.status_of(kept), self.status_of(dropped)), ("done", "planning"))
 
+    def copilot_refusal_keeps_the_published_scope(self, failing) -> None:
+        """A renewal by hand that drops an item, whose explicit Copilot step refuses under `failing`: the
+        published closing set stays, merge refuses the scope and nothing merges."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        kept, dropped = self.closes_items()[:2]
+        self.prepare("--deliver", "--item", str(kept), "--item", str(dropped))
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with failing, contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "copilot"):
+            self.prepare("--deliver", "--item", str(kept), "--copilot-review", "request")
+        state = self.operation().state
+        self.assertEqual(state["closing"]["items"], [kept, dropped])
+        self.assertNotEqual(state.get("phase"), "ready_to_send")
+        with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed.*nothing merged"):
+            self.merge()
+        self.assertFalse(any(call.method == "PUT" for call in self.remote.calls))
+
+    def test_a_failed_copilot_request_never_publishes_a_renewal(self):
+        """Lane review of sd:9268: prepare published the renewed scope before the Copilot request; when that
+        request failed, merge closed the renewed set on the local review alone."""
+        self.copilot_refusal_keeps_the_published_scope(patch.object(
+            ship.GitHub, "request_copilot_review", side_effect=ship.Refusal("copilot request failed")))
+
+    def test_a_failed_copilot_review_read_never_publishes_a_renewal(self):
+        real = ship.GitHub.pages
+
+        def pages(api, path, *args, **kwargs):
+            if path.endswith("/reviews"):
+                raise ship.Refusal("copilot reviews unread")
+            return real(api, path, *args, **kwargs)
+
+        self.copilot_refusal_keeps_the_published_scope(patch.object(ship.GitHub, "pages", pages))
+
+    def test_a_copilot_limit_never_publishes_a_renewal(self):
+        self.copilot_refusal_keeps_the_published_scope(patch.object(
+            ship.Ship, "require_copilot_capacity", side_effect=ship.Refusal("copilot review limit")))
+
+    def test_a_first_prepare_whose_copilot_request_fails_records_no_pull_request(self):
+        """The same step on a first prepare: no pull request is recorded, so merge refuses to merge."""
+        with patch.object(ship.GitHub, "request_copilot_review", side_effect=ship.Refusal("copilot failed")):
+            with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "copilot"):
+                self.prepare("--copilot-review", "request")
+        self.assertNotIn("pull_request", self.operation().state)
+        with self.assertRaisesRegex(ship.Refusal, "prepare this branch before merging"):
+            self.merge()
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.prepare("--copilot-review", "request")["phase"], "ready_to_send")
+
     def reconciled_closing(self, passes: bool) -> tuple[list, int, int]:
         """The closing set a reconcile settles for a pull request merged on GitHub after a renewal by hand that
         dropped one item, whose prepare `passes` or fails at lint."""

@@ -1773,10 +1773,12 @@ class Ship(SharedReview):
                      "url": f"https://github.com/{self.repository}/pull/{number}"}
         if str(pull.get("html_url", "")).lower() != reference["url"]:
             raise Refusal("GitHub pull-request URL does not match the prepared repository")
-        self.save(pull_request=reference, phase="ready_to_send", **self.promoted())
+        # Every step that can still refuse runs before the publishing save: a failed Copilot request leaves
+        # a renewal's scope pending, and a first prepare's pull request unrecorded, so merge refuses (sd:9268).
         copilot = self.prepare_copilot_review(number, pull, head, mode)
-        if copilot.get("warning"):
-            self.save(warnings=list(self.state.get("warnings") or []) + [copilot["warning"]])
+        warned = {"warnings": list(self.state.get("warnings") or []) + [copilot["warning"]]} if copilot.get(
+            "warning") else {}
+        self.save(pull_request=reference, phase="ready_to_send", **warned, **self.promoted())
         return self.result("ready_to_send", copilot_review=copilot, invoker=self.state["invoker"],
                            body_source=self.body_source, normalized=list(self.body_normalized),
                            closes=self.closes_now(self.state.get("closing") or {}, bool(self.state.get("deliver"))))
