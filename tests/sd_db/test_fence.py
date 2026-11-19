@@ -391,7 +391,7 @@ class TheLiveServer(StubCase):
     def test_the_fence_state_crosses_the_wire(self):
         """pack sd:9543: a satellite tells a fence that could not answer from a demotion by `state`."""
         self.enterContext(mock.patch.object(serve, "FENCE_SECONDS", 0.0))
-        for dnsname, state in (("", "unknown"), ("old-hub.example.test.", "elsewhere")):
+        for dnsname, state, cause in (("", "unknown", "tailscale"), ("old-hub.example.test.", "elsewhere", None)):
             with self.subTest(state=state):
                 self.rename(dnsname)
                 hub._name_failed = None
@@ -401,6 +401,7 @@ class TheLiveServer(StubCase):
                 if not isinstance(rebuilt, hub.Fenced):
                     self.fail(f"rebuilt as {rebuilt!r}")
                 self.assertEqual(rebuilt.state, state, answers[0]["error"])
+                self.assertEqual(rebuilt.cause, cause, answers[0]["error"])
                 self.assertIn("this machine is not the hub", str(rebuilt))
 
     def test_a_partition_after_start_refuses_the_next_frame(self):
@@ -678,7 +679,17 @@ class TheOldPeer(unittest.TestCase):
         if not isinstance(rebuilt, hub.Fenced):
             self.fail(f"rebuilt as {rebuilt!r}")
         self.assertIsNone(rebuilt.state)
+        self.assertIsNone(rebuilt.cause)
         self.assertEqual(str(rebuilt), old["text"])
+
+    def test_an_unknown_that_tailscale_did_not_give_names_no_cause(self):
+        """pack sd:9543: a hub database that does not open is `unknown` too, but not the Tailscale case."""
+        with tempfile.TemporaryDirectory() as folder:
+            found = hub.role_at(Path(folder) / "missing" / "sd.db")
+        self.assertEqual(found.state, "unknown")
+        self.assertIsNone(found.cause)
+        fenced = serve.fenced_by(found)
+        self.assertEqual((fenced.state, fenced.cause), ("unknown", None))
 
 
 class TheName(StubCase):

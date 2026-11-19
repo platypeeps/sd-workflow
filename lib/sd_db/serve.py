@@ -141,8 +141,8 @@ Fenced = hub.Fenced
 
 
 def fenced_by(found: hub.Role) -> Fenced:
-    """The `Fenced` a session raises on a refusing role, its `state` the role's (pack sd:9543)."""
-    return Fenced(f"refused: this machine is not the hub: {found.reason}", state=found.state)
+    """The `Fenced` a session raises on a refusing role, its `state` and `cause` the role's (pack sd:9543)."""
+    return Fenced(f"refused: this machine is not the hub: {found.reason}", state=found.state, cause=found.cause)
 
 
 #: The PRAGMAs a session may run, from a grep for `PRAGMA` across

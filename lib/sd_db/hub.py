@@ -239,12 +239,16 @@ class Role:
     on `elsewhere` and `unknown`; a write to its own database refuses on
     `elsewhere` alone (`write_role`). `observed` is the `time.monotonic`
     reading of its oldest input, from which `Held` ages it; `None` is now.
+    `cause` is `tailscale` on an `unknown` that Tailscale gave, naming no
+    node, and `None` otherwise: a satellite skips only that one (pack
+    sd:9543). Not a fifth state: `sd-db fence` prints the state.
     """
 
     state: str
     holder: str | None
     reason: str
     observed: float | None = field(default=None, compare=False)
+    cause: str | None = field(default=None, compare=False)
 
     @property
     def refuses(self) -> bool:
@@ -307,7 +311,7 @@ def role(connection, name=None) -> Role:
         # A failure `_this_name` holds was seen when it was cached.
         failed = _name_failed[0] if _name_failed is not None and _name_failed[1] is error else read
         return Role("unknown", holder, f"Tailscale does not name this node, so it cannot match {holder}: {error}",
-                    min(read, failed))
+                    min(read, failed), cause="tailscale")
     told = time.monotonic()
     try:
         read, holder = setting()
@@ -482,10 +486,14 @@ class Fenced(remote.RemoteError):
     #: (pack sd:9543). `None` from a hub older than the field, which a
     #: rebuilt error leaves at this class default: read it as lasting.
     state: str | None = None
+    #: The role's `cause`: `tailscale` on the `unknown` Tailscale gave;
+    #: `None` on any other, and from a hub older than the field.
+    cause: str | None = None
 
-    def __init__(self, text: str, *, state: str | None = None) -> None:
+    def __init__(self, text: str, *, state: str | None = None, cause: str | None = None) -> None:
         super().__init__(text)
         self.state = state
+        self.cause = cause
 
 
 def write_role(path: Path, *, within: float | None = None) -> Role:
