@@ -303,6 +303,13 @@ PREPARE_LOG_BYTES = 1 << 20
 
 
 def _failure(entry: dict, lane: Path) -> dict:
+    """`_logged`, else the code the lane recorded on the entry: a member cancelled on its own, found before prepare,
+    before the merge or by the merge itself (pack sd:9303); `{}` when neither answers."""
+    code = entry.get("code")
+    return _logged(entry, lane) or ({"code": code} if isinstance(code, str) and code else {})
+
+
+def _logged(entry: dict, lane: Path) -> dict:
     """pack sd:8584: a failed prepare's answer from its log in the lane's `logs/`: the blocker's `code`, whether the
     lane marks it `retryable`, and its `next_action`. `{}` for a failure at another step or a log not read here: a log
     on another host, outside `logs/`, cut short or with no answer."""

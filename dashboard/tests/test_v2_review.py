@@ -36,7 +36,7 @@ PAGE_CSS = (STATIC / "review.css").read_text(encoding="utf-8") if (STATIC / "rev
 
 def batch(name, *, queue="labels", mode="open", count=3, options=("yes", "no"), **extra):
     found = {"schema": 1, "queue": queue, "batch": name, "title": f"Label: {name}", "source": "system@1a2b3c4",
-             "mode": mode, "questions": [{"subject": f"example.test/repo@1a2b3c4:file{n}.py",
+             "mode": mode, "context": {"purpose": "Fixture batch.", "rubric": ["Pick the option that fits."], "feeds": "This test."}, "questions": [{"subject": f"example.test/repo@1a2b3c4:file{n}.py",
                                           "text": f"Is file {n} right?\nRead it whole.",
                                           "evidence": [f"diff: git show 1a2b3c4 -- file{n}.py"],
                                           "options": list(options)} for n in range(1, count + 1)], **extra}
@@ -256,10 +256,11 @@ class TheRecommendation(ScreenCase):
         self.assertEqual(review.read(self.connection, ids["blind"])["questions"][0]["label"], "no")
 
     def test_a_question_with_no_recommendation_sends_none(self):
-        # The pack as pinned, or a batch filed with neither field: no key, and the batch's context is None.
+        # A batch filed with no recommendation: no key; its context is the fixture's (required since pack sd:9479).
         ids = seed(self)
         doc = review_screen.document(self.connection)
-        self.assertEqual({b.get("context") for b in doc["batches"] if b["item"] != ids["broken"]}, {None})
+        self.assertEqual({str(b.get("context")) for b in doc["batches"] if b["item"] != ids["broken"]},
+                         {str({"purpose": "Fixture batch.", "rubric": ["Pick the option that fits."], "feeds": "This test."})})
         self.assertFalse(any("recommendation" in q for q in doc["questions"]))
         note = questions_of(self.connection, ids["open"])[0]
         revision = workflow.item_state(self.connection, ids["open"])["revision"]
@@ -490,8 +491,23 @@ class TheScript(unittest.TestCase):
         rows = self.run_page("R.rows = ELS.rows.html;", "(path, body) => [200, DOC]", doc=doc)["R"]["rows"]
         self.assertIn('<dl class="brief" data-tkeep=""><dt>Purpose</dt><dd>Calibrate &lt;b&gt;</dd><dt>Rubric</dt>'
                       '<dd><ul><li>skip: docs only</li><li>deep: touches state</li></ul></dd><dt>Feeds</dt><dd>the router</dd></dl>', rows)
-        self.assertEqual(rows.count('class="brief"'), 1)
+        self.assertEqual(rows.count('<dl class="brief"'), 1)
         self.assertLess(rows.index('class="brief"'), rows.index('data-id="q10"'))
+
+    def test_a_band_whose_batch_has_no_context_says_to_ask_its_filer(self):
+        """pack sd:9479: a batch filed before its context was required showed no brief at all, so its questions
+        stood bare. Its band says so and names the batch to ask about; a partial context shows what it has."""
+        doc = doc_with(2, context=None)
+        doc["batches"].append({**doc["batches"][0], "item": 12, "title": "Label: C1",
+                               "context": {"purpose": "", "rubric": [], "feeds": None}})
+        doc["batches"].append({**doc["batches"][0], "item": 13, "title": "Label: C2",
+                               "context": {"purpose": "Calibrate", "rubric": [], "feeds": None}})
+        doc["questions"] += [question(30, item=12), question(31, item=13)]
+        rows = self.run_page("R.rows = ELS.rows.html;", "(path, body) => [200, DOC]", doc=doc)["R"]["rows"]
+        for item in (doc["batches"][0]["item"], 12):
+            self.assertIn(f'<p class="brief nobrief" data-tkeep="">No description: ask the filer (sd:{item})</p>', rows)
+        self.assertEqual(rows.count("No description"), 2)
+        self.assertIn('<dl class="brief" data-tkeep=""><dt>Purpose</dt><dd>Calibrate</dd></dl>', rows)
 
     def test_an_open_rows_recommendation_shows_its_reason_marks_its_option_and_bulk_accepts_it(self):
         doc = doc_with(2)
