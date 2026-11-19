@@ -3029,6 +3029,35 @@ R.lead = cmd('asg.cancel').consequence(C.get('asg:{head}'));""")
         self.assertIn(f"It does not park #{parked}: not ready, already parked, or owned by another assignment.",
                       out["R"]["lead"])
 
+    def test_a_lead_cancel_sends_the_revision_its_confirm_showed(self):
+        # Bundle review of pack sd:9290: the confirm read the Details' members and parks, but the cancel read the
+        # Details again at OK, and a refresh while the dialog was open had replaced them. It sent the new revision,
+        # so the cancel could end and park other rows than the confirm named. It sends the confirm's revision.
+        lead, member, other = (self.item(title, status="ready") for title in ("Lead", "Member", "Other"))
+        head, child = self.assignment(lead), self.assignment(member)
+        self.connection.execute("UPDATE assignment SET scope = 'build', parent = ? WHERE id = ?", (head, child))
+        self.connection.execute("UPDATE assignment SET scope = 'build' WHERE id = ?", (head,))
+        self.connection.commit()
+        self.doc = tasks_screen.document(self.connection, now=NOW)
+        self.details[str(lead)] = tasks_screen.details(self.connection, lead, now=NOW)
+        (shown,) = self.details[str(lead)]["assignments"]
+        ask = self.ids["ask"]
+        out = self.run_page(f"""open({lead}); await flush();
+const o = C.get('asg:{head}'); R.text = cmd('asg.cancel').consequence(o);
+const NEW = 'f'.repeat(64);
+DOC.rows.find(r => r.id === {lead}).revision = NEW;
+Object.assign(DETAILS[{lead}].assignments[0], {{ revision: NEW, members: [{member}, {other}], parks: [{lead}, {member}, {other}] }});
+ELS.main.listeners.change.forEach(f => f({{ target: {{ dataset: {{ edit: 'p', key: String({ask}) }}, value: '1' }} }}));
+await flush(); await flush();
+R.read = OUT.gets.filter(g => g === '/api/tasks/{lead}').length;
+await cmd('asg.cancel').run(o); await flush();""",
+                            f"(path, body) => path.startsWith('/api/assignments/') ? [200, {{}}] : ({self.ECHO})(path, body)")
+        self.assertIsNone(out.get("error"))
+        self.assertIn(f"It also cancels its 1 queued member: #{member}.", out["R"]["text"])
+        self.assertGreaterEqual(out["R"]["read"], 2, "the refresh did not read the Details again")
+        cancels = [p[1] for p in out["posts"] if p[0] == f"/api/assignments/{head}/cancel"]
+        self.assertEqual(cancels, [{"revision": shown["revision"]}])
+
     def test_a_task_added_under_a_filter_that_hides_it_is_not_selected(self):
         # Selection stays on a visible task: a new task the filters hide is added and named, not selected (review, PR #46).
         new = {**self.row("ask"), "id": 99, "title": "Call the bank", "kind": "task", "repo": None, "repo_path": None}
