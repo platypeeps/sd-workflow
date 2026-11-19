@@ -202,7 +202,7 @@
       return promise.then(v => {
         let spent = false;
         const undo = inverse && (() => { if (spent) return Promise.resolve(false); spent = true;
-          return inverse(v).then(() => true, err => { if (err.stale) refused(); throw err; }); });
+          return inverse(v).then(() => true, err => { if (err.stale || err.unknown) refused(); throw err; }); });
         return { text: text(v), undo };
       }, err => { if (err.stale || err.unknown) refused(); throw err; });
     }

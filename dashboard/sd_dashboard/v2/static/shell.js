@@ -760,7 +760,7 @@
     return p.then(v => {
       const undo = c.risk === 'undo' && c.undo ? () => undoOne(c, o, v).then(
         ok => toast(ok === false ? `${c.label} not undone · ${o.label}: nothing to reverse` : `${c.label} undone · ${o.label}`),
-        e => toast(`${c.label} not undone · ${o.label}: ${whyOf(e)}`)) : null;
+        e => toast(`${c.label} ${e && e.unknown ? 'undo outcome not known' : 'not undone'} · ${o.label}: ${whyOf(e)}`)) : null;
       toast(textOf(v, `${c.label} · ${o.label}`), undo);
       return true;
     }, e => { toast(`${o.label}${e && e.unknown ? '' : ' not changed'}: ${whyOf(e)}`); return false; }); // unknown: no answer (sd:8033)
@@ -780,7 +780,7 @@
         + (unknown.length ? ` · ${of(unknown.length)} outcome not known: ${named(unknown)}` : '');
       const undo = c.risk === 'undo' && c.undo && landed.length ? () => Promise.allSettled(inTurn(landed, x => c.undo(x.o, x.v))).then(us => {
         const not = stale.concat(failed).map(x => `${x.o.label} (its change did not land)`)
-          .concat(unknown.map(x => `${x.o.label} (whether its change landed is not known)`)).concat(us.map((u, i) => u.status === 'rejected' ? `${landed[i].o.label} (${whyOf(u.reason)})`
+          .concat(unknown.map(x => `${x.o.label} (whether its change landed is not known)`)).concat(us.map((u, i) => u.status === 'rejected' ? `${landed[i].o.label} (${u.reason && u.reason.unknown ? 'whether its undo landed is not known: ' : ''}${whyOf(u.reason)})`
           : u.value === false ? `${landed[i].o.label} (nothing to reverse)` : '').filter(Boolean));
         toast(`${c.label} undone · ${objs.length - not.length} of ${objs.length} reversed${not.length ? ` · not reversed: ${not.join(', ')}` : ''}`);
       }) : null;
