@@ -269,8 +269,8 @@ class OperationsCLI(unittest.TestCase):
         self.assertIn("bulk_storage_root is unset", kwargs["why"])
         run.archive.assert_not_called()  # no bulk root: an ended run's logs stay local
         self.assertIn("claimed 1, drafted 0, spawned 1", output)
-        from sd_db import hub, remote
-        outages = (remote.HubUnreachable, remote.BuildMismatch, hub.Fenced)  # pack sd:9541
+        from sd_db import remote
+        outages = (remote.HubUnreachable, remote.BuildMismatch)  # pack sd:9541
         self.connect.assert_called_with(sd_db, write=True, keep=outages)
         self.connection.close.assert_called_once()
 
@@ -345,39 +345,63 @@ class OperationsCLI(unittest.TestCase):
         run.dispatch.assert_not_called()
         self.assertEqual((code, output), (0, "skipped: sd_db build mismatch; the follow job follows\n"))
 
-    def outcome(self, run, *, at_connect=None):
-        """The tick's exit, as `bin/sd` gives it: a refusal is 1. `at_connect` raises through the real wrapper."""
-        if at_connect is not None:
-            fake = types.SimpleNamespace(connect=Mock(side_effect=at_connect))
+    def outcome(self, run, error, where, *flags):
+        """The tick's exit, as `bin/sd` gives it: a refusal is 1. `error` raises at the connect, through the real
+        wrapper, or mid-tick from `dispatch`."""
+        if where == "connect":
+            fake = types.SimpleNamespace(connect=Mock(side_effect=error))
             self.connect.side_effect = lambda _sd_db, **kwargs: CONNECT(fake, **kwargs)
+        else:
+            self.connect.side_effect = None
+            run.dispatch.side_effect = error
         try:
-            return self.tick(run)
+            with patch.object(cli, "gate_load", return_value=(1.0, 40.0)), \
+                    patch.object(cli, "interactive_builders", return_value=([], "")), \
+                    patch.object(cli, "log_root", return_value=Path("/bulk")):
+                return self.call("assignments", "dispatch", *flags)
         except (cli.WorkRefusal, cli.sd_handoff_rows.RowsRefusal) as refusal:
             return 1, str(refusal)
 
-    def test_a_hub_outage_skips_the_tick_with_exit_0(self):
-        """pack sd:9541: a satellite tick exited 1 when the hub timed out, when the hub's Tailscale named no node, or
-        between a hub refresh and the follow; the next tick was clean. Each skips with one line, at the connect or
-        mid-tick, as the hub's error arrives over the wire."""
-        from sd_db import hub, remote
+    def outages(self):
+        from sd_db import remote
         unreachable = remote.HubUnreachable("hub.example.test", 8769, "timed out")
-        fenced = remote.rebuild_error(remote.describe_error(hub.Fenced(
-            "refused: this machine is not the hub: Tailscale does not name this node, so it cannot match "
-            "hub.example.test: this node is not connected to the Tailscale control plane")))
         mismatch = remote.BuildMismatch("build", "80a4eacae0c346b5", "c3866a94f3d93ddf")
-        for error, line in ((unreachable, f"skipped: {unreachable}"), (fenced, f"skipped: {fenced}"),
-                            (mismatch, "skipped: sd_db build mismatch; the follow job follows")):
-            for where in ("connect", "tick"):
+        return ((unreachable, str(unreachable)), (mismatch, "sd_db build mismatch; the follow job follows"))
+
+    def test_a_hub_outage_skips_the_tick_with_exit_0(self):
+        """pack sd:9541: a satellite tick exited 1 when the hub timed out, or between a hub refresh and the follow;
+        the next tick was clean. Each skips with one line. Mid-tick, work the tick began may have committed, so the
+        line says `(partial)`."""
+        for error, reason in self.outages():
+            for where, label in (("connect", "skipped"), ("tick", "skipped (partial)")):
                 with self.subTest(error=type(error).__name__, where=where):
                     run = self.builds()
-                    if where == "tick":
-                        self.connect.side_effect = None
-                        run.dispatch.side_effect = error
-                        code, output = self.outcome(run)
-                    else:
-                        code, output = self.outcome(run, at_connect=error)
+                    code, output = self.outcome(run, error, where)
+                    if where == "connect":
                         run.dispatch.assert_not_called()
-                    self.assertEqual((code, output), (0, line + "\n"))
+                    self.assertEqual((code, output), (0, f"{label}: {reason}\n"))
+
+    def test_a_skipped_tick_answers_json_under_json(self):
+        """pack sd:9541: `--json` printed a skip as plain text, which no JSON reader parses."""
+        for error, reason in self.outages():
+            for where, partial in (("connect", False), ("tick", True)):
+                with self.subTest(error=type(error).__name__, where=where):
+                    code, output = self.outcome(self.builds(), error, where, "--json")
+                    self.assertEqual((code, json.loads(output)), (0, {"skipped": reason, "partial": partial}))
+
+    def test_a_fenced_hub_still_exits_1(self):
+        """pack sd:9541 review: a demoted hub's write refusal is lasting, and a `Fenced` from the hub carries no
+        field that tells its Tailscale outage from a demotion. Neither skips."""
+        from sd_db import hub, remote
+        demoted = hub.Fenced(hub.demotion(Path("/db/sd.sqlite"), hub.Role(
+            "elsewhere", "hub.example.test", "sd.hub_name names hub.example.test, and this node is old.example.test")))
+        unnamed = remote.rebuild_error(remote.describe_error(hub.Fenced(
+            "refused: this machine is not the hub: Tailscale does not name this node, so it cannot match "
+            "hub.example.test: this node is not connected to the Tailscale control plane")))
+        for error in (demoted, unnamed):
+            for where in ("connect", "tick"):
+                with self.subTest(error=str(error)[:40], where=where):
+                    self.assertEqual(self.outcome(self.builds(), error, where), (1, str(error)))
 
     def test_another_hub_error_still_exits_1(self):
         """pack sd:9541: only the outages skip; a lost commit answer or a broken wire stays a refusal."""
@@ -386,14 +410,7 @@ class OperationsCLI(unittest.TestCase):
         lost = remote.UnknownOutcome("r-1", "the hub stayed unreachable")
         for error, where in ((broken, "connect"), (lost, "tick")):
             with self.subTest(error=type(error).__name__, where=where):
-                run = self.builds()
-                if where == "tick":
-                    self.connect.side_effect = None
-                    run.dispatch.side_effect = error
-                    code, output = self.outcome(run)
-                else:
-                    code, output = self.outcome(run, at_connect=error)
-                self.assertEqual((code, output), (1, str(error)))
+                self.assertEqual(self.outcome(self.builds(), error, where), (1, str(error)))
 
     def test_the_load_read_does_not_follow_either(self):
         """pack sd:8685: `sd gate status`, the tick's child, carries the marker that keeps the refusal."""
