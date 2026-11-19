@@ -551,10 +551,11 @@
       const parked = o.members.filter(i => parks.includes(i)), stay = o.members.filter(i => !parks.includes(i));
       return (parks.includes(o.item)
         ? 'It parks the item, its status unchanged, so auto-pickup leaves it until Unpark.'
-        : 'The item stays unparked: it is not ready, is parked already, or another assignment owns it.')
+        : 'It does not park the item: it is not ready, already parked, or owned by another assignment.')
         + (o.members.length ? ` It also cancels its ${o.members.length} queued member${o.members.length === 1 ? '' : 's'}: ${ids(o.members)}.` : '')
         + (parked.length ? ` It parks ${ids(parked)}.` : '')
-        + (stay.length ? ` ${ids(stay)} stay${stay.length === 1 ? 's' : ''} unparked: not ready, parked already, or owned by another assignment.` : '');
+        // One parked already stays parked: the cancel leaves each of these as it is (pack sd:9290 review).
+        + (stay.length ? ` It does not park ${ids(stay)}: not ready, already parked, or owned by another assignment.` : '');
     }
     // A refused cancel reads the Details again too: they hold the revision a retry sends.
     async function cancelAsg(o) {

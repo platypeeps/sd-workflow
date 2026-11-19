@@ -3010,7 +3010,24 @@ R.lead = cmd('asg.cancel').consequence(C.get('asg:{head}'));""")
         self.assertIn("It parks the item,", text)
         self.assertIn(f"It also cancels its 3 queued members: #{ready}, #{moving}, #{owned}.", text)
         self.assertIn(f"It parks #{ready}.", text)
-        self.assertIn(f"#{moving}, #{owned} stay unparked", text)
+        self.assertIn(f"It does not park #{moving}, #{owned}: not ready, already parked", text)
+
+    def test_a_queued_lead_cancel_confirm_never_calls_a_parked_member_unparked(self):
+        # Lead review of pack sd:9290: a member parked already stays parked, and the confirm said it stayed
+        # unparked; it says the cancel does not park it.
+        lead, parked = (self.item(title, status="ready") for title in ("Lead", "Parked"))
+        head, member = self.assignment(lead), self.assignment(parked)
+        self.connection.execute("UPDATE item SET parked_at = ? WHERE id = ?", (NOW, parked))
+        self.connection.execute("UPDATE assignment SET scope = 'build', parent = ? WHERE id = ?", (head, member))
+        self.connection.execute("UPDATE assignment SET scope = 'build' WHERE id = ?", (head,))
+        self.connection.commit()
+        self.doc = tasks_screen.document(self.connection, now=NOW)
+        self.details[str(lead)] = tasks_screen.details(self.connection, lead, now=NOW)
+        out = self.run_page(f"""open({lead}); await flush();
+R.lead = cmd('asg.cancel').consequence(C.get('asg:{head}'));""")
+        self.assertNotIn("unparked", out["R"]["lead"])
+        self.assertIn(f"It does not park #{parked}: not ready, already parked, or owned by another assignment.",
+                      out["R"]["lead"])
 
     def test_a_task_added_under_a_filter_that_hides_it_is_not_selected(self):
         # Selection stays on a visible task: a new task the filters hide is added and named, not selected (review, PR #46).
