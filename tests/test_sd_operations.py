@@ -365,8 +365,8 @@ class OperationsCLI(unittest.TestCase):
     def outages(self):
         from sd_db import remote
         unreachable = remote.HubUnreachable("hub.example.test", 8769, "timed out")
-        mismatch = remote.BuildMismatch("build", "80a4eacae0c346b5", "c3866a94f3d93ddf")
-        return ((unreachable, str(unreachable)), (mismatch, "sd_db build mismatch; the follow job follows"))
+        behind = remote.BuildMismatch("package", "1.0", "1.1")  # this satellite is older: its follow job catches up
+        return ((unreachable, str(unreachable)), (behind, "sd_db build mismatch; the follow job follows"))
 
     def test_a_hub_outage_skips_the_tick_with_exit_0(self):
         """pack sd:9541: a satellite tick exited 1 when the hub timed out, or between a hub refresh and the follow;
@@ -402,6 +402,28 @@ class OperationsCLI(unittest.TestCase):
             for where in ("connect", "tick"):
                 with self.subTest(error=str(error)[:40], where=where):
                     self.assertEqual(self.outcome(self.builds(), error, where), (1, str(error)))
+
+    def test_a_mismatch_no_follow_fixes_still_exits_1_with_its_remedy(self):
+        """pack sd:9541 lane review: only a satellite behind the hub skips; its follow job catches up. A hub behind,
+        an unordered build digest, or a mismatch that names no side needs the operator: it exits 1 with its remedy,
+        read from `upgrade`, never the text. Each is rebuilt as the satellite gets it from the hub."""
+        from sd_db import remote
+
+        def wired(field, satellite, hub, *, upgrade=True):
+            described = remote.describe_error(remote.BuildMismatch(field, satellite, hub))
+            if not upgrade:
+                del described["attributes"]["upgrade"]  # a hub that sends no direction
+            return remote.rebuild_error(described)
+        cases = (("satellite", wired("package", "1.0", "1.1")), ("hub", wired("package", "1.1", "1.0")),
+                 ("both", wired("build", "80a4eacae0c346b5", "c3866a94f3d93ddf")),
+                 (None, wired("package", "1.0", "1.1", upgrade=False)))
+        for upgrade, error in cases:
+            self.assertEqual(getattr(error, "upgrade", None), upgrade)
+            for where, label in (("connect", "skipped"), ("tick", "skipped (partial)")):
+                with self.subTest(upgrade=upgrade, where=where):
+                    expected = ((0, f"{label}: sd_db build mismatch; the follow job follows\n") if upgrade == "satellite"
+                                else (1, str(error)))
+                    self.assertEqual(self.outcome(self.builds(), error, where), expected)
 
     def test_another_hub_error_still_exits_1(self):
         """pack sd:9541: only the outages skip; a lost commit answer or a broken wire stays a refusal."""

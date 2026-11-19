@@ -437,8 +437,8 @@ def tools(build_run: Any) -> Any:
 
 def hub_outages() -> tuple[type[BaseException], ...]:
     """The hub's brief outages a tick skips with exit 0, as a locked database (pack sd:9541): the hub timed out, or a
-    hub refresh is ahead of this satellite's follow. Not `Fenced`: no field tells the hub's Tailscale outage from a
-    demotion, which lasts."""
+    hub refresh is ahead of this satellite's follow (`outage` refuses any other mismatch). Not `Fenced`: no field
+    tells the hub's Tailscale outage from a demotion, which lasts."""
     sd_handoff_rows.library()
     from sd_db import remote  # noqa: PLC0415 - after the helper
     return remote.HubUnreachable, remote.BuildMismatch
@@ -453,14 +453,20 @@ class MidTick(Exception):
 
 
 def outage(error: BaseException) -> tuple[str, bool]:
-    """The `skipped` reason for one of `hub_outages`, and whether the tick had begun; a mismatch's remedy is the
-    follow job's (pack sd:8685)."""
+    """The `skipped` reason for one of `hub_outages`, and whether the tick had begun.
+
+    A mismatch skips only when its `upgrade` names this satellite: the follow job catches up (pack sd:8685). A hub
+    behind, an unordered build or no `upgrade` needs the operator, so it refuses with its own remedy (pack sd:9541).
+    """
     sd_handoff_rows.library()
     from sd_db import remote  # noqa: PLC0415 - after the helper
     partial = isinstance(error, MidTick)
     cause = error.error if isinstance(error, MidTick) else error
-    return ("sd_db build mismatch; the follow job follows" if isinstance(cause, remote.BuildMismatch)
-            else str(cause)), partial
+    if not isinstance(cause, remote.BuildMismatch):
+        return str(cause), partial
+    if getattr(cause, "upgrade", None) != "satellite":
+        raise WorkRefusal(str(cause)) from cause
+    return "sd_db build mismatch; the follow job follows", partial
 
 
 def say_skipped(args: argparse.Namespace, reason: str, partial: bool) -> None:
