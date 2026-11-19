@@ -1,4 +1,4 @@
-"""`/api/usage`, Today's Usage strip (pack sd:9257) and Health's Service status rows (pack sd:9260).
+"""`/api/usage`, the Usage dropdown's strip (pack sd:9257, sd:9569) and Health's Service status rows (pack sd:9260).
 
 `document` is `/api/usage`: the month as `sd usage --json` prints it, as the same bytes. Requirement 6 says the four
 numbers, the item screen and `sd usage` cannot disagree, so it serves `usage.json_text` of `usage.read`, the read `sd
@@ -282,7 +282,7 @@ def _usage_row(ident: str, label: str, *, status: str, why: str, read_at, window
 
 
 def strip(connection: sqlite3.Connection, *, now: str) -> dict:
-    """Today's Usage strip (pack sd:9257): one row per provider, and per cswap account for claude (`claude#N`).
+    """The Usage dropdown's strip (pack sd:9569): one row per provider, and per cswap account for claude (`claude#N`).
 
     A row shows the windows its reading has (claude has its seven days only: cswap has no five hours), each with its
     use, reset and pace, or its balance or spend; its read time; and the flag of the services that name its provider

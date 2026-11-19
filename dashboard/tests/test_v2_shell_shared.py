@@ -494,7 +494,7 @@ R.button = press('Enter', el('button'));""")
 // A tree: main > details.fpick[open] > summary, input; and a button outside the menu.
 const node = (name, parent, extra = {}) => Object.assign({ name, parent,
   contains(n) { for (; n; n = n.parent) if (n === this) return true; return false; },
-  closest(sel) { for (let n = this; n; n = n.parent) if (sel === 'details.fpick[open]' && n.name === 'details' && n.open) return n; return null; } }, extra);
+  closest(sel) { for (let n = this; n; n = n.parent) if (sel.split(', ').includes('details.fpick[open]') && n.name === 'details' && n.open) return n; return null; } }, extra);
 const main = node('main', null), menu = node('details', main, { open: true }), summary = node('summary', menu), box = node('input', menu);
 const outside = node('button', main);
 const blur = (target, relatedTarget) => { menu.open = true; DOC_LISTENERS.focusout.forEach(f => f({ target, relatedTarget })); return menu.open; };
@@ -1453,8 +1453,8 @@ class EveryDisclosureHasOneArrow(unittest.TestCase):
     "as a table" summaries were inline-flex, which drops the native marker, while Notes drew its own arrow."""
 
     def test_shell_css_draws_the_arrow_for_every_summary(self):
-        self.assertIn("details:not(.fpick) > summary::before { content: '▸';", SHELL_CSS)
-        self.assertIn("details:not(.fpick)[open] > summary::before { content: '▾'; }", SHELL_CSS)
+        self.assertIn("details:not(.fpick, .usage-drop) > summary::before { content: '▸';", SHELL_CSS)
+        self.assertIn("details:not(.fpick, .usage-drop)[open] > summary::before { content: '▾'; }", SHELL_CSS)
 
     def test_no_page_draws_its_own_arrow(self):
         for css in STATIC.glob("*.css"):
@@ -2191,31 +2191,35 @@ class ThePaneWithoutDetails(unittest.TestCase):
 
 
 AGAIN = re.search(r"^  // again:start\n(.*?)^  // again:end$", SHELL_JS, re.S | re.M)
+USAGE = re.search(r"^  // usage:start\n(.*?)^  // usage:end$", SHELL_JS, re.S | re.M)
 STALENESS = re.search(r"^  function staleness\(\) \{\n.*?^  \}$", SHELL_JS, re.S | re.M)
 
 
 class TheReadAgainButton(unittest.TestCase):
-    """sd:5638: the shell draws one Read again button for a page's window.PAGE_AGAIN, the same on every page."""
+    """sd:5638: the shell draws one Read again button for a page's window.PAGE_AGAIN, the same on every page; pack
+    sd:9569: beside it, on every page, the Usage dropdown."""
 
     def run_again(self, body, slot=False):
         self.assertIsNotNone(AGAIN, "shell.js has no again:start block")
+        self.assertIsNotNone(USAGE, "shell.js has no usage:start block, so no page has the Usage dropdown")
         script = "var window = globalThis;\n" + MARKUP_JS + r"""
 const { html, put } = window.markup;
 const ICON = n => html`<svg class="i" aria-hidden="true"><use href="#i-${n}"/></svg>`;
-var OUT = { toasts: [], error: null }, R = {}, WIN = [];
+var OUT = { toasts: [], gets: [], error: null }, R = {}, WIN = [], ELS = {}, location = { hash: "" };
 const toast = m => OUT.toasts.push(m), flush = async () => { for (let i = 0; i < 50; i++) await null; };
+const getJSON = async path => { OUT.gets.push(path); return { error: '', rows: [], nosource: [] }; };
 function addEventListener(t, f) { WIN.push([t, f]); }
-function El(id) { const e = { id, html: '', attrs: {}, listeners: {}, setAttribute(k, v) { e.attrs[k] = v; }, removeAttribute(k) { delete e.attrs[k]; },
-  addEventListener(t, f) { (e.listeners[t] = e.listeners[t] || []).push(f); }, append(f) { e.html += f.parsed; } }; return e; }
-var HEAD = El('head'), SLOT = """ + ("El('slot')" if slot else "null") + r""", BTN = null;
+function El(id) { const e = { id, html: '', attrs: {}, dataset: {}, listeners: {}, setAttribute(k, v) { e.attrs[k] = v; }, removeAttribute(k) { delete e.attrs[k]; },
+  addEventListener(t, f) { (e.listeners[t] = e.listeners[t] || []).push(f); }, append(f) { e.html += f.parsed; }, replaceChildren(f) { e.html = f ? f.parsed : ''; } }; return e; }
+var HEAD = El('head'), SLOT = """ + ("El('slot')" if slot else "null") + r""";
 const main = { querySelector: s => s === '.head, .home-head' ? HEAD : null };
 var document = { readyState: 'loading', querySelector: s => s === '[data-again]' ? SLOT : null,
-  getElementById: id => id === 'read-again' && /id="read-again"/.test(HEAD.html + (SLOT ? SLOT.html : '')) ? (BTN = BTN || El(id)) : null,
+  getElementById: id => new RegExp(`id="${id}"`).test(HEAD.html + (SLOT ? SLOT.html : '')) ? (ELS[id] = ELS[id] || El(id)) : null,
   createElement: () => { const t = {}; Object.defineProperty(t, 'innerHTML', { set(v) { t.content = { parsed: v }; } }); return t; } };
 const loaded = () => WIN.filter(([t]) => t === 'DOMContentLoaded').forEach(([, f]) => f());
-const click = () => BTN.listeners.click.forEach(f => f());
+const click = () => ELS['read-again'].listeners.click.forEach(f => f());
 (async () => { try {
-""" + body.replace("SHELL_AGAIN", AGAIN.group(1)) + r"""
+""" + body.replace("SHELL_AGAIN", USAGE.group(1) + AGAIN.group(1)).replace("BTN", "ELS['read-again']") + r"""
 } catch (e) { OUT.error = String(e) + ' ' + e.stack; } })();
 function run() { OUT.R = R; return JSON.stringify(OUT); }
 """
@@ -2234,8 +2238,9 @@ SHELL_AGAIN
 loaded(); R.head = HEAD.html;
 click(); await flush(); R.busy = BTN.attrs['aria-busy'];
 done(); await flush(); R.after = BTN.attrs['aria-busy'] || null;""")
-        self.assertEqual(out["R"]["head"], '<button class="btn quiet sm" type="button" id="read-again" title="Read the rows again">'
-                         '<svg class="i" aria-hidden="true"><use href="#i-rotate-ccw"/></svg><span>Read again</span></button>')
+        self.assertIn('<button class="btn quiet sm" type="button" id="read-again" title="Read the rows again">'
+                      '<svg class="i" aria-hidden="true"><use href="#i-rotate-ccw"/></svg><span>Read again</span></button></div>',
+                      out["R"]["head"])
         self.assertEqual((out["R"]["runs"], out["R"]["busy"], out["R"]["after"]), (1, "true", None))
 
     def test_a_page_slot_holds_it_and_a_page_without_page_again_gets_none(self):
@@ -2243,7 +2248,7 @@ done(); await flush(); R.after = BTN.attrs['aria-busy'] || null;""")
         self.assertEqual(placed["R"]["head"], "")
         self.assertIn('id="read-again" title="Read this page again"', placed["R"]["slot"])
         bare = self.run_again("SHELL_AGAIN\nloaded(); R.head = HEAD.html;")
-        self.assertEqual(bare["R"]["head"], "")
+        self.assertNotIn('id="read-again"', bare["R"]["head"])
 
     def test_a_page_with_no_observed_cell_gets_the_staleness_mark_on_read_again(self):
         """sd:5750: Home's Read again is the shell's button now, so the band marks #read-again when no #refresh is drawn."""
@@ -2255,6 +2260,28 @@ var body = { dataset: { observed: new Date(Date.now() - 3 * 60000).toISOString()
 staleness(); R.state = b.dataset.state || null; R.html = b.html;""")
         self.assertEqual(out["R"]["state"], "caution")
         self.assertIn('<small class="stale">stale since ', out["R"]["html"])
+
+    def test_the_usage_dropdown_sits_beside_read_again_and_reads_on_load_and_on_open(self):
+        """pack sd:9569: Today's Usage strip moved into a dropdown beside Read again, the same on every page."""
+        out = self.run_again("""window.PAGE_AGAIN = { run() {} };
+SHELL_AGAIN
+loaded(); await flush(); R.head = HEAD.html; R.gets = OUT.gets.length;
+const d = ELS['usage-drop']; d.open = true; d.listeners.toggle.forEach(f => f()); await flush();
+R.menu = ELS['usage-menu'].html;""")
+        head = out["R"]["head"]
+        self.assertRegex(head, r'^<div class="head-acts" id="head-acts"><details class="usage-drop" id="usage-drop">'
+                               r'<summary class="btn quiet sm" id="usage-sum">.*</details><button class="btn quiet sm" type="button" id="read-again"')
+        self.assertIn('<div class="fpick-menu ustrip" id="usage-menu" role="group" aria-label="Usage">', head)
+        self.assertEqual((out["R"]["gets"], out["gets"]), (1, ["/api/usage/strip", "/api/usage/strip"]))
+        self.assertIn("Providers in Settings", out["R"]["menu"])
+
+    def test_a_page_without_read_again_still_gets_the_usage_dropdown(self):
+        """Settings has no Read again (AGAIN_ALLOWED in test_v2_registry); the dropdown is on every page all the same."""
+        out = self.run_again("SHELL_AGAIN\nloaded(); R.head = HEAD.html;")
+        self.assertIn('id="usage-drop"', out["R"]["head"])
+        self.assertNotIn('id="read-again"', out["R"]["head"])
+        slot = self.run_again("window.PAGE_AGAIN = { run() {} };\nSHELL_AGAIN\nloaded(); R.slot = SLOT.html;", slot=True)
+        self.assertIn('id="usage-drop"', slot["R"]["slot"])
 
     def test_a_run_that_fails_says_so_and_ends_busy(self):
         out = self.run_again("""window.PAGE_AGAIN = { run: () => Promise.reject(new Error('no answer')) };
