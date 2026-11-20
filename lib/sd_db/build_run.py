@@ -70,8 +70,9 @@ from .writes import add_note, now, record_cost, record_state
 TIMEOUT_SECONDS = build.BUDGET_MINUTES * 60
 GRACE_SECONDS = 20
 BEAT_SECONDS = 30
-#: Reviews with blockers before the bundle blocks (lead, note #29482).
-REVIEW_ROUNDS = 3
+#: Reviews with blockers before the class pass and park (operator 2026-11-20,
+#: raised from 3: four-round parks re-queued by hand all day).
+REVIEW_ROUNDS = 7
 MAX_TURNS = 300
 TITLE_MAX = 63
 #: A read (`git status`, `lane list`) that takes longer is unread.
