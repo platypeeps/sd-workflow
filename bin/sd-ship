@@ -337,12 +337,16 @@ def review_process(root: pathlib.Path, argv: list[str], *, timeout: float) -> su
                 # SIGKILL, which a TERM-deaf worker forked on the TERM holds with no
                 # witness (pack sd:9600). A thread reads both pipes meanwhile, so a
                 # TERM handler writing a large report does not block on a full pipe.
+                # A detached worker that still holds a pipe keeps the rest of the
+                # grace, as the bounded `communicate` gave it, until the pipes close.
                 stop = threading.Event()
                 reader = threading.Thread(target=read_pipes, args=(stop,), name="sd-review-grace", daemon=True)
                 reader.start()
+                deadline = time.monotonic() + REVIEW_CLEANUP_SECONDS
                 try:
-                    sd_lib.wait_empty(process.pid, time.monotonic() + REVIEW_CLEANUP_SECONDS,
+                    sd_lib.wait_empty(process.pid, deadline,
                                       leader=process.pid if process.returncode is None else None)
+                    reader.join(max(0., deadline - time.monotonic()))
                 finally:
                     stop.set()
                     reader.join()  # each pass is bounded by its .05 s select

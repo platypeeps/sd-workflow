@@ -6585,6 +6585,45 @@ class ReviewWatchdogTests(unittest.TestCase):
         self.assertTrue(cleaned.exists(), "the TERM handler never reached its cleanup")
         self.assertEqual(raised.exception.diagnostic["stdout"]["bytes"], 1048576)
 
+    def test_a_detached_pipe_holder_gets_the_rest_of_the_grace(self):
+        """pack sd:9600 review, sd-ship:344: the grace ended once the group was empty, so a
+        detached worker still holding a pipe was SIGKILLed while it handled a forwarded TERM.
+        The bounded `communicate` it replaced gave a pipe holder the remaining grace."""
+        ready = self.root / "ready"
+        cleaned = self.root / "cleaned"
+        script = ("import os,pathlib,signal,sys,time\n"
+                  "worker=os.fork()\n"
+                  "if worker==0:\n"
+                  " os.setsid()\n"
+                  " def finish(*_):\n"
+                  "  time.sleep(1)\n"
+                  "  sys.stdout.buffer.write(b'worker report')\n  sys.stdout.buffer.flush()\n"
+                  f"  pathlib.Path({str(cleaned)!r}).write_text('done')\n  os._exit(0)\n"
+                  " signal.signal(signal.SIGTERM, finish)\n"
+                  f" pathlib.Path({str(ready)!r}).write_text(str(os.getpid()))\n"
+                  " while True: time.sleep(1)\n"
+                  "def forward(*_):\n"
+                  " os.kill(worker, signal.SIGTERM)\n os._exit(0)\n"
+                  "signal.signal(signal.SIGTERM, forward)\n"
+                  "while True: time.sleep(1)\n")
+        def stop_worker():
+            try:
+                os.kill(int(ready.read_text()), ship.signal.SIGKILL)
+            except (OSError, ValueError):
+                pass
+        self.addCleanup(stop_worker)
+        original_communicate = subprocess.Popen.communicate
+        def after_ready(process, *args, **kwargs):
+            deadline = time.monotonic() + 5
+            while not (ready.exists() and ready.read_text()) and time.monotonic() < deadline:
+                time.sleep(.005)
+            return original_communicate(process, *args, **kwargs)
+        with patch.object(subprocess.Popen, "communicate", after_ready), patch.object(ship, "REVIEW_CLEANUP_SECONDS", 4):
+            with self.assertRaises(ship.ReviewTimeout) as raised:
+                ship.review_process(self.root, [sys.executable, "-c", script], timeout=.3)
+        self.assertTrue(cleaned.exists(), "the detached worker was killed inside the grace")
+        self.assertIn("worker report", raised.exception.diagnostic["stdout"]["tail"])
+
     def test_an_interrupted_review_read_still_kills(self):
         """pack sd:9392 round 5, R2: a KeyboardInterrupt in the read before the TERM left the review group
         TERMed and never KILLed."""
