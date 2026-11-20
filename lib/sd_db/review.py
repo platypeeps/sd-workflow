@@ -460,7 +460,8 @@ def _difference(filed: dict, found: dict) -> str:
     given = {"schema": str(SCHEMA), "source": found["source"], "mode": found["mode"],
              "seal": found["seal"] and found["seal"]["sha256"], "context": found["context"]}
     for name, value in given.items():
-        if header[name] != value:
+        # A batch filed before context was required (pack sd:9479) differs elsewhere (sd:9659).
+        if header[name] != value and not (name == "context" and header[name] is None):
             return f"{name} is {header[name]!r} in the header and {value!r} in the file"
     questions = {question["subject"]: question for question in found["questions"]}
     for question in filed["questions"]:
