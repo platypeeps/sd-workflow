@@ -389,8 +389,10 @@ def landing(connection: sqlite3.Connection, *, repos: Iterable[str | None] | Non
         for member in closes if isinstance(closes, list) else ():
             if is_item_id(member):
                 closed[(repository, member)] = max(closed.get((repository, member), 0), row["first"])
+    # A newer bundle hides only a member's failed or skipped history: its own live entry still lands.
     live = [entry for key, (first, entry) in newest.items()
-            if entry.get("status") != "merged" and closed.get(key, 0) < first]
+            if entry.get("status") != "merged"
+            and (entry.get("status") not in FAILED_LANE or closed.get(key, 0) < first)]
     items = {row["id"]: row for row in connection.execute(
         f"SELECT id, title, status FROM item WHERE id IN ({', '.join('?' for _ in live)})",
         [entry.get("item") for entry in live]).fetchall()}

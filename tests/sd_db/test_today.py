@@ -116,6 +116,18 @@ class TheSections(TodayCase):
         self.assertEqual([row["id"] for row in found["entries"]], [healthy])
         self.assertEqual(found["unread"], 2)
 
+    def test_a_bundle_hides_only_a_members_failed_history_not_its_live_entry(self):
+        """Class pass on sd:9694: the lane tracks a member's own pending, running or prepared entry by its item,
+        so a newer bundle that closes the member hides only its failed or skipped entries."""
+        lead, pending, running, skipped = (self.item(title) for title in ("Lead", "Pending", "Running", "Skipped"))
+        self.lane("o/r", "e0", item=pending, status="pending", position=1)
+        self.lane("o/r", "e1", item=running, status="running", position=2)
+        self.lane("o/r", "e2", item=skipped, status="skipped", position=3)
+        self.lane("o/r", "e3", item=lead, closes=[pending, running, skipped], status="pending", position=4)
+        found = today.landing(self.connection)["entries"]
+        self.assertEqual(sorted((row["id"], row["status"]) for row in found),
+                         [(lead, "pending"), (pending, "pending"), (running, "running")])
+
     def test_landing_gives_exact_times_and_no_estimate(self):
         """The lane records no ETA: `since` is when the entry started, else when the hub queued it."""
         running, waiting = self.item("Running", repo=APP), self.item("Waiting", repo=APP)
