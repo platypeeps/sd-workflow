@@ -5716,6 +5716,34 @@ class HostedOrder(Lane):
             sd_lane.run_hosted(self.environ, self.ship)
         self.assertEqual(order, [later, self.repo])
 
+    def test_a_skipped_lane_never_runs_in_the_hosted_run(self) -> None:
+        """pack sd:9668. One long lane kept the shared run alive past its budget, so launchd started no tick
+        and every other lane waited. That lane gets its own job; the hosted run leaves it to that job."""
+        later = self.tmp / "zeta"
+        later.mkdir()
+        git(later, "init", "-q", "-b", "main")
+        git(later, "remote", "add", "origin", "https://github.com/example/zeta.git")
+        import sd_db
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            for path, remote in ((self.repo, "pack"), (later, "zeta")):
+                sd_db.upsert_repo(connection, str(path), remote=f"https://github.com/example/{remote}.git", managed=1)
+        finally:
+            connection.close()
+        for checkout, item in ((self.repo, 1), (later, 2)):
+            sd_lane.add_entry(sd_lane.queue_for(checkout, self.environ),
+                              {"id": f"e{item}", "item": item, "status": "pending",
+                               "enqueued_at": "2026-11-20T01:00:00Z"})
+        order: list[pathlib.Path] = []
+
+        def recorded(checkout: pathlib.Path, *args: Any) -> dict:
+            order.append(checkout)
+            return {"ran": []}
+        with mock.patch.object(sd_lane, "run_lane", recorded):
+            answer = sd_lane.run_hosted(self.environ, self.ship, skip=[self.repo])
+        self.assertEqual(order, [later])
+        self.assertIn({"path": str(self.repo), "skipped": "its own job runs this lane (--skip)"}, answer["lanes"])
+
     def test_a_build_mismatch_skips_the_tick_and_exits_0(self) -> None:
         """sd:6425. Between a hub refresh and the satellite's follow, the repo-table read met a
         build mismatch, exited 3, and the health check read the job as failed. The tick skips."""
@@ -5724,7 +5752,7 @@ class HostedOrder(Lane):
 
         def refused(*args: Any, **kwargs: Any) -> Any:
             raise remote.BuildMismatch("build", "0000aaaa", "1111bbbb")
-        args = mock.Mock(lane_command="run", hosted=True)
+        args = mock.Mock(lane_command="run", hosted=True, skip=[])
         with mock.patch.object(sd_db.database, "connect", refused), \
                 mock.patch("sys.stdout", new_callable=io.StringIO) as out:
             code = sd_lane.lane_main(args)
