@@ -642,7 +642,8 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
         # (sd:9015). A done lead refuses: the claim would lead with a member, on a new branch and worktree.
         if _done(items, current["item"]):
             raise BuildRefused(f"Retry refused: its lead sd:{current['item']} is done")
-        members = [member for member in members if not _done(items, member["item"])]
+        # A subset reads the bundle as it ended, done members included: a member landed elsewhere since may
+        # still have its earlier work on this branch, so it is left out too and the split guard reads it.
         if only is not None and {member["item"] for member in members} - set(only):
             if current["item"] not in only:
                 raise BuildRefused(f"Retry refused: a retry of part of the bundle names its lead sd:{current['item']}, "
@@ -662,6 +663,7 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
                      f"Build assignment {member['id']} left its bundle: a Retry of build run {run['id']} by {who} "
                      f"named other items; item parked; Build it to build it fresh")
             members = [member for member in members if member["item"] in only]
+        members = [member for member in members if not _done(items, member["item"])]
         newer = [member for member in members if not _current(connection, member)]
         if newer:
             owner = connection.execute("SELECT id FROM assignment WHERE item = ? AND scope = ? ORDER BY id DESC "

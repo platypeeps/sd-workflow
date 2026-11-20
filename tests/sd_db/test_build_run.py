@@ -1093,6 +1093,13 @@ class Supervise(Case):
         self.db.execute("UPDATE runner_run SET released_at = COALESCE(released_at, ?)", ("2026-01-01T00:00:00Z",))
         self.db.execute("UPDATE runner_lease SET released_at = COALESCE(released_at, ?)", ("2026-01-01T00:00:00Z",))
 
+    def test_a_left_item_done_elsewhere_still_splits(self):
+        """Row 20: the left item landed through another branch before the Retry; the branch still holds its
+        earlier work, so the split is read against the bundle as it ended, done members included."""
+        def landed(_work, _commit):
+            self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (self.items[2],))
+        self.assert_split_first(self.left_out_of_a_retry(landed))
+
     def test_a_rebased_branch_after_a_split_cannot_be_retried(self):
         """Round 6, row 10: a rebase onto newer main gives the earlier commits new ids and keeps their changes, so
         no git state proves a split; once the guard found earlier work, Retry of that bundle refuses."""
