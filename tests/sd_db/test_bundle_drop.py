@@ -332,3 +332,45 @@ class DropRound2(Repo):
             DROP.drop_item(self.db, build, items[1], who="operator")
         self.assertEqual(git(work, "rev-parse", "HEAD"), old)
         self.assertEqual(git(self.repo, "branch", "--list", f"{run['branch']}-drop-*"), "")
+
+
+class DropRound3(Repo):
+    """Review round 3 of pack sd:9709, class pass. The drop read stored bundle state raw, not through the readers the
+    build uses: the repo key as a disk path (`paths.expand`, as `Supervisor`), and the branch's commits without the
+    bundle's exclusions (`_in_group`, as `left`)."""
+
+    def home_is_root(self):
+        """HOME is the test root, so the repo is stored as the `~/repo` key, as on a real machine."""
+        env = mock.patch.dict("os.environ", {"HOME": str(self.root)})
+        env.start()
+        self.addCleanup(env.stop)
+        self.db.execute("UPDATE repo SET path = '~/repo' WHERE path = ?", (str(self.repo),))
+
+    def test_a_home_key_repo_drops_a_member(self):
+        self.home_is_root()
+        items, ids, run = self.bundle()
+        self.assertTrue(self.db.execute("SELECT repo FROM runner_run WHERE id = ?",
+                                        (run["id"],)).fetchone()["repo"].startswith("~/"))
+        DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual(self.files(Path(run["work_path"])), ["README", "a.txt", "c.txt"])
+
+    def test_a_home_key_repo_drops_the_lead(self):
+        self.home_is_root()
+        items, (lead, second, third), run = self.bundle()
+        DROP.drop_item(self.db, build, items[0], who="operator")
+        self.assertEqual(self.files(Path(run["work_path"]).parent / f"repo-build-{second}"),
+                         ["README", "b.txt", "c.txt"])
+
+    def test_a_member_left_out_earlier_stays_off_the_kept_branch(self):
+        items, (lead, second, third), run = self.bundle()
+        build.retry(self.db, lead, who="operator", only=[items[0], items[2]])
+        again = self.claim()
+        self.assertEqual(again["branch"], run["branch"])
+        build.write(self.db, again["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START)
+        build.end(self.db, again["id"], "blocked", "blockers")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        DROP.drop_item(self.db, build, items[0], who="operator")
+        new = self.claim()
+        self.assertEqual([member["item"] for member in build.run(self.db, new["id"])["members"]], [items[2]])
+        self.assertEqual(self.files(Path(new["work_path"])), ["README", "c.txt"])
+        self.assertNotIn(f"sd:{items[1]}", self.closes(Path(new["work_path"])))

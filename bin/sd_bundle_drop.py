@@ -77,37 +77,44 @@ def _ignored(work: str | Path, start: str, kept: list[str]) -> None:
         raise DropRefused(f"ignored local files the new branch tracks: {', '.join(clash[:5])}; move them first")
 
 
-def drop_sides(work: str | Path, start: str, tip: str, item: int) -> tuple[list[str], list[str]]:
-    """The non-merge commits of `start..tip`, oldest first, split into (kept, dropped) for dropping `item`."""
+def drop_sides(work: str | Path, start: str, tip: str, item: int, aside: set[int]) -> tuple[list[str], list[str]]:
+    """The non-merge commits of `start..tip`, oldest first, split into (kept, dropped) for dropping `item`. A commit
+    citing an item of `aside`, `item` and the members cancelled out of the bundle before, is not kept (round 3)."""
     shas = _out("rev-list", "--reverse", "--no-merges", f"{start}..{tip}", cwd=work).split()
     side: dict[str, str] = {}
     touched: dict[str, set[str]] = {"kept": set(), "dropped": set()}
-    loose = []
+    loose, named = [], False
     for sha in shas:
         cited = set(sd_ship_body.cited_ids("", [(sha, _out("log", "-1", "--format=%B", sha, cwd=work))]))
-        if item in cited and cited - {item}:
-            raise DropRefused(f"commit {sha[:12]} cites sd:{item} and "
-                              f"{', '.join(f'sd:{n}' for n in sorted(cited - {item}))}: split it by hand")
+        if cited & aside and cited - aside:
+            raise DropRefused(f"commit {sha[:12]} cites {', '.join(f'sd:{n}' for n in sorted(cited & aside))} and "
+                              f"{', '.join(f'sd:{n}' for n in sorted(cited - aside))}: split it by hand")
         if not cited:
             loose.append(sha)
             continue
-        side[sha] = "dropped" if item in cited else "kept"
+        side[sha] = "dropped" if cited & aside else "kept"
+        named = named or item in cited
         touched[side[sha]] |= _paths(work, sha)
     # Paths prove whose an uncited commit is only against both sides' cited commits: with one side uncited, every
     # such commit would fall to the other side, the dropped item's change shipping with the kept (round 2).
-    for name, who in (("dropped", f"sd:{item}"), ("kept", "a kept item")):
-        if loose and not any(value == name for value in side.values()):
+    # The dropped item's own: a commit of a member cancelled out before says nothing of whose this is (round 3).
+    for found, who in ((named, f"sd:{item}"), ("kept" in side.values(), "a kept item")):
+        if loose and not found:
             raise DropRefused(f"no commit cites {who}, so nothing says whose commit {loose[0][:12]} is; "
                               f"split it by hand")
-    for sha in loose:
-        paths = _paths(work, sha)
-        hits = [name for name in ("kept", "dropped") if paths & touched[name]]
-        if len(hits) != 1:
-            raise DropRefused(f"commit {sha[:12]} cites no item and touches "
-                              f"{'paths of both sides' if hits else 'no path a citing commit touched'}: "
-                              f"no message says whose it is")
-        side[sha] = hits[0]
+    side.update({sha: _whose(work, sha, touched) for sha in loose})
     return [sha for sha in shas if side[sha] == "kept"], [sha for sha in shas if side[sha] == "dropped"]
+
+
+def _whose(work: str | Path, sha: str, touched: dict[str, set[str]]) -> str:
+    """The side of the uncited commit `sha`: the one whose cited commits touch its paths, when only one does."""
+    paths = _paths(work, sha)
+    hits = [name for name in ("kept", "dropped") if paths & touched[name]]
+    if len(hits) != 1:
+        raise DropRefused(f"commit {sha[:12]} cites no item and touches "
+                          f"{'paths of both sides' if hits else 'no path a citing commit touched'}: "
+                          f"no message says whose it is")
+    return hits[0]
 
 
 def _clean(work: str | Path, branch: str) -> None:
@@ -136,7 +143,8 @@ def split_branch(plan: dict) -> dict:
     tip = _out("rev-parse", "HEAD", cwd=work)
     fork = _out("merge-base", start, tip, cwd=work)
     _merges(work, fork, tip)
-    kept, dropped = drop_sides(work, fork, tip, item)
+    aside = set(plan["aside"])
+    kept, dropped = drop_sides(work, fork, tip, item, aside)
     in_place = plan["new_work"] == plan["work"]
     saved = f"{branch}-drop-sd-{item}"
     new_work, new_branch = Path(plan["new_work"]), plan["new_branch"]
@@ -163,7 +171,7 @@ def split_branch(plan: dict) -> dict:
             _git("worktree", "add", "-q", "-b", new_branch, str(new_work), start, cwd=repo)
         for sha in kept:
             _git("cherry-pick", "--allow-empty", sha, cwd=new_work)
-        check_branch(new_work, start, kept, item)
+        check_branch(new_work, start, kept, aside)
         done["head"] = _out("rev-parse", "HEAD", cwd=new_work)
     except BaseException:  # Ctrl-C too: the branch moved, and nothing else would put it back (round 2)
         undo_split(done)
@@ -171,14 +179,15 @@ def split_branch(plan: dict) -> dict:
     return done
 
 
-def check_branch(work: str | Path, start: str, kept: list[str], item: int) -> None:
-    """The new branch holds the kept commits alone: one commit each, no path past theirs, no citation of `item`."""
+def check_branch(work: str | Path, start: str, kept: list[str], aside: set[int]) -> None:
+    """The new branch holds the kept commits alone: one commit each, no path past theirs, no `aside` citation."""
     shas = _out("rev-list", "--reverse", f"{start}..HEAD", cwd=work).split()
     if len(shas) != len(kept):
         raise DropRefused(f"the new branch holds {len(shas)} commits, not the {len(kept)} kept")
     commits = [(sha, _out("log", "-1", "--format=%B", sha, cwd=work)) for sha in shas]
-    if item in sd_ship_body.cited_ids("", commits):
-        raise DropRefused(f"the new branch still cites sd:{item}")
+    cited = aside & set(sd_ship_body.cited_ids("", commits))
+    if cited:
+        raise DropRefused(f"the new branch still cites {', '.join(f'sd:{n}' for n in sorted(cited))}")
     allowed = set().union(*(_paths(work, sha) for sha in kept)) if kept else set()
     changed = _names("diff", "--name-only", "-z", start, "HEAD", cwd=work)
     if changed - allowed:

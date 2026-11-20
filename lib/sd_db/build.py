@@ -746,10 +746,16 @@ def drop_plan(connection, item: int) -> dict:
         host = lane["lane_host"] if lane else None
         if _route(connection, host, lead) != _route(connection, host, None):
             raise BuildRefused(f"Drop refused: build {lead} ran off its lane's host; drop a member, or Retry it whole")
-    work = Path(last["work_path"])
+    # The bundle's members cancelled out of it before (`ALONE`), as `left` reads them: their commits stay on the
+    # branch, and the split must not carry them (round 3).
+    gone = {member["item"] for member in connection.execute(
+        f"SELECT item FROM assignment WHERE parent = ? AND scope = ? AND NOT {_in_group()}", (lead, SCOPE))}
+    # The stored repo is a key (`~/...`); git needs the disk path, as `Supervisor` expands it (round 3).
+    repo, work = paths.expand(last["repo"]), Path(last["work_path"])
     return {"item": item, "assignment": row["id"], "lead": lead, "new_lead": new, "kept": kept, "run": last["id"],
-            "revision": current["revision"], "repo": last["repo"], "work": str(work), "branch": last["branch"],
-            "new_work": str(work if new == lead else worktree(last["repo"], new, root=work.parent)),
+            "aside": sorted(gone - {member["item"] for member in kept} | {item}),
+            "revision": current["revision"], "repo": str(repo), "work": str(work), "branch": last["branch"],
+            "new_work": str(work if new == lead else worktree(str(repo), new, root=work.parent)),
             "new_branch": branch(new)}
 
 
