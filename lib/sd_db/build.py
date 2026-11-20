@@ -729,6 +729,12 @@ def drop_plan(connection, item: int) -> dict:
     kept = [member for member in members if member["id"] != row["id"] and not _done(items, member["item"])]
     if not kept:
         raise BuildRefused(f"Drop refused: sd:{item} is the only open item of build {lead}; Retry or cancel it")
+    # As Retry: a kept member whose item a newer build owns would resume this older branch over that work.
+    for member in kept:
+        if not _current(connection, member):
+            owner = connection.execute("SELECT id FROM assignment WHERE item = ? AND scope = ? ORDER BY id DESC "
+                                       "LIMIT 1", (member["item"], SCOPE)).fetchone()["id"]
+            raise BuildRefused(f"Drop refused: sd:{member['item']} has a newer build, assignment {owner}")
     new = lead if row["id"] != lead else kept[0]["id"]
     if new != lead:
         # The new lead never ran: a claim routes it to the repo's lane, so the old run must have built there too.
@@ -767,6 +773,9 @@ def drop_writes(connection, plan: dict, *, who: str, note: str, left: str) -> li
         unpark(connection, plan["item"])
         add_note(connection, plan["item"], "comment", left)
         alone = queue(connection, [plan["item"]], who=who)
+        # Built alone, as the drop promises: a claim bundles only fresh rows (no parent, `run_count` 0) together,
+        # and takes a row that counts a run as its own bundle, its lead (`_bundle`). No run row backs the count.
+        connection.execute("UPDATE assignment SET run_count = 1 WHERE id = ?", (alone[0]["id"],))
         return queued + [{"id": row["id"], "item": row["item"], "status": row["status"]} for row in alone]
 
 

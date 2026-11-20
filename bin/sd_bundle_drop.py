@@ -44,6 +44,35 @@ def _paths(work: str | Path, sha: str) -> set[str]:
     return set(filter(None, _out("diff-tree", "--no-commit-id", "-r", "--name-only", "-z", sha, cwd=work).split("\0")))
 
 
+def _merges(work: str | Path, start: str, tip: str) -> None:
+    """Refuse a merge in `start..tip` whose tree is not what git merges its parents to: its resolution is in no
+    commit the split cherry-picks, so the kept branch would lose it. A clean merge brings only what the base has."""
+    for line in _out("rev-list", "--merges", "--parents", f"{start}..{tip}", cwd=work).splitlines():
+        sha, *parents = line.split()
+        if len(parents) != 2:
+            raise DropRefused(f"merge {sha[:12]} has {len(parents)} parents; split it by hand")
+        tree = _git("merge-tree", "--write-tree", *parents, cwd=work, check=False)
+        if tree.returncode != 0 or tree.stdout.split()[0] != _out("rev-parse", f"{sha}^{{tree}}", cwd=work):
+            raise DropRefused(f"merge {sha[:12]} resolves by hand what no cherry-pick carries; split it by hand")
+
+
+def _ignored(work: str | Path, start: str, kept: list[str]) -> None:
+    """Refuse an ignored file where the base or a kept commit tracks a path: the in-place checkout would overwrite
+    it, and no branch holds its contents."""
+    ignored = set(filter(None, _out("ls-files", "-z", "--others", "--ignored", "--exclude-standard",
+                                    cwd=work).split("\0")))
+    if not ignored:
+        return
+    tracked = set(filter(None, _out("ls-tree", "-r", "-z", "--name-only", start, cwd=work).split("\0")))
+    for sha in kept:
+        tracked |= _paths(work, sha)
+    dirs = {"/".join(path.split("/")[:n]) for path in tracked for n in range(1, path.count("/") + 1)}
+    clash = sorted(path for path in ignored if path in tracked or path in dirs
+                   or any("/".join(path.split("/")[:n]) in tracked for n in range(1, path.count("/") + 1)))
+    if clash:
+        raise DropRefused(f"ignored local files the new branch tracks: {', '.join(clash[:5])}; move them first")
+
+
 def drop_sides(work: str | Path, start: str, tip: str, item: int) -> tuple[list[str], list[str]]:
     """The non-merge commits of `start..tip`, oldest first, split into (kept, dropped) for dropping `item`."""
     shas = _out("rev-list", "--reverse", "--no-merges", f"{start}..{tip}", cwd=work).split()
@@ -96,6 +125,7 @@ def split_branch(plan: dict) -> dict:
     start = drop_base(repo)
     tip = _out("rev-parse", "HEAD", cwd=work)
     fork = _out("merge-base", start, tip, cwd=work)
+    _merges(work, fork, tip)
     kept, dropped = drop_sides(work, fork, tip, item)
     in_place = plan["new_work"] == plan["work"]
     saved = f"{branch}-drop-sd-{item}"
@@ -106,18 +136,25 @@ def split_branch(plan: dict) -> dict:
             raise DropRefused(f"{branch} is on origin; drop it only before the lane pushed it")
         if _exists(repo, f"refs/heads/{saved}"):
             raise DropRefused(f"branch {saved} exists: an earlier drop kept it")
-        _git("branch", saved, tip, cwd=repo)
-        _git("checkout", "-q", "-B", branch, start, cwd=work)
-    else:
-        if new_work.exists() or _exists(repo, f"refs/heads/{new_branch}"):
-            raise DropRefused(f"{new_work} or branch {new_branch} exists already")
-        _git("worktree", "add", "-q", "-b", new_branch, str(new_work), start, cwd=repo)
-    done = {"plan": plan, "tip": tip, "saved": saved if in_place else None, "base": start, "kept": kept, "dropped": dropped}
+        _ignored(work, start, kept)
+    elif new_work.exists() or _exists(repo, f"refs/heads/{new_branch}"):
+        raise DropRefused(f"{new_work} or branch {new_branch} exists already")
+    # Each step is recorded once it moved something, so a failure undoes exactly what moved (`undo_split`).
+    done = {"plan": plan, "tip": tip, "saved": None, "made": False, "moved": False, "base": start, "kept": kept,
+            "dropped": dropped}
     try:
+        if in_place:
+            _git("branch", saved, tip, cwd=repo)
+            done["saved"] = saved
+            done["moved"] = True  # a failed checkout may still have moved files: restore the tip either way
+            _git("checkout", "-q", "-B", branch, start, cwd=work)
+        else:
+            done["made"] = True  # a failed add may leave a half-made worktree or branch: remove both either way
+            _git("worktree", "add", "-q", "-b", new_branch, str(new_work), start, cwd=repo)
         for sha in kept:
             _git("cherry-pick", "--allow-empty", sha, cwd=new_work)
         check_branch(new_work, start, kept, item)
-    except DropRefused:
+    except Exception:
         undo_split(done)
         raise
     done["head"] = _out("rev-parse", "HEAD", cwd=new_work)
@@ -139,15 +176,24 @@ def check_branch(work: str | Path, start: str, kept: list[str], item: int) -> No
 
 
 def undo_split(done: dict) -> None:
-    """Put the branches and worktrees back as `split` found them."""
+    """Put the branches and worktrees back as `split_branch` found them, only what it moved. The backup branch goes
+    only once the branch reads back at its old tip; otherwise it stays, and the refusal names it."""
     plan = done["plan"]
     repo, work = Path(plan["repo"]), Path(plan["new_work"])
-    _git("cherry-pick", "--abort", cwd=work, check=False)
-    if done["saved"]:
+    if done.get("moved") or done.get("made"):
+        _git("cherry-pick", "--abort", cwd=work, check=False)
+    if done.get("moved"):
         _git("checkout", "-q", "-f", "-B", plan["branch"], done["tip"], cwd=work, check=False)
+        back = _git("rev-parse", "HEAD", cwd=work, check=False).stdout.strip() == done["tip"] and \
+            _git("branch", "--show-current", cwd=work, check=False).stdout.strip() == plan["branch"]
+        if not back:
+            raise DropRefused(f"the drop failed and could not put {plan['branch']} back in {work}; its old tip "
+                              f"{done['tip'][:12]} is kept on {done['saved']}")
+    if done.get("saved"):
         _git("branch", "-D", done["saved"], cwd=repo, check=False)
-    else:
+    if done.get("made"):
         _git("worktree", "remove", "--force", str(work), cwd=repo, check=False)
+        _git("worktree", "prune", cwd=repo, check=False)
         _git("branch", "-D", plan["new_branch"], cwd=repo, check=False)
 
 

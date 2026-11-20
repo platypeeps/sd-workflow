@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from sd_db import build, runner
-from sd_db.writes import upsert_repo
+from sd_db.writes import create_assignment, upsert_repo
 
 from .test_build import START, Case, Kill, Probe
 
@@ -27,7 +27,9 @@ def git(cwd, *argv):
     return subprocess.run(["git", "-C", str(cwd), *argv], check=True, capture_output=True, text=True).stdout.strip()
 
 
-class Drop(Case):
+class Repo(Case):
+    """A real repository with an origin, and a three-item bundle built on it."""
+
     def setUp(self):
         super().setUp()
         env = mock.patch.dict("os.environ", IDENTITY)
@@ -72,6 +74,7 @@ class Drop(Case):
     def closes(self, work):
         return git(work, "log", "--format=%B", "origin/main..HEAD")
 
+class Drop(Repo):
     def test_dropping_a_member_keeps_the_others_commits_alone_and_builds_it_alone(self):
         items, (lead, second, third), run = self.bundle()
         work = Path(run["work_path"])
@@ -150,3 +153,110 @@ class Drop(Case):
         self.claim()
         with self.assertRaisesRegex(DROP.DropRefused, "Drop refused: the run still holds its lease"):
             DROP.drop_item(self.db, build, items[1], who="operator")
+
+
+class DropReview(Repo):
+    """Review round 1 of pack sd:9709, class pass. Git state: a merge's resolution, ignored files, rollback order.
+    Requeue: a kept item's newer build, and the dropped item bundled with fresh rows."""
+
+    def main_moves(self, name, text):
+        """origin/main gains a commit on `name`, made in a second clone."""
+        other = self.root / "other"
+        if not other.exists():
+            subprocess.run(["git", "clone", "-q", str(self.root / "origin.git"), str(other)], check=True,
+                           capture_output=True)
+        git(other, "pull", "-q", "origin", "main")
+        (other / name).write_text(text)
+        git(other, "add", "-f", "-A")
+        git(other, "commit", "-q", "-m", f"chore: main moves {name}")
+        git(other, "push", "-q", "origin", "HEAD:main")
+        git(self.repo, "fetch", "-q", "origin")
+
+    def test_a_merge_with_a_hand_resolution_refuses(self):
+        items, ids, run = self.bundle()
+        work = Path(run["work_path"])
+        self.commit(work, "README", "branch side\n", f"fix: second readme\n\nCloses: sd:{items[1]}")
+        self.main_moves("README", "main side\n")
+        subprocess.run(["git", "-C", str(work), "merge", "-q", "origin/main"], capture_output=True)
+        (work / "README").write_text("resolved by hand\n")
+        git(work, "add", "README")
+        git(work, "commit", "-q", "--no-edit")
+        old = git(work, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(DROP.DropRefused, "merge .* resolves"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), old)
+
+    def test_a_clean_merge_of_main_still_drops(self):
+        items, ids, run = self.bundle()
+        work = Path(run["work_path"])
+        self.main_moves("d.txt", "main\n")
+        git(work, "merge", "-q", "--no-edit", "origin/main")
+        DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual(self.files(work), ["README", "a.txt", "c.txt", "d.txt"])
+
+    def test_an_ignored_file_the_base_tracks_refuses_and_stays(self):
+        items, ids, run = self.bundle()
+        work = Path(run["work_path"])
+        exclude = Path(git(self.repo, "rev-parse", "--git-common-dir"))
+        exclude = (exclude if exclude.is_absolute() else self.repo / exclude) / "info" / "exclude"
+        exclude.parent.mkdir(exist_ok=True)
+        exclude.write_text("gen.txt\n")
+        (work / "gen.txt").write_text("local\n")
+        self.main_moves("gen.txt", "tracked on main\n")
+        with self.assertRaisesRegex(DROP.DropRefused, "ignored .*gen.txt"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual((work / "gen.txt").read_text(), "local\n")
+
+    def failing(self, *words):
+        """`_git` that fails each call whose argv holds every one of `words`."""
+        real = DROP._git
+
+        def fake(*argv, cwd, check=True):
+            if all(word in argv for word in words):
+                if check:
+                    raise DROP.DropRefused(f"git {' '.join(argv)} failed")
+                return subprocess.CompletedProcess(argv, 1, "", "failed")
+            return real(*argv, cwd=cwd, check=check)
+        return mock.patch.object(DROP, "_git", side_effect=fake)
+
+    def test_a_failed_checkout_leaves_no_backup_and_a_retry_drops(self):
+        items, ids, run = self.bundle()
+        work = Path(run["work_path"])
+        old = git(work, "rev-parse", "HEAD")
+        with self.failing("checkout", "-B"), self.assertRaises(DROP.DropRefused):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual(git(self.repo, "branch", "--list", f"{run['branch']}-drop-*"), "")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), old)
+        DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual(self.files(work), ["README", "a.txt", "c.txt"])
+
+    def test_a_failed_restore_keeps_the_backup_and_says_so(self):
+        items, ids, run = self.bundle()
+        with mock.patch.object(build, "drop_writes", side_effect=build.BuildRefused("Drop refused: changed")), \
+                self.failing("checkout", "-f"), self.assertRaisesRegex(DROP.DropRefused, "kept on .*-drop-sd-"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertNotEqual(git(self.repo, "branch", "--list", f"{run['branch']}-drop-*"), "")
+
+    def test_a_kept_item_with_a_newer_build_refuses(self):
+        items, ids, run = self.bundle()
+        newer = create_assignment(self.db, role="author", status="blocked", item=items[2])
+        self.db.execute("UPDATE assignment SET scope = ? WHERE id = ?", (build.SCOPE, newer))
+        work = Path(run["work_path"])
+        old = git(work, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(DROP.DropRefused, f"sd:{items[2]} has a newer build, assignment {newer}"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), old)
+
+    def test_the_dropped_item_builds_alone_beside_fresh_rows(self):
+        items, ids, run = self.bundle()
+        DROP.drop_item(self.db, build, items[1], who="operator")
+        other = self.item(repo=str(self.repo))
+        build.queue(self.db, [other], who="operator")
+        bundles = []
+        while (claimed := self.claim()) is not None:
+            bundles.append([member["item"] for member in build.run(self.db, claimed["id"])["members"]])
+            build.write(self.db, claimed["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START)
+            build.end(self.db, claimed["id"], "blocked", "fixture")
+            build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        self.assertIn([items[1]], bundles)
+        self.assertEqual(sorted(sum(bundles, [])), sorted([*items, other]))
