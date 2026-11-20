@@ -4268,9 +4268,6 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
             found, checkout = github_slug(row["remote"]), sd_lib.repo_disk(row["path"])
             if found is None or not (checkout / ".git").exists():
                 continue
-            if checkout.resolve() in skipped:
-                lanes.append({"path": row["path"], "skipped": "its own job runs this lane (--skip)"})
-                continue
             try:
                 (hosted if sd_lib.hosts_lane(connection, database, "/".join(found)) else others).append(
                     (row["path"], checkout))
@@ -4282,7 +4279,11 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
     lanes += settle_others(others, environ)
     def inline(checkout: pathlib.Path, budget: float) -> StartedLane:
         return inline_lane(lambda: run_lane(checkout, environ, ship, gate, note, clock() + budget))
-    order = longest_waiting_first(hosted, environ)
+    # A skipped lane is skipped only where it is hosted: elsewhere it is settled as before, and it keeps
+    # its wait and flake reports below; its own `lane run -C` job refuses on a machine that does not host it.
+    lanes += [{"path": path, "skipped": "its own job runs this lane (--skip)"}
+              for path, checkout in hosted if checkout.resolve() in skipped]
+    order = longest_waiting_first([lane for lane in hosted if lane[1].resolve() not in skipped], environ)
     lanes += run_parallel(order, start or inline, deadline, functools.partial(lane_room, environ),
                           functools.partial(new_work, environ), cap=lane_parallel(environ))
     for path, checkout in hosted:  # after the lanes ran: a slow read never holds a lane back (pack sd:6006)
@@ -4737,11 +4738,18 @@ def lane_main(args: Any) -> int:
             result = set_hold(root, args.item, environ, held=args.lane_command == "hold",
                               expected_revision=args.expected_revision)
         else:
-            result = run_lane(root, environ, deadline=None if args.budget is None else clock() + args.budget)
+            result = run_lane(root, environ, deadline=run_deadline(args))
     except (LaneError, sd_lib.ConfigError, OSError) as error:
         print(json.dumps({"ok": False, **refusal(error)}, indent=2, sort_keys=True))
         return 3
     return succeed(shown(result))
+
+
+def run_deadline(args: Any) -> float | None:
+    """A plain `lane run`'s claim deadline; it refuses `--skip`, which only `--hosted` reads (pack sd:9668)."""
+    if args.skip:
+        raise LaneError("--skip needs --hosted: a `lane run -C` job runs one lane and skips none")
+    return None if args.budget is None else clock() + args.budget
 
 
 def lane_prune(root: pathlib.Path, environ: dict[str, str], *, dry_run: bool, as_json: bool) -> int:

@@ -5744,6 +5744,37 @@ class HostedOrder(Lane):
         self.assertEqual(order, [later])
         self.assertIn({"path": str(self.repo), "skipped": "its own job runs this lane (--skip)"}, answer["lanes"])
 
+    def test_a_skipped_lane_another_machine_hosts_is_still_settled_here(self) -> None:
+        """pack sd:9668 review. The skip ran before the host check, so a machine that does not host the
+        lane stopped importing its file queue and reclaiming its dead holders; its own job refuses there."""
+        import sd_db
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            sd_db.upsert_repo(connection, str(self.repo), remote="https://github.com/example/pack.git", managed=1)
+        finally:
+            connection.close()
+        settled: list[pathlib.Path] = []
+
+        def recorded(others: list, environ: dict) -> list:
+            settled.extend(checkout for _, checkout in others)
+            return []
+        with mock.patch.object(sd_lane.sd_lib, "hosts_lane", return_value=False), \
+                mock.patch.object(sd_lane, "settle_others", recorded):
+            sd_lane.run_hosted(self.environ, self.ship, skip=[self.repo])
+        self.assertEqual([path.resolve() for path in settled], [self.repo.resolve()])
+
+    def test_skip_without_hosted_runs_no_lane(self) -> None:
+        """pack sd:9668 review: `lane run -C X --skip Y` ran as if the flag were absent."""
+        import argparse  # noqa: PLC0415
+        parser = argparse.ArgumentParser()
+        sd_lane.add_lane_verbs(parser.add_subparsers(dest="command"))
+        with contextlib.chdir(self.repo), mock.patch.dict(os.environ, self.environ), \
+                mock.patch.object(sd_lane, "run_lane", side_effect=AssertionError("ran a lane")), \
+                contextlib.redirect_stdout(io.StringIO()) as said, contextlib.redirect_stderr(said):
+            code = sd_lane.lane_main(parser.parse_args(["lane", "run", "--skip", str(self.repo)]))
+        self.assertNotEqual(code, 0)
+        self.assertIn("--skip needs --hosted", said.getvalue())
+
     def test_a_build_mismatch_skips_the_tick_and_exits_0(self) -> None:
         """sd:6425. Between a hub refresh and the satellite's follow, the repo-table read met a
         build mismatch, exited 3, and the health check read the job as failed. The tick skips."""
