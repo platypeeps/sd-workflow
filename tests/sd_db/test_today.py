@@ -106,6 +106,16 @@ class TheSections(TodayCase):
         found = today.landing(self.connection)["entries"]
         self.assertEqual([(row["id"], row["status"]) for row in found], [(lead, "pending"), (dropped, "failed")])
 
+    def test_a_malformed_closes_or_item_is_counted_not_raised(self):
+        """Class pass on sd:9694: a `closes` member or an `item` that is no item id hides no other row."""
+        healthy = self.item("Healthy")
+        self.lane("o/r", "e1", item=healthy, status="running", position=1, closes=[{}, "x", 1.5, [2]])
+        self.lane("o/r", "e2", item=[3], status="failed", position=2)
+        self.lane("o/r", "e3", item={}, status="failed", position=3)
+        found = today.landing(self.connection)
+        self.assertEqual([row["id"] for row in found["entries"]], [healthy])
+        self.assertEqual(found["unread"], 2)
+
     def test_landing_gives_exact_times_and_no_estimate(self):
         """The lane records no ETA: `since` is when the entry started, else when the hub queued it."""
         running, waiting = self.item("Running", repo=APP), self.item("Waiting", repo=APP)

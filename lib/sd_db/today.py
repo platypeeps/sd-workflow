@@ -34,6 +34,7 @@ from .reads import (
 from .reporting import _current_basis
 from .runner import OWNING
 from .ship import this_host
+from .workflow import is_item_id
 
 #: `sd_lane.KEY_PREFIX`: a lane entry is the newest `checkpoint` row of its key.
 LANE_KEY_PREFIX = "lane:v1:"
@@ -371,7 +372,8 @@ def landing(connection: sqlite3.Connection, *, repos: Iterable[str | None] | Non
             entry = json.loads(row["body"])
         except (TypeError, ValueError):
             entry = None
-        if not isinstance(entry, dict):
+        # An item that is no item id, or a `closes` member that is none, names no row (pack sd:9694 class pass).
+        if not isinstance(entry, dict) or not is_item_id(entry.get("item")):
             unread += 1
             continue
         repository = row["key"][len(LANE_KEY_PREFIX):].rpartition(":")[0]
@@ -385,7 +387,8 @@ def landing(connection: sqlite3.Connection, *, repos: Iterable[str | None] | Non
             newest[key] = (row["first"], {**entry, "repository": repository, "queued_at": row["queued_at"]})
         closes = entry.get("closes")
         for member in closes if isinstance(closes, list) else ():
-            closed[(repository, member)] = max(closed.get((repository, member), 0), row["first"])
+            if is_item_id(member):
+                closed[(repository, member)] = max(closed.get((repository, member), 0), row["first"])
     live = [entry for key, (first, entry) in newest.items()
             if entry.get("status") != "merged" and closed.get(key, 0) < first]
     items = {row["id"]: row for row in connection.execute(
