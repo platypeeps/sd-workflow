@@ -740,6 +740,40 @@ def _refuse_cycle(connection: sqlite3.Connection, item: int, named: list[int]) -
             queue.append(other)
 
 
+def reopen_waits(connection: sqlite3.Connection, item: int, stamp: str) -> str | None:
+    """Drop each entry of a reopened item's set that an open item waits back through, and say so; None when none
+    does (pack sd:9570 class pass).
+
+    A done item's stale set takes no part in the edit's cycle check (pack
+    sd:9591), so B may wait on a done A that still names B. Reopening A
+    would close that cycle and hold both builds for ever; the reopen drops
+    A's stale entry instead, so B, which waits now, builds after A.
+    """
+    row = connection.execute("SELECT fields FROM item WHERE id = ?", (item,)).fetchone()
+    try:
+        named = item_blocked_by(row)
+    except ValueError:
+        return None
+    dropped = []
+    for other in named:
+        try:
+            _refuse_cycle(connection, item, [other])
+        except WorkflowError:
+            dropped.append(other)
+    if not dropped:
+        return None
+    kept = [other for other in named if other not in dropped]
+    fields = json.loads(row["fields"])
+    if kept:
+        fields["blocked_by"] = kept
+    else:
+        fields.pop("blocked_by")
+    connection.execute("UPDATE item SET fields = ?, updated_at = ? WHERE id = ?",
+                       (json.dumps(fields, sort_keys=True) if fields else None, stamp, item))
+    waits = ", ".join(f"sd:{other}" for other in kept) or "nothing"
+    return f"Waits on {waits}: {', '.join(f'sd:{other}' for other in dropped)} waits on it"
+
+
 def _park(item: int, row: Any, values: dict) -> dict:
     """`values` with a park refused on a done item and dropped on a parked one (sd:5905).
 

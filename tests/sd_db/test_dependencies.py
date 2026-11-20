@@ -66,6 +66,29 @@ class TheRecord(DependencyCase):
         self.assertEqual(self.fields(item), {"blocked_by": [later]})
 
 
+class TheReopen(DependencyCase):
+    def test_a_reopen_that_would_close_a_cycle_drops_the_reopened_items_stale_entry(self):
+        """Class pass: the edit refuses a cycle among open items, and a reopen reached one around it. A waits on B,
+        A done, B waits on A, A reopened: A's stale entry goes, with a note, so B builds after A."""
+        first, second = self.item(), self.item()
+        self.wait(first, second)
+        change_status(self.db, first, "done", who="operator")
+        self.wait(second, first)
+        change_status(self.db, first, "ready", who="operator")
+        self.assertEqual(self.fields(first), None)
+        self.assertIn(f"Waits on nothing: sd:{second} waits on it", item_state(self.db, first)["notes"][-1]["body"])
+        self.assertEqual(build.waiting_on(self.db, item_state(self.db, first)["item"]), "")
+        self.assertEqual(build.waiting_on(self.db, item_state(self.db, second)["item"]), f"waits on sd:{first}")
+
+    def test_a_reopen_keeps_an_entry_that_closes_no_cycle(self):
+        first, second, third = self.item(), self.item(), self.item(status="planning")
+        self.wait(first, second, third)
+        change_status(self.db, first, "done", who="operator")
+        self.wait(second, first)
+        change_status(self.db, first, "ready", who="operator")
+        self.assertEqual(self.fields(first), {"blocked_by": [third]})
+
+
 class TheBuild(DependencyCase):
     def test_an_item_without_the_key_builds_as_before(self):
         item = self.item()
