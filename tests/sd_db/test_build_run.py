@@ -1182,7 +1182,7 @@ class Supervise(Case):
                 (work / "__pycache__").mkdir()
                 (work / "__pycache__" / "x.pyc").write_bytes(b"\0")
             elif kind == "unstaged":
-                tracked = work / support.git(work, "ls-files").split()[0]
+                tracked = work / support.git(work, "ls-files", "--deduplicate").split()[0]
                 tracked.write_text(tracked.read_text() + "the left item's work\n")
             else:
                 (work / "dropped.txt").write_text("the left item's work\n")
