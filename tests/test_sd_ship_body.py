@@ -322,6 +322,22 @@ class CitedIdTests(unittest.TestCase):
                    (undone, "feat: renew\n\nCloses: sd:2\n")]
         self.assertEqual(sd_ship_body.cited_ids("", commits), (4, 3, 5))
 
+    def test_a_list_under_a_negated_or_other_heading_undoes_nothing(self) -> None:
+        """pack sd:9666 review, round 2: `Commits not reverted:` passed the heading match, and the commits it
+        listed lost their `Closes:` and review-fix citations. Only a heading that says reverted counts."""
+        work, revert = "a" * 40, "d" * 40
+        cited = (work, "fix: shared\n\nLane review fix, pack sd:5: y.\n\nCloses: sd:4\n")
+        for heading in ("Commits not reverted:", "Unreverted commits:", "Commits never reverted:",
+                        "Left unreverted:", "Kept, not reverted:", "Reverted as below, for example:",
+                        "Not reverted commits:"):
+            with self.subTest(heading=heading):
+                message = f"revert: split the renewal out\n\n{heading}\n\n- {work[:9]} shared\n"
+                self.assertEqual(sd_ship_body.cited_ids("", [(revert, message), cited]), (4, 5))
+        for heading in ("Reverted commits:", "Work moved out. Reverted commits:", "Reverts:", "Reverted:"):
+            with self.subTest(heading=heading):
+                message = f"revert: split the renewal out\n\n{heading}\n\n- {work[:9]} shared\n"
+                self.assertEqual(sd_ship_body.cited_ids("", [(revert, message), cited]), ())
+
     def test_a_merge_the_branch_reverts_cites_nothing_it_brought_in(self) -> None:
         """Lane review of sd:5999, round 3: `git revert -m 1 <merge>` undoes each commit the merge brought in."""
         base, side, main, merge, undo, again = (c * 40 for c in "abcdef")
