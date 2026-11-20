@@ -18,7 +18,8 @@ provenance. No table is new:
   a question added by hand later is not one of them.
 - The batch's **context** (purpose, rubric, what the labels feed) rides the
   header as `Purpose:`, `Rubric:` and `Feeds:` lines. A new batch files with
-  all three or not at all (pack sd:9479); one filed before reads None. A question's
+  all three or not at all (pack sd:9479); one filed before reads None until a
+  refile with all three writes them into its header (pack sd:9649). A question's
   optional **recommendation** rides its note as two more evidence lines,
   `Evidence: Recommended: <option>` and `Evidence: Recommended because:
   <reason>`, so a reader older than system sd:5759 files it under evidence,
@@ -282,14 +283,33 @@ def _header_body(found: dict, digest: str, kept: list[dict]) -> str:
              f"Source: {found['source']}", f"Mode: {found['mode']}"]
     if found["seal"] is not None:
         lines.append(f"Seal: {found['seal']['sha256']} {found['seal']['name']}")
-    context = found.get("context") or {}
-    for key, tag in CONTEXT_TAGS.items():
-        values = context.get(key)
-        lines += [f"{tag}: {value}" for value in (values if isinstance(values, list) else [values]) if value]
+    lines += _context_lines(found)
     advised = sum("recommendation" in question for question in kept)
     if advised:
         lines.append(f"Recommendations: {advised}")
     return "\n".join([*lines, f"Questions: {len(kept)}", f"Digest: {digest}"])
+
+
+def _context_lines(found: dict) -> list[str]:
+    context = found.get("context") or {}
+    lines = []
+    for key, tag in CONTEXT_TAGS.items():
+        values = context.get(key)
+        lines += [f"{tag}: {value}" for value in (values if isinstance(values, list) else [values]) if value]
+    return lines
+
+
+def _add_context(connection: sqlite3.Connection, item: int, found: dict, digest: str) -> None:
+    """Write `found`'s context into the header of batch `item`, filed with none, and bind the header to `digest`.
+
+    The one rewrite a header takes (pack sd:9649): the refile found the batch, said so and stored nothing.
+    """
+    header = connection.execute("SELECT id, body FROM note WHERE item = ? AND kind = 'comment' ORDER BY id LIMIT 1",
+                                (item,)).fetchone()
+    lines = [line for line in header["body"].splitlines() if not line.startswith("Digest: ")]
+    at = next(number for number, line in enumerate(lines) if line.startswith(("Recommendations: ", "Questions: ")))
+    writes.set_note_body(connection, header["id"],
+                         "\n".join([*lines[:at], *_context_lines(found), *lines[at:], f"Digest: {digest}"]))
 
 
 def _question_body(found: dict) -> str:
@@ -499,6 +519,9 @@ def file(connection: sqlite3.Connection, batch: Any, *, who: str, now: str | Non
             if filed["header"]["digest"] != digest and filed["header"]["digest"] not in before:
                 raise ReviewError(f"{ref} is filed as sd:{held['id']} with other content: "
                                   f"{_difference(filed, found)}")
+            if filed["header"]["context"] is None and found["context"] is not None:
+                _require_context(found)
+                _add_context(connection, held["id"], found, digest)
             return {"item": held["id"], "ref": ref, "created": False, "filed": len(filed["questions"]),
                     "dropped": []}
         _require_context(found)
