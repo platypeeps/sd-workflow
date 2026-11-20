@@ -315,6 +315,11 @@ _CLOSES = re.compile(rf"^{re.escape(sd_lib.CLOSES_TRAILER)} sd:([0-9]+)[ \t]*$")
 _REVERTS = re.compile(r"^This reverts commit ([0-9a-f]{7,40})\b(?:, reversing\s+changes made to ([0-9a-f]{7,40}))?",
                       re.MULTILINE)
 
+#: A revert's subject: `git revert`'s `Revert "..."`, or a Conventional `revert:` (sd:8373).
+REVERT_SUBJECT = re.compile(r"^(?:Revert\b|revert(?:\([^)]*\))?!?:)", re.IGNORECASE)
+#: A list line a hand-written revert names an undone commit on: `- <sha> ...` or `* <sha> ...` (pack sd:9666).
+_LISTED = re.compile(r"^[ \t]*[-*][ \t]+([0-9a-f]{7,40})\b", re.MULTILINE)
+
 
 def kept_commits(commits, parents=None) -> list:
     """`commits`, newest first, less each one a later commit of them reverts (sd:5999 lane review, rounds 2 and 3).
@@ -322,7 +327,10 @@ def kept_commits(commits, parents=None) -> list:
     A revert of a merge also undoes each commit the merge brought in over
     the mainline parent its message names, read from `parents` (sha to
     parent shas, the range's `git rev-list --parents`). A revert that is
-    itself reverted undoes nothing, so its target stays.
+    itself reverted undoes nothing, so its target stays. A hand-written
+    revert (`REVERT_SUBJECT`) also undoes each commit a list line of its
+    message opens with: a split listed its commits by short sha, and the
+    squash closed the items they cited (pack sd:9666).
     """
     parents = parents or {}
 
@@ -345,6 +353,8 @@ def kept_commits(commits, parents=None) -> list:
             continue
         for target, mainline in _REVERTS.findall(message):
             undone |= ancestors(full(target)) - ancestors(full(mainline)) if mainline else {full(target)}
+        if REVERT_SUBJECT.match(message):
+            undone |= {full(target) for target in _LISTED.findall(message)}
         kept.append((sha, message))
     return kept
 

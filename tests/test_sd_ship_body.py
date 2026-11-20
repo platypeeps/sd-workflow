@@ -294,6 +294,22 @@ class CitedIdTests(unittest.TestCase):
         elsewhere = ("d" * 40, f'Revert "fix: x"\n\nThis reverts commit {"e" * 40}.\n')
         self.assertEqual(sd_ship_body.cited_ids("", [elsewhere, work]), (2, 3))
 
+    def test_a_hand_revert_that_lists_its_commits_cites_nothing_they_cited(self) -> None:
+        """pack sd:9666: a `revert(...):` commit listed the commits it undid by short sha, one per line; the
+        squash still closed the items their `Closes:` trailers named. A sha it names in prose keeps its close."""
+        undone, kept, other, revert = "a" * 40, "b" * 40, "c" * 40, "d" * 40
+        commits = [(revert, f"revert(ship): split the renewal out (sd:2)\n\nReverted commits:\n\n"
+                            f"- {undone[:9]} an explicit flag renews a claim\n"
+                            f"  * {other[:9]} a lane prepare never renews\n\n"
+                            f"Kept where a hunk is shared: {kept[:9]} (sd:4) keeps it.\n"),
+                   (kept, "fix: shared\n\nCloses: sd:4\n"),
+                   (other, "fix: prepare\n\nCloses: sd:3\n"),
+                   (undone, "feat: renew\n\nCloses: sd:2\n")]
+        self.assertEqual(sd_ship_body.cited_ids("", commits), (4,))
+        # A list line in a commit that is no revert undoes nothing.
+        notes = (revert, f"docs: history\n\nEarlier commits:\n\n- {undone[:9]} renew\n")
+        self.assertEqual(sd_ship_body.cited_ids("", [notes, *commits[1:]]), (4, 3, 2))
+
     def test_a_merge_the_branch_reverts_cites_nothing_it_brought_in(self) -> None:
         """Lane review of sd:5999, round 3: `git revert -m 1 <merge>` undoes each commit the merge brought in."""
         base, side, main, merge, undo, again = (c * 40 for c in "abcdef")
