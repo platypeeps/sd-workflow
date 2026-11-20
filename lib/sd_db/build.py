@@ -727,6 +727,10 @@ def drop_plan(connection, item: int) -> dict:
         raise BuildRefused(f"Drop refused: sd:{item} is not a {current['status']} member of build {lead}")
     items = reads.items_by_ids(connection, [member["item"] for member in members])
     kept = [member for member in members if member["id"] != row["id"] and not _done(items, member["item"])]
+    # As Retry: a done lead kept as the parent would not lead the claim, which would start a member's own branch
+    # and skip the cherry-picked one (round 2). Dropping the lead itself is the way out.
+    if row["id"] != lead and _done(items, current["item"]):
+        raise BuildRefused(f"Drop refused: its lead sd:{current['item']} is done")
     if not kept:
         raise BuildRefused(f"Drop refused: sd:{item} is the only open item of build {lead}; Retry or cancel it")
     # As Retry: a kept member whose item a newer build owns would resume this older branch over that work.

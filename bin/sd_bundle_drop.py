@@ -34,6 +34,11 @@ def _out(*argv: str, cwd: str | Path) -> str:
     return _git(*argv, cwd=cwd).stdout.strip()
 
 
+def _names(*argv: str, cwd: str | Path) -> set[str]:
+    """The paths a `-z` git command lists, every byte kept: a stripped read lost a leading space (round 2)."""
+    return set(filter(None, _git(*argv, cwd=cwd).stdout.split("\0")))
+
+
 def drop_base(repo: str | Path) -> str:
     """The branch a build starts from, as `build_run.Supervisor.base` reads it."""
     done = _git("symbolic-ref", "--short", "refs/remotes/origin/HEAD", cwd=repo, check=False)
@@ -41,7 +46,7 @@ def drop_base(repo: str | Path) -> str:
 
 
 def _paths(work: str | Path, sha: str) -> set[str]:
-    return set(filter(None, _out("diff-tree", "--no-commit-id", "-r", "--name-only", "-z", sha, cwd=work).split("\0")))
+    return _names("diff-tree", "--no-commit-id", "-r", "--name-only", "-z", sha, cwd=work)
 
 
 def _merges(work: str | Path, start: str, tip: str) -> None:
@@ -59,11 +64,10 @@ def _merges(work: str | Path, start: str, tip: str) -> None:
 def _ignored(work: str | Path, start: str, kept: list[str]) -> None:
     """Refuse an ignored file where the base or a kept commit tracks a path: the in-place checkout would overwrite
     it, and no branch holds its contents."""
-    ignored = set(filter(None, _out("ls-files", "-z", "--others", "--ignored", "--exclude-standard",
-                                    cwd=work).split("\0")))
+    ignored = _names("ls-files", "-z", "--others", "--ignored", "--exclude-standard", cwd=work)
     if not ignored:
         return
-    tracked = set(filter(None, _out("ls-tree", "-r", "-z", "--name-only", start, cwd=work).split("\0")))
+    tracked = _names("ls-tree", "-r", "-z", "--name-only", start, cwd=work)
     for sha in kept:
         tracked |= _paths(work, sha)
     dirs = {"/".join(path.split("/")[:n]) for path in tracked for n in range(1, path.count("/") + 1)}
@@ -89,6 +93,12 @@ def drop_sides(work: str | Path, start: str, tip: str, item: int) -> tuple[list[
             continue
         side[sha] = "dropped" if item in cited else "kept"
         touched[side[sha]] |= _paths(work, sha)
+    # Paths prove whose an uncited commit is only against both sides' cited commits: with one side uncited, every
+    # such commit would fall to the other side, the dropped item's change shipping with the kept (round 2).
+    for name, who in (("dropped", f"sd:{item}"), ("kept", "a kept item")):
+        if loose and not any(value == name for value in side.values()):
+            raise DropRefused(f"no commit cites {who}, so nothing says whose commit {loose[0][:12]} is; "
+                              f"split it by hand")
     for sha in loose:
         paths = _paths(work, sha)
         hits = [name for name in ("kept", "dropped") if paths & touched[name]]
@@ -144,8 +154,8 @@ def split_branch(plan: dict) -> dict:
             "dropped": dropped}
     try:
         if in_place:
+            done["saved"] = saved  # first: an interrupt after the branch is made still deletes it
             _git("branch", saved, tip, cwd=repo)
-            done["saved"] = saved
             done["moved"] = True  # a failed checkout may still have moved files: restore the tip either way
             _git("checkout", "-q", "-B", branch, start, cwd=work)
         else:
@@ -154,10 +164,10 @@ def split_branch(plan: dict) -> dict:
         for sha in kept:
             _git("cherry-pick", "--allow-empty", sha, cwd=new_work)
         check_branch(new_work, start, kept, item)
-    except Exception:
+        done["head"] = _out("rev-parse", "HEAD", cwd=new_work)
+    except BaseException:  # Ctrl-C too: the branch moved, and nothing else would put it back (round 2)
         undo_split(done)
         raise
-    done["head"] = _out("rev-parse", "HEAD", cwd=new_work)
     return done
 
 
@@ -170,7 +180,7 @@ def check_branch(work: str | Path, start: str, kept: list[str], item: int) -> No
     if item in sd_ship_body.cited_ids("", commits):
         raise DropRefused(f"the new branch still cites sd:{item}")
     allowed = set().union(*(_paths(work, sha) for sha in kept)) if kept else set()
-    changed = set(filter(None, _out("diff", "--name-only", "-z", start, "HEAD", cwd=work).split("\0")))
+    changed = _names("diff", "--name-only", "-z", start, "HEAD", cwd=work)
     if changed - allowed:
         raise DropRefused(f"the new branch changes {', '.join(sorted(changed - allowed))}, which no kept commit does")
 
@@ -223,6 +233,6 @@ def drop_item(connection, build, item: int, *, who: str) -> list[dict]:
     done = split_branch(plan)
     try:
         return build.drop_writes(connection, plan, who=who, note=kept_note(done), left=dropped_note(done))
-    except Exception:
+    except BaseException:
         undo_split(done)
         raise

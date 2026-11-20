@@ -50,16 +50,18 @@ class Repo(Case):
         git(work, "add", "-A")
         git(work, "commit", "-q", "-m", message)
 
-    def bundle(self):
+    def bundle(self, cite_second=True):
         """Three items built on one branch, ended blocked: the lead's commit, the second's, an uncited fix of the
-        lead's file, the third's. (items, assignment ids, run)."""
+        lead's file, the third's. (items, assignment ids, run). `cite_second` False: the second's commit is an
+        uncited edit of the lead's file instead."""
         items = [self.item(repo=str(self.repo)) for _ in range(3)]
         build.queue(self.db, items, who="operator")
         run = self.claim()
         work = Path(run["work_path"])
         git(self.repo, "worktree", "add", "-q", "-b", run["branch"], str(work), "origin/main")
         self.commit(work, "a.txt", "lead\n", f"feat: lead\n\nCloses: sd:{items[0]}")
-        self.commit(work, "b.txt", "second\n", f"feat: second\n\nCloses: sd:{items[1]}")
+        if cite_second:
+            self.commit(work, "b.txt", "second\n", f"feat: second\n\nCloses: sd:{items[1]}")
         self.commit(work, "a.txt", "lead fixed\n", "fix: review round")
         self.commit(work, "c.txt", "third\n", f"feat: third\n\nCloses: sd:{items[2]}")
         build.write(self.db, run["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START)
@@ -67,6 +69,19 @@ class Repo(Case):
         build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
         ids = [member["id"] for member in build.run(self.db, run["id"])["members"]]
         return items, ids, run
+
+    def main_moves(self, name, text):
+        """origin/main gains a commit on `name`, made in a second clone."""
+        other = self.root / "other"
+        if not other.exists():
+            subprocess.run(["git", "clone", "-q", str(self.root / "origin.git"), str(other)], check=True,
+                           capture_output=True)
+        git(other, "pull", "-q", "origin", "main")
+        (other / name).write_text(text)
+        git(other, "add", "-f", "-A")
+        git(other, "commit", "-q", "-m", f"chore: main moves {name}")
+        git(other, "push", "-q", "origin", "HEAD:main")
+        git(self.repo, "fetch", "-q", "origin")
 
     def files(self, work):
         return sorted(git(work, "ls-files").split())
@@ -159,19 +174,6 @@ class DropReview(Repo):
     """Review round 1 of pack sd:9709, class pass. Git state: a merge's resolution, ignored files, rollback order.
     Requeue: a kept item's newer build, and the dropped item bundled with fresh rows."""
 
-    def main_moves(self, name, text):
-        """origin/main gains a commit on `name`, made in a second clone."""
-        other = self.root / "other"
-        if not other.exists():
-            subprocess.run(["git", "clone", "-q", str(self.root / "origin.git"), str(other)], check=True,
-                           capture_output=True)
-        git(other, "pull", "-q", "origin", "main")
-        (other / name).write_text(text)
-        git(other, "add", "-f", "-A")
-        git(other, "commit", "-q", "-m", f"chore: main moves {name}")
-        git(other, "push", "-q", "origin", "HEAD:main")
-        git(self.repo, "fetch", "-q", "origin")
-
     def test_a_merge_with_a_hand_resolution_refuses(self):
         items, ids, run = self.bundle()
         work = Path(run["work_path"])
@@ -260,3 +262,73 @@ class DropReview(Repo):
             build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
         self.assertIn([items[1]], bundles)
         self.assertEqual(sorted(sum(bundles, [])), sorted([*items, other]))
+
+
+class DropRound2(Repo):
+    """Review round 2 of pack sd:9709, class pass. Paths read as NUL-delimited lists keep every byte; a split no
+    commit proves refuses; the lead must be one Retry would take; any interrupt after a ref moved rolls back."""
+
+
+    def test_a_leading_space_ignored_file_the_base_tracks_refuses(self):
+        items, ids, run = self.bundle()
+        work = Path(run["work_path"])
+        exclude = Path(git(self.repo, "rev-parse", "--git-common-dir"))
+        exclude = (exclude if exclude.is_absolute() else self.repo / exclude) / "info" / "exclude"
+        exclude.parent.mkdir(exist_ok=True)
+        exclude.write_text("*local.txt\n")
+        (work / " local.txt").write_text("local\n")
+        self.main_moves(" a.txt", "first\n")
+        self.main_moves(" local.txt", "tracked on main\n")
+        with self.assertRaisesRegex(DROP.DropRefused, "ignored .* local.txt"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual((work / " local.txt").read_text(), "local\n")
+
+    def test_a_done_lead_refuses_a_member_drop(self):
+        items, ids, run = self.bundle()
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[0],))
+        with self.assertRaisesRegex(DROP.DropRefused, f"its lead sd:{items[0]} is done"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+
+    def test_a_dropped_item_no_commit_cites_refuses_an_uncited_commit(self):
+        items, ids, run = self.bundle(cite_second=False)
+        work = Path(run["work_path"])
+        old = git(work, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(DROP.DropRefused, f"no commit cites sd:{items[1]}"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), old)
+
+    def interrupted(self, when):
+        """`_git` that raises `when(argv, check)`'s exception, or runs the real git."""
+        real = DROP._git
+
+        def fake(*argv, cwd, check=True):
+            fault = when(argv, check)
+            if fault:
+                raise fault
+            return real(*argv, cwd=cwd, check=check)
+        return mock.patch.object(DROP, "_git", side_effect=fake)
+
+    def test_ctrl_c_during_cherry_pick_puts_the_branch_back(self):
+        items, ids, run = self.bundle()
+        work = Path(run["work_path"])
+        old = git(work, "rev-parse", "HEAD")
+        def when(argv, check):
+            return KeyboardInterrupt() if argv[0] == "cherry-pick" and "--abort" not in argv else None
+        with self.interrupted(when), self.assertRaises(KeyboardInterrupt):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual((git(work, "rev-parse", "HEAD"), git(work, "branch", "--show-current")), (old, run["branch"]))
+        self.assertEqual(git(self.repo, "branch", "--list", f"{run['branch']}-drop-*"), "")
+
+    def test_a_failed_head_read_after_the_picks_puts_the_branch_back(self):
+        items, ids, run = self.bundle()
+        work = Path(run["work_path"])
+        old = git(work, "rev-parse", "HEAD")
+        picked = []
+
+        def when(argv, check):
+            picked.extend(["x"] if argv[0] == "cherry-pick" else [])
+            return DROP.DropRefused("read failed") if picked and argv == ("rev-parse", "HEAD") and check else None
+        with self.interrupted(when), self.assertRaisesRegex(DROP.DropRefused, "read failed"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), old)
+        self.assertEqual(git(self.repo, "branch", "--list", f"{run['branch']}-drop-*"), "")
