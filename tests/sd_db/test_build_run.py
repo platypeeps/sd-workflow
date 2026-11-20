@@ -1170,6 +1170,47 @@ class Supervise(Case):
         self.assertEqual(self.db.execute("SELECT status FROM item WHERE id = ?", (self.items[1],)).fetchone()[0],
                          "blocked")
 
+    def leftover(self, kind):
+        """`prepare` for a bundle cancelled before any commit that left `kind` of uncommitted state behind."""
+        def shape(work, _commit):
+            support.git(work, "reset", "-q", "--hard", "origin/main")
+            if kind == "ignored":
+                exclude(work, "local.conf\n")
+                (work / "local.conf").write_text("the left item's setting\n")
+            elif kind == "cache":
+                exclude(work, "__pycache__/\n")
+                (work / "__pycache__").mkdir()
+                (work / "__pycache__" / "x.pyc").write_bytes(b"\0")
+            elif kind == "unstaged":
+                tracked = work / support.git(work, "ls-files").split()[0]
+                tracked.write_text(tracked.read_text() + "the left item's work\n")
+            else:
+                (work / "dropped.txt").write_text("the left item's work\n")
+                if kind == "staged":
+                    support.git(work, "add", "dropped.txt")
+        return shape
+
+    def test_a_split_guard_holds_a_staged_leftover(self):
+        """Round 9 class pass, the guard reads less than the worktree holds; row 15: a staged change."""
+        self.assert_split_first(self.left_out_of_a_retry(self.leftover("staged")))
+
+    def test_a_split_guard_holds_an_unstaged_leftover(self):
+        """Row 16: a tracked file changed but not staged."""
+        self.assert_split_first(self.left_out_of_a_retry(self.leftover("unstaged")))
+
+    def test_a_split_guard_holds_an_untracked_leftover(self):
+        """Row 17: a new file never added."""
+        self.assert_split_first(self.left_out_of_a_retry(self.leftover("untracked")))
+
+    def test_a_split_guard_holds_an_ignored_leftover(self):
+        """Row 18: an ignored local config outside a `DISPOSABLE` folder, which `kept_files` counts."""
+        self.assert_split_first(self.left_out_of_a_retry(self.leftover("ignored")))
+
+    def test_a_split_guard_passes_an_ignored_cache(self):
+        """Row 19: an ignored file under a `DISPOSABLE` folder is a cache no builder inherits as work."""
+        supervisor = self.left_out_of_a_retry(self.leftover("cache"))
+        self.assertEqual(supervisor.run()["step"], "enqueued")
+
     def test_a_subset_retry_with_no_earlier_work_builds_on(self):
         """Row 5, the guard: a bundle cancelled before any build holds no earlier commit, so the kept items build."""
         supervisor = self.left_out_of_a_retry(run=False)

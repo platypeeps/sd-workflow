@@ -1168,8 +1168,8 @@ class Supervisor:
             base, head = self.base(), self.head()
             commits = _read([*self.tools.git, "-C", str(self.work), "rev-list", f"{base}..{head}"],
                             env=self.env).split()
-            dirty = _read([*self.tools.git, "-C", str(self.work), "-c", "core.quotePath=false", "status",
-                           "--porcelain", "--untracked-files=all"], env=self.env).strip()
+            # Ignored files count too: a left item's local config is work a builder would inherit.
+            dirty = kept_files(self.tools.git, str(self.work), env=self.env)
             if not commits and not dirty:
                 if not build.write(self.db, self.ident, base_head=head):
                     raise Lost
