@@ -521,7 +521,9 @@ The ruling then reads `Ruling on note #N: Approve -> sd:<task>`, and `apply` fin
 If the ref already names a task, as after a withdrawn approval, the ruling names it instead; a withdrawal leaves the task and ends `; sd:<task> stays filed`.
 It resolves a batch's open questions as `Expired, not ruled` after 7 days.
 
-A batch file may carry `context` (`purpose`, `rubric` as a list of lines, `feeds`: what the labels feed), which the header holds as `Purpose:`, `Rubric:` and `Feeds:` lines.
+A batch file carries `context` (`purpose`, `rubric` as a list of 1 to 10 lines, `feeds`: what the labels decide and when), which the header holds as `Purpose:`, `Rubric:` and `Feeds:` lines.
+`file` refuses a new batch that lacks any of the three, naming it (pack sd:9479); a Kev file gets a context from the import, and a batch filed before still files again unchanged.
+The Review page shows `No description: ask the filer (sd:N)` for a batch with none.
 A question may carry `recommendation` (`option`, one of its options, and a one-line `reason`), which its note holds as two evidence lines, `Recommended:` and `Recommended because:`.
 The header then holds `Recommendations: <n>`, and only such a batch reads those lines as one; in it, an evidence line of the producer's own may not start with either.
 A batch that recommends nothing keeps such evidence as evidence, as before.

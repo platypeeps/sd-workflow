@@ -223,8 +223,11 @@ class BuildsPanel(Fixture):
                                     {"revision": row["cancel"]["revision"]})
         self.assertEqual(status, 200, body)
         self.assertIsNotNone(build.run(self.connection, run["id"])["cancel_requested"])
-        again = builds.panel(self.connection, now=run["created_at"])["runs"][0]["cancel"]
-        self.assertFalse(again["allowed"])
+        again = builds.panel(self.connection, now=run["created_at"])["runs"][0]
+        self.assertFalse(again["cancel"]["allowed"])
+        # pack sd:9375: the row names the request, and the refusal says the run stops on its own.
+        self.assertEqual(again["cancel_requested"], "cancelled by dashboard")
+        self.assertIn("cancelled by dashboard; build run", again["cancel"]["reason"])
 
     def test_an_enqueued_run_reads_merging_and_its_untrailed_member_is_no_blocked_row(self):
         """sd:8960: a run in the lane waits on review; the member no `Closes:` trailer named is no blocked build."""

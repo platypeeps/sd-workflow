@@ -408,10 +408,12 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     : r.shots_warning ? html` · screenshots not drawn: ${r.shots_warning}` : '';
   // `p`, a prepared entry's pull-request wait (pack sd:7859): in a manual-merge repo the lane stops prepared and the PR
   // waits on a person's review, so the row leads with that wait and keeps its Retry and Approve.
+  // A blocked entry's Retry, Approve and Fix, on its own row or, with its Details, on its item's Parked row (pack sd:9425).
+  const unblock = (l, r) => { const e = { ...r, lane: l.path }; return html`${again(e, l.runner_merge === 'manual')}${mendBtn(e)}`; };
   function entryRow(l, r, p) {
     const [s0, type, facts] = ENTRY[r.state](r), last = l.rows.filter(x => x.state === 'next').length, e = { ...r, lane: l.path };
     const s = p ? (p.on === 'you' ? 'warning' : 'queued') : s0;
-    const ctl = r.state === 'next' ? controls(e, last) : r.state === 'blocked' ? html`${again(e, l.runner_merge === 'manual')}${mendBtn(e)}` : r.state === 'cancelled' ? back(e) : r.state === 'merging' ? free(e) : '';
+    const ctl = r.state === 'next' ? controls(e, last) : r.state === 'blocked' ? unblock(l, r) : r.state === 'cancelled' ? back(e) : r.state === 'merging' ? free(e) : '';
     const id = r.state === 'building' ? null : entryId(l, r);
     return [type, s, html`<tr class="child" data-type="${type}"${id ? html` data-id="${id}" aria-selected="${String(row() === id)}"` : ''}${r.held ? html` data-held=""` : ''}${p ? html` data-pr="${String(p.item)}"` : ''}>${marker(s, type)}
       <td class="what">${r.state === 'building' ? html`<code>${r.builder}</code>` : html`<a href="${shell.itemHref(r.item)}">#${r.item} ${r.title}</a>`}</td>
@@ -436,7 +438,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     const s = RUNSTATE[r.state] || 'unknown', id = `run:${r.run}`;
     return ['working', s, html`<tr class="child" data-type="working" data-run="${r.run}" data-id="${id}" aria-selected="${String(row() === id)}">${marker(s, 'working')}
       <td class="what">${names(r)}</td>
-      <td class="detail">${r.teammate ? teamFacts(r) : html`<b>${r.state}</b> · build ${r.run} · ${r.model || 'model not recorded'} · step <b>${r.step}</b> · ${r.quiet == null ? 'no output yet' : `output ${dur(r.quiet)} ago`} · ${usd(r.usd || 0)} so far`}${hostFacts(r)}${r.why ? ` · ${r.why}` : ''}</td>
+      <td class="detail">${r.teammate ? teamFacts(r) : html`<b>${r.state}</b> · build ${r.run} · ${r.model || 'model not recorded'} · step <b>${r.step}</b> · ${r.quiet == null ? 'no output yet' : `output ${dur(r.quiet)} ago`} · ${usd(r.usd || 0)} so far`}${hostFacts(r)}${r.why ? ` · ${r.why}` : ''}${r.cancel_requested ? ` · cancel requested: ${r.cancel_requested}` : ''}</td>
       <td class="num">${dur(r.elapsed)}</td>
       <td class="act"><div class="ctl" role="group" aria-label="Run ${r.run}">${bb('cancel', r, 'Cancel…', `Cancel build run ${r.run}`, r.cancel.allowed ? '' : r.cancel.reason || 'cancel is off')}${prLink(r)}${logBtn(r)}</div></td></tr>`];
   }
@@ -463,7 +465,11 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   const blockedAsg = a => ['blocked', 'warning', html`<tr class="child" data-type="blocked" data-asg-row="${String(a.id)}">${marker('warning', 'blocked')}
     <td class="what">${a.item ? html`<a href="${shell.itemHref(a.item)}">#${a.item} ${a.title}</a>` : a.title}</td>
     <td class="detail"><b>blocked build</b> · assignment ${String(a.id)}${a.lead !== a.id ? ` of bundle ${a.lead}` : ''} · ${a.why} · since ${at(a.since)}</td><td class="num"></td>
-    <td class="act"><div class="ctl" role="group" aria-label="Assignment ${String(a.id)}">${ab('retry', a, 'Retry', `Retry assignment ${a.id}: queue its bundle again`, a.retry.allowed ? '' : a.retry.reason || 'retry is off')}${ab('cancel', a, 'Cancel…', `Cancel assignment ${a.id}`, a.cancel.allowed ? '' : a.cancel.reason || 'cancel is off')}${asgBtn(a.id)}</div></td></tr>`];
+    <td class="act">${asgCtl(a)}</td></tr>`];
+  // Its Retry and Cancel, on its own row or on its parked item's Parked row (pack sd:9425).
+  function asgCtl(a) {
+    return html`<div class="ctl" role="group" aria-label="Assignment ${String(a.id)}">${ab('retry', a, 'Retry', `Retry assignment ${a.id}: queue its bundle again`, a.retry.allowed ? '' : a.retry.reason || 'retry is off')}${ab('cancel', a, 'Cancel…', `Cancel assignment ${a.id}`, a.cancel.allowed ? '' : a.cancel.reason || 'cancel is off')}${asgBtn(a.id)}</div>`;
+  }
   // A live item (In motion's sources: worktrees and processes, herdr agents, Fix notes, lane-less sessions): its sessions in
   // the row, Open item, Show assignment and Fix in its actions, and its Details on a click (sd:6714).
   function liveRow(item, rows) {
@@ -513,9 +519,9 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // sd:7251), so All items alone keeps a repo's first suggested tasks. Its act is Tasks' list row's.
   const OPENS = { blocked: 'caution', in_progress: 'ok' }; // a blocked task is a look, not a lane's needs-you
   // sd:9247: a parked task is the same row under the parked type, which only its box shows.
-  const openRow = (t, type = 'open') => [type, OPENS[t.status] || 'queued', html`<tr class="child" data-type="${type}" data-item="${t.key}" data-id="${t.key}" aria-selected="${String(row() === t.key)}">${marker(OPENS[t.status] || 'queued', type)}
+  const openRow = (t, type = 'open', waits = []) => [type, OPENS[t.status] || 'queued', html`<tr class="child" data-type="${type}" data-item="${t.key}" data-id="${t.key}" aria-selected="${String(row() === t.key)}">${marker(OPENS[t.status] || 'queued', type)}
     <td class="what"><a href="${shell.itemHref(t.id)}">#${t.id} ${t.title}</a></td>
-    <td class="detail">${type === 'parked' ? 'parked · ' : ''}${String(t.status).replace(/_/g, ' ')}${t.p ? ` · P${t.p}` : ''}${runNote(t.id)}</td><td class="num">${t.since ? age(t.since) : ''}</td><td class="act">${shell.commands.rowActions(t.key)}</td></tr>`];
+    <td class="detail">${type === 'parked' ? 'parked · ' : ''}${String(t.status).replace(/_/g, ' ')}${t.p ? ` · P${t.p}` : ''}${runNote(t.id)}${waits.map(w => ` · ${w.text}`).join('')}</td><td class="num">${t.since ? age(t.since) : ''}</td><td class="act">${waits.map(w => w.ctl)}${shell.commands.rowActions(t.key)}</td></tr>`];
   // pack sd:7699: an idea kind (/api/tasks' `ideas`, reads.IDEA_KINDS) is no Queue row; ideas live on Writing.
   // pack sd:8127: `all` gives them while All items is off too, so its tile counts them; its rows stay hidden.
   function openItems(all) {
@@ -557,12 +563,19 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       && r.items.filter(m => !['done', 'cancelled'].includes(m.status)).every(shown)));
     B.runs.forEach(r => { r.items.forEach(m => held.add(m.assignment)); if (!inPr(r)) add(r.repo, runRow(r)); });
     ((QV.runner || {}).live || []).filter(a => !held.has(a.id)).forEach(a => add(a.repo, asgRow(a)));
-    ((QV.runner || {}).blocked || []).filter(a => !held.has(a.id) && !laned.has(Number(a.item))).forEach(a => add(a.repo, blockedAsg(a)));
+    // pack sd:9425: a parked item is its Parked row alone: a blocked build or lane entry of it is no row and counts in no
+    // box; the Parked row says why it waits instead. A parked task with no repo is no row, so its blocked rows stay.
+    const parked = new Set(parkedTasks().filter(t => t.repo_path).map(t => Number(t.id))), why = new Map();
+    // Each blocked row's reason and its controls move to the Parked row, so the item can still be retried or cancelled.
+    const aside = (item, text, ctl) => parked.has(Number(item)) && !!why.set(Number(item), [...(why.get(Number(item)) || []), { text, ctl }]);
+    ((QV.runner || {}).blocked || []).filter(a => !held.has(a.id) && !laned.has(Number(a.item))
+      && !aside(a.item, `blocked build · assignment ${a.id} · ${a.why}`, asgCtl(a))).forEach(a => add(a.repo, blockedAsg(a)));
     // A prepared entry and its item's PR wait are one row (pack sd:7859): the lane's, leading with the wait.
     const waitOf = new Map(prs.map(p => [Number(p.item), p])), drawn = new Set();
     (QV.lanes ? QV.lanes.lanes : []).forEach(l => { l.rows.forEach(r => {
       const p = r.state === 'blocked' && r.status === 'prepared' ? waitOf.get(Number(r.item)) : undefined;
       if (p) drawn.add(p);
+      if (r.state === 'blocked' && !p && aside(r.item, `lane ${r.status}${r.step ? ` at ${r.step}` : ''} · ${r.reason}`, html`${unblock(l, r)}${shell.commands.rowActions(entryId(l, r))}`)) return;
       add(l.key, entryRow(l, r, p)); });
       if (G.has(repoKey(l.key))) G.get(repoKey(l.key)).host = l.host; });
     prs.filter(p => !drawn.has(p)).forEach(p => add(p.repo, prRow(p)));
@@ -570,7 +583,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     OPENI.forEach(t => { if (!waits.has(Number(t.id))) add(t.repo_path, openRow(t)); });
     // sd:9247: each repo's parked tasks (no idea kind), PR wait or lane entry or not; hidden until their box is pressed.
     // A task with no repo is no row (pack sd:7731), as in Suggested; the tally counts it, as Tasks' Parked chip lists it.
-    parkedTasks().filter(t => t.repo_path).forEach(t => add(t.repo_path, openRow(t, 'parked')));
+    parkedTasks().filter(t => t.repo_path).forEach(t => add(t.repo_path, openRow(t, 'parked', why.get(Number(t.id)))));
     B.recent.forEach(r => add(r.repo, endedRun(r)));
     const RANK = { warning: 0, caution: 1, unknown: 2, ok: 3, queued: 4 };
     // pack sd:7679: the busiest repo first, box by box in the boxes' order, each most first; then the name. Unassociated last.

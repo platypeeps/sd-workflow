@@ -108,7 +108,7 @@ html[data-kiosk] .tile .nm { font-size: var(--text-xs); }
 html[data-kiosk] .tile .st { font-size: var(--text-xl); }
 html[data-kiosk] .tile time { font-size: var(--text-sm); }
 html[data-kiosk] .tile .act { padding: 0 var(--space-md) var(--space-md); }
-html[data-kiosk] .tile .act .btn, html[data-kiosk] .tile .act .icon-btn, html[data-kiosk] .exit, html[data-kiosk] #read-again, html[data-kiosk] #usage-sum, html[data-kiosk] dialog.confirm .btn { min-height: 4rem; min-width: 4rem; padding: 0 var(--space-lg); font-size: var(--text-md); }
+html[data-kiosk] .tile .act .btn, html[data-kiosk] .tile .act .icon-btn, html[data-kiosk] .exit, html[data-kiosk] #read-again, html[data-kiosk] #usage-sum, html[data-kiosk] #status-sum, html[data-kiosk] dialog.confirm .btn { min-height: 4rem; min-width: 4rem; padding: 0 var(--space-lg); font-size: var(--text-md); }
 html[data-kiosk] .headline { padding: var(--space-lg); }
 html[data-kiosk] .headline .what b { font-size: var(--text-xl); }
 
