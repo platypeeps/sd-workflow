@@ -630,51 +630,53 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
         current = queue_state(connection, assignment)
         if current["scope"] != SCOPE:
             raise BuildRefused(f"assignment {assignment} is not a build")
-        run = current["run"]
-        state = retry_state(connection, run) if run else {"allowed": False, "reason": "it never ran"}
+        last = current["run"]
+        state = retry_state(connection, last) if last else {"allowed": False, "reason": "it never ran"}
         if not state["allowed"]:
             raise BuildRefused(f"Retry refused: {state['reason']}")
         members = _members(connection, assignment, current["status"])
         if not members:
-            raise BuildRefused(f"Retry refused: build run {run['id']} has no {current['status']} member")
-        items = reads.items_by_ids(connection, [current["item"], *(member["item"] for member in members)])
-        # A member done since the bundle ended, by another build, has nothing to retry: it stays as it ended
-        # (sd:9015). A done lead refuses: the claim would lead with a member, on a new branch and worktree.
+            raise BuildRefused(f"Retry refused: build run {last['id']} has no {current['status']} member")
+        # Who leaves is read from the members the retried run built (`run`), not from this filtered view: a member
+        # whose item moved to done or planning (its blocked assignment cancelled, `UNBUILT`) or that is done since
+        # by another build (sd:9015) is left out too, as one `only` omits, so the split guard reads the branch for
+        # its earlier work. A member an operator cancelled on its own (`ALONE`) left already (sd:9222).
+        built = [member for member in run(connection, last["id"])["members"][1:]
+                 if not (member["result"] or "").startswith(ALONE)]
+        items = reads.items_by_ids(connection, [current["item"], *(member["item"] for member in members + built)])
+        # A done lead refuses: the claim would lead with a member, on a new branch and worktree.
         if _done(items, current["item"]):
             raise BuildRefused(f"Retry refused: its lead sd:{current['item']} is done")
-        # A subset reads the bundle as it ended, done members included: a member landed elsewhere since may
-        # still have its earlier work on this branch, so it is left out too and the split guard reads it.
-        if only is not None and {member["item"] for member in members} - set(only):
-            if current["item"] not in only:
-                raise BuildRefused(f"Retry refused: a retry of part of the bundle names its lead sd:{current['item']}, "
-                                   f"whose worktree holds its work")
-            stamp = clock()
-            for member in [member for member in members if member["item"] not in only]:
-                owns = _current(connection, member)  # read before this row's own write below
-                connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
-                                   (stamp, f"{ALONE}{who}: {LEFT_OUT}{run['id']}",
-                                    member["id"]))
-                if not owns:  # a newer build owns the item: its state is that build's, not this bundle's
-                    continue
-                if member["item"] in items and items[member["item"]]["status"] == "blocked":
-                    transition(connection, member["item"], "ready", who=who,
-                               reason=f"left out of a Retry of build run {run['id']}")
-                park(connection, member["item"], ("ready",), stamp,
-                     f"Build assignment {member['id']} left its bundle: a Retry of build run {run['id']} by {who} "
-                     f"named other items; item parked; Build it to build it fresh")
-            members = [member for member in members if member["item"] in only]
-        members = [member for member in members if not _done(items, member["item"])]
+        if only is not None and current["item"] not in only and {member["item"] for member in members} - set(only):
+            raise BuildRefused(f"Retry refused: a retry of part of the bundle names its lead sd:{current['item']}, "
+                               f"whose worktree holds its work")
+        members = [member for member in members if (only is None or member["item"] in only)
+                   and not _done(items, member["item"])]
+        kept = {member["id"] for member in members}
+        stamp = clock()
+        for member in [member for member in built if member["id"] not in kept]:
+            owns = _current(connection, member)  # read before this row's own write below
+            connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
+                               (stamp, f"{ALONE}{who}: {LEFT_OUT}{last['id']}", member["id"]))
+            if not owns:  # a newer build owns the item: its state is that build's, not this bundle's
+                continue
+            if member["item"] in items and items[member["item"]]["status"] == "blocked":
+                transition(connection, member["item"], "ready", who=who,
+                           reason=f"left out of a Retry of build run {last['id']}")
+            park(connection, member["item"], ("ready",), stamp,
+                 f"Build assignment {member['id']} left its bundle: a Retry of build run {last['id']} by {who} "
+                 f"named other items; item parked; Build it to build it fresh")
         newer = [member for member in members if not _current(connection, member)]
         if newer:
             owner = connection.execute("SELECT id FROM assignment WHERE item = ? AND scope = ? ORDER BY id DESC "
                                        "LIMIT 1", (newer[0]["item"], SCOPE)).fetchone()["id"]
             raise BuildRefused(f"Retry refused: sd:{newer[0]['item']} has a newer build, assignment {owner}")
-        parked = "" if finding else parked_finding(run.get("detail"))
+        parked = "" if finding else parked_finding(last.get("detail"))
         queued = []
         for member in members:
             item = items.get(member["item"])
             if item is not None and item["status"] == "blocked":
-                transition(connection, member["item"], "ready", who=who, reason=f"Retry of build run {run['id']}")
+                transition(connection, member["item"], "ready", who=who, reason=f"Retry of build run {last['id']}")
             unpark(connection, member["item"])
             try:
                 _item(connection, member["item"], lead=assignment)
@@ -688,8 +690,8 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
             queued.append(requeue(connection, member["id"], expected_revision=fresh, who=who))
             add_note(connection, member["item"], "comment",
                      f"Build assignment {member['id']} queued again by {who}: "
-                     f"{'Send to builder' if finding else 'Retry'} of build run {run['id']}")
-        return {"run": run["id"], "queued": [{"id": row["id"], "item": row["item"], "status": row["status"]}
+                     f"{'Send to builder' if finding else 'Retry'} of build run {last['id']}")
+        return {"run": last["id"], "queued": [{"id": row["id"], "item": row["item"], "status": row["status"]}
                                              for row in queued]}
 
 
@@ -1393,7 +1395,7 @@ def run(connection, ident: str) -> dict:
     result["budget_minutes"] = connection.execute("SELECT budget_minutes FROM assignment WHERE id = ?",
                                                   (row["assignment"],)).fetchone()[0]
     result["members"] = [dict(member) for member in connection.execute(
-        f"SELECT id, item, status FROM assignment WHERE (id = ? OR parent = ?) AND scope = ? "
+        f"SELECT id, item, status, result FROM assignment WHERE (id = ? OR parent = ?) AND scope = ? "
         f"AND ({_in_group()} OR (run_count >= ? AND ? IS NOT NULL)) ORDER BY id = ? DESC, id",
         (row["assignment"], row["assignment"], SCOPE, row["run"], row["released_at"], row["assignment"]))]
     return result

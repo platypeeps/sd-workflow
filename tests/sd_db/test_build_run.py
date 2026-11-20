@@ -1100,6 +1100,51 @@ class Supervise(Case):
             self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (self.items[2],))
         self.assert_split_first(self.left_out_of_a_retry(landed))
 
+    def moved_then_retried(self, target, *, cancelled=False, retried=2):
+        """Round 11 class pass: who leaves the bundle is read from a filtered view of it, not from the members the
+        retried run built. A three-item bundle commits for all three and ends blocked (or `cancelled`); the
+        operator moves the third item to `target` through `transition`, which cancels a blocked member's
+        assignment (`UNBUILT`); a Retry names the first `retried` items (one: the whole bundle)."""
+        self.press(3)
+        self.write_pr()
+        if cancelled:
+            self.plan(claude=["pass"], sd_review=["cancel"])
+        else:
+            self.plan(claude=["pass"] * 9, sd_review=["blocking"] * 9)
+        self.assertEqual(self.supervisor().run()["outcome"], "cancelled" if cancelled else "blocked")
+        self.release_all()
+        writes.transition(self.db, self.items[2], target, who="operator")
+        if not cancelled:
+            self.assertEqual(self.db.execute("SELECT status FROM assignment WHERE item = ?",
+                                             (self.items[2],)).fetchone()[0], "cancelled")
+        build.queue_again(self.db, self.items[:retried], who="operator")
+        again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                            root=self.root / "worktrees")
+        assert again is not None
+        self.bundle = again
+        self.plan(claude=["pass"], sd_review=["clean"])
+        return self.supervisor()
+
+    def test_a_subset_retry_after_a_move_to_planning_splits(self):
+        """Row 21: the move cancelled the third member's assignment, so the blocked bundle's view lacks it."""
+        self.assert_split_first(self.moved_then_retried("planning"))
+
+    def test_a_subset_retry_after_a_move_to_done_splits(self):
+        """Row 22: the same through done, the reviewer's case."""
+        self.assert_split_first(self.moved_then_retried("done"))
+
+    def test_a_whole_retry_after_a_move_to_planning_splits(self):
+        """Row 23: Retry of the whole bundle drops the cancelled member the same way, with no `only` at all."""
+        self.assert_split_first(self.moved_then_retried("planning", retried=1))
+
+    def test_a_whole_retry_after_a_move_to_done_splits(self):
+        """Row 24: a done member is dropped from a whole Retry too (sd:9015); its work is still on the branch."""
+        self.assert_split_first(self.moved_then_retried("done", retried=1))
+
+    def test_a_whole_retry_of_a_cancelled_bundle_with_a_done_member_splits(self):
+        """Row 25: a cancelled bundle keeps the member's assignment, but the done filter drops it."""
+        self.assert_split_first(self.moved_then_retried("done", cancelled=True, retried=1))
+
     def test_a_rebased_branch_after_a_split_cannot_be_retried(self):
         """Round 6, row 10: a rebase onto newer main gives the earlier commits new ids and keeps their changes, so
         no git state proves a split; once the guard found earlier work, Retry of that bundle refuses."""
