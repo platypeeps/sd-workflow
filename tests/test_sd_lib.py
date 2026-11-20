@@ -2494,13 +2494,15 @@ class KillReachTests(unittest.TestCase):
         leader = subprocess.Popen([sys.executable, "-c", ""], start_new_session=True)
         self.addCleanup(leader.wait)
         time.sleep(0.3)  # the leader has exited, unreaped
-        saved = os.waitid
-        del os.waitid
+        saved = getattr(os, "waitid", None)
+        if saved is not None:
+            del os.waitid
         try:
             start = time.monotonic()
             sd_lib.wait_empty(leader.pid, start + 0.3, leader=leader.pid)
         finally:
-            os.waitid = saved
+            if saved is not None:
+                os.waitid = saved
         self.assertGreaterEqual(time.monotonic() - start, 0.3)
         self.assertIsNone(leader.returncode, "the leader stays unreaped")
 
