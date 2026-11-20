@@ -320,8 +320,9 @@ REVERT_SUBJECT = re.compile(r"^(?:Revert\b|revert(?:\([^)]*\))?!?:)", re.IGNOREC
 #: A list line a hand-written revert names an undone commit on: `- <sha> ...` or `* <sha> ...` (pack sd:9666).
 _LISTED = re.compile(r"^[ \t]*[-*][ \t]+([0-9a-f]{7,40})\b")
 _BULLET = re.compile(r"^[ \t]*[-*][ \t]")
-#: The line that opens a list of undone commits: its last sentence names a revert and ends with a colon.
-_REVERTED_INTRO = re.compile(r"\brevert[a-z]*\b[^.]*:[ \t]*$", re.IGNORECASE)
+#: The line that opens a list of undone commits: its last sentence is exactly `Reverted commits:`,
+#: `Reverted:` or `Reverts:`. A substring match let `Commits not reverted:` undo its list (pack sd:9666).
+_REVERTED_INTRO = re.compile(r"(?:^|[.!?][ \t]+)(?:reverted(?:[ \t]+commits)?|reverts):[ \t]*$", re.IGNORECASE)
 
 
 def _listed_undone(message: str) -> list[str]:
