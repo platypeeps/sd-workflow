@@ -897,6 +897,12 @@ class Supervise(Case):
         self.assertIn("- work.txt:1 a blocker", prompts[2])
         self.assertEqual(self.statuses(), ["blocked"])
 
+    def test_review_rounds_rule_reaches_the_builder(self):
+        """Pack sd:9584: the brief asks for a failure table on a parser or event matching; the class pass keeps scope."""
+        self.assertIn("a parser, a journal or event matching", build_run.BRIEF)
+        self.assertIn("within this change's own scope", build_run.CLASS_PASS)
+        self.assertIn("becomes its own item", build_run.CLASS_PASS)
+
     def test_a_question_on_one_member_keeps_the_class_pass_for_the_other(self):
         """Review of sd:9263: a question on a skipped member B must not park A, which the class pass can still fix."""
         self.press(2)
@@ -1037,6 +1043,309 @@ class Supervise(Case):
         cited = LANE.cited_closes(self.db, self.items[0], body, LANE.branch_commits(work, "main", head), (),
                                   branch=build.branch(self.bundle["assignment"]))
         self.assertEqual([row["item"] for row in cited], [], "run 1's trailer must not close the child")
+
+    def left_out_of_a_retry(self, prepare=None, *, run=True):
+        """A three-item bundle ends cancelled, `run` once its builder committed for all three, else before any
+        build; `prepare(worktree, commit)` then shapes the branch as a builder might; a Retry names the first two,
+        so the third leaves the bundle; the next run is claimed. (The next run's supervisor.)"""
+        self.press(3)
+        self.write_pr()
+        if run:
+            self.plan(claude=["pass"], sd_review=["cancel"])
+            self.assertEqual(self.supervisor().run()["outcome"], "cancelled")
+        else:
+            build.end(self.db, self.bundle["id"], "cancelled", "cancelled by operator")
+        work = Path(self.bundle["work_path"])
+        if prepare:
+            prepare(work, support.git(work, "rev-parse", "HEAD").strip())
+        self.assertEqual(sorted(entry["item"] for entry in build.queue_again(self.db, self.items[:2], who="operator")),
+                         sorted(self.items[:2]))
+        again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                            root=self.root / "worktrees")
+        assert again is not None
+        self.bundle = again
+        self.plan(claude=["pass"], sd_review=["clean"])
+        return self.supervisor()
+
+    def assert_split_first(self, supervisor):
+        """The run blocks at its worktree step, before a builder starts, and names the left item."""
+        builders = len(self.calls("claude"))
+        ended = supervisor.run()
+        self.assertEqual((ended["outcome"], len(self.calls("claude"))), ("blocked", builders), ended)
+        detail = build.run(self.db, self.bundle["id"])["detail"]
+        self.assertIn(f"sd:{self.items[2]} left the bundle at a Retry", detail)
+
+    def test_a_subset_retry_on_a_branch_with_earlier_work_blocks_before_the_builder(self):
+        """Pack sd:9581 class pass, row 1: run 1's commit closes all three items; no commit message can say which
+        change is whose, so the run blocks for the operator's split instead of shipping the left item's work."""
+        self.assert_split_first(self.left_out_of_a_retry())
+
+    def test_a_reverted_earlier_commit_still_blocks(self):
+        """Row 2: a revert message proved nothing about what it removed (a conflict may keep a change)."""
+        def revert(work, commit):
+            support.git(work, "-c", "commit.gpgsign=false", "revert", "--no-edit", commit)
+        self.assert_split_first(self.left_out_of_a_retry(revert))
+
+    def test_an_earlier_commit_naming_a_kept_item_in_its_body_still_blocks(self):
+        """Row 3: a body `Refs:` paragraph is no trailer, and no trailer binds the content anyway."""
+        def refs(work, commit):
+            support.git(work, "-c", "commit.gpgsign=false", "revert", "--no-edit", commit)
+            (work / "dropped.txt").write_text("the left item's work\n")
+            support.git(work, "add", "dropped.txt")
+            support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm",
+                        f"fix: tidy\n\nRefs: sd:{self.items[0]}\n\nThen the left item's file.")
+        self.assert_split_first(self.left_out_of_a_retry(refs))
+
+    def test_an_earlier_merge_resolution_still_blocks(self):
+        """Row 4: a merge commit's own resolution carried work that a `--no-merges` read never saw."""
+        def merge(work, commit):
+            support.git(work, "-c", "commit.gpgsign=false", "revert", "--no-edit", commit)
+            support.git(work, "checkout", "-q", "-b", "side", "origin/main")
+            (work / "side.txt").write_text("kept\n")
+            support.git(work, "add", "side.txt")
+            support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", f"fix: kept\n\nCloses: sd:{self.items[0]}")
+            support.git(work, "checkout", "-q", "-")
+            support.git(work, "-c", "commit.gpgsign=false", "merge", "-q", "--no-ff", "--no-commit", "side")
+            (work / "dropped.txt").write_text("the left item's work\n")
+            support.git(work, "add", "dropped.txt")
+            support.git(work, "-c", "commit.gpgsign=false", "commit", "-qm", "chore: merge side")
+            support.git(work, "branch", "-q", "-D", "side")
+        self.assert_split_first(self.left_out_of_a_retry(merge))
+
+    def release_all(self):
+        self.db.execute("UPDATE runner_run SET released_at = COALESCE(released_at, ?)", ("2026-01-01T00:00:00Z",))
+        self.db.execute("UPDATE runner_lease SET released_at = COALESCE(released_at, ?)", ("2026-01-01T00:00:00Z",))
+
+    def test_a_left_item_done_elsewhere_still_splits(self):
+        """Row 20: the left item landed through another branch before the Retry; the branch still holds its
+        earlier work, so the split is read against the bundle as it ended, done members included."""
+        def landed(_work, _commit):
+            self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (self.items[2],))
+        self.assert_split_first(self.left_out_of_a_retry(landed))
+
+    def moved_then_retried(self, target, *, cancelled=False, retried=2):
+        """Round 11 class pass: who leaves the bundle is read from a filtered view of it, not from the members the
+        retried run built. A three-item bundle commits for all three and ends blocked (or `cancelled`); the
+        operator moves the third item to `target` through `transition`, which cancels a blocked member's
+        assignment (`UNBUILT`); a Retry names the first `retried` items (one: the whole bundle)."""
+        self.press(3)
+        self.write_pr()
+        if cancelled:
+            self.plan(claude=["pass"], sd_review=["cancel"])
+        else:
+            self.plan(claude=["pass"] * 9, sd_review=["blocking"] * 9)
+        self.assertEqual(self.supervisor().run()["outcome"], "cancelled" if cancelled else "blocked")
+        self.release_all()
+        writes.transition(self.db, self.items[2], target, who="operator")
+        if not cancelled:
+            self.assertEqual(self.db.execute("SELECT status FROM assignment WHERE item = ?",
+                                             (self.items[2],)).fetchone()[0], "cancelled")
+        build.queue_again(self.db, self.items[:retried], who="operator")
+        again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                            root=self.root / "worktrees")
+        assert again is not None
+        self.bundle = again
+        self.plan(claude=["pass"], sd_review=["clean"])
+        return self.supervisor()
+
+    def test_a_subset_retry_after_a_move_to_planning_splits(self):
+        """Row 21: the move cancelled the third member's assignment, so the blocked bundle's view lacks it."""
+        self.assert_split_first(self.moved_then_retried("planning"))
+
+    def test_a_subset_retry_after_a_move_to_done_splits(self):
+        """Row 22: the same through done, the reviewer's case."""
+        self.assert_split_first(self.moved_then_retried("done"))
+
+    def test_a_whole_retry_after_a_move_to_planning_splits(self):
+        """Row 23: Retry of the whole bundle drops the cancelled member the same way, with no `only` at all."""
+        self.assert_split_first(self.moved_then_retried("planning", retried=1))
+
+    def test_a_whole_retry_after_a_move_to_done_splits(self):
+        """Row 24: a done member is dropped from a whole Retry too (sd:9015); its work is still on the branch."""
+        self.assert_split_first(self.moved_then_retried("done", retried=1))
+
+    def test_a_whole_retry_of_a_cancelled_bundle_with_a_done_member_splits(self):
+        """Row 25: a cancelled bundle keeps the member's assignment, but the done filter drops it."""
+        self.assert_split_first(self.moved_then_retried("done", cancelled=True, retried=1))
+
+    def test_a_rebased_branch_after_a_split_cannot_be_retried(self):
+        """Round 6, row 10: a rebase onto newer main gives the earlier commits new ids and keeps their changes, so
+        no git state proves a split; once the guard found earlier work, Retry of that bundle refuses."""
+        self.assert_split_first(self.left_out_of_a_retry())
+        work = Path(self.bundle["work_path"])
+        old = support.git(work, "rev-parse", "HEAD")
+        support.git(work, "reset", "-q", "--hard", "origin/main")
+        support.git(work, "-c", "commit.gpgsign=false", "cherry-pick", "--allow-empty", f"origin/main..{old}")
+        self.release_all()
+        with self.assertRaisesRegex(build.BuildRefused, "fresh"):
+            build.retry(self.db, self.bundle["assignment"], who="operator")
+
+    def test_a_retry_after_a_split_builds_the_kept_items_fresh(self):
+        """Row 11: the kept items build on a new branch from main, never the held branch, whose tip may also be
+        published (an unmanaged bundle parked after its push), so a rebuilt head would not push."""
+        self.assert_split_first(self.left_out_of_a_retry())
+        held = (self.bundle["branch"], self.bundle["work_path"])
+        self.release_all()
+        queued = build.queue_again(self.db, self.items[:2], who="operator")
+        self.assertEqual(sorted(entry["item"] for entry in queued), sorted(self.items[:2]))
+        again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                            root=self.root / "worktrees")
+        assert again is not None
+        self.assertNotEqual((again["branch"], again["work_path"]), held)
+        self.bundle = again
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        ended = self.supervisor().run()
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        prompt = self.calls("claude")[-1]["argv"]
+        self.assertNotIn(f"- sd:{self.items[2]}", prompt[prompt.index("-p") + 1])
+
+    def test_the_build_press_takes_a_held_bundles_items_fresh(self):
+        """Row 12: the held bundle's refusal says Build; the dashboard's Build dialog checks each item (`_item`) and
+        its press calls `queue`, not `queue_again`, so both take the blocked items and build them on a new branch."""
+        self.assert_split_first(self.left_out_of_a_retry())
+        held = self.bundle["branch"]
+        self.release_all()
+        for item in self.items[:2]:
+            build._item(self.db, item)
+        queued = build.queue(self.db, self.items[:2], who="dashboard")
+        self.assertEqual(sorted(row["item"] for row in queued), sorted(self.items[:2]))
+        again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                            root=self.root / "worktrees")
+        assert again is not None
+        self.assertNotEqual(again["branch"], held)
+
+    def blocked_elsewhere(self, index):
+        """A bundle of three ends cancelled; its item `index` is then built on its own, and that newer build blocks."""
+        self.press(3)
+        item = self.items[index]
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["cancel"])
+        self.assertEqual(self.supervisor().run()["outcome"], "cancelled")
+        self.release_all()
+        self.db.execute("UPDATE item SET status = 'ready' WHERE id = ?", (item,))
+        newer = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'blocked' WHERE id = ?", (newer,))
+        self.db.execute("UPDATE item SET status = 'blocked' WHERE id = ?", (item,))
+        return newer
+
+    def test_a_subset_retry_leaves_a_left_items_newer_block_alone(self):
+        """Round 8 class pass, row 13: a left-out member whose item a newer build owns keeps that build's state; the
+        Retry ends the old membership only, never the newer block, and parks nothing."""
+        self.blocked_elsewhere(2)
+        build.retry(self.db, self.bundle["assignment"], who="operator", only=self.items[:2])
+        row = self.db.execute("SELECT status, parked_at FROM item WHERE id = ?", (self.items[2],)).fetchone()
+        self.assertEqual((row["status"], row["parked_at"]), ("blocked", None))
+
+    def test_a_subset_retry_refuses_a_kept_item_a_newer_build_owns(self):
+        """Row 14: a kept member whose item a newer build owns would be queued twice; the Retry refuses."""
+        newer = self.blocked_elsewhere(1)
+        with self.assertRaisesRegex(build.BuildRefused, f"assignment {newer}"):
+            build.retry(self.db, self.bundle["assignment"], who="operator", only=self.items[:2])
+        self.assertEqual(self.db.execute("SELECT status FROM item WHERE id = ?", (self.items[1],)).fetchone()[0],
+                         "blocked")
+
+    def leftover(self, kind):
+        """`prepare` for a bundle cancelled before any commit that left `kind` of uncommitted state behind."""
+        def shape(work, _commit):
+            support.git(work, "reset", "-q", "--hard", "origin/main")
+            if kind == "ignored":
+                exclude(work, "local.conf\n")
+                (work / "local.conf").write_text("the left item's setting\n")
+            elif kind == "cache":
+                exclude(work, "__pycache__/\n")
+                (work / "__pycache__").mkdir()
+                (work / "__pycache__" / "x.pyc").write_bytes(b"\0")
+            elif kind == "unstaged":
+                tracked = work / support.git(work, "ls-files", "--deduplicate").split()[0]
+                tracked.write_text(tracked.read_text() + "the left item's work\n")
+            else:
+                (work / "dropped.txt").write_text("the left item's work\n")
+                if kind == "staged":
+                    support.git(work, "add", "dropped.txt")
+        return shape
+
+    def test_a_split_guard_holds_a_staged_leftover(self):
+        """Round 9 class pass, the guard reads less than the worktree holds; row 15: a staged change."""
+        self.assert_split_first(self.left_out_of_a_retry(self.leftover("staged")))
+
+    def test_a_split_guard_holds_an_unstaged_leftover(self):
+        """Row 16: a tracked file changed but not staged."""
+        self.assert_split_first(self.left_out_of_a_retry(self.leftover("unstaged")))
+
+    def test_a_split_guard_holds_an_untracked_leftover(self):
+        """Row 17: a new file never added."""
+        self.assert_split_first(self.left_out_of_a_retry(self.leftover("untracked")))
+
+    def test_a_split_guard_holds_an_ignored_leftover(self):
+        """Row 18: an ignored local config outside a `DISPOSABLE` folder, which `kept_files` counts."""
+        self.assert_split_first(self.left_out_of_a_retry(self.leftover("ignored")))
+
+    def pending(self, state):
+        """`prepare` that leaves `state`, an unfinished Git operation, over a clean tree at the base: HEAD and
+        `git status --porcelain` match a fresh start, so only the operation's state file tells."""
+        def shape(work, commit):
+            support.git(work, "reset", "-q", "--hard", "origin/main")
+            if state == "MERGE_HEAD":
+                # The finding's own form: `-s ours` keeps the tree; the next commit would take `commit` as a parent.
+                support.git(work, "merge", "--no-commit", "--no-ff", "-s", "ours", commit)
+            else:
+                path = Path(work, support.git(work, "rev-parse", "--git-path", state).strip())
+                if state.startswith("rebase-"):
+                    path.mkdir()
+                    (path / "head-name").write_text("refs/heads/example\n")
+                else:
+                    path.write_text(commit + "\n")
+            self.assertEqual(support.git(work, "status", "--porcelain").strip(), "", "the tree must look clean")
+        return shape
+
+    def test_a_split_guard_holds_a_pending_merge(self):
+        """Round 12 class pass, an unfinished Git operation the clean tree hides; row 20: MERGE_HEAD."""
+        self.assert_split_first(self.left_out_of_a_retry(self.pending("MERGE_HEAD")))
+
+    def test_a_split_guard_holds_a_pending_cherry_pick(self):
+        """Row 21: CHERRY_PICK_HEAD."""
+        self.assert_split_first(self.left_out_of_a_retry(self.pending("CHERRY_PICK_HEAD")))
+
+    def test_a_split_guard_holds_a_pending_revert(self):
+        """Row 22: REVERT_HEAD."""
+        self.assert_split_first(self.left_out_of_a_retry(self.pending("REVERT_HEAD")))
+
+    def test_a_split_guard_holds_a_pending_rebase_merge(self):
+        """Row 23: rebase-merge/, an interactive or merge-backend rebase."""
+        self.assert_split_first(self.left_out_of_a_retry(self.pending("rebase-merge")))
+
+    def test_a_split_guard_holds_a_pending_rebase_apply(self):
+        """Row 24: rebase-apply/, an apply-backend rebase or `git am`."""
+        self.assert_split_first(self.left_out_of_a_retry(self.pending("rebase-apply")))
+
+    def test_a_split_guard_holds_a_pending_bisect(self):
+        """Row 25: BISECT_LOG, a bisect that checks out other commits."""
+        self.assert_split_first(self.left_out_of_a_retry(self.pending("BISECT_LOG")))
+
+    def test_a_split_guard_holds_a_real_rebase_off_its_branch(self):
+        """Review of build/sd-1242: a real rebase stopped midway detaches HEAD, and the branch check ended the run
+        before the guard, so no hold was recorded and each Retry blocked again. The guard reads first and holds."""
+        def stopped(work, _commit):
+            support.git(work, "reset", "-q", "--hard", "origin/main")
+            done = subprocess.run(["git", "-C", str(work), "rebase", "--exec", "false", "--root"],
+                                  capture_output=True, check=False)
+            self.assertNotEqual(done.returncode, 0, "the rebase must stop")
+            self.assertEqual(support.git(work, "branch", "--show-current").strip(), "", "HEAD is detached")
+        self.assert_split_first(self.left_out_of_a_retry(stopped))
+        self.assertEqual(build.split(self.db, self.bundle["assignment"]), "held")
+
+    def test_a_split_guard_passes_an_ignored_cache(self):
+        """Row 19: an ignored file under a `DISPOSABLE` folder is a cache no builder inherits as work."""
+        supervisor = self.left_out_of_a_retry(self.leftover("cache"))
+        self.assertEqual(supervisor.run()["step"], "enqueued")
+
+    def test_a_subset_retry_with_no_earlier_work_builds_on(self):
+        """Row 5, the guard: a bundle cancelled before any build holds no earlier commit, so the kept items build."""
+        supervisor = self.left_out_of_a_retry(run=False)
+        self.assertEqual(supervisor.run()["step"], "enqueued")
+        prompt = self.calls("claude")[-1]["argv"]
+        self.assertNotIn(f"- sd:{self.items[2]}", prompt[prompt.index("-p") + 1])
 
     def test_cancel_kills_the_active_group(self):
         """Failure table, Cancel: a cancel during building kills the builder's group at the next beat."""
