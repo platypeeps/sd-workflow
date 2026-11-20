@@ -4113,6 +4113,9 @@ def wait_empty(pgid: int, deadline: float, *, leader: int | None = None) -> None
 
 
 def _exited(pid: int) -> bool:
+    # macOS Python 3.11 and 3.12 lack waitid: the grace runs to its deadline, the leader unreaped (sd:9600).
+    if not hasattr(os, "waitid"):
+        return False
     try:
         return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
     except ChildProcessError:  # not a child of this process: its table entry, if any, is a member

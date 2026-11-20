@@ -2488,6 +2488,22 @@ class KillReachTests(unittest.TestCase):
                     sd_lib.end_group(leader)
                 self.assert_killed(leader)
 
+    def test_a_python_without_waitid_waits_out_the_grace_unreaped(self) -> None:
+        """Lane review of sd:9600: macOS Python 3.11 and 3.12 lack `os.waitid`, so the grace raised
+        AttributeError. It now waits out the deadline and leaves the leader unreaped."""
+        leader = subprocess.Popen([sys.executable, "-c", ""], start_new_session=True)
+        self.addCleanup(leader.wait)
+        time.sleep(0.3)  # the leader has exited, unreaped
+        saved = os.waitid
+        del os.waitid
+        try:
+            start = time.monotonic()
+            sd_lib.wait_empty(leader.pid, start + 0.3, leader=leader.pid)
+        finally:
+            os.waitid = saved
+        self.assertGreaterEqual(time.monotonic() - start, 0.3)
+        self.assertIsNone(leader.returncode, "the leader stays unreaped")
+
     def test_an_interrupted_grace_in_end_group_still_kills(self) -> None:
         """Round 5, R2: a KeyboardInterrupt in the grace left the workers to finish with no SIGKILL."""
         with tempfile.TemporaryDirectory() as scratch:
