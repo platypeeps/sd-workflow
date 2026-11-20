@@ -1147,10 +1147,14 @@ class Supervisor:
         self.enter("worktree")
         branch = self.row["branch"]
         if self.work.is_dir():
+            # The guard reads first: a stopped rebase detaches HEAD, and a block here would record no hold.
+            held = self.split_first()
+            if held:
+                return held
             current = _read([*self.tools.git, "-C", str(self.work), "branch", "--show-current"], env=self.env).strip()
             if current != branch:
                 return self.finish("blocked", f"worktree {self.work} is on {current or 'no branch'}, not {branch}")
-            return self.split_first() or "building"
+            return "building"
         if self.child([*self.tools.git, "-C", str(self.repo), "fetch", "-q", "origin"], cwd=self.repo,
                       name="worktree") != 0:
             return self.finish("blocked", f"git fetch in {self.repo} failed; see {self.out('worktree')}")
@@ -1183,7 +1187,10 @@ class Supervisor:
             dirty = kept_files(self.tools.git, str(self.work), env=self.env)
             # A pending merge leaves HEAD and status as they were; the next commit would take its parent.
             pending = unfinished(self.tools.git, str(self.work), env=self.env)
-            if not commits and not dirty and not pending:
+            # Off its branch, HEAD is not the branch's tip: the commits read above say nothing of the branch.
+            on = _read([*self.tools.git, "-C", str(self.work), "branch", "--show-current"],
+                       env=self.env).strip() == self.row["branch"]
+            if on and not commits and not dirty and not pending:
                 if not build.write(self.db, self.ident, base_head=head):
                     raise Lost
                 return None

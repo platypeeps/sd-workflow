@@ -1300,6 +1300,18 @@ class Supervise(Case):
         """Row 25: BISECT_LOG, a bisect that checks out other commits."""
         self.assert_split_first(self.left_out_of_a_retry(self.pending("BISECT_LOG")))
 
+    def test_a_split_guard_holds_a_real_rebase_off_its_branch(self):
+        """Review of build/sd-1242: a real rebase stopped midway detaches HEAD, and the branch check ended the run
+        before the guard, so no hold was recorded and each Retry blocked again. The guard reads first and holds."""
+        def stopped(work, _commit):
+            support.git(work, "reset", "-q", "--hard", "origin/main")
+            done = subprocess.run(["git", "-C", str(work), "rebase", "--exec", "false", "--root"],
+                                  capture_output=True, check=False)
+            self.assertNotEqual(done.returncode, 0, "the rebase must stop")
+            self.assertEqual(support.git(work, "branch", "--show-current").strip(), "", "HEAD is detached")
+        self.assert_split_first(self.left_out_of_a_retry(stopped))
+        self.assertEqual(build.split(self.db, self.bundle["assignment"]), "held")
+
     def test_a_split_guard_passes_an_ignored_cache(self):
         """Row 19: an ignored file under a `DISPOSABLE` folder is a cache no builder inherits as work."""
         supervisor = self.left_out_of_a_retry(self.leftover("cache"))
