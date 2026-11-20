@@ -92,6 +92,14 @@ class TheReopen(DependencyCase):
 class TheOtherStarts(DependencyCase):
     """Class pass: every path that starts work on an item reads what it waits on, as the Build press does."""
 
+    def test_a_teammate_start_refuses_an_item_that_waits(self):
+        from sd_db import teammate
+        first, item = self.item(status="planning"), self.item(status="in_progress")
+        self.wait(item, first)
+        with self.assertRaisesRegex(teammate.TeammateRefused, f"item {item} waits on sd:{first}"):
+            teammate.start(self.db, [item], worktree="/w/x", branch="feat/x", budget_minutes=30, owner="lead")
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment"), 0)
+
     def test_a_runner_enqueue_refuses_an_author_run_of_an_item_that_waits(self):
         from sd_db import runner
         first, item = self.item(status="planning"), self.item()

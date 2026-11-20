@@ -209,6 +209,9 @@ def start(connection, items: list[int], *, worktree: str, branch: str, budget_mi
                 raise TeammateRefused(f"item {item} needs a registered repository")
             if row["status"] in CLOSED:
                 raise TeammateRefused(f"item {item} is {row['status']}")
+            waiting = build.waiting_on(connection, row)  # as the Build press reads it (pack sd:9570)
+            if waiting:
+                raise TeammateRefused(f"item {item} {waiting}")
             held = holding(connection, item)
             if held:
                 raise TeammateRefused(f"item {item} is held by teammate run {held['id']}; end it first")
