@@ -2124,6 +2124,21 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         # Re-review of sd:9425: the entry's own actions, its Details among them, stay with it.
         self.assertIn(f'data-acts="entry:{self.checkout}:{made}"', row(made))
 
+    def test_a_parked_items_failed_entry_opens_its_lane_entry_details_from_the_parked_row(self):
+        """sd:9657: a click on the Parked row selects the task, and the entry's menu holds no command that opens
+        Lane entry Details, so the parked row keeps a Details button that selects the entry."""
+        made, answers = self.parked_answers(self.checkout)
+        self.list(self.entries() + [{"item": made, "title": "Set aside", "status": "failed", "step": "prepare",
+                                     "reason": "gate failed", "finished_at": NOW}])
+        entry = f"entry:{self.checkout}:{made}"
+        out = self.run_view(self.TILE + " open('system'); tile('system', 'parked'); R.tiled = ELS.queue.html;"
+                            " act('button[data-entry]', { entry: " + json.dumps(entry) + " });"
+                            " R.details = ELS.details.html; R.row = location.search;", answers=answers, search="")
+        row = out["R"]["tiled"].split(f'data-type="parked" data-item="{made}"')[1].split("</tr>")[0]
+        self.assertIn(f'data-entry="{entry}"', row)
+        self.assertIn("Lane entry · blocked", out["R"]["details"])
+        self.assertIn(f"#{made} Set aside", out["R"]["details"])
+
     def test_a_repo_whose_only_rows_are_parked_still_shows_its_parked_box(self):
         """Review of sd:9247: a repo with nothing but parked tasks drew no row, so its box was unreachable."""
         solo = self.checkout.parent / "solo"
