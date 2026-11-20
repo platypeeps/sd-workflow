@@ -19,12 +19,16 @@ and the CLI verb share one path (operator ruling Q3); the page adds no store and
 - `recommendations` is `/api/briefs/<item>/recommendations` (sd:5064): the questions of each batch an adversarial review's
   brief names in its frontmatter (`batches: sd:N, ...`), ruled and open, with each batch's revision, so the Briefs page
   can rule the chosen ones Approve through `/api/review/rule`. A repository is sent by name, never by its local path.
+- `sweeps` is `/api/review`'s `sweeps` (sd:9505): the weekly advisory sweep, one row per week, newest first: the
+  RESULT line and the cap's `sampled N of M` from the job's log, and its filed items (`advisory-sweep:<date>:<repo>`
+  refs) done and not done, each keyed on its week's ending Sunday, the day the job runs. A week with no RESULT keeps None, never zero; a log that does not read keeps the items.
 - `export` is `/api/review/<item>/export`: `review.export` without a key, the lines `sd-db review export` writes.
   A blind or sealed batch exports only once no question is open, so the page never shows a subject while labelling.
 """
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import re
@@ -32,13 +36,22 @@ import sqlite3
 
 from sd_db import reads, workflow
 
-__all__ = ["BLIND", "NIGHTLY", "document", "export", "recommendations", "rule_request", "withdraw_request"]
+__all__ = ["BLIND", "NIGHTLY", "SWEEP_JOB", "document", "export", "recommendations", "rule_request", "sweeps",
+           "withdraw_request"]
 
 #: The queue the nightly review job files (`sd-db review apply nightly`); its suggestions come first.
 NIGHTLY = "nightly"
 #: Modes whose questions show text and options only.
 BLIND = ("blind", "sealed")
 MAX_ID = 9223372036854775807
+#: The weekly advisory sweep (code-review-research sd:9494) and the ref prefix of the items it files.
+SWEEP_JOB = "advisory-sweep-weekly"
+SWEEP_REF = "advisory-sweep:"
+# ponytail: the whole log is read up to 1 MB, about 200 weekly runs; read backwards if it ever grows past that.
+SWEEP_LOG_BYTES = 1 << 20
+SWEEP_START = re.compile(rf"^\[{SWEEP_JOB}\] (\d{{4}}-\d{{2}}-\d{{2}})T\S* starting", re.M)
+SWEEP_RESULT = re.compile(r"^RESULT: (\d+) packets, (\d+) open, (\d+) filed\s*$", re.M)
+SWEEP_CAP = re.compile(r"sampled (\d+) of (\d+)")
 
 
 def _rows(connection):
@@ -102,6 +115,52 @@ def document(connection) -> dict:
 
     found = attention(["caution"] * sum(batch.get("open") or 0 for batch in batches), {"caution": "questions open"})
     return {"batches": batches, "questions": questions, "reviewed": reviewed, "attention": found}
+
+
+def sweeps(connection, cron_root) -> dict:
+    """The advisory sweep by week (sd:9505): `state` and `reason` as `management_screen.job_log` gives them, and `weeks`."""
+    from .management_screen import job_log
+
+    # One read: a second open of a log rotated in between raised past job_log's error handling (sd:9505 review).
+    log = job_log(cron_root, SWEEP_JOB, SWEEP_LOG_BYTES)
+    text = log["text"]
+    weeks: dict[str, dict] = {}
+
+    def week(date):
+        # One sweep week ends on the Sunday the job runs (05:30): a run or a ref dated Monday to Sunday keys on that
+        # Sunday, so a rerun by hand mid-week and the Sunday run are one row (sd:9505 review). A date that is no
+        # calendar date keys nowhere: its run or item is left out, not the page.
+        try:
+            day = datetime.date.fromisoformat(date) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date) else None
+        except ValueError:
+            day = None
+        if day is None:
+            return None
+        date = (day + datetime.timedelta(days=(6 - day.weekday()) % 7)).isoformat()
+        return weeks.setdefault(date, {"week": date, "runs": 0, "packets": None, "open": None, "filed": None,
+                                       "skipped": None, "fixed": 0, "unfixed": 0})
+
+    starts = list(SWEEP_START.finditer(text))
+    for n, start in enumerate(starts):
+        block = text[start.end():starts[n + 1].start() if n + 1 < len(starts) else len(text)]
+        row = week(start[1])
+        if row is None:
+            continue
+        row["runs"] += 1
+        results = SWEEP_RESULT.findall(block)
+        if results:
+            # A rerun in one week only adds (the script records what it swept), so its counts add too.
+            for name, value in zip(("packets", "open", "filed"), results[-1], strict=True):
+                row[name] = (row[name] or 0) + int(value)
+        caps = SWEEP_CAP.findall(block)
+        if caps:
+            row["skipped"] = (row["skipped"] or 0) + int(caps[-1][1]) - int(caps[-1][0])
+    for found in reads.ref_items(connection, SWEEP_REF):
+        row = week(found["external_id"][len(SWEEP_REF):].partition(":")[0])
+        if row is not None:
+            row["fixed" if found["status"] == "done" else "unfixed"] += 1
+    return {"state": log["state"], "reason": log["reason"],
+            "weeks": sorted(weeks.values(), key=lambda row: row["week"], reverse=True)}
 
 
 def _advice(question: dict, blind: bool) -> dict:

@@ -2061,6 +2061,16 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertEqual(label.get("margin-right"), box.get("margin-right"))
         self.assertNotIn("min-width", box, "a box that grows with its count leaves its label behind")
 
+    def test_on_touch_the_labels_widen_with_the_boxes(self):
+        """pack sd:9654: on touch, shell.css widens each td button to --row-touch; the 2.25rem labels fell behind."""
+        shell = (v2.HERE / "static" / "shell.css").read_text(encoding="utf-8")
+        self.assertRegex(shell, r"td > button:not\([^)]*\)[^{]*\{[^}]*min-width: var\(--row-touch\)",
+                         "the touch rule this test guards against changed; recheck the queue boxes")
+        css = (v2.HERE / "static" / "today.css").read_text(encoding="utf-8")
+        coarse = re.search(r"@media \(pointer: coarse\) \{\s*\.queue \{([^}]*)\}", css)
+        self.assertIsNotNone(coarse, "on touch each box is 2.75rem wide and its label stays 2.25rem")
+        self.assertIn("--q-tile: var(--row-touch);", coarse.group(1))
+
     def parked_answers(self, repo):
         from sd_dashboard import tasks_screen
         if repo != self.checkout:

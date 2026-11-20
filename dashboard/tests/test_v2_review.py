@@ -862,3 +862,138 @@ class TheBulkView(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+SWEEP_LOG = """[advisory-sweep-weekly] 2026-11-18T15:40:37-0700 starting (cwd: /home/operator)
+The script sampled 100 of 192 advisories, so 92 were not triaged this week.
+
+RESULT: 100 packets, 14 open, 10 filed
+[advisory-sweep-weekly] 2026-11-18T15:44:05-0700 done
+[advisory-sweep-weekly] 2026-11-22T05:30:00-0700 starting (cwd: /home/operator)
+none
+RESULT: 0 packets, 0 open, 0 filed
+[advisory-sweep-weekly] 2026-11-22T05:31:00-0700 done
+[advisory-sweep-weekly] 2026-11-29T05:30:00-0700 starting (cwd: /home/operator)
+RESULT: failed, the packet file is missing
+[advisory-sweep-weekly] 2026-11-29T05:31:00-0700 FAILED
+"""
+
+
+class TheAdvisorySweep(ScreenCase):
+    """sd:9505: the weekly advisory sweep's RESULT, its cap shortfall and its filed items, one row per week."""
+
+    def setUp(self):
+        super().setUp()
+        self.cron = Path(self.tmp.name) / "cron"
+        (self.cron / "logs").mkdir(parents=True)
+
+    def file(self, ref, status="planning"):
+        found = self.item("Open review advisories", source="task-ref", external_id=ref)
+        # The status alone is what the panel reads; how an item reached it is the workflow's business.
+        self.connection.execute("UPDATE item SET status = ? WHERE id = ?", (status, found))
+
+    def test_each_week_carries_its_result_cap_shortfall_and_filed_items(self):
+        (self.cron / "logs" / f"{review_screen.SWEEP_JOB}.log").write_text(SWEEP_LOG, encoding="utf-8")
+        self.file("advisory-sweep:2026-11-18:alpha", "done")
+        self.file("advisory-sweep:2026-11-18:beta")
+        self.file("advisory-sweep:2026-11-18:gamma", "in_progress")
+        self.file("advisory-sweep:2026-12-06:alpha")
+        self.item("Not the sweep's", source="task-ref", external_id="review:nightly:x")
+        found = review_screen.sweeps(self.connection, self.cron)
+        self.assertEqual(found["state"], "read")
+        self.assertEqual(found["weeks"], [
+            {"week": "2026-12-06", "runs": 0, "packets": None, "open": None, "filed": None, "skipped": None,
+             "fixed": 0, "unfixed": 1},
+            {"week": "2026-11-29", "runs": 1, "packets": None, "open": None, "filed": None, "skipped": None,
+             "fixed": 0, "unfixed": 0},
+            {"week": "2026-11-22", "runs": 2, "packets": 100, "open": 14, "filed": 10, "skipped": 92,
+             "fixed": 1, "unfixed": 2}])
+
+    def test_runs_and_items_of_one_sweep_week_are_one_row_keyed_on_its_sunday(self):
+        # sd:9505 review: a Wednesday run by hand, a Sunday run and a Tuesday item are one sweep week, the one ending
+        # Sunday 2026-11-22, the day the job runs; the Monday after starts the next week.
+        log = SWEEP_LOG.split("[advisory-sweep-weekly] 2026-11-29")[0] + (
+            "[advisory-sweep-weekly] 2026-11-23T09:00:00-0700 starting (cwd: /home/operator)\n"
+            "RESULT: 5 packets, 1 open, 1 filed\n")
+        (self.cron / "logs" / f"{review_screen.SWEEP_JOB}.log").write_text(log, encoding="utf-8")
+        self.file("advisory-sweep:2026-11-17:alpha", "done")
+        self.file("advisory-sweep:2026-11-22:beta")
+        self.file("advisory-sweep:2026-11-23:gamma")
+        # Not calendar dates: each is left out, and the page still reads.
+        self.file("advisory-sweep:2026-13-45:delta")
+        self.file("advisory-sweep:20261124:epsilon")
+        found = review_screen.sweeps(self.connection, self.cron)["weeks"]
+        self.assertEqual([(w["week"], w["runs"], w["packets"], w["filed"], w["skipped"], w["fixed"], w["unfixed"])
+                          for w in found],
+                         [("2026-11-29", 1, 5, 1, None, 0, 1), ("2026-11-22", 2, 100, 10, 92, 1, 1)])
+
+    def test_a_log_rotated_away_after_its_first_read_breaks_no_page(self):
+        # sd:9505 review: the log was opened twice, the second open outside job_log's error handling, so a rotation
+        # between them raised FileNotFoundError through the whole Scoring read. One read: whatever it finds stands.
+        from sd_dashboard import management_screen
+
+        (self.cron / "logs" / f"{review_screen.SWEEP_JOB}.log").write_text(SWEEP_LOG, encoding="utf-8")
+        self.file("advisory-sweep:2026-11-18:alpha", "done")
+        real = management_screen.log_tail
+        with mock.patch.object(management_screen, "log_tail",
+                               side_effect=[real(self.cron / "logs" / f"{review_screen.SWEEP_JOB}.log", 1 << 20),
+                                            FileNotFoundError(2, "rotated")]):
+            found = review_screen.sweeps(self.connection, self.cron)
+        self.assertEqual(found["state"], "read")
+        self.assertEqual([(w["week"], w["packets"], w["fixed"]) for w in found["weeks"]][-1], ("2026-11-22", 100, 1))
+
+    def test_no_log_still_lists_the_filed_items_and_says_why(self):
+        self.file("advisory-sweep:2026-11-18:alpha", "done")
+        found = review_screen.sweeps(self.connection, self.cron)
+        self.assertEqual(found["state"], "none")
+        self.assertIn("no log", found["reason"])
+        self.assertEqual([(w["week"], w["fixed"], w["packets"]) for w in found["weeks"]], [("2026-11-22", 1, None)])
+
+    def test_the_review_api_sends_the_sweep_beside_the_queue(self):
+        from sd_dashboard.v2.pages import decide
+
+        read = mock.Mock(connection=self.connection, jobs=mock.Mock(cron_root=self.cron))
+        found = decide._read(read)
+        self.assertIn("batches", found)
+        self.assertEqual(found["sweeps"]["state"], "none")
+
+    def test_the_served_review_api_reads_the_sweep_log_with_no_jobs_backend(self):
+        # sd:9505 lane review: the server passes no jobs backend, so the read falls back to launchd's, as every
+        # sibling page does, and reads the log; without the fallback it read no logs folder at all.
+        from sd_dashboard.v2.pages import decide
+        from sd_db import operations
+
+        (self.cron / "logs" / f"{review_screen.SWEEP_JOB}.log").write_text(SWEEP_LOG, encoding="utf-8")
+        read = mock.Mock(connection=self.connection, jobs=None)
+        with mock.patch.object(operations, "LaunchdBackend", return_value=mock.Mock(cron_root=self.cron)):
+            found = decide._read(read)
+        self.assertEqual(found["sweeps"]["state"], "read")
+
+
+class TheSweepPanel(unittest.TestCase):
+    """sd:9505: Scoring's Advisory sweep panel draws one row per week from `/api/review`'s `sweeps`."""
+
+    run_page = TheScript.run_page
+
+    def test_each_week_is_a_row_and_an_unknown_count_is_a_dash(self):
+        doc = doc_with(1)
+        doc["sweeps"] = {"state": "read", "reason": "", "weeks": [
+            {"week": "2026-11-29", "runs": 1, "packets": None, "open": None, "filed": None, "skipped": None,
+             "fixed": 0, "unfixed": 0},
+            {"week": "2026-11-18", "runs": 1, "packets": 100, "open": 14, "filed": 10, "skipped": 92,
+             "fixed": 3, "unfixed": 7}]}
+        out = self.run_page("R.rows = ELS.sweeps.html; R.tally = ELS['sweep-tally'].textContent;",
+                            "(path, body) => [200, DOC]", doc=doc)
+        rows = out["R"]["rows"]
+        self.assertEqual(rows.count("<tr>"), 2)
+        self.assertIn("<td>2026-11-18</td><td>100</td><td>14</td><td>10</td><td>92</td><td>3 of 10</td>", rows)
+        self.assertIn("<td>2026-11-29</td><td>—</td><td>—</td><td>—</td><td>—</td><td>—</td>", rows)
+        self.assertEqual(out["R"]["tally"], "2 weeks")
+
+    def test_an_unread_log_says_why_and_no_week_is_an_empty_row(self):
+        doc = doc_with(1)
+        doc["sweeps"] = {"state": "none", "reason": "no log: the job has not run <b>", "weeks": []}
+        out = self.run_page("R.rows = ELS.sweeps.html; R.tally = ELS['sweep-tally'].textContent;",
+                            "(path, body) => [200, DOC]", doc=doc)
+        self.assertIn('<tr class="empty"><td colspan="6">No sweep has run yet.</td></tr>', out["R"]["rows"])
+        self.assertEqual(out["R"]["tally"], "0 weeks · log: no log: the job has not run <b>")

@@ -6399,8 +6399,9 @@ class FailureNotes(SharedQueue):
 
     def test_a_failed_step_keeps_the_blocker_code_sd_ship_answered(self) -> None:
         """Lead review of sd:9303: the prepare step dropped its blocker code as the merge step did, so Queue and
-        Metrics read a prepare refusal, such as a renewed claim, from its text alone. Each step keeps the code."""
-        for step, code in (("prepare", "delivery_claim_renewed"), ("merge", "ci_not_passing")):
+        Metrics read a prepare refusal, such as a missing delivery claim, from its text alone. Each step keeps
+        the code."""
+        for step, code in (("prepare", "delivery_claim_required"), ("merge", "ci_not_passing")):
             with self.subTest(step=step):
                 self.answers.clear()
                 sd_lane.enqueue_entry(self.feature, 1, "fix: one", self.body, self.environ, manual=True, claim="deliver")

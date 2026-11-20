@@ -251,7 +251,7 @@
       Object.values(DET.items).forEach(d => {
         const as = live(String(d.item.id)) ? o => o : o => ({ id: o.id, type: 'not listed', label: `${o.label} (no longer listed)` });
         d.notes.forEach(n => C.put(as({ id: `note:${n.id}`, type: 'note', label: `${n.kind} ${n.id} on #${d.item.id}`, note: n.id, kind: n.kind, resolved: n.resolved, item: d.item.id })));
-        d.assignments.forEach(a => C.put(as({ id: `asg:${a.id}`, type: 'assignment', label: `Assignment #${a.id}`, n: a.id, scope: a.scope, members: a.members || [], parks: a.parks || [], status: a.status, item: d.item.id, repo: d.item.repo, can: a.cancel })));
+        d.assignments.forEach(a => C.put(as({ id: `asg:${a.id}`, type: 'assignment', label: `Assignment #${a.id}`, n: a.id, scope: a.scope, members: a.members || [], parks: a.parks || [], revision: a.revision, status: a.status, item: d.item.id, repo: d.item.repo, can: a.cancel })));
       });
       ISSUE_RUNS.forEach(r => C.put(issueObject(r)));
     }
@@ -558,10 +558,11 @@
         + (stay.length ? ` It does not park ${ids(stay)}: not ready, already parked, or owned by another assignment.` : '');
     }
     // A refused cancel reads the Details again too: they hold the revision a retry sends.
+    // It sends the revision of the object its confirm read, never the Details at OK: a refresh while the dialog is
+    // open can replace them, and the queued lead's revision holds its members and parks (pack sd:9290 review).
     async function cancelAsg(o) {
-      const a = Object.values(DET.items).flatMap(d => d.assignments).find(x => x.id === o.n);
-      if (!a) throw new Error(`assignment #${o.n} was not read`);
-      try { await window.shell.post(`/api/assignments/${o.n}/cancel`, { revision: a.revision }); } catch (err) { if (err.stale) redrawDet(o.item); throw err; }
+      if (!o.revision) throw new Error(`assignment #${o.n} was not read`);
+      try { await window.shell.post(`/api/assignments/${o.n}/cancel`, { revision: o.revision }); } catch (err) { if (err.stale) redrawDet(o.item); throw err; }
       redrawDet(o.item); await host.reread();
     }
 
