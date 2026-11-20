@@ -848,8 +848,10 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
     return moved
 
 
-def _environ(environ: dict | None) -> dict:
+def _environ(environ: dict | None, ident: str) -> dict:
     env = dict(os.environ if environ is None else environ)
+    # Machine hooks tell a headless builder from a session by this (pack sd:9715).
+    env["SD_BUILD_RUN"] = ident
     # The token reaches the child's environment only: no row or log holds it.
     if env.get("CUSTOM_CLAUDE_CODE_OAUTH_TOKEN"):
         env["CLAUDE_CODE_OAUTH_TOKEN"] = env["CUSTOM_CLAUDE_CODE_OAUTH_TOKEN"]
@@ -901,7 +903,7 @@ class Supervisor:
         self.reviewed: str | None = None
         self.blockers: list[dict] = []
         self.last_beat = 0.0
-        self.env = _environ(environ)
+        self.env = _environ(environ, ident)
         # Claude Code's own OTel, where the machine turns it on, names the run
         # by these (pack sd:6943); the switch and endpoint are system sd:6944's.
         self.env["OTEL_RESOURCE_ATTRIBUTES"] = ",".join(filter(None, (
@@ -2027,7 +2029,7 @@ class DraftSupervisor(Supervisor):
         self.item = self.db.execute("SELECT item FROM assignment WHERE id = ?",
                                        (self.row["assignment"],)).fetchone()["item"]
         self.last_beat = 0.0
-        self.env = _environ(environ)
+        self.env = _environ(environ, ident)
         self.reviewed: str | None = None
         self.take_resume(settle_seconds)
 

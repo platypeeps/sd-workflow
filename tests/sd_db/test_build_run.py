@@ -65,7 +65,8 @@ FAKE = textwrap.dedent('''
     from pathlib import Path
     role, plans = Path(sys.argv[0]).stem, Path(os.environ["FAKE_PLANS"])
     with open(plans / "calls.jsonl", "a") as log:
-        log.write(json.dumps({"role": role, "argv": sys.argv[1:], "cwd": os.getcwd()}) + "\\n")
+        log.write(json.dumps({"role": role, "argv": sys.argv[1:], "cwd": os.getcwd(),
+                             "run": os.environ.get("SD_BUILD_RUN")}) + "\\n")
     plan = plans / f"{role}.json"
     queue = json.loads(plan.read_text()) if plan.exists() else []
     # `gh repo view` (the visibility read) takes no plan: plans/visibility.txt answers it.
@@ -526,6 +527,16 @@ class Supervise(Case):
         self.assertEqual(env["OTEL_RESOURCE_ATTRIBUTES"], f"host.name=fixture,sd.build_run={self.bundle['id']},"
                          f"sd.items={self.items[0]};{self.items[1]}")
         self.assertNotIn("CLAUDE_CODE_ENABLE_TELEMETRY", {key for key in env if key not in os.environ})
+
+    def test_the_claude_child_env_names_the_run(self):
+        """pack sd:9715: machine hooks tell a headless builder by SD_BUILD_RUN."""
+        self.press(2)
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        runs = [call["run"] for call in self.calls("claude")]
+        self.assertTrue(runs)
+        self.assertEqual(set(runs), {self.bundle["id"]})
 
     def test_a_press_runs_to_the_lane(self):
         """Two items, one run, one branch, one lane entry; the members end done and the items stay in progress."""
@@ -4369,7 +4380,7 @@ class ChildEnvironment(unittest.TestCase):
 
     def test_the_supervisor_env_holds_no_github_token_from_the_pat(self) -> None:
         """sd:8515: gh and its credential helper would act as the PAT, not the gh login."""
-        env = build_run._environ({"GITHUB_PERSONAL_ACCESS_TOKEN": "example-pat"})
+        env = build_run._environ({"GITHUB_PERSONAL_ACCESS_TOKEN": "example-pat"}, "run")
         self.assertIsNone(env.get("GITHUB_TOKEN"))
 
     def test_a_check_gets_github_token_from_the_pat(self) -> None:
