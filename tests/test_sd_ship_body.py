@@ -338,6 +338,53 @@ class CitedIdTests(unittest.TestCase):
                 message = f"revert: split the renewal out\n\n{heading}\n\n- {work[:9]} shared\n"
                 self.assertEqual(sd_ship_body.cited_ids("", [(revert, message), cited]), ())
 
+    def revert_of(self, body: str) -> tuple[str, str]:
+        return ("d" * 40, f"revert: split the renewal out\n\n{body}")
+
+    def test_a_bullet_or_indented_heading_starts_its_own_list(self) -> None:
+        """pack sd:9666 review, round 3, instances 1 and 2: `- Kept commits:` and an indented `Kept commits:`
+        kept the `Reverted commits:` heading above them, and their nested shas lost their citations."""
+        undone, kept = "a" * 40, "b" * 40
+        work = [(kept, "fix: shared\n\nLane review fix, pack sd:5: y.\n\nCloses: sd:4\n"),
+                (undone, "feat: renew\n\nCloses: sd:2\n")]
+        for heading in ("- Kept commits:", "  Kept commits:", "* Kept commits:"):
+            with self.subTest(heading=heading):
+                revert = self.revert_of(f"Reverted commits:\n\n- {undone[:9]} renew\n{heading}\n"
+                                        f"  - {kept[:9]} shared\n")
+                self.assertEqual(sd_ship_body.cited_ids("", [revert, *work]), (4, 5))
+        # A bullet heading that says reverted opens a list too.
+        revert = self.revert_of(f"Kept commits:\n\n- {kept[:9]} shared\n- Reverted commits:\n"
+                                f"  - {undone[:9]} renew\n")
+        self.assertEqual(sd_ship_body.cited_ids("", [revert, *work]), (4, 5))
+
+    def test_every_list_marker_under_a_reverted_heading_undoes(self) -> None:
+        """pack sd:9666 review, round 3, instance 3: a `+` or numbered list under `Reverted commits:` undid
+        nothing, so the reverted work still closed its item."""
+        undone = "a" * 40
+        for marker in ("+", "1.", "2)"):
+            with self.subTest(marker=marker):
+                revert = self.revert_of(f"Reverted commits:\n\n{marker} {undone[:9]} renew\n")
+                self.assertEqual(sd_ship_body.cited_ids("", [revert, (undone, "feat: x\n\nCloses: sd:2\n")]), ())
+
+    def test_a_listed_merge_undoes_what_it_brought_in(self) -> None:
+        """pack sd:9666 review, round 3, instance 4: a listed merge sha undid the merge alone, so the side
+        commit it brought in kept its close; `This reverts commit <merge>` with `-m 1` drops it."""
+        base, side, main, merge = (c * 40 for c in "abce")
+        commits = [self.revert_of(f"Reverted commits:\n\n- {merge[:9]} the side branch\n"),
+                   (merge, "Merge branch 'side'"), (main, "fix: mainline\n\nCloses: sd:4"),
+                   (side, "fix: implement\n\nLane review fix, pack sd:3: y.\n\nCloses: sd:2\n"),
+                   (base, "fix: base\n\nCloses: sd:5")]
+        parents = {merge: (main, side), main: (base,), side: (base,), base: ()}
+        self.assertEqual(sd_ship_body.cited_ids("", commits, parents), (4, 5))
+
+    def test_an_ambiguous_listed_prefix_undoes_nothing(self) -> None:
+        """pack sd:9666 review, round 3, instance 5: a short sha two branch commits share undid whichever came
+        first; git refuses an ambiguous prefix, and so does the list."""
+        first, second = "abcdef1" + "1" * 33, "abcdef1" + "2" * 33
+        commits = [self.revert_of("Reverted commits:\n\n- abcdef1 one of them\n"),
+                   (first, "fix: one\n\nCloses: sd:2\n"), (second, "fix: two\n\nCloses: sd:3\n")]
+        self.assertEqual(sd_ship_body.cited_ids("", commits), (2, 3))
+
     def test_a_merge_the_branch_reverts_cites_nothing_it_brought_in(self) -> None:
         """Lane review of sd:5999, round 3: `git revert -m 1 <merge>` undoes each commit the merge brought in."""
         base, side, main, merge, undo, again = (c * 40 for c in "abcdef")
