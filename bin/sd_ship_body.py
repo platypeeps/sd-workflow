@@ -318,7 +318,30 @@ _REVERTS = re.compile(r"^This reverts commit ([0-9a-f]{7,40})\b(?:, reversing\s+
 #: A revert's subject: `git revert`'s `Revert "..."`, or a Conventional `revert:` (sd:8373).
 REVERT_SUBJECT = re.compile(r"^(?:Revert\b|revert(?:\([^)]*\))?!?:)", re.IGNORECASE)
 #: A list line a hand-written revert names an undone commit on: `- <sha> ...` or `* <sha> ...` (pack sd:9666).
-_LISTED = re.compile(r"^[ \t]*[-*][ \t]+([0-9a-f]{7,40})\b", re.MULTILINE)
+_LISTED = re.compile(r"^[ \t]*[-*][ \t]+([0-9a-f]{7,40})\b")
+_BULLET = re.compile(r"^[ \t]*[-*][ \t]")
+#: The line that opens a list of undone commits: its last sentence names a revert and ends with a colon.
+_REVERTED_INTRO = re.compile(r"\brevert[a-z]*\b[^.]*:[ \t]*$", re.IGNORECASE)
+
+
+def _listed_undone(message: str) -> list[str]:
+    """The shas a hand-written revert lists as undone (pack sd:9666).
+
+    A bullet that opens with a sha, under a line such as `Reverted commits:`;
+    a bullet under any other line (`Kept commits:`) or inside a fence or an
+    HTML comment names a commit the revert did not undo.
+    """
+    quoted, intro, found = quoted_lines(message), "", []
+    for number, line in enumerate(message.split("\n"), start=1):
+        line = line.rstrip("\r")
+        if number in quoted or not line.strip():
+            continue
+        if _BULLET.match(line):
+            if (match := _LISTED.match(line)) and _REVERTED_INTRO.search(intro):
+                found.append(match[1])
+        elif not line[0].isspace():  # an indented line continues the bullet above it
+            intro = line
+    return found
 
 
 def kept_commits(commits, parents=None) -> list:
@@ -328,9 +351,9 @@ def kept_commits(commits, parents=None) -> list:
     the mainline parent its message names, read from `parents` (sha to
     parent shas, the range's `git rev-list --parents`). A revert that is
     itself reverted undoes nothing, so its target stays. A hand-written
-    revert (`REVERT_SUBJECT`) also undoes each commit a list line of its
-    message opens with: a split listed its commits by short sha, and the
-    squash closed the items they cited (pack sd:9666).
+    revert (`REVERT_SUBJECT`) also undoes each commit its list of reverted
+    commits names (`_listed_undone`): a split listed its commits by short
+    sha, and the squash closed the items they cited (pack sd:9666).
     """
     parents = parents or {}
 
@@ -354,7 +377,7 @@ def kept_commits(commits, parents=None) -> list:
         for target, mainline in _REVERTS.findall(message):
             undone |= ancestors(full(target)) - ancestors(full(mainline)) if mainline else {full(target)}
         if REVERT_SUBJECT.match(message):
-            undone |= {full(target) for target in _LISTED.findall(message)}
+            undone |= {full(target) for target in _listed_undone(message)}
         kept.append((sha, message))
     return kept
 
