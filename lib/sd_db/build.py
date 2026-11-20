@@ -640,9 +640,10 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
         # Who leaves is read from the members the retried run built (`run`), not from this filtered view: a member
         # whose item moved to done or planning (its blocked assignment cancelled, `UNBUILT`) or that is done since
         # by another build (sd:9015) is left out too, as one `only` omits, so the split guard reads the branch for
-        # its earlier work. A member an operator cancelled on its own (`ALONE`) left already (sd:9222).
+        # its earlier work. A member an operator cancelled on its own (`ALONE`) left already (sd:9222), and one
+        # Retry would not end (not `AGAIN`, as a member delivered `done` beside a skipped lead) stays as it is.
         built = [member for member in run(connection, last["id"])["members"][1:]
-                 if not (member["result"] or "").startswith(ALONE)]
+                 if member["status"] in AGAIN and not (member["result"] or "").startswith(ALONE)]
         items = reads.items_by_ids(connection, [current["item"], *(member["item"] for member in members + built)])
         # A done lead refuses: the claim would lead with a member, on a new branch and worktree.
         if _done(items, current["item"]):

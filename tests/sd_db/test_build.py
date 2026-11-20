@@ -656,6 +656,18 @@ class Writes(Case):
                 self.skip(self.items[0], question=question)
                 self.assertEqual([row["item"] for row in self.build_again(self.items[0])], [self.items[0]])
 
+    def test_a_plain_retry_of_a_skipped_lead_keeps_the_delivered_member(self):
+        """Review of build/sd-1242: a mixed bundle, its member delivered (`done`) and its lead skipped with a
+        question (`blocked`). A plain Retry of the lead cancelled the delivered member as left out, erasing its
+        delivery and holding the bundle for good; it leaves the member `done` and the bundle unsplit."""
+        self.skip(self.items[0], question=True)
+        build.end(self.db, self.bundle["id"], "done", "merged by fixture")
+        lead, member = (row["id"] for row in build.run(self.db, self.bundle["id"])["members"])
+        self.assertEqual([row["item"] for row in build.retry(self.db, lead, who="operator")["queued"]],
+                         [self.items[0]])
+        self.assertEqual(runner.queue_state(self.db, member)["status"], "done", "the delivery record stays")
+        self.assertEqual(build.split(self.db, lead), "", "no member left the bundle at this Retry")
+
     def test_a_delivered_member_still_holds_its_item(self):
         """Guard: at a lane step the run holds each member it delivers; the lane owns that item until the merge."""
         self.skip(self.items[1])
