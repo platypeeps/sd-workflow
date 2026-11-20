@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 
 from sd_db import usage
 
-__all__ = ["document", "parse_providers", "parse_services", "services", "strip"]
+__all__ = ["document", "down", "parse_providers", "parse_services", "services", "strip"]
 
 #: A provider or service name in a Settings list (system usage_sources.NAME).
 NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
@@ -300,7 +300,7 @@ def strip(connection: sqlite3.Connection, *, now: str) -> dict:
         except sqlite3.Error as failure:
             flags, flags_error = [], str(failure) or "the service status rows could not be read"
     except sqlite3.Error as failure:
-        return {"error": str(failure) or "the usage rows could not be read", "rows": [], "nosource": [],
+        return {"error": str(failure) or "the usage rows could not be read", "rows": [], "nosource": [], "down": [],
                 "providers": PROVIDERS_LIST, "services": SERVICES_LIST}
     by_provider: dict[str, list[dict]] = {}
     for found in flags:
@@ -359,5 +359,16 @@ def strip(connection: sqlite3.Connection, *, now: str) -> dict:
         if name not in readings:
             rows.append(_usage_row(f"usage:{name}", name, status="unknown", why=NO_READING, read_at=None, windows=[],
                                    balance=None, spend=None, flag=_flag(by_provider.get(name, []))))
-    return {"error": "", "rows": rows, "nosource": nosource, "flags_error": flags_error,
+    return {"error": "", "rows": rows, "nosource": nosource, "flags_error": flags_error, "down": down(flags, now),
             "providers": PROVIDERS_LIST, "services": SERVICES_LIST}
+
+
+def down(found: list[dict], now: str) -> list[dict]:
+    """The header's Service status dropdown (pack sd:9656): each watched service degraded or out, the outage first,
+    with its first incident and how long the oldest open one has lasted. An ok or unknown service is not down."""
+    out = [one for one in found if one["status"] in ("degraded", "outage")]
+    out.sort(key=lambda one: RANK[SERVICE_STATE[one["status"]]])
+    return [{"name": one["name"], "status": one["status"], "state": SERVICE_STATE[one["status"]],
+             "title": one["incidents"][0]["title"] if one["incidents"] else "",
+             "url": (one["incidents"][0]["url"] if one["incidents"] and one["incidents"][0]["url"] else one["url"]),
+             "lasted": lasted(one["incidents"], now)} for one in out]

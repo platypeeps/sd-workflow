@@ -277,8 +277,8 @@ class OperationsCLI(unittest.TestCase):
         self.assertIn("bulk_storage_root is unset", kwargs["why"])
         run.archive.assert_not_called()  # no bulk root: an ended run's logs stay local
         self.assertIn("claimed 1, drafted 0, spawned 1", output)
-        from sd_db import remote
-        kept = (remote.HubUnreachable, remote.BuildMismatch, sqlite3.OperationalError)  # pack sd:9541
+        from sd_db import hub, remote
+        kept = (remote.HubUnreachable, remote.BuildMismatch, hub.Fenced, sqlite3.OperationalError)  # sd:9574
         self.connect.assert_called_with(sd_db, write=True, keep=kept)
         self.connection.close.assert_called_once()
 
@@ -402,8 +402,8 @@ class OperationsCLI(unittest.TestCase):
                     self.assertEqual((code, json.loads(output)), (0, {"skipped": reason, "partial": partial}))
 
     def test_a_fenced_hub_still_exits_1(self):
-        """pack sd:9541 review: a demoted hub's write refusal is lasting, and a `Fenced` from the hub carries no
-        field that tells its Tailscale outage from a demotion. Neither skips."""
+        """pack sd:9541 review: a demoted hub's write refusal is lasting. A `Fenced` with no `cause`, as an old hub
+        sends, reads as lasting too (pack sd:9574). Neither skips."""
         from sd_db import hub, remote
         demoted = hub.Fenced(hub.demotion(Path("/db/sd.sqlite"), hub.Role(
             "elsewhere", "hub.example.test", "sd.hub_name names hub.example.test, and this node is old.example.test")))
@@ -414,6 +414,19 @@ class OperationsCLI(unittest.TestCase):
             for where in ("connect", "tick"):
                 with self.subTest(error=str(error)[:40], where=where):
                     self.assertEqual(self.outcome(self.builds(), error, where), (1, str(error)))
+
+    def test_a_tailscale_unnamed_fence_counts_in_the_streak(self):
+        """pack sd:9574: a hub whose Tailscale names no node raised `Fenced` with `cause` `tailscale` (sd:9543),
+        and each such tick exited 1 at once. It is an outage like an unreachable hub: two skip, the third exits 1."""
+        from sd_db import hub, remote
+        text = ("refused: this machine is not the hub: Tailscale does not name this node, so it cannot match "
+                "hub.example.test: this node is not connected to the Tailscale control plane")
+        unnamed = remote.rebuild_error(remote.describe_error(hub.Fenced(text, state="unknown", cause="tailscale")))
+        self.assertEqual(self.outcome(self.builds(), unnamed, "connect"), (0, f"skipped: {text}{FIRST}\n"))
+        code, output = self.outcome(self.builds(), unnamed, "tick")
+        self.assertEqual(code, 0)
+        self.assertIn("skipped (partial)", output)
+        self.assertEqual(self.outcome(self.builds(), unnamed, "connect"), (1, text))
 
     def test_only_a_hub_behind_exits_1_with_its_remedy(self):
         """pack sd:9541 review: a mismatch whose `upgrade` names the hub needs `repo-sync.sh refresh` there, which no

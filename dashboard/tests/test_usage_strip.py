@@ -156,6 +156,24 @@ class TheStrip(ScreenCase):
     def test_a_store_that_does_not_answer_is_its_reason_never_an_empty_strip(self):
         with mock.patch.object(usage_screen, "_newest", side_effect=sqlite3.OperationalError("database is locked")):
             self.assertEqual(self.strip()["error"], "database is locked")
+        self.assertEqual(self.strip()["down"], [])
+
+    def test_down_lists_each_degraded_or_out_service_worst_first(self):
+        """pack sd:9656: the header's Service status dropdown shows only while a watched service is degraded or out.
+        `down` holds those services, the outage first; an ok or unknown one is not down."""
+        status(self.connection, "github", status="degraded", url="https://status.example.test")
+        status(self.connection, "openai", status="outage", incidents=[
+            {"title": "API errors", "url": "https://status.example.test/incidents/9", "started_at": "2026-09-06T11:00:00Z"}])
+        status(self.connection, "slack", status="ok")
+        status(self.connection, "stale", status="outage", read_at="2026-09-06T10:00:00Z")
+        self.assertEqual(self.strip()["down"], [
+            {"name": "openai", "status": "outage", "state": "warning", "title": "API errors",
+             "url": "https://status.example.test/incidents/9", "lasted": "1h"},
+            {"name": "github", "status": "degraded", "state": "caution", "title": "",
+             "url": "https://status.example.test", "lasted": ""}])
+        status(self.connection, "openai", status="ok", timestamp="2026-09-06T11:58:00Z")
+        status(self.connection, "github", status="ok", timestamp="2026-09-06T11:58:00Z")
+        self.assertEqual(self.strip()["down"], [])
 
 
 USAGE = re.search(r"^  // usage:start\n(.*?)^  // usage:end$", SHELL_JS, re.S | re.M)
