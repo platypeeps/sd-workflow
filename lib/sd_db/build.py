@@ -93,6 +93,8 @@ STUCK_TICKS = 3
 RETRIES = 1
 # The note on an item a blocked run parked (pack sd:6132).
 PARKED = "Parked: build run {run} ended blocked; Retry on the Builds panel unparks it"
+# The note on an item whose retried bundle a reopened dependency held at its claim (review of sd:9570).
+WAIT_PARKED = "Parked: build assignment {lead}'s bundle waits ({held}); Retry on the Builds panel unparks it"
 # The note on an item a cancelled run parked: auto-pickup takes unparked items only (sd:9222).
 CANCEL_PARKED = "Parked: build run {run} was cancelled; Unpark to build it again"
 
@@ -1240,8 +1242,12 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             # A bundle that ran before holds whole: a member left queued would lead a new branch and worktree, and
             # Retry would lose the checkout it resumes (review of sd:9570).
             held = "; ".join(f"item {row['item']} {why}" for row, why in waiting)
+            stamp = clock()
             for row in bundle:
                 _refuse(connection, row, f"its bundle waits: {held}")
+                # Parked, as a blocked run parks its items: auto-pickup takes unparked items only, so no member is
+                # built alone on a new branch; Retry unparks them onto this one (review of sd:9570).
+                park(connection, row["item"], ("ready",), stamp, WAIT_PARKED.format(lead=bundle[0]["id"], held=held))
         if waiting:
             return None
         lead = bundle[0]["id"]

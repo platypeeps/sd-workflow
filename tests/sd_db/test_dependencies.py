@@ -139,6 +139,22 @@ class TheBuild(DependencyCase):
         build.retry(self.db, run["assignment"], who="operator")
         self.assertEqual(self.claim()["branch"], run["branch"])
 
+    def test_auto_pickup_does_not_split_a_held_retried_bundle(self):
+        """Review of build/sd-1306: the held bundle's items stayed ready and unparked, so the next pickup built the
+        free member on a new branch. The hold parks them; Retry unparks them onto the original branch."""
+        first, lead, member = self.item(status="done"), self.item(), self.item()
+        run = self.blocked_bundle(lead, member)
+        self.wait(lead, first)
+        build.retry(self.db, run["assignment"], who="operator")
+        change_status(self.db, first, "planning", who="operator")
+        self.assertIsNone(self.claim())
+        build.set_pickup(self.db, True, now=NOW)
+        self.assertEqual(build.pickup(self.db, build.room(self.db, **IDLE), now=NOW), [], "no member built alone")
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment"), 2)
+        change_status(self.db, first, "done", who="operator")
+        build.retry(self.db, run["assignment"], who="operator")
+        self.assertEqual([m["item"] for m in self.claim()["members"]], [lead, member])
+
     def test_every_queue_path_runs_item(self):
         """Failure table row 5: each function in `build` that writes a build assignment or starts one reads the set,
         through `_item` or `waiting_on`. A new path that does neither fails here."""
