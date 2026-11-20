@@ -50,7 +50,7 @@ from .runner import (
     restoration_pending,
 )
 from .ship import this_host
-from .workflow import item_area
+from .workflow import item_area, item_blocked_by
 from .writes import (
     add_note,
     cancel_unwanted_blocked,
@@ -450,6 +450,9 @@ def _item(connection, item: int, *, lead: int | None = None) -> dict:
                            f"{', '.join(RUNNABLE_KINDS[:-1])} and {RUNNABLE_KINDS[-1]} items")
     if row["status"] != "ready":
         raise BuildRefused(f"item {item} is {row['status']}; a build takes a ready item")
+    waiting = waiting_on(connection, row)
+    if waiting:
+        raise BuildRefused(f"item {item} {waiting}")
     refused = _repo_refusal(row, connection)
     if refused:
         raise BuildRefused(refused)
@@ -468,6 +471,26 @@ def _item(connection, item: int, *, lead: int | None = None) -> dict:
     if held:
         raise BuildRefused(held)
     return dict(row)
+
+
+def waiting_on(connection, row) -> str:
+    """What the item `row` waits on, as "waits on sd:M", or "" (pack sd:9570): each item its `fields.blocked_by`
+    names that is not done. Read where a build is chosen, so nothing runs on a done. Fails closed: fields that cannot
+    be read, or a named item gone, hold it too."""
+    try:
+        named = item_blocked_by(row)
+    except ValueError as error:
+        return f"may wait on an item: its {error}"
+    if not named:
+        return ""
+    marks = ", ".join("?" for _ in named)
+    found = {other["id"]: other["status"] for other in connection.execute(
+        f"SELECT id, status FROM item WHERE id IN ({marks})", named)}
+    gone = [other for other in named if other not in found]
+    if gone:
+        return f"waits on sd:{gone[0]}, which no longer exists; clear it with sd task edit --blocked-by"
+    held = [other for other in named if found[other] != "done"]
+    return f"waits on {', '.join(f'sd:{other}' for other in held)}" if held else ""
 
 
 #: A status change into a wait that gave its reason: `<from> -> <to> by <who>: <reason>` (writes.transition).
@@ -1195,6 +1218,13 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             others = [row for row in others if kin(best, row)] if beside(best) else [
                 row for row in others if not beside(row)]
         bundle = _bundle(connection, [best, *others])
+        # A dependency reopened since the press holds the build: dispatch's start reads it too (pack sd:9570).
+        waiting = [(row, why) for row in bundle if (why := waiting_on(connection, connection.execute(
+            "SELECT id, fields FROM item WHERE id = ?", (row["item"],)).fetchone()))]
+        for row, why in waiting:
+            _refuse(connection, row, f"item {row['item']} {why}")
+        if waiting:
+            return None
         lead = bundle[0]["id"]
         ids = [row["id"] for row in bundle]
         marks = ", ".join("?" for _ in ids)

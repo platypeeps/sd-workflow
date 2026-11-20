@@ -732,7 +732,7 @@
       const cost = a => `${a.estimated ? '~' : ''}$${Number(a.usd).toFixed(2)}`;
       const open = d.notes.filter(n => n.kind === 'followup' && !n.resolved).length;
       const docs = d.documents || [];
-      return html`${desc}${baseOf(t, d)}${pull(d)}
+      return html`${desc}${baseOf(t, d)}${pull(d)}${waitsOn(t, d.blocked_by || [])}
         <h3>Documents ${src('Documents', `The files linked to this task: its path, its work folder, design files that name sd:${t.id}, and paths its notes name.`)}</h3>
         ${docs.length ? html`<ol class="rec">${docs.map(x => html`<li><span>${x.url ? html`<a class="ext" href="${x.url}" target="_blank" rel="noopener noreferrer">${x.path}</a>` : html`<code>${x.path}</code>`} <small>${x.why}</small></span></li>`)}</ol>` : html`<p class="why">No design or document names this item.</p>`}
         ${published(t, d.published || [])}
@@ -751,6 +751,13 @@
     }
     // sd:3465: where the item's work was published, each URL under its document's title; tasks_screen._published sets
     // `href` only for an address the page may open, so any other shows as text. Nothing published shows no section.
+    // pack sd:9570: the items this one waits on (`sd task edit --blocked-by`), each with its status; no build takes
+    // it until each is done. Read-only; an item that waits on nothing shows no section.
+    function waitsOn(t, list) {
+      if (!list.length) return '';
+      return html`<h3>Waits on ${src('Waits on', 'The items this one waits on; no build takes it until each is done.', `sd task show ${t.id}`)}</h3>
+        <ol class="rec">${list.map(x => html`<li><span><b>sd:${String(x.id)}</b> ${x.title ? html`${x.title} ` : ''}<small>${x.status ? `${x.status}${x.repo ? ` · ${String(x.repo).split('/').pop()}` : ''}` : 'no such item'}</small></span></li>`)}</ol>`;
+    }
     function published(t, list) {
       if (!list.length) return '';
       return html`<h3>Published ${src('Published', 'Where this work was published, under each document\'s title.')}</h3>

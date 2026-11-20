@@ -174,6 +174,19 @@ class TheDocuments(ScreenCase):
         details = tasks_screen.details(self.connection, self.ids["plan"], now=NOW)
         self.assertEqual(details["allowed"], workflow.allowed_statuses(self.connection, self.ids["plan"]))
 
+    def test_the_details_carry_each_item_the_task_waits_on(self):
+        # pack sd:9570: `blocked_by` names each item `fields.blocked_by` holds, with its title, status and repo; a
+        # missing one keeps its id.
+        plan, port = self.ids["plan"], self.ids["port"]
+        self.assertEqual(tasks_screen.details(self.connection, plan, now=NOW)["blocked_by"], [])
+        workflow.edit_item(self.connection, plan, {"blocked_by": [port]}, who="test")
+        self.connection.execute("UPDATE item SET fields = json_set(fields, '$.blocked_by', json('[%d, 999999]')) "
+                                "WHERE id = ?" % port, (plan,))
+        row = reads.item_by_id(self.connection, port)
+        self.assertEqual(tasks_screen.details(self.connection, plan, now=NOW)["blocked_by"], [
+            {"id": port, "title": row["title"], "status": row["status"], "repo": row["repo"]},
+            {"id": 999999, "title": None, "status": None, "repo": None}])
+
     def test_the_details_carry_the_work_controls_for_a_work_item_only(self):
         # sd:2200: relink and cancel are on where progress.work_controls says the mutation would take them.
         from sd_db import progress
@@ -1327,6 +1340,20 @@ change('det-area', 'lab'); await flush();""", self.AREA_ECHO,
         state = workflow.edit_item(self.connection, plan, {"kind": "work-idea", "repo": None}, who="test")
         self.assertEqual((state["item"]["kind"], state["item"]["repo"]), ("work-idea", None))
         self.assertEqual(workflow.edit_item(self.connection, plan, {"kind": "task"}, who="test")["item"]["kind"], "task")
+
+    def test_the_waits_on_section_lists_each_item_the_task_waits_on_with_its_status(self):
+        # pack sd:9570: the Details show `fields.blocked_by`, each item with its title and status, read-only; an item
+        # that waits on nothing shows no section. The text is the page's to escape.
+        plan, ask, port = self.ids["plan"], self.ids["ask"], self.ids["port"]
+        self.details[str(plan)]["blocked_by"] = [
+            {"id": port, "title": "Port <the> page", "status": "in_progress", "repo": "~/repos/example/anvil"},
+            {"id": 999999, "title": None, "status": None, "repo": None}]
+        out = self.run_page(f"open({plan}); await flush(); R.plan = ELS.details.html; open({ask}); await flush(); R.ask = ELS.details.html;")
+        html = out["R"]["plan"]
+        self.assertIn("<h3>Waits on ", html)
+        self.assertIn(f'<li><span><b>sd:{port}</b> Port &lt;the&gt; page <small>in_progress · anvil</small></span></li>', html)
+        self.assertIn("<li><span><b>sd:999999</b> <small>no such item</small></span></li>", html)
+        self.assertNotIn("<h3>Waits on ", out["R"]["ask"])
 
     def test_the_published_section_links_each_url_under_its_documents_title(self):
         # sd:3465: the Details link where the item's work was published; an address that is not a link stays text, and an

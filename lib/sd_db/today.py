@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from . import hub
-from .build import HEALTH
+from .build import HEALTH, waiting_on
 from .reads import (
     IDEA_KINDS,
     REVIEW_BATCH,
@@ -430,7 +430,9 @@ def queues(connection: sqlite3.Connection, *, repos: Iterable[str | None] | None
     built = builds(connection, repos=keep)
     building = {row["item"] for row in built}
     found = [{"queue": "ready", "id": row["id"], "repo": row["repo"], "title": row["title"], "status": "ready",
-              "detail": f"P{row['priority']}" if row["priority"] is not None else "-", "since": row["status_since"]}
+              "detail": " · ".join(part for part in (f"P{row['priority']}" if row["priority"] is not None else "-",
+                                                     waiting_on(connection, row)) if part),
+              "since": row["status_since"]}
              for row in backlog_items(connection, status="ready", now=now)
              if (keep is None or row["repo"] in keep) and row["id"] not in building and not row["scheduled"]]
     found += [{"queue": "build", "id": row["item"], "repo": row["repo"], "title": row["title"], "status": row["status"],

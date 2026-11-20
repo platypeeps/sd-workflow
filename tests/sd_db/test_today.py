@@ -161,6 +161,14 @@ class TheSections(TodayCase):
         self.assertEqual([row["id"] for row in today.queues(self.connection, repos=[LIB], now=NOW)], [stuck])
         self.assertEqual(today.sections(self.connection, now=NOW)["summary"]["queues"], 5)
 
+    def test_a_ready_item_that_waits_names_what_it_waits_on(self):
+        """Pack sd:9570: a ready item whose `blocked_by` names an open item says so in its Queues detail."""
+        first = self.item("First", repo=APP, status="planning")
+        waits = self.item("Waits", repo=APP, status="ready", priority=2, fields={"blocked_by": [first]})
+        rows = today.queues(self.connection, now=NOW)
+        self.assertEqual([(row["id"], row["detail"]) for row in rows if row["queue"] == "ready"],
+                         [(waits, f"P2 · waits on sd:{first}")])
+
     def test_a_failure_is_due_for_a_push_once_and_a_success_never(self):
         """Pack sd:6946: a push only when a lane entry or a build fails or blocks, once per entry."""
         failed, merged = self.item("Failed", repo=APP), self.item("Merged", repo=APP)

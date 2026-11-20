@@ -41,6 +41,9 @@ An item's Experiments field (sd:4639) shows its designation for the team experim
 `POST /api/items/<id>/experiment` sends the values `sd task edit <id> --experiment` takes to `projection.designate`;
 a pack without the projection turns the field off. Published links the row once a drain records its URL.
 
+Waits on (pack sd:9570) lists each item `sd task edit <id> --blocked-by` named, with its status and repo, read-only.
+An item that waits on nothing shows no section.
+
 A v1 `/backlog` address answers 301 to `/tasks` with the query v1 read
 (`tasks_screen.from_backlog`, sd:2356); a repository path becomes the label
 Tasks filters on. v1's screen and its run selection were deleted in sd:2622;
