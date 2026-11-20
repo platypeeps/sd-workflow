@@ -310,6 +310,18 @@ class CitedIdTests(unittest.TestCase):
         notes = (revert, f"docs: history\n\nEarlier commits:\n\n- {undone[:9]} renew\n")
         self.assertEqual(sd_ship_body.cited_ids("", [notes, *commits[1:]]), (4, 3, 2))
 
+    def test_a_hand_revert_undoes_only_the_list_it_says_it_reverted(self) -> None:
+        """pack sd:9666 review: a sha-led bullet under `Kept commits:`, or in a fenced example, counted as
+        an undo, and the commits' `Closes:` and review-fix citations dropped."""
+        undone, kept, quoted, revert = "a" * 40, "b" * 40, "c" * 40, "d" * 40
+        commits = [(revert, f"revert: split the renewal out\n\nReverted commits:\n\n"
+                            f"- {undone[:9]} renew\n\nKept commits:\n\n- {kept[:9]} shared\n\n"
+                            f"Reverted as below, for example:\n\n```\n- {quoted[:9]} example\n```\n"),
+                   (kept, "fix: shared\n\nLane review fix, pack sd:5: y.\n\nCloses: sd:4\n"),
+                   (quoted, "fix: other\n\nCloses: sd:3\n"),
+                   (undone, "feat: renew\n\nCloses: sd:2\n")]
+        self.assertEqual(sd_ship_body.cited_ids("", commits), (4, 3, 5))
+
     def test_a_merge_the_branch_reverts_cites_nothing_it_brought_in(self) -> None:
         """Lane review of sd:5999, round 3: `git revert -m 1 <merge>` undoes each commit the merge brought in."""
         base, side, main, merge, undo, again = (c * 40 for c in "abcdef")
