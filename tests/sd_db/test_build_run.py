@@ -1258,6 +1258,48 @@ class Supervise(Case):
         """Row 18: an ignored local config outside a `DISPOSABLE` folder, which `kept_files` counts."""
         self.assert_split_first(self.left_out_of_a_retry(self.leftover("ignored")))
 
+    def pending(self, state):
+        """`prepare` that leaves `state`, an unfinished Git operation, over a clean tree at the base: HEAD and
+        `git status --porcelain` match a fresh start, so only the operation's state file tells."""
+        def shape(work, commit):
+            support.git(work, "reset", "-q", "--hard", "origin/main")
+            if state == "MERGE_HEAD":
+                # The finding's own form: `-s ours` keeps the tree; the next commit would take `commit` as a parent.
+                support.git(work, "merge", "--no-commit", "--no-ff", "-s", "ours", commit)
+            else:
+                path = Path(work, support.git(work, "rev-parse", "--git-path", state).strip())
+                if state.startswith("rebase-"):
+                    path.mkdir()
+                    (path / "head-name").write_text("refs/heads/example\n")
+                else:
+                    path.write_text(commit + "\n")
+            self.assertEqual(support.git(work, "status", "--porcelain").strip(), "", "the tree must look clean")
+        return shape
+
+    def test_a_split_guard_holds_a_pending_merge(self):
+        """Round 12 class pass, an unfinished Git operation the clean tree hides; row 20: MERGE_HEAD."""
+        self.assert_split_first(self.left_out_of_a_retry(self.pending("MERGE_HEAD")))
+
+    def test_a_split_guard_holds_a_pending_cherry_pick(self):
+        """Row 21: CHERRY_PICK_HEAD."""
+        self.assert_split_first(self.left_out_of_a_retry(self.pending("CHERRY_PICK_HEAD")))
+
+    def test_a_split_guard_holds_a_pending_revert(self):
+        """Row 22: REVERT_HEAD."""
+        self.assert_split_first(self.left_out_of_a_retry(self.pending("REVERT_HEAD")))
+
+    def test_a_split_guard_holds_a_pending_rebase_merge(self):
+        """Row 23: rebase-merge/, an interactive or merge-backend rebase."""
+        self.assert_split_first(self.left_out_of_a_retry(self.pending("rebase-merge")))
+
+    def test_a_split_guard_holds_a_pending_rebase_apply(self):
+        """Row 24: rebase-apply/, an apply-backend rebase or `git am`."""
+        self.assert_split_first(self.left_out_of_a_retry(self.pending("rebase-apply")))
+
+    def test_a_split_guard_holds_a_pending_bisect(self):
+        """Row 25: BISECT_LOG, a bisect that checks out other commits."""
+        self.assert_split_first(self.left_out_of_a_retry(self.pending("BISECT_LOG")))
+
     def test_a_split_guard_passes_an_ignored_cache(self):
         """Row 19: an ignored file under a `DISPOSABLE` folder is a cache no builder inherits as work."""
         supervisor = self.left_out_of_a_retry(self.leftover("cache"))

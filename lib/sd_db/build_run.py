@@ -435,6 +435,17 @@ def kept_files(git: Collection[str], work: str, *, env: dict | None = None) -> s
         line.startswith("!! ") and DISPOSABLE.intersection(line[3:].strip('"').split("/")[:-1])))
 
 
+# Git's state for an operation a worktree has not finished; each can carry commits the tree does not show.
+UNFINISHED = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "BISECT_LOG")
+
+
+def unfinished(git: Collection[str], work: str, *, env: dict | None = None) -> list[str]:
+    """The `UNFINISHED` names present in `work`, read where Git keeps them for that worktree (`--git-path`)."""
+    argv = [*git, "-C", work, "rev-parse", *(arg for name in UNFINISHED for arg in ("--git-path", name))]
+    paths = _read(argv, env=env).splitlines()
+    return [name for name, path in zip(UNFINISHED, paths, strict=True) if Path(work, path).exists()]
+
+
 def lane_entry(ship: list[str], cwd: Path | str, items: Collection[int], *, env: dict | None = None) -> dict | None:
     """The newest lane entry of any of `items` by enqueue order, from `sd-ship lane list`; None when there is none.
 
@@ -1170,7 +1181,9 @@ class Supervisor:
                             env=self.env).split()
             # Ignored files count too: a left item's local config is work a builder would inherit.
             dirty = kept_files(self.tools.git, str(self.work), env=self.env)
-            if not commits and not dirty:
+            # A pending merge leaves HEAD and status as they were; the next commit would take its parent.
+            pending = unfinished(self.tools.git, str(self.work), env=self.env)
+            if not commits and not dirty and not pending:
                 if not build.write(self.db, self.ident, base_head=head):
                     raise Lost
                 return None
