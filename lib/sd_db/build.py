@@ -102,6 +102,17 @@ def beside(row) -> bool:
     return type(row["priority"]) is int and row["priority"] <= BESIDE_PRIORITY
 
 
+#: A queued build row's bundle lead's item priority: a retried bundle takes room by its lead, as `room` counts its
+#: run, never by a member raised to P1 since (review of sd:9700).
+LEAD_PRIORITY = ("(SELECT lead.priority FROM assignment AS head JOIN item AS lead ON lead.id = head.item "
+                 "WHERE head.id = COALESCE(assignment.parent, assignment.id)) AS lead_priority")
+
+
+def _leads_beside(row) -> bool:
+    """Whether a queued build row's bundle builds beside its repository's bundle: its lead is P1 (sd:9700)."""
+    return beside({"priority": row["lead_priority"]})
+
+
 def kin(lead, row) -> bool:
     """Whether `row` builds in the P1 `lead`'s bundle: an item of the lead's own area, never of none (sd:9700)."""
     area = item_area(lead)
@@ -849,9 +860,10 @@ def pickup(connection, available: dict, *, now: str | None = None) -> list[int]:
     # Only this host's presses hold it: the hub never claims a satellite's.
     hosts = lane_hosts(connection)
     if any(_route(connection, row["lane_host"], _lead(row)) in hosts
-           and room_for(available, row["repo"], p1=beside(row)) > 0
+           and room_for(available, row["repo"], p1=_leads_beside(row)) > 0
            for row in connection.execute(
-            "SELECT assignment.id, assignment.parent, assignment.run_count, item.repo, item.priority, repo.lane_host "
+            f"SELECT assignment.id, assignment.parent, assignment.run_count, item.repo, {LEAD_PRIORITY}, "
+            "repo.lane_host "
             "FROM assignment JOIN item ON item.id = assignment.item "
             "LEFT JOIN repo ON repo.path = item.repo WHERE assignment.status = 'queued' AND assignment.scope = ?",
             (SCOPE,))):
@@ -1181,7 +1193,8 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             _requeue_beat_blocked(connection, hosts)
         queued = connection.execute(
             "SELECT assignment.id, assignment.item, assignment.parent, assignment.run_count, item.repo, "
-            "item.priority, item.fields, repo.lane_host FROM assignment JOIN item ON item.id = assignment.item "
+            f"item.priority, item.fields, {LEAD_PRIORITY}, repo.lane_host "
+            "FROM assignment JOIN item ON item.id = assignment.item "
             "LEFT JOIN repo ON repo.path = item.repo "
             "WHERE assignment.status = 'queued' AND assignment.scope = ? AND item.repo IS NOT NULL "
             "ORDER BY item.priority IS NULL, item.priority, assignment.queued_at, assignment.id", (SCOPE,)).fetchall()
@@ -1208,7 +1221,7 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
         if available["why"]:
             return None
         queued = [row for row in queued if lanes[row["id"]] in hosts and not _refused_repo(connection, row)]
-        best = next((row for row in queued if room_for(available, row["repo"], p1=beside(row)) > 0), None)
+        best = next((row for row in queued if room_for(available, row["repo"], p1=_leads_beside(row)) > 0), None)
         if best is None:
             return None
         repo = best["repo"]
@@ -1223,6 +1236,12 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             "SELECT id, fields FROM item WHERE id = ?", (row["item"],)).fetchone()))]
         for row, why in waiting:
             _refuse(connection, row, f"item {row['item']} {why}")
+        if waiting and (bundle[0]["parent"] is not None or bundle[0]["run_count"]):
+            # A bundle that ran before holds whole: a member left queued would lead a new branch and worktree, and
+            # Retry would lose the checkout it resumes (review of sd:9570).
+            held = "; ".join(f"item {row['item']} {why}" for row, why in waiting)
+            for row in bundle:
+                _refuse(connection, row, f"its bundle waits: {held}")
         if waiting:
             return None
         lead = bundle[0]["id"]

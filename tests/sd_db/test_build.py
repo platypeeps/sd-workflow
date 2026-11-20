@@ -362,6 +362,27 @@ class Claim(Case):
         build.end(self.db, ordinary["id"], "cancelled", "the operator cancelled it")
         self.assertEqual([m["item"] for m in self.claim()["members"]], [later], "P1 runs hold no ordinary slot")
 
+    def test_a_retried_bundle_takes_room_by_its_leads_priority(self):
+        """Review of build/sd-1306: a member raised to P1 made its ordinary retried bundle bypass the repository
+        cap, in the claim and in pickup's queued-work check. The bundle's lead decides, as `room` counts it."""
+        lead, member = self.item(priority=2), self.item(priority=2)
+        build.queue(self.db, [lead, member], who="operator")
+        run = self.claim()
+        build.write(self.db, run["id"], step="building")
+        build.end(self.db, run["id"], "blocked", "the builder stopped")
+        for table in ("runner_run", "runner_lease"):
+            self.db.execute(f"UPDATE {table} SET released_at = ? WHERE {'id' if table == 'runner_run' else 'run'} = ?",
+                            ("2026-01-01T00:00:00Z", run["id"]))
+        build.queue(self.db, [self.item(priority=3)], who="operator")
+        self.claim()
+        build.retry(self.db, run["assignment"], who="operator")
+        self.db.execute("UPDATE item SET priority = 1 WHERE id = ?", (member,))
+        self.assertIsNone(self.claim(), "the ordinary bundle waits for the repository's running one")
+        build.set_pickup(self.db, True)
+        self.item(repo=B, priority=2)
+        self.assertEqual(len(build.pickup(self.db, build.room(self.db, **IDLE))), 1,
+                         "a press with no room holds nothing")
+
     def test_a_p1_item_bundles_only_with_items_of_its_own_area(self):
         """sd:9700: a P1 item with an area takes the queued items of that area, whatever their priority."""
         home = {"area": "home"}
