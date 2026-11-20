@@ -89,6 +89,19 @@ class TheReopen(DependencyCase):
         self.assertEqual(self.fields(first), {"blocked_by": [third]})
 
 
+class TheOtherStarts(DependencyCase):
+    """Class pass: every path that starts work on an item reads what it waits on, as the Build press does."""
+
+    def test_a_runner_enqueue_refuses_an_author_run_of_an_item_that_waits(self):
+        from sd_db import runner
+        first, item = self.item(status="planning"), self.item()
+        self.db.execute("UPDATE item SET branch = 'work/x' WHERE id = ?", (item,))
+        self.wait(item, first)
+        with self.assertRaisesRegex(runner.RunnerRefused, f"item {item} waits on sd:{first}"):
+            runner.enqueue(self.db, [item], who="operator")
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment"), 0)
+
+
 class TheBuild(DependencyCase):
     def test_an_item_without_the_key_builds_as_before(self):
         item = self.item()

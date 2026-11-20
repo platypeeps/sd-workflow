@@ -164,6 +164,14 @@ def enqueue(connection, items: list[int], *, parallel=False, role="author", scop
                 if item_state(connection, item)["revision"] != expected:
                     raise RunnerRefused(f"item {item} changed; refresh the selection")
         selected = [_item(connection, item, delivery=role == "merge") for item in items]
+        if role == "author":
+            # An author run builds the item, so it reads what the item waits on as the Build press does
+            # (pack sd:9570). Read when the rule runs: `build` imports this module.
+            from .build import waiting_on
+
+            for chosen in selected:
+                if waiting := waiting_on(connection, chosen):
+                    raise RunnerRefused(f"item {chosen['id']} {waiting}")
         pairs = {}
         for item in selected:
             pair = item["repo"], item["branch"]
