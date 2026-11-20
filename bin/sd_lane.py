@@ -4281,8 +4281,7 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
         return inline_lane(lambda: run_lane(checkout, environ, ship, gate, note, clock() + budget))
     # A skipped lane is skipped only where it is hosted: elsewhere it is settled as before, and it keeps
     # its wait and flake reports below; its own `lane run -C` job refuses on a machine that does not host it.
-    lanes += [{"path": path, "skipped": "its own job runs this lane (--skip)"}
-              for path, checkout in hosted if checkout.resolve() in skipped]
+    lanes += skip_rows(hosted, others, skipped)
     order = longest_waiting_first([lane for lane in hosted if lane[1].resolve() not in skipped], environ)
     lanes += run_parallel(order, start or inline, deadline, functools.partial(lane_room, environ),
                           functools.partial(new_work, environ), cap=lane_parallel(environ))
@@ -4291,6 +4290,19 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
             if asked:
                 lanes.append(asked)
     return {"lanes": lanes}
+
+
+def skip_rows(hosted: list[tuple[str, pathlib.Path]], others: list[tuple[str, pathlib.Path]],
+              skipped: set[pathlib.Path]) -> list[dict[str, Any]]:
+    """A row per hosted lane `--skip` names, and per `--skip` that names no managed checkout.
+
+    A typo once said nothing, so the lane it meant ran here and in its own job (pack sd:9669).
+    """
+    known = {checkout.resolve() for _, checkout in hosted + others}
+    return ([{"path": path, "skipped": "its own job runs this lane (--skip)"}
+             for path, checkout in hosted if checkout.resolve() in skipped]
+            + [{"path": str(path), "skipped": "--skip names no managed checkout", "code": "skip_unknown"}
+               for path in sorted(skipped - known)])
 
 
 def new_work(environ: dict[str, str],
