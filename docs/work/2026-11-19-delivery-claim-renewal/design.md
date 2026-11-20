@@ -61,7 +61,7 @@ the `renewed` mark in `bin/sd-ship`. Tests are in
 | merge read of scope | none | the item changed after the claim | refuses; nothing merged; renew by hand | `test_a_scope_change_before_the_merge_says_nothing_merged` |
 | reconcile read of scope | `merged`, the closing set | the item changed after the merge | refuses; the advice delivers by hand | `test_a_scope_change_after_the_merge_gives_the_merged_advice` |
 | lane retry after a renewal | none | old items or evidence | refuses `delivery_claim_renewed` | `test_a_lane_retry_of_an_entry_older_than_a_renewal_refuses`, `test_a_lane_retry_with_the_items_a_renewal_dropped_refuses` |
-| `renewed` mark | kept on every later claim | a new enqueue with new evidence refuses too | a prepare by hand; the fix is pack sd:9580 | `test_a_lane_retry_of_an_entry_older_than_a_renewal_refuses` |
+| `renewed` mark | kept on every later claim | a new enqueue with new evidence refuses too | sd:9580, next PR; no fix here (ruling #64736) | `test_a_lane_retry_of_an_entry_older_than_a_renewal_refuses` |
 
 ## Acceptance criteria
 
