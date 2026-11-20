@@ -321,9 +321,8 @@ def _open_row(connection, run: dict, now: str) -> dict:
                       reason=current["capabilities"]["cancel"]["reason"])
     except (SdDbError, sqlite3.Error) as failure:
         cancel["reason"] = f"the assignment was not read: {failure}"
-    if cancel["allowed"] and run["cancel_requested"]:
-        cancel.update(allowed=False, reason=f"{run['cancel_requested']}; the supervisor stops at its next beat")
-    elif cancel["allowed"] and step not in build.CANCELLABLE:
+    # A requested cancel refuses in `assignment_state`, its reason naming the request (pack sd:9375).
+    if cancel["allowed"] and step not in build.CANCELLABLE:
         cancel.update(allowed=False, reason=f"the run is at {step}; " + build.stop_step(
             connection, run["id"], members[0]["item"] if members else "<item>"))
     return {"run": run["id"], "attempt": run["run"], "repo": run["repo"], "name": Path(run["repo"]).name, "host": host,
@@ -332,7 +331,7 @@ def _open_row(connection, run: dict, now: str) -> dict:
             "beat": beat, "quiet": quiet, "usd": round(build.run_spent(connection, run["id"]), 2),
             "log": run["log_path"] or "", "branch": run["branch"] or "", "worktree": run["work_path"] or "",
             "pull": build.pull_url(connection, run["repo"], run["branch"], [member["item"] for member in members]),
-            "cancel": cancel}
+            "cancel": cancel, "cancel_requested": run["cancel_requested"] or ""}
 
 
 def _teammate_row(connection, run: dict, now: str) -> dict:

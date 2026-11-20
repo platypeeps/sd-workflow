@@ -416,14 +416,19 @@ def _details(connection, item: int, *, now: str) -> dict:
     assignments = []
     for assignment in reads.item_assignments(connection, item):
         held = operations.assignment_state(connection, assignment["id"])
+        queued_build = assignment["scope"] == build.SCOPE and assignment["status"] == "queued"
+        members = build.queued_members(connection, assignment["id"]) if queued_build else []
+        ending = (assignment["id"], *(ident for ident, _ in members))
         assignments.append({
             "id": assignment["id"], "role": assignment["role"], "provider": assignment["provider"],
             "scope": assignment["scope"], "status": assignment["status"], "started": assignment["started"], "ended": assignment["ended"],
             "usd": assignment["usd"], "estimated": bool(assignment["estimated"]),
             "revision": held["revision"], "cancel": held["capabilities"]["cancel"],
-            # The items a cancel of this queued build lead also cancels and parks (sd:9222).
-            "members": [item for _, item in build.queued_members(connection, assignment["id"])]
-            if assignment["scope"] == build.SCOPE and assignment["status"] == "queued" else [],
+            # The items a cancel of this queued build lead also cancels (sd:9222), and of its own item and
+            # those, the ones the cancel parks, by `build.park`'s rule (pack sd:9290).
+            "members": [member for _, member in members],
+            "parks": [one for one in (assignment["item"], *(member for _, member in members))
+                      if queued_build and one is not None and build.parks(connection, one, ("ready",), ending)],
         })
     return {
         "read": now, "item": state["item"], "revision": state["revision"],

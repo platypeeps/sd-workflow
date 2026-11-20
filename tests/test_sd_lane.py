@@ -98,6 +98,32 @@ with mock.patch.object(sd_lane, "end_group", noted), \\
 """
 
 
+#: A child that ignores TERM and starts a session below it (pack sd:9392).
+DEAF_CHILD = ('CHILD = "import os, pathlib, signal, subprocess, sys, time; '
+              'signal.signal(signal.SIGTERM, signal.SIG_IGN); '
+              "below = subprocess.Popen(['sleep', '60'], start_new_session=True); "
+              "pathlib.Path(sys.argv[1] + '.below').write_text(str(below.pid)); "
+              'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)"')
+#: A child that starts `sleep 60` in a session below it, holding no pipe, and dies on TERM at once (pack sd:9392).
+QUITTER_CHILD = ('CHILD = "import os, pathlib, subprocess, sys, time; '
+                 "below = subprocess.Popen(['sleep', '60'], start_new_session=True, stdout=subprocess.DEVNULL, "
+                 "stderr=subprocess.DEVNULL); "
+                 "pathlib.Path(sys.argv[1] + '.below').write_text(str(below.pid)); "
+                 'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)"')
+
+
+def interrupt_first(real: Any) -> Any:
+    """A stand-in for `real` whose first call raises KeyboardInterrupt and whose later calls pass through."""
+    calls = [0]
+
+    def read() -> Any:
+        calls[0] += 1
+        if calls[0] == 1:
+            raise KeyboardInterrupt
+        return real()
+    return read
+
+
 def end_group(group: int) -> None:
     """Kill a group a failed test left running; one already gone is fine."""
     with contextlib.suppress(OSError):
@@ -5690,6 +5716,65 @@ class HostedOrder(Lane):
             sd_lane.run_hosted(self.environ, self.ship)
         self.assertEqual(order, [later, self.repo])
 
+    def test_a_skipped_lane_never_runs_in_the_hosted_run(self) -> None:
+        """pack sd:9668. One long lane kept the shared run alive past its budget, so launchd started no tick
+        and every other lane waited. That lane gets its own job; the hosted run leaves it to that job."""
+        later = self.tmp / "zeta"
+        later.mkdir()
+        git(later, "init", "-q", "-b", "main")
+        git(later, "remote", "add", "origin", "https://github.com/example/zeta.git")
+        import sd_db
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            for path, remote in ((self.repo, "pack"), (later, "zeta")):
+                sd_db.upsert_repo(connection, str(path), remote=f"https://github.com/example/{remote}.git", managed=1)
+        finally:
+            connection.close()
+        for checkout, item in ((self.repo, 1), (later, 2)):
+            sd_lane.add_entry(sd_lane.queue_for(checkout, self.environ),
+                              {"id": f"e{item}", "item": item, "status": "pending",
+                               "enqueued_at": "2026-11-20T01:00:00Z"})
+        order: list[pathlib.Path] = []
+
+        def recorded(checkout: pathlib.Path, *args: Any) -> dict:
+            order.append(checkout)
+            return {"ran": []}
+        with mock.patch.object(sd_lane, "run_lane", recorded):
+            answer = sd_lane.run_hosted(self.environ, self.ship, skip=[self.repo])
+        self.assertEqual(order, [later])
+        self.assertIn({"path": str(self.repo), "skipped": "its own job runs this lane (--skip)"}, answer["lanes"])
+
+    def test_a_skipped_lane_another_machine_hosts_is_still_settled_here(self) -> None:
+        """pack sd:9668 review. The skip ran before the host check, so a machine that does not host the
+        lane stopped importing its file queue and reclaiming its dead holders; its own job refuses there."""
+        import sd_db
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            sd_db.upsert_repo(connection, str(self.repo), remote="https://github.com/example/pack.git", managed=1)
+        finally:
+            connection.close()
+        settled: list[pathlib.Path] = []
+
+        def recorded(others: list, environ: dict) -> list:
+            settled.extend(checkout for _, checkout in others)
+            return []
+        with mock.patch.object(sd_lane.sd_lib, "hosts_lane", return_value=False), \
+                mock.patch.object(sd_lane, "settle_others", recorded):
+            sd_lane.run_hosted(self.environ, self.ship, skip=[self.repo])
+        self.assertEqual([path.resolve() for path in settled], [self.repo.resolve()])
+
+    def test_skip_without_hosted_runs_no_lane(self) -> None:
+        """pack sd:9668 review: `lane run -C X --skip Y` ran as if the flag were absent."""
+        import argparse  # noqa: PLC0415
+        parser = argparse.ArgumentParser()
+        sd_lane.add_lane_verbs(parser.add_subparsers(dest="command"))
+        with contextlib.chdir(self.repo), mock.patch.dict(os.environ, self.environ), \
+                mock.patch.object(sd_lane, "run_lane", side_effect=AssertionError("ran a lane")), \
+                contextlib.redirect_stdout(io.StringIO()) as said, contextlib.redirect_stderr(said):
+            code = sd_lane.lane_main(parser.parse_args(["lane", "run", "--skip", str(self.repo)]))
+        self.assertNotEqual(code, 0)
+        self.assertIn("--skip needs --hosted", said.getvalue())
+
     def test_a_build_mismatch_skips_the_tick_and_exits_0(self) -> None:
         """sd:6425. Between a hub refresh and the satellite's follow, the repo-table read met a
         build mismatch, exited 3, and the health check read the job as failed. The tick skips."""
@@ -5698,7 +5783,7 @@ class HostedOrder(Lane):
 
         def refused(*args: Any, **kwargs: Any) -> Any:
             raise remote.BuildMismatch("build", "0000aaaa", "1111bbbb")
-        args = mock.Mock(lane_command="run", hosted=True)
+        args = mock.Mock(lane_command="run", hosted=True, skip=[])
         with mock.patch.object(sd_db.database, "connect", refused), \
                 mock.patch("sys.stdout", new_callable=io.StringIO) as out:
             code = sd_lane.lane_main(args)
@@ -6087,6 +6172,179 @@ class Bounds(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 10)
         self.assertEqual(answers[0][0], -signal.SIGKILL)
 
+    def deaf_child(self, line: str = DEAF_CHILD) -> tuple[list[str], pathlib.Path]:
+        """argv for a child that ignores TERM and starts `sleep 60` in a session below it, and its pid file."""
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        mark = pathlib.Path(scratch.name) / "child.pid"
+        code = line.removeprefix("CHILD = ").strip('"')
+        return [sys.executable, "-c", code, str(mark)], mark
+
+    def test_a_gate_that_ends_on_term_still_kills_what_it_left(self) -> None:
+        """Class pass, rule 1: the gate's leader ended on the TERM, so `cancel_gate` returned at once and
+        never killed the session read below it before the TERM."""
+        argv, mark = self.deaf_child(QUITTER_CHILD)
+        gate = sd_lane.SpeculativeGate(lambda: sd_lane.gate_run()(argv, dict(os.environ), pathlib.Path.cwd(), 120),
+                                       "quits")
+        gate.start()
+        below = self.below_of(mark)
+        self.assertTrue(gate.cancel_gate())
+        self.assert_gone(below, "the session below a gate that ended on TERM")
+
+    def test_a_gate_kill_after_its_group_cleared_still_kills_what_was_read(self) -> None:
+        """Class pass, rule 1: the gate's `run_group` ended between the TERM wait and the SIGKILL and cleared
+        `group`, so the SIGKILL step skipped the sessions read below it at the TERM."""
+        gate = sd_lane.SpeculativeGate(lambda: None, "cleared")
+        read = {424242: (4242, 424242, "start")}
+        gate.below, gate.group = {4242: read}, None
+        with mock.patch.object(sd_lane.sd_lib, "kill_below") as kill:
+            gate.signal_gate(signal.SIGKILL)
+        kill.assert_called_once_with(4242, read, mock.ANY)
+
+    def test_a_lane_child_that_ends_on_term_still_has_what_it_left_killed(self) -> None:
+        """Class pass, rule 1: the lane child ended on the TERM, so `end_child` returned after `wait` and
+        never killed the session read below it before the TERM."""
+        argv, mark = self.deaf_child(QUITTER_CHILD)
+        lane = sd_lane.child_lane(pathlib.Path.cwd(), 0, argv)
+        below = self.below_of(mark)
+        lane.end()
+        self.assert_gone(below, "the session below a lane child that ended on TERM")
+
+    def late_gate(self, argv: list[str], until: Any) -> tuple[Any, list[Any]]:
+        """A gate cancelled before its group registers, which it does once `until` returns; its answers."""
+        go, answers = threading.Event(), []
+        gate = sd_lane.SpeculativeGate(lambda: go.wait(10) and answers.append(sd_lane.gate_run()(
+            argv, dict(os.environ), pathlib.Path.cwd(), 120)), "late")
+        release = sd_lane.sd_lib.release_term
+
+        def late() -> None:
+            release()
+            until()
+        patch = mock.patch.object(sd_lane.sd_lib, "release_term", late)
+        patch.start()
+        self.addCleanup(patch.stop)
+        gate.start()
+        cancelled: list[bool] = []
+        canceller = threading.Thread(target=lambda: cancelled.append(gate.cancel_gate()))
+        canceller.start()
+        for _ in range(1000):  # bounded: a cancel that never lands fails below rather than hangs
+            if gate.cancelled:
+                break
+            time.sleep(0.01)
+        go.set()
+        canceller.join(60)
+        self.assertEqual(cancelled, [True])
+        return gate, answers
+
+    def test_a_gate_registered_after_the_cancel_still_kills_the_detached_check(self) -> None:
+        """Round 3, rule B: `started` TERMed a group that registered after the cancel with no read before
+        it; the leader quit on the TERM, and the session it left ran on with ppid 1."""
+        argv, mark = self.deaf_child(QUITTER_CHILD)
+        self.late_gate(argv, lambda: self.below_of(mark))
+        self.assert_gone(int(pathlib.Path(f"{mark}.below").read_text()), "the session below a late gate group")
+
+    def test_a_gate_registered_late_gets_the_full_term_grace(self) -> None:
+        """Round 3, rule B: the TERM wait counted from the cancel, not from the late group's TERM, so a
+        leader that ends in its grace was KILLed first."""
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        mark = pathlib.Path(scratch.name) / "child.pid"
+        code = ("import pathlib, signal, sys, time; "
+                "signal.signal(signal.SIGTERM, lambda *_: (time.sleep(2), sys.exit(3))); "
+                "pathlib.Path(sys.argv[1]).write_text('ready'); time.sleep(60)")
+        began = time.monotonic()
+
+        def until() -> None:  # registers 1.5 s into the 3 s wait, once the child's handler is in
+            for _ in range(400):
+                if mark.exists():
+                    break
+                time.sleep(0.01)
+            time.sleep(max(0.0, began + 1.5 - time.monotonic()))
+        with mock.patch.object(sd_lane, "CANCEL_SECONDS", 3):
+            _, answers = self.late_gate([sys.executable, "-c", code, str(mark)], until)
+        self.assertEqual(answers[0][0], 3, "the late group was KILLed inside its TERM grace")
+
+    def deaf_gate(self) -> tuple[Any, int]:
+        """A started gate whose `sd-check` stand-in ignores TERM, and that stand-in's pid."""
+        argv, mark = self.deaf_child()
+        gate = sd_lane.SpeculativeGate(lambda: sd_lane.gate_run()(argv, dict(os.environ), pathlib.Path.cwd(), 120),
+                                       "deaf")
+        gate.start()
+        self.below_of(mark)
+        child = int(mark.read_text())
+        self.addCleanup(end_group, child)
+        self.addCleanup(gate.join, 30)
+        return gate, child
+
+    def test_an_interrupted_gate_cancel_still_kills(self) -> None:
+        """Round 5, R2: a KeyboardInterrupt in `signal_gate`'s read or in the TERM wait left the TERMed
+        gate group with no SIGKILL."""
+        for where in ("read", "wait"):
+            with self.subTest(where=where):
+                gate, child = self.deaf_gate()
+                if where == "read":
+                    patch = mock.patch.object(sd_lane.sd_lib, "process_table",
+                                              side_effect=interrupt_first(sd_lane.sd_lib.process_table))
+                else:
+                    patch = mock.patch.object(gate, "join", side_effect=[KeyboardInterrupt, None, None])
+                with patch, self.assertRaises(KeyboardInterrupt):
+                    gate.cancel_gate()
+                self.assert_gone(child, "the TERM-deaf gate child after an interrupted cancel")
+
+    def test_an_interrupted_lane_child_end_still_kills(self) -> None:
+        """Round 5, R2, `end_child`: a KeyboardInterrupt in the read before the TERM left the child TERMed
+        and never KILLed."""
+        argv, mark = self.deaf_child()
+        lane = sd_lane.child_lane(pathlib.Path.cwd(), 0, argv)
+        self.below_of(mark)
+        with mock.patch.object(sd_lane.sd_lib, "process_table", side_effect=KeyboardInterrupt), \
+                self.assertRaises(KeyboardInterrupt):
+            lane.end()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            lane.process.wait(5)
+        self.assertEqual(lane.process.returncode, -signal.SIGKILL)
+
+    def below_of(self, mark: pathlib.Path) -> int:
+        below = pathlib.Path(f"{mark}.below")
+        for _ in range(400):  # bounded: a child that never writes fails on the read
+            if mark.exists() and mark.read_text():
+                break
+            time.sleep(0.05)
+        time.sleep(0.3)  # the child has installed its handler
+        self.addCleanup(end_group, int(below.read_text()))
+        return int(below.read_text())
+
+    def assert_gone(self, pid: int, what: str) -> None:
+        for _ in range(60):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.05)
+        self.fail(f"{what} ran on with ppid 1")
+
+    def test_a_gate_kill_ends_the_sessions_below_its_group(self) -> None:
+        """pack sd:9392, failure table row 2: `cancel_gate`'s SIGKILL reached the gate's group only."""
+        argv, mark = self.deaf_child()
+        gate = sd_lane.SpeculativeGate(lambda: sd_lane.gate_run()(argv, dict(os.environ), pathlib.Path.cwd(), 120),
+                                       "deaf")
+        gate.start()
+        below = self.below_of(mark)
+        with mock.patch.object(sd_lane, "CANCEL_SECONDS", 1):
+            self.assertTrue(gate.cancel_gate())
+        self.assert_gone(below, "the session below the gate's group")
+
+    def test_a_killed_lane_child_leaves_no_session_below(self) -> None:
+        """pack sd:9392, failure table row 5: `end_child` KILLed the lane child alone after
+        `CHILD_STOP_SECONDS`; the ship session it led ran on and held its gate slot."""
+        argv, mark = self.deaf_child()
+        lane = sd_lane.child_lane(pathlib.Path.cwd(), 0, argv)
+        below = self.below_of(mark)
+        with mock.patch.object(sd_lane, "CHILD_STOP_SECONDS", 0.5):
+            lane.end()
+        self.assertIsNotNone(lane.process.poll())
+        self.assert_gone(below, "the session below the lane child")
+
     def test_a_drained_run_waits_for_its_speculative_gate_only_until_its_deadline(self) -> None:
         """pack sd:7412, failure table row 4: a run that ran out of entries joined its speculative gate with no
         bound, so a gate queued behind builders held the runner lock past the job's TERM."""
@@ -6174,6 +6432,30 @@ class FailureNotes(SharedQueue):
         [entry] = self.entries()
         self.assertEqual(self.lane_notes(), [(1, "Lane failed in merge at head-1: the merge was refused; "
                                                  f"full text: {entry['merge_log']}")])
+
+    def test_a_merge_refused_for_a_member_cancelled_alone_keeps_its_code(self) -> None:
+        """pack sd:9303: a cancel that lands during the merge makes `sd-ship merge` refuse `member_cancelled_alone`;
+        the lane dropped the code, so Queue showed a generic merge failure. The entry keeps it, as `left_stop`'s does."""
+        sd_lane.enqueue_entry(self.feature, 1, "fix: one", self.body, self.environ, manual=True, claim="deliver")
+        self.answers[(1, "merge")] = {"ok": False, "phase": "merging", "error": "sd:2 was cancelled on its own",
+                                      "workflow": {"blocker": {"code": "member_cancelled_alone", "retryable": False}}}
+        sd_lane.run_lane(self.repo, self.environ, self.ship)
+        [entry] = self.entries()
+        self.assertEqual((entry["status"], entry["step"], entry.get("code")), ("failed", "merge", "member_cancelled_alone"))
+
+    def test_a_failed_step_keeps_the_blocker_code_sd_ship_answered(self) -> None:
+        """Lead review of sd:9303: the prepare step dropped its blocker code as the merge step did, so Queue and
+        Metrics read a prepare refusal, such as a missing delivery claim, from its text alone. Each step keeps
+        the code."""
+        for step, code in (("prepare", "delivery_claim_required"), ("merge", "ci_not_passing")):
+            with self.subTest(step=step):
+                self.answers.clear()
+                sd_lane.enqueue_entry(self.feature, 1, "fix: one", self.body, self.environ, manual=True, claim="deliver")
+                self.answers[(1, step)] = {"ok": False, "phase": "refused", "error": f"{step} refused",
+                                           "workflow": {"blocker": {"code": code, "retryable": False}}}
+                sd_lane.run_lane(self.repo, self.environ, self.ship)
+                entry = self.entries()[-1]
+                self.assertEqual((entry["status"], entry["step"], entry.get("code")), ("failed", step, code))
 
     def test_an_exception_in_the_merge_step_notes_merge(self) -> None:
         """pack sd:5968: a raise after `advance` names merge in the note and the finish record, not prepare."""

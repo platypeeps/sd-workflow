@@ -257,7 +257,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 import sd_lib
 import sd_release
@@ -2012,6 +2012,12 @@ def blocker_code(answer: dict[str, Any]) -> str | None:
     return ((answer.get("workflow") or {}).get("blocker") or {}).get("code")
 
 
+def coded(answer: dict[str, Any]) -> dict[str, str]:
+    """`{"code": ...}` from an `sd-ship` answer's blocker, for a failed entry; `{}` when it names none."""
+    code = blocker_code(answer)
+    return {"code": code} if isinstance(code, str) and code else {}
+
+
 def answered_hub_fault(answer: dict[str, Any]) -> bool:
     """Whether `sd-ship` answered with a hub fault, which the next run retries (sd:3239)."""
     return blocker_code(answer) == sd_ship_workflow.HUB_UNAVAILABLE
@@ -2069,9 +2075,10 @@ def process(entry: dict[str, Any], queue: Queue, ship: Ship, advance: Callable[[
     if blocker_code(merged) == LANE_ELSEWHERE:
         return {**fields, "moved": str(merged.get("error") or "the lane moved")[:600]}  # a move, not a failure
     if not (merged.get("ok") and merged.get("phase") == "merged"):
+        # The blocker code stays, as `left_stop`'s does: Queue and Metrics read it (pack sd:9303).
         return {**fields, "status": "failed", "step": "merge", "phase": merged.get("phase"),
                 "reason": str(merged.get("error") or merged.get("code") or "merge did not confirm")[:REASON_CHARS],
-                **({"hub_fault": True} if answered_hub_fault(merged) else {})}
+                **({"hub_fault": True} if answered_hub_fault(merged) else {}), **coded(merged)}
     return {**fields, "status": "merged", "merge_commit": merged.get("merge_commit")}
 
 
@@ -2175,7 +2182,7 @@ def prepare_stop(entry: dict[str, Any], worktree: pathlib.Path, prepared: dict[s
             "reason": str(prepared.get("error") or prepared.get("code") or "prepare did not reach ready_to_send")[:REASON_CHARS],
             **({"hub_fault": True} if answered_hub_fault(prepared) else
                {"slot_wait": True} if blocker_code(prepared) == SLOT_WAIT else
-               {"retryable": True} if answered_retryable(prepared) else {})}
+               {"retryable": True} if answered_retryable(prepared) else {}), **coded(prepared)}
 
 
 class SpeculativeGate(threading.Thread):
@@ -2194,30 +2201,75 @@ class SpeculativeGate(threading.Thread):
         self.why = "the run stopped, so it ended this gate (sd:3361)"
         self.cancelled = False
         self.group: int | None = None
+        self.below: dict[int, sd_lib.Table | None] = {}  # each group's read before its first signal (pack sd:9392)
         self.guard = threading.RLock()  # `signal_gate` may run in a SIGTERM handler while this thread holds it
 
     def started(self, group: int | None) -> None:
+        """Record the gate's group, or None as it ends; one that starts after the cancel is ended here.
+
+        That late group gets its own read and its full grace from its own
+        TERM (`sd_lib.end_late_group`, pack sd:9392), outside the guard, so
+        a signal to the gate waits on none of it, and unrecorded, so none
+        cuts that grace short."""
         with self.guard:
-            self.group = group
-            if self.cancelled and group is not None:
-                end_group(group, signal.SIGTERM)
+            late = self.cancelled and group is not None
+            self.group = None if late else group
+        if late and group is not None:
+            sd_lib.end_late_group(group)
 
     def signal_gate(self, number: int) -> None:
-        """Mark the gate cancelled and send `number` to its group, if one runs."""
+        """Mark the gate cancelled and send `number` to its group, if one runs.
+
+        Each group's first signal reads the groups below it first, and the
+        SIGKILL reaches what each read found, and what a walk from each
+        group's members finds now (`sd_lib.kill_below`, pack sd:9392). A
+        signal that lands in the read still sends `number` to the group.
+        """
         with self.guard:
             self.cancelled = True
-            if self.group is not None:
-                end_group(self.group, number)
+            if (group := self.group) is not None and group not in self.below:
+                self.below[group] = sd_lib.read_or_term(sd_lib.process_table, lambda: end_group(group, number))
+            try:
+                if number == signal.SIGKILL:  # a cleared group leaves what was read (rule 1)
+                    self.kill_left()
+            finally:
+                if self.group is not None:  # registered, so unreaped: the number is its own
+                    end_group(self.group, number)
 
     def cancel_gate(self) -> bool:
-        """End the gate's group, SIGTERM then SIGKILL, each followed by `CANCEL_SECONDS`; whether the gate ended."""
-        for number in (signal.SIGTERM, signal.SIGKILL):
-            self.signal_gate(number)
+        """End the gate's group, SIGTERM then SIGKILL, each followed by up to `CANCEL_SECONDS`; whether it ended.
+
+        A gate that ended on the SIGTERM still has the sessions read below
+        it then killed: its leader's exit left them to no one (`kill_left`).
+        Once the TERM is out, the SIGKILL step runs whatever interrupts the
+        read or the wait, then the interruption goes on (pack sd:9392)."""
+        ended = False
+        try:
+            self.signal_gate(signal.SIGTERM)
             with contextlib.suppress(RuntimeError):  # not started yet: `started` ends a group that starts later
                 self.join(CANCEL_SECONDS)
-            if not self.is_alive():
-                return True
-        return False
+            ended = not self.is_alive()
+        finally:
+            if ended:
+                self.kill_left()
+            else:
+                self.signal_gate(signal.SIGKILL)
+        if ended:
+            return True
+        with contextlib.suppress(RuntimeError):
+            self.join(CANCEL_SECONDS)
+        return not self.is_alive()
+
+    def kill_left(self) -> None:
+        """SIGKILL each session read below the gate's groups before their first signal that is still that session."""
+        with self.guard:
+            if not self.below:
+                return
+            table, interrupted = sd_lib.read_after()
+            for group, below in self.below.items():
+                sd_lib.kill_below(group, below, table)
+            if interrupted is not None:
+                raise interrupted
 
 
 end_group = sd_lib.signal_group
@@ -4146,8 +4198,24 @@ def run_checkout(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token:
     return {"item": entry["item"], **outcome}, None
 
 
+def settle_others(others: list[tuple[str, pathlib.Path]], environ: dict[str, str]) -> list[dict[str, Any]]:
+    """Import the file queue and reclaim dead holders of each checkout this run does not host (sd:3282)."""
+    lanes: list[dict[str, Any]] = []
+    for path, checkout in others:
+        try:
+            queue = queue_for(checkout, environ)
+            with runner_lock(queue) as locked:
+                settled = settle_checkout(checkout, queue) if locked else {}
+        except (LaneError, sd_lib.ConfigError, OSError) as error:
+            settled = refusal(error)
+        if settled:
+            lanes.append({"path": path, "settled": settled})
+    return lanes
+
+
 def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = default_gate,
-               note: Note | None = None, start: Start | None = None) -> dict[str, Any]:
+               note: Note | None = None, start: Start | None = None,
+               skip: Iterable[pathlib.Path] = ()) -> dict[str, Any]:
     """`lane run --hosted`: `run_lane` for each repository this machine hosts (sd:3003), side by side (sd:5774).
 
     The same job runs on every machine. Its lanes are the managed `repo` rows,
@@ -4168,8 +4236,12 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
     suite as a defect (`file_flakes`, pack sd:6739).
     A build refusal on the repo-table read (`BUILD_FAULTS`) skips the run
     with exit 0: the satellite's follow fixes it, not a retry (sd:6425).
+    A `skip` checkout is left to its own job (`lane run -C`): one long lane
+    kept this run alive past its budget, and launchd starts no tick of a
+    job while a run lives, so every other lane waited (pack sd:9668).
     """
     deadline = clock() + RUN_BUDGET_SECONDS
+    skipped = {pathlib.Path(path).expanduser().resolve() for path in skip}
     imported = sd_lib.import_sd_db()
     if imported.module is None:
         raise LaneError(f"lane run --hosted reads the repo table: {imported.problem}")
@@ -4204,18 +4276,14 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
                 others.append((row["path"], checkout))
     finally:
         connection.close()  # a lane runs for hours; each reads its host again on its own connection
-    for path, checkout in others:
-        try:
-            queue = queue_for(checkout, environ)
-            with runner_lock(queue) as locked:
-                settled = settle_checkout(checkout, queue) if locked else {}
-        except (LaneError, sd_lib.ConfigError, OSError) as error:
-            settled = refusal(error)
-        if settled:
-            lanes.append({"path": path, "settled": settled})
+    lanes += settle_others(others, environ)
     def inline(checkout: pathlib.Path, budget: float) -> StartedLane:
         return inline_lane(lambda: run_lane(checkout, environ, ship, gate, note, clock() + budget))
-    order = longest_waiting_first(hosted, environ)
+    # A skipped lane is skipped only where it is hosted: elsewhere it is settled as before, and it keeps
+    # its wait and flake reports below; its own `lane run -C` job refuses on a machine that does not host it.
+    lanes += [{"path": path, "skipped": "its own job runs this lane (--skip)"}
+              for path, checkout in hosted if checkout.resolve() in skipped]
+    order = longest_waiting_first([lane for lane in hosted if lane[1].resolve() not in skipped], environ)
     lanes += run_parallel(order, start or inline, deadline, functools.partial(lane_room, environ),
                           functools.partial(new_work, environ), cap=lane_parallel(environ))
     for path, checkout in hosted:  # after the lanes ran: a slow read never holds a lane back (pack sd:6006)
@@ -4331,17 +4399,30 @@ def child_answer(process: subprocess.Popen[bytes], out: Any, err: Any) -> dict[s
 
 
 def end_child(process: subprocess.Popen[bytes], out: Any, err: Any) -> None:
-    """TERM a lane child still running, then KILL it after `CHILD_STOP_SECONDS`; its answer is not read."""
+    """TERM a lane child still running, then KILL it after `CHILD_STOP_SECONDS`; its answer is not read.
+
+    The KILL reaches each session below the child too, read before the TERM
+    and again before the KILL, while the child is unreaped (pack sd:9392):
+    its `sd-ship` and gate groups ran on with ppid 1. A child that ended on
+    the TERM still has the witnessed sessions read before it killed; its
+    reaped pid roots no new walk. The KILL step runs whatever interrupts.
+    """
     with out, err:
         if process.poll() is not None:
             return
-        process.terminate()
-        try:
-            process.wait(CHILD_STOP_SECONDS)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
+        def kill_child(earlier: sd_lib.Table | None) -> None:
+            table, interrupted = sd_lib.read_after()
+            sd_lib.kill_below(process.pid, earlier, table, process=True)
+            if process.returncode is None:  # unreaped: the pid is still the child
+                process.kill()
+                process.wait()
+            if interrupted is not None:
+                raise interrupted
 
+        def child_grace() -> None:
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                process.wait(CHILD_STOP_SECONDS)
+        sd_lib.escalate(sd_lib.process_table, process.terminate, child_grace, kill_child)
 
 def lane_room(environ: dict[str, str]) -> str | None:
     """Why a second lane may not start now, or None: fewer lane gates than slots, and load under the limit.
@@ -4599,6 +4680,9 @@ def add_lane_verbs(commands: Any) -> None:
     runner.add_argument("--hosted", action="store_true",
                         help="run the lane of each repository this machine hosts (sd:3003), each in its own child, "
                              "several at once while the gate has a free slot and load is under its limit (sd:5774)")
+    runner.add_argument("--skip", type=pathlib.Path, action="append", default=[], metavar="CHECKOUT",
+                        help="with --hosted: leave this checkout's lane to its own `lane run -C` job; repeat it "
+                             "(pack sd:9668)")
     runner.add_argument("--budget", type=float, metavar="SECONDS",
                         help="claim no entry after this many seconds; a hosted run passes what is left of its own")
     pruner = verbs.add_parser("prune", help="delete each local branch no worktree holds whose changes are on origin's "
@@ -4620,7 +4704,7 @@ def lane_main(args: Any) -> int:
         if args.lane_command == "watch" and not getattr(args, "items", None):
             return watch(lane_root(environ), once=args.once)
         if args.lane_command == "run" and args.hosted:  # from any folder: it reads the repo table, not the cwd
-            return succeed(run_hosted(environ, start=child_lane))
+            return succeed(run_hosted(environ, start=child_lane, skip=args.skip))
         root = sd_lib.repo_root(None)  # a git that gave no answer says why, as a ConfigError (sd:2986)
         if root is None:
             raise LaneError("cwd is not inside a Git repository")
@@ -4654,11 +4738,18 @@ def lane_main(args: Any) -> int:
             result = set_hold(root, args.item, environ, held=args.lane_command == "hold",
                               expected_revision=args.expected_revision)
         else:
-            result = run_lane(root, environ, deadline=None if args.budget is None else clock() + args.budget)
+            result = run_lane(root, environ, deadline=run_deadline(args))
     except (LaneError, sd_lib.ConfigError, OSError) as error:
         print(json.dumps({"ok": False, **refusal(error)}, indent=2, sort_keys=True))
         return 3
     return succeed(shown(result))
+
+
+def run_deadline(args: Any) -> float | None:
+    """A plain `lane run`'s claim deadline; it refuses `--skip`, which only `--hosted` reads (pack sd:9668)."""
+    if args.skip:
+        raise LaneError("--skip needs --hosted: a `lane run -C` job runs one lane and skips none")
+    return None if args.budget is None else clock() + args.budget
 
 
 def lane_prune(root: pathlib.Path, environ: dict[str, str], *, dry_run: bool, as_json: bool) -> int:

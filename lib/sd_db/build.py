@@ -2344,15 +2344,23 @@ def _park(connection, ident: str, lead: int, stamp: str) -> None:
         park(connection, member["item"], ("blocked",), stamp, PARKED.format(run=ident))
 
 
+def parks(connection, item: int, statuses: tuple[str, ...], ending: tuple[int, ...] = ()) -> bool:
+    """Whether `park` parks `item` once the assignments `ending` have ended: the one rule `park` reads, and what a
+    cancel's confirm reads to name the items it parks (pack sd:9290)."""
+    row = connection.execute("SELECT status, parked_at FROM item WHERE id = ?", (item,)).fetchone()
+    if row is None or row["status"] not in statuses or row["parked_at"] is not None:
+        return False
+    marks = ", ".join("?" for _ in ending)
+    return connection.execute(f"SELECT 1 FROM assignment WHERE item = ? AND status IN {OWNING}"
+                              + (f" AND id NOT IN ({marks})" if ending else "") + " LIMIT 1",
+                              (item, *ending)).fetchone() is None
+
+
 def park(connection, item: int, statuses: tuple[str, ...], stamp: str, note: str | None = None) -> bool:
     """Park `item` while its status is one of `statuses`, with `note` when given; whether it parked. An item the
     operator moved on, one parked already, or one an assignment still owns (another build queued since, sd:8960)
     stays as it is. Auto-pickup takes unparked items only (sd:9222)."""
-    row = connection.execute("SELECT status, parked_at FROM item WHERE id = ?", (item,)).fetchone()
-    if row is None or row["status"] not in statuses or row["parked_at"] is not None:
-        return False
-    if connection.execute(f"SELECT 1 FROM assignment WHERE item = ? AND status IN {OWNING} LIMIT 1",
-                          (item,)).fetchone():
+    if not parks(connection, item, statuses):
         return False
     set_item_fields(connection, item, parked_at=stamp)
     if note:

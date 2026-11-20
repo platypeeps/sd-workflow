@@ -291,6 +291,8 @@ the provider scorecard and the cap and configure controls were already there.
 month the served dashboard answers its kept reading: one past 45 seconds starts a refresh, one past 300
 seconds waits for it. Read-only: the sweep is the verb's, so a dead owner's hold shows until the next
 reservation or `sd-db usage` binds it.
+`/api/usage/strip` serves the Usage dropdown beside Read again on every page (pack sd:9569; Today's
+Usage strip under the annunciator until then): `usage_screen.strip`, read on load and on each open.
 Resources' four views moved in pack sd:7527, each read through `/api/<page>/<view>` when shown:
 Toolbox is Management's Machine view, Research the Repos filter `?research=yes|no`, Vault a section
 on Notes and Queues a folded section on Tasks. `/operations?area=resources&resource=<view>` answers
@@ -309,8 +311,10 @@ Every job or service control rechecks the observed state and revision. The last
 request's acceptance is shown separately from the current state; acceptance is
 not proof that a job finished or that an application is healthy.
 Queued assignments can be cancelled without completing their item, with
-`sd assignments cancel`. A cancelled queued or running build parks its
-items, so auto-pickup skips them until Unpark (sd:9222). A blocked assignment can be cancelled, whatever its
+`sd assignments cancel`. A queued build lead's cancel ends each queued
+member too, and the answer lists every row it ended (pack sd:9266).
+A cancelled queued or running build parks its items, so auto-pickup
+skips them until Unpark (sd:9222). A blocked assignment can be cancelled, whatever its
 item's status, once no runner attempt holds its lease, its own or its bundle
 lead's. A restore
 blocks starting jobs and starting or restarting services, while supported stop

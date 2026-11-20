@@ -88,6 +88,63 @@ html, body { overflow-x: clip; }
   max-height: 18rem; overflow-y: auto; overscroll-behavior: contain; padding: var(--space-2xs);
   border: var(--rule-hair) solid var(--color-rule); border-radius: var(--radius-md); background: var(--color-panel); box-shadow: var(--shadow-overlay);
 }
+/* The Usage dropdown (pack sd:9569; Today's Usage strip until then, pack sd:9257): beside Read again in the head's
+ * .head-acts group on every page. Its summary is a quiet small button like Read again, with the worst state's glyph; its
+ * menu is the filter dropdown's (.fpick-menu), anchored to the head's right edge and as wide as the strip needs, one
+ * hairline row per provider. A window is a 100-unit track filled to its use; caution from 80 %, warning at the limit.
+ * Unknown rows carry their why, never a bar.
+ * Hallmark · component: usage dropdown · genre: modern-minimal · theme: design.md instrument panel
+ * states: default · hover · focus · open (accent ring) · loading (Reading usage…) · error (Not read: why) · state glyph */
+/* The menu anchors to the page head, never to a page's [data-again] slot or .head-acts: on a phone those wrap to the
+ * head's left, and a menu as wide as the screen anchored to their right end ran past its left edge. The head spans the
+ * gutters, so 100% keeps the menu inside them. */
+.head, .home-head { position: relative; }
+.head-acts { display: inline-flex; flex-wrap: wrap; align-items: center; gap: var(--space-xs); align-self: end; margin-left: auto; }
+/* The title block gives way first, so the group keeps the head's right end beside it on a desktop. */
+.head > div:first-child { flex: 1 1 20rem; min-width: 0; }
+.usage-drop > summary.btn { display: inline-flex; gap: var(--space-2xs); list-style: none; }
+.usage-drop > summary::-webkit-details-marker { display: none; }
+.usage-drop > summary::after { content: '▾'; font: 400 var(--text-xs)/1 var(--font-data); color: var(--color-muted); }
+.usage-drop > summary [aria-hidden] { font: 400 var(--text-xs)/1 var(--font-data); }
+.usage-drop[open] > summary { border-color: var(--color-accent); background: var(--color-accent-bg); }
+.usage-drop > summary:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 1px; }
+.usage-drop > .ustrip { left: auto; right: 0; width: min(48rem, calc(100vw - 2 * var(--space-md)), 100%); max-width: none; max-height: min(70vh, 36rem); padding: 0; display: block; }
+.ustrip .urows { list-style: none; margin: 0; padding: 0; }
+.ustrip li { display: grid; grid-template-columns: minmax(7rem, max-content) minmax(0, 1fr) auto; align-items: center; gap: var(--space-2xs) var(--space-sm);
+  padding: var(--space-2xs) var(--space-sm); border-bottom: var(--rule-hair) solid var(--color-rule); font-size: var(--text-sm); }
+/* A long provider name, window label, unit, incident title, footer name or error wraps inside its cell, never past
+ * the screen's edge (pack sd:9597). */
+.ustrip .nm, .ustrip .why, .ustrip .flag, .ustrip .w, .ustrip .wl, .ustrip .foot { min-width: 0; overflow-wrap: anywhere; }
+.ustrip .nm { font: 500 var(--text-sm)/1.2 var(--font-data); color: var(--color-ink); max-width: 16rem; }
+.ustrip .nm > span[aria-hidden] { margin-right: var(--space-2xs); }
+.ustrip .nm small { color: var(--color-muted); font: 400 var(--text-2xs)/1 var(--font-label); letter-spacing: .06em; text-transform: uppercase; }
+.ustrip .ws { display: flex; flex-wrap: wrap; gap: var(--space-3xs) var(--space-md); min-width: 0; color: var(--color-ink-2); }
+.ustrip .w { display: inline-flex; flex-wrap: wrap; min-width: 0; align-items: center; gap: var(--space-3xs) var(--space-2xs); font-family: var(--font-data); font-size: var(--text-xs); }
+.ustrip .w b { color: var(--color-ink); font-weight: 500; }
+.ustrip .wl { font: 600 var(--text-2xs)/1 var(--font-label); letter-spacing: .09em; text-transform: uppercase; color: var(--color-muted); }
+.ustrip .track { width: 6rem; height: 0.5rem; background: var(--color-well); border-radius: 2px; }
+.ustrip .fill { fill: var(--color-series-1); }
+.ustrip .fill.caution { fill: var(--color-caution); }
+.ustrip .fill.warning { fill: var(--color-warning); }
+.ustrip .why { color: var(--color-muted); font-size: var(--text-xs); }
+/* A service flag sits under its row's windows, so a long incident title never crowds them. */
+.ustrip .nm, .ustrip .ws { grid-row: 1; }
+.ustrip .age { grid-row: 1; grid-column: 3; }
+.ustrip .flag { grid-row: 2; grid-column: 2 / -1; }
+.ustrip .flag, .ustrip .foot a { color: inherit; text-decoration-color: var(--color-rule); text-underline-offset: 3px; font-size: var(--text-xs); }
+.ustrip .age { color: var(--color-muted); font: var(--text-2xs)/1 var(--font-data); white-space: nowrap; justify-self: end; }
+.ustrip .foot { margin: 0; display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2xs) var(--space-xs); padding: var(--space-2xs) var(--space-sm);
+  color: var(--color-muted); font-size: var(--text-xs); }
+.ustrip a:hover { text-decoration-color: currentColor; }
+.ustrip a:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
+@media (pointer: coarse) { .ustrip a { display: inline-flex; align-items: center; min-height: var(--row-touch); } }
+@media (max-width: 47.99rem) {
+  .ustrip li { grid-template-columns: minmax(0, 1fr) auto; }
+  .ustrip .nm { max-width: none; }
+  .ustrip .age { grid-column: 2; }
+  .ustrip .ws { grid-row: 2; grid-column: 1 / -1; }
+  .ustrip .flag { grid-row: 3; grid-column: 1 / -1; }
+}
 .fpick-opt {
   display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 0 var(--space-xs); min-height: var(--row); padding: 0 var(--space-xs);
   border-radius: var(--radius-sm); color: var(--color-ink-2); font: 400 var(--text-xs)/1.2 var(--font-data); cursor: pointer;
@@ -230,7 +287,6 @@ body[data-rail="min"] .rail-grip { display: none; }
 .btn[aria-busy="true"]:disabled { color: var(--color-ink-2); cursor: progress; }
 @keyframes busy-turn { to { transform: rotate(-1turn); } }
 @media (prefers-reduced-motion: reduce) { :is(.btn, .icon-btn)[aria-busy="true"] > svg.i { animation: none; } }
-.head > #read-again { align-self: end; }
 .icon-btn {
   display: inline-grid; place-items: center; width: 2rem; height: 2rem; padding: 0;
   border: var(--rule-hair) solid transparent; border-radius: var(--radius-sm);
@@ -351,8 +407,8 @@ body[data-rail="min"] .rail-grip { display: none; }
  * here and not by the browser, so a summary a page lays out as flex keeps it. */
 details:not(.fpick) > summary { list-style: none; }
 details:not(.fpick) > summary::-webkit-details-marker { display: none; }
-details:not(.fpick) > summary::before { content: '▸'; display: inline-block; width: 1em; flex: none; font-family: var(--font-data); color: var(--color-muted); }
-details:not(.fpick)[open] > summary::before { content: '▾'; }
+details:not(.fpick, .usage-drop) > summary::before { content: '▸'; display: inline-block; width: 1em; flex: none; font-family: var(--font-data); color: var(--color-muted); }
+details:not(.fpick, .usage-drop)[open] > summary::before { content: '▾'; }
 /* The CLI lines fold under one summary, closed by default (sd:3464). */
 .cli-all { margin: var(--space-sm) 0 0; }
 .cli-all > summary { cursor: pointer; font-size: var(--text-xs); color: var(--color-muted); white-space: nowrap; }

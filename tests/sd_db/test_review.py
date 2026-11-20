@@ -32,7 +32,7 @@ def batch(**changes) -> dict:
     """A small valid batch file, open mode, two questions."""
     found = {
         "schema": 1, "queue": "jev-entry-2", "batch": "C1", "title": "Label: C1 review tiers",
-        "source": "system@6c4317b", "mode": "open",
+        "source": "system@6c4317b", "mode": "open", "context": CONTEXT,
         "questions": [
             {"subject": "example.test/a@1a2b3c4:src/one.py", "text": "Which review tier fits this change?",
              "evidence": ["diff: git show 1a2b3c4"], "options": ["skip", "cheap", "standard", "deep"]},
@@ -416,8 +416,9 @@ class ContextAndRecommendation(ReviewCase):
                                  (item,)).fetchone()[0]
         self.assertIn("\nPurpose: Calibrate the review-tier router.\nRubric: skip: docs only\n"
                       "Rubric: deep: touches state\nFeeds: jev-entry-2 training labels\nRecommendations: 1\n", header)
-        # A batch filed with none reads none.
-        self.assertIsNone(review.read(self.db, self.file(batch(batch="C2")))["header"]["context"])
+        # A batch filed with none, before pack sd:9479 required one, reads none.
+        with mock.patch.object(review, "_require_context", lambda found: None):
+            self.assertIsNone(review.read(self.db, self.file(batch(batch="C2", context=None)))["header"]["context"])
 
     def test_a_recommendation_reads_apart_from_the_evidence(self):
         item = self.file(advised())
@@ -498,7 +499,7 @@ class ContextAndRecommendation(ReviewCase):
                 review.file(self.db, found, who="tester")
         self.assertEqual(self.counts(), before)
         # Each limit itself files, whole.
-        edge = batch(batch="edge", context={"purpose": "p" * review.CONTEXT_CHARS,
+        edge = batch(batch="edge", context={"purpose": "p" * review.CONTEXT_CHARS, "feeds": "f" * review.CONTEXT_CHARS,
                                             "rubric": ["r" * review.CONTEXT_CHARS] * review.RUBRIC_LINES})
         edge["questions"][0]["recommendation"] = {"option": "deep", "reason": "w" * review.REASON_CHARS}
         found = review.read(self.db, self.file(edge))
@@ -514,11 +515,51 @@ class ContextAndRecommendation(ReviewCase):
         with self.assertRaisesRegex(review.ReviewError, r"context is"):
             review.file(self.db, advised(context={"purpose": "Another purpose."}), who="tester")
 
+    def test_a_batch_missing_part_of_its_context_is_refused_naming_the_tag(self):
+        """pack sd:9479: two batches reached the Review page with no purpose, rubric or expectations. A batch files
+        with its Purpose, at least one Rubric line and its Feeds, or not at all, and the refusal names the format."""
+        cases = {"Purpose": {k: v for k, v in CONTEXT.items() if k != "purpose"},
+                 "Rubric": {k: v for k, v in CONTEXT.items() if k != "rubric"},
+                 "Feeds": {k: v for k, v in CONTEXT.items() if k != "feeds"},
+                 "Purpose, Rubric or Feeds": None}
+        before = self.counts()
+        for tags, context in cases.items():
+            with self.subTest(tags), self.assertRaisesRegex(
+                    review.ReviewError, rf"no {tags} line; .*\"context\": {{\"purpose\": TEXT, \"rubric\": \[LINE"):
+                review.file(self.db, batch(context=context), who="tester")
+        self.assertEqual(self.counts(), before)
+
+    def test_a_batch_filed_before_without_context_files_again(self):
+        """pack sd:9479: the same file again, or that file once its filer adds the context, finds the batch filed
+        before context was required and writes nothing."""
+        with mock.patch.object(review, "_require_context", lambda found: None):
+            first = review.file(self.db, batch(context=None), who="tester")
+        before = self.counts()
+        for found in (batch(context=None), batch()):
+            again = review.file(self.db, found, who="tester")
+            self.assertEqual((again["item"], again["created"]), (first["item"], False))
+        self.assertEqual(self.counts(), before)
+        self.assertIsNone(review.read(self.db, first["item"])["header"]["context"])
+
+    def test_a_kev_file_carries_its_context_and_files(self):
+        """pack sd:9479: a Kev file holds no context, so the import says what its lines are, how to label them and
+        what the labels feed."""
+        found = review.from_kev(kev_text([kev_line("span:a")]), batch="b", mode="blind", source="kev:t.jsonl")
+        context = found["context"]
+        self.assertIn("kev:t.jsonl", context["purpose"])
+        self.assertTrue(context["rubric"])
+        self.assertIn("reviews", context["feeds"])
+        self.assertIsNotNone(self.file(found))
+
     def test_a_kev_file_digests_as_before(self):
-        # A Kev batch filed before sd:5759 must find itself again: the import adds no key to its questions.
+        # A Kev batch filed before sd:5759 must find itself again: the import adds no key to its questions. Its
+        # context, added for pack sd:9479, still finds a batch filed without one.
         found = review.from_kev(kev_text([kev_line("span:a")]), batch="b", mode="blind", source="kev:t.jsonl")
         self.assertEqual(set(found["questions"][0]), {"subject", "text", "evidence", "options"})
-        self.assertNotIn("context", found)
+        with mock.patch.object(review, "_require_context", lambda found: None):
+            first = review.file(self.db, {key: value for key, value in found.items() if key != "context"}, who="t")
+        again = review.file(self.db, found, who="tester")
+        self.assertEqual((again["item"], again["created"]), (first["item"], False))
 
     def test_an_open_ruling_agrees_but_is_never_blind(self):
         item = self.file(advised())
@@ -563,7 +604,7 @@ class ContextAndRecommendation(ReviewCase):
         self.rule(item, 0, "cheap")
         manifest, first, _ = review.export(self.db, item, who="tester")
         self.assertEqual((manifest["context"], manifest["agreement"]),
-                         (None, {"recommended": 0, "agreed": 0, "ruled_blind": 0, "agreed_blind": 0}))
+                         (CONTEXT, {"recommended": 0, "agreed": 0, "ruled_blind": 0, "agreed_blind": 0}))
         self.assertEqual((first["recommendation"], first["agreed"], first["ruled_blind"]), (None, None, None))
 
 

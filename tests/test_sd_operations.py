@@ -22,6 +22,10 @@ from tests.clean_env import clean_environment
 ROOT = Path(__file__).resolve().parents[1]
 with patch.object(sys, "path", [str(ROOT / "bin"), *sys.path]):
     cli = importlib.import_module("sd_operations")
+#: The wrapper itself, before a test patches it: a tick's outage must pass through it (pack sd:9541).
+CONNECT = cli.sd_handoff_rows.connect
+#: What a first skipped tick adds to its reason (pack sd:9541): the streak's count and its first time.
+FIRST = " (skipped tick 1 in a row since 2026-11-19T00:00:00Z; tick 3 fails)"
 
 
 class OperationsCLI(unittest.TestCase):
@@ -44,7 +48,13 @@ class OperationsCLI(unittest.TestCase):
             "id": "user:com.example.server", "label": "com.example.server",
             "state": "running", "revision": "current-service"}
         self.connect = Mock(return_value=self.connection)
-        for patcher in (patch.dict(sys.modules, {"sd_db.operations": self.service, "sd_db.services": self.launchd}),
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        # pack sd:9541: a tick's skip count; no test reads or clears this machine's own.
+        self.stamp = Path(scratch.name) / "sd" / "dispatch-skipped"
+        for patcher in (patch.object(cli, "skip_stamp", return_value=self.stamp, create=True),
+                        patch.object(cli, "utc_now", return_value="2026-11-19T00:00:00Z", create=True),
+                        patch.dict(sys.modules, {"sd_db.operations": self.service, "sd_db.services": self.launchd}),
                         patch.object(sd_db, "operations", self.service, create=True),
                         patch.object(sd_db, "services", self.launchd, create=True),
                         patch.object(cli.sd_handoff_rows, "library", return_value=sd_db),
@@ -267,7 +277,9 @@ class OperationsCLI(unittest.TestCase):
         self.assertIn("bulk_storage_root is unset", kwargs["why"])
         run.archive.assert_not_called()  # no bulk root: an ended run's logs stay local
         self.assertIn("claimed 1, drafted 0, spawned 1", output)
-        self.connect.assert_called_with(sd_db, write=True)
+        from sd_db import hub, remote
+        kept = (remote.HubUnreachable, remote.BuildMismatch, hub.Fenced, sqlite3.OperationalError)  # sd:9574
+        self.connect.assert_called_with(sd_db, write=True, keep=kept)
         self.connection.close.assert_called_once()
 
     def test_a_spawn_runs_the_supervise_verb_the_real_parser_reads(self):
@@ -318,7 +330,8 @@ class OperationsCLI(unittest.TestCase):
         run = self.builds()
         run.dispatch.side_effect = sqlite3.OperationalError("database is locked")
         code, output = self.tick(run)
-        self.assertEqual((code, output), (0, "skipped: database is locked\n"))
+        # pack sd:9541: the lock met the tick's work, so the skip says it began.
+        self.assertEqual((code, output), (0, f"skipped (partial): database is locked{FIRST}\n"))
         self.connection.close.assert_called_once()
 
     def test_a_build_mismatch_skips_the_tick_without_a_follow(self):
@@ -341,6 +354,248 @@ class OperationsCLI(unittest.TestCase):
         run.dispatch.assert_not_called()
         self.assertEqual((code, output), (0, "skipped: sd_db build mismatch; the follow job follows\n"))
 
+    def outcome(self, run, error, where, *flags):
+        """The tick's exit, as `bin/sd` gives it: a refusal is 1. `error` raises at the connect, through the real
+        wrapper, or mid-tick from `dispatch`."""
+        if where == "connect":
+            fake = types.SimpleNamespace(connect=Mock(side_effect=error))
+            self.connect.side_effect = lambda _sd_db, **kwargs: CONNECT(fake, **kwargs)
+        else:
+            self.connect.side_effect = None
+            run.dispatch.side_effect = error
+        try:
+            with patch.object(cli, "gate_load", return_value=(1.0, 40.0)), \
+                    patch.object(cli, "interactive_builders", return_value=([], "")), \
+                    patch.object(cli, "log_root", return_value=Path("/bulk")), \
+                    patch.object(cli, "writable", return_value=True):
+                return self.call("assignments", "dispatch", *flags)
+        except (cli.WorkRefusal, cli.sd_handoff_rows.RowsRefusal) as refusal:
+            return 1, str(refusal)
+
+    def outages(self):
+        from sd_db import remote
+        unreachable = remote.HubUnreachable("hub.example.test", 8769, "timed out")
+        behind = remote.BuildMismatch("package", "1.0", "1.1")  # this satellite is older: its follow job catches up
+        return ((unreachable, f"{unreachable}{FIRST}"), (behind, "sd_db build mismatch; the follow job follows"))
+
+    def test_a_hub_outage_skips_the_tick_with_exit_0(self):
+        """pack sd:9541: a satellite tick exited 1 when the hub timed out, or between a hub refresh and the follow;
+        the next tick was clean. Each skips with one line. Mid-tick, work the tick began may have committed, so the
+        line says `(partial)`."""
+        for error, reason in self.outages():
+            for where, label in (("connect", "skipped"), ("tick", "skipped (partial)")):
+                with self.subTest(error=type(error).__name__, where=where):
+                    self.stamp.unlink(missing_ok=True)  # each case is a first outage
+                    run = self.builds()
+                    code, output = self.outcome(run, error, where)
+                    if where == "connect":
+                        run.dispatch.assert_not_called()
+                    self.assertEqual((code, output), (0, f"{label}: {reason}\n"))
+
+    def test_a_skipped_tick_answers_json_under_json(self):
+        """pack sd:9541: `--json` printed a skip as plain text, which no JSON reader parses."""
+        for error, reason in self.outages():
+            for where, partial in (("connect", False), ("tick", True)):
+                with self.subTest(error=type(error).__name__, where=where):
+                    self.stamp.unlink(missing_ok=True)  # each case is a first outage
+                    code, output = self.outcome(self.builds(), error, where, "--json")
+                    self.assertEqual((code, json.loads(output)), (0, {"skipped": reason, "partial": partial}))
+
+    def test_a_fenced_hub_still_exits_1(self):
+        """pack sd:9541 review: a demoted hub's write refusal is lasting. A `Fenced` with no `cause`, as an old hub
+        sends, reads as lasting too (pack sd:9574). Neither skips."""
+        from sd_db import hub, remote
+        demoted = hub.Fenced(hub.demotion(Path("/db/sd.sqlite"), hub.Role(
+            "elsewhere", "hub.example.test", "sd.hub_name names hub.example.test, and this node is old.example.test")))
+        unnamed = remote.rebuild_error(remote.describe_error(hub.Fenced(
+            "refused: this machine is not the hub: Tailscale does not name this node, so it cannot match "
+            "hub.example.test: this node is not connected to the Tailscale control plane")))
+        for error in (demoted, unnamed):
+            for where in ("connect", "tick"):
+                with self.subTest(error=str(error)[:40], where=where):
+                    self.assertEqual(self.outcome(self.builds(), error, where), (1, str(error)))
+
+    def test_a_tailscale_unnamed_fence_counts_in_the_streak(self):
+        """pack sd:9574: a hub whose Tailscale names no node raised `Fenced` with `cause` `tailscale` (sd:9543),
+        and each such tick exited 1 at once. It is an outage like an unreachable hub: two skip, the third exits 1."""
+        from sd_db import hub, remote
+        text = ("refused: this machine is not the hub: Tailscale does not name this node, so it cannot match "
+                "hub.example.test: this node is not connected to the Tailscale control plane")
+        unnamed = remote.rebuild_error(remote.describe_error(hub.Fenced(text, state="unknown", cause="tailscale")))
+        self.assertEqual(self.outcome(self.builds(), unnamed, "connect"), (0, f"skipped: {text}{FIRST}\n"))
+        code, output = self.outcome(self.builds(), unnamed, "tick")
+        self.assertEqual(code, 0)
+        self.assertIn("skipped (partial)", output)
+        self.assertEqual(self.outcome(self.builds(), unnamed, "connect"), (1, text))
+
+    def test_only_a_hub_behind_exits_1_with_its_remedy(self):
+        """pack sd:9541 review: a mismatch whose `upgrade` names the hub needs `repo-sync.sh refresh` there, which no
+        follow job runs: it exits 1 with its remedy. `satellite`, `both` (every hub refresh: the package version is
+        fixed, so only the digests differ) and no `upgrade` skip, as sd:8685 decided; a lasting one is the follow
+        job's alert. Read from `upgrade`, never the text; each is rebuilt as the satellite gets it from the hub."""
+        from sd_db import remote
+
+        def wired(field, satellite, hub, *, upgrade=True):
+            described = remote.describe_error(remote.BuildMismatch(field, satellite, hub))
+            if not upgrade:
+                del described["attributes"]["upgrade"]  # a hub that sends no direction
+            return remote.rebuild_error(described)
+        cases = (("satellite", wired("package", "1.0", "1.1")), ("hub", wired("package", "1.1", "1.0")),
+                 ("both", wired("build", "80a4eacae0c346b5", "c3866a94f3d93ddf")),
+                 (None, wired("package", "1.0", "1.1", upgrade=False)))
+        for upgrade, error in cases:
+            self.assertEqual(getattr(error, "upgrade", None), upgrade)
+            for where, label in (("connect", "skipped"), ("tick", "skipped (partial)")):
+                with self.subTest(upgrade=upgrade, where=where):
+                    self.stamp.unlink(missing_ok=True)  # each case is a first skip
+                    expected = ((1, str(error)) if upgrade == "hub"
+                                else (0, f"{label}: sd_db build mismatch; the follow job follows\n"))
+                    self.assertEqual(self.outcome(self.builds(), error, where), expected)
+
+    def unreachable(self, where="connect"):
+        from sd_db import remote
+        return self.outcome(self.builds(), remote.HubUnreachable("hub.example.test", 8769, "timed out"), where)
+
+    def test_the_third_unreachable_tick_in_a_row_exits_1(self):
+        """pack sd:9541 review: every unreachable tick exited 0, so a lasting outage or a wrong port never alerted.
+        The first two in a row skip; the third, and each after it, exits 1 with the hub's own error."""
+        error = "the sd hub at hub.example.test:8769 is unreachable: timed out"
+        self.assertEqual(self.unreachable(), (0, f"skipped: {error}{FIRST}\n"))
+        code, output = self.unreachable()
+        self.assertEqual(code, 0)
+        self.assertIn("skipped tick 2 in a row since 2026-11-19T00:00:00Z", output)
+        self.assertEqual(self.unreachable(), (1, error))
+        self.assertEqual(self.unreachable(), (1, error))
+        self.assertEqual(json.loads(self.stamp.read_text()), {"first": "2026-11-19T00:00:00Z", "count": 4})
+
+    def test_a_hub_that_drops_every_tick_mid_way_still_alerts(self):
+        """pack sd:9541 review: the stamp was cleared at the connect, so a hub that took the connect and dropped
+        each request after it never alerted. A connect is not a pass: mid-tick outages count in the same streak."""
+        error = "the sd hub at hub.example.test:8769 is unreachable: timed out"
+        self.assertEqual([self.unreachable("tick")[0], self.unreachable("tick")[0]], [0, 0])
+        self.assertEqual(self.unreachable("tick"), (1, error))
+
+    def test_a_completed_tick_ends_the_skip_streak(self):
+        """pack sd:9541 review: only a tick that ran to its end removes the stamp; two skips of any kind, then a
+        whole tick, and the next skip starts at one."""
+        self.unreachable()
+        run = self.builds()
+        self.connect.side_effect = None
+        run.dispatch.side_effect = sqlite3.OperationalError("database is locked")
+        self.assertEqual(self.tick(run)[0], 0)
+        self.assertEqual(json.loads(self.stamp.read_text())["count"], 2)
+        self.connect.side_effect = None
+        code, _ = self.tick(self.builds())
+        self.assertEqual(code, 0)
+        self.assertFalse(self.stamp.exists())
+        code, output = self.unreachable()
+        self.assertEqual(code, 0)
+        self.assertIn("skipped tick 1 in a row", output)
+
+    def test_three_ticks_past_the_deadline_in_a_row_exit_1(self):
+        """pack sd:9541 review: a hub that takes the connect and then hangs trips the tick's deadline before its own
+        answer timeout, and that skip counted nothing, so it never alerted. Every skip counts in one streak."""
+        codes = []
+        for _ in range(3):
+            run = self.builds()
+            run.dispatch.side_effect = lambda connection, **kwargs: time.sleep(5)
+            with patch.object(cli, "TICK_SECONDS", 0.2, create=True):
+                try:
+                    codes.append(self.tick(run))
+                except cli.WorkRefusal as refusal:
+                    codes.append((1, str(refusal)))
+        self.assertEqual([code for code, _ in codes], [0, 0, 1])
+        self.assertEqual(codes[2][1], "the tick ran past 0.2 s")
+
+    def test_three_mixed_skips_in_a_row_exit_1_with_the_last_reason(self):
+        """pack sd:9541 review: an outage, a lock mid-tick and a lock at the open are one streak; the third fails
+        with its own text. A mismatch between them neither counts nor resets."""
+        from sd_db import remote
+        self.assertEqual(self.unreachable()[0], 0)
+        run = self.builds()
+        self.connect.side_effect = None
+        run.dispatch.side_effect = sqlite3.OperationalError("database is locked")
+        self.assertEqual(self.tick(run)[0], 0)
+        mismatch = remote.BuildMismatch("build", "80a4eacae0c346b5", "c3866a94f3d93ddf")
+        self.assertEqual(self.outcome(self.builds(), mismatch, "connect")[0], 0)
+        self.assertEqual(json.loads(self.stamp.read_text())["count"], 2)
+        locked = sqlite3.OperationalError("database is locked")
+        self.assertEqual(self.outcome(self.builds(), locked, "connect"), (1, "database is locked"))
+
+    def test_a_lock_at_the_open_is_a_counted_skip(self):
+        """pack sd:9541 review: a lock while the database opens (its version check or WAL setup) came wrapped as a
+        refusal and exited 1 at once; it is the same locked-database skip as one mid-tick."""
+        locked = sqlite3.OperationalError("database is locked")
+        self.assertEqual(self.outcome(self.builds(), locked, "connect"),
+                         (0, f"skipped: database is locked{FIRST}\n"))
+        other = sqlite3.OperationalError("disk I/O error")
+        self.assertEqual(self.outcome(self.builds(), other, "connect"), (1, "disk I/O error"))
+
+    def test_a_mismatch_tick_neither_counts_nor_resets(self):
+        """pack sd:9541 review: a satellite stays mismatched 5-9 min after every pack merge, so a counted mismatch
+        alerted on each merge. Five in a row exit 0, and a streak already begun keeps its count (pack sd:8685)."""
+        from sd_db import remote
+        mismatch = remote.BuildMismatch("build", "80a4eacae0c346b5", "c3866a94f3d93ddf")
+        for where in ("connect", "tick"):
+            for _ in range(5):
+                with self.subTest(where=where):
+                    self.assertEqual(self.outcome(self.builds(), mismatch, where)[0], 0)
+                    self.assertFalse(self.stamp.exists())
+        self.assertEqual(self.unreachable()[0], 0)
+        for _ in range(5):
+            self.assertEqual(self.outcome(self.builds(), mismatch, "connect")[0], 0)
+        self.assertEqual(json.loads(self.stamp.read_text())["count"], 1)
+
+    def test_a_corrupt_stamp_starts_a_streak_never_a_pass(self):
+        """pack sd:9541 review: a stamp that does not parse is one failure, rewritten whole; it is never healthy."""
+        for garbage in ("not json", '{"count": "two"}', '{"count": -3}', "[]"):
+            with self.subTest(garbage=garbage):
+                self.stamp.parent.mkdir(parents=True, exist_ok=True)
+                self.stamp.write_text(garbage)
+                code, output = self.unreachable()
+                self.assertEqual(code, 0)
+                self.assertIn("skipped tick 1 in a row", output)
+                self.assertEqual(json.loads(self.stamp.read_text())["count"], 1)
+
+    def test_an_unwritten_stamp_exits_1(self):
+        """pack sd:9541 review: a count that was not recorded is unknown, so the tick fails rather than skip."""
+        self.stamp.parent.parent.mkdir(parents=True, exist_ok=True)
+        self.stamp.parent.write_text("a file where the folder goes")
+        code, output = self.unreachable()
+        self.assertEqual(code, 1)
+        self.assertIn("is unreachable: timed out", output)
+        self.assertIn("was not recorded", output)
+
+    def test_an_outage_at_the_deadline_is_handled_whole(self):
+        """pack sd:9541 review: the tick's alarm stayed armed while the stamp was written, so the deadline could
+        escape the skip as a traceback. The alarm ends before the outage is counted."""
+        real = os.replace
+
+        def slow(source, target):
+            time.sleep(0.5)
+            real(source, target)
+        with patch.object(cli, "TICK_SECONDS", 0.2, create=True), patch.object(cli.os, "replace", slow):
+            code, output = self.unreachable("tick")
+        self.assertEqual(code, 0)
+        self.assertIn("skipped tick 1 in a row", output)
+        self.assertEqual(json.loads(self.stamp.read_text())["count"], 1)
+
+    def test_a_clock_jump_does_not_reset_the_streak(self):
+        """pack sd:9541 review: the count, not the clock, ends the skips: a stamp whose first failure is in the
+        future (the clock went back) still makes the third tick fail."""
+        self.stamp.parent.mkdir(parents=True, exist_ok=True)
+        self.stamp.write_text(json.dumps({"first": "2099-01-01T00:00:00Z", "count": 2}))
+        self.assertEqual(self.unreachable()[0], 1)
+
+    def test_another_hub_error_still_exits_1(self):
+        """pack sd:9541: only the outages skip; a lost commit answer or a broken wire stays a refusal."""
+        from sd_db import remote
+        broken = remote.RemoteError("the wire broke")
+        lost = remote.UnknownOutcome("r-1", "the hub stayed unreachable")
+        for error, where in ((broken, "connect"), (lost, "tick")):
+            with self.subTest(error=type(error).__name__, where=where):
+                self.assertEqual(self.outcome(self.builds(), error, where), (1, str(error)))
+
     def test_the_load_read_does_not_follow_either(self):
         """pack sd:8685: `sd gate status`, the tick's child, carries the marker that keeps the refusal."""
         from sd_db import follow
@@ -357,8 +612,22 @@ class OperationsCLI(unittest.TestCase):
         with patch.object(cli, "TICK_SECONDS", 0.2, create=True):
             code, output = self.tick(run)
         self.assertLess(time.monotonic() - started, 2)
-        self.assertEqual((code, output), (0, "skipped: the tick ran past 0.2 s\n"))
+        # pack sd:9541: the deadline met the tick's work, so the skip says it began.
+        self.assertEqual((code, output), (0, f"skipped (partial): the tick ran past 0.2 s{FIRST}\n"))
         self.connection.close.assert_called_once()
+
+    def test_a_deadline_before_the_connect_is_a_plain_skip(self):
+        """pack sd:9541: `partial` is the tick's own flag, set once it connected: a slow load read began nothing."""
+        run = self.builds()
+        run.dispatch.side_effect = AssertionError("the tick never connected")
+        with patch.object(cli, "TICK_SECONDS", 0.2, create=True), \
+                patch.object(cli, "gate_load", side_effect=lambda: time.sleep(5)), \
+                patch.object(cli, "interactive_builders", return_value=([], "")), \
+                patch.object(cli, "log_root", return_value=Path("/bulk")), \
+                patch.object(cli, "writable", return_value=True):
+            code, output = self.call("assignments", "dispatch", "--json")
+        self.assertEqual((code, json.loads(output)), (0, {"skipped": f"the tick ran past 0.2 s{FIRST}", "partial": False}))
+        self.connect.assert_not_called()
 
     def test_a_hung_bulk_root_probe_claims_within_its_bound_and_skips_the_archive(self):
         """pack sd:6749: a stat on a hung bulk volume blocked the tick before its alarm was set. pack sd:8845: a live

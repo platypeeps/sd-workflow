@@ -251,7 +251,7 @@
       Object.values(DET.items).forEach(d => {
         const as = live(String(d.item.id)) ? o => o : o => ({ id: o.id, type: 'not listed', label: `${o.label} (no longer listed)` });
         d.notes.forEach(n => C.put(as({ id: `note:${n.id}`, type: 'note', label: `${n.kind} ${n.id} on #${d.item.id}`, note: n.id, kind: n.kind, resolved: n.resolved, item: d.item.id })));
-        d.assignments.forEach(a => C.put(as({ id: `asg:${a.id}`, type: 'assignment', label: `Assignment #${a.id}`, n: a.id, scope: a.scope, members: a.members || [], status: a.status, item: d.item.id, repo: d.item.repo, can: a.cancel })));
+        d.assignments.forEach(a => C.put(as({ id: `asg:${a.id}`, type: 'assignment', label: `Assignment #${a.id}`, n: a.id, scope: a.scope, members: a.members || [], parks: a.parks || [], revision: a.revision, status: a.status, item: d.item.id, repo: d.item.repo, can: a.cancel })));
       });
       ISSUE_RUNS.forEach(r => C.put(issueObject(r)));
     }
@@ -536,21 +536,33 @@
         when: o => o.can.allowed || o.can.reason, cli: o => `sd assignments cancel ${o.n}`,
         // sd:9222: a queued build's cancel parks its item; a running one parks at the run's end, or ends blocked.
         // Only a build parks, so the text reads the scope as well as the status (review round 4).
+        // pack sd:9290: it parks only the items the Details name in `parks`, by the backend's rule (`build.parks`).
         consequence: o => `Ends assignment #${o.n} in ${o.repo} as cancelled. ` + (o.scope === 'build' && o.status === 'queued'
-          ? "It parks the item, its status unchanged, so auto-pickup leaves it until Unpark." + (o.members.length
-            ? ` It also cancels and parks its ${o.members.length} queued member${o.members.length === 1 ? '' : 's'}: ${o.members.map(i => `#${i}`).join(', ')}.`
-            : '')
+          ? queuedCancel(o)
           : o.scope === 'build' && o.status === 'running'
             ? 'The build stops at its next beat and parks its items at ready until Unpark; if the reap cannot confirm the process stopped, it ends blocked instead: check the process, then Retry once the lease is released.'
             : "The item's status is unchanged."),
         run: o => landing(cancelAsg(o), () => `Cancelled · #${o.n} · sd assignments cancel ${o.n}`) },
       window.commands.showAssignment({ primary: o => o.status !== 'blocked' }),
     );
+    // A queued build's cancel: what parks, and of a lead, which members it cancels and which of them park (pack sd:9290).
+    function queuedCancel(o) {
+      const ids = list => list.map(i => `#${i}`).join(', '), parks = o.parks || [];
+      const parked = o.members.filter(i => parks.includes(i)), stay = o.members.filter(i => !parks.includes(i));
+      return (parks.includes(o.item)
+        ? 'It parks the item, its status unchanged, so auto-pickup leaves it until Unpark.'
+        : 'It does not park the item: it is not ready, already parked, or owned by another assignment.')
+        + (o.members.length ? ` It also cancels its ${o.members.length} queued member${o.members.length === 1 ? '' : 's'}: ${ids(o.members)}.` : '')
+        + (parked.length ? ` It parks ${ids(parked)}.` : '')
+        // One parked already stays parked: the cancel leaves each of these as it is (pack sd:9290 review).
+        + (stay.length ? ` It does not park ${ids(stay)}: not ready, already parked, or owned by another assignment.` : '');
+    }
     // A refused cancel reads the Details again too: they hold the revision a retry sends.
+    // It sends the revision of the object its confirm read, never the Details at OK: a refresh while the dialog is
+    // open can replace them, and the queued lead's revision holds its members and parks (pack sd:9290 review).
     async function cancelAsg(o) {
-      const a = Object.values(DET.items).flatMap(d => d.assignments).find(x => x.id === o.n);
-      if (!a) throw new Error(`assignment #${o.n} was not read`);
-      try { await window.shell.post(`/api/assignments/${o.n}/cancel`, { revision: a.revision }); } catch (err) { if (err.stale) redrawDet(o.item); throw err; }
+      if (!o.revision) throw new Error(`assignment #${o.n} was not read`);
+      try { await window.shell.post(`/api/assignments/${o.n}/cancel`, { revision: o.revision }); } catch (err) { if (err.stale) redrawDet(o.item); throw err; }
       redrawDet(o.item); await host.reread();
     }
 

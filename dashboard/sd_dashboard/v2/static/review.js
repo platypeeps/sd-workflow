@@ -131,14 +131,15 @@
     const open = list.filter(isOpen), on = open.filter(q => PICKED.has(q.note)).length, name = b.title || `sd:${b.item}`;
     const state = open.length && on === open.length ? html` checked` : on ? html` data-mixed=""` : '';
     return html`<tr class="band" data-band="${`b${b.item}`}"><td colspan="4">${name}${b.nightly ? html`<span class="tag">nightly</span>` : ''}<span class="n">${open.length} open · sd:${b.item}</span>${open.length
-      ? html`<label class="bandpick" data-tkeep=""><input type="checkbox" data-band-pick="${b.item}" aria-label="${`Select every open question in ${name}`}"${state}><span>Select batch</span></label>` : ''}${brief(b.context)}</td></tr>`;
+      ? html`<label class="bandpick" data-tkeep=""><input type="checkbox" data-band-pick="${b.item}" aria-label="${`Select every open question in ${name}`}"${state}><span>Select batch</span></label>` : ''}${brief(b.context, b.item)}</td></tr>`;
   }
 
   // sd:5759: the batch's context under its band, above its questions. It stays out of the fold button (data-tkeep), as the
-  // batch checkbox does, and a shut fold hides it (review.css).
-  function brief(c) {
-    if (!c) return '';
-    const rubric = c.rubric || [];
+  // batch checkbox does, and a shut fold hides it (review.css). A batch filed with none, before pack sd:9479 required
+  // one, says so and names itself, so its questions never stand bare.
+  function brief(c, item) {
+    const rubric = (c && c.rubric) || [];
+    if (!c || !(c.purpose || rubric.length || c.feeds)) return html`<p class="brief nobrief" data-tkeep="">No description: ask the filer (sd:${item})</p>`;
     return html`<dl class="brief" data-tkeep="">${c.purpose ? html`<dt>Purpose</dt><dd>${c.purpose}</dd>` : ''}${rubric.length
       ? html`<dt>Rubric</dt><dd><ul>${rubric.map(r => html`<li>${r}</li>`)}</ul></dd>` : ''}${c.feeds ? html`<dt>Feeds</dt><dd>${c.feeds}</dd>` : ''}</dl>`;
   }
@@ -180,7 +181,19 @@
       <button class="btn quiet sm" type="button" id="accept-rec"${recs ? '' : html` disabled`}>Accept recommendation <span class="n">${recs}</span></button>` : ''}`);
   }
 
-  function draw() { lamps(); rows(); progress(); }
+  // The weekly advisory sweep (sd:9505): one row per week from `sweeps`, newest first. A count the log does not hold is
+  // a dash, never a zero; Fixed is the week's filed items done, of all it filed. The tally says why a log did not read.
+  function sweeps() {
+    const s = DOC && DOC.sweeps, weeks = s ? s.weeks : [], n = v => (v === null || v === undefined ? '—' : v);
+    const why = !s ? 'not read' : s.state === 'read' ? '' : `log: ${s.reason}`;
+    $('sweep-tally').textContent = `${plural(weeks.length, 'week')}${why ? ` · ${why}` : ''}`;
+    const fixed = w => (w.fixed + w.unfixed ? `${w.fixed} of ${w.fixed + w.unfixed}` : '—');
+    put($('sweeps'), weeks.length
+      ? html`${weeks.map(w => html`<tr><td>${w.week}</td><td>${n(w.packets)}</td><td>${n(w.open)}</td><td>${n(w.filed)}</td><td>${n(w.skipped)}</td><td>${fixed(w)}</td></tr>`)}`
+      : html`<tr class="empty"><td colspan="6">${s ? 'No sweep has run yet.' : 'The sweep was not read.'}</td></tr>`);
+  }
+
+  function draw() { lamps(); rows(); progress(); sweeps(); }
 
   // ---------- Selection ----------
   function select(note) {

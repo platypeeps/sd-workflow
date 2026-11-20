@@ -8,8 +8,7 @@
   one lane per Activity kind (merges, runs, reviews, commands, from /api/activity?range=7d, read when the view first
   shows), over the last 24 hours or 7 days as its range tiles pick; a table of the marks and a key to Tasks.
   Under it the spend line (sd:6031): spent in the last 24 hours and each of the last 7, from the cost table; Metrics has the rest.
-  Under the annunciator the Usage strip (pack sd:9257, usage_screen.strip): each provider's windows, reset, pace and read
-  time, flagged by the services Health's Status view watches; a reading over 30 minutes old is unknown, never 0.
+  The Usage strip (pack sd:9257) is the shell's Usage dropdown beside Read again since pack sd:9569, on every page.
   The annunciator: Jobs, Lane, Reports, Pulls, Mail and Repos filter Needs you to their rows; Sessions and Gate open the
   Queue view. Each number counts the rows its filter shows.
   Needs you: the document's `needs`, every fact that asks for an act, ranked in the bands, with group rows for the work items
@@ -61,9 +60,6 @@
       <li><a class="cell" href="#view=queue" id="lamp-gate" data-state="unknown"><span class="lbl">Gate<svg class="i" aria-hidden="true"><use href="#i-gauge"/></svg></span><span class="val">reading…</span></a></li>
     </ul></annunciator-strip>
 
-    <!-- pack sd:9257: the Usage strip, the page's evidence strip, from /api/now's usage (usage_screen.strip). -->
-    <section class="usage" aria-labelledby="usage-h"><h2 class="sr" id="usage-h">Usage</h2><div id="usage"><p class="foot">Reading usage…</p></div></section>
-
     <!-- The toolbar standard (sd:5281): the shell's Shapeshift bar (sd:5539) over every view; its text filters Needs you. -->
     <div class="toolbar" id="toolbar" data-shift></div>
 
@@ -105,7 +101,7 @@
 
     <section id="view-queue" aria-labelledby="queue-h" hidden>
       <div class="sec-head">
-        <h2 id="queue-h">Queue <button class="help" type="button" aria-label="Help: Queue" data-help="&lt;b&gt;What runs and what waits, one row per repo.&lt;/b&gt; A click opens a repo and closes the one that was open. Its rows, in order: working (live sessions, build runs, runner assignments), merging, next and blocked (the lane entries, with the lane's own actions; an item whose pull request waits on review is blocked too, on you or on reviewers, with how long it waited), suggested (up to six tasks to do next: ready, then planned, then unscheduled) and ended (ended build runs, cancelled and landed entries). The marker on the left names each row's type; its glyph is the row's state, and a repo's glyph is its worst row's. Suggested shows until you press it off; Ended builds show only once you press them. Each repo row counts its merging, review, working, next, blocked, suggested and parked rows in seven boxes, in that order, named under the Detail head; review counts the pull requests waiting on a review and lights when one waits on you. Press a box to open its repo with only that box's rows, Show filters or not; press it again, or Show all, for every row.">
+        <h2 id="queue-h">Queue <button class="help" type="button" aria-label="Help: Queue" data-help="&lt;b&gt;What runs and what waits, one row per repo.&lt;/b&gt; A click opens a repo and closes the one that was open. Its rows, in order: working (live sessions, build runs, runner assignments), merging, next and blocked (the lane entries, with the lane's own actions; an item whose pull request waits on review is blocked too, on you or on reviewers, with how long it waited), suggested (up to six tasks to do next: ready, then planned, then unscheduled) and ended (ended build runs, cancelled and landed entries). The marker on the left names each row's type; its glyph is the row's state, and a repo's glyph is its worst row's. Suggested shows until you press it off; Ended builds show only once you press them. Each repo row counts its merging, review, working, next, blocked, suggested and parked rows in seven boxes, in that order, each named in three letters over its box under the Detail head; review counts the pull requests waiting on a review and lights when one waits on you. Press a box to open its repo with only that box's rows, Show filters or not; press it again, or Show all, for every row.">
           <svg class="i" aria-hidden="true"><use href="#i-circle-help"/></svg></button></h2>
         <p class="tally" id="queue-tally"></p>
       </div>
@@ -114,7 +110,7 @@
       <p class="filtered" id="queue-pickup"></p>
       <table class="ledger active queue" aria-labelledby="queue-h" data-tgrid="off">
         <caption>One row per repo; open one for its working, merging, next, blocked, suggested, open and ended rows.</caption>
-        <thead><tr><th class="mk">Type</th><th>What</th><th>Detail <span class="keys" aria-hidden="true"><span>merging</span><span>review</span><span>working</span><span>next</span><span>blocked</span><span>suggested</span><span>parked</span></span></th><th class="num">Age</th><th class="act"><span class="sr">Actions</span></th></tr></thead>
+        <thead><tr><th class="mk">Type</th><th>What</th><th>Detail <span class="keys" aria-hidden="true"><abbr title="merging">mrg</abbr><abbr title="review">rev</abbr><abbr title="working">wrk</abbr><abbr title="next">nxt</abbr><abbr title="blocked">blk</abbr><abbr title="suggested">sug</abbr><abbr title="parked">prk</abbr></span></th><th class="num">Age</th><th class="act"><span class="sr">Actions</span></th></tr></thead>
         <tbody id="queue"><tr class="empty"><td colspan="5">Reading the queue…</td></tr></tbody>
       </table>
       <p class="filtered" id="queue-note" hidden></p>

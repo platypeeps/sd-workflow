@@ -1444,8 +1444,8 @@
   // WebKit (Safari, the iPad) does not focus a box it taps, and focuses its focusable ancestor (<main tabindex="-1">)
   // instead, which shut the menu before the click landed (sd:6254).
   document.addEventListener('toggle', e => { const d = e.target; if (d.matches?.('details.fpick')) { if (d.open) PICKS.add(d.dataset.pick); else PICKS.delete(d.dataset.pick); } }, true);
-  document.addEventListener('pointerdown', e => document.querySelectorAll('details.fpick[open]').forEach(d => { if (!d.contains(e.target)) d.open = false; }));
-  document.addEventListener('focusout', e => { const d = e.target.closest?.('details.fpick[open]'); if (d && e.relatedTarget && !d.contains(e.relatedTarget) && !e.relatedTarget.contains(d)) d.open = false; });
+  document.addEventListener('pointerdown', e => document.querySelectorAll('details.fpick[open], details.usage-drop[open]').forEach(d => { if (!d.contains(e.target)) d.open = false; }));
+  document.addEventListener('focusout', e => { const d = e.target.closest?.('details.fpick[open], details.usage-drop[open]'); if (d && e.relatedTarget && !d.contains(e.relatedTarget) && !e.relatedTarget.contains(d)) d.open = false; });
 
   // ---------- Table grammar: every table sorts, filters and folds (sd:5064) ----------
   // tables:start
@@ -1770,7 +1770,7 @@
     if (e.key === 'Escape') {
       if (document.querySelector('dialog[open]')) return; // the dialog closes itself; the pane behind it stays
       if (pinned || !pop.hidden) { hideHelp(); return; } if (!menuEl.hidden) { closeMenu(); return; }
-      const fp = document.querySelector('details.fpick[open]'); if (fp) { fp.open = false; fp.querySelector('summary').focus(); return; }
+      const fp = document.querySelector('details.fpick[open], details.usage-drop[open]'); if (fp) { fp.open = false; fp.querySelector('summary').focus(); return; }
       const sheet = !wide() && pane.hasAttribute('data-open'), menuOpen = rail.hasAttribute('data-menu');
       closePane(); setMenu(false);
       if (sheet || menuOpen) return;
@@ -1910,20 +1910,95 @@
     else if (hiddenAt && Date.now() - hiddenAt >= 5 * 60 * 1000) location.reload();
   });
 
+  // usage:start
+  // The Usage dropdown (pack sd:9569; Today's Usage strip under its annunciator until then, pack sd:9257): beside Read
+  // again on every page, a <details> menu that closes as the filter dropdowns' (.fpick) do: Esc, a press outside or focus leaving
+  // closes it). It reads /api/usage/strip (usage_screen.strip) when the page loads and each time it opens: one row per
+  // provider, and per cswap account for claude, with the windows its reading has, each with use, reset in this zone with
+  // its label, and pace; its read time; and the flag of the services that name it (Health's Status view). A reading not
+  // read, or over 30 minutes old, is unknown with why and no number. The summary wears the worst state of the rows and
+  // their flags; a read that failed is unknown, never ok. The lists' add and remove are Settings'.
+  const UGLYPH = { ok: '●', caution: '▲', warning: '■', queued: '◌', unknown: '▨' };
+  const URANK = ['ok', 'queued', 'unknown', 'caution', 'warning'];
+  const usd = n => `$${Number(n).toFixed(2)}`;
+  const zoned = iso => new Date(iso).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
+  const pace = p => p === null || p === undefined ? '' : Math.abs(p) < 3 ? ' · on pace' : ` · ${Math.abs(p)} pts ${p > 0 ? 'over' : 'under'} pace`;
+  const money = (m, what) => m ? html`<span class="w">${what} <b>${m.unit === 'USD' || !m.unit ? usd(m.amount) : `${m.amount} ${m.unit}`}</b>${m.period ? ` ${m.period}` : ''}</span>` : '';
+  function usageRow(r) {
+    const f = r.service;
+    const flag = f && f.state !== 'ok' ? html`<a class="flag" href="${f.url && f.state !== 'unknown' ? f.url : '/fleet-health#view=status'}"${f.url && f.state !== 'unknown' ? html` target="_blank" rel="noopener noreferrer"` : ''}><span class="g-${f.state}" aria-hidden="true">${UGLYPH[f.state]}</span> ${f.name} ${f.status}${f.title ? `: ${f.title}` : ''}</a>` : '';
+    const body = r.state === 'unknown' ? html`<span class="why">Unknown: ${r.why}</span>`
+      : html`${r.windows.map(w => html`<span class="w"><span class="wl">${w.label}</span><svg class="track" viewBox="0 0 100 1" preserveAspectRatio="none" role="img" aria-label="${`${w.label} window ${w.used}% used`}"><rect class="fill${w.used >= 100 ? ' warning' : w.used >= 80 ? ' caution' : ''}" width="${Math.min(100, w.used)}" height="1"/></svg><b>${Math.round(w.used)}%</b>${w.resets_at ? html` · resets <time datetime="${w.resets_at}">${zoned(w.resets_at)}</time>` : ''}${pace(w.pace)}</span>`)}${money(r.balance, 'balance')}${money(r.spend, 'spent')}`;
+    return html`<li data-state="${r.state}"><span class="nm"><span class="g-${r.state}" aria-hidden="true">${UGLYPH[r.state]}</span><span class="sr">${r.state} · </span>${r.label}${r.active ? html` <small>active</small>` : ''}</span>
+      <span class="ws">${body}</span>${flag}<span class="age">${r.read_at ? html`read <time class="rel" datetime="${r.read_at}"></time>` : 'not read'}</span></li>`;
+  }
+  function usageBody(U) {
+    const links = html`<a href="${U.providers || '/settings#f-dashboard.usage_providers'}">Providers in Settings</a> · <a href="/metrics">Spend in Metrics</a>`;
+    if (U.error) return html`<p class="foot">Not read: ${U.error}. Opening it again tries again. ${links}</p>`;
+    const nosource = U.nosource || [], none = !U.rows.length && !nosource.length;
+    return html`${U.rows.length ? html`<ul class="urows">${U.rows.map(usageRow)}</ul>` : ''}
+      <p class="foot">${none ? 'No provider read yet. ' : ''}${nosource.length ? `No reader for ${nosource.join(', ')}. ` : ''}${U.flags_error ? `Service status not read: ${U.flags_error}. ` : ''}${links}</p>`;
+  }
+  // Pack sd:9597: no row, or a provider with no reader, is no reading: unknown, never ok.
+  const usageWorst = U => U.error ? 'unknown' : (U.rows || []).flatMap(r => [r.state, r.service && r.service.state])
+    .reduce((worst, s) => URANK.indexOf(s) > URANK.indexOf(worst) ? s : worst,
+      U.flags_error || !(U.rows || []).length || (U.nosource || []).length ? 'unknown' : 'ok');
+  const usageSum = state => html`${ICON('gauge')}<span>Usage</span>${state ? html`<span class="g-${state}" aria-hidden="true">${UGLYPH[state]}</span><span class="sr"> ${state}</span>` : ''}`;
+  const usageDrop = html`<details class="usage-drop" id="usage-drop"><summary class="btn quiet sm" id="usage-sum">${usageSum('')}</summary><div class="fpick-menu ustrip" id="usage-menu" role="group" aria-label="Usage"><p class="foot">Reading usage…</p></div></details>`;
+  // Service status (pack sd:9656): a second dropdown beside Usage, drawn hidden and shown only while the strip's `down`
+  // names a watched service degraded or out; the same read draws it. A failed read hides it: unknown is Usage's to say.
+  const statusSum = state => html`${ICON('activity')}<span>Service status</span>${state ? html`<span class="g-${state}" aria-hidden="true">${UGLYPH[state]}</span><span class="sr"> ${state}</span>` : ''}`;
+  const statusBody = down => html`<ul class="urows">${down.map(f => html`<li data-state="${f.state}"><span class="nm"><span class="g-${f.state}" aria-hidden="true">${UGLYPH[f.state]}</span><span class="sr">${f.state} · </span>${f.name}</span>
+      <span class="ws">${f.url ? html`<a class="flag" href="${f.url}" target="_blank" rel="noopener noreferrer">${f.name} ${f.status}${f.title ? `: ${f.title}` : ''}</a>` : `${f.name} ${f.status}${f.title ? `: ${f.title}` : ''}`}</span><span class="age">${f.lasted ? `for ${f.lasted}` : ''}</span></li>`)}</ul>
+      <p class="foot"><a href="/fleet-health#view=status">Service status in Health</a></p>`;
+  const statusDrop = html`<details class="usage-drop" id="status-drop" hidden><summary class="btn quiet sm" id="status-sum">${statusSum('')}</summary><div class="fpick-menu ustrip" id="status-menu" role="group" aria-label="Service status"></div></details>`;
+  // Wires the drawn dropdowns and returns their read, which Read again calls too: of overlapping reads only the newest
+  // draws. A failed read, an answer without rows and a row that does not render all draw "Not read: why", unknown.
+  function usageWire() {
+    const d = document.getElementById('usage-drop'), menu = document.getElementById('usage-menu'), sum = document.getElementById('usage-sum');
+    const s = document.getElementById('status-drop');
+    let n = 0;
+    const read = () => {
+      const k = ++n;
+      getJSON('/api/usage/strip').then(U => {
+        if (!U || !Array.isArray(U.rows)) throw new Error('the answer held no provider rows');
+        const down = Array.isArray(U.down) ? U.down : [];
+        return [usageBody(U), usageWorst(U), down, down.length ? statusBody(down) : null];
+      }).catch(e => [usageBody({ error: e && e.message || String(e) }), 'unknown', [], null]).then(([body, state, down, list]) => {
+        if (k !== n) return;
+        put(menu, body); put(sum, usageSum(state)); sum.dataset.state = state;
+        if (!s) return;
+        if (list) {
+          const worst = down.reduce((w, f) => URANK.indexOf(f.state) > URANK.indexOf(w) ? f.state : w, 'ok'), ssum = document.getElementById('status-sum');
+          put(document.getElementById('status-menu'), list); put(ssum, statusSum(worst)); ssum.dataset.state = worst;
+        } else s.open = false;
+        s.hidden = !list;
+      });
+    };
+    d.addEventListener('toggle', () => { if (d.open) read(); });
+    if (location.hash === '#usage') d.open = true; // screenshot hook, as #menu and #chat are; opening reads
+    else read();
+    return read;
+  }
+  // usage:end
   // again:start
   // Read again (sd:5638): a page sets window.PAGE_AGAIN = { title, run } on load or in its DOMContentLoaded; run reads the page's
   // documents again and redraws, keeping the selection and the filters, and may return a promise. The shell draws one button
   // for it, the same label and icon on every page, in the page's [data-again] element or at the end of its head, once every
   // page's DOMContentLoaded ran (a window listener added last). It is busy while a run is pending; a run that throws says so.
   // It collects nothing: a page whose collector can run again keeps that as its own action. test_v2_registry holds every page to it.
+  // pack sd:9569: the Usage dropdown (usage:start) sits before it in one .head-acts group, on a page without Read again
+  // too, with Service status (pack sd:9656) beside it; Read again reads both again as well.
   function again() {
     const a = window.PAGE_AGAIN, at = document.querySelector('[data-again]') || main.querySelector('.head, .home-head');
-    if (!a || !at || document.getElementById('read-again')) return;
-    put(at, html`<button class="btn quiet sm" type="button" id="read-again" title="${a.title || 'Read this page again'}">${ICON('rotate-ccw')}<span>Read again</span></button>`, 'append');
+    if (!at || document.getElementById('head-acts')) return;
+    put(at, html`<div class="head-acts" id="head-acts">${usageDrop}${statusDrop}${a ? html`<button class="btn quiet sm" type="button" id="read-again" title="${a.title || 'Read this page again'}">${ICON('rotate-ccw')}<span>Read again</span></button>` : ''}</div>`, 'append');
+    const usageRead = usageWire();
+    if (!a) return;
     const b = document.getElementById('read-again');
     let runs = 0;
     b.addEventListener('click', () => {
-      b.setAttribute('aria-busy', 'true'); runs++;
+      b.setAttribute('aria-busy', 'true'); runs++; usageRead();
       Promise.resolve().then(() => window.PAGE_AGAIN.run())
         .catch(e => toast(`Not read again: ${e && e.message || e}`))
         .finally(() => { if (!--runs) b.removeAttribute('aria-busy'); });

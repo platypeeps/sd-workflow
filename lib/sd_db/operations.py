@@ -528,7 +528,10 @@ def assignment_state(connection: sqlite3.Connection, assignment: int) -> dict:
                              "AS build_run, "
                              "(SELECT runner_run.step FROM runner_run WHERE runner_run.assignment="
                              "COALESCE(assignment.parent, assignment.id) AND runner_run.released_at IS NULL) "
-                             "AS build_step "
+                             "AS build_step, "
+                             "(SELECT runner_run.cancel_requested FROM runner_run WHERE runner_run.assignment="
+                             "COALESCE(assignment.parent, assignment.id) AND runner_run.released_at IS NULL) "
+                             "AS cancel_requested "
                              "FROM assignment LEFT JOIN item ON item.id=assignment.item WHERE assignment.id=?",
                              (assignment,)).fetchone()
     if row is None:
@@ -540,6 +543,10 @@ def assignment_state(connection: sqlite3.Connection, assignment: int) -> dict:
     # with no way to clear them (pack sd:8606).
     if row["status"] == "queued":
         reason = ""
+    elif row["status"] == "running" and row["scope"] == "build" and row["build_run"] and row["cancel_requested"]:
+        # Asked once is enough: a repeat posted the note again and changed nothing (pack sd:9375).
+        reason = (f"{row['cancel_requested']}; build run {row['build_run']} stops at its supervisor's next "
+                  "beat, or at the reap")
     elif row["status"] == "running" and row["scope"] == "build" and row["build_run"]:
         # From `enqueuing` on the lane may hold the branch: the lane entry is what to cancel (pack sd:6094).
         reason = ("" if row["build_step"] is None or row["build_step"] in build.CANCELLABLE
@@ -554,8 +561,16 @@ def assignment_state(connection: sqlite3.Connection, assignment: int) -> dict:
     else:
         reason = ""
     result = {key: row[key] for key in ("id", "item", "title", "role", "provider", "status", "started", "ended",
-                                        "scope", "build_run")}
-    result["revision"] = _digest(dict(row))
+                                        "scope", "build_run", "cancel_requested")}
+    # A queued build lead's cancel parks by `build.parks`, and its confirm names which items park (pack sd:9290):
+    # each one's outcome is in the revision, so a park or unpark between preview and confirm refuses.
+    parking = []
+    if row["scope"] == build.SCOPE and row["status"] == "queued":
+        members = build.queued_members(connection, assignment)
+        ending = (assignment, *(member for member, _ in members))
+        parking = [[ident, one, build.parks(connection, one, ("ready",), ending)]
+                   for ident, one in ((assignment, row["item"]), *members) if one is not None]
+    result["revision"] = _digest({**dict(row), **({"parking": parking} if parking else {})})
     result["capabilities"] = {"cancel": {"allowed": not reason, "reason": reason}}
     return result
 
@@ -631,4 +646,8 @@ def cancel_assignment(connection: sqlite3.Connection, assignment: int, *, expect
             add_note(connection, item, "comment",
                      f"{current['status'].capitalize()} assignment {ident} cancelled by {who}{lead}; item status "
                      f"unchanged" + ("; item parked; Unpark to build it again" if parked else ""), session=who)
-        return assignment_state(connection, assignment)
+        # Every row it ended, so `sd assignments cancel` prints the members too (pack sd:9266).
+        answer = assignment_state(connection, assignment)
+        if members:
+            answer["members"] = [assignment_state(connection, member) for member, _ in members]
+        return answer
