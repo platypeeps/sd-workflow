@@ -362,6 +362,8 @@ def landing(connection: sqlite3.Connection, *, repos: Iterable[str | None] | Non
     ).fetchall()
     keys, keep = repo_keys(connection), _keep(repos)
     newest: dict[tuple[str, Any], tuple[int, dict]] = {}
+    # A bundle entry's `closes` supersede each member's older entries too (pack sd:9694).
+    closed: dict[tuple[str, Any], int] = {}
     unread = 0
     for row in rows:
         # One bad checkpoint is counted, never the end of every other row (pack sd:8822).
@@ -377,9 +379,15 @@ def landing(connection: sqlite3.Connection, *, repos: Iterable[str | None] | Non
         if keep is not None and (keys.get(repository.lower()) is None or keys[repository.lower()] not in keep):
             continue
         key = (repository, entry.get("item"))
-        if entry.get("status") != "cancelled" and row["first"] > newest.get(key, (0, {}))[0]:
+        if entry.get("status") == "cancelled":
+            continue
+        if row["first"] > newest.get(key, (0, {}))[0]:
             newest[key] = (row["first"], {**entry, "repository": repository, "queued_at": row["queued_at"]})
-    live = [entry for _, entry in newest.values() if entry.get("status") != "merged"]
+        closes = entry.get("closes")
+        for member in closes if isinstance(closes, list) else ():
+            closed[(repository, member)] = max(closed.get((repository, member), 0), row["first"])
+    live = [entry for key, (first, entry) in newest.items()
+            if entry.get("status") != "merged" and closed.get(key, 0) < first]
     items = {row["id"]: row for row in connection.execute(
         f"SELECT id, title, status FROM item WHERE id IN ({', '.join('?' for _ in live)})",
         [entry.get("item") for entry in live]).fetchall()}

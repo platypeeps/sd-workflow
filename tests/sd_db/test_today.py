@@ -94,6 +94,18 @@ class TheSections(TodayCase):
                           (failed, "o/s", "failed", None)])
         self.assertIsNone(found["gate"])
 
+    def test_a_bundle_entrys_closes_supersede_a_members_older_entry(self):
+        """Pack sd:9694: a member's older failed entry hides once a newer bundle entry closes it."""
+        lead, merged, queued, dropped = (self.item(title) for title in ("Lead", "Merged", "Queued", "Dropped"))
+        self.lane("o/r", "e0", item=merged, status="failed", position=1)
+        self.lane("o/r", "e1", item=queued, status="failed", position=2)
+        self.lane("o/r", "e2", item=dropped, status="failed", position=3)
+        self.lane("o/r", "e3", item=lead, closes=[merged], status="merged", position=4)
+        self.lane("o/r", "e4", item=lead, closes=[queued], status="pending", position=5)
+        self.lane("o/r", "e5", item=lead, closes=[dropped], status="cancelled", position=6)
+        found = today.landing(self.connection)["entries"]
+        self.assertEqual([(row["id"], row["status"]) for row in found], [(lead, "pending"), (dropped, "failed")])
+
     def test_landing_gives_exact_times_and_no_estimate(self):
         """The lane records no ETA: `since` is when the entry started, else when the hub queued it."""
         running, waiting = self.item("Running", repo=APP), self.item("Waiting", repo=APP)
