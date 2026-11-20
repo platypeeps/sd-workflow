@@ -257,7 +257,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 import sd_lib
 import sd_release
@@ -4198,8 +4198,24 @@ def run_checkout(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token:
     return {"item": entry["item"], **outcome}, None
 
 
+def settle_others(others: list[tuple[str, pathlib.Path]], environ: dict[str, str]) -> list[dict[str, Any]]:
+    """Import the file queue and reclaim dead holders of each checkout this run does not host (sd:3282)."""
+    lanes: list[dict[str, Any]] = []
+    for path, checkout in others:
+        try:
+            queue = queue_for(checkout, environ)
+            with runner_lock(queue) as locked:
+                settled = settle_checkout(checkout, queue) if locked else {}
+        except (LaneError, sd_lib.ConfigError, OSError) as error:
+            settled = refusal(error)
+        if settled:
+            lanes.append({"path": path, "settled": settled})
+    return lanes
+
+
 def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = default_gate,
-               note: Note | None = None, start: Start | None = None) -> dict[str, Any]:
+               note: Note | None = None, start: Start | None = None,
+               skip: Iterable[pathlib.Path] = ()) -> dict[str, Any]:
     """`lane run --hosted`: `run_lane` for each repository this machine hosts (sd:3003), side by side (sd:5774).
 
     The same job runs on every machine. Its lanes are the managed `repo` rows,
@@ -4220,8 +4236,12 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
     suite as a defect (`file_flakes`, pack sd:6739).
     A build refusal on the repo-table read (`BUILD_FAULTS`) skips the run
     with exit 0: the satellite's follow fixes it, not a retry (sd:6425).
+    A `skip` checkout is left to its own job (`lane run -C`): one long lane
+    kept this run alive past its budget, and launchd starts no tick of a
+    job while a run lives, so every other lane waited (pack sd:9668).
     """
     deadline = clock() + RUN_BUDGET_SECONDS
+    skipped = {pathlib.Path(path).expanduser().resolve() for path in skip}
     imported = sd_lib.import_sd_db()
     if imported.module is None:
         raise LaneError(f"lane run --hosted reads the repo table: {imported.problem}")
@@ -4256,18 +4276,14 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
                 others.append((row["path"], checkout))
     finally:
         connection.close()  # a lane runs for hours; each reads its host again on its own connection
-    for path, checkout in others:
-        try:
-            queue = queue_for(checkout, environ)
-            with runner_lock(queue) as locked:
-                settled = settle_checkout(checkout, queue) if locked else {}
-        except (LaneError, sd_lib.ConfigError, OSError) as error:
-            settled = refusal(error)
-        if settled:
-            lanes.append({"path": path, "settled": settled})
+    lanes += settle_others(others, environ)
     def inline(checkout: pathlib.Path, budget: float) -> StartedLane:
         return inline_lane(lambda: run_lane(checkout, environ, ship, gate, note, clock() + budget))
-    order = longest_waiting_first(hosted, environ)
+    # A skipped lane is skipped only where it is hosted: elsewhere it is settled as before, and it keeps
+    # its wait and flake reports below; its own `lane run -C` job refuses on a machine that does not host it.
+    lanes += [{"path": path, "skipped": "its own job runs this lane (--skip)"}
+              for path, checkout in hosted if checkout.resolve() in skipped]
+    order = longest_waiting_first([lane for lane in hosted if lane[1].resolve() not in skipped], environ)
     lanes += run_parallel(order, start or inline, deadline, functools.partial(lane_room, environ),
                           functools.partial(new_work, environ), cap=lane_parallel(environ))
     for path, checkout in hosted:  # after the lanes ran: a slow read never holds a lane back (pack sd:6006)
@@ -4664,6 +4680,9 @@ def add_lane_verbs(commands: Any) -> None:
     runner.add_argument("--hosted", action="store_true",
                         help="run the lane of each repository this machine hosts (sd:3003), each in its own child, "
                              "several at once while the gate has a free slot and load is under its limit (sd:5774)")
+    runner.add_argument("--skip", type=pathlib.Path, action="append", default=[], metavar="CHECKOUT",
+                        help="with --hosted: leave this checkout's lane to its own `lane run -C` job; repeat it "
+                             "(pack sd:9668)")
     runner.add_argument("--budget", type=float, metavar="SECONDS",
                         help="claim no entry after this many seconds; a hosted run passes what is left of its own")
     pruner = verbs.add_parser("prune", help="delete each local branch no worktree holds whose changes are on origin's "
@@ -4685,7 +4704,7 @@ def lane_main(args: Any) -> int:
         if args.lane_command == "watch" and not getattr(args, "items", None):
             return watch(lane_root(environ), once=args.once)
         if args.lane_command == "run" and args.hosted:  # from any folder: it reads the repo table, not the cwd
-            return succeed(run_hosted(environ, start=child_lane))
+            return succeed(run_hosted(environ, start=child_lane, skip=args.skip))
         root = sd_lib.repo_root(None)  # a git that gave no answer says why, as a ConfigError (sd:2986)
         if root is None:
             raise LaneError("cwd is not inside a Git repository")
@@ -4719,11 +4738,18 @@ def lane_main(args: Any) -> int:
             result = set_hold(root, args.item, environ, held=args.lane_command == "hold",
                               expected_revision=args.expected_revision)
         else:
-            result = run_lane(root, environ, deadline=None if args.budget is None else clock() + args.budget)
+            result = run_lane(root, environ, deadline=run_deadline(args))
     except (LaneError, sd_lib.ConfigError, OSError) as error:
         print(json.dumps({"ok": False, **refusal(error)}, indent=2, sort_keys=True))
         return 3
     return succeed(shown(result))
+
+
+def run_deadline(args: Any) -> float | None:
+    """A plain `lane run`'s claim deadline; it refuses `--skip`, which only `--hosted` reads (pack sd:9668)."""
+    if args.skip:
+        raise LaneError("--skip needs --hosted: a `lane run -C` job runs one lane and skips none")
+    return None if args.budget is None else clock() + args.budget
 
 
 def lane_prune(root: pathlib.Path, environ: dict[str, str], *, dry_run: bool, as_json: bool) -> int:
