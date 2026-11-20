@@ -50,6 +50,7 @@ from .runner import (
     restoration_pending,
 )
 from .ship import this_host
+from .workflow import item_area
 from .writes import (
     add_note,
     cancel_unwanted_blocked,
@@ -76,6 +77,9 @@ REPO_CAP = 1
 #: of the bundle it claimed, never less (`budget_minutes`).
 BUNDLE_MAX = 3
 BUDGET_MINUTES = 120
+#: A P1 item builds beside its repository's bundle, alone or with the queued items of its own area, under the
+#: machine cap only; every other item keeps one bundle per repository (operator ruling #64744, sd:9700).
+BESIDE_PRIORITY = 1
 #: A supervisor beats every 30 s; one silent this long, or unspawned this long after its claim, is lost.
 #: 600, not 180: a beat a held lock skips no longer ends a long build (pack sd:6741).
 STALE_SECONDS = 600
@@ -91,6 +95,17 @@ RETRIES = 1
 PARKED = "Parked: build run {run} ended blocked; Retry on the Builds panel unparks it"
 # The note on an item a cancelled run parked: auto-pickup takes unparked items only (sd:9222).
 CANCEL_PARKED = "Parked: build run {run} was cancelled; Unpark to build it again"
+
+
+def beside(row) -> bool:
+    """Whether a row's item is P1, so builds beside its repository's bundle (`BESIDE_PRIORITY`, sd:9700)."""
+    return type(row["priority"]) is int and row["priority"] <= BESIDE_PRIORITY
+
+
+def kin(lead, row) -> bool:
+    """Whether `row` builds in the P1 `lead`'s bundle: an item of the lead's own area, never of none (sd:9700)."""
+    area = item_area(lead)
+    return area is not None and item_area(row) == area
 
 
 def _in_group(alias: str = "assignment") -> str:
@@ -766,7 +781,8 @@ def eligible(connection, *, now: str | None = None) -> list[dict]:
             continue
         if lane_of(connection, taken["lane_host"]) not in hosts:
             continue
-        found.append({"id": row["id"], "title": row["title"], "repo": row["repo"], "priority": row["priority"]})
+        found.append({"id": row["id"], "title": row["title"], "repo": row["repo"], "priority": row["priority"],
+                      "fields": row["fields"]})
     return found
 
 
@@ -809,18 +825,30 @@ def pickup(connection, available: dict, *, now: str | None = None) -> list[int]:
         return []
     # Only this host's presses hold it: the hub never claims a satellite's.
     hosts = lane_hosts(connection)
-    if any(_route(connection, row["lane_host"], _lead(row)) in hosts and room_for(available, row["repo"]) > 0
+    if any(_route(connection, row["lane_host"], _lead(row)) in hosts
+           and room_for(available, row["repo"], p1=beside(row)) > 0
            for row in connection.execute(
-            "SELECT assignment.id, assignment.parent, assignment.run_count, item.repo, repo.lane_host FROM assignment JOIN item ON item.id = assignment.item "
+            "SELECT assignment.id, assignment.parent, assignment.run_count, item.repo, item.priority, repo.lane_host "
+            "FROM assignment JOIN item ON item.id = assignment.item "
             "LEFT JOIN repo ON repo.path = item.repo WHERE assignment.status = 'queued' AND assignment.scope = ?",
             (SCOPE,))):
         return []
     slots, chosen = available["machine"], []
     bundles: dict[str, list[list[int]]] = {}
+    urgent: list[tuple[dict, list[int]]] = []  # each P1 bundle's lead and items, as the claim forms them
     for row in eligible(connection, now=now):
         repo = row["repo"]
         taken = bundles.setdefault(repo, [])
-        if taken and bundled(connection, [*taken[-1], row["id"]]) > len(taken[-1]):
+        near = next((items for lead, items in urgent if lead["repo"] == repo and kin(lead, row)
+                     and bundled(connection, [*items, row["id"]]) > len(items)), None)
+        if near is not None:
+            near.append(row["id"])
+        elif beside(row):
+            if slots <= 0 or room_for(available, repo, p1=True) <= 0:
+                continue
+            urgent.append((row, [row["id"]]))
+            slots -= 1
+        elif taken and bundled(connection, [*taken[-1], row["id"]]) > len(taken[-1]):
             taken[-1].append(row["id"])
         elif slots > 0 and len(taken) < room_for(available, repo):
             taken.append([row["id"]])
@@ -936,9 +964,10 @@ def room(connection, *, load: float | None, load_cap: float | None, interactive:
     hosts = lane_hosts(connection) if hosts is None else hosts
     why = unread(load, load_cap, interactive)
     leases = connection.execute(
-        "SELECT lease.repo, lease.exclusive, run.quarantine, run.session_id, run.owner, assignment.scope "
-        "FROM runner_lease lease JOIN runner_run run ON run.id = lease.run "
-        "LEFT JOIN assignment ON assignment.id = run.assignment WHERE lease.released_at IS NULL").fetchall()
+        "SELECT lease.repo, lease.exclusive, run.quarantine, run.session_id, run.owner, assignment.scope, "
+        "item.priority FROM runner_lease lease JOIN runner_run run ON run.id = lease.run "
+        "LEFT JOIN assignment ON assignment.id = run.assignment LEFT JOIN item ON item.id = assignment.item "
+        "WHERE lease.released_at IS NULL").fetchall()
     builds = [row for row in leases if row["scope"] == SCOPE and mine(row, hosts)]
     drafts = [row for row in connection.execute(
         "SELECT runner_run.session_id, runner_run.owner FROM runner_run JOIN assignment "
@@ -954,9 +983,10 @@ def room(connection, *, load: float | None, load_cap: float | None, interactive:
         (SCOPE, *LANE_STEPS)).fetchall() if mine(row, hosts)]
     headless = {row["session_id"] for row in [*builds, *drafts, *lane] if row["session_id"]}
     used: dict[str, int] = {}
-    # Every host's builds hold a repository's slot: the hub may build a satellite's lane (sd:8991).
+    # Every host's builds hold a repository's slot: the hub may build a satellite's lane (sd:8991). A P1-led
+    # run builds beside the bundle and holds none (sd:9700).
     for row in leases:
-        if row["scope"] == SCOPE:
+        if row["scope"] == SCOPE and not beside(row):
             used[row["repo"]] = used.get(row["repo"], 0) + 1
     others = [entry for entry in interactive or [] if not (entry.get("session_id") and entry["session_id"] in headless)]
     for entry in others:
@@ -972,10 +1002,15 @@ def room(connection, *, load: float | None, load_cap: float | None, interactive:
     return {"machine": 0 if why else machine, "used": used, "held": held, "why": why}
 
 
-def room_for(available: dict, repo: str) -> int:
-    """`room`'s answer for one repository: at most `repo_cap()` builders there, and none while it is held."""
+def room_for(available: dict, repo: str, *, p1: bool = False) -> int:
+    """`room`'s answer for one repository: at most `repo_cap()` builders there, and none while it is held.
+
+    `p1` asks for a P1 bundle, which builds beside the repository's own under the machine cap alone (sd:9700).
+    """
     if available["why"] or repo in available["held"]:
         return 0
+    if p1:
+        return available["machine"]
     return max(0, min(available["machine"], repo_cap() - available["used"].get(repo, 0)))
 
 
@@ -1123,7 +1158,7 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             _requeue_beat_blocked(connection, hosts)
         queued = connection.execute(
             "SELECT assignment.id, assignment.item, assignment.parent, assignment.run_count, item.repo, "
-            "repo.lane_host FROM assignment JOIN item ON item.id = assignment.item "
+            "item.priority, item.fields, repo.lane_host FROM assignment JOIN item ON item.id = assignment.item "
             "LEFT JOIN repo ON repo.path = item.repo "
             "WHERE assignment.status = 'queued' AND assignment.scope = ? AND item.repo IS NOT NULL "
             "ORDER BY item.priority IS NULL, item.priority, assignment.queued_at, assignment.id", (SCOPE,)).fetchall()
@@ -1150,10 +1185,16 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
         if available["why"]:
             return None
         queued = [row for row in queued if lanes[row["id"]] in hosts and not _refused_repo(connection, row)]
-        repo = next((row["repo"] for row in queued if room_for(available, row["repo"]) > 0), None)
-        if repo is None:
+        best = next((row for row in queued if room_for(available, row["repo"], p1=beside(row)) > 0), None)
+        if best is None:
             return None
-        bundle = _bundle(connection, [row for row in queued if row["repo"] == repo])
+        repo = best["repo"]
+        others = [row for row in queued if row["repo"] == repo and row["id"] != best["id"]]
+        if best["parent"] is None and not best["run_count"]:
+            # A fresh P1 lead takes its own area's items; an ordinary one leaves P1 items to their own (sd:9700).
+            others = [row for row in others if kin(best, row)] if beside(best) else [
+                row for row in others if not beside(row)]
+        bundle = _bundle(connection, [best, *others])
         lead = bundle[0]["id"]
         ids = [row["id"] for row in bundle]
         marks = ", ".join("?" for _ in ids)

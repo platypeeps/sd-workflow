@@ -49,8 +49,9 @@ CLOSED = ("done", "cancelled")
 #: prepared and waiting for a hand merge (lead ruling on pack sd:7288).
 LANE_LIVE = ("pending", "running", "prepared")
 #: Why a repository may hold a second open branch beside its open bundle (pack sd:7737): a change that moves
-#: state in steps gets its own PR, and a bundle already in the lane takes no more commits.
-SECOND_BRANCH = ("state-move", "in-lane")
+#: state in steps gets its own PR, and a bundle already in the lane takes no more commits; a P1 item builds
+#: beside it, alone or with items of its own area (operator ruling #64744, sd:9700).
+SECOND_BRANCH = ("state-move", "in-lane", "p1")
 
 
 class TeammateRefused(SdDbError):
@@ -194,15 +195,16 @@ def start(connection, items: list[int], *, worktree: str, branch: str, budget_mi
     if into is not None and (not isinstance(into, str) or not into or any(c.isspace() for c in into)):
         raise TeammateRefused(f"--into names a branch, not {into!r}")
     if reason is not None and reason not in SECOND_BRANCH:
-        raise TeammateRefused(f"a second open branch's reason is state-move or in-lane, not {reason!r}")
+        raise TeammateRefused(f"a second open branch's reason is state-move, in-lane or p1, not {reason!r}")
     with transaction(connection):
         if restoration_pending(connection):
             raise TeammateRefused("database restore reimport is incomplete; teammate runs are held")
-        repos = set()
+        repos, rows = set(), []
         for item in items:
             row = connection.execute(build._REPO, (item,)).fetchone()
             if row is None:
                 raise TeammateRefused(f"no item {item}")
+            rows.append(row)
             if row["repo_path"] is None:
                 raise TeammateRefused(f"item {item} needs a registered repository")
             if row["status"] in CLOSED:
@@ -224,6 +226,8 @@ def start(connection, items: list[int], *, worktree: str, branch: str, budget_mi
             repos.add(row["repo"])
         if len(repos) != 1:
             raise TeammateRefused("a teammate run's items share one repository")
+        if reason == "p1" and not (build.beside(rows[0]) and all(build.kin(rows[0], row) for row in rows[1:])):
+            raise TeammateRefused("--reason p1 takes a P1 item first, then only items of its own area")
         repo = repos.pop()
         mine = {branch, into} - {None}
         beside = []
@@ -242,8 +246,8 @@ def start(connection, items: list[int], *, worktree: str, branch: str, budget_mi
             raise TeammateRefused(
                 f"{repo} has open branch {other['branch']} in {other['work_path']} ({other.get('scope', SCOPE)} run {other['id']}"
                 f"{side}): one open bundle branch per repository; build these items there, pass --into "
-                f"{bundle} for a side branch that merges into it, or --reason state-move or "
-                "--reason in-lane for a second pull request")
+                f"{bundle} for a side branch that merges into it, or --reason state-move, "
+                "--reason in-lane or --reason p1 for a second pull request")
         stamp = clock()
         lead = None
         for item in items:

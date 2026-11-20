@@ -750,5 +750,6 @@ def register(groups: Any) -> None:
             parser.add_argument("--into", metavar="BRANCH",
                                 help="with --start: the open bundle branch this side branch merges into (pack sd:7737)")
             parser.add_argument("--reason", help="with --end: why it ended (default: ended by its lead); with --start: "
-                                "state-move or in-lane, why the repository gets a second open branch (pack sd:7737)")
+                                "state-move, in-lane or p1, why the repository gets a second open branch "
+                                "(pack sd:7737, sd:9700)")
             parser.add_argument("--json", action="store_true")
