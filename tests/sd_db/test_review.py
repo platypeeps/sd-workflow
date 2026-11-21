@@ -541,6 +541,17 @@ class ContextAndRecommendation(ReviewCase):
         self.assertEqual(self.counts(), before)
         self.assertIsNone(review.read(self.db, first["item"])["header"]["context"])
 
+    def test_a_legacy_batch_refiled_with_context_and_a_change_names_the_change(self):
+        """sd:9659: a batch filed without context, refiled with its context and another change, names that change,
+        not the context the header never had."""
+        with mock.patch.object(review, "_require_context", lambda found: None):
+            review.file(self.db, batch(context=None), who="tester")
+        with self.assertRaises(review.ReviewError) as caught:
+            changed = batch()
+            changed["questions"][1]["text"] = "Which tier now?"
+            review.file(self.db, changed, who="tester")
+        self.assertIn("question example.test/a@1a2b3c4:src/two.py: the text differ", str(caught.exception))
+
     def test_a_kev_file_carries_its_context_and_files(self):
         """pack sd:9479: a Kev file holds no context, so the import says what its lines are, how to label them and
         what the labels feed."""
