@@ -1953,6 +1953,26 @@ R.after = BODY().html; R.kept = STORE['health.machine'];""", doc, view="machine"
         self.assertIn("Readings of sat-a", after)
         self.assertEqual(out["R"]["kept"], "sat-a")
 
+    def test_a_chosen_satellites_lamps_and_machine_count_are_its_own(self):
+        """Review round 6: with sat-a chosen, the Disk lamp and the Machine tab's count, Services included, read
+        sat-a's reading, not the hub's summary; its stale reading may not show green. Services has no lamp."""
+        doc, answer = self.machine_docs()
+        # A quiet disk, read hours ago: its rows say ok, so only its age can keep its lamp from green.
+        record_state(self.connection, "heartbeat", key=health_screen.MACHINE_PREFIX + "sat-a", timestamp="2026-09-06T11:31:00Z",
+                     body={"interval_seconds": 3600, "disk": CLEAN_DISK, "services": SERVICES["services"]})
+        with patch.object(health_screen, "this_host", lambda: "hub-a"):
+            stale = health_screen.part(self.connection, "machine", now="2026-09-06T14:00:00Z", host="sat-a")
+        answer = answer.replace("var SAT = ", f"var SAT = {json.dumps(stale)}, FRESH = ")
+        hub = {lamp["id"]: lamp for lamp in summary_of(doc)["lamps"]}
+        out = self.run_page("""PANEL().listeners.change[0]({ target: { id: 'machine-host', value: 'sat-a', closest: () => null } }); await flush();
+R.lamps = ELS.annunciator.html;""", doc, view="machine", pre=self.STORE + answer)
+        states = dict(re.findall(r'data-area="(disk|svc)" data-state="([a-z]+)"', out["R"]["lamps"]))
+        self.assertNotEqual(hub["disk"]["state"], "unknown")
+        self.assertEqual(states, {"disk": "unknown"})
+        self.assertRegex(out["R"]["lamps"], r'data-area="disk"[^>]*>.*?on sat-a')
+        own = sum(lamp["n"] for lamp in stale["lamps"])
+        self.assertEqual(out["counts"]["machine"], own)
+
     def test_a_satellite_row_offers_no_command_that_runs_on_the_hub(self):
         """Review round 5: Show biggest, Show use, Restart and Start run on the hub; on a satellite's row each is off,
         naming the host, and its line stays for copying there."""

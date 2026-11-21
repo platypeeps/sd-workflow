@@ -1504,8 +1504,10 @@ def _machine_part(connection: sqlite3.Connection, host: str, *, now: str) -> dic
             row["host"] = host
         area["rows"], area["snoozed"] = snooze.split("health", rows, snoozes)
         areas.append(area)
+    # Its own lamps (review round 6): the page shows them, and counts the Machine tab, in place of the hub's.
+    lamps = [{**lamp, "value": [*lamp["value"], {"b": "", "t": f"on {host}"}]} for lamp in map(_lamp, areas)]
     return {"read": now, "view": "machine", "host": host, "machines": machines(connection), "areas": areas,
-            "snooze_error": snooze_error, "attention": _attention(areas)}
+            "lamps": lamps, "snooze_error": snooze_error, "attention": _attention(areas)}
 
 
 def part(connection: sqlite3.Connection, view: str, *, now: str, host: str | None = None, **seams) -> dict:

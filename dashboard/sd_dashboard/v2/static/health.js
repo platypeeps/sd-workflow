@@ -114,9 +114,15 @@
   const areaShown = a => a.rows.some(passes) || ((!F.state.size || atStart()) && !query && (!F.area.size || F.area.has(a.id)));
   const loud = { warning: 0, caution: 1, unknown: 2 };
 
+  // The summary's lamps, with a chosen machine's own in place of the hub's Disk and Services (review round 6).
+  const ownLamps = () => S.machine?.DOC?.host && S.machine.DOC.lamps;
+  const lampsNow = () => {
+    const L = SUMMARY ? SUMMARY.lamps : [], own = ownLamps();
+    return own ? L.map(l => own.find(o => o.id === l.id) || l) : L;
+  };
   // Every area's lamp, from the summary: pressing one opens its view with its area alone, or toggles it in this view.
   function lamps() {
-    const L = SUMMARY ? SUMMARY.lamps : [];
+    const L = lampsNow();
     put($('annunciator'), cells([...L.filter(l => !NO_LAMP.has(l.id)).map(l => ({ button: true, state: l.state, pressed: F.area.has(l.id),
       attrs: html` data-area="${l.id}"`, label: l.name, mark: I(LOOK[l.id]?.[0] || 'circle-help'), val: lampValue(l),
       sr: `state ${l.state} · ${l.view === VIEW ? `shows only ${l.name} rows` : `opens ${PAGE_VIEWS.find(v => v.id === l.view)?.label}`}` }))]));
@@ -274,7 +280,7 @@
   function attention() {
     window.PAGE_ATTENTION = SUMMARY && SUMMARY.attention || { state: 'unknown', n: 0, what: 'rows' };
     shell.attention(window.PAGE_ATTENTION);
-    const a = window.PAGE_ATTENTION, failed = SUMMARY ? SUMMARY.lamps.filter(l => l.error).length : 0;
+    const a = window.PAGE_ATTENTION, failed = lampsNow().filter(l => l.error).length;
     put($('subhead'), SUMMARY ? html`${plural(PAGE_VIEWS.length, 'view')} · ${a.n ? `${a.n} ${a.state} ${a.n === 1 ? 'row wants' : 'rows want'} you` : 'no row wants you'}${failed ? ` · ${plural(failed, 'area')} not read` : ''} · read <time class="rel" datetime="${SUMMARY.read}"></time>`
       : html`Health's summary could not be read.`);
   }
@@ -283,7 +289,8 @@
   const readSummary = () => shell.getJSON('/api/health/summary').then(doc => { SUMMARY = doc; }, () => { SUMMARY = null; })
     .then(() => {
       attention(); lamps();
-      PAGE_VIEWS.forEach(v => { const L = SUMMARY ? SUMMARY.lamps.filter(l => l.view === v.id) : [];
+      // A chosen machine's tab counts its own areas alone: the view shows no other.
+      PAGE_VIEWS.forEach(v => { const L = v.id === 'machine' && ownLamps() || lampsNow().filter(l => l.view === v.id);
         shell.view.count(v.id, L.length && L.every(l => l.n != null) ? L.reduce((n, l) => n + l.n, 0) : null); });
     });
 
@@ -522,7 +529,7 @@
     // A lamp is the Area pick's value for its area: pressing it adds the area to the filter, pressing it again takes it out.
     $('annunciator').addEventListener('click', e => {
       const c = e.target.closest('button.cell'); if (!c) return;
-      const id = c.dataset.area, lamp = SUMMARY?.lamps.find(l => l.id === id);
+      const id = c.dataset.area, lamp = lampsNow().find(l => l.id === id);
       if (lamp && lamp.view !== VIEW) { F.area.clear(); F.area.add(id); shell.view.show(lamp.view); return; }
       F.area.has(id) ? F.area.delete(id) : F.area.add(id);
       lamps(); apply();
