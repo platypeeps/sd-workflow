@@ -142,6 +142,7 @@ FAKE = textwrap.dedent('''
         # `extra`: plans/extra.json adds files (name to hex bytes) and message lines, as a builder may write.
         extra = json.loads((plans / "extra.json").read_text()) if mode == "extra" else {}
         for name, data in extra.get("files", {}).items():
+            Path(name).parent.mkdir(parents=True, exist_ok=True)
             Path(name).write_bytes(bytes.fromhex(data))
             git("add", "--", name)
         for old, new in extra.get("move", {}).items():
@@ -907,6 +908,71 @@ class Supervise(Case):
         self.assertIn("a parser, a journal or event matching", build_run.BRIEF)
         self.assertIn("within this change's own scope", build_run.CLASS_PASS)
         self.assertIn("becomes its own item", build_run.CLASS_PASS)
+
+    def test_the_brief_lists_the_blocker_classes_reviews_found_most(self):
+        """sd:9770: the brief carries the classes recorded review rounds found most, top first, with counts."""
+        self.press()
+        item = self.items[0]
+        for _ in range(2):
+            add_note(self.db, item, "comment", build.ROUND_BLOCKERS + "- a.py:3 a race between two writers\n"
+                     "- b.py:4 a retry charges the cost twice")
+        add_note(self.db, item, "comment", build.ROUND_BLOCKERS + "- c.py:1 a race on the lease")
+        add_note(self.db, item, "comment", "Some other comment about a stale head")
+        old = add_note(self.db, item, "comment", build.ROUND_BLOCKERS + "- d.py:1 a stale head")
+        self.db.execute("UPDATE note SET timestamp = '2000-01-01T00:00:00+00:00' WHERE id = ?", (old,))
+        prompt = build_run.BRIEF.format(**self.supervisor().brief())
+        race = "- two writers or a read-then-write that another process can interleave (3)"
+        retry = "- a step run twice: a retry or replay that writes or charges again (2)"
+        self.assertIn("Before the first review, check the change against the blocker classes", prompt)
+        self.assertIn(race, prompt)
+        self.assertIn(retry, prompt)
+        self.assertLess(prompt.index(race), prompt.index(retry), "the most found class comes first")
+        self.assertNotIn("went stale", prompt, "neither an old round nor another note counts")
+
+    def test_a_brief_with_no_recorded_round_has_no_checklist(self):
+        """sd:9770: no recorded blocker, no checklist."""
+        self.press()
+        self.assertEqual(self.supervisor().brief()["checklist"], "")
+
+    def test_a_blocked_round_records_its_blockers_for_the_checklist(self):
+        """sd:9770: each blocked round notes its blockers on the lead, once, as the checklist's record."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix"], sd_review=["blocking", "clean"])
+        ended = self.supervisor().run()
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        notes = [body for (body,) in self.db.execute("SELECT body FROM note WHERE item = ? AND body LIKE ?",
+                                                     (self.items[0], build.ROUND_BLOCKERS + "%"))]
+        self.assertEqual(notes, [build.ROUND_BLOCKERS + "- work.txt:1 a blocker"])
+
+    def design(self, body):
+        """A builder commit that adds a docs/work design.md with no failure table, and `body` as the PR body."""
+        (self.plans / "extra.json").write_text(json.dumps({"files": {
+            "docs/work/2026-11-21-example/design.md": b"# Example\n\nitem: sd:1\n\nSteps move state.\n".hex()}}))
+        self.press()
+        self.write_pr(body=body)
+        self.plan(claude=["extra"], sd_review=["clean"])
+
+    def test_a_state_moving_change_with_no_failure_table_does_not_reach_review(self):
+        """sd:9770: a change with a docs/work design.md and no failure table never starts review; the refusal
+        names the rule."""
+        self.design("## Summary\n\nx\n\n## Test plan\n\ny\n")
+        with mock.patch.object(build_run, "REVIEW_ROUNDS", 1):
+            ended = self.supervisor().run()
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual(self.calls("sd-review"), [], "no review ran")
+        self.assertIn("failure table", self.latest()["detail"])
+        self.assertIn("WORKFLOW.md, Review rounds", self.latest()["detail"])
+        fix = self.calls("claude")[1]["argv"]
+        self.assertIn("docs/work/2026-11-21-example/design.md", fix[fix.index("-p") + 1])
+
+    def test_a_state_moving_change_with_a_failure_table_reaches_review(self):
+        """sd:9770: the same change with the table in the body is reviewed and enqueued."""
+        self.design("## Summary\n\nx\n\n```\n| Step | State moved | Failure | Recovery | Test |\n```\n\n"
+                    "## Test plan\n\ny\n")
+        ended = self.supervisor().run()
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        self.assertEqual(len(self.calls("sd-review")), 1)
 
     def test_a_question_on_one_member_keeps_the_class_pass_for_the_other(self):
         """Review of sd:9263: a question on a skipped member B must not park A, which the class pass can still fix."""

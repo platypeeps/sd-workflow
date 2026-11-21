@@ -87,6 +87,46 @@ HEARTBEAT = build.HEARTBEAT
 #: `lane retry` queues again (`prepared` is a merge the lane refused), and a cancel.
 LANE_ENDED = ("failed", "skipped", "prepared", "cancelled")
 
+#: The blocker classes the brief checks a change against (sd:9770): a pattern over one recorded blocker, the
+#: checklist line. The brief shows the `CHECKLIST_TOP` that recorded rounds (`build.ROUND_BLOCKERS`) of the last
+#: `CHECKLIST_DAYS` days matched most, so the list follows the reviews; a blocker no pattern names counts nowhere.
+BLOCKER_CLASSES = (
+    (re.compile(r"\b(race|concurren\w*|lock\w*|atomic\w*|toctou|interleav\w*)\b", re.I),
+     "two writers or a read-then-write that another process can interleave"),
+    (re.compile(r"\b(crash\w*|interrupt\w*|replay\w*|resum\w*|idempoten\w*|partial\w*|half)\b", re.I),
+     "a step interrupted halfway: what state it leaves and what recovers it"),
+    (re.compile(r"\b(retr(y|ies|ied)|again|twice|duplicate\w*|repeat\w*)\b", re.I),
+     "a step run twice: a retry or replay that writes or charges again"),
+    (re.compile(r"\b(stale|moved|outdated|newer|older)\b", re.I),
+     "a value read once and used after it went stale (a head, a row, a revision)"),
+    (re.compile(r"\b(untracked|ignored|uncommitted|staged|dirty)\b", re.I),
+     "untracked, ignored or uncommitted files a git check does not see"),
+    (re.compile(r"\b(swallow\w*|silent\w*|ignores? (the )?(error|failure|exit)|masks?|hides?)\b", re.I),
+     "an error swallowed or reported as success, or as another stage's"),
+    (re.compile(r"\b(json|narrow\w*|isinstance|malformed|unvalidated|type)\b", re.I),
+     "external input used before its type and shape are checked"),
+    (re.compile(r"\b(substring|prefix|suffix|token boundar\w*|startswith|regex|pattern)\b", re.I),
+     "names matched by substring or loose pattern, not exactly"),
+    (re.compile(r"\b(empty|unicode|non-ascii|escap\w*|quot\w*|newline|markup|long)\b", re.I),
+     "input that is empty, long, non-ASCII or carries markup or newlines"),
+    (re.compile(r"\b(clock|timestamp\w*|timezone|utc|deadline|timeout\w*)\b", re.I),
+     "time: clock skew, time zones, deadlines and timeouts"),
+    (re.compile(r"\b(pid|process group|pgid|kill\w*|orphan\w*|child(ren)?|signal\w*)\b", re.I),
+     "processes: a kill that misses children or ends another's process"),
+    (re.compile(r"\b(no test|untested|test (does not|doesn't|never)|fail-first|not (covered|tested))\b", re.I),
+     "a fix or branch with no test that failed before it"),
+    (re.compile(r"\b(path|symlink|outside|traversal|home directory)\b", re.I),
+     "paths: symlinks, relative paths, and writes outside the intended root"),
+)
+CHECKLIST_TOP = 10
+CHECKLIST_DAYS = 30
+#: A header line naming the five columns, in order: what a failure table is to the review's precheck (sd:9770).
+FAILURE_TABLE = re.compile(r"step.*state.*failure.*recovery.*test", re.I)
+#: The rule the precheck names when a state-moving change has no failure table (sd:9584, sd:9770).
+FAILURE_TABLE_RULE = ("WORKFLOW.md, Review rounds: a change that moves state in steps carries a failure table "
+                      "(step, state moved, failure, recovery, test) in its design.md or the PR body before review "
+                      "round 1 (sd:9584)")
+
 #: The builder's pre-approved calls: the brief's two commit forms (pack sd:6723). A prefix rule cannot pin
 #: the -F file inside the worktree; the brief does.
 ALLOWED = ("Bash(git commit -m:*)", "Bash(git commit -F:*)")
@@ -121,7 +161,7 @@ BRIEF = """You are a headless builder run by the build dispatcher (pack sd:6094)
 
 Build these items, one commit per item, in the worktree {worktree} on branch {branch}:
 {items}
-{findings}{denied}
+{findings}{checklist}{denied}
 Rules:
 - Work only in {worktree}. Read each item with `sd task show N` and the repository's CLAUDE.md first.
 - Write no file outside the worktree but the title and body below, not even in /tmp. Commit with
@@ -1282,18 +1322,49 @@ class Supervisor:
         return bool(said) and said[-1] == GATE_NOT_STARTED
 
     def prechecked(self, head: str) -> list[str]:
-        if self.checked is None:
-            return []
         try:
             title, body = (path.read_text(encoding="utf-8") if path.exists() else "" for path in (self.title, self.body))
         except ValueError:  # not UTF-8: the builder rewrites it, as for any other refusal
             return [f"the title at {self.title} or the body at {self.body} is not UTF-8 text"]
-        return self.checked(self.work, self.base(), head, title.strip(), body)
+        refused = self.checked(self.work, self.base(), head, title.strip(), body) if self.checked else []
+        return refused + self.untabled(head, body)
+
+    def untabled(self, head: str, body: str) -> list[str]:
+        """The failure-table refusal for a change that moves state in steps, or none (sd:9770).
+
+        `docs/work/*/design.md` exists only for such a change (docs/work/README.md): the change is one when the
+        branch touches a design.md there, or one there names a member (`item: sd:N`). It passes when that
+        design.md or the body holds a header line naming the five columns.
+        """
+        work = Path(self.work)
+        changed = _read([*self.tools.git, "-C", str(work), "diff", "--name-only", f"{self.base()}...{head}", "--",
+                         "docs/work"], env=self.env).splitlines()
+        named = re.compile(r"^item:\s*sd:(" + "|".join(str(item) for item in [self.lead, *self.others]) + r")\b", re.M)
+        designs = {path for path in changed if path.endswith("/design.md")}
+        texts = {}
+        for path in sorted(work.glob("docs/work/*/design.md")):
+            relative = path.relative_to(work).as_posix()
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, ValueError):
+                text = ""
+            if relative in designs or named.search(text):
+                designs.add(relative)
+                texts[relative] = text
+        if not designs or any(FAILURE_TABLE.search(text) for text in [body, *texts.values()]):
+            return []
+        return [f"this change moves state in steps ({', '.join(sorted(designs))}), and neither that design.md nor "
+                f"the body holds a failure table: {FAILURE_TABLE_RULE}. Add the table, one row per step"]
 
     def blocked_round(self, blockers: list[dict]) -> str | dict:
         self.blockers = blockers
         # Once per child that blocked: a fault after this write re-walks the held review, which is the same review.
-        self.once(f"round:{(self.last or {}).get('pid')}", self.count_round)
+        child = (self.last or {}).get("pid")
+        self.once(f"round:{child}", self.count_round)
+        # The record the brief's checklist counts (sd:9770).
+        self.once(f"blockers:{child}", lambda: add_note(
+            self.db, self.lead, "comment",
+            (build.ROUND_BLOCKERS + self.summary(blockers, limit=None))[:build.FINDING_MAX]))
         rounds = self.fresh()["review_round"] or 0
         if rounds < REVIEW_ROUNDS:
             return self.fix()
@@ -1617,7 +1688,24 @@ class Supervisor:
             f"SELECT id, title FROM item WHERE id IN ({', '.join('?' for _ in items)})", items)}
         return {"worktree": self.work, "branch": self.row["branch"], "title": self.title, "body": self.body,
                 "title_max": TITLE_MAX, "items": "\n".join(f"- sd:{item} {titles.get(item, '')}" for item in items),
-                "findings": self.findings(items), "denied": self.denied()}
+                "findings": self.findings(items), "checklist": self.checklist(), "denied": self.denied()}
+
+    def checklist(self) -> str:
+        """The blocker classes recorded review rounds of the last `CHECKLIST_DAYS` found most, top first; "" for
+        none (sd:9770). Each recorded blocker counts once per class it matches."""
+        since = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - CHECKLIST_DAYS * 86400))
+        counts = [0] * len(BLOCKER_CLASSES)
+        for (body,) in self.db.execute("SELECT body FROM note WHERE body LIKE ? AND timestamp >= ?",
+                                       (build.ROUND_BLOCKERS + "%", since)):
+            for line in body[len(build.ROUND_BLOCKERS):].splitlines():
+                for at, (pattern, _) in enumerate(BLOCKER_CLASSES):
+                    counts[at] += bool(line.strip() and pattern.search(line))
+        top = sorted((-count, at) for at, count in enumerate(counts) if count)[:CHECKLIST_TOP]
+        if not top:
+            return ""
+        lines = "\n".join(f"- {BLOCKER_CLASSES[at][1]} ({-count})" for count, at in top)
+        return (f"\nBefore the first review, check the change against the blocker classes recorded review rounds\n"
+                f"found most in the last {CHECKLIST_DAYS} days, with their counts, and fix what applies:\n{lines}\n")
 
     def findings(self, items: list[int]) -> str:
         """The Send to builder notes on `items` since the lead's first run, up to this run (pack sd:6020), then the
