@@ -71,7 +71,7 @@ class RepeatFixture(ReviewFixture):
         """One `sd-ship adjudicate` record: each (summary, disposition, reason) a blocking finding's answer,
         at the reviewed head unless `head` names another."""
         findings = [{"index": index, "finding_digest": "0" * 64, "response_disposition": answer, "reason": reason,
-                     "raw_finding": {"path": "bin/tool.py", "line": line, "severity": "high", "summary": summary,
+                     "raw_finding": {"path": "bin/tool.py", "line": line, "severity": "high", "instances": ["src.py:1"], "summary": summary,
                                      "family": "correctness", "disposition": "blocking"}}
                     for index, (summary, answer, reason) in enumerate(rows, 1)]
         bindings = {"repository": repository, "branch": branch, "head": head if head != "" else self.head}
@@ -295,7 +295,9 @@ class RepeatRuleTests(unittest.TestCase):
             self.assertEqual([record["disposition"] for record in limit], ["blocking"])
 
     def test_the_parser_carries_evidence_and_reads_an_answer_without_it(self) -> None:
-        parsed = sd_review.parse_findings(json.dumps({"findings": [row(evidence="  make test: 1 failed  "), row()]}))
+        listed = {"instances": ["src.py:1"]}  # pack sd:9769: a high finding lists its instances
+        parsed = sd_review.parse_findings(json.dumps({"findings": [row(evidence="  make test: 1 failed  ", **listed),
+                                                                   row(**listed)]}))
         assert parsed is not None
         self.assertEqual(parsed.error, "")
         self.assertEqual(parsed.findings[0]["evidence"], "make test: 1 failed")
@@ -311,7 +313,7 @@ class RepeatRuleTests(unittest.TestCase):
         """Round 12: a reader that sends `"evidence": null`, or another type, cites nothing and breaks nothing."""
         for evidence in (None, 0, 7, True, [], ["cmd"], {}, {"command": {"argv": ["git"]}}):
             with self.subTest(evidence=evidence):
-                parsed = sd_review.parse_findings(json.dumps({"findings": [row(evidence=evidence)]}))
+                parsed = sd_review.parse_findings(json.dumps({"findings": [row(evidence=evidence, instances=["src.py:1"])]}))
                 assert parsed is not None
                 self.assertEqual(parsed.error, "")
                 self.assertNotIn("evidence", parsed.findings[0])
@@ -378,7 +380,7 @@ def adjudicated(*rows: tuple[Any, ...], decision: str = "accepted", line: Any = 
     """One adjudication body at `ON_BRANCH`: each (path, summary, disposition[, line]) a blocking finding's answer."""
     return json.dumps({"decision": decision, "proposal": {"bindings": {"head": ON_BRANCH}, "findings": [
         {"response_disposition": answer, "reason": "a reason",
-         "raw_finding": {"path": path, "line": (*rest, line)[0], "severity": "high", "summary": summary,
+         "raw_finding": {"path": path, "line": (*rest, line)[0], "severity": "high", "instances": ["src.py:1"], "summary": summary,
                          "family": "correctness"}}
         for path, summary, answer, *rest in rows]}})
 

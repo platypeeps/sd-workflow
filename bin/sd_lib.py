@@ -4318,14 +4318,14 @@ def fill_slots(items: Any, slots: int, run: Callable[[Any], Any], counted: Calla
 def distinct_findings(findings: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """sd:7519. Each finding once: one two readers both report keeps the first reader's `backend`.
 
-    Identical means every key but `backend` and `evidence` is equal: two readers cite
-    their checks in their own words (pack sd:9270). Adjudication takes a row per
+    Identical means every key but `backend`, `evidence` and `instances` is equal: two
+    readers cite their checks and list instances in their own words (pack sd:9270, sd:9769). Adjudication takes a row per
     blocking finding, so a copy was a second row to dispute. The kept row takes
     the first evidence any copy gives, so a bare first copy does not lose a cited one.
     """
     seen: dict[str, dict[str, Any]] = {}
     for finding in findings:
-        key = json.dumps({name: value for name, value in finding.items() if name not in ("backend", "evidence")},
+        key = json.dumps({name: value for name, value in finding.items() if name not in ("backend", "evidence", "instances")},
                          sort_keys=True, default=str)
         kept = seen.setdefault(key, dict(finding))
         if not kept.get("evidence") and finding.get("evidence"):

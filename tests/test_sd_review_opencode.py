@@ -74,7 +74,7 @@ def finding_stream(text: str) -> str:
     return CLEAN_STREAM.replace('{\\"findings\\": []}', json.dumps(text)[1:-1])
 
 
-FINDING = {"findings": [{"path": "bin/x.py", "line": 3, "severity": "high",
+FINDING = {"findings": [{"path": "bin/x.py", "line": 3, "severity": "high", "instances": ["src.py:1"],
                          "summary": "unchecked input", "family": "correctness"}]}
 
 

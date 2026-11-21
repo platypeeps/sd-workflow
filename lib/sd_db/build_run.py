@@ -63,7 +63,7 @@ from .database import Patient, transaction
 from .errors import SchemaTooNew
 from .ship import this_host
 from .workflow import WorkflowError
-from .writes import add_note, now, record_cost, record_state
+from .writes import add_note, create_item, now, record_cost, record_state
 
 #: A child past this many seconds is ended: TERM to its group, `GRACE_SECONDS`, KILL. The floor; a supervisor
 #: reads the budget its claim fixed (`build.budget_minutes`, sd:9109).
@@ -444,6 +444,31 @@ def kept_files(git: Collection[str], work: str, *, env: dict | None = None) -> s
     return "\n".join(line for line in lines.splitlines() if line.strip() and not (
         # Folder parts only: git ends an ignored folder with "/", so a file of that name is no cache.
         line.startswith("!! ") and DISPOSABLE.intersection(line[3:].strip('"').split("/")[:-1])))
+
+
+def changed_lines(git: Collection[str], work: str, base: str, head: str, *,
+                  env: dict | None = None) -> dict[str, set[int]] | None:
+    """Each path `base..head` changes, with the new-side lines its hunks touch; None when git cannot answer.
+
+    A hunk that only deletes names the line after it, where the deletion now sits (pack sd:9769).
+    """
+    try:
+        diff = _read([*git, "-C", work, "diff", "-U0", "--no-renames", "--no-color", base, head], env=env)
+    except Unread:
+        return None
+    changed: dict[str, set[int]] = {}
+    path = None
+    for line in diff.splitlines():
+        if line.startswith("+++ "):
+            path = line[6:] if line.startswith("+++ b/") else None
+            if path is not None:
+                changed.setdefault(path, set())
+        elif line.startswith("@@") and path is not None:
+            hunk = re.match(r"@@ -\S+ \+(\d+)(?:,(\d+))? @@", line)
+            if hunk:
+                start, count = int(hunk[1]), int(hunk[2] if hunk[2] is not None else 1)
+                changed[path].update(range(start, start + max(count, 1)))
+    return changed
 
 
 # Git's state for an operation a worktree has not finished; each can carry commits the tree does not show.
@@ -1223,16 +1248,22 @@ class Supervisor:
         if refused:
             return self.blocked_round([{"path": "enqueue check", "line": "-", "summary": text} for text in refused])
         answer: dict | None = None
+        prior = self.prior_review(head)
+        # Pack sd:9769: round 1 reviews the whole branch; a later one verifies the last round's findings over
+        # the lines changed since its head.
+        verify = ["--verify-report", str(self.out("prior")), "--base", prior["subject"]["head"]] if prior else []
         for _attempt in range(2):
             out = self.out("review")
             self.empty(out, "review")
-            self.child([*self.tools.review, "-C", str(self.work), "--scope", "branch", "--json"], cwd=self.work,
-                       name="review")
+            self.child([*self.tools.review, "-C", str(self.work), "--scope", "branch", "--json", *verify],
+                       cwd=self.work, name="review")
             answer = self.review_answer(out, head)
             if answer is not None:
                 break
         if answer is None:
             return self.finish("blocked", f"the review gave no answer twice at {head[:12]}; see {self.out('review')}")
+        if prior and answer["status"] == "blocking":
+            answer = self.file_new_findings(answer, prior, head)
         if answer["status"] in ("clean", "advisory", "skipped"):
             # `sd-review` runs no gate in an unmanaged checkout (sd:5953): the repository's own checks run here.
             failed = self.own_checks(head) if build.unmanaged(self.db, self.row["repo"]) else []
@@ -1243,6 +1274,57 @@ class Supervisor:
             self.reviewed = head
             return "enqueuing"
         return self.blocked_round(answer["blockers"])
+
+    def prior_review(self, head: str) -> dict | None:
+        """The last round's review answer, kept as `prior`, when a fix round followed it; None for round 1.
+
+        Its head must be an ancestor of `head`: the delta since it is what the next round reads (pack sd:9769).
+        """
+        if not (self.fresh()["review_round"] or 0):
+            return None
+        last, kept = self.out("review"), self.out("prior")
+        for path in (last, kept):
+            try:
+                answer = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+            reviewed = (answer.get("subject") or {}).get("head") if isinstance(answer, dict) else None
+            if (not isinstance(reviewed, str) or reviewed == head or answer.get("scope") != "branch"
+                    or not isinstance(answer.get("findings"), list)):
+                continue
+            try:
+                _read([*self.tools.git, "-C", str(self.work), "merge-base", "--is-ancestor", reviewed, head],
+                      env=self.env)
+            except Unread:
+                continue
+            if path == last:
+                shutil.copyfile(last, kept)
+            return answer
+        return None
+
+    def file_new_findings(self, answer: dict, prior: dict, head: str) -> dict:
+        """File each blocker on code neither the last round's findings nor the delta since name as a follow-up
+        item; the rest still block (pack sd:9769). A blocker with no file (`<review-response>`) still blocks."""
+        base = prior["subject"]["head"]
+        named = {row.get("path") for row in prior["findings"] if isinstance(row, dict)}
+        changed = changed_lines(self.tools.git, str(self.work), base, head, env=self.env)
+        new = [row for row in answer["blockers"] if not str(row.get("path", "<")).startswith("<")
+               and row.get("path") not in named and changed is not None
+               and (row.get("path") not in changed or row.get("line") not in (None, *changed[row["path"]]))]
+        if not new:
+            return answer
+
+        def file() -> None:
+            for row in new:
+                title = f"Review follow-up from build {self.row['branch']}: {row.get('path')}:{row.get('line')}"
+                filed = create_item(self.db, kind="task", title=f"{title} {row.get('summary') or ''}"[:200],
+                                    repo=self.row["repo"])
+                add_note(self.db, filed, "comment", f"Build run {self.ident} round {self.fresh()['review_round'] or 0}"
+                                                    f" found this on code its fix did not change, so it is filed, "
+                                                    f"not a blocker (pack sd:9769): {self.summary([row], None)}")
+        self.once(f"followups:{head}", file)
+        blockers = [row for row in answer["blockers"] if row not in new]
+        return {"status": "blocking" if blockers else "advisory", "blockers": blockers}
 
     def own_checks(self, head: str) -> list[dict] | dict:
         """Run an unmanaged repository's own checks at `head`, each in a gate slot; a blocker per failure.
@@ -1833,7 +1915,9 @@ class Supervisor:
     @staticmethod
     def summary(blockers: list[dict], limit: int | None = 3) -> str:
         # `summary` is the text of an `sd-review --json` finding record.
-        lines = [f"{row.get('path', '?')}:{row.get('line', '?')} {row.get('summary') or ''}".strip() for row in blockers]
+        lines = [f"{row.get('path', '?')}:{row.get('line', '?')} {row.get('summary') or ''}".strip()
+                 + (f" (class {row.get('family')}; instances: {', '.join(map(str, row['instances']))})"
+                    if isinstance(row.get("instances"), list) and row["instances"] else "") for row in blockers]
         return "; ".join(lines[:limit]) if limit else "\n".join(f"- {line}" for line in lines)
 
     def out(self, name: str) -> Path:

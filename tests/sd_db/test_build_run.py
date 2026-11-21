@@ -194,7 +194,7 @@ FAKE = textwrap.dedent('''
         if mode == "garbage":
             print("not json")
             sys.exit(4)
-        raw = {"path": "work.txt", "line": 1, "severity": "high", "summary": "a blocker", "family": "correctness"}
+        raw = {"path": "work.txt", "line": 1, "severity": "high", "instances": ["src.py:1"], "summary": "a blocker", "family": "correctness"}
         findings = review.dispose([review._finding(raw)], "high")  # the record shape `--json` prints
         if mode == "gate_failed":
             print(json.dumps({"status": "gate_failed", "cleared_status": "clean", "findings": [],
@@ -208,7 +208,13 @@ FAKE = textwrap.dedent('''
                               "route": {"tier": "skip" if mode == "skip_route" else "cheap", "category": "docs"},
                               "subject": {"head": git("-C", work, "rev-parse", "HEAD")}}))
             sys.exit(0)
-        print(json.dumps({"status": "blocking" if mode == "blocking" else "clean",
+        if mode == "offdelta":  # pack sd:9769: a new blocker on a file neither the fix nor round 1 touched
+            far = {**raw, "path": "far.txt", "instances": ["far.txt:1"], "summary": "an old defect"}
+            print(json.dumps({"status": "blocking", "scope": "branch",
+                              "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
+                              "findings": review.dispose([review._finding(far)], "high")}))
+            sys.exit(0)
+        print(json.dumps({"status": "blocking" if mode == "blocking" else "clean", "scope": "branch",
                           "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                           "findings": findings if mode == "blocking" else []}))
     if role == "sd-ship":
@@ -992,6 +998,40 @@ class Supervise(Case):
         self.plan(claude=["pass", "fix1"], sd_review=["blocking", "clean"])
         self.assertEqual(self.supervisor().run()["step"], "enqueued")
         self.assertEqual(self.latest()["review_round"], 1)
+
+    def test_round_one_reviews_the_whole_branch_and_round_two_the_findings_and_delta(self):
+        """Pack sd:9769: round 1 is the full branch review; round 2 verifies round 1's findings over the delta."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1"], sd_review=["blocking", "clean"])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        first, second = [call["argv"] for call in self.calls("sd-review")]
+        self.assertNotIn("--base", first, "round 1 is not the full branch review")
+        self.assertNotIn("--verify-report", first)
+        prior = json.loads(Path(second[second.index("--verify-report") + 1]).read_text(encoding="utf-8"))
+        self.assertEqual(prior["status"], "blocking", "round 2 does not verify round 1's findings")
+        self.assertEqual(second[second.index("--base") + 1], prior["subject"]["head"],
+                         "round 2 does not review the delta since the last reviewed head")
+        fix = [call["argv"] for call in self.calls("claude")][1]
+        self.assertIn("instances: src.py:1", fix[fix.index("-p") + 1], "the fix brief lacks the instance list")
+
+    def test_a_new_round_two_finding_on_unchanged_code_files_a_follow_up(self):
+        """Pack sd:9769: a later round's finding off the delta and off the earlier findings is filed, not a block."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1"], sd_review=["blocking", "offdelta"])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued", "an off-delta finding blocked")
+        self.assertEqual(self.latest()["review_round"], 1)
+        filed = self.db.execute("SELECT id, title, repo FROM item WHERE title LIKE 'Review follow-up%'").fetchall()
+        self.assertEqual(len(filed), 1, "no follow-up item was filed")
+        self.assertIn("far.txt:1", filed[0]["title"])
+
+    def test_a_round_two_repeat_of_a_round_one_finding_still_blocks(self):
+        self.press()
+        self.plan(claude=["pass", "fix1", "fix2"], sd_review=["blocking", "blocking", "clean"])
+        self.write_pr()
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        self.assertEqual(self.latest()["review_round"], 2, "a repeated blocker did not block")
 
     def test_a_failed_gate_goes_back_to_the_builder(self):
         """A review that cleared over a failed gate is a blocker to fix, not an unknown answer (runs 155-203)."""

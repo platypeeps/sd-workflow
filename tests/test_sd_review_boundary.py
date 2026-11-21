@@ -1003,11 +1003,17 @@ class LineBudgetTests(unittest.TestCase):
         # for `reads_checkout`, the one fact that sets the launch directory
         # and lets a reader cite the head's files, and the planning rule.
         # Measured: `sd-review` is 2882 here.
+        #
+        # 4852 -> 4885 is pack sd:9769, under the 4900 ceiling: `bin/sd-review`
+        # +33 for a finding's `instances` (schema, parser refusal, prompt),
+        # the whole-file read of a full branch pass (`whole_files`), and
+        # recording a build's passing verify round for the lane, split into
+        # helpers under the complexity ceiling. Measured: `sd-review` is 2915.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4852,
+            4885,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

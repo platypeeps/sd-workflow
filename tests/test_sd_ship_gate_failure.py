@@ -211,7 +211,7 @@ class GateFailureSpendsNoPass(unittest.TestCase):
 
     def test_a_blocking_finding_beside_a_failed_gate_still_spends_its_pass(self):
         """Not a gate failure: the finding refuses the head on its own."""
-        finding = {"path": "a.py", "line": 1, "severity": "high", "summary": "s", "disposition": "blocking"}
+        finding = {"path": "a.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "summary": "s", "disposition": "blocking"}
         blocked = {**GATE_FAILED, "outcomes": [{"backend": "automatic", "status": "findings"}],
                    "reviewed_by": ["automatic"], "completed_reviews": 1, "findings": [finding]}
         review, _process = self.context(report_changes=blocked)
@@ -332,7 +332,7 @@ class AClearedReviewOutlivesItsGate(unittest.TestCase):
 
 
 NOT_RUN = {"status": "not_run", "exit_code": None, "reason": "the review is blocking; the gate runs on a head it does not block"}
-FINDING = {"path": "a.py", "line": 1, "severity": "high", "summary": "wrong", "family": "correctness",
+FINDING = {"path": "a.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "summary": "wrong", "family": "correctness",
            "disposition": "blocking", "backend": "automatic"}
 
 

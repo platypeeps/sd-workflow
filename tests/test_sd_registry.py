@@ -1481,7 +1481,7 @@ class TheOneReader(unittest.TestCase):
         entry that answered correctly into an unavailable one."""
         answer = self.body(
             '<think>The diff renames a symbol. Let me check every caller.</think>\n'
-            '{"findings": [{"path": "bin/sd", "line": 4, "severity": "high",'
+            '{"findings": [{"path": "bin/sd", "line": 4, "severity": "high", "instances": ["src.py:1"],'
             ' "summary": "the old name is still read", "family": "correctness"}]}',
             reasoning_content="The diff renames a symbol. Let me check every caller.",
         )

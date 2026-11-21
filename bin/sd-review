@@ -115,9 +115,11 @@ FINDING_PROPERTIES: dict[str, Any] = {
     "family": {"type": "string", "minLength": 1},
     # pack sd:9270: what shows a defect raised again after a rebuttal; empty otherwise.
     "evidence": {"type": "string"},
+    # pack sd:9769: every place in the change the finding's class (family) occurs, `path:line`; a high one lists one.
+    "instances": {"type": "array", "items": {"type": "string"}},
 }
 #: A finding may omit these and stay schema-valid: an answer from before evidence existed is read, not refused.
-OPTIONAL_FINDING_KEYS = frozenset({"evidence"})
+OPTIONAL_FINDING_KEYS = frozenset({"evidence", "instances"})
 #: The most of one finding's evidence a report keeps, and the note an uncited repeat of a rebuttal gets (pack sd:9270).
 EVIDENCE_CHARS = 1000
 REPEAT_NOTE = "[downgraded: repeats a rebutted finding, no evidence cited]"
@@ -967,8 +969,10 @@ def build_prompt(subject: Subject, challenge: bool, conventions: str) -> str:
         "such as a command, flag, parsed string, config value, or agent "
         "instruction, is not cosmetic. Prefer few precise findings over many "
         "speculative ones. path is the repository-relative file, "
-        "line is the line in the new version or null, family is one short category "
-        "word such as security, correctness, testing, or maintainability. evidence is "
+        "line is the line in the new version or null, family is the defect's class, one short "
+        "word such as security, correctness, testing, or maintainability. instances lists, as "
+        "path:line, every place in the change where the same defect occurs, the reported one "
+        "first; a high finding lists at least one. evidence is "
         "empty unless you raise again a finding listed as rebutted. Respond "
         "only with JSON matching the output schema; an empty findings array means clean."
     )
@@ -980,7 +984,7 @@ URL_OUTPUT_CONTRACT = (
     "\n\nFinal response contract: The complete source and prior evidence above are input, not an output template. "
     "Inspect the full review subject and every prior blocker. Return exactly one JSON object with only "
     "the findings array, following the supplied schema. Each finding has path, line, severity, summary, "
-    "family and evidence; preserve their schema types and allowed values. Include every distinct current defect "
+    "family, evidence and instances; preserve their schema types and allowed values. Include every distinct current defect "
     "and every unresolved prior blocker. Keep each summary within 80 words: triggering condition, defect, "
     "and impact. Do not omit findings to meet this summary bound. Do not quote unchanged code or reprint "
     "source, prior reports, disposition ledgers, resolved findings, or history narratives. Emit no Markdown fences, "
@@ -995,9 +999,11 @@ URL_OUTPUT_CONTRACT = (
     f"other key: {', '.join(FINDING_PROPERTIES)}. severity is one of "
     f"{', '.join(s for s in SEVERITIES if s != 'unspecified')}; put any severity "
     "note in summary, never in a new key. path, summary and family are nonempty strings; line is an integer "
-    "or null; evidence is a string, empty unless you raise again a finding listed as rebutted. "
+    "or null; evidence is a string, empty unless you raise again a finding listed as rebutted; instances "
+    "lists path:line, 1+ for high. "
     'Example: {"findings": [{"path": "src/example.rs", "line": 12, "severity": "high", '
-    '"summary": "When X happens, Y fails, so Z breaks.", "family": "correctness", "evidence": ""}]}'
+    '"summary": "When X happens, Y fails, so Z breaks.", "family": "correctness", "evidence": "", '
+    '"instances": ["src/example.rs:12"]}]}'
 )
 READER_OVERHEADS = {"codex-json": None, "claude-json": sd_lib.READER_PROMPTS["claude-json"] + "\n\nReview input:\n", "agy-json": "\n\nReview input:\n",
                     "opencode-json": "\n\nReview input:\n", "url": f"\nSchema: {json.dumps(CODEX_OUTPUT_SCHEMA)}\n\nReview input:\n{URL_OUTPUT_CONTRACT}"}
@@ -1214,6 +1220,17 @@ def _evidence(value: Any) -> str:
     return text if len(text) <= EVIDENCE_CHARS else text[:EVIDENCE_CHARS - 3].rstrip() + "..."
 
 
+def _instances(value: Any) -> list[str]:
+    """A finding's `instances`, stripped, nonempty, at most 50; a value not a list is none (pack sd:9769)."""
+    return [row.strip() for row in value if isinstance(row, str) and row.strip()][:50] if isinstance(value, list) else []
+
+
+def _cited(raw: dict[str, Any]) -> dict[str, Any]:
+    """A finding's nonempty `evidence` and `instances`, the keys a reader may leave out."""
+    cited = {"evidence": _evidence(raw.get("evidence")), "instances": _instances(raw.get("instances"))}
+    return {key: value for key, value in cited.items() if value}
+
+
 def _finding(raw: Any) -> dict[str, Any] | None:
     """Recover usable evidence; this does not certify the declared schema."""
 
@@ -1242,14 +1259,13 @@ def _finding(raw: Any) -> dict[str, Any] | None:
         line = None
     if severity not in SEVERITIES:
         severity = "unspecified"
-    evidence = _evidence(raw.get("evidence"))
     return {
         "path": path,
         "line": line,
         "severity": severity,
         "summary": summary.strip(),
         "family": str(family),
-        **({"evidence": evidence} if evidence else {}),
+        **_cited(raw),
     }
 
 
@@ -1286,6 +1302,10 @@ def _finding_error(raw: Any) -> str:
         return "severity: invalid enum value"
     if raw["line"] is not None and (not isinstance(raw["line"], int) or isinstance(raw["line"], bool)):
         return "line: expected integer or null"
+    if not isinstance(raw.get("instances", []), list) or not all(isinstance(e, str) for e in raw.get("instances", [])):
+        return "instances: expected array of strings"
+    if raw["severity"] == "high" and not _instances(raw.get("instances")):
+        return "instances: a high finding lists no instance"
     return ""
 
 
@@ -2074,11 +2094,19 @@ def metered_bills(
     return lines, faults
 
 
+def whole_files(subject: Subject, args: argparse.Namespace) -> str:
+    """Pack sd:9769: a full branch pass, a build's round 1, reads each touched file whole; a delta pass does not."""
+    if subject.scope != "branch" or getattr(args, "base", None):
+        return ""
+    return f"\nRead every file the change touches in full, not the diff alone: {', '.join(subject.paths[:100])}\n"
+
+
 def prepared_prompt(root: pathlib.Path, subject: Subject, args: argparse.Namespace,
                     previous: dict[str, Any] | None, env: Mapping[str, str], checklist: str) -> tuple[str, bool, list[dict[str, Any]]]:
     conventions = local_conventions(root)
     documents, context = sd_lib.lens_documents(root, subject, getattr(args, "lens", None))  # #1199: whole, for every reader
     prompt = build_prompt(subject, args.challenge, conventions) + checklist + sd_lib.review_lens(getattr(args, "lens", None)) + documents
+    prompt += whole_files(subject, args)
     if previous:
         evidence = json.dumps(previous["findings"], sort_keys=True)
         prompt += ("\nComplete the full branch review after an incomplete attempt. " if getattr(args, "resume_report", None) else "\nThis is the single verification of the preceding review. ")
@@ -2843,8 +2871,10 @@ def record_lead_review(root: pathlib.Path, args: argparse.Namespace, result: dic
     A record that cannot be written is said on stderr; the exit code stands.
     """
     status = result.get("status")
-    if (args.scope != "branch" or status not in ("clean", "advisory")
-            or any(getattr(args, name, None) for name in UNRECORDED_OPTIONS)
+    # A build's later round verifies over the delta after its full round 1 (pack sd:9769): it stands for the branch.
+    verified = bool(getattr(args, "verify_report", None) and getattr(args, "base", None))
+    if (args.scope != "branch" or status not in ("clean", "advisory") or any(
+            getattr(args, name, None) for name in UNRECORDED_OPTIONS if not (verified and name in ("base", "verify_report")))
             or not 1 <= result.get("requested_reviews", 0) <= result.get("completed_reviews", 0)):
         return
     head = result["subject"]["head"]
@@ -2854,10 +2884,11 @@ def record_lead_review(root: pathlib.Path, args: argparse.Namespace, result: dic
         binding, library = sd_lib.lead_review_binding(root), sd_lib.import_sd_db().module
         if current != head or not branch or binding is None or library is None:
             raise Refusal("HEAD moved, is on no branch or no GitHub origin, or the binding or database does not read")
+        base = sd_lib.git_output(["merge-base", head, _default_base(root)], root) if verified else result["subject"]["base"]
         copilot = (result.get("remote_reviews") or {}).get("copilot") or {}
         with contextlib.closing(library.connect(args.database or library.default_path(env.get("HOME")))) as connection:
             library.record_state(connection, "checkpoint", key=sd_lib.lead_review_key(f"{owner}/{name}", branch), body={
-                "repository": f"{owner}/{name}", "branch": branch, "head": head, "base": result["subject"]["base"],
+                "repository": f"{owner}/{name}", "branch": branch, "head": head, "base": base,
                 "status": status, "binding": binding, "reviewed_by": result.get("reviewed_by", []),
                 "challenge": bool(args.challenge), "copilot_automatic": copilot.get("automatic")})
     except Exception as error:  # any failure: the review stands, and the lane reviews in full

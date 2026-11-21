@@ -26,7 +26,8 @@ from tests.test_sd_review import (
 
 def finding(severity: str = "high") -> str:
     return json.dumps({"findings": [{"path": "src.py", "line": 1,
-                                    "severity": severity, "summary": "defect", "family": "correctness"}]})
+                                    "severity": severity, "summary": "defect", "family": "correctness",
+                                    **({"instances": ["src.py:1"]} if severity == "high" else {})}]})
 
 
 class ReviewRunFixture(ReviewFixture):
@@ -175,7 +176,7 @@ class FallbackTests(ReviewRunFixture):
 
     def test_invalid_review_evidence_survives_a_clean_fallback(self) -> None:
         root = self.prepare()
-        for payload in (finding("HIGH"), '{"findings":[{"severity":"high","summary":"blocker with missing location"}]}', json.dumps({"findings":
+        for payload in (finding("HIGH"), '{"findings":[{"severity":"high","instances":["src.py:1"],"summary":"blocker with missing location"}]}', json.dumps({"findings":
                 json.loads(finding("low"))["findings"] * 50 + json.loads(finding())["findings"]})):
             with self.subTest(payload=payload[:100]):
                 result = self.run_review(root, FakeRunner({"codex": sd_review.Completed(0, payload, "")}))
@@ -524,7 +525,7 @@ class SchemaAcrossTransportsTests(ReviewFixture):
     def test_schema_violations_never_complete_a_review_on_any_transport(self) -> None:
         valid = json.loads(finding())["findings"][0]
         invalid_rows = [{"summary": "missing path"}, {**valid, "severity": "HIGH"},
-                        {"severity": "high", "summary": "blocker with missing location"},
+                        {"severity": "high", "instances": ["src.py:1"], "summary": "blocker with missing location"},
                         {**valid, "line": True}, {**valid, "line": "1"},
                         {**valid, "family": None}, {**valid, "unexpected": "extra"},
                         {key: value for key, value in valid.items() if key != "family"}]

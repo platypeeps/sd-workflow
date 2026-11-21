@@ -42,7 +42,7 @@ class FixReviewTests(ReviewFixture):
     def test_unchanged_blocker_and_source_reach_the_fix_reviewer(self):
         root, first = self.branch()
         blocking = json.dumps({"findings": [{"path": "src.py", "line": 1, "summary": "original unresolved defect",
-                                            "family": "correctness", "severity": "high"}]})
+                                            "family": "correctness", "severity": "high", "instances": ["src.py:1"]}]})
         prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": sd_review.Completed(0, blocking, "")}),
                                  self.environment(), self.chatgpt_home())
         report = self.tmp / "prior.json"
@@ -64,7 +64,7 @@ class FixReviewTests(ReviewFixture):
         holder; the cleanup after a failed reader must not join it."""
         root, first = self.branch()
         blocking = json.dumps({"findings": [{"path": "src.py", "line": 1, "summary": "original unresolved defect",
-                                            "family": "correctness", "severity": "high"}]})
+                                            "family": "correctness", "severity": "high", "instances": ["src.py:1"]}]})
         prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": sd_review.Completed(0, blocking, "")}),
                                  self.environment(), self.chatgpt_home())
         report = self.tmp / "prior.json"
@@ -112,7 +112,7 @@ class FixReviewTests(ReviewFixture):
     def test_resume_reviews_full_branch_and_repeats_prior_blockers(self):
         root, first = self.branch()
         blocking = json.dumps({"findings": [{"path": "src.py", "line": 1, "summary": "original unresolved defect",
-                                            "family": "correctness", "severity": "high"}]})
+                                            "family": "correctness", "severity": "high", "instances": ["src.py:1"]}]})
         prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": sd_review.Completed(0, blocking, "")}),
                                  self.environment(), self.chatgpt_home())
         prior["completed_reviews"] = 0
@@ -135,7 +135,7 @@ class FixReviewTests(ReviewFixture):
     def test_explain_refuses_oversized_resume_report_and_current_source(self):
         root, first = self.branch()
         report = self.tmp / "prior.json"
-        row = {"path": "src.py", "line": 1, "severity": "high", "family": "correctness",
+        row = {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness",
                "disposition": "blocking", "summary": "x" * (sd_review.MAX_OUTPUT_BYTES + 1)}
         prior = {"scope": "branch", "subject": {"head": first}, "findings": [row]}
         for oversized in ("report", "source"):
@@ -390,7 +390,7 @@ class FixReviewTests(ReviewFixture):
         self.assertNotIn("OTHER_KEY", result)
 
     def test_native_auth_error_is_reported_while_structured_blocker_survives(self):
-        findings = {"findings": [{"path": "src.py", "line": 1, "summary": "blocker", "family": "correctness", "severity": "high"}]}
+        findings = {"findings": [{"path": "src.py", "line": 1, "summary": "blocker", "family": "correctness", "severity": "high", "instances": ["src.py:1"]}]}
         result, parsed = sd_review.claude_answer(sd_review.Completed(0, json.dumps({"type": "result", "subtype": "error",
                                  "is_error": True, "result": "Not logged in", "structured_output": findings}), ""))
         self.assertEqual(result.exit_code, 1)
