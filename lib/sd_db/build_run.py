@@ -1347,6 +1347,8 @@ class Supervisor:
         its own mark, so a lost answer stands for that one write only."""
         named = {path for row in prior["findings"] if isinstance(row, dict) for path, _ in self.locations(row)}
         changed = changed_lines(self.tools.git, str(self.work), prior["subject"]["head"], head, env=self.env)
+        if not 1 <= int(prior.get("requested_reviews") or 0) <= int(prior.get("completed_reviews") or 0):
+            changed = None  # a last round short of a reader proves no finding absent: hold every blocker
 
         def held(row: dict) -> bool:
             # `<...>` names no file; an absolute or `..` path is outside the checkout no delta of it can clear.

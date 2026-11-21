@@ -218,6 +218,7 @@ FAKE = textwrap.dedent('''
         if mode == "absolute":  # pack sd:9769: a blocker spelled as an absolute path inside the checkout
             findings = review.dispose([review._finding({**raw, "path": os.path.join(work, "work.txt")})], "high")
         print(json.dumps({"status": "blocking" if mode in ("blocking", "absolute") else "clean", "scope": "branch",
+                          "requested_reviews": 2, "completed_reviews": 2,
                           "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                           "findings": findings if mode in ("blocking", "absolute") else []}))
     if role == "sd-ship":
@@ -1171,7 +1172,19 @@ class Supervise(Case):
         self.assertEqual(build_run.changed_lines(["git"], str(repo), base, run("rev-parse", "HEAD")),
                          {"a b.txt": {1}, "gone b.txt": {1}})
 
-    PRIOR = {"subject": {"head": "b" * 40}, "findings": [{"path": "named.py", "line": 1}]}
+    PRIOR = {"subject": {"head": "b" * 40}, "findings": [{"path": "named.py", "line": 1}],
+             "requested_reviews": 2, "completed_reviews": 2}
+
+    def test_a_short_prior_report_defers_nothing(self):
+        """Class pass, sd:9769: deferral trusts the last round's findings; a round short of a reader proves none."""
+        self.press()
+        supervisor = self.supervisor()
+        row = {"path": "far.py", "line": 1, "summary": "a"}
+        for short in ({"completed_reviews": 1}, {"requested_reviews": 0, "completed_reviews": 0}):
+            with self.subTest(short=short), mock.patch.object(build_run, "changed_lines", return_value={}):
+                kept = supervisor.file_new_findings({"status": "blocking", "blockers": [row]},
+                                                    {**self.PRIOR, **short}, "a" * 40)
+                self.assertEqual(kept["blockers"], [row], "a short prior report deferred a blocker")
 
     def deferred(self, blockers, changed):
         """`file_new_findings` over `blockers` with the delta `changed`: the blockers it keeps."""
