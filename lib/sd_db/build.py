@@ -130,9 +130,10 @@ DROPPED = "dropped from build run "
 RESERVED = "build-drop"
 #: The keys `drop_reserve` adds to a drop plan.
 RESERVED_KEYS = ("new_lead", "new_work", "new_branch")
-#: The result of a bundle drop's new lead until its first run, then the ended run's id: its kept work is in a
-#: worktree on the host that ran that run, which alone may claim it (pack sd:9709, round 16).
-KEPT = "kept by a bundle drop of build run "
+#: How a bundle drop queues its kept members, in the queue note of each, the ended run's id last: the new lead's
+#: kept work is in a worktree on the host that ran that run, which alone may claim it until the lead runs (pack
+#: sd:9709, round 16). A note, as no writer changes one; the row's `result` lost it (round 17).
+DROP_HOW = "bundle drop of sd:{item} from build run "
 #: The bundle statuses Retry and Send to builder take: each keeps its worktree.
 AGAIN = ("blocked", "cancelled")
 #: A lane entry that failed only because prepare's merge of origin/<base> conflicted goes back to its builder on
@@ -828,10 +829,9 @@ def drop_writes(connection, plan: dict, *, who: str, note: str, left: str) -> li
                 (member["item"], lead, BUDGET_MINUTES, SCOPE))
             members.append({"id": int(cursor.lastrowid), "item": member["item"]})
         items = reads.items_by_ids(connection, [plan["item"], *(member["item"] for member in members)])
-        how = f"bundle drop of sd:{plan['item']} from build run {plan['run']}"
+        how = DROP_HOW.format(item=plan["item"]) + plan["run"]
         queued = _queue_members(connection, members, items, lead=lead, who=who, finding=note, parked="",
                                 how=how, verb="Drop")
-        connection.execute("UPDATE assignment SET result = ? WHERE id = ?", (f"{KEPT}{plan['run']}", lead))
         if items[plan["item"]]["status"] == "blocked":
             transition(connection, plan["item"], "ready", who=who, reason=how)
         unpark(connection, plan["item"])
@@ -1485,12 +1485,17 @@ def _bundle(connection, rows: list) -> list:
 def _kept_host(connection, row) -> tuple[str, str | None] | None:
     """(run, host) of the ended run a bundle drop's new lead `row` keeps the work of, until the lead runs; None for
     any other row, or when that run reads gone."""
-    result = connection.execute("SELECT result FROM assignment WHERE id = ? AND parent IS NULL AND NOT EXISTS "
-                                "(SELECT 1 FROM runner_run WHERE assignment = ?)", (row["id"], row["id"])).fetchone()
-    if result is None or not (result["result"] or "").startswith(KEPT):
+    if row["parent"] is not None or connection.execute("SELECT 1 FROM runner_run WHERE assignment = ?",
+                                                       (row["id"],)).fetchone():
         return None
-    ran = connection.execute("SELECT owner FROM runner_run WHERE id = ?", (result["result"][len(KEPT):],)).fetchone()
-    return (result["result"][len(KEPT):], run_host(ran["owner"])) if ran else None
+    note = connection.execute(
+        "SELECT body FROM note WHERE item = ? AND body LIKE ? ORDER BY timestamp, id LIMIT 1",
+        (row["item"], f"Build assignment {row['id']} queued again by %: {DROP_HOW.format(item='%')}%")).fetchone()
+    if note is None:
+        return None
+    ident = note["body"].rsplit(" ", 1)[1]
+    ran = connection.execute("SELECT owner FROM runner_run WHERE id = ?", (ident,)).fetchone()
+    return (ident, run_host(ran["owner"])) if ran else None
 
 
 def _refuse(connection, row, reason: str) -> None:

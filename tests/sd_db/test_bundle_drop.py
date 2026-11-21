@@ -712,3 +712,34 @@ class DropRound16(Repo):
         row = self.db.execute("SELECT status, result FROM assignment WHERE id = ?", (lead,)).fetchone()
         self.assertEqual(row["status"], "blocked")
         self.assertIn("sat-a", row["result"])
+
+
+class DropRound17(Repo):
+    """Review round 17 of pack sd:9709, class pass: the new lead's host was kept in `result`, which every writer of
+    a queued row's outcome overwrites before the lead's first run: a claim's refusal (`_refuse`), the quiet
+    dispatcher's recovery (`_requeue_beat_blocked`, which clears it) and a requeue. The drop's queue note holds it
+    now, which no writer changes."""
+
+    def on_sat_a(self, items, run):
+        self.db.execute("UPDATE runner_run SET owner = 'fixture@sat-a' WHERE id = ?", (run["id"],))
+        self.db.execute("UPDATE repo SET lane_host = 'sat-a' WHERE path = ?", (str(self.repo),))
+        for host in ("sat-a", "sat-b"):
+            record_state(self.db, "heartbeat", key=f"build-dispatch@{host}", body={})
+        with mock.patch.multiple(build, lane_hosts=mock.Mock(return_value=frozenset({"sat-a"})),
+                                 hub_host=mock.Mock(return_value="hub")):
+            return DROP.drop_item(self.db, build, items[1], who="operator")[0]["id"]
+
+    def test_each_result_writer_keeps_the_kept_host(self):
+        writers = {"refused then recovered": "UPDATE assignment SET status = 'queued', result = NULL WHERE id = ?",
+                   "a claim's refusal": "UPDATE assignment SET result = 'item 1 refused; not built' WHERE id = ?",
+                   "a requeue": "UPDATE assignment SET result = 'requeued by operator' WHERE id = ?"}
+        for name, sql in writers.items():
+            with self.subTest(name):
+                self.setUp()
+                items, ids, run = self.bundle()
+                lead = self.on_sat_a(items, run)
+                self.db.execute(sql, (lead,))
+                self.db.execute("UPDATE repo SET lane_host = 'sat-b' WHERE path = ?", (str(self.repo),))
+                with mock.patch.object(build, "hub_host", return_value="hub"):
+                    claimed = [self.claim(hosts=frozenset({"sat-b"})) for _ in range(3)]
+                self.assertNotIn(lead, [one["assignment"] for one in claimed if one])
