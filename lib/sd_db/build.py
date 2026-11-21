@@ -873,11 +873,9 @@ def eligible(connection, *, now: str | None = None) -> list[dict]:
     hosts, found = lane_hosts(connection), []
     # An item whose own build the hub blocked on a quiet dispatcher waits for that build to queue again
     # (`_requeue_beat_blocked`): a fresh one from main drops its branch's work (sd:9774).
-    # One stranded on a satellite its lane left (`_stranded`) has no host to requeue it: pickup builds it fresh.
-    waiting = {row["item"] for row in connection.execute(
-        f"SELECT assignment.id, assignment.item, assignment.parent, assignment.run_count, repo.lane_host "
-        f"FROM assignment JOIN item ON item.id = assignment.item LEFT JOIN repo ON repo.path = item.repo "
-        f"WHERE {_BEAT_BLOCKED}", (SCOPE, _BEAT_RESULT)) if not _stranded(connection, row)}
+    # Only one recovery would queue (`_recoverable`): pickup builds any other fresh, as one stranded on a
+    # satellite its lane left (round 4 of sd:9774).
+    waiting = {row["item"] for row in _recoverable(connection)}
     for row in reads.backlog_items(connection, status="ready", now=now):
         if row["recurrence"] or row["id"] in waiting:  # a scheduled occurrence recurs too
             continue
@@ -1373,6 +1371,20 @@ def _stranded(connection, row) -> bool:
     return away is not None and lead is not None and _ran_on(connection, lead) != away
 
 
+def _recoverable(connection) -> list:
+    """The builds blocked on a quiet beat that recovery may queue again once a beat is back, a build that ran first:
+    the one reader recovery and pickup's wait share, so pickup never waits on a row recovery leaves (class pass,
+    review round 7). Its item `ready` and not parked: a park is the operator's pause, as a cancel of a newer press
+    leaves it; not `_stranded`."""
+    rows = connection.execute(
+        f"SELECT assignment.id, assignment.item, assignment.parent, assignment.run_count, assignment.result, "
+        f"repo.lane_host FROM assignment "
+        f"JOIN item ON item.id = assignment.item LEFT JOIN repo ON repo.path = item.repo "
+        f"WHERE {_BEAT_BLOCKED} AND item.status = 'ready' AND item.parked_at IS NULL "
+        f"ORDER BY assignment.run_count > 0 DESC, assignment.id DESC", (SCOPE, _BEAT_RESULT)).fetchall()
+    return [row for row in rows if not _stranded(connection, row)]
+
+
 def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
     """Put back to queued each build the hub's claim blocked on another host's quiet dispatcher, once that host's
     beat is fresh and not stuck again (pack sd:8745): a slow-DB stretch blocked them for good before.
@@ -1384,15 +1396,7 @@ def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
     first tick back, before its pickup reads, so a hub outage that left its
     beat stale requeues its bundles as they were (sd:9775).
     """
-    rows = connection.execute(
-        f"SELECT assignment.id, assignment.item, assignment.parent, assignment.run_count, assignment.result, "
-        f"repo.lane_host FROM assignment "
-        f"JOIN item ON item.id = assignment.item LEFT JOIN repo ON repo.path = item.repo "
-        f"WHERE {_BEAT_BLOCKED} AND item.status = 'ready' "
-        f"ORDER BY assignment.run_count > 0 DESC, assignment.id DESC", (SCOPE, _BEAT_RESULT)).fetchall()
-    for row in rows:
-        if _stranded(connection, row):
-            continue
+    for row in _recoverable(connection):
         away = _route(connection, row["lane_host"], _lead(row))
         # Not stranded, a retry's lane is on the host it ran on, which holds its worktree: that host owns the block
         # whatever host it names, as one blocked while its lane was away (review round 5 of sd:9775).

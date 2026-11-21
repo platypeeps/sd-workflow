@@ -2734,6 +2734,22 @@ class Hosts(Case):
         self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE item = ? AND status IN "
                                     "('queued', 'running')", item), 1)
 
+    def test_beat_recovery_leaves_a_build_whose_item_a_cancel_parked(self):
+        """Class pass, review round 7 of sd:9775: a build blocked on a quiet beat; the operator pressed a
+        replacement and cancelled it before its claim, which parked the item. Recovery passed the cancelled build,
+        which never ran, and queued the old one over the operator's pause. A parked item's build stays blocked."""
+        item = self.item(repo=SAT)
+        old = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        newer = build.queue(self.db, [item], who="operator")[0]["id"]
+        state = operations.assignment_state(self.db, newer)
+        operations.cancel_assignment(self.db, newer, expected_revision=state["revision"], who="operator")
+        self.assertIsNotNone(item_state(self.db, item)["item"]["parked_at"])
+        self.assertIsNone(self.claim(hosts=WORK))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", old), "blocked")
+
     def test_the_hub_blocks_a_row_whose_satellite_beat_comes_from_a_clock_ahead(self):
         """Pack sd:7955: a beat stamped more than STALE_SECONDS after now has no age to trust, so the claim blocks
         the row as for a stale beat, and its note names the skew, not a dead dispatcher."""
