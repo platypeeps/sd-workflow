@@ -902,6 +902,20 @@ class DropRound21(Repo):
         self.assertEqual(row["status"], "blocked", "no claim would take it queued with no repository")
         self.assertIn("no repository", row["result"])
 
+    def test_a_kept_member_moved_to_another_hosts_repository_holds_the_lead(self):
+        """Round 23: the claim drops a row whose lane runs on another host before it checks moves, so a member moved
+        to a repository a live satellite serves stayed queued, out of sight, and the lead shipped its commits."""
+        items, (lead, member) = self.kept()
+        other = self.move(items[1])
+        self.db.execute("UPDATE repo SET lane_host = 'sat-b' WHERE path = ?", (str(other),))
+        with mock.patch.object(build, "dispatcher_gone", return_value=None), \
+                mock.patch.object(build, "dispatcher_stuck", return_value=None):
+            self.assertNotIn(lead["id"], self.claims())
+        self.blocked_naming(lead["id"], items[1])
+        row = self.db.execute("SELECT status, result FROM assignment WHERE id = ?", (member["id"],)).fetchone()
+        self.assertEqual(row["status"], "blocked", row["result"])
+        self.assertIn(str(other), row["result"])
+
     def test_a_kept_member_done_lets_the_lead_build(self):
         items, (lead, member) = self.kept()
         self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[1],))

@@ -1442,21 +1442,26 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
         # A member that left a bundle with work after it queued (moved above, cancelled, refused at a claim) leaves
         # its commits on the lead's branch, which the lane would ship with the lead's: the lead blocks (round 21).
         # A done item's commits may stay: the merge closes nothing open; one left out (`LEFT_OUT`) the split check
-        # reads at the run's start. A queued member whose item lost its repository is not in `queued`, which no
-        # claim would ever take: it blocks, and counts as left (round 22).
+        # reads at the run's start. A queued member is checked here against the work's repository too, as its item
+        # reads now: one whose item lost its repository (round 22), or moved to one whose lane runs on another host
+        # (round 23), is not in `queued`, so no check above saw it. It blocks, and counts as left.
         for row in queued:
-            if row["parent"] is not None or _work_repo(connection, row) is None:
+            home = _work_repo(connection, row) if row["parent"] is None else None
+            if home is None:
                 continue
-            found = connection.execute(
+            found = [one for one in connection.execute(
                 "SELECT member.id, member.item, member.status, item.repo FROM assignment member "
                 "JOIN item ON item.id = member.item JOIN assignment lead ON lead.id = member.parent "
-                "WHERE member.parent = ? AND member.scope = ? AND (member.status != 'queued' OR item.repo IS NULL) "
+                "WHERE member.parent = ? AND member.scope = ? "
                 "AND member.queued_at >= lead.queued_at AND item.status != 'done' "
                 "AND COALESCE(member.result, '') NOT LIKE ? ORDER BY member.id",
                 (row["id"], SCOPE, f"%: {LEFT_OUT}%")).fetchall()
+                if one["status"] != "queued" or one["repo"] is None or not paths.same(home, one["repo"])]
             for one in found:
                 if one["status"] == "queued":
-                    _refuse(connection, one, f"item {one['item']} has no repository; set one, then Build it again")
+                    _refuse(connection, one, f"item {one['item']} has no repository; set one, then Build it again"
+                            if one["repo"] is None else f"its item moved to {one['repo']}, away from its bundle's "
+                            f"work in {home}; Build it again there")
             strays = [one["item"] for one in found]
             if strays:
                 names = ", ".join(f"sd:{item}" for item in strays)
