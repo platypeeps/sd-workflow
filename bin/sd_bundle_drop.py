@@ -6,8 +6,7 @@ must name the lead (ruling #64210), and a reverted commit keeps its `Closes: sd:
 it dropped (sd:9651).
 
 A commit is the dropped item's when its message cites it (`sd_ship_body.cited_ids`), the kept items' when it
-cites only others. One that cites nothing goes with the side whose cited commits touched its paths; one that
-touches both sides' paths, or neither, refuses the drop: no message says whose it is.
+cites only others. One that cites nothing refuses the drop: no message says whose it is.
 """
 
 from __future__ import annotations
@@ -88,42 +87,20 @@ def _ignored(work: str | Path, start: str, kept: list[str]) -> None:
 
 def drop_sides(work: str | Path, start: str, tip: str, item: int, aside: set[int]) -> tuple[list[str], list[str]]:
     """The non-merge commits of `start..tip`, oldest first, split into (kept, dropped) for dropping `item`. A commit
-    citing an item of `aside`, `item` and the members cancelled out of the bundle before, is not kept (round 3)."""
+    citing an item of `aside`, `item` and the members cancelled out of the bundle before, is not kept (round 3).
+    A commit that cites no item refuses the drop: paths cannot say whose it is, since a follow-up of the dropped
+    item may edit only a file a kept commit touched (round 6)."""
     shas = _out("rev-list", "--reverse", "--no-merges", f"{start}..{tip}", cwd=work).split()
-    side: dict[str, str] = {}
-    touched: dict[str, set[str]] = {"kept": set(), "dropped": set()}
-    loose, named = [], False
+    kept, dropped = [], []
     for sha in shas:
         cited = set(sd_ship_body.cited_ids("", [(sha, _out("log", "-1", "--format=%B", sha, cwd=work))]))
+        if not cited:
+            raise DropRefused(f"commit {sha[:12]} cites no item, so nothing says whose it is; split it by hand")
         if cited & aside and cited - aside:
             raise DropRefused(f"commit {sha[:12]} cites {', '.join(f'sd:{n}' for n in sorted(cited & aside))} and "
                               f"{', '.join(f'sd:{n}' for n in sorted(cited - aside))}: split it by hand")
-        if not cited:
-            loose.append(sha)
-            continue
-        side[sha] = "dropped" if cited & aside else "kept"
-        named = named or item in cited
-        touched[side[sha]] |= _paths(work, sha)
-    # Paths prove whose an uncited commit is only against both sides' cited commits: with one side uncited, every
-    # such commit would fall to the other side, the dropped item's change shipping with the kept (round 2).
-    # The dropped item's own: a commit of a member cancelled out before says nothing of whose this is (round 3).
-    for found, who in ((named, f"sd:{item}"), ("kept" in side.values(), "a kept item")):
-        if loose and not found:
-            raise DropRefused(f"no commit cites {who}, so nothing says whose commit {loose[0][:12]} is; "
-                              f"split it by hand")
-    side.update({sha: _whose(work, sha, touched) for sha in loose})
-    return [sha for sha in shas if side[sha] == "kept"], [sha for sha in shas if side[sha] == "dropped"]
-
-
-def _whose(work: str | Path, sha: str, touched: dict[str, set[str]]) -> str:
-    """The side of the uncited commit `sha`: the one whose cited commits touch its paths, when only one does."""
-    paths = _paths(work, sha)
-    hits = [name for name in ("kept", "dropped") if paths & touched[name]]
-    if len(hits) != 1:
-        raise DropRefused(f"commit {sha[:12]} cites no item and touches "
-                          f"{'paths of both sides' if hits else 'no path a citing commit touched'}: "
-                          f"no message says whose it is")
-    return hits[0]
+        (dropped if cited & aside else kept).append(sha)
+    return kept, dropped
 
 
 def _clean(work: str | Path, branch: str) -> None:

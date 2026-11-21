@@ -51,8 +51,8 @@ class Repo(Case):
         git(work, "commit", "-q", "-m", message)
 
     def bundle(self, cite_second=True):
-        """Three items built on one branch, ended blocked: the lead's commit, the second's, an uncited fix of the
-        lead's file, the third's. (items, assignment ids, run). `cite_second` False: the second's commit is an
+        """Three items built on one branch, ended blocked: the lead's commit, the second's, a review fix citing the
+        lead, the third's. (items, assignment ids, run). `cite_second` False: the second's commit is an
         uncited edit of the lead's file instead."""
         items = [self.item(repo=str(self.repo)) for _ in range(3)]
         build.queue(self.db, items, who="operator")
@@ -62,7 +62,9 @@ class Repo(Case):
         self.commit(work, "a.txt", "lead\n", f"feat: lead\n\nCloses: sd:{items[0]}")
         if cite_second:
             self.commit(work, "b.txt", "second\n", f"feat: second\n\nCloses: sd:{items[1]}")
-        self.commit(work, "a.txt", "lead fixed\n", "fix: review round")
+        else:
+            self.commit(work, "a.txt", "second\n", "fix: second")
+        self.commit(work, "a.txt", "lead fixed\n", f"fix: review round\n\nLane review fix, repo sd:{items[0]}")
         self.commit(work, "c.txt", "third\n", f"feat: third\n\nCloses: sd:{items[2]}")
         build.write(self.db, run["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START)
         build.end(self.db, run["id"], "blocked", "3 review rounds left blockers: a.txt:1 lead")
@@ -133,7 +135,7 @@ class Drop(Repo):
         (work / "b.txt").write_text("both\n")
         self.commit(work, "a.txt", "both\n", "fix: touches both")
         old = git(work, "rev-parse", "HEAD")
-        with self.assertRaisesRegex(DROP.DropRefused, "paths of both sides"):
+        with self.assertRaisesRegex(DROP.DropRefused, "cites no item"):
             DROP.drop_item(self.db, build, items[1], who="operator")
         self.assertEqual(git(work, "rev-parse", "HEAD"), old)
         self.assertEqual(self.statuses(items), ["blocked"] * 3)
@@ -293,7 +295,7 @@ class DropRound2(Repo):
         items, ids, run = self.bundle(cite_second=False)
         work = Path(run["work_path"])
         old = git(work, "rev-parse", "HEAD")
-        with self.assertRaisesRegex(DROP.DropRefused, f"no commit cites sd:{items[1]}"):
+        with self.assertRaisesRegex(DROP.DropRefused, "cites no item"):
             DROP.drop_item(self.db, build, items[1], who="operator")
         self.assertEqual(git(work, "rev-parse", "HEAD"), old)
 
@@ -412,3 +414,21 @@ class DropRound5(Repo):
                 DROP.drop_item(self.db, build, item, who="operator")
             self.assert_unwritten(items, run, old)
             self.assertFalse((Path(run["work_path"]).parent / f"repo-build-{ids[1]}").exists())
+
+
+class DropRound6(Repo):
+    """Review round 6 of pack sd:9709: paths cannot say whose an uncited commit is. A follow-up of the dropped
+    item that edits only a file a kept commit touched would ship with the kept items, and the branch check took it,
+    since the follow-up supplied its own allowed path. Every uncited commit now refuses the drop."""
+
+    def test_an_uncited_follow_up_of_the_dropped_item_on_a_kept_file_refuses(self):
+        items, ids, run = self.bundle()
+        work = Path(run["work_path"])
+        self.commit(work, "a.txt", "second's follow-up\n", "fix: second follow-up")
+        old = git(work, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(DROP.DropRefused, "cites no item"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual((git(work, "rev-parse", "HEAD"), git(work, "branch", "--show-current")),
+                         (old, run["branch"]))
+        self.assertEqual(git(self.repo, "branch", "--list", f"{run['branch']}-drop-*"), "")
+        self.assertEqual(self.statuses(items), ["blocked"] * 3)
