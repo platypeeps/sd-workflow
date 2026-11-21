@@ -1250,6 +1250,12 @@ class Supervise(Case):
                 mock.patch.object(build_run, "_read", return_value="100644 blob 0123\tsrc.py\0"):
             self.assertIsNotNone(supervisor.prior_review("a" * 40), "a tracked file's blocker dropped the chain")
 
+    def test_a_non_ascii_digit_line_reads_as_no_line(self):
+        """Review of sd:9769: `str.isdigit` takes `²`, which `int` refuses; the place reads with no line."""
+        self.press()
+        self.assertEqual(self.supervisor().locations({"path": "src/file.py", "line": 1, "instances": ["src/file.py:\u00b2"]}),
+                         [("src/file.py", 1), ("src/file.py:\u00b2", None)])
+
     def deferred(self, blockers, changed):
         """`file_new_findings` over `blockers` with the delta `changed`: the blockers it keeps."""
         supervisor = self.supervisor()

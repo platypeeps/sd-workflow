@@ -1351,7 +1351,7 @@ class Supervisor:
         places: list[tuple[Any, Any]] = [(row.get("path"), row.get("line"))]
         for entry in row.get("instances") or []:
             path, _, line = str(entry).rpartition(":")
-            places.append((path, int(line)) if path and line.isdigit() else (str(entry), None))
+            places.append((path, int(line)) if path and line.isascii() and line.isdigit() else (str(entry), None))
         root = os.path.realpath(self.work)
         found = []
         for path, line in places:
