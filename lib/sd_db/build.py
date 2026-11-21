@@ -1005,15 +1005,17 @@ def stop_on_blocks(connection, *, now: str | None = None) -> str | None:
 
     A bundle ends `done` (it reached the lane) or `blocked`; a blocked run,
     a second loss and a denied run each end it blocked. A cancel is the
-    operator's and does not count. The note on the latest one's item says
-    why. The reason, or None.
+    operator's and does not count, nor does a build the claim refused before
+    it started (`started` NULL): a dependency wait, a moved item or a quiet
+    lane is no build failure (review of pack sd:9570). The note on the
+    latest one's item says why. The reason, or None.
     """
     state = pickup_state(connection, now=now)
     if not state["on"]:
         return None
     rows = connection.execute(
         "SELECT id, item, status FROM assignment WHERE scope = ? AND parent IS NULL AND status IN ('done', 'blocked') "
-        "AND ended >= ? ORDER BY ended DESC, id DESC", (SCOPE, state["since"])).fetchall()
+        "AND started IS NOT NULL AND ended >= ? ORDER BY ended DESC, id DESC", (SCOPE, state["since"])).fetchall()
     ended = [row for row in rows if picked(connection, row["id"])][:2]
     if len(ended) < 2 or any(row["status"] != "blocked" for row in ended):
         return None

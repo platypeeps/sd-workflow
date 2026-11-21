@@ -259,6 +259,21 @@ class TheBuild(DependencyCase):
         self.assertEqual((row["status"], row["result"]), ("blocked", f"item {item} waits on sd:{first}; not built"))
         self.assertEqual(item_state(self.db, item)["item"]["status"], "ready")
 
+    def test_dependency_waits_at_the_claim_leave_auto_pickup_on(self):
+        """Review: a shared prerequisite reopened after pickup queued two dependents; the claim refused
+        both before any builder started, and the next tick read two blocked builds and turned pickup off."""
+        shared, one, two = self.item(status="done"), self.item(), self.item()
+        self.wait(one, shared)
+        self.wait(two, shared)
+        build.set_pickup(self.db, True, now="2026-01-01T00:00:00+00:00")
+        build.queue(self.db, [one], who=build.PICKUP)
+        build.queue(self.db, [two], who=build.PICKUP)
+        change_status(self.db, shared, "ready", who="operator")
+        self.assertIsNone(self.claim())
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE status = 'blocked'"), 2)
+        self.assertIsNone(build.stop_on_blocks(self.db), "a refusal at the claim is no build failure")
+        self.assertTrue(build.pickup_state(self.db)["on"])
+
     def blocked_bundle(self, *items):
         """A bundle of `items` claimed, ended blocked and released: one Retry takes back to its branch."""
         build.queue(self.db, list(items), who="operator")

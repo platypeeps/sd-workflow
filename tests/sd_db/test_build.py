@@ -2099,8 +2099,9 @@ class Pickup(Case):
     def end(self, status):
         item = self.item()
         lead = build.queue(self.db, [item], who=build.PICKUP)[0]["id"]
-        self.db.execute("UPDATE assignment SET status = ?, ended = ? WHERE id = ?",
-                        (status, later(build.clock(), self.count("SELECT COUNT(*) FROM assignment")), lead))
+        stamp = later(build.clock(), self.count("SELECT COUNT(*) FROM assignment"))
+        self.db.execute("UPDATE assignment SET status = ?, started = ?, ended = ? WHERE id = ?",
+                        (status, stamp, stamp, lead))
         return item
 
     def test_two_blocked_runs_turn_off(self):
@@ -2112,7 +2113,7 @@ class Pickup(Case):
         self.assertIsNone(build.stop_on_blocks(self.db, now=self.NOW), "a done between breaks the row")
         operator = self.item()
         lead = build.queue(self.db, [operator], who="operator")[0]["id"]
-        self.db.execute("UPDATE assignment SET status = 'blocked', ended = ? WHERE id = ?",
+        self.db.execute("UPDATE assignment SET status = 'blocked', started = ?1, ended = ?1 WHERE id = ?2",
                         (later(build.clock(), 90), lead))
         self.assertIsNone(build.stop_on_blocks(self.db, now=self.NOW), "a pressed build is not auto-pickup's")
         last = self.end("blocked")
