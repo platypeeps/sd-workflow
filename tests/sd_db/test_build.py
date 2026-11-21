@@ -656,6 +656,18 @@ class Writes(Case):
                 self.skip(self.items[0], question=question)
                 self.assertEqual([row["item"] for row in self.build_again(self.items[0])], [self.items[0]])
 
+    def test_a_plain_retry_of_a_skipped_lead_keeps_the_delivered_member(self):
+        """Review of build/sd-1242: a mixed bundle, its member delivered (`done`) and its lead skipped with a
+        question (`blocked`). A plain Retry of the lead cancelled the delivered member as left out, erasing its
+        delivery and holding the bundle for good; it leaves the member `done` and the bundle unsplit."""
+        self.skip(self.items[0], question=True)
+        build.end(self.db, self.bundle["id"], "done", "merged by fixture")
+        lead, member = (row["id"] for row in build.run(self.db, self.bundle["id"])["members"])
+        self.assertEqual([row["item"] for row in build.retry(self.db, lead, who="operator")["queued"]],
+                         [self.items[0]])
+        self.assertEqual(runner.queue_state(self.db, member)["status"], "done", "the delivery record stays")
+        self.assertEqual(build.split(self.db, lead), "", "no member left the bundle at this Retry")
+
     def test_a_delivered_member_still_holds_its_item(self):
         """Guard: at a lane step the run holds each member it delivers; the lane owns that item until the merge."""
         self.skip(self.items[1])
@@ -1734,6 +1746,46 @@ class CancelParks(Case):
         build.end(self.db, again["id"], "cancelled", "cancelled by operator")
         self.assertEqual([entry["id"] for entry in build.queue_again(self.db, [items[0]], who="operator")], [lead])
         self.assertEqual(runner.queue_state(self.db, child)["status"], "cancelled")
+
+    def blocked_bundle(self, size=3):
+        """A bundle of `size` items that ran and ended blocked, its lease released: (items, lead first ids)."""
+        items = [self.item() for _ in range(size)]
+        build.queue(self.db, items, who="operator")
+        bundle = self.claim()
+        build.write(self.db, bundle["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START)
+        build.end(self.db, bundle["id"], "blocked", "3 review rounds left blockers: a.py:2 one item")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        ids = [member["id"] for member in build.run(self.db, bundle["id"])["members"]]
+        self.assertEqual(len(ids), size)
+        return items, ids
+
+    def test_a_retry_naming_a_subset_queues_only_those_items(self):
+        """Pack sd:9581: retrying two of a blocked bundle's three items requeued the third too. The named items
+        queue again under the lead; the third leaves the bundle, ready and parked, and builds fresh later."""
+        items, (lead, kept, left) = self.blocked_bundle()
+        queued = build.queue_again(self.db, items[:2], who="operator")
+        self.assertEqual(sorted(entry["id"] for entry in queued), [lead, kept])
+        self.assertEqual(runner.queue_state(self.db, left)["status"], "cancelled")
+        self.assertEqual((self.statuses(items), self.parked(items)),
+                         (["ready", "ready", "ready"], [False, False, True]))
+        again = self.claim()
+        self.assertEqual([member["id"] for member in build.run(self.db, again["id"])["members"]], [lead, kept])
+        fresh = build.queue_again(self.db, [items[2]], who="operator")
+        self.assertNotIn(fresh[0]["id"], (lead, kept, left))
+
+    def test_a_subset_retry_must_name_the_lead(self):
+        """Pack sd:9581: the lead's worktree holds the bundle's work, so a subset without it refuses, writing nothing."""
+        items, ids = self.blocked_bundle()
+        with self.assertRaisesRegex(build.BuildRefused, f"names its lead sd:{items[0]}"):
+            build.queue_again(self.db, items[1:], who="operator")
+        self.assertEqual(self.statuses(items), ["blocked"] * 3)
+        self.assertEqual({runner.queue_state(self.db, ident)["status"] for ident in ids}, {"blocked"})
+
+    def test_a_retry_naming_one_item_still_retries_the_whole_bundle(self):
+        """The Builds panel's row Retry names one item: it retries the bundle, as before (pack sd:8785)."""
+        items, ids = self.blocked_bundle()
+        self.assertEqual(sorted(entry["id"] for entry in build.queue_again(self.db, [items[1]], who="operator")),
+                         sorted(ids))
 
     def test_a_cancel_of_another_scope_parks_nothing(self):
         item = self.item()

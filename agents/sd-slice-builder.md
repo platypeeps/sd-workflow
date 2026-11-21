@@ -63,7 +63,9 @@ Effort is `high` on purpose: multi-file code, tests and evidence. You hold no Ag
    Name each PNG in the report, not in the pull-request body: the shots hold live data.
 7. Write the pull-request body to the path your brief names. It holds `## Summary`, one bullet group per item
    naming `<repo> sd:N`, and `## Test plan`, with the fail-first tests and focused test lines.
-   No tables or checklists, except the failure table that the sd-review skill's class pass asks for.
+   No tables or checklists, except a failure table: a change that moves state in steps,
+   or adds a parser, a journal or event matching, carries one before review round 1,
+   and the sd-review skill's class pass adds to it within the change's own scope.
    No line starts with `Closes:`, `Item:` or `Delivers:`: enqueue takes items by `--item` and refuses
    a body trailer (sd:3704); name the primary item in the report instead.
    A `Work:` line is allowed: `sd-ship prepare` strips one that matches what it writes.

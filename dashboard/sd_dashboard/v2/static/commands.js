@@ -229,7 +229,7 @@
     }
     return { id: 'item.build', on: 'item', label: 'Build', icon: 'rocket', risk: 'safe', bulk: true, executes: true, primary,
       does: 'Queues an unattended build for each item, grouped by repo.',
-      when: o => { const t = row(o); return !t ? 'the task is no longer listed' : t.status !== 'ready' ? `a build takes a ready task; this one is ${String(t.status || '').replace(/_/g, ' ').toLowerCase()}`
+      when: o => { const t = row(o); return !t ? 'the task is no longer listed' : t.status !== 'ready' && !t.split_held ? `a build takes a ready task; this one is ${String(t.status || '').replace(/_/g, ' ').toLowerCase()}`
         : !t.repo_path ? 'a build needs a repository'
         : t.kind && !BUILD_KINDS.includes(t.kind) ? `a build takes a ${buildKinds} item; this one's kind is ${t.kind}. Make it a task first: sd task edit ${t.id} --kind task`
         : t.assignment === 'running' || t.assignment === 'queued' ? `an agent run is ${t.assignment} for it` : true; },

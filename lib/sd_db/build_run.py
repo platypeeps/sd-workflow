@@ -70,8 +70,9 @@ from .writes import add_note, now, record_cost, record_state
 TIMEOUT_SECONDS = build.BUDGET_MINUTES * 60
 GRACE_SECONDS = 20
 BEAT_SECONDS = 30
-#: Reviews with blockers before the bundle blocks (lead, note #29482).
-REVIEW_ROUNDS = 3
+#: Reviews with blockers before the class pass and park (operator 2026-11-20,
+#: raised from 3: four-round parks re-queued by hand all day).
+REVIEW_ROUNDS = 7
 MAX_TURNS = 300
 TITLE_MAX = 63
 #: A read (`git status`, `lane list`) that takes longer is unread.
@@ -138,6 +139,8 @@ Rules:
 - Write the pull-request body, with `## Summary` and `## Test plan`, to {body}; quote each fail-first line.
   The body is public, so it names no local path (the worktree, a home directory): use repo-relative paths.
   The body carries no `Closes:` line: enqueue takes items by `--item` and refuses one (sd:3704).
+- A change that moves state in steps, or adds a parser, a journal or event matching, carries a failure
+  table in the body before review: step, state moved, failure, recovery, test (sd:9584).
 - Fence each failure table and any other line over 72 characters in the body in a code block.
 - Use synthetic names in tests and commits (`operator`, `example.test`), never a real person, host or path:
   the pre-push leak guard refuses them.
@@ -162,8 +165,9 @@ FIX = """The review of branch {branch} found these blockers. Fix each one fail-f
 CLASS_PASS = """The review of branch {branch} still found blockers after {rounds} rounds. This is the last round
 before the build parks, so do one class pass, not another single-finding fix: name the class these blockers
 share, enumerate every instance of it from the code, not from the findings, and fix each one fail-first as a
-new commit in {worktree}. Add each instance to the failure table in the body at {body}. Never push. Your
-final message is your report: the class, each instance and its test.
+new commit in {worktree}. Fix the class within this change's own scope: a new reader, audit or entry kind
+becomes its own item, not a commit here (sd:9584). Add each instance to the failure table in the body at
+{body}. Never push. Your final message is your report: the class, each instance and its test.
 
 {blockers}
 """
@@ -430,6 +434,17 @@ def kept_files(git: Collection[str], work: str, *, env: dict | None = None) -> s
     return "\n".join(line for line in lines.splitlines() if line.strip() and not (
         # Folder parts only: git ends an ignored folder with "/", so a file of that name is no cache.
         line.startswith("!! ") and DISPOSABLE.intersection(line[3:].strip('"').split("/")[:-1])))
+
+
+# Git's state for an operation a worktree has not finished; each can carry commits the tree does not show.
+UNFINISHED = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "BISECT_LOG")
+
+
+def unfinished(git: Collection[str], work: str, *, env: dict | None = None) -> list[str]:
+    """The `UNFINISHED` names present in `work`, read where Git keeps them for that worktree (`--git-path`)."""
+    argv = [*git, "-C", work, "rev-parse", *(arg for name in UNFINISHED for arg in ("--git-path", name))]
+    paths = _read(argv, env=env).splitlines()
+    return [name for name, path in zip(UNFINISHED, paths, strict=True) if Path(work, path).exists()]
 
 
 def lane_entry(ship: list[str], cwd: Path | str, items: Collection[int], *, env: dict | None = None) -> dict | None:
@@ -1133,6 +1148,10 @@ class Supervisor:
         self.enter("worktree")
         branch = self.row["branch"]
         if self.work.is_dir():
+            # The guard reads first: a stopped rebase detaches HEAD, and a block here would record no hold.
+            held = self.split_first()
+            if held:
+                return held
             current = _read([*self.tools.git, "-C", str(self.work), "branch", "--show-current"], env=self.env).strip()
             if current != branch:
                 return self.finish("blocked", f"worktree {self.work} is on {current or 'no branch'}, not {branch}")
@@ -1147,7 +1166,38 @@ class Supervisor:
             argv = ["worktree", "add", "-b", branch, str(self.work), self.base()]
         if self.child([*self.tools.git, "-C", str(self.repo), *argv], cwd=self.repo, name="worktree") != 0:
             return self.finish("blocked", f"git worktree add {self.work} failed; see {self.out('worktree')}")
-        return "building"
+        return self.split_first() or "building"
+
+    def split_first(self) -> dict | None:
+        """The blocked end of a run whose bundle a subset Retry left a member out of while its branch or worktree
+        held earlier work; None when it held none (pack sd:9581). No message, trailer, revert or merge says which
+        change is whose, and a rebase gives a change new ids, so only the first run after the Retry reads the
+        branch: no builder ran since, so its start is the Retry's state. Commits past the base or a worktree not
+        clean hold the bundle for good (`build.split`); Build then takes its items fresh on a new branch, which
+        also never pushes over a tip an unmanaged bundle published. A clean start records its head (`base_head`).
+        ponytail: a left item's change in `git stash`, shared across worktrees, goes unread; no builder stashes."""
+        state = build.split(self.db, self.row["assignment"])
+        if state in ("", "clear"):
+            return None
+        named = ", ".join(f"sd:{item}" for item, _ in build.left_out(self.db, self.row["assignment"]))
+        if state == "unread":
+            base, head = self.base(), self.head()
+            commits = _read([*self.tools.git, "-C", str(self.work), "rev-list", f"{base}..{head}"],
+                            env=self.env).split()
+            # Ignored files count too: a left item's local config is work a builder would inherit.
+            dirty = kept_files(self.tools.git, str(self.work), env=self.env)
+            # A pending merge leaves HEAD and status as they were; the next commit would take its parent.
+            pending = unfinished(self.tools.git, str(self.work), env=self.env)
+            # Off its branch, HEAD is not the branch's tip: the commits read above say nothing of the branch.
+            on = _read([*self.tools.git, "-C", str(self.work), "branch", "--show-current"],
+                       env=self.env).strip() == self.row["branch"]
+            if on and not commits and not dirty and not pending:
+                if not build.write(self.db, self.ident, base_head=head):
+                    raise Lost
+                return None
+        return self.finish("blocked", f"{named} {build.SPLIT}{self.row['branch']} held work from before it, which "
+                                      f"may carry that work: Build the kept items to build them fresh on a new "
+                                      f"branch (WORKFLOW.md, Parallel work)")
 
     def building(self) -> str | dict:
         self.enter("building", log_path=str(self.log))

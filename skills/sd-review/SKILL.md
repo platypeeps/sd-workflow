@@ -124,6 +124,7 @@ Then stop single-finding fixes and run one class pass:
 4. Fix each row that lacks a recovery or a test, with a test that fails first.
 5. Send the next round with the table.
 
+Keep the pass within the change's own scope: a new reader, audit or entry kind becomes its own item.
 If the table shows the PR does too much, split it.
 
 ## Flags and results
