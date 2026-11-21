@@ -48,6 +48,16 @@ class TheList(unittest.TestCase):
         self.assertEqual(check("claude\ncodex  # session logs\n\nopenrouter\n"), [])
         self.assertEqual(check("Claude\nco dex\n"), ["line 1: not a provider name", "line 2: not a provider name"])
 
+    def test_a_provider_line_takes_a_cap_as_the_job_does(self):
+        """pack sd:9702: system sd:9701's `name cap=N`, N a positive decimal; one problem per bad line."""
+        check = settings_screen._list("dashboard.usage_providers")[1]
+        self.assertEqual(check("baseten cap=50\nopenrouter cap=12.5  # monthly budget\n"), [])
+        self.assertEqual(usage_screen.parse_providers("baseten cap=50\nbaseten\ncodex\n")[0], ["baseten", "codex"])
+        self.assertEqual(check("a cap=0\nb cap=x\nc limit=5\nd cap=5 cap=6\ne cap=-1\n"),
+                         ["line 1: cap=N wants N a positive decimal", "line 2: cap=N wants N a positive decimal",
+                          "line 3: not a provider name", "line 4: cap=N wants N a positive decimal",
+                          "line 5: cap=N wants N a positive decimal"])
+
 
 class TheStrip(ScreenCase):
     def strip(self):
@@ -117,6 +127,25 @@ class TheStrip(ScreenCase):
         [row] = self.strip()["rows"]
         self.assertEqual((len(row["windows"][0]["label"]), len(row["balance"]["unit"]), len(row["balance"]["period"])),
                          (200, 200, 200))
+
+    def test_a_spend_keeps_its_cycle_end_and_cap_and_its_share_flags_the_row(self):
+        """pack sd:9702: the spend lost its resets_at and limit, so the strip could show no cycle or cap."""
+        for amount, state in ((10, "ok"), (40, "caution"), (50, "warning")):
+            with self.subTest(amount=amount):
+                reading(self.connection, "baseten", spend={"amount": amount, "unit": "USD", "period": "month",
+                                                           "resets_at": "2026-10-01T00:00:00Z", "limit": 50})
+                row = self.strip()["rows"][0]
+                self.assertEqual((row["spend"]["resets_at"], row["spend"]["limit"], row["state"]),
+                                 ("2026-10-01T00:00:00Z", 50.0, state))
+        reading(self.connection, "baseten", spend={"amount": 5, "resets_at": "soon", "limit": -1})
+        self.assertEqual({key: self.strip()["rows"][0]["spend"][key] for key in ("resets_at", "limit")},
+                         {"resets_at": None, "limit": None})
+        for limit, kept, state in ((True, None, "ok"), (0, None, "ok"), ("50", None, "ok"), (float("inf"), None, "ok"),
+                                   (5e-324, 5e-324, "warning"), (1e308, 1e308, "ok")):
+            with self.subTest(limit=limit):
+                reading(self.connection, "baseten", spend={"amount": 5, "limit": limit})
+                row = self.strip()["rows"][0]
+                self.assertEqual((row["spend"]["limit"], row["state"]), (kept, state))
 
     def test_a_reading_over_30_minutes_old_is_unknown_and_shows_no_number(self):
         reading(self.connection, "codex", read_at="2026-09-06T11:29:00Z", **CODEX)
@@ -236,6 +265,25 @@ class TheStripInTheUsageDropdown(ScreenCase):
         self.assertIn('read <time class="rel" datetime="2026-09-06T11:50:00Z">', body)
         # The outage on codex's service is the worst state the summary shows.
         self.assertEqual(out["R"]["state"], "warning")
+
+    def test_a_spend_shows_its_cap_and_the_days_left_in_the_local_zone(self):
+        """pack sd:9702: 'spent $X of $CAP · N days left', caution at 80 % of the cap and warning at 100 %."""
+        stub = "Date.now = () => Date.parse('2026-09-06T12:00:00Z');"
+        for amount, fill in ((10, '<rect class="fill" width="20"'), (40, '<rect class="fill caution" width="80"'),
+                             (60, '<rect class="fill warning" width="100"')):
+            with self.subTest(amount=amount):
+                reading(self.connection, "baseten", spend={"amount": amount, "unit": "USD", "period": "month",
+                                                           "resets_at": "2026-09-10T06:00:00Z", "limit": 50})
+                body = run_usage(stub + "R.body = usageBody(ANSWER).text;", answer=self.strip(),
+                                 tz="America/Denver")["R"]["body"]
+                self.assertIn(f"<b>${amount:.2f}</b> of $50.00 · 4 days left", body)
+                self.assertIn(fill, body)
+        # 2026-10-01T00:00Z is still 30 September in Denver: 24 days, not 25.
+        reading(self.connection, "baseten", spend={"amount": 3, "unit": "USD", "period": "month",
+                                                   "resets_at": "2026-10-01T00:00:00Z"})
+        body = run_usage(stub + "R.body = usageBody(ANSWER).text;", answer=self.strip(), tz="America/Denver")["R"]["body"]
+        self.assertIn("spent <b>$3.00</b> · 24 days left", body)
+        self.assertNotIn("<rect", body)
 
     def test_an_unknown_reading_says_why_and_draws_no_bar(self):
         reading(self.connection, "codex", read_at="2026-09-06T11:00:00Z", **CODEX)

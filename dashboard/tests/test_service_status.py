@@ -44,7 +44,31 @@ class TheList(unittest.TestCase):
                                "y http https://status.example.test\ny http https://status.example.test\n"),
                          ["line 1: name is not a new lower-case name", "line 2: kind is not one of statuspage, slack, "
                           "google-incidents, http", "line 3: url is not http(s)", "line 4: a provider is not a lower-case name",
-                          "line 5: want <name> <kind> <url> [provider]", "line 7: name is not a new lower-case name"])
+                          "line 5: want <name> <kind> <url> [provider] [key=value ...]",
+                          "line 7: name is not a new lower-case name"])
+
+    def test_a_line_takes_groups_and_stale_options_as_the_job_does(self):
+        """pack sd:9746: system sd:9722's options; Settings refused the line and the view dropped it."""
+        check = settings_screen._list("dashboard.status_services")[1]
+        self.assertEqual(check("edge statuspage https://status.example.test edge groups=north-america,europe stale=3\n"
+                               "cdn statuspage https://cdn.example.test stale=1\n"), [])
+        found, _ = usage_screen.parse_services("edge statuspage https://status.example.test edge groups=north-america "
+                                               "stale=3\ncdn statuspage https://cdn.example.test\n")
+        self.assertEqual(found, [("edge", "statuspage", "https://status.example.test", ["edge"],
+                                  {"groups": ["north-america"], "stale": 3}),
+                                 ("cdn", "statuspage", "https://cdn.example.test", [], {})])
+        self.assertEqual(check("a statuspage https://a.example.test color=red\n"
+                               "b statuspage https://b.example.test stale=1 stale=2\n"
+                               "c statuspage https://c.example.test stale=0\n"
+                               "d statuspage https://d.example.test stale=x\n"
+                               "e statuspage https://e.example.test groups=North-America\n"
+                               "f http https://f.example.test stale=3\n"
+                               "g statuspage https://g.example.test stale=3 extra\n"),
+                         ["line 1: option color is not groups or stale", "line 2: option stale given twice",
+                          "line 3: stale is not a whole number of days above 0",
+                          "line 4: stale is not a whole number of days above 0",
+                          "line 5: groups is not lower-case group names", "line 6: options need kind statuspage",
+                          "line 7: want <name> <kind> <url> [provider] [key=value ...]"])
 
 
 class TheRows(ScreenCase):
@@ -111,6 +135,13 @@ class TheRows(ScreenCase):
                           rows["stat:opnai"]["facts"]["Providers"]),
                          ("unknown", "no reading yet: the job has written no row for it", "https://other.example.test", "codex"))
         self.assertEqual(rows["stat:github"]["state"], "ok")
+
+    def test_a_listed_line_with_options_is_not_dropped(self):
+        # pack sd:9746: a line with groups= or stale= did not parse, so its service never showed.
+        set_setting(self.connection, "dashboard.status_services",
+                    "edge statuspage https://status.example.test codex groups=north-america stale=3\n")
+        rows = {row["id"]: row for row in self.area()["rows"]}
+        self.assertEqual((rows["stat:edge"]["state"], rows["stat:edge"]["facts"]["Providers"]), ("unknown", "codex"))
 
     def test_only_removed_services_mean_none_watched_and_no_row(self):
         # Bundle review round 4: after the last service was removed, the

@@ -1923,7 +1923,17 @@
   const usd = n => `$${Number(n).toFixed(2)}`;
   const zoned = iso => new Date(iso).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
   const pace = p => p === null || p === undefined ? '' : Math.abs(p) < 3 ? ' · on pace' : ` · ${Math.abs(p)} pts ${p > 0 ? 'over' : 'under'} pace`;
-  const money = (m, what) => m ? html`<span class="w">${what} <b>${m.unit === 'USD' || !m.unit ? usd(m.amount) : `${m.amount} ${m.unit}`}</b>${m.period ? ` ${m.period}` : ''}</span>` : '';
+  // Pack sd:9702: a spend with a cap draws a window's bar, caution at 80 % and warning at 100 %, and its cycle end as
+  // the days left to it, counted in this zone's calendar days.
+  const days = iso => { const a = new Date(Date.now()), b = new Date(iso); return Math.round((Date.UTC(b.getFullYear(), b.getMonth(), b.getDate()) - Date.UTC(a.getFullYear(), a.getMonth(), a.getDate())) / 864e5); };
+  const left = iso => { const n = iso ? days(iso) : -1; return n < 0 ? '' : ` · ${n} day${n === 1 ? '' : 's'} left`; };
+  const money = (m, what) => {
+    if (!m) return '';
+    const fmt = n => m.unit === 'USD' || !m.unit ? usd(n) : `${n} ${m.unit}`;
+    if (!m.limit) return html`<span class="w">${what} <b>${fmt(m.amount)}</b>${m.period && !m.resets_at ? ` ${m.period}` : ''}${left(m.resets_at)}</span>`;
+    const used = m.amount / m.limit * 100;
+    return html`<span class="w"><span class="wl">${what}</span><svg class="track" viewBox="0 0 100 1" preserveAspectRatio="none" role="img" aria-label="${`${what} ${Math.round(used)}% of the cap`}"><rect class="fill${used >= 100 ? ' warning' : used >= 80 ? ' caution' : ''}" width="${Math.min(100, used)}" height="1"/></svg><b>${fmt(m.amount)}</b> of ${fmt(m.limit)}${left(m.resets_at)}</span>`;
+  };
   function usageRow(r) {
     const f = r.service;
     const flag = f && f.state !== 'ok' ? html`<a class="flag" href="${f.url && f.state !== 'unknown' ? f.url : '/fleet-health#view=status'}"${f.url && f.state !== 'unknown' ? html` target="_blank" rel="noopener noreferrer"` : ''}><span class="g-${f.state}" aria-hidden="true">${UGLYPH[f.state]}</span> ${f.name} ${f.status}${f.title ? `: ${f.title}` : ''}</a>` : '';
