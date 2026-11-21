@@ -2266,7 +2266,8 @@ class SpeculativeGate(threading.Thread):
             if not self.below:
                 return
             table, interrupted = sd_lib.read_after()
-            for group, below in self.below.items():
+            # A copy: `signal_gate` from a SIGTERM handler may add to it here (pack sd:9600).
+            for group, below in list(self.below.items()):
                 sd_lib.kill_below(group, below, table)
             if interrupted is not None:
                 raise interrupted

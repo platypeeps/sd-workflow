@@ -2374,6 +2374,21 @@ if (D) { D.returnValue = 'build'; D.onclose(); await flush(); }"""
         out = self.run_page(f"R.off = cmd('item.build').when(C.get('{ask}'));", "() => [404, {}]")
         self.assertEqual(out["R"]["off"], "a build needs a repository")
 
+    def test_build_is_on_for_a_blocked_item_whose_bundle_a_split_holds(self):
+        """Pack sd:9581 round 8, row 15: Retry refuses a split-held bundle and names Build, which takes its blocked
+        items fresh (`build.split_held`); the row says so, and Build is on for it, off for another blocked item."""
+        from sd_db import build
+
+        held, other = self.ids["plan"], self.ids["port"]
+        for item in (held, other):
+            self.connection.execute("UPDATE item SET status = 'blocked' WHERE id = ?", (item,))
+        with patch.object(build, "split_held", side_effect=lambda connection, item: item == held):
+            self.doc = tasks_screen.document(self.connection, now=NOW)
+        out = self.run_page(f"R.on = cmd('item.build').when(C.get('{held}'));"
+                            f" R.off = cmd('item.build').when(C.get('{other}'));", "() => [404, {}]")
+        self.assertIs(out["R"]["on"], True)
+        self.assertIn("a build takes a ready task", out["R"]["off"])
+
     def test_build_is_off_for_a_kind_no_build_takes_and_names_the_edit(self):
         """Pack sd:8532. build._item refuses a kind outside runner.RUNNABLE_KINDS, so a ready followup with a repository
         offers Build greyed out, with why and the command that makes it a task; a ready task in the same repo is on."""

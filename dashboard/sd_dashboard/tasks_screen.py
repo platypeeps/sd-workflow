@@ -127,6 +127,8 @@ def _rows(connection, rows, found, *, now: str) -> list[dict]:
 
     `found` is `places.realms`, the realm rules each row's `realm` follows.
     """
+    from sd_db import build
+
     from .hoa_screen import checkout
     from .places import area_of, realm_of, report_realm
     from .screens import _repo_labels
@@ -165,6 +167,8 @@ def _rows(connection, rows, found, *, now: str) -> list[dict]:
             "allowed": workflow.allowed_statuses(connection, row["id"], state=state),
             "edit": _edit_capability(row),
             "parked": row["parked_at"],
+            # Build takes a blocked item whose bundle a split holds (pack sd:9581); its Retry refuses.
+            "split_held": row["status"] == "blocked" and build.split_held(connection, row["id"]),
             # The place Tasks' Realm HOA and Home filter on: the HOA and Home pages' Tasks rule (`places.area_of`).
             # pack sd:8010: an item's own area (`fields.area`) wins, and `area_set` says so: such a row sits in its
             # area's tab alone, not in Personal or a realm tab.

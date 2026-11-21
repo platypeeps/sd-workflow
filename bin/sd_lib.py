@@ -3794,9 +3794,10 @@ def end_group(process: subprocess.Popen, *, drain: bool = False) -> tuple[str, s
     descendant in a group of its own that holds a pipe stops nothing. A group kill refused EPERM (macOS for
     an exiting group, sd:7900) signals the leader alone (sd:8820). The SIGKILL also reaches each session
     below the group, read before the SIGTERM and again before the SIGKILL (`kill_below`, pack sd:9392).
-    The grace after SIGTERM lasts until the group is empty, not until the leader alone exits. A reaped
-    leader's number gets the SIGKILL only while a witness holds it, and the SIGKILL step runs whatever
-    interrupts the reads or the grace (`escalate`).
+    The grace after SIGTERM lasts until the group is empty, not until the leader alone exits, and
+    leaves an unreaped leader unreaped, so its number stays its own for the SIGKILL: a TERM-deaf
+    worker forked on the TERM holds no witness (pack sd:9600). A leader reaped before the call gets
+    the SIGKILL only while a witness holds its number. The SIGKILL step runs whatever interrupts the reads or the grace (`escalate`).
     """
     import signal  # noqa: PLC0415 - only the group helpers need it
 
@@ -3810,10 +3811,9 @@ def end_group(process: subprocess.Popen, *, drain: bool = False) -> tuple[str, s
                 process.send_signal(number)
 
     def group_grace() -> None:
-        deadline = time.monotonic() + GROUP_CLEANUP_SECONDS
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            process.wait(timeout=GROUP_CLEANUP_SECONDS)
-            wait_empty(process.pid, deadline)  # the leader is reaped: what is left of the group is its workers
+        # An unreaped leader stays a zombie member until the SIGKILL is out (pack sd:9600).
+        wait_empty(process.pid, time.monotonic() + GROUP_CLEANUP_SECONDS,
+                   leader=process.pid if process.returncode is None else None)
 
     def kill_group(earlier: Table | None) -> None:
         table, interrupted = read_after()
@@ -3932,7 +3932,9 @@ class ThreadGroups:
     def __init__(self) -> None:
         import threading  # noqa: PLC0415 - only the group helpers need it
 
-        self._lock = threading.Lock()
+        # Reentrant: `end_groups` runs in the main thread's SIGTERM handler, which may interrupt any
+        # block below that holds it on that thread (pack sd:9600).
+        self._lock = threading.RLock()
         self._live: set[int] = set()
         self._holders: set[threading.Thread] = set()
         self._ending = False
@@ -4011,8 +4013,11 @@ class ThreadGroups:
             table, interrupted = read_after()  # one read for every group's SIGKILL
             for pid in live:  # a group that left the set leaves what it captured to no one else
                 kill_below(pid, earlier, table)
-            for pid in left[0]:  # still registered, so unreaped: the number is its own
-                signal_group(pid, signal.SIGKILL)
+            # Still registered after the read, so unreaped: the number is its own. The lock holds the
+            # set while the KILLs go out, as a group leaves it before its leader is reaped (pack sd:9600).
+            with self._lock:
+                for pid in live & self._live:
+                    signal_group(pid, signal.SIGKILL)
             if interrupted is not None:
                 raise interrupted
         escalate(process_table, term_all, groups_grace, kill_groups)  # one read for every group, before the TERM (pack sd:9392)
@@ -4108,6 +4113,9 @@ def wait_empty(pgid: int, deadline: float, *, leader: int | None = None) -> None
 
 
 def _exited(pid: int) -> bool:
+    # macOS Python 3.11 and 3.12 lack waitid: the grace runs to its deadline, the leader unreaped (sd:9600).
+    if not hasattr(os, "waitid"):
+        return False
     try:
         return os.waitid(os.P_PID, pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
     except ChildProcessError:  # not a child of this process: its table entry, if any, is a member
@@ -4192,7 +4200,11 @@ def kill_below(root: int, earlier: Table | None, table: Table | None, *, process
     is a process, the same while its pid and start match. A `table` that
     could not be read leaves the witness to `os.getpgid` and walks
     nothing; an `earlier` of None, no read before the TERM, signals
-    nothing. Stderr says so for either: unknown is not none. The line
+    nothing and holds no root: a reaped leader's number may be another
+    group's by then, so only an unreaped leader's group is killed
+    (pack sd:9600). Stderr says so for either: unknown is not none. Each surviving witnessed group below also roots a walk
+    in `table`: a detached gate whose parent ended may have started a
+    session since (pack sd:9600). The line
     never raises: under SIGHUP the terminal may be gone. An empty
     `earlier` means the group was empty before the TERM: nothing to do.
     """
@@ -4201,7 +4213,9 @@ def kill_below(root: int, earlier: Table | None, table: Table | None, *, process
     if earlier is not None and not earlier:
         return False
     if earlier is None or table is None:
-        with contextlib.suppress(OSError, ValueError):  # EIO on a revoked terminal, a closed stream
+        # EIO on a revoked terminal, a closed stream; RuntimeError for a handler's write re-entering the
+        # stderr writer the main thread was in (pack sd:9600).
+        with contextlib.suppress(OSError, ValueError, RuntimeError):
             print(f"sd: cannot read the process table; groups below {root} may still run", file=sys.stderr)
         if earlier is None:
             return False
@@ -4211,8 +4225,11 @@ def kill_below(root: int, earlier: Table | None, table: Table | None, *, process
     else:
         root_held = holds_witness(root)
     groups = {group for group in groups_below(root, process=process, table=earlier) or {} if holds_witness(group)}
-    if root_held and table is not None:
-        groups |= set(groups_below(root, process=process, table=table) or {})
+    if table is not None:
+        for seed in set(groups):
+            groups |= set(groups_below(seed, table=table) or {})
+        if root_held:
+            groups |= set(groups_below(root, process=process, table=table) or {})
     for group in groups:
         signal_group(group, signal.SIGKILL)
     return root_held

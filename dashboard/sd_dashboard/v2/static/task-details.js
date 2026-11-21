@@ -41,7 +41,7 @@
   // ---------- Data (build) ----------
   // /api/tasks rows become the reference's task shape: p is priority, repo the short label v1 shows, key the id.
   const shape = r => ({ id: r.id, key: String(r.id), title: r.title, repo: r.repo || 'no repo', repo_path: r.repo_path, p: r.priority, due: r.due,
-    status: r.status, since: r.status_since, kind: r.kind, urgent: !!r.urgent, urgentOtherwise: !!r.urgent_otherwise, assignment: r.assignment, age: r.age, recurrence: r.recurrence, anchor: r.recurrence_anchor ?? null, lead: r.recurrence_lead ?? null, opensOn: r.opens_on ?? null, scheduled: !!r.scheduled, nextDue: r.next_due ?? null, revision: r.revision, allowed: r.allowed, edit: r.edit, run: r.run, parked: r.parked ?? null,
+    status: r.status, since: r.status_since, kind: r.kind, urgent: !!r.urgent, urgentOtherwise: !!r.urgent_otherwise, assignment: r.assignment, age: r.age, recurrence: r.recurrence, anchor: r.recurrence_anchor ?? null, lead: r.recurrence_lead ?? null, opensOn: r.opens_on ?? null, scheduled: !!r.scheduled, nextDue: r.next_due ?? null, revision: r.revision, allowed: r.allowed, edit: r.edit, run: r.run, parked: r.parked ?? null, split_held: !!r.split_held,
     base: r.base ?? null, stage: r.stage ?? null, score: r.score ?? null, area: r.area ?? null, area_set: !!r.area_set, realm: r.realm ?? null, issueTargets: r.issue_targets ?? null, issueLink: r.issue_link ?? null, real: true });
   const label = t => `#${t.id}`;
 

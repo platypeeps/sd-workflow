@@ -410,6 +410,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // waits on a person's review, so the row leads with that wait and keeps its Retry and Approve.
   // A blocked entry's Retry, Approve and Fix, on its own row or, with its Details, on its item's Parked row (pack sd:9425).
   const unblock = (l, r) => { const e = { ...r, lane: l.path }; return html`${again(e, l.runner_merge === 'manual')}${mendBtn(e)}`; };
+  // sd:9657: a click on that Parked row selects the task, so its Details button selects the entry.
+  const entryBtn = (l, r) => html`<button class="btn quiet sm" type="button" data-entry="${entryId(l, r)}" aria-label="Show lane entry sd:${String(r.item)} in Details">Details</button>`;
   function entryRow(l, r, p) {
     const [s0, type, facts] = ENTRY[r.state](r), last = l.rows.filter(x => x.state === 'next').length, e = { ...r, lane: l.path };
     const s = p ? (p.on === 'you' ? 'warning' : 'queued') : s0;
@@ -575,7 +577,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     (QV.lanes ? QV.lanes.lanes : []).forEach(l => { l.rows.forEach(r => {
       const p = r.state === 'blocked' && r.status === 'prepared' ? waitOf.get(Number(r.item)) : undefined;
       if (p) drawn.add(p);
-      if (r.state === 'blocked' && !p && aside(r.item, `lane ${r.status}${r.step ? ` at ${r.step}` : ''} · ${r.reason}`, html`${unblock(l, r)}${shell.commands.rowActions(entryId(l, r))}`)) return;
+      if (r.state === 'blocked' && !p && aside(r.item, `lane ${r.status}${r.step ? ` at ${r.step}` : ''} · ${r.reason}`, html`${unblock(l, r)}${entryBtn(l, r)}${shell.commands.rowActions(entryId(l, r))}`)) return;
       add(l.key, entryRow(l, r, p)); });
       if (G.has(repoKey(l.key))) G.get(repoKey(l.key)).host = l.host; });
     prs.filter(p => !drawn.has(p)).forEach(p => add(p.repo, prRow(p)));
@@ -1269,6 +1271,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       const w = e.target.closest('button[data-act]'); if (w) { if (!w.disabled) laneAct(w); return; }
       const b = e.target.closest('button[data-build]'); if (b) { if (!b.disabled) buildAct(b); return; }
       const g = e.target.closest('button[data-asg]'); if (g) { if (!g.disabled) asgAct(g); return; }
+      const d = e.target.closest('button[data-entry]'); if (d) { select(d.dataset.entry, true); return; }
       // pack sd:8138: a box opens its repo filtered to its rows; a second press clears, another switches. No disclosure toggle.
       const t = e.target.closest('button[data-tile]');
       if (t) { if (t.disabled) return; const { repo, tile: box } = t.dataset, same = qOpen === repo && qTile && qTile.box === box;
