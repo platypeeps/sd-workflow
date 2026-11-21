@@ -766,3 +766,23 @@ class DropRound18(Repo):
             DROP.drop_item(self.db, build, items[1], who="operator")
         self.assertIsNotNone(self.db.execute("SELECT 1 FROM assignment WHERE id = ?", (lead,)).fetchone())
         self.assertNotEqual(self.next_lead(), lead)
+
+    def test_a_retry_after_a_claim_still_builds_only_where_the_work_is(self):
+        items, ids, run = self.bundle()
+        self.db.execute("UPDATE runner_run SET owner = 'fixture@sat-a' WHERE id = ?", (run["id"],))
+        self.db.execute("UPDATE repo SET lane_host = 'sat-a' WHERE path = ?", (str(self.repo),))
+        for host in ("sat-a", "sat-b"):
+            record_state(self.db, "heartbeat", key=f"build-dispatch@{host}", body={})
+        with mock.patch.multiple(build, lane_hosts=mock.Mock(return_value=frozenset({"sat-a"})),
+                                 hub_host=mock.Mock(return_value="hub")):
+            lead = DROP.drop_item(self.db, build, items[1], who="operator")[0]["id"]
+            first = self.claim(hosts=frozenset({"sat-a"}))
+            self.assertEqual(first["assignment"], lead)
+            # The run ends before its supervisor ever starts: nothing was built.
+            build.end(self.db, first["id"], "blocked", "supervisor did not start")
+            build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+            build.retry(self.db, lead, who="operator")
+        self.db.execute("UPDATE repo SET lane_host = 'sat-b' WHERE path = ?", (str(self.repo),))
+        with mock.patch.object(build, "hub_host", return_value="hub"):
+            claimed = [self.claim(hosts=frozenset({"sat-b"})) for _ in range(3)]
+        self.assertNotIn(lead, [one["assignment"] for one in claimed if one])

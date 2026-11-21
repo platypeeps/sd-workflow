@@ -131,8 +131,8 @@ RESERVED = "build-drop"
 #: The keys `drop_reserve` adds to a drop plan.
 RESERVED_KEYS = ("new_lead", "new_work", "new_branch")
 #: How a bundle drop queues its kept members, in the queue note of each, the ended run's id last: the new lead's
-#: kept work is in a worktree on the host that ran that run, which alone may claim it until the lead runs (pack
-#: sd:9709, round 16). A note, as no writer changes one; the row's `result` lost it (round 17).
+#: kept work is in a worktree on the host that ran that run, which alone may claim it, before and after its first
+#: claim (pack sd:9709, rounds 16 and 18). A note, as no writer changes one; the row's `result` lost it (round 17).
 DROP_HOW = "bundle drop of sd:{item} from build run "
 #: The bundle statuses Retry and Send to builder take: each keeps its worktree.
 AGAIN = ("blocked", "cancelled")
@@ -1483,10 +1483,10 @@ def _bundle(connection, rows: list) -> list:
 
 
 def _kept_host(connection, row) -> tuple[str, str | None] | None:
-    """(run, host) of the ended run a bundle drop's new lead `row` keeps the work of, until the lead runs; None for
-    any other row, or when that run reads gone."""
-    if row["parent"] is not None or connection.execute("SELECT 1 FROM runner_run WHERE assignment = ?",
-                                                       (row["id"],)).fetchone():
+    """(run, host) of the ended run a bundle drop's new lead `row` keeps the work of; None for any other row, or
+    when that run reads gone. It holds after the lead's first claim too: a Retry rebuilds the same worktree, which
+    stays on that host (round 18)."""
+    if row["parent"] is not None:
         return None
     note = connection.execute(
         "SELECT body FROM note WHERE item = ? AND body LIKE ? ORDER BY timestamp, id LIMIT 1",
