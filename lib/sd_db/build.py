@@ -854,9 +854,13 @@ def _retry_row(connection, item: int):
                               "ORDER BY id DESC", (item, SCOPE)).fetchall()
     if rows and rows[0]["status"] == "cancelled" and not rows[0]["run_count"]:
         ran = next((row for row in rows[1:] if row["run_count"]), None)
-        if (ran is not None and ran["status"] in AGAIN and not _alone(connection, ran["id"])
-                and queue_state(connection, ran["parent"] or ran["id"])["status"] == ran["status"]):
-            return ran
+        # Only a bundle Retry can take: every member it would queue owns its item (`_current`), or Retry refuses the
+        # whole press and Build reads a fresh one instead (class pass, review round 7).
+        if ran is not None and ran["status"] in AGAIN and not _alone(connection, ran["id"]):
+            lead: int = ran["parent"] or ran["id"]
+            if (queue_state(connection, lead)["status"] == ran["status"]
+                    and all(_current(connection, member) for member in _members(connection, lead, ran["status"]))):
+                return ran
     return rows[0] if rows else None
 
 

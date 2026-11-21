@@ -967,6 +967,23 @@ class Reap(Case):
         queued = build.queue_again(self.db, [self.items[1]], who="operator")
         self.assertEqual([entry["id"] for entry in queued], [newer])
 
+    def test_build_by_item_builds_fresh_when_its_bundle_has_a_member_a_newer_build_owns(self):
+        """Class pass, review round 7 of sd:9788: bundle A ends blocked; its first item gets a newer build that
+        ran, its second a newer build cancelled before its claim. Build of the second read A, whose Retry refused
+        on the first ('has a newer build'). Build reads only a bundle Retry can take: here a fresh build."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        transition(self.db, self.items[0], "ready", who="operator")
+        build.queue(self.db, [self.items[0]], who="operator")
+        build.end(self.db, self.claim()["id"], "cancelled", "the operator cancelled it")
+        transition(self.db, self.items[1], "ready", who="operator")
+        cancelled = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (cancelled,))
+        queued = build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [self.items[1]])
+        self.assertGreater(queued[0]["id"], cancelled, "a fresh build")
+
     def test_build_by_item_skips_a_blocked_build_that_never_ran(self):
         """Review of sd:9788: a fresh build the claim refused never ran, then a newer one was cancelled before its
         claim. Build of the item read the refused one, a fresh press from main; the bundle that ran, whose
