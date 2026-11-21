@@ -598,3 +598,28 @@ class DropRound11(Repo):
                 self.assertRaises(KeyboardInterrupt):
             DROP.drop_item(self.db, build, items[1], who="operator")
         self.unsplit(items, run, old)
+
+
+class DropRound12(Repo):
+    """Review round 12 of pack sd:9709, class pass: an identity checked by its stored spelling, not by what the
+    system resolves it to. A path compared as a string where the disk folds case and Unicode form (file, directory
+    and prefix collisions); a host compared as the repo's current lane, where the worktree is on the machine that
+    ran the run (a lead drop, an in-place drop, and the machine that runs the drop)."""
+
+    NFC, NFD = "café", "café"
+
+    def guard(self, ignored, tracked):
+        """`_ignored` over git listings `ignored` and `tracked` (the base's tree; no kept commit)."""
+        def names(*argv, cwd):
+            return set(ignored if argv[0] == "ls-files" else tracked)
+        with mock.patch.object(DROP, "_names", side_effect=names):
+            DROP._ignored("/example.test/work", "origin/main", [])
+
+    def test_an_ignored_path_in_another_unicode_form_refuses(self):
+        cases = {"file": ([f"{self.NFD}.txt"], [f"{self.NFC}.TXT"]),
+                 "directory": ([self.NFD], [f"{self.NFC}/a.txt"]),
+                 "under a tracked file": ([f"{self.NFD}/local.txt"], [self.NFC]),
+                 "tracked under it": ([f"{self.NFD}/"], [f"{self.NFC}/a.txt"])}
+        for name, (ignored, tracked) in cases.items():
+            with self.subTest(name), self.assertRaisesRegex(DROP.DropRefused, "ignored local files"):
+                self.guard(ignored, tracked)

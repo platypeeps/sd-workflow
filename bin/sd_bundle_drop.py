@@ -12,6 +12,7 @@ cites only others. One that cites nothing refuses the drop: no message says whos
 from __future__ import annotations
 
 import subprocess
+import unicodedata
 from pathlib import Path
 
 import sd_ship_body
@@ -69,6 +70,11 @@ def _merges(work: str | Path, start: str, tip: str) -> None:
             raise DropRefused(f"merge {sha[:12]} resolves by hand what no cherry-pick carries; split it by hand")
 
 
+def _fold(path: str) -> str:
+    """`path` as a case- and normalization-insensitive disk names it: Unicode canonical caseless matching."""
+    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", path).casefold())
+
+
 def _ignored(work: str | Path, start: str, kept: list[str]) -> None:
     """Refuse an ignored file where the base or a kept commit tracks a path: the in-place checkout would overwrite
     it, and no branch holds its contents."""
@@ -78,11 +84,13 @@ def _ignored(work: str | Path, start: str, kept: list[str]) -> None:
     tracked = _names("ls-tree", "-r", "-z", "--name-only", start, cwd=work)
     for sha in kept:
         tracked |= _paths(work, sha)
-    # Compared case-folded: on a case-insensitive disk an ignored `local.txt` is the tracked `Local.txt` (round 11).
-    # ponytail: casefold, not the disk's own Unicode normalization; a refusal too many on a case-sensitive disk.
-    tracked = {path.casefold() for path in tracked}
+    # Compared as the disk resolves them, case and Unicode form folded: on macOS an ignored `local.txt` is the
+    # tracked `Local.txt`, and `café` in one form is `café` in the other (rounds 11 and 12). Every check reads the
+    # folded names: the file, the directory, and each prefix. ponytail: a refusal too many on a disk that folds
+    # neither.
+    tracked = {_fold(path) for path in tracked}
     dirs = {"/".join(path.split("/")[:n]) for path in tracked for n in range(1, path.count("/") + 1)}
-    clash = sorted(path for path in ignored if (folded := path.casefold()) in tracked or folded in dirs
+    clash = sorted(path for path in ignored if (folded := _fold(path).rstrip("/")) in tracked or folded in dirs
                    or any("/".join(folded.split("/")[:n]) in tracked for n in range(1, folded.count("/") + 1)))
     if clash:
         raise DropRefused(f"ignored local files the new branch tracks: {', '.join(clash[:5])}; move them first")
