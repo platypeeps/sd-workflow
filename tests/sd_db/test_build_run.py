@@ -1072,6 +1072,35 @@ class Supervise(Case):
         prior = json.loads(Path(second[second.index("--verify-report") + 1]).read_text(encoding="utf-8"))
         self.assertEqual(prior["findings"][0]["path"], "work.txt", "an absolute path reached the next round")
 
+    def scratch_repo(self, **config):
+        """A throwaway repository with `config` set in it, and a `git` runner over it."""
+        repo = Path(tempfile.mkdtemp(dir=self.root))
+
+        def run(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.name=operator",
+                                   "-c", "user.email=operator@example.test", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        run("init", "-q")
+        for name, value in config.items():
+            run("config", name.replace("_", "."), value)
+        return repo, run
+
+    def test_an_external_diff_or_textconv_does_not_reach_the_delta(self):
+        """Class pass, sd:9769: the operator's diff.external or a textconv driver must not shape the delta."""
+        repo, run = self.scratch_repo(diff_external="true", diff_drop_textconv="sed 1d")
+        (repo / ".gitattributes").write_text("conv.txt diff=drop\n")
+        (repo / "plain.txt").write_text("a\nb\n")
+        (repo / "conv.txt").write_text("a\nb\nc\n")
+        run("add", "-A")
+        run("commit", "-q", "-m", "base")
+        base = run("rev-parse", "HEAD")
+        (repo / "plain.txt").write_text("a\nB\n")
+        (repo / "conv.txt").write_text("a\nb\nC\n")
+        run("commit", "-qam", "change")
+        self.assertEqual(build_run.changed_lines(["git"], str(repo), base, run("rev-parse", "HEAD")),
+                         {"plain.txt": {2}, "conv.txt": {3}})
+
     def test_a_mode_or_binary_change_reads_as_the_whole_file(self):
         """Review of sd:9769: git gives a mode-only or binary change no line range; any line of it is changed."""
         repo = Path(tempfile.mkdtemp(dir=self.root))

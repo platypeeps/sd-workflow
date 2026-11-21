@@ -459,7 +459,7 @@ def changed_lines(git: Collection[str], work: str, base: str, head: str, *,
     """
     try:
         diff = _read([*git, "-C", work, "-c", "core.quotePath=false", "diff", "-U0", "--no-renames", "--no-color",
-                      base, head], env=env)
+                      "--no-ext-diff", "--no-textconv", base, head], env=env)  # git's own lines, not a driver's
     except Unread:
         return None
     changed: dict[str, set[int]] = {}
