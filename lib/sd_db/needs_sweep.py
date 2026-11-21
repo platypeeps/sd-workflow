@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from typing import TypeGuard
 
 from . import issue_attention, pr_attention, reporting, workflow
 from .database import transaction
@@ -56,25 +57,65 @@ def _fields(row) -> dict:
     return fields if isinstance(fields, dict) else {}
 
 
+#: Why a row stays open when the data a clear rests on has the wrong shape (review round 3): proof needs its fields.
+BAD_FIELDS = "its report fields are not in the shape a clear needs"
+BAD_READ = "the newest read is not in the shape a clear needs"
+
+
+def _text(value) -> TypeGuard[str]:
+    return isinstance(value, str) and value != ""
+
+
+def _texts(value) -> bool:
+    return isinstance(value, list) and all(isinstance(entry, str) for entry in value)
+
+
+def _body(text) -> dict | None:
+    """A heartbeat body as a dict, or None when it does not parse to one: then it proves nothing."""
+    try:
+        body = json.loads(text)
+    except (TypeError, ValueError, RecursionError):
+        return None
+    return body if isinstance(body, dict) else None
+
+
 def _report_cleared(connection: sqlite3.Connection, row, fields: dict) -> tuple[str | None, str]:
-    """Why `row`'s condition cleared, or None and why that is not known."""
+    """Why `row`'s condition cleared, or None and why that is not known.
+
+    Every stored value a clear rests on is checked for its shape first: a field or a heartbeat of another shape
+    keeps the row open, never closes it and never stops the sweep.
+    """
     report = found if isinstance(found := fields.get("report"), dict) else {}
     job, host, basis = report.get("job"), report.get("host"), report.get("attention_basis")
+    if job is not None and not _text(job):
+        return None, BAD_FIELDS
     if job in SEEN:
+        if not _text(basis):
+            return None, BAD_FIELDS
         seen = connection.execute("SELECT body, timestamp FROM state WHERE kind = 'heartbeat' AND key = ?"
                                   " ORDER BY id DESC LIMIT 1", (SEEN[job],)).fetchone()
         # By the second: the read that filed the alert records it seen in that second, so only a later read counts.
         if seen is None or (seen["timestamp"] or "")[:19] <= (row["created_at"] or "")[:19]:
             return None, "no read since it was filed"
-        read = json.loads(seen["body"])
+        read = _body(seen["body"])
+        # `pr_attention.alert` writes all three: a list of seen states, `complete`, and a list of unread kinds.
+        if read is None or not _texts(read.get("seen")) or not _texts(read.get("unread")) \
+                or not isinstance(read.get("complete"), bool):
+            return None, BAD_READ
         # Absence proves a clear only from a complete read that read this state (`pr_attention.alert`).
-        if read.get("complete") is not True or str(basis).split(" ", 1)[0] in (read.get("unread") or []):
+        if read["complete"] is not True or basis.split(" ", 1)[0] in read["unread"]:
             return None, "the newest read did not read its state"
-        if basis in set(read.get("seen") or []):
+        if basis in read["seen"]:
             return None, "its state still holds"
         return f"the read at {seen['timestamp']} no longer sees {basis}", ""
     if not job or not host:
-        return None, "no job or host stored"
+        return None, "no job or host stored" if host is None or _text(host) else BAD_FIELDS
+    if not _text(host):
+        return None, BAD_FIELDS
+    repeats = found if isinstance(found := fields.get("repeats"), dict) else {}
+    ended = repeats.get("last_ended") or report.get("ended") or ""
+    if not isinstance(ended, str):
+        return None, BAD_FIELDS
     # As `reporting._host_reports`: a report another host's newest run folded into is that host's finding.
     prefix = f"{reporting.CHAIN_KEY}{job}@"
     if connection.execute("SELECT 1 FROM state WHERE kind = 'heartbeat' AND substr(key, 1, ?) = ? AND key != ?"
@@ -83,11 +124,11 @@ def _report_cleared(connection: sqlite3.Connection, row, fields: dict) -> tuple[
         return None, f"another host's newest run of {job} holds it"
     chain = connection.execute("SELECT body FROM state WHERE kind = 'heartbeat' AND key = ? ORDER BY id DESC LIMIT 1",
                                (f"{reporting.CHAIN_KEY}{job}@{host}",)).fetchone()
-    last = json.loads(chain["body"]) if chain else {}
-    repeats = found if isinstance(found := fields.get("repeats"), dict) else {}
-    ended = repeats.get("last_ended") or report.get("ended") or ""
+    # `reporting`'s chain row is `{"run_id", "ended", "item"}`; a clean run is one whose `item` is stored as null.
+    last = (_body(chain["body"]) if chain else None) or {}
     run = last.get("run_id")
-    if not run or last.get("item") is not None or not (last.get("ended") or "") > ended:
+    if not _text(run) or not _text(last.get("ended")) or "item" not in last or last["item"] is not None \
+            or not last["ended"] > ended:
         return None, f"no clean run of {job} on {host} since"
     if connection.execute("SELECT 1 FROM item WHERE source = 'cron-report' AND external_id = ?",
                           (f"{job}:{run}",)).fetchone() or reporting._folded_into(connection, job, run):

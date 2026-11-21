@@ -130,6 +130,73 @@ class TheSweep(unittest.TestCase):
                 self.sweep()
                 self.assertEqual(self.status(item), "planning")
 
+    def raw_heartbeat(self, key, stamp, text):
+        """A heartbeat whose body is the text as stored, malformed or not: `record_state` serialises every body."""
+        self.db.execute("INSERT INTO state (kind, key, timestamp, body) VALUES ('heartbeat', ?, ?, ?)", (key, stamp, text))
+        self.db.commit()
+
+    def fresh(self):
+        for table in ("state", "note", "item"):
+            self.db.execute(f"DELETE FROM {table}")
+
+    def test_a_malformed_seen_row_proves_no_clear(self):
+        """Review round 3: a seen row of the wrong shape kept the alert open only by luck, or closed it, or raised."""
+        basis = "waiting_on_reviewers https://github.com/example/widget/pull/7"
+        for name, text in (("no seen list", '{"complete": true}'),
+                           ("a string seen", '{"complete": true, "unread": [], "seen": "waiting_on_reviewers x"}'),
+                           ("a seen list of numbers", '{"complete": true, "unread": [], "seen": [1]}'),
+                           ("no unread list", '{"complete": true, "seen": []}'),
+                           ("a string unread", '{"complete": true, "unread": "", "seen": []}'),
+                           ("a list body", "[1, 2]"),
+                           ("a body that is no JSON", "{not json")):
+            with self.subTest(name):
+                self.fresh()
+                item = self.pr_alert(basis)
+                self.raw_heartbeat(pr_attention.SEEN_KEY, "2099-01-01T00:00:00Z", text)
+                out = self.sweep()
+                self.assertEqual(self.status(item), "planning")
+                self.assertEqual((out["closed"], out["problems"]), ([], []))
+                self.assertEqual(out["kept"][0]["why"], "the newest read is not in the shape a clear needs")
+
+    def test_a_malformed_chain_row_proves_no_clean_run(self):
+        key = f"{reporting.CHAIN_KEY}disk-check@box"
+        for name, text in (("a list body", "[1]"), ("a body that is no JSON", "{oops"),
+                           ("a number ended", '{"run_id": "r2", "ended": 99999999, "item": null}'),
+                           ("a number run", f'{{"run_id": 2, "ended": "{LATER}", "item": null}}'),
+                           ("no item field", f'{{"run_id": "r2", "ended": "{LATER}"}}')):
+            with self.subTest(name):
+                self.fresh()
+                item = self.report()
+                self.raw_heartbeat(key, LATER, text)
+                out = self.sweep()
+                self.assertEqual(self.status(item), "planning")
+                self.assertEqual((out["closed"], out["problems"]), ([], []))
+                self.assertEqual(out["kept"][0]["why"], "no clean run of disk-check on box since")
+
+    def test_a_report_with_malformed_fields_stays_open(self):
+        seen = {"seen": ["ready https://github.com/example/widget/pull/8"], "complete": True, "unread": []}
+        for name, path, value, pr in (("a list job", "$.report.job", '["disk-check"]', False),
+                                      ("a number host", "$.report.host", "7", False),
+                                      ("a number last_ended", "$.repeats.last_ended", "1", False),
+                                      ("a null basis", "$.report.attention_basis", "null", True),
+                                      ("a list basis", "$.report.attention_basis", '["x"]', True)):
+            with self.subTest(name):
+                self.fresh()
+                item = self.pr_alert() if pr else self.report()
+                if pr:
+                    record_state(self.db, "heartbeat", key=pr_attention.SEEN_KEY, timestamp="2099-01-01T00:00:00Z",
+                                 body=seen)
+                else:
+                    self.chain()
+                    self.db.execute("UPDATE item SET fields = json_set(fields, '$.repeats', json('{}')) WHERE id = ?"
+                                    " AND json_extract(fields, '$.repeats') IS NULL", (item,))
+                self.db.execute("UPDATE item SET fields = json_set(fields, ?, json(?)) WHERE id = ?", (path, value, item))
+                self.db.commit()
+                out = self.sweep()
+                self.assertEqual(self.status(item), "planning")
+                self.assertEqual((out["closed"], out["problems"]), ([], []))
+                self.assertEqual(out["kept"][0]["why"], "its report fields are not in the shape a clear needs")
+
     def task(self, status="planning"):
         item = create_item(self.db, kind="task", title="a task", status="planning")
         if status != "planning":
