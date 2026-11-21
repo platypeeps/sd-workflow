@@ -449,7 +449,8 @@ def kept_files(git: Collection[str], work: str, *, env: dict | None = None) -> s
 
 def changed_lines(git: Collection[str], work: str, base: str, head: str, *,
                   env: dict | None = None) -> dict[str, set[int]] | None:
-    """Each path `base..head` changes, with the new-side lines its hunks touch; None when git cannot answer.
+    """Each path `base..head` changes, with the new-side lines its hunks touch, or no lines for a change git
+    gives no range (a mode, a binary file), which stands for the whole file; None when git cannot answer.
 
     A hunk that only deletes names the lines on both sides of where the deletion now sits; a deleted file
     keeps its old path and old lines (pack sd:9769). `---`/`+++` are headers only before a file's first hunk.
@@ -466,7 +467,11 @@ def changed_lines(git: Collection[str], work: str, base: str, head: str, *,
     header = deleted = False
     for line in diff.splitlines():
         if line.startswith("diff --git "):
-            header, path = True, None
+            header, path, rest = True, None, line[len("diff --git "):]
+            half = (len(rest) - 5) // 2  # `a/P b/P`: renames are off, so both sides name one path
+            if not (rest.startswith("a/") and rest[2 + half:] == f" b/{rest[2:2 + half]}"):
+                return None  # a quoted or unparseable path: the delta is unknown
+            changed.setdefault(rest[2:2 + half], set())  # no hunk (mode, binary): the whole file changed
         elif header and line.startswith(('--- "', '+++ "')):
             return None
         elif header and line.startswith("--- "):
@@ -1344,7 +1349,7 @@ class Supervisor:
 
         def held(row: dict) -> bool:
             return changed is None or any(path.startswith("<") or path in named or path in changed and (
-                line is None or line in changed[path]) for path, line in self.locations(row))
+                line is None or not changed[path] or line in changed[path]) for path, line in self.locations(row))
         new = [row for row in answer["blockers"] if not held(row)]
         for index, row in enumerate(new):
             self.once(f"followup:{head}:{index}", functools.partial(self.file_follow_up, row))

@@ -1047,6 +1047,33 @@ class Supervise(Case):
         prior = json.loads(Path(second[second.index("--verify-report") + 1]).read_text(encoding="utf-8"))
         self.assertEqual(prior["findings"][0]["path"], "work.txt", "an absolute path reached the next round")
 
+    def test_a_mode_or_binary_change_reads_as_the_whole_file(self):
+        """Review of sd:9769: git gives a mode-only or binary change no line range; any line of it is changed."""
+        repo = Path(tempfile.mkdtemp(dir=self.root))
+
+        def run(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.name=operator",
+                                   "-c", "user.email=operator@example.test", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        run("init", "-q")
+        (repo / "run.sh").write_text("#!/bin/sh\necho\n")
+        (repo / "run.sh").chmod(0o755)
+        (repo / "blob.bin").write_bytes(b"\0one")
+        run("add", "-A")
+        run("commit", "-q", "-m", "base")
+        base = run("rev-parse", "HEAD")
+        (repo / "run.sh").chmod(0o644)
+        (repo / "blob.bin").write_bytes(b"\0two")
+        run("add", "-A")
+        run("commit", "-q", "-m", "mode")
+        self.assertEqual(build_run.changed_lines(["git"], str(repo), base, run("rev-parse", "HEAD")),
+                         {"run.sh": set(), "blob.bin": set()})
+        self.press()
+        _, kept = self.deferred([{"path": "run.sh", "line": 2, "summary": "lost its executable bit"}],
+                                {"run.sh": set()})
+        self.assertEqual(len(kept["blockers"]), 1, "a blocker on a mode change was deferred")
+
     def test_a_path_with_a_space_reads_without_git_s_tab(self):
         """Review of sd:9769: git ends a header naming a path with a space with a tab."""
         repo = Path(tempfile.mkdtemp(dir=self.root))
