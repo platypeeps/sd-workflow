@@ -2096,15 +2096,14 @@ def metered_bills(
 
 def covers_from(subject: Subject, args: argparse.Namespace, previous: dict[str, Any] | None) -> str | None:
     """The base a passing run stands for (pack sd:9769): a full branch pass its own; a verify pass its prior's."""
-    if subject.scope != "branch" or any(getattr(args, name, None) for name in UNRECORDED_OPTIONS[2:]):
-        return None  # a pass the lane would not record seeds no chain
-    return (previous or {}).get("covers_from") if getattr(args, "base", None) else subject.base
+    if subject.scope == "branch" and not any(getattr(args, name, None) for name in UNRECORDED_OPTIONS[2:]):  # else unrecorded
+        return (previous or {}).get("covers_from") if getattr(args, "base", None) else subject.base
 
 
 def whole_files(subject: Subject, args: argparse.Namespace) -> str:
     """Pack sd:9769: a full branch pass, a build's round 1, reads each touched file whole; a delta pass does not."""
-    whole = subject.scope == "branch" and not getattr(args, "base", None)
-    return f"\nRead every file the change touches in full, not the diff alone: {', '.join(subject.paths[:100])}\n" * whole
+    return f"\nRead every file the change touches in full, not the diff alone: {', '.join(subject.paths[:100])}\n" * (
+        subject.scope == "branch" and not getattr(args, "base", None))
 
 
 def prepared_prompt(root: pathlib.Path, subject: Subject, args: argparse.Namespace,
@@ -2433,8 +2432,9 @@ def review(
         result["codex_skill_suppression"] = next((row for row in measures if row["state"] != SKILLS_SUPPRESSED), measures[-1]) if measures else skills
         outcomes = [outcome for _measured, attempts in answers for outcome in attempts]
         outcomes = [row._replace(status=FINDINGS if row.findings else CLEAN) if (row.diagnostic or {}).get("coverage") == "partial" and set(row.diagnostic["omitted_paths"]) <= {path["path"] for path in input_manifest.get("paths", ()) if path.get("media")} and any(other.status in (CLEAN, FINDINGS) for other in outcomes) else row for row in outcomes]
-        finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)],
-                      rebutted)
+        finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)], rebutted)
+        if any(not reads_checkout(provider) for provider in chosen if provider.name in result["reviewed_by"]):
+            result["covers_from"] = None  # a reader handed patches saw no whole file: no chain (sd:9769)
     finally:
         slot.give_back()  # sd:2523: on every exit; the gate below queues in its own pool
     # Shadow only (sd:2092): Jev's kind for each finding goes to its ledger and
