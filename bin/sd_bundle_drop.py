@@ -78,9 +78,12 @@ def _ignored(work: str | Path, start: str, kept: list[str]) -> None:
     tracked = _names("ls-tree", "-r", "-z", "--name-only", start, cwd=work)
     for sha in kept:
         tracked |= _paths(work, sha)
+    # Compared case-folded: on a case-insensitive disk an ignored `local.txt` is the tracked `Local.txt` (round 11).
+    # ponytail: casefold, not the disk's own Unicode normalization; a refusal too many on a case-sensitive disk.
+    tracked = {path.casefold() for path in tracked}
     dirs = {"/".join(path.split("/")[:n]) for path in tracked for n in range(1, path.count("/") + 1)}
-    clash = sorted(path for path in ignored if path in tracked or path in dirs
-                   or any("/".join(path.split("/")[:n]) in tracked for n in range(1, path.count("/") + 1)))
+    clash = sorted(path for path in ignored if (folded := path.casefold()) in tracked or folded in dirs
+                   or any("/".join(folded.split("/")[:n]) in tracked for n in range(1, folded.count("/") + 1)))
     if clash:
         raise DropRefused(f"ignored local files the new branch tracks: {', '.join(clash[:5])}; move them first")
 

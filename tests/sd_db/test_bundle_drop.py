@@ -541,3 +541,28 @@ class DropRound10(Repo):
         self.assertEqual(git(work, "rev-parse", "HEAD"), old)
         self.assertEqual(self.db.execute("SELECT status FROM assignment WHERE id = ?", (ids[2],)).fetchone()[0],
                          "cancelled")
+
+
+class DropRound11(Repo):
+    """Review round 11 of pack sd:9709: an ignored file whose name differs from a tracked path only in case, a
+    COMMIT that fails and leaves its transaction open, and Ctrl-C between the split and the writes."""
+
+    def unsplit(self, items, run, old):
+        work = Path(run["work_path"])
+        self.assertEqual((git(work, "rev-parse", "HEAD"), git(work, "branch", "--show-current")),
+                         (old, run["branch"]))
+        self.assertEqual(git(self.repo, "branch", "--list", f"{run['branch']}-drop-*"), "")
+        self.assertEqual(self.statuses(items), ["blocked"] * 3)
+
+    def test_an_ignored_file_the_base_tracks_in_another_case_refuses(self):
+        items, ids, run = self.bundle()
+        work = Path(run["work_path"])
+        exclude = Path(git(self.repo, "rev-parse", "--git-common-dir"))
+        exclude = (exclude if exclude.is_absolute() else self.repo / exclude) / "info" / "exclude"
+        exclude.parent.mkdir(exist_ok=True)
+        exclude.write_text("local.txt\n")
+        (work / "local.txt").write_text("local\n")
+        self.main_moves("Local.txt", "tracked on main\n")
+        with self.assertRaisesRegex(DROP.DropRefused, "ignored .*local.txt"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual((work / "local.txt").read_text(), "local\n")
