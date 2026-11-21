@@ -2584,6 +2584,21 @@ class Hosts(Case):
         self.assertIsNone(self.claim(hosts=frozenset({"other"})))
         self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", first["assignment"]), "blocked")
 
+    def test_a_satellite_takes_a_beat_blocked_build_that_never_ran_after_its_lane_moved(self):
+        """Review round 2 of sd:9775: a fresh build blocked on one satellite's quiet beat, then its repository moved
+        to another. No host requeued it, and pickup skipped the item for good. It never ran, so it has no worktree
+        to keep: the new lane host queues it again and builds it."""
+        item = self.item(repo=SAT)
+        lead = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", lead), "blocked")
+        self.db.execute("UPDATE repo SET lane_host = 'other' WHERE path = ?", (SAT,))
+        record_state(self.db, "heartbeat", key="build-dispatch@other", body={})
+        run = self.claim(hosts=frozenset({"other"}))
+        assert run is not None
+        self.assertEqual((run["assignment"], run["owner"]), (lead, "fixture@other"))
+
     def test_the_hub_blocks_a_row_whose_satellite_beat_comes_from_a_clock_ahead(self):
         """Pack sd:7955: a beat stamped more than STALE_SECONDS after now has no age to trust, so the claim blocks
         the row as for a stale beat, and its note names the skew, not a dead dispatcher."""

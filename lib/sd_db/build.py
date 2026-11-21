@@ -1370,8 +1370,9 @@ def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
         away = _route(connection, row["lane_host"], _lead(row))
         names = away is not None and row["result"].startswith(f"item {row['item']}'s lane runs on {away}, ")
         # This host ticks, so its beat is back: a satellite takes the rows its own quiet beat blocked (sd:9775), not
-        # one another satellite ran, whose worktree is there (review of sd:9775); the hub takes a lane moved to it.
-        if away in hosts and (names or None in hosts):
+        # one another satellite ran, whose worktree is there (review of sd:9775); the hub takes a lane moved to it,
+        # and any host one that never ran, with no worktree to keep (review round 2).
+        if away in hosts and (names or None in hosts or _lead(row) is None):
             why = f"the {HEARTBEAT}@{away} beat is fresh" if names else "its lane runs on this host now"
         elif (away is None or None not in hosts or not names
               or dispatcher_gone(connection, away) or dispatcher_stuck(connection, away)):
