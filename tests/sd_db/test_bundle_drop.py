@@ -4,6 +4,7 @@ The revert recipe it replaces failed twice on one bundle (sd:9651): a subset Ret
 reverted commit keeps its `Closes: sd:N`, so the merge would close the dropped item undone.
 """
 import importlib
+import sqlite3
 import subprocess
 import sys
 from pathlib import Path
@@ -566,3 +567,20 @@ class DropRound11(Repo):
         with self.assertRaisesRegex(DROP.DropRefused, "ignored .*local.txt"):
             DROP.drop_item(self.db, build, items[1], who="operator")
         self.assertEqual((work / "local.txt").read_text(), "local\n")
+
+    def test_a_failed_commit_left_open_undoes_the_split(self):
+        items, ids, run = self.bundle()
+        old = git(Path(run["work_path"]), "rev-parse", "HEAD")
+
+        def commit_fails(connection, plan, **_):
+            # The writes ran, then COMMIT failed outside the helper's rollback: the transaction stays open.
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute("UPDATE assignment SET status = 'cancelled', result = ? WHERE id = ?",
+                               (f"{build.ALONE}operator: {build.DROPPED}{plan['run']}", plan["assignment"]))
+            raise sqlite3.OperationalError("database is locked")
+
+        with mock.patch.object(build, "drop_writes", side_effect=commit_fails), \
+                self.assertRaises(sqlite3.OperationalError):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertFalse(self.db.in_transaction)
+        self.unsplit(items, run, old)
