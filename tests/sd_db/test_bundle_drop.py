@@ -891,6 +891,17 @@ class DropRound21(Repo):
         fresh = build.queue_again(self.db, [items[0]], who="operator")
         self.assertNotEqual(fresh[0]["id"], lead["id"], "Build takes the kept item fresh, on a new branch")
 
+    def test_a_kept_member_whose_repository_is_cleared_holds_the_lead(self):
+        """Round 22: the claim reads only rows with a repository, so a kept member whose item lost its repository
+        stayed queued, out of sight of the stray check, and the lead shipped its commits."""
+        items, (lead, member) = self.kept()
+        self.db.execute("UPDATE item SET repo = NULL WHERE id = ?", (items[1],))
+        self.assertNotIn(lead["id"], self.claims())
+        self.blocked_naming(lead["id"], items[1])
+        row = self.db.execute("SELECT status, result FROM assignment WHERE id = ?", (member["id"],)).fetchone()
+        self.assertEqual(row["status"], "blocked", "no claim would take it queued with no repository")
+        self.assertIn("no repository", row["result"])
+
     def test_a_kept_member_done_lets_the_lead_build(self):
         items, (lead, member) = self.kept()
         self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[1],))
