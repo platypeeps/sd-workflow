@@ -5199,7 +5199,11 @@ roles:
         args = review.build_parser().parse_args(["--scope", "branch"])
         head = _git(self.root, "rev-parse", "HEAD")
         result = {"status": "advisory", "requested_reviews": 1, "completed_reviews": 1,
-                  "subject": {"base": head, "head": head}}
+                  "subject": {"base": head, "head": head}, "binding": review.sd_lib.lead_review_binding(self.root)}
+        with contextlib.redirect_stderr(io.StringIO()) as said:
+            review.record_lead_review(self.root, args, {**result, "binding": {"review_declaration": "older"}},
+                                      dict(os.environ))
+        self.assertIsNone(self.lead_record(), "a pass under another binding was stamped with the current one")
         review.record_lead_review(self.root, args, {**result, "status": "blocking"}, dict(os.environ))
         self.assertIsNone(self.lead_record(), "a blocking pass was recorded")
         with contextlib.redirect_stderr(io.StringIO()):
@@ -5231,7 +5235,7 @@ roles:
         args = review.build_parser().parse_args(["--scope", "branch", "--verify-report", "prior.json", "--base", prior])
         fork = _git(self.root, "merge-base", head, "origin/main")
         result = {"status": "clean", "requested_reviews": 2, "completed_reviews": 2,
-                  "subject": {"base": prior, "head": head}}
+                  "subject": {"base": prior, "head": head}, "binding": review.sd_lib.lead_review_binding(self.root)}
         for narrow in (None, "0" * 40):  # review of sd:9769: a chain that covers less than the fork stands for nothing
             with contextlib.redirect_stderr(io.StringIO()):
                 review.record_lead_review(self.root, args, {**result, "covers_from": narrow}, dict(os.environ))
