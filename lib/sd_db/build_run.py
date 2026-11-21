@@ -1352,19 +1352,33 @@ class Supervisor:
                 line is None or not changed[path] or line in changed[path]) for path, line in self.locations(row))
         new = [row for row in answer["blockers"] if not held(row)]
         for index, row in enumerate(new):
-            self.once(f"followup:{head}:{index}", functools.partial(self.file_follow_up, row))
+            self.once(f"followup:{head}:{index}", functools.partial(self.file_follow_up, row, head))
         blockers = [row for row in answer["blockers"] if row not in new]
         return {"status": "blocking" if blockers else "advisory", "blockers": blockers}
 
-    def file_follow_up(self, row: dict) -> None:
-        """One deferred blocker as a follow-up item and its note, in one transaction (pack sd:9769)."""
+    def file_follow_up(self, row: dict, head: str) -> None:
+        """One deferred blocker as a follow-up item, its note and its rebuttal, in one transaction (pack sd:9769).
+
+        The lane reviews the branch again; the rebuttal, in the record `sd-review` reads for this branch
+        (pack sd:9270), holds back the same finding there and tells its readers where it went."""
         title = f"Review follow-up from build {self.row['branch']}: {row.get('path')}:{row.get('line')}"
+        remote = self.db.execute(f"SELECT remote FROM repo WHERE path IN ({paths.placeholders(paths.keys(self.row['repo']))})",
+                                 paths.keys(self.row["repo"])).fetchone()
+        repository = build.github_repository(remote["remote"] if remote else None).lower()
         with transaction(self.db):
             filed = create_item(self.db, kind="task", title=f"{title} {row.get('summary') or ''}"[:200],
                                 repo=self.row["repo"])
             add_note(self.db, filed, "comment", f"Build run {self.ident} round {self.fresh()['review_round'] or 0} "
                                                 f"found this on code its fix did not change, so it is filed, not a "
                                                 f"blocker (pack sd:9769): {self.summary([row], None)}")
+            if repository:  # no GitHub origin: `sd-review` reads no rebuttal there either
+                raw = {"path": self.locations(row)[0][0], "summary": row.get("summary"), "line": row.get("line")}
+                record_state(self.db, "checkpoint", key=f"ship-adjudication:build-run:{self.ident}:{filed}", body={
+                    "decision": "accepted", "proposal": {
+                        "bindings": {"repository": repository, "branch": self.row["branch"], "head": head},
+                        "findings": [{"raw_finding": raw, "response_disposition": "rebutted",
+                                      "reason": f"filed as follow-up sd:{filed}: it is on code the build's fix did "
+                                                f"not change (pack sd:9769)"}]}})
 
     def own_checks(self, head: str) -> list[dict] | dict:
         """Run an unmanaged repository's own checks at `head`, each in a gate slot; a blocker per failure.

@@ -1029,6 +1029,31 @@ class Supervise(Case):
         self.assertEqual(len(filed), 1, "no follow-up item was filed")
         self.assertIn("far.txt:1", filed[0]["title"])
 
+    def test_a_filed_follow_up_is_a_rebuttal_the_lane_review_honours(self):
+        """Review of sd:9769: the lane reviews the branch again; the same finding must not block it there."""
+        import importlib.machinery
+        import types
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1"], sd_review=["blocking", "offdelta"])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        bodies = [(row["body"],) for row in self.db.execute(
+            "SELECT body FROM state WHERE kind = 'checkpoint' AND key LIKE 'ship-adjudication:%'")]
+        bin_dir = str(Path(build_run.__file__).resolve().parents[2] / "bin")
+        sys.path.insert(0, bin_dir)
+        try:
+            loader = importlib.machinery.SourceFileLoader("sd_review_lane", os.path.join(bin_dir, "sd-review"))
+            review = types.ModuleType(loader.name)
+            review.__file__ = loader.path
+            loader.exec_module(review)
+        finally:
+            sys.path.remove(bin_dir)
+        recorded = review.rebuttals(bodies, lambda head: True, lambda head, path: True)
+        far = {"path": "far.txt", "line": 1, "severity": "high", "instances": ["far.txt:1"],
+               "summary": "an old defect", "family": "correctness"}
+        self.assertEqual([row["disposition"] for row in review.dispose([far], "high", recorded)], ["advisory"],
+                         "the lane would block on the finding the build filed")
+
     def test_a_short_blocking_report_is_never_made_advisory(self):
         """Review of sd:9769: a blocking report missing a reader's answer blocks, whatever the delta."""
         self.press()
@@ -1169,8 +1194,8 @@ class Supervise(Case):
         supervisor = self.supervisor()
         real, lost = supervisor.file_follow_up, list[dict]()
 
-        def committed_then_lost(row):  # the first follow-up's transaction commits; its answer is lost
-            real(row)
+        def committed_then_lost(row, head):  # the first follow-up's transaction commits; its answer is lost
+            real(row, head)
             if not lost:
                 lost.append(row)
                 raise remote.UnknownOutcome("r" * 26, "the answer to COMMIT was lost")
