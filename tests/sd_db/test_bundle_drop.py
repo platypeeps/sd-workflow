@@ -1008,3 +1008,24 @@ class GitLocation(Repo):
         listed = set(git(self.repo, "rev-parse", "--local-env-vars").split())
         self.assertTrue(listed)
         self.assertEqual(listed - paths.GIT_LOCAL, set())
+
+
+class GitPolicy(Repo):
+    """The gate's git policy: every drop git call has a bound, and a git that outlasts it refuses the drop
+    unwritten, its undo still running every step."""
+
+    def test_a_git_that_outlasts_its_bound_refuses_unwritten(self):
+        items, ids, run = self.bundle()
+        old = git(Path(run["work_path"]), "rev-parse", "HEAD")
+        real = subprocess.run
+
+        def slow(argv, *args, **kwargs):
+            if argv[:1] == ["git"] and "cherry-pick" in argv and "--abort" not in argv:
+                raise subprocess.TimeoutExpired(argv, DROP.GIT_SECONDS)
+            return real(argv, *args, **kwargs)
+        with mock.patch.object(DROP.subprocess, "run", side_effect=slow) as run_git, \
+                self.assertRaisesRegex(DROP.DropRefused, "cherry-pick"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertTrue(all(call.kwargs.get("timeout") == DROP.GIT_SECONDS for call in run_git.call_args_list))
+        self.assertEqual(git(Path(run["work_path"]), "rev-parse", "HEAD"), old)
+        self.unmade(run)

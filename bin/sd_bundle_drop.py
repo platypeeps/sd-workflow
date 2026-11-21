@@ -14,8 +14,14 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import sd_lib
 import sd_ship_body
-from sd_db import paths
+
+sd_lib.import_sd_db()
+from sd_db import paths  # noqa: E402 - after the helper puts the checkout's lib/ first (sd:745)
+
+#: A fetch, a worktree add or a cherry-pick outlasts `sd_lib`'s 15 s read bound.
+GIT_SECONDS = 300
 
 
 class DropRefused(Exception):
@@ -24,8 +30,12 @@ class DropRefused(Exception):
 
 def _git(*argv: str, cwd: str | Path, check: bool = True) -> subprocess.CompletedProcess:
     # `-C` alone names the repository: a hook's `GIT_DIR` would point every call at its own (round 26).
-    done = subprocess.run(["git", "-C", str(cwd), *argv], capture_output=True, text=True, check=False,
-                          stdin=subprocess.DEVNULL, env=paths.git_env())
+    try:
+        done = subprocess.run(["git", "-C", str(cwd), *argv], capture_output=True, text=True, check=False,
+                              stdin=subprocess.DEVNULL, env=paths.git_env(), timeout=GIT_SECONDS)
+    except (OSError, subprocess.SubprocessError) as error:
+        # Unchecked, a git that never answered reads as a failed exit: undo goes on to its next step.
+        done = subprocess.CompletedProcess(argv, -1, "", str(error))
     if check and done.returncode != 0:
         raise DropRefused(f"git {' '.join(argv)} failed in {cwd}: {(done.stderr or done.stdout).strip()}")
     return done
