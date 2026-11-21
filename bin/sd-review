@@ -2619,7 +2619,7 @@ def finish_review(result: dict[str, Any], outcomes: Sequence[Outcome], reviewed:
         status = "advisory" if disposed else "clean" if reviewed else "skipped"
     result.update(outcomes=[outcome.outcome_report() for outcome in outcomes], findings=disposed,
                   completed_reviews=len(reviewed), reviewed_by=reviewed, remaining=remaining, status=status,
-                  covers_from=None if incomplete else result.get("covers_from"))  # a short pass seeds no chain (sd:9769)
+                  covers_from=None if incomplete or result.get("review_shortfall") else result.get("covers_from"))  # a short pass seeds no chain (sd:9769)
     return result
 
 

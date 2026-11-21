@@ -148,6 +148,13 @@ class FixReviewTests(ReviewFixture):
         self.assertEqual(result["status"], "blocking")
         self.assertIsNone(result["covers_from"], "a pass one reader short still covers the branch")
 
+    def test_a_pass_short_of_its_policy_depth_covers_nothing(self):
+        """Review of sd:9769: `requested_reviews` is capped to the readers left; the shortfall is not a full pass."""
+        answered = sd_review.Outcome("codex", sd_review.CLEAN, (), "", (), ())
+        result = sd_review.finish_review({"severity_floor": "medium", "requested_reviews": 1, "covers_from": "a" * 40,
+                                          "review_shortfall": {"requested": 2, "eligible": 1}}, [answered], ["codex"])
+        self.assertIsNone(result["covers_from"], "a pass one provider short of its policy covers the branch")
+
     def test_a_verify_pass_keeps_the_branch_s_copilot_requirement(self):
         """Review of sd:9769: a small fix's tier must not drop the Copilot review the branch's tier required."""
         root, first = self.branch()
