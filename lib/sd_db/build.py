@@ -1345,10 +1345,13 @@ def _refuse(connection, row, reason: str) -> None:
 
 #: The result `_refuse` writes on a build the hub blocked on another host's quiet dispatcher.
 _BEAT_RESULT = "%'s lane runs on %, and %"
-#: An item's newest build, blocked with `_BEAT_RESULT`, no other assignment owning the item; binds SCOPE, _BEAT_RESULT.
+#: An item's newest build that stands (a newer one that ended before it ran owns nothing, as `_current` reads:
+#: review round 5 of sd:9775), blocked with `_BEAT_RESULT`, no other assignment owning the item; binds SCOPE,
+#: _BEAT_RESULT.
 _BEAT_BLOCKED = (f"assignment.scope = ? AND assignment.status = 'blocked' AND assignment.result LIKE ? "
-                 f"AND assignment.id = (SELECT MAX(newest.id) FROM assignment newest "
-                 f"WHERE newest.item = assignment.item AND newest.scope = assignment.scope) "
+                 f"AND NOT EXISTS (SELECT 1 FROM assignment newer WHERE newer.item = assignment.item "
+                 f"AND newer.scope = assignment.scope AND newer.id > assignment.id "
+                 f"AND NOT (newer.status IN {AGAIN} AND newer.run_count = 0)) "
                  f"AND NOT EXISTS (SELECT 1 FROM assignment other WHERE other.item = assignment.item "
                  f"AND other.status IN {OWNING})")
 

@@ -2666,6 +2666,34 @@ class Hosts(Case):
             self.assertEqual(build.pickup(self.db, build.room(self.db, **IDLE, hosts=other), now=Pickup.NOW), [item])
         self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", first["assignment"]), "blocked")
 
+    def test_a_beat_blocked_bundle_requeues_whole_past_a_leads_cancel_that_never_ran(self):
+        """Review round 5 of sd:9775: a bundle's lead item had a newer build cancelled before it ran, then the
+        bundle was retried and the hub blocked it on a quiet beat. Recovery read only each item's highest
+        assignment, so it requeued the member alone, and the claim led with it on another branch. A newer build
+        that never ran owns nothing: the whole bundle queues again under its lead, and pickup leaves its items."""
+        items = [self.item(repo=SAT), self.item(repo=SAT)]
+        build.queue(self.db, items, who="operator")
+        first = self.claim(hosts=WORK)
+        lead = first["assignment"]
+        stamp = build.clock()
+        self.db.execute("UPDATE runner_run SET outcome = 'blocked', released_at = ? WHERE id = ?", (stamp, first["id"]))
+        self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (stamp, first["id"]))
+        self.db.execute("UPDATE assignment SET status = 'blocked' WHERE id = ? OR parent = ?", (lead, lead))
+        self.db.execute("UPDATE item SET status = 'ready'")
+        newer = build.queue(self.db, [items[0]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (newer,))
+        self.db.execute("UPDATE assignment SET status = 'queued' WHERE id = ? OR parent = ?", (lead, lead))
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE status = 'blocked'"), 2)
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        with mock.patch.object(build, "lane_hosts", return_value=WORK):
+            self.assertEqual(build.eligible(self.db, now=Pickup.NOW), [])
+        run = self.claim(hosts=WORK)
+        assert run is not None
+        self.assertEqual((run["assignment"], run["work_path"]), (lead, first["work_path"]))
+        self.assertEqual(sorted(member["item"] for member in run["members"]), sorted(items))
+
     def test_the_hub_blocks_a_row_whose_satellite_beat_comes_from_a_clock_ahead(self):
         """Pack sd:7955: a beat stamped more than STALE_SECONDS after now has no age to trust, so the claim blocks
         the row as for a stale beat, and its note names the skew, not a dead dispatcher."""
