@@ -125,6 +125,16 @@ thread, not one per refresh. Meanwhile the area shows its last answer under
   drops it. The page waits 2 seconds on a run in flight, then says it is still
   running.
 
+Machine has a chooser (sd:9757): this machine, the hub, first, then each
+other machine with a stored reading, by host name. The viewer's pick is kept
+in the browser. Each satellite's scheduled job runs
+`sd services list --record SECONDS`, which stores its Disk volumes and
+folders and its Services as the `machine-health:<host>` heartbeat; the hub
+reads that row and never reaches the machine. A chosen satellite shows only
+Disk and Services, read at the reading's time, with no controls and no
+build-output rule; a reading older than its SECONDS is stale, and a host
+with no reading is unknown. `GET /api/health/machine?host=<name>` answers it.
+
 Prune registrations, Delete merged and Remove build output run from the page
 (sd:3393), behind a confirm that names the registrations, branches or folders.
 Each posts `/api/health/cleanup` with the row and its `revision`, a digest of

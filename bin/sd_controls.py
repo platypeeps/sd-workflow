@@ -8,6 +8,7 @@ import getpass
 import inspect
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 from typing import Any
@@ -132,6 +133,31 @@ def open_table(rows: list[dict[str, Any]]) -> str:
     return "\n".join(sd_views.table(["ID", "Status", "Filed", "Job", "Title"],
                                     [[f"#{row['id']}", row["status"], row["created_at"], job(row), row["title"]]
                                      for row in rows], width))
+
+
+def sweep_lines(result: dict[str, Any]) -> str:
+    """`sd reports sweep`'s text: how many closed, or would, then one line each, then what failed."""
+    def named(row: dict[str, Any]) -> str:
+        return f"sd:{row['item']} {row['kind']}" + (f" #{row['note']}" if row.get("note") else "")
+    lines = [f"{'closed' if result['applied'] else 'would close'} {len(result['closed'])}"]
+    lines += [f"  {named(row)}: {row['why']}" for row in result["closed"]]
+    lines += [f"  not closed, {named(row)}: {row['why']}" for row in result["problems"]]
+    return "\n".join(lines)
+
+
+def sweep_reports(args: argparse.Namespace) -> int:
+    """`sd reports sweep` (sd:9759): the Needs you sweep, as text unless `--json`; `--dry-run` opens the store read-only."""
+    sd_db = sd_handoff_rows.library()
+    from sd_db import needs_sweep  # noqa: PLC0415 -- after the library's gateway
+    connection = sd_handoff_rows.connect(sd_db, write=not args.dry_run)
+    try:
+        result = needs_sweep.sweep(connection, who=getpass.getuser(), apply=not args.dry_run)
+    except (sd_db.SdDbError, sqlite3.Error) as error:
+        raise WorkRefusal(str(error)) from error
+    finally:
+        connection.close()
+    print(json.dumps(result, ensure_ascii=False) if args.json else sweep_lines(result))
+    return 0
 
 
 def list_reports(args: argparse.Namespace, connection: Any, reporting: Any) -> int:
@@ -381,9 +407,11 @@ def register(groups: Any) -> None:
     for name in ("providers", "reports"):
         group = groups.add_parser(name, help=f"inspect and control {name} through the workflow database")
         verbs = group.add_subparsers(dest="verb", required=True)
-        for action in (("list", "configure") if name == "providers" else ("list", "ingest", "acknowledge", "reopen")):
+        for action in (("list", "configure") if name == "providers"
+                       else ("list", "ingest", "acknowledge", "reopen", "sweep")):
             command = verbs.add_parser(action)
-            command.set_defaults(handler=run, control_group=name, control_action=action)
+            command.set_defaults(handler=sweep_reports if action == "sweep" else run, control_group=name,
+                                 control_action=action)
             command.add_argument("--json", action="store_true")
             if name == "reports" and action == "list":
                 command.add_argument("--open", action="store_true",
@@ -408,6 +436,10 @@ def register(groups: Any) -> None:
                                      help="also resolve every open followup this report owns, in the same "
                                           "transaction; without it the refusal names each followup, which "
                                           "`sd note resolve <id>` closes")
+            if action == "sweep":
+                command.help = ("close what Needs you lists but no longer needs you, each with a note naming why "
+                                "(sd:9759); a row it cannot prove stays open")
+                command.add_argument("--dry-run", action="store_true", help="list what would close; write nothing")
             if action == "reopen":
                 command.add_argument("item", type=item_id, help=ITEM_HELP)
                 command.add_argument("--if-revision")

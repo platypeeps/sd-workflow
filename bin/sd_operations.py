@@ -23,13 +23,31 @@ from sd_notes import ITEM_HELP, item_id
 from sd_work import WorkRefusal
 
 
+def record_machine(connection: Any, interval: int, inventory: dict) -> None:
+    """Store this machine's Disk and Services readings for Health's machine chooser (sd:9757).
+
+    A satellite's scheduled job runs `sd services list --record SECONDS`; the hub's Health reads the row back, keyed
+    by this machine's host, and marks it stale past SECONDS. Machines meet through the database, never a session.
+    """
+    sys.path.insert(0, str(BIN.parent / "dashboard"))
+    try:
+        # By name, as `sd_work` loads its modules: the dashboard is not on bin/'s lint path.
+        collectors = importlib.import_module("sd_dashboard.health_collectors")
+        collectors.record_reading(connection, interval=interval, services=inventory)
+    finally:
+        sys.path.remove(str(BIN.parent / "dashboard"))
+
+
 def service_result(connection: Any, args: argparse.Namespace) -> Any:
     try:
         import sd_db.services as services
     except ImportError:
         raise WorkRefusal("update this pack checkout, whose lib/ is the sd_db bin/ runs for service controls") from None
     if args.operation == "list":
-        return services.inventory(connection)["services"]
+        inventory = services.inventory(connection)
+        if getattr(args, "record", None) is not None:
+            record_machine(connection, args.record, inventory)
+        return inventory["services"]
     state = services.service_state(connection, args.identity)
     if args.operation == "get":
         return state
@@ -94,7 +112,7 @@ def run(args: argparse.Namespace) -> int:
         import sd_db.operations as operations
     except ImportError:
         raise WorkRefusal("update this pack checkout, whose lib/ is the sd_db bin/ runs for job controls") from None
-    write = args.operation in {"retry", "cancel", "start", "stop", "restart"}
+    write = args.operation in {"retry", "cancel", "start", "stop", "restart"} or getattr(args, "record", None) is not None
     connection = sd_handoff_rows.connect(sd_db, write=write)
     try:
         result: Any
@@ -710,6 +728,10 @@ def register(groups: Any) -> None:
                 parser.add_argument("--until", choices=("ended", "merged"), default="ended",
                                     help="with --wait: merged also waits out a done build's lane entry, "
                                          "exit 0 only when each merged")
+            elif (name, action) == ("services", "list"):
+                parser.add_argument("--record", type=int, metavar="SECONDS",
+                                    help="also store this machine's disk and services for Health; the job runs "
+                                         "every SECONDS, and a reading older than that is stale (sd:9757)")
             elif action != "list":
                 parser.add_argument("identity", help={"jobs": "registered job name",
                     "assignments": "assignment ID", "services": "launchd label (get also accepts system:LABEL)"}[name])

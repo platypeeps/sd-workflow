@@ -12,17 +12,19 @@ window.PAGE_COMMANDS = [
   { label: 'Start next ready tasks', icon: 'play', run: () => document.dispatchEvent(new CustomEvent('tasks:start-next')) },
 ];
 // sd:6263: each realm is a sub tab, in place of sd:5753's Realm filter. The tabs narrow the one board, matrix and list, so
-// they have no view-<id> panel: the shell draws the switch in #viewswitch. Personal, then the realms the dashboard.realms
-// row names (SHELL_REALMS, from /ui/sections.js), then HOA and Home. A realm named for one of those tabs, or for a
+// they have no view-<id> panel: the shell draws the switch in #viewswitch. The realms the dashboard.realms row names
+// (SHELL_REALMS, from /ui/sections.js), then Personal, Home and HOA. A realm named for one of those tabs, or for a
 // layout panel (list, board, matrix) or the layout menu's view-btn and view-menu (sd:5641), takes no tab: the shell
 // would hide that panel. Home takes v o (g o opens the Home page), since v h is HOA's; a realm takes the first letter
 // of its id that no other tab, and not the layouts' v l, v b and v m, holds. pack sd:7216: no All tab; every task sits in
 // Personal or a realm (inPlace), so All only repeated them. An old #view=all opens Personal; ?realm=all, Today's and
 // Metrics' drilldowns, still lists every realm (PLACE below). 'all' stays reserved and v a unused, so no key moves.
-if (location.hash === '#view=all') history.replaceState(history.state, '', '#view=personal');
-window.PAGE_VIEWS = [{ id: 'personal', label: 'Personal' },
+// Operator 2026-11-20: the realms first (Work, then the rest in dashboard.realms order), Personal and Home; HOA last.
+window.PAGE_VIEWS = [
   ...(window.SHELL_REALMS || []).filter(r => /^[a-z0-9][a-z0-9-]*$/.test(r.id) && !['personal', 'hoa', 'home', 'all', 'list', 'board', 'matrix', 'btn', 'menu'].includes(r.id)).map(r => ({ id: r.id, label: r.label })),
-  { id: 'hoa', label: 'HOA', key: 'h' }, { id: 'home', label: 'Home', key: 'o' }];
+  { id: 'personal', label: 'Personal' }, { id: 'home', label: 'Home', key: 'o' }, { id: 'hoa', label: 'HOA', key: 'h' }];
+// sd:9758: Work is only the default tab; an old or unknown #view= (all, nope) still opens Personal, as ?realm=nope does below.
+if (/^#view=/.test(location.hash) && !window.PAGE_VIEWS.some(v => location.hash === `#view=${v.id}`)) history.replaceState(history.state, '', '#view=personal');
 {
   const used = new Set(['l', 'b', 'm', 'a', ...window.PAGE_VIEWS.map(v => v.key).filter(Boolean)]);
   window.PAGE_VIEWS.forEach(v => { if (!v.key) { v.key = [...v.id].find(c => /[a-z]/.test(c) && !used.has(c)); used.add(v.key); } });
@@ -84,7 +86,7 @@ addEventListener('DOMContentLoaded', () => {
   // ?realm= shows that tab. Metrics' and Today's drilldowns count every realm and name ?realm=all (pack sd:7216): PLACE is
   // 'all', every row shows, no tab is current and the head says All realms, until a tab is picked.
   const asked = new URLSearchParams(location.search).get('realm');
-  if (asked === 'all') window.shell.view.none(); else if (asked) window.shell.view.show(asked);
+  if (asked === 'all') window.shell.view.none(); else if (asked) window.shell.view.show(window.PAGE_VIEWS.some(v => v.id === asked) ? asked : 'personal');
   let PLACE = asked === 'all' ? 'all' : window.shell.view.current() || window.PAGE_VIEWS[0].id, REALMS = null;
   const place = () => PLACE;
   document.addEventListener('shell:view', e => { if (e.detail.id === PLACE) return; PLACE = e.detail.id; L.page = 1; if (READ) { subhead(); render(); } });

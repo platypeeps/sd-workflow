@@ -254,6 +254,18 @@ class Alerts(unittest.TestCase):
         self.assertIn("more than 100 open pulls", reason)
         self.assertEqual([status for _, status, _ in self.reports()], ["planning", "planning"])
 
+    def test_the_seen_row_says_whether_its_read_was_complete_and_what_went_unread(self):
+        """sd:9759 review round 2: the Needs you sweep reads absence as a clear only from a complete read."""
+        def last():
+            return json.loads(self.db.execute("SELECT body FROM state WHERE key = ? ORDER BY id DESC LIMIT 1",
+                                              (pr_attention.SEEN_KEY,)).fetchone()["body"])
+        self.run_(Gh(requested=[pull(7)]))
+        self.assertEqual((last()["complete"], last()["unread"]), (True, []))
+        self.run_(Gh(fail="HTTP 502"))
+        self.assertIs(last()["complete"], False)
+        pr_attention.alert(self.db, {}, True, now=NOW, unread=frozenset({"checks_failing"}))
+        self.assertEqual(last()["unread"], ["checks_failing"])
+
     def test_a_malformed_search_is_cut_and_keeps_every_alert(self):
         """A search block or node of the wrong shape is no read: it neither raises nor clears an open alert."""
         self.run_(Gh(requested=[pull(7)]))
