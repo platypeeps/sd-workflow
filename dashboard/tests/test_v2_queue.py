@@ -1895,13 +1895,18 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         ended = {**self.BUILDS["recent"][0], "run": "r9", "repo": str(self.checkout), "outcome": "done",
                  "items": [{"item": n, "assignment": 9, "status": "done", "title": "Stamp the files"}],
                  "retry": {**self.BUILDS["recent"][0]["retry"], "bundle": None}}
-        out = self.run_view("open('system'); R.html = ELS.queue.html;", search="?show=suggested,open,ended",
+        entry = f"entry:{self.checkout}:{n}"
+        out = self.run_view("open('system'); R.html = ELS.queue.html;"
+                            " act('button[data-entry]', { entry: " + json.dumps(entry) + " }); R.details = ELS.details.html;",
+                            search="?show=suggested,open,ended",
                             answers={"/api/queue": [200, doc],
                                      "/api/queue/builds?show=all": [200, {**self.BUILDS, "recent": [ended]}],
                                      "/api/tasks": [200, tasks_screen.document(self.connection, now=NOW)]})
         rows = re.findall(rf'<tr class="child"[^>]*>(?:(?!</tr>).)*#{n} Stamp the files', out["R"]["html"], re.S)
         self.assertEqual(len(rows), 1, rows)
         self.assertIn('data-type="blocked"', rows[0])
+        # Review of sd:9761: the hidden cancelled entry shares the drawn one's id; its Details must not replace it.
+        self.assertIn("Lane entry · blocked", out["R"]["details"])
 
     def test_a_run_not_in_the_lane_keeps_its_row_beside_its_items_pr_wait(self):
         """sd:9022 review: a builder fixing an open PR's review is working, not waiting; its row and Cancel stay."""

@@ -542,6 +542,11 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // sd:9078: the items with a lane entry not yet ended.
   const lanedItems = () => new Set((QV.lanes ? QV.lanes.lanes : []).flatMap(l => l.rows)
     .filter(r => r.item != null && !['cancelled', 'landed'].includes(r.state)).map(r => Number(r.item)));
+  // sd:9761: a lane's drawn rows, one per item: its first open entry (the lane lists them merging, next, blocked, then
+  // ended) wins, and an ended one of an item with an open entry anywhere is no row. The rows and the entry commands and
+  // Details (qAdopt) both read this, so a hidden entry, which shares the drawn one's id, never replaces it.
+  const drawnRows = (l, laned = lanedItems()) => { const seen = new Set();
+    return l.rows.filter(r => r.item == null || (!seen.has(r.item) && !(laned.has(Number(r.item)) && ['cancelled', 'landed'].includes(r.state)) && !!seen.add(r.item))); };
   // Each repo's children, from the four reads, each with the rows the filters show; queueView draws a repo that shows one.
   function qGroups() {
     const G = new Map(), add = (repo, [type, s, tr, pr]) => {
@@ -576,11 +581,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       && !aside(a.item, `blocked build · assignment ${a.id} · ${a.why}`, asgCtl(a))).forEach(a => add(a.repo, blockedAsg(a)));
     // A prepared entry and its item's PR wait are one row (pack sd:7859): the lane's, leading with the wait.
     const waitOf = new Map(prs.map(p => [Number(p.item), p])), drawn = new Set();
-    // sd:9761: one row per item: its first open entry (the lane lists them merging, next, blocked, then ended) wins.
-    const entered = new Set();
-    (QV.lanes ? QV.lanes.lanes : []).forEach(l => { l.rows.forEach(r => {
-      if (r.item != null && (entered.has(`${l.key}:${r.item}`) || (laned.has(Number(r.item)) && ['cancelled', 'landed'].includes(r.state)))) return;
-      if (r.item != null) entered.add(`${l.key}:${r.item}`);
+    (QV.lanes ? QV.lanes.lanes : []).forEach(l => { drawnRows(l, laned).forEach(r => {
       const p = r.state === 'blocked' && r.status === 'prepared' ? waitOf.get(Number(r.item)) : undefined;
       if (p) drawn.add(p);
       if (r.state === 'blocked' && !p && aside(r.item, `lane ${r.status}${r.step ? ` at ${r.step}` : ''} · ${r.reason}`, html`${unblock(l, r)}${entryBtn(l, r)}${shell.commands.rowActions(entryId(l, r))}`)) return;
@@ -715,7 +716,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     const now = new Set();
     [...OPENI.values(), ...PARKI.values()].forEach(x => { shell.commands.put(TD.objectOf(taskOf(x.key))); now.add(x.key); });
     QOTHER.clear();
-    (QV.lanes ? QV.lanes.lanes : []).forEach(lane => lane.rows.filter(x => x.state !== 'building').forEach(x => {
+    (QV.lanes ? QV.lanes.lanes : []).forEach(lane => drawnRows(lane).filter(x => x.state !== 'building').forEach(x => {
       const id = entryId(lane, x);
       shell.commands.put({ id, type: 'entry', label: `sd:${x.item}`, item: x.item, worktree: x.worktree, repo: lane.repo });
       QOTHER.set(id, { draw: () => entryDetails(lane, x) }); now.add(id);
