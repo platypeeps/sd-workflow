@@ -25,6 +25,19 @@ class DependencyCase(Case):
     def fields(self, item):
         return json.loads(item_state(self.db, item)["item"]["fields"] or "null")
 
+    def serial(self, count, **options):
+        from sd_db import runner
+        items = [self.item() for _ in range(count)]
+        for index, item in enumerate(items):
+            self.db.execute("UPDATE item SET branch = ? WHERE id = ?", (f"work/{index}", item))
+        return items, [row["id"] for row in runner.enqueue(self.db, items, who="operator", **options)]
+
+    def lone(self, branch, **options):
+        from sd_db import runner
+        item = self.item()
+        self.db.execute("UPDATE item SET branch = ? WHERE id = ?", (branch, item))
+        return item, runner.enqueue(self.db, [item], who="operator", **options)[0]["id"]
+
 
 class TheRecord(DependencyCase):
     def test_a_dependency_is_recorded_sorted_with_a_note_and_kept_beside_other_fields(self):
@@ -124,13 +137,6 @@ class TheOtherStarts(DependencyCase):
         started = runner.claim(self.db, queued, owner="fixture", **roots)
         self.assertEqual(started and started["status"], "running", "a done dependency lets it start")
 
-    def serial(self, count, **options):
-        from sd_db import runner
-        items = [self.item() for _ in range(count)]
-        for index, item in enumerate(items):
-            self.db.execute("UPDATE item SET branch = ? WHERE id = ?", (f"work/{index}", item))
-        return items, [row["id"] for row in runner.enqueue(self.db, items, who="operator", **options)]
-
     def test_a_serial_run_that_waits_on_one_behind_it_yields_its_place(self):
         """Lane review: A queued before B, then A set to wait on B; A held for B, B held behind A."""
         from sd_db import runner
@@ -142,14 +148,16 @@ class TheOtherStarts(DependencyCase):
         self.assertEqual(started and started["status"], "running", "A yields its place to B")
 
     def test_a_run_yields_to_one_two_places_behind_it(self):
-        """Class pass: A waits on C with B between them; A yields, so B runs, and C after B."""
+        """Class pass: A waits on C with B between them. C, the one A needs, passes A and B; B plays no
+        part in the wait, so it keeps its place behind A (the queue graph, third lane blocker)."""
         from sd_db import runner
-        (first, _, third), (ahead, middle, _) = self.serial(3)
+        (first, _, third), (ahead, middle, last) = self.serial(3)
         self.wait(first, third)
         roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
-        started = runner.claim(self.db, middle, owner="fixture", **roots)
-        self.assertEqual(started and started["status"], "running", "B passes the waiting A")
-        self.assertIsNone(runner.claim(self.db, ahead, owner="fixture", **roots))
+        self.assertIsNone(runner.claim(self.db, middle, owner="fixture", **roots), "B waits for A")
+        self.assertIsNone(runner.claim(self.db, ahead, owner="fixture", **roots), "A waits on C")
+        started = runner.claim(self.db, last, owner="fixture", **roots)
+        self.assertEqual(started and started["status"], "running", "C passes A and B")
 
     def test_a_run_yields_to_one_its_dependency_waits_on(self):
         """Review: A, B, C queued; A waits on C, B waits on A. B waits on C through A, so B yields too."""
@@ -162,12 +170,6 @@ class TheOtherStarts(DependencyCase):
         self.assertIsNone(runner.claim(self.db, middle, owner="fixture", **roots))
         started = runner.claim(self.db, last, owner="fixture", **roots)
         self.assertEqual(started and started["status"], "running", "C passes A and B")
-
-    def lone(self, branch, **options):
-        from sd_db import runner
-        item = self.item()
-        self.db.execute("UPDATE item SET branch = ? WHERE id = ?", (branch, item))
-        return item, runner.enqueue(self.db, [item], who="operator", **options)[0]["id"]
 
     def test_a_run_that_plays_no_part_in_the_wait_stays_behind(self):
         """Review: B after A, A waits on a later C queued apart; B does not unblock A, so B waits for A."""
@@ -222,6 +224,67 @@ class TheOtherStarts(DependencyCase):
         roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
         started = runner.claim(self.db, parallel, owner="fixture", **roots)
         self.assertEqual(started and started["status"], "running", "the held serial run does not hold it")
+
+
+
+class TheQueueGraph(DependencyCase):
+    """A property test over random batches and waits: every queue drains (third lane blocker)."""
+
+    def drain(self):
+        """Claim every queued run that may start and finish it, merged, until none is left or none starts;
+        return the runs still queued."""
+        from sd_db import runner
+
+        roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
+        while queued := [row["id"] for row in runner.queued(self.db)]:
+            started = [ident for ident in queued if runner.claim(self.db, ident, owner="fixture", **roots)]
+            if not started:
+                return queued
+            for ident in started:
+                item = self.db.execute("SELECT item FROM assignment WHERE id = ?", (ident,)).fetchone()[0]
+                self.db.execute("UPDATE assignment SET status = 'done' WHERE id = ?", (ident,))
+                self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run IN "
+                                "(SELECT id FROM runner_run WHERE assignment = ?)", (NOW, ident))
+                self.db.execute("INSERT INTO assignment (item, role, status, phase, lane) "
+                                "VALUES (?, 'merge', 'done', 'merged', 'serial')", (item,))
+                self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (item,))
+        return []
+
+    def test_a_wait_cycle_across_a_serial_batch_and_a_parallel_run_drains(self):
+        """Third lane blocker: A, B, C serial, D parallel; A waits on C, B on D. Each pairwise yield held."""
+        (first, second, third), _ = self.serial(3)
+        fourth, _ = self.lone("work/d", parallel=True)
+        self.wait(first, third)
+        self.wait(second, fourth)
+        self.assertEqual(self.drain(), [], "every queued run ran")
+
+
+    def test_every_queue_drains(self):
+        import random
+
+        from sd_db import runner
+
+        for seed in range(400):
+            with self.subTest(seed=seed):
+                if seed:
+                    self.setUp()  # a fresh store per seed; each one's cleanups run at the end
+                rng = random.Random(seed)
+                items, branch = [], 0
+                for _ in range(rng.randint(1, 4)):
+                    batch = [self.item() for _ in range(rng.randint(1, 3))]
+                    for item in batch:
+                        branch += 1
+                        self.db.execute("UPDATE item SET branch = ? WHERE id = ?", (f"work/{branch}", item))
+                    runner.enqueue(self.db, batch, who="operator", parallel=rng.random() < 0.4)
+                    items += batch
+                # Waits follow a random order of the items, so none closes an item cycle.
+                order = rng.sample(items, len(items))
+                for index, item in enumerate(order):
+                    later = order[index + 1:]
+                    named = [other for other in later if rng.random() < 0.3]
+                    if named:
+                        self.wait(item, *named)
+                self.assertEqual(self.drain(), [], f"seed {seed}: the queue stalled")
 
 
 class TheBuild(DependencyCase):

@@ -96,57 +96,112 @@ def _item(connection, item: int, *, delivery=False) -> dict:
     return result
 
 
-def _eligible_after(connection, assignment: dict) -> bool:
-    predecessor = assignment["after"]
-    if predecessor is None:
-        return True
-    row = connection.execute("SELECT * FROM assignment WHERE id = ?", (predecessor,)).fetchone()
-    if row is None:
-        raise RunnerRefused(f"missing predecessor {predecessor}")
-    if row["status"] in {"blocked", "cancelled"}:
-        connection.execute("UPDATE assignment SET status = 'blocked', result = ?, ended = ? WHERE id = ?",
-                           (f"predecessor {predecessor} ended {row['status']}", now(), assignment["id"]))
-        return False
-    if _yields(connection, row, assignment["id"]):
-        return _eligible_after(connection, {**assignment, "after": row["after"]})
-    # A successful provider exit is completion; only a verified merge is delivery.
+def _merged(connection, row) -> bool:
+    """Whether the run `row` is delivered: done, with its item's merge done. A successful provider exit
+    is completion; only a verified merge is delivery."""
     return row["status"] == "done" and connection.execute(
         "SELECT 1 FROM assignment WHERE item = ? AND role = 'merge' AND status = 'done' AND phase = 'merged'",
         (row["item"],)).fetchone() is not None
 
 
-def _yields(connection, row, to: int) -> bool:
-    """Whether the queued author run `row` lets assignment `to` pass: `to` runs an open item `row` waits
-    on, directly or through other open items, queued behind `row`, or a run that item's chain waits
-    behind. Else A waits for B while B waits behind A (lane review of pack sd:9570), or A, B, C with A
-    waiting on C and B on A stalls (review). Any other run keeps its place behind `row` (review): a wait
-    on an item with no run behind it keeps the order; unreadable fields keep it too."""
-    if row["status"] != "queued" or row["role"] != "author":
-        return False
+def _predecessor_ended(connection, assignment: dict) -> bool:
+    """Block `assignment` when a run ahead of it in its serial chain ended blocked or cancelled; walk the
+    queued runs ahead to the first that is not queued."""
+    predecessor = assignment["after"]
+    while predecessor is not None:
+        row = connection.execute("SELECT * FROM assignment WHERE id = ?", (predecessor,)).fetchone()
+        if row is None:
+            raise RunnerRefused(f"missing predecessor {predecessor}")
+        if row["status"] in {"blocked", "cancelled"}:
+            connection.execute("UPDATE assignment SET status = 'blocked', result = ?, ended = ? WHERE id = ?",
+                               (f"predecessor {predecessor} ended {row['status']}", now(), assignment["id"]))
+            return True
+        if row["status"] != "queued":
+            return False
+        predecessor = row["after"]
+    return False
+
+
+def _reaches(graph: dict[int, set[int]], start: int, goal: int) -> bool:
+    seen, pending = set(), [start]
+    while pending:
+        node = pending.pop()
+        if node == goal:
+            return True
+        if node not in seen:
+            seen.add(node)
+            pending.extend(graph.get(node, ()))
+    return False
+
+
+def _waits(connection) -> dict[int, set[int]]:
+    """The queue as a graph: each queued run and the unfinished runs it waits on (third lane blocker of
+    pack sd:9570). Pairwise yields missed cycles through several batches, so the graph is built whole.
+
+    A dependency edge, kept always: an author run waits on each queued run of an open item its item
+    waits on, directly or through other open items; the workflow refuses an item cycle, so these alone
+    make none. An order edge, kept unless it closes a cycle: a serial run waits on each run ahead of it
+    in its chain, up to the first that is not queued and not merged; then a parallel author run waits
+    on each earlier queued serial or non-author run in its repository that has no order edge left. An
+    order edge that closes a cycle is dropped, so the run it held passes: the graph stays acyclic, and
+    an acyclic graph always has a run that waits on none, so every queue drains."""
     from .workflow import item_blocked_by
 
-    seen: set[int] = set()
-    pending, needed = [row["item"]], set[int]()
-    while pending:
-        found = connection.execute("SELECT fields FROM item WHERE id = ?", (pending.pop(),)).fetchone()
-        try:
-            named = item_blocked_by(found) if found else []
-        except ValueError:
+    rows = {row["id"]: dict(row) for row in connection.execute(
+        "SELECT assignment.*, item.repo FROM assignment LEFT JOIN item ON item.id = assignment.item "
+        "WHERE assignment.status = 'queued' ORDER BY assignment.id")}
+    graph: dict[int, set[int]] = {ident: set() for ident in rows}
+    by_item: dict[int, list[int]] = {}
+    for ident, row in rows.items():
+        by_item.setdefault(row["item"], []).append(ident)
+    for ident, row in rows.items():
+        if row["role"] != "author":
             continue
-        for other in named:
-            status = connection.execute("SELECT status FROM item WHERE id = ?", (other,)).fetchone()
-            if other in seen or status is None or status["status"] == "done":
+        seen: set[int] = set()
+        pending = [row["item"]]
+        while pending:
+            found = connection.execute("SELECT fields FROM item WHERE id = ?", (pending.pop(),)).fetchone()
+            try:
+                named = item_blocked_by(found) if found else []
+            except ValueError:
                 continue
-            seen.add(other)
-            pending.append(other)
-            needed.update(ident for (ident,) in connection.execute(
-                "SELECT id FROM assignment WHERE item = ? AND status = 'queued' AND id > ?", (other, row["id"])))
-    # A run the needed one waits behind in its serial chain must run first too.
-    for ident in list(needed):
-        while (ident := connection.execute("SELECT after FROM assignment WHERE id = ?", (ident,)).fetchone()[0]) \
-                not in (None, row["id"]) and ident not in needed:
-            needed.add(ident)
-    return to in needed
+            for other in named:
+                status = connection.execute("SELECT status FROM item WHERE id = ?", (other,)).fetchone()
+                if other in seen or status is None or status["status"] == "done":
+                    continue
+                seen.add(other)
+                pending.append(other)
+                graph[ident].update(by_item.get(other, ()))
+
+    def add(source: int, target: int) -> bool:
+        if _reaches(graph, target, source):
+            return False
+        graph[source].add(target)
+        return True
+
+    held: set[int] = set()
+    for ident, row in rows.items():
+        predecessor = row["after"]
+        while predecessor is not None:
+            ahead = rows.get(predecessor) or connection.execute(
+                "SELECT * FROM assignment WHERE id = ?", (predecessor,)).fetchone()
+            if ahead is None or _merged(connection, ahead):
+                break
+            if add(ident, predecessor):
+                held.add(ident)
+            if predecessor not in rows:
+                break
+            predecessor = ahead["after"]
+    for ident, row in rows.items():
+        if row["lane"] != "parallel" or row["role"] != "author":
+            continue
+        for earlier, before in rows.items():
+            if earlier >= ident:
+                break
+            if before["repo"] == row["repo"] and earlier not in held and (
+                    before["lane"] == "serial" or before["role"] != "author"):
+                add(ident, earlier)
+    return graph
 
 
 def _acyclic(connection) -> None:
@@ -252,7 +307,7 @@ def claim(connection, assignment: int, *, owner: str, work_root: Path, retention
         if restoration_pending(connection):
             raise RunnerRefused("database restore reimport is incomplete; queue dispatch is held")
         _acyclic(connection)
-        if request["status"] != "queued" or not _eligible_after(connection, request):
+        if request["status"] != "queued" or _predecessor_ended(connection, request) or _waits(connection)[assignment]:
             return None
         item = _item(connection, request["item"], delivery=request["role"] == "merge")
         if request["role"] == "author":
@@ -268,13 +323,6 @@ def claim(connection, assignment: int, *, owner: str, work_root: Path, retention
         exclusive = request["lane"] != "parallel" or request["role"] != "author"
         if any(row["quarantine"] or exclusive or row["exclusive"] or row["branch"] == item["branch"] for row in leases):
             return None
-        if not exclusive:
-            earlier = connection.execute("SELECT assignment.* FROM assignment JOIN item ON item.id = assignment.item "
-                "WHERE item.repo = ? AND assignment.status = 'queued' AND assignment.id < ? "
-                "AND (assignment.lane = 'serial' OR assignment.role != 'author') ORDER BY assignment.id",
-                (item["repo"], assignment)).fetchall()
-            if any(_eligible_after(connection, dict(row)) and not _yields(connection, row, assignment) for row in earlier):
-                return None
         run = request["run_count"] + 1
         ident = uuid.uuid4().hex
         stamp = now()
