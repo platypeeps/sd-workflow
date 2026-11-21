@@ -1078,13 +1078,15 @@ def _items(sd_db: Any, workflow: Any, args: argparse.Namespace, connection: Any)
     sd:8854. `--belongs-to` names another checkout the way `task add` does;
     `--ref` and `--grep` also read done items older than the listing's week,
     and a `--grep` row names each hit under `matches`.
+    sd:9729. `--parked` reads the Parked view's rows instead, open items only.
     """
     here = (_task_repo(argparse.Namespace(kind=None, no_repo=False, here=True), connection, workflow)
             if args.here else _belongs_to(args.belongs_to) if getattr(args, "belongs_to", None) else None)
     ref, needle = getattr(args, "ref", None), getattr(args, "grep", None)
     # ponytail: every done row is read when searching; a SQL filter if the store outgrows a scan.
     rows = [row for row in (dict(found) for found in sd_db.reads.backlog_items(
-                connection, repo=here, include_done_days=36500 if ref or needle else 7))
+                connection, repo=here, include_done_days=36500 if ref or needle else 7,
+                parked=getattr(args, "parked", False)))
             if (not args.open or row["status"] != "done")
             and (not args.kind or row["kind"] == args.kind)
             and (not args.status or row["status"] == args.status)
@@ -1632,6 +1634,8 @@ def register(groups: Any, store: Any) -> None:
 
     items = store.add_parser("items", help="workspace items from the shared database")
     items.add_argument("--open", action="store_true", help="exclude done items")
+    items.add_argument("--parked", action="store_true",
+                       help="only the open items the nightly prune parked, which the list hides")
     where = items.add_mutually_exclusive_group()
     where.add_argument("--here", action="store_true",
                        help="only this checkout's items; refuse unless it is registered in the sd database")
