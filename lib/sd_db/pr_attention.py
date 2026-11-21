@@ -301,5 +301,7 @@ def alert(connection: sqlite3.Connection, found: dict[str, dict], complete: bool
                 problems.append(f"{basis}: {error}")
     # A cut read keeps what it did not see: a pull it missed is not a pull whose state cleared.
     kept = (seen if not complete else held) | {basis for basis in found if basis in seen or basis in filed or basis in quiet}
-    record_state(connection, "heartbeat", key=seen_key, timestamp=when, body={"seen": sorted(kept)})
+    # `complete` and `unread` say what absence from `seen` proves: the Needs you sweep clears on it only then.
+    record_state(connection, "heartbeat", key=seen_key, timestamp=when,
+                 body={"seen": sorted(kept), "complete": complete, "unread": sorted(unread)})
     return {"filed": filed, "cleared": cleared, "problems": problems}
