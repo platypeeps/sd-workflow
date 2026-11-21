@@ -1115,6 +1115,13 @@ class Supervise(Case):
                 self.assertEqual(build_run.changed_lines(["git"], str(repo), base, run("rev-parse", "HEAD")),
                                  {"a.txt": {1}})
 
+    def test_output_with_no_file_header_reads_as_unknown(self):
+        """Class pass, sd:9769: git output the parser names no file in is unknown, never an empty delta."""
+        with mock.patch.object(build_run, "_read", return_value="some driver's own rendering\n"):
+            self.assertIsNone(build_run.changed_lines(["git"], "work", "a" * 40, "b" * 40))
+        with mock.patch.object(build_run, "_read", return_value=""):
+            self.assertEqual(build_run.changed_lines(["git"], "work", "a" * 40, "b" * 40), {})
+
     def test_a_mode_or_binary_change_reads_as_the_whole_file(self):
         """Review of sd:9769: git gives a mode-only or binary change no line range; any line of it is changed."""
         repo = Path(tempfile.mkdtemp(dir=self.root))

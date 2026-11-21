@@ -489,7 +489,7 @@ def changed_lines(git: Collection[str], work: str, base: str, head: str, *,
                 at, size = (hunk[1], hunk[2]) if deleted else (hunk[3], hunk[4])
                 start, count = int(at), int(size if size is not None else 1)
                 changed[path].update(range(max(start, 1), start + max(count, 1) + (count == 0)))
-    return changed
+    return changed if changed or not diff.strip() else None  # output naming no file is unknown, not empty
 
 
 # Git's state for an operation a worktree has not finished; each can carry commits the tree does not show.
