@@ -147,6 +147,8 @@ FAKE = textwrap.dedent('''
             git("add", "--", name)
         for old, new in extra.get("move", {}).items():
             git("mv", old, new)
+        for name in extra.get("remove", []):
+            git("rm", "-q", "--", name)
         # One `Closes: sd:N` trailer per item the brief lists, as the brief asks; `skip` leaves out the last
         # one, as a builder that skips an item for the operator does, and `none` delivers nothing.
         prompt = sys.argv[sys.argv.index("-p") + 1]
@@ -970,6 +972,22 @@ class Supervise(Case):
         """sd:9770: the same change with the table in the body is reviewed and enqueued."""
         self.design("## Summary\n\nx\n\n```\n| Step | State moved | Failure | Recovery | Test |\n```\n\n"
                     "## Test plan\n\ny\n")
+        ended = self.supervisor().run()
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        self.assertEqual(len(self.calls("sd-review")), 1)
+
+    def test_deleting_a_finished_design_md_needs_no_failure_table(self):
+        """Review of sd:9770: removing a done item's design.md moves no state; it reaches review untabled."""
+        done = "docs/work/2026-10-01-done/design.md"
+        (self.repo / done).parent.mkdir(parents=True)
+        (self.repo / done).write_text("# Done\n\nitem: sd:1\n", encoding="utf-8")
+        support.git(self.repo, "add", done)
+        support.git(self.repo, "commit", "-qm", "docs: a finished design")
+        support.git(self.repo, "push", "-q", "origin", "main")
+        (self.plans / "extra.json").write_text(json.dumps({"remove": [done]}))
+        self.press()
+        self.write_pr(body="## Summary\n\nx\n\n## Test plan\n\ny\n")
+        self.plan(claude=["extra"], sd_review=["clean"])
         ended = self.supervisor().run()
         self.assertEqual(ended.get("step"), "enqueued", ended)
         self.assertEqual(len(self.calls("sd-review")), 1)

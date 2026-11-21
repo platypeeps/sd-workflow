@@ -709,6 +709,8 @@ class SharedReview:
                 print(f"sd-ship: {test} failed a rerun in the last {FLAKE_DAYS} days; no flake retry", file=sys.stderr)
                 return None
         code, out, err = rerun_tests(self.root, head, tests)
+        if code == 0 and SKIPPED.search(f"{out}\n{err}"):
+            code = None  # `make test` refuses a skip: a skipped rerun proves nothing and bars nothing
         sd_lib.import_sd_db()
         from sd_db.database import transaction  # noqa: PLC0415
         from sd_db.writes import add_note  # noqa: PLC0415
@@ -1721,6 +1723,13 @@ def gate_code(check: dict) -> str:
 FAILED_TEST = re.compile(r"^(?:FAIL|ERROR): (\w+) \(([\w.]+)\)", re.M)
 #: The most failing tests a gate may name and be rerun as a flake: more is a real break.
 FLAKE_TESTS = 5
+#: A unittest run that skipped something, which `make test` refuses.
+SKIPPED = re.compile(r"skipped=[1-9]")
+#: A fault of the gate's runner, not a test, outside every shard block: `run-tests.sh`'s `error:` lines
+#: (a log it could not assemble, results it could not publish) and `make test`'s skip refusal.
+RUNNER_FAULT = re.compile(r"^(?:error: |fatal: |Tests skipped locally)", re.M)
+#: One shard's block of `run-tests.sh` output, from its start line to its end line.
+SHARD_BLOCK = re.compile(r"^shard (\S+): start$.*?^shard \1: \d+s exit=\d+$", re.M | re.S)
 #: How long a test that failed its rerun stays out of the flake retry (sd:9768).
 FLAKE_DAYS = 7
 #: The note a flake writes on the entry's item, and the one a failed rerun writes: one test each, then " at ".
@@ -1743,6 +1752,8 @@ def failed_tests(check: dict) -> list[str]:
             return []
         steps = [str(step) for step in shard_lines(row.get("failed_steps"))]
         text = whole_output(row)
+        if RUNNER_FAULT.search(SHARD_BLOCK.sub("", text)):
+            return []
         found = [paren if paren.endswith(f".{name}") else f"{paren}.{name}" for name, paren in FAILED_TEST.findall(text)]
         if not steps or not found or not all(test_step(step, text) for step in steps):
             return []
@@ -1787,8 +1798,23 @@ def test_suite(test: str) -> str:
     return ".".join(parts[:at]) or test
 
 
+def gate_python(tree: pathlib.Path, environment: dict[str, str]) -> str | None:
+    """The interpreter `make test` runs at `tree` under `environment`, or None: the Makefile's `VENV_PYTHON`,
+    after its `$(GATE_ENV)` prerequisite, which in gate mode builds the worktree's own `.venv` as the gate does."""
+    probe = "sd-rerun-python: $(GATE_ENV)\n\t@echo $(abspath $(VENV_PYTHON))\n"
+    try:
+        done = subprocess.run(["make", "-s", "--no-print-directory", "-f", "Makefile", "-f", "-", "sd-rerun-python"],
+                              cwd=tree, env=environment, input=probe, capture_output=True, text=True,
+                              timeout=sd_lib.GATE_CHECK_SECONDS)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    lines = done.stdout.strip().splitlines()
+    python = lines[-1] if done.returncode == 0 and lines else ""
+    return python if python and os.access(python, os.X_OK) else None
+
+
 def rerun_tests(root: pathlib.Path, head: str, tests: list[str]) -> tuple[int | None, str, str]:
-    """`python3 -m unittest` on `tests` alone in a clean detached worktree of `head`, as the gate ran them
+    """The gate's interpreter `-m unittest` on `tests` alone in a clean detached worktree of `head`, as the gate ran them
     (sd:9768): no uncommitted or untracked file in `root` reaches the rerun. None for the exit code when the
     worktree could not be made or the rerun did not finish.
 
@@ -1806,8 +1832,12 @@ def rerun_tests(root: pathlib.Path, head: str, tests: list[str]) -> tuple[int | 
         try:
             if sd_gate_run.gate_git(tree, "rev-parse", "HEAD") != head:
                 return None, "", f"the rerun's worktree is not at {head[:12]}"
-            return sd_gate_run.run_child(["python3", "-m", "unittest", *tests], sd_gate_run.gate_environment(tree),
-                                         tree, sd_lib.GATE_CHECK_SECONDS)
+            environment = sd_gate_run.gate_environment(tree)
+            python = gate_python(tree, environment)
+            if python is None:
+                return None, "", f"no gate interpreter (the Makefile's VENV_PYTHON) at {head[:12]}"
+            return sd_gate_run.run_child([python, "-m", "unittest", *tests], environment, tree,
+                                         sd_lib.GATE_CHECK_SECONDS)
         finally:
             sd_lib.git_output(["worktree", "remove", "--force", str(tree)], root)
 

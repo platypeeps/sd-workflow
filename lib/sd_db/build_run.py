@@ -1333,11 +1333,12 @@ class Supervisor:
         """The failure-table refusal for a change that moves state in steps, or none (sd:9770).
 
         `docs/work/*/design.md` exists only for such a change (docs/work/README.md): the change is one when the
-        branch touches a design.md there, or one there names a member (`item: sd:N`). It passes when that
+        branch adds or changes a design.md there, or one there names a member (`item: sd:N`); deleting a finished
+        one moves no state (review of sd:9770). It passes when that
         design.md or the body holds a header line naming the five columns.
         """
         work = Path(self.work)
-        changed = _read([*self.tools.git, "-C", str(work), "diff", "--name-only", f"{self.base()}...{head}", "--",
+        changed = _read([*self.tools.git, "-C", str(work), "diff", "--name-only", "--diff-filter=d", f"{self.base()}...{head}", "--",
                          "docs/work"], env=self.env).splitlines()
         named = re.compile(r"^item:\s*sd:(" + "|".join(str(item) for item in [self.lead, *self.others]) + r")\b", re.M)
         designs = {path for path in changed if path.endswith("/design.md")}

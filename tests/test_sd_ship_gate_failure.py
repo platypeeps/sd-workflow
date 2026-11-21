@@ -724,6 +724,28 @@ class AFlakyGateTestIsRerunAlone(unittest.TestCase):
         self.assertIsNotNone(refused)
         self.assertEqual(rerun.call_count, 0)
 
+    def test_a_gate_whose_runner_also_failed_is_no_flake(self):
+        """`run-tests.sh` failing to publish its results gives the same shard and step lines as a failed test:
+        the test passing alone must not clear that second fault."""
+        log = pathlib.Path(self.row["output_path"])
+        log.write_text(OUTPUT + "error: could not publish this run's results to example; the files there are "
+                       "not this run's.\n", encoding="utf-8")
+        self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [])
+        log.write_text(OUTPUT + "Tests skipped locally; install required tools or make the skip explicit.\n",
+                       encoding="utf-8")
+        self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [])
+        _review, rerun, refused = self.prepared()
+        self.assertIsNotNone(refused)
+        self.assertEqual(rerun.call_count, 0)
+
+    def test_a_rerun_that_skipped_is_no_pass(self):
+        """`make test` refuses a skip; a rerun that skipped the test (a missing tool) proves nothing and bars
+        nothing."""
+        review, _rerun, refused = self.prepared(rerun=(0, "", "Ran 1 test in 0.001s\n\nOK (skipped=1)\n"))
+        self.assertIsNotNone(refused)
+        self.assertEqual((self.notes(FLAKE), self.notes(RERUN_FAILED)), ([], []))
+        self.assertIsNone(review.state.get("gate_flake"))
+
     def test_a_rerun_that_never_ran_the_test_bars_nothing(self):
         """An import or environment fault in the rerun names no failed test: the gate failure stands, but no
         test goes on the seven-day list for it."""
@@ -756,10 +778,13 @@ class TheRerunRunsAtTheReviewedHead(unittest.TestCase):
                                   text=True, env=clean_environment()).stdout.strip()
 
         git("init", "-q")
+        # The gate's Makefile builds its environment first (`$(GATE_ENV)`), then names it relative to the tree.
+        (root / "Makefile").write_text(f"GATE_ENV := made\nVENV_PYTHON = v/bin/python\nmade:\n"
+                                       f"\t@mkdir -p v/bin && ln -sf {sys.executable} v/bin/python\n", encoding="utf-8")
         git("config", "user.email", "operator@example.test")
         git("config", "user.name", "operator")
         (root / "example.py").write_text("BROKEN = True\n", encoding="utf-8")
-        git("add", "example.py")
+        git("add", "example.py", "Makefile")
         git("commit", "-q", "-m", "head")
         head = git("rev-parse", "HEAD")
         (root / "example.py").write_text("BROKEN = False\n", encoding="utf-8")  # an uncommitted fix
@@ -776,9 +801,15 @@ class TheRerunRunsAtTheReviewedHead(unittest.TestCase):
             self.assertEqual(sd_ship_review.rerun_tests(root, head, [FLAKY_TEST]), (0, "OK", ""))
         self.assertNotEqual(seen["cwd"].resolve(), root.resolve())
         self.assertEqual((seen["head"], seen["text"]), (head, "BROKEN = True\n"))
-        self.assertEqual(seen["command"][-1], FLAKY_TEST)
+        self.assertEqual((seen["command"][0], seen["command"][-1]), (f"{seen['cwd']}/v/bin/python", FLAKY_TEST),
+                         "the gate's interpreter, built and named by the Makefile at head")
         self.assertFalse(seen["cwd"].exists(), "the worktree is removed after the rerun")
         self.assertNotIn(str(seen["cwd"]), git("worktree", "list"))
+        git("rm", "-q", "Makefile")
+        git("commit", "-q", "-m", "no makefile")
+        with unittest.mock.patch.object(sd_gate_run, "run_child", side_effect=child) as ran:
+            code, _out, err = sd_ship_review.rerun_tests(root, git("rev-parse", "HEAD"), [FLAKY_TEST])
+        self.assertEqual((code, ran.call_count), (None, 0), err)
 
 
 if __name__ == "__main__":
