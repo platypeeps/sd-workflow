@@ -743,9 +743,11 @@ def split(connection, lead: int) -> str:
 def _current(connection, member: dict) -> bool:
     """Whether no newer build of bundle `member`'s item stands, open, blocked or delivered: only then may this
     bundle write the item's status or parking; a newer build owns them otherwise (pack sd:9581). A newer one
-    cancelled owns nothing, so the older bundle, whose branch holds the item's work, may retry it (sd:9788)."""
+    cancelled, or one blocked before it ever ran (a refused press), owns nothing, so the older bundle, whose
+    branch holds the item's work, may retry it (sd:9788)."""
     return connection.execute("SELECT 1 FROM assignment WHERE item = ? AND scope = ? AND id > ? "
-                              "AND status != 'cancelled'", (member["item"], SCOPE, member["id"])).fetchone() is None
+                              "AND status != 'cancelled' AND NOT (status = 'blocked' AND run_count = 0)",
+                              (member["item"], SCOPE, member["id"])).fetchone() is None
 
 
 def split_held(connection, item: int) -> bool:
@@ -850,8 +852,10 @@ def _retry_row(connection, item: int):
     if rows and rows[0]["status"] == "cancelled":
         for row in rows[1:]:
             lead = row["parent"] or row["id"]
+            state = queue_state(connection, lead)
+            # One that never ran has no worktree: it would mask an older bundle that ran (review of sd:9788).
             if (row["status"] == "blocked" and not _alone(connection, row["id"])
-                    and queue_state(connection, lead)["status"] == "blocked"):
+                    and state["status"] == "blocked" and state["run"] is not None):
                 return row
     return rows[0] if rows else None
 

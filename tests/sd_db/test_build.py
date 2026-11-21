@@ -936,6 +936,24 @@ class Reap(Case):
         self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", newer), "cancelled")
         self.assertEqual(self.claim()["assignment"], self.bundle["assignment"])
 
+    def test_build_by_item_skips_a_blocked_build_that_never_ran(self):
+        """Review of sd:9788: a fresh build the claim refused never ran, then a newer one was cancelled before its
+        claim. Build of the item read the refused one, a fresh press from main; the bundle that ran, whose
+        worktree holds the item's work, is the one queued again."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        old = sorted(member["id"] for member in build.run(self.db, row["id"])["members"])
+        transition(self.db, self.items[1], "ready", who="operator")
+        refused = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'blocked', result = 'refused; not built' WHERE id = ?",
+                        (refused,))
+        cancelled = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (cancelled,))
+        queued = build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual(sorted(entry["id"] for entry in queued), old)
+        self.assertEqual(self.claim()["assignment"], self.bundle["assignment"])
+
     def test_build_with_a_finding_on_a_blocked_bundle_sends_it_to_the_builder(self):
         """pack sd:8792: `sd assignments build N --finding TEXT` is Send to builder: the finding note the builder
         reads, then the bundle queued again. A fresh build has no builder to send it to, so it refuses."""

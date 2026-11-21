@@ -1233,7 +1233,7 @@ class Supervise(Case):
         self.release_all()
         self.db.execute("UPDATE item SET status = 'ready' WHERE id = ?", (item,))
         newer = build.queue(self.db, [item], who="operator")[0]["id"]
-        self.db.execute("UPDATE assignment SET status = 'blocked' WHERE id = ?", (newer,))
+        self.db.execute("UPDATE assignment SET status = 'blocked', run_count = 1 WHERE id = ?", (newer,))
         self.db.execute("UPDATE item SET status = 'blocked' WHERE id = ?", (item,))
         return newer
 
