@@ -190,6 +190,19 @@ class TheOtherStarts(DependencyCase):
         roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
         self.assertIsNone(runner.claim(self.db, parallel, owner="fixture", **roots))
 
+    def test_a_parallel_prerequisite_passes_the_serial_batch_behind_its_dependent(self):
+        """Review: A, B one serial batch, C parallel apart, A waits on C. B waits for A's merge, and the
+        repository rule held C behind B; C, the one A needs, runs first."""
+        from sd_db import runner
+        (first, _), (ahead, behind) = self.serial(2)
+        third, parallel = self.lone("work/c", parallel=True)
+        self.wait(first, third)
+        roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
+        self.assertIsNone(runner.claim(self.db, ahead, owner="fixture", **roots))
+        self.assertIsNone(runner.claim(self.db, behind, owner="fixture", **roots))
+        started = runner.claim(self.db, parallel, owner="fixture", **roots)
+        self.assertEqual(started and started["status"], "running", "C runs first")
+
     def test_a_run_that_waits_outside_the_queue_keeps_its_place(self):
         """A waits on an item with no queued run: nothing behind it can unblock it, so the order holds."""
         from sd_db import runner
