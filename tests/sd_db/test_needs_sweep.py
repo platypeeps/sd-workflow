@@ -229,6 +229,26 @@ class TheSweep(unittest.TestCase):
                 self.assertEqual(self.status(item), "planning")
                 self.assertEqual(out["closed"], [])
 
+    def test_a_report_the_operator_reopened_needs_evidence_newer_than_the_reopen(self):
+        """Review round 6: a reopen outranks the evidence that closed it; only a run or a read after it clears."""
+        for name, item, evidence in (
+                ("a clean run", self.report(), lambda: self.chain()),
+                ("a read that no longer sees it", self.pr_alert(),
+                 lambda: record_state(self.db, "heartbeat", key=pr_attention.SEEN_KEY, timestamp="2099-01-01T00:00:00Z",
+                                      body={"seen": [], "complete": True, "unread": []}))):
+            with self.subTest(name):
+                evidence()
+                self.sweep()
+                self.assertEqual(self.status(item), "done")
+                transition(self.db, item, "planning", who="operator", reason="still broken")
+                # The reopen lands after the evidence: a seen read stamped 2099 needs a later reopen.
+                self.db.execute("UPDATE note SET timestamp = '2100-01-01T00:00:00+00:00' WHERE id ="
+                                " (SELECT max(id) FROM note WHERE item = ? AND kind = 'status_change')", (item,))
+                out = self.sweep()
+                self.assertEqual(self.status(item), "planning")
+                self.assertEqual([row["why"] for row in out["kept"] if row["item"] == item],
+                                 ["no evidence since the operator reopened it"])
+
     def test_a_report_end_or_a_run_end_that_is_no_time_proves_no_clean_run(self):
         """Review round 4: a missing report end read as "" and any run sorted after it; text that is no time sorted
         after a real one. Only two real times, in order, prove the run came after the report."""

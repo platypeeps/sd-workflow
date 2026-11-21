@@ -37,7 +37,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TypeGuard
 
 from . import issue_attention, pr_attention, reporting, workflow
@@ -98,6 +98,8 @@ def _report_cleared(connection: sqlite3.Connection, row, fields: dict) -> tuple[
     keeps the row open, never closes it and never stops the sweep.
     """
     report = found if isinstance(found := fields.get("report"), dict) else {}
+    # A reopen outranks the evidence before it (review round 6): only a run or a read after it can clear the row.
+    reopened = _reopened(connection, row["id"])
     job, host, basis = report.get("job"), report.get("host"), report.get("attention_basis")
     if job is not None and not _text(job):
         return None, BAD_FIELDS
@@ -109,6 +111,8 @@ def _report_cleared(connection: sqlite3.Connection, row, fields: dict) -> tuple[
         # By the second: the read that filed the alert records it seen in that second, so only a later read counts.
         if seen is None or (seen["timestamp"] or "")[:19] <= (row["created_at"] or "")[:19]:
             return None, "no read since it was filed"
+        if reopened and seen["timestamp"][:19] <= reopened.isoformat()[:19]:
+            return None, REOPENED
         read = _body(seen["body"])
         # `pr_attention.alert` writes all three: a list of seen states, `complete`, and a list of unread kinds.
         if read is None or not _texts(read.get("seen")) or not _texts(read.get("unread")) \
@@ -143,10 +147,24 @@ def _report_cleared(connection: sqlite3.Connection, row, fields: dict) -> tuple[
     run_ended = _time(last.get("ended"))
     if not _text(run) or run_ended is None or "item" not in last or last["item"] is not None or not run_ended > ended:
         return None, f"no clean run of {job} on {host} since"
+    if reopened and not run_ended > reopened:
+        return None, REOPENED
     if connection.execute("SELECT 1 FROM item WHERE source = 'cron-report' AND external_id = ?",
                           (f"{job}:{run}",)).fetchone() or reporting._folded_into(connection, job, run):
         return None, f"{job}'s newest run on {host} filed a report"
     return f"{reporting.RECOVERED}{job}:{run} on {host} ended {last['ended']}", ""
+
+
+REOPENED = "no evidence since the operator reopened it"
+
+
+def _reopened(connection: sqlite3.Connection, item: int) -> datetime | None:
+    """When `item` last left done, or None if it never did; a stamp that is no time is the end of time: no clear."""
+    note = connection.execute("SELECT timestamp FROM note WHERE item = ? AND kind = 'status_change'"
+                              " AND body LIKE 'done -> %' ORDER BY id DESC LIMIT 1", (item,)).fetchone()
+    if note is None:
+        return None
+    return _time(note["timestamp"]) or datetime.max.replace(tzinfo=UTC)
 
 
 def _report_check(connection: sqlite3.Connection, item: int) -> tuple[str | None, str]:
