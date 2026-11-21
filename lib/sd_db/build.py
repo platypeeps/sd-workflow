@@ -751,10 +751,10 @@ def _current(connection, member: dict) -> bool:
 
 
 def split_held(connection, item: int) -> bool:
-    """Whether `item`'s latest build bundle is held after a split (`split`): Build takes it fresh, blocked as it is,
-    on a new branch; Retry refuses that bundle (pack sd:9581)."""
-    row = connection.execute("SELECT id, parent, status FROM assignment WHERE item = ? AND scope = ? "
-                             "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
+    """Whether the build bundle Build reads for `item` (`_retry_row`) is held after a split (`split`): Build takes
+    it fresh, blocked as it is, on a new branch; Retry refuses that bundle (pack sd:9581). The same row Retry
+    would take, not merely the newest, which may be a cancelled build (review of sd:9788)."""
+    row = _retry_row(connection, item)
     return (row is not None and row["status"] in AGAIN and not _alone(connection, row["id"])
             and split(connection, row["parent"] or row["id"]) == "held")
 

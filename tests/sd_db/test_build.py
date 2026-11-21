@@ -954,6 +954,28 @@ class Reap(Case):
         self.assertEqual(sorted(entry["id"] for entry in queued), old)
         self.assertEqual(self.claim()["assignment"], self.bundle["assignment"])
 
+    def test_build_by_item_reads_the_held_split_of_the_bundle_it_chose(self):
+        """Review of sd:9788: Build read the held split on the item's newest build, a cancelled one, while it chose
+        the older blocked bundle, held after a subset Retry; that bundle's Retry refused and no fresh build ran.
+        The held bundle it chose sends the item to a fresh build on a new branch."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        lead = self.bundle["assignment"]
+        build.retry(self.db, lead, who="operator", only=[self.items[0]])
+        held = self.claim()
+        self.db.execute("UPDATE runner_run SET outcome = 'blocked', detail = ?, released_at = ? WHERE id = ?",
+                        (build.SPLIT + "its branch holds earlier work", build.clock(), held["id"]))
+        self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (build.clock(), held["id"]))
+        self.db.execute("UPDATE assignment SET status = 'blocked' WHERE id = ?", (lead,))
+        self.db.execute("UPDATE item SET status = 'blocked' WHERE id = ?", (self.items[0],))
+        self.assertEqual(build.split(self.db, lead), "held")
+        cancelled = build.queue(self.db, [self.items[0]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (cancelled,))
+        queued = build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [self.items[0]])
+        self.assertNotIn(queued[0]["id"], (lead, cancelled), "a fresh build")
+
     def test_build_with_a_finding_on_a_blocked_bundle_sends_it_to_the_builder(self):
         """pack sd:8792: `sd assignments build N --finding TEXT` is Send to builder: the finding note the builder
         reads, then the bundle queued again. A fresh build has no builder to send it to, so it refuses."""
