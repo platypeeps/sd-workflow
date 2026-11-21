@@ -849,7 +849,9 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
 
 
 def _environ(environ: dict | None, ident: str) -> dict:
-    env = dict(os.environ if environ is None else environ)
+    # The supervisor's `git -C` calls and the builder start here: a hook's `GIT_DIR` would point them at its own
+    # repository, not the run's worktree (pack sd:9709, round 26).
+    env = paths.git_env(os.environ if environ is None else environ)
     # Machine hooks tell a headless builder from a session by this (pack sd:9715).
     env["SD_BUILD_RUN"] = ident
     # The token reaches the child's environment only: no row or log holds it.

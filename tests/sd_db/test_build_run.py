@@ -37,6 +37,7 @@ from sd_db import (
     follow,
     hub,
     operations,
+    paths,
     remote,
     runner,
     sessions,
@@ -537,6 +538,15 @@ class Supervise(Case):
         runs = [call["run"] for call in self.calls("claude")]
         self.assertTrue(runs)
         self.assertEqual(set(runs), {self.bundle["id"]})
+
+    def test_the_supervisor_env_drops_a_hooks_git_location(self):
+        """pack sd:9709 round 26: the supervisor's git calls and the builder start from this env; a hook's
+        `GIT_DIR` or `GIT_WORK_TREE` would point them at the hook's repository, not the run's worktree."""
+        self.press(1)
+        self.env.update({"GIT_DIR": "/decoy/.git", "GIT_WORK_TREE": "/decoy", "GIT_INDEX_FILE": "/decoy/index"})
+        env = self.supervisor().env
+        self.assertEqual({key for key in env if key in paths.GIT_LOCAL}, set())
+        self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], self.env["GIT_CONFIG_NOSYSTEM"], "config isolation stays")
 
     def test_a_press_runs_to_the_lane(self):
         """Two items, one run, one branch, one lane entry; the members end done and the items stay in progress."""
