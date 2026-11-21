@@ -746,10 +746,13 @@ def drop_plan(connection, item: int) -> dict:
         host = lane["lane_host"] if lane else None
         if _route(connection, host, lead) != _route(connection, host, None):
             raise BuildRefused(f"Drop refused: build {lead} ran off its lane's host; drop a member, or Retry it whole")
-    # The bundle's members cancelled out of it before (`ALONE`), as `left` reads them: their commits stay on the
-    # branch, and the split must not carry them (round 3).
-    gone = {member["item"] for member in connection.execute(
-        f"SELECT item FROM assignment WHERE parent = ? AND scope = ? AND NOT {_in_group()}", (lead, SCOPE))}
+    # Every item the bundle built that is not kept, as Retry reads who leaves from the run's membership: a member
+    # cancelled out before (`ALONE`, round 3) or moved to planning (`UNBUILT`, round 8). Its commits stay on the old
+    # branch, and the split must not carry them. A done item's commits may stay: the merge closes nothing open.
+    built = [member["item"] for member in connection.execute(
+        "SELECT item FROM assignment WHERE (id = ? OR parent = ?) AND scope = ?", (lead, lead, SCOPE))]
+    states = reads.items_by_ids(connection, built)
+    gone = {one for one in built if not _done(states, one)}
     # The stored repo is a key (`~/...`); git needs the disk path, as `Supervisor` expands it (round 3).
     repo, work = paths.expand(last["repo"]), Path(last["work_path"])
     return {"item": item, "assignment": row["id"], "lead": lead, "new_lead": new, "kept": kept, "run": last["id"],

@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 from unittest import mock
 
-from sd_db import build, runner
+from sd_db import build, runner, writes
 from sd_db.writes import create_assignment, upsert_repo
 
 from .test_build import START, Case, Kill, Probe
@@ -465,3 +465,18 @@ class DropRound7(Repo):
             DROP.drop_item(self.db, build, items[1], who="operator")
         self.assertEqual(self.files(work), ["README", "a.txt", "c.txt"])
         self.assertNotIn(f"sd:{items[1]}", self.closes(work))
+
+
+class DropRound8(Repo):
+    """Review round 8 of pack sd:9709: the drop set aside only the dropped item and members marked `ALONE`. A
+    member moved back to planning (its assignment cancelled, `UNBUILT`) fell outside both, so its cited commits
+    reached the kept branch, and the next merge would close it in planning. Every item the bundle built that is
+    not kept, and not done, is now set aside, as Retry reads who leaves from the run's membership."""
+
+    def test_a_member_moved_to_planning_stays_off_the_kept_branch(self):
+        items, ids, run = self.bundle()
+        writes.transition(self.db, items[2], "planning", who="operator")
+        DROP.drop_item(self.db, build, items[1], who="operator")
+        work = Path(run["work_path"])
+        self.assertEqual(self.files(work), ["README", "a.txt"])
+        self.assertNotIn(f"sd:{items[2]}", self.closes(work))
