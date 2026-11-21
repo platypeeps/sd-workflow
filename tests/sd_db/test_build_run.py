@@ -1256,6 +1256,20 @@ class Supervise(Case):
         self.assertEqual(self.supervisor().locations({"path": "src/file.py", "line": 1, "instances": ["src/file.py:\u00b2"]}),
                          [("src/file.py", 1), ("src/file.py:\u00b2", None)])
 
+    def test_a_last_round_at_this_head_drops_to_a_full_review(self):
+        """Review of sd:9769: a fix round with no commit leaves the last report at this head; the older kept
+        report omits that round's blockers, so the next round reviews in full."""
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        for name, reviewed in (("review", "a" * 40), ("prior", "b" * 40)):
+            supervisor.out(name).write_text(json.dumps(
+                {"status": "blocking", "scope": "branch", "subject": {"head": reviewed}, "findings": []}),
+                encoding="utf-8")
+        with mock.patch.object(supervisor, "fresh", return_value={"review_round": 2}), \
+                mock.patch.object(build_run, "_read", return_value=""):
+            self.assertIsNone(supervisor.prior_review("a" * 40), "the older report stood in for this head's")
+
     def deferred(self, blockers, changed):
         """`file_new_findings` over `blockers` with the delta `changed`: the blockers it keeps."""
         supervisor = self.supervisor()

@@ -1310,8 +1310,10 @@ class Supervisor:
             except (OSError, ValueError):
                 continue
             reviewed = (answer.get("subject") or {}).get("head") if isinstance(answer, dict) else None
+            if reviewed == head:  # a fix with no commit: an older report would omit this round's blockers
+                return None
             # `sd-review` verifies only these statuses: a `skipped` round has no prior to verify (sd:2721).
-            if (not isinstance(reviewed, str) or reviewed == head or answer.get("scope") != "branch"
+            if (not isinstance(reviewed, str) or answer.get("scope") != "branch"
                     or answer.get("status") not in ("clean", "advisory", "blocking", "gate_failed")
                     or not isinstance(answer.get("findings"), list)):
                 continue
