@@ -375,6 +375,22 @@ class TheBuild(DependencyCase):
         build.retry(self.db, run["assignment"], who="operator")
         self.assertEqual(self.claim()["branch"], run["branch"])
 
+    def test_a_member_its_held_lead_waits_on_builds_on_its_own(self):
+        """Review of build/sd-1306: a retried bundle whose lead came to wait on its own member parked both, a
+        Build of the member retried the same bundle, and a subset Retry needs the lead. The member the lead
+        waits on leaves the bundle at the hold, so a Build takes it fresh on its own branch."""
+        lead, member = self.item(), self.item()
+        run = self.blocked_bundle(lead, member)
+        build.retry(self.db, run["assignment"], who="operator")
+        self.wait(lead, member)
+        self.assertIsNone(self.claim())
+        self.assertIsNone(item_state(self.db, member)["item"]["parked_at"], "the prerequisite stays free")
+        self.assertIsNotNone(item_state(self.db, lead)["item"]["parked_at"], "the lead stays held")
+        build.queue_again(self.db, [member], who="operator")
+        started = self.claim()
+        self.assertEqual([m["item"] for m in started["members"]], [member])
+        self.assertNotEqual(started["branch"], run["branch"])
+
     def test_auto_pickup_does_not_split_a_held_retried_bundle(self):
         """Review of build/sd-1306: the held bundle's items stayed ready and unparked, so the next pickup built the
         free member on a new branch. The hold parks them; Retry unparks them onto the original branch."""

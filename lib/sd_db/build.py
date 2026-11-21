@@ -1343,7 +1343,19 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             # Retry would lose the checkout it resumes (review of sd:9570).
             held = "; ".join(f"item {row['item']} {why}" for row, why in waiting)
             stamp = clock()
-            for row in bundle:
+            # A member the waiting ones need leaves the bundle, as a subset Retry leaves one out (`LEFT_OUT`):
+            # held with them it could never build, and its Build would retry this bundle (review of sd:9570).
+            needed = _needed(connection, [row["item"] for row, _ in waiting])
+            last = queue_state(connection, bundle[0]["id"])["run"]
+            for row in bundle[1:]:
+                if row["item"] in needed and last is not None:
+                    connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? "
+                                       "WHERE id = ? AND status = 'queued'",
+                                       (stamp, f"{ALONE}build: {LEFT_OUT}{last['id']}", row["id"]))
+                    add_note(connection, row["item"], "comment",
+                             f"Build assignment {row['id']} left its bundle: its lead waits on it ({held}); "
+                             f"Build it to build it on its own")
+            for row in [row for row in bundle if not _alone(connection, row["id"])]:
                 _refuse(connection, row, f"its bundle waits: {held}")
                 # Parked, as a blocked run parks its items: auto-pickup takes unparked items only, so no member is
                 # built alone on a new branch; Retry unparks them onto this one (review of sd:9570).
@@ -1407,6 +1419,24 @@ def _bundle(connection, rows: list) -> list:
         fresh = [row for row in rows if row["parent"] is None and not row["run_count"]]
         return fresh[:bundled(connection, [row["item"] for row in fresh])]
     return sorted((row for row in rows if group in (row["id"], row["parent"])), key=lambda row: row["id"] != group)
+
+
+def _needed(connection, items: list[int]) -> set[int]:
+    """The open items `items` wait on, directly or through other open items (pack sd:9570)."""
+    needed: set[int] = set()
+    pending = list(items)
+    while pending:
+        row = connection.execute("SELECT fields FROM item WHERE id = ?", (pending.pop(),)).fetchone()
+        try:
+            named = item_blocked_by(row) if row else []
+        except ValueError:
+            continue
+        for other in named:
+            status = connection.execute("SELECT status FROM item WHERE id = ?", (other,)).fetchone()
+            if other not in needed and status is not None and status["status"] != "done":
+                needed.add(other)
+                pending.append(other)
+    return needed
 
 
 def _refuse(connection, row, reason: str) -> None:
