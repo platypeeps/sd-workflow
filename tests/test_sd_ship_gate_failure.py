@@ -723,6 +723,16 @@ class AFlakyGateTestIsRerunAlone(unittest.TestCase):
         self.assertIsNotNone(refused)
         self.assertEqual(len(self.notes(f"{RERUN_FAILED}{FLAKY_TEST} at ")), 1)
 
+    def test_a_skipped_rerun_says_so_without_a_skip_summary(self):
+        """Gate of sd:9768: the refusal echoed the rerun's `OK (skipped=1)`, and `make test`'s skip check read that
+        line in the gate's own log as a skipped test. It names the reason in words instead."""
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            _review, _rerun, refused = self.prepared(rerun=(0, "", "Ran 1 test\n\nOK (skipped=1)"))
+        self.assertIsNotNone(refused)
+        self.assertNotRegex(stderr.getvalue(), r"skipped=[1-9]")
+        self.assertIn("skipped a test or passed one unexpectedly", stderr.getvalue())
+
     def test_a_second_flake_on_the_same_entry_fails(self):
         _review, rerun, refused = self.prepared(state={"passes": [], "gate_flake": {"head": HEAD, "tests": []}})
         self.assertIsNotNone(refused)

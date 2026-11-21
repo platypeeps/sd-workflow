@@ -725,7 +725,7 @@ class SharedReview:
                     if test in named:
                         add_note(self.connection, item, "comment",
                                  f"{RERUN_FAILED_NOTE}{test} at {head[:12]}: it failed alone too (sd:9768)")
-            print(f"sd-ship: the failing tests failed again alone ({rerun_reason(code, err)}); "
+            print(f"sd-ship: the failing tests failed again alone ({rerun_reason(code, out, err)}); "
                   "the gate failure stands",
                   file=sys.stderr)
             return None
@@ -1905,9 +1905,14 @@ def gate_python(tree: pathlib.Path, environment: dict[str, str]) -> str | None:
     return python if python and os.access(python, os.X_OK) else None
 
 
-def rerun_reason(code: int | None, err: str) -> str:
-    """A failed rerun's exit code; with none, the last line of its errors, which says why it stopped."""
-    return f"exit {code}" if code is not None else (err.strip().splitlines() or ["no clean pass"])[-1]
+def rerun_reason(code: int | None, out: str, err: str) -> str:
+    """A failed rerun's exit code; with none, why it stopped: in words for a skip or an unexpected success, never
+    unittest's own summary, which `make test`'s skip check would read in the gate's log as a skip of its own."""
+    if code is not None:
+        return f"exit {code}"
+    if FAILING_OUTCOME.search(f"{out}\n{err}"):
+        return "the rerun skipped a test or passed one unexpectedly"
+    return (err.strip().splitlines() or ["no clean pass"])[-1]
 
 
 def rerun_tests(root: pathlib.Path, head: str, tests: list[str]) -> tuple[int | None, str, str]:
