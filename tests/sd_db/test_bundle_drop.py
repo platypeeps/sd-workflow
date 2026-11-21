@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from unittest import mock
 
-from sd_db import build, runner, writes
+from sd_db import build, build_run, runner, writes
 from sd_db.writes import create_assignment, record_state, upsert_repo
 
 from .test_build import START, Case, Kill, Probe
@@ -625,3 +625,15 @@ class DropRound14(Repo):
         items, ids, run = self.bundle()
         DROP.drop_item(self.db, build, items[0], who="operator")
         self.assertEqual(build.left(self.db, run["branch"], items), set(items))
+
+    def test_the_kept_bundles_first_brief_carries_the_drop_finding(self):
+        items, ids, run = self.bundle()
+        DROP.drop_item(self.db, build, items[1], who="operator")
+        again = self.claim()
+        # The claim opens the new lead's first run a while after the drop: at test speed both share one second.
+        self.db.execute("UPDATE runner_run SET created_at = '2999-01-01T00:00:00+00:00' WHERE id = ?", (again["id"],))
+        supervisor = build_run.Supervisor(self.db, again["id"], tools=mock.Mock(), log_root=self.root / "logs",
+                                          cited=mock.Mock(), environ={})
+        findings = supervisor.brief()["findings"]
+        self.assertIn("already holds the commits of an earlier run", findings)
+        self.assertIn(f"sd:{items[1]} left this bundle", findings)

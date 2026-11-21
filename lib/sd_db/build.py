@@ -698,12 +698,14 @@ def _queue_members(connection, members: list[dict], items: dict, *, lead: int, w
             _item(connection, member["item"], lead=lead)
         except BuildRefused as refusal:
             raise BuildRefused(f"{verb} refused: {refusal}") from None
+        fresh = queue_state(connection, member["id"])["revision"]
+        queued.append(requeue(connection, member["id"], expected_revision=fresh, who=who))
+        # After the requeue, so the note is not older than the lead's `queued_at`, where a lead with no earlier run
+        # starts its brief's findings (round 14).
         if finding:
             add_note(connection, member["item"], "comment", FINDING + finding)
         elif parked:
             add_note(connection, member["item"], "comment", REVIEWED + parked)
-        fresh = queue_state(connection, member["id"])["revision"]
-        queued.append(requeue(connection, member["id"], expected_revision=fresh, who=who))
         add_note(connection, member["item"], "comment", f"Build assignment {member['id']} queued again by {who}: {how}")
     return [{"id": row["id"], "item": row["item"], "status": row["status"]} for row in queued]
 

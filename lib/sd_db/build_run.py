@@ -1628,8 +1628,11 @@ class Supervisor:
         A bundle queued again keeps its lead, so this run resumes the branch an earlier run left. Only a Send to
         builder note is the operator's; a REVIEWED note is the reviewer's text, and the brief says so.
         """
-        first = self.db.execute("SELECT MIN(created_at) FROM runner_run WHERE assignment = ?",
-                                (self.row["assignment"],)).fetchone()[0]
+        # Or since the lead was queued, if that is earlier: a bundle drop notes its finding on a new lead before
+        # the lead's first run (pack sd:9709, round 14).
+        first = self.db.execute("SELECT MIN(at) FROM (SELECT created_at AS at FROM runner_run WHERE assignment = ? "
+                                "UNION ALL SELECT queued_at FROM assignment WHERE id = ?)",
+                                (self.row["assignment"], self.row["assignment"])).fetchone()[0]
 
         def listed(prefix: str, *, latest: bool = False) -> str:
             notes = self.db.execute(
