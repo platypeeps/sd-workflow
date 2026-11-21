@@ -130,6 +130,9 @@ DROPPED = "dropped from build run "
 RESERVED = "build-drop"
 #: The keys `drop_reserve` adds to a drop plan.
 RESERVED_KEYS = ("new_lead", "new_work", "new_branch")
+#: The result of a bundle drop's new lead until its first run, then the ended run's id: its kept work is in a
+#: worktree on the host that ran that run, which alone may claim it (pack sd:9709, round 16).
+KEPT = "kept by a bundle drop of build run "
 #: The bundle statuses Retry and Send to builder take: each keeps its worktree.
 AGAIN = ("blocked", "cancelled")
 #: A lane entry that failed only because prepare's merge of origin/<base> conflicted goes back to its builder on
@@ -828,6 +831,7 @@ def drop_writes(connection, plan: dict, *, who: str, note: str, left: str) -> li
         how = f"bundle drop of sd:{plan['item']} from build run {plan['run']}"
         queued = _queue_members(connection, members, items, lead=lead, who=who, finding=note, parked="",
                                 how=how, verb="Drop")
+        connection.execute("UPDATE assignment SET result = ? WHERE id = ?", (f"{KEPT}{plan['run']}", lead))
         if items[plan["item"]]["status"] == "blocked":
             transition(connection, plan["item"], "ready", who=who, reason=how)
         unpark(connection, plan["item"])
@@ -1398,9 +1402,17 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
         available = room(connection, load=load, load_cap=load_cap, interactive=interactive, hosts=hosts)
         if available["why"]:
             return None
+        # A bundle drop's new lead has no run, so it routes by the lane as it reads now; its kept work is in a
+        # worktree on the host that ran the ended run. A lane moved since would build it there fresh (round 16).
+        for row in queued:
+            held = _kept_host(connection, row)
+            if held is not None and lanes[row["id"]] in hosts and lanes[row["id"]] != lane_of(connection, held[1]):
+                _refuse(connection, row, f"its kept work is in a worktree on {held[1] or 'the hub'}, which ran build "
+                                         f"run {held[0]}, but its lane moved; drop or Build its items again there")
         # A member whose lead is no longer queued (moved to planning, refused) would lead its own fresh branch, past
         # the lead's branch, which holds the bundle's work, a bundle drop's cherry-picks alone (round 15).
-        leads = {row["id"] for row in queued}
+        leads = {row["id"] for row in queued if connection.execute(
+            "SELECT status FROM assignment WHERE id = ?", (row["id"],)).fetchone()[0] == "queued"}
         for row in queued:
             if row["parent"] is not None and row["parent"] not in leads and lanes[row["id"]] in hosts:
                 _refuse(connection, row, f"its lead, assignment {row['parent']}, is no longer queued, and its "
@@ -1468,6 +1480,17 @@ def _bundle(connection, rows: list) -> list:
         fresh = [row for row in rows if row["parent"] is None and not row["run_count"]]
         return fresh[:bundled(connection, [row["item"] for row in fresh])]
     return sorted((row for row in rows if group in (row["id"], row["parent"])), key=lambda row: row["id"] != group)
+
+
+def _kept_host(connection, row) -> tuple[str, str | None] | None:
+    """(run, host) of the ended run a bundle drop's new lead `row` keeps the work of, until the lead runs; None for
+    any other row, or when that run reads gone."""
+    result = connection.execute("SELECT result FROM assignment WHERE id = ? AND parent IS NULL AND NOT EXISTS "
+                                "(SELECT 1 FROM runner_run WHERE assignment = ?)", (row["id"], row["id"])).fetchone()
+    if result is None or not (result["result"] or "").startswith(KEPT):
+        return None
+    ran = connection.execute("SELECT owner FROM runner_run WHERE id = ?", (result["result"][len(KEPT):],)).fetchone()
+    return (result["result"][len(KEPT):], run_host(ran["owner"])) if ran else None
 
 
 def _refuse(connection, row, reason: str) -> None:

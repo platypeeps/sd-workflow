@@ -693,3 +693,22 @@ class DropRound16(Repo):
         supervisor = build_run.Supervisor(self.db, again["id"], tools=mock.Mock(), log_root=self.root / "logs",
                                           cited=mock.Mock(), environ={})
         self.assertIn(f"sd:{items[1]} left this bundle", supervisor.brief()["findings"])
+
+    def test_a_lane_moved_after_the_drop_does_not_claim_the_kept_bundle_elsewhere(self):
+        items, ids, run = self.bundle()
+        self.db.execute("UPDATE runner_run SET owner = 'fixture@sat-a' WHERE id = ?", (run["id"],))
+        self.db.execute("UPDATE repo SET lane_host = 'sat-a' WHERE path = ?", (str(self.repo),))
+        for host in ("sat-a", "sat-b"):
+            record_state(self.db, "heartbeat", key=f"build-dispatch@{host}", body={})
+        with mock.patch.multiple(build, lane_hosts=mock.Mock(return_value=frozenset({"sat-a"})),
+                                 hub_host=mock.Mock(return_value="hub")):
+            lead = DROP.drop_item(self.db, build, items[1], who="operator")[0]["id"]
+        self.db.execute("UPDATE repo SET lane_host = 'sat-b' WHERE path = ?", (str(self.repo),))
+        with mock.patch.object(build, "hub_host", return_value="hub"):
+            for _ in range(3):
+                claimed = self.claim(hosts=frozenset({"sat-b"}))
+                if claimed is not None:
+                    self.assertNotEqual(claimed["assignment"], lead)
+        row = self.db.execute("SELECT status, result FROM assignment WHERE id = ?", (lead,)).fetchone()
+        self.assertEqual(row["status"], "blocked")
+        self.assertIn("sat-a", row["result"])
