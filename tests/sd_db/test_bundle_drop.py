@@ -670,3 +670,26 @@ class DropRound15(Repo):
         member = self.db.execute("SELECT status, result FROM assignment WHERE id = ?", (queued[1]["id"],)).fetchone()
         self.assertEqual(member["status"], "blocked")
         self.assertIn(f"build/sd-{queued[0]['id']}", member["result"])
+
+
+class DropRound16(Repo):
+    """Review round 16 of pack sd:9709: a Retry after the kept bundle's first run moved `queued_at` past the
+    drop's finding, so the next brief lost it; and a lane moved after the drop sent the new lead, which has no run
+    of its own, to a host that holds none of its work."""
+
+    def test_a_retry_after_the_first_run_keeps_the_drop_finding(self):
+        items, ids, run = self.bundle()
+        lead = DROP.drop_item(self.db, build, items[1], who="operator")[0]["id"]
+        # The drop's notes are older than the first claim, as on a real machine.
+        self.db.execute("UPDATE note SET timestamp = '2000-01-01T00:00:00+00:00' WHERE item IN (?, ?)",
+                        (items[0], items[2]))
+        first = self.claim()
+        build.write(self.db, first["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START)
+        build.end(self.db, first["id"], "blocked", "fixture")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        build.retry(self.db, lead, who="operator")
+        again = self.claim()
+        self.assertEqual(again["assignment"], lead)
+        supervisor = build_run.Supervisor(self.db, again["id"], tools=mock.Mock(), log_root=self.root / "logs",
+                                          cited=mock.Mock(), environ={})
+        self.assertIn(f"sd:{items[1]} left this bundle", supervisor.brief()["findings"])
