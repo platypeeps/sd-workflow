@@ -708,13 +708,14 @@ class SharedReview:
                                        (since, len(failed), failed)).fetchone():
                 print(f"sd-ship: {test} failed a rerun in the last {FLAKE_DAYS} days; no flake retry", file=sys.stderr)
                 return None
-        code, out, err = rerun_tests(self.root, tests)
+        code, out, err = rerun_tests(self.root, head, tests)
         sd_lib.import_sd_db()
         from sd_db.database import transaction  # noqa: PLC0415
         from sd_db.writes import add_note  # noqa: PLC0415
         if code != 0:
-            named = set(failed_tests({"checks": [{"status": "fail", "failed_steps": ["make target test"],
-                                                  "failure": f"{out}\n{err}"}]})) or set(tests)
+            # Only a test the rerun ran and saw fail is barred: one that did not load or run is not (sd:9768).
+            named = {paren if paren.endswith(f".{name}") else f"{paren}.{name}"
+                     for name, paren in FAILED_TEST.findall(f"{out}\n{err}")} if code is not None else set()
             with transaction(self.connection):
                 for test in tests:
                     if test in named:
@@ -1738,6 +1739,8 @@ def failed_tests(check: dict) -> list[str]:
         return []
     ids: list[str] = []
     for row in rows:
+        if not exited_failing(row):
+            return []
         steps = [str(step) for step in shard_lines(row.get("failed_steps"))]
         text = whole_output(row)
         found = [paren if paren.endswith(f".{name}") else f"{paren}.{name}" for name, paren in FAILED_TEST.findall(text)]
@@ -1746,6 +1749,13 @@ def failed_tests(check: dict) -> list[str]:
         ids += found
     ids = list(dict.fromkeys(ids))
     return ids if len(ids) <= FLAKE_TESTS and not any(test.startswith("unittest.") for test in ids) else []
+
+
+def exited_failing(row: dict[str, Any]) -> bool:
+    """Whether `row`'s check exited on its own with a failure: a timeout or a check that could not start
+    (`exit_code` None, a `reason`) never finished its work, so no test in it is known to be the only fault."""
+    code = row.get("exit_code")
+    return isinstance(code, int) and not isinstance(code, bool) and code != 0 and not row.get("reason")
 
 
 def test_step(step: str, text: str) -> bool:
@@ -1777,15 +1787,29 @@ def test_suite(test: str) -> str:
     return ".".join(parts[:at]) or test
 
 
-def rerun_tests(root: pathlib.Path, tests: list[str]) -> tuple[int | None, str, str]:
-    """`python3 -m unittest` on `tests` alone in `root`, under the gate's environment (sd:9768).
+def rerun_tests(root: pathlib.Path, head: str, tests: list[str]) -> tuple[int | None, str, str]:
+    """`python3 -m unittest` on `tests` alone in a clean detached worktree of `head`, as the gate ran them
+    (sd:9768): no uncommitted or untracked file in `root` reaches the rerun. None for the exit code when the
+    worktree could not be made or the rerun did not finish.
 
     ponytail: no gate slot, as a handful of tests is not a gate; take one if reruns ever grow.
     """
+    import sd_gate_cache  # noqa: PLC0415
     import sd_gate_run  # noqa: PLC0415
 
-    return sd_gate_run.run_child(["python3", "-m", "unittest", *tests], sd_gate_run.gate_environment(root), root,
-                                 sd_lib.GATE_CHECK_SECONDS)
+    with tempfile.TemporaryDirectory(**sd_gate_cache.worktree_place(root, head)) as parent:
+        tree = pathlib.Path(parent) / "tree"
+        try:
+            sd_gate_run.gate_git(root, "worktree", "add", "--detach", str(tree), head)
+        except sd_gate_run.GateError as error:
+            return None, "", f"no worktree of {head[:12]} for the rerun: {error}"
+        try:
+            if sd_gate_run.gate_git(tree, "rev-parse", "HEAD") != head:
+                return None, "", f"the rerun's worktree is not at {head[:12]}"
+            return sd_gate_run.run_child(["python3", "-m", "unittest", *tests], sd_gate_run.gate_environment(tree),
+                                         tree, sd_lib.GATE_CHECK_SECONDS)
+        finally:
+            sd_lib.git_output(["worktree", "remove", "--force", str(tree)], root)
 
 
 #: The statuses a review clears a head with; `cleared_status` is one of them when the gate failed after it.

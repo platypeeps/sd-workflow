@@ -644,7 +644,7 @@ class AFlakyGateTestIsRerunAlone(unittest.TestCase):
     def test_a_flaky_test_passes_on_rerun_and_the_entry_proceeds_with_a_flake_record(self):
         review, rerun, refused = self.prepared()
         self.assertIsNone(refused)
-        self.assertEqual(rerun.call_args.args[1], [FLAKY_TEST], "only the failing test, alone")
+        self.assertEqual(rerun.call_args.args[1:], (HEAD, [FLAKY_TEST]), "only the failing test, alone, at head")
         [entry] = review.state["passes"]
         self.assertEqual((entry["report"]["status"], entry["report"]["check"]["status"]), ("clean", "pass"))
         self.assertEqual(entry["report"]["failed_check"]["status"], "fail")
@@ -712,6 +712,73 @@ class AFlakyGateTestIsRerunAlone(unittest.TestCase):
         _review, rerun, refused = self.prepared(check=lint)
         self.assertIsNotNone(refused)
         self.assertEqual(rerun.call_count, 0)
+
+    def test_a_timed_out_gate_is_not_taken_for_a_flake(self):
+        """A row that timed out after a failing shard finished never ran its other shards: it is no flake."""
+        timed_out = {**self.row, "exit_code": None, "reason": "timed out after 900s"}
+        unstarted = {**self.row, "exit_code": None, "reason": "cannot run make: not found"}
+        for name, row in (("timed out", timed_out), ("unstarted", unstarted)):
+            with self.subTest(name):
+                self.assertEqual(sd_ship_review.failed_tests({"checks": [row]}), [])
+        _review, rerun, refused = self.prepared(check=timed_out)
+        self.assertIsNotNone(refused)
+        self.assertEqual(rerun.call_count, 0)
+
+    def test_a_rerun_that_never_ran_the_test_bars_nothing(self):
+        """An import or environment fault in the rerun names no failed test: the gate failure stands, but no
+        test goes on the seven-day list for it."""
+        for name, rerun in (("import", (1, "", "ImportError: No module named 'example'\nFAILED (errors=1)")),
+                            ("timeout", (None, "", "timed out"))):
+            with self.subTest(name):
+                _review, _rerun, refused = self.prepared(rerun=rerun)
+                self.assertIsNotNone(refused)
+                self.assertEqual(self.notes(RERUN_FAILED), [])
+
+
+class TheRerunRunsAtTheReviewedHead(unittest.TestCase):
+    """sd:9768 review: the rerun runs in a clean worktree of the gate's head, never the caller's checkout."""
+
+    def test_the_rerun_runs_in_a_clean_worktree_of_head(self):
+        import subprocess
+        import tempfile
+
+        import sd_gate_run
+
+        from tests.clean_env import clean_environment
+
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        root = pathlib.Path(scratch.name) / "repo"
+        root.mkdir()
+
+        def git(*args):
+            return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True,
+                                  text=True, env=clean_environment()).stdout.strip()
+
+        git("init", "-q")
+        git("config", "user.email", "operator@example.test")
+        git("config", "user.name", "operator")
+        (root / "example.py").write_text("BROKEN = True\n", encoding="utf-8")
+        git("add", "example.py")
+        git("commit", "-q", "-m", "head")
+        head = git("rev-parse", "HEAD")
+        (root / "example.py").write_text("BROKEN = False\n", encoding="utf-8")  # an uncommitted fix
+        seen = {}
+
+        def child(command, env, cwd, timeout):
+            seen.update(cwd=pathlib.Path(cwd), command=command,
+                        head=subprocess.run(["git", "-C", str(cwd), "rev-parse", "HEAD"], capture_output=True,
+                                            text=True, env=clean_environment()).stdout.strip(),
+                        text=(pathlib.Path(cwd) / "example.py").read_text(encoding="utf-8"))
+            return 0, "OK", ""
+
+        with unittest.mock.patch.object(sd_gate_run, "run_child", side_effect=child):
+            self.assertEqual(sd_ship_review.rerun_tests(root, head, [FLAKY_TEST]), (0, "OK", ""))
+        self.assertNotEqual(seen["cwd"].resolve(), root.resolve())
+        self.assertEqual((seen["head"], seen["text"]), (head, "BROKEN = True\n"))
+        self.assertEqual(seen["command"][-1], FLAKY_TEST)
+        self.assertFalse(seen["cwd"].exists(), "the worktree is removed after the rerun")
+        self.assertNotIn(str(seen["cwd"]), git("worktree", "list"))
 
 
 if __name__ == "__main__":
