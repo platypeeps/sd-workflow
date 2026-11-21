@@ -108,7 +108,7 @@ html, body { overflow-x: clip; }
 .usage-drop > summary [aria-hidden] { font: 400 var(--text-xs)/1 var(--font-data); }
 .usage-drop[open] > summary { border-color: var(--color-accent); background: var(--color-accent-bg); }
 .usage-drop > summary:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 1px; }
-.usage-drop > .ustrip { left: auto; right: 0; width: min(48rem, calc(100vw - 2 * var(--space-md)), 100%); max-width: none; max-height: min(70vh, 36rem); padding: 0; display: block; }
+.usage-drop > .ustrip { left: auto; right: 0; width: min(48rem, calc(100vw - 2 * var(--space-md)), 100%); max-width: none; max-height: min(70vh, 36rem); padding: 0; display: block; } /* until opened: sd:9760 sizes it to the room below */
 /* sd:9792: every row takes its columns from the list's one grid, so each row's windows start at one x. */
 .ustrip .urows { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: minmax(7rem, max-content) minmax(0, 1fr) auto; }
 .ustrip li { grid-column: 1 / -1; display: grid; grid-template-columns: subgrid; align-items: center; gap: var(--space-2xs) var(--space-sm);

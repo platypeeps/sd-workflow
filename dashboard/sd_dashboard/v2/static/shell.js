@@ -1985,7 +1985,8 @@
         s.hidden = !list;
       });
     };
-    d.addEventListener('toggle', () => { if (d.open) read(); });
+    // sd:9760: open, the menu may be as tall as the window below its top, less a margin; past that it scrolls.
+    d.addEventListener('toggle', () => { if (!d.open) return; menu.style.maxHeight = `${Math.max(160, Math.floor(innerHeight - menu.getBoundingClientRect().top - 16))}px`; read(); });
     if (location.hash === '#usage') d.open = true; // screenshot hook, as #menu and #chat are; opening reads
     else read();
     return read;
