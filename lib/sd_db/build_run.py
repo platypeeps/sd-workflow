@@ -120,8 +120,10 @@ BLOCKER_CLASSES = (
 )
 CHECKLIST_TOP = 10
 CHECKLIST_DAYS = 30
-#: A header line naming the five columns, in order: what a failure table is to the review's precheck (sd:9770).
-FAILURE_TABLE = re.compile(r"step.*state.*failure.*recovery.*test", re.I)
+#: The columns a failure table's header names, in order (sd:9770).
+FAILURE_COLUMNS = ("step", "state", "failure", "recovery", "test")
+#: A table's header separator row, `| --- | :-: |`: no data.
+TABLE_SEPARATOR = re.compile(r"[\s|:-]+")
 #: The rule the precheck names when a state-moving change has no failure table (sd:9584, sd:9770).
 FAILURE_TABLE_RULE = ("WORKFLOW.md, Review rounds: a change that moves state in steps carries a failure table "
                       "(step, state moved, failure, recovery, test) in its design.md or the PR body before review "
@@ -1335,7 +1337,7 @@ class Supervisor:
         `docs/work/*/design.md` exists only for such a change (docs/work/README.md): the change is one when the
         branch adds or changes a design.md there, or one there names a member (`item: sd:N`); deleting a finished
         one moves no state (review of sd:9770). It passes when that
-        design.md or the body holds a header line naming the five columns.
+        design.md or the body holds a failure table (`failure_table`): a header and a data row.
         """
         work = Path(self.work)
         changed = _read([*self.tools.git, "-C", str(work), "diff", "--name-only", "--diff-filter=d", f"{self.base()}...{head}", "--",
@@ -1352,7 +1354,7 @@ class Supervisor:
             if relative in designs or named.search(text):
                 designs.add(relative)
                 texts[relative] = text
-        if not designs or any(FAILURE_TABLE.search(text) for text in [body, *texts.values()]):
+        if not designs or any(failure_table(text) for text in [body, *texts.values()]):
             return []
         return [f"this change moves state in steps ({', '.join(sorted(designs))}), and neither that design.md nor "
                 f"the body holds a failure table: {FAILURE_TABLE_RULE}. Add the table, one row per step"]
@@ -2176,3 +2178,20 @@ class DraftSupervisor(Supervisor):
         if not draft.write(self.db, self.ident, *parsed):
             raise Lost
         return {"run": self.ident, "outcome": "done", "questions": len(parsed[1])}
+
+
+def failure_table(text: str) -> bool:
+    """Whether `text` holds a failure table (sd:9770): a header line whose `|`-separated cells begin with the five
+    `FAILURE_COLUMNS` in order, then at least one data row in the lines of `|` right below it. Prose naming the
+    words, or a header with only its separator, is no table."""
+    lines = text.splitlines()
+    for at, line in enumerate(lines):
+        cells = [cell.strip().lower() for cell in line.strip().strip("|").split("|")]
+        if len(cells) < len(FAILURE_COLUMNS) or not all(map(str.startswith, cells, FAILURE_COLUMNS)):
+            continue
+        for row in lines[at + 1:]:
+            if "|" not in row:
+                break
+            if not TABLE_SEPARATOR.fullmatch(row.strip()):
+                return True
+    return False

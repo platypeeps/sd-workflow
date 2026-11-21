@@ -968,9 +968,36 @@ class Supervise(Case):
         fix = self.calls("claude")[1]["argv"]
         self.assertIn("docs/work/2026-11-21-example/design.md", fix[fix.index("-p") + 1])
 
+    def untabled_body_blocks(self, table):
+        """Review of sd:9770: a table is a header naming the five columns and at least one data row."""
+        self.design(f"## Summary\n\n{table}\n## Test plan\n\ny\n")
+        with mock.patch.object(build_run, "REVIEW_ROUNDS", 1):
+            ended = self.supervisor().run()
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual(self.calls("sd-review"), [], "no review ran")
+
+    def test_prose_naming_the_columns_is_no_failure_table(self):
+        self.untabled_body_blocks("Each step needs state, failure, recovery and test.\n")
+
+    def test_a_header_with_no_rows_is_no_failure_table(self):
+        self.untabled_body_blocks("```\n| Step | State moved | Failure | Recovery | Test |\n"
+                                  "| --- | --- | --- | --- | --- |\n```\n")
+
+    def test_a_table_is_a_header_and_a_data_row(self):
+        header = "| Step | State moved | Failure | Recovery | Test |\n"
+        row = "| write | note | crash | replay | test_x |\n"
+        plain = "step   | state moved | failure | recovery | test\nwrite  | note        | crash   | replay   | test_x\n"
+        for text, expected in (("Each step needs state, failure, recovery and test.", False), (header, False),
+                               (header + "| --- | --- | --- | --- | --- |\n", False),
+                               (header + "| --- | --- | --- | --- | --- |\n" + row, True), (header + row, True),
+                               (plain, True), (header + "\n" + row, False)):
+            with self.subTest(text=text):
+                self.assertIs(build_run.failure_table(text), expected)
+
     def test_a_state_moving_change_with_a_failure_table_reaches_review(self):
         """sd:9770: the same change with the table in the body is reviewed and enqueued."""
-        self.design("## Summary\n\nx\n\n```\n| Step | State moved | Failure | Recovery | Test |\n```\n\n"
+        self.design("## Summary\n\nx\n\n```\n| Step | State moved | Failure | Recovery | Test |\n"
+                    "| --- | --- | --- | --- | --- |\n| write | note | crash | replay | test_x |\n```\n\n"
                     "## Test plan\n\ny\n")
         ended = self.supervisor().run()
         self.assertEqual(ended.get("step"), "enqueued", ended)
