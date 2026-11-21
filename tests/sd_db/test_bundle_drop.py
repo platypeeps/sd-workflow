@@ -802,5 +802,46 @@ class DropRound19(Repo):
         claimed = self.claim()
         self.assertTrue(claimed is None or claimed["assignment"] == queued[0]["id"], claimed)
         member = self.db.execute("SELECT status, result FROM assignment WHERE id = ?", (queued[1]["id"],)).fetchone()
-        self.assertEqual(member["status"], "blocked")
-        self.assertIn(f"build/sd-{queued[0]['id']}", member["result"])
+        # Since round 20 it leaves the bundle, as it no longer shares its lead's repository.
+        self.assertEqual(member["status"], "cancelled")
+        self.assertTrue(member["result"].startswith(runner.ALONE), member["result"])
+
+
+class DropRound20(Repo):
+    """Review round 20 of pack sd:9709, a class pass: the claim read a bundle row's repository from its item as it
+    reads now, though the bundle's work sits on a branch in the repository of the run that made it. Each row of a
+    bundle that has work (a retry, a drop's kept bundle) is checked against that repository."""
+
+    def move(self, item):
+        other = self.root / "other"
+        upsert_repo(self.db, str(other), remote="https://example.test/other.git", managed=1)
+        self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (str(other), item))
+        return other
+
+    def test_a_kept_lead_moved_to_another_repository_is_not_built_there(self):
+        items, ids, run = self.bundle()
+        queued = DROP.drop_item(self.db, build, items[2], who="operator")
+        self.move(items[0])
+        claimed = self.claim()  # the dropped item's own fresh build may start; the kept bundle does not
+        self.assertNotEqual((claimed or {}).get("assignment"), queued[0]["id"])
+        lead = self.db.execute("SELECT status, result FROM assignment WHERE id = ?", (queued[0]["id"],)).fetchone()
+        self.assertEqual(lead["status"], "blocked")
+        self.assertIn(str(self.repo), lead["result"])
+
+    def test_a_retried_lead_moved_to_another_repository_is_not_built_there(self):
+        items, ids, run = self.bundle()
+        build.retry(self.db, ids[0], who="operator")
+        self.move(items[0])
+        self.assertIsNone(self.claim())
+        lead = self.db.execute("SELECT status, result FROM assignment WHERE id = ?", (ids[0],)).fetchone()
+        self.assertEqual(lead["status"], "blocked")
+        self.assertIn(str(self.repo), lead["result"])
+
+    def test_a_kept_member_moved_to_another_repository_leaves_the_bundle(self):
+        items, ids, run = self.bundle()
+        queued = DROP.drop_item(self.db, build, items[2], who="operator")
+        self.move(items[1])
+        claimed = self.claim()
+        self.assertEqual(claimed["assignment"], queued[0]["id"])
+        self.assertEqual([member["item"] for member in build.run(self.db, claimed["id"])["members"]], [items[0]])
+        self.assertEqual(build.left(self.db, claimed["branch"], [items[1]]), {items[1]})

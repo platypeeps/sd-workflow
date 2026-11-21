@@ -1410,6 +1410,22 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
                 _refuse(connection, row, f"its kept work is in a worktree on {held[1] or 'the hub'}, which ran build "
                                          f"run {held[0]}, but its lane moved; drop or Build its items again there")
         queued = [row for row in queued if lanes[row["id"]] in hosts and not _refused_repo(connection, row)]
+        # A bundle's work is on its lead's branch in the repository of the run that made it, not wherever its item
+        # reads now: a lead moved since would build fresh there, and a member moved since would still be briefed and
+        # delivered from the old one (round 20). The lead blocks; the member leaves the bundle (`ALONE`).
+        for row in queued:
+            home = _work_repo(connection, row)
+            if home is None or paths.same(home, row["repo"]):
+                continue
+            if row["parent"] is None:
+                _refuse(connection, row, f"its work is on branch {branch(row['id'])} in {home}, but its item moved "
+                                         f"to {row['repo']}; move it back, or Build it again there")
+                continue
+            reason = (f"{ALONE}build: its item moved to {row['repo']}, away from its bundle's work in {home}; "
+                      f"Build it again there")
+            connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? "
+                               "WHERE id = ? AND status = 'queued'", (clock(), reason, row["id"]))
+            add_note(connection, row["item"], "comment", f"Build assignment {row['id']} left its bundle: {reason}")
         queued = [row for row in queued if connection.execute(
             "SELECT status FROM assignment WHERE id = ?", (row["id"],)).fetchone()[0] == "queued"]
         # A member whose lead is not in this claim's group (moved to planning, refused, or the member moved to another
@@ -1499,6 +1515,20 @@ def _kept_host(connection, row) -> tuple[str, str | None] | None:
     ident = note["body"].rsplit(" ", 1)[1]
     ran = connection.execute("SELECT owner FROM runner_run WHERE id = ?", (ident,)).fetchone()
     return (ident, run_host(ran["owner"])) if ran else None
+
+
+def _work_repo(connection, row) -> str | None:
+    """The repository holding the work of `row`'s bundle: its lead's latest run's, or, for a bundle drop's new lead
+    that has not run, the ended run's whose work it keeps (`_kept_host`); None for a fresh bundle."""
+    lead = row["parent"] or row["id"]
+    ran = connection.execute("SELECT repo FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
+                             (lead,)).fetchone()
+    if ran is not None:
+        return ran["repo"]
+    held = _kept_host(connection, connection.execute("SELECT id, item, parent FROM assignment WHERE id = ?",
+                                                     (lead,)).fetchone())
+    ran = connection.execute("SELECT repo FROM runner_run WHERE id = ?", (held[0],)).fetchone() if held else None
+    return ran["repo"] if ran else None
 
 
 def _refuse(connection, row, reason: str) -> None:
