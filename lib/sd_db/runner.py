@@ -107,7 +107,7 @@ def _eligible_after(connection, assignment: dict) -> bool:
         connection.execute("UPDATE assignment SET status = 'blocked', result = ?, ended = ? WHERE id = ?",
                            (f"predecessor {predecessor} ended {row['status']}", now(), assignment["id"]))
         return False
-    if _yields(connection, row):
+    if _yields(connection, row, assignment["id"]):
         return _eligible_after(connection, {**assignment, "after": row["after"]})
     # A successful provider exit is completion; only a verified merge is delivery.
     return row["status"] == "done" and connection.execute(
@@ -115,16 +115,18 @@ def _eligible_after(connection, assignment: dict) -> bool:
         (row["item"],)).fetchone() is not None
 
 
-def _yields(connection, row) -> bool:
-    """Whether the queued author run `row` gives up its place: its item waits, directly or through other
-    open items, on an open item with a run queued behind it. Else A waits for B while B waits behind A
-    (lane review of pack sd:9570); A, B, C with A waiting on C and B on A needs the chain (review). A wait
+def _yields(connection, row, to: int) -> bool:
+    """Whether the queued author run `row` lets assignment `to` pass: `to` runs an open item `row` waits
+    on, directly or through other open items, queued behind `row`, or a run that item's chain waits
+    behind. Else A waits for B while B waits behind A (lane review of pack sd:9570), or A, B, C with A
+    waiting on C and B on A stalls (review). Any other run keeps its place behind `row` (review): a wait
     on an item with no run behind it keeps the order; unreadable fields keep it too."""
     if row["status"] != "queued" or row["role"] != "author":
         return False
     from .workflow import item_blocked_by
 
-    seen, pending = set(), [row["item"]]
+    seen: set[int] = set()
+    pending, needed = [row["item"]], set[int]()
     while pending:
         found = connection.execute("SELECT fields FROM item WHERE id = ?", (pending.pop(),)).fetchone()
         try:
@@ -132,17 +134,19 @@ def _yields(connection, row) -> bool:
         except ValueError:
             continue
         for other in named:
-            if other in seen:
+            status = connection.execute("SELECT status FROM item WHERE id = ?", (other,)).fetchone()
+            if other in seen or status is None or status["status"] == "done":
                 continue
             seen.add(other)
-            status = connection.execute("SELECT status FROM item WHERE id = ?", (other,)).fetchone()
-            if status is None or status["status"] == "done":
-                continue
-            if connection.execute("SELECT 1 FROM assignment WHERE item = ? AND status = 'queued' AND id > ?",
-                                  (other, row["id"])).fetchone():
-                return True
             pending.append(other)
-    return False
+            needed.update(ident for (ident,) in connection.execute(
+                "SELECT id FROM assignment WHERE item = ? AND status = 'queued' AND id > ?", (other, row["id"])))
+    # A run the needed one waits behind in its serial chain must run first too.
+    for ident in list(needed):
+        while (ident := connection.execute("SELECT after FROM assignment WHERE id = ?", (ident,)).fetchone()[0]) \
+                not in (None, row["id"]) and ident not in needed:
+            needed.add(ident)
+    return to in needed
 
 
 def _acyclic(connection) -> None:
@@ -269,7 +273,7 @@ def claim(connection, assignment: int, *, owner: str, work_root: Path, retention
                 "WHERE item.repo = ? AND assignment.status = 'queued' AND assignment.id < ? "
                 "AND (assignment.lane = 'serial' OR assignment.role != 'author') ORDER BY assignment.id",
                 (item["repo"], assignment)).fetchall()
-            if any(_eligible_after(connection, dict(row)) and not _yields(connection, row) for row in earlier):
+            if any(_eligible_after(connection, dict(row)) and not _yields(connection, row, assignment) for row in earlier):
                 return None
         run = request["run_count"] + 1
         ident = uuid.uuid4().hex

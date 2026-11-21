@@ -163,6 +163,33 @@ class TheOtherStarts(DependencyCase):
         started = runner.claim(self.db, last, owner="fixture", **roots)
         self.assertEqual(started and started["status"], "running", "C passes A and B")
 
+    def lone(self, branch, **options):
+        from sd_db import runner
+        item = self.item()
+        self.db.execute("UPDATE item SET branch = ? WHERE id = ?", (branch, item))
+        return item, runner.enqueue(self.db, [item], who="operator", **options)[0]["id"]
+
+    def test_a_run_that_plays_no_part_in_the_wait_stays_behind(self):
+        """Review: B after A, A waits on a later C queued apart; B does not unblock A, so B waits for A."""
+        from sd_db import runner
+        (first, _), (_, behind) = self.serial(2)
+        third, later = self.lone("work/c")
+        self.wait(first, third)
+        roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
+        self.assertIsNone(runner.claim(self.db, behind, owner="fixture", **roots), "B waits for A's merge")
+        started = runner.claim(self.db, later, owner="fixture", **roots)
+        self.assertEqual(started and started["status"], "running", "C, the one A waits on, runs")
+
+    def test_an_unrelated_parallel_run_stays_behind_a_waiting_serial_run(self):
+        """Review: the broad check let any parallel run pass A; only the one A waits on may."""
+        from sd_db import runner
+        (first,), _ = self.serial(1)
+        _, parallel = self.lone("work/p", parallel=True)
+        third, _ = self.lone("work/c")
+        self.wait(first, third)
+        roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
+        self.assertIsNone(runner.claim(self.db, parallel, owner="fixture", **roots))
+
     def test_a_run_that_waits_outside_the_queue_keeps_its_place(self):
         """A waits on an item with no queued run: nothing behind it can unblock it, so the order holds."""
         from sd_db import runner
