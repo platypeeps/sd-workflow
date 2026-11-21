@@ -2711,6 +2711,29 @@ class Hosts(Case):
         assert run is not None
         self.assertEqual((run["assignment"], run["work_path"]), (first["assignment"], first["work_path"]))
 
+    def test_beat_recovery_queues_one_assignment_per_item(self):
+        """Review round 6 of sd:9775: two fresh presses of one item both blocked on a quiet beat. Neither ran, so
+        neither disqualified the other, and one recovery queued both: two open builds of one item. Recovery
+        queues one."""
+        item = self.item(repo=SAT)
+        first = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        second = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual([self.count("SELECT status FROM assignment WHERE id = ?", row) for row in (first, second)],
+                         ["blocked", "blocked"])
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        build.set_pickup(self.db, True, now=Pickup.NOW)
+        with mock.patch.object(build, "lane_hosts", return_value=WORK):
+            build.pickup(self.db, build.room(self.db, **IDLE, hosts=WORK), now=Pickup.NOW)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE item = ? AND status = 'queued'", item), 1)
+        self.assertIsNotNone(self.claim(hosts=WORK))
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE item = ? AND status IN "
+                                    "('queued', 'running')", item), 1)
+
     def test_the_hub_blocks_a_row_whose_satellite_beat_comes_from_a_clock_ahead(self):
         """Pack sd:7955: a beat stamped more than STALE_SECONDS after now has no age to trust, so the claim blocks
         the row as for a stale beat, and its note names the skew, not a dead dispatcher."""

@@ -1388,7 +1388,8 @@ def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
         f"SELECT assignment.id, assignment.item, assignment.parent, assignment.run_count, assignment.result, "
         f"repo.lane_host FROM assignment "
         f"JOIN item ON item.id = assignment.item LEFT JOIN repo ON repo.path = item.repo "
-        f"WHERE {_BEAT_BLOCKED} AND item.status = 'ready'", (SCOPE, _BEAT_RESULT)).fetchall()
+        f"WHERE {_BEAT_BLOCKED} AND item.status = 'ready' "
+        f"ORDER BY assignment.run_count > 0 DESC, assignment.id DESC", (SCOPE, _BEAT_RESULT)).fetchall()
     for row in rows:
         if _stranded(connection, row):
             continue
@@ -1407,9 +1408,13 @@ def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
             continue
         else:
             why = f"the {HEARTBEAT}@{away} beat is fresh"
-        connection.execute("UPDATE assignment SET status = 'queued', ended = NULL, result = NULL "
-                           "WHERE id = ? AND status = 'blocked'", (row["id"],))
-        add_note(connection, row["item"], "comment", f"Build assignment {row['id']} queued again: {why}")
+        # The rows were read before any write: two blocked builds of one item that never ran both pass the read,
+        # so the write itself queues one per item, a build that ran first (review round 6 of sd:9775).
+        if connection.execute(f"UPDATE assignment SET status = 'queued', ended = NULL, result = NULL "
+                              f"WHERE id = ? AND status = 'blocked' AND NOT EXISTS (SELECT 1 FROM assignment other "
+                              f"WHERE other.item = ? AND other.status IN {OWNING})",
+                              (row["id"], row["item"])).rowcount:
+            add_note(connection, row["item"], "comment", f"Build assignment {row['id']} queued again: {why}")
 
 
 def _refused_repo(connection, row) -> bool:
