@@ -205,6 +205,18 @@ class TheOtherStarts(DependencyCase):
         started = runner.claim(self.db, parallel, owner="fixture", **roots)
         self.assertEqual(started and started["status"], "running", "C runs first")
 
+    def test_a_serial_run_that_waits_outside_the_queue_holds_no_parallel_run(self):
+        """Review of build/sd-1306: a serial run waits on an open item with no queued run. The graph saw no
+        wait, so the run stood as a barrier: it could not start, and every parallel run in its repository
+        waited behind it."""
+        from sd_db import runner
+        (first,), _ = self.serial(1)
+        _, parallel = self.lone("work/p", parallel=True)
+        self.wait(first, self.item(status="planning"))
+        roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
+        started = runner.claim(self.db, parallel, owner="fixture", **roots)
+        self.assertEqual(started and started["status"], "running", "the parallel run starts")
+
     def test_a_run_that_waits_outside_the_queue_keeps_its_place(self):
         """A waits on an item with no queued run: nothing behind it can unblock it, so the order holds."""
         from sd_db import runner

@@ -151,6 +151,9 @@ def _waits(connection) -> dict[int, set[int]]:
         "WHERE assignment.status = 'queued' ORDER BY assignment.id")}
     graph: dict[int, set[int]] = {ident: set() for ident in rows}
     by_item: dict[int, list[int]] = {}
+    # A run that waits on an open item with no queued run waits outside the queue, for as long as that item
+    # stays open: it is no barrier a parallel run waits behind (review of build/sd-1306).
+    outside: set[int] = set()
     for ident, row in rows.items():
         by_item.setdefault(row["item"], []).append(ident)
     for ident, row in rows.items():
@@ -171,6 +174,8 @@ def _waits(connection) -> dict[int, set[int]]:
                 seen.add(other)
                 pending.append(other)
                 graph[ident].update(by_item.get(other, ()))
+                if other not in by_item:
+                    outside.add(ident)
 
     def add(source: int, target: int) -> bool:
         if _reaches(graph, target, source):
@@ -178,7 +183,7 @@ def _waits(connection) -> dict[int, set[int]]:
         graph[source].add(target)
         return True
 
-    held: set[int] = set()
+    held: set[int] = set(outside)
     for ident, row in rows.items():
         predecessor = row["after"]
         while predecessor is not None:
