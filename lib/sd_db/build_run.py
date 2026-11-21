@@ -1336,28 +1336,27 @@ class Supervisor:
 
         `docs/work/*/design.md` exists only for such a change (docs/work/README.md): the change is one when the
         branch adds or changes a design.md there, or one there names a member (`item: sd:N`); deleting a finished
-        one moves no state (review of sd:9770). It passes when that
-        design.md or the body holds a failure table (`failure_table`): a header and a data row.
+        one moves no state (review of sd:9770). It passes when each such
+        design.md, or the body, holds a failure table (`failure_table`): a header and a data row.
         """
-        work = Path(self.work)
-        changed = _read([*self.tools.git, "-C", str(work), "diff", "--name-only", "--diff-filter=d", f"{self.base()}...{head}", "--",
+        git = [*self.tools.git, "-C", str(self.work)]
+        changed = _read([*git, "diff", "--name-only", "--diff-filter=d", f"{self.base()}...{head}", "--",
                          "docs/work"], env=self.env).splitlines()
         named = re.compile(r"^item:\s*sd:(" + "|".join(str(item) for item in [self.lead, *self.others]) + r")\b", re.M)
-        designs = {path for path in changed if path.endswith("/design.md")}
+        # The committed head, as the clean review worktree holds it: no uncommitted or ignored file counts.
         texts = {}
-        for path in sorted(work.glob("docs/work/*/design.md")):
-            relative = path.relative_to(work).as_posix()
-            try:
-                text = path.read_text(encoding="utf-8")
-            except (OSError, ValueError):
-                text = ""
-            if relative in designs or named.search(text):
-                designs.add(relative)
-                texts[relative] = text
-        if not designs or any(failure_table(text) for text in [body, *texts.values()]):
+        for path in _read([*git, "ls-tree", "-r", "--name-only", head, "--", "docs/work"], env=self.env).splitlines():
+            if re.fullmatch(r"docs/work/[^/]+/design\.md", path):
+                text = _read_bytes([*git, "cat-file", "blob", f"{head}:{path}"], env=self.env).decode("utf-8", "replace")
+                if path in changed or named.search(text):
+                    texts[path] = text
+        # Each design needs its own table; the body's covers one it names, or the only one (review of sd:9770).
+        bare = [path for path, text in sorted(texts.items()) if not failure_table(text)
+                and not (failure_table(body) and (len(texts) == 1 or str(Path(path).parent) in body))]
+        if not bare:
             return []
-        return [f"this change moves state in steps ({', '.join(sorted(designs))}), and neither that design.md nor "
-                f"the body holds a failure table: {FAILURE_TABLE_RULE}. Add the table, one row per step"]
+        return [f"this change moves state in steps ({', '.join(bare)}), and neither that design.md nor "
+                f"the body holds its failure table: {FAILURE_TABLE_RULE}. Add the table, one row per step"]
 
     def blocked_round(self, blockers: list[dict]) -> str | dict:
         self.blockers = blockers

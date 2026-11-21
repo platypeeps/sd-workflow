@@ -145,6 +145,9 @@ FAKE = textwrap.dedent('''
             Path(name).parent.mkdir(parents=True, exist_ok=True)
             Path(name).write_bytes(bytes.fromhex(data))
             git("add", "--", name)
+        for name, data in extra.get("unadded", {}).items():  # written, never added: ignored or untracked
+            Path(name).parent.mkdir(parents=True, exist_ok=True)
+            Path(name).write_bytes(bytes.fromhex(data))
         for old, new in extra.get("move", {}).items():
             git("mv", old, new)
         for name in extra.get("remove", []):
@@ -1002,6 +1005,45 @@ class Supervise(Case):
         ended = self.supervisor().run()
         self.assertEqual(ended.get("step"), "enqueued", ended)
         self.assertEqual(len(self.calls("sd-review")), 1)
+
+    TABLE = "| Step | State moved | Failure | Recovery | Test |\n| --- | --- | --- | --- | --- |\n| w | n | c | r | t |\n"
+
+    def designs_block(self, files, unadded=None, body="## Summary\n\nx\n\n## Test plan\n\ny\n"):
+        (self.plans / "extra.json").write_text(json.dumps({
+            "files": {name: text.encode().hex() for name, text in files.items()},
+            "unadded": {name: text.encode().hex() for name, text in (unadded or {}).items()}}))
+        self.press()
+        self.write_pr(body=body)
+        self.plan(claude=["extra"], sd_review=["clean"])
+        with mock.patch.object(build_run, "REVIEW_ROUNDS", 1):
+            ended = self.supervisor().run()
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual(self.calls("sd-review"), [], "no review ran")
+        return self.latest()["detail"]
+
+    def test_each_changed_design_needs_its_own_failure_table(self):
+        """Review of sd:9770: one design's table does not clear another design in the same bundle."""
+        detail = self.designs_block({"docs/work/2026-11-21-a/design.md": f"# A\n\n{self.TABLE}",
+                                     "docs/work/2026-11-21-b/design.md": "# B\n\nSteps move state.\n"})
+        self.assertIn("docs/work/2026-11-21-b/design.md", detail)
+        self.assertNotIn("docs/work/2026-11-21-a/design.md", detail)
+
+    def test_a_body_table_covers_a_bundles_design_only_when_it_names_it(self):
+        """Review of sd:9770: with two designs, the body's table covers only the design it names."""
+        body = f"## Summary\n\nx\n\ndocs/work/2026-11-21-a\n\n```\n{self.TABLE}```\n\n## Test plan\n\ny\n"
+        detail = self.designs_block({"docs/work/2026-11-21-a/design.md": "# A\n",
+                                     "docs/work/2026-11-21-b/design.md": "# B\n"}, body=body)
+        self.assertIn("docs/work/2026-11-21-b/design.md", detail)
+        self.assertNotIn("docs/work/2026-11-21-a/design.md", detail)
+
+    def test_an_uncommitted_design_does_not_satisfy_the_table(self):
+        """Review of sd:9770: the precheck reads the committed head; an ignored design with a table, which the
+        clean review worktree never sees, clears nothing."""
+        detail = self.designs_block(
+            {"docs/work/2026-11-21-a/design.md": "# A\n\nitem: sd:1\n", ".gitignore": "docs/work/2026-11-21-z/\n"},
+            unadded={"docs/work/2026-11-21-z/design.md": f"# Z\n\nitem: sd:1\n\n{self.TABLE}"})
+        self.assertIn("docs/work/2026-11-21-a/design.md", detail)
+        self.assertNotIn("2026-11-21-z", detail)
 
     def test_deleting_a_finished_design_md_needs_no_failure_table(self):
         """Review of sd:9770: removing a done item's design.md moves no state; it reaches review untabled."""
