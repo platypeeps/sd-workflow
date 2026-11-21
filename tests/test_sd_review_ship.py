@@ -117,6 +117,29 @@ class FixReviewTests(ReviewFixture):
                                      FakeRunner(), self.environment(), self.chatgpt_home())
         self.assertIsNone(unchained["covers_from"], "a narrow prior report was read as a full pass")
 
+    def test_a_blocking_pass_short_of_its_depth_covers_nothing(self):
+        """Review of sd:9769: a pass one reader short must not seed a chain the lane trusts."""
+        blocker = {"path": "src.py", "line": 1, "summary": "defect", "family": "correctness",
+                   "severity": "high", "instances": ["src.py:1"]}
+        answered = sd_review.Outcome("codex", sd_review.FINDINGS, (blocker,), "", (), ())
+        missing = sd_review.Outcome("claude", sd_review.UNAVAILABLE, (), "no answer", (), ())
+        result = sd_review.finish_review({"severity_floor": "medium", "requested_reviews": 2, "covers_from": "a" * 40},
+                                         [answered, missing], ["codex"])
+        self.assertEqual(result["status"], "blocking")
+        self.assertIsNone(result["covers_from"], "a pass one reader short still covers the branch")
+
+    def test_a_verify_pass_keeps_the_branch_s_copilot_requirement(self):
+        """Review of sd:9769: a small fix's tier must not drop the Copilot review the branch's tier required."""
+        root, first = self.branch()
+        full = sd_review.review(root, namespace(scope="branch"), FakeRunner(), self.environment(), self.chatgpt_home())
+        full["remote_reviews"]["copilot"]["automatic"] = True  # the deep branch's own requirement
+        report = self.tmp / "prior.json"
+        report.write_text(json.dumps(full))
+        self.commit(root, "fix.py", "fix = True\n")
+        chained = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)),
+                                   FakeRunner(), self.environment(), self.chatgpt_home())
+        self.assertIs(chained["remote_reviews"]["copilot"]["automatic"], True, "the fix tier dropped Copilot")
+
     def test_mismatched_or_malformed_previous_report_cannot_verify(self):
         root, first = self.branch()
         self.commit(root, "fix.py", "fix = True\n")

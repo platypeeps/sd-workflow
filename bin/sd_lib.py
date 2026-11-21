@@ -4321,7 +4321,8 @@ def distinct_findings(findings: Iterable[Mapping[str, Any]]) -> list[dict[str, A
     Identical means every key but `backend`, `evidence` and `instances` is equal: two
     readers cite their checks and list instances in their own words (pack sd:9270, sd:9769). Adjudication takes a row per
     blocking finding, so a copy was a second row to dispute. The kept row takes
-    the first evidence any copy gives, so a bare first copy does not lose a cited one.
+    the first evidence any copy gives, so a bare first copy does not lose a cited one,
+    and every instance any copy lists.
     """
     seen: dict[str, dict[str, Any]] = {}
     for finding in findings:
@@ -4330,6 +4331,8 @@ def distinct_findings(findings: Iterable[Mapping[str, Any]]) -> list[dict[str, A
         kept = seen.setdefault(key, dict(finding))
         if not kept.get("evidence") and finding.get("evidence"):
             kept["evidence"] = finding["evidence"]
+        if finding.get("instances"):  # each copy's instances, once: the build matches blockers by them (sd:9769)
+            kept["instances"] = list(dict.fromkeys([*(kept.get("instances") or []), *finding["instances"]]))
     return list(seen.values())
 
 

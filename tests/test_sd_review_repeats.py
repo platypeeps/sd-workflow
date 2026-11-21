@@ -343,6 +343,12 @@ class RepeatRuleTests(unittest.TestCase):
         two = sd_review.sd_lib.distinct_findings([dict(row(), backend="codex"), dict(row(summary="other"), backend="x")])
         self.assertEqual(len(two), 2)
 
+    def test_one_finding_from_two_readers_keeps_every_instance(self) -> None:
+        """Review of sd:9769: the build matches a blocker by its instances, so a dropped list ships a blocker."""
+        kept = sd_review.sd_lib.distinct_findings([dict(row(), backend="codex", instances=["src.py:1"]),
+                                                   dict(row(), backend="second", instances=["src.py:1", "far.py:9"])])
+        self.assertEqual(kept[0]["instances"], ["src.py:1", "far.py:9"])
+
 
 class RepeatReviewTests(RepeatFixture):
     def test_no_reviewer_is_told_to_cite_every_blocker(self) -> None:

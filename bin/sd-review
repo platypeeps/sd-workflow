@@ -2098,8 +2098,7 @@ def covers_from(subject: Subject, args: argparse.Namespace, previous: dict[str, 
     """The base a passing run stands for (pack sd:9769): a full branch pass its own; a verify pass its prior's."""
     if subject.scope == "branch" and not getattr(args, "base", None):
         return subject.base
-    chained = (previous or {}).get("covers_from") if getattr(args, "verify_report", None) else None
-    return chained if isinstance(chained, str) else None
+    return (previous or {}).get("covers_from") if getattr(args, "verify_report", None) else None
 
 
 def whole_files(subject: Subject, args: argparse.Namespace) -> str:
@@ -2336,7 +2335,8 @@ def review(
         "route": plan._asdict(),
         "remote_reviews": {
             "copilot": {
-                "automatic": sd_lib.copilot_automatic(copilot_word, plan.tier, plan.depth),
+                "automatic": sd_lib.copilot_automatic(copilot_word, plan.tier, plan.depth) or bool(  # the chain's (sd:9769)
+                    verify and (((previous or {}).get("remote_reviews") or {}).get("copilot") or {}).get("automatic")),
                 "tier": plan.tier,
                 "policy": copilot_word,
                 "source": copilot_source,
@@ -2618,7 +2618,8 @@ def finish_review(result: dict[str, Any], outcomes: Sequence[Outcome], reviewed:
     else:
         status = "advisory" if disposed else "clean" if reviewed else "skipped"
     result.update(outcomes=[outcome.outcome_report() for outcome in outcomes], findings=disposed,
-                  completed_reviews=len(reviewed), reviewed_by=reviewed, remaining=remaining, status=status)
+                  completed_reviews=len(reviewed), reviewed_by=reviewed, remaining=remaining, status=status,
+                  covers_from=None if incomplete else result.get("covers_from"))  # a short pass seeds no chain (sd:9769)
     return result
 
 
@@ -2871,8 +2872,7 @@ UNRECORDED_OPTIONS = ("base", "verify_report", "resume_report", "item", "draft",
 
 
 def recorded_base(root: pathlib.Path, result: dict[str, Any], head: str) -> str:
-    """A build's verify pass after its full round 1 stands for the branch from the fork its chain covers from;
-    one that covers less is a Refusal (pack sd:9769)."""
+    """A build's verify pass stands for the branch only from the fork its chain covers (pack sd:9769)."""
     if result.get("covers_from") != sd_lib.git_output(["merge-base", head, _default_base(root)], root):
         raise Refusal("the verify pass's chain does not cover the branch from its fork")
     return str(result["covers_from"])
