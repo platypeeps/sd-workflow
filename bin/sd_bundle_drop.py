@@ -180,7 +180,7 @@ def dropped_note(done: dict) -> str:
 def drop_item(connection, build, item: int, *, who: str) -> list[dict]:
     """The drop end to end: plan, branch, then the writes; a refused write puts the branch back."""
     try:
-        plan = build.drop_plan(connection, item)
+        plan = build.drop_reserve(connection, build.drop_plan(connection, item))
     except build.BuildRefused as refusal:
         raise DropRefused(str(refusal)) from None
     done: dict = {}
@@ -193,6 +193,10 @@ def drop_item(connection, build, item: int, *, who: str) -> list[dict]:
         if connection.in_transaction:
             connection.execute("ROLLBACK")
         # Ctrl-C after the commit: the queued builds read the split branch, so it stays (round 7).
-        if done and not build.drop_committed(connection, plan):
-            undo_split(done)
+        if not build.drop_committed(connection, plan):
+            try:
+                if done:
+                    undo_split(done)
+            finally:
+                build.drop_release(connection, plan)
         raise

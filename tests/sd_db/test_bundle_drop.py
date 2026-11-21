@@ -590,3 +590,33 @@ class DropRound13(Repo):
         self.assertEqual(git(new, "status", "--porcelain", "--ignored", "--untracked-files=all"), "")
         self.assertEqual(self.files(new), ["README", "a.txt", "c.txt"])
         self.assertEqual((work / "gen.cfg").read_text(), "generated\n", "the old worktree keeps the dropped work")
+
+
+class DropRound14(Repo):
+    """Review round 14 of pack sd:9709: the new lead's id was predicted (`MAX(id) + 1`), not reserved, so a build
+    queued during the split took it, and the refused writes' undo removed that build's branch and worktree; the
+    old branch's dropped lead read as still in the bundle (`left`); and the kept bundle's first brief lost the
+    drop's finding, written before the new lead's first run."""
+
+    def test_a_build_queued_during_the_split_does_not_take_the_new_lead(self):
+        items, ids, run = self.bundle()
+        other = self.item(repo=str(self.repo))
+        real, taken = DROP.split_branch, list[int]()
+
+        def queued_meanwhile(plan, done):
+            taken.extend(row["id"] for row in build.queue(self.db, [other], who="operator"))
+            return real(plan, done)
+
+        with mock.patch.object(DROP, "split_branch", side_effect=queued_meanwhile):
+            queued = DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertNotIn(taken[0], [entry["id"] for entry in queued[:2]])
+        new = Path(run["work_path"]).parent / f"repo-build-{queued[0]['id']}"
+        self.assertEqual(self.files(new), ["README", "a.txt", "c.txt"])
+
+    def test_a_refused_drop_releases_its_reserved_lead(self):
+        items, ids, run = self.bundle()
+        before = self.db.execute("SELECT COUNT(*) FROM assignment").fetchone()[0]
+        with mock.patch.object(build, "drop_writes", side_effect=build.BuildRefused("Drop refused: changed")), \
+                self.assertRaises(build.BuildRefused):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM assignment").fetchone()[0], before)

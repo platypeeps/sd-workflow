@@ -126,6 +126,10 @@ LEFT_OUT = "left out of a Retry of build run "
 SPLIT = "left the bundle at a Retry, and "
 #: The result a member bundle drop took out ends with, after `ALONE` (pack sd:9709).
 DROPPED = "dropped from build run "
+#: The scope of the row a bundle drop reserves its new lead's id with (`drop_reserve`): no build reader reads it.
+RESERVED = "build-drop"
+#: The keys `drop_reserve` adds to a drop plan.
+RESERVED_KEYS = ("new_lead", "new_work", "new_branch")
 #: The bundle statuses Retry and Send to builder take: each keeps its worktree.
 AGAIN = ("blocked", "cancelled")
 #: A lane entry that failed only because prepare's merge of origin/<base> conflicted goes back to its builder on
@@ -709,8 +713,8 @@ def drop_plan(connection, item: int) -> dict:
 
     The bundle must be one Retry takes. The kept members are its other open members, under a new lead on a new
     branch and worktree beside the old ones, which keep the dropped item's work and its ignored files: a drop in
-    place left those for the kept bundle's next builder (round 13). `revision` is the lead's, which `drop_writes`
-    checks again before it writes."""
+    place left those for the kept bundle's next builder (round 13); `drop_reserve` reserves its id. `revision` is
+    the lead's, which `drop_writes` checks again before it writes."""
     row = connection.execute("SELECT id, parent, result FROM assignment WHERE item = ? AND scope = ? "
                              "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
     if row is None:
@@ -740,10 +744,6 @@ def drop_plan(connection, item: int) -> dict:
             owner = connection.execute("SELECT id FROM assignment WHERE item = ? AND scope = ? ORDER BY id DESC "
                                        "LIMIT 1", (member["item"], SCOPE)).fetchone()["id"]
             raise BuildRefused(f"Drop refused: sd:{member['item']} has a newer build, assignment {owner}")
-    # The drop queues the kept items as fresh rows under a new lead, so the ended run keeps its members by `parent`
-    # (round 10). Its id names the new branch and worktree the split makes first: the next id, reserved here and
-    # read again by `drop_writes`, which refuses when another row took it.
-    new = connection.execute("SELECT COALESCE(MAX(id), 0) + 1 FROM assignment").fetchone()[0]
     # The kept work is in the new worktree on the machine that ran the run, not on the repo's lane as it reads now:
     # the drop runs there, and the new lead, which never ran, must route there (round 12). A lane moved since would
     # claim it elsewhere, fresh.
@@ -765,11 +765,29 @@ def drop_plan(connection, item: int) -> dict:
     gone = {one for one in built if not _done(states, one)}
     # The stored repo is a key (`~/...`); git needs the disk path, as `Supervisor` expands it (round 3).
     repo, work = paths.expand(last["repo"]), Path(last["work_path"])
-    return {"item": item, "assignment": row["id"], "lead": lead, "new_lead": new, "kept": kept, "run": last["id"],
+    return {"item": item, "assignment": row["id"], "lead": lead, "kept": kept, "run": last["id"],
             "aside": sorted(gone - {member["item"] for member in kept} | {item}),
-            "revision": current["revision"], "repo": str(repo), "work": str(work), "branch": last["branch"],
-            "new_work": str(worktree(str(repo), new, root=work.parent)),
+            "revision": current["revision"], "repo": str(repo), "work": str(work), "branch": last["branch"]}
+
+
+def drop_reserve(connection, plan: dict) -> dict:
+    """`plan` with its new lead: the drop queues the kept items as fresh rows under it, so the ended run keeps its
+    members by `parent` (round 10). Its id names the branch and worktree the split makes, so it is reserved by a
+    committed row before the split: a predicted `MAX(id) + 1` went to a build queued meanwhile, whose branch and
+    worktree the refused drop's undo then removed (round 14). `drop_writes` makes the row the lead; a drop that
+    does not commit deletes it (`drop_release`)."""
+    with transaction(connection):
+        new = connection.execute(
+            "INSERT INTO assignment (role, status, scope, result) VALUES ('author', 'cancelled', ?, ?)",
+            (RESERVED, f"reserved by a bundle drop of sd:{plan['item']}")).lastrowid
+    return {**plan, "new_lead": new, "new_work": str(worktree(plan["repo"], new, root=Path(plan["work"]).parent)),
             "new_branch": branch(new)}
+
+
+def drop_release(connection, plan: dict) -> None:
+    """Delete the row `drop_reserve` made for a drop that did not commit."""
+    with transaction(connection):
+        connection.execute("DELETE FROM assignment WHERE id = ? AND scope = ?", (plan["new_lead"], RESERVED))
 
 
 def drop_writes(connection, plan: dict, *, who: str, note: str, left: str) -> list[dict]:
@@ -780,7 +798,7 @@ def drop_writes(connection, plan: dict, *, who: str, note: str, left: str) -> li
     with transaction(connection):
         # The whole plan, read again: a kept member moved during the split (to planning and back, its assignment
         # cancelled) leaves the lead's revision as it was, and would queue again (round 10).
-        if drop_plan(connection, plan["item"]) != plan:
+        if drop_plan(connection, plan["item"]) != {key: plan[key] for key in plan if key not in RESERVED_KEYS}:
             raise BuildRefused(f"Drop refused: build {plan['lead']} changed since the drop read it; drop again")
         stamp, lead, gone = clock(), plan["new_lead"], plan["assignment"]
         connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
@@ -792,10 +810,18 @@ def drop_writes(connection, plan: dict, *, who: str, note: str, left: str) -> li
         for member in plan["kept"]:
             connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
                                (stamp, f"{ALONE}{who}: {DROPPED}{plan['run']}", member["id"]))
+            if not members:  # the reserved row becomes the lead
+                made = connection.execute(
+                    "UPDATE assignment SET item = ?, lane = 'parallel', budget_minutes = ?, scope = ?, run_count = 1, "
+                    "result = NULL WHERE id = ? AND scope = ?", (member["item"], BUDGET_MINUTES, SCOPE, lead, RESERVED))
+                if made.rowcount != 1:
+                    raise BuildRefused(f"Drop refused: the reserved assignment {lead} is gone; drop again")
+                members.append({"id": lead, "item": member["item"]})
+                continue
             cursor = connection.execute(
-                "INSERT INTO assignment (id, item, role, status, parent, lane, budget_minutes, scope, run_count) "
-                "VALUES (?, ?, 'author', 'cancelled', ?, 'parallel', ?, ?, 1)",
-                (None if members else lead, member["item"], lead if members else None, BUDGET_MINUTES, SCOPE))
+                "INSERT INTO assignment (item, role, status, parent, lane, budget_minutes, scope, run_count) "
+                "VALUES (?, 'author', 'cancelled', ?, 'parallel', ?, ?, 1)",
+                (member["item"], lead, BUDGET_MINUTES, SCOPE))
             members.append({"id": int(cursor.lastrowid), "item": member["item"]})
         items = reads.items_by_ids(connection, [plan["item"], *(member["item"] for member in members)])
         how = f"bundle drop of sd:{plan['item']} from build run {plan['run']}"
