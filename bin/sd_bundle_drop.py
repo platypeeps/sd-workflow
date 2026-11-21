@@ -15,6 +15,7 @@ import subprocess
 from pathlib import Path
 
 import sd_ship_body
+from sd_db import paths
 
 
 class DropRefused(Exception):
@@ -22,8 +23,9 @@ class DropRefused(Exception):
 
 
 def _git(*argv: str, cwd: str | Path, check: bool = True) -> subprocess.CompletedProcess:
+    # `-C` alone names the repository: a hook's `GIT_DIR` would point every call at its own (round 26).
     done = subprocess.run(["git", "-C", str(cwd), *argv], capture_output=True, text=True, check=False,
-                          stdin=subprocess.DEVNULL)
+                          stdin=subprocess.DEVNULL, env=paths.git_env())
     if check and done.returncode != 0:
         raise DropRefused(f"git {' '.join(argv)} failed in {cwd}: {(done.stderr or done.stdout).strip()}")
     return done

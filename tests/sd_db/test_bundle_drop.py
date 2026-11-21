@@ -13,7 +13,7 @@ import tempfile
 from pathlib import Path
 from unittest import mock
 
-from sd_db import build, build_run, operations, runner, writes
+from sd_db import build, build_run, operations, paths, runner, writes
 from sd_db.writes import create_assignment, record_state, upsert_repo
 
 from .test_build import START, Case, Kill, Probe
@@ -981,24 +981,30 @@ class DropRound24(Repo):
 
 
 class DecoyGitEnvironment(Repo):
-    """Round 25: a git hook exports `GIT_DIR` and `GIT_WORK_TREE`; the fixture's git calls and the drop's own must
-    still reach the fixture repository, never the one those name."""
-
-    def setUp(self):
-        self.decoy = Path(tempfile.mkdtemp(prefix="decoy-"))
-        self.addCleanup(shutil.rmtree, self.decoy, True)
-        subprocess.run(["git", "init", "-q", "-b", "main", str(self.decoy)], check=True,
-                       env={"PATH": os.environ["PATH"], "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull})
-        hook = mock.patch.dict("os.environ", {"GIT_DIR": str(self.decoy / ".git"), "GIT_WORK_TREE": str(self.decoy)})
-        hook.start()
-        self.addCleanup(hook.stop)
-        super().setUp()
+    """Rounds 25 and 26: a git hook exports `GIT_DIR` and `GIT_WORK_TREE`. The fixture clears them in `setUp`; the
+    drop, started under them, must still reach the fixture repository, never the one they name."""
 
     def test_a_drop_under_a_hooks_git_environment_leaves_that_repository_alone(self):
         items, ids, run = self.bundle()
-        DROP.drop_item(self.db, build, items[1], who="operator")
-        decoy = subprocess.run(["git", "-C", str(self.decoy), "for-each-ref"], capture_output=True, text=True,
-                               env={"PATH": os.environ["PATH"], "GIT_CONFIG_NOSYSTEM": "1",
-                                    "GIT_CONFIG_GLOBAL": os.devnull})
-        self.assertEqual((decoy.returncode, decoy.stdout), (0, ""), "no commit, branch or remote reached it")
-        self.assertEqual(sorted(os.listdir(self.decoy)), [".git"])
+        clean = {"PATH": os.environ["PATH"], "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull}
+        decoy = Path(tempfile.mkdtemp(prefix="decoy-"))
+        self.addCleanup(shutil.rmtree, decoy, True)
+        subprocess.run(["git", "init", "-q", "-b", "main", str(decoy)], check=True, env=clean)
+        hook = {"GIT_DIR": str(decoy / ".git"), "GIT_WORK_TREE": str(decoy), "GIT_INDEX_FILE": str(decoy / "idx")}
+        lead = self.next_lead()
+        with mock.patch.dict("os.environ", hook):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        new = Path(run["work_path"]).parent / f"repo-build-{lead}"
+        self.assertEqual(self.files(new), ["README", "a.txt", "c.txt"], "the drop split the fixture's branch")
+        refs = subprocess.run(["git", "-C", str(decoy), "for-each-ref"], capture_output=True, text=True, env=clean)
+        self.assertEqual((refs.returncode, refs.stdout), (0, ""), "no commit, branch or remote reached it")
+        self.assertEqual(sorted(os.listdir(decoy)), [".git"])
+
+
+class GitLocation(Repo):
+    """Round 26: `paths.GIT_LOCAL` holds every variable git itself reads as repository-local."""
+
+    def test_it_covers_gits_own_list(self):
+        listed = set(git(self.repo, "rev-parse", "--local-env-vars").split())
+        self.assertTrue(listed)
+        self.assertEqual(listed - paths.GIT_LOCAL, set())
