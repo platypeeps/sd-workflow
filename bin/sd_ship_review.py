@@ -1733,6 +1733,13 @@ FAILING_OUTCOME = re.compile(r"skipped=[1-9]|unexpected successes=[1-9]|^UNEXPEC
 RUNNER_FAULT = re.compile(r"^(?:error: |fatal: |Tests skipped locally)", re.M)
 #: A constant guard `run-tests.sh` exports to its shards: Jev off, git maintenance off.
 RUNNER_GUARD = re.compile(r"^export ((?:JEV|GIT_CONFIG)_\w+)=([\w.-]*)$", re.M)
+#: A shard's start and complete end lines in `run-tests.sh` output; unittest exits 1 when a test failed.
+SHARD_START = re.compile(r"^shard (\S+): start$", re.M)
+SHARD_END = re.compile(r"^shard (\S+): \d+s exit=(\d+)$", re.M)
+UNITTEST_FAILED = "1"
+#: The paths, under the tree, a shard of these tests puts on PYTHONPATH (`run-tests.sh`); `()` for none. Every
+#: other test runs with none here: the runner adds only its coverage hook, which the rerun does not use.
+SHARD_PATHS = {"dashboard.tests.": ("dashboard", "lib", "dashboard/tests"), "tests.sd_db.": ()}
 #: One shard's block of `run-tests.sh` output, from its start line to its end line.
 SHARD_BLOCK = re.compile(r"^shard (\S+): start$.*?^shard \1: \d+s exit=\d+$", re.M | re.S)
 #: How long a test that failed its rerun stays out of the flake retry (sd:9768).
@@ -1753,16 +1760,8 @@ def failed_tests(check: dict) -> list[str]:
         return []
     ids: list[str] = []
     for row in rows:
-        if not exited_failing(row):
-            return []
-        steps = [str(step) for step in shard_lines(row.get("failed_steps"))]
-        text = whole_output(row)
-        # A skip or an unexpected success anywhere fails the gate by itself; a failing shard only ends
-        # `make test` before it says so.
-        if RUNNER_FAULT.search(SHARD_BLOCK.sub("", text)) or FAILING_OUTCOME.search(text):
-            return []
-        found = [paren if paren.endswith(f".{name}") else f"{paren}.{name}" for name, paren in FAILED_TEST.findall(text)]
-        if not steps or not found or not all(test_step(step, text) for step in steps):
+        found = row_tests(row)
+        if not found:
             return []
         ids += found
     ids = list(dict.fromkeys(ids))
@@ -1776,15 +1775,47 @@ def exited_failing(row: dict[str, Any]) -> bool:
     return isinstance(code, int) and not isinstance(code, bool) and code != 0 and not row.get("reason")
 
 
-def test_step(step: str, text: str) -> bool:
-    """`make target test`, or a finished shard whose block of `text` holds a FAIL or ERROR header."""
+def row_tests(row: dict) -> list[str]:
+    """The unittest ids one failing check row names when failing tests are all that failed in it; [] otherwise."""
+    if not exited_failing(row):
+        return []
+    steps = [str(step) for step in shard_lines(row.get("failed_steps"))]
+    text = whole_output(row)
+    failing = unittest_failed_shards(text)
+    # A skip or an unexpected success anywhere fails the gate by itself; a failing shard only ends
+    # `make test` before it says so.
+    if RUNNER_FAULT.search(SHARD_BLOCK.sub("", text)) or FAILING_OUTCOME.search(text):
+        return []
+    found = [paren if paren.endswith(f".{name}") else f"{paren}.{name}" for name, paren in FAILED_TEST.findall(text)]
+    if not steps or not failing or not all(test_step(step, failing) for step in steps):
+        return []
+    return found
+
+
+def unittest_failed_shards(text: str) -> set[str]:
+    """The shards in `run-tests.sh` output `text` that finished with unittest's own failure exit and printed a FAIL
+    or ERROR header; empty when any shard did not write its complete end line (killed or hung), ended with any
+    other non-zero exit (137 for a kill), or failed with no header: then more than a test failed."""
+    started = SHARD_START.findall(text)
+    ended = {match.group(1): match for match in SHARD_END.finditer(text)}
+    if any(name not in ended for name in started):
+        return set()
+    failing = {name for name, match in ended.items() if match.group(2) != "0"}
+    for name in failing:
+        match = ended[name]
+        opened = text.rfind(f"shard {name}: start\n", 0, match.start())
+        if match.group(2) != UNITTEST_FAILED or opened < 0 or not FAILED_TEST.search(text, opened, match.start()):
+            return set()
+    return failing
+
+
+def test_step(step: str, failing: set[str]) -> bool:
+    """`make target test`, or one complete `shard X: Ns exit=1` line of a shard in `failing`: a listed step that
+    only starts like one (`exit=1` of `exit=137`) or names an unfinished shard is not a test failure."""
     if step == "make target test":
         return True
-    if not step.startswith("shard ") or step.endswith(": unfinished"):
-        return False
-    end = text.find(step)
-    start = text.rfind(f"shard {step.split()[1]} start", 0, end) if end >= 0 else -1
-    return start >= 0 and FAILED_TEST.search(text, start, end) is not None
+    match = SHARD_END.fullmatch(step)
+    return match is not None and match.group(2) == UNITTEST_FAILED and match.group(1) in failing
 
 
 def whole_output(row: dict) -> str:
@@ -1821,6 +1852,15 @@ def runner_guards(tree: pathlib.Path) -> dict[str, str]:
     except (OSError, ValueError):
         text = ""
     return {"JEV_ENABLED": "0", **dict(RUNNER_GUARD.findall(text))}
+
+
+def shard_environment(environment: dict[str, str], tree: pathlib.Path, test: str) -> dict[str, str]:
+    """`environment` with the PYTHONPATH `run-tests.sh` gives the shard `test` runs in (`SHARD_PATHS`)."""
+    env = {key: value for key, value in environment.items() if key != "PYTHONPATH"}
+    paths = next((paths for prefix, paths in SHARD_PATHS.items() if test.startswith(prefix)), ())
+    if paths:
+        env["PYTHONPATH"] = os.pathsep.join(str(tree / path) for path in paths)
+    return env
 
 
 def gate_python(tree: pathlib.Path, environment: dict[str, str]) -> str | None:
@@ -1864,8 +1904,18 @@ def rerun_tests(root: pathlib.Path, head: str, tests: list[str]) -> tuple[int | 
                 return None, "", f"no gate interpreter (the Makefile's VENV_PYTHON) at {head[:12]}"
             # The Makefile reads SD_LOCAL_GATE and unexports it from its recipes: the tests see a plain checkout.
             environment.pop(sd_gate_run.GATE_VARIABLE, None)
-            return sd_gate_run.run_child([python, "-m", "unittest", *tests], environment, tree,
-                                         sd_lib.GATE_CHECK_SECONDS)
+            # As `make test` and `run-tests.sh` give every shard: no real review or gate slot to wait on.
+            environment.update(SD_REVIEW_SLOTS="0", SD_GATE_SLOTS="0", SD_AI_COMMAND_PACK_PYTHON=python)
+            outputs, code = [], 0
+            for test in tests:  # one child per test, each with its own shard's path
+                ran, out, err = sd_gate_run.run_child([python, "-m", "unittest", test],
+                                                      shard_environment(environment, tree, test), tree,
+                                                      sd_lib.GATE_CHECK_SECONDS)
+                outputs.append((out, err))
+                code = ran if ran is None or code == 0 else code
+                if ran is None:
+                    break
+            return code, "\n".join(out for out, _ in outputs), "\n".join(err for _, err in outputs)
         finally:
             sd_lib.git_output(["worktree", "remove", "--force", str(tree)], root)
 

@@ -741,6 +741,25 @@ class AFlakyGateTestIsRerunAlone(unittest.TestCase):
         self.assertEqual(review.state["reviewed_head"], HEAD)
         self.assertEqual(review.state["passes"][-1]["report"]["check"]["flake"]["tests"], [FLAKY_TEST])
 
+    def test_only_a_finished_shard_with_unittests_failure_exit_is_a_flake(self):
+        """Review of sd:9768: a shard killed after it printed a unittest failure (exit 137), one whose end line
+        only starts like the listed step, or one that never wrote its end line, is no flake: only a complete
+        `shard X: Ns exit=1` line counts, read from the whole output."""
+        log = pathlib.Path(self.row["output_path"])
+        killed = OUTPUT.replace(SHARD, "shard tests.test_example: 4s exit=137")
+        cases = (("killed, listed as killed", killed, ["shard tests.test_example: 4s exit=137", "make target test"]),
+                 ("killed, listed as exit=1", killed, [SHARD, "make target test"]),
+                 ("no end line", OUTPUT.replace(SHARD, ""), ["make target test"]),
+                 ("an unlisted failing shard", OUTPUT.replace("shard tests.test_other: 2s exit=0",
+                                                               "shard tests.test_other: 2s exit=2"),
+                  [SHARD, "make target test"]))
+        for name, text, steps in cases:
+            with self.subTest(name):
+                log.write_text(text, encoding="utf-8")
+                self.assertEqual(sd_ship_review.failed_tests({"checks": [{**self.row, "failed_steps": steps}]}), [])
+        log.write_text(OUTPUT, encoding="utf-8")
+        self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [FLAKY_TEST])
+
     def test_only_a_failure_of_tests_alone_is_rerun(self):
         lint = {**self.row, "failed_steps": [SHARD, "make target lint"]}
         crashed = {**self.row, "failed_steps": ["shard tests.test_crash: 1s exit=1", "make target test"]}
@@ -893,6 +912,61 @@ class TheRerunRunsAtTheReviewedHead(unittest.TestCase):
         with unittest.mock.patch.object(sd_gate_run, "run_child", side_effect=child) as ran:
             code, _out, err = sd_ship_review.rerun_tests(root, git("rev-parse", "HEAD"), [FLAKY_TEST])
         self.assertEqual((code, ran.call_count), (None, 0), err)
+
+    def test_each_test_reruns_in_its_shards_environment(self):
+        """Review of sd:9768: a dashboard test imports `support` through `dashboard/tests`, as its gate shard
+        runs it; every rerun gets the runner's `SD_REVIEW_SLOTS=0` and `SD_GATE_SLOTS=0`, so no gate test waits
+        on a real slot. One child per test, so each gets its own shard's path."""
+        import subprocess
+        import tempfile
+
+        import sd_gate_run
+
+        from tests.clean_env import clean_environment
+
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        root = pathlib.Path(scratch.name) / "repo"
+        root.mkdir()
+
+        def git(*args):
+            return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True,
+                                  text=True, env=clean_environment()).stdout.strip()
+
+        git("init", "-q")
+        git("config", "user.email", "operator@example.test")
+        git("config", "user.name", "operator")
+        (root / "Makefile").write_text(f"VENV_PYTHON = {sys.executable}\n", encoding="utf-8")
+        git("add", "Makefile")
+        git("commit", "-q", "-m", "head")
+        runs = []
+
+        def child(command, env, cwd, timeout):
+            runs.append((command[3:], env.get("PYTHONPATH"), env.get("SD_REVIEW_SLOTS"), env.get("SD_GATE_SLOTS"),
+                         env.get("SD_AI_COMMAND_PACK_PYTHON"), str(cwd)))
+            return 0, "", "OK"
+
+        dashboard, sd_db = "dashboard.tests.test_example.Case.test_a", "tests.sd_db.test_example.Case.test_a"
+        with unittest.mock.patch.object(sd_gate_run, "run_child", side_effect=child), \
+                unittest.mock.patch.dict("os.environ", {"SD_REVIEW_SLOTS": "4", "PYTHONPATH": "/elsewhere"}):
+            code, _out, _err = sd_ship_review.rerun_tests(root, git("rev-parse", "HEAD"), [FLAKY_TEST, dashboard, sd_db])
+        self.assertEqual(code, 0)
+        self.assertEqual([run[0] for run in runs], [[FLAKY_TEST], [dashboard], [sd_db]])
+        tree = runs[0][5]
+        self.assertEqual([run[1] for run in runs],
+                         [None, f"{tree}/dashboard:{tree}/lib:{tree}/dashboard/tests", None])
+        self.assertEqual({run[2:5] for run in runs}, {("0", "0", sys.executable)})
+
+    def test_the_shard_rules_still_match_the_runner(self):
+        """The rerun copies the shard rules `run-tests.sh` and `make test` give: this fails when either moves."""
+        root = pathlib.Path(__file__).resolve().parents[1]
+        runner = (root / ".github/scripts/run-tests.sh").read_text(encoding="utf-8")
+        self.assertIn('export PYTHONPATH="$5/dashboard:$5/lib:$5/dashboard/tests${4:+:$4}"', runner)
+        self.assertIn("export SD_GATE_SLOTS=0", runner)
+        self.assertIn('export SD_AI_COMMAND_PACK_PYTHON="$toolchain_python"', runner)
+        self.assertIn("SD_REVIEW_SLOTS=0", (root / "Makefile").read_text(encoding="utf-8"))
+        self.assertEqual(sd_ship_review.SHARD_PATHS["dashboard.tests."],
+                         ("dashboard", "lib", "dashboard/tests"))
 
 
 if __name__ == "__main__":
