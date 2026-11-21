@@ -4,9 +4,12 @@ The revert recipe it replaces failed twice on one bundle (sd:9651): a subset Ret
 reverted commit keeps its `Closes: sd:N`, so the merge would close the dropped item undone.
 """
 import importlib
+import os
+import shutil
 import sqlite3
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from unittest import mock
 
@@ -33,7 +36,10 @@ class Repo(Case):
 
     def setUp(self):
         super().setUp()
-        env = mock.patch.dict("os.environ", IDENTITY)
+        # Every git child, the fixture's and the drop's own, inherits this process's environment: a hook's
+        # `GIT_DIR` or `GIT_WORK_TREE` would point them at the operator's repository and its origin (round 25).
+        kept = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        env = mock.patch.dict("os.environ", {**kept, **IDENTITY}, clear=True)
         env.start()
         self.addCleanup(env.stop)
         origin, self.repo = self.root / "origin.git", self.root / "repo"
@@ -972,3 +978,27 @@ class DropRound24(Repo):
             DROP.drop_item(self.db, build, items[1], who="operator")
         self.unmade(run)
         self.assertTrue(admin.is_dir(), "the other worktree's metadata and index stay")
+
+
+class DecoyGitEnvironment(Repo):
+    """Round 25: a git hook exports `GIT_DIR` and `GIT_WORK_TREE`; the fixture's git calls and the drop's own must
+    still reach the fixture repository, never the one those name."""
+
+    def setUp(self):
+        self.decoy = Path(tempfile.mkdtemp(prefix="decoy-"))
+        self.addCleanup(shutil.rmtree, self.decoy, True)
+        subprocess.run(["git", "init", "-q", "-b", "main", str(self.decoy)], check=True,
+                       env={"PATH": os.environ["PATH"], "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull})
+        hook = mock.patch.dict("os.environ", {"GIT_DIR": str(self.decoy / ".git"), "GIT_WORK_TREE": str(self.decoy)})
+        hook.start()
+        self.addCleanup(hook.stop)
+        super().setUp()
+
+    def test_a_drop_under_a_hooks_git_environment_leaves_that_repository_alone(self):
+        items, ids, run = self.bundle()
+        DROP.drop_item(self.db, build, items[1], who="operator")
+        decoy = subprocess.run(["git", "-C", str(self.decoy), "for-each-ref"], capture_output=True, text=True,
+                               env={"PATH": os.environ["PATH"], "GIT_CONFIG_NOSYSTEM": "1",
+                                    "GIT_CONFIG_GLOBAL": os.devnull})
+        self.assertEqual((decoy.returncode, decoy.stdout), (0, ""), "no commit, branch or remote reached it")
+        self.assertEqual(sorted(os.listdir(self.decoy)), [".git"])
