@@ -163,8 +163,9 @@ def undo_split(done: dict) -> str:
     if not done.get("made"):
         return ""
     _git("cherry-pick", "--abort", cwd=work, check=False)
+    # By name alone: `--force` drops a registration whose folder is gone, where a repository-wide `worktree prune`
+    # would also drop another worktree's metadata, its index included, while its volume is away (round 24).
     _git("worktree", "remove", "--force", str(work), cwd=repo, check=False)
-    _git("worktree", "prune", cwd=repo, check=False)
     _git("branch", "-D", plan["new_branch"], cwd=repo, check=False)
     left = [str(work)] if work.exists() else []
     try:

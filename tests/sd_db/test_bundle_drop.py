@@ -947,3 +947,28 @@ class DropRound21(Repo):
         runner.request_cancel(self.db, ids[1], expected_revision=current["revision"], who="operator")
         self.assertNotIn(ids[0], self.claims())
         self.blocked_naming(ids[0], items[1])
+
+
+class DropRound24(Repo):
+    """Review round 24 of pack sd:9709: the drop read the old run's repository and route, never each kept item's
+    as it reads now; and its rollback pruned every linked worktree of the repository, not its own."""
+
+    def test_a_kept_item_moved_to_another_repository_refuses_the_drop(self):
+        items, ids, run = self.bundle()
+        self.move(items[1])
+        with self.assertRaisesRegex(DROP.DropRefused, f"sd:{items[1]} moved to"):
+            DROP.drop_item(self.db, build, items[2], who="operator")
+        self.unmade(run)
+        self.assertEqual(runner.queue_state(self.db, ids[0])["status"], "blocked", "nothing was written")
+
+    def test_a_failed_drop_leaves_another_worktrees_registration_alone(self):
+        items, ids, run = self.bundle()
+        other = self.root / "elsewhere"
+        git(self.repo, "worktree", "add", "-q", "-b", "elsewhere", str(other), "origin/main")
+        admin = Path(git(other, "rev-parse", "--absolute-git-dir"))
+        other.rename(self.root / "unmounted")  # its volume went away; git reads it as prunable
+        with mock.patch.object(build, "drop_writes", side_effect=build.BuildRefused("Drop refused: changed")), \
+                self.assertRaisesRegex(build.BuildRefused, "changed"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.unmade(run)
+        self.assertTrue(admin.is_dir(), "the other worktree's metadata and index stay")

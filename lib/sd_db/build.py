@@ -749,6 +749,13 @@ def drop_plan(connection, item: int) -> dict:
             owner = connection.execute("SELECT id FROM assignment WHERE item = ? AND scope = ? ORDER BY id DESC "
                                        "LIMIT 1", (member["item"], SCOPE)).fetchone()["id"]
             raise BuildRefused(f"Drop refused: sd:{member['item']} has a newer build, assignment {owner}")
+    # The kept work stays in the run's repository: a kept item moved since would queue where no claim resumes it,
+    # as the claim blocks a member away from its bundle's work (round 24).
+    for member in kept:
+        now = items[member["item"]]["repo"] if member["item"] in items else None
+        if now is None or not paths.same(now, last["repo"]):
+            raise BuildRefused(f"Drop refused: sd:{member['item']} moved to {now or 'no repository'}, away from "
+                               f"build run {last['id']}'s work in {last['repo']}; move it back first")
     # The kept work is in the new worktree on the machine that ran the run, not on the repo's lane as it reads now:
     # the drop runs there, and the new lead, which never ran, must route there (round 12). A lane moved since would
     # claim it elsewhere, fresh.
