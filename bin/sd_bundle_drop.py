@@ -30,6 +30,15 @@ def _git(*argv: str, cwd: str | Path, check: bool = True) -> subprocess.Complete
     return done
 
 
+def _has(*argv: str, cwd: str | Path, absent: int) -> bool:
+    """Whether a lookup found its ref: exit 0 yes, exit `absent` no; any other exit is a failed lookup, which
+    refuses rather than reads as no (round 5: a failed `ls-remote` let the drop rewrite a pushed branch)."""
+    done = _git(*argv, cwd=cwd, check=False)
+    if done.returncode not in (0, absent):
+        raise DropRefused(f"git {' '.join(argv)} failed in {cwd}: {(done.stderr or done.stdout).strip()}")
+    return done.returncode == 0
+
+
 def _out(*argv: str, cwd: str | Path) -> str:
     return _git(*argv, cwd=cwd).stdout.strip()
 
@@ -123,12 +132,12 @@ def _clean(work: str | Path, branch: str) -> None:
     if _out("status", "--porcelain", "--untracked-files=all", cwd=work):
         raise DropRefused(f"worktree {work} is not clean")
     for ref in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "REBASE_HEAD"):
-        if _git("rev-parse", "-q", "--verify", ref, cwd=work, check=False).returncode == 0:
+        if _exists(work, ref):
             raise DropRefused(f"worktree {work} has an unfinished {ref.split('_')[0].lower()}")
 
 
 def _exists(repo: str | Path, ref: str) -> bool:
-    return _git("rev-parse", "-q", "--verify", ref, cwd=repo, check=False).returncode == 0
+    return _has("rev-parse", "-q", "--verify", ref, cwd=repo, absent=1)
 
 
 def split_branch(plan: dict) -> dict:
@@ -150,7 +159,7 @@ def split_branch(plan: dict) -> dict:
     new_work, new_branch = Path(plan["new_work"]), plan["new_branch"]
     if in_place:
         # The lane pushes without force: a rewritten branch already on origin would not push.
-        if _git("ls-remote", "--exit-code", "origin", f"refs/heads/{branch}", cwd=repo, check=False).returncode == 0:
+        if _has("ls-remote", "--exit-code", "origin", f"refs/heads/{branch}", cwd=repo, absent=2):
             raise DropRefused(f"{branch} is on origin; drop it only before the lane pushed it")
         if _exists(repo, f"refs/heads/{saved}"):
             raise DropRefused(f"branch {saved} exists: an earlier drop kept it")

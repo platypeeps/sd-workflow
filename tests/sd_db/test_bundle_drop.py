@@ -374,3 +374,41 @@ class DropRound3(Repo):
         self.assertEqual([member["item"] for member in build.run(self.db, new["id"])["members"]], [items[2]])
         self.assertEqual(self.files(Path(new["work_path"])), ["README", "c.txt"])
         self.assertNotIn(f"sd:{items[1]}", self.closes(Path(new["work_path"])))
+
+
+class DropRound5(Repo):
+    """Review round 5 of pack sd:9709, class pass: a git exit code read as an answer. Only `ls-remote` exit 2 says a
+    ref is absent, only `rev-parse -q --verify` exit 1 says a ref is unset; any other failure refuses unwritten."""
+
+    def failing(self, *prefix, code=128):
+        real = DROP._git
+
+        def fake(*argv, cwd, check=True):
+            if argv[:len(prefix)] == prefix:
+                return subprocess.CompletedProcess(["git", *argv], code, "", "fatal: example failure")
+            return real(*argv, cwd=cwd, check=check)
+        return mock.patch.object(DROP, "_git", side_effect=fake)
+
+    def assert_unwritten(self, items, run, old):
+        work = Path(run["work_path"])
+        self.assertEqual((git(work, "rev-parse", "HEAD"), git(work, "branch", "--show-current")),
+                         (old, run["branch"]))
+        self.assertEqual(git(self.repo, "branch", "--list", f"{run['branch']}-drop-*"), "")
+        self.assertEqual(self.statuses(items), ["blocked"] * 3)
+
+    def test_a_failed_ls_remote_refuses_an_in_place_drop(self):
+        items, ids, run = self.bundle()
+        old = git(Path(run["work_path"]), "rev-parse", "HEAD")
+        with self.failing("ls-remote"), self.assertRaisesRegex(DROP.DropRefused, "ls-remote"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assert_unwritten(items, run, old)
+
+    def test_a_failed_rev_parse_refuses_the_drop(self):
+        items, ids, run = self.bundle()
+        old = git(Path(run["work_path"]), "rev-parse", "HEAD")
+        for item in (items[1], items[0]):
+            with self.subTest(item=item), self.failing("rev-parse", "-q", "--verify"), \
+                    self.assertRaisesRegex(DROP.DropRefused, "rev-parse"):
+                DROP.drop_item(self.db, build, item, who="operator")
+            self.assert_unwritten(items, run, old)
+            self.assertFalse((Path(run["work_path"]).parent / f"repo-build-{ids[1]}").exists())
