@@ -470,10 +470,10 @@ def changed_lines(git: Collection[str], work: str, base: str, head: str, *,
         elif header and line.startswith(('--- "', '+++ "')):
             return None
         elif header and line.startswith("--- "):
-            gone = line[6:] if line.startswith("--- a/") else None
+            gone = line[6:].removesuffix("\t") if line.startswith("--- a/") else None  # git's tab after a space
         elif header and line.startswith("+++ "):
             deleted = line == "+++ /dev/null"
-            path = gone if deleted else line[6:] if line.startswith("+++ b/") else None
+            path = gone if deleted else line[6:].removesuffix("\t") if line.startswith("+++ b/") else None
             if path is not None:
                 changed.setdefault(path, set())
         elif line.startswith("@@") and path is not None:
@@ -1277,7 +1277,7 @@ class Supervisor:
                 break
         if answer is None:
             return self.finish("blocked", f"the review gave no answer twice at {head[:12]}; see {self.out('review')}")
-        if prior and answer["status"] == "blocking":
+        if prior and answer["status"] == "blocking" and answer.get("complete"):  # a short report blocks (sd:9769)
             answer = self.file_new_findings(answer, prior, head)
         if answer["status"] in ("clean", "advisory", "skipped"):
             # `sd-review` runs no gate in an unmanaged checkout (sd:5953): the repository's own checks run here.
@@ -1312,8 +1312,10 @@ class Supervisor:
                       env=self.env)
             except Unread:
                 continue
-            if path == last:
-                shutil.copyfile(last, kept)
+            for row in answer["findings"]:  # `sd-review` refuses an absolute prior path, even inside the checkout
+                if isinstance(row, dict) and isinstance(row.get("path"), str) and os.path.isabs(row["path"]):
+                    row["path"] = self.locations({"path": row["path"]})[0][0]
+            kept.write_text(json.dumps(answer), encoding="utf-8")
             return answer
         return None
 
@@ -1934,7 +1936,8 @@ class Supervisor:
             return {"status": status, "blockers": []}
         if status == "blocking":
             return {"status": status, "blockers": [row for row in findings
-                                                   if isinstance(row, dict) and row.get("disposition") == "blocking"]}
+                                                   if isinstance(row, dict) and row.get("disposition") == "blocking"],
+                    "complete": 1 <= int(answer.get("requested_reviews") or 0) <= int(answer.get("completed_reviews") or 0)}
         if status == "gate_failed":  # the review cleared and the repository's gate failed: the builder fixes it
             checks = (answer.get("check") or {}).get("checks") or []
             return {"status": status, "blockers": [

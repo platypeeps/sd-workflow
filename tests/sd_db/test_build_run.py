@@ -208,15 +208,18 @@ FAKE = textwrap.dedent('''
                               "route": {"tier": "skip" if mode == "skip_route" else "cheap", "category": "docs"},
                               "subject": {"head": git("-C", work, "rev-parse", "HEAD")}}))
             sys.exit(0)
-        if mode == "offdelta":  # pack sd:9769: a new blocker on a file neither the fix nor round 1 touched
+        if mode in ("offdelta", "offdelta_short"):  # pack sd:9769: a new blocker on a file nobody touched
             far = {**raw, "path": "far.txt", "instances": ["far.txt:1"], "summary": "an old defect"}
-            print(json.dumps({"status": "blocking", "scope": "branch",
+            print(json.dumps({"status": "blocking", "scope": "branch", "requested_reviews": 2,
+                              "completed_reviews": 1 if mode == "offdelta_short" else 2,
                               "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                               "findings": review.dispose([review._finding(far)], "high")}))
             sys.exit(0)
-        print(json.dumps({"status": "blocking" if mode == "blocking" else "clean", "scope": "branch",
+        if mode == "absolute":  # pack sd:9769: a blocker spelled as an absolute path inside the checkout
+            findings = review.dispose([review._finding({**raw, "path": os.path.join(work, "work.txt")})], "high")
+        print(json.dumps({"status": "blocking" if mode in ("blocking", "absolute") else "clean", "scope": "branch",
                           "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
-                          "findings": findings if mode == "blocking" else []}))
+                          "findings": findings if mode in ("blocking", "absolute") else []}))
     if role == "sd-ship":
         lane = plans / "lane.json"
         entries = json.loads(lane.read_text()) if lane.exists() else []
@@ -1025,6 +1028,46 @@ class Supervise(Case):
         filed = self.db.execute("SELECT id, title, repo FROM item WHERE title LIKE 'Review follow-up%'").fetchall()
         self.assertEqual(len(filed), 1, "no follow-up item was filed")
         self.assertIn("far.txt:1", filed[0]["title"])
+
+    def test_a_short_blocking_report_is_never_made_advisory(self):
+        """Review of sd:9769: a blocking report missing a reader's answer blocks, whatever the delta."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1", "fix2"], sd_review=["blocking", "offdelta_short", "clean"])
+        self.supervisor().run()
+        self.assertEqual(len(self.calls("sd-review")), 3, "a short report was taken as a pass")
+
+    def test_an_absolute_blocker_path_reaches_the_next_round_relative(self):
+        """Review of sd:9769: `sd-review` refuses an absolute prior path, so the kept report holds it relative."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1"], sd_review=["absolute", "clean"])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        second = self.calls("sd-review")[1]["argv"]
+        prior = json.loads(Path(second[second.index("--verify-report") + 1]).read_text(encoding="utf-8"))
+        self.assertEqual(prior["findings"][0]["path"], "work.txt", "an absolute path reached the next round")
+
+    def test_a_path_with_a_space_reads_without_git_s_tab(self):
+        """Review of sd:9769: git ends a header naming a path with a space with a tab."""
+        repo = Path(tempfile.mkdtemp(dir=self.root))
+
+        def run(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.name=operator",
+                                   "-c", "user.email=operator@example.test", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        run("init", "-q")
+        (repo / "a b.txt").write_text("x\n")
+        (repo / "gone b.txt").write_text("y\n")
+        run("add", "-A")
+        run("commit", "-q", "-m", "base")
+        base = run("rev-parse", "HEAD")
+        (repo / "a b.txt").write_text("z\n")
+        (repo / "gone b.txt").unlink()
+        run("add", "-A")
+        run("commit", "-q", "-m", "change")
+        self.assertEqual(build_run.changed_lines(["git"], str(repo), base, run("rev-parse", "HEAD")),
+                         {"a b.txt": {1}, "gone b.txt": {1}})
 
     PRIOR = {"subject": {"head": "b" * 40}, "findings": [{"path": "named.py", "line": 1}]}
 
