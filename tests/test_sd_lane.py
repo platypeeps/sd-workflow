@@ -6746,5 +6746,30 @@ class ShotsEnd(unittest.TestCase):
         self.assertIsNotNone(children[0].returncode, "the leader was not reaped")
 
 
+
+class HandlerReentry(unittest.TestCase):
+    """pack sd:9600 class pass: a SIGTERM handler re-enters what the main thread it interrupted holds."""
+
+    def test_a_gate_signalled_in_kill_left_still_kills_every_read_group(self) -> None:
+        """`kill_left` iterated `self.below` under its RLock; `signal_gate` from the handler got in and
+        recorded a new group, and the iteration raised before the remaining SIGKILLs."""
+        gate = sd_lane.SpeculativeGate(target=lambda: None, name="sd-gate-test")
+        gate.below = {100: {}, 101: {}}
+        gate.group = 300
+        walked: list[int] = []
+
+        def kill_below(group: int, *_: Any) -> bool:
+            walked.append(group)
+            if len(walked) == 1:
+                gate.signal_gate(signal.SIGTERM)  # the handler's `term_gate`, on this thread
+            return False
+        with mock.patch.object(sd_lane.sd_lib, "read_after", return_value=({}, None)), \
+                mock.patch.object(sd_lane.sd_lib, "process_table", return_value={}), \
+                mock.patch.object(sd_lane.sd_lib, "kill_below", side_effect=kill_below), \
+                mock.patch.object(sd_lane, "end_group"):
+            gate.kill_left()
+        self.assertEqual(walked[:2], [100, 101])
+
+
 if __name__ == "__main__":
     unittest.main()
