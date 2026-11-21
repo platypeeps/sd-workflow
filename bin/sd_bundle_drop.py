@@ -77,7 +77,8 @@ def drop_sides(work: str | Path, start: str, tip: str, item: int, aside: set[int
     item may edit only a file a kept commit touched (round 6). So does one citing an item the bundle did not build
     (`built`): replayed on the kept branch, its `Closes:` would close that item at merge (round 15)."""
     shas = _out("rev-list", "--reverse", "--no-merges", f"{start}..{tip}", cwd=work).split()
-    kept, dropped = [], []
+    kept: list[str] = []
+    dropped: list[str] = []
     for sha in shas:
         message = _out("log", "-1", "--format=%B", sha, cwd=work)
         # A cherry-picked revert still names the old sha, so the lane would not pair it with the replayed commit,
