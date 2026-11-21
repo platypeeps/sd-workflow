@@ -124,6 +124,16 @@ LEFT_OUT = "left out of a Retry of build run "
 #: The words of a run's blocked end when its branch held work from before a subset Retry: that bundle is held for
 #: good, and its items build fresh on a new branch (pack sd:9581).
 SPLIT = "left the bundle at a Retry, and "
+#: The result a member bundle drop took out ends with, after `ALONE` (pack sd:9709).
+DROPPED = "dropped from build run "
+#: The scope of the row a bundle drop reserves its new lead's id with (`drop_reserve`): no build reader reads it.
+RESERVED = "build-drop"
+#: The keys `drop_reserve` adds to a drop plan.
+RESERVED_KEYS = ("new_lead", "new_work", "new_branch")
+#: How a bundle drop queues its kept members, in the queue note of each, the ended run's id last: the new lead's
+#: kept work is in a worktree on the host that ran that run, which alone may claim it, before and after its first
+#: claim (pack sd:9709, rounds 16 and 18). A note, as no writer changes one; the row's `result` lost it (round 17).
+DROP_HOW = "bundle drop of sd:{item} from build run "
 #: The bundle statuses Retry and Send to builder take: each keeps its worktree.
 AGAIN = ("blocked", "cancelled")
 #: A lane entry that failed only because prepare's merge of origin/<base> conflicted goes back to its builder on
@@ -673,27 +683,179 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
                                        "LIMIT 1", (newer[0]["item"], SCOPE)).fetchone()["id"]
             raise BuildRefused(f"Retry refused: sd:{newer[0]['item']} has a newer build, assignment {owner}")
         parked = "" if finding else parked_finding(last.get("detail"))
-        queued = []
-        for member in members:
-            item = items.get(member["item"])
-            if item is not None and item["status"] == "blocked":
-                transition(connection, member["item"], "ready", who=who, reason=f"Retry of build run {last['id']}")
-            unpark(connection, member["item"])
-            try:
-                _item(connection, member["item"], lead=assignment)
-            except BuildRefused as refusal:
-                raise BuildRefused(f"Retry refused: {refusal}") from None
-            if finding:
-                add_note(connection, member["item"], "comment", FINDING + finding)
-            elif parked:
-                add_note(connection, member["item"], "comment", REVIEWED + parked)
-            fresh = queue_state(connection, member["id"])["revision"]
-            queued.append(requeue(connection, member["id"], expected_revision=fresh, who=who))
-            add_note(connection, member["item"], "comment",
-                     f"Build assignment {member['id']} queued again by {who}: "
-                     f"{'Send to builder' if finding else 'Retry'} of build run {last['id']}")
-        return {"run": last["id"], "queued": [{"id": row["id"], "item": row["item"], "status": row["status"]}
-                                             for row in queued]}
+        how = f"{'Send to builder' if finding else 'Retry'} of build run {last['id']}"
+        return {"run": last["id"], "queued": _queue_members(connection, members, items, lead=assignment, who=who,
+                                                             finding=finding, parked=parked, how=how, verb="Retry")}
+
+
+def _queue_members(connection, members: list[dict], items: dict, *, lead: int, who: str, finding: str, parked: str,
+                   how: str, verb: str) -> list[dict]:
+    """Queue each ended bundle member again under `lead`, its item ready and unparked, with the finding or the
+    parked run's blockers as a note: Retry's and bundle drop's one path (pack sd:9709)."""
+    queued = []
+    for member in members:
+        item = items.get(member["item"])
+        if item is not None and item["status"] == "blocked":
+            transition(connection, member["item"], "ready", who=who, reason=how)
+        unpark(connection, member["item"])
+        try:
+            _item(connection, member["item"], lead=lead)
+        except BuildRefused as refusal:
+            raise BuildRefused(f"{verb} refused: {refusal}") from None
+        fresh = queue_state(connection, member["id"])["revision"]
+        queued.append(requeue(connection, member["id"], expected_revision=fresh, who=who))
+        add_note(connection, member["item"], "comment", f"Build assignment {member['id']} queued again by {who}: {how}")
+        # After the queue's note, where a lead with no earlier run starts its brief's findings (rounds 14 and 16).
+        if finding:
+            add_note(connection, member["item"], "comment", FINDING + finding)
+        elif parked:
+            add_note(connection, member["item"], "comment", REVIEWED + parked)
+    return [{"id": row["id"], "item": row["item"], "status": row["status"]} for row in queued]
+
+
+def drop_plan(connection, item: int) -> dict:
+    """Bundle drop (pack sd:9709): what taking `item` out of its ended build bundle moves, or BuildRefused.
+
+    The bundle must be one Retry takes. The kept members are its other open members, under a new lead on a new
+    branch and worktree beside the old ones, which keep the dropped item's work and its ignored files: a drop in
+    place left those for the kept bundle's next builder (round 13); `drop_reserve` reserves its id. `revision` is
+    the lead's, which `drop_writes` checks again before it writes."""
+    row = connection.execute("SELECT id, parent, result FROM assignment WHERE item = ? AND scope = ? "
+                             "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
+    if row is None:
+        raise BuildRefused(f"Drop refused: sd:{item} has no build")
+    if row["parent"] is not None and (row["result"] or "").startswith(ALONE):
+        raise BuildRefused(f"Drop refused: sd:{item} left its bundle already; Build it to build it alone")
+    lead = row["parent"] or row["id"]
+    current = queue_state(connection, lead)
+    last = current["run"]
+    state = retry_state(connection, last) if last else {"allowed": False, "reason": "it never ran"}
+    if not state["allowed"]:
+        raise BuildRefused(f"Drop refused: {state['reason']}")
+    members = _members(connection, lead, current["status"])
+    if row["id"] not in {member["id"] for member in members}:
+        raise BuildRefused(f"Drop refused: sd:{item} is not a {current['status']} member of build {lead}")
+    items = reads.items_by_ids(connection, [member["item"] for member in members])
+    kept = [member for member in members if member["id"] != row["id"] and not _done(items, member["item"])]
+    # As Retry: a done lead kept as the parent would not lead the claim, which would start a member's own branch
+    # and skip the cherry-picked one (round 2). Dropping the lead itself is the way out.
+    if row["id"] != lead and _done(items, current["item"]):
+        raise BuildRefused(f"Drop refused: its lead sd:{current['item']} is done")
+    if not kept:
+        raise BuildRefused(f"Drop refused: sd:{item} is the only open item of build {lead}; Retry or cancel it")
+    # As Retry: a kept member whose item a newer build owns would resume this older branch over that work.
+    for member in kept:
+        if not _current(connection, member):
+            owner = connection.execute("SELECT id FROM assignment WHERE item = ? AND scope = ? ORDER BY id DESC "
+                                       "LIMIT 1", (member["item"], SCOPE)).fetchone()["id"]
+            raise BuildRefused(f"Drop refused: sd:{member['item']} has a newer build, assignment {owner}")
+    # The kept work stays in the run's repository: a kept item moved since would queue where no claim resumes it,
+    # as the claim blocks a member away from its bundle's work (round 24).
+    for member in kept:
+        now = items[member["item"]]["repo"] if member["item"] in items else None
+        if now is None or not paths.same(now, last["repo"]):
+            raise BuildRefused(f"Drop refused: sd:{member['item']} moved to {now or 'no repository'}, away from "
+                               f"build run {last['id']}'s work in {last['repo']}; move it back first")
+    # The kept work is in the new worktree on the machine that ran the run, not on the repo's lane as it reads now:
+    # the drop runs there, and the new lead, which never ran, must route there (round 12). A lane moved since would
+    # claim it elsewhere, fresh.
+    ran_on = run_host(last["owner"])
+    if ran_on not in lane_hosts(connection):
+        raise BuildRefused(f"Drop refused: build run {last['id']} ran on {ran_on or 'the hub'}; "
+                           f"drop it on {ran_on or 'the hub'}")
+    lane = connection.execute("SELECT repo.lane_host FROM repo WHERE repo.path = ?", (last["repo"],)).fetchone()
+    claims = _route(connection, lane["lane_host"] if lane else None, None)
+    if claims != lane_of(connection, ran_on):
+        raise BuildRefused(f"Drop refused: its kept items would build on {claims or 'the hub'}, but build run "
+                           f"{last['id']} ran on {ran_on or 'the hub'}, which holds their work; Retry it whole")
+    # Every item the bundle built that is not kept, as Retry reads who leaves from the run's membership: a member
+    # cancelled out before (`ALONE`, round 3) or moved to planning (`UNBUILT`, round 8). Its commits stay on the old
+    # branch, and the split must not carry them. A done item's commits may stay: the merge closes nothing open.
+    built = [member["item"] for member in connection.execute(
+        "SELECT item FROM assignment WHERE (id = ? OR parent = ?) AND scope = ?", (lead, lead, SCOPE))]
+    states = reads.items_by_ids(connection, built)
+    gone = {one for one in built if not _done(states, one)}
+    # The stored repo is a key (`~/...`); git needs the disk path, as `Supervisor` expands it (round 3).
+    repo, work = paths.expand(last["repo"]), Path(last["work_path"])
+    return {"item": item, "assignment": row["id"], "lead": lead, "kept": kept, "run": last["id"],
+            "aside": sorted(gone - {member["item"] for member in kept} | {item}), "built": sorted(set(built)),
+            "revision": current["revision"], "repo": str(repo), "work": str(work), "branch": last["branch"]}
+
+
+def drop_reserve(connection, plan: dict) -> dict:
+    """`plan` with its new lead: the drop queues the kept items as fresh rows under it, so the ended run keeps its
+    members by `parent` (round 10). Its id names the branch and worktree the split makes, so it is reserved by a
+    committed row before the split: a predicted `MAX(id) + 1` went to a build queued meanwhile, whose branch and
+    worktree the refused drop's undo then removed (round 14). `drop_writes` makes the row the lead; a drop that
+    does not commit deletes it (`drop_release`)."""
+    with transaction(connection):
+        new = connection.execute(
+            "INSERT INTO assignment (role, status, scope, result) VALUES ('author', 'cancelled', ?, ?)",
+            (RESERVED, f"reserved by a bundle drop of sd:{plan['item']}")).lastrowid
+    return {**plan, "new_lead": new, "new_work": str(worktree(plan["repo"], new, root=Path(plan["work"]).parent)),
+            "new_branch": branch(new)}
+
+
+def drop_release(connection, plan: dict) -> None:
+    """Delete the row `drop_reserve` made for a drop that did not commit."""
+    with transaction(connection):
+        connection.execute("DELETE FROM assignment WHERE id = ? AND scope = ?", (plan["new_lead"], RESERVED))
+
+
+def drop_writes(connection, plan: dict, *, who: str, note: str, left: str) -> list[dict]:
+    """Bundle drop's writes, once its branch holds the kept commits alone (pack sd:9709), in one transaction: the
+    dropped member leaves its bundle (`ALONE`), the kept members queue as fresh rows under the new lead with `note`
+    as the finding, and the dropped item queues alone as a fresh build, `left` noted on it. Each queued assignment,
+    the kept first."""
+    with transaction(connection):
+        # The whole plan, read again: a kept member moved during the split (to planning and back, its assignment
+        # cancelled) leaves the lead's revision as it was, and would queue again (round 10).
+        if drop_plan(connection, plan["item"]) != {key: plan[key] for key in plan if key not in RESERVED_KEYS}:
+            raise BuildRefused(f"Drop refused: build {plan['lead']} changed since the drop read it; drop again")
+        stamp, lead, gone = clock(), plan["new_lead"], plan["assignment"]
+        connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
+                           (stamp, f"{ALONE}{who}: {DROPPED}{plan['run']}", gone))
+        # The old rows stay in the ended run's bundle, cancelled out of it (`ALONE`) at the count of its last run,
+        # which `run` and the sweep read; fresh rows queue under the reserved lead, and a claim takes a lead that
+        # counts a run as its own bundle (`_bundle`). No run row backs the count.
+        members: list[dict] = []
+        for member in plan["kept"]:
+            connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
+                               (stamp, f"{ALONE}{who}: {DROPPED}{plan['run']}", member["id"]))
+            if not members:  # the reserved row becomes the lead
+                made = connection.execute(
+                    "UPDATE assignment SET item = ?, lane = 'parallel', budget_minutes = ?, scope = ?, run_count = 1, "
+                    "result = NULL WHERE id = ? AND scope = ?", (member["item"], BUDGET_MINUTES, SCOPE, lead, RESERVED))
+                if made.rowcount != 1:
+                    raise BuildRefused(f"Drop refused: the reserved assignment {lead} is gone; drop again")
+                members.append({"id": lead, "item": member["item"]})
+                continue
+            cursor = connection.execute(
+                "INSERT INTO assignment (item, role, status, parent, lane, budget_minutes, scope, run_count) "
+                "VALUES (?, 'author', 'cancelled', ?, 'parallel', ?, ?, 1)",
+                (member["item"], lead, BUDGET_MINUTES, SCOPE))
+            members.append({"id": int(cursor.lastrowid), "item": member["item"]})
+        items = reads.items_by_ids(connection, [plan["item"], *(member["item"] for member in members)])
+        how = DROP_HOW.format(item=plan["item"]) + plan["run"]
+        queued = _queue_members(connection, members, items, lead=lead, who=who, finding=note, parked="",
+                                how=how, verb="Drop")
+        if items[plan["item"]]["status"] == "blocked":
+            transition(connection, plan["item"], "ready", who=who, reason=how)
+        unpark(connection, plan["item"])
+        add_note(connection, plan["item"], "comment", left)
+        alone = queue(connection, [plan["item"]], who=who)
+        # Built alone, as the drop promises: a claim bundles only fresh rows (no parent, `run_count` 0) together,
+        # and takes a row that counts a run as its own bundle, its lead (`_bundle`). No run row backs the count.
+        connection.execute("UPDATE assignment SET run_count = 1 WHERE id = ?", (alone[0]["id"],))
+        return queued + [{"id": row["id"], "item": row["item"], "status": row["status"]} for row in alone]
+
+
+def drop_committed(connection, plan: dict) -> bool:
+    """Whether `drop_writes` of `plan` committed: its dropped member reads cancelled out of this run's bundle. An
+    interrupt after the commit must keep the branch the queued builds read (round 7)."""
+    row = connection.execute("SELECT status, result FROM assignment WHERE id = ?", (plan["assignment"],)).fetchone()
+    return (row is not None and row["status"] == "cancelled"
+            and (row["result"] or "").endswith(f": {DROPPED}{plan['run']}"))
 
 
 def left(connection, branch: str, items) -> set[int]:
@@ -701,14 +863,16 @@ def left(connection, branch: str, items) -> set[int]:
     published `branch` (`branch_run`). A lane entry on that branch neither closes nor demands one, whatever its
     commits, title or body say: an older run's `Closes:` trailer may still cite it (review rounds 4 and 5 of sd:9222).
     The branch names the bundle whichever member the entry claims first, and a fresh build of the member elsewhere
-    is another bundle and another branch; an entry on any other branch reads nothing here."""
+    is another bundle and another branch; an entry on any other branch reads nothing here. The lead counts too: a
+    bundle drop cancels it out (`ALONE`) when it leaves its branch (pack sd:9709, round 14)."""
     run = branch_run(connection, branch) if branch else None
     if run is None:
         return set()
     wanted = set(items)
     return {row["item"] for row in connection.execute(
-        f"SELECT item FROM assignment WHERE parent = ? AND scope = ? AND NOT {_in_group()}",
-        (run["assignment"], SCOPE)) if row["item"] in wanted}
+        f"SELECT item FROM assignment WHERE (id = ? OR parent = ?) AND scope = ? "
+        f"AND COALESCE(result, '') LIKE '{ALONE}%'",
+        (run["assignment"], run["assignment"], SCOPE)) if row["item"] in wanted}
 
 
 def left_out(connection, lead: int) -> list[tuple[int, int]]:
@@ -723,6 +887,15 @@ def left_out(connection, lead: int) -> list[tuple[int, int]]:
                                      (row["result"].rsplit(LEFT_OUT, 1)[1],)).fetchone()
         left.append((row["item"], retried["run"] if retried else 0))
     return left
+
+
+def left_mark(connection, lead: int) -> str:
+    """The tail a member leaving build `lead`'s bundle on its own (`ALONE`) ends its result with, ": LEFT_OUT<run>"
+    of the lead's latest run, so the next run's split check reads the branch for its commits, as after a subset
+    Retry; "" when the lead never ran (round 21)."""
+    ran = connection.execute("SELECT id FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
+                             (lead,)).fetchone()
+    return f": {LEFT_OUT}{ran['id']}" if ran else ""
 
 
 def split(connection, lead: int) -> str:
@@ -1245,7 +1418,75 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
         available = room(connection, load=load, load_cap=load_cap, interactive=interactive, hosts=hosts)
         if available["why"]:
             return None
+        # A bundle drop's new lead has no run, so it routes by the lane as it reads now; its kept work is in a
+        # worktree on the host that ran the ended run. A lane moved since would build it there fresh (round 16).
+        for row in queued:
+            held = _kept_host(connection, row)
+            if held is not None and lanes[row["id"]] in hosts and lanes[row["id"]] != lane_of(connection, held[1]):
+                _refuse(connection, row, f"its kept work is in a worktree on {held[1] or 'the hub'}, which ran build "
+                                         f"run {held[0]}, but its lane moved; drop or Build its items again there")
         queued = [row for row in queued if lanes[row["id"]] in hosts and not _refused_repo(connection, row)]
+        # A bundle's work is on its lead's branch in the repository of the run that made it, not wherever its item
+        # reads now: a lead moved since would build fresh there, and a member moved since would still be briefed and
+        # delivered from the old one (round 20). The lead blocks; the member leaves the bundle (`ALONE`). Its commits
+        # stay on the lead's branch: once the lead ran, it is left out of that run as a subset Retry leaves one
+        # (`LEFT_OUT`), so the next run's split check holds the branch; a drop's kept lead that never ran blocks
+        # below, and Build takes its items fresh (round 21).
+        for row in queued:
+            home = _work_repo(connection, row)
+            if home is None or paths.same(home, row["repo"]):
+                continue
+            if row["parent"] is None:
+                _refuse(connection, row, f"its work is on branch {branch(row['id'])} in {home}, but its item moved "
+                                         f"to {row['repo']}; move it back, or Build it again there")
+                continue
+            reason = (f"{ALONE}build: its item moved to {row['repo']}, away from its bundle's work in {home}; "
+                      f"Build it again there")
+            reason += left_mark(connection, row["parent"])
+            connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? "
+                               "WHERE id = ? AND status = 'queued'", (clock(), reason, row["id"]))
+            add_note(connection, row["item"], "comment", f"Build assignment {row['id']} left its bundle: {reason}")
+        # A member that left a bundle with work after it queued (moved above, cancelled, refused at a claim) leaves
+        # its commits on the lead's branch, which the lane would ship with the lead's: the lead blocks (round 21).
+        # A done item's commits may stay: the merge closes nothing open; one left out (`LEFT_OUT`) the split check
+        # reads at the run's start. A queued member is checked here against the work's repository too, as its item
+        # reads now: one whose item lost its repository (round 22), or moved to one whose lane runs on another host
+        # (round 23), is not in `queued`, so no check above saw it. It blocks, and counts as left.
+        for row in queued:
+            home = _work_repo(connection, row) if row["parent"] is None else None
+            if home is None:
+                continue
+            found = [one for one in connection.execute(
+                "SELECT member.id, member.item, member.status, item.repo FROM assignment member "
+                "JOIN item ON item.id = member.item JOIN assignment lead ON lead.id = member.parent "
+                "WHERE member.parent = ? AND member.scope = ? "
+                "AND member.queued_at >= lead.queued_at AND item.status != 'done' "
+                "AND COALESCE(member.result, '') NOT LIKE ? ORDER BY member.id",
+                (row["id"], SCOPE, f"%: {LEFT_OUT}%")).fetchall()
+                if one["status"] != "queued" or one["repo"] is None or not paths.same(home, one["repo"])]
+            for one in found:
+                if one["status"] == "queued":
+                    _refuse(connection, one, f"item {one['item']} has no repository; set one, then Build it again"
+                            if one["repo"] is None else f"its item moved to {one['repo']}, away from its bundle's "
+                            f"work in {home}; Build it again there")
+            strays = [one["item"] for one in found]
+            if strays:
+                names = ", ".join(f"sd:{item}" for item in strays)
+                _refuse(connection, row, f"{names} left the bundle after it queued, and branch {branch(row['id'])} "
+                                         f"holds its commits; Build the other items again to build them fresh on "
+                                         f"a new branch")
+        queued = [row for row in queued if connection.execute(
+            "SELECT status FROM assignment WHERE id = ?", (row["id"],)).fetchone()[0] == "queued"]
+        # A member whose lead is not in this claim's group (moved to planning, refused, or the member moved to another
+        # repository) would lead its own fresh branch, past the lead's branch, which holds the bundle's work, a bundle
+        # drop's cherry-picks alone (rounds 15 and 19).
+        leads = {row["id"]: row["repo"] for row in queued}
+        for row in queued:
+            if row["parent"] is not None and leads.get(row["parent"]) != row["repo"]:
+                _refuse(connection, row, f"its lead, assignment {row['parent']}, is no longer queued in "
+                                         f"{row['repo']}, and its branch {branch(row['parent'])} holds the "
+                                         f"bundle's work")
+        queued = [row for row in queued if row["parent"] is None or leads.get(row["parent"]) == row["repo"]]
         repo = next((row["repo"] for row in queued if room_for(available, row["repo"]) > 0), None)
         if repo is None:
             return None
@@ -1307,6 +1548,36 @@ def _bundle(connection, rows: list) -> list:
         fresh = [row for row in rows if row["parent"] is None and not row["run_count"]]
         return fresh[:bundled(connection, [row["item"] for row in fresh])]
     return sorted((row for row in rows if group in (row["id"], row["parent"])), key=lambda row: row["id"] != group)
+
+
+def _kept_host(connection, row) -> tuple[str, str | None] | None:
+    """(run, host) of the ended run a bundle drop's new lead `row` keeps the work of; None for any other row, or
+    when that run reads gone. It holds after the lead's first claim too: a Retry rebuilds the same worktree, which
+    stays on that host (round 18)."""
+    if row["parent"] is not None:
+        return None
+    note = connection.execute(
+        "SELECT body FROM note WHERE item = ? AND body LIKE ? ORDER BY timestamp, id LIMIT 1",
+        (row["item"], f"Build assignment {row['id']} queued again by %: {DROP_HOW.format(item='%')}%")).fetchone()
+    if note is None:
+        return None
+    ident = note["body"].rsplit(" ", 1)[1]
+    ran = connection.execute("SELECT owner FROM runner_run WHERE id = ?", (ident,)).fetchone()
+    return (ident, run_host(ran["owner"])) if ran else None
+
+
+def _work_repo(connection, row) -> str | None:
+    """The repository holding the work of `row`'s bundle: its lead's latest run's, or, for a bundle drop's new lead
+    that has not run, the ended run's whose work it keeps (`_kept_host`); None for a fresh bundle."""
+    lead = row["parent"] or row["id"]
+    ran = connection.execute("SELECT repo FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
+                             (lead,)).fetchone()
+    if ran is not None:
+        return ran["repo"]
+    held = _kept_host(connection, connection.execute("SELECT id, item, parent FROM assignment WHERE id = ?",
+                                                     (lead,)).fetchone())
+    ran = connection.execute("SELECT repo FROM runner_run WHERE id = ?", (held[0],)).fetchone() if held else None
+    return ran["repo"] if ran else None
 
 
 def _refuse(connection, row, reason: str) -> None:
