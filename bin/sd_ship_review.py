@@ -723,7 +723,8 @@ class SharedReview:
                     if test in named:
                         add_note(self.connection, item, "comment",
                                  f"{RERUN_FAILED_NOTE}{test} at {head[:12]}: it failed alone too (sd:9768)")
-            print(f"sd-ship: the failing tests failed again alone (exit {code}); the gate failure stands",
+            print(f"sd-ship: the failing tests failed again alone ({rerun_reason(code, err)}); "
+                  "the gate failure stands",
                   file=sys.stderr)
             return None
         flake = {"head": head, "tests": tests, "recorded_at": self.runtime.clock()}
@@ -1878,6 +1879,11 @@ def gate_python(tree: pathlib.Path, environment: dict[str, str]) -> str | None:
     return python if python and os.access(python, os.X_OK) else None
 
 
+def rerun_reason(code: int | None, err: str) -> str:
+    """A failed rerun's exit code; with none, the last line of its errors, which says why it stopped."""
+    return f"exit {code}" if code is not None else (err.strip().splitlines() or ["no clean pass"])[-1]
+
+
 def rerun_tests(root: pathlib.Path, head: str, tests: list[str]) -> tuple[int | None, str, str]:
     """The gate's interpreter `-m unittest` on `tests` alone in a clean detached worktree of `head`, as the gate ran them
     (sd:9768): no uncommitted or untracked file in `root` reaches the rerun. None for the exit code when the
@@ -1906,15 +1912,19 @@ def rerun_tests(root: pathlib.Path, head: str, tests: list[str]) -> tuple[int | 
             environment.pop(sd_gate_run.GATE_VARIABLE, None)
             # As `make test` and `run-tests.sh` give every shard: no real review or gate slot to wait on.
             environment.update(SD_REVIEW_SLOTS="0", SD_GATE_SLOTS="0", SD_AI_COMMAND_PACK_PYTHON=python)
-            outputs, code = [], 0
+            outputs: list[tuple[str, str]] = []
+            code: int | None = 0
             for test in tests:  # one child per test, each with its own shard's path
                 ran, out, err = sd_gate_run.run_child([python, "-m", "unittest", test],
                                                       shard_environment(environment, tree, test), tree,
                                                       sd_lib.GATE_CHECK_SECONDS)
-                outputs.append((out, err))
-                code = ran if ran is None or code == 0 else code
                 if ran is None:
+                    # `out` says why it did not finish: it ends the errors. An earlier failure keeps its code.
+                    outputs.append((err, out))
+                    code = code or None
                     break
+                outputs.append((out, err))
+                code = code or ran
             return code, "\n".join(out for out, _ in outputs), "\n".join(err for _, err in outputs)
         finally:
             sd_lib.git_output(["worktree", "remove", "--force", str(tree)], root)

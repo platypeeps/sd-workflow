@@ -707,6 +707,15 @@ class AFlakyGateTestIsRerunAlone(unittest.TestCase):
         self.assertEqual(len(self.notes(f"{RERUN_FAILED}{FLAKY_TEST} at ")), 1)
         self.assertEqual(self.notes(FLAKE), [])
 
+    def test_an_unfinished_rerun_names_its_reason_not_exit_none(self):
+        """Lead triage of sd:9768: a rerun that did not finish says why, not 'exit None'."""
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            _review, _rerun, refused = self.prepared(rerun=(None, "", "no worktree of 0123456789ab: boom"))
+        self.assertIsNotNone(refused)
+        self.assertNotIn("exit None", stderr.getvalue())
+        self.assertIn("no worktree of 0123456789ab: boom", stderr.getvalue())
+
     def test_a_second_flake_on_the_same_entry_fails(self):
         _review, rerun, refused = self.prepared(state={"passes": [], "gate_flake": {"head": HEAD, "tests": []}})
         self.assertIsNotNone(refused)
@@ -956,6 +965,38 @@ class TheRerunRunsAtTheReviewedHead(unittest.TestCase):
         self.assertEqual([run[1] for run in runs],
                          [None, f"{tree}/dashboard:{tree}/lib:{tree}/dashboard/tests", None])
         self.assertEqual({run[2:5] for run in runs}, {("0", "0", sys.executable)})
+
+    def test_a_later_unfinished_rerun_keeps_an_earlier_failures_code(self):
+        """Lead triage of sd:9768: a test that failed alone stays failed when a later one times out; the
+        timeout's reason ends the error output."""
+        import subprocess
+        import tempfile
+
+        import sd_gate_run
+
+        from tests.clean_env import clean_environment
+
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        root = pathlib.Path(scratch.name) / "repo"
+        root.mkdir()
+
+        def git(*args):
+            return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True,
+                                  text=True, env=clean_environment()).stdout.strip()
+
+        git("init", "-q")
+        git("config", "user.email", "operator@example.test")
+        git("config", "user.name", "operator")
+        (root / "Makefile").write_text(f"VENV_PYTHON = {sys.executable}\n", encoding="utf-8")
+        git("add", "Makefile")
+        git("commit", "-q", "-m", "head")
+        answers = iter([(1, "", f"FAIL: test_a ({FLAKY_TEST})"), (None, "sd-check could not finish: timeout", "")])
+        with unittest.mock.patch.object(sd_gate_run, "run_child", side_effect=lambda *_a: next(answers)):
+            code, _out, err = sd_ship_review.rerun_tests(root, git("rev-parse", "HEAD"),
+                                                         [FLAKY_TEST, f"{FLAKY_TEST}_other"])
+        self.assertEqual(code, 1)
+        self.assertTrue(err.endswith("sd-check could not finish: timeout"), err)
 
     def test_the_shard_rules_still_match_the_runner(self):
         """The rerun copies the shard rules `run-tests.sh` and `make test` give: this fails when either moves."""
