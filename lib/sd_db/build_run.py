@@ -40,6 +40,7 @@ The hub's tick and each satellite's act only on their own lanes' runs
 from __future__ import annotations
 
 import contextlib
+import functools
 import json
 import os
 import re
@@ -450,15 +451,19 @@ def changed_lines(git: Collection[str], work: str, base: str, head: str, *,
                   env: dict | None = None) -> dict[str, set[int]] | None:
     """Each path `base..head` changes, with the new-side lines its hunks touch; None when git cannot answer.
 
-    A hunk that only deletes names the line after it, where the deletion now sits (pack sd:9769).
+    A hunk that only deletes names the line after it, where the deletion now sits (pack sd:9769). Non-ASCII
+    paths read as themselves; a path git still quotes (a quote, a control character) makes the delta unknown.
     """
     try:
-        diff = _read([*git, "-C", work, "diff", "-U0", "--no-renames", "--no-color", base, head], env=env)
+        diff = _read([*git, "-C", work, "-c", "core.quotePath=false", "diff", "-U0", "--no-renames", "--no-color",
+                      base, head], env=env)
     except Unread:
         return None
     changed: dict[str, set[int]] = {}
     path = None
     for line in diff.splitlines():
+        if line.startswith('+++ "'):
+            return None
         if line.startswith("+++ "):
             path = line[6:] if line.startswith("+++ b/") else None
             if path is not None:
@@ -1302,29 +1307,47 @@ class Supervisor:
             return answer
         return None
 
-    def file_new_findings(self, answer: dict, prior: dict, head: str) -> dict:
-        """File each blocker on code neither the last round's findings nor the delta since name as a follow-up
-        item; the rest still block (pack sd:9769). A blocker with no file (`<review-response>`) still blocks."""
-        base = prior["subject"]["head"]
-        named = {row.get("path") for row in prior["findings"] if isinstance(row, dict)}
-        changed = changed_lines(self.tools.git, str(self.work), base, head, env=self.env)
-        new = [row for row in answer["blockers"] if not str(row.get("path", "<")).startswith("<")
-               and row.get("path") not in named and changed is not None
-               and (row.get("path") not in changed or row.get("line") not in (None, *changed[row["path"]]))]
-        if not new:
-            return answer
+    def locations(self, row: dict) -> list[tuple[str, int | None]]:
+        """A finding's primary place and each `path:line` instance, paths relative to the worktree (sd:9769)."""
+        places: list[tuple[Any, Any]] = [(row.get("path"), row.get("line"))]
+        for entry in row.get("instances") or []:
+            path, _, line = str(entry).rpartition(":")
+            places.append((path, int(line)) if path and line.isdigit() else (str(entry), None))
+        root = os.path.realpath(self.work)
+        found = []
+        for path, line in places:
+            path = str(path or "<unknown>")
+            if os.path.isabs(path) and os.path.realpath(path).startswith(root + os.sep):
+                path = os.path.relpath(os.path.realpath(path), root)
+            found.append((os.path.normpath(path), line if isinstance(line, int) else None))
+        return found
 
-        def file() -> None:
-            for row in new:
-                title = f"Review follow-up from build {self.row['branch']}: {row.get('path')}:{row.get('line')}"
-                filed = create_item(self.db, kind="task", title=f"{title} {row.get('summary') or ''}"[:200],
-                                    repo=self.row["repo"])
-                add_note(self.db, filed, "comment", f"Build run {self.ident} round {self.fresh()['review_round'] or 0}"
-                                                    f" found this on code its fix did not change, so it is filed, "
-                                                    f"not a blocker (pack sd:9769): {self.summary([row], None)}")
-        self.once(f"followups:{head}", file)
+    def file_new_findings(self, answer: dict, prior: dict, head: str) -> dict:
+        """File each blocker on code neither the last round's findings nor the delta since name, at any of its
+        places, as a follow-up item; the rest still block (pack sd:9769). A blocker with no file
+        (`<review-response>`) or a delta git cannot read still blocks. Each follow-up is one transaction under
+        its own mark, so a lost answer stands for that one write only."""
+        named = {path for row in prior["findings"] if isinstance(row, dict) for path, _ in self.locations(row)}
+        changed = changed_lines(self.tools.git, str(self.work), prior["subject"]["head"], head, env=self.env)
+
+        def held(row: dict) -> bool:
+            return changed is None or any(path.startswith("<") or path in named or path in changed and (
+                line is None or line in changed[path]) for path, line in self.locations(row))
+        new = [row for row in answer["blockers"] if not held(row)]
+        for index, row in enumerate(new):
+            self.once(f"followup:{head}:{index}", functools.partial(self.file_follow_up, row))
         blockers = [row for row in answer["blockers"] if row not in new]
         return {"status": "blocking" if blockers else "advisory", "blockers": blockers}
+
+    def file_follow_up(self, row: dict) -> None:
+        """One deferred blocker as a follow-up item and its note, in one transaction (pack sd:9769)."""
+        title = f"Review follow-up from build {self.row['branch']}: {row.get('path')}:{row.get('line')}"
+        with transaction(self.db):
+            filed = create_item(self.db, kind="task", title=f"{title} {row.get('summary') or ''}"[:200],
+                                repo=self.row["repo"])
+            add_note(self.db, filed, "comment", f"Build run {self.ident} round {self.fresh()['review_round'] or 0} "
+                                                f"found this on code its fix did not change, so it is filed, not a "
+                                                f"blocker (pack sd:9769): {self.summary([row], None)}")
 
     def own_checks(self, head: str) -> list[dict] | dict:
         """Run an unmanaged repository's own checks at `head`, each in a gate slot; a blocker per failure.

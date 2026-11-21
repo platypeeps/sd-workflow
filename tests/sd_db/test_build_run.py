@@ -1026,6 +1026,73 @@ class Supervise(Case):
         self.assertEqual(len(filed), 1, "no follow-up item was filed")
         self.assertIn("far.txt:1", filed[0]["title"])
 
+    PRIOR = {"subject": {"head": "b" * 40}, "findings": [{"path": "named.py", "line": 1}]}
+
+    def deferred(self, blockers, changed):
+        """`file_new_findings` over `blockers` with the delta `changed`: the blockers it keeps."""
+        supervisor = self.supervisor()
+        with mock.patch.object(build_run, "changed_lines", return_value=changed):
+            return supervisor, supervisor.file_new_findings({"status": "blocking", "blockers": blockers}, self.PRIOR,
+                                                            "a" * 40)
+
+    def test_a_blocker_on_a_changed_line_by_any_spelling_or_instance_still_blocks(self):
+        """Review of sd:9769: an instance on the delta, `./` or an absolute spelling of a changed path, blocks."""
+        self.press()
+        work = str(self.supervisor().work)
+        rows = [{"path": "far.py", "line": 9, "summary": "a", "instances": ["far.py:9", "src.py:5"]},
+                {"path": "./src.py", "line": 5, "summary": "b"},
+                {"path": f"{work}/src.py", "line": 5, "summary": "c"},
+                {"path": "./named.py", "line": 40, "summary": "d"}]
+        _, kept = self.deferred(rows, {"src.py": {5}})
+        self.assertEqual(kept["blockers"], rows, "a blocker on changed code was deferred")
+
+    def test_a_quoted_path_in_the_delta_reads_as_unknown(self):
+        """Review of sd:9769: a non-ASCII path reads as itself; one git still quotes reads as unknown."""
+        repo = Path(tempfile.mkdtemp(dir=self.root))
+
+        def run(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.name=operator",
+                                   "-c", "user.email=operator@example.test", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        run("init", "-q")
+        run("commit", "-q", "--allow-empty", "-m", "base")
+        base = run("rev-parse", "HEAD")
+        (repo / "na\u00efve.txt").write_text("x\n")
+        run("add", "-A")
+        run("commit", "-q", "-m", "plain")
+        plain = run("rev-parse", "HEAD")
+        self.assertEqual(build_run.changed_lines(["git"], str(repo), base, plain), {"na\u00efve.txt": {1}})
+        (repo / 'q"uote.txt').write_text("y\n")
+        run("add", "-A")
+        run("commit", "-q", "-m", "quoted")
+        self.assertIsNone(build_run.changed_lines(["git"], str(repo), base, run("rev-parse", "HEAD")),
+                          "a quoted path was read")
+
+    def test_each_follow_up_is_its_own_write(self):
+        """Review of sd:9769: a lost answer on the first follow-up must not stand for the second."""
+        rows = [{"path": "a.txt", "line": 1, "summary": "first"}, {"path": "b.txt", "line": 2, "summary": "second"}]
+        self.press()
+        supervisor = self.supervisor()
+        real, lost = supervisor.file_follow_up, list[dict]()
+
+        def committed_then_lost(row):  # the first follow-up's transaction commits; its answer is lost
+            real(row)
+            if not lost:
+                lost.append(row)
+                raise remote.UnknownOutcome("r" * 26, "the answer to COMMIT was lost")
+
+        supervisor.db.outcome = mock.Mock(return_value="recorded")
+        answer = {"status": "blocking", "blockers": rows}
+        with mock.patch.object(build_run, "changed_lines", return_value={}), \
+                mock.patch.object(supervisor, "file_follow_up", committed_then_lost):
+            with self.assertRaises(remote.UnknownOutcome):
+                supervisor.file_new_findings(answer, self.PRIOR, "a" * 40)
+            kept = supervisor.file_new_findings(answer, self.PRIOR, "a" * 40)
+        self.assertEqual(kept["status"], "advisory")
+        titles = [row[0] for row in self.db.execute("SELECT title FROM item WHERE title LIKE 'Review follow-up%'")]
+        self.assertEqual(len(titles), 2, f"a deferred blocker was never filed: {titles}")
+
     def test_a_round_two_repeat_of_a_round_one_finding_still_blocks(self):
         self.press()
         self.plan(claude=["pass", "fix1", "fix2"], sd_review=["blocking", "blocking", "clean"])

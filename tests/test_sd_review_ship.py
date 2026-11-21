@@ -82,6 +82,41 @@ class FixReviewTests(ReviewFixture):
                 sd_review.review(root, namespace(scope="branch", **mode), FakeRunner({"codex": broken_reader}),
                                  self.environment(), self.chatgpt_home())
 
+    def test_a_docs_only_fix_still_verifies_the_prior_code_blockers(self):
+        """Review of sd:9769: a delta the router would skip must not clear blockers nobody checked."""
+        root, first = self.branch()
+        blocking = json.dumps({"findings": [{"path": "src.py", "line": 1, "summary": "original unresolved defect",
+                                            "family": "correctness", "severity": "high", "instances": ["src.py:1"]}]})
+        prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": sd_review.Completed(0, blocking, "")}),
+                                 self.environment(), self.chatgpt_home())
+        self.assertEqual(prior["status"], "blocking")
+        report = self.tmp / "prior.json"
+        report.write_text(json.dumps(prior))
+        self.commit(root, "notes.md", "a note\n")
+        runner = FakeRunner({"codex": sd_review.Completed(0, blocking, "")})
+        result = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)), runner,
+                                  self.environment(), self.chatgpt_home())
+        self.assertEqual(result["status"], "blocking", "a docs-only delta skipped the prior blockers")
+
+    def test_a_verify_pass_carries_the_base_its_chain_covers(self):
+        """Review of sd:9769: a verify pass covers from where its first full pass started, and no further."""
+        root, first = self.branch()
+        full = sd_review.review(root, namespace(scope="branch"), FakeRunner(), self.environment(), self.chatgpt_home())
+        self.assertEqual(full["covers_from"], full["subject"]["base"])
+        report = self.tmp / "prior.json"
+        report.write_text(json.dumps(full))
+        second = self.commit(root, "fix.py", "fix = True\n")
+        chained = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)),
+                                   FakeRunner(), self.environment(), self.chatgpt_home())
+        self.assertEqual(chained["covers_from"], full["subject"]["base"])
+        narrow = {**full, "subject": {**full["subject"], "base": first, "head": second}}  # delta-only, no covers_from
+        narrow.pop("covers_from")
+        report.write_text(json.dumps(narrow))
+        self.commit(root, "more.py", "more = True\n")
+        unchained = sd_review.review(root, namespace(scope="branch", base=second, verify_report=str(report)),
+                                     FakeRunner(), self.environment(), self.chatgpt_home())
+        self.assertIsNone(unchained["covers_from"], "a narrow prior report was read as a full pass")
+
     def test_mismatched_or_malformed_previous_report_cannot_verify(self):
         root, first = self.branch()
         self.commit(root, "fix.py", "fix = True\n")

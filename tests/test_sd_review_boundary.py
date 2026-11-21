@@ -1009,11 +1009,14 @@ class LineBudgetTests(unittest.TestCase):
         # the whole-file read of a full branch pass (`whole_files`), and
         # recording a build's passing verify round for the lane, split into
         # helpers under the complexity ceiling. Measured: `sd-review` is 2915.
+        # 4885 -> 4900, the ceiling: +15 so a verify pass is recorded only
+        # from the fork its chain covers (`covers_from`) and a held blocker
+        # keeps a docs-only delta at depth. Measured: `sd-review` is 2930.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4885,
+            4900,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

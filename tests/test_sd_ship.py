@@ -5226,13 +5226,18 @@ roles:
         head = _git(self.root, "rev-parse", "HEAD")
         prior = _git(self.root, "rev-parse", "HEAD~1")
         args = review.build_parser().parse_args(["--scope", "branch", "--verify-report", "prior.json", "--base", prior])
+        fork = _git(self.root, "merge-base", head, "origin/main")
         result = {"status": "clean", "requested_reviews": 2, "completed_reviews": 2,
                   "subject": {"base": prior, "head": head}}
+        for narrow in (None, "0" * 40):  # review of sd:9769: a chain that covers less than the fork stands for nothing
+            with contextlib.redirect_stderr(io.StringIO()):
+                review.record_lead_review(self.root, args, {**result, "covers_from": narrow}, dict(os.environ))
+            self.assertIsNone(self.lead_record(), f"a verify pass covering from {narrow} was recorded")
         with contextlib.redirect_stderr(io.StringIO()):
-            review.record_lead_review(self.root, args, result, dict(os.environ))
+            review.record_lead_review(self.root, args, {**result, "covers_from": fork}, dict(os.environ))
         record = self.lead_record()
         self.assertIsNotNone(record, "a build's passing verify round was not recorded")
-        self.assertEqual(record["base"], _git(self.root, "merge-base", head, "origin/main"))
+        self.assertEqual(record["base"], fork)
         self.assertEqual(record["head"], head)
 
     def assert_tier_reviews(self, files: dict[str, str], policy: str | None = None) -> None:
