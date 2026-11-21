@@ -2530,6 +2530,20 @@ class Hosts(Case):
         self.assertIn("beat is fresh", self.count("SELECT body FROM note WHERE item = ? AND body LIKE ? "
                                                   "ORDER BY id DESC LIMIT 1", items[0], "%queued again%"))
 
+    def test_a_satellite_takes_no_beat_blocked_retry_another_satellite_ran(self):
+        """Review of sd:9775: a satellite requeued a blocked retry whose lane had moved to it from another
+        satellite, and built it without the first satellite's worktree. It takes only the rows its own quiet
+        beat blocked."""
+        build.queue(self.db, [self.item(repo=SAT)], who="operator")
+        first = self.claim(hosts=WORK)
+        self.retried(first)
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.db.execute("UPDATE repo SET lane_host = 'other' WHERE path = ?", (SAT,))
+        record_state(self.db, "heartbeat", key="build-dispatch@other", body={})
+        self.assertIsNone(self.claim(hosts=frozenset({"other"})))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", first["assignment"]), "blocked")
+
     def test_the_hub_blocks_a_row_whose_satellite_beat_comes_from_a_clock_ahead(self):
         """Pack sd:7955: a beat stamped more than STALE_SECONDS after now has no age to trust, so the claim blocks
         the row as for a stale beat, and its note names the skew, not a dead dispatcher."""
