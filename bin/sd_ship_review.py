@@ -1736,6 +1736,8 @@ RUNNER_FAULT = re.compile(r"^(?:error: |fatal: |Tests skipped locally)", re.M)
 RUNNER_GUARD = re.compile(r"^export ((?:JEV|GIT_CONFIG)_\w+)=([\w.-]*)$", re.M)
 #: A shard's start and complete end lines in `run-tests.sh` output; unittest exits 1 when a test failed.
 SHARD_START = re.compile(r"^shard (\S+): start$", re.M)
+#: The shard count `run-tests.sh` planned; a shard `xargs` never launched leaves no log, so no start line.
+SHARDS_PLANNED = re.compile(r"^test runner: workers=\d+ shards=(\d+)$", re.M)
 SHARD_END = re.compile(r"^shard (\S+): \d+s exit=(\d+)$", re.M)
 UNITTEST_FAILED = "1"
 #: The paths, under the tree, a shard of these tests puts on PYTHONPATH (`run-tests.sh`); `()` for none. Every
@@ -1799,7 +1801,9 @@ def unittest_failed_shards(text: str) -> set[str]:
     other non-zero exit (137 for a kill), or failed with no header: then more than a test failed."""
     started = SHARD_START.findall(text)
     ended = {match.group(1): match for match in SHARD_END.finditer(text)}
-    if any(name not in ended for name in started):
+    planned = SHARDS_PLANNED.findall(text)
+    # Every planned shard finished: one that never launched left no log to count (review of sd:9768).
+    if any(name not in ended for name in started) or planned != [str(len(ended))]:
         return set()
     failing = {name for name, match in ended.items() if match.group(2) != "0"}
     for name in failing:
@@ -1868,11 +1872,10 @@ def gate_python(tree: pathlib.Path, environment: dict[str, str]) -> str | None:
     """The interpreter `make test` runs at `tree` under `environment`, or None: the Makefile's `VENV_PYTHON`,
     after its `$(GATE_ENV)` prerequisite, which in gate mode builds the worktree's own `.venv` as the gate does."""
     probe = "sd-rerun-python: $(GATE_ENV)\n\t@echo $(abspath $(VENV_PYTHON))\n"
-    try:
-        done = subprocess.run(["make", "-s", "--no-print-directory", "-f", "Makefile", "-f", "-", "sd-rerun-python"],
-                              cwd=tree, env=environment, input=probe, capture_output=True, text=True,
-                              timeout=sd_lib.GATE_CHECK_SECONDS)
-    except (OSError, subprocess.SubprocessError):
+    try:  # as a group: at the deadline no provisioning child outlives `make` into the removed worktree
+        done = sd_lib.run_group(["make", "-s", "--no-print-directory", "-f", "Makefile", "-f", "-", "sd-rerun-python"],
+                                cwd=tree, env=environment, input_text=probe, timeout=sd_lib.GATE_CHECK_SECONDS)
+    except (OSError, subprocess.SubprocessError, sd_lib.GroupTimeout):
         return None
     lines = done.stdout.strip().splitlines()
     python = lines[-1] if done.returncode == 0 and lines else ""

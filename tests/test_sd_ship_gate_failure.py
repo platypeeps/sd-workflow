@@ -596,7 +596,7 @@ FLAKY_TEST = "tests.test_example.Case.test_a"
 SHARD = "shard tests.test_example: 4s exit=1"
 #: The notes a flake and a failed rerun write.
 FLAKE, RERUN_FAILED = "Gate flake: ", "Gate rerun failed: "
-OUTPUT = ("shard tests.test_other: start\nOK\nshard tests.test_other: 2s exit=0\n"
+OUTPUT = ("test runner: workers=2 shards=2\nshard tests.test_other: start\nOK\nshard tests.test_other: 2s exit=0\n"
           f"shard tests.test_example: start\nFAIL: test_a ({FLAKY_TEST})\nAssertionError: git failed\n"
           f"Ran 3 tests\nFAILED (failures=1)\n{SHARD}\nmake: *** [test] Error 1\n")
 
@@ -997,6 +997,43 @@ class TheRerunRunsAtTheReviewedHead(unittest.TestCase):
                                                          [FLAKY_TEST, f"{FLAKY_TEST}_other"])
         self.assertEqual(code, 1)
         self.assertTrue(err.endswith("sd-check could not finish: timeout"), err)
+
+    def test_a_planned_shard_with_no_log_is_no_flake(self):
+        """Review of sd:9768: the runner prints the planned shard count and appends only the logs that exist, so a
+        shard `xargs` never launched leaves no start line; a gate with fewer finished shards than planned is no
+        flake. A gate output with no planned count says nothing either way, so it is none too."""
+        root = pathlib.Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        for name, text, expected in (
+                ("planned and finished", OUTPUT, [FLAKY_TEST]),
+                ("one never launched", OUTPUT.replace("shards=2", "shards=3"), []),
+                ("no planned count", OUTPUT.replace("test runner: workers=2 shards=2\n", ""), [])):
+            with self.subTest(name):
+                (root / "check.log").write_text(text, encoding="utf-8")
+                row = {"name": "check", "status": "fail", "exit_code": 2, "output_path": str(root / "check.log"),
+                       "failed_steps": [SHARD, "make target test"]}
+                self.assertEqual(sd_ship_review.failed_tests({"checks": [row]}), expected)
+
+    def test_the_interpreter_probe_ends_its_whole_group_at_its_deadline(self):
+        """Review of sd:9768: a provisioning child of the probe's `make` must not outlive the timeout and keep
+        writing while the rerun removes its worktree."""
+        import tempfile
+
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        tree = pathlib.Path(scratch.name)
+        (tree / "Makefile").write_text("GATE_ENV = slow\nVENV_PYTHON = /usr/bin/true\n"
+                                       "slow:\n\tsleep 30 & echo $$! > pid; wait\n", encoding="utf-8")
+        with unittest.mock.patch.object(sd_ship_review.sd_lib, "GATE_CHECK_SECONDS", 2):
+            self.assertIsNone(sd_ship_review.gate_python(tree, dict(os.environ)))
+        pid = int((tree / "pid").read_text(encoding="utf-8"))
+        alive = True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            alive = False
+        if alive:
+            os.kill(pid, 9)
+        self.assertFalse(alive, "the probe's provisioning child outlived its deadline")
 
     def test_the_shard_rules_still_match_the_runner(self):
         """The rerun copies the shard rules `run-tests.sh` and `make test` give: this fails when either moves."""
