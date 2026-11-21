@@ -1086,7 +1086,7 @@ def _items(sd_db: Any, workflow: Any, args: argparse.Namespace, connection: Any)
     # ponytail: every done row is read when searching; a SQL filter if the store outgrows a scan.
     rows = [row for row in (dict(found) for found in sd_db.reads.backlog_items(
                 connection, repo=here, include_done_days=36500 if ref or needle else 7,
-                parked=getattr(args, "parked", False)))
+                parked=getattr(args, "parked_only", False)))
             if (not args.open or row["status"] != "done")
             and (not args.kind or row["kind"] == args.kind)
             and (not args.status or row["status"] == args.status)
@@ -1634,7 +1634,8 @@ def register(groups: Any, store: Any) -> None:
 
     items = store.add_parser("items", help="workspace items from the shared database")
     items.add_argument("--open", action="store_true", help="exclude done items")
-    items.add_argument("--parked", action="store_true",
+    # `parked_only`, not `parked`: the cut item field must keep no reader (tests/test_cut_symbols.py).
+    items.add_argument("--parked", action="store_true", dest="parked_only",
                        help="only the open items the nightly prune parked, which the list hides")
     where = items.add_mutually_exclusive_group()
     where.add_argument("--here", action="store_true",
