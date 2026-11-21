@@ -50,6 +50,17 @@ class Repo(Case):
         """The id a lead drop reserves for its new lead: the next assignment id (round 10)."""
         return self.db.execute("SELECT MAX(id) + 1 FROM assignment").fetchone()[0]
 
+    def drop(self, run, item):
+        """Drop `item`; the kept bundle's new worktree, named by the lead the drop reserves (round 13)."""
+        lead = self.next_lead()
+        DROP.drop_item(self.db, build, item, who="operator")
+        return Path(run["work_path"]).parent / f"repo-build-{lead}"
+
+    def unmade(self, run):
+        """No new worktree or branch is left for the lead a drop would reserve."""
+        self.assertFalse((Path(run["work_path"]).parent / f"repo-build-{self.next_lead()}").exists())
+        self.assertEqual(git(self.repo, "branch", "--list", f"build/sd-{self.next_lead()}"), "")
+
     def commit(self, work, name, text, message):
         (Path(work) / name).write_text(text)
         git(work, "add", "-A")
@@ -101,20 +112,23 @@ class Drop(Repo):
         items, (lead, second, third), run = self.bundle()
         work = Path(run["work_path"])
         old = git(work, "rev-parse", "HEAD")
+        lead_id = self.next_lead()
         queued = DROP.drop_item(self.db, build, items[1], who="operator")
-        self.assertEqual(self.files(work), ["README", "a.txt", "c.txt"])
-        self.assertEqual((work / "a.txt").read_text(), "lead fixed\n")
-        self.assertNotIn(f"Closes: sd:{items[1]}", self.closes(work))
-        self.assertEqual(git(work, "rev-list", "--count", "origin/main..HEAD"), "3")
-        self.assertEqual(git(self.repo, "rev-parse", f"{run['branch']}-drop-sd-{items[1]}"), old)
-        self.assertEqual([(entry["id"], entry["item"]) for entry in queued[:2]], [(lead, items[0]), (third, items[2])])
-        self.assertEqual(queued[2]["item"], items[1])
-        self.assertNotIn(queued[2]["id"], (lead, second, third))
-        self.assertEqual(runner.queue_state(self.db, second)["status"], "cancelled")
+        new = work.parent / f"repo-build-{lead_id}"
+        self.assertEqual(self.files(new), ["README", "a.txt", "c.txt"])
+        self.assertEqual((new / "a.txt").read_text(), "lead fixed\n")
+        self.assertNotIn(f"Closes: sd:{items[1]}", self.closes(new))
+        self.assertEqual(git(new, "rev-list", "--count", "origin/main..HEAD"), "3")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), old, "the old branch keeps the dropped item's work")
+        self.assertEqual([entry["item"] for entry in queued], [items[0], items[2], items[1]])
+        self.assertEqual(queued[0]["id"], lead_id)
+        self.assertFalse({entry["id"] for entry in queued} & {lead, second, third})
+        self.assertEqual({runner.queue_state(self.db, ident)["status"] for ident in (lead, second, third)},
+                         {"cancelled"})
         again = self.claim()
         self.assertEqual([member["item"] for member in build.run(self.db, again["id"])["members"]],
                          [items[0], items[2]])
-        self.assertEqual((again["work_path"], again["branch"]), (run["work_path"], run["branch"]))
+        self.assertEqual((Path(again["work_path"]), again["branch"]), (new, f"build/sd-{lead_id}"))
 
     def test_dropping_the_lead_makes_a_kept_item_the_lead_on_a_fresh_branch(self):
         items, (lead, second, third), run = self.bundle()
@@ -152,24 +166,14 @@ class Drop(Repo):
         items, ids, run = self.bundle()
         work = Path(run["work_path"])
         old = git(work, "rev-parse", "HEAD")
-        with mock.patch.object(build, "drop_writes", side_effect=build.BuildRefused("Drop refused: changed")), \
-                self.assertRaisesRegex(build.BuildRefused, "changed"):
-            DROP.drop_item(self.db, build, items[1], who="operator")
-        self.assertEqual((git(work, "rev-parse", "HEAD"), git(work, "branch", "--show-current")),
-                         (old, run["branch"]))
-        self.assertEqual(git(self.repo, "branch", "--list", f"{run['branch']}-drop-*"), "")
-        with mock.patch.object(build, "drop_writes", side_effect=build.BuildRefused("Drop refused: changed")), \
-                self.assertRaises(build.BuildRefused):
-            DROP.drop_item(self.db, build, items[0], who="operator")
-        self.assertFalse((work.parent / f"repo-build-{self.next_lead()}").exists())
-        self.assertEqual(git(self.repo, "branch", "--list", f"build/sd-{self.next_lead()}"), "")
-
-    def test_a_bundle_whose_branch_is_on_origin_refuses_a_member_drop(self):
-        items, ids, run = self.bundle()
-        git(Path(run["work_path"]), "push", "-q", "origin", f"HEAD:refs/heads/{run['branch']}")
-        with self.assertRaisesRegex(DROP.DropRefused, "is on origin"):
-            DROP.drop_item(self.db, build, items[1], who="operator")
-        self.assertEqual(self.statuses(items), ["blocked"] * 3)
+        for item in (items[1], items[0]):
+            with self.subTest(item=item), \
+                    mock.patch.object(build, "drop_writes", side_effect=build.BuildRefused("Drop refused: changed")), \
+                    self.assertRaisesRegex(build.BuildRefused, "changed"):
+                DROP.drop_item(self.db, build, item, who="operator")
+            self.assertEqual((git(work, "rev-parse", "HEAD"), git(work, "branch", "--show-current")),
+                             (old, run["branch"]))
+            self.unmade(run)
 
     def test_a_drop_refuses_a_running_bundle(self):
         items = [self.item(repo=str(self.repo)) for _ in range(2)]
@@ -202,51 +206,7 @@ class DropReview(Repo):
         work = Path(run["work_path"])
         self.main_moves("d.txt", "main\n")
         git(work, "merge", "-q", "--no-edit", "origin/main")
-        DROP.drop_item(self.db, build, items[1], who="operator")
-        self.assertEqual(self.files(work), ["README", "a.txt", "c.txt", "d.txt"])
-
-    def test_an_ignored_file_the_base_tracks_refuses_and_stays(self):
-        items, ids, run = self.bundle()
-        work = Path(run["work_path"])
-        exclude = Path(git(self.repo, "rev-parse", "--git-common-dir"))
-        exclude = (exclude if exclude.is_absolute() else self.repo / exclude) / "info" / "exclude"
-        exclude.parent.mkdir(exist_ok=True)
-        exclude.write_text("gen.txt\n")
-        (work / "gen.txt").write_text("local\n")
-        self.main_moves("gen.txt", "tracked on main\n")
-        with self.assertRaisesRegex(DROP.DropRefused, "ignored .*gen.txt"):
-            DROP.drop_item(self.db, build, items[1], who="operator")
-        self.assertEqual((work / "gen.txt").read_text(), "local\n")
-
-    def failing(self, *words):
-        """`_git` that fails each call whose argv holds every one of `words`."""
-        real = DROP._git
-
-        def fake(*argv, cwd, check=True):
-            if all(word in argv for word in words):
-                if check:
-                    raise DROP.DropRefused(f"git {' '.join(argv)} failed")
-                return subprocess.CompletedProcess(argv, 1, "", "failed")
-            return real(*argv, cwd=cwd, check=check)
-        return mock.patch.object(DROP, "_git", side_effect=fake)
-
-    def test_a_failed_checkout_leaves_no_backup_and_a_retry_drops(self):
-        items, ids, run = self.bundle()
-        work = Path(run["work_path"])
-        old = git(work, "rev-parse", "HEAD")
-        with self.failing("checkout", "-B"), self.assertRaises(DROP.DropRefused):
-            DROP.drop_item(self.db, build, items[1], who="operator")
-        self.assertEqual(git(self.repo, "branch", "--list", f"{run['branch']}-drop-*"), "")
-        self.assertEqual(git(work, "rev-parse", "HEAD"), old)
-        DROP.drop_item(self.db, build, items[1], who="operator")
-        self.assertEqual(self.files(work), ["README", "a.txt", "c.txt"])
-
-    def test_a_failed_restore_keeps_the_backup_and_says_so(self):
-        items, ids, run = self.bundle()
-        with mock.patch.object(build, "drop_writes", side_effect=build.BuildRefused("Drop refused: changed")), \
-                self.failing("checkout", "-f"), self.assertRaisesRegex(DROP.DropRefused, "kept on .*-drop-sd-"):
-            DROP.drop_item(self.db, build, items[1], who="operator")
-        self.assertNotEqual(git(self.repo, "branch", "--list", f"{run['branch']}-drop-*"), "")
+        self.assertEqual(self.files(self.drop(run, items[1])), ["README", "a.txt", "c.txt", "d.txt"])
 
     def test_a_kept_item_with_a_newer_build_refuses(self):
         items, ids, run = self.bundle()
@@ -277,20 +237,6 @@ class DropRound2(Repo):
     """Review round 2 of pack sd:9709, class pass. Paths read as NUL-delimited lists keep every byte; a split no
     commit proves refuses; the lead must be one Retry would take; any interrupt after a ref moved rolls back."""
 
-
-    def test_a_leading_space_ignored_file_the_base_tracks_refuses(self):
-        items, ids, run = self.bundle()
-        work = Path(run["work_path"])
-        exclude = Path(git(self.repo, "rev-parse", "--git-common-dir"))
-        exclude = (exclude if exclude.is_absolute() else self.repo / exclude) / "info" / "exclude"
-        exclude.parent.mkdir(exist_ok=True)
-        exclude.write_text("*local.txt\n")
-        (work / " local.txt").write_text("local\n")
-        self.main_moves(" a.txt", "first\n")
-        self.main_moves(" local.txt", "tracked on main\n")
-        with self.assertRaisesRegex(DROP.DropRefused, "ignored .* local.txt"):
-            DROP.drop_item(self.db, build, items[1], who="operator")
-        self.assertEqual((work / " local.txt").read_text(), "local\n")
 
     def test_a_done_lead_refuses_a_member_drop(self):
         items, ids, run = self.bundle()
@@ -326,7 +272,7 @@ class DropRound2(Repo):
         with self.interrupted(when), self.assertRaises(KeyboardInterrupt):
             DROP.drop_item(self.db, build, items[1], who="operator")
         self.assertEqual((git(work, "rev-parse", "HEAD"), git(work, "branch", "--show-current")), (old, run["branch"]))
-        self.assertEqual(git(self.repo, "branch", "--list", f"{run['branch']}-drop-*"), "")
+        self.unmade(run)
 
     def test_a_failed_head_read_after_the_picks_puts_the_branch_back(self):
         items, ids, run = self.bundle()
@@ -340,7 +286,7 @@ class DropRound2(Repo):
         with self.interrupted(when), self.assertRaisesRegex(DROP.DropRefused, "read failed"):
             DROP.drop_item(self.db, build, items[1], who="operator")
         self.assertEqual(git(work, "rev-parse", "HEAD"), old)
-        self.assertEqual(git(self.repo, "branch", "--list", f"{run['branch']}-drop-*"), "")
+        self.unmade(run)
 
 
 class DropRound3(Repo):
@@ -360,8 +306,7 @@ class DropRound3(Repo):
         items, ids, run = self.bundle()
         self.assertTrue(self.db.execute("SELECT repo FROM runner_run WHERE id = ?",
                                         (run["id"],)).fetchone()["repo"].startswith("~/"))
-        DROP.drop_item(self.db, build, items[1], who="operator")
-        self.assertEqual(self.files(Path(run["work_path"])), ["README", "a.txt", "c.txt"])
+        self.assertEqual(self.files(self.drop(run, items[1])), ["README", "a.txt", "c.txt"])
 
     def test_a_home_key_repo_drops_the_lead(self):
         self.home_is_root()
@@ -387,8 +332,8 @@ class DropRound3(Repo):
 
 
 class DropRound5(Repo):
-    """Review round 5 of pack sd:9709, class pass: a git exit code read as an answer. Only `ls-remote` exit 2 says a
-    ref is absent, only `rev-parse -q --verify` exit 1 says a ref is unset; any other failure refuses unwritten."""
+    """Review round 5 of pack sd:9709, class pass: a git exit code read as an answer. Only `rev-parse -q --verify`
+    exit 1 says a ref is unset; any other failure refuses unwritten."""
 
     def failing(self, *prefix, code=128):
         real = DROP._git
@@ -403,15 +348,8 @@ class DropRound5(Repo):
         work = Path(run["work_path"])
         self.assertEqual((git(work, "rev-parse", "HEAD"), git(work, "branch", "--show-current")),
                          (old, run["branch"]))
-        self.assertEqual(git(self.repo, "branch", "--list", f"{run['branch']}-drop-*"), "")
+        self.unmade(run)
         self.assertEqual(self.statuses(items), ["blocked"] * 3)
-
-    def test_a_failed_ls_remote_refuses_an_in_place_drop(self):
-        items, ids, run = self.bundle()
-        old = git(Path(run["work_path"]), "rev-parse", "HEAD")
-        with self.failing("ls-remote"), self.assertRaisesRegex(DROP.DropRefused, "ls-remote"):
-            DROP.drop_item(self.db, build, items[1], who="operator")
-        self.assert_unwritten(items, run, old)
 
     def test_a_failed_rev_parse_refuses_the_drop(self):
         items, ids, run = self.bundle()
@@ -421,7 +359,6 @@ class DropRound5(Repo):
                     self.assertRaisesRegex(DROP.DropRefused, "rev-parse"):
                 DROP.drop_item(self.db, build, item, who="operator")
             self.assert_unwritten(items, run, old)
-            self.assertFalse((Path(run["work_path"]).parent / f"repo-build-{self.next_lead()}").exists())
 
 
 class DropRound6(Repo):
@@ -438,7 +375,7 @@ class DropRound6(Repo):
             DROP.drop_item(self.db, build, items[1], who="operator")
         self.assertEqual((git(work, "rev-parse", "HEAD"), git(work, "branch", "--show-current")),
                          (old, run["branch"]))
-        self.assertEqual(git(self.repo, "branch", "--list", f"{run['branch']}-drop-*"), "")
+        self.unmade(run)
         self.assertEqual(self.statuses(items), ["blocked"] * 3)
 
 
@@ -454,14 +391,15 @@ class DropRound7(Repo):
         build.end(self.db, again["id"], "cancelled", "operator cancelled")
         build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
         self.assertEqual(build.split(self.db, lead), "unread")
-        DROP.drop_item(self.db, build, items[2], who="operator")
-        # The drop's split proved the left-out member's work off the branch, so its next run must not hold it.
-        self.assertIn(build.split(self.db, lead), ("", "clear"))
-        self.assertEqual(self.files(Path(run["work_path"])), ["README", "a.txt"])
+        lead_id = self.next_lead()
+        new = self.drop(run, items[2])
+        # The kept bundle is a new lead on a new branch no subset Retry touched: its next run holds nothing.
+        self.assertEqual(build.split(self.db, lead_id), "")
+        self.assertEqual(self.files(new), ["README", "a.txt"])
 
     def test_an_interrupt_after_the_writes_committed_keeps_the_split(self):
         items, ids, run = self.bundle()
-        work = Path(run["work_path"])
+        work = Path(run["work_path"]).parent / f"repo-build-{self.next_lead()}"
         real = build.drop_writes
 
         def committed_then_interrupted(*args, **kwargs):
@@ -484,8 +422,7 @@ class DropRound8(Repo):
     def test_a_member_moved_to_planning_stays_off_the_kept_branch(self):
         items, ids, run = self.bundle()
         writes.transition(self.db, items[2], "planning", who="operator")
-        DROP.drop_item(self.db, build, items[1], who="operator")
-        work = Path(run["work_path"])
+        work = self.drop(run, items[1])
         self.assertEqual(self.files(work), ["README", "a.txt"])
         self.assertNotIn(f"sd:{items[2]}", self.closes(work))
 
@@ -545,28 +482,15 @@ class DropRound10(Repo):
 
 
 class DropRound11(Repo):
-    """Review round 11 of pack sd:9709: an ignored file whose name differs from a tracked path only in case, a
-    COMMIT that fails and leaves its transaction open, and Ctrl-C between the split and the writes."""
+    """Review round 11 of pack sd:9709: a COMMIT that fails and leaves its transaction open, and Ctrl-C between
+    the split and the writes."""
 
     def unsplit(self, items, run, old):
         work = Path(run["work_path"])
         self.assertEqual((git(work, "rev-parse", "HEAD"), git(work, "branch", "--show-current")),
                          (old, run["branch"]))
-        self.assertEqual(git(self.repo, "branch", "--list", f"{run['branch']}-drop-*"), "")
+        self.unmade(run)
         self.assertEqual(self.statuses(items), ["blocked"] * 3)
-
-    def test_an_ignored_file_the_base_tracks_in_another_case_refuses(self):
-        items, ids, run = self.bundle()
-        work = Path(run["work_path"])
-        exclude = Path(git(self.repo, "rev-parse", "--git-common-dir"))
-        exclude = (exclude if exclude.is_absolute() else self.repo / exclude) / "info" / "exclude"
-        exclude.parent.mkdir(exist_ok=True)
-        exclude.write_text("local.txt\n")
-        (work / "local.txt").write_text("local\n")
-        self.main_moves("Local.txt", "tracked on main\n")
-        with self.assertRaisesRegex(DROP.DropRefused, "ignored .*local.txt"):
-            DROP.drop_item(self.db, build, items[1], who="operator")
-        self.assertEqual((work / "local.txt").read_text(), "local\n")
 
     def test_a_failed_commit_left_open_undoes_the_split(self):
         items, ids, run = self.bundle()
@@ -602,27 +526,8 @@ class DropRound11(Repo):
 
 class DropRound12(Repo):
     """Review round 12 of pack sd:9709, class pass: an identity checked by its stored spelling, not by what the
-    system resolves it to. A path compared as a string where the disk folds case and Unicode form (file, directory
-    and prefix collisions); a host compared as the repo's current lane, where the worktree is on the machine that
-    ran the run (a lead drop, an in-place drop, and the machine that runs the drop)."""
-
-    NFC, NFD = "café", "café"
-
-    def guard(self, ignored, tracked):
-        """`_ignored` over git listings `ignored` and `tracked` (the base's tree; no kept commit)."""
-        def names(*argv, cwd):
-            return set(ignored if argv[0] == "ls-files" else tracked)
-        with mock.patch.object(DROP, "_names", side_effect=names):
-            DROP._ignored("/example.test/work", "origin/main", [])
-
-    def test_an_ignored_path_in_another_unicode_form_refuses(self):
-        cases = {"file": ([f"{self.NFD}.txt"], [f"{self.NFC}.TXT"]),
-                 "directory": ([self.NFD], [f"{self.NFC}/a.txt"]),
-                 "under a tracked file": ([f"{self.NFD}/local.txt"], [self.NFC]),
-                 "tracked under it": ([f"{self.NFD}/"], [f"{self.NFC}/a.txt"])}
-        for name, (ignored, tracked) in cases.items():
-            with self.subTest(name), self.assertRaisesRegex(DROP.DropRefused, "ignored local files"):
-                self.guard(ignored, tracked)
+    system resolves it to. A host compared as the repo's current lane, where the worktree is on the machine that
+    ran the run (a lead drop, a member drop, and the machine that runs the drop)."""
 
     def on_satellite(self, run, lane):
         """This machine is satellite `sat-a`, which ran `run`; the repo's lane is now `lane`."""
@@ -650,8 +555,8 @@ class DropRound12(Repo):
     def test_a_drop_on_the_host_that_ran_it_still_drops(self):
         items, ids, run = self.bundle()
         with self.on_satellite(run, "sat-a"):
-            DROP.drop_item(self.db, build, items[1], who="operator")
-        self.assertEqual(self.files(Path(run["work_path"])), ["README", "a.txt", "c.txt"])
+            new = self.drop(run, items[1])
+        self.assertEqual(self.files(new), ["README", "a.txt", "c.txt"])
 
     def test_a_drop_refuses_on_a_machine_that_did_not_run_it(self):
         items, ids, run = self.bundle()
@@ -661,3 +566,27 @@ class DropRound12(Repo):
         with self.assertRaisesRegex(DROP.DropRefused, "drop it on sat-a"):
             DROP.drop_item(self.db, build, items[1], who="operator")
         self.assertEqual(self.statuses(items), ["blocked"] * 3)
+
+
+class DropRound13(Repo):
+    """Review round 13 of pack sd:9709: an in-place member drop left the dropped commit's ignored files in the
+    worktree the kept bundle resumes: a generated file its ignore rule hid turned untracked there, for the next
+    builder to use or stage. A member drop now builds the kept items on a new branch and worktree, as a lead drop
+    does; the old worktree keeps the dropped item's work and files."""
+
+    def test_a_member_drop_leaves_the_dropped_items_ignored_files_behind(self):
+        items, ids, run = self.bundle()
+        work = Path(run["work_path"])
+        self.commit(work, ".gitignore", "gen.cfg\n", f"chore: ignore gen.cfg\n\nCloses: sd:{items[1]}")
+        (work / "gen.cfg").write_text("generated\n")
+        lead_id = self.next_lead()
+        DROP.drop_item(self.db, build, items[1], who="operator")
+        again = self.claim()
+        new = Path(again["work_path"])
+        self.assertEqual([member["item"] for member in build.run(self.db, again["id"])["members"]],
+                         [items[0], items[2]])
+        self.assertEqual((new, again["branch"]), (work.parent / f"repo-build-{lead_id}", f"build/sd-{lead_id}"))
+        self.assertFalse((new / "gen.cfg").exists())
+        self.assertEqual(git(new, "status", "--porcelain", "--ignored", "--untracked-files=all"), "")
+        self.assertEqual(self.files(new), ["README", "a.txt", "c.txt"])
+        self.assertEqual((work / "gen.cfg").read_text(), "generated\n", "the old worktree keeps the dropped work")

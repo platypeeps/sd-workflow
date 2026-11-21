@@ -12,7 +12,6 @@ cites only others. One that cites nothing refuses the drop: no message says whos
 from __future__ import annotations
 
 import subprocess
-import unicodedata
 from pathlib import Path
 
 import sd_ship_body
@@ -32,7 +31,7 @@ def _git(*argv: str, cwd: str | Path, check: bool = True) -> subprocess.Complete
 
 def _has(*argv: str, cwd: str | Path, absent: int) -> bool:
     """Whether a lookup found its ref: exit 0 yes, exit `absent` no; any other exit is a failed lookup, which
-    refuses rather than reads as no (round 5: a failed `ls-remote` let the drop rewrite a pushed branch)."""
+    refuses rather than reads as no (round 5)."""
     done = _git(*argv, cwd=cwd, check=False)
     if done.returncode not in (0, absent):
         raise DropRefused(f"git {' '.join(argv)} failed in {cwd}: {(done.stderr or done.stdout).strip()}")
@@ -68,32 +67,6 @@ def _merges(work: str | Path, start: str, tip: str) -> None:
         tree = _git("merge-tree", "--write-tree", *parents, cwd=work, check=False)
         if tree.returncode != 0 or tree.stdout.split()[0] != _out("rev-parse", f"{sha}^{{tree}}", cwd=work):
             raise DropRefused(f"merge {sha[:12]} resolves by hand what no cherry-pick carries; split it by hand")
-
-
-def _fold(path: str) -> str:
-    """`path` as a case- and normalization-insensitive disk names it: Unicode canonical caseless matching."""
-    return unicodedata.normalize("NFD", unicodedata.normalize("NFD", path).casefold())
-
-
-def _ignored(work: str | Path, start: str, kept: list[str]) -> None:
-    """Refuse an ignored file where the base or a kept commit tracks a path: the in-place checkout would overwrite
-    it, and no branch holds its contents."""
-    ignored = _names("ls-files", "-z", "--others", "--ignored", "--exclude-standard", cwd=work)
-    if not ignored:
-        return
-    tracked = _names("ls-tree", "-r", "-z", "--name-only", start, cwd=work)
-    for sha in kept:
-        tracked |= _paths(work, sha)
-    # Compared as the disk resolves them, case and Unicode form folded: on macOS an ignored `local.txt` is the
-    # tracked `Local.txt`, and `café` in one form is `café` in the other (rounds 11 and 12). Every check reads the
-    # folded names: the file, the directory, and each prefix. ponytail: a refusal too many on a disk that folds
-    # neither.
-    tracked = {_fold(path) for path in tracked}
-    dirs = {"/".join(path.split("/")[:n]) for path in tracked for n in range(1, path.count("/") + 1)}
-    clash = sorted(path for path in ignored if (folded := _fold(path).rstrip("/")) in tracked or folded in dirs
-                   or any("/".join(folded.split("/")[:n]) in tracked for n in range(1, folded.count("/") + 1)))
-    if clash:
-        raise DropRefused(f"ignored local files the new branch tracks: {', '.join(clash[:5])}; move them first")
 
 
 def drop_sides(work: str | Path, start: str, tip: str, item: int, aside: set[int]) -> tuple[list[str], list[str]]:
@@ -134,10 +107,10 @@ def _exists(repo: str | Path, ref: str) -> bool:
 
 
 def split_branch(plan: dict, done: dict) -> dict:
-    """The kept commits on `plan["new_branch"]`, fresh from the base, in `plan["new_work"]`; the old tip kept on
-    `saved` when the branch is rewritten in place. Each step is recorded in the caller's `done` once it moved
-    something, so the caller's one handler undoes exactly what moved (`undo_split`), whenever it is interrupted:
-    a Ctrl-C between this return and the writes undid nothing before (round 11)."""
+    """The kept commits on `plan["new_branch"]`, fresh from the base, in the new worktree `plan["new_work"]`; the
+    old branch and worktree stay as they were, with the dropped item's work and files. Each step is recorded in the
+    caller's `done` once it moved something, so the caller's one handler undoes exactly what moved (`undo_split`),
+    whenever it is interrupted: a Ctrl-C between this return and the writes undid nothing before (round 11)."""
     repo, work, branch, item = Path(plan["repo"]), Path(plan["work"]), plan["branch"], plan["item"]
     if not work.is_dir():
         raise DropRefused(f"worktree {work} is not on this machine: drop it on the host that built it")
@@ -149,28 +122,12 @@ def split_branch(plan: dict, done: dict) -> dict:
     _merges(work, fork, tip)
     aside = set(plan["aside"])
     kept, dropped = drop_sides(work, fork, tip, item, aside)
-    in_place = plan["new_work"] == plan["work"]
-    saved = f"{branch}-drop-sd-{item}"
     new_work, new_branch = Path(plan["new_work"]), plan["new_branch"]
-    if in_place:
-        # The lane pushes without force: a rewritten branch already on origin would not push.
-        if _has("ls-remote", "--exit-code", "origin", f"refs/heads/{branch}", cwd=repo, absent=2):
-            raise DropRefused(f"{branch} is on origin; drop it only before the lane pushed it")
-        if _exists(repo, f"refs/heads/{saved}"):
-            raise DropRefused(f"branch {saved} exists: an earlier drop kept it")
-        _ignored(work, start, kept)
-    elif new_work.exists() or _exists(repo, f"refs/heads/{new_branch}"):
+    if new_work.exists() or _exists(repo, f"refs/heads/{new_branch}"):
         raise DropRefused(f"{new_work} or branch {new_branch} exists already")
-    done.update({"plan": plan, "tip": tip, "saved": None, "made": False, "moved": False, "base": start,
-                 "kept": kept, "dropped": dropped})
-    if in_place:
-        done["saved"] = saved  # first: an interrupt after the branch is made still deletes it
-        _git("branch", saved, tip, cwd=repo)
-        done["moved"] = True  # a failed checkout may still have moved files: restore the tip either way
-        _git("checkout", "-q", "-B", branch, start, cwd=work)
-    else:
-        done["made"] = True  # a failed add may leave a half-made worktree or branch: remove both either way
-        _git("worktree", "add", "-q", "-b", new_branch, str(new_work), start, cwd=repo)
+    done.update({"plan": plan, "tip": tip, "made": True, "base": start, "kept": kept, "dropped": dropped})
+    # Marked made first: a failed add may leave a half-made worktree or branch; undo removes both either way.
+    _git("worktree", "add", "-q", "-b", new_branch, str(new_work), start, cwd=repo)
     for sha in kept:
         _git("cherry-pick", "--allow-empty", sha, cwd=new_work)
     check_branch(new_work, start, kept, aside)
@@ -194,22 +151,11 @@ def check_branch(work: str | Path, start: str, kept: list[str], aside: set[int])
 
 
 def undo_split(done: dict) -> None:
-    """Put the branches and worktrees back as `split_branch` found them, only what it moved. The backup branch goes
-    only once the branch reads back at its old tip; otherwise it stays, and the refusal names it."""
+    """Remove the new worktree and branch `split_branch` made; the old ones it never moved."""
     plan = done["plan"]
     repo, work = Path(plan["repo"]), Path(plan["new_work"])
-    if done.get("moved") or done.get("made"):
-        _git("cherry-pick", "--abort", cwd=work, check=False)
-    if done.get("moved"):
-        _git("checkout", "-q", "-f", "-B", plan["branch"], done["tip"], cwd=work, check=False)
-        back = _git("rev-parse", "HEAD", cwd=work, check=False).stdout.strip() == done["tip"] and \
-            _git("branch", "--show-current", cwd=work, check=False).stdout.strip() == plan["branch"]
-        if not back:
-            raise DropRefused(f"the drop failed and could not put {plan['branch']} back in {work}; its old tip "
-                              f"{done['tip'][:12]} is kept on {done['saved']}")
-    if done.get("saved"):
-        _git("branch", "-D", done["saved"], cwd=repo, check=False)
     if done.get("made"):
+        _git("cherry-pick", "--abort", cwd=work, check=False)
         _git("worktree", "remove", "--force", str(work), cwd=repo, check=False)
         _git("worktree", "prune", cwd=repo, check=False)
         _git("branch", "-D", plan["new_branch"], cwd=repo, check=False)
@@ -226,10 +172,9 @@ def kept_note(done: dict) -> str:
 def dropped_note(done: dict) -> str:
     """Where the dropped item's earlier work stays, for its own fresh build."""
     plan = done["plan"]
-    where = done["saved"] or plan["branch"]
     shas = ", ".join(sha[:12] for sha in done["dropped"]) or "none"
     return (f"Bundle drop: sd:{plan['item']} left build {plan['lead']} and builds alone from {done['base']}. "
-            f"Its earlier commits stay on {where}: {shas}.")
+            f"Its earlier commits stay on {plan['branch']}: {shas}.")
 
 
 def drop_item(connection, build, item: int, *, who: str) -> list[dict]:
