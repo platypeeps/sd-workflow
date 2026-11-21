@@ -1214,6 +1214,19 @@ class Supervise(Case):
         self.assertFalse(supervisor.review_answer(out, "a" * 40)["complete"],
                          "a round one reader short of its policy counts as complete")
 
+    def test_a_skipped_last_round_is_no_prior_to_verify(self):
+        """Review of sd:9769: `sd-review` refuses a `skipped` report as `--verify-report`; the next round
+        reviews in full instead of parking on that refusal twice."""
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        supervisor.out("review").write_text(json.dumps(
+            {"status": "skipped", "scope": "branch", "subject": {"head": "b" * 40}, "findings": [],
+             "route": {"tier": "skip"}}), encoding="utf-8")
+        with mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
+                mock.patch.object(build_run, "_read", return_value=""):
+            self.assertIsNone(supervisor.prior_review("a" * 40), "a skipped report was chosen to verify")
+
     def deferred(self, blockers, changed):
         """`file_new_findings` over `blockers` with the delta `changed`: the blockers it keeps."""
         supervisor = self.supervisor()
