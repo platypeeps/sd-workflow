@@ -1175,13 +1175,28 @@ class Supervise(Case):
     PRIOR = {"subject": {"head": "b" * 40}, "findings": [{"path": "named.py", "line": 1}],
              "requested_reviews": 2, "completed_reviews": 2}
 
+    def test_a_blocker_on_a_line_the_branch_added_before_the_fix_still_blocks(self):
+        """Class pass, sd:9769: deferral is for code the branch does not change, not code the fix did not touch."""
+        self.press()
+        supervisor = self.supervisor()
+        early = {"path": "early.py", "line": 5, "summary": "round one's own defect"}
+
+        def delta(_git, _work, base, _head, env=None):
+            return {} if base == "b" * 40 else {"early.py": {5}, "whole.bin": set()}
+        with mock.patch.object(build_run, "changed_lines", side_effect=delta), \
+                mock.patch.object(build_run, "_read", return_value="f" * 40):  # the fork reads
+            self.assertEqual(supervisor.branch_delta("b" * 40, "a" * 40),
+                             {"early.py": {5}, "whole.bin": set()}, "the branch's own lines are not in the delta")
+            kept = supervisor.file_new_findings({"status": "blocking", "blockers": [early]}, self.PRIOR, "a" * 40)
+        self.assertEqual(kept["blockers"], [early], "a blocker on the branch's own line was deferred")
+
     def test_a_short_prior_report_defers_nothing(self):
         """Class pass, sd:9769: deferral trusts the last round's findings; a round short of a reader proves none."""
         self.press()
         supervisor = self.supervisor()
         row = {"path": "far.py", "line": 1, "summary": "a"}
         for short in ({"completed_reviews": 1}, {"requested_reviews": 0, "completed_reviews": 0}):
-            with self.subTest(short=short), mock.patch.object(build_run, "changed_lines", return_value={}):
+            with self.subTest(short=short), mock.patch.object(supervisor, "branch_delta", return_value={}):
                 kept = supervisor.file_new_findings({"status": "blocking", "blockers": [row]},
                                                     {**self.PRIOR, **short}, "a" * 40)
                 self.assertEqual(kept["blockers"], [row], "a short prior report deferred a blocker")
@@ -1189,7 +1204,7 @@ class Supervise(Case):
     def deferred(self, blockers, changed):
         """`file_new_findings` over `blockers` with the delta `changed`: the blockers it keeps."""
         supervisor = self.supervisor()
-        with mock.patch.object(build_run, "changed_lines", return_value=changed):
+        with mock.patch.object(supervisor, "branch_delta", return_value=changed):
             return supervisor, supervisor.file_new_findings({"status": "blocking", "blockers": blockers}, self.PRIOR,
                                                             "a" * 40)
 
@@ -1273,7 +1288,7 @@ class Supervise(Case):
 
         supervisor.db.outcome = mock.Mock(return_value="recorded")
         answer = {"status": "blocking", "blockers": rows}
-        with mock.patch.object(build_run, "changed_lines", return_value={}), \
+        with mock.patch.object(supervisor, "branch_delta", return_value={}), \
                 mock.patch.object(supervisor, "file_follow_up", committed_then_lost):
             with self.assertRaises(remote.UnknownOutcome):
                 supervisor.file_new_findings(answer, self.PRIOR, "a" * 40)

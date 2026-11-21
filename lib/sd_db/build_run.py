@@ -1346,7 +1346,7 @@ class Supervisor:
         (`<review-response>`) or a delta git cannot read still blocks. Each follow-up is one transaction under
         its own mark, so a lost answer stands for that one write only."""
         named = {path for row in prior["findings"] if isinstance(row, dict) for path, _ in self.locations(row)}
-        changed = changed_lines(self.tools.git, str(self.work), prior["subject"]["head"], head, env=self.env)
+        changed = self.branch_delta(prior["subject"]["head"], head)
         if not 1 <= int(prior.get("requested_reviews") or 0) <= int(prior.get("completed_reviews") or 0):
             changed = None  # a last round short of a reader proves no finding absent: hold every blocker
 
@@ -1359,6 +1359,21 @@ class Supervisor:
             self.once(f"followup:{head}:{index}", functools.partial(self.file_follow_up, row, head))
         blockers = [row for row in answer["blockers"] if row not in new]
         return {"status": "blocking" if blockers else "advisory", "blockers": blockers}
+
+    def branch_delta(self, since: str, head: str) -> dict[str, set[int]] | None:
+        """The lines the fix changed since `since` together with every line the branch changes from its fork:
+        a blocker on either is the change's own, whichever round introduced it (pack sd:9769). None when
+        either delta, or the fork, does not read; a path either marks whole stays whole."""
+        try:
+            fork = _read([*self.tools.git, "-C", str(self.work), "merge-base", self.base(), head], env=self.env).strip()
+        except Unread:
+            return None
+        deltas = [changed_lines(self.tools.git, str(self.work), base, head, env=self.env) for base in (since, fork)]
+        if not fork or any(delta is None for delta in deltas):
+            return None
+        fix, branch = deltas[0] or {}, deltas[1] or {}
+        return {path: set() if (path in fix and not fix[path]) or (path in branch and not branch[path])
+                else fix.get(path, set()) | branch.get(path, set()) for path in fix.keys() | branch.keys()}
 
     def file_follow_up(self, row: dict, head: str) -> None:
         """One deferred blocker as a follow-up item, its note and its rebuttal, in one transaction (pack sd:9769).
