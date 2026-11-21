@@ -499,3 +499,29 @@ class DropRound9(Repo):
             DROP.drop_item(self.db, build, items[1], who="operator")
         self.assertEqual(git(work, "rev-parse", "HEAD"), head)
         self.assertEqual(self.statuses(items), ["blocked"] * 3)
+
+
+class DropRound10(Repo):
+    """Review round 10 of pack sd:9709: a lead drop reparented the kept members, so the ended run lost them and the
+    sweeper could remove its worktree while their items stayed open; and the writes rechecked only the lead's
+    revision, so a kept member moved to planning during the split was queued again."""
+
+    def test_a_kept_member_moved_during_the_split_refuses_the_writes(self):
+        items, ids, run = self.bundle()
+        work = Path(run["work_path"])
+        old = git(work, "rev-parse", "HEAD")
+        real = DROP.split_branch
+
+        def moved(plan):
+            done = real(plan)
+            # Planning cancels its assignment; back to ready passes the press's own item check.
+            writes.transition(self.db, items[2], "planning", who="operator")
+            writes.transition(self.db, items[2], "ready", who="operator")
+            return done
+
+        with mock.patch.object(DROP, "split_branch", side_effect=moved), \
+                self.assertRaisesRegex(build.BuildRefused, "changed since the drop read it"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), old)
+        self.assertEqual(self.db.execute("SELECT status FROM assignment WHERE id = ?", (ids[2],)).fetchone()[0],
+                         "cancelled")

@@ -768,7 +768,9 @@ def drop_writes(connection, plan: dict, *, who: str, note: str, left: str) -> li
     finding, and the dropped item queues alone as a fresh build, `left` noted on it. Each queued assignment, the
     kept first."""
     with transaction(connection):
-        if queue_state(connection, plan["lead"])["revision"] != plan["revision"]:
+        # The whole plan, read again: a kept member moved during the split (to planning and back, its assignment
+        # cancelled) leaves the lead's revision as it was, and would queue again (round 10).
+        if drop_plan(connection, plan["item"]) != plan:
             raise BuildRefused(f"Drop refused: build {plan['lead']} changed since the drop read it; drop again")
         stamp, lead, gone = clock(), plan["new_lead"], plan["assignment"]
         connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
