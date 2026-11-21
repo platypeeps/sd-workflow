@@ -152,7 +152,8 @@ def _waits(connection) -> dict[int, set[int]]:
     graph: dict[int, set[int]] = {ident: set() for ident in rows}
     by_item: dict[int, list[int]] = {}
     # A run that waits on an open item with no queued run waits outside the queue, for as long as that item
-    # stays open: it is no barrier a parallel run waits behind (review of build/sd-1306).
+    # stays open: it is no barrier a parallel run waits behind (review of build/sd-1306). So does one whose
+    # wait the claim holds on and the graph cannot follow: a named item gone, or fields it cannot read.
     outside: set[int] = set()
     for ident, row in rows.items():
         by_item.setdefault(row["item"], []).append(ident)
@@ -166,9 +167,12 @@ def _waits(connection) -> dict[int, set[int]]:
             try:
                 named = item_blocked_by(found) if found else []
             except ValueError:
+                outside.add(ident)  # the claim's `waiting_on` holds it on fields it cannot read
                 continue
             for other in named:
                 status = connection.execute("SELECT status FROM item WHERE id = ?", (other,)).fetchone()
+                if status is None:
+                    outside.add(ident)  # and on a named item that is gone
                 if other in seen or status is None or status["status"] == "done":
                     continue
                 seen.add(other)

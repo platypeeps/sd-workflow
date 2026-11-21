@@ -217,6 +217,27 @@ class TheOtherStarts(DependencyCase):
         started = runner.claim(self.db, parallel, owner="fixture", **roots)
         self.assertEqual(started and started["status"], "running", "the parallel run starts")
 
+    def test_a_serial_run_whose_wait_cannot_be_read_holds_no_parallel_run(self):
+        """Review of build/sd-1306: a dependency gone since the enqueue, or fields that cannot be read, hold
+        the serial run at its claim; the graph skipped both and made the run a barrier for parallel runs."""
+        from sd_db import runner
+        for broken in ("gone", "unreadable"):
+            with self.subTest(broken=broken):
+                (first,), (serial,) = self.serial(1)
+                _, parallel = self.lone(f"work/p-{broken}", parallel=True)
+                if broken == "gone":
+                    self.wait(first, other := self.item(status="planning"))
+                    self.db.execute("DELETE FROM note WHERE item = ?", (other,))
+                    self.db.execute("DELETE FROM item WHERE id = ?", (other,))
+                else:
+                    self.db.execute("UPDATE item SET fields = ? WHERE id = ?", ('{"blocked_by": "x"}', first))
+                roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
+                self.assertIsNone(runner.claim(self.db, serial, owner="fixture", **roots), "the serial run waits")
+                started = runner.claim(self.db, parallel, owner="fixture", **roots)
+                self.assertEqual(started and started["status"], "running", "the parallel run starts")
+                self.db.execute("UPDATE runner_lease SET released_at = ?", (NOW,))
+                self.db.execute("UPDATE assignment SET status = 'cancelled'")
+
     def test_a_run_that_waits_outside_the_queue_keeps_its_place(self):
         """A waits on an item with no queued run: nothing behind it can unblock it, so the order holds."""
         from sd_db import runner
