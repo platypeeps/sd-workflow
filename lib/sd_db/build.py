@@ -873,8 +873,11 @@ def eligible(connection, *, now: str | None = None) -> list[dict]:
     hosts, found = lane_hosts(connection), []
     # An item whose own build the hub blocked on a quiet dispatcher waits for that build to queue again
     # (`_requeue_beat_blocked`): a fresh one from main drops its branch's work (sd:9774).
+    # One stranded on a satellite its lane left (`_stranded`) has no host to requeue it: pickup builds it fresh.
     waiting = {row["item"] for row in connection.execute(
-        f"SELECT assignment.item FROM assignment WHERE {_BEAT_BLOCKED}", (SCOPE, _BEAT_RESULT))}
+        f"SELECT assignment.id, assignment.item, assignment.parent, assignment.run_count, repo.lane_host "
+        f"FROM assignment JOIN item ON item.id = assignment.item LEFT JOIN repo ON repo.path = item.repo "
+        f"WHERE {_BEAT_BLOCKED}", (SCOPE, _BEAT_RESULT)) if not _stranded(connection, row)}
     for row in reads.backlog_items(connection, status="ready", now=now):
         if row["recurrence"] or row["id"] in waiting:  # a scheduled occurrence recurs too
             continue
@@ -1358,6 +1361,15 @@ def _ran_on(connection, lead: int) -> str | None:
     return lane_of(connection, run_host(ran["owner"])) if ran else None
 
 
+def _stranded(connection, row) -> bool:
+    """Whether the blocked build `row` ran on a satellite other than the one its lane runs on now: its worktree is
+    there, whatever host the block names, so no host requeues it (review round 3 of sd:9775), and pickup builds
+    its item fresh rather than wait on it (round 4 of sd:9774)."""
+    lead = _lead(row)
+    away = _route(connection, row["lane_host"], lead)
+    return away is not None and lead is not None and _ran_on(connection, lead) != away
+
+
 def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
     """Put back to queued each build the hub's claim blocked on another host's quiet dispatcher, once that host's
     beat is fresh and not stuck again (pack sd:8745): a slow-DB stretch blocked them for good before.
@@ -1375,10 +1387,9 @@ def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
         f"JOIN item ON item.id = assignment.item LEFT JOIN repo ON repo.path = item.repo "
         f"WHERE {_BEAT_BLOCKED} AND item.status = 'ready'", (SCOPE, _BEAT_RESULT)).fetchall()
     for row in rows:
-        lead = _lead(row)
-        away = _route(connection, row["lane_host"], lead)
-        if away is not None and lead is not None and _ran_on(connection, lead) != away:
-            continue  # a retry another host ran: its worktree is there, whatever host the block names (round 3)
+        if _stranded(connection, row):
+            continue
+        away = _route(connection, row["lane_host"], _lead(row))
         names = away is not None and row["result"].startswith(f"item {row['item']}'s lane runs on {away}, ")
         # This host ticks, so its beat is back: a satellite takes the rows its own quiet beat blocked (sd:9775), not
         # one another satellite ran, whose worktree is there (review of sd:9775); the hub takes a lane moved to it,

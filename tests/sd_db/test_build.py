@@ -2647,6 +2647,25 @@ class Hosts(Case):
         self.assertIsNone(self.claim(hosts=HUB))
         self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", first["assignment"]), "blocked")
 
+    def test_pickup_builds_fresh_a_retry_stranded_on_the_satellite_its_lane_left(self):
+        """Review round 4 of sd:9774: a retry ran on one satellite, its lane moved to another, and the hub blocked
+        it there. No host may requeue it, its worktree being on the first, so pickup must not wait on it either:
+        the new lane host builds the item fresh, as before this branch."""
+        item = self.item(repo=SAT)
+        build.queue(self.db, [item], who="operator")
+        first = self.claim(hosts=WORK)
+        self.retried(first)
+        self.db.execute("UPDATE repo SET lane_host = 'other' WHERE path = ?", (SAT,))
+        self.quiet("other")
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", first["assignment"]), "blocked")
+        record_state(self.db, "heartbeat", key="build-dispatch@other", body={})
+        build.set_pickup(self.db, True, now=Pickup.NOW)
+        other = frozenset({"other"})
+        with mock.patch.object(build, "lane_hosts", return_value=other):
+            self.assertEqual(build.pickup(self.db, build.room(self.db, **IDLE, hosts=other), now=Pickup.NOW), [item])
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", first["assignment"]), "blocked")
+
     def test_the_hub_blocks_a_row_whose_satellite_beat_comes_from_a_clock_ahead(self):
         """Pack sd:7955: a beat stamped more than STALE_SECONDS after now has no age to trust, so the claim blocks
         the row as for a stale beat, and its note names the skew, not a dead dispatcher."""
