@@ -770,6 +770,10 @@ def drop_writes(connection, plan: dict, *, who: str, note: str, left: str) -> li
         stamp, lead, gone = clock(), plan["new_lead"], plan["assignment"]
         connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
                            (stamp, f"{ALONE}{who}: {DROPPED}{plan['run']}", gone))
+        # The split proved every member a subset Retry left out off the kept branch (`aside`): it is settled, not
+        # `unread`, so the next run's `split_first` does not hold the kept commits as that member's (round 7).
+        connection.execute("UPDATE assignment SET result = REPLACE(result, ?, ?) WHERE parent = ? AND scope = ? "
+                           "AND result LIKE ?", (LEFT_OUT, DROPPED, plan["lead"], SCOPE, f"{ALONE}%: {LEFT_OUT}%"))
         kept = [member["id"] for member in plan["kept"]]
         marks = ", ".join("?" for _ in kept)
         connection.execute(f"UPDATE assignment SET parent = CASE WHEN id = ? THEN NULL ELSE ? END WHERE id IN ({marks})",

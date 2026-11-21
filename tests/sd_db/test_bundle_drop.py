@@ -432,3 +432,20 @@ class DropRound6(Repo):
                          (old, run["branch"]))
         self.assertEqual(git(self.repo, "branch", "--list", f"{run['branch']}-drop-*"), "")
         self.assertEqual(self.statuses(items), ["blocked"] * 3)
+
+
+class DropRound7(Repo):
+    """Review round 7 of pack sd:9709: a drop after a subset Retry whose next run never read the branch."""
+
+    def test_a_member_drop_after_an_unread_subset_retry_leaves_the_bundle_unheld(self):
+        items, (lead, second, third), run = self.bundle()
+        build.retry(self.db, lead, who="operator", only=[items[0], items[2]])
+        again = self.claim()
+        build.write(self.db, again["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START)
+        build.end(self.db, again["id"], "cancelled", "operator cancelled")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        self.assertEqual(build.split(self.db, lead), "unread")
+        DROP.drop_item(self.db, build, items[2], who="operator")
+        # The drop's split proved the left-out member's work off the branch, so its next run must not hold it.
+        self.assertIn(build.split(self.db, lead), ("", "clear"))
+        self.assertEqual(self.files(Path(run["work_path"])), ["README", "a.txt"])
