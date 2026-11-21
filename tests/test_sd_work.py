@@ -183,6 +183,18 @@ class TaskCLI(unittest.TestCase):
                 self.assertIn("give YYYY-MM-DD (00:00 UTC) or a duration such as 90m, 6h, 2d or 1w",
                               " ".join(refused.stderr.split()))
 
+    def test_store_items_parked_lists_the_parked_items_only(self):
+        """sd:9729: `store items` hid a parked item silently; `--parked` lists it, with parked_at."""
+        kept = json.loads(self.call("task", "add", "--priority", "3", "Kept", "--json").stdout)["item"]["id"]
+        parked = json.loads(self.call("task", "add", "--priority", "3", "Parked", "--json").stdout)["item"]["id"]
+        with database(sd_db.default_path(self.home), write=True) as connection:
+            connection.execute("UPDATE item SET parked_at = '2026-01-02T00:00:00+00:00' WHERE id = ?", (parked,))
+            connection.commit()
+        listed = json.loads(self.call("store", "items", "--json").stdout)
+        self.assertEqual([row["id"] for row in listed], [kept])
+        listed = json.loads(self.call("store", "items", "--parked", "--json").stdout)
+        self.assertEqual([(row["id"], row["parked_at"]) for row in listed], [(parked, "2026-01-02T00:00:00+00:00")])
+
     def test_task_show_reads_what_store_item_reads(self):
         """sd:1112. `sd task show` is a read alias; `sd store item` stays canonical.
 

@@ -33,6 +33,8 @@ __all__ = ["document", "down", "parse_providers", "parse_services", "services", 
 
 #: A provider or service name in a Settings list (system usage_sources.NAME).
 NAME = re.compile(r"[a-z0-9][a-z0-9._-]{0,63}")
+#: A provider line's spend cap (system usage_sources.CAP).
+CAP = re.compile(r"cap=(\d{1,15}(?:\.\d{1,6})?)")
 #: The service kinds the status job reads (system service_status.KINDS).
 KINDS = ("statuspage", "slack", "google-incidents", "http")
 #: A Usage reading older than this reads unknown (pack sd:9257).
@@ -59,16 +61,23 @@ def document(connection: sqlite3.Connection, *, now: str, month: str | None) -> 
 
 
 def parse_providers(text: str | None) -> tuple[list[str], list[str]]:
-    """The list's names in order, and one problem per line that is not one; `#` starts a comment."""
+    """The list's names in order, and one problem per line that is not one; `#` starts a comment.
+
+    A line is a name and an optional `cap=N`, N a positive decimal (system sd:9701): the job reads the cap into the
+    spend's limit, so only the name matters here (pack sd:9702)."""
     names, problems = [], []
     for number, line in enumerate((text or "").splitlines(), 1):
-        line = line.split("#", 1)[0].strip()
-        if not line:
+        words = line.split("#", 1)[0].split(None, 1)
+        if not words:
             continue
-        if not NAME.fullmatch(line):
+        name, rest = words[0], words[1].strip() if len(words) > 1 else ""
+        cap = CAP.fullmatch(rest)
+        if not NAME.fullmatch(name) or rest and not rest.startswith("cap="):
             problems.append(f"line {number}: not a provider name")
-        elif line not in names:
-            names.append(line)
+        elif rest and not (cap and float(cap.group(1)) > 0):
+            problems.append(f"line {number}: cap=N wants N a positive decimal")
+        elif name not in names:
+            names.append(name)
     return names, problems
 
 
@@ -81,19 +90,46 @@ def _web_url(url: str) -> bool:
     return parts.scheme in ("http", "https") and bool(parts.hostname)
 
 
-def parse_services(text: str | None) -> tuple[list[tuple[str, str, str, list[str]]], list[str]]:
-    """`[(name, kind, url, providers)]` in order, and one problem per refused line."""
+def _options(fields: list[str]) -> dict | str:
+    """`{key: value}` from key=value fields, or the problem (system service_status.parse_options, sd:9722)."""
+    options: dict = {}
+    for field in fields:
+        key, _, value = field.partition("=")
+        if key not in ("groups", "stale"):
+            return f"option {key} is not groups or stale"
+        if key in options:
+            return f"option {key} given twice"
+        if key == "stale":
+            if not (value.isascii() and value.isdigit() and int(value) > 0):
+                return "stale is not a whole number of days above 0"
+            options[key] = int(value)
+        else:
+            groups = value.split(",")
+            if not all(NAME.fullmatch(group) for group in groups):
+                return "groups is not lower-case group names"
+            options[key] = groups
+    return options
+
+
+def parse_services(text: str | None) -> tuple[list[tuple[str, str, str, list[str], dict]], list[str]]:
+    """`[(name, kind, url, providers, options)]` in order, and one problem per refused line (pack sd:9746)."""
     found, problems, seen = [], [], set()
     for number, line in enumerate((text or "").splitlines(), 1):
         fields = line.split("#", 1)[0].split()
         if not fields:
             continue
-        if len(fields) not in (3, 4):
-            problems.append(f"line {number}: want <name> <kind> <url> [provider]")
+        rest = fields[3:]
+        providers = rest.pop(0).split(",") if rest and "=" not in rest[0] else []
+        if len(fields) < 3 or not all("=" in field for field in rest):
+            problems.append(f"line {number}: want <name> <kind> <url> [provider] [key=value ...]")
             continue
         name, kind, url = fields[:3]
-        providers = fields[3].split(",") if len(fields) == 4 else []
-        if not NAME.fullmatch(name) or name in seen:
+        options = _options(rest)
+        if isinstance(options, str):
+            problems.append(f"line {number}: {options}")
+        elif options and kind != "statuspage":
+            problems.append(f"line {number}: options need kind statuspage")
+        elif not NAME.fullmatch(name) or name in seen:
             problems.append(f"line {number}: name is not a new lower-case name")
         elif kind not in KINDS:
             problems.append(f"line {number}: kind is not one of {', '.join(KINDS)}")
@@ -103,7 +139,7 @@ def parse_services(text: str | None) -> tuple[list[tuple[str, str, str, list[str
             problems.append(f"line {number}: a provider is not a lower-case name")
         else:
             seen.add(name)
-            found.append((name, kind, url, providers))
+            found.append((name, kind, url, providers, options))
     return found, problems
 
 
@@ -210,7 +246,7 @@ def services(connection: sqlite3.Connection, *, now: str) -> list[dict]:
                     "components": [{"name": _text(one.get("name")), "status": _text(one.get("status"))}
                                    for one in components]})
     read = {one["name"] for one in out}
-    for name, kind, url, providers in parse_services(_listed(connection, "dashboard.status_services"))[0]:
+    for name, kind, url, providers, _ in parse_services(_listed(connection, "dashboard.status_services"))[0]:
         if name not in read:
             out.append({"name": name, "status": "unknown", "why": NO_READING, "read_at": None, "row_at": None,
                         "kind": kind, "url": url, "providers": providers, "indicator": "", "incidents": [],
@@ -267,9 +303,14 @@ def _window(window: dict, clock: datetime, expected=None) -> dict | None:
 
 
 def _money(value) -> dict | None:
+    """A balance or spend; a spend's cycle end and cap (pack sd:9702) are None unless they read as a time and a
+    positive amount."""
     if not isinstance(value, dict) or _number(value.get("amount")) is None:
         return None
-    return {"amount": _number(value["amount"]), "unit": _text(value.get("unit")), "period": _text(value.get("period"))}
+    limit = _number(value.get("limit"))
+    return {"amount": _number(value["amount"]), "unit": _text(value.get("unit")), "period": _text(value.get("period")),
+            "resets_at": value.get("resets_at") if _when(value.get("resets_at")) else None,
+            "limit": limit if limit is not None and limit > 0 else None}
 
 
 def _usage_row(ident: str, label: str, *, status: str, why: str, read_at, windows: list[dict], balance, spend,
@@ -277,7 +318,11 @@ def _usage_row(ident: str, label: str, *, status: str, why: str, read_at, window
     if status != "ok" or why:
         state, windows, balance, spend = "unknown", [], None, None
     else:
-        top = max((window["used"] for window in windows), default=0.0)
+        # A spend against its cap reads as a window does (pack sd:9702).
+        shares = [window["used"] for window in windows]
+        if spend and spend["limit"]:
+            shares.append(spend["amount"] / spend["limit"] * 100)
+        top = max(shares, default=0.0)
         state = "warning" if top >= WARNING_PERCENT else "caution" if top >= CAUTION_PERCENT else "ok"
     return {"id": ident, "label": label, "state": state, "status": status, "why": why, "read_at": read_at,
             "windows": windows, "balance": balance, "spend": spend, "service": flag, "active": active}
