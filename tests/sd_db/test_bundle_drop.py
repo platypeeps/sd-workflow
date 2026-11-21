@@ -786,3 +786,21 @@ class DropRound18(Repo):
         with mock.patch.object(build, "hub_host", return_value="hub"):
             claimed = [self.claim(hosts=frozenset({"sat-b"})) for _ in range(3)]
         self.assertNotIn(lead, [one["assignment"] for one in claimed if one])
+
+
+class DropRound19(Repo):
+    """Review round 19 of pack sd:9709: a kept member moved to another repository passed the lead check, as its
+    lead was still queued, and then led a fresh build there without the prepared commits."""
+
+    def test_a_kept_member_moved_to_another_repository_does_not_lead_there(self):
+        items, ids, run = self.bundle()
+        queued = DROP.drop_item(self.db, build, items[2], who="operator")
+        other = self.root / "other"
+        upsert_repo(self.db, str(other), remote="https://example.test/other.git", managed=1)
+        # The member, moved while it waits, sorts first so the claim picks its new repository.
+        self.db.execute("UPDATE item SET repo = ?, priority = 0 WHERE id = ?", (str(other), items[1]))
+        claimed = self.claim()
+        self.assertTrue(claimed is None or claimed["assignment"] == queued[0]["id"], claimed)
+        member = self.db.execute("SELECT status, result FROM assignment WHERE id = ?", (queued[1]["id"],)).fetchone()
+        self.assertEqual(member["status"], "blocked")
+        self.assertIn(f"build/sd-{queued[0]['id']}", member["result"])

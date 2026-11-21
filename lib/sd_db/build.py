@@ -1409,16 +1409,19 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             if held is not None and lanes[row["id"]] in hosts and lanes[row["id"]] != lane_of(connection, held[1]):
                 _refuse(connection, row, f"its kept work is in a worktree on {held[1] or 'the hub'}, which ran build "
                                          f"run {held[0]}, but its lane moved; drop or Build its items again there")
-        # A member whose lead is no longer queued (moved to planning, refused) would lead its own fresh branch, past
-        # the lead's branch, which holds the bundle's work, a bundle drop's cherry-picks alone (round 15).
-        leads = {row["id"] for row in queued if connection.execute(
-            "SELECT status FROM assignment WHERE id = ?", (row["id"],)).fetchone()[0] == "queued"}
+        queued = [row for row in queued if lanes[row["id"]] in hosts and not _refused_repo(connection, row)]
+        queued = [row for row in queued if connection.execute(
+            "SELECT status FROM assignment WHERE id = ?", (row["id"],)).fetchone()[0] == "queued"]
+        # A member whose lead is not in this claim's group (moved to planning, refused, or the member moved to another
+        # repository) would lead its own fresh branch, past the lead's branch, which holds the bundle's work, a bundle
+        # drop's cherry-picks alone (rounds 15 and 19).
+        leads = {row["id"]: row["repo"] for row in queued}
         for row in queued:
-            if row["parent"] is not None and row["parent"] not in leads and lanes[row["id"]] in hosts:
-                _refuse(connection, row, f"its lead, assignment {row['parent']}, is no longer queued, and its "
-                                         f"branch {branch(row['parent'])} holds the bundle's work")
-        queued = [row for row in queued if lanes[row["id"]] in hosts and (row["parent"] is None or row["parent"] in leads)
-                  and not _refused_repo(connection, row)]
+            if row["parent"] is not None and leads.get(row["parent"]) != row["repo"]:
+                _refuse(connection, row, f"its lead, assignment {row['parent']}, is no longer queued in "
+                                         f"{row['repo']}, and its branch {branch(row['parent'])} holds the "
+                                         f"bundle's work")
+        queued = [row for row in queued if row["parent"] is None or leads.get(row["parent"]) == row["repo"]]
         repo = next((row["repo"] for row in queued if room_for(available, row["repo"]) > 0), None)
         if repo is None:
             return None
