@@ -1101,6 +1101,20 @@ class Supervise(Case):
         self.assertEqual(build_run.changed_lines(["git"], str(repo), base, run("rev-parse", "HEAD")),
                          {"plain.txt": {2}, "conv.txt": {3}})
 
+    def test_the_operator_s_diff_prefixes_do_not_reach_the_delta(self):
+        """Class pass, sd:9769: diff.noprefix or diff.mnemonicPrefix must not make the delta unreadable."""
+        for config in ({"diff_noprefix": "true"}, {"diff_mnemonicPrefix": "true"}):
+            with self.subTest(config=config):
+                repo, run = self.scratch_repo(**config)
+                (repo / "a.txt").write_text("a\n")
+                run("add", "-A")
+                run("commit", "-q", "-m", "base")
+                base = run("rev-parse", "HEAD")
+                (repo / "a.txt").write_text("b\n")
+                run("commit", "-qam", "change")
+                self.assertEqual(build_run.changed_lines(["git"], str(repo), base, run("rev-parse", "HEAD")),
+                                 {"a.txt": {1}})
+
     def test_a_mode_or_binary_change_reads_as_the_whole_file(self):
         """Review of sd:9769: git gives a mode-only or binary change no line range; any line of it is changed."""
         repo = Path(tempfile.mkdtemp(dir=self.root))
