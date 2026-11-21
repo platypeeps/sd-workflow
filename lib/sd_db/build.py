@@ -1393,7 +1393,10 @@ def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
         if _stranded(connection, row):
             continue
         away = _route(connection, row["lane_host"], _lead(row))
-        names = away is not None and row["result"].startswith(f"item {row['item']}'s lane runs on {away}, ")
+        # Not stranded, a retry's lane is on the host it ran on, which holds its worktree: that host owns the block
+        # whatever host it names, as one blocked while its lane was away (review round 5 of sd:9775).
+        names = away is not None and (_lead(row) is not None
+                                      or row["result"].startswith(f"item {row['item']}'s lane runs on {away}, "))
         # This host ticks, so its beat is back: a satellite takes the rows its own quiet beat blocked (sd:9775), not
         # one another satellite ran, whose worktree is there (review of sd:9775); the hub takes a lane moved to it,
         # and any host one that never ran, with no worktree to keep (review round 2).

@@ -2694,6 +2694,23 @@ class Hosts(Case):
         self.assertEqual((run["assignment"], run["work_path"]), (lead, first["work_path"]))
         self.assertEqual(sorted(member["item"] for member in run["members"]), sorted(items))
 
+    def test_a_retry_blocked_while_its_lane_was_away_requeues_once_the_lane_returns(self):
+        """Review round 5 of sd:9775: a retry ran on one satellite; the hub blocked it while its lane pointed to
+        another, so the block names that one. Once the lane is back on the satellite holding its worktree, that
+        satellite queues it again; before, both hosts refused and pickup waited for good."""
+        build.queue(self.db, [self.item(repo=SAT)], who="operator")
+        first = self.claim(hosts=WORK)
+        self.retried(first)
+        self.db.execute("UPDATE repo SET lane_host = 'other' WHERE path = ?", (SAT,))
+        self.quiet("other")
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", first["assignment"]), "blocked")
+        self.db.execute("UPDATE repo SET lane_host = 'work' WHERE path = ?", (SAT,))
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        run = self.claim(hosts=WORK)
+        assert run is not None
+        self.assertEqual((run["assignment"], run["work_path"]), (first["assignment"], first["work_path"]))
+
     def test_the_hub_blocks_a_row_whose_satellite_beat_comes_from_a_clock_ahead(self):
         """Pack sd:7955: a beat stamped more than STALE_SECONDS after now has no age to trust, so the claim blocks
         the row as for a stale beat, and its note names the skew, not a dead dispatcher."""
