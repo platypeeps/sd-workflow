@@ -2681,6 +2681,47 @@ class Tick(Case):
         self.assertNotIn("handed_back", self.stored("e1"))
         self.assertEqual(self.statuses(), ["in_progress"])
 
+    def lane_failed_bundle(self, waiter, on):
+        """A two-item bundle whose lane entry failed; then item `waiter` waits on item `on`, both its members."""
+        run = self.enqueued(2)
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red"}
+        self.tick()
+        with self.db:
+            self.db.execute("UPDATE item SET fields = ? WHERE id = ?",
+                            (json.dumps({"blocked_by": [self.items[on]]}), self.items[waiter]))
+        return run
+
+    def queued_builds(self, item):
+        return self.db.execute("SELECT COUNT(*) FROM assignment WHERE item = ? AND status = 'queued'",
+                               (item,)).fetchone()[0]
+
+    def lead_waits_on_its_member(self, pressed):
+        """Review of build/sd-1306: the lead waits on its member. Fix refused the bundle until the member was
+        done, and a Build of the member refused the same way. The member leaves and builds on its own."""
+        run = self.lane_failed_bundle(0, 1)
+        build.queue_again(self.db, [self.items[pressed]], who="operator")
+        self.assertEqual(self.queued_builds(self.items[1]), 1, "the member builds")
+        self.assertEqual(self.queued_builds(self.items[0]), 0, "the lead waits")
+        self.assertEqual(build.run(self.db, run["id"])["outcome"], "lane_failed")
+        self.assertEqual(self.statuses(), ["in_progress", "ready"])
+
+    def test_a_build_of_the_member_a_lane_failed_lead_waits_on_builds_it_alone(self):
+        self.lead_waits_on_its_member(1)
+
+    def test_a_build_of_a_lane_failed_lead_that_waits_on_its_member_builds_the_member(self):
+        self.lead_waits_on_its_member(0)
+
+    def test_fix_of_a_lane_failed_lead_leaves_out_the_member_that_waits_on_it(self):
+        """Review of build/sd-1306: the member waits on the lead, so Fix refused the whole bundle. The member
+        leaves the Fix, parked, and the lead goes back to its builder."""
+        run = self.lane_failed_bundle(1, 0)
+        self.assertEqual([member["item"] for member in build.lane_fix_check(self.db, run["id"])[0]],
+                         [self.items[0]])
+        build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertEqual(self.queued_builds(self.items[0]), 1)
+        self.assertEqual(self.statuses(), ["ready", "ready"])
+        self.assertIsNotNone(item_state(self.db, self.items[1])["item"]["parked_at"], "the member waits, parked")
+
     CONFLICT = ("merging origin/main into build/sd-1 conflicts; the branch is unchanged; "
                 "sd-ship lane retry --item 1 queues it again")
 

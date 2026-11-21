@@ -860,6 +860,13 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             # A bundle whose lane entry failed is the panel's Fix when its check passes (pack sd:8791); a state Fix
             # refuses, such as an item moved back to ready, is a fresh press with that press's own check.
             if state and (state["run"] or {}).get("outcome") == "lane_failed":
+                # The members its lead waits on leave first, so they build on their own (review of build/sd-1306).
+                sent = _sent_back(connection, state["run"])
+                ahead = _inside(connection, sent[0]["item"], sent)[0] if sent else []
+                if ahead:
+                    fresh += _free(connection, ahead, who=who, run=state["run"]["id"], lead=sent[0]["item"])
+                    if item in [sent[0]["item"], *(member["item"] for member in ahead)]:
+                        continue
                 try:
                     members = lane_fix_check(connection, state["run"]["id"])[0]
                 except BuildRefused:
@@ -903,6 +910,7 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                 state = item_state(connection, item)
                 if state["item"]["status"] == "planning":
                     change_status(connection, item, "ready", who=who, expected_revision=state["revision"])
+        fresh = list(dict.fromkeys(fresh))
         return queued + (queue(connection, fresh, who=who) if fresh else [])
 
 
@@ -1846,7 +1854,7 @@ def _rebuild(connection, read: dict, reason: str, stamp: str, base: str, entry: 
     The branch's newest lane entry, the one the watch read (`entry`), is handed back to the builder as Fix hands
     it, so `lane retry` refuses it while the builder holds the worktree (pack sd:8601). One not read, another
     entry since, or none: no rebuild, and a note on the lead's item says why."""
-    members = _sent_back(connection, read)
+    members, behind = _sendable(connection, read)
     if not members:
         return
     done = connection.execute("SELECT COUNT(*) FROM note WHERE item = ? AND body LIKE ?",
@@ -1870,6 +1878,8 @@ def _rebuild(connection, read: dict, reason: str, stamp: str, base: str, entry: 
                  f"entry was not handed back: {refusal}. Retry or Fix it on Queue.")
         return
     _hand_back(connection, key, found, read["id"], who="build", by="a conflict rebuild", stamp=stamp)
+    _leave(connection, behind, who="build", run=read["id"], parked=True,
+           note=f"left the rebuild of build run {read['id']}: it waits on an item of its bundle")
     _send_back(connection, members, finding, stamp, who="build",
                why=f"build run {read['id']}: the lane's merge of {base} conflicted", result=reason,
                said=f"rebuild {done + 1} of {CONFLICT_REBUILDS} after the lane's merge of {base} conflicted")
@@ -1912,6 +1922,14 @@ def _free(connection, ahead: list[dict], *, who: str, run: str, lead: int) -> li
            note=f"left its bundle: its lead sd:{lead} waits on it; it builds on its own")
     return [member["item"] for member in ahead if not waiting_on(connection, connection.execute(
         "SELECT id, fields FROM item WHERE id = ?", (member["item"],)).fetchone())]
+
+
+def _sendable(connection, read: dict) -> tuple[list[dict], list[dict]]:
+    """The members a send-back of `read`'s bundle queues again (`_sent_back`), less `behind` (`_inside`), and
+    `behind`: Fix, its check and a conflict rebuild read the same split."""
+    members = _sent_back(connection, read)
+    behind = _inside(connection, members[0]["item"], members)[1] if members else []
+    return [member for member in members if member not in behind], behind
 
 
 def _waiting(connection, members: list[dict]) -> str:
@@ -1974,7 +1992,7 @@ def lane_fix_check(connection, run: str) -> tuple[list[dict], str, dict]:
                            "back only a bundle whose lane entry failed")
     if status is None or status[0] != "done":
         raise BuildRefused(f"the bundle is {status[0] if status else 'gone'} again")
-    members = _sent_back(connection, dict(read))
+    members = _sendable(connection, dict(read))[0]
     if not members:
         raise BuildRefused("its lead item moved on since the lane failed; build it from Tasks")
     if waiting := _waiting(connection, members):
@@ -1989,6 +2007,9 @@ def lane_fix(connection, run: str, finding: str, *, who: str) -> list[int]:
     handed back to the builder first. The caller holds the transaction and checked the lead's revision. A state
     `lane_fix_check` refuses is `BuildRefused` and writes nothing."""
     members, key, entry = lane_fix_check(connection, run)
+    _leave(connection, _sendable(connection, dict(connection.execute("SELECT * FROM runner_run WHERE id = ?",
+                                                                     (run,)).fetchone()))[1],
+           who=who, run=run, parked=True, note=f"left Fix of build run {run}: it waits on an item of its bundle")
     stamp = clock()
     _hand_back(connection, key, entry, run, who=who, by="Fix", stamp=stamp)
     said = f"Fix of build run {run}'s failed lane entry"
