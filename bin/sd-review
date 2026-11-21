@@ -2094,10 +2094,10 @@ def metered_bills(
     return lines, faults
 
 
-def covers_from(subject: Subject, args: argparse.Namespace, previous: dict[str, Any] | None) -> str | None:
-    """The base a passing run stands for (pack sd:9769): a full branch pass its own; a verify pass its prior's."""
+def covers_from(subject: Subject, args: argparse.Namespace, previous: dict[str, Any] | None, binding: Any) -> str | None:
+    """The base a passing run stands for (pack sd:9769): a full branch pass its own; a verify pass its prior's, under one binding."""
     if subject.scope == "branch" and not any(getattr(args, name, None) for name in UNRECORDED_OPTIONS[2:]):  # else unrecorded
-        return (previous or {}).get("covers_from") if getattr(args, "base", None) else subject.base
+        return subject.base if not getattr(args, "base", None) else (previous or {}).get("covers_from") if (previous or {}).get("binding") == binding else None
 
 
 def whole_files(subject: Subject, args: argparse.Namespace) -> str:
@@ -2315,7 +2315,7 @@ def review(
         "schema_version": SCHEMA_VERSION,
         "repo": str(root),
         "scope": args.scope,
-        "covers_from": covers_from(subject, args, previous),
+        "covers_from": covers_from(subject, args, previous, binding := sd_lib.lead_review_binding(root)),
         "verification_report_digest": hashlib.sha256(json.dumps(previous, sort_keys=True).encode()).hexdigest() if verify and previous else None,
         "resume_report_digest": hashlib.sha256(json.dumps(previous, sort_keys=True).encode()).hexdigest() if resume and previous else None,
         "item": item,
@@ -2323,7 +2323,7 @@ def review(
         "lens": getattr(args, "lens", None),
         "draft": bool(args.draft),
         "policy_source": source,
-        "severity_floor": str(policy["severity_floor"]),
+        "severity_floor": str(policy["severity_floor"]), "binding": binding,  # a chain spans one binding (sd:9769)
         "subject": {
             "base": subject.base,
             "head": subject.head,

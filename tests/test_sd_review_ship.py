@@ -117,6 +117,17 @@ class FixReviewTests(ReviewFixture):
                                      FakeRunner(), self.environment(), self.chatgpt_home())
         self.assertIsNone(unchained["covers_from"], "a narrow prior report was read as a full pass")
 
+    def test_a_verify_pass_under_another_binding_covers_nothing(self):
+        """Review of sd:9769: a policy changed between rounds never reviewed the branch the chain stands for."""
+        root, first = self.branch()
+        full = sd_review.review(root, namespace(scope="branch"), FakeRunner(), self.environment(), self.chatgpt_home())
+        report = self.tmp / "prior.json"
+        report.write_text(json.dumps({**full, "binding": {"review_declaration": {"severity_floor": "high"}}}))
+        self.commit(root, "fix.py", "fix = True\n")
+        chained = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)),
+                                   FakeRunner(), self.environment(), self.chatgpt_home())
+        self.assertIsNone(chained["covers_from"], "a pass under another policy extended the chain")
+
     def test_a_pass_the_lane_would_not_record_seeds_no_chain(self):
         """Review of sd:9769: a --draft or --provider pass must not hand its coverage to a verify pass."""
         root, first = self.branch()
