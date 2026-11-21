@@ -521,7 +521,7 @@ EQUALITY_LOOKUPS = {
                  "`mine_issues` and `intake_issues` match `shadow.repo`, a slug"),
     "removal.py": (8, "`_plan_repo` rebinds `path` to the row `row_for` found, and P7's vote lookup binds it; "
                    "`_detach` reads it off the plan"),
-    "runner.py": (6, "every argument is an item or run row's `repo`"),
+    "runner.py": (5, "every argument is an item or run row's `repo`"),
     "runner_exec.py": (1, "the item row's `repo`"),
     "ship.py": (1, "the item row's `repo`"),
     "votes.py": (2, "`_get` and `rows` bind the row path `_stored` read through `repos.row_for`"),
