@@ -3182,6 +3182,25 @@ roles:
         with patch.object(ship.time, "sleep"):
             self.assert_closed_by_merge(self.merge())
 
+    def test_a_delivery_resolves_only_the_followups_it_names_or_the_lanes(self):
+        """sd:9869. A merge closed an item and resolved two followups that
+        still waited on an outside reply. A delivery resolves a followup its
+        message names as `#<id>`, and the lane's own blockers; others stay."""
+        self.task_item("task")
+        waiting = sd_db.add_note(self.connection, self.item, "followup", "Waits on the reviewer's reply")
+        sd_db.add_note(self.connection, self.item, "followup", "Lane failed in prepare: gate red")
+        named = sd_db.add_note(self.connection, self.item, "followup", "Rename the flag")
+        self.connection.commit()
+        body = self.directory / "body.md"
+        body.write_text(f"Renames the flag; settles followup #{named}.\n")
+        self.unanswered("--deliver", "--title", "Rename", "--body-file", str(body)).prepare()
+        with patch.object(ship.time, "sleep"):
+            self.merge()
+        self.assertEqual(self.status_of(self.item), "done")
+        still = {row[0] for row in self.connection.execute(
+            "SELECT id FROM note WHERE item = ? AND kind = 'followup' AND resolved_at IS NULL", (self.item,))}
+        self.assertEqual(still, {waiting})
+
     def test_a_design_only_branch_cannot_deliver_its_build_item(self):
         """sd:3519. PR #260 changed docs/work/ and CLAUDE.md, merged with
         `--deliver`, and closed two build items nobody built. A branch of

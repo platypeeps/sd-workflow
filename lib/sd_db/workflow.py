@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 import sqlite3
+from collections.abc import Collection
 from datetime import date
 from typing import Any
 
@@ -739,10 +740,14 @@ def _refuse_unlanded_branch(state: dict, item: int) -> None:
 def change_status(
     connection: sqlite3.Connection, item: int, target: str, *, who: str,
     reason: str | None = None, expected_revision: str | None = None, session: str | None = None,
+    followups: Collection[int] | None = None,
 ) -> dict:
     """Move a task, followup, hand idea or active work item without bypassing delivery authority.
 
     `session` is the status note's session, `who` when not given (pack sd:6046).
+    `followups` limits which open followups a move to done resolves: a
+    delivery passes the ones it settles; None, a hand close, resolves all
+    (sd:9869).
     """
     who = _text(who, "who")
     if reason is not None:
@@ -824,7 +829,8 @@ def change_status(
             # question is not owed work: it waits on the operator's answer,
             # which a close does not give (pack sd:6329).
             owed = [note["id"] for note in state["notes"]
-                    if note["kind"] == "followup" and not note["resolved_at"]]
+                    if note["kind"] == "followup" and not note["resolved_at"]
+                    and (followups is None or note["id"] in followups)]
             for note in owed:
                 resolve_note(connection, note)
             if owed:
