@@ -73,6 +73,10 @@ BEAT_SECONDS = 30
 #: Reviews with blockers before the class pass and park (operator 2026-11-20,
 #: raised from 3: four-round parks re-queued by hand all day).
 REVIEW_ROUNDS = 7
+#: Fix rounds past this many blocked reviews run on the strongest model at high effort, the brief asking for
+#: the blockers' class (operator ruling on pack sd:9264, 2026-11-20); the park after REVIEW_ROUNDS stays.
+ESCALATE_AFTER = 3
+STRONGEST, ESCALATED_EFFORT = "fable", "high"
 MAX_TURNS = 300
 TITLE_MAX = 63
 #: A read (`git status`, `lane list`) that takes longer is unread.
@@ -159,6 +163,12 @@ FIX = """The review of branch {branch} found these blockers. Fix each one fail-f
 {worktree}, then update the body at {body}. Never push. Your final message is your report.
 
 {blockers}
+"""
+
+# sd:9264: added to each fix brief past ESCALATE_AFTER rounds.
+ESCALATED = """
+These blockers repeat after {rounds} review rounds. Before you fix them, name the class they share and
+enumerate every instance of it in this change, from the code, not from the findings; fix each instance.
 """
 
 # sd:9263: the round after the last, once. The Review rounds rule's class pass, sent instead of another single-finding fix.
@@ -1319,7 +1329,20 @@ class Supervisor:
         if not session:
             return self.finish("blocked", "no builder session recorded to resume for the fix")
         prompt = brief.format(blockers=self.summary(self.blockers, limit=None), **self.brief(), **extra)
-        return self.claude(prompt, session=session, then="reviewing", role=self.fix_role())
+        rounds = self.fresh()["review_round"] or 0
+        if rounds <= ESCALATE_AFTER:
+            return self.claude(prompt, session=session, then="reviewing", role=self.fix_role())
+        self.once("escalated", lambda: self.escalate(rounds))
+        return self.claude(prompt + ESCALATED.format(rounds=rounds), session=session, then="reviewing",
+                           role=self.fix_role(), model=STRONGEST, effort=ESCALATED_EFFORT)
+
+    def escalate(self, rounds: int) -> None:
+        """Record on the lead item that this run's fix rounds now escalate (pack sd:9264).
+
+        A note, not the run's `model`: a retry copies that column, and its first build should not escalate.
+        """
+        add_note(self.db, self.lead, "comment", f"Build run {self.ident}: fix rounds escalated to {STRONGEST} at "
+                                                f"{ESCALATED_EFFORT} effort after {rounds} review rounds with blockers")
 
     def enqueuing(self) -> str | dict:
         if not build.enqueuing(self.db, self.ident):
@@ -1654,10 +1677,11 @@ class Supervisor:
                     f"commit:\n{reviewed}\n")
         return out
 
-    def claude(self, prompt: str, *, session: str | None, then: str, role: str) -> str | dict:
+    def claude(self, prompt: str, *, session: str | None, then: str, role: str, model: str | None = None,
+               effort: str | None = None) -> str | dict:
         argv = [*self.tools.claude, "-p", prompt, "--output-format", "stream-json", "--verbose",
                 "--allowedTools", *ALLOWED, "--permission-mode", "auto", "--max-turns", str(MAX_TURNS),
-                "--model", self.row["model"] or build.OPUS]
+                "--model", model or self.row["model"] or build.OPUS, *(["--effort", effort] if effort else [])]
         if session:
             argv += ["--resume", session]
         offset = self.start_offset(role)

@@ -898,6 +898,27 @@ class Supervise(Case):
         self.assertIn("- work.txt:1 a blocker", prompts[-1])
         self.assertEqual(self.statuses(), ["blocked"])
 
+    def test_fix_rounds_past_the_third_escalate(self):
+        """Pack sd:9264: fix rounds 1-3 run on the bundle's model; round 4 on runs on the strongest model at high
+        effort, its brief naming the repeating blockers' class; the park still comes after REVIEW_ROUNDS."""
+        R = build_run.REVIEW_ROUNDS
+        self.press()
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1))], sd_review=["blocking"] * (R + 1))
+        ended = self.supervisor().run()
+        self.assertEqual(ended["outcome"], "blocked")
+        self.assertEqual(len(self.calls("sd-review")), R + 1, "the park moved")
+        fixes = [call["argv"] for call in self.calls("claude")][1:]
+        models = [(argv[argv.index("--model") + 1], "--effort" in argv) for argv in fixes]
+        self.assertEqual(models[:3], [("opus", False)] * 3, "rounds 1-3 escalated")
+        self.assertEqual(models[3:], [(build_run.STRONGEST, True)] * (R - 3), "round 4 on did not escalate")
+        self.assertEqual(fixes[3][fixes[3].index("--effort") + 1], "high")
+        prompts = [argv[argv.index("-p") + 1] for argv in fixes]
+        self.assertNotIn("name the class", prompts[2])
+        self.assertIn("name the class", prompts[3])
+        escalated = [body for (body,) in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))
+                     if "escalated" in body]
+        self.assertEqual(len(escalated), 1, "the escalation is not recorded once on the run's item")
+
     def test_review_rounds_cap_is_seven(self):
         """Operator 2026-11-20: seven rounds with blockers, then the class pass, before a build parks."""
         self.assertEqual(build_run.REVIEW_ROUNDS, 7)
