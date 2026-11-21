@@ -851,14 +851,16 @@ def left(connection, branch: str, items) -> set[int]:
     published `branch` (`branch_run`). A lane entry on that branch neither closes nor demands one, whatever its
     commits, title or body say: an older run's `Closes:` trailer may still cite it (review rounds 4 and 5 of sd:9222).
     The branch names the bundle whichever member the entry claims first, and a fresh build of the member elsewhere
-    is another bundle and another branch; an entry on any other branch reads nothing here."""
+    is another bundle and another branch; an entry on any other branch reads nothing here. The lead counts too: a
+    bundle drop cancels it out (`ALONE`) when it leaves its branch (pack sd:9709, round 14)."""
     run = branch_run(connection, branch) if branch else None
     if run is None:
         return set()
     wanted = set(items)
     return {row["item"] for row in connection.execute(
-        f"SELECT item FROM assignment WHERE parent = ? AND scope = ? AND NOT {_in_group()}",
-        (run["assignment"], SCOPE)) if row["item"] in wanted}
+        f"SELECT item FROM assignment WHERE (id = ? OR parent = ?) AND scope = ? "
+        f"AND COALESCE(result, '') LIKE '{ALONE}%'",
+        (run["assignment"], run["assignment"], SCOPE)) if row["item"] in wanted}
 
 
 def left_out(connection, lead: int) -> list[tuple[int, int]]:

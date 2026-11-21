@@ -620,3 +620,8 @@ class DropRound14(Repo):
                 self.assertRaises(build.BuildRefused):
             DROP.drop_item(self.db, build, items[1], who="operator")
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM assignment").fetchone()[0], before)
+
+    def test_the_old_branch_leaves_the_dropped_lead_out(self):
+        items, ids, run = self.bundle()
+        DROP.drop_item(self.db, build, items[0], who="operator")
+        self.assertEqual(build.left(self.db, run["branch"], items), set(items))
