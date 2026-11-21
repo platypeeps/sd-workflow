@@ -112,6 +112,14 @@ class TheReads(Run):
                                       "lsof -nP -iTCP:8080 -sTCP:LISTEN", f"df -h {self.store}", f"du -k -d 1 {self.store}",
                                       "sd skill scan", "machine-setup.sh doctor"])
 
+    def test_needs_sweep_runs_the_reports_sweep_and_takes_no_field(self):
+        """sd:9759: Today's Clean up runs `sd reports sweep`, the line the nightly job runs; a field is refused."""
+        status, body = self.run_("needs.sweep")
+        self.assertEqual((status, body["line"], body["exit"]), (200, "sd reports sweep", 0))
+        self.assertEqual(self.ran(), ["sd reports sweep"])
+        status, _ = self.run_("needs.sweep", item=1)
+        self.assertEqual((status, self.ran()), (400, ["sd reports sweep"]))
+
     def test_the_journal_keeps_each_runs_own_exit(self):
         self.run_("job.log", job="nightly-sync")
         self.run_("port.lsof", port=8080)
