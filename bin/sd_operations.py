@@ -149,7 +149,11 @@ def queue_builds(args: argparse.Namespace) -> int:
         raise WorkRefusal("update this pack checkout, whose lib/ is the sd_db bin/ runs for builds") from None
     if args.drop and (len(args.items) != 1 or args.finding):
         raise WorkRefusal("--drop takes one item and no --finding")
-    import sd_bundle_drop
+    sys.path.insert(0, str(BIN))
+    try:  # by name from bin/, as `holders` loads the dashboard: a caller may not have bin/ on its path
+        sd_bundle_drop = importlib.import_module("sd_bundle_drop")
+    finally:
+        sys.path.remove(str(BIN))
     connection = sd_handoff_rows.connect(sd_db, write=True)
     try:
         if args.drop:
