@@ -5133,8 +5133,28 @@ roles:
     def test_a_lead_record_naming_another_repository_is_not_reused(self):
         self.assert_other_subject("it names another subject", repository="fixture/other")
 
-    def test_a_lead_record_that_is_not_clean_is_not_reused(self):
-        self.assert_other_subject("it names another subject", status="advisory")
+    def test_a_blocking_lead_record_is_not_reused(self):
+        self.assert_other_subject("it names another subject", status="blocking")
+
+    def test_an_advisory_build_review_of_the_head_runs_the_gate_only(self):
+        # sd:9767: a build's review that cleared with advisory findings alone
+        # stands for the lane review at the same head; only the gate runs.
+        calls = self.lead_reviewed_branch()
+        self.rewrite_lead_record(status="advisory")
+        head = _git(self.root, "rev-parse", "HEAD")
+        with contextlib.redirect_stderr(io.StringIO()) as said:
+            result = self.prepare()
+        self.assertEqual(result["review_skipped"], "lead-review")
+        self.assertIn(f"lead review reused: the advisory pass of {head[:12]} covers it", said.getvalue())
+        self.assertFalse(calls.exists(), "a reader was called for a head the build's pass covers")
+        self.assertEqual(self.operation().state["review_skipped"]["check"]["status"], "pass")
+
+    def test_an_advisory_build_review_of_a_moved_head_reviews(self):
+        calls = self.lead_reviewed_branch()
+        self.rewrite_lead_record(status="advisory")
+        (self.root / "src.py").write_text("value = 3\n")
+        _git(self.root, "commit", "-qam", "code\n\nAuthored-with: human")
+        self.assert_full_review(calls, "it changed more than a clean merge of origin/main")
 
     def test_a_lead_review_from_a_local_only_base_is_not_reused(self):
         # A missing origin/HEAD makes sd-review diff from local main, which may
@@ -5180,8 +5200,13 @@ roles:
         head = _git(self.root, "rev-parse", "HEAD")
         result = {"status": "advisory", "requested_reviews": 1, "completed_reviews": 1,
                   "subject": {"base": head, "head": head}}
-        review.record_lead_review(self.root, args, result, dict(os.environ))
-        self.assertIsNone(self.lead_record(), "an advisory pass was recorded")
+        review.record_lead_review(self.root, args, {**result, "status": "blocking"}, dict(os.environ))
+        self.assertIsNone(self.lead_record(), "a blocking pass was recorded")
+        with contextlib.redirect_stderr(io.StringIO()):
+            review.record_lead_review(self.root, args, result, dict(os.environ))
+        self.assertEqual(self.lead_record()["status"], "advisory", "an advisory pass was not recorded (sd:9767)")
+        self.connection.execute("DELETE FROM state WHERE key = ?", (self.LEAD_KEY,))
+        self.connection.commit()
         moved = {**result, "status": "clean", "subject": {"base": head, "head": "0" * 40}}
         with contextlib.redirect_stderr(io.StringIO()) as said:
             review.record_lead_review(self.root, args, moved, dict(os.environ))

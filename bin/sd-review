@@ -2836,12 +2836,14 @@ UNRECORDED_OPTIONS = ("base", "verify_report", "resume_report", "item", "draft",
 
 def record_lead_review(root: pathlib.Path, args: argparse.Namespace, result: dict[str, Any],
                        env: Mapping[str, str]) -> None:
-    """Record a clean plain `--scope branch` review of HEAD, so lane prepare can skip its own (sd:5988).
+    """Record a passing plain `--scope branch` review of HEAD, so lane prepare can skip its own (sd:5988).
 
+    Clean or advisory only (sd:9767): lane prepare then runs the gate alone.
     Only a pass with every reviewer it asked for, while HEAD is still its head.
     A record that cannot be written is said on stderr; the exit code stands.
     """
-    if (args.scope != "branch" or result.get("status") != "clean"
+    status = result.get("status")
+    if (args.scope != "branch" or status not in ("clean", "advisory")
             or any(getattr(args, name, None) for name in UNRECORDED_OPTIONS)
             or not 1 <= result.get("requested_reviews", 0) <= result.get("completed_reviews", 0)):
         return
@@ -2856,13 +2858,13 @@ def record_lead_review(root: pathlib.Path, args: argparse.Namespace, result: dic
         with contextlib.closing(library.connect(args.database or library.default_path(env.get("HOME")))) as connection:
             library.record_state(connection, "checkpoint", key=sd_lib.lead_review_key(f"{owner}/{name}", branch), body={
                 "repository": f"{owner}/{name}", "branch": branch, "head": head, "base": result["subject"]["base"],
-                "status": "clean", "binding": binding, "reviewed_by": result.get("reviewed_by", []),
+                "status": status, "binding": binding, "reviewed_by": result.get("reviewed_by", []),
                 "challenge": bool(args.challenge), "copilot_automatic": copilot.get("automatic")})
     except Exception as error:  # any failure: the review stands, and the lane reviews in full
-        print(f"sd-review: the clean pass was not recorded for lane prepare: {type(error).__name__}: {error}",
+        print(f"sd-review: the {status} pass was not recorded for lane prepare: {type(error).__name__}: {error}",
               file=sys.stderr)
         return
-    print(f"sd-review: recorded the clean pass of {head[:12]} on {branch} for lane prepare (sd:5988)", file=sys.stderr)
+    print(f"sd-review: recorded the {status} pass of {head[:12]} on {branch} for lane prepare (sd:5988)", file=sys.stderr)
 
 
 def _validate_copilot_policy(policy: dict[str, Any], source: str) -> dict[str, Any]:
