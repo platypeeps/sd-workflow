@@ -124,6 +124,53 @@ class TheOtherStarts(DependencyCase):
         started = runner.claim(self.db, queued, owner="fixture", **roots)
         self.assertEqual(started and started["status"], "running", "a done dependency lets it start")
 
+    def serial(self, count, **options):
+        from sd_db import runner
+        items = [self.item() for _ in range(count)]
+        for index, item in enumerate(items):
+            self.db.execute("UPDATE item SET branch = ? WHERE id = ?", (f"work/{index}", item))
+        return items, [row["id"] for row in runner.enqueue(self.db, items, who="operator", **options)]
+
+    def test_a_serial_run_that_waits_on_one_behind_it_yields_its_place(self):
+        """Lane review: A queued before B, then A set to wait on B; A held for B, B held behind A."""
+        from sd_db import runner
+        (first, second), (ahead, behind) = self.serial(2)
+        self.wait(first, second)
+        roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
+        self.assertIsNone(runner.claim(self.db, ahead, owner="fixture", **roots), "A waits on B")
+        started = runner.claim(self.db, behind, owner="fixture", **roots)
+        self.assertEqual(started and started["status"], "running", "A yields its place to B")
+
+    def test_a_run_yields_to_one_two_places_behind_it(self):
+        """Class pass: A waits on C with B between them; A yields, so B runs, and C after B."""
+        from sd_db import runner
+        (first, _, third), (ahead, middle, _) = self.serial(3)
+        self.wait(first, third)
+        roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
+        started = runner.claim(self.db, middle, owner="fixture", **roots)
+        self.assertEqual(started and started["status"], "running", "B passes the waiting A")
+        self.assertIsNone(runner.claim(self.db, ahead, owner="fixture", **roots))
+
+    def test_a_run_that_waits_outside_the_queue_keeps_its_place(self):
+        """A waits on an item with no queued run: nothing behind it can unblock it, so the order holds."""
+        from sd_db import runner
+        (first, _), (_, behind) = self.serial(2)
+        self.wait(first, self.item(status="planning"))
+        roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
+        self.assertIsNone(runner.claim(self.db, behind, owner="fixture", **roots))
+
+    def test_a_parallel_run_passes_an_earlier_serial_run_that_waits_on_it(self):
+        """Class pass: a parallel author run waits for every eligible earlier serial run in its repository."""
+        from sd_db import runner
+        (first,), _ = self.serial(1)
+        second = self.item()
+        self.db.execute("UPDATE item SET branch = 'work/p' WHERE id = ?", (second,))
+        parallel = runner.enqueue(self.db, [second], who="operator", parallel=True)[0]["id"]
+        self.wait(first, second)
+        roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
+        started = runner.claim(self.db, parallel, owner="fixture", **roots)
+        self.assertEqual(started and started["status"], "running", "the held serial run does not hold it")
+
 
 class TheBuild(DependencyCase):
     def test_an_item_without_the_key_builds_as_before(self):

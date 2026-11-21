@@ -100,17 +100,38 @@ def _eligible_after(connection, assignment: dict) -> bool:
     predecessor = assignment["after"]
     if predecessor is None:
         return True
-    row = connection.execute("SELECT status, item FROM assignment WHERE id = ?", (predecessor,)).fetchone()
+    row = connection.execute("SELECT * FROM assignment WHERE id = ?", (predecessor,)).fetchone()
     if row is None:
         raise RunnerRefused(f"missing predecessor {predecessor}")
     if row["status"] in {"blocked", "cancelled"}:
         connection.execute("UPDATE assignment SET status = 'blocked', result = ?, ended = ? WHERE id = ?",
                            (f"predecessor {predecessor} ended {row['status']}", now(), assignment["id"]))
         return False
+    if _yields(connection, row):
+        return _eligible_after(connection, {**assignment, "after": row["after"]})
     # A successful provider exit is completion; only a verified merge is delivery.
     return row["status"] == "done" and connection.execute(
         "SELECT 1 FROM assignment WHERE item = ? AND role = 'merge' AND status = 'done' AND phase = 'merged'",
         (row["item"],)).fetchone() is not None
+
+
+def _yields(connection, row) -> bool:
+    """Whether the queued author run `row` gives up its place: its item waits on an open item with a run
+    queued behind it. Else A waits for B while B waits behind A (lane review of pack sd:9570). A wait on
+    an item with no run behind it keeps the order; unreadable fields keep it too."""
+    if row["status"] != "queued" or row["role"] != "author":
+        return False
+    from .workflow import item_blocked_by
+
+    try:
+        named = item_blocked_by(connection.execute("SELECT fields FROM item WHERE id = ?", (row["item"],)).fetchone())
+    except ValueError:
+        return False
+    marks = ",".join("?" * len(named))
+    return bool(named) and connection.execute(
+        f"SELECT 1 FROM assignment JOIN item ON item.id = assignment.item WHERE assignment.item IN ({marks}) "
+        "AND assignment.status = 'queued' AND assignment.id > ? AND item.status != 'done' LIMIT 1",
+        (*named, row["id"])).fetchone() is not None
 
 
 def _acyclic(connection) -> None:
@@ -237,7 +258,7 @@ def claim(connection, assignment: int, *, owner: str, work_root: Path, retention
                 "WHERE item.repo = ? AND assignment.status = 'queued' AND assignment.id < ? "
                 "AND (assignment.lane = 'serial' OR assignment.role != 'author') ORDER BY assignment.id",
                 (item["repo"], assignment)).fetchall()
-            if any(_eligible_after(connection, dict(row)) for row in earlier):
+            if any(_eligible_after(connection, dict(row)) and not _yields(connection, row) for row in earlier):
                 return None
         run = request["run_count"] + 1
         ident = uuid.uuid4().hex
