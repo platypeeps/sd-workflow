@@ -81,19 +81,46 @@ def _web_url(url: str) -> bool:
     return parts.scheme in ("http", "https") and bool(parts.hostname)
 
 
-def parse_services(text: str | None) -> tuple[list[tuple[str, str, str, list[str]]], list[str]]:
-    """`[(name, kind, url, providers)]` in order, and one problem per refused line."""
+def _options(fields: list[str]) -> dict | str:
+    """`{key: value}` from key=value fields, or the problem (system service_status.parse_options, sd:9722)."""
+    options: dict = {}
+    for field in fields:
+        key, _, value = field.partition("=")
+        if key not in ("groups", "stale"):
+            return f"option {key} is not groups or stale"
+        if key in options:
+            return f"option {key} given twice"
+        if key == "stale":
+            if not (value.isascii() and value.isdigit() and int(value) > 0):
+                return "stale is not a whole number of days above 0"
+            options[key] = int(value)
+        else:
+            groups = value.split(",")
+            if not all(NAME.fullmatch(group) for group in groups):
+                return "groups is not lower-case group names"
+            options[key] = groups
+    return options
+
+
+def parse_services(text: str | None) -> tuple[list[tuple[str, str, str, list[str], dict]], list[str]]:
+    """`[(name, kind, url, providers, options)]` in order, and one problem per refused line (pack sd:9746)."""
     found, problems, seen = [], [], set()
     for number, line in enumerate((text or "").splitlines(), 1):
         fields = line.split("#", 1)[0].split()
         if not fields:
             continue
-        if len(fields) not in (3, 4):
-            problems.append(f"line {number}: want <name> <kind> <url> [provider]")
+        rest = fields[3:]
+        providers = rest.pop(0).split(",") if rest and "=" not in rest[0] else []
+        if len(fields) < 3 or not all("=" in field for field in rest):
+            problems.append(f"line {number}: want <name> <kind> <url> [provider] [key=value ...]")
             continue
         name, kind, url = fields[:3]
-        providers = fields[3].split(",") if len(fields) == 4 else []
-        if not NAME.fullmatch(name) or name in seen:
+        options = _options(rest)
+        if isinstance(options, str):
+            problems.append(f"line {number}: {options}")
+        elif options and kind != "statuspage":
+            problems.append(f"line {number}: options need kind statuspage")
+        elif not NAME.fullmatch(name) or name in seen:
             problems.append(f"line {number}: name is not a new lower-case name")
         elif kind not in KINDS:
             problems.append(f"line {number}: kind is not one of {', '.join(KINDS)}")
@@ -103,7 +130,7 @@ def parse_services(text: str | None) -> tuple[list[tuple[str, str, str, list[str
             problems.append(f"line {number}: a provider is not a lower-case name")
         else:
             seen.add(name)
-            found.append((name, kind, url, providers))
+            found.append((name, kind, url, providers, options))
     return found, problems
 
 
@@ -210,7 +237,7 @@ def services(connection: sqlite3.Connection, *, now: str) -> list[dict]:
                     "components": [{"name": _text(one.get("name")), "status": _text(one.get("status"))}
                                    for one in components]})
     read = {one["name"] for one in out}
-    for name, kind, url, providers in parse_services(_listed(connection, "dashboard.status_services"))[0]:
+    for name, kind, url, providers, _ in parse_services(_listed(connection, "dashboard.status_services"))[0]:
         if name not in read:
             out.append({"name": name, "status": "unknown", "why": NO_READING, "read_at": None, "row_at": None,
                         "kind": kind, "url": url, "providers": providers, "indicator": "", "incidents": [],
