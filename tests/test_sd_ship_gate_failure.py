@@ -716,6 +716,13 @@ class AFlakyGateTestIsRerunAlone(unittest.TestCase):
         self.assertNotIn("exit None", stderr.getvalue())
         self.assertIn("no worktree of 0123456789ab: boom", stderr.getvalue())
 
+    def test_a_rerun_failure_it_cannot_name_bars_every_rerun_test(self):
+        """Review of sd:9768: a rerun that failed in a header the parser cannot read bars all it reran."""
+        odd = "FAIL: test_e\u0301 (tests.test_example.Case.test_e\u0301)"
+        _review, _rerun, refused = self.prepared(rerun=(1, f"{odd}\nFAILED (failures=1)", ""))
+        self.assertIsNotNone(refused)
+        self.assertEqual(len(self.notes(f"{RERUN_FAILED}{FLAKY_TEST} at ")), 1)
+
     def test_a_second_flake_on_the_same_entry_fails(self):
         _review, rerun, refused = self.prepared(state={"passes": [], "gate_flake": {"head": HEAD, "tests": []}})
         self.assertIsNotNone(refused)
@@ -1012,6 +1019,26 @@ class TheRerunRunsAtTheReviewedHead(unittest.TestCase):
                 row = {"name": "check", "status": "fail", "exit_code": 2, "output_path": str(root / "check.log"),
                        "failed_steps": [SHARD, "make target test"]}
                 self.assertEqual(sd_ship_review.failed_tests({"checks": [row]}), expected)
+
+    def test_a_failing_shard_with_a_header_it_cannot_parse_is_no_flake(self):
+        """Review of sd:9768: a valid test name with a combining mark escapes the header pattern; a shard whose
+        headers do not all parse, or do not add up to its FAILED count, is no flake."""
+        root = pathlib.Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        odd = "FAIL: test_e\u0301 (tests.test_example.Case.test_e\u0301)\nAssertionError\n"
+        for name, text in (
+                ("unparsed header", OUTPUT.replace("Ran 3 tests\nFAILED (failures=1)",
+                                                   f"{odd}Ran 3 tests\nFAILED (failures=2)")),
+                ("count above headers", OUTPUT.replace("FAILED (failures=1)", "FAILED (failures=1, errors=1)"))):
+            with self.subTest(name):
+                (root / "check.log").write_text(text, encoding="utf-8")
+                row = {"name": "check", "status": "fail", "exit_code": 2, "output_path": str(root / "check.log"),
+                       "failed_steps": [SHARD, "make target test"]}
+                self.assertEqual(sd_ship_review.failed_tests({"checks": [row]}), [])
+        (root / "check.log").write_text(OUTPUT.replace("FAILED (failures=1)", "FAILED (failures=1, expected failures=2)"),
+                                        encoding="utf-8")
+        row = {"name": "check", "status": "fail", "exit_code": 2, "output_path": str(root / "check.log"),
+               "failed_steps": [SHARD, "make target test"]}
+        self.assertEqual(sd_ship_review.failed_tests({"checks": [row]}), [FLAKY_TEST], "expected failures pass")
 
     def test_the_interpreter_probe_ends_its_whole_group_at_its_deadline(self):
         """Review of sd:9768: a provisioning child of the probe's `make` must not outlive the timeout and keep

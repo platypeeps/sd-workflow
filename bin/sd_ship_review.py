@@ -716,8 +716,10 @@ class SharedReview:
         from sd_db.writes import add_note  # noqa: PLC0415
         if code != 0:
             # Only a test the rerun ran and saw fail is barred: one that did not load or run is not (sd:9768).
-            named = {paren if paren.endswith(f".{name}") else f"{paren}.{name}"
-                     for name, paren in FAILED_TEST.findall(f"{out}\n{err}")} if code is not None else set()
+            # A header the parser cannot read bars every test it reran: the omitted one may be any of them.
+            parsed = named_failures(f"{out}\n{err}") if code is not None else []
+            named = set(tests) if parsed is None else {paren if paren.endswith(f".{name}") else f"{paren}.{name}"
+                                                       for name, paren in parsed}
             with transaction(self.connection):
                 for test in tests:
                     if test in named:
@@ -1724,6 +1726,10 @@ def gate_code(check: dict) -> str:
 
 #: A unittest failure header, `FAIL: test_x (tests.mod.Class.test_x)`, or before 3.11 `(tests.mod.Class)` (sd:9768).
 FAILED_TEST = re.compile(r"^(?:FAIL|ERROR): (\w+) \(([\w.]+)\)", re.M)
+#: Every unittest failure header, parsed or not: a name `FAILED_TEST` cannot read must not drop out unseen.
+FAILURE_HEADER = re.compile(r"^(?:FAIL|ERROR): ", re.M)
+#: A unittest run's failure summary: `FAILED (failures=N, errors=M, ...)`.
+FAILED_SUMMARY = re.compile(r"^FAILED \(([^)]*)\)$", re.M)
 #: The most failing tests a gate may name and be rerun as a flake: more is a real break.
 FLAKE_TESTS = 5
 #: A unittest outcome other than FAIL and ERROR that fails a gate or a rerun by itself: a skip, which `make test`
@@ -1789,7 +1795,7 @@ def row_tests(row: dict) -> list[str]:
     # `make test` before it says so.
     if RUNNER_FAULT.search(SHARD_BLOCK.sub("", text)) or FAILING_OUTCOME.search(text):
         return []
-    found = [paren if paren.endswith(f".{name}") else f"{paren}.{name}" for name, paren in FAILED_TEST.findall(text)]
+    found = [paren if paren.endswith(f".{name}") else f"{paren}.{name}" for name, paren in named_failures(text) or []]
     if not steps or not failing or not all(test_step(step, failing) for step in steps):
         return []
     return found
@@ -1809,9 +1815,26 @@ def unittest_failed_shards(text: str) -> set[str]:
     for name in failing:
         match = ended[name]
         opened = text.rfind(f"shard {name}: start\n", 0, match.start())
-        if match.group(2) != UNITTEST_FAILED or opened < 0 or not FAILED_TEST.search(text, opened, match.start()):
+        if match.group(2) != UNITTEST_FAILED or opened < 0 or not read_failures(text[opened:match.start()]):
             return set()
     return failing
+
+
+def named_failures(text: str) -> list[tuple[str, str]] | None:
+    """The `(name, parent)` of each unittest failure header in `text`, or None when any header does not parse:
+    a valid name with a combining mark escapes `FAILED_TEST` (review of sd:9768)."""
+    named = FAILED_TEST.findall(text)
+    return named if len(named) == len(FAILURE_HEADER.findall(text)) else None
+
+
+def read_failures(block: str) -> bool:
+    """Whether one shard's output names every failure it counts: each header parses, and they add up to its
+    `FAILED (failures=N, errors=M)` summary; one it cannot read is a failure no rerun would clear."""
+    named = named_failures(block)
+    summaries = FAILED_SUMMARY.findall(block)
+    if not named or len(summaries) != 1:
+        return False
+    return sum(int(count) for count in re.findall(r"(?:^|, )(?:failures|errors)=(\d+)", summaries[0])) == len(named)
 
 
 def test_step(step: str, failing: set[str]) -> bool:
