@@ -1069,6 +1069,29 @@ class Supervise(Case):
         self.assertIsNone(build_run.changed_lines(["git"], str(repo), base, run("rev-parse", "HEAD")),
                           "a quoted path was read")
 
+    def test_a_deletion_marks_the_surviving_line_and_a_deleted_file(self):
+        """Review of sd:9769: git's zero-length range names the line before a deletion; a deleted file's
+        new path is /dev/null; a deleted line reading `-- x` is not a header."""
+        repo = Path(tempfile.mkdtemp(dir=self.root))
+
+        def run(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.name=operator",
+                                   "-c", "user.email=operator@example.test", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        run("init", "-q")
+        (repo / "kept.txt").write_text("one\ntwo\n-- x\nfour\n")
+        (repo / "gone.txt").write_text("a\nb\n")
+        run("add", "-A")
+        run("commit", "-q", "-m", "base")
+        base = run("rev-parse", "HEAD")
+        (repo / "kept.txt").write_text("one\ntwo\nfour\n")
+        (repo / "gone.txt").unlink()
+        run("add", "-A")
+        run("commit", "-q", "-m", "delete")
+        self.assertEqual(build_run.changed_lines(["git"], str(repo), base, run("rev-parse", "HEAD")),
+                         {"kept.txt": {2, 3}, "gone.txt": {1, 2}})
+
     def test_each_follow_up_is_its_own_write(self):
         """Review of sd:9769: a lost answer on the first follow-up must not stand for the second."""
         rows = [{"path": "a.txt", "line": 1, "summary": "first"}, {"path": "b.txt", "line": 2, "summary": "second"}]

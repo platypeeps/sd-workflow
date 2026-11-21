@@ -451,8 +451,10 @@ def changed_lines(git: Collection[str], work: str, base: str, head: str, *,
                   env: dict | None = None) -> dict[str, set[int]] | None:
     """Each path `base..head` changes, with the new-side lines its hunks touch; None when git cannot answer.
 
-    A hunk that only deletes names the line after it, where the deletion now sits (pack sd:9769). Non-ASCII
-    paths read as themselves; a path git still quotes (a quote, a control character) makes the delta unknown.
+    A hunk that only deletes names the lines on both sides of where the deletion now sits; a deleted file
+    keeps its old path and old lines (pack sd:9769). `---`/`+++` are headers only before a file's first hunk.
+    Non-ASCII paths read as themselves; a path git still quotes (a quote, a control character) makes the
+    delta unknown.
     """
     try:
         diff = _read([*git, "-C", work, "-c", "core.quotePath=false", "diff", "-U0", "--no-renames", "--no-color",
@@ -460,19 +462,27 @@ def changed_lines(git: Collection[str], work: str, base: str, head: str, *,
     except Unread:
         return None
     changed: dict[str, set[int]] = {}
-    path = None
+    path = gone = None
+    header = deleted = False
     for line in diff.splitlines():
-        if line.startswith('+++ "'):
+        if line.startswith("diff --git "):
+            header, path = True, None
+        elif header and line.startswith(('--- "', '+++ "')):
             return None
-        if line.startswith("+++ "):
-            path = line[6:] if line.startswith("+++ b/") else None
+        elif header and line.startswith("--- "):
+            gone = line[6:] if line.startswith("--- a/") else None
+        elif header and line.startswith("+++ "):
+            deleted = line == "+++ /dev/null"
+            path = gone if deleted else line[6:] if line.startswith("+++ b/") else None
             if path is not None:
                 changed.setdefault(path, set())
         elif line.startswith("@@") and path is not None:
-            hunk = re.match(r"@@ -\S+ \+(\d+)(?:,(\d+))? @@", line)
+            header = False
+            hunk = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
             if hunk:
-                start, count = int(hunk[1]), int(hunk[2] if hunk[2] is not None else 1)
-                changed[path].update(range(start, start + max(count, 1)))
+                at, size = (hunk[1], hunk[2]) if deleted else (hunk[3], hunk[4])
+                start, count = int(at), int(size if size is not None else 1)
+                changed[path].update(range(max(start, 1), start + max(count, 1) + (count == 0)))
     return changed
 
 
