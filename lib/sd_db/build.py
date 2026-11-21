@@ -909,6 +909,8 @@ def pickup(connection, available: dict, *, now: str | None = None) -> list[int]:
         return []
     # Only this host's presses hold it: the hub never claims a satellite's.
     hosts = lane_hosts(connection)
+    with transaction(connection):  # a build blocked on a quiet beat is this host's press again (sd:9775)
+        _requeue_beat_blocked(connection, hosts)
     if any(_route(connection, row["lane_host"], _lead(row)) in hosts and room_for(available, row["repo"]) > 0
            for row in connection.execute(
             "SELECT assignment.id, assignment.parent, assignment.run_count, item.repo, repo.lane_host FROM assignment JOIN item ON item.id = assignment.item "
@@ -1219,8 +1221,7 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
     with transaction(connection):
         if restoration_pending(connection):
             raise BuildRefused(RESTORING)
-        if None in hosts:
-            _requeue_beat_blocked(connection, hosts)
+        _requeue_beat_blocked(connection, hosts)
         queued = connection.execute(
             "SELECT assignment.id, assignment.item, assignment.parent, assignment.run_count, item.repo, "
             "repo.lane_host FROM assignment JOIN item ON item.id = assignment.item "
@@ -1338,7 +1339,9 @@ def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
     Only the item's newest build, its item still `ready`, no other assignment
     owning it, and its lane (`_route`) still on the host the block names, or
     moved to this hub's own lanes (sd:8991): an item moved on, or a build
-    requeued by hand since, stays as it is.
+    requeued by hand since, stays as it is. A satellite takes its own on its
+    first tick back, before its pickup reads, so a hub outage that left its
+    beat stale requeues its bundles as they were (sd:9775).
     """
     rows = connection.execute(
         f"SELECT assignment.id, assignment.item, assignment.parent, assignment.run_count, assignment.result, "
@@ -1347,10 +1350,11 @@ def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
         f"WHERE {_BEAT_BLOCKED} AND item.status = 'ready'", (SCOPE, _BEAT_RESULT)).fetchall()
     for row in rows:
         away = _route(connection, row["lane_host"], _lead(row))
-        if away in hosts:
-            why = "its lane runs on this host now"
-        elif (away is None or not row["result"].startswith(f"item {row['item']}'s lane runs on {away}, ")
-                or dispatcher_gone(connection, away) or dispatcher_stuck(connection, away)):
+        names = away is not None and row["result"].startswith(f"item {row['item']}'s lane runs on {away}, ")
+        if away in hosts:  # this host ticks, so its beat is back: a satellite takes its own (sd:9775)
+            why = f"the {HEARTBEAT}@{away} beat is fresh" if names else "its lane runs on this host now"
+        elif (away is None or None not in hosts or not names
+              or dispatcher_gone(connection, away) or dispatcher_stuck(connection, away)):
             continue
         else:
             why = f"the {HEARTBEAT}@{away} beat is fresh"

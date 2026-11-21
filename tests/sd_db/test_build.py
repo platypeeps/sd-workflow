@@ -2487,6 +2487,32 @@ class Hosts(Case):
         self.assertIsNone(self.claim(hosts=HUB))
         self.assertEqual(self.claim(hosts=WORK)["assignment"], lead, "the same assignment builds")
 
+    def test_a_satellite_back_after_a_hub_outage_requeues_its_blocked_bundle_as_it_was(self):
+        """sd:9775: the hub was down, so the satellite's beat went stale and the hub blocked its retried bundle.
+        On its first tick back, before any hub tick, the satellite queues that bundle again and claims it under
+        its lead, worktree and all; its pickup takes no other item of the repository meanwhile."""
+        items = [self.item(repo=SAT), self.item(repo=SAT)]
+        build.queue(self.db, items, who="operator")
+        first = self.claim(hosts=WORK)
+        self.retried(first)
+        self.db.execute("UPDATE assignment SET status = 'queued' WHERE parent = ?", (first["assignment"],))
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE status = 'blocked'"), 2)
+        other = self.item(repo=SAT)
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        build.set_pickup(self.db, True, now=Pickup.NOW)
+        with mock.patch.object(build, "lane_hosts", return_value=WORK):
+            self.assertEqual(build.pickup(self.db, build.room(self.db, **IDLE, hosts=WORK), now=Pickup.NOW), [],
+                             "the requeued bundle goes first")
+        run = self.claim(hosts=WORK)
+        assert run is not None
+        self.assertEqual((run["assignment"], run["work_path"]), (first["assignment"], first["work_path"]))
+        self.assertEqual(sorted(member["item"] for member in run["members"]), sorted(items))
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE item = ?", other), 0)
+        self.assertIn("beat is fresh", self.count("SELECT body FROM note WHERE item = ? AND body LIKE ? "
+                                                  "ORDER BY id DESC LIMIT 1", items[0], "%queued again%"))
+
     def test_the_hub_blocks_a_row_whose_satellite_beat_comes_from_a_clock_ahead(self):
         """Pack sd:7955: a beat stamped more than STALE_SECONDS after now has no age to trust, so the claim blocks
         the row as for a stale beat, and its note names the skew, not a dead dispatcher."""
