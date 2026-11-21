@@ -80,13 +80,14 @@ class TheStrip(ScreenCase):
         self.assertEqual(rows[0]["windows"], [{"label": "7d", "used": 40.0, "resets_at": "2026-09-08T12:00:00Z", "pace": -10}])
         self.assertEqual((rows[1]["windows"], rows[1]["why"]), ([], "read 2h ago; a reading over 30 min old is unknown"))
 
-    def test_a_claude_account_with_a_cswap_alias_shows_it_after_its_number(self):
-        """pack sd:9861: system sd:9860 keeps cswap's alias; the id stays usage:claude#N; no alias is unchanged."""
+    def test_a_claude_account_with_a_cswap_alias_is_labelled_by_the_alias_alone(self):
+        """pack sd:9861, sd:9873: system sd:9860 keeps cswap's alias, the label is the alias alone; the id stays
+        usage:claude#N; no alias is unchanged."""
         accounts = [dict(CLAUDE["accounts"][0], alias="grinch"), dict(CLAUDE["accounts"][1], alias=" "),
                     dict(CLAUDE["accounts"][0], number=3, alias=7)]
         reading(self.connection, "claude", windows=[], accounts=accounts)
         self.assertEqual([(row["id"], row["label"]) for row in self.strip()["rows"]],
-                         [("usage:claude#1", "claude#1 grinch"), ("usage:claude#2", "claude#2"),
+                         [("usage:claude#1", "grinch"), ("usage:claude#2", "claude#2"),
                           ("usage:claude#3", "claude#3")])
 
     def test_a_claude_account_with_no_expected_share_paces_at_its_fetch_time(self):
@@ -342,6 +343,23 @@ class TheStripInTheUsageDropdown(ScreenCase):
         menu = shell[".usage-drop > .ustrip"]
         self.assertRegex(menu, r"\bright:\s*0\b")
         self.assertRegex(menu, r"\bwidth:\s*min\(48rem, calc\(100vw - 2 \* var\(--space-md\)\), 100%\)")
+
+    def test_every_row_starts_its_usage_at_one_x(self):
+        """sd:9873: each row was its own grid, so a long name pushed that row's usage right of the others. The list is
+        the grid and each row a subgrid of it: the name column is the longest name's, on every row, at every width."""
+        css = re.sub(r"/\*.*?\*/", "", (V2 / "static" / "shell.css").read_text(encoding="utf-8"), flags=re.S)
+        top, phone = css.split("@media (max-width: 47.99rem)", 1)
+        phone = phone[:phone.index("\n}") + 2]
+
+        def body(text, selector):
+            return next(b for s, b in re.findall(r"([^{}]+)\{([^{}]*)\}", text) if selector in [p.strip() for p in s.split(",")])
+
+        self.assertRegex(body(top, ".ustrip .urows"), r"display:\s*grid;.*grid-template-columns:\s*minmax\(7rem, max-content\)")
+        row = body(top, ".ustrip li")
+        self.assertRegex(row, r"grid-template-columns:\s*subgrid")
+        self.assertRegex(row, r"grid-column:\s*1 / -1")
+        self.assertRegex(body(phone, ".ustrip .urows"), r"grid-template-columns:\s*minmax\(0, 1fr\) auto")
+        self.assertNotIn("grid-template-columns", body(phone, ".ustrip li") if ".ustrip li" in phone else "")
 
     def test_the_kiosk_gives_the_usage_summary_read_again_s_touch_size(self):
         """Lead review of 8f483c6: Home's kiosk enlarged #read-again to 4rem but left the Usage summary beside it small."""

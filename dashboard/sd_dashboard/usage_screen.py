@@ -376,9 +376,9 @@ def strip(connection: sqlite3.Connection, *, now: str) -> dict:
                 why = (_stale(_age(_when(read_at), clock), USAGE_STALE_MINUTES) if read_at else "cswap has no fetch time")
                 if not why and week is None:
                     why = "cswap has no seven-day share"
-                # cswap's alias (system sd:9860) follows the number; the page renders it as text (pack sd:9861).
+                # cswap's alias (system sd:9860) is the label alone; the page renders it as text (pack sd:9861, sd:9873).
                 alias = _text(account.get("alias")).strip() if isinstance(account.get("alias"), str) else ""
-                label = f"claude#{number} {alias}" if alias else f"claude#{number}"
+                label = alias or f"claude#{number}"
                 rows.append(_usage_row(f"usage:claude#{number}", label, status="ok", why=why, read_at=read_at,
                                        windows=[week] if week else [], balance=None, spend=None, flag=flag,
                                        active=bool(account.get("active"))))

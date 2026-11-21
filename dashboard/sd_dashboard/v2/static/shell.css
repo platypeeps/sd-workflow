@@ -109,8 +109,10 @@ html, body { overflow-x: clip; }
 .usage-drop[open] > summary { border-color: var(--color-accent); background: var(--color-accent-bg); }
 .usage-drop > summary:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 1px; }
 .usage-drop > .ustrip { left: auto; right: 0; width: min(48rem, calc(100vw - 2 * var(--space-md)), 100%); max-width: none; max-height: min(70vh, 36rem); padding: 0; display: block; }
-.ustrip .urows { list-style: none; margin: 0; padding: 0; }
-.ustrip li { display: grid; grid-template-columns: minmax(7rem, max-content) minmax(0, 1fr) auto; align-items: center; gap: var(--space-2xs) var(--space-sm);
+/* The list is the grid and each row a subgrid of it, so the name column is the longest name's and every row's usage
+ * starts at one x (sd:9873). */
+.ustrip .urows { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: minmax(7rem, max-content) minmax(0, 1fr) auto; column-gap: var(--space-sm); }
+.ustrip li { display: grid; grid-template-columns: subgrid; grid-column: 1 / -1; align-items: center; gap: var(--space-2xs) var(--space-sm);
   padding: var(--space-2xs) var(--space-sm); border-bottom: var(--rule-hair) solid var(--color-rule); font-size: var(--text-sm); }
 /* A long provider name, window label, unit, incident title, footer name or error wraps inside its cell, never past
  * the screen's edge (pack sd:9597). */
@@ -139,7 +141,7 @@ html, body { overflow-x: clip; }
 .ustrip a:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
 @media (pointer: coarse) { .ustrip a { display: inline-flex; align-items: center; min-height: var(--row-touch); } }
 @media (max-width: 47.99rem) {
-  .ustrip li { grid-template-columns: minmax(0, 1fr) auto; }
+  .ustrip .urows { grid-template-columns: minmax(0, 1fr) auto; }
   .ustrip .nm { max-width: none; }
   .ustrip .age { grid-column: 2; }
   .ustrip .ws { grid-row: 2; grid-column: 1 / -1; }
