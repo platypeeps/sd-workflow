@@ -2711,6 +2711,21 @@ class Tick(Case):
     def test_a_build_of_a_lane_failed_lead_that_waits_on_its_member_builds_the_member(self):
         self.lead_waits_on_its_member(0)
 
+    def test_a_freed_member_that_waited_builds_once_its_own_dependency_is_done(self):
+        """Review of build/sd-1306: A waits on B, B on C outside the bundle. A Build of A freed B without
+        queueing it; once C was done, a Build of B went to A's Fix again and refused, as A waits on B."""
+        self.lane_failed_bundle(0, 1)
+        third = create_item(self.db, kind="task", title="Outside", repo=str(self.repo), status="ready")
+        with self.db:
+            self.db.execute("UPDATE item SET fields = ? WHERE id = ?",
+                            (json.dumps({"blocked_by": [third]}), self.items[1]))
+        build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertEqual(self.queued_builds(self.items[1]), 0, "B waits on C")
+        with self.db:
+            self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (third,))
+        build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual(self.queued_builds(self.items[1]), 1, "B builds on its own")
+
     def test_fix_of_a_lane_failed_lead_leaves_out_the_member_that_waits_on_it(self):
         """Review of build/sd-1306: the member waits on the lead, so Fix refused the whole bundle. The member
         leaves the Fix, parked, and the lead goes back to its builder."""

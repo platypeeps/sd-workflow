@@ -859,7 +859,8 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             state = queue_state(connection, lead) if lead else None
             # A bundle whose lane entry failed is the panel's Fix when its check passes (pack sd:8791); a state Fix
             # refuses, such as an item moved back to ready, is a fresh press with that press's own check.
-            if state and (state["run"] or {}).get("outcome") == "lane_failed":
+            # A member that left the bundle (`alone`) is a fresh press, never the bundle's Fix (review of build/sd-1306).
+            if state and not alone and (state["run"] or {}).get("outcome") == "lane_failed":
                 # The members its lead waits on leave first, so they build on their own (review of build/sd-1306).
                 sent = _sent_back(connection, state["run"])
                 ahead = _inside(connection, sent[0]["item"], sent)[0] if sent else []
