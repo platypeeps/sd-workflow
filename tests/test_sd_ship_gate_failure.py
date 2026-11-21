@@ -750,6 +750,24 @@ class AFlakyGateTestIsRerunAlone(unittest.TestCase):
         self.assertIsNotNone(refused)
         self.assertEqual(rerun.call_count, 0)
 
+    def test_a_gate_with_an_unexpected_success_is_no_flake(self):
+        """Every unittest outcome that fails a run besides FAIL and ERROR: an unexpected success fails the gate
+        by itself, so the test that passes alone must not clear it."""
+        log = pathlib.Path(self.row["output_path"])
+        for name, extra in (("header", "UNEXPECTED SUCCESS: test_b (tests.test_example.Case.test_b)\n"),
+                            ("summary", "FAILED (failures=1, unexpected successes=1)\n")):
+            with self.subTest(name):
+                log.write_text(OUTPUT.replace("Ran 3 tests\n", f"{extra}Ran 3 tests\n"), encoding="utf-8")
+                self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [])
+        _review, rerun, refused = self.prepared()
+        self.assertIsNotNone(refused)
+        self.assertEqual(rerun.call_count, 0)
+
+    def test_a_rerun_with_an_unexpected_success_is_no_pass(self):
+        review, _rerun, refused = self.prepared(rerun=(0, "", "Ran 1 test\n\nOK (unexpected successes=1)\n"))
+        self.assertIsNotNone(refused)
+        self.assertEqual((self.notes(FLAKE), self.notes(RERUN_FAILED)), ([], []))
+
     def test_a_rerun_that_skipped_is_no_pass(self):
         """`make test` refuses a skip; a rerun that skipped the test (a missing tool) proves nothing and bars
         nothing."""
@@ -791,7 +809,9 @@ class TheRerunRunsAtTheReviewedHead(unittest.TestCase):
 
         git("init", "-q")
         # The gate's Makefile builds its environment first (`$(GATE_ENV)`), then names it relative to the tree.
-        (root / "Makefile").write_text(f"GATE_ENV := made\nVENV_PYTHON = v/bin/python\nmade:\n"
+        # In gate mode only, as the real one: the probe must see SD_LOCAL_GATE, the tests must not.
+        (root / "Makefile").write_text(f"ifeq ($(SD_LOCAL_GATE),1)\nGATE_ENV := made\nendif\n"
+                                       f"VENV_PYTHON = v/bin/python\nmade:\n"
                                        f"\t@mkdir -p v/bin && ln -sf {sys.executable} v/bin/python\n", encoding="utf-8")
         git("config", "user.email", "operator@example.test")
         git("config", "user.name", "operator")
@@ -818,6 +838,8 @@ class TheRerunRunsAtTheReviewedHead(unittest.TestCase):
         self.assertEqual({key: seen["env"].get(key) for key in ("JEV_ENABLED", "JEV_METER", "JEV_CORPUS")},
                          {"JEV_ENABLED": "0", "JEV_METER": "0", "JEV_CORPUS": "0"},
                          "the runner's Jev guards at head: no live, metered call")
+        # A boolean, never the mapping: a failure must not print the environment (it holds secrets).
+        self.assertFalse("SD_LOCAL_GATE" in seen["env"], "the Makefile unexports it from its recipes")
         self.assertNotEqual(seen["cwd"].resolve(), root.resolve())
         self.assertEqual((seen["head"], seen["text"]), (head, "BROKEN = True\n"))
         self.assertEqual((seen["command"][0], seen["command"][-1]), (f"{seen['cwd']}/v/bin/python", FLAKY_TEST),

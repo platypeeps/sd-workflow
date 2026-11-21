@@ -709,8 +709,8 @@ class SharedReview:
                 print(f"sd-ship: {test} failed a rerun in the last {FLAKE_DAYS} days; no flake retry", file=sys.stderr)
                 return None
         code, out, err = rerun_tests(self.root, head, tests)
-        if code == 0 and SKIPPED.search(f"{out}\n{err}"):
-            code = None  # `make test` refuses a skip: a skipped rerun proves nothing and bars nothing
+        if code == 0 and FAILING_OUTCOME.search(f"{out}\n{err}"):
+            code = None  # a skipped or unexpectedly passing rerun is no pass, and bars nothing
         sd_lib.import_sd_db()
         from sd_db.database import transaction  # noqa: PLC0415
         from sd_db.writes import add_note  # noqa: PLC0415
@@ -1723,8 +1723,9 @@ def gate_code(check: dict) -> str:
 FAILED_TEST = re.compile(r"^(?:FAIL|ERROR): (\w+) \(([\w.]+)\)", re.M)
 #: The most failing tests a gate may name and be rerun as a flake: more is a real break.
 FLAKE_TESTS = 5
-#: A unittest run that skipped something, which `make test` refuses, in the gate or a rerun.
-SKIPPED = re.compile(r"skipped=[1-9]")
+#: A unittest outcome other than FAIL and ERROR that fails a gate or a rerun by itself: a skip, which `make test`
+#: refuses, and an unexpected success, which fails the run.
+FAILING_OUTCOME = re.compile(r"skipped=[1-9]|unexpected successes=[1-9]|^UNEXPECTED SUCCESS:", re.M)
 #: A fault of the gate's runner, not a test, outside every shard block: `run-tests.sh`'s `error:` lines
 #: (a log it could not assemble, results it could not publish) and `make test`'s skip refusal.
 RUNNER_FAULT = re.compile(r"^(?:error: |fatal: |Tests skipped locally)", re.M)
@@ -1754,8 +1755,9 @@ def failed_tests(check: dict) -> list[str]:
             return []
         steps = [str(step) for step in shard_lines(row.get("failed_steps"))]
         text = whole_output(row)
-        # A skip anywhere fails the gate by itself; a failing shard only ends `make test` before it says so.
-        if RUNNER_FAULT.search(SHARD_BLOCK.sub("", text)) or SKIPPED.search(text):
+        # A skip or an unexpected success anywhere fails the gate by itself; a failing shard only ends
+        # `make test` before it says so.
+        if RUNNER_FAULT.search(SHARD_BLOCK.sub("", text)) or FAILING_OUTCOME.search(text):
             return []
         found = [paren if paren.endswith(f".{name}") else f"{paren}.{name}" for name, paren in FAILED_TEST.findall(text)]
         if not steps or not found or not all(test_step(step, text) for step in steps):
@@ -1851,6 +1853,8 @@ def rerun_tests(root: pathlib.Path, head: str, tests: list[str]) -> tuple[int | 
             python = gate_python(tree, environment)
             if python is None:
                 return None, "", f"no gate interpreter (the Makefile's VENV_PYTHON) at {head[:12]}"
+            # The Makefile reads SD_LOCAL_GATE and unexports it from its recipes: the tests see a plain checkout.
+            environment.pop(sd_gate_run.GATE_VARIABLE, None)
             return sd_gate_run.run_child([python, "-m", "unittest", *tests], environment, tree,
                                          sd_lib.GATE_CHECK_SECONDS)
         finally:
