@@ -275,7 +275,7 @@ def alert(connection: sqlite3.Connection, found: dict[str, dict], complete: bool
     not read, so its alerts stand as a cut read's do. A basis in `quiet` is recorded as seen and files nothing.
     """
     when = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    seen, filed, cleared, problems = _seen(connection, seen_key), [], [], []
+    seen, filed, cleared, problems, unfiled = _seen(connection, seen_key), [], [], [], []
     held = {basis for basis in seen if basis.split(" ", 1)[0] in unread}
     for basis, pull in sorted(found.items()):
         if basis in seen or basis in quiet:
@@ -290,6 +290,7 @@ def alert(connection: sqlite3.Connection, found: dict[str, dict], complete: bool
             filed.append(basis)
         except (workflow.WorkflowError, sqlite3.Error) as error:
             problems.append(f"{basis}: {error}")
+            unfiled.append(basis)
     if complete:
         for basis, item in _open_alerts(connection, job).items():
             if basis in found or basis.split(" ", 1)[0] in unread:
@@ -301,7 +302,9 @@ def alert(connection: sqlite3.Connection, found: dict[str, dict], complete: bool
                 problems.append(f"{basis}: {error}")
     # A cut read keeps what it did not see: a pull it missed is not a pull whose state cleared.
     kept = (seen if not complete else held) | {basis for basis in found if basis in seen or basis in filed or basis in quiet}
-    # `complete` and `unread` say what absence from `seen` proves: the Needs you sweep clears on it only then.
+    # `complete` and `unread` say what absence from `seen` proves: the Needs you sweep clears on it only then. A state
+    # found whose report write failed stays out of `seen`, so the next run files it again; it was read all the same,
+    # so this read is not complete for the sweep: its absence there is a failed write, not a clear (sd:9759 round 4).
     record_state(connection, "heartbeat", key=seen_key, timestamp=when,
-                 body={"seen": sorted(kept), "complete": complete, "unread": sorted(unread)})
+                 body={"seen": sorted(kept), "complete": complete and not unfiled, "unread": sorted(unread)})
     return {"filed": filed, "cleared": cleared, "problems": problems}

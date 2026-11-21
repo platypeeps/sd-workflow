@@ -37,6 +37,7 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+from datetime import datetime
 from typing import TypeGuard
 
 from . import issue_attention, pr_attention, reporting, workflow
@@ -68,6 +69,17 @@ def _text(value) -> TypeGuard[str]:
 
 def _texts(value) -> bool:
     return isinstance(value, list) and all(isinstance(entry, str) for entry in value)
+
+
+def _time(value) -> datetime | None:
+    """An ISO time with its zone, or None: a time a clear compares must be one, never text that merely sorts."""
+    if not _text(value):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo is not None else None
 
 
 def _body(text) -> dict | None:
@@ -113,8 +125,9 @@ def _report_cleared(connection: sqlite3.Connection, row, fields: dict) -> tuple[
     if not _text(host):
         return None, BAD_FIELDS
     repeats = found if isinstance(found := fields.get("repeats"), dict) else {}
-    ended = repeats.get("last_ended") or report.get("ended") or ""
-    if not isinstance(ended, str):
+    # The report's end, which a clean run must come after: two real times, compared as times (review round 4).
+    ended = _time(repeats.get("last_ended") or report.get("ended"))
+    if ended is None:
         return None, BAD_FIELDS
     # As `reporting._host_reports`: a report another host's newest run folded into is that host's finding.
     prefix = f"{reporting.CHAIN_KEY}{job}@"
@@ -127,8 +140,8 @@ def _report_cleared(connection: sqlite3.Connection, row, fields: dict) -> tuple[
     # `reporting`'s chain row is `{"run_id", "ended", "item"}`; a clean run is one whose `item` is stored as null.
     last = (_body(chain["body"]) if chain else None) or {}
     run = last.get("run_id")
-    if not _text(run) or not _text(last.get("ended")) or "item" not in last or last["item"] is not None \
-            or not last["ended"] > ended:
+    run_ended = _time(last.get("ended"))
+    if not _text(run) or run_ended is None or "item" not in last or last["item"] is not None or not run_ended > ended:
         return None, f"no clean run of {job} on {host} since"
     if connection.execute("SELECT 1 FROM item WHERE source = 'cron-report' AND external_id = ?",
                           (f"{job}:{run}",)).fetchone() or reporting._folded_into(connection, job, run):

@@ -1,12 +1,22 @@
 """The Needs you sweep (sd:9759): each close rule, and a row it cannot prove stays open."""
 
 import contextlib
+import sqlite3
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from sd_db import connect, initialise, needs_sweep, pr_attention, reporting, workflow
+from sd_db import (
+    connect,
+    initialise,
+    issue_attention,
+    needs_sweep,
+    pr_attention,
+    reporting,
+    workflow,
+)
 from sd_db.writes import add_note, create_item, record_state, transition
 
 ENDED = "2026-11-20T01:00:00+00:00"
@@ -196,6 +206,52 @@ class TheSweep(unittest.TestCase):
                 self.assertEqual(self.status(item), "planning")
                 self.assertEqual((out["closed"], out["problems"]), ([], []))
                 self.assertEqual(out["kept"][0]["why"], "its report fields are not in the shape a clear needs")
+
+    def test_a_returned_finding_whose_refile_failed_keeps_its_open_report(self):
+        """Review round 4: a found state whose report write failed was left out of `seen`, so the sweep read its
+        absence as a clear and closed the old report that still stood for it. Issue attention shares the writer."""
+        for job, key, state, labels in ((pr_attention.JOB, pr_attention.SEEN_KEY, "review_requested", pr_attention.LABELS),
+                                        (issue_attention.JOB, issue_attention.SEEN_KEY, "assigned", issue_attention.LABELS)):
+            with self.subTest(job):
+                self.fresh()
+                url = "https://github.com/example/widget/pull/7"
+                basis = f"{state} {url}"
+                item = self.report(job=job, host=None, basis=basis, run="2026-11-20T01:00:00Z:x")
+                found = {basis: {"state": state, "repo": "example/widget", "number": 7, "title": "t", "url": url}}
+
+                def refused(*_, **__):
+                    raise sqlite3.OperationalError("database is locked")
+                with mock.patch.object(reporting, "ingest", refused):
+                    done = pr_attention.alert(self.db, found, True, now=datetime(2099, 1, 1, tzinfo=timezone.utc),
+                                              job=job, seen_key=key, labels=labels)
+                self.assertEqual(done["filed"], [])
+                out = self.sweep()
+                self.assertEqual(self.status(item), "planning")
+                self.assertEqual(out["closed"], [])
+
+    def test_a_report_end_or_a_run_end_that_is_no_time_proves_no_clean_run(self):
+        """Review round 4: a missing report end read as "" and any run sorted after it; text that is no time sorted
+        after a real one. Only two real times, in order, prove the run came after the report."""
+        no_run = "no clean run of disk-check on box since"
+        for name, drop, run_ended, why in (("no report end", True, LATER, needs_sweep.BAD_FIELDS),
+                                           ("a report end that is no time", "not-a-time", LATER, needs_sweep.BAD_FIELDS),
+                                           ("a run end that is no time", None, "zzzz", no_run),
+                                           ("a run end with no zone", None, "2026-11-20T02:00:00", no_run)):
+            with self.subTest(name):
+                self.fresh()
+                item = self.report()
+                self.chain(ended=run_ended)
+                if drop is True:
+                    self.db.execute("UPDATE item SET fields = json_remove(fields, '$.report.ended', '$.repeats.last_ended')"
+                                    " WHERE id = ?", (item,))
+                elif drop:
+                    self.db.execute("UPDATE item SET fields = json_set(json_remove(fields, '$.repeats.last_ended'),"
+                                    " '$.report.ended', ?) WHERE id = ?", (drop, item))
+                self.db.commit()
+                out = self.sweep()
+                self.assertEqual(self.status(item), "planning")
+                self.assertEqual(out["closed"], [])
+                self.assertEqual(out["kept"][0]["why"], why)
 
     def task(self, status="planning"):
         item = create_item(self.db, kind="task", title="a task", status="planning")
