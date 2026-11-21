@@ -2750,6 +2750,25 @@ class Hosts(Case):
         self.assertIsNone(self.claim(hosts=WORK))
         self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", old), "blocked")
 
+    def test_beat_recovery_requeues_no_member_of_a_bundle_whose_lead_it_leaves(self):
+        """Class pass, review round 7 of sd:9775: recovery left a retried bundle's lead (its item parked) and
+        queued the member, and the claim made the member a lead on a new branch. A member of a bundle that ran
+        queues again only with its lead; pickup builds its item fresh, as before this branch."""
+        items = [self.item(repo=SAT), self.item(repo=SAT)]
+        build.queue(self.db, items, who="operator")
+        first = self.claim(hosts=WORK)
+        self.retried(first)
+        self.db.execute("UPDATE assignment SET status = 'queued' WHERE parent = ?", (first["assignment"],))
+        self.db.execute("UPDATE item SET status = 'ready'")
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.db.execute("UPDATE item SET parked_at = ? WHERE id = ?", (build.clock(), items[0]))
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        with mock.patch.object(build, "lane_hosts", return_value=WORK):
+            self.assertEqual([row["id"] for row in build.eligible(self.db, now=Pickup.NOW)], [items[1]])
+        self.assertIsNone(self.claim(hosts=WORK))
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE status = 'blocked'"), 2)
+
     def test_the_hub_blocks_a_row_whose_satellite_beat_comes_from_a_clock_ahead(self):
         """Pack sd:7955: a beat stamped more than STALE_SECONDS after now has no age to trust, so the claim blocks
         the row as for a stale beat, and its note names the skew, not a dead dispatcher."""

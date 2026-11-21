@@ -1375,14 +1375,17 @@ def _recoverable(connection) -> list:
     """The builds blocked on a quiet beat that recovery may queue again once a beat is back, a build that ran first:
     the one reader recovery and pickup's wait share, so pickup never waits on a row recovery leaves (class pass,
     review round 7). Its item `ready` and not parked: a park is the operator's pause, as a cancel of a newer press
-    leaves it; not `_stranded`."""
+    leaves it; not `_stranded`. A member of a bundle that ran only with its lead: alone, the claim would make it a
+    lead on a new branch."""
     rows = connection.execute(
         f"SELECT assignment.id, assignment.item, assignment.parent, assignment.run_count, assignment.result, "
         f"repo.lane_host FROM assignment "
         f"JOIN item ON item.id = assignment.item LEFT JOIN repo ON repo.path = item.repo "
         f"WHERE {_BEAT_BLOCKED} AND item.status = 'ready' AND item.parked_at IS NULL "
         f"ORDER BY assignment.run_count > 0 DESC, assignment.id DESC", (SCOPE, _BEAT_RESULT)).fetchall()
-    return [row for row in rows if not _stranded(connection, row)]
+    rows = [row for row in rows if not _stranded(connection, row)]
+    leads = {row["id"] for row in rows if row["parent"] is None}
+    return [row for row in rows if row["parent"] is None or row["parent"] in leads]
 
 
 def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
