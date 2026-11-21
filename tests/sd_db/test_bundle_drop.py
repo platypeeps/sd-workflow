@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 from unittest import mock
 
-from sd_db import build, build_run, runner, writes
+from sd_db import build, build_run, operations, runner, writes
 from sd_db.writes import create_assignment, record_state, upsert_repo
 
 from .test_build import START, Case, Kill, Probe
@@ -100,6 +100,13 @@ class Repo(Case):
         git(other, "commit", "-q", "-m", f"chore: main moves {name}")
         git(other, "push", "-q", "origin", "HEAD:main")
         git(self.repo, "fetch", "-q", "origin")
+
+    def move(self, item):
+        """`item` moves to another managed repository."""
+        other = self.root / "other"
+        upsert_repo(self.db, str(other), remote="https://example.test/other.git", managed=1)
+        self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (str(other), item))
+        return other
 
     def files(self, work):
         return sorted(git(work, "ls-files").split())
@@ -800,7 +807,8 @@ class DropRound19(Repo):
         # The member, moved while it waits, sorts first so the claim picks its new repository.
         self.db.execute("UPDATE item SET repo = ?, priority = 0 WHERE id = ?", (str(other), items[1]))
         claimed = self.claim()
-        self.assertTrue(claimed is None or claimed["assignment"] == queued[0]["id"], claimed)
+        # Since round 21 the kept lead holds too, so the dropped item's own build may start; the member does not.
+        self.assertNotEqual((claimed or {}).get("assignment"), queued[1]["id"], claimed)
         member = self.db.execute("SELECT status, result FROM assignment WHERE id = ?", (queued[1]["id"],)).fetchone()
         # Since round 20 it leaves the bundle, as it no longer shares its lead's repository.
         self.assertEqual(member["status"], "cancelled")
@@ -811,12 +819,6 @@ class DropRound20(Repo):
     """Review round 20 of pack sd:9709, a class pass: the claim read a bundle row's repository from its item as it
     reads now, though the bundle's work sits on a branch in the repository of the run that made it. Each row of a
     bundle that has work (a retry, a drop's kept bundle) is checked against that repository."""
-
-    def move(self, item):
-        other = self.root / "other"
-        upsert_repo(self.db, str(other), remote="https://example.test/other.git", managed=1)
-        self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (str(other), item))
-        return other
 
     def test_a_kept_lead_moved_to_another_repository_is_not_built_there(self):
         items, ids, run = self.bundle()
@@ -841,7 +843,82 @@ class DropRound20(Repo):
         items, ids, run = self.bundle()
         queued = DROP.drop_item(self.db, build, items[2], who="operator")
         self.move(items[1])
+        claimed = [self.claim() for _ in range(3)]
+        member = self.db.execute("SELECT status, result FROM assignment WHERE id = ?", (queued[1]["id"],)).fetchone()
+        self.assertEqual(member["status"], "cancelled")
+        self.assertTrue(member["result"].startswith(runner.ALONE), member["result"])
+        # Its commits stay on the kept branch: since round 21 the kept lead does not build with them.
+        self.assertNotIn(queued[0]["id"], [one["assignment"] for one in claimed if one])
+
+
+class DropRound21(Repo):
+    """Review round 21 of pack sd:9709, a class pass: a member that leaves a bundle with work between its queue and
+    its claim (moved, cancelled, refused at a claim) leaves its commits on the lead's branch. The lead must not
+    build with them; a done member's may stay, as the merge closes nothing open."""
+
+    def kept(self):
+        """A drop of the third item: (items, the kept bundle's queued rows, lead first)."""
+        items, ids, run = self.bundle()
+        queued = DROP.drop_item(self.db, build, items[2], who="operator")
+        return items, queued[:2]
+
+    def claims(self):
+        return [one["assignment"] for one in (self.claim() for _ in range(3)) if one]
+
+    def blocked_naming(self, lead, item):
+        row = self.db.execute("SELECT status, result FROM assignment WHERE id = ?", (lead,)).fetchone()
+        self.assertEqual(row["status"], "blocked", row["result"])
+        self.assertIn(f"sd:{item} left the bundle", row["result"])
+
+    def test_a_kept_member_cancelled_while_queued_holds_the_lead(self):
+        items, (lead, member) = self.kept()
+        current = runner.queue_state(self.db, member["id"])
+        runner.request_cancel(self.db, member["id"], expected_revision=current["revision"], who="operator")
+        self.assertNotIn(lead["id"], self.claims())
+        self.blocked_naming(lead["id"], items[1])
+
+    def test_a_kept_member_moved_to_planning_holds_the_lead(self):
+        items, (lead, member) = self.kept()
+        self.db.execute("UPDATE item SET status = 'planning' WHERE id = ?", (items[1],))
+        self.assertNotIn(lead["id"], self.claims())
+        self.blocked_naming(lead["id"], items[1])
+
+    def test_a_kept_member_moved_away_holds_the_lead_and_build_takes_it_fresh(self):
+        items, (lead, member) = self.kept()
+        self.move(items[1])
+        self.assertNotIn(lead["id"], self.claims())
+        self.blocked_naming(lead["id"], items[1])
+        fresh = build.queue_again(self.db, [items[0]], who="operator")
+        self.assertNotEqual(fresh[0]["id"], lead["id"], "Build takes the kept item fresh, on a new branch")
+
+    def test_a_kept_member_done_lets_the_lead_build(self):
+        items, (lead, member) = self.kept()
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[1],))
+        self.assertIn(lead["id"], self.claims())
+
+    def test_a_retried_member_moved_away_is_left_out_for_the_split_check(self):
+        items, ids, run = self.bundle()
+        build.retry(self.db, ids[0], who="operator")
+        self.move(items[1])
         claimed = self.claim()
-        self.assertEqual(claimed["assignment"], queued[0]["id"])
-        self.assertEqual([member["item"] for member in build.run(self.db, claimed["id"])["members"]], [items[0]])
-        self.assertEqual(build.left(self.db, claimed["branch"], [items[1]]), {items[1]})
+        self.assertEqual(claimed["assignment"], ids[0])
+        self.assertEqual(build.left_out(self.db, ids[0]), [(items[1], 1)])
+        self.assertEqual(build.split(self.db, ids[0]), "unread", "the run's first step reads the branch")
+
+    def test_a_retried_member_cancelled_on_its_own_is_left_out_for_the_split_check(self):
+        """The sd:9222 lone cancel: the lead builds without it, and its next run reads the branch for its work."""
+        items, ids, run = self.bundle()
+        build.retry(self.db, ids[0], who="operator")
+        state = operations.assignment_state(self.db, ids[1])
+        operations.cancel_assignment(self.db, ids[1], expected_revision=state["revision"], who="operator")
+        self.assertEqual(self.claim()["assignment"], ids[0])
+        self.assertEqual(build.left_out(self.db, ids[0]), [(items[1], 1)])
+        self.assertEqual(build.split(self.db, ids[0]), "unread")
+
+    def test_a_retried_member_cancelled_while_queued_holds_the_lead(self):
+        items, ids, run = self.bundle()
+        build.retry(self.db, ids[0], who="operator")
+        current = runner.queue_state(self.db, ids[1])
+        runner.request_cancel(self.db, ids[1], expected_revision=current["revision"], who="operator")
+        self.assertNotIn(ids[0], self.claims())
+        self.blocked_naming(ids[0], items[1])

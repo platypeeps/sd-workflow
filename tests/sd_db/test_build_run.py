@@ -1021,8 +1021,9 @@ class Supervise(Case):
 
     def test_a_member_cancelled_on_its_own_is_neither_briefed_nor_delivered(self):
         """Review round 3 of sd:9222: run 1 commits `Closes:` for both items and ends cancelled; Retry queues both;
-        the operator cancels the child, then the lead; Retry of the lead runs again on the same branch. The brief
-        lists the lead alone, the enqueue delivers the lead alone, and run 1's trailer does not close the child."""
+        the operator cancels the child, then the lead; Retry of the lead runs again on the same branch. Since
+        pack sd:9709 round 21 the child's commits on that branch hold the run before a builder starts, as a
+        subset Retry's do, so neither its work nor its trailer ships with the lead; Build takes the lead fresh."""
         self.press(2)
         self.write_pr()
         self.plan(claude=["pass"], sd_review=["cancel"])
@@ -1039,21 +1040,13 @@ class Supervise(Case):
         assert again is not None
         self.bundle = again
         self.plan(claude=["pass"], sd_review=["clean"])
-        self.assertEqual(self.supervisor().run()["step"], "enqueued")
-        prompt = self.calls("claude")[-1]["argv"]
-        prompt = prompt[prompt.index("-p") + 1]
-        self.assertIn(f"- sd:{self.items[0]}", prompt)
-        self.assertNotIn(f"- sd:{self.items[1]}", prompt, "the brief lists no member cancelled on its own")
-        enqueue = next(call["argv"] for call in self.calls("sd-ship") if "enqueue" in call["argv"])
-        self.assertEqual([enqueue[n + 1] for n, arg in enumerate(enqueue) if arg == "--item"], [str(self.items[0])])
-        work = Path(self.bundle["work_path"])
-        head = enqueue[enqueue.index("--expected-head") + 1]
-        body = Path(enqueue[enqueue.index("--body-file") + 1]).read_text(encoding="utf-8")
-        self.assertNotIn("Refs:", body, "data keeps the child open, not a body line the lane may not read")
-        self.db.execute("UPDATE item SET status = 'in_progress' WHERE id = ?", (self.items[1],))
-        cited = LANE.cited_closes(self.db, self.items[0], body, LANE.branch_commits(work, "main", head), (),
-                                  branch=build.branch(self.bundle["assignment"]))
-        self.assertEqual([row["item"] for row in cited], [], "run 1's trailer must not close the child")
+        self.items = [self.items[0], self.items[0], self.items[1]]  # `assert_split_first` names the third
+        self.assert_split_first(self.supervisor())
+        self.assertNotIn("sd-ship", [call["argv"][0].rsplit("/", 1)[-1] for call in self.calls("sd-ship")
+                                     if "enqueue" in call["argv"]])
+        self.release_all()
+        fresh = build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertNotEqual([entry["id"] for entry in fresh], [lead], "Build takes the lead fresh")
 
     def left_out_of_a_retry(self, prepare=None, *, run=True):
         """A three-item bundle ends cancelled, `run` once its builder committed for all three, else before any

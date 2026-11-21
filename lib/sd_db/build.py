@@ -882,6 +882,15 @@ def left_out(connection, lead: int) -> list[tuple[int, int]]:
     return left
 
 
+def left_mark(connection, lead: int) -> str:
+    """The tail a member leaving build `lead`'s bundle on its own (`ALONE`) ends its result with, ": LEFT_OUT<run>"
+    of the lead's latest run, so the next run's split check reads the branch for its commits, as after a subset
+    Retry; "" when the lead never ran (round 21)."""
+    ran = connection.execute("SELECT id FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
+                             (lead,)).fetchone()
+    return f": {LEFT_OUT}{ran['id']}" if ran else ""
+
+
 def split(connection, lead: int) -> str:
     """Where build `lead` stands after its latest subset Retry (pack sd:9581): "" when none left a member out;
     "unread" until a run after it checked its branch; "clear" once one found no earlier work there (it recorded
@@ -1412,7 +1421,10 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
         queued = [row for row in queued if lanes[row["id"]] in hosts and not _refused_repo(connection, row)]
         # A bundle's work is on its lead's branch in the repository of the run that made it, not wherever its item
         # reads now: a lead moved since would build fresh there, and a member moved since would still be briefed and
-        # delivered from the old one (round 20). The lead blocks; the member leaves the bundle (`ALONE`).
+        # delivered from the old one (round 20). The lead blocks; the member leaves the bundle (`ALONE`). Its commits
+        # stay on the lead's branch: once the lead ran, it is left out of that run as a subset Retry leaves one
+        # (`LEFT_OUT`), so the next run's split check holds the branch; a drop's kept lead that never ran blocks
+        # below, and Build takes its items fresh (round 21).
         for row in queued:
             home = _work_repo(connection, row)
             if home is None or paths.same(home, row["repo"]):
@@ -1423,9 +1435,27 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
                 continue
             reason = (f"{ALONE}build: its item moved to {row['repo']}, away from its bundle's work in {home}; "
                       f"Build it again there")
+            reason += left_mark(connection, row["parent"])
             connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? "
                                "WHERE id = ? AND status = 'queued'", (clock(), reason, row["id"]))
             add_note(connection, row["item"], "comment", f"Build assignment {row['id']} left its bundle: {reason}")
+        # A member that left a bundle with work after it queued (moved above, cancelled, refused at a claim) leaves
+        # its commits on the lead's branch, which the lane would ship with the lead's: the lead blocks (round 21).
+        # A done item's commits may stay: the merge closes nothing open; one left out (`LEFT_OUT`) the split check
+        # reads at the run's start.
+        for row in queued:
+            if row["parent"] is not None or _work_repo(connection, row) is None:
+                continue
+            strays = [one["item"] for one in connection.execute(
+                "SELECT member.item FROM assignment member JOIN item ON item.id = member.item "
+                "JOIN assignment lead ON lead.id = member.parent WHERE member.parent = ? AND member.scope = ? "
+                "AND member.status != 'queued' AND member.queued_at >= lead.queued_at AND item.status != 'done' "
+                "AND COALESCE(member.result, '') NOT LIKE ? ORDER BY member.id", (row["id"], SCOPE, f"%: {LEFT_OUT}%"))]
+            if strays:
+                names = ", ".join(f"sd:{item}" for item in strays)
+                _refuse(connection, row, f"{names} left the bundle after it queued, and branch {branch(row['id'])} "
+                                         f"holds its commits; Build the other items again to build them fresh on "
+                                         f"a new branch")
         queued = [row for row in queued if connection.execute(
             "SELECT status FROM assignment WHERE id = ?", (row["id"],)).fetchone()[0] == "queued"]
         # A member whose lead is not in this claim's group (moved to planning, refused, or the member moved to another
