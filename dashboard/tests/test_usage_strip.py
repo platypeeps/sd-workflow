@@ -147,6 +147,15 @@ class TheStrip(ScreenCase):
                 row = self.strip()["rows"][0]
                 self.assertEqual((row["spend"]["limit"], row["state"]), (kept, state))
 
+    def test_a_reset_in_iso_basic_form_is_sent_as_an_extended_utc_stamp(self):
+        """pack sd:9756: 20261001T000000Z passed through, and the browser drew 'NaN days left'."""
+        reading(self.connection, "baseten", spend={"amount": 5, "resets_at": "20261001T000000Z"},
+                windows=[{"name": "primary", "used_percent": 5, "window_minutes": 300,
+                          "resets_at": "20260906T080000-0600"}])
+        row = self.strip()["rows"][0]
+        self.assertEqual((row["spend"]["resets_at"], row["windows"][0]["resets_at"]),
+                         ("2026-10-01T00:00:00Z", "2026-09-06T14:00:00Z"))
+
     def test_a_reading_over_30_minutes_old_is_unknown_and_shows_no_number(self):
         reading(self.connection, "codex", read_at="2026-09-06T11:29:00Z", **CODEX)
         row = self.strip()["rows"][0]
@@ -284,6 +293,23 @@ class TheStripInTheUsageDropdown(ScreenCase):
         body = run_usage(stub + "R.body = usageBody(ANSWER).text;", answer=self.strip(), tz="America/Denver")["R"]["body"]
         self.assertIn("spent <b>$3.00</b> · 24 days left", body)
         self.assertNotIn("<rect", body)
+
+    def test_a_bar_stays_between_0_and_100_and_its_label_is_a_number(self):
+        """pack sd:9756: a negative amount drew a negative width; a subnormal cap labelled Infinity%."""
+        answer = {"rows": [{"id": "x", "label": "x", "state": "ok", "status": "ok", "why": "", "read_at": None,
+                            "windows": [{"label": "5h", "used": -4, "resets_at": None, "pace": None}],
+                            "balance": None, "spend": {"amount": -3, "unit": "USD", "period": "", "resets_at": None,
+                                                       "limit": 50}, "service": None},
+                           {"id": "y", "label": "y", "state": "warning", "status": "ok", "why": "", "read_at": None,
+                            "windows": [], "balance": None, "spend": {"amount": 5, "unit": "USD", "period": "",
+                                                                      "resets_at": None, "limit": 5e-324},
+                            "service": None}], "nosource": []}
+        body = run_usage("R.body = usageBody(ANSWER).text;", answer=answer)["R"]["body"]
+        self.assertNotIn('width="-', body)
+        self.assertEqual(body.count('width="0"'), 2)
+        self.assertNotIn("Infinity", body)
+        self.assertIn('spent over 100% of the cap', body)
+        self.assertIn('<rect class="fill warning" width="100"', body)
 
     def test_an_unknown_reading_says_why_and_draws_no_bar(self):
         reading(self.connection, "codex", read_at="2026-09-06T11:00:00Z", **CODEX)
