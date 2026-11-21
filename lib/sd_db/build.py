@@ -763,6 +763,8 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                 try:
                     members = lane_fix_check(connection, state["run"]["id"])[0]
                 except BuildRefused:
+                    if _waiting(connection, _sent_back(connection, state["run"])):
+                        raise  # a Fix that waits on a dependency is no fresh press either
                     members = []
                 if item in [member["item"] for member in members]:
                     fixes += [] if state["run"] in fixes else [state["run"]]
@@ -1708,6 +1710,11 @@ def _rebuild(connection, read: dict, reason: str, stamp: str, base: str, entry: 
                               (members[0]["item"], REBUILD + "%")).fetchone()[0]
     if done >= CONFLICT_REBUILDS:
         return
+    if waiting := _waiting(connection, members):
+        add_note(connection, members[0]["item"], "comment",
+                 f"Build run {read['id']}: no rebuild after the lane's merge of {base} conflicted, since {waiting}. "
+                 "Fix it on Queue once that is done.")
+        return
     finding = (f"{REBUILD}{base} conflicted. Merge {base} into {read['branch']}, resolve each conflict, run the tests the "
                f"conflict touched, and commit the merge; the lane said: {reason}"[:2000])
     try:
@@ -1723,6 +1730,13 @@ def _rebuild(connection, read: dict, reason: str, stamp: str, base: str, entry: 
     _send_back(connection, members, finding, stamp, who="build",
                why=f"build run {read['id']}: the lane's merge of {base} conflicted", result=reason,
                said=f"rebuild {done + 1} of {CONFLICT_REBUILDS} after the lane's merge of {base} conflicted")
+
+
+def _waiting(connection, members: list[dict]) -> str:
+    """What a send-back's members wait on, as Retry's `_item` reads it, or "": dispatch would block and park a
+    bundle sent back while a dependency is open (review of pack sd:9570)."""
+    return "; ".join(f"item {member['item']} {why}" for member in members if (why := waiting_on(
+        connection, connection.execute("SELECT id, fields FROM item WHERE id = ?", (member["item"],)).fetchone())))
 
 
 def _sent_back(connection, read: dict) -> list[dict]:
@@ -1781,6 +1795,8 @@ def lane_fix_check(connection, run: str) -> tuple[list[dict], str, dict]:
     members = _sent_back(connection, dict(read))
     if not members:
         raise BuildRefused("its lead item moved on since the lane failed; build it from Tasks")
+    if waiting := _waiting(connection, members):
+        raise BuildRefused(f"{waiting}; Fix sends the bundle back once that is done")
     named = LANE_ENTRY.match(read["detail"] or "")
     return members, *_lane_entry(connection, read["branch"], named.group(1) if named else None)
 

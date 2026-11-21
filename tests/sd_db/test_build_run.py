@@ -2342,6 +2342,28 @@ class Tick(Case):
         notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", self.items)]
         self.assertIn(build.FINDING + "pin the fixture clock", notes)
 
+    def reopened_dependency(self):
+        """The bundle's lead waits on an item reopened since its build: the dependency is open again."""
+        first = create_item(self.db, kind="task", title="Prerequisite", repo=str(self.repo), status="ready")
+        with self.db:
+            self.db.execute("UPDATE item SET fields = ? WHERE id = ?", (json.dumps({"blocked_by": [first]}),
+                                                                        self.items[0]))
+        return first
+
+    def test_fix_on_a_failed_lane_entry_refuses_while_a_dependency_is_open(self):
+        """Review of build/sd-1306: Fix handed back the lane entry and queued the bundle past the check Retry
+        runs; dispatch then blocked and parked it. It refuses first and writes nothing."""
+        run = self.enqueued()
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red"}
+        self.tick()
+        first = self.reopened_dependency()
+        with self.assertRaisesRegex(build.BuildRefused, f"item {self.items[0]} waits on sd:{first}"):
+            build.lane_fix_check(self.db, run["id"])
+        with self.assertRaisesRegex(build.BuildRefused, f"waits on sd:{first}"):
+            build.queue_again(self.db, self.items, who="operator")
+        self.assertNotIn("handed_back", self.stored("e1"))
+        self.assertEqual(self.statuses(), ["in_progress"])
+
     CONFLICT = ("merging origin/main into build/sd-1 conflicts; the branch is unchanged; "
                 "sd-ship lane retry --item 1 queues it again")
 
@@ -2424,6 +2446,20 @@ class Tick(Case):
         self.assertEqual((row["step"], row["outcome"], "handed_back" in self.stored("e1")), ("enqueued", None, False))
         self.assertEqual(len(self.tick()["claimed"]), 1)
         self.assertEqual(self.stored("e1")["handed_back"]["by"], "build")
+
+    def test_a_conflict_rebuild_waits_while_a_dependency_is_open(self):
+        """Class pass of the Fix finding: the conflict rebuild sends the bundle back as Fix does, so it reads the
+        dependencies too, and leaves the run lane_failed with a note that names the wait."""
+        run = self.enqueued()
+        first = self.reopened_dependency()
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": self.CONFLICT}
+        self.assertEqual(self.tick()["claimed"], [])
+        self.assertEqual(build.run(self.db, run["id"])["outcome"], "lane_failed")
+        self.assertNotIn("handed_back", self.stored("e1"))
+        self.assertEqual(self.statuses(), ["in_progress"])
+        notes = [row["body"] for row in self.db.execute("SELECT body FROM note WHERE item = ?", self.items)]
+        self.assertTrue(any(body.startswith(f"Build run {run['id']}: no rebuild") and f"waits on sd:{first}" in body
+                            for body in notes), notes)
 
     def test_a_rebuild_names_the_base_that_conflicted(self):
         """pack sd:7008: the finding said origin/main whatever base the lane merged."""
