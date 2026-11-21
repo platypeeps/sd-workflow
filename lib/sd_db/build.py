@@ -741,11 +741,11 @@ def split(connection, lead: int) -> str:
 
 
 def _current(connection, member: dict) -> bool:
-    """Whether bundle `member` is its item's latest build assignment: only then may this bundle write the item's
-    status or parking; a newer build owns them otherwise (pack sd:9581)."""
-    latest = connection.execute("SELECT id FROM assignment WHERE item = ? AND scope = ? ORDER BY id DESC LIMIT 1",
-                                (member["item"], SCOPE)).fetchone()
-    return latest is not None and latest["id"] == member["id"]
+    """Whether no newer build of bundle `member`'s item stands, open, blocked or delivered: only then may this
+    bundle write the item's status or parking; a newer build owns them otherwise (pack sd:9581). A newer one
+    cancelled owns nothing, so the older bundle, whose branch holds the item's work, may retry it (sd:9788)."""
+    return connection.execute("SELECT 1 FROM assignment WHERE item = ? AND scope = ? AND id > ? "
+                              "AND status != 'cancelled'", (member["item"], SCOPE, member["id"])).fetchone() is None
 
 
 def split_held(connection, item: int) -> bool:
@@ -789,8 +789,7 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
         leads, fixes, fresh = [], [], []
         named: dict[int, set[int]] = {}
         for item in items:
-            row = connection.execute("SELECT id, parent, status FROM assignment WHERE item = ? AND scope = ? "
-                                     "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
+            row = _retry_row(connection, item)
             # A member cancelled on its own left its bundle: building it is a fresh press, not the bundle's Retry.
             alone = row is not None and row["parent"] is not None and _alone(connection, row["id"])
             lead = row and (row["parent"] or row["id"])
@@ -840,6 +839,21 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                 if state["item"]["status"] == "planning":
                     change_status(connection, item, "ready", who=who, expected_revision=state["revision"])
         return queued + (queue(connection, fresh, who=who) if fresh else [])
+
+
+def _retry_row(connection, item: int):
+    """The build assignment `sd assignments build` reads for `item`: its newest, unless that one was cancelled and
+    an older one sits blocked in a bundle, not left on its own: that bundle's branch holds the item's work, and a
+    cancel is the operator's stop of the newer one (sd:9788)."""
+    rows = connection.execute("SELECT id, parent, status FROM assignment WHERE item = ? AND scope = ? "
+                              "ORDER BY id DESC", (item, SCOPE)).fetchall()
+    if rows and rows[0]["status"] == "cancelled":
+        for row in rows[1:]:
+            lead = row["parent"] or row["id"]
+            if (row["status"] == "blocked" and not _alone(connection, row["id"])
+                    and queue_state(connection, lead)["status"] == "blocked"):
+                return row
+    return rows[0] if rows else None
 
 
 def eligible(connection, *, now: str | None = None) -> list[dict]:

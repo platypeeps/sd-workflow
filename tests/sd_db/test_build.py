@@ -919,6 +919,23 @@ class Reap(Case):
                                                         "has queued assignment"):
             build.queue_again(self.db, [self.items[0]], who="operator")
 
+    def test_build_by_item_retries_its_blocked_bundle_over_a_newer_cancelled_build(self):
+        """sd:9788: a member blocked in its bundle got a newer fresh build, then cancelled; `sd assignments build`
+        of the item revived the cancelled one, and the blocked bundle's Retry refused ('has a newer build'). The
+        blocked bundle, whose branch holds the item's work, is the one queued again, under its lead."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        old = sorted(member["id"] for member in build.run(self.db, row["id"])["members"])
+        transition(self.db, self.items[1], "ready", who="operator")
+        newer = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        build.end(self.db, self.claim()["id"], "cancelled", "the operator cancelled it")
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", newer), "cancelled")
+        queued = build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual(sorted(entry["id"] for entry in queued), old)
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", newer), "cancelled")
+        self.assertEqual(self.claim()["assignment"], self.bundle["assignment"])
+
     def test_build_with_a_finding_on_a_blocked_bundle_sends_it_to_the_builder(self):
         """pack sd:8792: `sd assignments build N --finding TEXT` is Send to builder: the finding note the builder
         reads, then the bundle queued again. A fresh build has no builder to send it to, so it refuses."""
