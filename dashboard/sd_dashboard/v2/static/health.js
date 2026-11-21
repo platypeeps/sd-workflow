@@ -63,6 +63,24 @@
   let DOC = null, AREAS = [], ROWS = [], SNOOZED = [], IGNORED = [], selected = null, query = '';
   let SUMMARY = null, VIEW = null, showing = 'findings', repos = 'managed';
   const S = {}, readers = {}; // each view's last reading and its reader
+  // The Machine view's chooser (sd:9757): the hub first, then each machine with a stored reading. The viewer's pick is
+  // kept in localStorage; the hub is no ?host=, another machine its stored reading at /api/health/machine?host=<name>.
+  const HOST_KEY = 'health.machine';
+  let host = (() => { try { return localStorage.getItem(HOST_KEY) || ''; } catch (_) { return ''; } })();
+  const machineSource = () => host ? `/api/health/machine?host=${encodeURIComponent(host)}` : '/api/health/machine';
+  function chooseHost(value) {
+    const hub = S.machine?.DOC?.machines?.hub;
+    host = value === hub ? '' : value;
+    try { localStorage.setItem(HOST_KEY, host); } catch (_) { /* blocked: the choice lasts this page */ }
+    selected = null;
+    return load();
+  }
+  function chooser() {
+    const m = DOC?.machines; if (!m || VIEW !== 'machine') return '';
+    const shown = DOC.host || m.hub;
+    return html`<p class="counts machine-pick"><label>Machine <select id="machine-host">${m.hosts.map(h => html`<option value="${h}"${h === shown ? html` selected` : ''}>${h === m.hub ? `${h} · hub` : h}</option>`)}</select></label>${
+      DOC.host ? html` · Readings of ${DOC.host}, as its own job stored them` : ''}${m.error ? html` · ${m.error}` : ''}</p>`;
+  }
   const F = { state: new Set(), area: new Set() };
   const byId = id => ROWS.find(r => r.id === id);
   // Show: the areas' rows, or the ignored ones. State does the rest: it starts on the states that want something
@@ -242,7 +260,7 @@
   // The open view's panel: its filters, the filter note and its areas. Another view's panel keeps what it last drew.
   function apply() {
     if (!VIEW) return;
-    put($(`body-${VIEW}`), html`${DOC ? filters() : ''}${DOC && showing === 'ignored' ? ignored() : areas()}`);
+    put($(`body-${VIEW}`), html`${chooser()}${DOC ? filters() : ''}${DOC && showing === 'ignored' ? ignored() : areas()}`);
     // The selection is always a row the viewer can see: the first visible one, or none with the reason.
     // sd:9312: S[VIEW] is undefined until the view's first read settles, null after a failed one.
     shell.reconcile({ rows: document.querySelectorAll('.ledger tbody tr[data-id]'), current: selected, select: id => select(id, false),
@@ -277,7 +295,7 @@
   // dropped the Observed lamp. Re-run collector, on the protection collector, runs the sync first.
   window.PAGE_AGAIN = { title: 'Refresh this view and the status lights', run: load };
   const spec = view => ({
-    source: `/api/health/${view}`, what: `the ${PAGE_VIEWS.find(v => v.id === view).label} rows`,
+    source: view === 'machine' ? machineSource : `/api/health/${view}`, what: `the ${PAGE_VIEWS.find(v => v.id === view).label} rows`,
     // Each view's reading state sits in its own panel, and a late read of a view not open leaves the selection alone.
     slot: `state-${view}`, active: () => view === VIEW,
     adopt: doc => {
@@ -288,7 +306,7 @@
       const hidden = areas.flatMap(a => a.snoozed), forever = r => r.until === window.snooze.FOREVER;
       S[view] = { DOC: doc, AREAS: areas, ROWS: areas.flatMap(a => a.rows), SNOOZED: hidden.filter(r => !forever(r)), IGNORED: hidden.filter(forever) };
       if (view === VIEW) use(view);
-      const { ROWS: rows } = S[view], snoozed = hidden, failed = areas.filter(a => a.error || a.stale), source = `/api/health/${view}`;
+      const { ROWS: rows } = S[view], snoozed = hidden, failed = areas.filter(a => a.error || a.stale), source = view === 'machine' ? machineSource() : `/api/health/${view}`;
       return { objects: [...rows.map(r => ({ ...r, label: r.what })), ...snoozed.map(window.snooze.object)],
         state: failed.length ? { kind: 'partial', text: `${failed.map(a => `${a.name}: ${a.error || a.stale}`).join(' · ')}. The other areas are current.`, source }
           : doc.snooze_error ? window.snooze.unread(doc.snooze_error, source) : null };
@@ -494,7 +512,10 @@
       const col = e.target.closest('.pmx-col'); if (col) { select(col.dataset.row, true); return; }
       const tr = e.target.closest('tbody tr[data-id]'); if (tr) select(tr.dataset.id, true);
     }));
-    PAGE_VIEWS.forEach(v => $(`view-${v.id}`).addEventListener('change', e => shell.list.pickChange(e, F, () => { lamps(); apply(); })));
+    PAGE_VIEWS.forEach(v => $(`view-${v.id}`).addEventListener('change', e => {
+      if (e.target.id === 'machine-host') { chooseHost(e.target.value); return; }
+      shell.list.pickChange(e, F, () => { lamps(); apply(); });
+    }));
     // A lamp is the Area pick's value for its area: pressing it adds the area to the filter, pressing it again takes it out.
     $('annunciator').addEventListener('click', e => {
       const c = e.target.closest('button.cell'); if (!c) return;

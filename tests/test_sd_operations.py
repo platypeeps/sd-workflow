@@ -820,6 +820,17 @@ class OperationsCLI(unittest.TestCase):
         self.connect.assert_called_once_with(sd_db, write=False)
         self.service.inventory.assert_not_called()
 
+    def test_services_list_record_stores_this_machines_reading_for_health(self):
+        """sd:9757: a satellite's job runs `sd services list --record`; its Disk and Services go to the database."""
+        inventory = {"services": [{"id": "user:com.example.server", "state": "running"}]}
+        self.launchd.inventory.return_value = inventory
+        with patch.object(cli, "record_machine") as record:
+            code, output = self.call("services", "list", "--record", "900")
+        self.assertEqual(code, 0)
+        self.assertIn("user:com.example.server  running", output)
+        record.assert_called_once_with(self.connection, 900, inventory)
+        self.connect.assert_called_once_with(sd_db, write=True)
+
     def test_service_get_preserves_system_identity(self):
         self.call("services", "get", "system:com.example.server", "--json")
         self.launchd.service_state.assert_called_once_with(self.connection, "system:com.example.server")

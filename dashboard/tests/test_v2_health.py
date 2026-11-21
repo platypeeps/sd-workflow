@@ -1654,6 +1654,65 @@ class TheViews(Collectors, ScreenCase):
         self.assertEqual((lamps["wt"]["state"], lamps["wt"]["error"], lamps["wt"]["at"]), ("caution", "", NOW))
 
 
+class TheMachines(Collectors, ScreenCase):
+    """sd:9757: each machine's stored reading (`sd services list --record`), chosen by host in the Machine view.
+
+    A satellite writes its Disk and Services readings to the database as a `machine-health:<host>` heartbeat; the hub
+    reads them back, never the satellite. A reading older than the interval it names is stale, never current.
+    """
+
+    def reading(self, host, stamp, interval=3600):
+        record_state(self.connection, "heartbeat", key=health_screen.MACHINE_PREFIX + host, timestamp=stamp,
+                     body={"interval_seconds": interval, "disk": DISK, "services": SERVICES["services"]})
+
+    def test_a_satellite_reading_renders_under_its_host(self):
+        self.reading("sat-a", "2026-09-06T11:30:00Z")
+        found = health_screen.part(self.connection, "machine", now=NOW, host="sat-a")
+        self.assertEqual(found["host"], "sat-a")
+        self.assertEqual([(area["id"], area["at"], area["stale"], area["error"]) for area in found["areas"]],
+                         [("disk", "2026-09-06T11:30:00Z", "", ""), ("svc", "2026-09-06T11:30:00Z", "", "")])
+        disk, svc = (area["rows"] for area in found["areas"])
+        self.assertIn("sat-a:vol:/System/Volumes/Data", [row["id"] for row in disk])
+        self.assertTrue(svc)
+        self.assertTrue(all(row["id"].startswith("sat-a:") for row in disk + svc), "a satellite row shares a hub row's id")
+        self.assertFalse([row["id"] for row in disk if "build:" in row["id"]], "the hub's worktree rule read a satellite")
+        self.assertFalse([row["id"] for row in svc if row.get("can") or row.get("kickstart")],
+                         "a satellite's service offers the hub's controls")
+
+    def test_a_reading_older_than_its_interval_is_marked_stale(self):
+        self.reading("sat-a", "2026-09-06T10:00:00Z", interval=3600)
+        found = health_screen.part(self.connection, "machine", now=NOW, host="sat-a")
+        for area in found["areas"]:
+            self.assertIn("sat-a's reading of 2026-09-06T10:00:00Z is older than its interval of 60 minutes",
+                          area["stale"])
+            self.assertTrue(area["rows"], "a stale reading still shows its rows")
+
+    def test_a_host_with_no_reading_is_unknown_not_clean(self):
+        found = health_screen.part(self.connection, "machine", now=NOW, host="sat-z")
+        self.assertEqual([(area["id"], area["rows"]) for area in found["areas"]], [("disk", []), ("svc", [])])
+        for area in found["areas"]:
+            self.assertIn("no reading from sat-z", area["error"])
+
+    def test_the_chooser_lists_the_hub_first_then_every_host_with_readings(self):
+        for host in ("sat-b", "hub-a", "sat-a"):
+            self.reading(host, "2026-09-06T11:30:00Z")
+        with patch.object(health_screen, "this_host", lambda: "hub-a"):
+            self.assertEqual(health_screen.machines(self.connection), {"hub": "hub-a", "hosts": ["hub-a", "sat-a", "sat-b"]})
+            found = health_screen.part(self.connection, "machine", now=NOW, fleet=fleet_of(TREES), ports=ports_snapshot)
+        self.assertEqual(found["machines"]["hosts"], ["hub-a", "sat-a", "sat-b"])
+        self.assertNotIn("host", found)
+
+    def test_record_writes_this_machines_reading_keyed_by_its_host(self):
+        with patch.object(health_collectors, "this_host", lambda: "sat-a"):
+            body = health_collectors.record_reading(self.connection, interval=900, disk=DISK,
+                                                    services=SERVICES)
+        stamp, stored = health_screen.read_machine(self.connection, "sat-a")
+        self.assertEqual((stored, body["interval_seconds"]), (body, 900))
+        self.assertEqual([volume["mount"] for volume in stored["disk"]["volumes"]],
+                         [volume["mount"] for volume in DISK["volumes"]])
+        self.assertEqual(len(stored["services"]), len(SERVICES["services"]))
+
+
 class ThePage(Collectors, BrowserSession):
     fleet_backend = staticmethod(fleet_of(TREES))
 
@@ -1687,6 +1746,19 @@ class ThePage(Collectors, BrowserSession):
         self.assertRegex(doc["read"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
         self.assertEqual([row["id"] for row in doc["areas"][2]["rows"]], ["gone:group/alpha", "unread:beta"])
         self.assertEqual(len(doc["areas"][6]["rows"]), 3)
+
+    def test_the_machine_view_answers_for_a_host_its_query_names(self):
+        """sd:9757: `?host=` reads a satellite's stored reading; any other query, or a host name with a path in it, is a 400."""
+        cookie = {"Cookie": self.cookie}
+        record_state(self.connection, "heartbeat", key=health_screen.MACHINE_PREFIX + "sat-a",
+                     body={"interval_seconds": 3600, "disk": DISK, "services": SERVICES["services"]})
+        self.connection.commit()
+        status, _, body = self.request("/api/health/machine?host=sat-a", headers=cookie)
+        doc = json.loads(body)
+        self.assertEqual((status, doc["host"], [area["id"] for area in doc["areas"]]), (200, "sat-a", ["disk", "svc"]))
+        self.assertIn("sat-a", doc["machines"]["hosts"])
+        for bad in ("/api/health/machine?host=../x", "/api/health/machine?area=disk", "/api/health/github?host=sat-a"):
+            self.assertEqual(self.request(bad, headers=cookie)[0], 400, bad)
 
     def test_each_view_and_the_summary_answer_alone_and_another_name_is_a_404(self):
         cookie = {"Cookie": self.cookie}
@@ -1834,6 +1906,43 @@ class TheScript(Collectors, ScreenCase):
         out = json.loads(result.stdout)
         self.assertIsNone(out["error"])
         return out
+
+    #: The viewer's localStorage, which the stand-in page lacks: the Machine chooser keeps its pick there (sd:9757).
+    STORE = "var STORE = {}; var localStorage = { getItem: k => k in STORE ? STORE[k] : null, setItem: (k, v) => { STORE[k] = String(v); } };\n"
+
+    def machine_docs(self):
+        """The hub's document with its chooser, and sat-a's stored reading as `/api/health/machine?host=sat-a` answers it."""
+        record_state(self.connection, "heartbeat", key=health_screen.MACHINE_PREFIX + "sat-a", timestamp="2026-09-06T11:30:00Z",
+                     body={"interval_seconds": 3600, "disk": DISK, "services": SERVICES["services"]})
+        doc = {**self.run_doc(), "machines": {"hub": "hub-a", "hosts": ["hub-a", "sat-a"]}}
+        with patch.object(health_screen, "this_host", lambda: "hub-a"):
+            sat = health_screen.part(self.connection, "machine", now=NOW, host="sat-a")
+        answer = (f"var SAT = {json.dumps(sat)};\n"
+                  "ANSWER = (path, body) => path === '/api/health/machine?host=sat-a' ? [200, SAT] : HEALTH_READ(path) ? HEALTH(path) : [404, { error: 'no answer' }];\n")
+        return doc, answer
+
+    def test_the_machine_view_chooses_a_host_and_keeps_the_choice(self):
+        """sd:9757: a combobox lists the hub first, then each host with readings; a pick reads that host's stored reading."""
+        doc, answer = self.machine_docs()
+        out = self.run_page("""R.before = BODY().html; OUT.gets = [];
+PANEL().listeners.change[0]({ target: { id: 'machine-host', value: 'sat-a', closest: () => null } }); await flush();
+R.after = BODY().html; R.kept = STORE['health.machine'];""", doc, view="machine", pre=self.STORE + answer)
+        before, after = out["R"]["before"], out["R"]["after"]
+        self.assertEqual(re.findall(r'<option value="([^"]+)"', before), ["hub-a", "sat-a"])
+        self.assertRegex(before, r'<select id="machine-host"[^>]*>\s*<option value="hub-a" selected>')
+        self.assertEqual(out["gets"][0], "/api/health/machine?host=sat-a")
+        self.assertIn('data-id="sat-a:vol:/System/Volumes/Data"', after)
+        self.assertRegex(after, r'<option value="sat-a" selected>')
+        self.assertIn("Readings of sat-a", after)
+        self.assertEqual(out["R"]["kept"], "sat-a")
+
+    def test_a_kept_host_is_read_when_the_machine_view_opens(self):
+        doc, answer = self.machine_docs()
+        out = self.run_page("R.areas = BODY().html;", doc, view="machine",
+                            pre=self.STORE + "STORE['health.machine'] = 'sat-a';\n" + answer)
+        self.assertIn("/api/health/machine?host=sat-a", out["gets"])
+        self.assertNotIn("/api/health/machine", out["gets"], "the hub's machine was read for a viewer who chose sat-a")
+        self.assertIn('data-id="sat-a:vol:/System/Volumes/Data"', out["R"]["areas"])
 
     def test_every_command_is_registered_with_the_design_id_risk_and_key(self):
         out = self.run_page("""R.reg = REG.map(c => [c.id, c.on, c.risk, c.key || null, typeof c.executes === 'boolean' ? c.executes : null, !!c.bulk]);""")

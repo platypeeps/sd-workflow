@@ -77,7 +77,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 from sd_db import protection as protection_module
-from sd_db import reads, repos
+from sd_db import reads, repos, usage
 from sd_db.errors import SdDbError
 
 from . import fleet as fleet_module
@@ -1069,10 +1069,11 @@ def read_services(connection: sqlite3.Connection, backend=None) -> dict:
 RUN_ONCE = {"startup": "Run-once", "scheduled": "Scheduled"}
 
 
-def _service_rows(inventory, *, served_commit=None) -> list[dict]:
+def _service_rows(inventory, *, served_commit=None, here: bool = True) -> list[dict]:
     """One row per long-running user LaunchAgent, and per run-once or scheduled one whose last run failed.
 
-    The dashboard's row also says whether it serves the checkout.
+    The dashboard's row also says whether it serves the checkout. A row of another machine (`here` false, sd:9757)
+    has no control and no dashboard check: Restart and Start act on this machine's launchctl.
     """
     if not isinstance(inventory, dict) or not isinstance(inventory.get("services"), list):
         raise ValueError("the service inventory is incomplete")
@@ -1105,7 +1106,10 @@ def _service_rows(inventory, *, served_commit=None) -> list[dict]:
                "kind": "Service · user LaunchAgent", "facts": facts,
                "can": {action: entry["capabilities"][action] for action in ("start", "restart")},
                "note": (entry.get("last_request") or {}).get("message") or ""}
-        if label == runtime.LABEL:
+        if not here:
+            del row["can"]
+            row["note"] = "Read on another machine: start or restart it there with sd services."
+        elif label == runtime.LABEL:
             row["type"], row["kind"] = "dashboard service", "Service · this dashboard"
             row["kickstart"] = f"launchctl kickstart -k gui/{os.getuid()}/{label}"
             facts["Served commit"] = served_commit or "unknown"
@@ -1435,13 +1439,87 @@ def document(connection: sqlite3.Connection, *, now: str, fleet=None, ports=None
     return {**found, "view": view} if view else found
 
 
-def part(connection: sqlite3.Connection, view: str, *, now: str, **seams) -> dict:
+MACHINE_PREFIX = health_collectors.MACHINE_PREFIX
+#: The areas a stored machine reading carries (sd:9757); the Machine view's others read only this machine.
+MACHINE_AREAS = ("disk", "svc")
+
+
+def this_host() -> str:
+    return health_collectors.this_host()
+
+
+def machines(connection: sqlite3.Connection) -> dict:
+    """The Machine view's chooser: this machine, the hub, first, then every other host with a stored reading."""
+    here = this_host()
+    try:
+        found = usage.newest_heartbeats(connection, MACHINE_PREFIX)
+    except sqlite3.Error as failure:  # the hub's own rows still read; the chooser says why it lists no other
+        return {"hub": here, "hosts": [here], "error": f"the other machines' readings were not read: {failure}"}
+    return {"hub": here, "hosts": [here, *sorted(set(found) - {here})]}
+
+
+def read_machine(connection: sqlite3.Connection, host: str) -> tuple[str, dict] | None:
+    """`host`'s newest reading as `(timestamp, body)`, or None; a body that does not parse is a ValueError."""
+    found = usage.newest_heartbeats(connection, MACHINE_PREFIX).get(host)
+    if found is None:
+        return None
+    if not isinstance(found[1], dict) or not isinstance(found[1].get("disk"), dict):
+        raise ValueError(f"{host}'s reading has no Disk part")
+    return found
+
+
+def _machine_part(connection: sqlite3.Connection, host: str, *, now: str) -> dict:
+    """The Machine view for another host (sd:9757): its stored Disk and Services, read at the reading's time.
+
+    A row's id carries the host, so a snooze of a hub row never hides a satellite's. A reading older than its interval
+    is `stale`, so its lamp is never green; a host with no reading is each area's error.
+    """
+    snoozes, snooze_error = snooze.held(connection, now=now)
+    try:
+        found, failed = read_machine(connection, host), ""
+    except (ValueError, sqlite3.Error) as failure:
+        found, failed = None, f"{host}'s reading was not read: {failure}"
+    if found is None and not failed:
+        failed = (f"no reading from {host}: its `sd services list --record` job has not written one "
+                  f"(heartbeat {MACHINE_PREFIX}{host})")
+    at, body = found if found else (None, {})
+    stale = ""
+    if found:
+        interval = int(body.get("interval_seconds") or health_collectors.MACHINE_INTERVAL)
+        if (_when(now) - _when(at)).total_seconds() > interval:
+            stale = f"{host}'s reading of {at} is older than its interval of {interval // 60} minutes"
+    readers = {"disk": lambda: _disk_rows(body["disk"]),
+               "svc": lambda: _service_rows({"services": body.get("services")}, here=False)}
+    areas = []
+    for key, name, _source, missing in AREAS:
+        if key not in MACHINE_AREAS:
+            continue
+        area = {**_area(key, name, f"{host} · sd services list --record → state heartbeat {MACHINE_PREFIX}{host}",
+                        missing, at=at), "error": failed, "stale": stale}
+        if not failed:
+            _settle(area, name, readers[key])
+        rows = [row for row in area["rows"] if not row["id"].startswith("build:")]
+        for row in rows:
+            row["id"] = f"{host}:{row['id']}"
+            row["host"] = host
+        area["rows"], area["snoozed"] = snooze.split("health", rows, snoozes)
+        areas.append(area)
+    return {"read": now, "view": "machine", "host": host, "machines": machines(connection), "areas": areas,
+            "snooze_error": snooze_error, "attention": _attention(areas)}
+
+
+def part(connection: sqlite3.Connection, view: str, *, now: str, host: str | None = None, **seams) -> dict:
     """One view's areas (`VIEWS`), read alone, for `/api/health/<view>`.
 
     A failure the areas' own guards do not catch stays in this view: each of its areas is unknown with the reason,
-    and no other view's read is touched, since each view is its own request.
+    and no other view's read is touched, since each view is its own request. `host`, for the Machine view, names
+    another machine whose stored reading answers instead (sd:9757); the Machine view lists the hosts to choose.
     """
     try:
+        if view == "machine" and host and host != this_host():
+            return _machine_part(connection, host, now=now)
+        if view == "machine":
+            return {**document(connection, now=now, view=view, **seams), "machines": machines(connection)}
         return document(connection, now=now, view=view, **seams)
     except Exception as failure:  # noqa: BLE001 - one view's failure must not take the page with it
         why = f"the {VIEW_NAMES[view]} read failed: {failure!r}"

@@ -65,6 +65,7 @@ import hashlib
 import json
 import os
 import re
+import socket
 import sqlite3
 import subprocess
 import time
@@ -535,6 +536,34 @@ def disk_scan(connection: sqlite3.Connection, *, within: float = DISK_SECONDS, l
     roots, refused = parse_storage(text or "")
     return {"volumes": volumes, "build": build, "storage": _storage(walk, roots), "refused": refused,
             "config": source, "problem": problem}
+
+
+#: The heartbeat each machine's `sd services list --record` writes (sd:9757): its Disk and Services readings, keyed by
+#: host, so the hub's Health reads a satellite from the database and never reaches the machine.
+MACHINE_PREFIX = "machine-health:"
+#: How often the job that records a reading runs, unless it names its own: a reading older than this is stale.
+MACHINE_INTERVAL = 3600
+
+
+def this_host() -> str:
+    """This machine's `hostname -s`, lower-cased: the name the cron jobs and the lane hosts use."""
+    return socket.gethostname().split(".")[0].lower()
+
+
+def record_reading(connection: sqlite3.Connection, *, interval: int = MACHINE_INTERVAL, disk=None, services=None) -> dict:
+    """This machine's Disk and Services readings, stored as its `machine-health:<host>` heartbeat.
+
+    Disk is `disk_scan` with no registered worktree: the build-output rule reads the hub's registry, whose paths are
+    not this machine's. `disk` and `services` are seams a test fills; unset, they read this machine.
+    """
+    from sd_db import services as service_store
+    from sd_db.writes import record_state
+
+    disk = disk if disk is not None else disk_scan(connection, repo_paths=[])
+    found = services if services is not None else service_store.inventory(connection)
+    body = {"interval_seconds": int(interval), "disk": disk, "services": found["services"]}
+    record_state(connection, "heartbeat", key=MACHINE_PREFIX + this_host(), body=body)
+    return body
 
 
 #: The doctor's deadline: it runs `brew doctor`, which takes tens of seconds on a quiet machine.
