@@ -2630,6 +2630,23 @@ class Hosts(Case):
         assert run is not None
         self.assertEqual((run["assignment"], run["owner"]), (lead, "fixture@other"))
 
+    def test_a_satellite_takes_no_retry_another_satellite_ran_when_the_block_names_it(self):
+        """Review round 3 of sd:9775: a retry ran on one satellite, its lane moved to another before the hub
+        blocked it, so the block names the new host. The new host took it without the first host's worktree.
+        A retry requeues only on the host its last run ran on."""
+        build.queue(self.db, [self.item(repo=SAT)], who="operator")
+        first = self.claim(hosts=WORK)
+        self.retried(first)
+        self.db.execute("UPDATE repo SET lane_host = 'other' WHERE path = ?", (SAT,))
+        self.quiet("other")
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertIn("lane runs on other,", self.count("SELECT result FROM assignment WHERE id = ?",
+                                                        first["assignment"]))
+        record_state(self.db, "heartbeat", key="build-dispatch@other", body={})
+        self.assertIsNone(self.claim(hosts=frozenset({"other"})))
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", first["assignment"]), "blocked")
+
     def test_the_hub_blocks_a_row_whose_satellite_beat_comes_from_a_clock_ahead(self):
         """Pack sd:7955: a beat stamped more than STALE_SECONDS after now has no age to trust, so the claim blocks
         the row as for a stale beat, and its note names the skew, not a dead dispatcher."""

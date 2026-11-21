@@ -1350,6 +1350,14 @@ _BEAT_BLOCKED = (f"assignment.scope = ? AND assignment.status = 'blocked' AND as
                  f"AND other.status IN {OWNING})")
 
 
+def _ran_on(connection, lead: int) -> str | None:
+    """`lane_of` the host whose dispatcher ran build `lead`'s latest run, which holds its worktree; None for the
+    hub's, or when it never ran."""
+    ran = connection.execute("SELECT owner FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
+                             (lead,)).fetchone()
+    return lane_of(connection, run_host(ran["owner"])) if ran else None
+
+
 def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
     """Put back to queued each build the hub's claim blocked on another host's quiet dispatcher, once that host's
     beat is fresh and not stuck again (pack sd:8745): a slow-DB stretch blocked them for good before.
@@ -1367,7 +1375,10 @@ def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
         f"JOIN item ON item.id = assignment.item LEFT JOIN repo ON repo.path = item.repo "
         f"WHERE {_BEAT_BLOCKED} AND item.status = 'ready'", (SCOPE, _BEAT_RESULT)).fetchall()
     for row in rows:
-        away = _route(connection, row["lane_host"], _lead(row))
+        lead = _lead(row)
+        away = _route(connection, row["lane_host"], lead)
+        if away is not None and lead is not None and _ran_on(connection, lead) != away:
+            continue  # a retry another host ran: its worktree is there, whatever host the block names (round 3)
         names = away is not None and row["result"].startswith(f"item {row['item']}'s lane runs on {away}, ")
         # This host ticks, so its beat is back: a satellite takes the rows its own quiet beat blocked (sd:9775), not
         # one another satellite ran, whose worktree is there (review of sd:9775); the hub takes a lane moved to it,
