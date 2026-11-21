@@ -869,9 +869,18 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                 sent = _sent_back(connection, state["run"])
                 ahead = _inside(connection, sent[0]["item"], sent)[0] if sent else []
                 if ahead:
-                    fresh += _free(connection, ahead, who=who, run=state["run"]["id"], lead=sent[0]["item"])
-                    if item in [sent[0]["item"], *(member["item"] for member in ahead)]:
-                        continue
+                    # Refuse before `_free` writes, as `retry` does (lead triage of build/sd-1306): a finding has
+                    # no builder to go to, and only the lead or a member it waits on frees what it needs.
+                    lead_item = sent[0]["item"]
+                    names = ", ".join("sd:" + str(member["item"]) for member in ahead)
+                    if finding:
+                        raise BuildRefused(f"--finding goes to a Retry or a Fix; its lead sd:{lead_item} waits on "
+                                           f"{names}, which would build fresh; send the finding once they are done")
+                    if item not in [lead_item, *(member["item"] for member in ahead)]:
+                        raise BuildRefused(f"its lead sd:{lead_item} waits on {names}; Build sd:{lead_item} or "
+                                           f"{names} to build those first, then Fix the bundle")
+                    fresh += _free(connection, ahead, who=who, run=state["run"]["id"], lead=lead_item)
+                    continue
                 try:
                     members = lane_fix_check(connection, state["run"]["id"])[0]
                 except BuildRefused:

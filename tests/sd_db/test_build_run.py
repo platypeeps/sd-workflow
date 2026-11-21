@@ -2726,6 +2726,42 @@ class Tick(Case):
         build.queue_again(self.db, [self.items[1]], who="operator")
         self.assertEqual(self.queued_builds(self.items[1]), 1, "B builds on its own")
 
+    def build_rows(self):
+        return self.db.execute("SELECT id, status, result FROM assignment ORDER BY id").fetchall()
+
+    def test_a_finding_refuses_to_free_a_member_that_waits_outside_the_bundle(self):
+        """Lead triage of build/sd-1306: the lead waits on its member, which waits on an open item outside the
+        bundle. A Fix with a finding freed the member, queued nothing and reported success: the finding was lost.
+        It refuses before it frees, and writes nothing."""
+        outside = create_item(self.db, kind="task", title="Outside", repo=str(self.repo), status="ready")
+        self.lane_failed_bundle(0, 1)
+        with self.db:
+            self.db.execute("UPDATE item SET fields = ? WHERE id = ?",
+                            (json.dumps({"blocked_by": [outside]}), self.items[1]))
+        before = [tuple(row) for row in self.build_rows()]
+        with self.assertRaisesRegex(build.BuildRefused, "finding"):
+            build.queue_again(self.db, [self.items[0]], who="operator", finding="fix the gate")
+        self.assertEqual([tuple(row) for row in self.build_rows()], before)
+
+    def test_a_build_of_another_member_names_the_press_that_frees_the_waited_on_one(self):
+        """Lead triage of build/sd-1306: the lead waits on one member and a third member is pressed. The press
+        freed the needed member, then refused with a hint to Fix once it is done, which no press could reach.
+        It refuses first, writes nothing, and names the lead and the member it waits on."""
+        run = self.enqueued(3)
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red"}
+        self.tick()
+        with self.db:
+            self.db.execute("UPDATE item SET fields = ? WHERE id = ?",
+                            (json.dumps({"blocked_by": [self.items[1]]}), self.items[0]))
+        before = [tuple(row) for row in self.build_rows()]
+        with self.assertRaises(build.BuildRefused) as refused:
+            build.queue_again(self.db, [self.items[2]], who="operator")
+        self.assertIn(f"sd:{self.items[0]}", str(refused.exception))
+        self.assertIn(f"sd:{self.items[1]}", str(refused.exception))
+        self.assertNotIn("Fix sends the bundle back", str(refused.exception))
+        self.assertEqual([tuple(row) for row in self.build_rows()], before)
+        self.assertEqual(build.run(self.db, run["id"])["outcome"], "lane_failed")
+
     def test_fix_of_a_lane_failed_lead_leaves_out_the_member_that_waits_on_it(self):
         """Review of build/sd-1306: the member waits on the lead, so Fix refused the whole bundle. The member
         leaves the Fix, parked, and the lead goes back to its builder."""
