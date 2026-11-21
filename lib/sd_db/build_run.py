@@ -1323,9 +1323,28 @@ class Supervisor:
             for row in answer["findings"]:  # `sd-review` refuses an absolute prior path, even inside the checkout
                 if isinstance(row, dict) and isinstance(row.get("path"), str) and os.path.isabs(row["path"]):
                     row["path"] = self.locations({"path": row["path"]})[0][0]
+            if not all(self.verifiable(row["path"], head) for row in answer["findings"]
+                       if isinstance(row, dict) and row.get("disposition") == "blocking"):
+                return None  # `sd-review` would refuse it as --verify-report: review the branch in full
             kept.write_text(json.dumps(answer), encoding="utf-8")
             return answer
         return None
+
+    def verifiable(self, path: Any, head: str) -> bool:
+        """Whether `sd-review --verify-report` takes a prior blocker at `path`: inside the checkout and a
+        tracked regular file at `head`, or absent from it (pack sd:9769)."""
+        if not isinstance(path, str) or os.path.isabs(path) or ".." in Path(path).parts:
+            return False
+        if not os.path.realpath(self.work / path).startswith(os.path.realpath(self.work) + os.sep):
+            return False
+        try:
+            entry = _read([*self.tools.git, "-C", str(self.work), "ls-tree", "-z", head, "--", f":(literal){path}"],
+                          env=self.env)
+        except Unread:
+            return False
+        if entry:
+            return entry.split()[:2] in (["100644", "blob"], ["100755", "blob"])
+        return not (os.path.lexists(self.work / path))
 
     def locations(self, row: dict) -> list[tuple[str, int | None]]:
         """A finding's primary place and each `path:line` instance, paths relative to the worktree (sd:9769)."""

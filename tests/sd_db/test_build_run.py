@@ -1227,6 +1227,29 @@ class Supervise(Case):
                 mock.patch.object(build_run, "_read", return_value=""):
             self.assertIsNone(supervisor.prior_review("a" * 40), "a skipped report was chosen to verify")
 
+    def test_a_prior_blocker_sd_review_would_refuse_drops_to_a_full_review(self):
+        """Review of sd:9769: `sd-review` refuses a prior blocking path outside the checkout or not a tracked
+        regular file; the next round reviews in full rather than failing twice on that refusal."""
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+
+        def read(argv, env=None):
+            return "040000 tree 0123\tsub\0" if "ls-tree" in argv and argv[-1].endswith("sub") else ""
+        for path in ("/elsewhere/x.py", "../up.py", "sub"):
+            supervisor.out("review").write_text(json.dumps(
+                {"status": "blocking", "scope": "branch", "subject": {"head": "b" * 40},
+                 "findings": [{"path": path, "line": 1, "disposition": "blocking"}]}), encoding="utf-8")
+            with self.subTest(path=path), mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
+                    mock.patch.object(build_run, "_read", side_effect=read):
+                self.assertIsNone(supervisor.prior_review("a" * 40), f"{path} was handed to --verify-report")
+        supervisor.out("review").write_text(json.dumps(
+            {"status": "blocking", "scope": "branch", "subject": {"head": "b" * 40},
+             "findings": [{"path": "src.py", "line": 1, "disposition": "blocking"}]}), encoding="utf-8")
+        with mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
+                mock.patch.object(build_run, "_read", return_value="100644 blob 0123\tsrc.py\0"):
+            self.assertIsNotNone(supervisor.prior_review("a" * 40), "a tracked file's blocker dropped the chain")
+
     def deferred(self, blockers, changed):
         """`file_new_findings` over `blockers` with the delta `changed`: the blockers it keeps."""
         supervisor = self.supervisor()
