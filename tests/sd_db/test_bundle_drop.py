@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from sd_db import build, runner, writes
-from sd_db.writes import create_assignment, upsert_repo
+from sd_db.writes import create_assignment, record_state, upsert_repo
 
 from .test_build import START, Case, Kill, Probe
 
@@ -623,3 +623,41 @@ class DropRound12(Repo):
         for name, (ignored, tracked) in cases.items():
             with self.subTest(name), self.assertRaisesRegex(DROP.DropRefused, "ignored local files"):
                 self.guard(ignored, tracked)
+
+    def on_satellite(self, run, lane):
+        """This machine is satellite `sat-a`, which ran `run`; the repo's lane is now `lane`."""
+        self.db.execute("UPDATE runner_run SET owner = 'fixture@sat-a' WHERE id = ?", (run["id"],))
+        self.db.execute("UPDATE repo SET lane_host = ? WHERE path = ?", (lane, str(self.repo)))
+        for host in ("sat-a", "sat-b"):
+            record_state(self.db, "heartbeat", key=f"build-dispatch@{host}", body={})
+        return mock.patch.multiple(build, lane_hosts=mock.Mock(return_value=frozenset({"sat-a"})),
+                                   hub_host=mock.Mock(return_value="hub"))
+
+    def moved_lane_refuses(self, index):
+        items, ids, run = self.bundle()
+        old = git(Path(run["work_path"]), "rev-parse", "HEAD")
+        with self.on_satellite(run, "sat-b"), self.assertRaisesRegex(DROP.DropRefused, "sat-a"):
+            DROP.drop_item(self.db, build, items[index], who="operator")
+        self.assertEqual(git(Path(run["work_path"]), "rev-parse", "HEAD"), old)
+        self.assertEqual(self.statuses(items), ["blocked"] * 3)
+
+    def test_a_lead_drop_refuses_when_the_lane_moved_off_the_host_that_ran_it(self):
+        self.moved_lane_refuses(0)
+
+    def test_a_member_drop_refuses_when_the_lane_moved_off_the_host_that_ran_it(self):
+        self.moved_lane_refuses(1)
+
+    def test_a_drop_on_the_host_that_ran_it_still_drops(self):
+        items, ids, run = self.bundle()
+        with self.on_satellite(run, "sat-a"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual(self.files(Path(run["work_path"])), ["README", "a.txt", "c.txt"])
+
+    def test_a_drop_refuses_on_a_machine_that_did_not_run_it(self):
+        items, ids, run = self.bundle()
+        self.db.execute("UPDATE runner_run SET owner = 'fixture@sat-a' WHERE id = ?", (run["id"],))
+        self.db.execute("UPDATE repo SET lane_host = 'sat-a' WHERE path = ?", (str(self.repo),))
+        record_state(self.db, "heartbeat", key="build-dispatch@sat-a", body={})
+        with self.assertRaisesRegex(DROP.DropRefused, "drop it on sat-a"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual(self.statuses(items), ["blocked"] * 3)

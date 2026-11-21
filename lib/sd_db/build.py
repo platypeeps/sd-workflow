@@ -744,12 +744,18 @@ def drop_plan(connection, item: int) -> dict:
     # here and read again by `drop_writes`, which refuses when another row took it.
     new = lead if row["id"] != lead else connection.execute(
         "SELECT COALESCE(MAX(id), 0) + 1 FROM assignment").fetchone()[0]
-    if new != lead:
-        # The new lead never ran: a claim routes it to the repo's lane, so the old run must have built there too.
-        lane = connection.execute("SELECT repo.lane_host FROM repo WHERE repo.path = ?", (last["repo"],)).fetchone()
-        host = lane["lane_host"] if lane else None
-        if _route(connection, host, lead) != _route(connection, host, None):
-            raise BuildRefused(f"Drop refused: build {lead} ran off its lane's host; drop a member, or Retry it whole")
+    # The kept work is in the worktree on the machine that ran the run, not on the repo's lane as it reads now: the
+    # drop runs there, and the kept bundle's next claim must route there, a member drop (its old lead) and a lead
+    # drop (a new lead, which never ran) alike (round 12). A lane moved since would claim it elsewhere, fresh.
+    ran_on = run_host(last["owner"])
+    if ran_on not in lane_hosts(connection):
+        raise BuildRefused(f"Drop refused: build run {last['id']} ran on {ran_on or 'the hub'}; "
+                           f"drop it on {ran_on or 'the hub'}")
+    lane = connection.execute("SELECT repo.lane_host FROM repo WHERE repo.path = ?", (last["repo"],)).fetchone()
+    claims = _route(connection, lane["lane_host"] if lane else None, lead if new == lead else None)
+    if claims != lane_of(connection, ran_on):
+        raise BuildRefused(f"Drop refused: its kept items would build on {claims or 'the hub'}, but build run "
+                           f"{last['id']} ran on {ran_on or 'the hub'}, which holds their work; Retry it whole")
     # Every item the bundle built that is not kept, as Retry reads who leaves from the run's membership: a member
     # cancelled out before (`ALONE`, round 3) or moved to planning (`UNBUILT`, round 8). Its commits stay on the old
     # branch, and the split must not carry them. A done item's commits may stay: the merge closes nothing open.
