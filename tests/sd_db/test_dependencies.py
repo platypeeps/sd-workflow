@@ -407,6 +407,22 @@ class TheBuild(DependencyCase):
         self.assertEqual([m["item"] for m in started["members"]], [member])
         self.assertNotEqual(started["branch"], run["branch"])
 
+    def test_a_prerequisite_with_its_own_prerequisite_leaves_the_held_bundle(self):
+        """Review of build/sd-1306: A waits on B, B on C. The claim blocked B as a waiting row before it
+        took B out, and the removal touched only queued rows, so B stayed in the bundle and its Build
+        retried the whole bundle."""
+        lead, member, third = self.item(), self.item(), self.item(status="planning")
+        run = self.blocked_bundle(lead, member)
+        build.retry(self.db, run["assignment"], who="operator")
+        self.wait(member, third)
+        self.wait(lead, member)
+        self.assertIsNone(self.claim())
+        change_status(self.db, third, "done", who="operator")
+        build.queue_again(self.db, [member], who="operator")
+        started = self.claim()
+        self.assertEqual(started and [m["item"] for m in started["members"]], [member])
+        self.assertNotEqual(started["branch"], run["branch"])
+
     def test_auto_pickup_does_not_split_a_held_retried_bundle(self):
         """Review of build/sd-1306: the held bundle's items stayed ready and unparked, so the next pickup built the
         free member on a new branch. The hold parks them; Retry unparks them onto the original branch."""

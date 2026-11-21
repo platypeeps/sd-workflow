@@ -1336,25 +1336,29 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
         # A dependency reopened since the press holds the build: dispatch's start reads it too (pack sd:9570).
         waiting = [(row, why) for row in bundle if (why := waiting_on(connection, connection.execute(
             "SELECT id, fields FROM item WHERE id = ?", (row["item"],)).fetchone()))]
-        for row, why in waiting:
-            _refuse(connection, row, f"item {row['item']} {why}")
-        if waiting and (bundle[0]["parent"] is not None or bundle[0]["run_count"]):
-            # A bundle that ran before holds whole: a member left queued would lead a new branch and worktree, and
-            # Retry would lose the checkout it resumes (review of sd:9570).
-            held = "; ".join(f"item {row['item']} {why}" for row, why in waiting)
-            stamp = clock()
+        retried = waiting and (bundle[0]["parent"] is not None or bundle[0]["run_count"])
+        held = "; ".join(f"item {row['item']} {why}" for row, why in waiting)
+        stamp = clock()
+        if retried:
             # A member the waiting ones need leaves the bundle, as a subset Retry leaves one out (`LEFT_OUT`):
             # held with them it could never build, and its Build would retry this bundle (review of sd:9570).
+            # It leaves before any row is refused, so one that waits itself leaves too (review of build/sd-1306).
             needed = _needed(connection, [row["item"] for row, _ in waiting])
             last = queue_state(connection, bundle[0]["id"])["run"]
             for row in bundle[1:]:
-                if row["item"] in needed and last is not None:
-                    connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? "
-                                       "WHERE id = ? AND status = 'queued'",
-                                       (stamp, f"{ALONE}build: {LEFT_OUT}{last['id']}", row["id"]))
+                if row["item"] in needed and last is not None and connection.execute(
+                        "UPDATE assignment SET status = 'cancelled', ended = ?, result = ? "
+                        "WHERE id = ? AND status = 'queued'",
+                        (stamp, f"{ALONE}build: {LEFT_OUT}{last['id']}", row["id"])).rowcount:
                     add_note(connection, row["item"], "comment",
                              f"Build assignment {row['id']} left its bundle: its lead waits on it ({held}); "
                              f"Build it to build it on its own")
+        for row, why in waiting:
+            if not _alone(connection, row["id"]):
+                _refuse(connection, row, f"item {row['item']} {why}")
+        if retried:
+            # A bundle that ran before holds whole: a member left queued would lead a new branch and worktree, and
+            # Retry would lose the checkout it resumes (review of sd:9570).
             for row in [row for row in bundle if not _alone(connection, row["id"])]:
                 _refuse(connection, row, f"its bundle waits: {held}")
                 # Parked, as a blocked run parks its items: auto-pickup takes unparked items only, so no member is
