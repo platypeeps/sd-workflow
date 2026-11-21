@@ -110,6 +110,17 @@ LEAD_PRIORITY = ("(SELECT lead.priority FROM assignment AS head JOIN item AS lea
                  "WHERE head.id = COALESCE(assignment.parent, assignment.id)) AS lead_priority")
 
 
+#: The lead item's `fields` key that keeps the slot its claim took, `beside` or `bundle`: `room` reads it, not the
+#: priority now, so a priority edit during the run moves no run (review of build/sd-1306).
+SLOT = "build_slot"
+
+
+def _holds_slot(row) -> bool:
+    """Whether a running build's lease holds its repository's slot: as its claim classified it (`SLOT`), or, for a
+    run claimed before the key, by its lead's priority now."""
+    return row["slot"] == "bundle" if row["slot"] in ("beside", "bundle") else not beside(row)
+
+
 def _leads_beside(row) -> bool:
     """Whether a queued build row's bundle builds beside its repository's bundle: its lead is P1 (sd:9700)."""
     return beside({"priority": row["lead_priority"]})
@@ -1135,7 +1146,8 @@ def room(connection, *, load: float | None, load_cap: float | None, interactive:
     why = unread(load, load_cap, interactive)
     leases = connection.execute(
         "SELECT lease.repo, lease.exclusive, run.quarantine, run.session_id, run.owner, assignment.scope, "
-        "item.priority FROM runner_lease lease JOIN runner_run run ON run.id = lease.run "
+        f"item.priority, json_extract(CASE WHEN json_valid(item.fields) THEN item.fields END, '$.{SLOT}') "
+        "AS slot FROM runner_lease lease JOIN runner_run run ON run.id = lease.run "
         "LEFT JOIN assignment ON assignment.id = run.assignment LEFT JOIN item ON item.id = assignment.item "
         "WHERE lease.released_at IS NULL").fetchall()
     builds = [row for row in leases if row["scope"] == SCOPE and mine(row, hosts)]
@@ -1156,7 +1168,7 @@ def room(connection, *, load: float | None, load_cap: float | None, interactive:
     # Every host's builds hold a repository's slot: the hub may build a satellite's lane (sd:8991). A P1-led
     # run builds beside the bundle and holds none (sd:9700).
     for row in leases:
-        if row["scope"] == SCOPE and not beside(row):
+        if row["scope"] == SCOPE and _holds_slot(row):
             used[row["repo"]] = used.get(row["repo"], 0) + 1
     others = [entry for entry in interactive or [] if not (entry.get("session_id") and entry["session_id"] in headless)]
     for entry in others:
@@ -1422,6 +1434,10 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
                     transition(connection, row["item"], "in_progress", who="build",
                                reason=f"build run {ident} claimed assignment {row['id']}")
                     set_item_fields(connection, row["item"], branch=branch(lead))
+                # The slot this claim took, kept on the lead for `room` (`SLOT`): a P1 edit later moves no run.
+                connection.execute(f"UPDATE item SET fields = json_set(COALESCE(fields, '{{}}'), '$.{SLOT}', ?) "
+                                   "WHERE id = ? AND json_valid(COALESCE(fields, '{}'))",
+                                   ("beside" if _leads_beside(best) else "bundle", bundle[0]["item"]))
         except _Moved:
             moved = connection.execute(
                 f"SELECT assignment.id, assignment.item, item.status FROM assignment JOIN item ON item.id = assignment.item "

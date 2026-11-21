@@ -362,6 +362,23 @@ class Claim(Case):
         build.end(self.db, ordinary["id"], "cancelled", "the operator cancelled it")
         self.assertEqual([m["item"] for m in self.claim()["members"]], [later], "P1 runs hold no ordinary slot")
 
+    def test_a_running_bundle_keeps_the_slot_its_claim_gave_it(self):
+        """Review of build/sd-1306: `room` read the running lead's priority now, so a lead raised to P1 during its
+        run freed its repository's slot and a second ordinary bundle started; one lowered from P1 took the slot.
+        The slot is the claim's: a priority edit during the run moves no run."""
+        ordinary = self.item(priority=2)
+        build.queue(self.db, [ordinary], who="operator")
+        self.claim()
+        self.db.execute("UPDATE item SET priority = 1 WHERE id = ?", (ordinary,))
+        build.queue(self.db, [self.item(priority=2)], who="operator")
+        self.assertIsNone(self.claim(), "the raised lead still holds its repository's slot")
+        self.assertEqual(build.room_for(build.room(self.db, **IDLE), A), 0)
+        urgent = self.item(repo=B, priority=1)
+        build.queue(self.db, [urgent], who="operator")
+        self.claim()
+        self.db.execute("UPDATE item SET priority = 2 WHERE id = ?", (urgent,))
+        self.assertEqual(build.room_for(build.room(self.db, **IDLE), B), 1, "the lowered P1 run holds no slot")
+
     def test_a_retried_bundle_takes_room_by_its_leads_priority(self):
         """Review of build/sd-1306: a member raised to P1 made its ordinary retried bundle bypass the repository
         cap, in the claim and in pickup's queued-work check. The bundle's lead decides, as `room` counts it."""
