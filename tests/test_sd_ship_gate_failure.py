@@ -591,5 +591,128 @@ class ASlotWaitThatRanOut(unittest.TestCase):
         self.assertNotIn("slot_ran_out", check)
 
 
+#: A gate that failed in one test of one shard, as `sd-check` reports it (sd:9768).
+FLAKY_TEST = "tests.test_example.Case.test_a"
+SHARD = "shard tests.test_example: 4s exit=1"
+#: The notes a flake and a failed rerun write.
+FLAKE, RERUN_FAILED = "Gate flake: ", "Gate rerun failed: "
+OUTPUT = ("shard tests.test_other: start\nOK\nshard tests.test_other: 2s exit=0\n"
+          f"shard tests.test_example: start\nFAIL: test_a ({FLAKY_TEST})\nAssertionError: git failed\n"
+          f"Ran 3 tests\nFAILED (failures=1)\n{SHARD}\nmake: *** [test] Error 1\n")
+
+
+class AFlakyGateTestIsRerunAlone(unittest.TestCase):
+    """sd:9768. A gate that failed in tests that pass alone on one rerun records a flake and goes on."""
+
+    context = provider_tests.ProviderSelection.context
+
+    def setUp(self):
+        import tempfile
+
+        from sd_db import connect, create_item, initialise
+        from sd_db.writes import upsert_repo
+
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        root = pathlib.Path(scratch.name)
+        initialise(root / "sd.db")
+        self.db = connect(root / "sd.db")
+        self.addCleanup(self.db.close)
+        upsert_repo(self.db, str(root / "repo"))
+        self.item = create_item(self.db, kind="task", title="Example entry", repo=str(root / "repo"))
+        (root / "check.log").write_text(OUTPUT, encoding="utf-8")
+        self.row = {"name": "check", "status": "fail", "exit_code": 2, "stdout": "", "stderr": "",
+                    "output_path": str(root / "check.log"), "failed_shards": [SHARD],
+                    "failed_steps": [SHARD, "make target test"], "failure": OUTPUT[-200:]}
+
+    def prepared(self, rerun=(0, "OK", ""), state=None, check=None):
+        """One prepare whose cleared review's gate failed in FLAKY_TEST, the rerun answering `rerun`."""
+        failed = {"status": "fail", "exit_code": 1, "detail": "", "checks": [check or self.row]}
+        review, _process = self.context(report_changes={**CLEARED, "check": failed}, state=state)
+        review.connection, review.identity = self.db, ship.ItemIdentity(self.item)
+        with unittest.mock.patch.object(sd_ship_review, "rerun_tests", return_value=rerun, create=True) as rerun_mock:
+            try:
+                review.review(HEAD)
+            except ship.Refusal as refusal:
+                return review, rerun_mock, refusal
+        return review, rerun_mock, None
+
+    def notes(self, prefix):
+        return [body for (body,) in self.db.execute("SELECT body FROM note WHERE substr(body, 1, ?) = ?",
+                                                    (len(prefix), prefix))]
+
+    def test_a_flaky_test_passes_on_rerun_and_the_entry_proceeds_with_a_flake_record(self):
+        review, rerun, refused = self.prepared()
+        self.assertIsNone(refused)
+        self.assertEqual(rerun.call_args.args[1], [FLAKY_TEST], "only the failing test, alone")
+        [entry] = review.state["passes"]
+        self.assertEqual((entry["report"]["status"], entry["report"]["check"]["status"]), ("clean", "pass"))
+        self.assertEqual(entry["report"]["failed_check"]["status"], "fail")
+        self.assertEqual(review.state["reviewed_head"], HEAD)
+        self.assertEqual((review.state["gate_flake"]["head"], review.state["gate_flake"]["tests"]), (HEAD, [FLAKY_TEST]))
+        [note] = self.notes(FLAKE)
+        self.assertIn(f"{FLAKY_TEST} failed the gate at {HEAD[:12]} and passed alone", note)
+        listed = self.db.execute("SELECT id FROM item WHERE external_id = 'flake:tests.test_example'").fetchone()
+        self.assertIsNotNone(listed, "the flake list holds the suite")
+        self.assertEqual(len(self.notes(f"Gate flake in fixture/repo: {FLAKY_TEST}")), 1)
+
+    def test_a_real_failure_still_fails_and_is_noted(self):
+        review, rerun, refused = self.prepared(rerun=(1, f"FAIL: test_a ({FLAKY_TEST})\nFAILED", ""))
+        self.assertIsNotNone(refused)
+        self.assertIn("after the review cleared; the review pass is kept", str(refused))
+        self.assertEqual(rerun.call_count, 1)
+        self.assertIsNone(review.state.get("reviewed_head"))
+        self.assertEqual(len(self.notes(f"{RERUN_FAILED}{FLAKY_TEST} at ")), 1)
+        self.assertEqual(self.notes(FLAKE), [])
+
+    def test_a_second_flake_on_the_same_entry_fails(self):
+        _review, rerun, refused = self.prepared(state={"passes": [], "gate_flake": {"head": HEAD, "tests": []}})
+        self.assertIsNotNone(refused)
+        self.assertEqual(rerun.call_count, 0)
+
+    def test_a_test_that_failed_its_rerun_this_week_is_not_rerun(self):
+        from sd_db.writes import add_note
+
+        add_note(self.db, self.item, "comment", f"{RERUN_FAILED}{FLAKY_TEST} at 0123456789ab: x")
+        _review, rerun, refused = self.prepared()
+        self.assertIsNotNone(refused)
+        self.assertEqual(rerun.call_count, 0)
+
+    def test_a_rerun_failure_of_a_longer_named_test_does_not_bar_this_one(self):
+        """A name that extends FLAKY_TEST is another test: matched whole, never by prefix."""
+        from sd_db.writes import add_note
+
+        add_note(self.db, self.item, "comment", f"{RERUN_FAILED}{FLAKY_TEST}b at 0123456789ab")
+        _review, rerun, refused = self.prepared()
+        self.assertIsNone(refused)
+        self.assertEqual(rerun.call_count, 1)
+
+    def test_the_kept_reviews_gate_alone_takes_the_flake_retry_too(self):
+        """The next prepare at the head runs only the gate (`rerun_gate`): a flake there goes on as well."""
+        state = AClearedReviewOutlivesItsGate.kept(self)
+        review, _process = self.context(state=state)
+        review.connection, review.identity = self.db, ship.ItemIdentity(self.item)
+        failed = {"status": "fail", "exit_code": 1, "detail": "", "checks": [self.row]}
+        with unittest.mock.patch.object(sd_ship_review, "adjudicated_check", return_value=failed), \
+                unittest.mock.patch.object(sd_ship_review, "rerun_tests", return_value=(0, "OK", ""), create=True):
+            review.review(HEAD)
+        self.assertEqual(review.state["reviewed_head"], HEAD)
+        self.assertEqual(review.state["passes"][-1]["report"]["check"]["flake"]["tests"], [FLAKY_TEST])
+
+    def test_only_a_failure_of_tests_alone_is_rerun(self):
+        lint = {**self.row, "failed_steps": [SHARD, "make target lint"]}
+        crashed = {**self.row, "failed_steps": ["shard tests.test_crash: 1s exit=1", "make target test"]}
+        hung = {**self.row, "failed_steps": ["shard tests.test_example: unfinished"]}
+        many = {**self.row, "output_path": None, "failed_steps": ["make target test"],
+                "failure": "".join(f"FAIL: test_{n} (tests.m.C.test_{n})\n" for n in range(6))}
+        self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [FLAKY_TEST])
+        for name, row in (("lint", lint), ("crashed", crashed), ("hung", hung), ("many", many)):
+            with self.subTest(name):
+                self.assertEqual(sd_ship_review.failed_tests({"checks": [row]}), [])
+        _review, rerun, refused = self.prepared(check=lint)
+        self.assertIsNotNone(refused)
+        self.assertEqual(rerun.call_count, 0)
+
+
 if __name__ == "__main__":
     unittest.main()

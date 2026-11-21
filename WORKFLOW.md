@@ -437,6 +437,9 @@ Gates and reviews:
   and fix each row that lacks a recovery or a test, fail-first. Record the trigger in `sd task note`. Split the pull request if the table shows it does too much.
   A class pass fixes the class within the change's own scope; a new reader, audit or entry kind becomes its own item:
   a round that added an entry kind with three readers blocked on one of them the next round (sd:9584).
+- **A cleared review's gate that failed only in unittest tests reruns those tests once, alone** (sd:9768).
+  A pass notes a flake on the item and on its suite's `flake:` item, and prepare goes on; the merge still runs its own gate.
+  It runs once per head, never for a test that failed a rerun in the last 7 days.
 - **Gates share the machine through slots** (`sd.gate_slots`). Every `sd-check` run and every gate `sd-ship` runs queues in one machine-wide order.
   Wrap any other gate as `sd gate run -- make check`. Use no per-repository `lockf` and do not wait on the load average. `sd gate status` shows holders and waiters.
 - **Gates start in the order they queued** (sd:5409). Every `sd-check` run is a lane gate; a builder's `sd gate run` waits its turn beside it.
