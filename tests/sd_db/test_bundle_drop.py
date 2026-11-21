@@ -115,7 +115,7 @@ class Repo(Case):
         return other
 
     def files(self, work):
-        return sorted(git(work, "ls-files").split())
+        return sorted(git(work, "ls-files", "--deduplicate").split())
 
     def closes(self, work):
         return git(work, "log", "--format=%B", "origin/main..HEAD")
