@@ -1347,8 +1347,10 @@ class Supervisor:
         its own mark, so a lost answer stands for that one write only."""
         named = {path for row in prior["findings"] if isinstance(row, dict) for path, _ in self.locations(row)}
         changed = self.branch_delta(prior["subject"]["head"], head)
-        if not 1 <= int(prior.get("requested_reviews") or 0) <= int(prior.get("completed_reviews") or 0):
+        if (not 1 <= int(prior.get("requested_reviews") or 0) <= int(prior.get("completed_reviews") or 0)
+                or prior.get("review_shortfall")):
             changed = None  # a last round short of a reader proves no finding absent: hold every blocker
+        # ponytail: location, not causation: a defect a new caller causes in unchanged code is filed, not held.
 
         def held(row: dict) -> bool:
             # `<...>` names no file; an absolute or `..` path is outside the checkout no delta of it can clear.
@@ -1975,7 +1977,8 @@ class Supervisor:
         if status == "blocking":
             return {"status": status, "blockers": [row for row in findings
                                                    if isinstance(row, dict) and row.get("disposition") == "blocking"],
-                    "complete": 1 <= int(answer.get("requested_reviews") or 0) <= int(answer.get("completed_reviews") or 0)}
+                    "complete": 1 <= int(answer.get("requested_reviews") or 0) <= int(answer.get("completed_reviews") or 0)
+                    and not answer.get("review_shortfall")}
         if status == "gate_failed":  # the review cleared and the repository's gate failed: the builder fixes it
             checks = (answer.get("check") or {}).get("checks") or []
             return {"status": status, "blockers": [

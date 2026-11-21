@@ -5212,6 +5212,9 @@ roles:
             review.record_lead_review(self.root, args, moved, dict(os.environ))
         self.assertIsNone(self.lead_record(), "a pass of a head HEAD moved from was recorded")
         self.assertIn("not recorded for lane prepare: Refusal: HEAD moved", said.getvalue())
+        short = {**result, "status": "clean", "review_shortfall": {"requested": 2, "eligible": 1}}
+        review.record_lead_review(self.root, args, short, dict(os.environ))
+        self.assertIsNone(self.lead_record(), "a pass one reader short of its policy was recorded")
         with patch.object(review.sd_lib, "import_sd_db", side_effect=OSError("disk full")), \
                 contextlib.redirect_stderr(io.StringIO()) as said:
             review.record_lead_review(self.root, args, {**result, "status": "clean"}, dict(os.environ))

@@ -2883,14 +2883,14 @@ def record_lead_review(root: pathlib.Path, args: argparse.Namespace, result: dic
     """Record a passing plain `--scope branch` review of HEAD, so lane prepare can skip its own (sd:5988).
 
     Clean or advisory only (sd:9767): lane prepare then runs the gate alone.
-    Only a pass with every reviewer it asked for, while HEAD is still its head.
+    Only a pass with every reviewer its policy asked for, while HEAD is still its head.
     A record that cannot be written is said on stderr; the exit code stands.
     """
     status = result.get("status")
     verified = bool(getattr(args, "verify_report", None) and getattr(args, "base", None))
     if (args.scope != "branch" or status not in ("clean", "advisory") or any(
             getattr(args, name, None) for name in UNRECORDED_OPTIONS if not (verified and name in ("base", "verify_report")))
-            or not 1 <= result.get("requested_reviews", 0) <= result.get("completed_reviews", 0)):
+            or not 1 <= result.get("requested_reviews", 0) <= result.get("completed_reviews", 0) or result.get("review_shortfall")):
         return
     head = result["subject"]["head"]
     try:

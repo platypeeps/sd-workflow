@@ -1195,11 +1195,24 @@ class Supervise(Case):
         self.press()
         supervisor = self.supervisor()
         row = {"path": "far.py", "line": 1, "summary": "a"}
-        for short in ({"completed_reviews": 1}, {"requested_reviews": 0, "completed_reviews": 0}):
+        for short in ({"completed_reviews": 1}, {"requested_reviews": 0, "completed_reviews": 0},
+                      {"requested_reviews": 1, "completed_reviews": 1,
+                       "review_shortfall": {"requested": 2, "eligible": 1}}):
             with self.subTest(short=short), mock.patch.object(supervisor, "branch_delta", return_value={}):
                 kept = supervisor.file_new_findings({"status": "blocking", "blockers": [row]},
                                                     {**self.PRIOR, **short}, "a" * 40)
                 self.assertEqual(kept["blockers"], [row], "a short prior report deferred a blocker")
+
+    def test_a_blocking_answer_short_of_its_policy_is_not_complete(self):
+        """Class pass, sd:9769: the capped `requested_reviews` hides a chain shorter than the policy asked."""
+        self.press()
+        supervisor = self.supervisor()
+        out = Path(tempfile.mkdtemp(dir=self.root)) / "review.out"
+        out.write_text(json.dumps({"status": "blocking", "requested_reviews": 1, "completed_reviews": 1,
+                                   "review_shortfall": {"requested": 2, "eligible": 1},
+                                   "subject": {"head": "a" * 40}, "findings": []}), encoding="utf-8")
+        self.assertFalse(supervisor.review_answer(out, "a" * 40)["complete"],
+                         "a round one reader short of its policy counts as complete")
 
     def deferred(self, blockers, changed):
         """`file_new_findings` over `blockers` with the delta `changed`: the blockers it keeps."""
