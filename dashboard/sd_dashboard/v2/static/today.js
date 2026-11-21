@@ -539,6 +539,9 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // A task's read row (SROW) holds while it is still an item row at the revision its /api/tasks row has (pack sd:7251): a
   // row read at another revision is dropped, so taskOf acts on the fresh row, not the status it had when it was selected.
   const freshRows = () => [...SROW].filter(([k, t]) => !isItem(k) || (listedTask(k) && listedTask(k).revision !== t.revision)).forEach(([k]) => SROW.delete(k));
+  // sd:9078: the items with a lane entry not yet ended.
+  const lanedItems = () => new Set((QV.lanes ? QV.lanes.lanes : []).flatMap(l => l.rows)
+    .filter(r => r.item != null && !['cancelled', 'landed'].includes(r.state)).map(r => Number(r.item)));
   // Each repo's children, from the four reads, each with the rows the filters show; queueView draws a repo that shows one.
   function qGroups() {
     const G = new Map(), add = (repo, [type, s, tr, pr]) => {
@@ -549,8 +552,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     const live = new Map(), prs = ((QV.lanes || {}).prs || {}).rows || [], waits = new Set(prs.filter(p => p.item != null).map(p => Number(p.item)));
     // sd:9078: an item with a lane entry not yet ended is that entry's row alone: no live-session, run or blocked
     // assignment row beside it.
-    const laned = new Set((QV.lanes ? QV.lanes.lanes : []).flatMap(l => l.rows)
-      .filter(r => r.item != null && !['cancelled', 'landed'].includes(r.state)).map(r => Number(r.item)));
+    const laned = lanedItems();
     // pack sd:7859: an item waiting on its PR is its PR row alone: no live-session, suggested or open row beside it.
     ((ACTIVE || {}).rows || []).filter(r => !waits.has(Number(r.item)) && !laned.has(Number(r.item))).forEach(r => { if (!live.has(r.item)) live.set(r.item, []); live.get(r.item).push(r); });
     live.forEach((rows, item) => add(rows[0].repo, liveRow(item, rows)));
@@ -574,19 +576,24 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       && !aside(a.item, `blocked build · assignment ${a.id} · ${a.why}`, asgCtl(a))).forEach(a => add(a.repo, blockedAsg(a)));
     // A prepared entry and its item's PR wait are one row (pack sd:7859): the lane's, leading with the wait.
     const waitOf = new Map(prs.map(p => [Number(p.item), p])), drawn = new Set();
+    // sd:9761: one row per item: its first open entry (the lane lists them merging, next, blocked, then ended) wins.
+    const entered = new Set();
     (QV.lanes ? QV.lanes.lanes : []).forEach(l => { l.rows.forEach(r => {
+      if (r.item != null && (entered.has(`${l.key}:${r.item}`) || (laned.has(Number(r.item)) && ['cancelled', 'landed'].includes(r.state)))) return;
+      if (r.item != null) entered.add(`${l.key}:${r.item}`);
       const p = r.state === 'blocked' && r.status === 'prepared' ? waitOf.get(Number(r.item)) : undefined;
       if (p) drawn.add(p);
       if (r.state === 'blocked' && !p && aside(r.item, `lane ${r.status}${r.step ? ` at ${r.step}` : ''} · ${r.reason}`, html`${unblock(l, r)}${entryBtn(l, r)}${shell.commands.rowActions(entryId(l, r))}`)) return;
       add(l.key, entryRow(l, r, p)); });
       if (G.has(repoKey(l.key))) G.get(repoKey(l.key)).host = l.host; });
     prs.filter(p => !drawn.has(p)).forEach(p => add(p.repo, prRow(p)));
-    SUGG.forEach(r => { if (!waits.has(Number(r.id))) add(r.repo, suggestRow(r)); });
-    OPENI.forEach(t => { if (!waits.has(Number(t.id))) add(t.repo_path, openRow(t)); });
+    // sd:9761: an item with an open lane entry is that row alone: no suggested, open or ended-run row beside it.
+    SUGG.forEach(r => { if (!waits.has(Number(r.id)) && !laned.has(Number(r.id))) add(r.repo, suggestRow(r)); });
+    OPENI.forEach(t => { if (!waits.has(Number(t.id)) && !laned.has(Number(t.id))) add(t.repo_path, openRow(t)); });
     // sd:9247: each repo's parked tasks (no idea kind), PR wait or lane entry or not; hidden until their box is pressed.
     // A task with no repo is no row (pack sd:7731), as in Suggested; the tally counts it, as Tasks' Parked chip lists it.
     parkedTasks().filter(t => t.repo_path).forEach(t => add(t.repo_path, openRow(t, 'parked', why.get(Number(t.id)))));
-    B.recent.forEach(r => add(r.repo, endedRun(r)));
+    B.recent.filter(r => !(r.items.length && r.items.every(shown))).forEach(r => add(r.repo, endedRun(r)));
     const RANK = { warning: 0, caution: 1, unknown: 2, ok: 3, queued: 4 };
     // pack sd:7679: the busiest repo first, box by box in the boxes' order, each most first; then the name. Unassociated last.
     const busy = (a, b) => BOXES.reduce((d, t) => d || b.n[t] - a.n[t], 0);
@@ -646,8 +653,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     if (!groups.some(g => g.key === qOpen)) qOpen = null;
     if (qTile && qTile.repo !== qOpen) qTile = null;
     // pack sd:8127: All items counts its open items with the filter off as on, less those waiting on a PR; a failed read counts nothing.
-    const waits = new Set((((QV.lanes || {}).prs || {}).rows || []).map(p => Number(p.item)));
-    const opens = QV.tasks ? [...openItems(true).values()].filter(t => !waits.has(Number(t.id))).length : null;
+    const waits = new Set((((QV.lanes || {}).prs || {}).rows || []).map(p => Number(p.item))), laned = lanedItems();
+    const opens = QV.tasks ? [...openItems(true).values()].filter(t => !waits.has(Number(t.id)) && !laned.has(Number(t.id))).length : null;
     const n = v => v !== 'open' ? every.filter(c => c.type === v).length : opens;
     put($('queue-filters'), shell.list.fseg('qshow', 'Show', [['suggested', 'Suggested'], ['open', 'All items'], ['ended', 'Ended builds']].map(([v, label]) =>
       ({ v, pressed: qShow.has(v), label: n(v) === null ? html`${label}` : html`${label} <span class="n">${String(n(v))}</span>` }))));
