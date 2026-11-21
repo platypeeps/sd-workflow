@@ -1519,7 +1519,8 @@ def part(connection: sqlite3.Connection, view: str, *, now: str, host: str | Non
         if view == "machine" and host and host != this_host():
             return _machine_part(connection, host, now=now)
         if view == "machine":
-            return {**document(connection, now=now, view=view, **seams), "machines": machines(connection)}
+            found = machines(connection)  # before `document`, whose `release` closes the connection
+            return {**document(connection, now=now, view=view, **seams), "machines": found}
         return document(connection, now=now, view=view, **seams)
     except Exception as failure:  # noqa: BLE001 - one view's failure must not take the page with it
         why = f"the {VIEW_NAMES[view]} read failed: {failure!r}"

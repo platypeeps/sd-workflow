@@ -386,7 +386,10 @@
     return `Not known what changed · ${o.facts.Label}: ${e.message}. Health was read again; check the row before you act again.`;
   });
   const statusHref = o => (o.list || []).find(x => x.href)?.href || o.url || '';
-  const can = action => o => revised(o) === true ? (o.can[action].allowed || o.can[action].reason) : revised(o);
+  // A satellite's row is a stored reading: an action here would run on this hub, so its line is for that host.
+  const local = o => !o.host || `read on ${o.host}: this hub would run it on itself; run the line on ${o.host}`;
+  const can = action => o => local(o) !== true ? local(o)
+    : revised(o) === true ? (o.can[action].allowed || o.can[action].reason) : revised(o);
   window.PAGE_COMMANDS = [
     { label: 'Read Health again', icon: 'rotate-ccw', run: () => load() },
     { label: 'Open Sessions in Management', icon: 'folder-x', run: () => { location.href = '/management#view=sessions'; } },
@@ -412,14 +415,14 @@
         consequence: o => `Files "${o.what}" in the system repo, or reuses the open item that has it, then opens a Claude session that fixes it (herdr).`,
         run: o => shell.post('/api/items', { title: o.what, body: `Doctor: ${o.detail}`, ref: `doctor:${pathOf(o)}` }).then(filed => DOCTOR_FIX.run({ ...o, filed })) },
       { id: 'storage folder.du', on: 'storage folder', label: 'Show biggest', does: 'Lists this folder\'s biggest entries in Details.', key: 'b', icon: 'chart-no-axes-column', risk: 'safe', executes: true, primary: () => true,
-        cli: o => o.cli, sends: o => `POST /api/actions/run {action: storage.du, path: ${pathOf(o)}}`, run: o => run(o, 'storage.du', { path: pathOf(o) }) },
+        cli: o => o.cli, sends: o => `POST /api/actions/run {action: storage.du, path: ${pathOf(o)}}`, run: o => run(o, 'storage.du', { path: pathOf(o) }), when: local },
       { id: 'build output.rm', on: 'build output', label: 'Remove build output', does: 'Deletes build output in merged, clean worktrees; this cannot be undone.', key: 'r', icon: 'folder-x', risk: 'confirm', executes: true, primary: () => true,
         when: o => revised(o) === true ? (o.remove.length ? true : 'every merged worktree has uncommitted changes: nothing is removed') : revised(o),
         cli: o => o.cli, consequence: o => `Deletes ${o.remove.length} build output folders in merged, clean worktrees: ${names(o.remove)}.`
           + (o.kept.length ? ` Keeps ${o.kept.length} with uncommitted changes: ${names(o.kept)}.` : '') + ' Each worktree is checked again first. This cannot be undone.', run: cleanup },
       // Volume rows are the build's: the design draws volumes as bars only. Its line shows the volume's use in a terminal.
       { id: 'volume.df', on: 'volume', label: 'Show use', does: 'Shows this volume\'s use in Details.', key: 'b', icon: 'gauge', risk: 'safe', executes: true, primary: () => true,
-        cli: o => o.cli, sends: o => `POST /api/actions/run {action: volume.df, path: ${pathOf(o)}}`, run: o => run(o, 'volume.df', { path: pathOf(o) }) },
+        cli: o => o.cli, sends: o => `POST /api/actions/run {action: volume.df, path: ${pathOf(o)}}`, run: o => run(o, 'volume.df', { path: pathOf(o) }), when: local },
       { id: 'worktree registrations.prune', on: 'worktree registrations', label: 'Prune registrations', does: 'Removes registrations of worktrees whose folders are gone; cannot be undone.', key: 'p', risk: 'confirm',
         executes: true, primary: () => true, cli: CLEAN['worktree registrations'].cli, when: CLEAN['worktree registrations'].ready,
         consequence: o => `Removes ${o.facts.Registered} worktree registrations whose directories are gone: ${names(o.list)}. No directory is touched.`, run: cleanup },

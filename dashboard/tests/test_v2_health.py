@@ -225,6 +225,13 @@ REAL_DISK_SCAN, REAL_BRANCH_SCAN, REAL_DOCTOR_SCAN = (health_collectors.disk_sca
                                                      health_collectors.doctor_scan)
 
 
+def health_screen_connection(path):
+    """A connection of the test's own, which a `release` seam may close."""
+    from sd_db import connect
+
+    return connect(path)
+
+
 def scan_of(scan):
     return lambda connection, **_: scan
 
@@ -1702,6 +1709,16 @@ class TheMachines(Collectors, ScreenCase):
         self.assertEqual(found["machines"]["hosts"], ["hub-a", "sat-a", "sat-b"])
         self.assertNotIn("host", found)
 
+    def test_the_hubs_machine_view_lists_the_hosts_before_it_releases_its_connection(self):
+        """Review round 5: `document` closes the connection at `release`; the chooser read after it saw only the hub."""
+        self.reading("sat-a", "2026-09-06T11:30:00Z")
+        self.connection.commit()
+        own = health_screen_connection(self.path)
+        with patch.object(health_screen, "this_host", lambda: "hub-a"):
+            found = health_screen.part(own, "machine", now=NOW, fleet=fleet_of(TREES), ports=ports_snapshot,
+                                       release=own.close)
+        self.assertEqual(found["machines"], {"hub": "hub-a", "hosts": ["hub-a", "sat-a"]})
+
     def test_record_writes_this_machines_reading_keyed_by_its_host(self):
         with patch.object(health_collectors, "this_host", lambda: "sat-a"):
             body = health_collectors.record_reading(self.connection, interval=900, disk=DISK,
@@ -1935,6 +1952,21 @@ R.after = BODY().html; R.kept = STORE['health.machine'];""", doc, view="machine"
         self.assertRegex(after, r'<option value="sat-a" selected>')
         self.assertIn("Readings of sat-a", after)
         self.assertEqual(out["R"]["kept"], "sat-a")
+
+    def test_a_satellite_row_offers_no_command_that_runs_on_the_hub(self):
+        """Review round 5: Show biggest, Show use, Restart and Start run on the hub; on a satellite's row each is off,
+        naming the host, and its line stays for copying there."""
+        doc, answer = self.machine_docs()
+        out = self.run_page("""PANEL().listeners.change[0]({ target: { id: 'machine-host', value: 'sat-a', closest: () => null } }); await flush();
+const off = (c, id) => { const o = C.get(id); return [cmd(c).when(o), cmd(c).cli(o)]; };
+R.du = off('storage folder.du', 'sat-a:rs:/Volumes/store/repo-storage/alpha');
+R.df = off('volume.df', 'sat-a:vol:/System/Volumes/Data');
+R.restart = off('service.restart', 'sat-a:svc:com.example.alpha');
+R.start = off('service.start', 'sat-a:svc:com.example.beta');""", doc, view="machine", pre=self.STORE + answer)
+        why = "read on sat-a: this hub would run it on itself; run the line on sat-a"
+        self.assertEqual(out["R"]["du"][0], why)
+        self.assertEqual(out["R"]["df"], [why, "df -h /System/Volumes/Data"])
+        self.assertEqual((out["R"]["restart"][0], out["R"]["start"][0]), (why, why))
 
     def test_a_kept_host_is_read_when_the_machine_view_opens(self):
         doc, answer = self.machine_docs()
