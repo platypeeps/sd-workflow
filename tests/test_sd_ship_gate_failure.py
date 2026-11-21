@@ -637,6 +637,23 @@ class AFlakyGateTestIsRerunAlone(unittest.TestCase):
                 return review, rerun_mock, refusal
         return review, rerun_mock, None
 
+    def saved_with_the_review(self, review, run):
+        """Every save that records the flake also clears the review, in one write: a stop between two writes
+        must not leave the once-per-entry retry spent with no cleared review to reuse it."""
+        saves = []
+        real = review.save
+
+        def save(**updates):
+            saves.append(set(updates))
+            real(**updates)
+
+        with unittest.mock.patch.object(review, "save", side_effect=save):
+            run()
+        flaked = [keys for keys in saves if "gate_flake" in keys]
+        self.assertTrue(flaked, saves)
+        for keys in flaked:
+            self.assertLessEqual({"gate_flake", "passes", "reviewed_head"}, keys, saves)
+
     def notes(self, prefix):
         return [body for (body,) in self.db.execute("SELECT body FROM note WHERE substr(body, 1, ?) = ?",
                                                     (len(prefix), prefix))]
@@ -655,6 +672,31 @@ class AFlakyGateTestIsRerunAlone(unittest.TestCase):
         listed = self.db.execute("SELECT id FROM item WHERE external_id = 'flake:tests.test_example'").fetchone()
         self.assertIsNotNone(listed, "the flake list holds the suite")
         self.assertEqual(len(self.notes(f"Gate flake in fixture/repo: {FLAKY_TEST}")), 1)
+
+    def test_the_flake_is_saved_with_the_cleared_review(self):
+        failed = {"status": "fail", "exit_code": 1, "detail": "", "checks": [self.row]}
+        review, _process = self.context(report_changes={**CLEARED, "check": failed})
+        review.connection, review.identity = self.db, ship.ItemIdentity(self.item)
+        with unittest.mock.patch.object(sd_ship_review, "rerun_tests", return_value=(0, "OK", "")):
+            self.saved_with_the_review(review, lambda: review.review(HEAD))
+        state = AClearedReviewOutlivesItsGate.kept(self)
+        review, _process = self.context(state=state)
+        review.connection, review.identity = self.db, ship.ItemIdentity(self.item)
+        with unittest.mock.patch.object(sd_ship_review, "adjudicated_check", return_value=failed), \
+                unittest.mock.patch.object(sd_ship_review, "rerun_tests", return_value=(0, "OK", "")):
+            self.saved_with_the_review(review, lambda: review.review(HEAD))
+
+    def test_only_the_whole_output_can_show_that_only_tests_failed(self):
+        """An excerpt can leave out a runner error or a skip summary: with no whole output, no flake."""
+        excerpt = {**self.row, "output_path": None, "failure": OUTPUT}
+        gone = {**self.row, "output_path": str(pathlib.Path(self.row["output_path"]).with_name("gone.log")),
+                "failure": OUTPUT}
+        for name, row in (("excerpt", excerpt), ("gone", gone)):
+            with self.subTest(name):
+                self.assertEqual(sd_ship_review.failed_tests({"checks": [row]}), [])
+        _review, rerun, refused = self.prepared(check=excerpt)
+        self.assertIsNotNone(refused)
+        self.assertEqual(rerun.call_count, 0)
 
     def test_a_real_failure_still_fails_and_is_noted(self):
         review, rerun, refused = self.prepared(rerun=(1, f"FAIL: test_a ({FLAKY_TEST})\nFAILED", ""))

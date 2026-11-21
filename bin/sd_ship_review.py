@@ -678,7 +678,7 @@ class SharedReview:
         passes[-1].update(exit_code=0, report={**report, "status": report["cleared_status"], "check": check,
                                                "failed_check": report["check"]})
         self.save(passes=passes, reviewed_head=head, review_preflight_error=None,
-                  **({"review_carry_forward": carried} if carried else {}))
+                  **({"review_carry_forward": carried} if carried else {}), **flake_record(check))
         self.check_review(head)
 
     def flaked(self, report: dict, head: str, passes: list[dict], exit_code: int) -> dict:
@@ -737,7 +737,8 @@ class SharedReview:
                     flaky = sd_lane.flake_item(self.connection, test_suite(test), repo[0], self.repository)
                     add_note(self.connection, flaky, "comment", f"Gate flake in {self.repository}: {said} "
                              f"(sd:{item}). Fix the suite at its root with a test that fails first.")
-        self.save(gate_flake=flake)
+        # No save here: each caller saves `gate_flake` with the cleared review in one write, so a stop between
+        # them leaves the retry unspent rather than spent with nothing to reuse it.
         print(f"sd-ship: {', '.join(tests)} passed alone on a rerun; recorded as a flake, prepare goes on",
               file=sys.stderr)
         return {"status": "pass", "exit_code": 0, "detail": f"flake: {', '.join(tests)} passed alone", "flake": flake}
@@ -1466,14 +1467,15 @@ class SharedReview:
             self.release_moved_request(report, head, passes, result.returncode)
         reserved = head
         head = self.covered_head(passes[-1], report)
-        code = result.returncode
+        code, flake = result.returncode, {}
         if released_gate_failure(report, code):
             report, code = self.flaked(report, head, passes, code), 0
+            flake = flake_record(report["check"])
         if request and unreviewed(report, code):
             self.release_unreviewed_request(report, head, passes, code)
         passes[-1]["report"] = report
         passes[-1]["exit_code"] = code
-        self.save(passes=passes, reviewed_head=head if code == 0 else None, phase="reviewed")
+        self.save(passes=passes, reviewed_head=head if code == 0 else None, phase="reviewed", **flake)
         try:
             validate_provider_selection(report, passes[-1].get("requested_provider"), completed=completed_depth(report))
         except Refusal:
@@ -1786,14 +1788,21 @@ def test_step(step: str, text: str) -> bool:
 
 
 def whole_output(row: dict) -> str:
-    """A failing check's whole output where `sd-check` kept it (sd:2558), else its excerpt and tails."""
+    """A failing check's whole output where `sd-check` kept it (sd:2558), else "": an excerpt or a tail can leave
+    out the runner error or skip summary that would show more than tests failed."""
     path = row.get("output_path")
     if isinstance(path, str) and path:
         try:
             return pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
         except OSError:
             pass
-    return "\n".join(str(row.get(key) or "") for key in ("failure", "stdout", "stderr"))
+    return ""
+
+
+def flake_record(check: dict) -> dict:
+    """The `gate_flake` state update a flake check carries, saved with the cleared review it stands for."""
+    flake = check.get("flake") if isinstance(check, dict) else None
+    return {"gate_flake": flake} if isinstance(flake, dict) else {}
 
 
 def test_suite(test: str) -> str:
