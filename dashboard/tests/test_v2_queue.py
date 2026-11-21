@@ -1864,6 +1864,19 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
             self.assertNotIn('data-run="r1"', html)
             self.assertIn('data-pr="7"', html)
 
+    def test_a_retryable_ended_build_keeps_its_row_beside_its_items_pr_wait(self):
+        """sd:9761 review: a blocked review-fix build whose item waits on its PR lost its Retry and Send to builder,
+        which the PR row does not offer; an ended build with those controls keeps its row."""
+        pr = {"item": 50, "title": "Fifty", "repo": "/repos/gamma", "url": "https://github.com/example/gamma/pull/50",
+              "lane": "awaiting_them", "on": "reviewers", "since": NOW, "waited": 60}
+        doc = queue_screen.document(self.connection, now=NOW)
+        doc["prs"] = {"error": "", "rows": [pr]}
+        out = self.run_view("open('gamma'); R.html = ELS.queue.html;", search="?show=ended",
+                            answers={"/api/queue": [200, doc]})
+        self.assertIn('data-pr="50"', out["R"]["html"])
+        self.assertIn('data-build="retry" data-run="r0"', out["R"]["html"])
+        self.assertIn('data-build="send" data-run="r0"', out["R"]["html"])
+
     def test_an_item_with_an_open_lane_entry_is_one_row_with_every_filter_on(self):
         """sd:9761: a handed-back cancelled entry, a failed one, the ended run and the open task drew 9748 twice."""
         from sd_dashboard import tasks_screen

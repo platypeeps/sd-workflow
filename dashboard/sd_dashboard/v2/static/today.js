@@ -593,7 +593,9 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     // sd:9247: each repo's parked tasks (no idea kind), PR wait or lane entry or not; hidden until their box is pressed.
     // A task with no repo is no row (pack sd:7731), as in Suggested; the tally counts it, as Tasks' Parked chip lists it.
     parkedTasks().filter(t => t.repo_path).forEach(t => add(t.repo_path, openRow(t, 'parked', why.get(Number(t.id)))));
-    B.recent.filter(r => !(r.items.length && r.items.every(shown))).forEach(r => add(r.repo, endedRun(r)));
+    // An ended build that offers Retry and Send to builder keeps its row: the entry or PR row offers neither.
+    B.recent.filter(r => ['blocked', 'cancelled'].includes(r.retry.bundle) || !(r.items.length && r.items.every(shown)))
+      .forEach(r => add(r.repo, endedRun(r)));
     const RANK = { warning: 0, caution: 1, unknown: 2, ok: 3, queued: 4 };
     // pack sd:7679: the busiest repo first, box by box in the boxes' order, each most first; then the name. Unassociated last.
     const busy = (a, b) => BOXES.reduce((d, t) => d || b.n[t] - a.n[t], 0);
