@@ -117,6 +117,15 @@ class FixReviewTests(ReviewFixture):
                                      FakeRunner(), self.environment(), self.chatgpt_home())
         self.assertIsNone(unchained["covers_from"], "a narrow prior report was read as a full pass")
 
+    def test_a_pass_the_lane_would_not_record_seeds_no_chain(self):
+        """Review of sd:9769: a --draft or --provider pass must not hand its coverage to a verify pass."""
+        root, first = self.branch()
+        for option in ({"draft": True}, {"provider": "codex"}):
+            with self.subTest(option=option):
+                full = sd_review.review(root, namespace(scope="branch", **option), FakeRunner(),
+                                        self.environment(), self.chatgpt_home())
+                self.assertIsNone(full["covers_from"], "an unrecordable pass covers the branch")
+
     def test_a_blocking_pass_short_of_its_depth_covers_nothing(self):
         """Review of sd:9769: a pass one reader short must not seed a chain the lane trusts."""
         blocker = {"path": "src.py", "line": 1, "summary": "defect", "family": "correctness",
