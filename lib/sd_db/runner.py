@@ -105,8 +105,9 @@ def _merged(connection, row) -> bool:
 
 
 def _predecessor_ended(connection, assignment: dict) -> bool:
-    """Block `assignment` when a run ahead of it in its serial chain ended blocked or cancelled; walk the
-    queued runs ahead to the first that is not queued."""
+    """Block `assignment` when a run ahead of it in its serial chain ended blocked or cancelled. The walk
+    takes the whole chain: a run ahead may have passed the ones before it (`_waits`), so a run that is
+    not queued says nothing of them (review of build/sd-1306)."""
     predecessor = assignment["after"]
     while predecessor is not None:
         row = connection.execute("SELECT * FROM assignment WHERE id = ?", (predecessor,)).fetchone()
@@ -116,8 +117,6 @@ def _predecessor_ended(connection, assignment: dict) -> bool:
             connection.execute("UPDATE assignment SET status = 'blocked', result = ?, ended = ? WHERE id = ?",
                                (f"predecessor {predecessor} ended {row['status']}", now(), assignment["id"]))
             return True
-        if row["status"] != "queued":
-            return False
         predecessor = row["after"]
     return False
 
@@ -141,7 +140,7 @@ def _waits(connection) -> dict[int, set[int]]:
     A dependency edge, kept always: an author run waits on each queued run of an open item its item
     waits on, directly or through other open items; the workflow refuses an item cycle, so these alone
     make none. An order edge, kept unless it closes a cycle: a serial run waits on each run ahead of it
-    in its chain, up to the first that is not queued and not merged; then a parallel author run waits
+    in its chain that is not merged, the whole chain; then a parallel author run waits
     on each earlier queued serial or non-author run in its repository that has no order edge left. An
     order edge that closes a cycle is dropped, so the run it held passes: the graph stays acyclic, and
     an acyclic graph always has a run that waits on none, so every queue drains."""
@@ -185,12 +184,11 @@ def _waits(connection) -> dict[int, set[int]]:
         while predecessor is not None:
             ahead = rows.get(predecessor) or connection.execute(
                 "SELECT * FROM assignment WHERE id = ?", (predecessor,)).fetchone()
-            if ahead is None or _merged(connection, ahead):
+            if ahead is None:
                 break
-            if add(ident, predecessor):
+            # A merged run ahead may have passed the ones before it, so the walk goes on past it.
+            if not _merged(connection, ahead) and add(ident, predecessor):
                 held.add(ident)
-            if predecessor not in rows:
-                break
             predecessor = ahead["after"]
     for ident, row in rows.items():
         if row["lane"] != "parallel" or row["role"] != "author":

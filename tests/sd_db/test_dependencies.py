@@ -241,14 +241,30 @@ class TheQueueGraph(DependencyCase):
             if not started:
                 return queued
             for ident in started:
-                item = self.db.execute("SELECT item FROM assignment WHERE id = ?", (ident,)).fetchone()[0]
-                self.db.execute("UPDATE assignment SET status = 'done' WHERE id = ?", (ident,))
-                self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run IN "
-                                "(SELECT id FROM runner_run WHERE assignment = ?)", (NOW, ident))
-                self.db.execute("INSERT INTO assignment (item, role, status, phase, lane) "
-                                "VALUES (?, 'merge', 'done', 'merged', 'serial')", (item,))
-                self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (item,))
+                self.finish(ident)
         return []
+
+    def finish(self, ident):
+        """End the claimed run `ident` done, its item merged and done."""
+        item = self.db.execute("SELECT item FROM assignment WHERE id = ?", (ident,)).fetchone()[0]
+        self.db.execute("UPDATE assignment SET status = 'done' WHERE id = ?", (ident,))
+        self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run IN "
+                        "(SELECT id FROM runner_run WHERE assignment = ?)", (NOW, ident))
+        self.db.execute("INSERT INTO assignment (item, role, status, phase, lane) "
+                        "VALUES (?, 'merge', 'done', 'merged', 'serial')", (item,))
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (item,))
+
+    def test_a_prerequisite_merged_out_of_order_releases_nothing_behind_its_dependent(self):
+        """Review of build/sd-1306: A, B, C serial; A waits on B and an open item. B passed A and merged;
+        the walk stopped at B, so C started before A."""
+        from sd_db import runner
+
+        (first, second, _), (_, middle, last) = self.serial(3)
+        self.wait(first, second, self.item(status="planning"))
+        roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
+        self.assertTrue(runner.claim(self.db, middle, owner="fixture", **roots), "B passes A")
+        self.finish(middle)
+        self.assertIsNone(runner.claim(self.db, last, owner="fixture", **roots), "C stays behind A")
 
     def test_a_wait_cycle_across_a_serial_batch_and_a_parallel_run_drains(self):
         """Third lane blocker: A, B, C serial, D parallel; A waits on C, B on D. Each pairwise yield held."""
