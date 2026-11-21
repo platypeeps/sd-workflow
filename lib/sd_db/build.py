@@ -768,7 +768,7 @@ def drop_plan(connection, item: int) -> dict:
     # The stored repo is a key (`~/...`); git needs the disk path, as `Supervisor` expands it (round 3).
     repo, work = paths.expand(last["repo"]), Path(last["work_path"])
     return {"item": item, "assignment": row["id"], "lead": lead, "kept": kept, "run": last["id"],
-            "aside": sorted(gone - {member["item"] for member in kept} | {item}),
+            "aside": sorted(gone - {member["item"] for member in kept} | {item}), "built": sorted(set(built)),
             "revision": current["revision"], "repo": str(repo), "work": str(work), "branch": last["branch"]}
 
 

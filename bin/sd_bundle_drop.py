@@ -69,11 +69,13 @@ def _merges(work: str | Path, start: str, tip: str) -> None:
             raise DropRefused(f"merge {sha[:12]} resolves by hand what no cherry-pick carries; split it by hand")
 
 
-def drop_sides(work: str | Path, start: str, tip: str, item: int, aside: set[int]) -> tuple[list[str], list[str]]:
+def drop_sides(work: str | Path, start: str, tip: str, item: int, aside: set[int],
+               built: set[int]) -> tuple[list[str], list[str]]:
     """The non-merge commits of `start..tip`, oldest first, split into (kept, dropped) for dropping `item`. A commit
     citing an item of `aside`, `item` and the members cancelled out of the bundle before, is not kept (round 3).
     A commit that cites no item refuses the drop: paths cannot say whose it is, since a follow-up of the dropped
-    item may edit only a file a kept commit touched (round 6)."""
+    item may edit only a file a kept commit touched (round 6). So does one citing an item the bundle did not build
+    (`built`): replayed on the kept branch, its `Closes:` would close that item at merge (round 15)."""
     shas = _out("rev-list", "--reverse", "--no-merges", f"{start}..{tip}", cwd=work).split()
     kept, dropped = [], []
     for sha in shas:
@@ -85,6 +87,9 @@ def drop_sides(work: str | Path, start: str, tip: str, item: int, aside: set[int
         cited = set(sd_ship_body.cited_ids("", [(sha, message)]))
         if not cited:
             raise DropRefused(f"commit {sha[:12]} cites no item, so nothing says whose it is; split it by hand")
+        if cited - built:
+            raise DropRefused(f"commit {sha[:12]} cites {', '.join(f'sd:{n}' for n in sorted(cited - built))}, "
+                              f"which this bundle did not build; split it by hand")
         if cited & aside and cited - aside:
             raise DropRefused(f"commit {sha[:12]} cites {', '.join(f'sd:{n}' for n in sorted(cited & aside))} and "
                               f"{', '.join(f'sd:{n}' for n in sorted(cited - aside))}: split it by hand")
@@ -121,7 +126,7 @@ def split_branch(plan: dict, done: dict) -> dict:
     fork = _out("merge-base", start, tip, cwd=work)
     _merges(work, fork, tip)
     aside = set(plan["aside"])
-    kept, dropped = drop_sides(work, fork, tip, item, aside)
+    kept, dropped = drop_sides(work, fork, tip, item, aside, set(plan["built"]))
     new_work, new_branch = Path(plan["new_work"]), plan["new_branch"]
     if new_work.exists() or _exists(repo, f"refs/heads/{new_branch}"):
         raise DropRefused(f"{new_work} or branch {new_branch} exists already")

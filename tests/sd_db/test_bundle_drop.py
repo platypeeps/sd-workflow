@@ -637,3 +637,20 @@ class DropRound14(Repo):
         findings = supervisor.brief()["findings"]
         self.assertIn("already holds the commits of an earlier run", findings)
         self.assertIn(f"sd:{items[1]} left this bundle", findings)
+
+
+class DropRound15(Repo):
+    """Review round 15 of pack sd:9709: a commit citing only an item outside the bundle read as the kept items'
+    and would close that item at merge; and the kept bundle's split work is on the new lead's branch alone, so a
+    claim after that lead left the queue started a member on its own fresh branch."""
+
+    def test_a_commit_citing_only_an_item_outside_the_bundle_refuses(self):
+        items, ids, run = self.bundle()
+        stranger = self.item(repo=str(self.repo))
+        work = Path(run["work_path"])
+        self.commit(work, "d.txt", "other\n", f"fix: other\n\nCloses: sd:{stranger}")
+        old = git(work, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(DROP.DropRefused, f"sd:{stranger}"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), old)
+        self.assertEqual(self.statuses(items), ["blocked"] * 3)
