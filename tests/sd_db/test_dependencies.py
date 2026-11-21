@@ -109,6 +109,21 @@ class TheOtherStarts(DependencyCase):
             runner.enqueue(self.db, [item], who="operator")
         self.assertEqual(self.count("SELECT COUNT(*) FROM assignment"), 0)
 
+    def test_a_runner_claim_holds_an_author_run_whose_dependency_reopened(self):
+        """Round 5: the enqueue read the set, and a reopen before the claim started the run anyway."""
+        from sd_db import runner
+        first, item = self.item(status="done"), self.item()
+        self.db.execute("UPDATE item SET branch = 'work/x' WHERE id = ?", (item,))
+        self.wait(item, first)
+        queued = runner.enqueue(self.db, [item], who="operator")[0]["id"]
+        change_status(self.db, first, "ready", who="operator")
+        roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
+        self.assertIsNone(runner.claim(self.db, queued, owner="fixture", **roots), "a reopen holds the run")
+        self.assertEqual(runner.queue_state(self.db, queued)["status"], "queued")
+        change_status(self.db, first, "done", who="operator")
+        started = runner.claim(self.db, queued, owner="fixture", **roots)
+        self.assertEqual(started and started["status"], "running", "a done dependency lets it start")
+
 
 class TheBuild(DependencyCase):
     def test_an_item_without_the_key_builds_as_before(self):

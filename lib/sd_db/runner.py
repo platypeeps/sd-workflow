@@ -219,6 +219,13 @@ def claim(connection, assignment: int, *, owner: str, work_root: Path, retention
         if request["status"] != "queued" or not _eligible_after(connection, request):
             return None
         item = _item(connection, request["item"], delivery=request["role"] == "merge")
+        if request["role"] == "author":
+            # A dependency reopened since the enqueue holds the run queued, as dispatch's start
+            # holds a build; it starts once the dependency is done again (review of pack sd:9570).
+            from .build import waiting_on
+
+            if waiting_on(connection, item):
+                return None
         leases = connection.execute("SELECT runner_lease.*, runner_run.quarantine FROM runner_lease "
             "JOIN runner_run ON runner_run.id = runner_lease.run WHERE runner_lease.repo = ? "
             "AND runner_lease.released_at IS NULL", (item["repo"],)).fetchall()
