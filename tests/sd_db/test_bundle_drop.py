@@ -529,8 +529,8 @@ class DropRound10(Repo):
         old = git(work, "rev-parse", "HEAD")
         real = DROP.split_branch
 
-        def moved(plan):
-            done = real(plan)
+        def moved(plan, done):
+            real(plan, done)
             # Planning cancels its assignment; back to ready passes the press's own item check.
             writes.transition(self.db, items[2], "planning", who="operator")
             writes.transition(self.db, items[2], "ready", who="operator")
@@ -583,4 +583,18 @@ class DropRound11(Repo):
                 self.assertRaises(sqlite3.OperationalError):
             DROP.drop_item(self.db, build, items[1], who="operator")
         self.assertFalse(self.db.in_transaction)
+        self.unsplit(items, run, old)
+
+    def test_an_interrupt_between_the_split_and_the_writes_undoes_the_split(self):
+        items, ids, run = self.bundle()
+        old = git(Path(run["work_path"]), "rev-parse", "HEAD")
+        real = DROP.split_branch
+
+        def split_then_interrupted(*args, **kwargs):
+            real(*args, **kwargs)
+            raise KeyboardInterrupt
+
+        with mock.patch.object(DROP, "split_branch", side_effect=split_then_interrupted), \
+                self.assertRaises(KeyboardInterrupt):
+            DROP.drop_item(self.db, build, items[1], who="operator")
         self.unsplit(items, run, old)

@@ -125,9 +125,11 @@ def _exists(repo: str | Path, ref: str) -> bool:
     return _has("rev-parse", "-q", "--verify", ref, cwd=repo, absent=1)
 
 
-def split_branch(plan: dict) -> dict:
+def split_branch(plan: dict, done: dict) -> dict:
     """The kept commits on `plan["new_branch"]`, fresh from the base, in `plan["new_work"]`; the old tip kept on
-    `saved` when the branch is rewritten in place. Undone on any failure, and `undo` undoes it after."""
+    `saved` when the branch is rewritten in place. Each step is recorded in the caller's `done` once it moved
+    something, so the caller's one handler undoes exactly what moved (`undo_split`), whenever it is interrupted:
+    a Ctrl-C between this return and the writes undid nothing before (round 11)."""
     repo, work, branch, item = Path(plan["repo"]), Path(plan["work"]), plan["branch"], plan["item"]
     if not work.is_dir():
         raise DropRefused(f"worktree {work} is not on this machine: drop it on the host that built it")
@@ -151,25 +153,20 @@ def split_branch(plan: dict) -> dict:
         _ignored(work, start, kept)
     elif new_work.exists() or _exists(repo, f"refs/heads/{new_branch}"):
         raise DropRefused(f"{new_work} or branch {new_branch} exists already")
-    # Each step is recorded once it moved something, so a failure undoes exactly what moved (`undo_split`).
-    done = {"plan": plan, "tip": tip, "saved": None, "made": False, "moved": False, "base": start, "kept": kept,
-            "dropped": dropped}
-    try:
-        if in_place:
-            done["saved"] = saved  # first: an interrupt after the branch is made still deletes it
-            _git("branch", saved, tip, cwd=repo)
-            done["moved"] = True  # a failed checkout may still have moved files: restore the tip either way
-            _git("checkout", "-q", "-B", branch, start, cwd=work)
-        else:
-            done["made"] = True  # a failed add may leave a half-made worktree or branch: remove both either way
-            _git("worktree", "add", "-q", "-b", new_branch, str(new_work), start, cwd=repo)
-        for sha in kept:
-            _git("cherry-pick", "--allow-empty", sha, cwd=new_work)
-        check_branch(new_work, start, kept, aside)
-        done["head"] = _out("rev-parse", "HEAD", cwd=new_work)
-    except BaseException:  # Ctrl-C too: the branch moved, and nothing else would put it back (round 2)
-        undo_split(done)
-        raise
+    done.update({"plan": plan, "tip": tip, "saved": None, "made": False, "moved": False, "base": start,
+                 "kept": kept, "dropped": dropped})
+    if in_place:
+        done["saved"] = saved  # first: an interrupt after the branch is made still deletes it
+        _git("branch", saved, tip, cwd=repo)
+        done["moved"] = True  # a failed checkout may still have moved files: restore the tip either way
+        _git("checkout", "-q", "-B", branch, start, cwd=work)
+    else:
+        done["made"] = True  # a failed add may leave a half-made worktree or branch: remove both either way
+        _git("worktree", "add", "-q", "-b", new_branch, str(new_work), start, cwd=repo)
+    for sha in kept:
+        _git("cherry-pick", "--allow-empty", sha, cwd=new_work)
+    check_branch(new_work, start, kept, aside)
+    done["head"] = _out("rev-parse", "HEAD", cwd=new_work)
     return done
 
 
@@ -233,8 +230,9 @@ def drop_item(connection, build, item: int, *, who: str) -> list[dict]:
         plan = build.drop_plan(connection, item)
     except build.BuildRefused as refusal:
         raise DropRefused(str(refusal)) from None
-    done = split_branch(plan)
-    try:
+    done: dict = {}
+    try:  # one handler from the split's first move to the writes' commit, Ctrl-C included (rounds 2 and 11)
+        split_branch(plan, done)
         return build.drop_writes(connection, plan, who=who, note=kept_note(done), left=dropped_note(done))
     except BaseException:
         # A COMMIT that failed outside the helper's rollback leaves the transaction open, its writes visible to
@@ -242,6 +240,6 @@ def drop_item(connection, build, item: int, *, who: str) -> list[dict]:
         if connection.in_transaction:
             connection.execute("ROLLBACK")
         # Ctrl-C after the commit: the queued builds read the split branch, so it stays (round 7).
-        if not build.drop_committed(connection, plan):
+        if done and not build.drop_committed(connection, plan):
             undo_split(done)
         raise
