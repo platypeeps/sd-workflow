@@ -853,8 +853,12 @@ def eligible(connection, *, now: str | None = None) -> list[dict]:
     skipped (pack sd:8861); a press still takes one by hand.
     """
     hosts, found = lane_hosts(connection), []
+    # An item whose own build the hub blocked on a quiet dispatcher waits for that build to queue again
+    # (`_requeue_beat_blocked`): a fresh one from main drops its branch's work (sd:9774).
+    waiting = {row["item"] for row in connection.execute(
+        f"SELECT assignment.item FROM assignment WHERE {_BEAT_BLOCKED}", (SCOPE, _BEAT_RESULT))}
     for row in reads.backlog_items(connection, status="ready", now=now):
-        if row["recurrence"]:  # a scheduled occurrence recurs too
+        if row["recurrence"] or row["id"] in waiting:  # a scheduled occurrence recurs too
             continue
         try:
             taken = _item(connection, row["id"])
@@ -1317,6 +1321,16 @@ def _refuse(connection, row, reason: str) -> None:
     add_note(connection, row["item"], "comment", f"Build assignment {row['id']} blocked: {reason}")
 
 
+#: The result `_refuse` writes on a build the hub blocked on another host's quiet dispatcher.
+_BEAT_RESULT = "%'s lane runs on %, and %"
+#: An item's newest build, blocked with `_BEAT_RESULT`, no other assignment owning the item; binds SCOPE, _BEAT_RESULT.
+_BEAT_BLOCKED = (f"assignment.scope = ? AND assignment.status = 'blocked' AND assignment.result LIKE ? "
+                 f"AND assignment.id = (SELECT MAX(newest.id) FROM assignment newest "
+                 f"WHERE newest.item = assignment.item AND newest.scope = assignment.scope) "
+                 f"AND NOT EXISTS (SELECT 1 FROM assignment other WHERE other.item = assignment.item "
+                 f"AND other.status IN {OWNING})")
+
+
 def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
     """Put back to queued each build the hub's claim blocked on another host's quiet dispatcher, once that host's
     beat is fresh and not stuck again (pack sd:8745): a slow-DB stretch blocked them for good before.
@@ -1330,11 +1344,7 @@ def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
         f"SELECT assignment.id, assignment.item, assignment.parent, assignment.run_count, assignment.result, "
         f"repo.lane_host FROM assignment "
         f"JOIN item ON item.id = assignment.item LEFT JOIN repo ON repo.path = item.repo "
-        f"WHERE assignment.scope = ? AND assignment.status = 'blocked' AND item.status = 'ready' "
-        f"AND assignment.result LIKE ? AND assignment.id = (SELECT MAX(newest.id) FROM assignment newest "
-        f"WHERE newest.item = assignment.item AND newest.scope = assignment.scope) "
-        f"AND NOT EXISTS (SELECT 1 FROM assignment other WHERE other.item = assignment.item "
-        f"AND other.status IN {OWNING})", (SCOPE, "%'s lane runs on %")).fetchall()
+        f"WHERE {_BEAT_BLOCKED} AND item.status = 'ready'", (SCOPE, _BEAT_RESULT)).fetchall()
     for row in rows:
         away = _route(connection, row["lane_host"], _lead(row))
         if away in hosts:

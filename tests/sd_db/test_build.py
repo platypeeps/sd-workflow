@@ -2468,6 +2468,25 @@ class Hosts(Case):
         assert run is not None
         self.assertEqual(run["assignment"], rows[0], "the satellite claims it")
 
+    def test_pickup_leaves_a_beat_blocked_item_to_its_own_assignment(self):
+        """sd:9774: after a hub outage the hub blocked a satellite's queued build on its quiet beat; once the beat
+        was back, the satellite's auto-pickup queued the item fresh from main, and Retry of the old bundle
+        refused ('has a newer build'). Pickup leaves such an item: its own build queues again."""
+        item = self.item(repo=SAT)
+        lead = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", lead), "blocked")
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        build.set_pickup(self.db, True, now=Pickup.NOW)
+        with mock.patch.object(build, "lane_hosts", return_value=WORK):
+            self.assertNotIn(item, [row["id"] for row in build.eligible(self.db, now=Pickup.NOW)])
+            build.pickup(self.db, build.room(self.db, **IDLE, hosts=WORK), now=Pickup.NOW)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE item = ?", item), 1,
+                         "no fresh build supersedes the blocked one")
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.claim(hosts=WORK)["assignment"], lead, "the same assignment builds")
+
     def test_the_hub_blocks_a_row_whose_satellite_beat_comes_from_a_clock_ahead(self):
         """Pack sd:7955: a beat stamped more than STALE_SECONDS after now has no age to trust, so the claim blocks
         the row as for a stale beat, and its note names the skew, not a dead dispatcher."""
