@@ -155,15 +155,23 @@ def check_branch(work: str | Path, start: str, kept: list[str], aside: set[int])
         raise DropRefused(f"the new branch changes {', '.join(sorted(changed - allowed))}, which no kept commit does")
 
 
-def undo_split(done: dict) -> None:
-    """Remove the new worktree and branch `split_branch` made; the old ones it never moved."""
+def undo_split(done: dict) -> str:
+    """Remove the new worktree and branch `split_branch` made; the old ones it never moved. What it could not
+    remove, read back from disk and git, or "" once both are gone."""
     plan = done["plan"]
     repo, work = Path(plan["repo"]), Path(plan["new_work"])
-    if done.get("made"):
-        _git("cherry-pick", "--abort", cwd=work, check=False)
-        _git("worktree", "remove", "--force", str(work), cwd=repo, check=False)
-        _git("worktree", "prune", cwd=repo, check=False)
-        _git("branch", "-D", plan["new_branch"], cwd=repo, check=False)
+    if not done.get("made"):
+        return ""
+    _git("cherry-pick", "--abort", cwd=work, check=False)
+    _git("worktree", "remove", "--force", str(work), cwd=repo, check=False)
+    _git("worktree", "prune", cwd=repo, check=False)
+    _git("branch", "-D", plan["new_branch"], cwd=repo, check=False)
+    left = [str(work)] if work.exists() else []
+    try:
+        left += [plan["new_branch"]] if _exists(repo, f"refs/heads/{plan['new_branch']}") else []
+    except DropRefused:
+        left.append(f"{plan['new_branch']} (unread)")
+    return " and ".join(left)
 
 
 def kept_note(done: dict) -> str:
@@ -192,16 +200,18 @@ def drop_item(connection, build, item: int, *, who: str) -> list[dict]:
     try:  # one handler from the split's first move to the writes' commit, Ctrl-C included (rounds 2 and 11)
         split_branch(plan, done)
         return build.drop_writes(connection, plan, who=who, note=kept_note(done), left=dropped_note(done))
-    except BaseException:
+    except BaseException as error:
         # A COMMIT that failed outside the helper's rollback leaves the transaction open, its writes visible to
         # this connection alone: roll it back before reading whether they committed (round 11).
         if connection.in_transaction:
             connection.execute("ROLLBACK")
         # Ctrl-C after the commit: the queued builds read the split branch, so it stays (round 7).
         if not build.drop_committed(connection, plan):
-            try:
-                if done:
-                    undo_split(done)
-            finally:
-                build.drop_release(connection, plan)
+            # The reserved id names the new worktree and branch: released while either stays, SQLite would give it
+            # to the next build, which would take them by name, with the wrong commits (round 18).
+            left = undo_split(done) if done else ""
+            if left:
+                raise DropRefused(f"the drop failed and could not remove {left}; assignment {plan['new_lead']} "
+                                  f"stays reserved so no build reuses them: remove them by hand") from error
+            build.drop_release(connection, plan)
         raise

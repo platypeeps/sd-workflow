@@ -743,3 +743,26 @@ class DropRound17(Repo):
                 with mock.patch.object(build, "hub_host", return_value="hub"):
                     claimed = [self.claim(hosts=frozenset({"sat-b"})) for _ in range(3)]
                 self.assertNotIn(lead, [one["assignment"] for one in claimed if one])
+
+
+class DropRound18(Repo):
+    """Review round 18 of pack sd:9709: a rollback whose git cleanup failed still released the reserved id, which
+    SQLite reuses, so a later build would take the stranded worktree by its branch name; and the host guard ended
+    at the new lead's first claim, though a run that never started left the work where it was."""
+
+    def test_a_failed_cleanup_keeps_the_reserved_id(self):
+        items, ids, run = self.bundle()
+        lead = self.next_lead()
+        real = DROP._git
+
+        def stuck(*argv, cwd, check=True):
+            if argv[:2] in (("worktree", "remove"), ("branch", "-D")):
+                return subprocess.CompletedProcess(["git", *argv], 1, "", "error: example failure")
+            return real(*argv, cwd=cwd, check=check)
+
+        with mock.patch.object(build, "drop_writes", side_effect=build.BuildRefused("Drop refused: changed")), \
+                mock.patch.object(DROP, "_git", side_effect=stuck), \
+                self.assertRaisesRegex(DROP.DropRefused, f"repo-build-{lead}"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertIsNotNone(self.db.execute("SELECT 1 FROM assignment WHERE id = ?", (lead,)).fetchone())
+        self.assertNotEqual(self.next_lead(), lead)
