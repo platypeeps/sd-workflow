@@ -1019,7 +1019,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     document.body.dataset.observed = doc.now;
     const items = [...[...SUGG].map(([id, r]) => SROW.has(id) ? TD.objectOf(SROW.get(id)) : { id, type: 'item', label: `#${r.id} ${r.title}`, item: r.id }),
       ...[...OPENI.keys(), ...PARKI.keys()].map(k => TD.objectOf(taskOf(k)))];
-    return { objects: [...[...ALL.values()].map(objectOf), ...[...OTHER].map(([id, o]) => ({ id, ...o.obj })), ...items, ...SNOOZED.map(window.snooze.object)],
+    return { objects: [...[...ALL.values()].map(objectOf), ...[...OTHER].map(([id, o]) => ({ id, ...o.obj })), ...items, ...SNOOZED.map(window.snooze.object),
+                       { id: 'needs', type: 'needs list', label: 'Needs you' }],
              state: doc.snooze_error ? window.snooze.unread(doc.snooze_error, '/api/now') : null };
   }
   function clear(err) { DOC = null; NEEDS = []; ALL = new Map(); OTHER = new Map(); SUGG = new Map(); OPENI = new Map(); PARKI = new Map(); TASKS = new Map(); SROW.clear(); SNOOZED = []; ACTIVE = null; failed = err.message; delete document.body.dataset.observed; }
@@ -1120,6 +1121,13 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     const found = o => taskOf(o.id) || (SUGG.has(o.id) ? { id: SUGG.get(o.id).id, status: SUGG.get(o.id).status, repo: SUGG.get(o.id).repo, repo_path: SUGG.get(o.id).repo, kind: SUGG.get(o.id).kind, assignment: null } : null);
     // sd:8565: a live assignment the queue read holds the row as a Tasks row's does, and the press is said on the queue's line.
     const ready = o => { const t = found(o), a = t && runFor(t.id); return t && a && !t.assignment ? { ...t, assignment: a.status } : t; };
+    // sd:9759: Clean up runs the sweep the nightly job runs: it closes each row that no longer needs you, with a note
+    // naming why, and keeps any it cannot prove; Details shows what it closed, and Today reads again.
+    C.register({ id: 'needs.sweep', on: 'needs list', label: 'Clean up', icon: 'sparkles', risk: 'confirm', executes: true,
+      does: 'Closes each row that no longer needs you, naming why.',
+      consequence: () => 'This closes each alert that cleared, pull alert no read sees, answered question and done item\'s followup, with a note naming why. A row it cannot prove stays open. Details lists what closed.',
+      cli: () => 'sd reports sweep', sends: () => 'POST /api/actions/run {action: needs.sweep}',
+      run: o => window.commands.runAction(o, 'needs.sweep').then(said => reading.reread().then(() => said)) });
     C.register(K.build({ row: ready, reread: () => reading.reread(), primary: () => true,
       said: (text, ok) => { qSaid = { ok, text }; queueView(); } }));
     TD = window.taskDetails.attach({ details: $('details'), rows: () => [...new Map([...OPENI, ...PARKI, ...SROW]).values()], byKey: taskOf, selected: sel,
