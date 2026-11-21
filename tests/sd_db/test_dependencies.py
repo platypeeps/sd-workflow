@@ -151,6 +151,18 @@ class TheOtherStarts(DependencyCase):
         self.assertEqual(started and started["status"], "running", "B passes the waiting A")
         self.assertIsNone(runner.claim(self.db, ahead, owner="fixture", **roots))
 
+    def test_a_run_yields_to_one_its_dependency_waits_on(self):
+        """Review: A, B, C queued; A waits on C, B waits on A. B waits on C through A, so B yields too."""
+        from sd_db import runner
+        (first, second, third), (ahead, middle, last) = self.serial(3)
+        self.wait(first, third)
+        self.wait(second, first)
+        roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
+        self.assertIsNone(runner.claim(self.db, ahead, owner="fixture", **roots))
+        self.assertIsNone(runner.claim(self.db, middle, owner="fixture", **roots))
+        started = runner.claim(self.db, last, owner="fixture", **roots)
+        self.assertEqual(started and started["status"], "running", "C passes A and B")
+
     def test_a_run_that_waits_outside_the_queue_keeps_its_place(self):
         """A waits on an item with no queued run: nothing behind it can unblock it, so the order holds."""
         from sd_db import runner

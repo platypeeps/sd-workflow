@@ -116,22 +116,33 @@ def _eligible_after(connection, assignment: dict) -> bool:
 
 
 def _yields(connection, row) -> bool:
-    """Whether the queued author run `row` gives up its place: its item waits on an open item with a run
-    queued behind it. Else A waits for B while B waits behind A (lane review of pack sd:9570). A wait on
-    an item with no run behind it keeps the order; unreadable fields keep it too."""
+    """Whether the queued author run `row` gives up its place: its item waits, directly or through other
+    open items, on an open item with a run queued behind it. Else A waits for B while B waits behind A
+    (lane review of pack sd:9570); A, B, C with A waiting on C and B on A needs the chain (review). A wait
+    on an item with no run behind it keeps the order; unreadable fields keep it too."""
     if row["status"] != "queued" or row["role"] != "author":
         return False
     from .workflow import item_blocked_by
 
-    try:
-        named = item_blocked_by(connection.execute("SELECT fields FROM item WHERE id = ?", (row["item"],)).fetchone())
-    except ValueError:
-        return False
-    marks = ",".join("?" * len(named))
-    return bool(named) and connection.execute(
-        f"SELECT 1 FROM assignment JOIN item ON item.id = assignment.item WHERE assignment.item IN ({marks}) "
-        "AND assignment.status = 'queued' AND assignment.id > ? AND item.status != 'done' LIMIT 1",
-        (*named, row["id"])).fetchone() is not None
+    seen, pending = set(), [row["item"]]
+    while pending:
+        found = connection.execute("SELECT fields FROM item WHERE id = ?", (pending.pop(),)).fetchone()
+        try:
+            named = item_blocked_by(found) if found else []
+        except ValueError:
+            continue
+        for other in named:
+            if other in seen:
+                continue
+            seen.add(other)
+            status = connection.execute("SELECT status FROM item WHERE id = ?", (other,)).fetchone()
+            if status is None or status["status"] == "done":
+                continue
+            if connection.execute("SELECT 1 FROM assignment WHERE item = ? AND status = 'queued' AND id > ?",
+                                  (other, row["id"])).fetchone():
+                return True
+            pending.append(other)
+    return False
 
 
 def _acyclic(connection) -> None:
