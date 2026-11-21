@@ -93,7 +93,12 @@ def drop_sides(work: str | Path, start: str, tip: str, item: int, aside: set[int
     shas = _out("rev-list", "--reverse", "--no-merges", f"{start}..{tip}", cwd=work).split()
     kept, dropped = [], []
     for sha in shas:
-        cited = set(sd_ship_body.cited_ids("", [(sha, _out("log", "-1", "--format=%B", sha, cwd=work))]))
+        message = _out("log", "-1", "--format=%B", sha, cwd=work)
+        # A cherry-picked revert still names the old sha, so the lane would not pair it with the replayed commit,
+        # whose `Closes:` would close an item the revert undid (round 9).
+        if sd_ship_body._REVERTS.search(message):
+            raise DropRefused(f"commit {sha[:12]} reverts another commit; split it by hand")
+        cited = set(sd_ship_body.cited_ids("", [(sha, message)]))
         if not cited:
             raise DropRefused(f"commit {sha[:12]} cites no item, so nothing says whose it is; split it by hand")
         if cited & aside and cited - aside:

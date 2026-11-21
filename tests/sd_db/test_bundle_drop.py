@@ -480,3 +480,22 @@ class DropRound8(Repo):
         work = Path(run["work_path"])
         self.assertEqual(self.files(work), ["README", "a.txt"])
         self.assertNotIn(f"sd:{items[2]}", self.closes(work))
+
+
+class DropRound9(Repo):
+    """Review round 9 of pack sd:9709: a cherry-picked revert still names the original sha, so on the new branch
+    the lane no longer pairs it with the replayed commit, whose `Closes:` then closes an item the revert undid.
+    The drop refuses a range that holds a revert."""
+
+    def test_a_kept_revert_refuses_the_drop(self):
+        items, ids, run = self.bundle()
+        work = Path(run["work_path"])
+        lead = git(work, "log", "--format=%H", "-1", "--grep", f"Closes: sd:{items[0]}")
+        git(work, "rm", "-q", "a.txt")
+        git(work, "commit", "-q", "-m",
+            f"Revert \"feat: lead\"\n\nThis reverts commit {lead}.\n\nLane review fix, repo sd:{items[2]}")
+        head = git(work, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(DROP.DropRefused, "reverts"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), head)
+        self.assertEqual(self.statuses(items), ["blocked"] * 3)
