@@ -1191,6 +1191,14 @@ class Supervise(Case):
         _, kept = self.deferred(rows, {"src.py": {5}})
         self.assertEqual(kept["blockers"], rows, "a blocker on changed code was deferred")
 
+    def test_a_blocker_outside_the_checkout_still_blocks(self):
+        """Class pass, sd:9769: no delta of this checkout can show a path outside it unchanged."""
+        self.press()
+        rows = [{"path": "/elsewhere/x.py", "line": 1, "summary": "a"}, {"path": "../up.py", "line": 2, "summary": "b"},
+                {"path": "src.py", "line": 9, "summary": "c", "instances": ["/elsewhere/y.py:3"]}]
+        _, kept = self.deferred(rows, {})
+        self.assertEqual(kept["blockers"], rows, "a blocker outside the checkout was deferred")
+
     def test_a_quoted_path_in_the_delta_reads_as_unknown(self):
         """Review of sd:9769: a non-ASCII path reads as itself; one git still quotes reads as unknown."""
         repo = Path(tempfile.mkdtemp(dir=self.root))

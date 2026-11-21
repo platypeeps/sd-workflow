@@ -1349,7 +1349,8 @@ class Supervisor:
         changed = changed_lines(self.tools.git, str(self.work), prior["subject"]["head"], head, env=self.env)
 
         def held(row: dict) -> bool:
-            return changed is None or any(path.startswith("<") or path in named or path in changed and (
+            # `<...>` names no file; an absolute or `..` path is outside the checkout no delta of it can clear.
+            return changed is None or any(path.startswith(("<", "/", "../")) or path == ".." or path in named or path in changed and (
                 line is None or not changed[path] or line in changed[path]) for path, line in self.locations(row))
         new = [row for row in answer["blockers"] if not held(row)]
         for index, row in enumerate(new):
