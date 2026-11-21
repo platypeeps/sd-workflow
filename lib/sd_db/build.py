@@ -793,6 +793,14 @@ def drop_writes(connection, plan: dict, *, who: str, note: str, left: str) -> li
         return queued + [{"id": row["id"], "item": row["item"], "status": row["status"]} for row in alone]
 
 
+def drop_committed(connection, plan: dict) -> bool:
+    """Whether `drop_writes` of `plan` committed: its dropped member reads cancelled out of this run's bundle. An
+    interrupt after the commit must keep the branch the queued builds read (round 7)."""
+    row = connection.execute("SELECT status, result FROM assignment WHERE id = ?", (plan["assignment"],)).fetchone()
+    return (row is not None and row["status"] == "cancelled"
+            and (row["result"] or "").endswith(f": {DROPPED}{plan['run']}"))
+
+
 def left(connection, branch: str, items) -> set[int]:
     """Of `items`, each a member an operator cancelled on its own (`ALONE`) out of the build bundle whose run
     published `branch` (`branch_run`). A lane entry on that branch neither closes nor demands one, whatever its

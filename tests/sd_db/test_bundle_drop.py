@@ -435,7 +435,8 @@ class DropRound6(Repo):
 
 
 class DropRound7(Repo):
-    """Review round 7 of pack sd:9709: a drop after a subset Retry whose next run never read the branch."""
+    """Review round 7 of pack sd:9709: a drop after a subset Retry whose next run never read the branch, and an
+    interrupt after the drop's writes committed."""
 
     def test_a_member_drop_after_an_unread_subset_retry_leaves_the_bundle_unheld(self):
         items, (lead, second, third), run = self.bundle()
@@ -449,3 +450,18 @@ class DropRound7(Repo):
         # The drop's split proved the left-out member's work off the branch, so its next run must not hold it.
         self.assertIn(build.split(self.db, lead), ("", "clear"))
         self.assertEqual(self.files(Path(run["work_path"])), ["README", "a.txt"])
+
+    def test_an_interrupt_after_the_writes_committed_keeps_the_split(self):
+        items, ids, run = self.bundle()
+        work = Path(run["work_path"])
+        real = build.drop_writes
+
+        def committed_then_interrupted(*args, **kwargs):
+            real(*args, **kwargs)
+            raise KeyboardInterrupt
+
+        with mock.patch.object(build, "drop_writes", side_effect=committed_then_interrupted), \
+                self.assertRaises(KeyboardInterrupt):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual(self.files(work), ["README", "a.txt", "c.txt"])
+        self.assertNotIn(f"sd:{items[1]}", self.closes(work))

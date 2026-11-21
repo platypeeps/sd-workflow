@@ -229,5 +229,7 @@ def drop_item(connection, build, item: int, *, who: str) -> list[dict]:
     try:
         return build.drop_writes(connection, plan, who=who, note=kept_note(done), left=dropped_note(done))
     except BaseException:
-        undo_split(done)
+        # Ctrl-C after the commit: the queued builds read the split branch, so it stays (round 7).
+        if not build.drop_committed(connection, plan):
+            undo_split(done)
         raise
