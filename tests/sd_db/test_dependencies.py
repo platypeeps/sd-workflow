@@ -423,6 +423,35 @@ class TheBuild(DependencyCase):
         self.assertEqual(started and [m["item"] for m in started["members"]], [member])
         self.assertNotEqual(started["branch"], run["branch"])
 
+    def lead_waits_on_its_member(self, pressed):
+        """Review of build/sd-1306: the lead of an ended bundle waits on its member. A Build of either item
+        retried the whole bundle and refused on the lead. The member leaves and builds on its own branch."""
+        lead, member = self.item(), self.item()
+        run = self.blocked_bundle(lead, member)
+        self.wait(lead, member)
+        build.queue_again(self.db, [member if pressed == "member" else lead], who="operator")
+        started = self.claim()
+        self.assertEqual(started and [m["item"] for m in started["members"]], [member])
+        self.assertNotEqual(started["branch"], run["branch"])
+        self.assertEqual(item_state(self.db, lead)["item"]["status"], "blocked", "the lead stays")
+
+    def test_a_failed_bundle_whose_lead_waits_on_its_member_builds_the_member_pressed(self):
+        self.lead_waits_on_its_member("member")
+
+    def test_a_failed_bundle_whose_lead_waits_on_its_member_builds_it_on_the_leads_press(self):
+        self.lead_waits_on_its_member("lead")
+
+    def test_a_failed_bundle_whose_member_waits_on_its_lead_retries_the_lead(self):
+        """Review of build/sd-1306: the member waits on the lead. A Build of the lead retried both and
+        refused on the member. The member leaves the Retry, and the lead resumes its branch."""
+        lead, member = self.item(), self.item()
+        run = self.blocked_bundle(lead, member)
+        self.wait(member, lead)
+        build.queue_again(self.db, [lead], who="operator")
+        started = self.claim()
+        self.assertEqual(started and [m["item"] for m in started["members"]], [lead])
+        self.assertEqual(started["branch"], run["branch"])
+
     def test_auto_pickup_does_not_split_a_held_retried_bundle(self):
         """Review of build/sd-1306: the held bundle's items stayed ready and unparked, so the next pickup built the
         free member on a new branch. The hold parks them; Retry unparks them onto the original branch."""

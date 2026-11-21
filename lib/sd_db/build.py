@@ -704,8 +704,33 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
                                f"whose worktree holds its work")
         members = [member for member in members if (only is None or member["item"] in only)
                    and not _done(items, member["item"])]
-        kept = {member["id"] for member in members}
         stamp = clock()
+        # A dependency inside the bundle (review of build/sd-1306). A lead that waits on its members cannot
+        # retry: they leave the bundle, as a subset Retry leaves one out, and build fresh on their own branch;
+        # the lead stays ended. A member that waits on another retried item leaves this Retry, parked.
+        lead_row = connection.execute("SELECT id, fields FROM item WHERE id = ?", (current["item"],)).fetchone()
+        if waiting_on(connection, lead_row):
+            needed = _needed(connection, [current["item"]])
+            ahead = [member for member in members
+                     if member["item"] in needed and member["item"] != current["item"] and _current(connection, member)]
+            if ahead:
+                for member in ahead:
+                    connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
+                                       (stamp, f"{ALONE}{who}: {LEFT_OUT}{last['id']}", member["id"]))
+                    if items[member["item"]]["status"] == "blocked":
+                        transition(connection, member["item"], "ready", who=who,
+                                   reason=f"its bundle's lead sd:{current['item']} waits on it")
+                    add_note(connection, member["item"], "comment",
+                             f"Build assignment {member['id']} left its bundle: its lead sd:{current['item']} "
+                             f"waits on it; built on its own")
+                fresh = queue(connection, [member["item"] for member in ahead], who=who)
+                return {"run": last["id"], "queued": [{"id": row["id"], "item": row["item"], "status": row["status"]}
+                                                     for row in fresh]}
+        else:
+            retried = {member["item"] for member in members}
+            members = [member for member in members if member["item"] == current["item"]
+                       or not _needed(connection, [member["item"]]) & retried]
+        kept = {member["id"] for member in members}
         for member in [member for member in built if member["id"] not in kept]:
             owns = _current(connection, member)  # read before this row's own write below
             connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
