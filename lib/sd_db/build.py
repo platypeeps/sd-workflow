@@ -739,7 +739,11 @@ def drop_plan(connection, item: int) -> dict:
             owner = connection.execute("SELECT id FROM assignment WHERE item = ? AND scope = ? ORDER BY id DESC "
                                        "LIMIT 1", (member["item"], SCOPE)).fetchone()["id"]
             raise BuildRefused(f"Drop refused: sd:{member['item']} has a newer build, assignment {owner}")
-    new = lead if row["id"] != lead else kept[0]["id"]
+    # A lead drop queues the kept items as fresh rows under a new lead, so the ended run keeps its members by
+    # `parent` (round 10). Its id names the new branch and worktree the split makes first: the next id, reserved
+    # here and read again by `drop_writes`, which refuses when another row took it.
+    new = lead if row["id"] != lead else connection.execute(
+        "SELECT COALESCE(MAX(id), 0) + 1 FROM assignment").fetchone()[0]
     if new != lead:
         # The new lead never ran: a claim routes it to the repo's lane, so the old run must have built there too.
         lane = connection.execute("SELECT repo.lane_host FROM repo WHERE repo.path = ?", (last["repo"],)).fetchone()
@@ -779,13 +783,24 @@ def drop_writes(connection, plan: dict, *, who: str, note: str, left: str) -> li
         # `unread`, so the next run's `split_first` does not hold the kept commits as that member's (round 7).
         connection.execute("UPDATE assignment SET result = REPLACE(result, ?, ?) WHERE parent = ? AND scope = ? "
                            "AND result LIKE ?", (LEFT_OUT, DROPPED, plan["lead"], SCOPE, f"{ALONE}%: {LEFT_OUT}%"))
-        kept = [member["id"] for member in plan["kept"]]
-        marks = ", ".join("?" for _ in kept)
-        connection.execute(f"UPDATE assignment SET parent = CASE WHEN id = ? THEN NULL ELSE ? END WHERE id IN ({marks})",
-                           (lead, lead, *kept))
-        items = reads.items_by_ids(connection, [plan["item"], *(member["item"] for member in plan["kept"])])
+        members = plan["kept"]
+        if lead != plan["lead"]:
+            # A lead drop leaves the old rows in the ended run's bundle, cancelled out of it (`ALONE`) at the count
+            # of its last run, which `run` and the sweep read, and queues fresh rows under the reserved lead; a
+            # claim takes a lead that counts a run as its own bundle (`_bundle`). No run row backs the count.
+            fresh: list[dict] = []
+            for member in members:
+                connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
+                                   (stamp, f"{ALONE}{who}: {DROPPED}{plan['run']}", member["id"]))
+                cursor = connection.execute(
+                    "INSERT INTO assignment (id, item, role, status, parent, lane, budget_minutes, scope, run_count) "
+                    "VALUES (?, ?, 'author', 'cancelled', ?, 'parallel', ?, ?, 1)",
+                    (None if fresh else lead, member["item"], lead if fresh else None, BUDGET_MINUTES, SCOPE))
+                fresh.append({"id": int(cursor.lastrowid), "item": member["item"]})
+            members = fresh
+        items = reads.items_by_ids(connection, [plan["item"], *(member["item"] for member in members)])
         how = f"bundle drop of sd:{plan['item']} from build run {plan['run']}"
-        queued = _queue_members(connection, plan["kept"], items, lead=lead, who=who, finding=note, parked="",
+        queued = _queue_members(connection, members, items, lead=lead, who=who, finding=note, parked="",
                                 how=how, verb="Drop")
         if items[plan["item"]]["status"] == "blocked":
             transition(connection, plan["item"], "ready", who=who, reason=how)

@@ -45,6 +45,10 @@ class Repo(Case):
         git(self.repo, "remote", "set-head", "origin", "main")
         upsert_repo(self.db, str(self.repo), remote=str(origin), managed=1)
 
+    def next_lead(self):
+        """The id a lead drop reserves for its new lead: the next assignment id (round 10)."""
+        return self.db.execute("SELECT MAX(id) + 1 FROM assignment").fetchone()[0]
+
     def commit(self, work, name, text, message):
         (Path(work) / name).write_text(text)
         git(work, "add", "-A")
@@ -115,12 +119,14 @@ class Drop(Repo):
         items, (lead, second, third), run = self.bundle()
         work = Path(run["work_path"])
         old = git(work, "rev-parse", "HEAD")
+        lead_id = self.next_lead()
         DROP.drop_item(self.db, build, items[0], who="operator")
         self.assertEqual(git(work, "rev-parse", "HEAD"), old, "the old branch keeps the dropped item's work")
         again = self.claim()
-        self.assertEqual([member["id"] for member in build.run(self.db, again["id"])["members"]], [second, third])
+        self.assertEqual([member["item"] for member in build.run(self.db, again["id"])["members"]], items[1:])
+        self.assertEqual(again["assignment"], lead_id)
         new = Path(again["work_path"])
-        self.assertEqual((new, again["branch"]), (work.parent / f"repo-build-{second}", f"build/sd-{second}"))
+        self.assertEqual((new, again["branch"]), (work.parent / f"repo-build-{lead_id}", f"build/sd-{lead_id}"))
         self.assertEqual(git(new, "branch", "--show-current"), again["branch"])
         self.assertEqual(self.files(new), ["README", "b.txt", "c.txt"])
         self.assertNotIn(f"sd:{items[0]}", self.closes(new))
@@ -154,8 +160,8 @@ class Drop(Repo):
         with mock.patch.object(build, "drop_writes", side_effect=build.BuildRefused("Drop refused: changed")), \
                 self.assertRaises(build.BuildRefused):
             DROP.drop_item(self.db, build, items[0], who="operator")
-        self.assertFalse((work.parent / f"repo-build-{ids[1]}").exists())
-        self.assertEqual(git(self.repo, "branch", "--list", f"build/sd-{ids[1]}"), "")
+        self.assertFalse((work.parent / f"repo-build-{self.next_lead()}").exists())
+        self.assertEqual(git(self.repo, "branch", "--list", f"build/sd-{self.next_lead()}"), "")
 
     def test_a_bundle_whose_branch_is_on_origin_refuses_a_member_drop(self):
         items, ids, run = self.bundle()
@@ -359,8 +365,9 @@ class DropRound3(Repo):
     def test_a_home_key_repo_drops_the_lead(self):
         self.home_is_root()
         items, (lead, second, third), run = self.bundle()
+        lead_id = self.next_lead()
         DROP.drop_item(self.db, build, items[0], who="operator")
-        self.assertEqual(self.files(Path(run["work_path"]).parent / f"repo-build-{second}"),
+        self.assertEqual(self.files(Path(run["work_path"]).parent / f"repo-build-{lead_id}"),
                          ["README", "b.txt", "c.txt"])
 
     def test_a_member_left_out_earlier_stays_off_the_kept_branch(self):
@@ -413,7 +420,7 @@ class DropRound5(Repo):
                     self.assertRaisesRegex(DROP.DropRefused, "rev-parse"):
                 DROP.drop_item(self.db, build, item, who="operator")
             self.assert_unwritten(items, run, old)
-            self.assertFalse((Path(run["work_path"]).parent / f"repo-build-{ids[1]}").exists())
+            self.assertFalse((Path(run["work_path"]).parent / f"repo-build-{self.next_lead()}").exists())
 
 
 class DropRound6(Repo):
@@ -505,6 +512,15 @@ class DropRound10(Repo):
     """Review round 10 of pack sd:9709: a lead drop reparented the kept members, so the ended run lost them and the
     sweeper could remove its worktree while their items stayed open; and the writes rechecked only the lead's
     revision, so a kept member moved to planning during the split was queued again."""
+
+    def test_a_lead_drop_keeps_the_ended_run_membership(self):
+        items, ids, run = self.bundle()
+        before = [member["item"] for member in build.run(self.db, run["id"])["members"]]
+        DROP.drop_item(self.db, build, items[0], who="operator")
+        self.assertEqual([member["item"] for member in build.run(self.db, run["id"])["members"]], before)
+        new = self.claim()
+        self.assertEqual([member["item"] for member in build.run(self.db, new["id"])["members"]], items[1:])
+        self.assertEqual(self.files(Path(new["work_path"])), ["README", "b.txt", "c.txt"])
 
     def test_a_kept_member_moved_during_the_split_refuses_the_writes(self):
         items, ids, run = self.bundle()
