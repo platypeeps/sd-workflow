@@ -1728,6 +1728,8 @@ SKIPPED = re.compile(r"skipped=[1-9]")
 #: A fault of the gate's runner, not a test, outside every shard block: `run-tests.sh`'s `error:` lines
 #: (a log it could not assemble, results it could not publish) and `make test`'s skip refusal.
 RUNNER_FAULT = re.compile(r"^(?:error: |fatal: |Tests skipped locally)", re.M)
+#: A constant guard `run-tests.sh` exports to its shards: Jev off, git maintenance off.
+RUNNER_GUARD = re.compile(r"^export ((?:JEV|GIT_CONFIG)_\w+)=([\w.-]*)$", re.M)
 #: One shard's block of `run-tests.sh` output, from its start line to its end line.
 SHARD_BLOCK = re.compile(r"^shard (\S+): start$.*?^shard \1: \d+s exit=\d+$", re.M | re.S)
 #: How long a test that failed its rerun stays out of the flake retry (sd:9768).
@@ -1799,6 +1801,17 @@ def test_suite(test: str) -> str:
     return ".".join(parts[:at]) or test
 
 
+def runner_guards(tree: pathlib.Path) -> dict[str, str]:
+    """The constant `JEV_*` and `GIT_CONFIG_*` exports of `tree`'s `run-tests.sh`, as its shards get them, read at
+    the rerun's head so they never drift; `JEV_ENABLED=0` even without the file: no rerun sends a live, metered
+    Jev call (sd:2136)."""
+    try:
+        text = (tree / ".github/scripts/run-tests.sh").read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        text = ""
+    return {"JEV_ENABLED": "0", **dict(RUNNER_GUARD.findall(text))}
+
+
 def gate_python(tree: pathlib.Path, environment: dict[str, str]) -> str | None:
     """The interpreter `make test` runs at `tree` under `environment`, or None: the Makefile's `VENV_PYTHON`,
     after its `$(GATE_ENV)` prerequisite, which in gate mode builds the worktree's own `.venv` as the gate does."""
@@ -1833,7 +1846,8 @@ def rerun_tests(root: pathlib.Path, head: str, tests: list[str]) -> tuple[int | 
         try:
             if sd_gate_run.gate_git(tree, "rev-parse", "HEAD") != head:
                 return None, "", f"the rerun's worktree is not at {head[:12]}"
-            environment = sd_gate_run.gate_environment(tree)
+            # The runner's git entries replace the gate's; fsmonitor stays off on top of them.
+            environment = sd_lib.without_fsmonitor({**sd_gate_run.gate_environment(tree), **runner_guards(tree)})
             python = gate_python(tree, environment)
             if python is None:
                 return None, "", f"no gate interpreter (the Makefile's VENV_PYTHON) at {head[:12]}"

@@ -796,21 +796,28 @@ class TheRerunRunsAtTheReviewedHead(unittest.TestCase):
         git("config", "user.email", "operator@example.test")
         git("config", "user.name", "operator")
         (root / "example.py").write_text("BROKEN = True\n", encoding="utf-8")
-        git("add", "example.py", "Makefile")
+        (root / ".github/scripts").mkdir(parents=True)
+        (root / ".github/scripts/run-tests.sh").write_text(
+            "export JEV_ENABLED=0\nexport JEV_METER=0\nexport JEV_CORPUS=0\n", encoding="utf-8")
+        git("add", "example.py", "Makefile", ".github/scripts/run-tests.sh")
         git("commit", "-q", "-m", "head")
         head = git("rev-parse", "HEAD")
         (root / "example.py").write_text("BROKEN = False\n", encoding="utf-8")  # an uncommitted fix
         seen = {}
 
         def child(command, env, cwd, timeout):
-            seen.update(cwd=pathlib.Path(cwd), command=command,
+            seen.update(cwd=pathlib.Path(cwd), command=command, env=env,
                         head=subprocess.run(["git", "-C", str(cwd), "rev-parse", "HEAD"], capture_output=True,
                                             text=True, env=clean_environment()).stdout.strip(),
                         text=(pathlib.Path(cwd) / "example.py").read_text(encoding="utf-8"))
             return 0, "OK", ""
 
-        with unittest.mock.patch.object(sd_gate_run, "run_child", side_effect=child):
+        with unittest.mock.patch.object(sd_gate_run, "run_child", side_effect=child), \
+                unittest.mock.patch.dict("os.environ", {"JEV_ENABLED": "1", "JEV_METER": "1"}):
             self.assertEqual(sd_ship_review.rerun_tests(root, head, [FLAKY_TEST]), (0, "OK", ""))
+        self.assertEqual({key: seen["env"].get(key) for key in ("JEV_ENABLED", "JEV_METER", "JEV_CORPUS")},
+                         {"JEV_ENABLED": "0", "JEV_METER": "0", "JEV_CORPUS": "0"},
+                         "the runner's Jev guards at head: no live, metered call")
         self.assertNotEqual(seen["cwd"].resolve(), root.resolve())
         self.assertEqual((seen["head"], seen["text"]), (head, "BROKEN = True\n"))
         self.assertEqual((seen["command"][0], seen["command"][-1]), (f"{seen['cwd']}/v/bin/python", FLAKY_TEST),
