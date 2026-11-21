@@ -654,3 +654,19 @@ class DropRound15(Repo):
             DROP.drop_item(self.db, build, items[1], who="operator")
         self.assertEqual(git(work, "rev-parse", "HEAD"), old)
         self.assertEqual(self.statuses(items), ["blocked"] * 3)
+
+    def test_a_kept_member_whose_lead_left_the_queue_does_not_start_alone(self):
+        items, ids, run = self.bundle()
+        queued = DROP.drop_item(self.db, build, items[2], who="operator")
+        writes.transition(self.db, items[0], "planning", who="operator")
+        for _ in range(4):  # the first claim refuses the planning lead and ends empty; the next ones go on
+            claimed = self.claim()
+            if claimed is None:
+                continue
+            self.assertNotIn(items[1], [member["item"] for member in build.run(self.db, claimed["id"])["members"]])
+            build.write(self.db, claimed["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START)
+            build.end(self.db, claimed["id"], "blocked", "fixture")
+            build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        member = self.db.execute("SELECT status, result FROM assignment WHERE id = ?", (queued[1]["id"],)).fetchone()
+        self.assertEqual(member["status"], "blocked")
+        self.assertIn(f"build/sd-{queued[0]['id']}", member["result"])

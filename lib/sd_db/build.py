@@ -1399,7 +1399,15 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
         available = room(connection, load=load, load_cap=load_cap, interactive=interactive, hosts=hosts)
         if available["why"]:
             return None
-        queued = [row for row in queued if lanes[row["id"]] in hosts and not _refused_repo(connection, row)]
+        # A member whose lead is no longer queued (moved to planning, refused) would lead its own fresh branch, past
+        # the lead's branch, which holds the bundle's work, a bundle drop's cherry-picks alone (round 15).
+        leads = {row["id"] for row in queued}
+        for row in queued:
+            if row["parent"] is not None and row["parent"] not in leads and lanes[row["id"]] in hosts:
+                _refuse(connection, row, f"its lead, assignment {row['parent']}, is no longer queued, and its "
+                                         f"branch {branch(row['parent'])} holds the bundle's work")
+        queued = [row for row in queued if lanes[row["id"]] in hosts and (row["parent"] is None or row["parent"] in leads)
+                  and not _refused_repo(connection, row)]
         repo = next((row["repo"] for row in queued if room_for(available, row["repo"]) > 0), None)
         if repo is None:
             return None
