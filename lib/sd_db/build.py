@@ -711,6 +711,10 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
         ahead, behind = _inside(connection, current["item"],
                                 [member for member in members if _current(connection, member)])
         if ahead:
+            if finding:  # these build fresh, with no builder to send it to; the lane-failed path refuses it too
+                names = ", ".join("sd:" + str(member["item"]) for member in ahead)
+                raise BuildRefused(f"Retry refused: its lead sd:{current['item']} waits on {names}, which would "
+                                   "build fresh; send the finding once they are done")
             free = _free(connection, ahead, who=who, run=last["id"], lead=current["item"])
             fresh = queue(connection, free, who=who) if free else []
             return {"run": last["id"], "queued": [{"id": row["id"], "item": row["item"], "status": row["status"]}

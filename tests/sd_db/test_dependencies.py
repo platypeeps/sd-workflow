@@ -487,6 +487,16 @@ class TheBuild(DependencyCase):
         self.assertNotEqual(started["branch"], run["branch"])
         self.assertIsNone(item_state(self.db, second)["item"]["parked_at"], "B builds once C is done")
 
+    def test_a_retry_with_a_finding_refuses_to_build_the_members_its_lead_waits_on(self):
+        """Review of build/sd-1306: a Retry with a finding freed the member the lead waits on, queued it
+        fresh, reported success and dropped the finding. A fresh build has no builder to send it to."""
+        lead, member = self.item(), self.item()
+        run = self.blocked_bundle(lead, member)
+        self.wait(lead, member)
+        with self.assertRaisesRegex(build.BuildRefused, "finding"):
+            build.retry(self.db, run["assignment"], who="operator", finding="pin the clock")
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE status = 'queued'"), 0)
+
     def test_a_failed_bundle_whose_member_waits_on_its_lead_retries_the_lead(self):
         """Review of build/sd-1306: the member waits on the lead. A Build of the lead retried both and
         refused on the member. The member leaves the Retry, and the lead resumes its branch."""
