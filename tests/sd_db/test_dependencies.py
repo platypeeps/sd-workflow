@@ -441,6 +441,19 @@ class TheBuild(DependencyCase):
     def test_a_failed_bundle_whose_lead_waits_on_its_member_builds_it_on_the_leads_press(self):
         self.lead_waits_on_its_member("lead")
 
+    def test_a_failed_bundle_whose_lead_waits_through_a_chain_builds_the_runnable_member(self):
+        """Review of build/sd-1306: lead waits on B, B on C, all one ended bundle. Retry freed B and C and
+        queued both; the queue refused B, which waits, and rolled back both. C builds; B stays free."""
+        lead, second, third = self.item(), self.item(), self.item()
+        run = self.blocked_bundle(lead, second, third)
+        self.wait(second, third)
+        self.wait(lead, second)
+        build.queue_again(self.db, [third], who="operator")
+        started = self.claim()
+        self.assertEqual(started and [m["item"] for m in started["members"]], [third])
+        self.assertNotEqual(started["branch"], run["branch"])
+        self.assertIsNone(item_state(self.db, second)["item"]["parked_at"], "B builds once C is done")
+
     def test_a_failed_bundle_whose_member_waits_on_its_lead_retries_the_lead(self):
         """Review of build/sd-1306: the member waits on the lead. A Build of the lead retried both and
         refused on the member. The member leaves the Retry, and the lead resumes its branch."""

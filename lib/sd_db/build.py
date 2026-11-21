@@ -705,31 +705,17 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
         members = [member for member in members if (only is None or member["item"] in only)
                    and not _done(items, member["item"])]
         stamp = clock()
-        # A dependency inside the bundle (review of build/sd-1306). A lead that waits on its members cannot
-        # retry: they leave the bundle, as a subset Retry leaves one out, and build fresh on their own branch;
-        # the lead stays ended. A member that waits on another retried item leaves this Retry, parked.
-        lead_row = connection.execute("SELECT id, fields FROM item WHERE id = ?", (current["item"],)).fetchone()
-        if waiting_on(connection, lead_row):
-            needed = _needed(connection, [current["item"]])
-            ahead = [member for member in members
-                     if member["item"] in needed and member["item"] != current["item"] and _current(connection, member)]
-            if ahead:
-                for member in ahead:
-                    connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
-                                       (stamp, f"{ALONE}{who}: {LEFT_OUT}{last['id']}", member["id"]))
-                    if items[member["item"]]["status"] == "blocked":
-                        transition(connection, member["item"], "ready", who=who,
-                                   reason=f"its bundle's lead sd:{current['item']} waits on it")
-                    add_note(connection, member["item"], "comment",
-                             f"Build assignment {member['id']} left its bundle: its lead sd:{current['item']} "
-                             f"waits on it; built on its own")
-                fresh = queue(connection, [member["item"] for member in ahead], who=who)
-                return {"run": last["id"], "queued": [{"id": row["id"], "item": row["item"], "status": row["status"]}
-                                                     for row in fresh]}
-        else:
-            retried = {member["item"] for member in members}
-            members = [member for member in members if member["item"] == current["item"]
-                       or not _needed(connection, [member["item"]]) & retried]
+        # A dependency inside the bundle (`_inside`, review of build/sd-1306): a lead that waits on its members
+        # cannot retry, so they leave and build fresh on their own branch while the lead stays ended; a member
+        # that waits on another item of the bundle leaves this Retry, parked.
+        ahead, behind = _inside(connection, current["item"],
+                                [member for member in members if _current(connection, member)])
+        if ahead:
+            free = _free(connection, ahead, who=who, run=last["id"], lead=current["item"])
+            fresh = queue(connection, free, who=who) if free else []
+            return {"run": last["id"], "queued": [{"id": row["id"], "item": row["item"], "status": row["status"]}
+                                                 for row in fresh]}
+        members = [member for member in members if member not in behind]
         kept = {member["id"] for member in members}
         for member in [member for member in built if member["id"] not in kept]:
             owns = _current(connection, member)  # read before this row's own write below
@@ -1887,6 +1873,45 @@ def _rebuild(connection, read: dict, reason: str, stamp: str, base: str, entry: 
     _send_back(connection, members, finding, stamp, who="build",
                why=f"build run {read['id']}: the lane's merge of {base} conflicted", result=reason,
                said=f"rebuild {done + 1} of {CONFLICT_REBUILDS} after the lane's merge of {base} conflicted")
+
+
+def _inside(connection, lead: int, members: list[dict]) -> tuple[list[dict], list[dict]]:
+    """A dependency inside an ended bundle whose lead's item is `lead` (review of build/sd-1306): `ahead`, the
+    members the lead waits on, directly or through other open items, and `behind`, every other member that
+    waits on an item of the bundle. Neither can build in it: `ahead` leaves to build on its own (`_free`), and
+    `behind` leaves the send-back, parked, as a subset Retry leaves one out."""
+    bundle = {member["item"] for member in members}
+    needed = _needed(connection, [lead])
+    ahead = [member for member in members if member["item"] != lead and member["item"] in needed]
+    behind = [member for member in members if member["item"] != lead and member not in ahead
+              and _needed(connection, [member["item"]]) & bundle]
+    return ahead, behind
+
+
+def _leave(connection, members: list[dict], *, who: str, run: str, note: str, parked: bool) -> None:
+    """Each of `members` leaves its bundle, as a subset Retry leaves one out (`ALONE` with `LEFT_OUT`, so the split
+    guard reads the lead's branch for its work): its item `ready`, parked or not, with `note` on it."""
+    stamp = clock()
+    for member in members:
+        connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
+                           (stamp, f"{ALONE}{who}: {LEFT_OUT}{run}", member["id"]))
+        status = connection.execute("SELECT status FROM item WHERE id = ?", (member["item"],)).fetchone()["status"]
+        if status in ("blocked", "in_progress"):
+            transition(connection, member["item"], "ready", who=who, reason=note)
+        if parked:
+            park(connection, member["item"], ("ready",), stamp, f"Build assignment {member['id']} {note}; item parked")
+        else:
+            unpark(connection, member["item"])
+        add_note(connection, member["item"], "comment", f"Build assignment {member['id']} {note}")
+
+
+def _free(connection, ahead: list[dict], *, who: str, run: str, lead: int) -> list[int]:
+    """`ahead` leaves its bundle unparked (`_leave`); the items of it free to build now, each that waits on nothing.
+    One that waits stays ready, so auto-pickup or a Build takes it once its own dependency is done."""
+    _leave(connection, ahead, who=who, run=run, parked=False,
+           note=f"left its bundle: its lead sd:{lead} waits on it; it builds on its own")
+    return [member["item"] for member in ahead if not waiting_on(connection, connection.execute(
+        "SELECT id, fields FROM item WHERE id = ?", (member["item"],)).fetchone())]
 
 
 def _waiting(connection, members: list[dict]) -> str:
