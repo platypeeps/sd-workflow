@@ -844,12 +844,13 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
 
 
 def _retry_row(connection, item: int):
-    """The build assignment `sd assignments build` reads for `item`: its newest, unless that one was cancelled and
-    an older one sits blocked in a bundle, not left on its own: that bundle's branch holds the item's work, and a
-    cancel is the operator's stop of the newer one (sd:9788)."""
-    rows = connection.execute("SELECT id, parent, status FROM assignment WHERE item = ? AND scope = ? "
+    """The build assignment `sd assignments build` reads for `item`: its newest, unless that one was cancelled
+    before it ever ran and an older one sits blocked in a bundle that ran, not left on its own: that bundle's
+    branch holds the item's work (sd:9788). A cancelled bundle that ran keeps its worktree, so it stays the one
+    read, as does a member a subset Retry left out (review round 2 of sd:9788)."""
+    rows = connection.execute("SELECT id, parent, status, run_count FROM assignment WHERE item = ? AND scope = ? "
                               "ORDER BY id DESC", (item, SCOPE)).fetchall()
-    if rows and rows[0]["status"] == "cancelled":
+    if rows and rows[0]["status"] == "cancelled" and not rows[0]["run_count"]:
         for row in rows[1:]:
             lead = row["parent"] or row["id"]
             state = queue_state(connection, lead)
