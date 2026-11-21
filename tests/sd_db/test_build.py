@@ -950,6 +950,23 @@ class Reap(Case):
         self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", self.bundle["assignment"]),
                          "blocked")
 
+    def test_build_by_item_resumes_the_newest_bundle_that_ran_past_a_cancel_that_never_ran(self):
+        """Review round 3 of sd:9788: bundle A ends blocked; item X builds as bundle B, cancelled after it ran; a
+        third build C of X is cancelled before it ran. Build of X skips C and resumes B, whose worktree is the
+        newest; A's Retry refuses, as B's cancel left newer work."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        transition(self.db, self.items[1], "ready", who="operator")
+        newer = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        build.end(self.db, self.claim()["id"], "cancelled", "the operator cancelled it")
+        third = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (third,))
+        with self.assertRaisesRegex(build.BuildRefused, f"has a newer build, assignment {third}|assignment {newer}"):
+            build.retry(self.db, self.bundle["assignment"], who="operator")
+        queued = build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual([entry["id"] for entry in queued], [newer])
+
     def test_build_by_item_skips_a_blocked_build_that_never_ran(self):
         """Review of sd:9788: a fresh build the claim refused never ran, then a newer one was cancelled before its
         claim. Build of the item read the refused one, a fresh press from main; the bundle that ran, whose

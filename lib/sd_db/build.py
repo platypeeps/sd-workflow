@@ -743,10 +743,11 @@ def split(connection, lead: int) -> str:
 def _current(connection, member: dict) -> bool:
     """Whether no newer build of bundle `member`'s item stands, open, blocked or delivered: only then may this
     bundle write the item's status or parking; a newer build owns them otherwise (pack sd:9581). A newer one
-    cancelled, or one blocked before it ever ran (a refused press), owns nothing, so the older bundle, whose
-    branch holds the item's work, may retry it (sd:9788)."""
-    return connection.execute("SELECT 1 FROM assignment WHERE item = ? AND scope = ? AND id > ? "
-                              "AND status != 'cancelled' AND NOT (status = 'blocked' AND run_count = 0)",
+    that ended before it ever ran (cancelled, or a refused press) owns nothing, so the older bundle, whose
+    branch holds the item's work, may retry it (sd:9788); one cancelled after it ran keeps newer work in its
+    worktree, and owns the item (review round 3)."""
+    return connection.execute(f"SELECT 1 FROM assignment WHERE item = ? AND scope = ? AND id > ? "
+                              f"AND NOT (status IN {AGAIN} AND run_count = 0)",
                               (member["item"], SCOPE, member["id"])).fetchone() is None
 
 
@@ -844,20 +845,18 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
 
 
 def _retry_row(connection, item: int):
-    """The build assignment `sd assignments build` reads for `item`: its newest, unless that one was cancelled
-    before it ever ran and an older one sits blocked in a bundle that ran, not left on its own: that bundle's
-    branch holds the item's work (sd:9788). A cancelled bundle that ran keeps its worktree, so it stays the one
-    read, as does a member a subset Retry left out (review round 2 of sd:9788)."""
+    """The build assignment `sd assignments build` reads for `item`: its newest that ran, past newer ones that
+    never ran (cancelled or blocked before a claim), when the newest was cancelled before it ran: the bundle that
+    ran last holds the item's newest work (sd:9788, review rounds 2 and 3). A cancelled bundle that ran keeps its
+    worktree, so it stays the one read, as does a member a subset Retry left out. A newest row that ran, or no
+    older row that ran in a bundle ended as it did and not left on its own, reads the newest."""
     rows = connection.execute("SELECT id, parent, status, run_count FROM assignment WHERE item = ? AND scope = ? "
                               "ORDER BY id DESC", (item, SCOPE)).fetchall()
     if rows and rows[0]["status"] == "cancelled" and not rows[0]["run_count"]:
-        for row in rows[1:]:
-            lead = row["parent"] or row["id"]
-            state = queue_state(connection, lead)
-            # One that never ran has no worktree: it would mask an older bundle that ran (review of sd:9788).
-            if (row["status"] == "blocked" and not _alone(connection, row["id"])
-                    and state["status"] == "blocked" and state["run"] is not None):
-                return row
+        ran = next((row for row in rows[1:] if row["run_count"]), None)
+        if (ran is not None and ran["status"] in AGAIN and not _alone(connection, ran["id"])
+                and queue_state(connection, ran["parent"] or ran["id"])["status"] == ran["status"]):
+            return ran
     return rows[0] if rows else None
 
 
