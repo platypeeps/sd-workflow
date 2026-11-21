@@ -1723,7 +1723,7 @@ def gate_code(check: dict) -> str:
 FAILED_TEST = re.compile(r"^(?:FAIL|ERROR): (\w+) \(([\w.]+)\)", re.M)
 #: The most failing tests a gate may name and be rerun as a flake: more is a real break.
 FLAKE_TESTS = 5
-#: A unittest run that skipped something, which `make test` refuses.
+#: A unittest run that skipped something, which `make test` refuses, in the gate or a rerun.
 SKIPPED = re.compile(r"skipped=[1-9]")
 #: A fault of the gate's runner, not a test, outside every shard block: `run-tests.sh`'s `error:` lines
 #: (a log it could not assemble, results it could not publish) and `make test`'s skip refusal.
@@ -1752,7 +1752,8 @@ def failed_tests(check: dict) -> list[str]:
             return []
         steps = [str(step) for step in shard_lines(row.get("failed_steps"))]
         text = whole_output(row)
-        if RUNNER_FAULT.search(SHARD_BLOCK.sub("", text)):
+        # A skip anywhere fails the gate by itself; a failing shard only ends `make test` before it says so.
+        if RUNNER_FAULT.search(SHARD_BLOCK.sub("", text)) or SKIPPED.search(text):
             return []
         found = [paren if paren.endswith(f".{name}") else f"{paren}.{name}" for name, paren in FAILED_TEST.findall(text)]
         if not steps or not found or not all(test_step(step, text) for step in steps):

@@ -738,6 +738,18 @@ class AFlakyGateTestIsRerunAlone(unittest.TestCase):
         self.assertIsNotNone(refused)
         self.assertEqual(rerun.call_count, 0)
 
+    def test_a_gate_that_also_skipped_a_test_is_no_flake(self):
+        """A failing shard ends `make test` before its skip refusal prints: a skip in the original output would
+        fail the gate on its own, so the test that passes alone must not clear it."""
+        log = pathlib.Path(self.row["output_path"])
+        log.write_text(OUTPUT.replace("FAILED (failures=1)", "FAILED (failures=1, skipped=1)"), encoding="utf-8")
+        self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [])
+        log.write_text(OUTPUT.replace("OK\n", "OK (skipped=2)\n", 1), encoding="utf-8")
+        self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [], "a skip in another shard")
+        _review, rerun, refused = self.prepared()
+        self.assertIsNotNone(refused)
+        self.assertEqual(rerun.call_count, 0)
+
     def test_a_rerun_that_skipped_is_no_pass(self):
         """`make test` refuses a skip; a rerun that skipped the test (a missing tool) proves nothing and bars
         nothing."""
