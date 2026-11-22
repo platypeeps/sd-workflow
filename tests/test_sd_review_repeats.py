@@ -761,6 +761,11 @@ class RepeatReviewTests(RepeatFixture):
         claude = sd_review.claude_argv(self.tmp, "claude")
         self.assertIn('"evidence"', claude[claude.index("--json-schema") + 1])
 
+    def test_the_evidence_ask_fits_a_read_only_reader(self) -> None:
+        # Readers get Read/Grep/Glob or a read-only sandbox: asking what they ran invites made-up output.
+        self.assertNotIn("you ran", sd_review.EVIDENCE_ASK)
+        self.assertIn("input", sd_review.EVIDENCE_ASK)
+
     def test_a_review_holds_only_an_uncited_repeat_of_a_rebuttal_back(self) -> None:
         """A cited repeat blocks, though bin/tool.py is not in this change: note #70162 on sd:9867."""
         self.adjudication(("lane claim", "rebutted", "git 2.54 matches it literally"))

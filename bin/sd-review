@@ -122,7 +122,7 @@ OPTIONAL_FINDING_KEYS = frozenset({"evidence"})
 EVIDENCE_CHARS = 1000
 REPEAT_NOTE = "[downgraded: repeats a rebutted finding, no evidence cited]"
 #: What a reader puts in `evidence`, and the note a finding without it gets (pack sd:9867, note #70162).
-EVIDENCE_ASK = ("input or command you ran and its result, showing a failure this change causes in code "
+EVIDENCE_ASK = ("a failing input and its path:line route, showing a failure this change causes in code "
                 "it touched or a caller it breaks; a code finding without one blocks nothing.")
 NO_REPRO_NOTE = "[advisory: no failing input or command cited]"
 #: How far a patch may move an unmatched prior blocker and its uncited repeat still block (fail closed).
