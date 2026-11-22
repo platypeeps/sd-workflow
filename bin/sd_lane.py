@@ -1010,7 +1010,8 @@ def cited_closes(connection: Any, item: int, body: str, commits: list[tuple[str,
     if row is None or not row["repo"]:
         return []
     sources = sd_ship_body.cited_sources(body, commits, parents)
-    kept = sd_ship_body.open_cited(connection, item, row["repo"], tuple(sources), closes, body, branch)
+    kept = sd_ship_body.open_cited(connection, item, row["repo"], tuple(sources), closes, body, branch,
+                                   trailers=sd_ship_body.trailer_cited(sources))
     return [{"item": number, "source": sources[number]} for number in kept]
 
 

@@ -265,7 +265,10 @@ _REFS = re.compile(r"^Refs[ \t]*:(.*)$", re.IGNORECASE)
 _CLOSABLE_KINDS = ("work", "task", "followup")
 _OPEN_STATUSES = ("planning", "ready", "in_progress", "ready_to_send")
 #: A commit's own `Closes:` trailer closes a parked item too: one waiting on the bundle that carries it (sd:9918).
-_CITED_STATUSES = (*_OPEN_STATUSES, "blocked")
+#: A review fix line does not: it names an item, and a parked one may be unrelated work.
+_TRAILER_STATUSES = (*_OPEN_STATUSES, "blocked")
+#: How `cited_sources` names a `Closes:` trailer citation; `trailer_cited` reads it back.
+TRAILER_SOURCE = "Closes trailer of commit "
 
 
 def summary_ids(body: str, names) -> tuple[int, ...]:
@@ -371,13 +374,18 @@ def cited_sources(body: str, commits, parents=None) -> dict[int, str]:
         quoted = quoted_lines(text)  # a block an open fence or comment holds is an example
         for number, line in enumerate(block, start=text.count("\n") + 2 - len(block)):
             if number not in quoted and (match := _CLOSES.match(line)):
-                found.setdefault(int(match[1]), f"Closes trailer of commit {sha[:12]}")
+                found.setdefault(int(match[1]), f"{TRAILER_SOURCE}{sha[:12]}")
     for text, where in ((body, "the body"), *((message, f"commit {sha[:12]}") for sha, message in commits)):
         quoted = quoted_lines(text)
         for number, line in enumerate(text.split("\n"), start=1):
             if number not in quoted and (match := _REVIEW_FIX.match(line.rstrip("\r"))):
                 found.setdefault(int(match[1]), f"review fix line in {where}")
     return found
+
+
+def trailer_cited(sources: dict[int, str]) -> set[int]:
+    """Of `cited_sources`' answer, the ids a `Closes:` trailer cites; trailers are read first, so they win."""
+    return {number for number, source in sources.items() if source.startswith(TRAILER_SOURCE)}
 
 
 def cited_ids(body: str, commits, parents=None) -> tuple[int, ...]:
@@ -424,12 +432,14 @@ def _left(connection, item: int, body: str, named, numbers, branch: str) -> set[
     return referenced_ids(body) | {item, *named} | build.left(connection, branch, numbers)
 
 
-def open_cited(connection, item: int, repo: str, cited, named, body: str, branch: str = "") -> tuple[int, ...]:
+def open_cited(connection, item: int, repo: str, cited, named, body: str, branch: str = "",
+               trailers=()) -> tuple[int, ...]:
     """Of `cited`, the items a merge of `item` should close beyond `named`, its later `--item` list (sd:5999).
 
     An item counts when it belongs to `repo`, is a kind a merge closes, and
-    is open or blocked; a blocked one waits on the commit that cites it
-    (sd:9918). A `Refs:` line of `body` keeps one open, as does the data
+    is open, or blocked and in `trailers`, the ids a `Closes:` trailer
+    cites: a parked item waits on the commit that closes it (sd:9918).
+    A `Refs:` line of `body` keeps one open, as does the data
     `_left` reads.
     """
     left = _left(connection, item, body, named, cited, branch)
@@ -439,7 +449,8 @@ def open_cited(connection, item: int, repo: str, cited, named, body: str, branch
             continue
         row = connection.execute("SELECT repo, kind, status FROM item WHERE id = ?", (number,)).fetchone()
         if row is not None and row["repo"] == repo and row["kind"] in _CLOSABLE_KINDS \
-                and row["status"] in _CITED_STATUSES:
+                and (row["status"] in _OPEN_STATUSES
+                     or number in trailers and row["status"] in _TRAILER_STATUSES):
             kept.append(number)
     return tuple(kept)
 

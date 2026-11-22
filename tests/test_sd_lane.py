@@ -2985,6 +2985,21 @@ class CitedCloses(SharedQueue):
         entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
         self.assertEqual(sorted(entry["closes"]), sorted([a, b]))
 
+    def test_a_review_fix_line_closes_no_blocked_item(self) -> None:
+        """Lane review of sd:9918: only a `Closes:` trailer closes a parked item; a review fix line in the body or a
+        commit message names one, and the merge would mark unrelated parked work done."""
+        import sd_db
+        a, b, *_ = self.open
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            connection.executemany("UPDATE item SET status = 'blocked' WHERE id = ?", [(a,), (b,)])
+            connection.commit()
+        finally:
+            connection.close()
+        entry = self.enqueue(f"## Summary\n\nWords.\n\nLane review fix, pack sd:{a}: x.\n",
+                             f"fix: a review fix\n\nLane review fix, pack sd:{b}: y.")
+        self.assertEqual((entry["closes"], "cited" in entry), ([], False))
+
     def test_a_cited_close_a_teammate_run_holds_is_refused_before_any_push(self) -> None:
         """pack sd:7221: a cited close is delivered too, and the cited set is known only before the push."""
         import sd_db
