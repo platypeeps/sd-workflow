@@ -3422,6 +3422,66 @@ class CitedCloses(SharedQueue):
         self.assertEqual([prepare[i + 1] for i, part in enumerate(prepare) if part == "--item"],
                          [str(self.own), str(a), str(b), str(e)])
 
+    def test_a_blocked_item_a_merged_branch_cites_is_refused_until_named(self) -> None:
+        """sd:9918: a bundle merged another build branch whose commits cite parked items; the merge left them open,
+        unseen. A blocked item may be blocked for a reason the commit does not settle (lane review), so enqueue
+        closes none on its own: it refuses with the list, and `--item` closes one or a `Refs:` line keeps it."""
+        import sd_db
+        a, b, *_ = self.open
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            connection.execute("UPDATE item SET status = 'blocked' WHERE id = ?", (a,))
+            connection.commit()
+        finally:
+            connection.close()
+        tree, _ = self.committed("topic-carried")
+        git(tree, "switch", "-q", "-c", "carried")
+        (tree / "carried.txt").write_text("carried\n", encoding="utf-8")
+        git(tree, "add", "carried.txt")
+        git(tree, "commit", "-q", "-m", f"fix: parked work\n\nCloses: sd:{a}")
+        git(tree, "switch", "-q", "topic-carried")
+        git(tree, "commit", "-q", "--allow-empty", "-m", f"fix: own work\n\nCloses: sd:{b}")
+        git(tree, "merge", "-q", "--no-ff", "--no-edit", "carried")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        before = len(self.entries())
+        with self.assertRaises(sd_lane.LaneError) as refused:
+            sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(refused.exception.code, "cited_blocked")
+        self.assertIn(f"sd:{a}", str(refused.exception))
+        self.assertEqual((len(self.entries()), "push" in self.git_verbs), (before, False))
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver",
+                                      closes=(a,))
+        self.assertEqual(sorted(entry["closes"]), sorted([a, b]), "a named blocked item closes")
+
+    def test_a_review_fix_line_closes_no_blocked_item(self) -> None:
+        """Lane review of sd:9918: only a `Closes:` trailer closes a parked item; a review fix line in the body or a
+        commit message names one, and the merge would mark unrelated parked work done."""
+        import sd_db
+        a, b, *_ = self.open
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            connection.executemany("UPDATE item SET status = 'blocked' WHERE id = ?", [(a,), (b,)])
+            connection.commit()
+        finally:
+            connection.close()
+        entry = self.enqueue(f"## Summary\n\nWords.\n\nLane review fix, pack sd:{a}: x.\n",
+                             f"fix: a review fix\n\nLane review fix, pack sd:{b}: y.")
+        self.assertEqual((entry["closes"], "cited" in entry), ([], False))
+
+    def test_a_refs_line_keeps_a_cited_blocked_item_open(self) -> None:
+        """Lane review of sd:9918: the operator blocked a task after its commit, as a followup remains; a `Refs:`
+        line leaves it blocked and the enqueue goes on."""
+        import sd_db
+        a, b, *_ = self.open
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            connection.execute("UPDATE item SET status = 'blocked' WHERE id = ?", (a,))
+            connection.commit()
+        finally:
+            connection.close()
+        entry = self.enqueue(f"Words.\n\nRefs: sd:{a}\n", f"fix: part\n\nCloses: sd:{a}", f"fix: rest\n\nCloses: sd:{b}")
+        self.assertEqual(entry["closes"], [b])
+
     def test_a_cited_close_a_teammate_run_holds_is_refused_before_any_push(self) -> None:
         """pack sd:7221: a cited close is delivered too, and the cited set is known only before the push."""
         import sd_db
