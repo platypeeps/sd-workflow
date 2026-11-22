@@ -62,7 +62,8 @@ class OwnedLine:
 
 #: A fence that opens or closes a fenced code block: up to three spaces, then
 #: three or more backticks or tildes (CommonMark).
-_FENCE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
+#: Any indent: a fence nested in a list item sits four or more spaces in (pack sd:9666).
+_FENCE_RE = re.compile(r"^[ \t]*(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
 
 
 def quoted_lines(body: str, comments: bool = True) -> set[int]:
@@ -333,23 +334,30 @@ def _listed_undone(message: str) -> list[str]:
 
     A list item that opens with a sha, under a heading such as `Reverted
     commits:`. A heading is a line that ends with a colon, bare, indented or
-    itself a list item, or any line at column zero that is no list item;
-    the nearest one above an item decides. An item under any other heading
-    (`Kept commits:`), or inside a fence or an HTML comment, names a commit
-    the revert did not undo.
+    itself a list item, or any line at column zero that is no list item.
+    A list-item heading holds the items indented past it; any other holds
+    those at or past its indent, until a heading at its indent or less.
+    The innermost heading that holds an item decides. An item under any
+    other heading (`Kept commits:`), or inside a fence or an HTML comment,
+    names a commit the revert did not undo.
     """
-    quoted, intro, found = quoted_lines(message), "", []
+    quoted, headings, found = quoted_lines(message), [], []  # headings: (indent, is an item, text)
     for number, line in enumerate(message.split("\n"), start=1):
-        line = line.rstrip("\r")
+        line = line.rstrip("\r").expandtabs(4)
         if number in quoted or not line.strip():
             continue
+        indent = len(line) - len(line.lstrip())
         item = _BULLET.match(line)
         text = (item[1] if item else line).strip()
         if item and (sha := _SHA_LED.match(text)):
-            if _REVERTED_INTRO.search(intro):
+            while headings and (headings[-1][0] > indent or (headings[-1][0] == indent and headings[-1][1])):
+                headings.pop()  # the item dedented out of that heading's list
+            if headings and _REVERTED_INTRO.search(headings[-1][2]):
                 found.append(sha[1])
-        elif text.endswith(":") or not (item or line[0].isspace()):  # an indented line continues an item
-            intro = text
+        elif text.endswith(":") or not (item or indent):  # an indented line continues an item
+            while headings and headings[-1][0] >= indent:
+                headings.pop()
+            headings.append((indent, bool(item), text))
     return found
 
 
