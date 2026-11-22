@@ -17,6 +17,7 @@ from pathlib import Path, PurePosixPath
 
 from . import paths
 from .database import transaction
+from .reads import KEPT_FOLLOWUPS
 from .repos import same_remote
 from .shadow_sync import read_watermark
 from .workflow import WorkflowError, _checked_state, _text, item_state
@@ -435,6 +436,11 @@ def _complete_delivery(connection: sqlite3.Connection, item: int, revision: str,
                                 "at": current_time(), "who": who, **evidence}
         if waived:
             fields["completion"]["waived"] = waived
+        # sd:9869: a delivery answers none of the item's followups, so Today keeps each open one,
+        # read from `fields` as `workflow.change_status` writes it for a task.
+        kept = [note["id"] for note in state["notes"] if note["kind"] == "followup" and not note["resolved_at"]]
+        if kept:
+            fields[KEPT_FOLLOWUPS] = kept
         set_item_fields(connection, item, fields=fields, shipped_at=evidence["shipped_at"])
         _transition(connection, item, "done", who=who,
                     reason=f"delivered at {evidence['commit']} on {evidence['verified_ref']}{waived_suffix(waived or [])}")
