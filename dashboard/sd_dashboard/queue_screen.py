@@ -743,8 +743,8 @@ def move(payload: dict):
 
 
 #: sd:9966 review round 3: what a failed `lane retry` after a recorded rebuttal adds to its answer.
-KEPT = ("The rebuttal is recorded: a later `sd-ship lane retry` reuses it and clears the review, as Reject and "
-        "enqueue pressed again does.")
+KEPT = ("The rebuttal is recorded: a later `sd-ship lane retry` reuses it and clears the review; Reject and enqueue "
+        "refuses a review that holds it.")
 
 
 def rebutted(retry):
@@ -768,7 +768,7 @@ def rebut(entry: dict | None, lane: Path, head: str, reason: str, shown: str) ->
     """sd:9966: Reject and enqueue's first step. Record a rebuttal, `reason`, of each blocking finding the lane's
     review raised on `entry` at `head`, through `sd-ship adjudicate` in its worktree; `lane retry` then reuses that
     review and clears it. Raises ValueError when nothing was written; returns why when a write may have landed.
-    Pressed twice, the second records the same rebuttals again, which a retry reads as the first.
+    Pressed twice, the second refuses: the first one's rebuttals are recorded dispositions, never replaced here.
 
     `shown` is the review key the page's row showed (`review_of`): a newer prepare log, or a review run again at
     the same head since, names other findings, and the reason given for the shown ones rebuts none of them."""
@@ -796,6 +796,12 @@ def rebut(entry: dict | None, lane: Path, head: str, reason: str, shown: str) ->
     if not (template.get("exit") == 0 and isinstance(proposal, dict) and isinstance(proposal.get("findings"), list)
             and all(isinstance(row, dict) for row in proposal["findings"])):
         raise ValueError(f"sd-ship adjudicate gave no findings to rebut: {template.get('error') or 'no template'}")
+    if "recorded_revision" not in template:
+        raise ValueError("sd-ship adjudicate does not say whether this review holds dispositions; update sd-ship.")
+    if template["recorded_revision"] is not None:  # the CLI's reasons or parked risks: a filled template replaces them
+        raise workflow.StaleItem(f"sd:{entry.get('item')}'s review holds dispositions recorded since the lane's run; "
+                                 f"Reject would replace them. Queue it with `sd-ship lane retry {entry.get('item')} "
+                                 f"--expected-head {head}`.")
     if [row.get("finding_digest") for row in proposal["findings"]] != digests:
         raise workflow.StaleItem(f"sd:{entry.get('item')}'s review at {seen[:12]} ran again since the lane's run; its "
                                  "findings are not the ones the page showed. Read it again, then retry.")

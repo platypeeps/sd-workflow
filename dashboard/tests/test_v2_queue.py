@@ -58,7 +58,7 @@ case "$*" in
   *" adjudicate "*) case "$*" in
        *--dispositions-file*) if [ -n "$QUEUE_REFUSE" ]; then printf '{"ok": false, "error": "%s"}\\n' "$QUEUE_REFUSE"; exit 3; fi
          eval "f=\\${$#}"; cp "$f" "$QUEUE_LOG.dispositions"; printf '{"ok": true, "phase": "disposition_recorded"}\\n' ;;
-       *) printf '{"ok": true, "phase": "disposition_template", "proposal": {"schema_version": 1, "bindings": {"head": "h"}, "findings": [{"index": 1, "finding_digest": "%s", "raw_finding": {"summary": "wrong"}, "response_disposition": "rebutted|parked", "reason": ""}]}}\\n' "${QUEUE_DIGEST:-f1}" ;;
+       *) printf '{"ok": true, "phase": "disposition_template", "proposal": {"schema_version": 1, "bindings": {"head": "h"}, "findings": [{"index": 1, "finding_digest": "%s", "raw_finding": {"summary": "wrong"}, "response_disposition": "rebutted|parked", "reason": ""}]}%s}\\n' "${QUEUE_DIGEST:-f1}" "${QUEUE_OLD_TEMPLATE-, \\"recorded_revision\\": ${QUEUE_RECORDED:-null}}" ;;
      esac ;;
   "gate status --json") printf '{"slots": 4, "holders": [{"slot": 1}], "waiters": [], "load": [1, 2, 3]}\\n' ;;
   *) if [ -n "$QUEUE_SLEEP" ]; then exec sleep "$QUEUE_SLEEP"; fi
@@ -899,6 +899,34 @@ class TheMove(Lane, BrowserSession):
                 self.assertEqual((status, answer.get("rebutted")), (code, True), answer)
                 self.assertIn("rebuttal is recorded", answer["error"])
                 Path(f"{self.log}.dispositions").unlink()
+
+    def test_reject_refuses_a_review_that_already_holds_dispositions(self):
+        """sd:9966 class pass: the operator adjudicated through the CLI with reasons of their own or a parked risk
+        after the lane's run; the log still shows the review, and a filled template would replace each one."""
+        self.failed()
+        with mock.patch.dict(os.environ, {"QUEUE_RECORDED": "7"}):
+            status, _, answer = self.reject()
+        self.assertEqual(status, 409, answer)
+        self.assertIn("lane retry", answer["error"])
+        self.assertFalse(Path(f"{self.log}.dispositions").exists())
+        self.assertNotIn("--dispositions-file", [word for call in self.calls() for word in call])
+        self.assertNotIn("retry", [word for call in self.calls() for word in call])
+
+    def test_reject_refuses_a_template_that_cannot_say_what_it_would_replace(self):
+        """sd:9966 class pass: an sd-ship whose template names no `recorded_revision` cannot rule out a loss."""
+        self.failed()
+        with mock.patch.dict(os.environ, {"QUEUE_OLD_TEMPLATE": ""}):
+            status, _, answer = self.reject()
+        self.assertEqual(status, 400, answer)
+        self.assertNotIn("--dispositions-file", [word for call in self.calls() for word in call])
+
+    def test_a_kept_rebuttal_points_at_lane_retry_not_another_reject(self):
+        """sd:9966 class pass: a second Reject now refuses the review the first one adjudicated."""
+        self.failed()
+        with mock.patch.dict(os.environ, {"QUEUE_RETRY_REFUSE": "cannot publish the branch"}):
+            _, _, answer = self.reject()
+        self.assertIn("lane retry", answer["error"])
+        self.assertNotIn("pressed again", answer["error"])
 
     def test_a_refused_adjudication_queues_nothing(self):
         self.failed()

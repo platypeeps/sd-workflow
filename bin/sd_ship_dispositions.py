@@ -187,7 +187,11 @@ def adjudicate(operation: Any) -> dict:
     if args.dispositions_file is None:
         proposal = {"schema_version": 1, "bindings": bindings,
                     "findings": [dict(row, response_disposition="|".join(DISPOSITIONS), reason="") for row in rows]}
-        return operation.result("disposition_template", proposal=proposal)
+        # sd:9966: the dispositions this review already holds, which a filled template replaces whole.
+        revision, value = operation.store.read(operation.connection, key(operation))
+        held = (revision and value.get("decision") == "accepted"
+                and digest((value.get("proposal") or {}).get("bindings")) == digest(bindings))
+        return operation.result("disposition_template", proposal=proposal, recorded_revision=revision if held else None)
     try:
         proposal = json.loads(read_file(args.dispositions_file, MAX_PROPOSAL_BYTES), object_pairs_hook=unique_object)
     except (ValueError, RecursionError):

@@ -104,6 +104,14 @@ class DispositionTests(unittest.TestCase):
         self.assertEqual(caught.exception.details["finding_digests"], [row["finding_digest"] for row in template])
         self.assertTrue(template)
 
+    def test_the_template_names_the_dispositions_this_review_already_holds(self):
+        """sd:9966 class pass: a filled template replaces every recorded disposition, so the template says
+        whether this review holds some; Reject and enqueue refuses rather than replace them."""
+        self.blocked()
+        self.assertIsNone(json.loads(self.command().stdout)["recorded_revision"])
+        self.accepted()
+        self.assertIsNotNone(json.loads(self.command().stdout)["recorded_revision"])
+
     def test_the_command_a_blocking_refusal_names_prints_each_finding_whole(self):
         """sd:2102. `next_action` is only useful if the command it names runs and shows the findings."""
         self.blocked()
