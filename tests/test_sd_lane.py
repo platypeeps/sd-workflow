@@ -1635,11 +1635,17 @@ class Train(Trees):
         self.third = self.branch("third", {"three.txt": "3\n"})
         self.trains: list[tuple[pathlib.Path, str, str]] = []
         self.answer: dict = {}
+        self.hold_train = False
+        self.events.update({name: threading.Event() for name in ("prepare 2", "train done")})
 
     def gate(self, root: pathlib.Path, head: str, base: str) -> dict:
         if threading.current_thread().name.startswith("sd-lane-train-"):
             self.trains.append((root, head, base))
             self.seen["prepare 1 ran beside the train gate"] = self.events["landed"].wait(10)
+            if self.hold_train:  # the conflict repro: the train gate ends only once sd:2 prepares, or after 5 s
+                self.seen["sd:2 prepared beside sd:3's gate"] = self.events["prepare 2"].wait(5)
+                time.sleep(0.5)
+                self.events["train done"].set()
         else:
             self.gates.append((root, head, base))
         red = "red.txt" in self.files(head)
@@ -1649,6 +1655,10 @@ class Train(Trees):
     def ship(self, argv: list[str], log: pathlib.Path) -> dict:
         if (argv[2], argv[argv.index("--item") + 1]) == ("prepare", "1"):
             self.events["landed"].set()
+        if (argv[2], argv[argv.index("--item") + 1]) == ("prepare", "2"):
+            self.events["prepare 2"].set()
+        if (argv[2], argv[argv.index("--item") + 1]) == ("prepare", "3"):
+            self.seen["train gate done before prepare 3"] = self.events["train done"].is_set()
         return super().ship(argv, log)
 
     def queue_three(self) -> None:
@@ -1708,6 +1718,29 @@ class Train(Trees):
         entries = self.entries()
         self.assertEqual(entries[1]["train"]["status"], "dropped")
         self.assertIn("it conflicts with", entries[1]["train"]["reason"])
+
+    def test_a_dropped_entry_still_first_is_claimed_beside_the_top_gate(self) -> None:
+        """Lane round 3 of sd:9899: with sd:2 dropped, sd:1's settlement waited for sd:3's gate.
+
+        sd:3 is gated on sd:1 alone; sd:2 is the next claim, so the runner claims it at once.
+        """
+        self.commit_files(self.second, {"one.txt": "not 1\n"}, "conflicts with first")
+        self.hold_train = True
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertEqual(self.trains[0][0], self.third)
+        self.assertTrue(self.seen["sd:2 prepared beside sd:3's gate"])
+
+    def test_a_dropped_entry_that_fails_leaves_the_top_its_gate(self) -> None:
+        """Lane round 3 of sd:9899: once sd:2 fails, sd:3's gate on sd:1 alone is the landing, so it is waited for."""
+        self.commit_files(self.second, {"one.txt": "not 1\n"}, "conflicts with first")
+        self.answers[(2, "prepare")] = {"ok": False, "workflow": {"blocker": {"code": "gate_failed",
+                                                                              "reason": "sd-check failed"}}}
+        self.hold_train = True
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertEqual([entry["status"] for entry in self.entries()], ["merged", "failed", "merged"])
+        self.assertTrue(self.seen["train gate done before prepare 3"])
 
     def test_the_stack_is_built_before_the_train_thread_starts(self) -> None:
         """Review of sd:9899: git work inside the thread ran on past a TERM or the deadline."""

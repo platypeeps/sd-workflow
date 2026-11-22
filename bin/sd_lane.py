@@ -4223,7 +4223,7 @@ def run_lane(root: pathlib.Path, environ: dict[str, str], ship: Ship = default_s
                     if stopped is not None:
                         answer["stopped"] = stopped
                         break
-                    settle_gates(gates, entry, row, deadline)
+                    settle_gates(gates, entry, row, deadline, queue)
                 answer = finish_speculation(gates, answer, deadline)
             except BaseException:  # a SIGTERM among them: no speculative gate outlives the run (sd:5776)
                 for held in gates:
@@ -4258,22 +4258,47 @@ def next_claim(queue: Queue, environ: dict[str, str], deadline: float,
 
 
 def settle_gates(gates: list[SpeculativeGate], entry: dict[str, Any], row: dict[str, Any] | None,
-                 deadline: float) -> None:
-    """After `entry` ends: wait for the next entry's gate once it merged, else cancel each gate its landing fed.
+                 deadline: float, queue: Queue | None = None) -> None:
+    """After `entry` ends: wait for the next claim's gate, and cancel each gate a failed landing fed.
 
     The next prepare reads the receipt of the gate that predicted `entry`
-    last; a gate two ahead runs on. An entry that did not merge makes every
-    prediction through it wrong, so those gates end and leave `gates`, and
-    the next claim gates their entries again (pack sd:7412).
+    last, so the runner waits for it when its entry is the next claim;
+    a gate farther ahead runs on beside that claim, as a train's top does
+    past a dropped member still first (sd:9899). Should that member fail,
+    the top's gate is the landing after all, so it is waited for then.
+    An entry that did not merge makes every prediction through it wrong,
+    so those gates end and leave `gates`, and the next claim gates their
+    entries again (pack sd:7412). A queue that cannot be read waits as
+    before trains.
     """
     merged = row is not None and row.get("status") == "merged"
+    up = next_up(queue)
+    for held in [held for held in gates if entry["id"] not in held.chain]:
+        if not merged and up == held.follower[0]:
+            held.join(remaining(deadline, PREPARE_SECONDS))
     for held in [held for held in gates if entry["id"] in held.chain]:
         if merged and held.chain[-1] == entry["id"]:
-            held.join(remaining(deadline, PREPARE_SECONDS))
+            if up in (UNREAD, held.follower[0]):
+                held.join(remaining(deadline, PREPARE_SECONDS))
         elif not merged:
             held.why = f"sd:{entry['item']} did not merge, so the landing this gate predicted will not happen"
             if not held.is_alive() or held.cancel_gate():
                 gates.remove(held)
+
+
+#: `next_up` when the queue cannot be read.
+UNREAD = object()
+
+
+def next_up(queue: Queue | None) -> object:
+    """The id of the entry the runner claims next, None for none, or `UNREAD`."""
+    try:
+        rows = read_queue(queue) if queue is not None else None
+    except LaneError:
+        rows = None
+    if rows is None:
+        return UNREAD
+    return next((row["id"] for row in rows if runnable(row)), None)
 
 
 def finish_speculation(gates: list[SpeculativeGate], answer: dict[str, Any],

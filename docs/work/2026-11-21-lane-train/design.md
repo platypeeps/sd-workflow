@@ -87,6 +87,9 @@ together, which needs one push of main (below).
 | 4 train gate | none | gate raises | top marked error; it ships alone | gate_top |
 | 4 train gate | none | member below does not merge, TERM, deadline | gate cancelled | settle_gates, cancel_gate |
 | 4 train gate | none | slow gate | prepare runs beside it | test_the_claimed_entry_prepares_beside_the_train_gate |
+| 5 settle | none | a dropped member is still first | it is claimed beside the top's gate | test_a_dropped_entry_still_first_is_claimed_beside_the_top_gate |
+| 5 settle | none | the dropped member fails | the top's gate is waited for | test_a_dropped_entry_that_fails_leaves_the_top_its_gate |
+| 5 settle | none | queue read fails | the runner waits as before trains | settle_gates |
 | 5 lower member | its own receipt | A fails alone, A+B passes | A gates its own tree | test_the_top_is_gated_on_the_landings_below_it_and_nothing_twice |
 | config | none | sd.lane_train invalid | reads 3 | test_lane_train_reads_the_machine_setting |
 ```
