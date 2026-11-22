@@ -371,6 +371,15 @@ def _git(tree: Path, *args: str) -> str | None:
 CATCH_UP_LINKS = 14
 
 
+def _here(entry: dict) -> Path | None:
+    """The entry's worktree when it is on this host: enqueued here and still a folder. None for another host's,
+    which the lane host ran in a lane worktree of its own and removed (sd:3283), or one gone."""
+    from sd_db.ship import this_host
+
+    tree = Path(str(entry.get("worktree") or ""))
+    return tree if entry.get("worktree") and entry.get("enqueued_on") == this_host() and tree.is_dir() else None
+
+
 def _unchanged(entry: dict) -> bool | None:
     """pack sd:8584: whether the entry's worktree still holds the head it ended at, or a chain of merges on it, the
     shape of prepare's catch-up. None when not read here: another host's worktree, one gone or on another branch,
@@ -379,10 +388,8 @@ def _unchanged(entry: dict) -> bool | None:
     One local git read under `GIT_SECONDS`: rows() runs on every page read. It never asks `sd_lane.at_head`, which
     reads origin and writes merge objects into the worktree (round 1). So a merge that is not a clean catch-up reads
     as unchanged here; `lane retry` makes the full check and refuses it `HEAD_MOVED`."""
-    from sd_db.ship import this_host
-
-    head, branch, tree = entry.get("expected_head"), entry.get("branch"), Path(str(entry.get("worktree") or ""))
-    if not (head and branch and entry.get("worktree") and entry.get("enqueued_on") == this_host() and tree.is_dir()):
+    head, branch, tree = entry.get("expected_head"), entry.get("branch"), _here(entry)
+    if not (head and branch and tree):
         return None
     if _git(tree, "branch", "--show-current") != branch:
         return None
@@ -483,7 +490,7 @@ def rows(entries: list[dict], *, path: str, lane: Path, now: float, done: frozen
                 # The log of the step that failed: a merge failure's prepare log is of a prepare that passed (sd:8601).
                 log = entry.get("merge_log" if entry.get("step") == "merge" else "prepare_log")
                 failed = {"branch": entry.get("branch"), "unchanged": _unchanged(entry), "failure": _failure(entry, lane),
-                          "log": str(log or "") or None, "review": (review_of(_answer(entry, lane)) or [None])[-1]
+                          "log": str(log or "") or None, "review": ((review_of(_answer(entry, lane)) if _here(entry) else None) or [None])[-1]
                           } if status == "failed" else {}
                 blocked.append({**base, "state": "blocked", "status": status, "step": entry.get("step"),
                                 "reason": reason, "who": who, "finished": entry.get("finished_at"),
@@ -693,6 +700,12 @@ def move(payload: dict):
                             values["reason"].strip(), values["review"])
             if unknown:
                 return 502, {"error": unknown, "outcome": "unknown"}
+            return rebutted(lambda: run(path, item, action, entries))
+        return run(path, item, action, entries)
+
+    def run(path, item, action, entries):
+        from sd_db import workflow
+
         verb = (["move", item, action] if action in ("up", "down", "top")
                 else ["retry", item, "--expected-head", values["head"]] if again
                 else ["cancel", item, "--expected-claim", values["claim"]] if reclaim else [action, item])
@@ -718,6 +731,28 @@ def move(payload: dict):
     return write
 
 
+#: sd:9966 review round 3: what a failed `lane retry` after a recorded rebuttal adds to its answer.
+KEPT = ("The rebuttal is recorded: a later `sd-ship lane retry` reuses it and clears the review, as Reject and "
+        "enqueue pressed again does.")
+
+
+def rebutted(retry):
+    """`retry()`, Reject and enqueue's second step, after `rebut` recorded its rebuttals: a refusal, a stale head
+    or an unknown outcome keeps them, so its answer says so (`rebutted`) rather than reading as nothing done."""
+    from sd_db import workflow
+
+    try:
+        answer = retry()
+    except workflow.StaleItem as error:
+        return 409, {"error": f"{error} {KEPT}", "reload": True, "rebutted": True}
+    except ValueError as error:
+        return 400, {"error": f"{error} {KEPT}", "rebutted": True}
+    if isinstance(answer, tuple):
+        status, said = answer
+        return status, {**said, "error": f"{said.get('error')} {KEPT}", "rebutted": True}
+    return answer
+
+
 def rebut(entry: dict | None, lane: Path, head: str, reason: str, shown: str) -> str | None:
     """sd:9966: Reject and enqueue's first step. Record a rebuttal, `reason`, of each blocking finding the lane's
     review raised on `entry` at `head`, through `sd-ship adjudicate` in its worktree; `lane retry` then reuses that
@@ -728,9 +763,11 @@ def rebut(entry: dict | None, lane: Path, head: str, reason: str, shown: str) ->
     the same head since, names other findings, and the reason given for the shown ones rebuts none of them."""
     from sd_db import workflow
 
-    if not (entry and entry.get("status") == "failed" and _logged(entry, lane).get("code") == REVIEW_BLOCKING
-            and entry.get("worktree")):
+    if not (entry and entry.get("status") == "failed" and _logged(entry, lane).get("code") == REVIEW_BLOCKING):
         raise ValueError("Reject and enqueue takes a lane entry whose prepare a review blocked, its log read here.")
+    if _here(entry) is None:  # sd:9966 review round 3
+        raise ValueError(f"sd:{entry.get('item')}'s worktree is on another host ({entry.get('enqueued_on')}) or gone, "
+                         "so adjudicate cannot run in it here; rebut it with sd-ship adjudicate in that worktree.")
     if entry.get("expected_head") != head:
         raise ValueError(f"sd:{entry.get('item')} failed at another head than the page showed. Read it again.")
     # Adjudicate binds the head the review saw, which prepare's catch-up may have moved past the queued `head`;

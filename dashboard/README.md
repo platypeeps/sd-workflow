@@ -225,7 +225,7 @@ On a repository whose `runner_merge` is manual it also offers Approve, `lane ret
 Both pass the head the row showed as `--expected-head`; the verb refuses under the queue's lock an entry that ended at another head since the read.
 Both stay hidden until `sd-ship lane retry --help` names `--expected-head`, so a pack before sd:3268 shows neither.
 A row whose prepare a lane review blocked (`review_blocking`) has Retry off: the same head gets the same review (sd:9966).
-It offers Send to builder (Fix) and Reject and enqueue, which asks for a reason, records it as the rebuttal of each blocker through `sd-ship adjudicate`, then runs `lane retry`.
+It offers Send to builder (Fix) and Reject and enqueue, which asks for a reason, records it as the rebuttal of each blocker through `sd-ship adjudicate` in the worktree, then runs `lane retry`. It is off for an entry another host enqueued: its worktree is not here. A retry that fails after the rebuttal says the rebuttal stands; a later retry reuses it.
 The page sends its revision, which covers the pending order, the holds and each blocked or cancelled entry's head; a queue that changed since the read is refused, and the page reads it again.
 Move, hold, release and cancel pass the lane revision `lane list` prints as `--expected-revision`, so the verb checks it again under the queue's lock.
 Cancel needs it most: `lane cancel` also releases a running entry, so a Cancel on a row the runner claimed since is refused.

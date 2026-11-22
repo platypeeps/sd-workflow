@@ -63,6 +63,7 @@ case "$*" in
   "gate status --json") printf '{"slots": 4, "holders": [{"slot": 1}], "waiters": [], "load": [1, 2, 3]}\\n' ;;
   *) if [ -n "$QUEUE_SLEEP" ]; then exec sleep "$QUEUE_SLEEP"; fi
      if [ -n "$QUEUE_CRASH" ]; then echo "Traceback: $QUEUE_CRASH" >&2; exit 1; fi
+     if [ -n "$QUEUE_RETRY_REFUSE" ]; then printf '{"ok": false, "error": "%s", "code": "%s"}\\n' "$QUEUE_RETRY_REFUSE" "$QUEUE_CODE"; exit 3; fi
      if [ -n "$QUEUE_REFUSE" ]; then printf '{"ok": false, "error": "%s", "code": "%s"}\\n' "$QUEUE_REFUSE" "$QUEUE_CODE"; exit "${QUEUE_EXIT:-3}"; fi
      printf '{"ok": true}\\n' ;;
 esac
@@ -852,6 +853,32 @@ class TheMove(Lane, BrowserSession):
             status, _, _ = self.reject(reason=reason, head=head)
             self.assertEqual(status, 400)
             self.assertEqual([c for c in self.calls() if "adjudicate" in c], [])
+
+    def test_reject_is_off_and_refused_for_a_checkout_another_host_enqueued(self):
+        """sd:9966 review round 3: the hub prepared a satellite's entry in a lane worktree it removed; the entry's
+        worktree is the satellite's, which adjudicate cannot open here."""
+        for extra in ({"enqueued_on": "satellite-1"}, {"worktree": str(self.checkout / "gone")}):
+            with self.subTest(extra=extra):
+                self.assertIsNone(self.failed(**extra)["review"])
+                status, _, answer = self.reject(review="0" * 16)
+                self.assertEqual(status, 400, answer)
+                self.assertIn("another host", answer["error"])
+                self.assertEqual(self.calls(), [["-C", str(self.checkout), "lane", "list"]])
+
+    def test_a_retry_that_fails_after_the_rebuttal_says_the_rebuttal_is_recorded(self):
+        """sd:9966 review round 3: adjudicate recorded the rebuttal, then lane retry refused, met a stale head or
+        gave no answer; each answer says the rebuttal stays and a later retry clears the review with it."""
+        for env, code in (({"QUEUE_RETRY_REFUSE": "cannot publish the branch"}, 400),
+                          ({"QUEUE_RETRY_REFUSE": "moved", "QUEUE_CODE": "stale_head"}, 409),
+                          ({"QUEUE_CRASH": "hub gone"}, 502)):
+            with self.subTest(env=env):
+                self.failed()
+                with mock.patch.dict(os.environ, env):
+                    status, _, answer = self.reject()
+                self.assertTrue(Path(f"{self.log}.dispositions").exists())
+                self.assertEqual((status, answer.get("rebutted")), (code, True), answer)
+                self.assertIn("rebuttal is recorded", answer["error"])
+                Path(f"{self.log}.dispositions").unlink()
 
     def test_a_refused_adjudication_queues_nothing(self):
         self.failed()
@@ -3111,10 +3138,28 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                          [("reject", 14, self.merged, reason, self.failed()["review"])])
         self.assertIn("sd:14 rebutted and queued again", out["R"]["said"])
 
+    def test_a_retry_that_fails_after_the_rebuttal_reads_as_rebutted_not_queued(self):
+        """sd:9966 review round 3: the server recorded the rebuttal, then lane retry failed; the page says the
+        rebuttal stands, not that nothing was done."""
+        self.failed()
+        kept = f"moved. {queue_screen.KEPT}"
+        for status, said in ((409, "sd:14 rebutted, not queued again"),
+                             (502, "sd:14 rebutted; not known whether it was queued again")):
+            with self.subTest(status=status):
+                fields = json.dumps({"repo": str(self.checkout), "item": "14", "act": "reject", "head": self.merged})
+                out = self.run_view(
+                    "window.shell.ask = a => Promise.resolve({ yes: true, values: { reason: 'a.py:1 holds' } });"
+                    f"open('system'); act('button[data-act]', {fields}); await flush(); await flush();"
+                    " R.said = ELS['queue-said'].textContent;",
+                    answers={"/api/queue/move": [status, {"error": kept, "rebutted": True}]})
+                self.assertIn(said, out["R"]["said"])
+                self.assertIn("rebuttal is recorded", out["R"]["said"])
+                self.assertNotIn("not rebutted", out["R"]["said"])
+
     def test_reject_is_off_on_a_row_whose_log_names_no_review(self):
         self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "review_blocking"}}}))
         html = self.run_view("open('system'); R.html = ELS.queue.html;")["R"]["html"]
-        self.assertRegex(html, r'data-act="reject" data-item="14"[^>]*disabled title="its prepare log names no review')
+        self.assertRegex(html, r'data-act="reject" data-item="14"[^>]*disabled title="no review to rebut here')
 
     def test_a_kept_or_empty_reject_posts_nothing(self):
         self.failed()

@@ -377,7 +377,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   const SAME = 'same code, same review: send it to the builder';
   const reviewed = r => !!r && (r.failure || {}).code === 'review_blocking';
   const again = (r, manual) => !QV.lanes.retry ? '' : reviewed(r)
-    ? html`<div class="ctl" role="group" aria-label="Unblock sd:${String(r.item)}"><button class="btn quiet sm" type="button" disabled title="${SAME}" aria-label="Retry sd:${String(r.item)}: ${SAME}">Retry</button>${sb('reject', r, 'Reject and enqueue…', `Reject sd:${r.item}'s review blockers with a reason and queue it again`, r.review ? html` data-head="${r.expected_head}"` : html` disabled title="its prepare log names no review to bind; rebut it with sd-ship adjudicate"`)}</div>`
+    ? html`<div class="ctl" role="group" aria-label="Unblock sd:${String(r.item)}"><button class="btn quiet sm" type="button" disabled title="${SAME}" aria-label="Retry sd:${String(r.item)}: ${SAME}">Retry</button>${sb('reject', r, 'Reject and enqueue…', `Reject sd:${r.item}'s review blockers with a reason and queue it again`, r.review ? html` data-head="${r.expected_head}"` : html` disabled title="no review to rebut here: its prepare log names none, or its worktree is on another host; rebut it with sd-ship adjudicate in that worktree"`)}</div>`
     : html`<div class="ctl" role="group" aria-label="Unblock sd:${String(r.item)}">${sb('retry', r, r.unchanged === true ? 'Retry…' : 'Retry', `Retry sd:${r.item}: queue it again at the same head`, html` data-head="${r.expected_head}"`)}${manual ? sb('approve', r, 'Approve…', `Approve sd:${r.item}: queue it again with the merge granted`, html` data-head="${r.expected_head}"`) : ''}</div>`;
   // pack sd:8584: a failed entry's Fix sends the lane's finding to the build run that enqueued its branch; off says why.
   // pack sd:9705: a Fix press's outcome shows on its own row: busy while it posts, then sent or why not.
@@ -754,6 +754,9 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     const after = err.stale ? `${why.replace(/\s*Read it again, then retry\.$/, '')} ${again}`
       : known ? `${why} The queue is unchanged.`
       : `${why} The lane was ${read ? '' : 'not '}read again; check sd:${item} there before you act again.`;
+    // sd:9966: Reject's rebuttal was recorded before its retry failed; only the queueing is not done.
+    if (action === 'reject' && err.answer && err.answer.rebutted)
+      return { why: after, text: known ? `${repo}: sd:${item} rebutted, not queued again: ${after}` : `${repo}: sd:${item} rebutted; not known whether it was queued again: ${after}` };
     return { why: after, text: known ? `${repo}: sd:${item} not ${DONE[action]}: ${after}` : `${repo}: not known whether sd:${item} was ${DONE[action]}: ${after}` };
   }
   // Cancel, Approve and Release are the writes no verb undoes; each dialog names the entry and the command it runs.
