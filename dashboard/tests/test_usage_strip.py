@@ -369,6 +369,55 @@ class TheStripInTheUsageDropdown(ScreenCase):
         self.assertRegex(menu, r"\bright:\s*0\b")
         self.assertRegex(menu, r"\bwidth:\s*min\(48rem, calc\(100vw - 2 \* var\(--space-md\)\), 100%\)")
 
+    def test_an_active_and_an_inactive_row_put_their_first_data_column_at_one_x(self):
+        """sd:9792: a word beside the active account widened its row's name column and pushed its windows right.
+        No test here computes layout, so read both halves: the marker is one glyph, named for a reader, and every
+        row takes its columns from the list's one grid (subgrid), so a wider name moves every row's column alike."""
+        row = {"label": "claude operator", "state": "ok", "windows": [], "balance": None, "spend": None,
+               "service": None, "read_at": None}
+        out = run_usage("R.on = usageRow(ANSWER[0]).text; R.off = usageRow(ANSWER[1]).text;",
+                        answer=[{**row, "active": True}, {**row, "active": False}])
+        def name(html):
+            return re.search(r'<span class="nm">(.*?)</span>\s*<span class="ws">', html, re.S).group(1)
+
+        on, off = name(out["R"]["on"]), name(out["R"]["off"])
+
+        def visible(html):
+            return re.sub(r'<span class="sr">.*?</span>|<[^>]+>', "", html)
+
+        self.assertEqual(len(visible(on)) - len(visible(off)), 1, f"the marker is one glyph: {visible(on)!r}")
+        self.assertIn('title="active account"', on)
+        self.assertIn('<span class="sr"> · active account</span>', on)
+        css = re.sub(r"/\*.*?\*/", "", (V2 / "static" / "shell.css").read_text(encoding="utf-8"), flags=re.S)
+        rules = {}
+        for selector, body in re.findall(r"([^{}@]+)\{([^{}]*)\}", css):
+            rules.setdefault(selector.strip(), body)  # the base rule, not the phone's
+        self.assertRegex(rules[".ustrip .urows"], r"display:\s*grid;.*grid-template-columns:\s*minmax\(7rem, max-content\)")
+        self.assertRegex(rules[".ustrip li"], r"grid-column:\s*1 / -1;.*grid-template-columns:\s*subgrid")
+
+    def test_the_open_menu_is_as_tall_as_the_room_below_it_and_scrolls_past_that(self):
+        """sd:9760: the menu stopped at min(70vh, 36rem) and scrolled a list the window had room for. Opened, it may
+        be as tall as the window below its top less a margin; .fpick-menu's overflow-y scrolls a list taller."""
+        body = r"""
+const EL = {};
+['usage-drop', 'usage-menu', 'usage-sum'].forEach(id => { EL[id] = { id, style: {}, dataset: {}, listeners: {},
+  addEventListener(t, f) { this.listeners[t] = f; }, getBoundingClientRect: () => ({ top: 60, bottom: 52 }) }; });
+globalThis.document = { getElementById: id => EL[id] || null };
+globalThis.location = { hash: '' };
+for (const [view, key] of [[1000, 'tall'], [400, 'short']]) {
+  globalThis.innerHeight = view;
+  usageWire(); EL['usage-drop'].open = true; EL['usage-drop'].listeners.toggle(); await flush();
+  R[key] = EL['usage-menu'].style.maxHeight || 'unset';
+}
+"""
+        out = run_usage(body, answer={"rows": [], "nosource": []})
+        # 1000 - 60 - 16: a 700 px list, taller than the old 36rem (576 px) cap, shows whole.
+        self.assertEqual(out["R"]["tall"], "924px")
+        # 400 - 60 - 16: the same list is taller than the room, so it scrolls.
+        self.assertEqual(out["R"]["short"], "324px")
+        css = re.sub(r"/\*.*?\*/", "", (V2 / "static" / "shell.css").read_text(encoding="utf-8"), flags=re.S)
+        self.assertRegex(re.search(r"\.fpick-menu \{([^}]*)\}", css).group(1), r"overflow-y:\s*auto")
+
     def test_the_kiosk_gives_the_usage_summary_read_again_s_touch_size(self):
         """Lead review of 8f483c6: Home's kiosk enlarged #read-again to 4rem but left the Usage summary beside it small."""
         css = re.sub(r"/\*.*?\*/", "", (V2 / "static" / "home.css").read_text(encoding="utf-8"), flags=re.S)
