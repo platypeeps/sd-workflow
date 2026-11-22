@@ -615,8 +615,11 @@ def parked_finding(detail: str | None) -> str:
             + "\n" + REVIEW_CLASS_PASS)
 
 
-def retry_state(connection, run: dict) -> dict:
+def retry_state(connection, run: dict, *, held: bool = False) -> dict:
     """Retry on an ended run: only the lead's latest run, released, whose bundle ended blocked or cancelled.
+
+    `held` True admits a bundle held after a split (`split`): bundle drop checks each commit's citation itself and
+    leaves the earlier work aside, on a fresh branch, so it may salvage one (pack sd:9863).
 
     A bundle blocks on a `blocked` outcome and on a second loss at one step, whose run keeps the loss as its
     outcome (`LOSSES`); the lead assignment's `blocked` status covers both. A `lane_failed` run's bundle ended
@@ -631,7 +634,7 @@ def retry_state(connection, run: dict) -> dict:
         reason = "the run still holds its lease"
     elif current["status"] not in AGAIN:
         reason = f"the bundle ended {current['status']}; Retry takes a blocked or cancelled one"
-    elif split(connection, run["assignment"]) == "held":
+    elif not held and split(connection, run["assignment"]) == "held":
         reason = ("its branch holds work from before a subset Retry; Build its items to build them fresh on a "
                   "new branch")
     return {"assignment": run["assignment"], "revision": current["revision"], "allowed": not reason, "reason": reason,
@@ -740,7 +743,7 @@ def drop_plan(connection, item: int) -> dict:
     lead = row["parent"] or row["id"]
     current = queue_state(connection, lead)
     last = current["run"]
-    state = retry_state(connection, last) if last else {"allowed": False, "reason": "it never ran"}
+    state = retry_state(connection, last, held=True) if last else {"allowed": False, "reason": "it never ran"}
     if not state["allowed"]:
         raise BuildRefused(f"Drop refused: {state['reason']}")
     members = _members(connection, lead, current["status"])
@@ -850,6 +853,9 @@ def drop_writes(connection, plan: dict, *, who: str, note: str, left: str) -> li
         how = DROP_HOW.format(item=plan["item"]) + plan["run"]
         queued = _queue_members(connection, members, items, lead=lead, who=who, finding=note, parked="",
                                 how=how, verb="Drop")
+        # A done lead leaves its bundle and nothing more: there is nothing left to build (pack sd:9863).
+        if _done(items, plan["item"]):
+            return queued
         if items[plan["item"]]["status"] == "blocked":
             transition(connection, plan["item"], "ready", who=who, reason=how)
         unpark(connection, plan["item"])
@@ -859,6 +865,13 @@ def drop_writes(connection, plan: dict, *, who: str, note: str, left: str) -> li
         # and takes a row that counts a run as its own bundle, its lead (`_bundle`). No run row backs the count.
         connection.execute("UPDATE assignment SET run_count = 1 WHERE id = ?", (alone[0]["id"],))
         return queued + [{"id": row["id"], "item": row["item"], "status": row["status"]} for row in alone]
+
+
+def done_items(connection, ids) -> set[int]:
+    """Of `ids`, the items that are done: a commit citing one closes nothing open, so a drop may carry it, as the
+    first drop carried a done member's commits onto the branch a second drop reads (pack sd:9863)."""
+    items = reads.items_by_ids(connection, sorted(ids))
+    return {item for item in items if _done(items, item)}
 
 
 def drop_committed(connection, plan: dict) -> bool:

@@ -375,9 +375,11 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   const again = (r, manual) => !QV.lanes.retry ? '' : html`<div class="ctl" role="group" aria-label="Unblock sd:${String(r.item)}">${sb('retry', r, r.unchanged === true ? 'Retry…' : 'Retry', `Retry sd:${r.item}: queue it again at the same head`, html` data-head="${r.expected_head}"`)}${manual ? sb('approve', r, 'Approve…', `Approve sd:${r.item}: queue it again with the merge granted`, html` data-head="${r.expected_head}"`) : ''}</div>`;
   // pack sd:8584: a failed entry's Fix sends the lane's finding to the build run that enqueued its branch; off says why.
   // pack sd:9705: a Fix press's outcome shows on its own row: busy while it posts, then sent or why not.
-  const QMEND = new Map(); // `${lane}:${item}` -> { busy, ok, text }
+  // `${lane}:${item}:${head}` -> { busy, ok, text }: scoped to the failed head, so a later failure of the item
+  // shows no earlier Fix's word (pack sd:9863).
+  const QMEND = new Map();
   const mendSaid = m => !m ? '' : html` <span class="said" role="${m.ok === false ? 'alert' : 'status'}">${m.text}</span>`;
-  const mendBtn = r => { const m = QMEND.get(`${r.lane}:${r.item}`); return !r.fix ? (m ? html`<div class="ctl">${mendSaid(m)}</div>` : '')
+  const mendBtn = r => { const m = QMEND.get(`${r.lane}:${r.item}:${r.head}`); return !r.fix ? (m ? html`<div class="ctl">${mendSaid(m)}</div>` : '')
     : html`<div class="ctl" role="group" aria-label="Fix sd:${String(r.item)}">${sb('fix', r, m && m.busy ? 'Sending…' : 'Fix…', `Fix sd:${r.item}: send the lane's finding to its builder`, r.fix.allowed ? '' : html` disabled title="${r.fix.reason}"`)}${mendSaid(m)}</div>`; };
   // pack sd:8584: what a failed entry's facts add: whether a commit moved its head since, and what prepare answered.
   const moved = r => r.unchanged === true ? ' · head unchanged since this failure: Retry repeats it unless the failure was transient'
@@ -785,7 +787,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   }
   // Fix (pack sd:8584): Send to builder on the build run that enqueued the entry, its finding the lane's, edited first.
   async function mend(l, item) {
-    const r = l.rows.find(x => x.state === 'blocked' && x.item === item), key = `${l.path}:${item}`;
+    const r = l.rows.find(x => x.state === 'blocked' && x.item === item), key = r && `${l.path}:${item}:${r.head}`;
     if (!r) { qSaid = { ok: false, text: `${l.repo}: sd:${item} is not blocked in this read; nothing sent. Read again.` }; return queueView(); }
     if (!r.fix || !r.fix.allowed) {
       QMEND.set(key, { ok: false, text: `not sent: ${(r.fix && r.fix.reason) || 'no build run enqueued this entry'}` });

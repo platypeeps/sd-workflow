@@ -41,10 +41,11 @@ PREFIX = "~/"
 
 #: What points git at another repository than the one `-C` names: the variables `git rev-parse --local-env-vars`
 #: lists. A hook exports `GIT_DIR` and `GIT_WORK_TREE`, and a child that inherits them reads and writes the hook's
-#: repository and its origin (pack sd:9709, round 26).
+#: repository and its origin (pack sd:9709, round 26). Not `GIT_CONFIG_PARAMETERS` or `GIT_CONFIG_COUNT`, which
+#: git lists too: they carry command-scope config, no location, and the suite's `maintenance.auto=false` rides
+#: them (pack sd:9863).
 GIT_LOCAL = frozenset({
-    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
-    "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
     "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX", "GIT_SHALLOW_FILE",
     "GIT_COMMON_DIR"})
 

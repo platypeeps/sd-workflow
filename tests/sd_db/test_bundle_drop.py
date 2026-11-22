@@ -10,6 +10,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import unittest
 from pathlib import Path
 from unittest import mock
 
@@ -38,7 +39,7 @@ class Repo(Case):
         super().setUp()
         # Every git child, the fixture's and the drop's own, inherits this process's environment: a hook's
         # `GIT_DIR` or `GIT_WORK_TREE` would point them at the operator's repository and its origin (round 25).
-        kept = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        kept = paths.git_env()
         env = mock.patch.dict("os.environ", {**kept, **IDENTITY}, clear=True)
         env.start()
         self.addCleanup(env.stop)
@@ -479,8 +480,8 @@ class DropRound10(Repo):
         old = git(work, "rev-parse", "HEAD")
         real = DROP.split_branch
 
-        def moved(plan, done):
-            real(plan, done)
+        def moved(plan, done, **kwargs):
+            real(plan, done, **kwargs)
             # Planning cancels its assignment; back to ready passes the press's own item check.
             writes.transition(self.db, items[2], "planning", who="operator")
             writes.transition(self.db, items[2], "ready", who="operator")
@@ -616,9 +617,9 @@ class DropRound14(Repo):
         other = self.item(repo=str(self.repo))
         real, taken = DROP.split_branch, list[int]()
 
-        def queued_meanwhile(plan, done):
+        def queued_meanwhile(plan, done, **kwargs):
             taken.extend(row["id"] for row in build.queue(self.db, [other], who="operator"))
-            return real(plan, done)
+            return real(plan, done, **kwargs)
 
         with mock.patch.object(DROP, "split_branch", side_effect=queued_meanwhile):
             queued = DROP.drop_item(self.db, build, items[1], who="operator")
@@ -1007,7 +1008,8 @@ class GitLocation(Repo):
     def test_it_covers_gits_own_list(self):
         listed = set(git(self.repo, "rev-parse", "--local-env-vars").split())
         self.assertTrue(listed)
-        self.assertEqual(listed - paths.GIT_LOCAL, set())
+        # Command-scope config is no location (pack sd:9863).
+        self.assertLessEqual(listed - paths.GIT_LOCAL, {"GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"})
 
 
 class GitPolicy(Repo):
@@ -1029,3 +1031,74 @@ class GitPolicy(Repo):
         self.assertTrue(all(call.kwargs.get("timeout") == DROP.GIT_SECONDS for call in run_git.call_args_list))
         self.assertEqual(git(Path(run["work_path"]), "rev-parse", "HEAD"), old)
         self.unmade(run)
+
+
+class Advisories(Repo):
+    """pack sd:9863: the review advisories on bundle drop (pack sd:9709)."""
+
+    def end(self, run, detail="fixture"):
+        build.write(self.db, run["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START)
+        build.end(self.db, run["id"], "blocked", detail)
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+
+    def test_a_held_split_still_drops(self):
+        """Drop checks every commit's citation itself, so a held split's earlier work stays aside."""
+        items, (lead, second, third), run = self.bundle()
+        build.retry(self.db, lead, who="operator", only=[items[0], items[2]])
+        self.end(self.claim(), f"{build.SPLIT}fixture")
+        self.assertEqual(build.split(self.db, lead), "held")
+        new = self.drop(run, items[2])
+        self.assertEqual(self.files(new), ["README", "a.txt"])
+        self.assertNotIn(f"sd:{items[1]}", self.closes(new))
+
+    def test_a_second_drop_keeps_a_done_members_carried_commit(self):
+        """A done member's commits ride the first drop's branch; a second drop must not read them as foreign."""
+        config = self.root / "config" / "sd-ai-command-pack" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text('{"config": {"sd": {"bundle_max": "4"}}}')
+        items = [self.item(repo=str(self.repo)) for _ in range(4)]
+        build.queue(self.db, items, who="operator")
+        run = self.claim()
+        work = Path(run["work_path"])
+        git(self.repo, "worktree", "add", "-q", "-b", run["branch"], str(work), "origin/main")
+        for index, item in enumerate(items):
+            self.commit(work, f"{index}.txt", f"{index}\n", f"feat: {index}\n\nCloses: sd:{item}")
+        self.end(run)
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[1],))
+        DROP.drop_item(self.db, build, items[3], who="operator")
+        again = self.claim()
+        self.assertEqual([member["item"] for member in build.run(self.db, again["id"])["members"]], [items[0], items[2]])
+        self.end(again)
+        new = self.drop(again, items[2])
+        self.assertEqual(self.files(new), ["0.txt", "1.txt", "README"])
+
+    def test_dropping_a_done_lead_queues_the_kept_items_and_leaves_it_done(self):
+        items, (lead, second, third), run = self.bundle()
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[0],))
+        lead_id = self.next_lead()
+        queued = DROP.drop_item(self.db, build, items[0], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], items[1:])
+        self.assertEqual(queued[0]["id"], lead_id)
+        self.assertEqual(self.db.execute("SELECT status FROM item WHERE id = ?", (items[0],)).fetchone()[0], "done")
+        latest = self.db.execute("SELECT id, status FROM assignment WHERE item = ? AND scope = ? ORDER BY id DESC "
+                                 "LIMIT 1", (items[0], build.SCOPE)).fetchone()
+        self.assertEqual((latest["id"], latest["status"]), (lead, "cancelled"))
+
+    def test_main_moving_a_kept_file_still_drops(self):
+        """The new branch starts at the bundle's fork, so each kept commit applies; the lane merges main."""
+        items, ids, run = self.bundle()
+        self.main_moves("a.txt", "main\n")
+        new = self.drop(run, items[1])
+        self.assertEqual(self.files(new), ["README", "a.txt", "c.txt"])
+        self.assertEqual((new / "a.txt").read_text(), "lead fixed\n")
+        self.assertEqual(git(new, "rev-list", "--count", "HEAD..origin/main"), "1", "main is the lane's to merge")
+
+
+class GitConfigScope(unittest.TestCase):
+    """pack sd:9863: command-scope config is no repository location; the suite's maintenance.auto=false rides it."""
+
+    def test_git_env_keeps_command_scope_config(self):
+        given = {"GIT_DIR": "/elsewhere/.git", "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "maintenance.auto",
+                 "GIT_CONFIG_VALUE_0": "false", "GIT_CONFIG_PARAMETERS": "'gc.auto'='0'", "PATH": "/bin"}
+        kept = paths.git_env(given)
+        self.assertEqual(kept, {key: value for key, value in given.items() if key != "GIT_DIR"})
