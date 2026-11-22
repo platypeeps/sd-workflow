@@ -73,6 +73,10 @@ BEAT_SECONDS = 30
 #: Reviews with blockers before the class pass and park (operator 2026-11-20,
 #: raised from 3: four-round parks re-queued by hand all day).
 REVIEW_ROUNDS = 7
+#: A rate-limited review waits this long, beating, then asks again, up to `RATE_LIMIT_WAITS` times before it
+#: blocks: a quota window passes, and a block parked the item for a manual Retry (sd:9882).
+RATE_LIMIT_WAIT_SECONDS = 900
+RATE_LIMIT_WAITS = 4
 MAX_TURNS = 300
 TITLE_MAX = 63
 #: A read (`git status`, `lane list`) that takes longer is unread.
@@ -1235,7 +1239,8 @@ class Supervisor:
         if refused:
             return self.blocked_round([{"path": "enqueue check", "line": "-", "summary": text} for text in refused])
         answer: dict | None = None
-        for _attempt in range(2):
+        unknown = waits = 0
+        while answer is None and unknown < 2:
             out = self.out("review")
             self.empty(out, "review")
             self.child([*self.tools.review, "-C", str(self.work), "--scope", "branch", "--json"], cwd=self.work,
@@ -1243,6 +1248,16 @@ class Supervisor:
             answer = self.review_answer(out, head)
             if answer is not None:
                 break
+            if not self.rate_limited(out):
+                unknown += 1
+            elif waits < RATE_LIMIT_WAITS:
+                waits += 1
+                self.note(self.lead, f"Build run {self.ident}: the review is rate_limited at {head[:12]}; "
+                                     f"asking again in {RATE_LIMIT_WAIT_SECONDS:g} s ({waits} of {RATE_LIMIT_WAITS})")
+                self.pause(RATE_LIMIT_WAIT_SECONDS)
+            else:
+                return self.finish("blocked", f"the review stayed rate_limited after {waits} waits of "
+                                              f"{RATE_LIMIT_WAIT_SECONDS:g} s at {head[:12]}; see {out}")
         if answer is None:
             return self.finish("blocked", f"the review gave no answer twice at {head[:12]}; see {self.out('review')}")
         if answer["status"] in ("clean", "advisory", "skipped"):
@@ -1805,6 +1820,23 @@ class Supervisor:
 
     def head(self) -> str:
         return _read([*self.tools.git, "-C", str(self.work), "rev-parse", "HEAD"], env=self.env).strip()
+
+    @staticmethod
+    def rate_limited(out: Path) -> bool:
+        """Whether the review's answer is the provider's quota, which a wait outlasts (sd:9882)."""
+        try:
+            answer = json.loads(out.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        return isinstance(answer, dict) and answer.get("status") == "rate_limited"
+
+    def pause(self, seconds: float) -> None:
+        """Wait `seconds`, beating, so the reap keeps the run and a cancel still ends it.
+        ponytail: the run holds its slot while it waits; a not-before column on the queue frees it if that matters."""
+        stop = time.monotonic() + seconds
+        while (left := stop - time.monotonic()) > 0:
+            time.sleep(min(self.beat_seconds, left))
+            self.enter("reviewing")
 
     def review_answer(self, out: Path, head: str) -> dict | None:
         """The review's `status` and blockers, for this head; None for an unknown answer."""

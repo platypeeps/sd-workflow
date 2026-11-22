@@ -68,7 +68,8 @@ SCOPE = "build"
 DRAFT = "draft"
 #: Code-writing builders per machine, the operator's standing rule, and bundles building per repository at once.
 #: One: later items wait and the next bundle takes them (sd:8158); a bundle in the lane frees it (sd:8277).
-#: `REPO_CAP` is the default of the machine setting `sd.repo_cap` (`repo_cap`, sd:9172).
+#: `REPO_CAP` is the default of the machine setting `sd.repo_cap` (`repo_cap`, sd:9172), and `MACHINE_CAP`
+#: of `sd.machine_cap` (`machine_cap`, sd:9891).
 MACHINE_CAP = 6
 REPO_CAP = 1
 #: Items per bundle, so a bundle fits one 120-minute run (lead, note #29482): the default of the machine
@@ -1283,12 +1284,13 @@ def room(connection, *, load: float | None, load_cap: float | None, interactive:
         if repo:
             used[repo] = used.get(repo, 0) + 1
     held = sorted({row["repo"] for row in leases if row["scope"] != SCOPE and (row["exclusive"] or row["quarantine"])})
-    machine = MACHINE_CAP - len(builds) - len(drafts) - len(others)
+    cap = machine_cap()
+    machine = cap - len(builds) - len(drafts) - len(others)
     if not why and isinstance(load, (int, float)) and isinstance(load_cap, (int, float)):
         why = over_load(load, load_cap)
     why = why or rate_hold(connection)
     if not why and machine <= 0:
-        why = f"{MACHINE_CAP - machine} builders run already; the cap is {MACHINE_CAP}"
+        why = f"{cap - machine} builders run already; the cap is {cap}"
     return {"machine": 0 if why else machine, "used": used, "held": held, "why": why}
 
 
@@ -1333,6 +1335,11 @@ def _machine_setting(key: str, pattern: str, default: int, environ: dict[str, st
 def bundle_max(environ: dict[str, str] | None = None) -> int:
     """This machine's `sd.bundle_max`, 1 to 99; `BUNDLE_MAX` when unset (sd:9109)."""
     return _machine_setting("bundle_max", "[1-9][0-9]?", BUNDLE_MAX, environ)
+
+
+def machine_cap(environ: dict[str, str] | None = None) -> int:
+    """This machine's `sd.machine_cap`, builders at once, 1 to 16; `MACHINE_CAP` when unset (sd:9891)."""
+    return _machine_setting("machine_cap", "[1-9]|1[0-6]", MACHINE_CAP, environ)
 
 
 def repo_cap(environ: dict[str, str] | None = None) -> int:

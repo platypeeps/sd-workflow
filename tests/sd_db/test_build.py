@@ -304,6 +304,22 @@ class Claim(Case):
             self.repo_cap(bad)
             self.assertEqual(build.repo_cap(), build.REPO_CAP, f"{bad!r} reads the default")
 
+    def machine_cap(self, value):
+        folder = self.root / "config" / "sd-ai-command-pack"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "config.json").write_text(json.dumps({"config": {"sd": {"machine_cap": value}}}))
+
+    def test_a_machine_cap_setting_sets_builders_per_machine(self):
+        """sd:9891: MACHINE_CAP was one constant; a machine's sd.machine_cap now sets its own, 1 to 16."""
+        self.assertEqual(build.machine_cap(), build.MACHINE_CAP)
+        self.assertEqual(build.room(self.db, **IDLE)["machine"], build.MACHINE_CAP)
+        self.machine_cap("8")
+        self.assertEqual(build.machine_cap(), 8)
+        self.assertEqual(build.room(self.db, **IDLE)["machine"], 8)
+        for bad in ("0", "17", "abc", 8):
+            self.machine_cap(bad)
+            self.assertEqual(build.machine_cap(), build.MACHINE_CAP, f"{bad!r} reads the default")
+
     def test_a_machine_bundle_max_sizes_its_bundles(self):
         """sd:9109: BUNDLE_MAX was one constant; a machine's sd.bundle_max now sets its own bundle size."""
         self.assertEqual(build.bundle_max(), 3)
