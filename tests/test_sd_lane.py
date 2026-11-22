@@ -6613,12 +6613,28 @@ class FailureNotes(SharedQueue):
             [(body, session)] = connection.execute("SELECT body, session FROM note WHERE item = ? AND kind = "
                                                    "'followup'", (item,)).fetchall()
             sd_db.add_note(connection, item, "followup", body)
-            sessions = [found[0] for found in connection.execute(
-                "SELECT session FROM note WHERE item = ? AND kind = 'followup' ORDER BY id", (item,))]
+            written = connection.execute(
+                "SELECT session, body FROM note WHERE item = ? AND kind = 'followup' ORDER BY id", (item,)).fetchall()
         finally:
             connection.close()
         self.assertIn("at an unrecorde", body)
-        self.assertEqual([sd_lane.lane_note(found) for found in sessions], [True, False])
+        self.assertEqual([sd_lane.lane_note(*found) for found in written], [True, False])
+
+    def test_a_passing_run_leaves_the_lanes_post_merge_and_release_followups_open(self) -> None:
+        """build/sd-1423 review: `default_note` also writes `Post-merge:` and `Release:` followups as the lane;
+        a later pass answers neither, so only `note_ended`'s blockers resolve."""
+        import sd_db
+        items = self.register_items(1)
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            kept = {sd_db.add_note(connection, items[0], "followup", body, session=sd_lane.LANE_SESSION): False
+                    for body in ("Post-merge: make deploy failed", "Release: the tag push was refused")}
+        finally:
+            connection.close()
+        sd_lane.enqueue_entry(self.feature, items[0], "fix: one", self.body, self.environ, claim="deliver")
+        sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertIn(self.entries()[0]["status"], sd_lane.GATE_PASSED)
+        self.assertEqual(self.resolved(dict.fromkeys(kept)), kept)
 
     def test_a_passing_run_resolves_only_the_lanes_open_followups(self) -> None:
         """Failure table S2 session resolves: a later pass closes the lane's followups on each item it carries."""

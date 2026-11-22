@@ -569,8 +569,8 @@ def settled_followups(connection: sqlite3.Connection, item: int) -> set[int]:
     leaves a followup open, which is safe; a false one hides work.
     """
     return {row[0] for row in connection.execute(
-        "SELECT id, session FROM note WHERE item = ? AND kind = 'followup' AND resolved_at IS NULL", (item,))
-        if sd_lane.lane_note(row[1])}
+        "SELECT id, session, body FROM note WHERE item = ? AND kind = 'followup' AND resolved_at IS NULL", (item,))
+        if sd_lane.lane_note(row[1], row[2])}
 
 
 class Ship(SharedReview):

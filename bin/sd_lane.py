@@ -314,14 +314,17 @@ SLOT_WAIT = sd_ship_workflow.GATE_SLOT_WAIT
 BLOCKED = ("failed", "skipped", "prepared")
 #: The ends whose entry notes each item it carries (`note_ended`, sd:5963), as the retired runner noted its runs.
 NOTED = ("failed", "skipped")
+#: How each `note_ended` body starts: of the lane's own notes, only these are blockers a pass answers (sd:7357).
+LANE_ENDED = tuple(f"Lane {status} in " for status in NOTED)
 #: The `note.session` every `default_note` write records (build/sd-1423 review): the lane's own
 #: followups are told apart by who wrote them, since an operator can paste the lane's text.
 LANE_SESSION = "sd-lane"
 
 
-def lane_note(session: object) -> bool:
-    """Whether a note with this `session` is one the lane wrote."""
-    return session == LANE_SESSION
+def lane_note(session: object, body: object) -> bool:
+    """Whether a note is a blocker `note_ended` wrote: the lane's session and its opening. The lane's
+    `Release:` and `Post-merge:` followups are its too, but a later merge answers neither."""
+    return session == LANE_SESSION and str(body).startswith(LANE_ENDED)
 
 
 class LaneError(RuntimeError):
@@ -3149,8 +3152,8 @@ def resolve_ended(row: dict[str, Any], queue: Queue) -> dict[str, str]:
         for item in items:
             try:
                 open_ids = [found["id"] for found in connection.execute(
-                    "SELECT id, session FROM note WHERE item = ? AND kind = 'followup' AND resolved_at IS NULL"
-                    " ORDER BY id", (item,)) if lane_note(found["session"])]
+                    "SELECT id, session, body FROM note WHERE item = ? AND kind = 'followup' AND resolved_at IS NULL"
+                    " ORDER BY id", (item,)) if lane_note(found["session"], found["body"])]
                 for number in open_ids:
                     writes.resolve_note(connection, number)
                 if open_ids:

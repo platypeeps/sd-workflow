@@ -6422,6 +6422,9 @@ class SettledFollowupTests(unittest.TestCase):
         self.assertEqual(self.settled(
             "Lane failed in prepare because the remote runner needs a separate repair"), {43})
         self.assertEqual(self.settled("Lane failed in prepare at noon: the runner was down"), {43})
+        # build/sd-1423 review: the lane's release and post-merge followups are not what a merge answers.
+        for body in ("Post-merge: make deploy failed", "Release: the tag push was refused"):
+            self.assertEqual(self.settled(body, ship.sd_lane.LANE_SESSION), {43})
         # build/sd-1423 review: the whole header pasted by hand is still the operator's.
         self.assertEqual(self.settled("Lane failed in prepare at aaaaaaaaaaaa: gate red"), {43})
 
