@@ -2246,8 +2246,8 @@ class DraftSupervisor(Supervisor):
 
 def failure_table(text: str) -> bool:
     """Whether `text` holds a failure table (sd:9770): a header line whose `|`-separated cells begin with the five
-    `FAILURE_COLUMNS` in order, then at least one data row in the lines of `|` right below it. Prose naming the
-    words, or a header with only its separator, is no table."""
+    `FAILURE_COLUMNS` in order, then at least one data row in the lines of `|` right below it, with a cell for
+    each column (pack sd:9866). Prose naming the words, or a header with only its separator, is no table."""
     lines = text.splitlines()
     for at, line in enumerate(lines):
         cells = [cell.strip().lower() for cell in line.strip().strip("|").split("|")]
@@ -2256,6 +2256,7 @@ def failure_table(text: str) -> bool:
         for row in lines[at + 1:]:
             if "|" not in row:
                 break
-            if not TABLE_SEPARATOR.fullmatch(row.strip()):
+            if (not TABLE_SEPARATOR.fullmatch(row.strip())
+                    and len(row.strip().strip("|").split("|")) >= len(FAILURE_COLUMNS)):
                 return True
     return False

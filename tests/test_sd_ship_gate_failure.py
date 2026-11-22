@@ -786,6 +786,14 @@ class AFlakyGateTestIsRerunAlone(unittest.TestCase):
         log.write_text(OUTPUT, encoding="utf-8")
         self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [FLAKY_TEST])
 
+    def test_a_failure_header_a_passing_shard_printed_is_not_rerun(self):
+        """Review of sd:9770 (sd:9866): only a failing shard's FAIL lines name the tests to rerun; one a passing
+        shard printed, such as a test that checks a runner's output, is not a failure."""
+        log = pathlib.Path(self.row["output_path"])
+        log.write_text(OUTPUT.replace("shard tests.test_other: start\nOK\n", "shard tests.test_other: start\n"
+                                      "FAIL: test_b (tests.test_other.Case.test_b)\nOK\n"), encoding="utf-8")
+        self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [FLAKY_TEST])
+
     def test_only_a_failure_of_tests_alone_is_rerun(self):
         lint = {**self.row, "failed_steps": [SHARD, "make target lint"]}
         crashed = {**self.row, "failed_steps": ["shard tests.test_crash: 1s exit=1", "make target test"]}
@@ -973,8 +981,17 @@ class TheRerunRunsAtTheReviewedHead(unittest.TestCase):
             return 0, "", "OK"
 
         dashboard, sd_db = "dashboard.tests.test_example.Case.test_a", "tests.sd_db.test_example.Case.test_a"
-        with unittest.mock.patch.object(sd_gate_run, "run_child", side_effect=child), \
-                unittest.mock.patch.dict("os.environ", {"SD_REVIEW_SLOTS": "4", "PYTHONPATH": "/elsewhere"}):
+        # As the gate's environment: no PATH entry in the checkout the rerun came from (sd:9866).
+        (root / "bin").mkdir()
+        paths = []
+
+        def child_path(command, env, cwd, timeout):
+            paths.append(env.get("PATH", ""))
+            return child(command, env, cwd, timeout)
+
+        with unittest.mock.patch.object(sd_gate_run, "run_child", side_effect=child_path), \
+                unittest.mock.patch.dict("os.environ", {"SD_REVIEW_SLOTS": "4", "PYTHONPATH": "/elsewhere",
+                                                        "PATH": f"{root / 'bin'}{os.pathsep}{os.environ['PATH']}"}):
             code, _out, _err = sd_ship_review.rerun_tests(root, git("rev-parse", "HEAD"), [FLAKY_TEST, dashboard, sd_db])
         self.assertEqual(code, 0)
         self.assertEqual([run[0] for run in runs], [[FLAKY_TEST], [dashboard], [sd_db]])
@@ -982,6 +999,7 @@ class TheRerunRunsAtTheReviewedHead(unittest.TestCase):
         self.assertEqual([run[1] for run in runs],
                          [None, f"{tree}/dashboard:{tree}/lib:{tree}/dashboard/tests", None])
         self.assertEqual({run[2:5] for run in runs}, {("0", "0", sys.executable)})
+        self.assertTrue(paths and not any(str((root / "bin").resolve()) in path.split(os.pathsep) for path in paths))
 
     def test_a_later_unfinished_rerun_keeps_an_earlier_failures_code(self):
         """Lead triage of sd:9768: a test that failed alone stays failed when a later one times out; the

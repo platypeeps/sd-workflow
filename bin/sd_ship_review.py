@@ -1795,10 +1795,11 @@ def row_tests(row: dict) -> list[str]:
     # `make test` before it says so.
     if RUNNER_FAULT.search(SHARD_BLOCK.sub("", text)) or FAILING_OUTCOME.search(text):
         return []
-    found = [paren if paren.endswith(f".{name}") else f"{paren}.{name}" for name, paren in named_failures(text) or []]
     if not steps or not failing or not all(test_step(step, failing) for step in steps):
         return []
-    return found
+    # Only a failing shard's headers name its failures: a passing one may print one as output (sd:9866).
+    blocks = "\n".join(block.group(0) for block in SHARD_BLOCK.finditer(text) if block.group(1) in failing)
+    return [paren if paren.endswith(f".{name}") else f"{paren}.{name}" for name, paren in named_failures(blocks) or []]
 
 
 def unittest_failed_shards(text: str) -> set[str]:
@@ -1934,8 +1935,9 @@ def rerun_tests(root: pathlib.Path, head: str, tests: list[str]) -> tuple[int | 
         try:
             if sd_gate_run.gate_git(tree, "rev-parse", "HEAD") != head:
                 return None, "", f"the rerun's worktree is not at {head[:12]}"
-            # The runner's git entries replace the gate's; fsmonitor stays off on top of them.
-            environment = sd_lib.without_fsmonitor({**sd_gate_run.gate_environment(tree), **runner_guards(tree)})
+            # The runner's git entries replace the gate's; fsmonitor stays off on top of them. The gate's own
+            # environment: no PATH entry in the checkout `root`, as `check_in_worktree` cuts it (sd:9866).
+            environment = sd_lib.without_fsmonitor({**sd_gate_run.gate_environment(root), **runner_guards(tree)})
             python = gate_python(tree, environment)
             if python is None:
                 return None, "", f"no gate interpreter (the Makefile's VENV_PYTHON) at {head[:12]}"
