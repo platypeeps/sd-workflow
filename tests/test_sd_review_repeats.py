@@ -252,6 +252,55 @@ def finding(evidence: Any = None, **extra: Any) -> dict[str, Any]:
     return row(**extra) if evidence is None else row(evidence=evidence, **extra)
 
 
+class ReproRuleTests(unittest.TestCase):
+    """Operator ruling on pack sd:9867, amended by note #70162: a finding at the floor blocks only with a
+    concrete failing input or command (`evidence`), in touched code or an unchanged caller it breaks; any
+    other is advisory, filed, and says why."""
+
+    def test_a_reproduced_finding_in_changed_code_blocks(self) -> None:
+        for evidence in CITED:
+            with self.subTest(evidence=evidence):
+                [record] = sd_review.dispose([finding(evidence)], "high", repro=True)
+                self.assertEqual((record["disposition"], record["summary"]), ("blocking", "defect"))
+
+    def test_a_finding_without_a_repro_is_advisory_and_says_why(self) -> None:
+        for evidence in UNCITED:
+            with self.subTest(evidence=evidence):
+                [record] = sd_review.dispose([finding(evidence)], "high", repro=True)
+                self.assertEqual((record["disposition"], record["summary"]),
+                                 ("advisory", f"defect {sd_review.NO_REPRO_NOTE}"))
+
+    def test_a_reproduced_break_in_an_unchanged_caller_blocks(self) -> None:
+        [record] = sd_review.dispose([finding("python3 reader.py: KeyError 'state'", path="reader.py")], "high",
+                                     repro=True)
+        self.assertEqual((record["disposition"], record["summary"]), ("blocking", "defect"))
+
+    def test_a_plan_keeps_the_floor_alone(self) -> None:
+        [record] = sd_review.dispose([finding()], "high")
+        self.assertEqual((record["disposition"], record["summary"]), ("blocking", "defect"))
+
+    def test_an_uncited_repeat_keeps_its_own_note(self) -> None:
+        rebutted = listed(adjudicated(("src.py", "defect", "rebutted")))
+        [record] = sd_review.dispose([finding()], "high", rebutted, repro=True)
+        self.assertEqual((record["disposition"], record["summary"]), ("advisory", f"defect {sd_review.REPEAT_NOTE}"))
+
+    def test_the_lanes_own_blockers_need_no_repro(self) -> None:
+        parsed = sd_review.oversized_findings()
+        assert parsed is not None
+        limit = [record for record in sd_review.dispose(parsed.findings, "high", repro=True)
+                 if record["path"] == "<review-response>"]
+        self.assertEqual([record["disposition"] for record in limit], ["blocking"])
+
+    def test_the_review_reads_the_changed_files_and_status_follows(self) -> None:
+        result = {"severity_floor": "high", "requested_reviews": 1}
+        answer = sd_review.Outcome("fake", sd_review.FINDINGS, (finding(),), "", (), ())
+        sd_review.finish_review(result, [answer], ["fake"], repro=True)
+        self.assertEqual(result["status"], "advisory")
+        cited = sd_review.Outcome("fake", sd_review.FINDINGS, (finding(CITED[0]),), "", (), ())
+        sd_review.finish_review(result, [cited], ["fake"], repro=True)
+        self.assertEqual(result["status"], "blocking")
+
+
 class RepeatRuleTests(unittest.TestCase):
     """Operator ruling on pack sd:9270: evidence is asked only of a repeat of a rebuttal."""
 
@@ -347,15 +396,16 @@ class RepeatReviewTests(RepeatFixture):
         prompts, _result, _stderr = self.prompts()
         self.assertEqual(len(prompts), 2)
         for text in [*prompts, sd_review.URL_OUTPUT_CONTRACT]:
-            self.assertIn("empty unless you raise again a finding listed as rebutted", text)
+            self.assertIn(sd_review.EVIDENCE_ASK, text)
             self.assertNotIn("posted as advisory", text)
             self.assertNotIn("run a check before", text)
         claude = sd_review.claude_argv(self.tmp, "claude")
         self.assertIn('"evidence"', claude[claude.index("--json-schema") + 1])
 
     def test_a_review_holds_only_an_uncited_repeat_of_a_rebuttal_back(self) -> None:
+        """A cited repeat blocks, though bin/tool.py is not in this change: note #70162 on sd:9867."""
         self.adjudication(("lane claim", "rebutted", "git 2.54 matches it literally"))
-        fresh = row(summary="a first-time claim")
+        fresh = row(summary="a first-time claim", evidence="python3 src.py: Traceback")
         for evidence, status in ((None, "advisory"), ("bin/tool.py:3: glob = True", "blocking")):
             with self.subTest(evidence=evidence):
                 repeat = finding(evidence, path="bin/tool.py", line=3, summary="lane claim")
@@ -486,7 +536,11 @@ class RebuttalScopeTests(RepeatFixture):
                              "codex": sd_review.Completed(0, json.dumps({"findings": [*findings, row()]}), "")},
                             default=sd_review.Completed(0, json.dumps({"findings": []}), ""))
         result = sd_review.review(self.root, namespace(), runner, self.environment(), self.chatgpt_home())
-        return {r["summary"].replace(" " + sd_review.REPEAT_NOTE, ""): (r["disposition"], r["path"])
+        # "blocking" is what the repeat rule leaves at the floor: these findings cite no repro, so sd:9867 posts
+        # them as advisory with NO_REPRO_NOTE; ReproRuleTests pins that rule.
+        return {r["summary"].replace(" " + sd_review.REPEAT_NOTE, "").replace(" " + sd_review.NO_REPRO_NOTE, ""):
+                ("blocking" if r["disposition"] == "blocking" or r["summary"].endswith(sd_review.NO_REPRO_NOTE)
+                 else r["disposition"], r["path"])
                 for r in result["findings"] if r["backend"] == "codex"}
 
     def repeat(self, summary: str) -> dict[str, Any]:

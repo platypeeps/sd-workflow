@@ -43,6 +43,7 @@ class DispositionTests(unittest.TestCase):
                         "severity": "high",
                         "family": "correctness",
                         "summary": "fixture disputed finding",
+                        "evidence": "python3 src.py: Traceback",
                     }
                 ]
             },

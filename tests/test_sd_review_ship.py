@@ -42,7 +42,8 @@ class FixReviewTests(ReviewFixture):
     def test_unchanged_blocker_and_source_reach_the_fix_reviewer(self):
         root, first = self.branch()
         blocking = json.dumps({"findings": [{"path": "src.py", "line": 1, "summary": "original unresolved defect",
-                                            "family": "correctness", "severity": "high"}]})
+                                            "family": "correctness", "severity": "high",
+                                            "evidence": "python3 src.py: Traceback"}]})
         prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": sd_review.Completed(0, blocking, "")}),
                                  self.environment(), self.chatgpt_home())
         report = self.tmp / "prior.json"
@@ -64,7 +65,8 @@ class FixReviewTests(ReviewFixture):
         holder; the cleanup after a failed reader must not join it."""
         root, first = self.branch()
         blocking = json.dumps({"findings": [{"path": "src.py", "line": 1, "summary": "original unresolved defect",
-                                            "family": "correctness", "severity": "high"}]})
+                                            "family": "correctness", "severity": "high",
+                                            "evidence": "python3 src.py: Traceback"}]})
         prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": sd_review.Completed(0, blocking, "")}),
                                  self.environment(), self.chatgpt_home())
         report = self.tmp / "prior.json"
@@ -112,7 +114,8 @@ class FixReviewTests(ReviewFixture):
     def test_resume_reviews_full_branch_and_repeats_prior_blockers(self):
         root, first = self.branch()
         blocking = json.dumps({"findings": [{"path": "src.py", "line": 1, "summary": "original unresolved defect",
-                                            "family": "correctness", "severity": "high"}]})
+                                            "family": "correctness", "severity": "high",
+                                            "evidence": "python3 src.py: Traceback"}]})
         prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": sd_review.Completed(0, blocking, "")}),
                                  self.environment(), self.chatgpt_home())
         prior["completed_reviews"] = 0

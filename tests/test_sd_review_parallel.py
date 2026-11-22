@@ -173,7 +173,8 @@ class TwoReadersAtOnce(ParallelFixture):
 
         def answer(*summaries: str) -> sd_review.Completed:
             return sd_review.Completed(0, json.dumps({"findings": [
-                {"path": "src.py", "line": 1, "severity": "high", "family": "correctness", "summary": text}
+                {"path": "src.py", "line": 1, "severity": "high", "family": "correctness", "summary": text,
+                 "evidence": "python3 src.py: Traceback"}
                 for text in summaries]}), "")
 
         def codex(argv: Any, env: Any, cwd: Any, timeout: int) -> Any:
