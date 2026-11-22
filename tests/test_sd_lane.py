@@ -5747,6 +5747,21 @@ class HostedOrder(Lane):
         self.assertEqual(order, [later])
         self.assertIn({"path": str(self.repo), "skipped": "its own job runs this lane (--skip)"}, answer["lanes"])
 
+    def test_a_skip_that_names_no_managed_checkout_gets_a_row(self) -> None:
+        """pack sd:9669. A mistyped --skip matched no lane and the run said nothing, so the lane it
+        meant ran here as well as in its own job."""
+        import sd_db
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            sd_db.upsert_repo(connection, str(self.repo), remote="https://github.com/example/pack.git", managed=1)
+        finally:
+            connection.close()
+        typo = self.tmp / "no-such-checkout"
+        with mock.patch.object(sd_lane, "run_lane", return_value={"ran": []}):
+            answer = sd_lane.run_hosted(self.environ, self.ship, skip=[typo])
+        self.assertIn({"path": str(typo.resolve()), "skipped": "--skip names no managed checkout",
+                       "code": "skip_unknown"}, answer["lanes"])
+
     def test_a_skipped_lane_another_machine_hosts_is_still_settled_here(self) -> None:
         """pack sd:9668 review. The skip ran before the host check, so a machine that does not host the
         lane stopped importing its file queue and reclaiming its dead holders; its own job refuses there."""

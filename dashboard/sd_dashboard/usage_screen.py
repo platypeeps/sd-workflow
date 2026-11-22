@@ -100,7 +100,8 @@ def _options(fields: list[str]) -> dict | str:
         if key in options:
             return f"option {key} given twice"
         if key == "stale":
-            if not (value.isascii() and value.isdigit() and int(value) > 0):
+            # Past 4300 digits int() raises (pack sd:9756): such a value is refused as any other bad one.
+            if not (value.isascii() and value.isdigit() and len(value) <= 4300 and int(value) > 0):
                 return "stale is not a whole number of days above 0"
             options[key] = int(value)
         else:
@@ -125,14 +126,15 @@ def parse_services(text: str | None) -> tuple[list[tuple[str, str, str, list[str
             continue
         name, kind, url = fields[:3]
         options = _options(rest)
-        if isinstance(options, str):
-            problems.append(f"line {number}: {options}")
-        elif options and kind != "statuspage":
-            problems.append(f"line {number}: options need kind statuspage")
-        elif not NAME.fullmatch(name) or name in seen:
+        # The kind is checked before the options, so a mistyped kind is named as one (pack sd:9756).
+        if not NAME.fullmatch(name) or name in seen:
             problems.append(f"line {number}: name is not a new lower-case name")
         elif kind not in KINDS:
             problems.append(f"line {number}: kind is not one of {', '.join(KINDS)}")
+        elif isinstance(options, str):
+            problems.append(f"line {number}: {options}")
+        elif options and kind != "statuspage":
+            problems.append(f"line {number}: options need kind statuspage")
         elif not _web_url(url):
             problems.append(f"line {number}: url is not http(s)")
         elif not all(NAME.fullmatch(provider) for provider in providers):
@@ -152,6 +154,12 @@ def _when(stamp) -> datetime | None:
         return moment.astimezone(timezone.utc) if moment.tzinfo else None
     except (ValueError, OverflowError):  # a time past the calendar's end, once in UTC
         return None
+
+
+def _utc(stamp) -> str | None:
+    """`stamp` as `YYYY-MM-DDTHH:MM:SSZ`, or None: the browser parses that form, not ISO basic (pack sd:9756)."""
+    moment = _when(stamp)
+    return moment.isoformat(timespec="seconds").replace("+00:00", "Z") if moment else None
 
 
 def _word(value, known) -> str:
@@ -297,7 +305,7 @@ def _window(window: dict, clock: datetime, expected=None) -> dict | None:
     used = _number(window.get("used_percent"))
     if used is None:
         return None
-    resets = window.get("resets_at") if _when(window.get("resets_at")) else None
+    resets = _utc(window.get("resets_at"))
     return {"label": _label(window), "used": round(used, 1), "resets_at": resets,
             "pace": _pace(used, window.get("window_minutes"), resets, clock, expected)}
 
@@ -309,7 +317,7 @@ def _money(value) -> dict | None:
         return None
     limit = _number(value.get("limit"))
     return {"amount": _number(value["amount"]), "unit": _text(value.get("unit")), "period": _text(value.get("period")),
-            "resets_at": value.get("resets_at") if _when(value.get("resets_at")) else None,
+            "resets_at": _utc(value.get("resets_at")),
             "limit": limit if limit is not None and limit > 0 else None}
 
 

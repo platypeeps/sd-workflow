@@ -1545,20 +1545,31 @@ def flake_items(connection: Any, repository: str, path: str, *, now: float, days
                     "SELECT 1 FROM note WHERE item = ? AND kind = 'comment' AND instr(body, ?) > 0",
                     (found["id"], mark)).fetchone():
                 continue
-            if found is None:
-                item = writes.create_item(connection, kind="task", title=f"Flaky suite {suite}: make it hermetic",
-                                          repo=path, priority=2, source="task-ref", external_id=key)
-            else:
-                item = found["id"]
-                if found["status"] == "done":
-                    writes.transition(connection, item, "planning", who="sd-lane",
-                                      reason=f"{suite} flaked again in {repository}")
+            item = flake_item(connection, suite, path, repository)
             failing = [line for line in str(failure.get("reason")).splitlines() if line.startswith("failing: ")][:2]
             written.append(writes.add_note(connection, item, "comment", (
                 f"Gate flake in {repository}: {suite} {mark} (sd:{failure.get('item')}, {failure['finished_at']}) "
                 f"and passed at the same head (sd:{entry.get('item')}, {entry['finished_at']}). Fix the suite at "
                 "its root with a test that fails first." + "".join(f"\n{line}" for line in failing))))
     return written
+
+
+def flake_item(connection: Any, suite: str, path: str, repository: str) -> int:
+    """The flake item of `suite`, `task-ref` `flake:<suite>`: opened in `path`'s repo the first time, reopened when
+    done (pack sd:6739); `sd-ship`'s flake retry notes on it too (sd:9768)."""
+    require_sd_db()
+    from sd_db import writes  # noqa: PLC0415
+
+    key = f"flake:{suite}"
+    found = connection.execute("SELECT id, status FROM item WHERE source = 'task-ref' AND external_id = ?",
+                               (key,)).fetchone()
+    if found is None:
+        return writes.create_item(connection, kind="task", title=f"Flaky suite {suite}: make it hermetic",
+                                  repo=path, priority=2, source="task-ref", external_id=key)
+    if found["status"] == "done":
+        writes.transition(connection, found["id"], "planning", who="sd-lane",
+                          reason=f"{suite} flaked again in {repository}")
+    return found["id"]
 
 
 def file_flakes(checkout: pathlib.Path, path: str, environ: dict[str, str]) -> dict[str, Any] | None:
@@ -4294,8 +4305,7 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
         return inline_lane(lambda: run_lane(checkout, environ, ship, gate, note, clock() + budget))
     # A skipped lane is skipped only where it is hosted: elsewhere it is settled as before, and it keeps
     # its wait and flake reports below; its own `lane run -C` job refuses on a machine that does not host it.
-    lanes += [{"path": path, "skipped": "its own job runs this lane (--skip)"}
-              for path, checkout in hosted if checkout.resolve() in skipped]
+    lanes += skip_rows(hosted, others, skipped)
     order = longest_waiting_first([lane for lane in hosted if lane[1].resolve() not in skipped], environ)
     lanes += run_parallel(order, start or inline, deadline, functools.partial(lane_room, environ),
                           functools.partial(new_work, environ), cap=lane_parallel(environ))
@@ -4304,6 +4314,19 @@ def run_hosted(environ: dict[str, str], ship: Ship = default_ship, gate: Gate = 
             if asked:
                 lanes.append(asked)
     return {"lanes": lanes}
+
+
+def skip_rows(hosted: list[tuple[str, pathlib.Path]], others: list[tuple[str, pathlib.Path]],
+              skipped: set[pathlib.Path]) -> list[dict[str, Any]]:
+    """A row per hosted lane `--skip` names, and per `--skip` that names no managed checkout.
+
+    A typo once said nothing, so the lane it meant ran here and in its own job (pack sd:9669).
+    """
+    known = {checkout.resolve() for _, checkout in hosted + others}
+    return ([{"path": path, "skipped": "its own job runs this lane (--skip)"}
+             for path, checkout in hosted if checkout.resolve() in skipped]
+            + [{"path": str(path), "skipped": "--skip names no managed checkout", "code": "skip_unknown"}
+               for path in sorted(skipped - known)])
 
 
 def new_work(environ: dict[str, str],

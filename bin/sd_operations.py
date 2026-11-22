@@ -165,11 +165,23 @@ def queue_builds(args: argparse.Namespace) -> int:
         import sd_db.build as build
     except ImportError:
         raise WorkRefusal("update this pack checkout, whose lib/ is the sd_db bin/ runs for builds") from None
+    if args.drop and (len(args.items) != 1 or args.finding):
+        raise WorkRefusal("--drop takes one item and no --finding")
+    sys.path.insert(0, str(BIN))
+    try:  # by name from bin/, as `holders` loads the dashboard: a caller may not have bin/ on its path
+        sd_bundle_drop = importlib.import_module("sd_bundle_drop")
+    finally:
+        sys.path.remove(str(BIN))
     connection = sd_handoff_rows.connect(sd_db, write=True)
     try:
-        queued = build.queue_again(connection, args.items, who=getpass.getuser(), finding=args.finding)
+        if args.drop:
+            queued = sd_bundle_drop.drop_item(connection, build, args.items[0], who=getpass.getuser())
+        else:
+            queued = build.queue_again(connection, args.items, who=getpass.getuser(), finding=args.finding)
     except (sd_db.SdDbError, ValueError) as error:
         raise WorkRefusal(str(error)) from error
+    except sd_bundle_drop.DropRefused as error:
+        raise WorkRefusal(f"Drop refused: {error}") from error
     finally:
         connection.close()
     if args.json:
@@ -746,6 +758,9 @@ def register(groups: Any) -> None:
             parser.add_argument("items", nargs="+", type=item_id, help=ITEM_HELP)
             parser.add_argument("--finding", default="", metavar="TEXT",
                                 help="Send to builder: the note the retried or fixed bundle's builder reads")
+            parser.add_argument("--drop", action="store_true",
+                                help="take the one item out of its ended bundle: the kept items' commits go on a "
+                                     "fresh branch under a kept lead, and the item builds alone (pack sd:9709)")
             parser.add_argument("--json", action="store_true")
             # One verb for the dispatcher (ruling #31545, pack sd:6356): the tick, and with a flag its supervisor or
             # the sessions it counts.
@@ -772,5 +787,6 @@ def register(groups: Any) -> None:
             parser.add_argument("--into", metavar="BRANCH",
                                 help="with --start: the open bundle branch this side branch merges into (pack sd:7737)")
             parser.add_argument("--reason", help="with --end: why it ended (default: ended by its lead); with --start: "
-                                "state-move or in-lane, why the repository gets a second open branch (pack sd:7737)")
+                                "state-move, in-lane or p1, why the repository gets a second open branch "
+                                "(pack sd:7737, sd:9700)")
             parser.add_argument("--json", action="store_true")
