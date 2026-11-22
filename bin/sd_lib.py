@@ -464,6 +464,18 @@ def git_output(args: list[str], root: pathlib.Path) -> str | None:
     return _git(args, root)
 
 
+def instance_files(instances: Any) -> list[str]:
+    """The file of each `path:line` in a finding's `instances`; a value not a list names none (sd:9769)."""
+    return [re.sub(r":[0-9]+$", "", entry.strip()) for entry in (instances if isinstance(instances, list) else [])
+            if isinstance(entry, str) and entry.strip()]
+
+
+def blocking_places(findings: list[Any]) -> list[str]:
+    """Each file a prior blocking finding names: its path and each instance's (sd:9769)."""
+    return sorted({place for row in findings if isinstance(row, dict) and row.get("disposition") == "blocking"
+                   for place in (row["path"], *instance_files(row.get("instances")))})
+
+
 #: One github.com repository as `origin` names it. An owner cannot contain `.`.
 GITHUB_ORIGIN = re.compile(r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
                            r"([\w-]+)/([\w.-]+?)(?:\.git)?/?")

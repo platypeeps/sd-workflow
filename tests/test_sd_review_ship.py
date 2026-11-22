@@ -59,6 +59,29 @@ class FixReviewTests(ReviewFixture):
         self.assertIn("the_original_defect = True", handed)
         self.assertTrue(result["verification_report_digest"])
 
+    def test_a_grouped_blocker_hands_the_reviewer_every_instance_file(self):
+        """Lead ruling on sd:9769 (15:20 MST): a fix to the primary file alone must not clear a blocker whose
+        second instance sits in another file; the verifier gets each listed file's current source and is told
+        the blocker clears only when every instance is fixed."""
+        root, _ = self.branch()
+        first = self.commit(root, "second.py", "the_second_instance = True\n")
+        blocking = json.dumps({"findings": [{"path": "src.py", "line": 1, "summary": "grouped unresolved defect",
+                                            "family": "correctness", "severity": "high",
+                                            "instances": ["src.py:1", "second.py:1"]}]})
+        prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": sd_review.Completed(0, blocking, "")}),
+                                 self.environment(), self.chatgpt_home())
+        report = self.tmp / "prior.json"
+        report.write_text(json.dumps(prior))
+        self.commit(root, "src.py", "the_original_defect = False\n")
+        runner = FakeRunner({"codex": sd_review.Completed(0, blocking, "")})
+        result = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)), runner,
+                                  self.environment(), self.chatgpt_home())
+        handed = json.dumps(runner.calls, default=str)
+        self.assertIn("Current source for prior finding second.py", handed, "an instance file's source was not attached")
+        self.assertIn("the_second_instance = True", handed)
+        self.assertIn("every listed instance", handed, "the verifier was not told each instance must be fixed")
+        self.assertEqual(result["status"], "blocking")
+
     def test_a_reader_that_raises_after_a_prior_report_ends_with_its_own_error(self):
         """sd:7569. The prior finding's source is read in the main thread
         through `subprocess_runner`, which registers that thread as a group
