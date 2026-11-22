@@ -1070,8 +1070,8 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
     with transaction(connection):
         leads, fixes, fresh = [], [], []
         named: dict[int, set[int]] = {}
-        # Each lane-failed run this press freed members of, and the items whose press that was (the lead and
-        # the members it waits on): a later one of them is done, whatever the order (review of build/sd-1306).
+        # Each lane-failed run this press split, and every member of its bundle: the split settled each, so a
+        # later one of them is done, whatever the order (review of build/sd-1306).
         freed: dict[str, set[int]] = {}
         for item in items:
             # The split this press made settled it: `_free` queued it if it waits on nothing, and the lead stays
@@ -1099,11 +1099,13 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                     if finding:
                         raise BuildRefused(f"--finding goes to a Retry or a Fix; its lead sd:{lead_item} waits on "
                                            f"{names}, which would build fresh; send the finding once they are done")
-                    if item not in [lead_item, *(member["item"] for member in ahead)]:
+                    # The selection, not this item, decides: with the lead or a member it waits on in it, the
+                    # split settles every selected member of the bundle (review of build/sd-1306).
+                    if not set(items) & {lead_item, *(member["item"] for member in ahead)}:
                         raise BuildRefused(f"its lead sd:{lead_item} waits on {names}; Build sd:{lead_item} or "
                                            f"{names} to build those first, then Fix the bundle")
                     fresh += _free(connection, ahead, who=who, run=state["run"]["id"], lead=lead_item)
-                    freed[state["run"]["id"]] = {lead_item, *(member["item"] for member in ahead)}
+                    freed[state["run"]["id"]] = {member["item"] for member in sent}
                     continue
                 try:
                     members = lane_fix_check(connection, state["run"]["id"])[0]

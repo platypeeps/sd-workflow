@@ -3060,6 +3060,41 @@ class Tick(Case):
                 self.assertEqual([self.queued_builds(item) for item in self.items], [0, 0, 1], "only C builds")
                 self.assertEqual(build.run(self.db, run["id"])["outcome"], "lane_failed")
 
+    def test_a_build_of_a_split_bundle_settles_every_selected_member(self):
+        """Review of build/sd-1306: lead A waits on member B, and C waits on nothing. Selecting A, B, C freed B,
+        then read C as the bundle's Fix, which refused, as A still waits on B, and rolled the split back. The
+        split settles every selected member: B builds alone, A and C stay for Fix, in any order."""
+        import itertools
+
+        for number, order in enumerate(itertools.permutations(range(3))):
+            with self.subTest(order=order):
+                if number:
+                    self.setUp()
+                run = self.enqueued(3)
+                self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red"}
+                self.tick()
+                with self.db:
+                    self.db.execute("UPDATE item SET fields = ? WHERE id = ?",
+                                    (json.dumps({"blocked_by": [self.items[1]]}), self.items[0]))
+                build.queue_again(self.db, [self.items[one] for one in order], who="operator")
+                self.assertEqual([self.queued_builds(item) for item in self.items], [0, 1, 0], "only B builds")
+                self.assertEqual(build.run(self.db, run["id"])["outcome"], "lane_failed")
+
+    def test_a_build_of_the_lead_and_an_unrelated_member_frees_the_one_it_waits_on(self):
+        """Class pass over the selection of `queue_again`: A and C selected, A waits on B. The press of C alone
+        refuses, but with A in the selection the split frees B, whichever comes first."""
+        for order in ((0, 2), (2, 0)):
+            with self.subTest(order=order):
+                self.setUp()
+                self.enqueued(3)
+                self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red"}
+                self.tick()
+                with self.db:
+                    self.db.execute("UPDATE item SET fields = ? WHERE id = ?",
+                                    (json.dumps({"blocked_by": [self.items[1]]}), self.items[0]))
+                build.queue_again(self.db, [self.items[one] for one in order], who="operator")
+                self.assertEqual([self.queued_builds(item) for item in self.items], [0, 1, 0], "only B builds")
+
     def build_rows(self):
         return self.db.execute("SELECT id, status, result FROM assignment ORDER BY id").fetchall()
 
