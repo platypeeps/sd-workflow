@@ -1698,10 +1698,14 @@ def _ran_on(connection, lead: int) -> str | None:
 def _stranded(connection, row) -> bool:
     """Whether the blocked build `row` ran on a satellite other than the one its lane runs on now: its worktree is
     there, whatever host the block names, so no host requeues it (review round 3 of sd:9775), and pickup builds
-    its item fresh rather than wait on it (round 4 of sd:9774)."""
+    its item fresh rather than wait on it (round 4 of sd:9774). A lead with no run row, as a bundle drop queues
+    its rows, ran nowhere: not stranded; the claim's `_kept_host` check guards a lane moved since the drop."""
     lead = _lead(row)
     away = _route(connection, row["lane_host"], lead)
-    return away is not None and lead is not None and _ran_on(connection, lead) != away
+    if away is None or lead is None or connection.execute(
+            "SELECT 1 FROM runner_run WHERE assignment = ?", (lead,)).fetchone() is None:
+        return False
+    return _ran_on(connection, lead) != away
 
 
 def _recoverable(connection) -> list:

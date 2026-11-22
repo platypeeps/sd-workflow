@@ -2608,6 +2608,24 @@ class Hosts(Case):
         self.assertIsNone(self.claim(hosts=HUB))
         self.assertEqual(self.claim(hosts=WORK)["assignment"], lead, "the same assignment builds")
 
+    def test_a_drop_lead_blocked_before_its_first_claim_requeues_on_its_satellite(self):
+        """Review of sd:9775: a bundle drop queues its rows with `run_count` 1 and no run row behind it. Blocked
+        on the quiet beat before its first claim, recovery read it as stranded, so pickup built the item fresh
+        and skipped the branch the drop made. It ran nowhere else: its satellite requeues it."""
+        item = self.item(repo=SAT)
+        lead = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET run_count = 1 WHERE id = ?", (lead,))
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", lead), "blocked")
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        build.set_pickup(self.db, True, now=Pickup.NOW)
+        with mock.patch.object(build, "lane_hosts", return_value=WORK):
+            build.pickup(self.db, build.room(self.db, **IDLE, hosts=WORK), now=Pickup.NOW)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE item = ?", item), 1,
+                         "no fresh build supersedes the dropped lead")
+        self.assertEqual(self.claim(hosts=WORK)["assignment"], lead, "the same assignment builds")
+
     def test_a_satellite_back_after_a_hub_outage_requeues_its_blocked_bundle_as_it_was(self):
         """sd:9775: the hub was down, so the satellite's beat went stale and the hub blocked its retried bundle.
         On its first tick back, before any hub tick, the satellite queues that bundle again and claims it under
