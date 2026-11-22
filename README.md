@@ -314,6 +314,7 @@ followup takes `--ref`, and not with `--recur`.
 
 `sd store items --open` lists the backlog, and `--here` narrows it to this registered checkout; `sd store item 42 --json` includes
 history and a revision that edits can require with `--if-revision`.
+Each `sd store items --json` row carries `status_reason`, the reason its latest status change gave, or null.
 `sd task show 42` is an alias that prints the same thing.
 `sd task cancel 42 --reason TEXT` closes a task or followup nobody will do,
 with the `cancelled` receipt `sd work cancel` writes. Notes,

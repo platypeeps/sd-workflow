@@ -195,6 +195,16 @@ class TaskCLI(unittest.TestCase):
         listed = json.loads(self.call("store", "items", "--parked", "--json").stdout)
         self.assertEqual([(row["id"], row["parked_at"]) for row in listed], [(parked, "2026-01-02T00:00:00+00:00")])
 
+    def test_store_items_json_carries_the_latest_status_reason(self):
+        """sd:9883: "blocked items whose reason says Parked" read a note per item; the row now carries it."""
+        moved = json.loads(self.call("task", "add", "--priority", "3", "Moved", "--json").stdout)["item"]["id"]
+        plain = json.loads(self.call("task", "add", "--priority", "3", "Plain", "--json").stdout)["item"]["id"]
+        self.call("task", "status", moved, "blocked", "--reason", "first: held")
+        self.call("task", "status", moved, "ready", "--reason", "Parked: waits on example.test")
+        listed = {row["id"]: row for row in json.loads(self.call("store", "items", "--json").stdout)}
+        self.assertEqual(listed[moved]["status_reason"], "Parked: waits on example.test")
+        self.assertIsNone(listed[plain]["status_reason"], "an opening note names no reason")
+
     def test_task_show_reads_what_store_item_reads(self):
         """sd:1112. `sd task show` is a read alias; `sd store item` stays canonical.
 
