@@ -88,6 +88,7 @@ import signal
 import subprocess
 import sys
 import time
+import typing
 from typing import Callable, Iterator, Mapping, NamedTuple, Sequence, TextIO
 
 #: How many gates may run at once; `0` means no cap. A holder exports `0`.
@@ -231,8 +232,12 @@ CPU_SAMPLE_SECONDS = 1.1
 CPU_SAMPLE_MAX_AGE = 60.0
 
 
+#: (monotonic time, ticks) of this process's previous `cpu_busy` sample.
+last_cpu_sample: tuple[float, tuple[int, int]] | None = None
+
+
 @functools.lru_cache(maxsize=1)
-def host_port() -> tuple[object, int]:
+def host_port() -> tuple[typing.Any, int]:
     """libSystem and this host's port, taken once: each `mach_host_self()` call adds a reference to the
     port, and a gate wait samples the CPU on every poll for hours."""
     import ctypes  # noqa: PLC0415 -- only the darwin path needs it
@@ -271,7 +276,8 @@ def cpu_busy(ticks: Callable[[], tuple[int, int] | None] = cpu_ticks,
     `CPU_SAMPLE_MAX_AGE` old, so a gate poll waits under the queue lock only on its first
     read; otherwise `cpu_busy` takes one and waits `CPU_SAMPLE_SECONDS`.
     """
-    last = cpu_busy.last
+    global last_cpu_sample  # noqa: PLW0603 -- one sample per process, by design
+    last = last_cpu_sample
     second, at = ticks(), clock()
     if second is None:
         return None
@@ -283,15 +289,13 @@ def cpu_busy(ticks: Callable[[], tuple[int, int] | None] = cpu_ticks,
             return None
     else:
         first = last[1]
-    cpu_busy.last = (at, second)
+    last_cpu_sample = (at, second)
     idle, total = second[0] - first[0], second[1] - first[1]
     if total <= 0 or not 0 <= idle <= total:
         return None
     return 1.0 - idle / total
 
 
-#: (monotonic time, ticks) of this process's previous `cpu_busy` sample.
-cpu_busy.last = None  # type: ignore[attr-defined]
 
 
 def counted_load(load: float, busy: float | None, cores: int | None = None) -> float:

@@ -381,12 +381,12 @@ class LoadRule(unittest.TestCase):
 
     def test_cpu_busy_reads_two_tick_samples(self):
         samples = iter([(100, 200), (130, 300)])
-        sd_gate_slots.cpu_busy.last = None
+        sd_gate_slots.last_cpu_sample = None
         self.assertAlmostEqual(sd_gate_slots.cpu_busy(lambda: next(samples), lambda _: None), 0.7)
         for broken in ([None], [(100, 200), (100, 200)], [(100, 200), (150, 240)]):
-            sd_gate_slots.cpu_busy.last = None
+            sd_gate_slots.last_cpu_sample = None
             self.assertIsNone(sd_gate_slots.cpu_busy(iter(broken).__next__, lambda _: None), broken)
-        sd_gate_slots.cpu_busy.last = None
+        sd_gate_slots.last_cpu_sample = None
         self.assertEqual(sd_gate_slots.counted_load(300.0, 0.63, cores=16), 0.63 * 16)
         self.assertEqual(sd_gate_slots.counted_load(300.0, 0.9, cores=16), 300.0)
         self.assertEqual(sd_gate_slots.counted_load(5.0, 0.5, cores=16), 5.0)
@@ -406,7 +406,7 @@ class LoadRule(unittest.TestCase):
         def pause(seconds):
             now[0] += seconds
 
-        sd_gate_slots.cpu_busy.last = None
+        sd_gate_slots.last_cpu_sample = None
         self.assertAlmostEqual(sd_gate_slots.cpu_busy(ticks, pause, clock=lambda: now[0]), 0.7)
         waited = now[0]
         now[0] += 5
@@ -415,7 +415,7 @@ class LoadRule(unittest.TestCase):
         now[0] += 500
         self.assertAlmostEqual(sd_gate_slots.cpu_busy(ticks, pause, clock=lambda: now[0]), 0.7)
         self.assertGreater(now[0], waited + 505, "a stale sample is not reused")
-        sd_gate_slots.cpu_busy.last = None
+        sd_gate_slots.last_cpu_sample = None
 
     def test_cpu_ticks_takes_the_host_port_once(self):
         """Each mach_host_self() call adds a reference to the host port; a gate wait polls for hours."""
