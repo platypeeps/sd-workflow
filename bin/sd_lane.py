@@ -2664,7 +2664,9 @@ def start_train(entry: dict[str, Any], queue: Queue, gate: Gate, environ: dict[s
     entry twice, and a top one of `gates` already holds gets no second
     train. Its `chain` is the members below, so one that does not merge
     cancels the gate (`settle_gates`). A stack that crosses `deadline`
-    starts none (`train_stack`).
+    starts none (`train_stack`), nor does a claim while `DEPTH` gates
+    still run: the train counts against the speculation's limit, which
+    counts the train in turn once it starts.
     """
     try:
         members = train_members(entry, queue, lane_train(environ))
@@ -2672,6 +2674,10 @@ def start_train(entry: dict[str, Any], queue: Queue, gate: Gate, environ: dict[s
         return None
     held = {gated.follower for gated in gates}
     if not members or (members[-1]["id"], members[-1]["expected_head"]) in held:
+        return None
+    if sum(gated.is_alive() for gated in gates) >= DEPTH:  # the speculation's limit: a train is one of them
+        mark_train(queue, {row["id"]: {"status": "skipped", "reason": f"{DEPTH} earlier speculative gates still run"}
+                           for row in members}, [row["item"] for row in members])
         return None
     top = stacked_top(members, queue, deadline)
     if top is None or (top["row"]["id"], top["row"]["expected_head"]) in held:

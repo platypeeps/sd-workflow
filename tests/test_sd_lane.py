@@ -1813,6 +1813,20 @@ class Train(Trees):
         self.assertEqual(self.entries()[2]["train"]["status"], "cancelled")
         self.assertEqual(self.entries()[2]["train"]["items"], [1, 2, 3])
 
+    def test_a_train_waits_while_depth_gates_still_run(self) -> None:
+        """Review of sd:9899: each claim started a train past `DEPTH` gates already running."""
+        self.queue_three()
+        [entry] = [row for row in self.entries() if row["item"] == 1]
+        hold = threading.Event()
+        self.addCleanup(hold.set)
+        running = [sd_lane.SpeculativeGate(lambda: hold.wait(30), f"held-{n}", (f"other-{n}", "h")) for n in (1, 2)]
+        for held in running:
+            held.start()
+        with mock.patch.object(sd_lane, "train_stack", side_effect=AssertionError("stacked")):
+            self.assertIsNone(sd_lane.start_train(entry, self.store(), self.gate, self.environ, running))
+        self.assertEqual({row["train"]["status"] for row in self.entries()}, {"skipped"})
+        self.assertIn(f"{sd_lane.DEPTH} earlier", self.entries()[0]["train"]["reason"])
+
     def test_a_train_of_one_gates_nothing_extra(self) -> None:
         with mock.patch.object(sd_lane, "TRAIN", 1):
             self.queue_three()
