@@ -10,6 +10,7 @@ refuse fails here too.
 """
 import contextlib
 import dataclasses
+import hashlib
 import importlib
 import io
 import json
@@ -1288,6 +1289,28 @@ class Supervise(Case):
             planned, chosen = supervisor.review_plan(head)
         self.assertEqual(planned, argv, "a replayed delta review dropped its verify arguments")
         self.assertEqual(chosen["subject"]["head"], earlier)
+
+    def test_a_replay_held_at_the_checks_keeps_the_delta_review_s_prior(self):
+        """Review of sd:9769: a hub fault during an unmanaged repo's checks replays the review step. The review's
+        report sits at HEAD; the prior it verified must still decide, or deferred findings go back to the
+        builder. A full review's report (no verified digest) keeps no prior."""
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        head, earlier = "a" * 40, "b" * 40
+        prior = {**self.PRIOR, "status": "blocking", "scope": "branch", "subject": {"head": earlier}}
+        supervisor.out("prior").write_text(json.dumps(prior), encoding="utf-8")
+        digest = hashlib.sha256(json.dumps(prior, sort_keys=True).encode()).hexdigest()
+        supervisor.held = {"name": "checks", "argv": ["checks"], "exit": 1}
+        for verified, expected in ((digest, earlier), (None, None)):
+            supervisor.out("review").write_text(json.dumps(
+                {**prior, "subject": {"head": head}, "verification_report_digest": verified}), encoding="utf-8")
+            with self.subTest(verified=bool(verified)), \
+                    mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
+                    mock.patch.object(build_run, "_read", return_value=""):
+                _planned, chosen = supervisor.review_plan(head)
+                self.assertEqual((chosen or {}).get("subject", {}).get("head"), expected,
+                                 "a replay held at the checks lost the delta review's prior")
 
     def test_a_skipped_last_round_is_no_prior_to_verify(self):
         """Review of sd:9769: `sd-review` refuses a `skipped` report as `--verify-report`; the next round

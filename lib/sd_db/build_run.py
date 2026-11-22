@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import hashlib
 import json
 import os
 import re
@@ -1322,10 +1323,26 @@ class Supervisor:
             # A replay after the review wrote its report: that report sits at `head` and would read as a fix
             # with no commit. The held review's own arguments decide, so it answers from its record.
             prior = self.kept_prior() if "--verify-report" in held["argv"] else None
+        elif held is not None and held["name"] == "checks":
+            # A replay held at an unmanaged repo's checks: the review ran and its report sits at `head`. The
+            # prior it verified decides, matched by the digest `sd-review` stamped on that report (sd:9769).
+            prior = self.kept_prior()
+            if prior is None or self.verified_digest() != hashlib.sha256(
+                    json.dumps(prior, sort_keys=True).encode()).hexdigest():
+                prior = None
         else:
             prior = self.prior_review(head)
         verify = ["--verify-report", str(self.out("prior")), "--base", prior["subject"]["head"]] if prior else []
         return [*self.tools.review, "-C", str(self.work), "--scope", "branch", "--json", *verify], prior
+
+    def verified_digest(self) -> str | None:
+        """The digest of the prior report this round's review verified, from its own report; None if none."""
+        try:
+            answer = json.loads(self.out("review").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        digest = answer.get("verification_report_digest") if isinstance(answer, dict) else None
+        return digest if isinstance(digest, str) else None
 
     def kept_prior(self) -> dict | None:
         """The prior report `prior_review` kept for this round's verification; None when it does not read."""
