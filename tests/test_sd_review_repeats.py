@@ -304,7 +304,26 @@ class PriorLineTests(RepeatFixture):
     def test_the_line_map_reads_each_hunk(self) -> None:
         diff = "@@ -0,0 +1,21 @@\n+x\n@@ -5,2 +26,3 @@\n@@ -20 +42,0 @@\n"
         self.assertEqual([sd_review.moved_line(diff, line) for line in (1, 4, 5, 6, 7, 19, 20, 30)],
-                         [22, 25, 26, 26, 29, 41, 42, 51])
+                         [(22, 22, 22), (25, 25, 25), (26, 26, 28), (27, 26, 28), (29, 29, 29), (41, 41, 41),
+                          (42, 42, 42), (51, 51, 51)])
+
+    def test_a_blocker_inside_a_replaced_hunk_keeps_its_place(self) -> None:
+        """build/sd-1423 review (bin/sd-review:1829): `@@ -100,60 +100,60 @@` mapped a blocker at line 145 to the
+        hunk start, 100, so an uncited repeat at 145 fell outside the fallback and posted as advisory. A replaced
+        line keeps its offset in the hunk, and the whole replacing hunk counts as near."""
+        (self.root / "src.py").write_text("".join(f"old{n}\n" for n in range(1, 201)), encoding="utf-8")
+        old = self.commit("add", "src.py") and self.commit("old")
+        lines = [f"old{n}\n" if not 100 <= n < 160 else f"new{n}\n" for n in range(1, 201)]
+        (self.root / "src.py").write_text("".join(lines), encoding="utf-8")
+        new = self.commit("add", "src.py") and self.commit("new")
+        prior = [dict(finding(REPRO, line=145, summary="Empty input crashes"), disposition="blocking")]
+        [moved] = sd_review.prior_at(self.root, old, new, prior)
+        self.assertEqual(moved["line"], 145)
+        for line in (145, 101, 159 + sd_review.SHIFT_LINES):
+            with self.subTest(line=line):
+                [record] = sd_review.dispose([finding(line=line, summary="An empty list raises IndexError")],
+                                             "high", repro=True, prior=[moved])
+                self.assertEqual(record["disposition"], "blocking")
 
 
 class ReproRuleTests(unittest.TestCase):

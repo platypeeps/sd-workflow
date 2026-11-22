@@ -1808,8 +1808,9 @@ def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]
     if matched:
         return "\n".join(dict.fromkeys(text for text in matched if isinstance(text, str) and text.strip()))
     def _near(old: Mapping[str, Any]) -> bool:  # an unplaced line may be anywhere, so it fails closed
-        lines = [row.get("line") for row in (old, record)]
-        return not all(type(line) is int for line in lines) or abs(lines[0] - lines[1]) <= SHIFT_LINES
+        span, line = old.get("line_span"), record.get("line")  # set by `prior_at`; any other shape is ignored
+        low, high = span if isinstance(span, list) and len(span) == 2 else (old.get("line"),) * 2
+        return not all(type(value) is int for value in (line, low, high)) or low - SHIFT_LINES <= line <= high + SHIFT_LINES
     return "" if any(_file(old, record) and _near(old) and not any(_same(old, row) for row in findings)
                      for old in blockers) else None
 
@@ -1817,18 +1818,18 @@ def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]
 _HUNK = re.compile(r"(?m)^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
-def moved_line(diff: str, line: int) -> int:
-    """`line` of the old file at its place in the new one, read from `git diff -U0`; a changed line maps to the
-    start of the hunk that replaced it."""
+def moved_line(diff: str, line: int) -> tuple[int, int, int]:
+    """`line` of the old file at its place in the new one, read from `git diff -U0`, with the first and last new
+    line it may now sit on: a replaced line keeps its offset in the hunk, and any line of that hunk is near it."""
     offset = 0
     for match in _HUNK.finditer(diff):
         start, count, new, added = (int(value) if value else 1 for value in match.groups())
         if line < start or not count and line <= start:
             break
         if count and line < start + count:
-            return new
+            return new + min(line - start, max(added - 1, 0)), new, new + max(added - 1, 0)
         offset += added - count
-    return line + offset
+    return line + offset, line + offset, line + offset
 
 
 def prior_at(root: pathlib.Path, old: str, new: str, rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -1850,7 +1851,8 @@ def prior_at(root: pathlib.Path, old: str, new: str, rows: Sequence[Mapping[str,
             return dict(row, path=path)
         diff = sd_lib.git_output(["diff", "-M", "-U0", "--no-color", "--no-ext-diff", old, new, "--",
                                   *dict.fromkeys((row["path"], path))], root)
-        return dict(row, path=path, line=row["line"] if diff is None else moved_line(diff, row["line"]))
+        line, *span = (row["line"],) * 3 if diff is None else moved_line(diff, row["line"])
+        return dict(row, path=path, line=line, line_span=span)
     return [_remapped(row) for row in rows]
 
 
