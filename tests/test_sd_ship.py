@@ -6428,6 +6428,19 @@ class SettlesLineTests(unittest.TestCase):
         self.assertEqual(self.settled("<!-- template -->\n\nSettles: followup #42\n"), {42})
         self.assertEqual(self.settled("```\n<!--\n```\n\nSettles: followup #42\n"), {42})
 
+    def test_markers_on_one_line_are_read_left_to_right(self) -> None:
+        """sd:9869 review: `--><pre>` closed a comment and opened a block, but only the comment was read. Every
+        raw HTML block CommonMark keeps (pre, script, style, textarea) hides its lines."""
+        for opening in ("<!-- a --><pre>", "<!--\nx --><pre>", "</pre><pre>", "<!-- --> <script>", "<STYLE>",
+                        "<textarea rows=2>", "<pre><!-- --></pre><pre>", "<pre>```"):
+            with self.subTest(opening=opening):
+                self.assertTrue(ship.left_open(f"Body.\n{opening}\nexample"))
+        for closed in ("<!-- a --><pre></pre>", "<pre><!--</pre>", "<pre>\n```\n</pre>", "<!--\n```\n-->",
+                       "`<pre>` is a tag", "<preview>", "<!-- <pre> -->```"):
+            with self.subTest(closed=closed):
+                self.assertFalse(ship.left_open(f"Body.\n{closed}\n"))
+        self.assertEqual(self.settled("<!-- a --><pre>\n\nSettles: followup #42\n"), set())
+
     def test_only_a_trailer_paragraph_settles(self) -> None:
         """sd:9869 review: a `<pre>` example settled note 42, and a fence inside a hidden comment hid a real
         line after it. A Settles line counts only in a paragraph of trailers, the body's last or the
