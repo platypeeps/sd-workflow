@@ -313,6 +313,19 @@ class PriorLineTests(RepeatFixture):
         self.assertEqual([row["line"] for row in sd_review.prior_at(self.root, old, new, prior)], [10])
         self.assertIsNone(sd_review.sd_lib.git_output(["show", f"{new}:src.py"], self.root))
 
+    def test_a_path_is_read_literally_not_as_a_pattern(self) -> None:
+        """build/sd-1423 class pass (bin/sd-review:1853): the remap passed `page[1].py` to git as a glob, so it
+        read page1.py's patch too, and an insertion of 25 lines above the defect mapped it wrong."""
+        source = "".join(f"line{number}\n" for number in range(1, 41))
+        for name in ("page1.py", "page[1].py"):
+            (self.root / name).write_text(source, encoding="utf-8")
+        old = self.commit("add", ".") and self.commit("old")
+        (self.root / "page[1].py").write_text("".join(f"new{n}\n" for n in range(25)) + source, encoding="utf-8")
+        (self.root / "page1.py").write_text(source.replace("line3\n", ""), encoding="utf-8")
+        new = self.commit("add", ".") and self.commit("new")
+        prior = [dict(finding(REPRO, path="page[1].py", line=10), disposition="blocking")]
+        self.assertEqual([row["line"] for row in sd_review.prior_at(self.root, old, new, prior)], [35])
+
     def test_the_line_map_reads_each_hunk(self) -> None:
         diff = "@@ -0,0 +1,21 @@\n+x\n@@ -5,2 +26,3 @@\n@@ -20 +42,0 @@\n"
         self.assertEqual([sd_review.moved_line(diff, line) for line in (1, 4, 5, 6, 7, 19, 20, 30)],

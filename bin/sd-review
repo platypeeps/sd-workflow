@@ -1852,7 +1852,7 @@ def prior_at(root: pathlib.Path, old: str, new: str, rows: Sequence[Mapping[str,
         if type(row.get("line")) is not int:  # an unplaced blocker still follows its file (bin/sd-review:1846)
             return dict(row, path=path)
         diff = sd_lib.git_output(["diff", "-M", "-U0", "--no-color", "--no-ext-diff", old, new, "--",
-                                  *dict.fromkeys((row["path"], path))], root)
+                                  *dict.fromkeys(f":(literal){name}" for name in (row["path"], path))], root)
         line, *span = (row["line"],) * 3 if diff is None else moved_line(diff, row["line"])
         return dict(row, path=path, line=line, line_span=span)
     return [_remapped(row) for row in rows]
