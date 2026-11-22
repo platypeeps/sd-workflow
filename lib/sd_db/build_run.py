@@ -507,16 +507,21 @@ def changed_lines(git: Collection[str], work: str, base: str, head: str, *,
 
 
 def function_words(git: Collection[str], work: str, base: str, head: str, *,
-                   env: dict | None = None) -> set[str] | None:
-    """Every identifier in the functions `base..head` changes, each read whole (`--function-context`), so a
-    finding naming the changed caller, or what it calls, by function ties to the branch (pack sd:9769);
-    None when git cannot answer. A function git cannot bound widens to more lines, never fewer."""
+                   env: dict | None = None) -> tuple[set[str], set[str]] | None:
+    """Every identifier in the functions `base..head` changes, each read whole (`--function-context`), and the
+    names those lines define, so a finding naming the changed caller, or what it calls, ties to the branch
+    (pack sd:9769); None when git cannot answer. A function git cannot bound widens to more lines, never fewer."""
     try:
         diff = _read([*git, "-C", work, "diff", "--function-context", "--no-renames", "--no-color", "--no-ext-diff",
                       "--no-textconv", base, head], env=env)
     except Unread:
         return None
-    return set(re.findall(r"[A-Za-z_]\w*", diff))
+    lines = [line[1:] for line in diff.splitlines() if line[:1] in "+- " and not line.startswith(("+++", "---"))]
+    # `def x`, `function x`, `fn x`, `class x`, ...; a shell `x() {`; a method `x(a, b) {`.
+    defined = {name for line in lines for pair in re.findall(
+        r"\b(?:def|function|func|fn|class|sub|proc|struct|interface|type)\s+([A-Za-z_]\w*)"
+        r"|^\s*(?:async\s+|static\s+)*([A-Za-z_]\w*)\s*\([^()]*\)\s*\{", line) for name in pair if name}
+    return set(re.findall(r"[A-Za-z_]\w*", diff)), defined
 
 
 def callable_words(text: str) -> set[str]:
@@ -1516,7 +1521,8 @@ class Supervisor:
             if any(word in names or os.path.basename(word) in names for word in spelled):
                 return True
             # A function or method the change touches, as `name(`, `a_b`, `camelCase` or `` `x.name` ``.
-            if callable_words(words) & functions:
+            # Or a plain word that is the name of a function the change defines (`export`).
+            if callable_words(words) & functions[0] or set(re.findall(r"[A-Za-z_]\w*", words)) & functions[1]:
                 return True
             # A name with a space or other character no word holds (`bin/my tool`), found literally and whole.
             return any(re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w/-]|\.\w)", words)
@@ -1524,8 +1530,8 @@ class Supervisor:
         new = [row for row in answer["blockers"] if not held(row)]
         return new, [row for row in answer["blockers"] if row not in new]
 
-    def branch_words(self, head: str) -> set[str] | None:
-        """The identifiers in each function the branch changes from its fork, read whole; None when unread."""
+    def branch_words(self, head: str) -> tuple[set[str], set[str]] | None:
+        """`function_words` of the branch from its fork: its identifiers and defined names; None when unread."""
         try:
             fork = _read([*self.tools.git, "-C", str(self.work), "merge-base", self.base(), head], env=self.env).strip()
         except Unread:

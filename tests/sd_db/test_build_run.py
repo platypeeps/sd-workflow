@@ -1487,11 +1487,12 @@ class Supervise(Case):
                 self.assertIsNone(supervisor.prior_review("a" * 40),
                                   "the older kept report stood in for a last report that failed its checks")
 
-    def deferred(self, blockers, changed, words=frozenset()):
+    def deferred(self, blockers, changed, words=frozenset(), defined=frozenset()):
         """`file_new_findings` over `blockers` with the delta `changed`: the blockers it keeps."""
         supervisor = self.supervisor()
         with mock.patch.object(supervisor, "branch_delta", return_value=changed), \
-                mock.patch.object(supervisor, "branch_words", return_value=words):
+                mock.patch.object(supervisor, "branch_words",
+                                  return_value=None if words is None else (set(words), set(defined))):
             return supervisor, supervisor.file_new_findings({"status": "blocking", "blockers": blockers}, self.PRIOR,
                                                             "a" * 40)
 
@@ -1565,6 +1566,17 @@ class Supervise(Case):
         raw = json.loads(body[0])["proposal"]["findings"][0]["raw_finding"]
         self.assertEqual(raw.get("instances"), ["far.py:2", "other.py:7"], "the rebuttal dropped the instances")
 
+    def test_a_changed_function_named_in_plain_words_holds(self):
+        """Review of sd:9769: a reviewer can name the changed caller as a plain word (`export`); a plain word
+        that is the name of a function the branch changes ties the blocker to the branch."""
+        self.press()
+        rows = [{"path": "lib/parse.py", "line": 3, "summary": "export now passes an empty value; the parser crashes"}]
+        _, kept = self.deferred(rows, {"src/caller.py": {12}}, {"export", "value"}, {"export"})
+        self.assertEqual(kept["blockers"], rows, "a blocker naming a changed function in plain words was deferred")
+        far = {"path": "lib/parse.py", "line": 3, "summary": "the parser crashes on an empty value"}
+        _, kept = self.deferred([far], {"src/caller.py": {12}}, {"the", "parser", "value"}, {"export"})
+        self.assertEqual(kept["blockers"], [], "a plain word that names no changed function held a blocker")
+
     def test_branch_words_hold_the_changed_function_and_what_it_calls(self):
         """Lead ruling on sd:9769: the branch's changed functions, read whole, name the caller and its callee."""
         repo = Path(tempfile.mkdtemp(dir=self.root))
@@ -1584,8 +1596,11 @@ class Supervise(Case):
         (repo / "caller.py").write_text(body.replace("x = 1", "x = None"))
         run("add", "-A")
         run("commit", "-q", "-m", "change")
-        words = build_run.function_words(["git"], str(repo), base, run("rev-parse", "HEAD"))
-        assert words is not None, "git's function context did not read"
+        read = build_run.function_words(["git"], str(repo), base, run("rev-parse", "HEAD"))
+        assert read is not None, "git's function context did not read"
+        words, defined = read
+        self.assertIn("review_plan", defined, "the changed function's own name is not a defined name")
+        self.assertNotIn("parse_row", defined, "a called name read as a defined one")
         self.assertTrue({"review_plan", "parse_row"} <= words, words)
         self.assertNotIn("untouched", words)
 
@@ -1679,7 +1694,7 @@ class Supervise(Case):
         supervisor.db.outcome = mock.Mock(return_value="recorded")
         answer = {"status": "blocking", "blockers": rows}
         with mock.patch.object(supervisor, "branch_delta", return_value={}), \
-                mock.patch.object(supervisor, "branch_words", return_value=set()), \
+                mock.patch.object(supervisor, "branch_words", return_value=(set(), set())), \
                 mock.patch.object(supervisor, "file_follow_up", committed_then_lost):
             with self.assertRaises(remote.UnknownOutcome):
                 supervisor.file_new_findings(answer, self.PRIOR, "a" * 40)
