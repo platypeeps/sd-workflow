@@ -372,6 +372,25 @@ class PriorLineTests(RepeatFixture):
         self.assertEqual([(row["disposition"], row.get("evidence")) for row in disposed],
                          [("blocking", REPRO), ("advisory", None)])
 
+    def test_an_edited_blocker_line_still_holds_its_paraphrase(self) -> None:
+        """build/sd-1423 review (bin/sd-review:1814): `return total / count` became `return round(total / count)`,
+        so the division by zero stayed, but the changed line gave `line_kept=False` and an uncited paraphrase at
+        the same line posted as advisory. A changed blocker line still holds an uncited finding on that line."""
+        source = [f"line{number}\n" for number in range(1, 41)]
+        source[9] = "    return total / count\n"
+        (self.root / "src.py").write_text("".join(source), encoding="utf-8")
+        old = self.commit("add", "src.py") and self.commit("old")
+        source[9] = "    return round(total / count)\n"
+        (self.root / "src.py").write_text("".join(source), encoding="utf-8")
+        new = self.commit("add", "src.py") and self.commit("new")
+        prior = [dict(finding(REPRO, line=10, summary="Empty input divides by zero"), disposition="blocking")]
+        [moved] = sd_review.prior_at(self.root, old, new, prior)
+        self.assertEqual((moved["line"], moved["line_kept"]), (10, False))
+        disposed = sd_review.dispose([finding(line=10, summary="count of zero raises ZeroDivisionError"),
+                                      finding(line=12, summary="the cache is never cleared")], "high",
+                                     repro=True, prior=[moved])
+        self.assertEqual([row["disposition"] for row in disposed], ["blocking", "advisory"])
+
     def test_a_fixed_blocker_holds_no_nearby_finding(self) -> None:
         """build/sd-1423 class pass (bin/sd-review:1816): after the blocker at src.py:10 was fixed, an unrelated
         uncited high finding at src.py:12 still blocked on closeness alone. Only a prior blocker whose own line

@@ -1789,9 +1789,9 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
 
 def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any], findings: Sequence[Any] = ()) -> str | None:
     """The evidence a prior report's blockers stored for `record`'s finding, one per line; "" when they stored
-    none, as a report from before sd:9867 may, or when a prior blocker whose line is unchanged at this head
-    (`line_kept`) and within `SHIFT_LINES` matches no finding in `findings` (fail closed: a shifted, paraphrased
-    repeat must not clear it, but a fixed one holds nothing); None otherwise.
+    none, as a report from before sd:9867 may, or when a prior blocker within `SHIFT_LINES` if its line is unchanged
+    at this head (`line_kept`), else at the same line, matches no finding in `findings` (fail closed: a shifted or
+    edited, paraphrased repeat must not clear it; a fixed one holds only its own line); None otherwise.
 
     A match is the same file, as `repo_spelling` spells it, the same line and the
     same `summary_key`: a line alone gave an unrelated finding the old repro (lead after round 8)."""
@@ -1809,10 +1809,10 @@ def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]
     matched = [old.get("evidence") for old in blockers if _same(old, record)]
     if matched:
         return "\n".join(dict.fromkeys(text for text in matched if isinstance(text, str) and text.strip()))
-    def _near(old: Mapping[str, Any]) -> bool:  # only a blocker whose own code `prior_at` found unchanged holds
-        lines = [row.get("line") for row in (old, record)]
-        return old.get("line_kept") is True and all(type(line) is int for line in lines) and abs(
-            lines[0] - lines[1]) <= SHIFT_LINES  # an unplaced line compares no code, so it holds nothing
+    def _near(old: Mapping[str, Any]) -> bool:  # an unchanged blocker holds nearby lines; an edited one its own
+        lines = [row.get("line") for row in (old, record)]  # (bin/sd-review:1814: `round(total / count)` kept it)
+        return all(type(line) is int for line in lines) and abs(lines[0] - lines[1]) <= (
+            SHIFT_LINES if old.get("line_kept") is True else 0)  # an unplaced line compares no code, so it holds nothing
     return "" if any(_file(old, record) and _near(old) and not any(_same(old, row) for row in findings)
                      for old in blockers) else None
 
