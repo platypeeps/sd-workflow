@@ -544,7 +544,8 @@ def waiting_on(connection, row) -> str:
         f"SELECT id, status FROM item WHERE id IN ({marks})", named)}
     gone = [other for other in named if other not in found]
     if gone:
-        return f"waits on sd:{gone[0]}, which no longer exists; clear it with sd task edit --blocked-by"
+        return (f"waits on sd:{gone[0]}, which no longer exists; clear it with sd task edit {row['id']} "
+                "--clear-blocked-by, or name the rest with --blocked-by")
     held = [other for other in named if found[other] != "done"]
     return f"waits on {', '.join(f'sd:{other}' for other in held)}" if held else ""
 
@@ -1793,10 +1794,10 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
 
 
 def queued_fresh(connection, repo: str) -> list[dict]:
-    """`repo`'s queued fresh builds (no parent, never run), as `{id, title, priority}` in queue order: the rows a
-    claim bundles with a new press, for the Build dialog's plan (pack sd:9484)."""
+    """`repo`'s queued fresh builds (no parent, never run), as `{id, title, priority, fields}` in queue order: the
+    rows a claim bundles with a new press, for the Build dialog's plan (pack sd:9484)."""
     return [dict(row) for row in connection.execute(
-        "SELECT item.id, item.title, item.priority FROM assignment JOIN item ON item.id = assignment.item "
+        "SELECT item.id, item.title, item.priority, item.fields FROM assignment JOIN item ON item.id = assignment.item "
         "WHERE assignment.status = 'queued' AND assignment.scope = ? AND assignment.parent IS NULL "
         "AND assignment.run_count = 0 AND item.repo = ? ORDER BY assignment.queued_at, assignment.id",
         (SCOPE, repo))]
@@ -1890,11 +1891,12 @@ def _work_repo(connection, row) -> str | None:
 
 
 def _refuse(connection, row, reason: str) -> None:
-    """End one queued build `blocked` with why the claim did not take it; its item stays as it is."""
+    """End one queued build `blocked` with why the claim did not take it; its item stays as it is. A row no longer
+    queued, such as one this claim refused already, writes no second note (pack sd:9862)."""
     reason += "; not built"
-    connection.execute("UPDATE assignment SET status = 'blocked', ended = ?, result = ? "
-                       "WHERE id = ? AND status = 'queued'", (clock(), reason, row["id"]))
-    add_note(connection, row["item"], "comment", f"Build assignment {row['id']} blocked: {reason}")
+    if connection.execute("UPDATE assignment SET status = 'blocked', ended = ?, result = ? "
+                          "WHERE id = ? AND status = 'queued'", (clock(), reason, row["id"])).rowcount:
+        add_note(connection, row["item"], "comment", f"Build assignment {row['id']} blocked: {reason}")
 
 
 def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:

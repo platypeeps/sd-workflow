@@ -33,6 +33,7 @@ from sd_db import repos as sd_repos
 from sd_db.config import label_prefix
 from sd_db.database import transaction
 from sd_db.errors import SdDbError
+from sd_db.workflow import item_area
 from sd_db.writes import SettingStale, set_setting
 
 __all__ = ["ENDED_MAX", "JOB", "QUIET_SECONDS", "answer", "file_and_build", "fix_flaky", "kickstart", "lane_fix_state", "panel",
@@ -114,6 +115,16 @@ def _room(connection, *, now: str, sessions=None, gate=None) -> dict:
                                                                                         sessions=sessions))
 
 
+def _slot(row) -> tuple | None:
+    """The bundle a claim puts `row` in within its repository, as dispatch splits them (sd:9700, review of pack
+    sd:9862): None for the ordinary bundle; a P1 item builds beside it with the P1 items of its own area, alone
+    when it has none (`build.kin`)."""
+    if not build.beside(row):
+        return None
+    area = item_area(row)
+    return ("area", area) if area is not None else ("item", row["id"])
+
+
 def plan(connection, items: list[int], *, now: str, sessions=None, gate=None) -> dict:
     """What a Build press on `items` would queue: `bundles` by repository, `refused` with each reason, the `room` now.
 
@@ -131,14 +142,14 @@ def plan(connection, items: list[int], *, now: str, sessions=None, gate=None) ->
     revisions = reads.revisions(connection, [row["id"] for row in taken]) if taken else {}
     waits = build.waits(connection, [row["id"] for row in taken]) if taken else {}
     room = _room(connection, now=now, sessions=sessions, gate=gate)
-    groups: dict[str, list[dict]] = {}
+    groups: dict[tuple, list[dict]] = {}
     for row in taken:
-        groups.setdefault(row["repo"], []).append(row)
+        groups.setdefault((row["repo"], _slot(row)), []).append(row)
     bundles = []
-    for repo, rows in groups.items():
+    for (repo, slot), rows in groups.items():
         # The claim bundles the repository's queued fresh builds with these, best first (pack sd:9484): show them
         # where it puts them. ponytail: a queued retry claims alone and is not shown; a press queues after now.
-        queued = build.queued_fresh(connection, repo)
+        queued = [row for row in build.queued_fresh(connection, repo) if _slot(row) == slot]
         lane = rows[0]["lane_host"]
         rows = sorted([*({**row, "queued": True} for row in queued), *({**row, "queued": False} for row in rows)],
                       key=lambda row: (row["priority"] is None, row["priority"] or 0))
@@ -148,7 +159,7 @@ def plan(connection, items: list[int], *, now: str, sessions=None, gate=None) ->
             host = build.lane_of(connection, lane) or ""
             bundles.append({"repo": repo, "name": Path(repo).name, "host": host,
                             "beat": build.dispatcher_beat(connection, host) if host else None,
-                            "room": 0 if host else build.room_for(room, repo),
+                            "room": 0 if host else build.room_for(room, repo, p1=slot is not None),
                             "model": build._model(connection, [row["id"] for row in chunk]),
                             "branch": "build/sd-<lead assignment>",
                             "items": [{"id": row["id"], "title": row["title"], "queued": True} if row["queued"] else

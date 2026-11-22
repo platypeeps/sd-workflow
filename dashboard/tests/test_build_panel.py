@@ -119,6 +119,24 @@ class BuildRoutes(Fixture):
         self.assertEqual([[(row["id"], row["queued"]) for row in bundle["items"]] for bundle in out["bundles"]],
                          [[(earlier, True), (pressed[0], False), (pressed[1], False)], [(pressed[2], False)]])
 
+    def test_the_plan_splits_p1_items_as_the_claim_does(self):
+        """Review of pack sd:9862: dispatch keeps P1 items out of the ordinary bundle, bundles them by area, and
+        gives them room beside the repository's running build; the plan shows that split and that room."""
+        queued = self.ready()
+        build.queue(self.connection, [queued], who="operator")
+        plain = self.ready()
+        p1 = [self.ready(priority=1, fields={"area": "alpha"}) for _ in range(2)]
+        other = self.ready(priority=1, fields={"area": "beta"})
+        full = {"machine": 6, "why": "", "held": [], "used": {REPO: build.repo_cap()}}
+        with patch.object(build, "room", return_value=full):
+            out = builds.plan(self.connection, [plain, *p1, other], now=NOW,
+                              sessions=lambda connection, *, now: {"sessions": [], "builders": {"running": 0,
+                                                                                                "why": ""}},
+                              gate=lambda: {"load": [1.0, 1.0, 1.0], "load_max": 40.0})
+        self.assertEqual(out["refused"], [])
+        self.assertEqual([([row["id"] for row in bundle["items"]], bundle["room"]) for bundle in out["bundles"]],
+                         [([queued, plain], 0), (p1, 6), ([other], 6)])
+
     def test_the_plan_shows_each_items_wait_before_the_press(self):
         """Pack sd:8964: a readied item that waited on outside work showed nothing of it in the Build dialog.
         Each item carries its parked_at and the reason of its latest move to planning or blocked that gave one."""
