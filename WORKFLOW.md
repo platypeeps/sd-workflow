@@ -678,6 +678,9 @@ The reserved `sd` namespace declares these settings:
 - `sd.bundle_max`: how many items one build bundle takes when this machine claims it, a mechanical item half
   of one. Absence reads 3. The claim fixes a build child's budget at 120 minutes per 3 slots it took, never
   less (sd:9109). It grants nothing.
+- `sd.build_model`: the model every build bundle this machine claims runs its builder on, as the builder's
+  `--model` takes it (`opus`, `sonnet`, `fable` or a model id). Absence runs opus, and sonnet for an
+  all-mechanical bundle (sd:9942). It grants nothing.
 - `sd.lane_parallel`: how many lanes one hosted lane run runs at once on this machine, 1 to 8. Absence reads 5
   (sd:9323); the gate's slots and load limit still hold lanes back below it. It grants nothing.
 - `sd.machine_cap`: how many code-writing builders, drafts and interactive builders may run at once on this
