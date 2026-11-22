@@ -676,7 +676,7 @@ def install(config_path, *, expected_fingerprint, home=None):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("preflight", "install", "health"))
-    parser.add_argument("--config", type=Path, default=Path.home() / ".config/sd/dashboard.json")
+    parser.add_argument("--config", type=Path)
     parser.add_argument("--apply", action="store_true")
     parser.add_argument("--expected-fingerprint")
     # health: seconds to wait for a starting server; 0, the default, tries once.
@@ -684,8 +684,13 @@ def main():
     args = parser.parse_args()
     if not (math.isfinite(args.wait) and args.wait >= 0):
         parser.error("--wait needs a finite number of seconds, 0 or more")
+    named, args.config = args.config is not None, args.config or Path.home() / ".config/sd/dashboard.json"
     try:
         if args.action == "health":
+            if not named and not os.path.lexists(args.config):  # a dangling link is a broken config
+                # sd:9916: a host with no dashboard (a satellite) has nothing to check; a named config still must read.
+                print(json.dumps({"status": "not_configured", "config": str(args.config)}))
+                return 0
             config = read_config(args.config)
             load_frontdoor(args.config, config["port"])
             result = health_check(config["port"], wait=args.wait)

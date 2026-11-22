@@ -1136,6 +1136,24 @@ class HealthWait(unittest.TestCase):
                 self.assertEqual(exit.exception.code, 2)
                 health.assert_not_called()
 
+    def test_health_on_a_host_with_no_dashboard_config_is_not_a_failure(self):
+        # REGRESSION sd:9916: a satellite runs no dashboard; health read the missing default config and exited 1.
+        with tempfile.TemporaryDirectory(prefix="dashboard-none-") as home, \
+                patch.object(runtime.Path, "home", return_value=Path(home)), \
+                patch.object(sys, "argv", ["runtime", "health"]), \
+                patch.object(runtime, "health_check") as health, patch("sys.stdout") as out:
+            self.assertEqual(runtime.main(), 0)
+            health.assert_not_called()
+        said = json.loads("".join(call.args[0] for call in out.write.call_args_list))
+        self.assertEqual(said["status"], "not_configured")
+
+    def test_health_with_a_named_config_that_is_missing_still_fails(self):
+        with tempfile.TemporaryDirectory(prefix="dashboard-none-") as home, \
+                patch.object(sys, "argv", ["runtime", "health", "--config", f"{home}/missing.json"]), \
+                patch.object(runtime, "health_check") as health, patch("sys.stderr"):
+            self.assertEqual(runtime.main(), 1)
+            health.assert_not_called()
+
     def test_no_wait_tries_once(self):
         result, tries = self.poll(1, wait=0)
         self.assertIsInstance(result, runtime.RuntimeRefused)
