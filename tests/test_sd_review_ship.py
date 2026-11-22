@@ -8,6 +8,7 @@ import pwd
 import subprocess
 from unittest.mock import patch
 
+from tests.clean_env import clean_environment
 from tests.test_sd_review import (
     FakeRunner,
     ReviewFixture,
@@ -127,6 +128,19 @@ class FixReviewTests(ReviewFixture):
         chained = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)),
                                    FakeRunner(), self.environment(), self.chatgpt_home())
         self.assertIsNone(chained["covers_from"], "a pass under another policy extended the chain")
+
+    def test_a_verify_report_from_a_sibling_branch_is_refused(self):
+        """Review of sd:9767: a report whose head is not an ancestor of HEAD never chains."""
+        root, first = self.branch()
+        full = sd_review.review(root, namespace(scope="branch"), FakeRunner(), self.environment(), self.chatgpt_home())
+        report = self.tmp / "prior.json"
+        report.write_text(json.dumps(full))
+        subprocess.run(["git", "checkout", "-b", "sibling", full["subject"]["base"]], cwd=root,
+                       capture_output=True, check=True, env=clean_environment())
+        self.commit(root, "src.py", "the_original_defect = True\n", message="same change\n\nAuthored-with: other")
+        with self.assertRaisesRegex(sd_review.UsageError, "ancestor of HEAD"):
+            sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)),
+                             FakeRunner(), self.environment(), self.chatgpt_home())
 
     def test_a_pass_the_lane_would_not_record_seeds_no_chain(self):
         """Review of sd:9769: a --draft or --provider pass must not hand its coverage to a verify pass."""
