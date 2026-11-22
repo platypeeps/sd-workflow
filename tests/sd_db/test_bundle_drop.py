@@ -1029,3 +1029,30 @@ class GitPolicy(Repo):
         self.assertTrue(all(call.kwargs.get("timeout") == DROP.GIT_SECONDS for call in run_git.call_args_list))
         self.assertEqual(git(Path(run["work_path"]), "rev-parse", "HEAD"), old)
         self.unmade(run)
+
+
+class DropWait(Repo):
+    """Review of build/sd-1306: a drop's kept lead counts a run it never had. Its lead set to wait on its kept
+    member before dispatch, the claim held both, parked (`parked=[1, 2], detached=[]`); Retry refused, as it never
+    ran, and a Build of the member started a fresh branch, leaving the kept commits on the split one."""
+
+    def test_a_kept_lead_that_waits_on_its_member_resumes_the_split_branch(self):
+        import json
+
+        items, _, run = self.bundle()
+        new = self.drop(run, items[1])
+        lead, member = (self.db.execute("SELECT id FROM assignment WHERE item = ? ORDER BY id DESC LIMIT 1",
+                                        (item,)).fetchone()["id"] for item in (items[0], items[2]))
+        self.db.execute("UPDATE item SET fields = ? WHERE id = ?",
+                        (json.dumps({"blocked_by": [items[2]]}), items[0]))
+        self.assertIsNone(self.claim(), "the lead waits")
+        # The member it waits on leaves the bundle, unparked, as after a run (`_needed`); the lead holds, parked.
+        self.assertTrue(runner.queue_state(self.db, member)["result"].startswith(build.ALONE))
+        self.assertIsNone(self.db.execute("SELECT parked_at FROM item WHERE id = ?", (items[2],)).fetchone()[0])
+        self.assertEqual(runner.queue_state(self.db, lead)["status"], "blocked")
+        # Once the member is done, a Build of the lead is its Retry: the claim resumes the split branch.
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[2],))
+        queued = build.queue_again(self.db, [items[0]], who="operator")
+        self.assertEqual([entry["id"] for entry in queued], [lead])
+        again = self.claim()
+        self.assertEqual((Path(again["work_path"]), again["branch"]), (new, f"build/sd-{lead}"))

@@ -717,19 +717,30 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
         if current["scope"] != SCOPE:
             raise BuildRefused(f"assignment {assignment} is not a build")
         last = current["run"]
-        state = retry_state(connection, last) if last else {"allowed": False, "reason": "it never ran"}
+        # A drop's kept lead never ran; its worktree is the split's, so a Retry of it held resumes that (review of
+        # build/sd-1306). It names the ended run whose work it keeps, and it retries whole.
+        resumes = None if last or current["parent"] is not None else _resumable(
+            connection, assignment, current["item"], current["status"])
+        if last:
+            state = retry_state(connection, last)
+        elif resumes and current["status"] in AGAIN and only is None:
+            state = {"allowed": True}
+        else:
+            state = {"allowed": False, "reason": "it never ran" if not resumes or only is None else
+                     "it never ran since its bundle drop; Retry it whole"}
         if not state["allowed"]:
             raise BuildRefused(f"Retry refused: {state['reason']}")
+        ran = last["id"] if last else resumes[0] if resumes else ""
         members = _members(connection, assignment, current["status"])
         if not members:
-            raise BuildRefused(f"Retry refused: build run {last['id']} has no {current['status']} member")
+            raise BuildRefused(f"Retry refused: build run {ran} has no {current['status']} member")
         # Who leaves is read from the members the retried run built (`run`), not from this filtered view: a member
         # whose item moved to done or planning (its blocked assignment cancelled, `UNBUILT`) or that is done since
         # by another build (sd:9015) is left out too, as one `only` omits, so the split guard reads the branch for
         # its earlier work. A member an operator cancelled on its own (`ALONE`) left already (sd:9222), and one
         # Retry would not end (not `AGAIN`, as a member delivered `done` beside a skipped lead) stays as it is.
         built = [member for member in run(connection, last["id"])["members"][1:]
-                 if member["status"] in AGAIN and not (member["result"] or "").startswith(ALONE)]
+                 if member["status"] in AGAIN and not (member["result"] or "").startswith(ALONE)] if last else []
         items = reads.items_by_ids(connection, [current["item"], *(member["item"] for member in members + built)])
         # A done lead refuses: the claim would lead with a member, on a new branch and worktree.
         if _done(items, current["item"]):
@@ -750,32 +761,32 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
                 names = ", ".join("sd:" + str(member["item"]) for member in ahead)
                 raise BuildRefused(f"Retry refused: its lead sd:{current['item']} waits on {names}, which would "
                                    "build fresh; send the finding once they are done")
-            free = _free(connection, ahead, who=who, run=last["id"], lead=current["item"])
+            free = _free(connection, ahead, who=who, run=ran, lead=current["item"])
             fresh = queue(connection, free, who=who) if free else []
-            return {"run": last["id"], "queued": [{"id": row["id"], "item": row["item"], "status": row["status"]}
+            return {"run": ran, "queued": [{"id": row["id"], "item": row["item"], "status": row["status"]}
                                                  for row in fresh]}
         members = [member for member in members if member not in behind]
         kept = {member["id"] for member in members}
         for member in [member for member in built if member["id"] not in kept]:
             owns = _current(connection, member)  # read before this row's own write below
             connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
-                               (stamp, f"{ALONE}{who}: {LEFT_OUT}{last['id']}", member["id"]))
+                               (stamp, f"{ALONE}{who}: {LEFT_OUT}{ran}", member["id"]))
             if not owns:  # a newer build owns the item: its state is that build's, not this bundle's
                 continue
             if member["item"] in items and items[member["item"]]["status"] == "blocked":
                 transition(connection, member["item"], "ready", who=who,
-                           reason=f"left out of a Retry of build run {last['id']}")
+                           reason=f"left out of a Retry of build run {ran}")
             park(connection, member["item"], ("ready",), stamp,
-                 f"Build assignment {member['id']} left its bundle: a Retry of build run {last['id']} by {who} "
+                 f"Build assignment {member['id']} left its bundle: a Retry of build run {ran} by {who} "
                  f"named other items; item parked; Build it to build it fresh")
         newer = [member for member in members if not _current(connection, member)]
         if newer:
             owner = connection.execute("SELECT id FROM assignment WHERE item = ? AND scope = ? ORDER BY id DESC "
                                        "LIMIT 1", (newer[0]["item"], SCOPE)).fetchone()["id"]
             raise BuildRefused(f"Retry refused: sd:{newer[0]['item']} has a newer build, assignment {owner}")
-        parked = "" if finding else parked_finding(last.get("detail"))
-        how = f"{'Send to builder' if finding else 'Retry'} of build run {last['id']}"
-        return {"run": last["id"], "queued": _queue_members(connection, members, items, lead=assignment, who=who,
+        parked = "" if finding or not last else parked_finding(last.get("detail"))
+        how = f"{'Send to builder' if finding else 'Retry'} of build run {ran}"
+        return {"run": ran, "queued": _queue_members(connection, members, items, lead=assignment, who=who,
                                                              finding=finding, parked=parked, how=how, verb="Retry")}
 
 
@@ -1104,9 +1115,11 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             if split_held(connection, item):  # its branch may hold a left item's work: a fresh press, new branch
                 fresh.append(item)
                 continue
-            if (state and state["status"] in AGAIN and state["run"] is not None
-                    and row["status"] == state["status"] and not alone
-                    and not (state["run"]["outcome"] is None and state["run"]["step"] in LANE_STEPS)
+            # A drop's kept lead never ran, and its Retry resumes the split branch (`retry`, review of build/sd-1306).
+            if (state and state["status"] in AGAIN and row["status"] == state["status"] and not alone
+                    and (state["run"] is not None
+                         or _resumable(connection, lead, state["item"], state["status"]) is not None)
+                    and not (state["run"] and state["run"]["outcome"] is None and state["run"]["step"] in LANE_STEPS)
                     and not _done(reads.items_by_ids(connection, [state["item"]]), state["item"])):
                 leads += [] if lead in leads else [lead]
                 named.setdefault(lead, set()).add(item)
@@ -1647,14 +1660,7 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             home = _work_repo(connection, row) if row["parent"] is None else None
             if home is None:
                 continue
-            found = [one for one in connection.execute(
-                "SELECT member.id, member.item, member.status, item.repo FROM assignment member "
-                "JOIN item ON item.id = member.item JOIN assignment lead ON lead.id = member.parent "
-                "WHERE member.parent = ? AND member.scope = ? "
-                "AND member.queued_at >= lead.queued_at AND item.status != 'done' "
-                "AND COALESCE(member.result, '') NOT LIKE ? ORDER BY member.id",
-                (row["id"], SCOPE, f"%: {LEFT_OUT}%")).fetchall()
-                if one["status"] != "queued" or one["repo"] is None or not paths.same(home, one["repo"])]
+            found = _strays(connection, row["id"], home, ("queued",))
             for one in found:
                 if one["status"] == "queued":
                     _refuse(connection, one, f"item {one['item']} has no repository; set one, then Build it again"
@@ -1698,13 +1704,17 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             # A member the waiting ones need leaves the bundle, as a subset Retry leaves one out (`LEFT_OUT`):
             # held with them it could never build, and its Build would retry this bundle (review of sd:9570).
             # It leaves before any row is refused, so one that waits itself leaves too (review of build/sd-1306).
+            # A drop's kept lead that never ran leaves its member too, with no run to mark (`left_mark`): its
+            # Retry resumes the split branch once the member is done (review of build/sd-1306).
             needed = _needed(connection, [row["item"] for row, _ in waiting])
-            last = queue_state(connection, bundle[0]["id"])["run"]
+            mark = left_mark(connection, bundle[0]["id"]) or ": its lead waits on it"
+            resumable = (queue_state(connection, bundle[0]["id"])["run"] is not None
+                         or _kept_host(connection, bundle[0]) is not None)
             for row in bundle[1:]:
-                if row["item"] in needed and last is not None and connection.execute(
+                if row["item"] in needed and resumable and connection.execute(
                         "UPDATE assignment SET status = 'cancelled', ended = ?, result = ? "
                         "WHERE id = ? AND status = 'queued'",
-                        (stamp, f"{ALONE}build: {LEFT_OUT}{last['id']}", row["id"])).rowcount:
+                        (stamp, f"{ALONE}build{mark}", row["id"])).rowcount:
                     add_note(connection, row["item"], "comment",
                              f"Build assignment {row['id']} left its bundle: its lead waits on it ({held}); "
                              f"Build it to build it on its own")
@@ -1800,6 +1810,30 @@ def _needed(connection, items: list[int]) -> set[int]:
                 needed.add(other)
                 pending.append(other)
     return needed
+
+
+def _strays(connection, lead: int, home: str, keep: tuple[str, ...]) -> list:
+    """The members that left build `lead`'s bundle after it queued, with work on its branch: each whose item is
+    open, not left out by a Retry (`LEFT_OUT`), and not in `keep` or away from the work's repository `home`
+    (round 21). The claim keeps only queued ones; a Retry of a drop's kept lead keeps its held ones too."""
+    return [one for one in connection.execute(
+        "SELECT member.id, member.item, member.status, item.repo FROM assignment member "
+        "JOIN item ON item.id = member.item JOIN assignment lead ON lead.id = member.parent "
+        "WHERE member.parent = ? AND member.scope = ? "
+        "AND member.queued_at >= lead.queued_at AND item.status != 'done' "
+        "AND COALESCE(member.result, '') NOT LIKE ? ORDER BY member.id",
+        (lead, SCOPE, f"%: {LEFT_OUT}%")).fetchall()
+        if one["status"] not in keep or one["repo"] is None or not paths.same(home, one["repo"])]
+
+
+def _resumable(connection, lead: int, item: int, status: str) -> tuple[str, str | None] | None:
+    """(run, host) of the ended run a drop's kept lead `lead` that never ran resumes the split branch of, or None:
+    none when a member left its bundle with work on it (`_strays`), which Build takes fresh (round 21; review of
+    build/sd-1306)."""
+    row = {"id": lead, "item": item, "parent": None}
+    kept = _kept_host(connection, row)
+    home = _work_repo(connection, row) if kept else None
+    return kept if home is not None and not _strays(connection, lead, home, ("queued", status)) else None
 
 
 def _kept_host(connection, row) -> tuple[str, str | None] | None:
