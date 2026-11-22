@@ -3095,6 +3095,55 @@ class Tick(Case):
                 build.queue_again(self.db, [self.items[one] for one in order], who="operator")
                 self.assertEqual([self.queued_builds(item) for item in self.items], [0, 1, 0], "only B builds")
 
+    def newer_build_of_member(self):
+        """Lead A and member B; the bundle fails in the lane; B builds fresh and its new build claims it, so
+        B's item is in_progress under the newer build. Then B waits on A."""
+        run = self.enqueued(2)
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red"}
+        self.tick()
+        with self.db:  # the operator moved B back to ready, then built it on its own
+            self.db.execute("UPDATE item SET status = 'ready' WHERE id = ?", (self.items[1],))
+        newer = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        with self.db:
+            self.db.execute("UPDATE assignment SET status = 'running' WHERE id = ?", (newer,))
+            self.db.execute("UPDATE item SET status = 'in_progress', fields = ? WHERE id = ?",
+                            (json.dumps({"blocked_by": [self.items[0]]}), self.items[1]))
+        return run, newer
+
+    def assert_newer_build_owns_member(self, newer):
+        state = item_state(self.db, self.items[1])["item"]
+        self.assertEqual((state["status"], state.get("parked_at")), ("in_progress", None),
+                         "the newer build owns B's status")
+        self.assertEqual(self.db.execute("SELECT status FROM assignment WHERE id = ?", (newer,)).fetchone()[0],
+                         "running")
+
+    def test_a_fix_leaves_a_member_a_newer_build_owns(self):
+        """Review of build/sd-1306: Fix of the old bundle read B by its in_progress status alone, then `_leave`
+        moved B to ready and parked it while the newer build ran it. Fix sends back only the members it owns."""
+        run, newer = self.newer_build_of_member()
+        build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assert_newer_build_owns_member(newer)
+        self.assertEqual(self.queued_builds(self.items[0]), 1, "Fix sends the lead back")
+
+    def test_a_conflict_rebuild_leaves_a_member_a_newer_build_owns(self):
+        """Class pass: the conflict rebuild reads the same members (`_sendable`)."""
+        run, newer = self.newer_build_of_member()
+        with self.db:
+            build._rebuild(self.db, build.run(self.db, run["id"]), "conflict", build.clock(), "origin/main", "e1")
+        self.assert_newer_build_owns_member(newer)
+
+    def test_a_build_frees_no_member_a_newer_build_owns(self):
+        """Class pass: the Build path frees the members the lead waits on (`_free`); one a newer build owns is
+        not its to free, so A waits for that build and the refusal says so."""
+        run, newer = self.newer_build_of_member()
+        with self.db:
+            self.db.execute("UPDATE item SET fields = '{}' WHERE id = ?", (self.items[1],))
+            self.db.execute("UPDATE item SET fields = ? WHERE id = ?",
+                            (json.dumps({"blocked_by": [self.items[1]]}), self.items[0]))
+        with self.assertRaisesRegex(build.BuildRefused, f"item {self.items[0]} waits on sd:{self.items[1]}"):
+            build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assert_newer_build_owns_member(newer)
+
     def build_rows(self):
         return self.db.execute("SELECT id, status, result FROM assignment ORDER BY id").fetchall()
 

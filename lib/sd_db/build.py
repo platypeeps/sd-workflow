@@ -2358,11 +2358,14 @@ def _waiting(connection, members: list[dict]) -> str:
 
 def _sent_back(connection, read: dict) -> list[dict]:
     """The members of `read`'s bundle a send-back queues again: each `done` one whose item is still `in_progress`,
-    the lead first; none without the lead, since the claim would then pick a child's branch and worktree."""
+    the lead first; none without the lead, since the claim would then pick a child's branch and worktree.
+    A member whose item a newer build owns (`_current`) is that build's: its `in_progress` is not this bundle's,
+    so Fix, a conflict rebuild and the Build path's split never move or park it (review of build/sd-1306)."""
     lead = read["assignment"]
     members = [member for member in _members(connection, lead, "done")
                if connection.execute("SELECT status FROM item WHERE id = ?",
-                                     (member["item"],)).fetchone()["status"] == "in_progress"]
+                                     (member["item"],)).fetchone()["status"] == "in_progress"
+               and _current(connection, member)]
     return members if members and members[0]["id"] == lead else []
 
 
