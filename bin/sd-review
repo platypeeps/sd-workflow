@@ -126,7 +126,7 @@ EVIDENCE_ASK = ("input or command you ran and its result, showing a failure this
                 "it touched or a caller it breaks; a code finding without one blocks nothing.")
 NO_REPRO_NOTE = "[advisory: no failing input or command cited]"
 #: How far a patch may move an unmatched prior blocker and its uncited repeat still block (fail closed).
-SHIFT_LINES = 20  # around the line `prior_at` mapped through the diff: a paraphrase may sit anywhere in a hunk
+SHIFT_LINES = 3  # ponytail: a reader's imprecision around `prior_at`'s mapped line; closer unrelated ones block
 CODEX_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -1834,6 +1834,15 @@ def moved_line(diff: str, line: int) -> tuple[int, bool]:
     return line + offset, True
 
 
+def live_findings(report: Mapping[str, Any]) -> list[Any]:
+    """The findings of an aggregate's newest completed pass and any after it: each pass re-reports every unresolved
+    prior blocker, so an older pass's blocker a later one cleared holds nothing (bin/sd-review:1816)."""
+    done = [row.get("pass") for row in report.get("history") or () if isinstance(row, dict) and row.get("report_digest")]
+    newest = max((number for number in done if type(number) is int), default=None)
+    return [row for row in report["findings"] if newest is None or not isinstance(row.get("prior_review"), dict)
+            or type(row["prior_review"].get("pass")) is not int or row["prior_review"]["pass"] >= newest]
+
+
 def prior_at(root: pathlib.Path, old: str, new: str, rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Each prior blocker's line moved from its own `prior_review.head`, else the prior head `old`, to `new` (lead
     2026-11-22: not the aggregate's latest head; build/sd-1423 review: an insertion above a blocker moved its repeat
@@ -2499,7 +2508,7 @@ def review(
         finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)],
                       [row._replace(path=spelled(row.path)) for row in rebutted], subject.scope != "planning",
                       prior_at(root, previous["subject"].get("head"), subject.head, [dict(row, path=spelled(row["path"]))
-                                                                                     for row in previous["findings"]]) if previous else ())
+                                                                                     for row in live_findings(previous)]) if previous else ())
     finally:
         slot.give_back()  # sd:2523: on every exit; the gate below queues in its own pool
     # Shadow only (sd:2092): Jev's kind for each finding goes to its ledger and

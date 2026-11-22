@@ -502,6 +502,31 @@ class ReproRuleTests(unittest.TestCase):
         disposed = sd_review.dispose(rows, "high", repro=True, prior=prior)
         self.assertEqual([row["disposition"] for row in disposed], ["advisory", "blocking"])
 
+    def test_an_unchanged_blocker_does_not_hold_a_finding_nineteen_lines_away(self) -> None:
+        """build/sd-1423 review (bin/sd-review:1816): an unchanged blocker at src.py:20 held an unrelated uncited
+        finding at line 39. `prior_at` maps the line through the diff, so the window covers only a reader's
+        imprecision about the same code, not a shift."""
+        prior = [dict(finding(REPRO, line=20, summary="Empty input crashes"), disposition="blocking", line_kept=True)]
+        disposed = sd_review.dispose([finding(line=39, summary="the cache is never cleared"),
+                                      finding(line=22, summary="An empty list raises IndexError")], "high",
+                                     repro=True, prior=prior)
+        self.assertEqual([row["disposition"] for row in disposed], ["advisory", "blocking"])
+
+    def test_a_blocker_a_later_pass_cleared_holds_nothing(self) -> None:
+        """build/sd-1423 review (bin/sd-review:1816): the aggregate keeps every pass's findings, so a blocker
+        pass 1 found and pass 2 cleared still held a nearby uncited finding. Each pass re-reports every
+        unresolved prior blocker, so only the newest completed pass's findings, and any after it, are live."""
+        def row_at(number: int, line: int) -> dict[str, Any]:
+            return dict(finding(REPRO, line=line), disposition="blocking", prior_review={"pass": number})
+        history = [{"pass": 1, "report_digest": "a"}, {"pass": 2, "report_digest": "b"},
+                   {"pass": 3, "report_digest": None}]
+        previous = {"history": history, "findings": [row_at(1, 10), row_at(2, 30), row_at(3, 50)]}
+        self.assertEqual([row["line"] for row in sd_review.live_findings(previous)], [30, 50])
+        self.assertEqual(len(sd_review.live_findings({"findings": [row_at(1, 10)]})), 1)
+        [record] = sd_review.dispose([finding(line=10, summary="the cache is never cleared")], "high", repro=True,
+                                     prior=[dict(row, line_kept=True) for row in sd_review.live_findings(previous)])
+        self.assertEqual(record["disposition"], "advisory")
+
     def test_a_line_that_cannot_be_placed_holds_nothing(self) -> None:
         """build/sd-1423 class pass: an uncited finding with no line, or a prior blocker with none, held the
         fallback as if near, though no code can be compared. Only an exact repeat or fresh evidence blocks."""

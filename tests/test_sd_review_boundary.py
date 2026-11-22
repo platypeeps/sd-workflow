@@ -1071,11 +1071,15 @@ class LineBudgetTests(unittest.TestCase):
         # +5 so `prior_at` maps each prior blocker from its own
         # `prior_review.head`, not the aggregate's latest head.
         # Measured: `sd-review` is 2995 here.
+        #
+        # 4965 -> 4974 is the next build/sd-1423 review: `bin/sd-review`
+        # +9 for `live_findings`, so a prior blocker a later pass cleared
+        # holds nothing. Measured: `sd-review` is 3004 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4965,
+            4974,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
