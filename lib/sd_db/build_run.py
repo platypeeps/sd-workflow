@@ -891,8 +891,12 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
     return moved
 
 
-def _environ(environ: dict | None) -> dict:
-    env = dict(os.environ if environ is None else environ)
+def _environ(environ: dict | None, ident: str) -> dict:
+    # The supervisor's `git -C` calls and the builder start here: a hook's `GIT_DIR` would point them at its own
+    # repository, not the run's worktree (pack sd:9709, round 26).
+    env = paths.git_env(os.environ if environ is None else environ)
+    # Machine hooks tell a headless builder from a session by this (pack sd:9715).
+    env["SD_BUILD_RUN"] = ident
     # The token reaches the child's environment only: no row or log holds it.
     if env.get("CUSTOM_CLAUDE_CODE_OAUTH_TOKEN"):
         env["CLAUDE_CODE_OAUTH_TOKEN"] = env["CUSTOM_CLAUDE_CODE_OAUTH_TOKEN"]
@@ -944,7 +948,7 @@ class Supervisor:
         self.reviewed: str | None = None
         self.blockers: list[dict] = []
         self.last_beat = 0.0
-        self.env = _environ(environ)
+        self.env = _environ(environ, ident)
         # Claude Code's own OTel, where the machine turns it on, names the run
         # by these (pack sd:6943); the switch and endpoint are system sd:6944's.
         self.env["OTEL_RESOURCE_ATTRIBUTES"] = ",".join(filter(None, (
@@ -1717,8 +1721,14 @@ class Supervisor:
         A bundle queued again keeps its lead, so this run resumes the branch an earlier run left. Only a Send to
         builder note is the operator's; a REVIEWED note is the reviewer's text, and the brief says so.
         """
-        first = self.db.execute("SELECT MIN(created_at) FROM runner_run WHERE assignment = ?",
-                                (self.row["assignment"],)).fetchone()[0]
+        # Or since the lead was first queued, if that is earlier: a bundle drop notes its finding on a new lead
+        # before the lead's first run (round 14). The queue's note keeps that time; `queued_at` moves at each
+        # Retry, which lost the finding from the second run on (pack sd:9709, round 16).
+        lead = self.row["assignment"]
+        first = self.db.execute(
+            f"SELECT MIN(at) FROM (SELECT created_at AS at FROM runner_run WHERE assignment = ? UNION ALL "
+            f"SELECT timestamp FROM note WHERE item IN ({', '.join('?' for _ in items)}) AND body LIKE ?)",
+            (lead, *items, f"Build assignment {lead} queued %")).fetchone()[0]
 
         def listed(prefix: str, *, latest: bool = False) -> str:
             notes = self.db.execute(
@@ -2118,7 +2128,7 @@ class DraftSupervisor(Supervisor):
         self.item = self.db.execute("SELECT item FROM assignment WHERE id = ?",
                                        (self.row["assignment"],)).fetchone()["item"]
         self.last_beat = 0.0
-        self.env = _environ(environ)
+        self.env = _environ(environ, ident)
         self.reviewed: str | None = None
         self.take_resume(settle_seconds)
 

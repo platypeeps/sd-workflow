@@ -37,6 +37,7 @@ from sd_db import (
     follow,
     hub,
     operations,
+    paths,
     remote,
     runner,
     sessions,
@@ -65,7 +66,8 @@ FAKE = textwrap.dedent('''
     from pathlib import Path
     role, plans = Path(sys.argv[0]).stem, Path(os.environ["FAKE_PLANS"])
     with open(plans / "calls.jsonl", "a") as log:
-        log.write(json.dumps({"role": role, "argv": sys.argv[1:], "cwd": os.getcwd()}) + "\\n")
+        log.write(json.dumps({"role": role, "argv": sys.argv[1:], "cwd": os.getcwd(),
+                             "run": os.environ.get("SD_BUILD_RUN")}) + "\\n")
     plan = plans / f"{role}.json"
     queue = json.loads(plan.read_text()) if plan.exists() else []
     # `gh repo view` (the visibility read) takes no plan: plans/visibility.txt answers it.
@@ -532,6 +534,25 @@ class Supervise(Case):
         self.assertEqual(env["OTEL_RESOURCE_ATTRIBUTES"], f"host.name=fixture,sd.build_run={self.bundle['id']},"
                          f"sd.items={self.items[0]};{self.items[1]}")
         self.assertNotIn("CLAUDE_CODE_ENABLE_TELEMETRY", {key for key in env if key not in os.environ})
+
+    def test_the_claude_child_env_names_the_run(self):
+        """pack sd:9715: machine hooks tell a headless builder by SD_BUILD_RUN."""
+        self.press(2)
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        runs = [call["run"] for call in self.calls("claude")]
+        self.assertTrue(runs)
+        self.assertEqual(set(runs), {self.bundle["id"]})
+
+    def test_the_supervisor_env_drops_a_hooks_git_location(self):
+        """pack sd:9709 round 26: the supervisor's git calls and the builder start from this env; a hook's
+        `GIT_DIR` or `GIT_WORK_TREE` would point them at the hook's repository, not the run's worktree."""
+        self.press(1)
+        self.env.update({"GIT_DIR": "/decoy/.git", "GIT_WORK_TREE": "/decoy", "GIT_INDEX_FILE": "/decoy/index"})
+        env = self.supervisor().env
+        self.assertEqual({key for key in env if key in paths.GIT_LOCAL}, set())
+        self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], self.env["GIT_CONFIG_NOSYSTEM"], "config isolation stays")
 
     def test_a_press_runs_to_the_lane(self):
         """Two items, one run, one branch, one lane entry; the members end done and the items stay in progress."""
@@ -1171,8 +1192,9 @@ class Supervise(Case):
 
     def test_a_member_cancelled_on_its_own_is_neither_briefed_nor_delivered(self):
         """Review round 3 of sd:9222: run 1 commits `Closes:` for both items and ends cancelled; Retry queues both;
-        the operator cancels the child, then the lead; Retry of the lead runs again on the same branch. The brief
-        lists the lead alone, the enqueue delivers the lead alone, and run 1's trailer does not close the child."""
+        the operator cancels the child, then the lead; Retry of the lead runs again on the same branch. Since
+        pack sd:9709 round 21 the child's commits on that branch hold the run before a builder starts, as a
+        subset Retry's do, so neither its work nor its trailer ships with the lead; Build takes the lead fresh."""
         self.press(2)
         self.write_pr()
         self.plan(claude=["pass"], sd_review=["cancel"])
@@ -1189,21 +1211,13 @@ class Supervise(Case):
         assert again is not None
         self.bundle = again
         self.plan(claude=["pass"], sd_review=["clean"])
-        self.assertEqual(self.supervisor().run()["step"], "enqueued")
-        prompt = self.calls("claude")[-1]["argv"]
-        prompt = prompt[prompt.index("-p") + 1]
-        self.assertIn(f"- sd:{self.items[0]}", prompt)
-        self.assertNotIn(f"- sd:{self.items[1]}", prompt, "the brief lists no member cancelled on its own")
-        enqueue = next(call["argv"] for call in self.calls("sd-ship") if "enqueue" in call["argv"])
-        self.assertEqual([enqueue[n + 1] for n, arg in enumerate(enqueue) if arg == "--item"], [str(self.items[0])])
-        work = Path(self.bundle["work_path"])
-        head = enqueue[enqueue.index("--expected-head") + 1]
-        body = Path(enqueue[enqueue.index("--body-file") + 1]).read_text(encoding="utf-8")
-        self.assertNotIn("Refs:", body, "data keeps the child open, not a body line the lane may not read")
-        self.db.execute("UPDATE item SET status = 'in_progress' WHERE id = ?", (self.items[1],))
-        cited = LANE.cited_closes(self.db, self.items[0], body, LANE.branch_commits(work, "main", head), (),
-                                  branch=build.branch(self.bundle["assignment"]))
-        self.assertEqual([row["item"] for row in cited], [], "run 1's trailer must not close the child")
+        self.items = [self.items[0], self.items[0], self.items[1]]  # `assert_split_first` names the third
+        self.assert_split_first(self.supervisor())
+        self.assertNotIn("sd-ship", [call["argv"][0].rsplit("/", 1)[-1] for call in self.calls("sd-ship")
+                                     if "enqueue" in call["argv"]])
+        self.release_all()
+        fresh = build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertNotEqual([entry["id"] for entry in fresh], [lead], "Build takes the lead fresh")
 
     def left_out_of_a_retry(self, prepare=None, *, run=True):
         """A three-item bundle ends cancelled, `run` once its builder committed for all three, else before any
@@ -4530,7 +4544,7 @@ class ChildEnvironment(unittest.TestCase):
 
     def test_the_supervisor_env_holds_no_github_token_from_the_pat(self) -> None:
         """sd:8515: gh and its credential helper would act as the PAT, not the gh login."""
-        env = build_run._environ({"GITHUB_PERSONAL_ACCESS_TOKEN": "example-pat"})
+        env = build_run._environ({"GITHUB_PERSONAL_ACCESS_TOKEN": "example-pat"}, "run")
         self.assertIsNone(env.get("GITHUB_TOKEN"))
 
     def test_a_check_gets_github_token_from_the_pat(self) -> None:

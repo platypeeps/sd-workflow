@@ -18,6 +18,7 @@ mounted volume, a port number, a Home Assistant tile, a registered repo row, a c
 | check.run          | a Health check row id this module knows      | the row's read, see `CHECKS`                  |
 | sensor.read        | a tile in Home's tile list                   | `GET /api/states/<entity>`                    |
 | skill.scan         | nothing                                      | `sd skill scan`                               |
+| needs.sweep        | nothing                                      | `sd reports sweep`                            |
 | idea.capture       | `notes_screen.quick_text`'s rules            | `sd store add sdw.blog-idea <text> ...`       |
 | declaration.write  | a registered repo row, the page's `before`   | `repos.set_declaration`, as `repo declare`    |
 | skill.run          | a skill on disk, a registered repo row       | claude `/<skill>` in herdr (`fix_session`)    |
@@ -852,6 +853,12 @@ def _delete(kind: str):
     return check
 
 
+def needs_sweep(connection, values, jobs=None) -> Step:
+    """sd:9759: Today's Clean up, the line the nightly sweep job runs too."""
+    _fields(values, set())
+    return Step(line="sd reports sweep", argv=(_command("sd"), "reports", "sweep"), seconds=60)
+
+
 #: Every action a page may post, by name: its label for the journal and Details, and its check.
 ACTIONS = {
     "job.log": ("Show log", job_log),
@@ -865,6 +872,7 @@ ACTIONS = {
     "check.run": ("Re-check", check_run),
     "sensor.read": ("Read state", sensor_read),
     "skill.scan": ("Scan", skill_scan),
+    "needs.sweep": ("Clean up", needs_sweep),
     "idea.capture": ("Capture idea", idea_capture),
     "declaration.write": ("Write declaration", declaration_write),
     "skill.run": ("Run skill", skill_run),
