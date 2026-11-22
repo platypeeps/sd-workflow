@@ -1050,6 +1050,17 @@ class Advisories(Repo):
         self.assertEqual(self.files(new), ["README", "a.txt"])
         self.assertNotIn(f"sd:{items[1]}", self.closes(new))
 
+    def test_a_done_member_a_held_retry_left_out_stays_off_the_kept_branch(self):
+        """Build review: a member a subset Retry left out is aside, done or not; reopened before enqueue, its
+        replayed `Closes:` would close it again."""
+        items, (lead, second, third), run = self.bundle()
+        build.retry(self.db, lead, who="operator", only=[items[0], items[2]])
+        self.end(self.claim(), f"{build.SPLIT}fixture")
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[1],))
+        new = self.drop(run, items[2])
+        self.assertEqual(self.files(new), ["README", "a.txt"])
+        self.assertNotIn(f"sd:{items[1]}", self.closes(new))
+
     def test_a_second_drop_refuses_a_done_members_carried_commit(self):
         """Build review: a done item reopened before enqueue would be closed by the carried commit, so a second
         drop refuses a citation outside its bundle, done or not, as round 15 did."""
