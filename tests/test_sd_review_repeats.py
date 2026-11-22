@@ -420,7 +420,7 @@ class ReproRuleTests(unittest.TestCase):
         unrelated uncited finding on that file is advisory, as on any file."""
         prior = [dict(finding(REPRO, line=10, summary="the cache is never cleared"), disposition="blocking")]
         rows = [finding(path=path, line=line, summary=summary) for path, line, summary in (
-            ("./src.py", 10, "The cache is  never cleared"), ("/work/repo/src.py", 12, "the cache is never cleared"),
+            ("./src.py", 10, "The cache is  never cleared"), ("src.py", 12, "the cache is never cleared"),
             ("src.py", 10, "an unrelated defect"), ("other/src.py", 10, "the cache is never cleared"))]
         disposed = sd_review.dispose(rows, "high", repro=True, prior=prior)
         self.assertEqual([(row["disposition"], row.get("evidence")) for row in disposed],
@@ -492,10 +492,15 @@ class ReproRuleTests(unittest.TestCase):
         [record] = sd_review.dispose([finding()], "high", rebutted, repro=True)
         self.assertEqual((record["disposition"], record["summary"]), ("advisory", f"defect {sd_review.REPEAT_NOTE}"))
 
-    def test_a_relative_repeat_of_an_absolute_prior_blocker_still_blocks(self) -> None:
-        """build/sd-1423 class pass: a prior blocker at `/work/repo/src.py`, repeated uncited as `src.py`,
-        posted as advisory: the suffix match ran one way only."""
-        prior = [dict(finding(REPRO, path="/work/repo/src.py"), disposition="blocking")]
+    def test_a_path_matches_only_in_its_one_spelling(self) -> None:
+        """build/sd-1423 class pass: the matcher also took any absolute path ending in the prior file's name, so a
+        finding at `/elsewhere/src.py`, outside the repository, gained the repro of `src.py`. `repo_spelling`
+        gives every path inside the repository one spelling before any is matched, so only equal paths match."""
+        prior = [dict(finding(REPRO), disposition="blocking")]
+        for path in ("/elsewhere/src.py", "/work/repo/src.py"):
+            with self.subTest(path=path):
+                [record] = sd_review.dispose([finding(path=path)], "high", repro=True, prior=prior)
+                self.assertEqual((record["disposition"], record.get("evidence")), ("advisory", None))
         [record] = sd_review.dispose([finding()], "high", repro=True, prior=prior)
         self.assertEqual((record["disposition"], record.get("evidence")), ("blocking", REPRO))
 

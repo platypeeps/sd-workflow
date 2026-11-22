@@ -1792,15 +1792,14 @@ def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]
     none, as a report from before sd:9867 may, or when a prior blocker within `SHIFT_LINES` on its file matches no
     finding in `findings` (fail closed: a shifted, paraphrased repeat must not clear it); None otherwise.
 
-    A match is the same file, in any spelling the review accepts (`reviewed_paths`), the same line and the
+    A match is the same file, as `repo_spelling` spells it, the same line and the
     same `summary_key`: a line alone gave an unrelated finding the old repro (lead after round 8)."""
     def _place(path: Any) -> str:
         return str(pathlib.PurePosixPath(path.strip())) if isinstance(path, str) and path.strip() else ""
 
     def _file(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:
         mine, theirs = _place(new.get("path")), _place(old.get("path"))
-        return bool(mine and theirs) and (mine == theirs or mine.startswith("/") and mine.endswith(f"/{theirs}")
-                                          or theirs.startswith("/") and theirs.endswith(f"/{mine}"))
+        return bool(mine) and mine == theirs  # one spelling (`repo_spelling`), never a suffix: /elsewhere/src.py
 
     def _same(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:
         return _file(old, new) and (old.get("line"), summary_key(old.get("summary"))) == (
