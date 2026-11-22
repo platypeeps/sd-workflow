@@ -525,7 +525,7 @@ def callable_words(text: str) -> set[str]:
     words |= set(re.findall(r"\b(\w*[A-Za-z]_\w*[A-Za-z0-9]|[a-z][a-z0-9]*[A-Z]\w*)\b", text))
     for span in re.findall(r"`([^`\n]+)`", text):
         words |= set(re.findall(r"[A-Za-z_]\w*", span))
-    return {word for word in words if len(word) > 2}
+    return words  # no length floor: `go()` names a function as surely as a long name does
 
 
 # Git's state for an operation a worktree has not finished; each can carry commits the tree does not show.

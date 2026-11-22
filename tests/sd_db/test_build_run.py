@@ -1544,6 +1544,14 @@ class Supervise(Case):
         _, kept = self.deferred([far], {"src/caller.py": {12}}, None)
         self.assertEqual(kept["blockers"], [far], "a function context git could not read deferred a blocker")
 
+    def test_a_short_function_name_still_names_the_changed_caller(self):
+        """Review of sd:9769: `go()` names a changed function; no length filter drops it."""
+        self.press()
+        rows = [{"path": "lib/helper.py", "line": 3, "summary": "go() now passes None here"},
+                {"path": "lib/helper.py", "line": 4, "summary": "the new call in `go` crashes this"}]
+        _, kept = self.deferred(rows, {"src/caller.py": {12}}, {"go"})
+        self.assertEqual(kept["blockers"], rows, "a blocker naming a short changed function was deferred")
+
     def test_branch_words_hold_the_changed_function_and_what_it_calls(self):
         """Lead ruling on sd:9769: the branch's changed functions, read whole, name the caller and its callee."""
         repo = Path(tempfile.mkdtemp(dir=self.root))
