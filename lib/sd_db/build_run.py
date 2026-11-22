@@ -414,11 +414,12 @@ def _denied_call(row) -> str:
 
 
 def _read(argv: list[str], *, env: dict | None = None) -> str:
-    """A short read-only command's stdout; `Unread` when it fails or gives no answer in `READ_SECONDS`."""
+    """A short read-only command's stdout; `Unread` when it fails, gives undecodable output or no answer in
+    `READ_SECONDS`."""
     try:
         done = subprocess.run(argv, capture_output=True, text=True, timeout=READ_SECONDS, check=False,
                               stdin=subprocess.DEVNULL, env=env)
-    except (OSError, subprocess.SubprocessError) as error:
+    except (OSError, subprocess.SubprocessError, UnicodeError) as error:  # bytes in no locale encoding: no answer
         raise Unread(f"{argv[0]} gave no answer: {error}") from None
     if done.returncode != 0:
         raise Unread(f"{' '.join(argv[:4])} failed: exit {done.returncode}: {done.stderr.strip()[:200]}")

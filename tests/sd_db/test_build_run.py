@@ -1123,6 +1123,12 @@ class Supervise(Case):
         with mock.patch.object(build_run, "_read", return_value=""):
             self.assertEqual(build_run.changed_lines(["git"], "work", "a" * 40, "b" * 40), {})
 
+    def test_a_diff_in_a_legacy_encoding_reads_as_unknown(self):
+        """Review of sd:9769: a raw Latin-1 byte in a hunk is an unknown delta that holds every blocker,
+        never a decode error that stops the supervisor."""
+        latin1 = [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'diff --git a/x b/x\\n+caf\\xe9\\n')"]
+        self.assertIsNone(build_run.changed_lines(latin1, "work", "a" * 40, "b" * 40))
+
     def test_a_mode_or_binary_change_reads_as_the_whole_file(self):
         """Review of sd:9769: git gives a mode-only or binary change no line range; any line of it is changed."""
         repo = Path(tempfile.mkdtemp(dir=self.root))
