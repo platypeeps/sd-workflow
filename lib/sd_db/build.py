@@ -51,6 +51,7 @@ from .runner import (
 )
 from .ship import this_host
 from .writes import (
+    UNBUILT,
     add_note,
     cancel_unwanted_blocked,
     create_assignment,
@@ -750,10 +751,15 @@ def drop_plan(connection, item: int) -> dict:
     if not state["allowed"]:
         raise BuildRefused(f"Drop refused: {state['reason']}")
     members = _members(connection, lead, current["status"])
+    # A done lead's own transition cancels its blocked row (`cancel_unwanted_blocked`) and leaves its members
+    # blocked: read those too, or the drop finds nothing to keep (lead review). One gone to planning stays out.
+    if current["status"] == "cancelled" and _done(reads.items_by_ids(connection, [current["item"]]), current["item"]):
+        members += [member for member in _members(connection, lead, "blocked") if member not in members]
     if row["id"] not in {member["id"] for member in members}:
         raise BuildRefused(f"Drop refused: sd:{item} is not a {current['status']} member of build {lead}")
     items = reads.items_by_ids(connection, [member["item"] for member in members])
-    kept = [member for member in members if member["id"] != row["id"] and not _done(items, member["item"])]
+    kept = [member for member in members if member["id"] != row["id"]
+            and (member["item"] not in items or items[member["item"]]["status"] not in UNBUILT)]
     # As Retry: a done lead kept as the parent would not lead the claim, which would start a member's own branch
     # and skip the cherry-picked one (round 2). Dropping the lead itself is the way out.
     if row["id"] != lead and _done(items, current["item"]):

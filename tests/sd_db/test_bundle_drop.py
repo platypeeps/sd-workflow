@@ -1109,6 +1109,25 @@ class Advisories(Repo):
                                  "LIMIT 1", (items[0], build.SCOPE)).fetchone()
         self.assertEqual((latest["id"], latest["status"]), (lead, "cancelled"))
 
+    def test_dropping_a_lead_marked_done_by_its_transition_queues_the_kept_items(self):
+        """Lead review: the done transition cancels the lead's blocked assignment (`cancel_unwanted_blocked`)
+        and leaves its members blocked; the drop read members by the lead's status and found none to keep."""
+        items, (lead, second, third), run = self.bundle()
+        writes.transition(self.db, items[0], "done", who="operator", reason="landed by hand")
+        self.assertEqual(self.db.execute("SELECT status FROM assignment WHERE id = ?", (lead,)).fetchone()[0],
+                         "cancelled")
+        queued = DROP.drop_item(self.db, build, items[0], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], items[1:])
+        self.assertEqual(self.db.execute("SELECT status FROM item WHERE id = ?", (items[0],)).fetchone()[0], "done")
+
+    def test_a_member_gone_to_planning_stays_out_when_the_done_lead_drops(self):
+        """Its transition cancels the member's blocked row too, the status the done lead's row now has."""
+        items, ids, run = self.bundle()
+        writes.transition(self.db, items[2], "planning", who="operator", reason="not now")
+        writes.transition(self.db, items[0], "done", who="operator", reason="landed by hand")
+        queued = DROP.drop_item(self.db, build, items[0], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [items[1]])
+
     def test_main_moving_a_kept_file_still_drops(self):
         """The new branch starts at the bundle's fork, so each kept commit applies; the lane merges main."""
         items, ids, run = self.bundle()
