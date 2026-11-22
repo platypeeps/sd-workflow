@@ -95,6 +95,15 @@ class DispositionTests(unittest.TestCase):
             self.prepare()
         self.assertEqual(caught.exception.details["reviewed_head"], self.head)
 
+    def test_a_blocking_refusal_names_the_digest_of_each_finding_adjudicate_binds(self):
+        """sd:9966 review round 2: Reject binds the review the page showed; adjudicate's rows carry the same digests."""
+        self.blocked()
+        with self.assertRaises(ship.Refusal) as caught:
+            self.prepare()
+        template = json.loads(self.command().stdout)["proposal"]["findings"]
+        self.assertEqual(caught.exception.details["finding_digests"], [row["finding_digest"] for row in template])
+        self.assertTrue(template)
+
     def test_the_command_a_blocking_refusal_names_prints_each_finding_whole(self):
         """sd:2102. `next_action` is only useful if the command it names runs and shows the findings."""
         self.blocked()

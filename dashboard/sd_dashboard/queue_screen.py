@@ -331,18 +331,18 @@ def _answer(entry: dict, lane: Path) -> dict:
     return answer if isinstance(answer, dict) else {}
 
 
-#: The adjudicate command a review block's `next_action` names, for an answer from before `reviewed_head` (sd:9966).
-NAMED_HEAD = re.compile(r"`sd-ship adjudicate [^`]*--expected-head ([0-9a-f]{40}|[0-9a-f]{64}) [^`]*`")
+HEAD = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
-def reviewed_head(answer: dict) -> str | None:
-    """The head a review-blocked prepare's review saw: its `reviewed_head`, else the head its `next_action` names."""
-    head = answer.get("reviewed_head")
-    if isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
-        return head
-    workflow = answer.get("workflow")
-    found = NAMED_HEAD.search(str(workflow.get("next_action") or "")) if isinstance(workflow, dict) else None
-    return found[1] if found else None
+def review_of(answer: dict) -> tuple[str, list[str], str] | None:
+    """sd:9966: the review a review-blocked prepare's answer names: the head it saw, the digest of each blocking
+    finding (`sd_ship_dispositions.blocking_refusal`), and the key a page binds Reject and enqueue to. None for an
+    answer that names neither, as one from before them: no review to bind."""
+    head, digests = answer.get("reviewed_head"), answer.get("finding_digests")
+    if not (isinstance(head, str) and HEAD.fullmatch(head) and isinstance(digests, list) and digests
+            and all(isinstance(row, str) and row for row in digests)):
+        return None
+    return head, digests, hashlib.sha256(json.dumps([head, digests]).encode()).hexdigest()[:16]
 
 
 def _logged(entry: dict, lane: Path) -> dict:
@@ -483,7 +483,8 @@ def rows(entries: list[dict], *, path: str, lane: Path, now: float, done: frozen
                 # The log of the step that failed: a merge failure's prepare log is of a prepare that passed (sd:8601).
                 log = entry.get("merge_log" if entry.get("step") == "merge" else "prepare_log")
                 failed = {"branch": entry.get("branch"), "unchanged": _unchanged(entry), "failure": _failure(entry, lane),
-                          "log": str(log or "") or None} if status == "failed" else {}
+                          "log": str(log or "") or None, "review": (review_of(_answer(entry, lane)) or [None])[-1]
+                          } if status == "failed" else {}
                 blocked.append({**base, "state": "blocked", "status": status, "step": entry.get("step"),
                                 "reason": reason, "who": who, "finished": entry.get("finished_at"),
                                 "head": head[:12], "expected_head": head, **failed})
@@ -651,7 +652,7 @@ def move(payload: dict):
     again, reclaim = values.get("action") in ("retry", "approve", "requeue", "reject"), values.get("action") == "reclaim"
     reject = values.get("action") == "reject"
     if (set(values) != {"repo", "item", "action", "revision", *(("head",) if again else ()), *(("claim",) if reclaim else ()),
-                        *(("reason",) if reject else ())}
+                        *(("reason", "review") if reject else ())}
             or not isinstance(values["repo"], str)
             or type(values["item"]) is not int or not 1 <= values["item"] <= 9223372036854775807
             or values["action"] not in ACTIONS or not isinstance(values["revision"], str)
@@ -659,11 +660,12 @@ def move(payload: dict):
             or (reclaim and not (isinstance(values["claim"], str) and len(values["claim"]) <= 200
                                  and all(values["claim"].partition(":")[::2])))
             or (reject and not (isinstance(values["reason"], str) and values["reason"].strip()
-                                and len(values["reason"].strip().encode()) <= REASON_BYTES))):
+                                and len(values["reason"].strip().encode()) <= REASON_BYTES
+                                and isinstance(values["review"], str) and re.fullmatch(r"[0-9a-f]{16}", values["review"])))):
         raise ValueError("Name the repository, the item, one of up, down, top, hold, release, cancel, retry, approve, "
                          "requeue, reclaim or reject, the lane's revision, for retry, approve, requeue or reject the "
-                         "full head the row showed, for reclaim the claim it showed, and for reject a reason of at "
-                         f"most {REASON_BYTES} bytes.")
+                         "full head the row showed, for reclaim the claim it showed, and for reject the review the row "
+                         f"showed and a reason of at most {REASON_BYTES} bytes.")
 
     def write(connection):
         from sd_db import repos, workflow
@@ -688,7 +690,7 @@ def move(payload: dict):
                              "Re-queue takes only a cancelled one.")
         if action == "reject":
             unknown = rebut(found, Path(str(listed.get("queue") or "")).parent.parent, values["head"],
-                            values["reason"].strip())
+                            values["reason"].strip(), values["review"])
             if unknown:
                 return 502, {"error": unknown, "outcome": "unknown"}
         verb = (["move", item, action] if action in ("up", "down", "top")
@@ -716,11 +718,16 @@ def move(payload: dict):
     return write
 
 
-def rebut(entry: dict | None, lane: Path, head: str, reason: str) -> str | None:
+def rebut(entry: dict | None, lane: Path, head: str, reason: str, shown: str) -> str | None:
     """sd:9966: Reject and enqueue's first step. Record a rebuttal, `reason`, of each blocking finding the lane's
     review raised on `entry` at `head`, through `sd-ship adjudicate` in its worktree; `lane retry` then reuses that
     review and clears it. Raises ValueError when nothing was written; returns why when a write may have landed.
-    Pressed twice, the second records the same rebuttals again, which a retry reads as the first."""
+    Pressed twice, the second records the same rebuttals again, which a retry reads as the first.
+
+    `shown` is the review key the page's row showed (`review_of`): a newer prepare log, or a review run again at
+    the same head since, names other findings, and the reason given for the shown ones rebuts none of them."""
+    from sd_db import workflow
+
     if not (entry and entry.get("status") == "failed" and _logged(entry, lane).get("code") == REVIEW_BLOCKING
             and entry.get("worktree")):
         raise ValueError("Reject and enqueue takes a lane entry whose prepare a review blocked, its log read here.")
@@ -728,9 +735,12 @@ def rebut(entry: dict | None, lane: Path, head: str, reason: str) -> str | None:
         raise ValueError(f"sd:{entry.get('item')} failed at another head than the page showed. Read it again.")
     # Adjudicate binds the head the review saw, which prepare's catch-up may have moved past the queued `head`;
     # `lane retry` still checks the queued one (sd:9966 review).
-    seen = reviewed_head(_answer(entry, lane))
-    if seen is None:
-        raise ValueError(f"sd:{entry.get('item')}'s prepare log names no reviewed head; rebut it with sd-ship adjudicate.")
+    review = review_of(_answer(entry, lane))
+    if review is None:
+        raise ValueError(f"sd:{entry.get('item')}'s prepare log names no review to bind; rebut it with sd-ship adjudicate.")
+    seen, digests, key = review
+    if key != shown:
+        raise workflow.StaleItem(f"sd:{entry.get('item')}'s review changed since the page read it. Read it again, then retry.")
     base = [command("sd-ship"), "-C", str(entry["worktree"]), "adjudicate", "--item", str(entry["item"]),
             "--expected-head", seen, "--json"]
     template = _run(base, WRITE_SECONDS)
@@ -738,6 +748,9 @@ def rebut(entry: dict | None, lane: Path, head: str, reason: str) -> str | None:
     if not (template.get("exit") == 0 and isinstance(proposal, dict) and isinstance(proposal.get("findings"), list)
             and all(isinstance(row, dict) for row in proposal["findings"])):
         raise ValueError(f"sd-ship adjudicate gave no findings to rebut: {template.get('error') or 'no template'}")
+    if [row.get("finding_digest") for row in proposal["findings"]] != digests:
+        raise workflow.StaleItem(f"sd:{entry.get('item')}'s review at {seen[:12]} ran again since the lane's run; its "
+                                 "findings are not the ones the page showed. Read it again, then retry.")
     for row in proposal["findings"]:
         row.update(response_disposition="rebutted", reason=reason)
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", prefix="sd-rebut-") as filled:

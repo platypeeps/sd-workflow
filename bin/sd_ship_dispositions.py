@@ -132,8 +132,11 @@ def blocking_refusal(operation: Any, head: str, report: dict, lead: str) -> Refu
     return Refusal(f"{lead}: {named}{more}", code="review_blocking", boundary="review", state="operator_decision",
                    next_action=f"Run `{command}` to print each blocking finding in full; fix them and prepare "
                                "again, or rebut or park each one through that adjudication.",
-                   # The head the review saw: a catch-up may have moved it past the queued one (sd:9966).
-                   details={"findings": findings, "check": report.get("check"), "reviewed_head": head})
+                   # The head the review saw, which a catch-up may have moved past the queued one, and the digest
+                   # `context` binds of each blocking finding: Reject rebuts only the review a page showed (sd:9966).
+                   details={"findings": findings, "check": report.get("check"), "reviewed_head": head,
+                            "finding_digests": [digest(row) for row in report.get("findings") or []
+                                                if isinstance(row, dict) and row.get("disposition") == "blocking"]})
 
 
 def place(row: dict) -> str:

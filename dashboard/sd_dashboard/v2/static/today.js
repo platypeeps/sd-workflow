@@ -377,7 +377,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   const SAME = 'same code, same review: send it to the builder';
   const reviewed = r => !!r && (r.failure || {}).code === 'review_blocking';
   const again = (r, manual) => !QV.lanes.retry ? '' : reviewed(r)
-    ? html`<div class="ctl" role="group" aria-label="Unblock sd:${String(r.item)}"><button class="btn quiet sm" type="button" disabled title="${SAME}" aria-label="Retry sd:${String(r.item)}: ${SAME}">Retry</button>${sb('reject', r, 'Reject and enqueue…', `Reject sd:${r.item}'s review blockers with a reason and queue it again`, html` data-head="${r.expected_head}"`)}</div>`
+    ? html`<div class="ctl" role="group" aria-label="Unblock sd:${String(r.item)}"><button class="btn quiet sm" type="button" disabled title="${SAME}" aria-label="Retry sd:${String(r.item)}: ${SAME}">Retry</button>${sb('reject', r, 'Reject and enqueue…', `Reject sd:${r.item}'s review blockers with a reason and queue it again`, r.review ? html` data-head="${r.expected_head}"` : html` disabled title="its prepare log names no review to bind; rebut it with sd-ship adjudicate"`)}</div>`
     : html`<div class="ctl" role="group" aria-label="Unblock sd:${String(r.item)}">${sb('retry', r, r.unchanged === true ? 'Retry…' : 'Retry', `Retry sd:${r.item}: queue it again at the same head`, html` data-head="${r.expected_head}"`)}${manual ? sb('approve', r, 'Approve…', `Approve sd:${r.item}: queue it again with the merge granted`, html` data-head="${r.expected_head}"`) : ''}</div>`;
   // pack sd:8584: a failed entry's Fix sends the lane's finding to the build run that enqueued its branch; off says why.
   // pack sd:9705: a Fix press's outcome shows on its own row: busy while it posts, then sent or why not.
@@ -843,7 +843,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     try {
       const body = { repo: l.path, item, action, revision: l.revision };
       if (action === 'retry' || action === 'approve' || action === 'requeue' || action === 'reject') body.head = head;
-      if (action === 'reject') body.reason = reason;
+      // The review the row showed: the server refuses one that changed since this read (sd:9966).
+      if (action === 'reject') { body.reason = reason; body.review = (l.rows.find(x => x.state === 'blocked' && x.item === item) || {}).review || ''; }
       if (action === 'reclaim') body.claim = claim;
       const out = await shell.post('/api/queue/move', body);
       const order = out.pending ? ` Order now: ${out.pending.map(n => `sd:${n}`).join(', ')}.` : '';

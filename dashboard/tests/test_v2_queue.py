@@ -58,7 +58,7 @@ case "$*" in
   *" adjudicate "*) case "$*" in
        *--dispositions-file*) if [ -n "$QUEUE_REFUSE" ]; then printf '{"ok": false, "error": "%s"}\\n' "$QUEUE_REFUSE"; exit 3; fi
          eval "f=\${$#}"; cp "$f" "$QUEUE_LOG.dispositions"; printf '{"ok": true, "phase": "disposition_recorded"}\\n' ;;
-       *) printf '{"ok": true, "phase": "disposition_template", "proposal": {"schema_version": 1, "bindings": {"head": "h"}, "findings": [{"index": 0, "summary": "wrong", "response_disposition": "rebutted|parked", "reason": ""}]}}\\n' ;;
+       *) printf '{"ok": true, "phase": "disposition_template", "proposal": {"schema_version": 1, "bindings": {"head": "h"}, "findings": [{"index": 1, "finding_digest": "%s", "raw_finding": {"summary": "wrong"}, "response_disposition": "rebutted|parked", "reason": ""}]}}\\n' "${QUEUE_DIGEST:-f1}" ;;
      esac ;;
   "gate status --json") printf '{"slots": 4, "holders": [{"slot": 1}], "waiters": [], "load": [1, 2, 3]}\\n' ;;
   *) if [ -n "$QUEUE_SLEEP" ]; then exec sleep "$QUEUE_SLEEP"; fi
@@ -150,7 +150,7 @@ class Lane:
         """pack sd:8584: item 14 failed prepare at the checkout's head, enqueued here, its log in the lane's logs;
         `answer` is the log's stdout in place of prepare's JSON answer."""
         log = self.lane / "logs" / "prepare-14-20260906T100000.log"
-        prepared = json.dumps({"ok": False, "error": "local review blocking: 1/1 completed", "reviewed_head": self.merged, "workflow": {
+        prepared = json.dumps({"ok": False, "error": "local review blocking: 1/1 completed", "reviewed_head": self.merged, "finding_digests": ["f1"], "workflow": {
             "blocker": {"code": "review_blocking", "retryable": False},
             "next_action": "Run `sd-ship adjudicate --item 14` to print each blocking finding in full; fix them."}},
             indent=2)
@@ -763,9 +763,17 @@ class TheMove(Lane, BrowserSession):
 
     REASON = "a.py:1 reads the value the finding says is missing"
 
-    def reject(self, item=14, reason=REASON, head=None):
+    def shown(self):
+        """The review key item 14's row showed, as the page read it."""
+        return next(row for row in queue_screen.document(self.connection, now=NOW)["lanes"][0]["rows"]
+                    if row.get("item") == 14).get("review")
+
+    def reject(self, item=14, reason=REASON, head=None, review=None):
+        review = review or self.shown() or "0" * 16
+        self.log.write_text("")
         return self.post("/api/queue/move", {"repo": str(self.checkout), "item": item, "action": "reject",
-                                             "revision": self.revision(), "head": head or self.merged, "reason": reason})
+                                             "revision": self.revision(), "head": head or self.merged, "reason": reason,
+                                             "review": review})
 
     def test_reject_rebuts_each_blocking_finding_then_queues_the_entry_again(self):
         """sd:9966: Reject and enqueue records a rebuttal of every lane review blocker, then lane retry."""
@@ -785,15 +793,13 @@ class TheMove(Lane, BrowserSession):
 
     def caught_up(self, answer):
         """Item 14's prepare merged main onto the queued head, then its review blocked at that merge."""
-        self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "review_blocking"}, **answer}}
-                                      if "reviewed_head" not in answer else
-                                      {"ok": False, "workflow": {"blocker": {"code": "review_blocking"}}, **answer}))
+        self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "review_blocking"}}, **answer}))
         self.log.write_text("")
 
     def test_reject_adjudicates_at_the_reviewed_head_and_retries_at_the_queued_one(self):
         """sd:9966 review: a catch-up moved the head before the review blocked; adjudicate refused the queued one."""
         reviewed = "e" * 40
-        self.caught_up({"reviewed_head": reviewed})
+        self.caught_up({"reviewed_head": reviewed, "finding_digests": ["f1"]})
         status, _, answer = self.reject()
         self.assertEqual(status, 200, answer)
         calls = self.calls()
@@ -801,19 +807,35 @@ class TheMove(Lane, BrowserSession):
                                     "--json"])
         self.assertEqual(calls[-1], ["-C", str(self.checkout), "lane", "retry", "14", "--expected-head", self.merged])
 
-    def test_reject_reads_the_reviewed_head_from_an_older_answers_next_action(self):
-        reviewed = "d" * 40
-        self.caught_up({"next_action": f"Run `sd-ship adjudicate --item 14 --expected-head {reviewed} --json` to "
-                                       "print each blocking finding in full."})
-        status, _, answer = self.reject()
-        self.assertEqual(status, 200, answer)
-        self.assertEqual(self.calls()[1][6], reviewed)
+    def test_an_older_answer_naming_no_review_offers_no_reject_and_refuses_one(self):
+        """An answer from before `reviewed_head` and `finding_digests` binds no review: nothing to reject."""
+        for answer in ({"workflow": {"blocker": {"code": "review_blocking"}, "next_action":
+                                     f"Run `sd-ship adjudicate --item 14 --expected-head {'d' * 40} --json`."}},
+                       {"reviewed_head": "d" * 40}, {"finding_digests": ["f1"]}):
+            with self.subTest(answer=answer):
+                self.caught_up(answer)
+                self.assertIsNone(self.shown())
+                status, _, said = self.reject()
+                self.assertEqual(status, 400, said)
+                self.assertEqual(self.calls(), [["-C", str(self.checkout), "lane", "list"]])
 
-    def test_reject_refuses_an_answer_that_names_no_reviewed_head(self):
-        self.caught_up({"next_action": "fix them"})
-        status, _, answer = self.reject()
-        self.assertEqual(status, 400, answer)
+    def test_reject_refuses_a_review_other_than_the_one_the_page_showed(self):
+        """sd:9966 review round 2: a newer prepare log names other findings than the page showed."""
+        self.failed()
+        seen = self.shown()
+        self.caught_up({"reviewed_head": self.merged, "finding_digests": ["f2"]})
+        status, _, answer = self.reject(review=seen)
+        self.assertEqual(status, 409, answer)
         self.assertEqual(self.calls(), [["-C", str(self.checkout), "lane", "list"]])
+
+    def test_reject_refuses_a_review_refreshed_at_the_same_head_since_the_lanes_run(self):
+        """sd:9966 review round 2: the review at that head was run again; its findings are not the ones shown."""
+        self.failed()
+        with mock.patch.dict(os.environ, {"QUEUE_DIGEST": "f9"}):
+            status, _, answer = self.reject()
+        self.assertEqual(status, 409, answer)
+        self.assertFalse(Path(f"{self.log}.dispositions").exists())
+        self.assertNotIn("--dispositions-file", [word for call in self.calls() for word in call])
 
     def test_reject_refuses_an_entry_no_review_blocked_before_any_verb(self):
         self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "merge_conflict"}}}))
@@ -3085,9 +3107,14 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertEqual(out["asked"]["ok"], "Reject and enqueue")
         self.assertIn(f"lane retry 14 --expected-head {self.merged}", out["asked"]["cli"])
         posted = [p[1] for p in out["posts"] if p[0] == "/api/queue/move"]
-        self.assertEqual([(p["action"], p["item"], p["head"], p["reason"]) for p in posted],
-                         [("reject", 14, self.merged, reason)])
+        self.assertEqual([(p["action"], p["item"], p["head"], p["reason"], p["review"]) for p in posted],
+                         [("reject", 14, self.merged, reason, self.failed()["review"])])
         self.assertIn("sd:14 rebutted and queued again", out["R"]["said"])
+
+    def test_reject_is_off_on_a_row_whose_log_names_no_review(self):
+        self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "review_blocking"}}}))
+        html = self.run_view("open('system'); R.html = ELS.queue.html;")["R"]["html"]
+        self.assertRegex(html, r'data-act="reject" data-item="14"[^>]*disabled title="its prepare log names no review')
 
     def test_a_kept_or_empty_reject_posts_nothing(self):
         self.failed()
