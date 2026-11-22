@@ -4316,13 +4316,20 @@ def settle_gates(gates: list[SpeculativeGate], entry: dict[str, Any], row: dict[
     so those gates end and leave `gates`, and the next claim gates their
     entries again (pack sd:7412). Only a queue read that names the
     gate's entry next proves a wait: one that fails waits for no gate,
-    so a transient fault cannot spend the run's budget on it.
+    so a transient fault cannot spend the run's budget on it. An entry
+    that merged outside a gate's chain, other than the gate's own entry,
+    lands under that entry where the gate predicted it would not, as a
+    dropped train member does, so that gate ends as well.
     """
     merged = row is not None and row.get("status") == "merged"
     up = next_up(queue)
     for held in [held for held in gates if entry["id"] not in held.chain]:
         if not merged and up == held.follower[0]:
             held.join(remaining(deadline, PREPARE_SECONDS))
+        elif merged and held.follower[0] != entry["id"]:
+            held.why = f"sd:{entry['item']} merged outside the landing this gate predicted"
+            if not held.is_alive() or held.cancel_gate():
+                gates.remove(held)
     for held in [held for held in gates if entry["id"] in held.chain]:
         if merged and held.chain[-1] == entry["id"]:
             if up == held.follower[0]:

@@ -1637,6 +1637,7 @@ class Train(Trees):
         self.trains: list[tuple[pathlib.Path, str, str]] = []
         self.answer: dict = {}
         self.hold_train = False
+        self.train_until_cancel = False
         self.events.update({name: threading.Event() for name in ("prepare 2", "train done")})
 
     def gate(self, root: pathlib.Path, head: str, base: str) -> dict:
@@ -1647,6 +1648,10 @@ class Train(Trees):
                 self.seen["sd:2 prepared beside sd:3's gate"] = self.events["prepare 2"].wait(5)
                 time.sleep(0.5)
                 self.events["train done"].set()
+            for _ in range(100) if self.train_until_cancel else ():  # a long gate: it runs until cancelled, or 5 s
+                if getattr(threading.current_thread(), "cancelled", False):
+                    break
+                time.sleep(0.05)
         else:
             self.gates.append((root, head, base))
         red = "red.txt" in self.files(head)
@@ -1731,6 +1736,19 @@ class Train(Trees):
         sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
         self.assertEqual(self.trains[0][0], self.third)
         self.assertTrue(self.seen["sd:2 prepared beside sd:3's gate"])
+
+    def test_a_merge_outside_the_train_chain_cancels_its_gate(self) -> None:
+        """Review of sd:9899: sd:3 gated on sd:1 alone ran on after the dropped sd:2 merged.
+
+        sd:3 lands on sd:2 now, so that gate predicts a landing that will not happen.
+        """
+        self.commit_files(self.second, {"one.txt": "not 1\n"}, "conflicts with first")
+        self.train_until_cancel = True
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        top = self.entries()[2]["train"]
+        self.assertEqual(top["status"], "cancelled")
+        self.assertIn("sd:2 merged", top["reason"])
 
     def test_an_unread_queue_after_a_merge_waits_for_no_gate(self) -> None:
         """Lane prepare of sd:9899: a failed queue read waited for sd:3's gate with sd:2 still first.

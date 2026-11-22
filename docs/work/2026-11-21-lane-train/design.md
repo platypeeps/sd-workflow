@@ -89,6 +89,7 @@ together, which needs one push of main (below).
 | 4 train gate | none | slow gate | prepare runs beside it | test_the_claimed_entry_prepares_beside_the_train_gate |
 | 5 settle | none | a dropped member is still first | it is claimed beside the top's gate | test_a_dropped_entry_still_first_is_claimed_beside_the_top_gate |
 | 5 settle | none | the dropped member fails | the top's gate is waited for | test_a_dropped_entry_that_fails_leaves_the_top_its_gate |
+| 5 settle | none | a dropped member merges outside the top chain | the top gate is cancelled | test_a_merge_outside_the_train_chain_cancels_its_gate |
 | 5 settle | none | queue read fails | no wait; the next prepare gates anew | test_an_unread_queue_after_a_merge_waits_for_no_gate |
 | 2-3 fetch, stack | scratch commits, unreferenced | the deadline passes | no further member, no train gate | test_a_train_whose_fetch_crosses_the_deadline_starts_no_gate, test_a_stack_that_crosses_the_deadline_stacks_no_further |
 | 1 members read | none | `DEPTH` gates still run | no train; members marked skipped | test_a_train_waits_while_depth_gates_still_run |
