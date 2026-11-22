@@ -1039,11 +1039,17 @@ class LineBudgetTests(unittest.TestCase):
         # +6 for `SHIFT_LINES`, so only a finding near an unmatched prior
         # blocker fails closed, not any finding on its file. Measured:
         # `sd-review` is 2943 here.
+        #
+        # 4913 -> 4942 is the next build/sd-1423 review: `bin/sd-review`
+        # +29 for `moved_line` and `prior_at`, which map each prior
+        # blocker's line through `git diff -U0` from the prior head, so a
+        # blocker an insertion moved still holds its repeat. Measured:
+        # `sd-review` is 2972 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4913,
+            4942,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

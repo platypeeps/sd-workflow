@@ -126,7 +126,7 @@ EVIDENCE_ASK = ("input or command you ran and its result, showing a failure this
                 "it touched or a caller it breaks; a code finding without one blocks nothing.")
 NO_REPRO_NOTE = "[advisory: no failing input or command cited]"
 #: How far a patch may move an unmatched prior blocker and its uncited repeat still block (fail closed).
-SHIFT_LINES = 20  # ponytail: a fixed window, not a diff-mapped line; widen if real shifts exceed it
+SHIFT_LINES = 20  # around the line `prior_at` mapped through the diff: a paraphrase may sit anywhere in a hunk
 CODEX_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -1812,6 +1812,34 @@ def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]
                      for old in blockers) else None
 
 
+_HUNK = re.compile(r"(?m)^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def moved_line(diff: str, line: int) -> int:
+    """`line` of the old file at its place in the new one, read from `git diff -U0`; a changed line maps to the
+    start of the hunk that replaced it."""
+    offset = 0
+    for match in _HUNK.finditer(diff):
+        start, count, new, added = (int(value) if value else 1 for value in match.groups())
+        if line < start or not count and line <= start:
+            break
+        if count and line < start + count:
+            return new
+        offset += added - count
+    return line + offset
+
+
+def prior_at(root: pathlib.Path, old: str, new: str, rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Each prior blocker's line moved from the prior head `old` to `new` (build/sd-1423 review: an insertion above a
+    blocker moved its repeat past `SHIFT_LINES`); a line git cannot map stays as stored."""
+    def _remapped(row: Mapping[str, Any]) -> dict[str, Any]:
+        if row.get("disposition") != "blocking" or type(row.get("line")) is not int:
+            return dict(row)
+        diff = sd_lib.git_output(["diff", "-U0", "--no-color", "--no-ext-diff", old, new, "--", row["path"]], root)
+        return dict(row, line=row["line"] if diff is None else moved_line(diff, row["line"]))
+    return [_remapped(row) for row in rows]
+
+
 # Pipeline
 
 #: What a failed gate is known to have lacked, read from evidence, not its exit code. Only sd-check's
@@ -2447,7 +2475,8 @@ def review(
         outcomes = [row._replace(findings=tuple(dict(found, path=spelled(found["path"])) for found in row.findings)) for row in outcomes]
         finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)],
                       [row._replace(path=spelled(row.path)) for row in rebutted], subject.scope != "planning",
-                      [dict(row, path=spelled(row["path"])) for row in previous["findings"]] if previous else ())
+                      prior_at(root, previous["subject"].get("head"), subject.head, [dict(row, path=spelled(row["path"]))
+                                                                                     for row in previous["findings"]]) if previous else ())
     finally:
         slot.give_back()  # sd:2523: on every exit; the gate below queues in its own pool
     # Shadow only (sd:2092): Jev's kind for each finding goes to its ledger and

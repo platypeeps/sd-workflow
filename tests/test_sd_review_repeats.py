@@ -253,6 +253,31 @@ def finding(evidence: Any = None, **extra: Any) -> dict[str, Any]:
     return row(**extra) if evidence is None else row(evidence=evidence, **extra)
 
 
+class PriorLineTests(RepeatFixture):
+    """build/sd-1423 review (bin/sd-review:1810): 21 lines inserted above a blocker at line 10 moved it past the
+    fixed window, so an uncited, paraphrased repeat at line 31 cleared the gate. Verification and resume now map
+    each prior blocker's line through the diff from the prior head to this head before any is matched."""
+
+    def test_a_blocker_moved_by_an_insertion_above_it_still_blocks(self) -> None:
+        source = "".join(f"line{number}\n" for number in range(1, 41))
+        (self.root / "src.py").write_text(source, encoding="utf-8")
+        old = self.commit("add", "src.py") and self.commit("old")
+        (self.root / "src.py").write_text("".join(f"new{n}\n" for n in range(21)) + source, encoding="utf-8")
+        new = self.commit("add", "src.py") and self.commit("new")
+        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking"),
+                 dict(finding(REPRO, path="gone.py", line=7), disposition="blocking")]
+        moved = sd_review.prior_at(self.root, old, new, prior)
+        self.assertEqual([row["line"] for row in moved], [31, 7])
+        [record] = sd_review.dispose([finding(line=31, summary="An empty list raises IndexError")], "high",
+                                     repro=True, prior=moved)
+        self.assertEqual(record["disposition"], "blocking")
+
+    def test_the_line_map_reads_each_hunk(self) -> None:
+        diff = "@@ -0,0 +1,21 @@\n+x\n@@ -5,2 +26,3 @@\n@@ -20 +42,0 @@\n"
+        self.assertEqual([sd_review.moved_line(diff, line) for line in (1, 4, 5, 6, 7, 19, 20, 30)],
+                         [22, 25, 26, 26, 29, 41, 42, 51])
+
+
 class ReproRuleTests(unittest.TestCase):
     """Operator ruling on pack sd:9867, amended by note #70162: a finding at the floor blocks only with a
     concrete failing input or command (`evidence`), in touched code or an unchanged caller it breaks; any
