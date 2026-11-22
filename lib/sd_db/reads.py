@@ -317,17 +317,10 @@ def repo_in(column: str, keep: set[str | None] | None) -> tuple[str, list[Any]]:
     return (f"({found} OR {column} IS NULL)" if None in keep else found), named
 
 
-#: What a delivery's done note says last, before the followups it leaves owed (sd:9869).
-KEPT_OPEN = "kept open notes"
-#: The item's latest done note names this followup after `KEPT_OPEN`, ids joined by ", ":
-#: matched whole, so note 4 is not note 42.
-_KEPT_OPEN = f"""EXISTS (
-    SELECT 1 FROM note AS closed
-     WHERE closed.id = (SELECT max(id) FROM note AS moved WHERE moved.item = note.item
-                         AND moved.kind = 'status_change' AND moved.body LIKE '%-> done by %')
-       AND instr(closed.body, '{KEPT_OPEN} ') > 0
-       AND instr(', ' || substr(closed.body, instr(closed.body, '{KEPT_OPEN} ') + {len(KEPT_OPEN) + 1}) || ',',
-                 ', ' || note.id || ',') > 0)"""
+#: The `item.fields` key that lists the followups a close left owed (sd:9869); `workflow.change_status` writes it.
+KEPT_FOLLOWUPS = "kept_followups"
+_KEPT_OPEN = (f"note.id IN (SELECT value FROM json_each(CASE WHEN json_valid(item.fields) THEN item.fields END, "
+              f"'$.{KEPT_FOLLOWUPS}'))")
 
 
 def open_notes(connection: sqlite3.Connection, kind: str, *, limit: int | None = 200,

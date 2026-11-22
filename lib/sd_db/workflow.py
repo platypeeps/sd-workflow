@@ -20,7 +20,7 @@ from . import repos
 from .assets import item_asset
 from .database import transaction
 from .errors import SdDbError
-from .reads import IDEA_KINDS, KEPT_OPEN, item_by_id, item_notes
+from .reads import IDEA_KINDS, KEPT_FOLLOWUPS, item_by_id, item_notes
 from .recurrence import (
     ANCHORS,
     MAX_LEAD_DAYS,
@@ -820,8 +820,9 @@ def change_status(
                 held = json.loads(row["fields"]) if row["fields"] else {}
             except ValueError:
                 held = None
-            if isinstance(held, dict) and "completion" in held:
-                del held["completion"]
+            if isinstance(held, dict) and {"completion", KEPT_FOLLOWUPS} & held.keys():
+                held.pop("completion", None)
+                held.pop(KEPT_FOLLOWUPS, None)
                 set_item_fields(connection, item, fields=held)
         if target == "done":
             # sd:3505: what a done item still owed is no longer owed; the brief
@@ -837,11 +838,13 @@ def change_status(
                 closed = (f"resolved open note{'s' if len(owed) > 1 else ''} "
                           + ", ".join(str(note) for note in owed))
                 reason = f"{reason}; {closed}" if reason else closed
-            # sd:9869: Today lists a done item's followup only when its close names it here.
+            # sd:9869: Today lists a done item's followup only when its close keeps it, in
+            # `fields`, not in the close note's text, which a hand-written reason can forge.
             kept = [note["id"] for note in state["notes"]
                     if note["kind"] == "followup" and not note["resolved_at"] and note["id"] not in owed]
+            _record_kept(connection, item, row["fields"], kept)
             if kept:
-                held = f"{KEPT_OPEN} " + ", ".join(str(note) for note in kept)
+                held = "kept open notes " + ", ".join(str(note) for note in kept)
                 reason = f"{reason}; {held}" if reason else held
         transition(connection, item, target, who=who, reason=reason, session=session)
         if target != "done" or row.get("recurrence") is None:
@@ -849,6 +852,22 @@ def change_status(
         spawned, ended = _next_occurrence(connection, row, who=who)
         return {**item_state(connection, item), "next_occurrence": spawned,
                 "next_occurrence_reason": ended}
+
+
+def _record_kept(connection: sqlite3.Connection, item: int, fields: str | None, kept: list[int]) -> None:
+    """Write the followups a close leaves owed to `fields[KEPT_FOLLOWUPS]`, or drop the key. Unreadable
+    fields are left for their repair, and keep nothing owed."""
+    try:
+        held = json.loads(fields) if fields else {}
+    except ValueError:
+        return
+    if not isinstance(held, dict) or (not kept and KEPT_FOLLOWUPS not in held):
+        return
+    if kept:
+        held[KEPT_FOLLOWUPS] = kept
+    else:
+        del held[KEPT_FOLLOWUPS]
+    set_item_fields(connection, item, fields=held)
 
 
 def _today() -> date:

@@ -104,6 +104,20 @@ class OpenFollowups(unittest.TestCase):
             workflow.change_status(connection, closed, "done", who="operator", reason="test")
             self.assertEqual([row["id"] for row in reads.open_followups(connection)], [waiting])
 
+    def test_a_close_reason_that_names_a_followup_does_not_keep_it_owed(self):
+        # sd:9869 class pass: Today read the kept followups from the close note's text, so a
+        # hand close whose reason says "kept open notes N" listed a later note N as owed.
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sd.db"
+            initialise(path)
+            connection = connect(path)
+            self.addCleanup(connection.close)
+            item = create_item(connection, kind="task", title="Closed by hand", status="in_progress")
+            named = ", ".join(str(note) for note in range(1, 50))
+            workflow.change_status(connection, item, "done", who="operator", reason=f"kept open notes {named}")
+            self.assertLess(add_note(connection, item, "followup", "Left behind"), 50)
+            self.assertEqual(reads.open_followups(connection), [])
+
 
 class ParkedWritingReads(unittest.TestCase):
     def test_due_date_does_not_put_parked_writing_back_in_today(self):
