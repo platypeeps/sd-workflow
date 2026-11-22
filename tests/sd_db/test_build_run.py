@@ -1485,6 +1485,13 @@ class Supervise(Case):
                 {"path": "lib/helper.py", "line": 4, "summary": f"{work}/src/caller.py passes None."}]
         _, kept = self.deferred(rows, {"src/caller.py": {12}})
         self.assertEqual(kept["blockers"], rows, "a blocker naming a changed caller by another spelling was deferred")
+        spaced = [{"path": "lib/parse.py", "line": 2, "summary": "bin/my tool now passes None to parse()"},
+                  {"path": "lib/parse.py", "line": 3, "summary": f"{work}/bin/my tool passes None."}]
+        _, kept = self.deferred(spaced, {"bin/my tool": {4}})
+        self.assertEqual(kept["blockers"], spaced, "a blocker naming a changed caller with a space was deferred")
+        _, kept = self.deferred([{"path": "lib/parse.py", "line": 2, "summary": "bin/my tool.bak is stale"}],
+                                {"bin/my tool": {4}})
+        self.assertEqual(kept["blockers"], [], "a lookalike of a spaced name held a blocker")
         far = {"path": "lib/helper.py", "line": 5, "summary": "src/caller.py.bak still holds the old parse()"}
         _, kept = self.deferred([far], {"src/caller.py": {12}})
         self.assertEqual(kept["blockers"], [], "a lookalike file name held a blocker")

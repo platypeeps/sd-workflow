@@ -1481,7 +1481,11 @@ class Supervisor:
             # Each path-like word, as `./x`, `a/../x` or an absolute path spells it: whole names, not substrings.
             words = " ".join(str(value) for key, value in row.items() if key not in ("path", "line", "instances"))
             spelled = {os.path.normpath(word.rstrip(".")) for word in re.findall(r"[\w./-]+", words) if word.rstrip(".")}
-            return any(word in names or os.path.basename(word) in names for word in spelled)
+            if any(word in names or os.path.basename(word) in names for word in spelled):
+                return True
+            # A name with a space or other character no word holds (`bin/my tool`), found literally and whole.
+            return any(re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w/-]|\.\w)", words)
+                       for name in names if re.search(r"[^\w./-]", name))
         new = [row for row in answer["blockers"] if not held(row)]
         return new, [row for row in answer["blockers"] if row not in new]
 
