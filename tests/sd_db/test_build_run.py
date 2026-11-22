@@ -2962,6 +2962,249 @@ class Tick(Case):
         notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", self.items)]
         self.assertIn(build.FINDING + "pin the fixture clock", notes)
 
+    def reopened_dependency(self):
+        """The bundle's lead waits on an item reopened since its build: the dependency is open again."""
+        first = create_item(self.db, kind="task", title="Prerequisite", repo=str(self.repo), status="ready")
+        with self.db:
+            self.db.execute("UPDATE item SET fields = ? WHERE id = ?", (json.dumps({"blocked_by": [first]}),
+                                                                        self.items[0]))
+        return first
+
+    def test_fix_on_a_failed_lane_entry_refuses_while_a_dependency_is_open(self):
+        """Review of build/sd-1306: Fix handed back the lane entry and queued the bundle past the check Retry
+        runs; dispatch then blocked and parked it. It refuses first and writes nothing."""
+        run = self.enqueued()
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red"}
+        self.tick()
+        first = self.reopened_dependency()
+        with self.assertRaisesRegex(build.BuildRefused, f"item {self.items[0]} waits on sd:{first}"):
+            build.lane_fix_check(self.db, run["id"])
+        with self.assertRaisesRegex(build.BuildRefused, f"waits on sd:{first}"):
+            build.queue_again(self.db, self.items, who="operator")
+        self.assertNotIn("handed_back", self.stored("e1"))
+        self.assertEqual(self.statuses(), ["in_progress"])
+
+    def lane_failed_bundle(self, waiter, on):
+        """A two-item bundle whose lane entry failed; then item `waiter` waits on item `on`, both its members."""
+        run = self.enqueued(2)
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red"}
+        self.tick()
+        with self.db:
+            self.db.execute("UPDATE item SET fields = ? WHERE id = ?",
+                            (json.dumps({"blocked_by": [self.items[on]]}), self.items[waiter]))
+        return run
+
+    def queued_builds(self, item):
+        return self.db.execute("SELECT COUNT(*) FROM assignment WHERE item = ? AND status = 'queued'",
+                               (item,)).fetchone()[0]
+
+    def lead_waits_on_its_member(self, pressed):
+        """Review of build/sd-1306: the lead waits on its member. Fix refused the bundle until the member was
+        done, and a Build of the member refused the same way. The member leaves and builds on its own."""
+        run = self.lane_failed_bundle(0, 1)
+        build.queue_again(self.db, [self.items[one] for one in ([pressed] if type(pressed) is int else pressed)],
+                          who="operator")
+        self.assertEqual(self.queued_builds(self.items[1]), 1, "the member builds")
+        self.assertEqual(self.queued_builds(self.items[0]), 0, "the lead waits")
+        self.assertEqual(build.run(self.db, run["id"])["outcome"], "lane_failed")
+        self.assertEqual(self.statuses(), ["in_progress", "ready"])
+
+    def test_a_build_of_the_member_a_lane_failed_lead_waits_on_builds_it_alone(self):
+        self.lead_waits_on_its_member(1)
+
+    def test_a_build_of_a_lane_failed_lead_that_waits_on_its_member_builds_the_member(self):
+        self.lead_waits_on_its_member(0)
+
+    def test_a_build_of_the_lead_and_its_member_frees_the_member_in_either_order(self):
+        """Review of build/sd-1306: selecting B then A freed B, then refused A as it waits on B, and rolled
+        both back. The lead's run freed once stays lane_failed for Fix, whatever the order."""
+        for order in ([0, 1], [1, 0]):
+            with self.subTest(order=order):
+                if order[0]:
+                    self.setUp()
+                self.lead_waits_on_its_member(order)
+
+    def test_a_freed_member_that_waited_builds_once_its_own_dependency_is_done(self):
+        """Review of build/sd-1306: A waits on B, B on C outside the bundle. A Build of A freed B without
+        queueing it; once C was done, a Build of B went to A's Fix again and refused, as A waits on B."""
+        self.lane_failed_bundle(0, 1)
+        third = create_item(self.db, kind="task", title="Outside", repo=str(self.repo), status="ready")
+        with self.db:
+            self.db.execute("UPDATE item SET fields = ? WHERE id = ?",
+                            (json.dumps({"blocked_by": [third]}), self.items[1]))
+        build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertEqual(self.queued_builds(self.items[1]), 0, "B waits on C")
+        with self.db:
+            self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (third,))
+        build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual(self.queued_builds(self.items[1]), 1, "B builds on its own")
+
+    def test_a_build_of_a_waiting_chain_frees_it_and_queues_only_its_runnable_member(self):
+        """Review of build/sd-1306: lead A waits on B and B on C, all members of a lane-failed bundle.
+        Selecting A, B, C freed B and C and queued C; the loop read B as left alone and queued it too, which
+        refused, as B waits on C, and rolled the split back. B is freed once and waits, in any order."""
+        import itertools
+
+        for number, order in enumerate(itertools.permutations(range(3))):
+            with self.subTest(order=order):
+                if number:
+                    self.setUp()
+                run = self.enqueued(3)
+                self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red"}
+                self.tick()
+                with self.db:
+                    for waiter, on in ((0, 1), (1, 2)):
+                        self.db.execute("UPDATE item SET fields = ? WHERE id = ?",
+                                        (json.dumps({"blocked_by": [self.items[on]]}), self.items[waiter]))
+                build.queue_again(self.db, [self.items[one] for one in order], who="operator")
+                self.assertEqual([self.queued_builds(item) for item in self.items], [0, 0, 1], "only C builds")
+                self.assertEqual(build.run(self.db, run["id"])["outcome"], "lane_failed")
+
+    def test_a_build_of_a_split_bundle_settles_every_selected_member(self):
+        """Review of build/sd-1306: lead A waits on member B, and C waits on nothing. Selecting A, B, C freed B,
+        then read C as the bundle's Fix, which refused, as A still waits on B, and rolled the split back. The
+        split settles every selected member: B builds alone, A and C stay for Fix, in any order."""
+        import itertools
+
+        for number, order in enumerate(itertools.permutations(range(3))):
+            with self.subTest(order=order):
+                if number:
+                    self.setUp()
+                run = self.enqueued(3)
+                self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red"}
+                self.tick()
+                with self.db:
+                    self.db.execute("UPDATE item SET fields = ? WHERE id = ?",
+                                    (json.dumps({"blocked_by": [self.items[1]]}), self.items[0]))
+                build.queue_again(self.db, [self.items[one] for one in order], who="operator")
+                self.assertEqual([self.queued_builds(item) for item in self.items], [0, 1, 0], "only B builds")
+                self.assertEqual(build.run(self.db, run["id"])["outcome"], "lane_failed")
+
+    def test_a_build_of_the_lead_and_an_unrelated_member_frees_the_one_it_waits_on(self):
+        """Class pass over the selection of `queue_again`: A and C selected, A waits on B. The press of C alone
+        refuses, but with A in the selection the split frees B, whichever comes first."""
+        for order in ((0, 2), (2, 0)):
+            with self.subTest(order=order):
+                self.setUp()
+                self.enqueued(3)
+                self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red"}
+                self.tick()
+                with self.db:
+                    self.db.execute("UPDATE item SET fields = ? WHERE id = ?",
+                                    (json.dumps({"blocked_by": [self.items[1]]}), self.items[0]))
+                build.queue_again(self.db, [self.items[one] for one in order], who="operator")
+                self.assertEqual([self.queued_builds(item) for item in self.items], [0, 1, 0], "only B builds")
+
+    def newer_build_of_member(self):
+        """Lead A and member B; the bundle fails in the lane; B builds fresh and its new build claims it, so
+        B's item is in_progress under the newer build. Then B waits on A."""
+        run = self.enqueued(2)
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red"}
+        self.tick()
+        with self.db:  # the operator moved B back to ready, then built it on its own
+            self.db.execute("UPDATE item SET status = 'ready' WHERE id = ?", (self.items[1],))
+        newer = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        with self.db:
+            self.db.execute("UPDATE assignment SET status = 'running' WHERE id = ?", (newer,))
+            self.db.execute("UPDATE item SET status = 'in_progress', fields = ? WHERE id = ?",
+                            (json.dumps({"blocked_by": [self.items[0]]}), self.items[1]))
+        return run, newer
+
+    def assert_newer_build_owns_member(self, newer):
+        state = item_state(self.db, self.items[1])["item"]
+        self.assertEqual((state["status"], state.get("parked_at")), ("in_progress", None),
+                         "the newer build owns B's status")
+        self.assertEqual(self.db.execute("SELECT status FROM assignment WHERE id = ?", (newer,)).fetchone()[0],
+                         "running")
+
+    def test_a_fix_leaves_a_member_a_newer_build_owns(self):
+        """Review of build/sd-1306: Fix of the old bundle read B by its in_progress status alone, then `_leave`
+        moved B to ready and parked it while the newer build ran it. Fix sends back only the members it owns."""
+        run, newer = self.newer_build_of_member()
+        build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assert_newer_build_owns_member(newer)
+        self.assertEqual(self.queued_builds(self.items[0]), 1, "Fix sends the lead back")
+
+    def test_a_conflict_rebuild_leaves_a_member_a_newer_build_owns(self):
+        """Class pass: the conflict rebuild reads the same members (`_sendable`)."""
+        run, newer = self.newer_build_of_member()
+        with self.db:
+            build._rebuild(self.db, build.run(self.db, run["id"]), "conflict", build.clock(), "origin/main", "e1")
+        self.assert_newer_build_owns_member(newer)
+
+    def test_a_build_frees_no_member_a_newer_build_owns(self):
+        """Class pass: the Build path frees the members the lead waits on (`_free`); one a newer build owns is
+        not its to free, so A waits for that build and the refusal says so."""
+        run, newer = self.newer_build_of_member()
+        with self.db:
+            self.db.execute("UPDATE item SET fields = '{}' WHERE id = ?", (self.items[1],))
+            self.db.execute("UPDATE item SET fields = ? WHERE id = ?",
+                            (json.dumps({"blocked_by": [self.items[1]]}), self.items[0]))
+        with self.assertRaisesRegex(build.BuildRefused, f"item {self.items[0]} waits on sd:{self.items[1]}"):
+            build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assert_newer_build_owns_member(newer)
+
+    def test_a_build_frees_no_member_while_the_lane_entry_is_back_in_the_lane(self):
+        """Review of build/sd-1306: lead A waits on member B of a lane-failed bundle, and the operator sent the
+        lane entry back to the lane. Build A freed and queued B while the bundle's PR ran in the lane. It
+        refuses, as Fix does, and writes nothing."""
+        for status in ("pending", "running"):
+            with self.subTest(status=status):
+                self.setUp()
+                run = self.lane_failed_bundle(0, 1)
+                self.store({"id": "e1", "status": status}, run["branch"])
+                with self.assertRaisesRegex(build.BuildRefused, f"the lane holds branch .* again \\({status}\\)"):
+                    build.queue_again(self.db, [self.items[0]], who="operator")
+                self.assertEqual([self.queued_builds(item) for item in self.items], [0, 0])
+                self.assertEqual(self.statuses(), ["in_progress", "in_progress"])
+
+    def build_rows(self):
+        return self.db.execute("SELECT id, status, result FROM assignment ORDER BY id").fetchall()
+
+    def test_a_finding_refuses_to_free_a_member_that_waits_outside_the_bundle(self):
+        """Lead triage of build/sd-1306: the lead waits on its member, which waits on an open item outside the
+        bundle. A Fix with a finding freed the member, queued nothing and reported success: the finding was lost.
+        It refuses before it frees, and writes nothing."""
+        outside = create_item(self.db, kind="task", title="Outside", repo=str(self.repo), status="ready")
+        self.lane_failed_bundle(0, 1)
+        with self.db:
+            self.db.execute("UPDATE item SET fields = ? WHERE id = ?",
+                            (json.dumps({"blocked_by": [outside]}), self.items[1]))
+        before = [tuple(row) for row in self.build_rows()]
+        with self.assertRaisesRegex(build.BuildRefused, "finding"):
+            build.queue_again(self.db, [self.items[0]], who="operator", finding="fix the gate")
+        self.assertEqual([tuple(row) for row in self.build_rows()], before)
+
+    def test_a_build_of_another_member_names_the_press_that_frees_the_waited_on_one(self):
+        """Lead triage of build/sd-1306: the lead waits on one member and a third member is pressed. The press
+        freed the needed member, then refused with a hint to Fix once it is done, which no press could reach.
+        It refuses first, writes nothing, and names the lead and the member it waits on."""
+        run = self.enqueued(3)
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red"}
+        self.tick()
+        with self.db:
+            self.db.execute("UPDATE item SET fields = ? WHERE id = ?",
+                            (json.dumps({"blocked_by": [self.items[1]]}), self.items[0]))
+        before = [tuple(row) for row in self.build_rows()]
+        with self.assertRaises(build.BuildRefused) as refused:
+            build.queue_again(self.db, [self.items[2]], who="operator")
+        self.assertIn(f"sd:{self.items[0]}", str(refused.exception))
+        self.assertIn(f"sd:{self.items[1]}", str(refused.exception))
+        self.assertNotIn("Fix sends the bundle back", str(refused.exception))
+        self.assertEqual([tuple(row) for row in self.build_rows()], before)
+        self.assertEqual(build.run(self.db, run["id"])["outcome"], "lane_failed")
+
+    def test_fix_of_a_lane_failed_lead_leaves_out_the_member_that_waits_on_it(self):
+        """Review of build/sd-1306: the member waits on the lead, so Fix refused the whole bundle. The member
+        leaves the Fix, parked, and the lead goes back to its builder."""
+        run = self.lane_failed_bundle(1, 0)
+        self.assertEqual([member["item"] for member in build.lane_fix_check(self.db, run["id"])[0]],
+                         [self.items[0]])
+        build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertEqual(self.queued_builds(self.items[0]), 1)
+        self.assertEqual(self.statuses(), ["ready", "ready"])
+        self.assertIsNotNone(item_state(self.db, self.items[1])["item"]["parked_at"], "the member waits, parked")
+
     CONFLICT = ("merging origin/main into build/sd-1 conflicts; the branch is unchanged; "
                 "sd-ship lane retry --item 1 queues it again")
 
@@ -3044,6 +3287,20 @@ class Tick(Case):
         self.assertEqual((row["step"], row["outcome"], "handed_back" in self.stored("e1")), ("enqueued", None, False))
         self.assertEqual(len(self.tick()["claimed"]), 1)
         self.assertEqual(self.stored("e1")["handed_back"]["by"], "build")
+
+    def test_a_conflict_rebuild_waits_while_a_dependency_is_open(self):
+        """Class pass of the Fix finding: the conflict rebuild sends the bundle back as Fix does, so it reads the
+        dependencies too, and leaves the run lane_failed with a note that names the wait."""
+        run = self.enqueued()
+        first = self.reopened_dependency()
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": self.CONFLICT}
+        self.assertEqual(self.tick()["claimed"], [])
+        self.assertEqual(build.run(self.db, run["id"])["outcome"], "lane_failed")
+        self.assertNotIn("handed_back", self.stored("e1"))
+        self.assertEqual(self.statuses(), ["in_progress"])
+        notes = [row["body"] for row in self.db.execute("SELECT body FROM note WHERE item = ?", self.items)]
+        self.assertTrue(any(body.startswith(f"Build run {run['id']}: no rebuild") and f"waits on sd:{first}" in body
+                            for body in notes), notes)
 
     def test_a_rebuild_names_the_base_that_conflicted(self):
         """pack sd:7008: the finding said origin/main whatever base the lane merged."""

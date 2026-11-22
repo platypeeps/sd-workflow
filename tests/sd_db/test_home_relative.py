@@ -48,7 +48,7 @@ WHEN = "2026-09-24T00:00:00+00:00"
 COLUMNS = {
     "assignment": {"history": "scope result",
                    "none": "id item role provider status started ended cost after parent lane "
-                           "budget_minutes budget_usd phase run_count queued_at"},
+                           "budget_minutes budget_usd phase run_count queued_at batch"},
     "bill": {"none": "name cost_basis cap_usd_month"},
     "cost": {"key": "repo",
              "none": "id call_id timestamp provider bill role assignment pass owner_pid tokens_in "
@@ -220,6 +220,9 @@ class TheMigration(AThirteenStore):
         # 043 appends `note.harness_session` after 014, NULL on every row.
         self.assertEqual({row[-1] for row in after["note"]}, {None})
         after["note"] = sorted((row[:-1] for row in after["note"]), key=repr)
+        # 050 appends `assignment.batch` after 014, NULL on every row.
+        self.assertEqual({row[-1] for row in after["assignment"]}, {None})
+        after["assignment"] = sorted((row[:-1] for row in after["assignment"]), key=repr)
         for (table, column), kind in known.items():
             values = [value[0] for value in connection.execute(f"SELECT {column} FROM {table}")]
             if kind == "key":
@@ -269,8 +272,9 @@ class TheMigration(AThirteenStore):
         # `status_source` back at `row`, which every row here held, and 025's
         # puts `satellite_gate` back so 020's can drop it. 041's goes first of
         # all: the one later column on `item`, whose rows this compares, after
-        # 049's `home_asset` table, 048's `vote` table, 044's `shadow` merge columns,
-        # 043's `note.harness_session` and 042's build columns on `runner_run`.
+        # 050's `assignment.batch`, 049's `home_asset` table, 048's `vote` table, 044's `shadow`
+        # merge columns, 043's `note.harness_session` and 042's build columns on `runner_run`.
+        connection.executescript(reverse_script("050_assignment_batch.sql"))
         connection.executescript(reverse_script("049_home_asset.sql"))
         connection.executescript(reverse_script("048_vote.sql"))
         connection.executescript(reverse_script("044_shadow_merge_state.sql"))
@@ -522,7 +526,7 @@ EQUALITY_LOOKUPS = {
                  "`mine_issues` and `intake_issues` match `shadow.repo`, a slug"),
     "removal.py": (8, "`_plan_repo` rebinds `path` to the row `row_for` found, and P7's vote lookup binds it; "
                    "`_detach` reads it off the plan"),
-    "runner.py": (6, "every argument is an item or run row's `repo`"),
+    "runner.py": (5, "every argument is an item or run row's `repo`"),
     "runner_exec.py": (1, "the item row's `repo`"),
     "ship.py": (1, "the item row's `repo`"),
     "votes.py": (2, "`_get` and `rows` bind the row path `_stored` read through `repos.row_for`"),
