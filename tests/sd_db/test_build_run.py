@@ -1443,6 +1443,15 @@ class Supervise(Case):
         with mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
                 mock.patch.object(build_run, "_read", return_value="100644 blob 0123\tsrc.py\0"):
             self.assertIsNotNone(supervisor.prior_review("a" * 40), "a tracked file's blocker dropped the chain")
+        # Each instance's file too: `sd-review` attaches and checks every one (lead ruling on sd:9769).
+        supervisor.out("review").write_text(json.dumps(
+            {"status": "blocking", "scope": "branch", "subject": {"head": "b" * 40},
+             "requested_reviews": 1, "completed_reviews": 1, "covers_from": "c" * 40,
+             "findings": [{"path": "src.py", "line": 1, "disposition": "blocking",
+                           "instances": ["src.py:1", "/elsewhere/x.py:2"]}]}), encoding="utf-8")
+        with mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
+                mock.patch.object(build_run, "_read", return_value="100644 blob 0123\tsrc.py\0"):
+            self.assertIsNone(supervisor.prior_review("a" * 40), "an instance outside the checkout was handed on")
 
     def test_a_non_ascii_digit_line_reads_as_no_line(self):
         """Review of sd:9769: `str.isdigit` takes `²`, which `int` refuses; the place reads with no line."""
@@ -1488,10 +1497,12 @@ class Supervise(Case):
                 self.assertIsNone(supervisor.prior_review("a" * 40),
                                   "the older kept report stood in for a last report that failed its checks")
 
-    def deferred(self, blockers, changed, words=frozenset(), defined=frozenset()):
-        """`file_new_findings` over `blockers` with the delta `changed`: the blockers it keeps."""
+    def deferred(self, blockers, changed, words=frozenset(), defined=frozenset(), callees=False):
+        """`file_new_findings` over `blockers` with the delta `changed`: the blockers it keeps. The places'
+        enclosing functions call nothing changed unless `callees` reads them from git."""
         supervisor = self.supervisor()
         with mock.patch.object(supervisor, "branch_delta", return_value=changed), \
+                (contextlib.nullcontext() if callees else mock.patch.object(supervisor, "enclosing", return_value=set())), \
                 mock.patch.object(supervisor, "branch_words",
                                   return_value=None if words is None else (set(words), set(defined))):
             return supervisor, supervisor.file_new_findings({"status": "blocking", "blockers": blockers}, self.PRIOR,
@@ -1545,6 +1556,36 @@ class Supervise(Case):
         self.assertEqual(kept["blockers"], [], "a blocker naming no changed function was held")
         _, kept = self.deferred([far], {"src/caller.py": {12}}, None)
         self.assertEqual(kept["blockers"], [far], "a function context git could not read deferred a blocker")
+
+    def test_a_blocker_in_an_unchanged_callee_of_a_changed_caller_still_blocks(self):
+        """Lead ruling on sd:9769 (15:20 MST): a changed caller can break an unchanged callee, as a crash on
+        an empty value; a finding cited inside a function the changed code calls is in scope, even when its
+        words name only the failing input, so its path does not defer it."""
+        self.press()
+        source = ("import os\n\n\ndef parse_row(value):\n    return value[0]\n\n\n"
+                  "def old_reader():\n    return 1\n")
+
+        def show(argv, **_kwargs):
+            if "show" in argv and argv[-1] == f"{'a' * 40}:lib/parse.py":
+                return source
+            raise build_run.Unread("no such file")
+
+        rows = [{"path": "lib/parse.py", "line": 5, "summary": "an empty value crashes here"},
+                {"path": "lib/other.py", "line": 1, "summary": "an empty value crashes here",
+                 "instances": ["lib/parse.py:5"]},
+                {"path": "lib/parse.py", "line": None, "summary": "an empty value crashes this module"}]
+        far = {"path": "lib/parse.py", "line": 9, "summary": "an old defect"}
+        with mock.patch.object(build_run, "_read", side_effect=show):
+            _, kept = self.deferred([*rows, far], {"src/caller.py": {12}}, {"export", "parse_row", "row"},
+                                    {"export"}, callees=True)
+        self.assertEqual(kept["blockers"], rows, "a blocker in a callee of the changed caller was deferred")
+
+        def broken(argv, **_kwargs):
+            raise build_run.Unread("git gave no answer")
+
+        with mock.patch.object(build_run, "_read", side_effect=broken):
+            _, kept = self.deferred([far], {"src/caller.py": {12}}, {"parse_row"}, {"export"}, callees=True)
+        self.assertEqual(kept["blockers"], [far], "a callee git could not read deferred its blocker")
 
     def test_a_short_function_name_still_names_the_changed_caller(self):
         """Review of sd:9769: `go()` names a changed function; no length filter drops it."""
@@ -1766,6 +1807,7 @@ class Supervise(Case):
         answer = {"status": "blocking", "blockers": rows}
         with mock.patch.object(supervisor, "branch_delta", return_value={}), \
                 mock.patch.object(supervisor, "branch_words", return_value=(set(), set())), \
+                mock.patch.object(supervisor, "enclosing", return_value=set()), \
                 mock.patch.object(supervisor, "file_follow_up", committed_then_lost):
             with self.assertRaises(remote.UnknownOutcome):
                 supervisor.file_new_findings(answer, self.PRIOR, "a" * 40)

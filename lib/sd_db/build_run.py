@@ -544,6 +544,13 @@ def defined_names(line: str) -> set[str]:
     return {name for pattern in (keyword, assigned, method) for name in re.findall(pattern, line)}
 
 
+def instance_files(instances: Any) -> list[str]:
+    """The file of each `path:line` in a finding's `instances`, as `sd-review` reads it; a value not a list
+    names none (pack sd:9769)."""
+    return [re.sub(r":[0-9]+$", "", entry.strip()) for entry in (instances if isinstance(instances, list) else [])
+            if isinstance(entry, str) and entry.strip()]
+
+
 def callable_words(text: str) -> set[str]:
     """The identifiers a finding names as code: `name(`, a snake or camel name, or a backticked dotted name."""
     words = set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", text))
@@ -1457,8 +1464,10 @@ class Supervisor:
             for row in answer["findings"]:  # `sd-review` refuses an absolute prior path, even inside the checkout
                 if isinstance(row, dict) and isinstance(row.get("path"), str) and os.path.isabs(row["path"]):
                     row["path"] = self.locations({"path": row["path"]})[0][0]
-            if not all(self.verifiable(row["path"], head) for row in answer["findings"]
-                       if isinstance(row, dict) and row.get("disposition") == "blocking"):
+            # Each instance's file too: `sd-review` attaches and checks every one (sd:9769).
+            if not all(self.verifiable(path, head) for row in answer["findings"]
+                       if isinstance(row, dict) and row.get("disposition") == "blocking"
+                       for path in (row["path"], *instance_files(row.get("instances")))):
                 return None  # `sd-review` would refuse it as --verify-report: review the branch in full
             encoded = json.dumps(answer)
             if len(encoded.encode("utf-8")) > PRIOR_REPORT_BYTES:
@@ -1530,6 +1539,8 @@ class Supervisor:
         # The identifiers of the functions the branch changes, read whole: a caller named by function (sd:9769).
         functions = self.branch_words(head) if changed is not None else None
 
+        sources: dict[str, list[str] | None] = {}
+
         def held(row: dict) -> bool:
             # `<...>` names no file; an absolute or `..` path is outside the checkout no delta of it can clear.
             # A file the branch changes holds at every line: a cited line can be off by a few, and a change can
@@ -1547,11 +1558,41 @@ class Supervisor:
             # Or a plain word that is the name of a function the change defines (`export`).
             if callable_words(words) & functions[0] or set(re.findall(r"[A-Za-z_]\w*", words)) & functions[1]:
                 return True
+            # A place inside a function the changed code calls: a changed caller can break an unchanged callee
+            # (a crash on an empty value) whatever the finding's words name, so its path defers nothing.
+            if any(names is None or names & functions[0] for path, line in self.locations(row)
+                   for names in [self.enclosing(path, line, head, sources)]):
+                return True
             # A name with a space or other character no word holds (`bin/my tool`), found literally and whole.
             return any(re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w/-]|\.\w)", words)
                        for name in names if re.search(r"[^\w./-]", name))
         new = [row for row in answer["blockers"] if not held(row)]
         return new, [row for row in answer["blockers"] if row not in new]
+
+    def enclosing(self, path: str, line: int | None, head: str,
+                  sources: dict[str, list[str] | None]) -> set[str] | None:
+        """The names the function around `path:line` at `head` defines, or every name the file defines when the
+        place has no line; none for a file `head` does not hold; None when git cannot say (lead ruling on pack
+        sd:9769)."""
+        if path not in sources:
+            try:
+                sources[path] = _read([*self.tools.git, "-C", str(self.work), "show", f"{head}:{path}"],
+                                      env=self.env).splitlines()
+            except Unread:
+                try:  # absent at `head` reads as no callee; any other failure is unknown, so the blocker holds
+                    absent = not _read([*self.tools.git, "-C", str(self.work), "ls-tree", "-z", head, "--",
+                                        f":(literal){path}"], env=self.env)
+                except Unread:
+                    absent = False
+                sources[path] = [] if absent else None
+        if (lines := sources[path]) is None:
+            return None
+        if line is None:
+            return {name for text in lines for name in defined_names(text)}
+        for text in reversed(lines[:line]):
+            if names := defined_names(text):
+                return names
+        return set()
 
     def branch_words(self, head: str) -> tuple[set[str], set[str]] | None:
         """`function_words` of the branch from its fork: its identifiers and defined names; None when unread
