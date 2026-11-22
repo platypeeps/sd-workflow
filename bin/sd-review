@@ -2870,10 +2870,10 @@ UNRECORDED_OPTIONS = ("base", "verify_report", "resume_report", "item", "draft",
                       "expected_timing", "reuse_check", "preflight", "explain", "dry_run")
 
 
-def recorded_base(root: pathlib.Path, result: dict[str, Any], head: str) -> str:
-    """A build's verify pass stands for the branch only from the fork its chain covers; an unread one is none (sd:9769)."""
-    if not result.get("covers_from") or result["covers_from"] != sd_lib.git_output(["merge-base", head, _default_base(root)], root):
-        raise Refusal("the verify pass's chain does not cover the branch from its fork")
+def recorded_base(root: pathlib.Path, result: dict[str, Any], head: str, verified: bool) -> str:
+    """The base a pass stands for: none when it covers no branch (a patch-only reader); a build's verify pass only from its fork (sd:9769)."""
+    if not result.get("covers_from") or verified and result["covers_from"] != sd_lib.git_output(["merge-base", head, _default_base(root)], root):
+        raise Refusal("the pass covers no branch, or the verify pass's chain does not cover it from its fork")
     return str(result["covers_from"])
 
 
@@ -2897,7 +2897,7 @@ def record_lead_review(root: pathlib.Path, args: argparse.Namespace, result: dic
         binding, library = sd_lib.lead_review_binding(root), sd_lib.import_sd_db().module
         if current != head or not branch or not (None is not binding == result.get("binding")) or library is None:  # read, and the review's own
             raise Refusal("HEAD moved, is on no branch or no GitHub origin, or the binding changed or the database does not read")
-        base = recorded_base(root, result, head) if verified else result["subject"]["base"]
+        base = recorded_base(root, result, head, verified)
         copilot = (result.get("remote_reviews") or {}).get("copilot") or {}
         with contextlib.closing(library.connect(args.database or library.default_path(env.get("HOME")))) as connection:
             library.record_state(connection, "checkpoint", key=sd_lib.lead_review_key(f"{owner}/{name}", branch), body={

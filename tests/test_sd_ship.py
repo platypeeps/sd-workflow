@@ -5198,7 +5198,7 @@ roles:
         review = ship.sd_lib.sibling("sd_review_lead_record", "sd-review")
         args = review.build_parser().parse_args(["--scope", "branch"])
         head = _git(self.root, "rev-parse", "HEAD")
-        result = {"status": "advisory", "requested_reviews": 1, "completed_reviews": 1,
+        result = {"status": "advisory", "requested_reviews": 1, "completed_reviews": 1, "covers_from": head,
                   "subject": {"base": head, "head": head}, "binding": review.sd_lib.lead_review_binding(self.root)}
         with contextlib.redirect_stderr(io.StringIO()) as said:
             review.record_lead_review(self.root, args, {**result, "binding": {"review_declaration": "older"}},
@@ -5252,6 +5252,23 @@ roles:
         self.assertIsNotNone(record, "a build's passing verify round was not recorded")
         self.assertEqual(record["base"], fork)
         self.assertEqual(record["head"], head)
+
+    def test_a_plain_pass_that_covers_no_branch_is_not_recorded(self):
+        """Review of sd:9767: `sd-review` clears `covers_from` for a patch-only reader's pass; an advisory
+        answer from it must not let lane prepare run the gate alone."""
+        self.tiered_branch({"src.py": "value = 2\n"})
+        review = ship.sd_lib.sibling("sd_review_lead_record", "sd-review")
+        head = _git(self.root, "rev-parse", "HEAD")
+        args = review.build_parser().parse_args(["--scope", "branch"])
+        base = _git(self.root, "merge-base", head, "origin/main")
+        result = {"status": "advisory", "requested_reviews": 2, "completed_reviews": 2, "covers_from": None,
+                  "subject": {"base": base, "head": head}, "binding": review.sd_lib.lead_review_binding(self.root)}
+        with contextlib.redirect_stderr(io.StringIO()):
+            review.record_lead_review(self.root, args, result, dict(os.environ))
+        self.assertIsNone(self.lead_record(), "a pass covering no branch was recorded for lane reuse")
+        with contextlib.redirect_stderr(io.StringIO()):
+            review.record_lead_review(self.root, args, {**result, "covers_from": base}, dict(os.environ))
+        self.assertIsNotNone(self.lead_record(), "a full pass covering the branch was not recorded")
 
     def assert_tier_reviews(self, files: dict[str, str], policy: str | None = None) -> None:
         calls = self.tiered_branch(files, policy=policy)
