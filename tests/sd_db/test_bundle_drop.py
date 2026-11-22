@@ -1008,8 +1008,7 @@ class GitLocation(Repo):
     def test_it_covers_gits_own_list(self):
         listed = set(git(self.repo, "rev-parse", "--local-env-vars").split())
         self.assertTrue(listed)
-        # Command-scope config is no location (pack sd:9863).
-        self.assertLessEqual(listed - paths.GIT_LOCAL, {"GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT"})
+        self.assertEqual(listed - paths.GIT_LOCAL, set())
 
 
 class GitPolicy(Repo):
@@ -1097,10 +1096,26 @@ class Advisories(Repo):
 
 
 class GitConfigScope(unittest.TestCase):
-    """pack sd:9863: command-scope config is no repository location; the suite's maintenance.auto=false rides it."""
+    """pack sd:9863: command-scope config may redirect a child's remote (`url.*.insteadOf`), so it is stripped; only
+    the auto-maintenance keys the suite sets ride on, renumbered."""
 
-    def test_git_env_keeps_command_scope_config(self):
-        given = {"GIT_DIR": "/elsewhere/.git", "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "maintenance.auto",
-                 "GIT_CONFIG_VALUE_0": "false", "GIT_CONFIG_PARAMETERS": "'gc.auto'='0'", "PATH": "/bin"}
-        kept = paths.git_env(given)
-        self.assertEqual(kept, {key: value for key, value in given.items() if key != "GIT_DIR"})
+    def test_git_env_keeps_only_the_maintenance_config(self):
+        given = {"GIT_DIR": "/elsewhere/.git", "GIT_CONFIG_COUNT": "3",
+                 "GIT_CONFIG_KEY_0": "url.file:///example.test/x.git.insteadOf", "GIT_CONFIG_VALUE_0": "origin",
+                 "GIT_CONFIG_KEY_1": "maintenance.auto", "GIT_CONFIG_VALUE_1": "false",
+                 "GIT_CONFIG_KEY_2": "gc.auto", "GIT_CONFIG_VALUE_2": "0",
+                 "GIT_CONFIG_PARAMETERS": "'url.file:///example.test/y.git.insteadof'='origin'", "PATH": "/bin"}
+        self.assertEqual(paths.git_env(given), {
+            "PATH": "/bin", "GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "maintenance.auto",
+            "GIT_CONFIG_VALUE_0": "false", "GIT_CONFIG_KEY_1": "gc.auto", "GIT_CONFIG_VALUE_1": "0"})
+
+    def test_git_env_without_maintenance_config_sets_none(self):
+        given = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "url.a.insteadOf", "GIT_CONFIG_VALUE_0": "b",
+                 "PATH": "/bin"}
+        self.assertEqual(paths.git_env(given), {"PATH": "/bin"})
+
+    def test_a_bad_count_keeps_nothing(self):
+        for count in ("x", "-1", "9" * 30):
+            with self.subTest(count=count):
+                self.assertEqual(paths.git_env({"GIT_CONFIG_COUNT": count, "GIT_CONFIG_KEY_0": "gc.auto",
+                                                "GIT_CONFIG_VALUE_0": "0"}), {})
