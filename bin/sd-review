@@ -2306,7 +2306,7 @@ def review(
                 or (verify and previous["subject"].get("head") != args.base)
                 or (verify and previous.get("status") not in ("clean", "advisory", "blocking", "gate_failed"))  # sd:2721
                 or not isinstance(previous.get("findings"), list)
-                or any(not isinstance(row, dict) or not isinstance(row.get("path"), str) for row in previous["findings"])):
+                or any(not isinstance(row, dict) or not isinstance(row.get("path"), str) or "\0" in row["path"] for row in previous["findings"])):
             raise UsageError("prior review report does not match the reviewed base")
         if resume:
             prior_head = previous["subject"].get("head")

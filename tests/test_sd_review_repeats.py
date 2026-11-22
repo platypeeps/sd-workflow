@@ -335,6 +335,18 @@ class PriorLineTests(RepeatFixture):
         self.assertEqual([row["line"] for row in sd_review.prior_at(self.root, old, new, prior)], [10])
         self.assertIsNone(sd_review.sd_lib.git_output(["show", f"{new}:src.py"], self.root))
 
+    def test_a_path_with_a_nul_leaves_the_blocker_as_stored(self) -> None:
+        """build/sd-1423 review (bin/sd-review:1865): a stored blocker's JSON path with a NUL reached git as a
+        pathspec, and subprocess raised `ValueError: embedded null byte` after the providers had finished. An
+        argument git cannot take is an answer it could not give, so the blocker stays as stored."""
+        old = self.commit("old")
+        new = self.commit("new")
+        prior = [dict(finding(REPRO, path="a\0b.py", line=3), disposition="blocking"),
+                 dict(finding(REPRO, path="c\0d.py", line=None), disposition="blocking")]
+        self.assertEqual([(row["path"], row["line"]) for row in sd_review.prior_at(self.root, old, new, prior)],
+                         [("a\0b.py", 3), ("c\0d.py", None)])
+        self.assertIsNone(sd_review.sd_lib.git_output(["log", "-1", "a\0b"], self.root))
+
     def test_a_path_is_read_literally_not_as_a_pattern(self) -> None:
         """build/sd-1423 class pass (bin/sd-review:1853): the remap passed `page[1].py` to git as a glob, so it
         read page1.py's patch too, and an insertion of 25 lines above the defect mapped it wrong."""
@@ -787,6 +799,20 @@ class RepeatReviewTests(RepeatFixture):
                                   self.chatgpt_home())
         self.assertEqual(result["subject"]["head"], head)
         self.assertEqual([r["disposition"] for r in result["findings"] if r["backend"] == "codex"], ["blocking"])
+
+    def test_a_prior_report_with_a_nul_in_a_path_is_refused_before_any_provider(self) -> None:
+        """build/sd-1423 class pass (bin/sd-review:1865): the prompt's source read resolves each prior blocker's
+        path, and a NUL raised `ValueError` there. Validation refuses the report as it refuses a non-string."""
+        report = self.tmp / "nul.json"
+        report.write_text(json.dumps({"scope": "branch", "subject": {"head": self.first}, "findings": [
+            dict(finding(REPRO, path="a\0b.py", line=3), disposition="blocking")]}))
+        for kwargs in ({"resume_report": str(report)}, {"verify_report": str(report), "base": self.first}):
+            with self.subTest(kwargs=sorted(kwargs)):
+                runner = FakeRunner()
+                with self.assertRaisesRegex(sd_review.UsageError, "prior review report does not match"):
+                    sd_review.review(self.root, namespace(scope="branch", **kwargs), runner, self.environment(),
+                                     self.chatgpt_home())
+                self.assertEqual(runner.calls, [])
 
 #: A receipt head `listed` takes for one on the reviewed branch.
 ON_BRANCH = "c" * 40
