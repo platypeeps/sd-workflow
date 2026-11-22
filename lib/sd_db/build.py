@@ -1473,16 +1473,26 @@ def _mechanical(connection, item: int) -> bool:
     return isinstance(fields, dict) and fields.get("work_kind") == "mechanical"
 
 
+#: What `sd.build_model` may hold: a model alias or id the builder's `--model` takes (sd:9942).
+BUILD_MODEL = r"[a-z][a-z0-9.-]{0,63}"
+
+
+def build_model(environ: dict[str, str] | None = None) -> str | None:
+    """This machine's `sd.build_model`, or None when unset or malformed (sd:9942)."""
+    return _machine_value("build_model", BUILD_MODEL, environ)
+
+
 def _model(connection, items: list[int]) -> str:
-    return SONNET if all(_mechanical(connection, item) for item in items) else OPUS
+    """The builder's model: `sd.build_model` when set; else sonnet for an all-mechanical bundle, opus otherwise."""
+    return build_model() or (SONNET if all(_mechanical(connection, item) for item in items) else OPUS)
 
 
-def _machine_setting(key: str, pattern: str, default: int, environ: dict[str, str] | None) -> int:
-    """This machine's `sd.<key>` from the pack's machine config as a number, `default` when unset.
+def _machine_value(key: str, pattern: str, environ: dict[str, str] | None) -> str | None:
+    """This machine's `sd.<key>` from the pack's machine config when it matches `pattern`, else None.
 
     The machine that claims a bundle reads its own, as `sd.gate_slots` is read
-    (`sd_lib.file_setting`); a value that does not match `pattern` is the
-    default, so a bad file never stops a dispatcher.
+    (`sd_lib.file_setting`); a value that does not match `pattern` reads as
+    unset, so a bad file never stops a dispatcher.
     """
     env = os.environ if environ is None else environ
     home = env.get("XDG_CONFIG_HOME") or str(Path(env.get("HOME") or Path.home()) / ".config")
@@ -1490,8 +1500,14 @@ def _machine_setting(key: str, pattern: str, default: int, environ: dict[str, st
         config = json.loads((Path(home) / "sd-ai-command-pack" / "config.json").read_text()).get("config", {})
         value = config.get("sd", {}).get(key)
     except (OSError, ValueError, AttributeError):
-        return default
-    return int(value) if isinstance(value, str) and re.fullmatch(pattern, value) else default
+        return None
+    return value if isinstance(value, str) and re.fullmatch(pattern, value) else None
+
+
+def _machine_setting(key: str, pattern: str, default: int, environ: dict[str, str] | None) -> int:
+    """This machine's `sd.<key>` as a number, `default` when unset or malformed."""
+    value = _machine_value(key, pattern, environ)
+    return int(value) if value is not None else default
 
 
 def bundle_max(environ: dict[str, str] | None = None) -> int:

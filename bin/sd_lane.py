@@ -355,6 +355,8 @@ STALE_HEAD = "stale_head"
 HANDED_BACK = "handed_back"
 #: An entry on a build bundle's branch would deliver a member the operator cancelled on its own (sd:9222).
 MEMBER_LEFT = "member_cancelled_alone"
+#: A `Closes:` trailer cites a blocked item that no `--item` names and no `Refs:` keeps (sd:9918).
+CITED_BLOCKED = "cited_blocked"
 #: The refusal code of a cancel whose `--expected-claim` no longer holds the item's running entry (sd:3330).
 STALE_CLAIM = "stale_claim"
 #: The refusals of a cancelled entry's retry (sd:3389): its item has a newer entry, or merged at its head.
@@ -1022,6 +1024,14 @@ def cited_closes(connection: Any, item: int, body: str, commits: list[tuple[str,
     if row is None or not row["repo"]:
         return []
     sources = sd_ship_body.cited_sources(body, commits, parents)
+    blocked = sd_ship_body.blocked_cited(connection, item, row["repo"], tuple(sd_ship_body.trailer_cited(sources)),
+                                         closes, body, branch)
+    if blocked:  # sd:9918: closed by hand after a tree compare once; closed unasked, a block's followup goes too
+        named = ", ".join(f"sd:{number}" for number in blocked)
+        raise LaneError(f"a branch commit's Closes: trailer cites blocked {named}; the merge would leave it open "
+                        f"unseen, and the lane closes no blocked item on its own. Name each the merge delivers "
+                        f"with --item, or keep it open with a `Refs: {named}` line in the body; nothing was "
+                        f"queued or pushed.", code=CITED_BLOCKED)
     kept = sd_ship_body.open_cited(connection, item, row["repo"], tuple(sources), closes, body, branch)
     return [{"item": number, "source": sources[number]} for number in kept]
 

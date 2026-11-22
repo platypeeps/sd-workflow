@@ -2232,6 +2232,8 @@ class DraftSupervisor(Supervisor):
             if not build.write(self.db, self.ident, **fields):
                 raise Lost
             self.once("cost", lambda: self.cost(final))
+        if verdict["state"] == "rate_limited":  # queued again, and this host held (sd:9938)
+            return self.finish(build.RATE_LIMITED, f"{verdict['why']}; nothing was written; log {self.log}")
         if verdict["state"] != "pass":
             # A turn limit is no loss here: a fresh run has no session to resume, so it blocks as any other end.
             return self.finish("blocked", f"{verdict['why']}; nothing was written; log {self.log}")
