@@ -1346,9 +1346,15 @@ def counted(answer: dict, load5: float) -> float:
     """The five-minute load a cap reads from an `sd gate status --json` answer: its `load_counted`, load5 with the
     CPU's own use standing in while the CPU is not busy (sd:9946), else `load5` where the gate gave none."""
     value = answer.get("load_counted")
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return load5
-    return min(float(value), load5)
+    try:
+        value = float(value)  # a JSON integer past the float range raises OverflowError
+    except OverflowError:
+        return load5
+    if not math.isfinite(value) or value < 0:
+        return load5
+    return min(value, load5)
 
 
 def over_load(load: float, cap: float) -> str:

@@ -273,8 +273,8 @@ def cpu_busy(ticks: Callable[[], tuple[int, int] | None] = cpu_ticks,
     """The share of CPU time not idle since an earlier sample, 0 to 1, or None when unread.
 
     The earlier sample is this process's previous one when it is `CPU_SAMPLE_SECONDS` to
-    `CPU_SAMPLE_MAX_AGE` old, so a gate poll waits under the queue lock only on its first
-    read; otherwise `cpu_busy` takes one and waits `CPU_SAMPLE_SECONDS`.
+    `CPU_SAMPLE_MAX_AGE` old, so a gate poll waits only on its first read; otherwise
+    `cpu_busy` takes one and waits `CPU_SAMPLE_SECONDS`.
     """
     global last_cpu_sample  # noqa: PLW0603 -- one sample per process, by design
     last = last_cpu_sample
@@ -472,6 +472,9 @@ class Queue:
         ticket leaves the queue in the same step, and a lane ticket locks the
         slot's `markers` entry in that step too (sd:5078).
         """
+        # Sampled before the lock: the sample may wait CPU_SAMPLE_SECONDS, and enter, leave and status wait
+        # on the lock; `now` is read after it, so the settle time counts from the admission itself.
+        share = busy() if rule.limit > 0 else None
         with self.admission_lock():
             state = self.state()
             now = wall()
@@ -486,9 +489,7 @@ class Queue:
                 # Only the head samples, under its own rule: callers may run
                 # different rules, and one waiter's sample must not count for another's.
                 load1, load5 = (float(value) for value in tuple(loadavg())[:2])
-                if rule.limit > 0:
-                    share = busy()
-                    load1, load5 = counted_load(load1, share), counted_load(load5, share)
+                load1, load5 = counted_load(load1, share), counted_load(load5, share)
                 record_sample(state, rule, load1, now)
                 held = load_hold(state, rule, load1, load5, now)
                 if held:

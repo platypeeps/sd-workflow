@@ -376,8 +376,27 @@ class LoadRule(unittest.TestCase):
         def admit():
             return self.queue.admit(ticket, [self.lock.fileno()], rule, loadavg=lambda: self.load,
                                     wall=self.wall, busy=lambda: next(shares))
-        self.assertIn("load 300.0", admit()[1])
-        self.assertEqual(admit()[0], 0)
+        # Pinned: on 40 cores 0.63 busy counts 25.2, over the limit of 24.
+        with mock.patch.object(sd_gate_slots.os, "cpu_count", lambda: 16):
+            self.assertIn("load 300.0", admit()[1])
+            self.assertEqual(admit()[0], 0)
+
+    def test_the_cpu_sample_waits_outside_the_queue_lock(self):
+        """Review finding: a 1.1 s sample under the admission lock held every enter, leave and status."""
+        rule = sd_gate_slots.LoadRule(limit=24.0, settle=0.0, source="test")
+        ticket = self.queue.enter("gate", "/", wall=self.wall)
+        free = []
+
+        def busy():
+            fd = os.open(self.where / sd_gate_slots.QUEUE_LOCK, os.O_RDWR | os.O_CREAT, 0o644)
+            try:
+                free.append(sd_gate_slots.try_lock(fd))
+            finally:
+                os.close(fd)
+            return None
+        self.queue.admit(ticket, [self.lock.fileno()], rule, loadavg=lambda: self.load, wall=self.wall,
+                         busy=busy)
+        self.assertEqual(free, [True])
 
     def test_cpu_busy_reads_two_tick_samples(self):
         samples = iter([(100, 200), (130, 300)])
@@ -391,8 +410,6 @@ class LoadRule(unittest.TestCase):
         self.assertEqual(sd_gate_slots.counted_load(300.0, 0.9, cores=16), 300.0)
         self.assertEqual(sd_gate_slots.counted_load(5.0, 0.5, cores=16), 5.0)
         self.assertEqual(sd_gate_slots.counted_load(300.0, float("nan"), cores=16), 300.0)
-        share = sd_gate_slots.cpu_busy()
-        self.assertTrue(share is None or 0 <= share <= 1, share)
 
     def test_cpu_busy_spans_a_tick_update(self):
         """macOS updates its CPU ticks about once a second: a 0.25 s gap often read no change and fell

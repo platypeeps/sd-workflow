@@ -2805,7 +2805,8 @@ class LoadCap(unittest.TestCase):
         """sd:9946: load5 277 with the CPU 37% idle paused every claim; the gate's counted load stands in."""
         self.assertEqual(build.counted({"load": [1, 277.0, 1], "load_counted": 10.1}, 277.0), 10.1)
         for answer in ({}, {"load_counted": None}, {"load_counted": True}, {"load_counted": float("nan")},
-                       {"load_counted": -1}, {"load_counted": "3"}):
+                       {"load_counted": -1}, {"load_counted": "3"},
+                       {"load_counted": 10**400}):
             self.assertEqual(build.counted(answer, 277.0), 277.0, answer)
         self.assertEqual(build.counted({"load_counted": 400.0}, 277.0), 277.0)
 
