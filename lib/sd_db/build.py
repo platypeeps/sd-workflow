@@ -1718,10 +1718,14 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             # A member the waiting ones need leaves the bundle, as a subset Retry leaves one out (`LEFT_OUT`):
             # held with them it could never build, and its Build would retry this bundle (review of sd:9570).
             # It leaves before any row is refused, so one that waits itself leaves too (review of build/sd-1306).
-            # A drop's kept lead that never ran leaves its member too, with no run to mark (`left_mark`): its
-            # Retry resumes the split branch once the member is done (review of build/sd-1306).
+            # A drop's kept lead that never ran leaves its member too: its Retry resumes the split branch once the
+            # member is done (review of build/sd-1306).
             needed = _needed(connection, [row["item"] for row, _ in waiting])
-            mark = left_mark(connection, bundle[0]["id"]) or ": its lead waits on it"
+            # A kept lead's marker names the kept run, which `left_out` reads as run 0. Unlike a member that leaves
+            # before the claim (round 21), this one may be marked done by hand, and the lead then resumes the
+            # split branch: only the marker makes its first run check that branch (review of build/sd-1306).
+            mark = left_mark(connection, bundle[0]["id"]) or (
+                f": {LEFT_OUT}{kept[0]}" if (kept := _kept_host(connection, bundle[0])) else ": its lead waits on it")
             for row in bundle[1:]:
                 if row["item"] in needed and resumable and connection.execute(
                         "UPDATE assignment SET status = 'cancelled', ended = ?, result = ? "

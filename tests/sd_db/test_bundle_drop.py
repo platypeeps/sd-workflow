@@ -1057,6 +1057,24 @@ class DropWait(Repo):
         again = self.claim()
         self.assertEqual((Path(again["work_path"]), again["branch"]), (new, f"build/sd-{lead}"))
 
+    def test_a_kept_lead_marks_the_member_it_detaches_left_out(self):
+        """Review of build/sd-1306: a kept lead has no run, so the claim detached the member it waits on with no
+        LEFT_OUT marker. Marked done by hand, Retry resumed the split branch, and the split guard read no left
+        member, so the lead could ship the member's kept commits. The marker names the kept run, read as run 0."""
+        import json
+
+        items, _, run = self.bundle()
+        self.drop(run, items[1])
+        lead = self.db.execute("SELECT id FROM assignment WHERE item = ? ORDER BY id DESC LIMIT 1",
+                               (items[0],)).fetchone()["id"]
+        self.db.execute("UPDATE item SET fields = ? WHERE id = ?",
+                        (json.dumps({"blocked_by": [items[2]]}), items[0]))
+        self.assertIsNone(self.claim(), "the lead waits")
+        self.assertEqual(build.left_out(self.db, lead), [(items[2], 0)], "the split guard reads the member")
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[2],))
+        build.queue_again(self.db, [items[0]], who="operator")
+        self.assertEqual(build.split(self.db, lead), "unread", "the lead's first run checks its branch")
+
     def test_a_dropped_item_that_waits_is_held_as_a_fresh_build(self):
         """Review of build/sd-1306: the drop's solo row for the dropped item counts a run it never had. A
         prerequisite reopened before its claim parked it as a retry; pickup skipped it and Retry refused,
