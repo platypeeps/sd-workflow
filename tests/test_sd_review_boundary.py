@@ -1075,11 +1075,16 @@ class LineBudgetTests(unittest.TestCase):
         # 4965 -> 4974 is the next build/sd-1423 review: `bin/sd-review`
         # +9 for `live_findings`, so a prior blocker a later pass cleared
         # holds nothing. Measured: `sd-review` is 3004 here.
+        #
+        # 4974 -> 4964 is the next build/sd-1423 review: `bin/sd-review`
+        # -10, `live_findings` and `line_kept` deleted: the aggregate has
+        # no pass status, so every pass's blocker holds (fail closed).
+        # Measured: `sd-review` is 2994 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4974,
+            4964,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

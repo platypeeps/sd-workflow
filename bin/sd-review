@@ -1789,9 +1789,9 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
 
 def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any], findings: Sequence[Any] = ()) -> str | None:
     """The evidence a prior report's blockers stored for `record`'s finding, one per line; "" when they stored
-    none, as a report from before sd:9867 may, or when a prior blocker within `SHIFT_LINES` if its line is unchanged
-    at this head (`line_kept`), else at the same line, matches no finding in `findings` (fail closed: a shifted or
-    edited, paraphrased repeat must not clear it; a fixed one holds only its own line); None otherwise.
+    none, as a report from before sd:9867 may, or when a prior blocker of any pass within `SHIFT_LINES` matches no
+    finding in `findings` (fail closed: a shifted or edited, paraphrased repeat must not clear it, and the aggregate
+    records no pass status that could say a later pass cleared it); None otherwise.
 
     A match is the same file, as `repo_spelling` spells it, the same line and the
     same `summary_key`: a line alone gave an unrelated finding the old repro (lead after round 8)."""
@@ -1809,10 +1809,10 @@ def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]
     matched = [old.get("evidence") for old in blockers if _same(old, record)]
     if matched:
         return "\n".join(dict.fromkeys(text for text in matched if isinstance(text, str) and text.strip()))
-    def _near(old: Mapping[str, Any]) -> bool:  # an unchanged blocker holds nearby lines; an edited one its own
-        lines = [row.get("line") for row in (old, record)]  # (bin/sd-review:1814: `round(total / count)` kept it)
-        return all(type(line) is int for line in lines) and abs(lines[0] - lines[1]) <= (
-            SHIFT_LINES if old.get("line_kept") is True else 0)  # an unplaced line compares no code, so it holds nothing
+    def _near(old: Mapping[str, Any]) -> bool:  # edited or not: a partial fix keeps its defect (bin/sd-review:1814)
+        lines = [row.get("line") for row in (old, record)]
+        return all(type(line) is int for line in lines) and abs(
+            lines[0] - lines[1]) <= SHIFT_LINES  # an unplaced line compares no code, so it holds nothing
     return "" if any(_file(old, record) and _near(old) and not any(_same(old, row) for row in findings)
                      for old in blockers) else None
 
@@ -1820,27 +1820,18 @@ def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]
 _HUNK = re.compile(r"(?m)^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
-def moved_line(diff: str, line: int) -> tuple[int, bool]:
-    """`line` of the old file at its place in the new one, read from `git diff -U0`, and whether that line is
-    unchanged: a replaced line keeps its offset in the hunk, but its code changed (build/sd-1423 class pass)."""
+def moved_line(diff: str, line: int) -> int:
+    """`line` of the old file at its place in the new one, read from `git diff -U0`: a replaced line keeps its
+    offset in the hunk (build/sd-1423 review)."""
     offset = 0
     for match in _HUNK.finditer(diff):
         start, count, new, added = (int(value) if value else 1 for value in match.groups())
         if line < start or not count and line <= start:
             break
         if count and line < start + count:
-            return new + min(line - start, max(added - 1, 0)), False
+            return new + min(line - start, max(added - 1, 0))
         offset += added - count
-    return line + offset, True
-
-
-def live_findings(report: Mapping[str, Any]) -> list[Any]:
-    """The findings of an aggregate's newest completed pass and any after it: each pass re-reports every unresolved
-    prior blocker, so an older pass's blocker a later one cleared holds nothing (bin/sd-review:1816)."""
-    done = [row.get("pass") for row in report.get("history") or () if isinstance(row, dict) and row.get("report_digest")]
-    newest = max((number for number in done if type(number) is int), default=None)
-    return [row for row in report["findings"] if newest is None or not isinstance(row.get("prior_review"), dict)
-            or type(row["prior_review"].get("pass")) is not int or row["prior_review"]["pass"] >= newest]
+    return line + offset
 
 
 def prior_at(root: pathlib.Path, old: str, new: str, rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -1864,11 +1855,10 @@ def prior_at(root: pathlib.Path, old: str, new: str, rows: Sequence[Mapping[str,
         start = found if isinstance(found, str) and re.fullmatch(r"[0-9a-f]{40,64}", found) else old
         path = _renames(start).get(row["path"], row["path"])
         if type(row.get("line")) is not int:  # an unplaced blocker still follows its file (bin/sd-review:1846)
-            return dict(row, path=path, line_kept=False)
+            return dict(row, path=path)
         diff = sd_lib.git_output(["diff", "-M", "-U0", "--no-color", "--no-ext-diff", start, new, "--",
                                   *dict.fromkeys(f":(literal){name}" for name in (row["path"], path))], root)
-        line, kept = (row["line"], False) if diff is None else moved_line(diff, row["line"])
-        return dict(row, path=path, line=line, line_kept=kept)
+        return dict(row, path=path, line=row["line"] if diff is None else moved_line(diff, row["line"]))
     return [_remapped(row) for row in rows]
 
 
@@ -2508,7 +2498,7 @@ def review(
         finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)],
                       [row._replace(path=spelled(row.path)) for row in rebutted], subject.scope != "planning",
                       prior_at(root, previous["subject"].get("head"), subject.head, [dict(row, path=spelled(row["path"]))
-                                                                                     for row in live_findings(previous)]) if previous else ())
+                                                                                     for row in previous["findings"]]) if previous else ())
     finally:
         slot.give_back()  # sd:2523: on every exit; the gate below queues in its own pool
     # Shadow only (sd:2092): Jev's kind for each finding goes to its ledger and

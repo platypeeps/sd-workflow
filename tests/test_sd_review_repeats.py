@@ -351,13 +351,12 @@ class PriorLineTests(RepeatFixture):
     def test_the_line_map_reads_each_hunk(self) -> None:
         diff = "@@ -0,0 +1,21 @@\n+x\n@@ -5,2 +26,3 @@\n@@ -20 +42,0 @@\n"
         self.assertEqual([sd_review.moved_line(diff, line) for line in (1, 4, 5, 6, 7, 19, 20, 30)],
-                         [(22, True), (25, True), (26, False), (27, False), (29, True), (41, True), (42, False),
-                          (51, True)])
+                         [22, 25, 26, 27, 29, 41, 42, 51])
 
     def test_a_blocker_inside_a_replaced_hunk_keeps_its_place(self) -> None:
         """build/sd-1423 review (bin/sd-review:1829): `@@ -100,60 +100,60 @@` mapped a blocker at line 145 to the
         hunk start, 100, so its exact repeat at 145 missed the match. A replaced line keeps its offset in the hunk.
-        The class pass after: its code changed, so only an exact repeat or fresh evidence blocks there."""
+        A finding past `SHIFT_LINES` of it is advisory."""
         (self.root / "src.py").write_text("".join(f"old{n}\n" for n in range(1, 201)), encoding="utf-8")
         old = self.commit("add", "src.py") and self.commit("old")
         lines = [f"old{n}\n" if not 100 <= n < 160 else f"new{n}\n" for n in range(1, 201)]
@@ -365,17 +364,17 @@ class PriorLineTests(RepeatFixture):
         new = self.commit("add", "src.py") and self.commit("new")
         prior = [dict(finding(REPRO, line=145, summary="Empty input crashes"), disposition="blocking")]
         [moved] = sd_review.prior_at(self.root, old, new, prior)
-        self.assertEqual((moved["line"], moved["line_kept"]), (145, False))
+        self.assertEqual(moved["line"], 145)
         disposed = sd_review.dispose([finding(line=145, summary="Empty input crashes"),
-                                      finding(line=146, summary="An empty list raises IndexError")],
+                                      finding(line=146 + sd_review.SHIFT_LINES, summary="An empty list raises IndexError")],
                                      "high", repro=True, prior=[moved])
         self.assertEqual([(row["disposition"], row.get("evidence")) for row in disposed],
                          [("blocking", REPRO), ("advisory", None)])
 
     def test_an_edited_blocker_line_still_holds_its_paraphrase(self) -> None:
         """build/sd-1423 review (bin/sd-review:1814): `return total / count` became `return round(total / count)`,
-        so the division by zero stayed, but the changed line gave `line_kept=False` and an uncited paraphrase at
-        the same line posted as advisory. A changed blocker line still holds an uncited finding on that line."""
+        so the division by zero stayed, but the changed line held nothing and an uncited paraphrase at the same
+        line posted as advisory. A changed blocker line still holds an uncited finding on it."""
         source = [f"line{number}\n" for number in range(1, 41)]
         source[9] = "    return total / count\n"
         (self.root / "src.py").write_text("".join(source), encoding="utf-8")
@@ -385,16 +384,32 @@ class PriorLineTests(RepeatFixture):
         new = self.commit("add", "src.py") and self.commit("new")
         prior = [dict(finding(REPRO, line=10, summary="Empty input divides by zero"), disposition="blocking")]
         [moved] = sd_review.prior_at(self.root, old, new, prior)
-        self.assertEqual((moved["line"], moved["line_kept"]), (10, False))
+        self.assertEqual(moved["line"], 10)
         disposed = sd_review.dispose([finding(line=10, summary="count of zero raises ZeroDivisionError"),
-                                      finding(line=12, summary="the cache is never cleared")], "high",
+                                      finding(line=11 + sd_review.SHIFT_LINES, summary="the cache is never cleared")], "high",
                                      repro=True, prior=[moved])
         self.assertEqual([row["disposition"] for row in disposed], ["blocking", "advisory"])
 
-    def test_a_fixed_blocker_holds_no_nearby_finding(self) -> None:
+    def test_a_partly_fixed_line_holds_a_repeat_one_line_off(self) -> None:
+        """build/sd-1423 review (bin/sd-review:1814): a partial fix edited line 20, and a reader cited the same
+        unresolved defect at line 21 uncited; the edited line held only itself, so it posted as advisory. An
+        edited blocker line holds the same `SHIFT_LINES` window as an unchanged one (fail closed)."""
+        source = [f"line{number}\n" for number in range(1, 41)]
+        source[19] = "    return total / count\n"
+        (self.root / "src.py").write_text("".join(source), encoding="utf-8")
+        old = self.commit("add", "src.py") and self.commit("old")
+        source[19] = "    return round(total / count)\n"
+        (self.root / "src.py").write_text("".join(source), encoding="utf-8")
+        new = self.commit("add", "src.py") and self.commit("new")
+        prior = [dict(finding(REPRO, line=20, summary="Empty input divides by zero"), disposition="blocking")]
+        [record] = sd_review.dispose([finding(line=21, summary="count of zero raises ZeroDivisionError")], "high",
+                                     repro=True, prior=sd_review.prior_at(self.root, old, new, prior))
+        self.assertEqual(record["disposition"], "blocking")
+
+    def test_a_fixed_blocker_holds_no_finding_past_the_window(self) -> None:
         """build/sd-1423 class pass (bin/sd-review:1816): after the blocker at src.py:10 was fixed, an unrelated
-        uncited high finding at src.py:12 still blocked on closeness alone. Only a prior blocker whose own line
-        is unchanged at this head holds a nearby uncited finding; a changed one needs a repeat or evidence."""
+        uncited finding blocked on closeness alone. A fixed line cannot be told from a partial fix
+        (bin/sd-review:1814), so it holds only within `SHIFT_LINES` (fail closed); past that, advisory."""
         source = [f"line{number}\n" for number in range(1, 41)]
         (self.root / "src.py").write_text("".join(source), encoding="utf-8")
         old = self.commit("add", "src.py") and self.commit("old")
@@ -403,8 +418,8 @@ class PriorLineTests(RepeatFixture):
         new = self.commit("add", "src.py") and self.commit("new")
         prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking")]
         moved = sd_review.prior_at(self.root, old, new, prior)
-        [record] = sd_review.dispose([finding(line=12, summary="the cache is never cleared")], "high", repro=True,
-                                     prior=moved)
+        [record] = sd_review.dispose([finding(line=11 + sd_review.SHIFT_LINES, summary="the cache is never cleared")],
+                                     "high", repro=True, prior=moved)
         self.assertEqual(record["disposition"], "advisory")
 
 
@@ -487,7 +502,7 @@ class ReproRuleTests(unittest.TestCase):
         """Lead after round 8 (bin/sd-review:1797): a patch moved the blocker from line 10 to 12 and the reader
         paraphrased it uncited; the matcher found nothing and it posted as advisory. A prior blocker no
         finding matches keeps every uncited finding on its file blocking (fail closed), with no evidence."""
-        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking", line_kept=True)]
+        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking")]
         rows = [finding(line=12, summary="An empty list raises IndexError"), finding(path="b.py")]
         disposed = sd_review.dispose(rows, "high", repro=True, prior=prior)
         self.assertEqual([(row["disposition"], row.get("evidence")) for row in disposed],
@@ -497,7 +512,7 @@ class ReproRuleTests(unittest.TestCase):
         """build/sd-1423 review (bin/sd-review:1806): the blocker at src.py:10 was fixed, and an unrelated uncited
         finding at src.py:90 blocked by the same-file fallback alone. Only a finding near the prior line can be
         its shifted repeat; one with no line cannot be placed, so it stays blocking."""
-        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking", line_kept=True)]
+        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking")]
         rows = [finding(line=90, summary="an unrelated defect"), finding(line=10 + sd_review.SHIFT_LINES)]
         disposed = sd_review.dispose(rows, "high", repro=True, prior=prior)
         self.assertEqual([row["disposition"] for row in disposed], ["advisory", "blocking"])
@@ -506,26 +521,11 @@ class ReproRuleTests(unittest.TestCase):
         """build/sd-1423 review (bin/sd-review:1816): an unchanged blocker at src.py:20 held an unrelated uncited
         finding at line 39. `prior_at` maps the line through the diff, so the window covers only a reader's
         imprecision about the same code, not a shift."""
-        prior = [dict(finding(REPRO, line=20, summary="Empty input crashes"), disposition="blocking", line_kept=True)]
+        prior = [dict(finding(REPRO, line=20, summary="Empty input crashes"), disposition="blocking")]
         disposed = sd_review.dispose([finding(line=39, summary="the cache is never cleared"),
                                       finding(line=22, summary="An empty list raises IndexError")], "high",
                                      repro=True, prior=prior)
         self.assertEqual([row["disposition"] for row in disposed], ["advisory", "blocking"])
-
-    def test_a_blocker_a_later_pass_cleared_holds_nothing(self) -> None:
-        """build/sd-1423 review (bin/sd-review:1816): the aggregate keeps every pass's findings, so a blocker
-        pass 1 found and pass 2 cleared still held a nearby uncited finding. Each pass re-reports every
-        unresolved prior blocker, so only the newest completed pass's findings, and any after it, are live."""
-        def row_at(number: int, line: int) -> dict[str, Any]:
-            return dict(finding(REPRO, line=line), disposition="blocking", prior_review={"pass": number})
-        history = [{"pass": 1, "report_digest": "a"}, {"pass": 2, "report_digest": "b"},
-                   {"pass": 3, "report_digest": None}]
-        previous = {"history": history, "findings": [row_at(1, 10), row_at(2, 30), row_at(3, 50)]}
-        self.assertEqual([row["line"] for row in sd_review.live_findings(previous)], [30, 50])
-        self.assertEqual(len(sd_review.live_findings({"findings": [row_at(1, 10)]})), 1)
-        [record] = sd_review.dispose([finding(line=10, summary="the cache is never cleared")], "high", repro=True,
-                                     prior=[dict(row, line_kept=True) for row in sd_review.live_findings(previous)])
-        self.assertEqual(record["disposition"], "advisory")
 
     def test_a_line_that_cannot_be_placed_holds_nothing(self) -> None:
         """build/sd-1423 class pass: an uncited finding with no line, or a prior blocker with none, held the
@@ -533,7 +533,7 @@ class ReproRuleTests(unittest.TestCase):
         for prior_line, line in ((10, None), (None, 12), (None, None)):
             with self.subTest(prior=prior_line, line=line):
                 prior = [dict(finding(REPRO, line=prior_line, summary="Empty input crashes"),
-                              disposition="blocking", line_kept=True)]
+                              disposition="blocking")]
                 [record] = sd_review.dispose([finding(line=line, summary="the cache is never cleared")], "high",
                                              repro=True, prior=prior)
                 self.assertEqual(record["disposition"], "advisory")
@@ -542,7 +542,7 @@ class ReproRuleTests(unittest.TestCase):
         """build/sd-1423 review (bin/sd-review:1811): one reader's exact repeat at medium, under a high floor,
         counted as the prior blocker's match, so another reader's nearby high paraphrase posted as advisory and
         the unresolved blocker cleared. Only a repeat that blocks at the floor answers a prior blocker."""
-        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking", line_kept=True)]
+        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking")]
         rows = [finding(severity="medium", line=10, summary="Empty input crashes"),
                 finding(line=12, summary="An empty list raises IndexError")]
         disposed = sd_review.dispose(rows, "high", repro=True, prior=prior)
@@ -553,14 +553,14 @@ class ReproRuleTests(unittest.TestCase):
         high finding at line 12 blocked: the rebuttal check read the new finding, the proximity check the
         rebutted prior row. A rebutted prior blocker is answered and holds nothing."""
         rebutted = listed(adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10))
-        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking", line_kept=True)]
+        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking")]
         [record] = sd_review.dispose([finding(line=12, summary="the cache is never cleared")], "high", rebutted,
                                      repro=True, prior=prior)
         self.assertEqual(record["disposition"], "advisory")
 
     def test_the_same_line_alone_gives_no_prior_evidence(self) -> None:
         """Lead after round 8: the matcher gave the old repro to an unrelated cache finding at the same line."""
-        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking", line_kept=True)]
+        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking")]
         [record] = sd_review.dispose([finding(line=10, summary="the cache is never cleared")], "high",
                                      repro=True, prior=prior)
         self.assertEqual((record["disposition"], record.get("evidence")), ("blocking", None))
@@ -754,6 +754,28 @@ class RepeatReviewTests(RepeatFixture):
                 note = " " + sd_review.REPEAT_NOTE if status == "advisory" else ""
                 self.assertEqual(rows["bin/tool.py"], (status, "lane claim" + note))
 
+
+    def test_a_failed_later_pass_keeps_an_earlier_blocker(self) -> None:
+        """build/sd-1423 review (bin/sd-review:1840): pass 1 recorded a blocker and pass 2 stored a report in
+        which every provider failed; its digest marked it complete, so the next full-branch pass dropped pass 1
+        and an uncited repeat posted as advisory. The aggregate records no pass status, so every pass counts."""
+        (self.root / "src.py").write_text("".join(f"line{n}\n" for n in range(1, 41)), encoding="utf-8")
+        prior_head = self.commit("add", "src.py") and self.commit("src")
+        head = self.commit("next")
+        blocker = dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking",
+                       prior_review={"pass": 1, "head": prior_head})
+        report = self.tmp / "aggregate.json"
+        report.write_text(json.dumps({"scope": "branch", "subject": {"head": prior_head}, "findings": [blocker],
+                                      "history": [{"pass": 1, "head": prior_head, "report_digest": "a"},
+                                                  {"pass": 2, "head": prior_head, "report_digest": "b"}]}))
+        repeat = finding(line=11, summary="An empty list raises IndexError")
+        runner = FakeRunner({"sd-check": sd_review.Completed(0, "{}", ""),
+                             "codex": sd_review.Completed(0, json.dumps({"findings": [repeat]}), "")},
+                            default=sd_review.Completed(0, json.dumps({"findings": []}), ""))
+        result = sd_review.review(self.root, namespace(scope="branch", resume_report=str(report)), runner, self.environment(),
+                                  self.chatgpt_home())
+        self.assertEqual(result["subject"]["head"], head)
+        self.assertEqual([r["disposition"] for r in result["findings"] if r["backend"] == "codex"], ["blocking"])
 
 #: A receipt head `listed` takes for one on the reviewed branch.
 ON_BRANCH = "c" * 40
