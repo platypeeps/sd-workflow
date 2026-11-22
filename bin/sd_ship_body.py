@@ -264,6 +264,8 @@ _REFS = re.compile(r"^Refs[ \t]*:(.*)$", re.IGNORECASE)
 #: The kinds a merge closes (`close_items`) and the statuses it would close from.
 _CLOSABLE_KINDS = ("work", "task", "followup")
 _OPEN_STATUSES = ("planning", "ready", "in_progress", "ready_to_send")
+#: A commit's own `Closes:` trailer closes a parked item too: one waiting on the bundle that carries it (sd:9918).
+_CITED_STATUSES = (*_OPEN_STATUSES, "blocked")
 
 
 def summary_ids(body: str, names) -> tuple[int, ...]:
@@ -426,8 +428,9 @@ def open_cited(connection, item: int, repo: str, cited, named, body: str, branch
     """Of `cited`, the items a merge of `item` should close beyond `named`, its later `--item` list (sd:5999).
 
     An item counts when it belongs to `repo`, is a kind a merge closes, and
-    is open, as `refuse_left_open` reads them; a `Refs:` line of `body`
-    keeps one open, as does the data `_left` reads.
+    is open or blocked; a blocked one waits on the commit that cites it
+    (sd:9918). A `Refs:` line of `body` keeps one open, as does the data
+    `_left` reads.
     """
     left = _left(connection, item, body, named, cited, branch)
     kept = []
@@ -436,7 +439,7 @@ def open_cited(connection, item: int, repo: str, cited, named, body: str, branch
             continue
         row = connection.execute("SELECT repo, kind, status FROM item WHERE id = ?", (number,)).fetchone()
         if row is not None and row["repo"] == repo and row["kind"] in _CLOSABLE_KINDS \
-                and row["status"] in _OPEN_STATUSES:
+                and row["status"] in _CITED_STATUSES:
             kept.append(number)
     return tuple(kept)
 

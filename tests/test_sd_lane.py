@@ -2963,6 +2963,28 @@ class CitedCloses(SharedQueue):
         self.assertEqual([prepare[i + 1] for i, part in enumerate(prepare) if part == "--item"],
                          [str(self.own), str(a), str(b), str(e)])
 
+    def test_a_blocked_item_a_merged_branch_cites_joins_the_closing_set(self) -> None:
+        """sd:9918: a bundle merged another build branch whose commits cite parked items; the merge left them open."""
+        import sd_db
+        a, b, *_ = self.open
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            connection.execute("UPDATE item SET status = 'blocked' WHERE id = ?", (a,))
+            connection.commit()
+        finally:
+            connection.close()
+        tree, _ = self.committed("topic-carried")
+        git(tree, "switch", "-q", "-c", "carried")
+        (tree / "carried.txt").write_text("carried\n", encoding="utf-8")
+        git(tree, "add", "carried.txt")
+        git(tree, "commit", "-q", "-m", f"fix: parked work\n\nCloses: sd:{a}")
+        git(tree, "switch", "-q", "topic-carried")
+        git(tree, "commit", "-q", "--allow-empty", "-m", f"fix: own work\n\nCloses: sd:{b}")
+        git(tree, "merge", "-q", "--no-ff", "--no-edit", "carried")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(sorted(entry["closes"]), sorted([a, b]))
+
     def test_a_cited_close_a_teammate_run_holds_is_refused_before_any_push(self) -> None:
         """pack sd:7221: a cited close is delivered too, and the cited set is known only before the push."""
         import sd_db
