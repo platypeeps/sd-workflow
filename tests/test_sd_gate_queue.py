@@ -24,6 +24,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 SLOTS = REPO_ROOT / "bin" / "sd_gate_slots.py"
@@ -380,15 +381,73 @@ class LoadRule(unittest.TestCase):
 
     def test_cpu_busy_reads_two_tick_samples(self):
         samples = iter([(100, 200), (130, 300)])
+        sd_gate_slots.cpu_busy.last = None
         self.assertAlmostEqual(sd_gate_slots.cpu_busy(lambda: next(samples), lambda _: None), 0.7)
         for broken in ([None], [(100, 200), (100, 200)], [(100, 200), (150, 240)]):
+            sd_gate_slots.cpu_busy.last = None
             self.assertIsNone(sd_gate_slots.cpu_busy(iter(broken).__next__, lambda _: None), broken)
+        sd_gate_slots.cpu_busy.last = None
         self.assertEqual(sd_gate_slots.counted_load(300.0, 0.63, cores=16), 0.63 * 16)
         self.assertEqual(sd_gate_slots.counted_load(300.0, 0.9, cores=16), 300.0)
         self.assertEqual(sd_gate_slots.counted_load(5.0, 0.5, cores=16), 5.0)
         self.assertEqual(sd_gate_slots.counted_load(300.0, float("nan"), cores=16), 300.0)
         share = sd_gate_slots.cpu_busy()
         self.assertTrue(share is None or 0 <= share <= 1, share)
+
+    def test_cpu_busy_spans_a_tick_update(self):
+        """macOS updates its CPU ticks about once a second: a 0.25 s gap often read no change and fell
+        back to load5. A poller's previous sample, 1 to 60 s old, stands in for the wait."""
+        now = [0.1]
+
+        def ticks():
+            second = int(now[0])
+            return 30 * second, 100 * second
+
+        def pause(seconds):
+            now[0] += seconds
+
+        sd_gate_slots.cpu_busy.last = None
+        self.assertAlmostEqual(sd_gate_slots.cpu_busy(ticks, pause, clock=lambda: now[0]), 0.7)
+        waited = now[0]
+        now[0] += 5
+        self.assertAlmostEqual(sd_gate_slots.cpu_busy(ticks, pause, clock=lambda: now[0]), 0.7)
+        self.assertEqual(now[0], waited + 5, "a 5 s old sample needs no wait")
+        now[0] += 500
+        self.assertAlmostEqual(sd_gate_slots.cpu_busy(ticks, pause, clock=lambda: now[0]), 0.7)
+        self.assertGreater(now[0], waited + 505, "a stale sample is not reused")
+        sd_gate_slots.cpu_busy.last = None
+
+    def test_cpu_ticks_takes_the_host_port_once(self):
+        """Each mach_host_self() call adds a reference to the host port; a gate wait polls for hours."""
+        calls = []
+
+        class System:
+            class mach_host_self:  # noqa: N801 -- the C name
+                restype = None
+
+                def __new__(cls):
+                    calls.append(1)
+                    return 7
+
+            @staticmethod
+            def host_statistics(port, flavor, info, count):
+                info[:] = [1, 2, 3, 4]
+                return 0
+
+        sd_gate_slots.host_port.cache_clear()
+        with mock.patch.object(sd_gate_slots.sys, "platform", "darwin"), \
+                mock.patch("ctypes.CDLL", lambda _: System):
+            self.assertEqual(sd_gate_slots.cpu_ticks(), (3, 10))
+            self.assertEqual(sd_gate_slots.cpu_ticks(), (3, 10))
+        sd_gate_slots.host_port.cache_clear()
+        self.assertEqual(len(calls), 1)
+
+    def test_cpu_ticks_without_ctypes_is_unread(self):
+        sd_gate_slots.host_port.cache_clear()
+        with mock.patch.object(sd_gate_slots.sys, "platform", "darwin"), \
+                mock.patch.dict(sys.modules, {"ctypes": None}):
+            self.assertIsNone(sd_gate_slots.cpu_ticks())
+        sd_gate_slots.host_port.cache_clear()
 
     def test_status_reports_the_counted_load(self):
         report = sd_gate_slots.snapshot(self.where, 1, sd_gate_slots.LoadRule(24.0, 0.0, "test"),

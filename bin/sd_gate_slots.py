@@ -78,6 +78,7 @@ import argparse
 import contextlib
 import datetime
 import fcntl
+import functools
 import json
 import os
 import pathlib
@@ -223,8 +224,21 @@ def load_rule(environ: Mapping[str, str], limit_setting: str | None = None,
 #: use, busy times cores, instead (sd:9946): on 2026-11-22 a booted simulator held load5 at 277-458 with the
 #: CPU 37% idle, and the load limits paused every build claim and lane start.
 CPU_BUSY_MAX = 0.9
-#: The gap between the two CPU tick samples `cpu_busy` takes.
-CPU_SAMPLE_SECONDS = 0.25
+#: The least gap between the two CPU tick samples `cpu_busy` compares: macOS updates its ticks every ~1.004 s,
+#: so a 0.25 s gap often read no change and fell back to load5 (8 polls: 4 unread).
+CPU_SAMPLE_SECONDS = 1.1
+#: The oldest previous sample `cpu_busy` compares against instead of waiting.
+CPU_SAMPLE_MAX_AGE = 60.0
+
+
+@functools.lru_cache(maxsize=1)
+def host_port() -> tuple[object, int]:
+    """libSystem and this host's port, taken once: each `mach_host_self()` call adds a reference to the
+    port, and a gate wait samples the CPU on every poll for hours."""
+    import ctypes  # noqa: PLC0415 -- only the darwin path needs it
+    system = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    system.mach_host_self.restype = ctypes.c_uint
+    return system, system.mach_host_self()
 
 
 def cpu_ticks() -> tuple[int, int] | None:
@@ -233,10 +247,9 @@ def cpu_ticks() -> tuple[int, int] | None:
     try:
         if sys.platform == "darwin":
             import ctypes  # noqa: PLC0415 -- only the darwin path needs it
-            system = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
-            system.mach_host_self.restype = ctypes.c_uint
+            system, port = host_port()
             info, count = (ctypes.c_uint * 4)(), ctypes.c_uint(4)
-            if system.host_statistics(system.mach_host_self(), 3, info, ctypes.byref(count)) != 0:
+            if system.host_statistics(port, 3, info, ctypes.byref(count)) != 0:
                 return None
             user, kernel, idle, nice = info
             return idle, user + kernel + idle + nice
@@ -245,24 +258,40 @@ def cpu_ticks() -> tuple[int, int] | None:
             return None
         ticks = [int(value) for value in fields[1:]]
         return ticks[3] + ticks[4], sum(ticks[:8])
-    except (OSError, ValueError, IndexError, AttributeError):
+    except (OSError, ValueError, IndexError, AttributeError, ImportError):
         return None
 
 
 def cpu_busy(ticks: Callable[[], tuple[int, int] | None] = cpu_ticks,
-             pause: Callable[[float], object] = time.sleep) -> float | None:
-    """The share of CPU time not idle over `CPU_SAMPLE_SECONDS`, 0 to 1, or None when unread."""
-    first = ticks()
-    if first is None:
-        return None
-    pause(CPU_SAMPLE_SECONDS)
-    second = ticks()
+             pause: Callable[[float], object] = time.sleep, *,
+             clock: Callable[[], float] = time.monotonic) -> float | None:
+    """The share of CPU time not idle since an earlier sample, 0 to 1, or None when unread.
+
+    The earlier sample is this process's previous one when it is `CPU_SAMPLE_SECONDS` to
+    `CPU_SAMPLE_MAX_AGE` old, so a gate poll waits under the queue lock only on its first
+    read; otherwise `cpu_busy` takes one and waits `CPU_SAMPLE_SECONDS`.
+    """
+    last = cpu_busy.last
+    second, at = ticks(), clock()
     if second is None:
         return None
+    if last is None or not CPU_SAMPLE_SECONDS <= at - last[0] <= CPU_SAMPLE_MAX_AGE:
+        first = second
+        pause(CPU_SAMPLE_SECONDS)
+        second, at = ticks(), clock()
+        if second is None:
+            return None
+    else:
+        first = last[1]
+    cpu_busy.last = (at, second)
     idle, total = second[0] - first[0], second[1] - first[1]
     if total <= 0 or not 0 <= idle <= total:
         return None
     return 1.0 - idle / total
+
+
+#: (monotonic time, ticks) of this process's previous `cpu_busy` sample.
+cpu_busy.last = None  # type: ignore[attr-defined]
 
 
 def counted_load(load: float, busy: float | None, cores: int | None = None) -> float:
