@@ -1385,6 +1385,7 @@ class Supervise(Case):
                 self.assertIsNone(supervisor.prior_review("a" * 40), f"{path} was handed to --verify-report")
         supervisor.out("review").write_text(json.dumps(
             {"status": "blocking", "scope": "branch", "subject": {"head": "b" * 40},
+             "requested_reviews": 1, "completed_reviews": 1,
              "findings": [{"path": "src.py", "line": 1, "disposition": "blocking"}]}), encoding="utf-8")
         with mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
                 mock.patch.object(build_run, "_read", return_value="100644 blob 0123\tsrc.py\0"):
