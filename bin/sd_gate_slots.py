@@ -80,7 +80,6 @@ import datetime
 import fcntl
 import functools
 import json
-import math
 import os
 import pathlib
 import re
@@ -226,11 +225,9 @@ def load_rule(environ: Mapping[str, str], limit_setting: str | None = None,
 #: use, busy times cores, instead (sd:9946): on 2026-11-22 a booted simulator held load5 at 277-458 with the
 #: CPU 37% idle, and the load limits paused every build claim and lane start.
 CPU_BUSY_MAX = 0.9
-#: The least gap between the two CPU tick samples `cpu_busy` compares: macOS updates its ticks every ~1.004 s,
-#: so a 0.25 s gap often read no change and fell back to load5 (8 polls: 4 unread).
+#: The least span of the recent CPU average `steady_busy` reads: macOS updates its ticks every ~1.004 s, so
+#: a shorter span often read no change (8 polls 0.25 s apart: 4 unread).
 CPU_SAMPLE_SECONDS = 1.1
-#: The oldest previous sample `cpu_busy` compares against instead of waiting.
-CPU_SAMPLE_MAX_AGE = 60.0
 
 
 #: The least span `steady_busy` averages the CPU over: the counted load falls no faster than this. One 1.1 s
@@ -243,9 +240,6 @@ CPU_HISTORY_SECONDS = 600.0
 CPU_ROW_SECONDS = 5.0
 #: The CPU tick rows `steady_busy` keeps, as JSON [[wall time, idle, total], ...], in the gate directory.
 CPU_HISTORY = "cpu-busy.json"
-
-#: (monotonic time, ticks) of this process's previous `cpu_busy` sample.
-last_cpu_sample: tuple[float, tuple[int, int]] | None = None
 
 
 @functools.lru_cache(maxsize=1)
@@ -279,37 +273,6 @@ def cpu_ticks() -> tuple[int, int] | None:
         return None
 
 
-def cpu_busy(ticks: Callable[[], tuple[int, int] | None] = cpu_ticks,
-             pause: Callable[[float], object] = time.sleep, *,
-             clock: Callable[[], float] = time.monotonic) -> float | None:
-    """The share of CPU time not idle since an earlier sample, 0 to 1, or None when unread.
-
-    The earlier sample is this process's previous one when it is `CPU_SAMPLE_SECONDS` to
-    `CPU_SAMPLE_MAX_AGE` old, so a gate poll waits only on its first read; otherwise
-    `cpu_busy` takes one and waits `CPU_SAMPLE_SECONDS`.
-    """
-    global last_cpu_sample  # noqa: PLW0603 -- one sample per process, by design
-    last = last_cpu_sample
-    second, at = ticks(), clock()
-    if second is None:
-        return None
-    if last is None or not CPU_SAMPLE_SECONDS <= at - last[0] <= CPU_SAMPLE_MAX_AGE:
-        first = second
-        pause(CPU_SAMPLE_SECONDS)
-        second, at = ticks(), clock()
-        if second is None:
-            return None
-    else:
-        first = last[1]
-    last_cpu_sample = (at, second)
-    idle, total = second[0] - first[0], second[1] - first[1]
-    if total <= 0 or not 0 <= idle <= total:
-        return None
-    return 1.0 - idle / total
-
-
-
-
 def busy_rows(text: bytes, now: float) -> list[tuple[float, int, int]]:
     """The `CPU_HISTORY` rows of the last `CPU_HISTORY_SECONDS` up to `now`; a bad row is left out."""
     try:
@@ -325,14 +288,22 @@ def busy_rows(text: bytes, now: float) -> list[tuple[float, int, int]]:
     return rows
 
 
-def steady_busy(where: pathlib.Path, share: float | None, now: float) -> float | None:
-    """The busy share a load limit counts: the higher of `share`, the sample just taken, and the CPU's
-    average since the newest tick row under `where` at least `CPU_SMOOTH_SECONDS` old (sd:9946).
+def busy_since(ticks: tuple[int, int], row: tuple[float, int, int]) -> float | None:
+    """The CPU's busy share from `row`'s ticks to `ticks`, or None when they fell (a reboot) or did not move."""
+    idle, total = ticks[0] - row[1], ticks[1] - row[2]
+    if total <= 0 or not 0 <= idle <= total:
+        return None
+    return 1.0 - idle / total
 
-    The average covers every second since that row, read or not, so no busy time between two samples
-    goes unseen. None, so the load counts in full, while `share` or the ticks are unread, no row is
-    old enough, or the ticks fell (a reboot). Every process that reads the load shares the rows, under
-    a lock on their file; a bad row or the clock set back counts as no row.
+
+def steady_busy(where: pathlib.Path, now: float) -> float | None:
+    """The busy share a load limit counts, read from the CPU tick rows under `where` without waiting (sd:9946).
+
+    The higher of two averages up to the ticks now: since the newest row at least `CPU_SMOOTH_SECONDS`
+    old, which covers every second since, read or not, and since the newest row at least
+    `CPU_SAMPLE_SECONDS` old, so a burst in the last seconds counts. None, so the load counts in full,
+    while the ticks are unread, no row is old enough, or the ticks fell (a reboot). Every process that
+    reads the load adds a row, under a lock on their file; a bad row or the clock set back counts as none.
     """
     ticks = cpu_ticks()
     try:
@@ -351,12 +322,11 @@ def steady_busy(where: pathlib.Path, share: float | None, now: float) -> float |
     finally:
         os.close(fd)
     anchors = [row for row in rows if row[0] <= now - CPU_SMOOTH_SECONDS]
-    if share is None or not 0 <= share <= 1 or ticks is None or not anchors:
+    if ticks is None or not anchors:
         return None
-    idle, total = ticks[0] - anchors[-1][1], ticks[1] - anchors[-1][2]
-    if total <= 0 or not 0 <= idle <= total:
-        return None
-    return max(share, 1.0 - idle / total)
+    recent = [row for row in rows if row[0] <= now - CPU_SAMPLE_SECONDS][-1]
+    shares = [busy_since(ticks, anchors[-1]), busy_since(ticks, recent)]
+    return None if None in shares else max(share for share in shares if share is not None)
 
 
 def counted_load(load: float, busy: float | None, cores: int | None = None) -> float:
@@ -525,17 +495,15 @@ class Queue:
 
     def admit(self, ticket: Ticket, fds: Sequence[int], rule: LoadRule, *, markers: Sequence[int] = (),
               loadavg: Callable[[], Sequence[float]] = os.getloadavg,
-              wall: Callable[[], float] = time.time,
-              busy: Callable[[], float | None] = cpu_busy) -> tuple[int | None, str]:
+              wall: Callable[[], float] = time.time) -> tuple[int | None, str]:
         """Lock one of `fds` for `ticket` when it heads the queue and the load rule holds.
 
         Returns the slot's index, or None and the reason it waits. An admitted
         ticket leaves the queue in the same step, and a lane ticket locks the
         slot's `markers` entry in that step too (sd:5078).
         """
-        # Sampled before the lock: the sample may wait CPU_SAMPLE_SECONDS, and enter, leave and status wait
-        # on the lock; `now` is read after it, so the settle time counts from the admission itself.
-        share = steady_busy(self.where, busy(), wall()) if rule.limit > 0 else None
+        # Read before the lock: status and the lane read the rows under their own lock, never this one.
+        share = steady_busy(self.where, wall()) if rule.limit > 0 else None
         with self.admission_lock():
             state = self.state()
             now = wall()
@@ -749,25 +717,11 @@ def place_line(ticket: Ticket | None, reason: str) -> str:
     return f"place {place[0]} of {place[1]} in the queue" + (f": {reason}" if place[0] == 1 else "")
 
 
-def report_wait(stream: TextIO, queue: Queue, reason: str, now: float, started: float,
-                reported: float | None) -> float | None:
-    """Say why the waiter waits at once and every `REPORT_EVERY_SECONDS` after; returns when it last said."""
-    if reported is None:
-        stream.write(f"waiting for a gate slot: {reason} under {queue.where}{held_by(queue)}\n")
-    elif now - reported >= REPORT_EVERY_SECONDS:
-        stream.write(f"still waiting for a gate slot after {now - started:.0f}s: {reason}{held_by(queue)}\n")
-    else:
-        return reported
-    stream.flush()
-    return now
-
-
 def wait_for_slot(fds: Sequence[int], where: pathlib.Path, *, poll: float, stream: TextIO,
                   stop: Callable[[], bool] = lambda: False, deadline: float | None = None,
                   clock: Callable[[], float] = time.monotonic, rule: LoadRule | None = None,
                   loadavg: Callable[[], Sequence[float]] = os.getloadavg, wall: Callable[[], float] = time.time,
-                  label: str = "", lane: bool = False, markers: Sequence[int] = (),
-                  busy: Callable[[], float | None] = cpu_busy) -> int | None:
+                  label: str = "", lane: bool = False, markers: Sequence[int] = ()) -> int | None:
     """Queue, then lock one of `fds` and return its index; None once `deadline` passes.
 
     `lane` queues as a lane gate, which locks `markers[i]` with slot i (sd:5078).
@@ -789,45 +743,34 @@ def wait_for_slot(fds: Sequence[int], where: pathlib.Path, *, poll: float, strea
         ticket = None
     started = clock()
     reported: float | None = None
-    reason = "the wait ran out during the CPU sample"  # until an attempt says why it waits
-    retry = False
-    limit = math.inf if deadline is None else deadline
     try:
         while True:
-            # The CPU sample may wait CPU_SAMPLE_SECONDS: take it before `stop` is read, so a launcher gone
-            # during it takes no slot.
-            # The first pass tries at once, before any sample, reading load5 alone: a 1.1 s sample there
-            # outlasted --max-wait 0.5. A retry at or past the deadline gives up before it samples, and
-            # one whose sample ran past it tries no more. Only a sample reads the clock twice (sd:9946).
-            before = clock()
-            expired = retry and before >= limit
-            sampling = retry and ticket is not None and rule.limit > 0 and not expired
-            share = busy() if sampling else None
             if stop():
                 raise LauncherExited()
-            now = clock() if sampling else before
-            if expired or before < limit <= now:  # the first pass takes no sample: now is before
-                taken = None  # the last attempt's reason is still why it waits
-            elif ticket is None:
+            if ticket is None:
                 taken, reason = take_free(fds, markers, label, wall())
             else:
-                def sampled(value: float | None = share) -> float | None:
-                    return value
-                taken, reason = queue.admit(ticket, fds, rule, markers=markers, loadavg=loadavg, wall=wall,
-                                             busy=sampled)
+                taken, reason = queue.admit(ticket, fds, rule, markers=markers, loadavg=loadavg, wall=wall)
             if taken is not None:
                 if reported is not None:
                     stream.write(f"gate slot taken after {clock() - started:.0f}s under {where}\n")
                     stream.flush()
                 return taken
-            reported = report_wait(stream, queue, reason, now, started, reported)
-            if now >= limit:
+            now = clock()
+            if reported is None:
+                stream.write(f"waiting for a gate slot: {reason} under {where}{held_by(queue)}\n")
+                stream.flush()
+                reported = now
+            elif now - reported >= REPORT_EVERY_SECONDS:
+                stream.write(f"still waiting for a gate slot after {now - started:.0f}s: {reason}{held_by(queue)}\n")
+                stream.flush()
+                reported = now
+            if deadline is not None and now >= deadline:
                 stream.write(f"gave up waiting for a gate slot after {now - started:.0f}s at "
                              f"{place_line(ticket, reason)}{held_by(queue)}\n")
                 stream.flush()
                 return None
-            retry = True
-            time.sleep(max(0.0, min(poll, limit - now)))
+            time.sleep(poll if deadline is None else max(0.0, min(poll, deadline - now)))
     finally:
         if ticket is not None:
             queue.leave(ticket)
@@ -1093,8 +1036,7 @@ def held_by(queue: Queue) -> str:
 
 
 def snapshot(where: pathlib.Path, slots: int, rule: LoadRule, *,
-             loadavg: Callable[[], Sequence[float]] = os.getloadavg, wall: Callable[[], float] = time.time,
-             busy: Callable[[], float | None] = cpu_busy) -> dict:
+             loadavg: Callable[[], Sequence[float]] = os.getloadavg, wall: Callable[[], float] = time.time) -> dict:
     """Who holds a slot (`read_holders`), who waits and in which place, the lane gates among them (sd:5078),
     and the load rule; read under `queue.lock`."""
     queue = Queue(where)
@@ -1114,7 +1056,7 @@ def snapshot(where: pathlib.Path, slots: int, rule: LoadRule, *,
         load = [round(float(value), 2) for value in tuple(loadavg())[:3]]
     except OSError:
         load = []
-    share = steady_busy(where, busy(), wall())  # creates `where`: status alone must build CPU rows
+    share = steady_busy(where, wall())  # creates `where`: status alone must build CPU rows
     last = state.get("last_admitted")
     return {"directory": str(where), "slots": slots, "holders": holders, "waiters": waiters, "lane_gates": lanes,
             "load": load, "cpu_busy": None if share is None else round(share, 3),

@@ -372,8 +372,7 @@ class LoadRule(unittest.TestCase):
         self.addCleanup(patch.stop)
 
     def admit(self, ticket, rule):
-        return self.queue.admit(ticket, [self.lock.fileno()], rule, loadavg=lambda: self.load, wall=self.wall,
-                                 busy=lambda: None)
+        return self.queue.admit(ticket, [self.lock.fileno()], rule, loadavg=lambda: self.load, wall=self.wall)
 
     def release(self) -> None:
         fcntl.flock(self.lock, fcntl.LOCK_UN)
@@ -388,45 +387,98 @@ class LoadRule(unittest.TestCase):
         self.load = (39.9, 10.0, 10.0)
         self.assertEqual(self.admit(ticket, rule)[0], 0)
 
-    def busy_admit(self, ticket, share):
-        """One admission under limit 24 on 16 cores with load 300, the CPU sample `share`."""
+    def busy_admit(self, ticket):
+        """One admission under limit 24 on 16 cores with load 300."""
         rule = sd_gate_slots.LoadRule(limit=24.0, settle=0.0, source="test")
         with mock.patch.object(sd_gate_slots.os, "cpu_count", lambda: 16):
             return self.queue.admit(ticket, [self.lock.fileno()], rule, loadavg=lambda: (300.0, 300.0, 300.0),
-                                    wall=self.wall, busy=lambda: share)
+                                    wall=self.wall)
 
     def test_a_load_the_cpu_does_not_carry_admits(self):
         """sd:9946: a simulator held load5 at 277-458 with the CPU 37% idle; the limit reads CPU use then."""
         ticket = self.queue.enter("gate", "/", wall=self.wall)
-        self.assertIn("load 300.0", self.busy_admit(ticket, None)[1], "an unread CPU keeps load5")
-        self.cpu.run(60, 0.63)
-        self.assertIn("load 300.0", self.busy_admit(ticket, 0.95)[1], "a busy sample now")
+        with mock.patch.object(sd_gate_slots, "cpu_ticks", lambda: None):
+            self.cpu.run(60, 0.63)
+            self.assertIn("load 300.0", self.busy_admit(ticket)[1], "an unread CPU keeps load5")
+        self.busy_admit(ticket)
+        self.cpu.run(55, 0.63)
+        self.busy_admit(ticket)
+        self.cpu.run(5, 0.95)
+        self.assertIn("load 300.0", self.busy_admit(ticket)[1], "a burst in the last seconds")
         self.cpu.run(60, 0.63)
         # Pinned: on 40 cores 0.63 busy counts 25.2, over the limit of 24.
-        self.assertEqual(self.busy_admit(ticket, 0.63)[0], 0)
+        self.assertEqual(self.busy_admit(ticket)[0], 0)
+
+    def warm(self, share: float, seconds: float = 60.0) -> None:
+        """CPU rows under the gate directory: `share` busy for `seconds`, one row every 5 s."""
+        for _ in range(int(seconds // 5)):
+            sd_gate_slots.steady_busy(self.where, self.wall.now)
+            self.cpu.run(5, share)
+
+    def test_a_short_wait_uses_the_warmed_cpu_history_at_once(self):
+        """Class pass, instance 1 (wait_for_slot): with --max-wait 0.5, a free slot and a minute of CPU rows
+        at 50%, the first attempt read load5 300 alone and the wait slept on a CPU sample."""
+        self.warm(0.5)
+        sleeps = []
+
+        def sleep(seconds):
+            sleeps.append(seconds)
+            self.wall.now += seconds
+        with mock.patch.object(sd_gate_slots.os, "cpu_count", lambda: 16), \
+                mock.patch.object(sd_gate_slots.time, "sleep", sleep):
+            taken = sd_gate_slots.wait_for_slot(
+                [self.lock.fileno()], self.where, poll=0.25, stream=io.StringIO(), deadline=self.wall.now + 0.5,
+                clock=self.wall, rule=sd_gate_slots.LoadRule(24.0, 0.0, "test"),
+                loadavg=lambda: (300.0, 300.0, 300.0), wall=self.wall)
+        self.assertEqual((taken, sleeps), (0, []))
+
+    def test_no_load_reader_waits_on_a_cpu_sample(self):
+        """Class pass, instances 2-4: admit, gate status and the lane's load stop each waited 1.1 s."""
+        import sd_lane  # noqa: PLC0415 -- the lane's load stop is one of the readers
+        rule = sd_gate_slots.LoadRule(24.0, 0.0, "test")
+        ticket = self.queue.enter("gate", "/", wall=self.wall)
+        readers = {
+            "admit": lambda: self.queue.admit(ticket, [self.lock.fileno()], rule, loadavg=lambda: self.load,
+                                              wall=self.wall),
+            "status": lambda: sd_gate_slots.snapshot(self.where, 1, rule, wall=self.wall),
+            "lane": lambda: sd_lane.load_stop({"SD_GATE_SLOTS_DIR": str(self.where), "SD_GATE_LOAD_MAX": "24"}),
+        }
+        for name, read in readers.items():
+            started = time.monotonic()
+            read()
+            self.assertLess(time.monotonic() - started, 0.5, name)
+            self.release()
+
+    def test_a_burst_now_counts_over_a_quiet_minute(self):
+        """Class pass, instance 5: the counted share took the blocking sample as 'now'; the newest row at
+        least CPU_SAMPLE_SECONDS old stands in, so a burst in the last seconds still counts."""
+        self.warm(0.5)
+        sd_gate_slots.steady_busy(self.where, self.wall.now)
+        self.cpu.run(5, 1.0)
+        self.assertGreaterEqual(sd_gate_slots.steady_busy(self.where, self.wall.now), 0.9)
 
     def test_one_short_cpu_sample_does_not_drop_the_counted_load(self):
         """Lane blocker: 16 cores, limit 24, load5 300, and one 63% sample admitted at once."""
         ticket = self.queue.enter("gate", "/", wall=self.wall)
-        self.assertIn("load 300.0", self.busy_admit(ticket, 0.63)[1], "one sample")
+        self.assertIn("load 300.0", self.busy_admit(ticket)[1], "one sample")
         self.cpu.run(30, 0.63)
-        self.assertIn("load 300.0", self.busy_admit(ticket, 0.63)[1], "30 s of samples")
+        self.assertIn("load 300.0", self.busy_admit(ticket)[1], "30 s of samples")
         self.cpu.run(30, 0.63)
-        self.assertEqual(self.busy_admit(ticket, 0.63)[0], 0, "a minute at 63%")
+        self.assertEqual(self.busy_admit(ticket)[0], 0, "a minute at 63%")
 
     def test_two_samples_far_apart_do_not_hide_the_busy_time_between(self):
         """Review blocker: two 63% samples 119 s apart, nothing read between, counted load 300 as 10.08."""
         ticket = self.queue.enter("gate", "/", wall=self.wall)
-        self.assertIn("load 300.0", self.busy_admit(ticket, 0.63)[1])
+        self.assertIn("load 300.0", self.busy_admit(ticket)[1])
         self.cpu.run(119, 1.0)
-        self.assertIn("load 300.0", self.busy_admit(ticket, 0.63)[1], "119 s fully busy, unobserved")
+        self.assertIn("load 300.0", self.busy_admit(ticket)[1], "119 s fully busy, unobserved")
 
     def test_probes_five_minutes_apart_read_the_cpu_between(self):
         """Review blocker: a probe every five minutes discarded the last one and always read load 300."""
         ticket = self.queue.enter("gate", "/", wall=self.wall)
-        self.assertIn("load 300.0", self.busy_admit(ticket, 0.63)[1])
+        self.assertIn("load 300.0", self.busy_admit(ticket)[1])
         self.cpu.run(300, 0.63)
-        self.assertEqual(self.busy_admit(ticket, 0.63)[0], 0)
+        self.assertEqual(self.busy_admit(ticket)[0], 0)
 
     def test_the_busy_history_drops_bad_rows_a_clock_set_back_and_a_reboot(self):
         now = self.wall.now
@@ -434,74 +486,26 @@ class LoadRule(unittest.TestCase):
         self.cpu.run(0, 0)
         history.write_text(f'[[{now - 61}, "x", 1], [{now + 5}, 0, 0], ["y", 1, 2], 7, [{now - 61}, 5, 3]]',
                            encoding="utf-8")
-        self.assertIsNone(sd_gate_slots.steady_busy(self.where, 0.3, now), "no good row")
+        self.assertIsNone(sd_gate_slots.steady_busy(self.where, now), "no good row")
         history.write_text("not json\n", encoding="utf-8")
-        self.assertIsNone(sd_gate_slots.steady_busy(self.where, 0.3, now))
+        self.assertIsNone(sd_gate_slots.steady_busy(self.where, now))
         self.cpu.run(61, 0.5)
-        self.assertEqual(sd_gate_slots.steady_busy(self.where, 0.3, self.wall.now), 0.5)
-        self.assertIsNone(sd_gate_slots.steady_busy(self.where, None, self.wall.now), "an unread sample")
-        self.assertIsNone(sd_gate_slots.steady_busy(self.where, 0.3, now - 120), "the clock went back")
+        self.assertEqual(sd_gate_slots.steady_busy(self.where, self.wall.now), 0.5)
+        self.assertIsNone(sd_gate_slots.steady_busy(self.where, now - 120), "the clock went back")
         self.cpu.idle, self.cpu.total = 0, 0
         self.cpu.run(30, 0.5)
-        self.assertIsNone(sd_gate_slots.steady_busy(self.where, 0.3, self.wall.now), "ticks fell: a reboot")
+        self.assertIsNone(sd_gate_slots.steady_busy(self.where, self.wall.now), "ticks fell: a reboot")
         self.cpu.run(sd_gate_slots.CPU_HISTORY_SECONDS + 1, 0.5)
-        self.assertIsNone(sd_gate_slots.steady_busy(self.where, 0.3, self.wall.now), "every row too old")
+        self.assertIsNone(sd_gate_slots.steady_busy(self.where, self.wall.now), "every row too old")
         with mock.patch.object(sd_gate_slots, "cpu_ticks", lambda: None):
             self.cpu.run(61, 0.5)
-            self.assertIsNone(sd_gate_slots.steady_busy(self.where, 0.3, self.wall.now), "unread ticks")
+            self.assertIsNone(sd_gate_slots.steady_busy(self.where, self.wall.now), "unread ticks")
 
-    def test_the_cpu_sample_waits_outside_the_queue_lock(self):
-        """Review finding: a 1.1 s sample under the admission lock held every enter, leave and status."""
-        rule = sd_gate_slots.LoadRule(limit=24.0, settle=0.0, source="test")
-        ticket = self.queue.enter("gate", "/", wall=self.wall)
-        free = []
-
-        def busy():
-            fd = os.open(self.where / sd_gate_slots.QUEUE_LOCK, os.O_RDWR | os.O_CREAT, 0o644)
-            try:
-                free.append(sd_gate_slots.try_lock(fd))
-            finally:
-                os.close(fd)
-            return None
-        self.queue.admit(ticket, [self.lock.fileno()], rule, loadavg=lambda: self.load, wall=self.wall,
-                         busy=busy)
-        self.assertEqual(free, [True])
-
-    def test_cpu_busy_reads_two_tick_samples(self):
-        samples = iter([(100, 200), (130, 300)])
-        sd_gate_slots.last_cpu_sample = None
-        self.assertAlmostEqual(sd_gate_slots.cpu_busy(lambda: next(samples), lambda _: None), 0.7)
-        for broken in ([None], [(100, 200), (100, 200)], [(100, 200), (150, 240)]):
-            sd_gate_slots.last_cpu_sample = None
-            self.assertIsNone(sd_gate_slots.cpu_busy(iter(broken).__next__, lambda _: None), broken)
-        sd_gate_slots.last_cpu_sample = None
+    def test_counted_load_reads_cpu_use_below_the_busy_line(self):
         self.assertEqual(sd_gate_slots.counted_load(300.0, 0.63, cores=16), 0.63 * 16)
         self.assertEqual(sd_gate_slots.counted_load(300.0, 0.9, cores=16), 300.0)
         self.assertEqual(sd_gate_slots.counted_load(5.0, 0.5, cores=16), 5.0)
         self.assertEqual(sd_gate_slots.counted_load(300.0, float("nan"), cores=16), 300.0)
-
-    def test_cpu_busy_spans_a_tick_update(self):
-        """macOS updates its CPU ticks about once a second: a 0.25 s gap often read no change and fell
-        back to load5. A poller's previous sample, 1 to 60 s old, stands in for the wait."""
-        now = [0.1]
-
-        def ticks():
-            second = int(now[0])
-            return 30 * second, 100 * second
-
-        def pause(seconds):
-            now[0] += seconds
-
-        sd_gate_slots.last_cpu_sample = None
-        self.assertAlmostEqual(sd_gate_slots.cpu_busy(ticks, pause, clock=lambda: now[0]), 0.7)
-        waited = now[0]
-        now[0] += 5
-        self.assertAlmostEqual(sd_gate_slots.cpu_busy(ticks, pause, clock=lambda: now[0]), 0.7)
-        self.assertEqual(now[0], waited + 5, "a 5 s old sample needs no wait")
-        now[0] += 500
-        self.assertAlmostEqual(sd_gate_slots.cpu_busy(ticks, pause, clock=lambda: now[0]), 0.7)
-        self.assertGreater(now[0], waited + 505, "a stale sample is not reused")
-        sd_gate_slots.last_cpu_sample = None
 
     def test_cpu_ticks_takes_the_host_port_once(self):
         """Each mach_host_self() call adds a reference to the host port; a gate wait polls for hours."""
@@ -541,16 +545,14 @@ class LoadRule(unittest.TestCase):
         for seconds in (0, 60):
             self.cpu.run(seconds, 0.5)
             report = sd_gate_slots.snapshot(fresh, 1, sd_gate_slots.LoadRule(24.0, 0.0, "test"),
-                                            loadavg=lambda: (300.0, 300.0, 300.0), busy=lambda: 0.5,
-                                            wall=self.wall)
+                                            loadavg=lambda: (300.0, 300.0, 300.0), wall=self.wall)
         self.assertEqual(report["load_counted"], round(0.5 * (os.cpu_count() or 1), 2))
 
     def test_status_reports_the_counted_load(self):
         for seconds in (0, 60):
             self.cpu.run(seconds, 0.5)
             report = sd_gate_slots.snapshot(self.where, 1, sd_gate_slots.LoadRule(24.0, 0.0, "test"),
-                                            loadavg=lambda: (300.0, 300.0, 300.0), busy=lambda: 0.5,
-                                            wall=self.wall)
+                                            loadavg=lambda: (300.0, 300.0, 300.0), wall=self.wall)
         self.assertEqual((report["cpu_busy"], report["load_counted"]),
                          (0.5, round(0.5 * (os.cpu_count() or 1), 2)))
 
@@ -626,8 +628,7 @@ class LoadRule(unittest.TestCase):
 
     def other(self, ticket, rule):
         """A second waiter's poll, with its own rule, while `ticket` heads the queue."""
-        return self.queue.admit(ticket, [self.lock.fileno()], rule, loadavg=lambda: self.load, wall=self.wall,
-                                 busy=lambda: None)
+        return self.queue.admit(ticket, [self.lock.fileno()], rule, loadavg=lambda: self.load, wall=self.wall)
 
     def test_a_stricter_waiter_behind_the_head_cannot_hold_it_back(self):
         """Review finding: a waiter with limit 20 kept clearing the head's low-load record at load1 30."""
@@ -722,49 +723,9 @@ class Settings(unittest.TestCase):
             taken = sd_gate_slots.wait_for_slot(
                 [mine.fileno()], pathlib.Path(tmp), poll=0.001, stream=stream, deadline=90,
                 clock=lambda: float(next(ticks)), rule=sd_gate_slots.LoadRule(40.0, 0.0, "test"),
-                loadavg=lambda: (55.0, 50.0, 50.0), busy=lambda: None)
+                loadavg=lambda: (55.0, 50.0, 50.0))
         self.assertIsNone(taken)
         self.assertIn("load 55.0 is at or above 40", stream.getvalue())
-
-    def test_the_first_attempt_runs_before_any_cpu_sample(self):
-        """Review blockers: with --max-wait 0.5 the first 1.1 s CPU sample used up the deadline; refusing
-        then refused a free slot under low load, and trying then started the command after the deadline.
-        The first attempt reads load5 before any sample, inside the deadline."""
-        with tempfile.TemporaryDirectory() as tmp, open(pathlib.Path(tmp) / "slot.1.lock", "a") as mine:
-            stream, now, read_at = io.StringIO(), [0.0], []
-
-            def busy():
-                now[0] += 1.1
-                return 0.1
-
-            def loadavg():
-                read_at.append(now[0])
-                return 1.0, 1.0, 1.0
-            taken = sd_gate_slots.wait_for_slot(
-                [mine.fileno()], pathlib.Path(tmp), poll=0.001, stream=stream, deadline=0.5,
-                clock=lambda: now[0], rule=sd_gate_slots.LoadRule(24.0, 0.0, "test"),
-                loadavg=loadavg, busy=busy)
-        self.assertEqual((taken, read_at), (0, [0.0]), stream.getvalue())
-
-    def test_a_retry_sample_past_the_deadline_takes_no_slot(self):
-        """A retry whose 1.1 s CPU sample ran past the deadline takes no slot freed during it."""
-        with tempfile.TemporaryDirectory() as tmp, open(pathlib.Path(tmp) / "slot.1.lock", "a") as mine, \
-                open(pathlib.Path(tmp) / "slot.1.lock", "a") as other:
-            fcntl.flock(other, fcntl.LOCK_EX)
-            stream, now, samples = io.StringIO(), [0.0], []
-
-            def busy():
-                samples.append(now[0])
-                if len(samples) > 1:
-                    fcntl.flock(other, fcntl.LOCK_UN)
-                now[0] += 1.1
-                return 0.1
-            taken = sd_gate_slots.wait_for_slot(
-                [mine.fileno()], pathlib.Path(tmp), poll=0.001, stream=stream, deadline=2.0,
-                clock=lambda: now[0], rule=sd_gate_slots.LoadRule(24.0, 0.0, "test"),
-                loadavg=lambda: (1.0, 1.0, 1.0), busy=busy)
-        self.assertEqual((taken, len(samples)), (None, 2))
-        self.assertIn("gave up waiting for a gate slot", stream.getvalue())
 
     def test_max_wait_zero_takes_a_free_slot(self):
         """Review blocker: `sd gate run --max-wait 0` refused a free slot; the deadline skipped the first try."""
@@ -773,47 +734,9 @@ class Settings(unittest.TestCase):
                     open(pathlib.Path(tmp) / "slot.1.lock", "a") as mine:
                 taken = sd_gate_slots.wait_for_slot(
                     [mine.fileno()], pathlib.Path(tmp), poll=0.001, stream=io.StringIO(), deadline=0.0,
-                    clock=lambda: 0.0, rule=rule, loadavg=lambda: (1.0, 1.0, 1.0), busy=lambda: None)
+                    clock=lambda: 0.0, rule=rule, loadavg=lambda: (1.0, 1.0, 1.0))
                 self.assertEqual(taken, 0)
 
-    def test_a_retry_woken_at_the_deadline_takes_no_slot(self):
-        """Review blocker: the poll sleep woke at the 2.0 s deadline, the retry sampled the CPU, and took a
-        slot freed meanwhile at 3.1 s."""
-        with tempfile.TemporaryDirectory() as tmp, open(pathlib.Path(tmp) / "slot.1.lock", "a") as mine, \
-                open(pathlib.Path(tmp) / "slot.1.lock", "a") as other:
-            fcntl.flock(other, fcntl.LOCK_EX)
-            now, samples = [0.0], []
-
-            def busy():
-                samples.append(now[0])
-                now[0] += 1.1
-                return 0.1
-
-            def sleep(seconds):
-                fcntl.flock(other, fcntl.LOCK_UN)
-                now[0] += seconds
-            with mock.patch.object(sd_gate_slots.time, "sleep", sleep):
-                taken = sd_gate_slots.wait_for_slot(
-                    [mine.fileno()], pathlib.Path(tmp), poll=5.0, stream=io.StringIO(), deadline=2.0,
-                    clock=lambda: now[0], rule=sd_gate_slots.LoadRule(24.0, 0.0, "test"),
-                    loadavg=lambda: (1.0, 1.0, 1.0), busy=busy)
-        self.assertEqual((taken, samples), (None, []), "an expired retry gives up before it samples")
-
-    def test_a_launcher_gone_during_the_cpu_sample_takes_no_slot(self):
-        """A retry samples the CPU (the first try takes none); a launcher gone during it takes no slot."""
-        with tempfile.TemporaryDirectory() as tmp, open(pathlib.Path(tmp) / "slot.1.lock", "a") as mine, \
-                open(pathlib.Path(tmp) / "slot.1.lock", "a") as other:
-            fcntl.flock(other, fcntl.LOCK_EX)
-            gone = [False]
-
-            def busy():
-                gone[0] = True
-                fcntl.flock(other, fcntl.LOCK_UN)
-                return 0.1
-            with self.assertRaises(sd_gate_slots.LauncherExited):
-                sd_gate_slots.wait_for_slot(
-                    [mine.fileno()], pathlib.Path(tmp), poll=0.001, stream=io.StringIO(), stop=lambda: gone[0],
-                    rule=sd_gate_slots.LoadRule(24.0, 0.0, "test"), loadavg=lambda: (1.0, 1.0, 1.0), busy=busy)
 
 
 if __name__ == "__main__":

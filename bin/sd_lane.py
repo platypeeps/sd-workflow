@@ -3949,7 +3949,7 @@ def load_stop(environ: dict[str, str]) -> str | None:
         limit = sd_gate_slots.load_rule(environ, sd_lib.core_setting("gate_load_max", environ)).limit
         if limit <= 0:
             return None
-        share = sd_gate_slots.steady_busy(sd_gate_slots.directory(environ), sd_gate_slots.cpu_busy(), time.time())
+        share = sd_gate_slots.steady_busy(sd_gate_slots.directory(environ), time.time())
         load5 = sd_gate_slots.counted_load(float(os.getloadavg()[1]), share)
     except (ValueError, OSError, sd_lib.ConfigError) as error:
         return f"cannot read the load average ({error}); the next run takes the pending entries"

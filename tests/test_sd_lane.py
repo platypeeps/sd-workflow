@@ -1012,15 +1012,18 @@ class Runner(Lane):
         with mock.patch.object(sd_lane.os, "getloadavg", lambda: (300.0, 300.0, 300.0)), \
                 mock.patch.object(sd_gate_slots.os, "cpu_count", lambda: 16):
             now = [1_000_000.0]
-            with mock.patch.object(sd_gate_slots, "cpu_busy", lambda: 0.63), \
-                    mock.patch.object(sd_gate_slots, "cpu_ticks", lambda: (int(now[0] * 37), int(now[0] * 100))), \
+            idle = [lambda: int(now[0] * 37)]  # 63% busy
+            with mock.patch.object(sd_gate_slots, "cpu_ticks", lambda: (idle[0](), int(now[0] * 100))), \
                     mock.patch.object(sd_lane.time, "time", lambda: now[0]):
-                self.assertIn("load5 300.0", sd_lane.load_stop(environ) or "", "one sample")
+                self.assertIn("load5 300.0", sd_lane.load_stop(environ) or "", "one probe")
                 now[0] += 300
                 self.assertIsNone(sd_lane.load_stop(environ), "a probe five minutes later")
-            for share in (0.95, None):
-                with mock.patch.object(sd_gate_slots, "cpu_busy", lambda share=share: share):
-                    self.assertIn("load5 300.0", sd_lane.load_stop(environ) or "", share)
+                since, base = now[0], idle[0]()
+                idle[0] = lambda: base + int((now[0] - since) * 5)  # 95% busy from here
+                now[0] += 300
+                self.assertIn("load5 300.0", sd_lane.load_stop(environ) or "", "95% busy")
+            with mock.patch.object(sd_gate_slots, "cpu_ticks", lambda: None):
+                self.assertIn("load5 300.0", sd_lane.load_stop(environ) or "", "unread ticks")
 
     def test_prepare_waits_for_a_slot_no_longer_than_the_runs_budget(self) -> None:
         """pack sd:7412, failure table row 2: an unbounded slot wait ran into the job's TERM, which spends a reclaim."""
