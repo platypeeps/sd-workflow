@@ -1342,6 +1342,15 @@ def load_cap() -> float:
     return LOAD_FACTOR * cores if cores else math.nan
 
 
+def counted(answer: dict, load5: float) -> float:
+    """The five-minute load a cap reads from an `sd gate status --json` answer: its `load_counted`, load5 with the
+    CPU's own use standing in while the CPU is not busy (sd:9946), else `load5` where the gate gave none."""
+    value = answer.get("load_counted")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        return load5
+    return min(float(value), load5)
+
+
 def over_load(load: float, cap: float) -> str:
     """Why no builder starts under this five-minute load, or "" (pack sd:6111).
 

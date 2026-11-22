@@ -2801,6 +2801,14 @@ class LoadCap(unittest.TestCase):
         with mock.patch.object(build.os, "cpu_count", return_value=None):
             self.assertEqual(build.unread(1.0, build.load_cap(), []), build.UNREAD[0])
 
+    def test_the_cap_reads_the_counted_load_the_gate_gives(self):
+        """sd:9946: load5 277 with the CPU 37% idle paused every claim; the gate's counted load stands in."""
+        self.assertEqual(build.counted({"load": [1, 277.0, 1], "load_counted": 10.1}, 277.0), 10.1)
+        for answer in ({}, {"load_counted": None}, {"load_counted": True}, {"load_counted": float("nan")},
+                       {"load_counted": -1}, {"load_counted": "3"}):
+            self.assertEqual(build.counted(answer, 277.0), 277.0, answer)
+        self.assertEqual(build.counted({"load_counted": 400.0}, 277.0), 277.0)
+
 
 if __name__ == "__main__":
     unittest.main()

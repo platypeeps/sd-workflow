@@ -219,6 +219,61 @@ def load_rule(environ: Mapping[str, str], limit_setting: str | None = None,
     return LoadRule(limit, settle, ", ".join(sources) or "default")
 
 
+#: At or above this CPU busy share the load average counts in full; below it a load limit reads the CPU's own
+#: use, busy times cores, instead (sd:9946): on 2026-11-22 a booted simulator held load5 at 277-458 with the
+#: CPU 37% idle, and the load limits paused every build claim and lane start.
+CPU_BUSY_MAX = 0.9
+#: The gap between the two CPU tick samples `cpu_busy` takes.
+CPU_SAMPLE_SECONDS = 0.25
+
+
+def cpu_ticks() -> tuple[int, int] | None:
+    """(idle, total) CPU ticks since boot, or None where they cannot be read: macOS
+    `host_statistics(HOST_CPU_LOAD_INFO)`, Linux `/proc/stat`. A disk wait counts as idle."""
+    try:
+        if sys.platform == "darwin":
+            import ctypes  # noqa: PLC0415 -- only the darwin path needs it
+            system = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+            system.mach_host_self.restype = ctypes.c_uint
+            info, count = (ctypes.c_uint * 4)(), ctypes.c_uint(4)
+            if system.host_statistics(system.mach_host_self(), 3, info, ctypes.byref(count)) != 0:
+                return None
+            user, kernel, idle, nice = info
+            return idle, user + kernel + idle + nice
+        fields = pathlib.Path("/proc/stat").read_text(encoding="ascii").splitlines()[0].split()
+        if fields[0] != "cpu" or len(fields) < 6:
+            return None
+        ticks = [int(value) for value in fields[1:]]
+        return ticks[3] + ticks[4], sum(ticks[:8])
+    except (OSError, ValueError, IndexError, AttributeError):
+        return None
+
+
+def cpu_busy(ticks: Callable[[], tuple[int, int] | None] = cpu_ticks,
+             pause: Callable[[float], object] = time.sleep) -> float | None:
+    """The share of CPU time not idle over `CPU_SAMPLE_SECONDS`, 0 to 1, or None when unread."""
+    first = ticks()
+    if first is None:
+        return None
+    pause(CPU_SAMPLE_SECONDS)
+    second = ticks()
+    if second is None:
+        return None
+    idle, total = second[0] - first[0], second[1] - first[1]
+    if total <= 0 or not 0 <= idle <= total:
+        return None
+    return 1.0 - idle / total
+
+
+def counted_load(load: float, busy: float | None, cores: int | None = None) -> float:
+    """The load a load limit reads (sd:9946): `load` while the CPU is at least `CPU_BUSY_MAX` busy or its
+    use is unread; otherwise the CPU's own use, busy times cores, when that is lower."""
+    count = cores if cores is not None else os.cpu_count()
+    if busy is None or not count or not 0 <= busy < CPU_BUSY_MAX:
+        return load
+    return min(load, busy * count)
+
+
 #: The machine settings the stdlib entry points read, with the check each value passes.
 MACHINE_SETTINGS: tuple[tuple[str, Callable[[str, str], object]], ...] = (
     ("gate_slots", parse_count), ("gate_load_max", parse_number), ("gate_settle_seconds", parse_number))
@@ -376,7 +431,8 @@ class Queue:
 
     def admit(self, ticket: Ticket, fds: Sequence[int], rule: LoadRule, *, markers: Sequence[int] = (),
               loadavg: Callable[[], Sequence[float]] = os.getloadavg,
-              wall: Callable[[], float] = time.time) -> tuple[int | None, str]:
+              wall: Callable[[], float] = time.time,
+              busy: Callable[[], float | None] = cpu_busy) -> tuple[int | None, str]:
         """Lock one of `fds` for `ticket` when it heads the queue and the load rule holds.
 
         Returns the slot's index, or None and the reason it waits. An admitted
@@ -397,6 +453,9 @@ class Queue:
                 # Only the head samples, under its own rule: callers may run
                 # different rules, and one waiter's sample must not count for another's.
                 load1, load5 = (float(value) for value in tuple(loadavg())[:2])
+                if rule.limit > 0:
+                    share = busy()
+                    load1, load5 = counted_load(load1, share), counted_load(load5, share)
                 record_sample(state, rule, load1, now)
                 held = load_hold(state, rule, load1, load5, now)
                 if held:
@@ -599,7 +658,8 @@ def wait_for_slot(fds: Sequence[int], where: pathlib.Path, *, poll: float, strea
                   stop: Callable[[], bool] = lambda: False, deadline: float | None = None,
                   clock: Callable[[], float] = time.monotonic, rule: LoadRule | None = None,
                   loadavg: Callable[[], Sequence[float]] = os.getloadavg, wall: Callable[[], float] = time.time,
-                  label: str = "", lane: bool = False, markers: Sequence[int] = ()) -> int | None:
+                  label: str = "", lane: bool = False, markers: Sequence[int] = (),
+                  busy: Callable[[], float | None] = cpu_busy) -> int | None:
     """Queue, then lock one of `fds` and return its index; None once `deadline` passes.
 
     `lane` queues as a lane gate, which locks `markers[i]` with slot i (sd:5078).
@@ -628,7 +688,8 @@ def wait_for_slot(fds: Sequence[int], where: pathlib.Path, *, poll: float, strea
             if ticket is None:
                 taken, reason = take_free(fds, markers, label, wall())
             else:
-                taken, reason = queue.admit(ticket, fds, rule, markers=markers, loadavg=loadavg, wall=wall)
+                taken, reason = queue.admit(ticket, fds, rule, markers=markers, loadavg=loadavg, wall=wall,
+                                             busy=busy)
             if taken is not None:
                 if reported is not None:
                     stream.write(f"gate slot taken after {clock() - started:.0f}s under {where}\n")
@@ -914,7 +975,8 @@ def held_by(queue: Queue) -> str:
 
 
 def snapshot(where: pathlib.Path, slots: int, rule: LoadRule, *,
-             loadavg: Callable[[], Sequence[float]] = os.getloadavg, wall: Callable[[], float] = time.time) -> dict:
+             loadavg: Callable[[], Sequence[float]] = os.getloadavg, wall: Callable[[], float] = time.time,
+             busy: Callable[[], float | None] = cpu_busy) -> dict:
     """Who holds a slot (`read_holders`), who waits and in which place, the lane gates among them (sd:5078),
     and the load rule; read under `queue.lock`."""
     queue = Queue(where)
@@ -934,9 +996,11 @@ def snapshot(where: pathlib.Path, slots: int, rule: LoadRule, *,
         load = [round(float(value), 2) for value in tuple(loadavg())[:3]]
     except OSError:
         load = []
+    share = busy()
     last = state.get("last_admitted")
     return {"directory": str(where), "slots": slots, "holders": holders, "waiters": waiters, "lane_gates": lanes,
-            "load": load,
+            "load": load, "cpu_busy": None if share is None else round(share, 3),
+            "load_counted": round(counted_load(load[1], share), 2) if len(load) > 1 else None,
             "load_max": rule.limit, "settle_seconds": rule.settle, "rule_source": rule.source,
             "last_admitted": utc_stamp(last) if isinstance(last, (int, float)) else None, "now": utc_stamp(wall())}
 

@@ -348,7 +348,8 @@ class LoadRule(unittest.TestCase):
         self.load = (1.0, 1.0, 1.0)
 
     def admit(self, ticket, rule):
-        return self.queue.admit(ticket, [self.lock.fileno()], rule, loadavg=lambda: self.load, wall=self.wall)
+        return self.queue.admit(ticket, [self.lock.fileno()], rule, loadavg=lambda: self.load, wall=self.wall,
+                                 busy=lambda: None)
 
     def release(self) -> None:
         fcntl.flock(self.lock, fcntl.LOCK_UN)
@@ -362,6 +363,38 @@ class LoadRule(unittest.TestCase):
         self.assertIn("load 40.0", reason)
         self.load = (39.9, 10.0, 10.0)
         self.assertEqual(self.admit(ticket, rule)[0], 0)
+
+    def test_a_load_the_cpu_does_not_carry_admits(self):
+        """sd:9946: a simulator held load5 at 277-458 with the CPU 37% idle; the limit reads CPU use then."""
+        rule = sd_gate_slots.LoadRule(limit=24.0, settle=0.0, source="test")
+        ticket = self.queue.enter("gate", "/", wall=self.wall)
+        self.load = (300.0, 300.0, 300.0)
+        self.assertIsNone(self.admit(ticket, rule)[0], "an unread CPU keeps load5 as the fallback")
+        shares = iter([0.95, 0.63])
+
+        def admit():
+            return self.queue.admit(ticket, [self.lock.fileno()], rule, loadavg=lambda: self.load,
+                                    wall=self.wall, busy=lambda: next(shares))
+        self.assertIn("load 300.0", admit()[1])
+        self.assertEqual(admit()[0], 0)
+
+    def test_cpu_busy_reads_two_tick_samples(self):
+        samples = iter([(100, 200), (130, 300)])
+        self.assertAlmostEqual(sd_gate_slots.cpu_busy(lambda: next(samples), lambda _: None), 0.7)
+        for broken in ([None], [(100, 200), (100, 200)], [(100, 200), (150, 240)]):
+            self.assertIsNone(sd_gate_slots.cpu_busy(iter(broken).__next__, lambda _: None), broken)
+        self.assertEqual(sd_gate_slots.counted_load(300.0, 0.63, cores=16), 0.63 * 16)
+        self.assertEqual(sd_gate_slots.counted_load(300.0, 0.9, cores=16), 300.0)
+        self.assertEqual(sd_gate_slots.counted_load(5.0, 0.5, cores=16), 5.0)
+        self.assertEqual(sd_gate_slots.counted_load(300.0, float("nan"), cores=16), 300.0)
+        share = sd_gate_slots.cpu_busy()
+        self.assertTrue(share is None or 0 <= share <= 1, share)
+
+    def test_status_reports_the_counted_load(self):
+        report = sd_gate_slots.snapshot(self.where, 1, sd_gate_slots.LoadRule(24.0, 0.0, "test"),
+                                        loadavg=lambda: (300.0, 300.0, 300.0), busy=lambda: 0.5)
+        self.assertEqual((report["cpu_busy"], report["load_counted"]),
+                         (0.5, round(0.5 * (os.cpu_count() or 1), 2)))
 
     def test_a_falling_load1_must_stay_low_for_the_settle_time_while_load5_is_high(self):
         """The 2026-10-01 case: load1 at 31 while load5 was still far above 40."""
@@ -435,7 +468,8 @@ class LoadRule(unittest.TestCase):
 
     def other(self, ticket, rule):
         """A second waiter's poll, with its own rule, while `ticket` heads the queue."""
-        return self.queue.admit(ticket, [self.lock.fileno()], rule, loadavg=lambda: self.load, wall=self.wall)
+        return self.queue.admit(ticket, [self.lock.fileno()], rule, loadavg=lambda: self.load, wall=self.wall,
+                                 busy=lambda: None)
 
     def test_a_stricter_waiter_behind_the_head_cannot_hold_it_back(self):
         """Review finding: a waiter with limit 20 kept clearing the head's low-load record at load1 30."""
@@ -530,7 +564,7 @@ class Settings(unittest.TestCase):
             taken = sd_gate_slots.wait_for_slot(
                 [mine.fileno()], pathlib.Path(tmp), poll=0.001, stream=stream, deadline=90,
                 clock=lambda: float(next(ticks)), rule=sd_gate_slots.LoadRule(40.0, 0.0, "test"),
-                loadavg=lambda: (55.0, 50.0, 50.0))
+                loadavg=lambda: (55.0, 50.0, 50.0), busy=lambda: None)
         self.assertIsNone(taken)
         self.assertIn("load 55.0 is at or above 40", stream.getvalue())
 
