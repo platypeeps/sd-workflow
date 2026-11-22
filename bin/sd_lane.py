@@ -4337,10 +4337,15 @@ def settle_gates(gates: list[SpeculativeGate], entry: dict[str, Any], row: dict[
     so a transient fault cannot spend the run's budget on it. An entry
     that merged outside a gate's chain, other than the gate's own entry,
     lands under that entry where the gate predicted it would not, as a
-    dropped train member does, so that gate ends as well.
+    dropped train member does, so that gate ends as well. So does a gate
+    whose entry the queue now holds ahead of a pending entry it predicted
+    to land first: a move put it there, and its receipt binds a tree its
+    prepare will not see (note #71950).
     """
     merged = row is not None and row.get("status") == "merged"
-    up = next_up(queue)
+    rows = queue_rows(queue)
+    up = next_up(rows)
+    cancel_overtaken(gates, rows)
     for held in [held for held in gates if entry["id"] not in held.chain]:
         if not merged and up == held.follower[0]:
             held.join(remaining(deadline, PREPARE_SECONDS))
@@ -4358,19 +4363,36 @@ def settle_gates(gates: list[SpeculativeGate], entry: dict[str, Any], row: dict[
                 gates.remove(held)
 
 
-#: `next_up` when the queue cannot be read.
+def cancel_overtaken(gates: list[SpeculativeGate], rows: list[dict[str, Any]] | None) -> None:
+    """End each gate whose entry `rows` hold ahead of a pending entry it predicted to land first (note #71950).
+
+    Unread rows (None) prove nothing, so they end no gate.
+    """
+    pending = [queued for queued in rows or [] if queued.get("status") == "pending"]
+    ids = [queued["id"] for queued in pending]
+    for held in list(gates):
+        after = pending[ids.index(held.follower[0]) + 1:] if held.follower[0] in ids else []
+        if passed := [queued for queued in after if queued["id"] in held.chain]:
+            held.why = f"sd:{passed[0]['item']} now lands after the entry this gate predicted on it"
+            if not held.is_alive() or held.cancel_gate():
+                gates.remove(held)
+
+
+#: The next claim when the queue cannot be read.
 UNREAD = object()
 
 
-def next_up(queue: Queue | None) -> object:
-    """The id of the entry the runner claims next, None for none, or `UNREAD`."""
+def next_up(rows: list[dict[str, Any]] | None) -> object:
+    """The id of the entry the runner claims next from `rows`, None for none, or `UNREAD` when unread."""
+    return UNREAD if rows is None else next((queued["id"] for queued in rows if runnable(queued)), None)
+
+
+def queue_rows(queue: Queue | None) -> list[dict[str, Any]] | None:
+    """The queue's rows in order, or None when there is no queue or it cannot be read."""
     try:
-        rows = read_queue(queue) if queue is not None else None
+        return read_queue(queue) if queue is not None else None
     except LaneError:
-        rows = None
-    if rows is None:
-        return UNREAD
-    return next((row["id"] for row in rows if runnable(row)), None)
+        return None
 
 
 def finish_speculation(gates: list[SpeculativeGate], answer: dict[str, Any],

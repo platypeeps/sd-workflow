@@ -1758,7 +1758,7 @@ class Train(Trees):
         self.commit_files(self.second, {"one.txt": "not 1\n"}, "conflicts with first")
         self.hold_train = True
         self.queue_three()
-        with mock.patch.object(sd_lane, "next_up", lambda queue: sd_lane.UNREAD):
+        with mock.patch.object(sd_lane, "queue_rows", lambda queue: None):
             sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
         self.assertTrue(self.seen["sd:2 prepared beside sd:3's gate"])
 
@@ -1962,6 +1962,33 @@ class Train(Trees):
         self.assertEqual(sd_lane.lane_train(self.environ), 2)
         (folder / "config.json").write_text(json.dumps({"config": {"sd": {"lane_train": "0"}}}))
         self.assertEqual(sd_lane.lane_train(self.environ), sd_lane.TRAIN)
+
+
+class SettleReordered(unittest.TestCase):
+    """Lane prepare of sd:9899 (note #71950): X and C move ahead of B while A runs; C is gated on A and B."""
+
+    def test_a_follower_moved_ahead_of_a_pending_prerequisite_is_waited_for_by_no_one(self) -> None:
+        rows = [{"id": "A", "item": 1, "status": "running"}, {"id": "X", "item": 4, "status": "pending"},
+                {"id": "C", "item": 3, "status": "pending"}, {"id": "B", "item": 2, "status": "pending"}]
+        gate: sd_lane.SpeculativeGate
+
+        def target() -> None:
+            while not gate.cancelled:
+                time.sleep(0.01)
+        gate = sd_lane.SpeculativeGate(target, "C on A and B", ("C", "h"), ("A", "B"))
+        gate.start()
+        self.addCleanup(gate.cancel_gate)
+        gates = [gate]
+        with mock.patch.object(sd_lane, "read_queue", lambda queue: rows):
+            rows[0]["status"] = "merged"
+            sd_lane.settle_gates(gates, {"id": "A", "item": 1}, {"status": "merged"}, sd_lane.clock() + 3, object())
+            rows[1]["status"] = "failed"
+            started = time.monotonic()
+            sd_lane.settle_gates(gates, {"id": "X", "item": 4}, {"status": "failed"}, sd_lane.clock() + 3, object())
+        self.assertLess(time.monotonic() - started, 1, "the failed X waited for C's gate with B still pending")
+        self.assertEqual(gates, [])
+        self.assertTrue(gate.cancelled)
+        self.assertIn("sd:2", gate.why)
 
 
 class DepthTwo(Trees):
