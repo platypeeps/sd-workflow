@@ -1057,6 +1057,26 @@ class DropWait(Repo):
         again = self.claim()
         self.assertEqual((Path(again["work_path"]), again["branch"]), (new, f"build/sd-{lead}"))
 
+    def test_a_dropped_item_that_waits_is_held_as_a_fresh_build(self):
+        """Review of build/sd-1306: the drop's solo row for the dropped item counts a run it never had. A
+        prerequisite reopened before its claim parked it as a retry; pickup skipped it and Retry refused,
+        as it never ran. It holds as a fresh build does: blocked, unparked, picked once the wait ends."""
+        import json
+
+        items, _, run = self.bundle()
+        self.drop(run, items[1])
+        alone = self.db.execute("SELECT id FROM assignment WHERE item = ? ORDER BY id DESC LIMIT 1",
+                                (items[1],)).fetchone()["id"]
+        first = self.item(repo=str(self.repo))
+        self.db.execute("UPDATE item SET priority = 2, fields = ? WHERE id = ?",
+                        (json.dumps({"blocked_by": [first]}), items[1]))
+        self.assertIsNone(self.claim(), "the dropped item waits")
+        self.assertEqual(runner.queue_state(self.db, alone)["status"], "blocked")
+        self.assertIsNone(self.db.execute("SELECT parked_at FROM item WHERE id = ?", (items[1],)).fetchone()[0],
+                          "a fresh build that waits is not parked")
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))
+        self.assertIn(items[1], [row["id"] for row in build.eligible(self.db)], "pickup takes it")
+
     def test_a_retry_of_a_kept_lead_marks_the_member_it_leaves_out(self):
         """Review of build/sd-1306: kept lead A and member B, B set to wait on A before the split branch's first
         claim. Retry queued A alone and never marked B left out, as the lead had no run to read members from:

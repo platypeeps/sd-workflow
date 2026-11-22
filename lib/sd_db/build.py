@@ -1704,7 +1704,12 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
         # A dependency reopened since the press holds the build: dispatch's start reads it too (pack sd:9570).
         waiting = [(row, why) for row in bundle if (why := waiting_on(connection, connection.execute(
             "SELECT id, fields FROM item WHERE id = ?", (row["item"],)).fetchone()))]
-        retried = waiting and (bundle[0]["parent"] is not None or bundle[0]["run_count"])
+        # Ran before means work to resume: a run, a drop's kept work, or members on the lead's branch. A drop's
+        # solo row counts a run with no run row (`drop_writes`); held as a retry it would park with nothing for
+        # Retry to resume, so it holds as a fresh build does (review of build/sd-1306).
+        resumable = (queue_state(connection, bundle[0]["id"])["run"] is not None
+                     or _kept_host(connection, bundle[0]) is not None)
+        retried = bool(waiting) and (resumable or any(row["parent"] is not None for row in bundle))
         held = "; ".join(f"item {row['item']} {why}" for row, why in waiting)
         stamp = clock()
         if retried:
@@ -1715,8 +1720,6 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             # Retry resumes the split branch once the member is done (review of build/sd-1306).
             needed = _needed(connection, [row["item"] for row, _ in waiting])
             mark = left_mark(connection, bundle[0]["id"]) or ": its lead waits on it"
-            resumable = (queue_state(connection, bundle[0]["id"])["run"] is not None
-                         or _kept_host(connection, bundle[0]) is not None)
             for row in bundle[1:]:
                 if row["item"] in needed and resumable and connection.execute(
                         "UPDATE assignment SET status = 'cancelled', ended = ?, result = ? "
