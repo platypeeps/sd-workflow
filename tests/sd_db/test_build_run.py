@@ -1288,6 +1288,19 @@ class Supervise(Case):
                 mock.patch.object(build_run, "_read", return_value=""):
             self.assertIsNone(supervisor.prior_review("a" * 40), "a skipped report was chosen to verify")
 
+    def test_a_prior_report_past_sd_reviews_bound_drops_to_a_full_review(self):
+        """Review of sd:9769: `sd-review` refuses a prior report over its 2 MB input bound before it writes any
+        JSON; the next round reviews in full rather than failing twice on that refusal."""
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        supervisor.out("review").write_text(json.dumps(
+            {"status": "advisory", "scope": "branch", "subject": {"head": "b" * 40},
+             "findings": [{"path": "src.py", "line": 1, "summary": "x" * 2_000_000}]}), encoding="utf-8")
+        with mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
+                mock.patch.object(build_run, "_read", return_value=""):
+            self.assertTrue(supervisor.prior_review("a" * 40) is None, "a report sd-review refuses was chosen to verify")
+
     def test_a_prior_blocker_sd_review_would_refuse_drops_to_a_full_review(self):
         """Review of sd:9769: `sd-review` refuses a prior blocking path outside the checkout or not a tracked
         regular file; the next round reviews in full rather than failing twice on that refusal."""

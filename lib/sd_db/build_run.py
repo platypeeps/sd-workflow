@@ -312,6 +312,10 @@ class Adopted:
         return code
 
 
+#: `sd-review`'s bound on a prior report (its MAX_OUTPUT_BYTES); a larger one it refuses (pack sd:9769).
+PRIOR_REPORT_BYTES = 2_000_000
+
+
 class Unread(Exception):
     """A read gave no answer: an unknown result, never a negative one."""
 
@@ -1371,7 +1375,10 @@ class Supervisor:
             if not all(self.verifiable(row["path"], head) for row in answer["findings"]
                        if isinstance(row, dict) and row.get("disposition") == "blocking"):
                 return None  # `sd-review` would refuse it as --verify-report: review the branch in full
-            kept.write_text(json.dumps(answer), encoding="utf-8")
+            encoded = json.dumps(answer)
+            if len(encoded.encode("utf-8")) > PRIOR_REPORT_BYTES:
+                return None  # `sd-review` refuses it before writing any JSON: review the branch in full
+            kept.write_text(encoded, encoding="utf-8")
             return answer
         return None
 
