@@ -288,6 +288,19 @@ class PriorLineTests(RepeatFixture):
                                      "high", repro=True, prior=moved)
         self.assertEqual(record["disposition"], "blocking")
 
+    def test_an_unplaced_blocker_follows_its_file_through_a_rename(self) -> None:
+        """build/sd-1423 review (bin/sd-review:1846): a prior blocker with `line: null` skipped the rename, so
+        its uncited repeat at the new path found no prior blocker and posted as advisory."""
+        (self.root / "old.py").write_text("x = 1\n" * 20, encoding="utf-8")
+        old = self.commit("add", "old.py") and self.commit("old")
+        self.commit("mv", "old.py", "new.py")
+        new = self.commit("renamed")
+        prior = [dict(finding(REPRO, path="old.py", line=None), disposition="blocking")]
+        moved = sd_review.prior_at(self.root, old, new, prior)
+        self.assertEqual([(row["path"], row["line"]) for row in moved], [("new.py", None)])
+        [record] = sd_review.dispose([finding(path="new.py", line=None)], "high", repro=True, prior=moved)
+        self.assertEqual((record["disposition"], record.get("evidence")), ("blocking", REPRO))
+
     def test_the_line_map_reads_each_hunk(self) -> None:
         diff = "@@ -0,0 +1,21 @@\n+x\n@@ -5,2 +26,3 @@\n@@ -20 +42,0 @@\n"
         self.assertEqual([sd_review.moved_line(diff, line) for line in (1, 4, 5, 6, 7, 19, 20, 30)],
