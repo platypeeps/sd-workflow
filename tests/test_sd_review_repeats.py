@@ -550,16 +550,17 @@ class ReproRuleTests(unittest.TestCase):
         self.assertEqual([(row["disposition"], row.get("evidence")) for row in disposed],
                          [("blocking", REPRO), ("advisory", None)])
 
-    def test_a_line_that_cannot_be_placed_holds_nothing(self) -> None:
-        """build/sd-1423 class pass: an uncited finding with no line, or a prior blocker with none, held the
-        fallback as if near, though no code can be compared. Only an exact repeat or fresh evidence blocks."""
+    def test_a_line_that_cannot_be_placed_holds_its_file(self) -> None:
+        """build/sd-1423 review (bin/sd-review:1821): a reader repeated the empty-input crash at line 10,
+        paraphrased, with the permitted `line: null` and no evidence, and it posted as advisory. A line that
+        cannot be placed may be the blocker's, so on its file it holds (fail closed); another file is free."""
         for prior_line, line in ((10, None), (None, 12), (None, None)):
             with self.subTest(prior=prior_line, line=line):
                 prior = [dict(finding(REPRO, line=prior_line, summary="Empty input crashes"),
                               disposition="blocking")]
-                [record] = sd_review.dispose([finding(line=line, summary="the cache is never cleared")], "high",
-                                             repro=True, prior=prior)
-                self.assertEqual(record["disposition"], "advisory")
+                disposed = sd_review.dispose([finding(line=line, summary="An empty list raises IndexError"),
+                                              finding(path="b.py", line=line)], "high", repro=True, prior=prior)
+                self.assertEqual([row["disposition"] for row in disposed], ["blocking", "advisory"])
 
     def test_a_repeat_below_the_floor_does_not_clear_the_fallback(self) -> None:
         """build/sd-1423 review (bin/sd-review:1811): one reader's exact repeat at medium, under a high floor,

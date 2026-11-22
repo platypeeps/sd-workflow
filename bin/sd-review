@@ -1816,8 +1816,8 @@ def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]
         return "\n".join(dict.fromkeys(text for text in matched if isinstance(text, str) and text.strip()))
     def _near(old: Mapping[str, Any]) -> bool:  # edited or not: a partial fix keeps its defect (bin/sd-review:1814)
         lines = [row.get("line") for row in (old, record)]
-        return all(type(line) is int for line in lines) and abs(
-            lines[0] - lines[1]) <= SHIFT_LINES  # an unplaced line compares no code, so it holds nothing
+        return not all(type(line) is int for line in lines) or abs(
+            lines[0] - lines[1]) <= SHIFT_LINES  # an unplaced line may be the blocker's: it holds (sd-review:1821)
     return "" if any(_file(old, record) and _near(old) and not any(_same(old, row) for row in findings)
                      for old in blockers) else None
 
