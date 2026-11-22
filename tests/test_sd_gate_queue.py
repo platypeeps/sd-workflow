@@ -335,6 +335,25 @@ class Clock:
         return self.now
 
 
+#: The module's own tick reader: LoadRule replaces it with a FakeCpu.
+REAL_CPU_TICKS = sd_gate_slots.cpu_ticks
+
+
+class FakeCpu:
+    """CPU ticks that advance with a fake wall clock, at a busy share the test sets."""
+
+    def __init__(self, wall: Clock) -> None:
+        self.wall, self.idle, self.total = wall, 0, 0
+
+    def run(self, seconds: float, share: float) -> None:
+        self.idle += round((1 - share) * 100 * seconds)
+        self.total += round(100 * seconds)
+        self.wall.now += seconds
+
+    def ticks(self) -> tuple[int, int]:
+        return self.idle, self.total
+
+
 class LoadRule(unittest.TestCase):
     """The admission decision itself, with a fake clock and a fake load average."""
 
@@ -347,6 +366,10 @@ class LoadRule(unittest.TestCase):
         self.queue = sd_gate_slots.Queue(self.where)
         self.wall = Clock()
         self.load = (1.0, 1.0, 1.0)
+        self.cpu = FakeCpu(self.wall)
+        patch = mock.patch.object(sd_gate_slots, "cpu_ticks", self.cpu.ticks)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def admit(self, ticket, rule):
         return self.queue.admit(ticket, [self.lock.fileno()], rule, loadavg=lambda: self.load, wall=self.wall,
@@ -365,61 +388,67 @@ class LoadRule(unittest.TestCase):
         self.load = (39.9, 10.0, 10.0)
         self.assertEqual(self.admit(ticket, rule)[0], 0)
 
+    def busy_admit(self, ticket, share):
+        """One admission under limit 24 on 16 cores with load 300, the CPU sample `share`."""
+        rule = sd_gate_slots.LoadRule(limit=24.0, settle=0.0, source="test")
+        with mock.patch.object(sd_gate_slots.os, "cpu_count", lambda: 16):
+            return self.queue.admit(ticket, [self.lock.fileno()], rule, loadavg=lambda: (300.0, 300.0, 300.0),
+                                    wall=self.wall, busy=lambda: share)
+
     def test_a_load_the_cpu_does_not_carry_admits(self):
         """sd:9946: a simulator held load5 at 277-458 with the CPU 37% idle; the limit reads CPU use then."""
-        rule = sd_gate_slots.LoadRule(limit=24.0, settle=0.0, source="test")
         ticket = self.queue.enter("gate", "/", wall=self.wall)
-        self.load = (300.0, 300.0, 300.0)
-        self.assertIsNone(self.admit(ticket, rule)[0], "an unread CPU keeps load5 as the fallback")
-        shares = iter([0.95, 0.63, 0.63])
-
-        def admit():
-            return self.queue.admit(ticket, [self.lock.fileno()], rule, loadavg=lambda: self.load,
-                                    wall=self.wall, busy=lambda: next(shares))
+        self.assertIn("load 300.0", self.busy_admit(ticket, None)[1], "an unread CPU keeps load5")
+        self.cpu.run(60, 0.63)
+        self.assertIn("load 300.0", self.busy_admit(ticket, 0.95)[1], "a busy sample now")
+        self.cpu.run(60, 0.63)
         # Pinned: on 40 cores 0.63 busy counts 25.2, over the limit of 24.
-        with mock.patch.object(sd_gate_slots.os, "cpu_count", lambda: 16):
-            self.assertIn("load 300.0", admit()[1])
-            self.wall.now += sd_gate_slots.CPU_SMOOTH_SECONDS
-            self.assertIn("load 300.0", admit()[1], "the 95% reading a minute ago")
-            self.wall.now += sd_gate_slots.CPU_SMOOTH_SECONDS
-            self.assertEqual(admit()[0], 0)
+        self.assertEqual(self.busy_admit(ticket, 0.63)[0], 0)
 
     def test_one_short_cpu_sample_does_not_drop_the_counted_load(self):
         """Lane blocker: 16 cores, limit 24, load5 300, and one 63% sample admitted at once."""
-        rule = sd_gate_slots.LoadRule(limit=24.0, settle=0.0, source="test")
         ticket = self.queue.enter("gate", "/", wall=self.wall)
-        self.load = (300.0, 300.0, 300.0)
-        shares = [0.63]
+        self.assertIn("load 300.0", self.busy_admit(ticket, 0.63)[1], "one sample")
+        self.cpu.run(30, 0.63)
+        self.assertIn("load 300.0", self.busy_admit(ticket, 0.63)[1], "30 s of samples")
+        self.cpu.run(30, 0.63)
+        self.assertEqual(self.busy_admit(ticket, 0.63)[0], 0, "a minute at 63%")
 
-        def admit():
-            return self.queue.admit(ticket, [self.lock.fileno()], rule, loadavg=lambda: self.load,
-                                    wall=self.wall, busy=lambda: shares[0])
-        with mock.patch.object(sd_gate_slots.os, "cpu_count", lambda: 16):
-            self.assertIn("load 300.0", admit()[1], "one sample")
-            self.wall.now += 30
-            self.assertIn("load 300.0", admit()[1], "30 s of samples")
-            shares[0] = 0.95
-            self.wall.now += 29
-            self.assertIn("load 300.0", admit()[1])
-            shares[0] = 0.63
-            self.wall.now += 31
-            self.assertIn("load 300.0", admit()[1], "a 95% reading 31 s ago")
-            self.wall.now += 60
-            self.assertEqual(admit()[0], 0, "a minute of 63% readings")
+    def test_two_samples_far_apart_do_not_hide_the_busy_time_between(self):
+        """Review blocker: two 63% samples 119 s apart, nothing read between, counted load 300 as 10.08."""
+        ticket = self.queue.enter("gate", "/", wall=self.wall)
+        self.assertIn("load 300.0", self.busy_admit(ticket, 0.63)[1])
+        self.cpu.run(119, 1.0)
+        self.assertIn("load 300.0", self.busy_admit(ticket, 0.63)[1], "119 s fully busy, unobserved")
 
-    def test_the_busy_history_drops_bad_rows_and_a_clock_set_back(self):
-        now = 1_000_000.0
+    def test_probes_five_minutes_apart_read_the_cpu_between(self):
+        """Review blocker: a probe every five minutes discarded the last one and always read load 300."""
+        ticket = self.queue.enter("gate", "/", wall=self.wall)
+        self.assertIn("load 300.0", self.busy_admit(ticket, 0.63)[1])
+        self.cpu.run(300, 0.63)
+        self.assertEqual(self.busy_admit(ticket, 0.63)[0], 0)
+
+    def test_the_busy_history_drops_bad_rows_a_clock_set_back_and_a_reboot(self):
+        now = self.wall.now
         history = self.where / sd_gate_slots.CPU_HISTORY
-        history.write_text("[[" + str(now - 61) + ", 0.5], [\"x\", 0.2], [" + str(now - 30)
-                           + ", 2.0], [" + str(now + 5) + ", 0.1], 7]", encoding="utf-8")
-        self.assertIsNone(sd_gate_slots.steady_busy(self.where, 0.3, now), "a 200% reading counts unread")
+        self.cpu.run(0, 0)
+        history.write_text(f'[[{now - 61}, "x", 1], [{now + 5}, 0, 0], ["y", 1, 2], 7, [{now - 61}, 5, 3]]',
+                           encoding="utf-8")
+        self.assertIsNone(sd_gate_slots.steady_busy(self.where, 0.3, now), "no good row")
         history.write_text("not json\n", encoding="utf-8")
         self.assertIsNone(sd_gate_slots.steady_busy(self.where, 0.3, now))
+        self.cpu.run(61, 0.5)
+        self.assertEqual(sd_gate_slots.steady_busy(self.where, 0.3, self.wall.now), 0.5)
+        self.assertIsNone(sd_gate_slots.steady_busy(self.where, None, self.wall.now), "an unread sample")
         self.assertIsNone(sd_gate_slots.steady_busy(self.where, 0.3, now - 120), "the clock went back")
-        self.assertEqual(sd_gate_slots.steady_busy(self.where, 0.2, now - 60), 0.3)
-        self.assertIsNone(sd_gate_slots.steady_busy(self.where, None, now))
-        self.assertIsNone(sd_gate_slots.steady_busy(self.where, 0.2, now + 61), "an unread reading")
-        self.assertEqual(sd_gate_slots.steady_busy(self.where, 0.2, now + 122), 0.2)
+        self.cpu.idle, self.cpu.total = 0, 0
+        self.cpu.run(30, 0.5)
+        self.assertIsNone(sd_gate_slots.steady_busy(self.where, 0.3, self.wall.now), "ticks fell: a reboot")
+        self.cpu.run(sd_gate_slots.CPU_HISTORY_SECONDS + 1, 0.5)
+        self.assertIsNone(sd_gate_slots.steady_busy(self.where, 0.3, self.wall.now), "every row too old")
+        with mock.patch.object(sd_gate_slots, "cpu_ticks", lambda: None):
+            self.cpu.run(61, 0.5)
+            self.assertIsNone(sd_gate_slots.steady_busy(self.where, 0.3, self.wall.now), "unread ticks")
 
     def test_the_cpu_sample_waits_outside_the_queue_lock(self):
         """Review finding: a 1.1 s sample under the admission lock held every enter, leave and status."""
@@ -494,8 +523,8 @@ class LoadRule(unittest.TestCase):
         sd_gate_slots.host_port.cache_clear()
         with mock.patch.object(sd_gate_slots.sys, "platform", "darwin"), \
                 mock.patch("ctypes.CDLL", lambda _: System):
-            self.assertEqual(sd_gate_slots.cpu_ticks(), (3, 10))
-            self.assertEqual(sd_gate_slots.cpu_ticks(), (3, 10))
+            self.assertEqual(REAL_CPU_TICKS(), (3, 10))
+            self.assertEqual(REAL_CPU_TICKS(), (3, 10))
         sd_gate_slots.host_port.cache_clear()
         self.assertEqual(len(calls), 1)
 
@@ -503,14 +532,15 @@ class LoadRule(unittest.TestCase):
         sd_gate_slots.host_port.cache_clear()
         with mock.patch.object(sd_gate_slots.sys, "platform", "darwin"), \
                 mock.patch.dict(sys.modules, {"ctypes": None}):
-            self.assertIsNone(sd_gate_slots.cpu_ticks())
+            self.assertIsNone(REAL_CPU_TICKS())
         sd_gate_slots.host_port.cache_clear()
 
     def test_status_reports_the_counted_load(self):
-        for at in (self.wall.now - 60, self.wall.now):
+        for seconds in (0, 60):
+            self.cpu.run(seconds, 0.5)
             report = sd_gate_slots.snapshot(self.where, 1, sd_gate_slots.LoadRule(24.0, 0.0, "test"),
                                             loadavg=lambda: (300.0, 300.0, 300.0), busy=lambda: 0.5,
-                                            wall=lambda at=at: at)
+                                            wall=self.wall)
         self.assertEqual((report["cpu_busy"], report["load_counted"]),
                          (0.5, round(0.5 * (os.cpu_count() or 1), 2)))
 

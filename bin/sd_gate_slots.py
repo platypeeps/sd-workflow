@@ -232,10 +232,15 @@ CPU_SAMPLE_SECONDS = 1.1
 CPU_SAMPLE_MAX_AGE = 60.0
 
 
-#: How far back `steady_busy` reads: the counted load falls no faster than this. One 1.1 s sample alone let
-#: load5 300 count 10 on 16 cores and erased the settle time load5 gives (sd:9946 lane review).
+#: The least span `steady_busy` averages the CPU over: the counted load falls no faster than this. One 1.1 s
+#: sample alone let load5 300 count 10 on 16 cores and erased the settle time load5 gives (sd:9946 review).
 CPU_SMOOTH_SECONDS = 60.0
-#: The busy readings `steady_busy` keeps, as JSON [[wall time, share or null], ...], in the gate directory.
+#: The oldest row `steady_busy` averages from, as far back as load5 reaches and twice over, so probes five
+#: minutes apart still read the CPU between them.
+CPU_HISTORY_SECONDS = 600.0
+#: The least gap between two rows `steady_busy` keeps: a poller every 0.25 s would grow the file.
+CPU_ROW_SECONDS = 5.0
+#: The CPU tick rows `steady_busy` keeps, as JSON [[wall time, idle, total], ...], in the gate directory.
 CPU_HISTORY = "cpu-busy.json"
 
 #: (monotonic time, ticks) of this process's previous `cpu_busy` sample.
@@ -304,34 +309,31 @@ def cpu_busy(ticks: Callable[[], tuple[int, int] | None] = cpu_ticks,
 
 
 
-def busy_share(value: object) -> float | None:
-    """`value` as a busy share, 0 to 1, or None when it is not one."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
-        return None
-    return float(value)
-
-
-def busy_rows(text: bytes, now: float) -> list[tuple[float, float | None]]:
-    """The `CPU_HISTORY` rows of the last two `CPU_SMOOTH_SECONDS` up to `now`; a bad row is left out."""
+def busy_rows(text: bytes, now: float) -> list[tuple[float, int, int]]:
+    """The `CPU_HISTORY` rows of the last `CPU_HISTORY_SECONDS` up to `now`; a bad row is left out."""
     try:
         loaded = json.loads(text.decode("utf-8") or "[]")
     except ValueError:
         return []
     rows = []
     for row in loaded if isinstance(loaded, list) else []:
-        if isinstance(row, list) and len(row) == 2 and isinstance(row[0], (int, float)) \
-                and now - 2 * CPU_SMOOTH_SECONDS <= row[0] <= now:
-            rows.append((float(row[0]), busy_share(row[1])))
+        if (isinstance(row, list) and len(row) == 3 and isinstance(row[0], (int, float))
+                and all(type(value) is int and value >= 0 for value in row[1:]) and row[1] <= row[2]
+                and now - CPU_HISTORY_SECONDS <= row[0] <= now):
+            rows.append((float(row[0]), row[1], row[2]))
     return rows
 
 
 def steady_busy(where: pathlib.Path, share: float | None, now: float) -> float | None:
-    """The highest busy share read under `where` over the last `CPU_SMOOTH_SECONDS`, `share` and `now` added.
+    """The busy share a load limit counts: the higher of `share`, the sample just taken, and the CPU's
+    average since the newest tick row under `where` at least `CPU_SMOOTH_SECONDS` old (sd:9946).
 
-    None, so the load counts in full, until the readings reach that far back, or when one in that time is
-    unread. Every process that reads the load shares the readings; a bad row or the clock set back counts
-    as no reading. The readings are kept under a lock on their file, so two readers lose neither's row.
+    The average covers every second since that row, read or not, so no busy time between two samples
+    goes unseen. None, so the load counts in full, while `share` or the ticks are unread, no row is
+    old enough, or the ticks fell (a reboot). Every process that reads the load shares the rows, under
+    a lock on their file; a bad row or the clock set back counts as no row.
     """
+    ticks = cpu_ticks()
     try:
         where.mkdir(parents=True, exist_ok=True)
         fd = os.open(where / CPU_HISTORY, os.O_RDWR | os.O_CREAT, 0o644)
@@ -339,18 +341,21 @@ def steady_busy(where: pathlib.Path, share: float | None, now: float) -> float |
         return None
     try:
         fcntl.flock(fd, fcntl.LOCK_EX)
-        rows = [*busy_rows(os.pread(fd, os.fstat(fd).st_size, 0), now), (now, busy_share(share))]
-        os.ftruncate(fd, 0)
-        os.pwrite(fd, json.dumps([list(row) for row in rows]).encode("utf-8"), 0)
+        rows = busy_rows(os.pread(fd, os.fstat(fd).st_size, 0), now)
+        if ticks is not None and (not rows or now - rows[-1][0] >= CPU_ROW_SECONDS):
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, json.dumps([list(row) for row in [*rows, (now, *ticks)]]).encode("utf-8"), 0)
     except OSError:
         return None
     finally:
         os.close(fd)
-    anchors = [at for at, _ in rows if at <= now - CPU_SMOOTH_SECONDS]
-    window = [value for at, value in rows if anchors and at >= max(anchors)]
-    if not window or None in window:
+    anchors = [row for row in rows if row[0] <= now - CPU_SMOOTH_SECONDS]
+    if share is None or not 0 <= share <= 1 or ticks is None or not anchors:
         return None
-    return max(value for value in window if value is not None)
+    idle, total = ticks[0] - anchors[-1][1], ticks[1] - anchors[-1][2]
+    if total <= 0 or not 0 <= idle <= total:
+        return None
+    return max(share, 1.0 - idle / total)
 
 
 def counted_load(load: float, busy: float | None, cores: int | None = None) -> float:

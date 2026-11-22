@@ -1013,10 +1013,11 @@ class Runner(Lane):
                 mock.patch.object(sd_gate_slots.os, "cpu_count", lambda: 16):
             now = [1_000_000.0]
             with mock.patch.object(sd_gate_slots, "cpu_busy", lambda: 0.63), \
+                    mock.patch.object(sd_gate_slots, "cpu_ticks", lambda: (int(now[0] * 37), int(now[0] * 100))), \
                     mock.patch.object(sd_lane.time, "time", lambda: now[0]):
                 self.assertIn("load5 300.0", sd_lane.load_stop(environ) or "", "one sample")
-                now[0] += sd_gate_slots.CPU_SMOOTH_SECONDS
-                self.assertIsNone(sd_lane.load_stop(environ))
+                now[0] += 300
+                self.assertIsNone(sd_lane.load_stop(environ), "a probe five minutes later")
             for share in (0.95, None):
                 with mock.patch.object(sd_gate_slots, "cpu_busy", lambda share=share: share):
                     self.assertIn("load5 300.0", sd_lane.load_stop(environ) or "", share)
