@@ -63,6 +63,24 @@
   let DOC = null, AREAS = [], ROWS = [], SNOOZED = [], IGNORED = [], selected = null, query = '';
   let SUMMARY = null, VIEW = null, showing = 'findings', repos = 'managed';
   const S = {}, readers = {}; // each view's last reading and its reader
+  // The Machine view's chooser (sd:9757): the hub first, then each machine with a stored reading. The viewer's pick is
+  // kept in localStorage; the hub is no ?host=, another machine its stored reading at /api/health/machine?host=<name>.
+  const HOST_KEY = 'health.machine';
+  let host = (() => { try { return localStorage.getItem(HOST_KEY) || ''; } catch (_) { return ''; } })();
+  const machineSource = () => host ? `/api/health/machine?host=${encodeURIComponent(host)}` : '/api/health/machine';
+  function chooseHost(value) {
+    const hub = S.machine?.DOC?.machines?.hub;
+    host = value === hub ? '' : value;
+    try { localStorage.setItem(HOST_KEY, host); } catch (_) { /* blocked: the choice lasts this page */ }
+    selected = null;
+    return load();
+  }
+  function chooser() {
+    const m = DOC?.machines; if (!m || VIEW !== 'machine') return '';
+    const shown = DOC.host || m.hub;
+    return html`<p class="counts machine-pick"><label>Machine <select id="machine-host">${m.hosts.map(h => html`<option value="${h}"${h === shown ? html` selected` : ''}>${h === m.hub ? `${h} · hub` : h}</option>`)}</select></label>${
+      DOC.host ? html` · Readings of ${DOC.host}, as its own job stored them` : ''}${m.error ? html` · ${m.error}` : ''}</p>`;
+  }
   const F = { state: new Set(), area: new Set() };
   const byId = id => ROWS.find(r => r.id === id);
   // Show: the areas' rows, or the ignored ones. State does the rest: it starts on the states that want something
@@ -96,9 +114,15 @@
   const areaShown = a => a.rows.some(passes) || ((!F.state.size || atStart()) && !query && (!F.area.size || F.area.has(a.id)));
   const loud = { warning: 0, caution: 1, unknown: 2 };
 
+  // The summary's lamps, with a chosen machine's own in place of the hub's Disk and Services (review round 6).
+  const ownLamps = () => S.machine?.DOC?.host && S.machine.DOC.lamps;
+  const lampsNow = () => {
+    const L = SUMMARY ? SUMMARY.lamps : [], own = ownLamps();
+    return own ? L.map(l => own.find(o => o.id === l.id) || l) : L;
+  };
   // Every area's lamp, from the summary: pressing one opens its view with its area alone, or toggles it in this view.
   function lamps() {
-    const L = SUMMARY ? SUMMARY.lamps : [];
+    const L = lampsNow();
     put($('annunciator'), cells([...L.filter(l => !NO_LAMP.has(l.id)).map(l => ({ button: true, state: l.state, pressed: F.area.has(l.id),
       attrs: html` data-area="${l.id}"`, label: l.name, mark: I(LOOK[l.id]?.[0] || 'circle-help'), val: lampValue(l),
       sr: `state ${l.state} · ${l.view === VIEW ? `shows only ${l.name} rows` : `opens ${PAGE_VIEWS.find(v => v.id === l.view)?.label}`}` }))]));
@@ -242,7 +266,7 @@
   // The open view's panel: its filters, the filter note and its areas. Another view's panel keeps what it last drew.
   function apply() {
     if (!VIEW) return;
-    put($(`body-${VIEW}`), html`${DOC ? filters() : ''}${DOC && showing === 'ignored' ? ignored() : areas()}`);
+    put($(`body-${VIEW}`), html`${chooser()}${DOC ? filters() : ''}${DOC && showing === 'ignored' ? ignored() : areas()}`);
     // The selection is always a row the viewer can see: the first visible one, or none with the reason.
     // sd:9312: S[VIEW] is undefined until the view's first read settles, null after a failed one.
     shell.reconcile({ rows: document.querySelectorAll('.ledger tbody tr[data-id]'), current: selected, select: id => select(id, false),
@@ -256,7 +280,7 @@
   function attention() {
     window.PAGE_ATTENTION = SUMMARY && SUMMARY.attention || { state: 'unknown', n: 0, what: 'rows' };
     shell.attention(window.PAGE_ATTENTION);
-    const a = window.PAGE_ATTENTION, failed = SUMMARY ? SUMMARY.lamps.filter(l => l.error).length : 0;
+    const a = window.PAGE_ATTENTION, failed = lampsNow().filter(l => l.error).length;
     put($('subhead'), SUMMARY ? html`${plural(PAGE_VIEWS.length, 'view')} · ${a.n ? `${a.n} ${a.state} ${a.n === 1 ? 'row wants' : 'rows want'} you` : 'no row wants you'}${failed ? ` · ${plural(failed, 'area')} not read` : ''} · read <time class="rel" datetime="${SUMMARY.read}"></time>`
       : html`Health's summary could not be read.`);
   }
@@ -265,7 +289,8 @@
   const readSummary = () => shell.getJSON('/api/health/summary').then(doc => { SUMMARY = doc; }, () => { SUMMARY = null; })
     .then(() => {
       attention(); lamps();
-      PAGE_VIEWS.forEach(v => { const L = SUMMARY ? SUMMARY.lamps.filter(l => l.view === v.id) : [];
+      // A chosen machine's tab counts its own areas alone: the view shows no other.
+      PAGE_VIEWS.forEach(v => { const L = v.id === 'machine' && ownLamps() || lampsNow().filter(l => l.view === v.id);
         shell.view.count(v.id, L.length && L.every(l => l.n != null) ? L.reduce((n, l) => n + l.n, 0) : null); });
     });
 
@@ -277,7 +302,7 @@
   // dropped the Observed lamp. Re-run collector, on the protection collector, runs the sync first.
   window.PAGE_AGAIN = { title: 'Refresh this view and the status lights', run: load };
   const spec = view => ({
-    source: `/api/health/${view}`, what: `the ${PAGE_VIEWS.find(v => v.id === view).label} rows`,
+    source: view === 'machine' ? machineSource : `/api/health/${view}`, what: `the ${PAGE_VIEWS.find(v => v.id === view).label} rows`,
     // Each view's reading state sits in its own panel, and a late read of a view not open leaves the selection alone.
     slot: `state-${view}`, active: () => view === VIEW,
     adopt: doc => {
@@ -288,7 +313,7 @@
       const hidden = areas.flatMap(a => a.snoozed), forever = r => r.until === window.snooze.FOREVER;
       S[view] = { DOC: doc, AREAS: areas, ROWS: areas.flatMap(a => a.rows), SNOOZED: hidden.filter(r => !forever(r)), IGNORED: hidden.filter(forever) };
       if (view === VIEW) use(view);
-      const { ROWS: rows } = S[view], snoozed = hidden, failed = areas.filter(a => a.error || a.stale), source = `/api/health/${view}`;
+      const { ROWS: rows } = S[view], snoozed = hidden, failed = areas.filter(a => a.error || a.stale), source = view === 'machine' ? machineSource() : `/api/health/${view}`;
       return { objects: [...rows.map(r => ({ ...r, label: r.what })), ...snoozed.map(window.snooze.object)],
         state: failed.length ? { kind: 'partial', text: `${failed.map(a => `${a.name}: ${a.error || a.stale}`).join(' · ')}. The other areas are current.`, source }
           : doc.snooze_error ? window.snooze.unread(doc.snooze_error, source) : null };
@@ -368,7 +393,10 @@
     return `Not known what changed · ${o.facts.Label}: ${e.message}. Health was read again; check the row before you act again.`;
   });
   const statusHref = o => (o.list || []).find(x => x.href)?.href || o.url || '';
-  const can = action => o => revised(o) === true ? (o.can[action].allowed || o.can[action].reason) : revised(o);
+  // A satellite's row is a stored reading: an action here would run on this hub, so its line is for that host.
+  const local = o => !o.host || `read on ${o.host}: this hub would run it on itself; run the line on ${o.host}`;
+  const can = action => o => local(o) !== true ? local(o)
+    : revised(o) === true ? (o.can[action].allowed || o.can[action].reason) : revised(o);
   window.PAGE_COMMANDS = [
     { label: 'Read Health again', icon: 'rotate-ccw', run: () => load() },
     { label: 'Open Sessions in Management', icon: 'folder-x', run: () => { location.href = '/management#view=sessions'; } },
@@ -394,14 +422,14 @@
         consequence: o => `Files "${o.what}" in the system repo, or reuses the open item that has it, then opens a Claude session that fixes it (herdr).`,
         run: o => shell.post('/api/items', { title: o.what, body: `Doctor: ${o.detail}`, ref: `doctor:${pathOf(o)}` }).then(filed => DOCTOR_FIX.run({ ...o, filed })) },
       { id: 'storage folder.du', on: 'storage folder', label: 'Show biggest', does: 'Lists this folder\'s biggest entries in Details.', key: 'b', icon: 'chart-no-axes-column', risk: 'safe', executes: true, primary: () => true,
-        cli: o => o.cli, sends: o => `POST /api/actions/run {action: storage.du, path: ${pathOf(o)}}`, run: o => run(o, 'storage.du', { path: pathOf(o) }) },
+        cli: o => o.cli, sends: o => `POST /api/actions/run {action: storage.du, path: ${pathOf(o)}}`, run: o => run(o, 'storage.du', { path: pathOf(o) }), when: local },
       { id: 'build output.rm', on: 'build output', label: 'Remove build output', does: 'Deletes build output in merged, clean worktrees; this cannot be undone.', key: 'r', icon: 'folder-x', risk: 'confirm', executes: true, primary: () => true,
         when: o => revised(o) === true ? (o.remove.length ? true : 'every merged worktree has uncommitted changes: nothing is removed') : revised(o),
         cli: o => o.cli, consequence: o => `Deletes ${o.remove.length} build output folders in merged, clean worktrees: ${names(o.remove)}.`
           + (o.kept.length ? ` Keeps ${o.kept.length} with uncommitted changes: ${names(o.kept)}.` : '') + ' Each worktree is checked again first. This cannot be undone.', run: cleanup },
       // Volume rows are the build's: the design draws volumes as bars only. Its line shows the volume's use in a terminal.
       { id: 'volume.df', on: 'volume', label: 'Show use', does: 'Shows this volume\'s use in Details.', key: 'b', icon: 'gauge', risk: 'safe', executes: true, primary: () => true,
-        cli: o => o.cli, sends: o => `POST /api/actions/run {action: volume.df, path: ${pathOf(o)}}`, run: o => run(o, 'volume.df', { path: pathOf(o) }) },
+        cli: o => o.cli, sends: o => `POST /api/actions/run {action: volume.df, path: ${pathOf(o)}}`, run: o => run(o, 'volume.df', { path: pathOf(o) }), when: local },
       { id: 'worktree registrations.prune', on: 'worktree registrations', label: 'Prune registrations', does: 'Removes registrations of worktrees whose folders are gone; cannot be undone.', key: 'p', risk: 'confirm',
         executes: true, primary: () => true, cli: CLEAN['worktree registrations'].cli, when: CLEAN['worktree registrations'].ready,
         consequence: o => `Removes ${o.facts.Registered} worktree registrations whose directories are gone: ${names(o.list)}. No directory is touched.`, run: cleanup },
@@ -494,11 +522,14 @@
       const col = e.target.closest('.pmx-col'); if (col) { select(col.dataset.row, true); return; }
       const tr = e.target.closest('tbody tr[data-id]'); if (tr) select(tr.dataset.id, true);
     }));
-    PAGE_VIEWS.forEach(v => $(`view-${v.id}`).addEventListener('change', e => shell.list.pickChange(e, F, () => { lamps(); apply(); })));
+    PAGE_VIEWS.forEach(v => $(`view-${v.id}`).addEventListener('change', e => {
+      if (e.target.id === 'machine-host') { chooseHost(e.target.value); return; }
+      shell.list.pickChange(e, F, () => { lamps(); apply(); });
+    }));
     // A lamp is the Area pick's value for its area: pressing it adds the area to the filter, pressing it again takes it out.
     $('annunciator').addEventListener('click', e => {
       const c = e.target.closest('button.cell'); if (!c) return;
-      const id = c.dataset.area, lamp = SUMMARY?.lamps.find(l => l.id === id);
+      const id = c.dataset.area, lamp = lampsNow().find(l => l.id === id);
       if (lamp && lamp.view !== VIEW) { F.area.clear(); F.area.add(id); shell.view.show(lamp.view); return; }
       F.area.has(id) ? F.area.delete(id) : F.area.add(id);
       lamps(); apply();

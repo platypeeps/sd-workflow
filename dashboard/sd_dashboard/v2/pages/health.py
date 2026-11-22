@@ -8,6 +8,8 @@ are read-only: the page writes no vault note (sd:5134)."""
 
 from __future__ import annotations
 
+import re
+
 from . import Api, Page
 
 
@@ -26,12 +28,19 @@ def _part(read):
     from ... import health_screen
 
     name = read.path.rsplit("/", 1)[1]
+    asked = read.parameters or {}
+    if name not in health_screen.VIEW_AREAS and name != "summary":
+        return 404, {"error": f"Health has no view {name!r}: it has summary, {', '.join(health_screen.VIEW_AREAS)}."}
+    # sd:9757: the Machine view takes one `host`, another machine's stored reading; no other read takes a query.
+    host = asked.get("host", [""])
+    if (set(asked) - ({"host"} if name == "machine" else set()) or len(host) != 1
+            or (host[0] and not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,62}", host[0]))):
+        return 400, {"error": "Health's Machine view takes one host, a short host name; no other read takes a query."}
     if name == "summary":
         return health_screen.summary(read.connection, now=read.now, **_seams(read))
-    if name not in health_screen.VIEW_AREAS:
-        return 404, {"error": f"Health has no view {name!r}: it has summary, {', '.join(health_screen.VIEW_AREAS)}."}
     # A view gives its read slot back before it waits on a walker (sd:7898); the summary waits on none.
-    return health_screen.part(read.connection, name, now=read.now, release=read.release, **_seams(read))
+    return health_screen.part(read.connection, name, now=read.now, release=read.release, host=host[0] or None,
+                              **_seams(read))
 
 
 def _cleanup(payload, principal):
@@ -45,7 +54,7 @@ PAGE = Page(
     routes=("/fleet-health",),
     html="health.html",
     item="sd:2115",
-    api=(Api("/api/health", _read), Api(pattern=r"/api/health/[a-z]+", example="/api/health/summary", read=_part),
+    api=(Api("/api/health", _read), Api(pattern=r"/api/health/[a-z]+", example="/api/health/summary", read=_part, query=True),
          Api("/api/health/cleanup", write=_cleanup)),
     count="/api/health/summary",
 )

@@ -68,6 +68,10 @@ PARK_FIELDS = frozenset({"parked_at"})
 #: reads it ahead of the repository rule, so a vault task can sit in Home
 #: alone. `edit_item` sets and clears it against `areas`; `item_area` reads it.
 AREA_FIELDS = frozenset({"area"})
+#: `blocked_by`, the items an item waits on (pack sd:9570), kept as
+#: `item.fields.blocked_by`, a sorted list of ids. `edit_item` sets the whole
+#: set and clears it; a build reads it (`build._item`) and nothing writes on a done.
+DEPENDENCY_FIELDS = frozenset({"blocked_by"})
 AREAS = ("home", "hoa", "personal")
 #: A realm id, as the dashboard's `places.parse_realms` takes one.
 AREA_ID = re.compile(r"[a-z0-9][a-z0-9-]*")
@@ -90,6 +94,28 @@ def areas(connection: sqlite3.Connection) -> tuple[str, ...]:
                 and fields[1] != "all"):
             found.setdefault(fields[1])
     return tuple(found)
+
+
+def is_item_id(value: Any) -> bool:
+    """Whether `value` can name an item row: a positive int no larger than SQLite's largest integer."""
+    return type(value) is int and 0 < value <= 2**63 - 1
+
+
+def item_blocked_by(item: Any) -> list[int]:
+    """The ids an item row waits on, `fields.blocked_by`, sorted; `[]` when it names none (pack sd:9570).
+
+    ValueError when the fields or the key cannot be read: a build reads that as a wait, never as none.
+    """
+    try:
+        fields = json.loads(item["fields"] or "{}")
+    except (TypeError, ValueError, RecursionError):
+        raise ValueError("fields cannot be read") from None
+    if not isinstance(fields, dict):
+        raise ValueError("fields cannot be read")
+    found = fields.get("blocked_by", [])
+    if not isinstance(found, list) or not all(is_item_id(value) for value in found):
+        raise ValueError("blocked_by is not a list of item ids")
+    return sorted(set(found))
 
 
 def item_area(item: Any) -> str | None:
@@ -310,7 +336,8 @@ def schema_kinds(connection: sqlite3.Connection) -> tuple[str, ...]:
 def _fields(connection: sqlite3.Connection, changes: dict) -> dict:
     if not isinstance(changes, dict) or any(not isinstance(key, str) for key in changes):
         raise WorkflowError("changes must be an object with named fields")
-    unknown = set(changes) - USER_FIELDS - RECURRENCE_FIELDS - BRANCH_FIELDS - PARK_FIELDS - AREA_FIELDS
+    unknown = (set(changes) - USER_FIELDS - RECURRENCE_FIELDS - BRANCH_FIELDS - PARK_FIELDS - AREA_FIELDS
+               - DEPENDENCY_FIELDS)
     if unknown:
         raise WorkflowError(f"fields cannot be edited here: {', '.join(sorted(unknown))}")
     result = dict(changes)
@@ -327,6 +354,11 @@ def _fields(connection: sqlite3.Connection, changes: dict) -> dict:
         known = areas(connection)
         if not isinstance(result["area"], str) or result["area"] not in known:
             raise WorkflowError(f"area must be one of {', '.join(known)}, or null")
+    if "blocked_by" in result and result["blocked_by"] is not None:
+        named = result["blocked_by"]
+        if not isinstance(named, list) or not all(is_item_id(value) for value in named):
+            raise WorkflowError("blocked_by must be a list of item ids, or null")
+        result["blocked_by"] = sorted(set(named)) or None
     if "title" in result:
         result["title"] = _text(result["title"], "title")
     if "body" in result:
@@ -579,6 +611,8 @@ def edit_item(
                                 "which moves its file")
         values = _park(item, row, values)
         values = _area(item, row, values)
+        area_moved = "fields" in values
+        values, waits = _blocked_by(connection, item, row, values, who=who)
         if "body" in values and row["kind"] not in ("task", "followup"):
             raise WorkflowError("body text can only be edited here for task and followup items")
         if "repo" in values and row["kind"] == "work" and values["repo"] != row["repo"]:
@@ -604,10 +638,17 @@ def edit_item(
             if "parked_at" in changed:
                 lines.append(f"{'Unparked' if changed['parked_at'] is None else 'Parked'} by {who}"
                              + (f": {park_reason}" if park_reason else ""))
-            # `fields` carries `area` alone here (`_area`), so the note names the area.
-            fields = sorted({"area" if key == "fields" else key for key in changed} - {"kind", "parked_at"})
+            # `fields` carries `area` (`_area`) and `blocked_by` (`_blocked_by`), so the note names each.
+            fields = sorted(({key for key in changed if key != "fields"} | ({"area"} if area_moved else set()))
+                            - {"kind", "parked_at"})
             if fields:
                 lines.append(f"Updated {', '.join(fields)} by {who}")
+            if waits is not None:
+                lines.append(waits)
+                from .runner import queue_contradiction  # runner imports this module
+
+                if contradiction := queue_contradiction(connection):
+                    raise WorkflowError(f"item {item} cannot wait on that: {contradiction}")
             add_note(connection, item, "comment", "\n".join(lines), session=who)
         return item_state(connection, item)
 
@@ -634,6 +675,107 @@ def _area(item: int, row: Any, values: dict) -> dict:
         fields["area"] = area
     values["fields"] = json.dumps(fields, sort_keys=True) if fields else None
     return values
+
+
+def _blocked_by(connection: sqlite3.Connection, item: int, row: Any, values: dict, *,
+                who: str) -> tuple[dict, str | None]:
+    """`values` with `blocked_by` folded into the row's `fields`, and the note line, or None for no change
+    (pack sd:9570).
+
+    Refused, so nothing is written: a done item, the item itself, an item
+    that does not exist, and a set that closes a cycle among open items,
+    which would leave each waiting on the other for ever.
+    """
+    if "blocked_by" not in values:
+        return values, None
+    values = dict(values)
+    named = values.pop("blocked_by") or []
+    base = values["fields"] if "fields" in values else row["fields"]
+    try:
+        fields = json.loads(base or "{}")
+    except (TypeError, ValueError, RecursionError):
+        fields = None
+    if not isinstance(fields, dict):
+        raise WorkflowError(f"item {item} has unreadable fields; what it waits on cannot be set here")
+    if named == fields.get("blocked_by", []):
+        return values, None  # no change: no write, no note, the revision holds
+    if named and row["status"] == "done":
+        raise WorkflowError(f"item {item} is done; a done item waits on nothing")
+    if item in named:
+        raise WorkflowError(f"item {item} cannot wait on itself")
+    for other in named:
+        if connection.execute("SELECT 1 FROM item WHERE id = ?", (other,)).fetchone() is None:
+            raise WorkflowError(f"no item {other}; name an item that exists")
+    _refuse_cycle(connection, item, named)
+    if named:
+        fields["blocked_by"] = named
+        line = f"Waits on {', '.join(f'sd:{other}' for other in named)}; set by {who}"
+    else:
+        fields.pop("blocked_by", None)
+        line = f"Waits on nothing; cleared by {who}"
+    values["fields"] = json.dumps(fields, sort_keys=True) if fields else None
+    return values, line
+
+
+def _refuse_cycle(connection: sqlite3.Connection, item: int, named: list[int]) -> None:
+    """Refuse a set under which `item` would wait, through the open items it names, on itself.
+
+    A done item holds nothing, so its stale set takes no part (pack sd:9591); nor does a set that cannot be read.
+    """
+    seen: set[int] = set()
+    path = {other: other for other in named}
+    queue = list(named)
+    while queue:
+        current = queue.pop()
+        if current in seen:
+            continue
+        seen.add(current)
+        found = connection.execute("SELECT status, fields FROM item WHERE id = ?", (current,)).fetchone()
+        if found is None or found["status"] == "done":
+            continue
+        try:
+            following = item_blocked_by(found)
+        except ValueError:
+            continue
+        for other in following:
+            if other == item:
+                raise WorkflowError(f"sd:{path[current]} already waits on sd:{item}, so sd:{item} cannot wait on it")
+            path.setdefault(other, path[current])
+            queue.append(other)
+
+
+def reopen_waits(connection: sqlite3.Connection, item: int, stamp: str) -> str | None:
+    """Drop each entry of a reopened item's set that an open item waits back through, and say so; None when none
+    does (pack sd:9570 class pass).
+
+    A done item's stale set takes no part in the edit's cycle check (pack
+    sd:9591), so B may wait on a done A that still names B. Reopening A
+    would close that cycle and hold both builds for ever; the reopen drops
+    A's stale entry instead, so B, which waits now, builds after A.
+    """
+    row = connection.execute("SELECT fields FROM item WHERE id = ?", (item,)).fetchone()
+    try:
+        named = item_blocked_by(row)
+    except ValueError:
+        return None
+    dropped = []
+    for other in named:
+        try:
+            _refuse_cycle(connection, item, [other])
+        except WorkflowError:
+            dropped.append(other)
+    if not dropped:
+        return None
+    kept = [other for other in named if other not in dropped]
+    fields = json.loads(row["fields"])
+    if kept:
+        fields["blocked_by"] = kept
+    else:
+        fields.pop("blocked_by")
+    connection.execute("UPDATE item SET fields = ?, updated_at = ? WHERE id = ?",
+                       (json.dumps(fields, sort_keys=True) if fields else None, stamp, item))
+    waits = ", ".join(f"sd:{other}" for other in kept) or "nothing"
+    return f"Waits on {waits}: {', '.join(f'sd:{other}' for other in dropped)} waits on it"
 
 
 def _park(item: int, row: Any, values: dict) -> dict:

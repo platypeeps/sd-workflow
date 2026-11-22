@@ -252,8 +252,22 @@ class SecondBranch(Case):
         with self.assertRaisesRegex(teammate.TeammateRefused, r"open branch feat/x in /w/pack-1 .*--reason state-move"):
             self.second([later])
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM assignment").fetchone()[0], before)
-        with self.assertRaisesRegex(teammate.TeammateRefused, "state-move or in-lane"):
+        with self.assertRaisesRegex(teammate.TeammateRefused, "state-move, in-lane or p1"):
             self.second([later], reason="because")
+
+    def test_a_p1_item_opens_a_second_branch_alone_or_with_its_area(self):
+        """sd:9700, operator ruling #64744: `--reason p1` opens a second branch for a P1 item and its area's."""
+        self.start([self.item()])
+        urgent = create_item(self.db, kind="task", title="Urgent", repo=A, status="in_progress", priority=1,
+                             fields={"area": "home"})
+        kin = create_item(self.db, kind="task", title="Kin", repo=A, status="in_progress", priority=3,
+                          fields={"area": "home"})
+        ordinary = self.item()
+        for items in ([ordinary], [urgent, ordinary]):
+            with self.assertRaisesRegex(teammate.TeammateRefused, "P1"):
+                self.second(items, reason="p1")
+        self.second([urgent, kin], reason="p1")
+        self.assertIn("beside feat/x: p1", self.notes(kin)[-2])
 
     def test_a_headless_build_run_holds_the_repositorys_one_branch(self):
         """sd:8821: a live build run of the repository refuses a teammate start on another branch."""

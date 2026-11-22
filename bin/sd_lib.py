@@ -148,6 +148,10 @@ CORE_CONFIG = {
                    "description": "How many items one build bundle takes when this machine claims it, a mechanical "
                                   "item half of one; the claim gives a child 120 minutes per 3 slots it took, never less. "
                                   "Unset reads 3. It grants nothing."},
+    "machine_cap": {"pattern": "[1-9]|1[0-6]",
+                    "description": "How many code-writing builders, drafts and interactive builders may run at once "
+                                   "on this machine, 1 to 16. Unset reads 6 (sd:9891); the load guard still holds "
+                                   "builds back below it. It grants nothing."},
     "repo_cap": {"pattern": "[1-6]",
                  "description": "How many build bundles may build at once in one repository when this machine "
                                 "claims them, 1 to 6. Unset reads 1 (sd:8158). It grants nothing."},
