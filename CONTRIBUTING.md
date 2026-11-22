@@ -73,8 +73,7 @@ The other three checks still run over their full scope.
 A narrowed run does not replace the full check before a push.
 
 `.github/scripts/run-tests.sh` runs the shards at `nice -n 10` locally.
-Its local workers are the CPUs divided by the machine's gate cap, at least one: 5 at the cap of 3 on 16 CPUs.
-With no cap it uses half the CPUs.
+Its local workers are `sd.gate_workers`, 8 when unset, whatever the CPUs or the gate cap.
 It uses every CPU when `CI` or `GITHUB_ACTIONS` has a non-empty value.
 Set `TEST_WORKERS` to override either default.
 Each shard reports its name, elapsed seconds, and exit status.

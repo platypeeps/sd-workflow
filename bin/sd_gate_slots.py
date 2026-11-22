@@ -219,9 +219,23 @@ def load_rule(environ: Mapping[str, str], limit_setting: str | None = None,
     return LoadRule(limit, settle, ", ".join(sources) or "default")
 
 
+#: Test workers one local gate runs, whatever the cores or the cap (sd:9925): cores over a cap of 8 gave 2
+#: and doubled the pack gate, 28 to 51 minutes, with the CPU half idle. `sd.gate_workers` overrides it.
+DEFAULT_WORKERS = 8
+WORKERS_PATTERN = re.compile(r"[1-9][0-9]?")
+
+
+def parse_workers(text: str, source: str) -> int:
+    """A worker count of 1 to 99, or a `ValueError` naming where it came from."""
+    if not WORKERS_PATTERN.fullmatch(text):
+        raise ValueError(f"{source} must be a whole number from 1 to 99 (got '{text[:40]}')")
+    return int(text)
+
+
 #: The machine settings the stdlib entry points read, with the check each value passes.
 MACHINE_SETTINGS: tuple[tuple[str, Callable[[str, str], object]], ...] = (
-    ("gate_slots", parse_count), ("gate_load_max", parse_number), ("gate_settle_seconds", parse_number))
+    ("gate_slots", parse_count), ("gate_load_max", parse_number), ("gate_settle_seconds", parse_number),
+    ("gate_workers", parse_workers))
 
 
 def machine_settings(environ: Mapping[str, str], *, stream: TextIO | None = None) -> dict[str, str | None]:
@@ -1018,6 +1032,7 @@ def slot_command(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command_name", required=True)
     commands.add_parser("directory", help="print the slot directory")
     commands.add_parser("count", help="print how many slots this machine has (0: no cap)")
+    commands.add_parser("workers", help="print how many test workers one local gate runs (sd.gate_workers)")
     wait = commands.add_parser("wait", help="queue, then lock one of the inherited slot descriptors")
     wait.add_argument("--pid", type=int, required=True, help="the gate's pid")
     wait.add_argument("--ppid", type=int, required=True, help="the gate's parent when it started")
@@ -1027,6 +1042,9 @@ def slot_command(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command_name == "directory":
         print(directory(os.environ))
+        return 0
+    if args.command_name == "workers":
+        print(machine_settings(os.environ, stream=sys.stderr)["gate_workers"] or DEFAULT_WORKERS)
         return 0
     try:
         settings = machine_settings(os.environ, stream=sys.stderr)

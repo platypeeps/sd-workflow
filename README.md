@@ -216,6 +216,7 @@ Merge permission is one setting, `repo.runner_merge` on the repository row; the 
 These values live in `~/.config/sd-ai-command-pack/config.json`; `XDG_CONFIG_HOME` overrides the configuration root.
 `sd config get`, `list`, and `unset` inspect or remove settings. No personal grant ships in this repository.
 `sd.gate_slots` is load control, not a grant: how many gates may run at once on the machine, across every repository (unset: a quarter of the cores).
+`sd.gate_workers` is load control too: how many test workers one local run of the pack's tests starts (unset: 8).
 `sd.gate_load_max` and `sd.gate_settle_seconds` are load control too: the gate queue starts its head 45 s after the last start by default, and only below a load1 limit where one is set (unset: none, since macOS counts disk waits in the load average).
 `sd.fleet_owners` names the GitHub logins whose repositories `sd fleet stamp` treats as the operator's own, comma-separated; it grants nothing.
 `sd.hub_name` names the hub by its tailnet name; a machine with its own database serves it and runs lanes from it only while its tailnet name matches, and writes to it unless another node holds the name (unset: no fence; `bin/sd-db fence` answers). It grants nothing.

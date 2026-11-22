@@ -13,27 +13,19 @@
 #
 # Env:
 #   PYTHON_BIN     interpreter to run (default: python3)
-#   TEST_WORKERS   workers (default: all CPUs in CI; locally the CPUs over the
-#                  machine's gate cap, at least one; half the CPUs with no cap)
+#   TEST_WORKERS   workers (default: all CPUs in CI; locally sd.gate_workers,
+#                  else 8)
 #
-# sd:1955. Locally the shards also run at `nice -n 10`. Two gates may hold the
-# two machine-wide slots at once (sd.gate_slots), and CPUs minus one each let
-# two gates put 30 workers on 16 cores: on 2026-09-28 the load average read
-# 65-73, and the runner daemon's heartbeat missed during such a run (sd:1941,
-# sd:1950). Half the CPUs puts two gates at one worker per core, and the lower
-# priority lets the daemon, the dashboard and the sessions run first.
-# Measured on the 16-core machine before the change, 15 workers, other gates
-# sharing it: 473 s of tests, 1-minute load peak 100 and mean 63.
-# CI gets every CPU at normal priority: nothing else runs on a CI runner.
+# sd:1955. Locally the shards also run at `nice -n 10`, so the runner daemon,
+# the dashboard and the sessions run first. CI gets every CPU at normal
+# priority: nothing else runs on a CI runner.
 #
-# sd:2607, sd:6823. The local default follows the gate cap, so the pool's full
-# load is the CPUs in workers whatever the cap: 5 each at the cap of 3 on 16
-# CPUs, 8 at a cap of 2. Twice the CPUs (10 each, 30 under three gates) read a
-# load of 115.6 on 2026-10-30 at about 600% CPU of 1600%: the shards' short
-# git, bash and python children queue, not compute. The cap is the one the gate
-# took its slot under: SD_GATE_POOL_SIZE from a holder such as `sd-check`, else
-# this run's own SD_GATE_SLOTS. It is the cap and not the slots in use, because the shards are
-# planned once, here: a run that started alone keeps its workers when others join.
+# sd:9925. The local count is fixed, not the CPUs over the gate cap (sd:2607,
+# sd:6823). With `sd.gate_slots` at 8 that rule gave each gate 2 workers on 16
+# cores, and the pack gate went from 28 to 51 minutes with the CPU 50-60% idle
+# (2026-11-21): the shards' git, bash and python children wait, not compute.
+# The slot count bounds how many gates run at once; `sd.gate_workers` (read by
+# `bin/sd_gate_slots.py workers`) sets each one's workers, 8 when unset.
 set -uo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -77,16 +69,14 @@ else
     '' | *[!0-9]*) cores=4 ;;
   esac
   [ "$cores" -ge 1 ] || cores=1
-  pool="${SD_GATE_POOL_SIZE:-${SD_GATE_SLOTS:-0}}"
-  case "$pool" in
-    '' | *[!0-9]*) pool=0 ;;
-  esac
   if [ -n "${CI:-}" ] || [ -n "${GITHUB_ACTIONS:-}" ]; then
     TEST_WORKERS="$cores"
-  elif [ "$pool" -gt 0 ]; then
-    TEST_WORKERS=$((cores / pool))
   else
-    TEST_WORKERS=$((cores / 2))
+    TEST_WORKERS=8
+    if [ -f "$REPO_ROOT/bin/sd_gate_slots.py" ]; then
+      TEST_WORKERS="$("$toolchain_python" "$REPO_ROOT/bin/sd_gate_slots.py" workers)" || TEST_WORKERS=8
+      case "$TEST_WORKERS" in '' | *[!0-9]*) TEST_WORKERS=8 ;; esac
+    fi
   fi
   [ "$TEST_WORKERS" -ge 1 ] || TEST_WORKERS=1
 fi
@@ -276,7 +266,10 @@ fi
 #
 # A name here that matches no file is skipped rather than refused, so a rename
 # costs time and never a test: the renamed module still runs, whole.
+# sd:9925: tests.test_sd_lane and tests.sd_db.test_build_run each set the tail
+# of a pack gate run whole, as tests.test_sd_ship did.
 SPLIT_MODULES="tests.test_sd_ship tests.test_sd_ship_dispositions tests.test_sd_ship_disposition_guards"
+SPLIT_MODULES="$SPLIT_MODULES tests.test_sd_lane tests.sd_db.test_build_run"
 
 # The ids a module holds, one per line, loaded the way `python -m unittest
 # <module>` loads them. Fails, printing nothing, if the module does not import
