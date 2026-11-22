@@ -1833,12 +1833,22 @@ def moved_line(diff: str, line: int) -> int:
 
 def prior_at(root: pathlib.Path, old: str, new: str, rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Each prior blocker's line moved from the prior head `old` to `new` (build/sd-1423 review: an insertion above a
-    blocker moved its repeat past `SHIFT_LINES`); a line git cannot map stays as stored."""
+    blocker moved its repeat past `SHIFT_LINES`), and its file through a rename; a line git cannot map stays as stored."""
+    fields, renamed = (sd_lib.git_output(["diff", "-M", "--name-status", "-z", old, new], root) or "").split("\0"), {}
+    while len(fields) > 2:  # `status\0path`, or `R<score>\0from\0to`: walked in order, a path is never a status
+        status, *fields = fields
+        if status[:1] == "R":
+            renamed[fields[0]], fields = fields[1], fields[2:]
+        else:
+            fields = fields[1:]
+
     def _remapped(row: Mapping[str, Any]) -> dict[str, Any]:
         if row.get("disposition") != "blocking" or type(row.get("line")) is not int:
             return dict(row)
-        diff = sd_lib.git_output(["diff", "-U0", "--no-color", "--no-ext-diff", old, new, "--", row["path"]], root)
-        return dict(row, line=row["line"] if diff is None else moved_line(diff, row["line"]))
+        path = renamed.get(row["path"], row["path"])
+        diff = sd_lib.git_output(["diff", "-M", "-U0", "--no-color", "--no-ext-diff", old, new, "--",
+                                  *dict.fromkeys((row["path"], path))], root)
+        return dict(row, path=path, line=row["line"] if diff is None else moved_line(diff, row["line"]))
     return [_remapped(row) for row in rows]
 
 

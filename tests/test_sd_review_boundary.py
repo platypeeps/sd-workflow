@@ -1049,11 +1049,15 @@ class LineBudgetTests(unittest.TestCase):
         # 4942 -> 4944 is the next build/sd-1423 review: `bin/sd-review`
         # +2 so only a repeat that blocks at the floor answers a prior
         # blocker. Measured: `sd-review` is 2974 here.
+        #
+        # 4944 -> 4954 is the next build/sd-1423 review: `bin/sd-review`
+        # +10 so `prior_at` follows a prior blocker's file through a
+        # rename. Measured: `sd-review` is 2984 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4944,
+            4954,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

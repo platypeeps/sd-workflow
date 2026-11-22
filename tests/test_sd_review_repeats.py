@@ -272,6 +272,22 @@ class PriorLineTests(RepeatFixture):
                                      repro=True, prior=moved)
         self.assertEqual(record["disposition"], "blocking")
 
+    def test_a_blocker_follows_its_file_through_a_rename(self) -> None:
+        """build/sd-1423 review (bin/sd-review:1839): renaming src.py to renamed.py left the prior blocker on
+        src.py, so an uncited repeat at renamed.py posted as advisory though the defect survived the rename."""
+        source = "".join(f"line{number}\n" for number in range(1, 41))
+        (self.root / "src.py").write_text(source, encoding="utf-8")
+        old = self.commit("add", "src.py") and self.commit("old")
+        self.commit("mv", "src.py", "renamed.py")
+        (self.root / "renamed.py").write_text("top\n" + source, encoding="utf-8")
+        new = self.commit("add", "renamed.py") and self.commit("renamed")
+        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking")]
+        moved = sd_review.prior_at(self.root, old, new, prior)
+        self.assertEqual([(row["path"], row["line"]) for row in moved], [("renamed.py", 11)])
+        [record] = sd_review.dispose([finding(path="renamed.py", line=11, summary="An empty list raises IndexError")],
+                                     "high", repro=True, prior=moved)
+        self.assertEqual(record["disposition"], "blocking")
+
     def test_the_line_map_reads_each_hunk(self) -> None:
         diff = "@@ -0,0 +1,21 @@\n+x\n@@ -5,2 +26,3 @@\n@@ -20 +42,0 @@\n"
         self.assertEqual([sd_review.moved_line(diff, line) for line in (1, 4, 5, 6, 7, 19, 20, 30)],
