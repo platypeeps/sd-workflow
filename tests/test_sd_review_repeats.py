@@ -316,6 +316,18 @@ class ReproRuleTests(unittest.TestCase):
         self.assertEqual([(row["disposition"], row.get("evidence")) for row in result["findings"]],
                          [("blocking", REPRO), ("advisory", None)])
 
+    def test_prior_evidence_goes_only_to_the_same_finding_in_any_spelling(self) -> None:
+        """build/sd-1423 review: matching by raw path alone gave an unrelated finding at `src.py:90` the old repro,
+        and left the real repeat at `./src.py:10` advisory. The finding must match by line or summary too, and
+        the path in any spelling the review accepts."""
+        prior = [dict(finding(REPRO, line=10, summary="the cache is never cleared"), disposition="blocking")]
+        rows = [finding(path=path, line=line, summary=summary) for path, line, summary in (
+            ("./src.py", 10, "Cache never cleared"), ("/work/repo/src.py", 12, "the cache is never cleared"),
+            ("src.py", 90, "an unrelated defect"), ("other/src.py", 10, "Cache never cleared"))]
+        disposed = sd_review.dispose(rows, "high", repro=True, prior=prior)
+        self.assertEqual([(row["disposition"], row.get("evidence")) for row in disposed],
+                         [("blocking", REPRO), ("blocking", REPRO), ("advisory", None), ("advisory", None)])
+
     def test_a_reproduced_break_in_an_unchanged_caller_blocks(self) -> None:
         [record] = sd_review.dispose([finding("python3 reader.py: KeyError 'state'", path="reader.py")], "high",
                                      repro=True)

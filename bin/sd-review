@@ -1779,9 +1779,20 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
 
 
 def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]) -> str:
-    """The evidence a prior report's blockers on `record`'s path stored, one per line, or ""."""
-    return "\n".join(dict.fromkeys(old["evidence"] for old in prior if old.get("disposition") == "blocking" and old.get(
-        "path") == record.get("path") and isinstance(old.get("evidence"), str) and old["evidence"].strip()))
+    """The evidence a prior report's blockers stored for `record`'s finding, one per line, or "".
+
+    One matches on its file, in any spelling the review accepts (`reviewed_paths`), and on its line or
+    `summary_key`: a different finding on the same file gains nothing (build/sd-1423 review)."""
+    def _place(path: Any) -> str:
+        return str(pathlib.PurePosixPath(path.strip())) if isinstance(path, str) and path.strip() else ""
+
+    def _same(old: Mapping[str, Any]) -> bool:
+        mine, theirs = _place(record.get("path")), _place(old.get("path"))
+        return bool(mine and theirs) and (mine == theirs or mine.startswith("/") and mine.endswith(f"/{theirs}")) and (
+            type(old.get("line")) is int and old.get("line") == record.get("line")
+            or summary_key(old.get("summary")) == summary_key(record.get("summary")))
+    return "\n".join(dict.fromkeys(old["evidence"] for old in prior if old.get("disposition") == "blocking"
+                                   and isinstance(old.get("evidence"), str) and old["evidence"].strip() and _same(old)))
 
 
 # Pipeline

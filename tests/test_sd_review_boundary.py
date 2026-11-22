@@ -1014,11 +1014,16 @@ class LineBudgetTests(unittest.TestCase):
         # evidence through `finish_review` to `dispose` (`prior_evidence`
         # keeps `dispose` under the branch ceiling). Measured:
         # `sd-review` is 2901 here.
+        #
+        # 4871 -> 4882 is the next build/sd-1423 review: `bin/sd-review`
+        # +11 so `prior_evidence` matches the finding (line or summary)
+        # and its file in any accepted spelling. Measured: `sd-review` is
+        # 2912 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4871,
+            4882,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
