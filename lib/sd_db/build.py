@@ -752,9 +752,12 @@ def drop_plan(connection, item: int) -> dict:
         raise BuildRefused(f"Drop refused: {state['reason']}")
     members = _members(connection, lead, current["status"])
     # A done lead's own transition cancels its blocked row (`cancel_unwanted_blocked`) and leaves its members
-    # blocked: read those too, or the drop finds nothing to keep (lead review). One gone to planning stays out.
+    # blocked: the bundle ended blocked, so its members are the lead and the blocked rows. A cancelled member row
+    # is not one: its item went to planning (and maybe back) after the run (lead review).
     if current["status"] == "cancelled" and _done(reads.items_by_ids(connection, [current["item"]]), current["item"]):
-        members += [member for member in _members(connection, lead, "blocked") if member not in members]
+        # With no blocked row left, a cancelled member cannot say which way it went, so none is kept: the drop
+        # refuses below and writes nothing.
+        members = [member for member in members if member["id"] == lead] + _members(connection, lead, "blocked")
     if row["id"] not in {member["id"] for member in members}:
         raise BuildRefused(f"Drop refused: sd:{item} is not a {current['status']} member of build {lead}")
     items = reads.items_by_ids(connection, [member["item"] for member in members])

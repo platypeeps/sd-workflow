@@ -1128,6 +1128,30 @@ class Advisories(Repo):
         queued = DROP.drop_item(self.db, build, items[0], who="operator")
         self.assertEqual([entry["item"] for entry in queued], [items[1]])
 
+    def test_a_member_cancelled_by_planning_and_back_to_ready_stays_out_when_the_done_lead_drops(self):
+        """Lead review: its old row stays cancelled after planning and back to ready, unqueued. The done lead's
+        cancelled row must not admit it: the drop would replay its commits and queue it with the kept."""
+        items, ids, run = self.bundle()
+        writes.transition(self.db, items[2], "planning", who="operator", reason="not now")
+        writes.transition(self.db, items[2], "ready", who="operator", reason="back")
+        writes.transition(self.db, items[0], "done", who="operator", reason="landed by hand")
+        lead = self.next_lead()
+        queued = DROP.drop_item(self.db, build, items[0], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [items[1]])
+        new = Path(run["work_path"]).parent / f"repo-build-{lead}"
+        self.assertEqual(self.files(new), ["README", "b.txt"])
+
+    def test_a_done_lead_with_only_a_member_back_from_planning_refuses(self):
+        """No blocked member is left to keep: the old cancelled row is not one, so nothing replays."""
+        items, ids, run = self.bundle()
+        for item in items[1:]:
+            writes.transition(self.db, item, "planning", who="operator", reason="not now")
+            writes.transition(self.db, item, "ready", who="operator", reason="back")
+        writes.transition(self.db, items[0], "done", who="operator", reason="landed by hand")
+        with self.assertRaisesRegex(DROP.DropRefused, "only open item"):
+            DROP.drop_item(self.db, build, items[0], who="operator")
+        self.unmade(run)
+
     def test_main_moving_a_kept_file_still_drops(self):
         """The new branch starts at the bundle's fork, so each kept commit applies; the lane merges main."""
         items, ids, run = self.bundle()
