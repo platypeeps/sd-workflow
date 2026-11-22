@@ -450,7 +450,8 @@ def kept_files(git: Collection[str], work: str, *, env: dict | None = None) -> s
 def changed_lines(git: Collection[str], work: str, base: str, head: str, *,
                   env: dict | None = None) -> dict[str, set[int]] | None:
     """Each path `base..head` changes, with the new-side lines its hunks touch, or no lines for a change git
-    gives no range (a mode, a binary file), which stands for the whole file; None when git cannot answer.
+    gives no range (a binary file) or whose mode changes, which stands for the whole file; None when git
+    cannot answer.
 
     A hunk that only deletes names the lines on both sides of where the deletion now sits; a deleted file
     keeps its old path and old lines (pack sd:9769). `---`/`+++` are headers only before a file's first hunk.
@@ -465,14 +466,19 @@ def changed_lines(git: Collection[str], work: str, base: str, head: str, *,
         return None
     changed: dict[str, set[int]] = {}
     path = gone = None
+    named = ""
     header = deleted = False
+    whole: set[str] = set()  # a mode change alters the whole file, whatever hunks it also has
     for line in diff.splitlines():
         if line.startswith("diff --git "):
             header, path, rest = True, None, line[len("diff --git "):]
             half = (len(rest) - 5) // 2  # `a/P b/P`: renames are off, so both sides name one path
             if not (rest.startswith("a/") and rest[2 + half:] == f" b/{rest[2:2 + half]}"):
                 return None  # a quoted or unparseable path: the delta is unknown
-            changed.setdefault(rest[2:2 + half], set())  # no hunk (mode, binary): the whole file changed
+            named = rest[2:2 + half]
+            changed.setdefault(named, set())  # no hunk (mode, binary): the whole file changed
+        elif header and line.startswith(("old mode ", "new mode ")):
+            whole.add(named)
         elif header and line.startswith(('--- "', '+++ "')):
             return None
         elif header and line.startswith("--- "):
@@ -489,6 +495,8 @@ def changed_lines(git: Collection[str], work: str, base: str, head: str, *,
                 at, size = (hunk[1], hunk[2]) if deleted else (hunk[3], hunk[4])
                 start, count = int(at), int(size if size is not None else 1)
                 changed[path].update(range(max(start, 1), start + max(count, 1) + (count == 0)))
+    for name in whole:
+        changed[name] = set()
     return changed if changed or not diff.strip() else None  # output naming no file is unknown, not empty
 
 

@@ -1150,6 +1150,29 @@ class Supervise(Case):
                                 {"run.sh": set()})
         self.assertEqual(len(kept["blockers"]), 1, "a blocker on a mode change was deferred")
 
+    def test_a_mode_change_with_a_content_hunk_reads_as_the_whole_file(self):
+        """Review of sd:9769: a fix that edits a script and drops its executable bit changes every line of it,
+        not only the edited ones: a blocker on the unchanged shebang is the change's own."""
+        repo = Path(tempfile.mkdtemp(dir=self.root))
+
+        def run(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.name=operator",
+                                   "-c", "user.email=operator@example.test", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        run("init", "-q")
+        (repo / "run.sh").write_text("#!/bin/sh\necho one\n")
+        (repo / "run.sh").chmod(0o755)
+        run("add", "-A")
+        run("commit", "-q", "-m", "base")
+        base = run("rev-parse", "HEAD")
+        (repo / "run.sh").write_text("#!/bin/sh\necho two\n")
+        (repo / "run.sh").chmod(0o644)
+        run("add", "-A")
+        run("commit", "-q", "-m", "edit and mode")
+        self.assertEqual(build_run.changed_lines(["git"], str(repo), base, run("rev-parse", "HEAD")),
+                         {"run.sh": set()}, "a mode change with a content hunk lost whole-file coverage")
+
     def test_a_path_with_a_space_reads_without_git_s_tab(self):
         """Review of sd:9769: git ends a header naming a path with a space with a tab."""
         repo = Path(tempfile.mkdtemp(dir=self.root))
