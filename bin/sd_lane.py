@@ -2406,7 +2406,7 @@ def landings(tree: pathlib.Path, ahead: list[dict[str, Any]], following: dict[st
 
 
 def speculate(entry: dict[str, Any], queue: Queue, gate: Gate,
-              gates: list[SpeculativeGate] | tuple[()] = ()) -> list[SpeculativeGate]:
+              gates: list[SpeculativeGate] | tuple[()] = (), deadline: float = math.inf) -> list[SpeculativeGate]:
     """The next entries' gates on the landings predicted ahead of them, not yet started.
 
     The caller holds each before it starts it, so a SIGTERM during the start still ends it (sd:5776).
@@ -2415,8 +2415,12 @@ def speculate(entry: dict[str, Any], queue: Queue, gate: Gate,
     after it on both (pack sd:7412). An entry the runner may not merge
     (`merge_refusal`) stops prepared and never lands, so nothing past it is
     predicted. A follower one of `gates` already gated is skipped, so no
-    entry is gated twice, and at most `DEPTH` gates run at once.
+    entry is gated twice, and at most `DEPTH` gates run at once. Past
+    `deadline` none is set up, and one whose setup crosses it starts no
+    gate: its machine time is prepare's (`OUT_OF_BUDGET`).
     """
+    if clock() >= deadline:
+        return []
     try:
         rows = read_queue(queue)
     except LaneError:  # a hub fault here left the claimed entry running under a runner that raised (sd:4184)
@@ -2429,13 +2433,14 @@ def speculate(entry: dict[str, Any], queue: Queue, gate: Gate,
         if merge_refusal(chain[-1]) is not None:
             break
         if (following["id"], following["expected_head"]) not in gated:
-            made += speculate_one(chain, following, queue, gate, busy=running + len(made) >= DEPTH)
+            made += speculate_one(chain, following, queue, gate, busy=running + len(made) >= DEPTH,
+                                  deadline=deadline)
         chain.append(following)
     return made
 
 
 def speculate_one(chain: list[dict[str, Any]], following: dict[str, Any], queue: Queue, gate: Gate,
-                  busy: bool) -> list[SpeculativeGate]:
+                  busy: bool, deadline: float = math.inf) -> list[SpeculativeGate]:
     """`following`'s gate once the `chain` entries land, as a list of one, or none.
 
     `busy` says `DEPTH` speculative gates still run. Any entry with no
@@ -2461,6 +2466,8 @@ def speculate_one(chain: list[dict[str, Any]], following: dict[str, Any], queue:
                 if not all(own_tree_here(row) for row in [*chain, following]) else predict(chain, following))
     except Exception as error:  # a speculation that cannot be set up gates nothing; the lane goes on
         plan = {"skipped": f"{type(error).__name__}: {error}"[:600]}
+    if "skipped" not in plan and clock() >= deadline:
+        plan = {"skipped": OUT_OF_BUDGET}
     if "skipped" in plan:
         record_speculation({"status": "skipped", "reason": plan["skipped"]})
         return []
@@ -2520,17 +2527,20 @@ def train_members(entry: dict[str, Any], queue: Queue, size: int) -> list[dict[s
     return members if len(members) > 1 else []
 
 
-def stack(tree: pathlib.Path, members: list[dict[str, Any]], fork: str,
-          branch: str) -> tuple[list[dict[str, Any]], list[tuple[dict[str, Any], str]]]:
+def stack(tree: pathlib.Path, members: list[dict[str, Any]], fork: str, branch: str,
+          deadline: float = math.inf) -> tuple[list[dict[str, Any]], list[tuple[dict[str, Any], str]]]:
     """In the scratch `tree`, each member's catch-up onto the landing before it, from `fork` (sd:9899).
 
     Answers the placed members, each `{"row", "head", "base"}`: `head` is
     its catch-up merge, the tree its prepare gates, and `base` the landing
     under it, as `landings` predicts one. A member that conflicts with the
-    stack drops out with why; the next member stacks without it.
+    stack drops out with why; the next member stacks without it. Past
+    `deadline` it stacks no further member; `train_stack` then skips.
     """
     landed, placed, dropped = fork, list[dict[str, Any]](), list[tuple[dict[str, Any], str]]()
     for row in members:
+        if clock() >= deadline:
+            break
         onto = f"sd:{placed[-1]['row']['item']}'s predicted landing" if placed else f"origin/{branch}"
         if scratch_git(tree, "checkout", "--quiet", "--detach", "--force", row["expected_head"]) is None:
             dropped.append((row, "its queued head could not be checked out"))
@@ -2565,8 +2575,15 @@ def mark_train(queue: Queue, fields: dict[str, dict[str, Any]], items: list[int]
         update(queue, on_members)
 
 
-def train_stack(members: list[dict[str, Any]]) -> dict[str, Any]:
-    """`{"fork", "placed", "dropped"}` for the members stacked on the fetched base, or `{"skipped": why}`."""
+#: Why a train or speculation set up past the run's deadline gates nothing: the time left is prepare's.
+OUT_OF_BUDGET = "the run's budget ran out during the setup, so its time left is the claimed entry's prepare"
+
+
+def train_stack(members: list[dict[str, Any]], deadline: float = math.inf) -> dict[str, Any]:
+    """`{"fork", "placed", "dropped"}` for the members stacked on the fetched base, or `{"skipped": why}`.
+
+    A fetch or stack that crosses `deadline` skips the train.
+    """
     import sd_gate_receipts  # noqa: PLC0415 -- the declaration reader loads only for a train
     root = pathlib.Path(members[0]["worktree"])
     remote = lane_git(root, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD") or ""
@@ -2574,6 +2591,8 @@ def train_stack(members: list[dict[str, Any]]) -> dict[str, Any]:
     if not branch or branch == remote or scratch_git(
             root, "fetch", "--quiet", "--no-tags", "origin", f"refs/heads/{branch}:{remote}") is None:
         return {"skipped": "origin/HEAD could not be fetched"}
+    if clock() >= deadline:
+        return {"skipped": OUT_OF_BUDGET}
     fork = lane_git(root, "rev-parse", "--verify", "--quiet", remote)
     with tempfile.TemporaryDirectory(prefix="sd-lane-train-") as parent:
         tree = pathlib.Path(parent) / "tree"
@@ -2583,11 +2602,13 @@ def train_stack(members: list[dict[str, Any]]) -> dict[str, Any]:
             if not sd_gate_receipts.keyed_by_tree(tree):
                 return {"skipped": f"no tree key in {sd_gate_receipts.REUSE_DECLARATION}, so prepare could not "
                                    "reuse a pass"}
-            placed, dropped = stack(tree, members, fork, branch)
+            placed, dropped = stack(tree, members, fork, branch, deadline)
         except sd_lib.DatabaseUnreadable as error:
             return {"skipped": f"{sd_gate_receipts.REUSE_DECLARATION} cannot be read: {error}"}
         finally:
             scratch_git(root, "worktree", "remove", "--force", str(tree))
+    if clock() >= deadline:
+        return {"skipped": OUT_OF_BUDGET}
     return {"fork": fork, "placed": placed, "dropped": dropped}
 
 
@@ -2610,7 +2631,7 @@ def gate_top(top: dict[str, Any], gate: Gate, thread: SpeculativeGate) -> dict[s
             **({"reason": thread.why} if thread.cancelled else {})}
 
 
-def stacked_top(members: list[dict[str, Any]], queue: Queue) -> dict[str, Any] | None:
+def stacked_top(members: list[dict[str, Any]], queue: Queue, deadline: float = math.inf) -> dict[str, Any] | None:
     """The placed top of the members' stack, built here in the runner's thread, or None for no train gate.
 
     The git work runs where `predict` runs a speculation's, so a TERM ends
@@ -2621,7 +2642,7 @@ def stacked_top(members: list[dict[str, Any]], queue: Queue) -> dict[str, Any] |
     """
     items = [row["item"] for row in members]
     try:
-        stacked = train_stack(members)
+        stacked = train_stack(members, deadline)
     except Exception as error:  # a train that cannot stack gates nothing; each member ships alone
         stacked = {"skipped": f"{type(error).__name__}: {error}"[:600]}
     if "skipped" in stacked:
@@ -2634,7 +2655,7 @@ def stacked_top(members: list[dict[str, Any]], queue: Queue) -> dict[str, Any] |
 
 
 def start_train(entry: dict[str, Any], queue: Queue, gate: Gate, environ: dict[str, str],
-                gates: list[SpeculativeGate]) -> SpeculativeGate | None:
+                gates: list[SpeculativeGate], deadline: float = math.inf) -> SpeculativeGate | None:
     """The train `entry` heads, as a gate thread not yet started, or None for no train gate (sd:9899).
 
     The stack is built before the thread exists (`stacked_top`); the
@@ -2642,7 +2663,8 @@ def start_train(entry: dict[str, Any], queue: Queue, gate: Gate, environ: dict[s
     is the top, so the speculation that starts after it does not gate that
     entry twice, and a top one of `gates` already holds gets no second
     train. Its `chain` is the members below, so one that does not merge
-    cancels the gate (`settle_gates`).
+    cancels the gate (`settle_gates`). A stack that crosses `deadline`
+    starts none (`train_stack`).
     """
     try:
         members = train_members(entry, queue, lane_train(environ))
@@ -2651,7 +2673,7 @@ def start_train(entry: dict[str, Any], queue: Queue, gate: Gate, environ: dict[s
     held = {gated.follower for gated in gates}
     if not members or (members[-1]["id"], members[-1]["expected_head"]) in held:
         return None
-    top = stacked_top(members, queue)
+    top = stacked_top(members, queue, deadline)
     if top is None or (top["row"]["id"], top["row"]["expected_head"]) in held:
         return None
     items = [row["item"] for row in members]
@@ -4210,11 +4232,11 @@ def run_lane(root: pathlib.Path, environ: dict[str, str], ship: Ship = default_s
                     entry, token = next_claim(queue, environ, deadline, answer)
                     if entry is None:
                         break
-                    train = start_train(entry, queue, gate, environ, gates)
+                    train = start_train(entry, queue, gate, environ, gates, deadline)
                     if train is not None:  # beside the prepare, as a speculative gate (sd:9899)
                         gates.append(train)  # held before it starts: a TERM in its start ends it
                         train.start()
-                    for made in speculate(entry, queue, gate, gates):
+                    for made in speculate(entry, queue, gate, gates, deadline):
                         gates.append(made)  # held before it starts: a TERM in its start ends it
                         made.start()
                     row, stopped = run_entry(root, queue, entry, token, environ, ship, note or default_note, deadline)

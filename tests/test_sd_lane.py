@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Callable
 from typing import Any
 from unittest import mock
 
@@ -1742,14 +1743,58 @@ class Train(Trees):
         self.assertEqual([entry["status"] for entry in self.entries()], ["merged", "failed", "merged"])
         self.assertTrue(self.seen["train gate done before prepare 3"])
 
+    def run_past_deadline(self, cross: Callable[[str, tuple], bool]) -> list[tuple]:
+        """Run the lane on a fake clock that passes the deadline at the first git call `cross` names."""
+        now = [sd_lane.clock()]
+        deadline = now[0] + 100
+        real, calls = sd_lane.scratch_git, []
+
+        def scratch(root: pathlib.Path, *argv: str) -> str | None:
+            calls.append(argv)
+            if now[0] < deadline and cross(threading.current_thread().name, argv):
+                now[0] = deadline + 1
+            return real(root, *argv)
+        self.queue_three()
+        with mock.patch.object(sd_lane, "clock", lambda: now[0]), mock.patch.object(sd_lane, "scratch_git", scratch):
+            sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate, deadline=deadline)
+        return calls
+
+    def test_a_train_whose_fetch_crosses_the_deadline_starts_no_gate(self) -> None:
+        """Review of sd:9899: the train and the speculation started after the deadline, past the fetch."""
+        calls = self.run_past_deadline(lambda _, argv: argv[0] == "fetch")
+        self.assertEqual((self.trains, self.gates), ([], []))
+        self.assertNotIn("add", [argv[1] for argv in calls if argv[0] == "worktree"])
+        entries = self.entries()
+        self.assertEqual(entries[0]["status"], "merged")
+        self.assertEqual({entry["train"]["status"] for entry in entries}, {"skipped"})
+        self.assertIn("budget", entries[0]["train"]["reason"])
+
+    def test_a_stack_that_crosses_the_deadline_stacks_no_further(self) -> None:
+        """Review of sd:9899: the stack merged every member after the deadline passed."""
+        calls = self.run_past_deadline(lambda _, argv: argv[0] == "merge")
+        self.assertEqual([argv for argv in calls if argv[0] == "merge"][1:], [])
+        self.assertEqual((self.trains, self.gates), ([], []))
+
+    def test_a_speculation_whose_fetch_crosses_the_deadline_starts_no_gate(self) -> None:
+        """Review of sd:9899: a speculation set up past the deadline still started its gate."""
+        fetches = []
+
+        def second_fetch(_: str, argv: tuple) -> bool:
+            fetches.append(argv[0] == "fetch")
+            return fetches.count(True) == 2
+        self.run_past_deadline(second_fetch)
+        self.assertEqual(len(self.trains), 1)
+        self.assertEqual(self.gates, [])
+        self.assertIn("budget", self.entries()[1]["speculation"]["reason"])
+
     def test_the_stack_is_built_before_the_train_thread_starts(self) -> None:
         """Review of sd:9899: git work inside the thread ran on past a TERM or the deadline."""
         built: list[str] = []
         real = sd_lane.train_stack
 
-        def recorded(members: list[dict]) -> dict:
+        def recorded(members: list[dict], deadline: float) -> dict:
             built.append(threading.current_thread().name)
-            return real(members)
+            return real(members, deadline)
         self.queue_three()
         with mock.patch.object(sd_lane, "train_stack", recorded):
             sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
