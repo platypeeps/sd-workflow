@@ -419,7 +419,7 @@ def _git(args: list[str], cwd: pathlib.Path) -> str | None:
             # No sd tool can answer a credential prompt: a remote read fails instead (sd:3495).
             env={**without_fsmonitor(os.environ), "GIT_TERMINAL_PROMPT": "0"},
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, UnicodeError):  # output that is not UTF-8 is no answer (sd:9867)
         return None
     answer = completed.stdout.strip() if completed.returncode == 0 else None
     if memo is not None:

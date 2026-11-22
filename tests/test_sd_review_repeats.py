@@ -301,6 +301,18 @@ class PriorLineTests(RepeatFixture):
         [record] = sd_review.dispose([finding(path="new.py", line=None)], "high", repro=True, prior=moved)
         self.assertEqual((record["disposition"], record.get("evidence")), ("blocking", REPRO))
 
+    def test_a_patch_that_is_not_utf8_leaves_the_line_as_stored(self) -> None:
+        """build/sd-1423 review (bin/sd-review:1852): an edited Windows-1252 line (byte 0xE9) in the blocker's
+        file raised UnicodeDecodeError out of the strict decode, after the providers had finished. git output
+        that does not decode is an answer git could not give: the line stays as stored."""
+        (self.root / "src.py").write_bytes(b"caf\xe9 = 1\n" * 20)
+        old = self.commit("add", "src.py") and self.commit("old")
+        (self.root / "src.py").write_bytes(b"x\n" + b"caf\xe9 = 2\n" * 20)
+        new = self.commit("add", "src.py") and self.commit("new")
+        prior = [dict(finding(REPRO, line=10), disposition="blocking")]
+        self.assertEqual([row["line"] for row in sd_review.prior_at(self.root, old, new, prior)], [10])
+        self.assertIsNone(sd_review.sd_lib.git_output(["show", f"{new}:src.py"], self.root))
+
     def test_the_line_map_reads_each_hunk(self) -> None:
         diff = "@@ -0,0 +1,21 @@\n+x\n@@ -5,2 +26,3 @@\n@@ -20 +42,0 @@\n"
         self.assertEqual([sd_review.moved_line(diff, line) for line in (1, 4, 5, 6, 7, 19, 20, 30)],
