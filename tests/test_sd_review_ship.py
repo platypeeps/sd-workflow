@@ -129,6 +129,21 @@ class FixReviewTests(ReviewFixture):
                                    FakeRunner(), self.environment(), self.chatgpt_home())
         self.assertIsNone(chained["covers_from"], "a pass under another policy extended the chain")
 
+    def test_an_unreadable_binding_seeds_no_chain_and_extends_none(self):
+        """Review of sd:9767: two unreadable bindings (None) are not one binding; a pass under no binding
+        covers nothing, full or delta."""
+        root, first = self.branch()
+        with patch.object(sd_review.sd_lib, "lead_review_binding", return_value=None):
+            full = sd_review.review(root, namespace(scope="branch"), FakeRunner(), self.environment(),
+                                    self.chatgpt_home())
+            self.assertIsNone(full["covers_from"], "a full pass under no binding covers the branch")
+            report = self.tmp / "prior.json"
+            report.write_text(json.dumps({**full, "covers_from": full["subject"]["base"]}))
+            self.commit(root, "fix.py", "fix = True\n")
+            chained = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)),
+                                       FakeRunner(), self.environment(), self.chatgpt_home())
+        self.assertIsNone(chained["covers_from"], "a delta under no binding inherited coverage")
+
     def test_a_verify_report_from_a_sibling_branch_is_refused(self):
         """Review of sd:9767: a report whose head is not an ancestor of HEAD never chains."""
         root, first = self.branch()

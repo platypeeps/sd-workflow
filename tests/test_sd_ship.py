@@ -5240,6 +5240,12 @@ roles:
             with contextlib.redirect_stderr(io.StringIO()):
                 review.record_lead_review(self.root, args, {**result, "covers_from": narrow}, dict(os.environ))
             self.assertIsNone(self.lead_record(), f"a verify pass covering from {narrow} was recorded")
+        real = review.sd_lib.git_output  # an unread fork and no chain are not one base (None == None)
+        with contextlib.redirect_stderr(io.StringIO()), patch.object(
+                review.sd_lib, "git_output", side_effect=lambda argv, root: None if argv[0] == "merge-base"
+                else real(argv, root)):
+            review.record_lead_review(self.root, args, {**result, "covers_from": None}, dict(os.environ))
+        self.assertIsNone(self.lead_record(), "a verify pass with no chain was recorded against an unread fork")
         with contextlib.redirect_stderr(io.StringIO()):
             review.record_lead_review(self.root, args, {**result, "covers_from": fork}, dict(os.environ))
         record = self.lead_record()
