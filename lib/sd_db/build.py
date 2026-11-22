@@ -1039,14 +1039,11 @@ def _retry_row(connection, item: int):
     if rows and rows[0]["status"] == "cancelled" and not rows[0]["run_count"]:
         ran = next((row for row in rows[1:] if row["run_count"]), None)
         # Only a bundle Retry can take: every member it would queue owns its item (`_current`), or Retry refuses the
-        # whole press and Build reads a fresh one instead (class pass, review round 7); and its work in the item's
-        # repository, or the claim refuses it and every later press reads it again (review round 14).
-        repo = connection.execute("SELECT repo FROM item WHERE id = ?", (item,)).fetchone()["repo"]
-        home = _work_repo(connection, ran) if ran is not None else None
-        if (ran is not None and ran["status"] in AGAIN and not _alone(connection, ran["id"])
-                and (home is None or (repo is not None and paths.same(home, repo)))):
+        # whole press and Build reads a fresh one instead (class pass, review round 7); and every member in the
+        # work's repository (`_resumable`), or the claim refuses it and every later press reads it again (round 14).
+        if ran is not None and ran["status"] in AGAIN and not _alone(connection, ran["id"]):
             lead: int = ran["parent"] or ran["id"]
-            if (queue_state(connection, lead)["status"] == ran["status"]
+            if (queue_state(connection, lead)["status"] == ran["status"] and _resumable(connection, lead, ran["status"])
                     and all(_current(connection, member) for member in _members(connection, lead, ran["status"]))):
                 return ran
     return rows[0] if rows else None
@@ -1712,6 +1709,19 @@ def _stranded(connection, row) -> bool:
     return _ran_on(connection, lead) != away
 
 
+def _resumable(connection, lead: int, status: str) -> bool:
+    """Whether the claim resumes build `lead`'s bundle in `status` where its work is: every member's item reads the
+    repository of that work (`_work_repo`), as the claim checks, which refuses the lead or drops the member
+    otherwise. The rule each resume selector shares, Build by item's and recovery's (class pass, review round 15)."""
+    row = connection.execute("SELECT id, item, parent FROM assignment WHERE id = ?", (lead,)).fetchone()
+    home = _work_repo(connection, row)
+    if home is None:
+        return True
+    repos = [connection.execute("SELECT repo FROM item WHERE id = ?", (member["item"],)).fetchone()["repo"]
+             for member in _members(connection, lead, status)]
+    return all(repo is not None and paths.same(home, repo) for repo in repos)
+
+
 def _recoverable(connection) -> list:
     """The builds blocked on a quiet beat that recovery may queue again once a beat is back, a build that ran first:
     the one reader recovery and pickup's wait share, so pickup never waits on a row recovery leaves (class pass,
@@ -1724,7 +1734,8 @@ def _recoverable(connection) -> list:
         f"JOIN item ON item.id = assignment.item LEFT JOIN repo ON repo.path = item.repo "
         f"WHERE {_BEAT_BLOCKED} AND item.status = 'ready' AND item.parked_at IS NULL "
         f"ORDER BY assignment.run_count > 0 DESC, assignment.id DESC", (SCOPE, _BEAT_RESULT)).fetchall()
-    rows = [row for row in rows if not _stranded(connection, row)]
+    rows = [row for row in rows if not _stranded(connection, row)
+            and ((lead := _lead(row)) is None or _resumable(connection, lead, "blocked"))]
     leads = {row["id"] for row in rows if row["parent"] is None}
     return [row for row in rows if row["parent"] is None or row["parent"] in leads]
 
