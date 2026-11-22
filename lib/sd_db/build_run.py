@@ -1292,11 +1292,17 @@ class Supervisor:
                 break
         if answer is None:
             return self.finish("blocked", f"the review gave no answer twice at {head[:12]}; see {self.out('review')}")
+        # `sd-review` runs no gate in an unmanaged checkout (sd:5953): the repository's own checks run here.
+        unmanaged, checked = build.unmanaged(self.db, self.row["repo"]), None
         if prior and answer["status"] == "blocking" and answer.get("complete"):  # a short report blocks (sd:9769)
-            answer = self.file_new_findings(answer, prior, head)
+            new, blockers = self.deferred(answer, prior, head)
+            if unmanaged and not blockers:  # before any rebuttal: a failed check means a fix round follows
+                checked = self.own_checks(head)
+            answer = self.file_new_findings(answer, prior, head, rebut=not checked, split=(new, blockers))
+            if isinstance(checked, dict):
+                return checked
         if answer["status"] in ("clean", "advisory", "skipped"):
-            # `sd-review` runs no gate in an unmanaged checkout (sd:5953): the repository's own checks run here.
-            failed = self.own_checks(head) if build.unmanaged(self.db, self.row["repo"]) else []
+            failed = checked if checked is not None else self.own_checks(head) if unmanaged else []
             if isinstance(failed, dict):
                 return failed
             if failed:
@@ -1413,11 +1419,23 @@ class Supervisor:
             found.append((os.path.normpath(path), line if isinstance(line, int) else None))
         return found
 
-    def file_new_findings(self, answer: dict, prior: dict, head: str) -> dict:
-        """File each blocker on code neither the last round's findings nor the delta since name, at any of its
-        places, as a follow-up item; the rest still block (pack sd:9769). A blocker with no file
-        (`<review-response>`) or a delta git cannot read still blocks. Each follow-up is one transaction under
-        its own mark, so a lost answer stands for that one write only."""
+    def file_new_findings(self, answer: dict, prior: dict, head: str, *, rebut: bool = True,
+                          split: tuple[list[dict], list[dict]] | None = None) -> dict:
+        """File each blocker `deferred` names as a follow-up item; the rest still block (pack sd:9769). Each
+        follow-up is one transaction under its own mark, so a lost answer stands for that one write only.
+
+        A rebuttal for the lane is written only from a round that ends the review: one that still holds a
+        blocker, or whose own checks failed (`rebut` False), is followed by a fix its deferral never judged."""
+        new, blockers = split or self.deferred(answer, prior, head)
+        rebut = rebut and not blockers
+        for index, row in enumerate(new):
+            self.once(f"followup:{head}:{index}", functools.partial(self.file_follow_up, row, head, rebut=rebut))
+        return {"status": "blocking" if blockers else "advisory", "blockers": blockers}
+
+    def deferred(self, answer: dict, prior: dict, head: str) -> tuple[list[dict], list[dict]]:
+        """The blockers on code neither the last round's findings nor the delta since name, at any of its
+        places, and the rest (pack sd:9769). A blocker with no file (`<review-response>`) or a delta git
+        cannot read stays with the rest."""
         named = {path for row in prior["findings"] if isinstance(row, dict) for path, _ in self.locations(row)}
         changed = self.branch_delta(prior["subject"]["head"], head)
         if (not 1 <= int(prior.get("requested_reviews") or 0) <= int(prior.get("completed_reviews") or 0)
@@ -1441,10 +1459,7 @@ class Supervisor:
             words = " ".join(str(value) for key, value in row.items() if key not in ("path", "line", "instances"))
             return any(re.search(rf"(?<![\w./-]){re.escape(name)}(?![\w-])", words) for name in names)
         new = [row for row in answer["blockers"] if not held(row)]
-        for index, row in enumerate(new):
-            self.once(f"followup:{head}:{index}", functools.partial(self.file_follow_up, row, head))
-        blockers = [row for row in answer["blockers"] if row not in new]
-        return {"status": "blocking" if blockers else "advisory", "blockers": blockers}
+        return new, [row for row in answer["blockers"] if row not in new]
 
     def branch_delta(self, since: str, head: str) -> dict[str, set[int]] | None:
         """The lines the fix changed since `since` together with every line the branch changes from its fork:
@@ -1461,7 +1476,7 @@ class Supervisor:
         return {path: set() if (path in fix and not fix[path]) or (path in branch and not branch[path])
                 else fix.get(path, set()) | branch.get(path, set()) for path in fix.keys() | branch.keys()}
 
-    def file_follow_up(self, row: dict, head: str) -> None:
+    def file_follow_up(self, row: dict, head: str, *, rebut: bool = True) -> None:
         """One deferred blocker as a follow-up item, its note and its rebuttal, in one transaction (pack sd:9769).
 
         The lane reviews the branch again; the rebuttal, in the record `sd-review` reads for this branch
@@ -1476,7 +1491,7 @@ class Supervisor:
             add_note(self.db, filed, "comment", f"Build run {self.ident} round {self.fresh()['review_round'] or 0} "
                                                 f"found this on code its fix did not change, so it is filed, not a "
                                                 f"blocker (pack sd:9769): {self.summary([row], None)}")
-            if repository:  # no GitHub origin: `sd-review` reads no rebuttal there either
+            if repository and rebut:  # no GitHub origin: `sd-review` reads no rebuttal there either
                 raw = {"path": self.locations(row)[0][0], "summary": row.get("summary"), "line": row.get("line")}
                 record_state(self.db, "checkpoint", key=f"ship-adjudication:build-run:{self.ident}:{filed}", body={
                     "decision": "accepted", "proposal": {

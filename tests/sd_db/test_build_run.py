@@ -208,12 +208,13 @@ FAKE = textwrap.dedent('''
                               "route": {"tier": "skip" if mode == "skip_route" else "cheap", "category": "docs"},
                               "subject": {"head": git("-C", work, "rev-parse", "HEAD")}}))
             sys.exit(0)
-        if mode in ("offdelta", "offdelta_short"):  # pack sd:9769: a new blocker on a file nobody touched
+        if mode in ("offdelta", "offdelta_short", "offdelta_held"):  # pack sd:9769: a blocker on a file nobody touched
             far = {**raw, "path": "far.txt", "instances": ["far.txt:1"], "summary": "an old defect"}
+            held = [review._finding(raw)] if mode == "offdelta_held" else []  # and one the fix's file still holds
             print(json.dumps({"status": "blocking", "scope": "branch", "requested_reviews": 2,
                               "completed_reviews": 1 if mode == "offdelta_short" else 2, "covers_from": "c" * 40,
                               "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
-                              "findings": review.dispose([review._finding(far)], "high")}))
+                              "findings": review.dispose([review._finding(far), *held], "high")}))
             sys.exit(0)
         if mode == "absolute":  # pack sd:9769: a blocker spelled as an absolute path inside the checkout
             findings = review.dispose([review._finding({**raw, "path": os.path.join(work, "work.txt")})], "high")
@@ -1055,6 +1056,19 @@ class Supervise(Case):
         self.assertEqual([row["disposition"] for row in review.dispose([far], "high", recorded)], ["advisory"],
                          "the lane would block on the finding the build filed")
 
+    def test_a_round_that_still_blocks_records_no_rebuttal(self):
+        """Review of sd:9769: a fix round follows a round that holds a blocker; a rebuttal written there would
+        outlive the code its deferral judged, so the follow-up is filed and the lane review stays free to block."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1", "fix2"], sd_review=["blocking", "offdelta_held", "clean"])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        filed = self.db.execute("SELECT title FROM item WHERE title LIKE 'Review follow-up%'").fetchall()
+        self.assertEqual(len(filed), 1, "the deferred blocker was not filed")
+        rebuttals = self.db.execute(
+            "SELECT COUNT(*) FROM state WHERE kind = 'checkpoint' AND key LIKE 'ship-adjudication:%'").fetchone()[0]
+        self.assertEqual(rebuttals, 0, "a round that still blocked recorded a rebuttal a later fix outlives")
+
     def test_a_short_blocking_report_is_never_made_advisory(self):
         """Review of sd:9769: a blocking report missing a reader's answer blocks, whatever the delta."""
         self.press()
@@ -1470,8 +1484,8 @@ class Supervise(Case):
         supervisor = self.supervisor()
         real, lost = supervisor.file_follow_up, list[dict]()
 
-        def committed_then_lost(row, head):  # the first follow-up's transaction commits; its answer is lost
-            real(row, head)
+        def committed_then_lost(row, head, **options):  # the first follow-up's transaction commits; its answer is lost
+            real(row, head, **options)
             if not lost:
                 lost.append(row)
                 raise remote.UnknownOutcome("r" * 26, "the answer to COMMIT was lost")
@@ -2450,6 +2464,20 @@ class Unmanaged(Case):
         self.assertIn("exit 1", fix[fix.index("-p") + 1])
         self.assertEqual(build.run(self.db, self.bundle["id"])["review_round"], 1)
         self.assertEqual(len(self.pulls()), 1)
+
+    def test_a_failing_check_after_a_deferral_records_no_rebuttal(self):
+        """Review of sd:9769: an unmanaged repository's own check runs after the review; when it fails, a fix
+        round follows, so the round's deferral records no rebuttal that the fix would outlive."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "mend", "fix"], sd_review=["blocking", "offdelta", "clean"])
+        self.assertEqual(self.supervisor(checks=lambda work: [CHECK]).run()["step"], "enqueued")
+        self.assertEqual(len(self.calls("claude")), 3, "the failing check did not go back to the builder")
+        filed = self.db.execute("SELECT title FROM item WHERE title LIKE 'Review follow-up%'").fetchall()
+        self.assertEqual(len(filed), 1, "the deferred blocker was not filed")
+        rebuttals = self.db.execute(
+            "SELECT COUNT(*) FROM state WHERE kind = 'checkpoint' AND key LIKE 'ship-adjudication:%'").fetchone()[0]
+        self.assertEqual(rebuttals, 0, "a round whose check failed recorded a rebuttal a later fix outlives")
 
     def test_a_check_that_edits_a_tracked_file_is_a_failure_not_a_pass(self):
         """Lane review of b64873f13: a check that rewrites a tracked file and exits 0 tested a tree the head does
