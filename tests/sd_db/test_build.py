@@ -2616,7 +2616,9 @@ class Hosts(Case):
         build.queue(self.db, items, who="operator")
         first = self.claim(hosts=WORK)
         self.retried(first)
+        # Retry queues each member and readies its item, as `retried` does the lead's.
         self.db.execute("UPDATE assignment SET status = 'queued' WHERE parent = ?", (first["assignment"],))
+        self.db.execute("UPDATE item SET status = 'ready' WHERE id = ?", (items[1],))
         self.quiet()
         self.assertIsNone(self.claim(hosts=HUB))
         self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE status = 'blocked'"), 2)
