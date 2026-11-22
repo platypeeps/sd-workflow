@@ -1878,10 +1878,18 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
                     raise _Moved
                 connection.execute("UPDATE assignment SET budget_minutes = ? WHERE id = ?",
                                    (budget_minutes(connection, [row["item"] for row in bundle]), lead))
+                # A bundle a usage limit queued again resumes as a loss retry does: its step, session and round
+                # (advisory of pack sd:9907, sd:9973). Any other claim starts fresh.
+                last = connection.execute("SELECT step, session_id, review_round, outcome FROM runner_run "
+                                          "WHERE assignment = ? ORDER BY run DESC LIMIT 1", (lead,)).fetchone()
+                limited = last is not None and last["outcome"] == RATE_LIMITED and last["step"] not in LANE_STEPS
+                step = RESUME.get(last["step"] or "claimed", last["step"] or "claimed") if limited else "claimed"
                 ident = _open_run(connection, lead, repo=repo, owner=run_owner(owner, lanes[lead]),
-                                  step="claimed",
+                                  step=step,
                                   model=_model(connection, [row["item"] for row in bundle]),
-                                  work=worktree(repo, lead, root=root), stamp=stamp)
+                                  work=worktree(repo, lead, root=root), stamp=stamp,
+                                  session_id=last["session_id"] if limited else None,
+                                  review_round=last["review_round"] if limited else None)
                 for row in bundle:
                     transition(connection, row["item"], "in_progress", who="build",
                                reason=f"build run {ident} claimed assignment {row['id']}")
@@ -2256,10 +2264,15 @@ def open_question(connection, items: list[int], since: str, *, pending: bool = F
     if not items:
         return None
     marks = ", ".join("?" for _ in items)
+    # A review withdrawal reopens the question and keeps its ruling (`review.withdraw`): pending, a withdrawn
+    # ruling answers nothing (advisory of PR #1940, sd:9973).
+    withdrawn = ("AND NOT EXISTS (SELECT 1 FROM note pulled WHERE pulled.item = asked.item AND pulled.kind = "
+                 "'decision' AND pulled.body LIKE 'Withdrawn: ruling #' || ruling.id || ' on note #' || asked.id || "
+                 "'%') " if pending else "")
     row = connection.execute(
         f"SELECT asked.id, asked.item FROM note asked WHERE asked.kind = 'question' AND asked.item IN ({marks}) "
         f"AND asked.timestamp >= ? {'AND asked.resolved_at IS NULL' if pending else ''} AND NOT EXISTS (SELECT 1 FROM note ruling WHERE ruling.item = asked.item "
-        f"AND ruling.kind = 'decision' AND ruling.body LIKE 'Ruling on note #' || asked.id || ':%') "
+        f"AND ruling.kind = 'decision' AND ruling.body LIKE 'Ruling on note #' || asked.id || ':%' {withdrawn}) "
         f"ORDER BY asked.id LIMIT 1", (*items, since)).fetchone()
     return dict(row) if row else None
 
