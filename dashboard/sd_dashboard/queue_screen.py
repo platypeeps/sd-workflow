@@ -85,6 +85,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -105,8 +106,13 @@ BUILDING_HOURS = 6
 BLOCKED_DAYS = 3
 #: What the page sends as `action`: `move`'s relative places, the two hold verbs, cancel, a blocked row's retry and
 #: approve (`retry --manual`), a cancelled row's Re-queue (`requeue`, which runs `lane retry`), and a running row's
-#: Release (`reclaim`, which runs `lane cancel --expected-claim`).
-ACTIONS = ("up", "down", "top", "hold", "release", "cancel", "retry", "approve", "requeue", "reclaim")
+#: Release (`reclaim`, which runs `lane cancel --expected-claim`), and a review-blocked row's Reject and enqueue
+#: (`reject`: `sd-ship adjudicate` rebuts each blocker with the operator's reason, then `lane retry`, sd:9966).
+ACTIONS = ("up", "down", "top", "hold", "release", "cancel", "retry", "approve", "requeue", "reclaim", "reject")
+#: The prepare blocker a lane review block answers with (`sd_ship_dispositions.blocking_refusal`).
+REVIEW_BLOCKING = "review_blocking"
+#: The most a rejection's reason may hold: `sd_ship_dispositions.text`'s bound.
+REASON_BYTES = 4096
 #: The ends short of a merge that the page shows as blocked and `lane retry` takes.
 BLOCKED = ("failed", "skipped", "prepared")
 #: Who acts on a blocked entry, by its status and failed step.
@@ -621,17 +627,22 @@ def document(connection, *, now: str = "") -> dict:
 def move(payload: dict):
     """Check the page's request, then return the write: a best-effort revision check, then one lane verb."""
     values = dict(payload)
-    again, reclaim = values.get("action") in ("retry", "approve", "requeue"), values.get("action") == "reclaim"
-    if (set(values) != {"repo", "item", "action", "revision", *(("head",) if again else ()), *(("claim",) if reclaim else ())}
+    again, reclaim = values.get("action") in ("retry", "approve", "requeue", "reject"), values.get("action") == "reclaim"
+    reject = values.get("action") == "reject"
+    if (set(values) != {"repo", "item", "action", "revision", *(("head",) if again else ()), *(("claim",) if reclaim else ()),
+                        *(("reason",) if reject else ())}
             or not isinstance(values["repo"], str)
             or type(values["item"]) is not int or not 1 <= values["item"] <= 9223372036854775807
             or values["action"] not in ACTIONS or not isinstance(values["revision"], str)
             or (again and not (isinstance(values["head"], str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", values["head"])))
             or (reclaim and not (isinstance(values["claim"], str) and len(values["claim"]) <= 200
-                                 and all(values["claim"].partition(":")[::2])))):
+                                 and all(values["claim"].partition(":")[::2])))
+            or (reject and not (isinstance(values["reason"], str) and values["reason"].strip()
+                                and len(values["reason"].strip().encode()) <= REASON_BYTES))):
         raise ValueError("Name the repository, the item, one of up, down, top, hold, release, cancel, retry, approve, "
-                         "requeue or reclaim, the lane's revision, for retry, approve or requeue the full head the row "
-                         "showed, and for reclaim the claim it showed.")
+                         "requeue, reclaim or reject, the lane's revision, for retry, approve, requeue or reject the "
+                         "full head the row showed, for reclaim the claim it showed, and for reject a reason of at "
+                         f"most {REASON_BYTES} bytes.")
 
     def write(connection):
         from sd_db import repos, workflow
@@ -654,6 +665,11 @@ def move(payload: dict):
             # The operator's ruling (sd:3398): Re-queue takes back a cancel; it enqueues nothing new.
             raise ValueError(f"sd:{item}'s newest entry in this lane is {found.get('status') if found else 'missing'}; "
                              "Re-queue takes only a cancelled one.")
+        if action == "reject":
+            unknown = rebut(found, Path(str(listed.get("queue") or "")).parent.parent, values["head"],
+                            values["reason"].strip())
+            if unknown:
+                return 502, {"error": unknown, "outcome": "unknown"}
         verb = (["move", item, action] if action in ("up", "down", "top")
                 else ["retry", item, "--expected-head", values["head"]] if again
                 else ["cancel", item, "--expected-claim", values["claim"]] if reclaim else [action, item])
@@ -677,6 +693,36 @@ def move(payload: dict):
             raise ValueError(answer.get("error") or "sd-ship lane refused the change.")
         return {"ok": True, "action": action, "item": values["item"], "pending": answer.get("pending"), "edits": EDITS}
     return write
+
+
+def rebut(entry: dict | None, lane: Path, head: str, reason: str) -> str | None:
+    """sd:9966: Reject and enqueue's first step. Record a rebuttal, `reason`, of each blocking finding the lane's
+    review raised on `entry` at `head`, through `sd-ship adjudicate` in its worktree; `lane retry` then reuses that
+    review and clears it. Raises ValueError when nothing was written; returns why when a write may have landed.
+    Pressed twice, the second records the same rebuttals again, which a retry reads as the first."""
+    if not (entry and entry.get("status") == "failed" and _logged(entry, lane).get("code") == REVIEW_BLOCKING
+            and entry.get("worktree")):
+        raise ValueError("Reject and enqueue takes a lane entry whose prepare a review blocked, its log read here.")
+    if entry.get("expected_head") != head:
+        raise ValueError(f"sd:{entry.get('item')} failed at another head than the page showed. Read it again.")
+    base = [command("sd-ship"), "-C", str(entry["worktree"]), "adjudicate", "--item", str(entry["item"]),
+            "--expected-head", head, "--json"]
+    template = _run(base, WRITE_SECONDS)
+    proposal = template.get("proposal")
+    if not (template.get("exit") == 0 and isinstance(proposal, dict) and isinstance(proposal.get("findings"), list)
+            and all(isinstance(row, dict) for row in proposal["findings"])):
+        raise ValueError(f"sd-ship adjudicate gave no findings to rebut: {template.get('error') or 'no template'}")
+    for row in proposal["findings"]:
+        row.update(response_disposition="rebutted", reason=reason)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", prefix="sd-rebut-") as filled:
+        json.dump(proposal, filled)
+        filled.flush()
+        answer = _run([*base, "--dispositions-file", filled.name], WRITE_SECONDS)
+    if answer.get("exit") == 0 and answer.get("phase") == "disposition_recorded":
+        return None
+    if answer.get("exit") == 3:
+        raise ValueError(f"sd-ship adjudicate refused the rebuttal: {answer.get('error') or 'no reason given'}")
+    return f"not known whether the rebuttal was recorded: {answer.get('error') or 'sd-ship adjudicate gave no answer'}"
 
 
 def check_prs(payload: dict):

@@ -55,6 +55,11 @@ case "$*" in
   "lane retry --help") if [ -n "$QUEUE_NO_RETRY" ]; then echo "invalid choice: 'retry'" >&2; exit 2; fi
      if [ -n "$QUEUE_OLD_RETRY" ]; then echo "usage: sd-ship lane retry [--manual] item"; else echo "usage: sd-ship lane retry [--manual] [--expected-head EXPECTED_HEAD] item"; fi
      if [ -z "$QUEUE_OLD_REQUEUE$QUEUE_OLD_RETRY" ]; then echo "  --expected-head  ...; a cancelled entry needs it (sd:3389)"; fi ;;
+  *" adjudicate "*) case "$*" in
+       *--dispositions-file*) if [ -n "$QUEUE_REFUSE" ]; then printf '{"ok": false, "error": "%s"}\\n' "$QUEUE_REFUSE"; exit 3; fi
+         eval "f=\${$#}"; cp "$f" "$QUEUE_LOG.dispositions"; printf '{"ok": true, "phase": "disposition_recorded"}\\n' ;;
+       *) printf '{"ok": true, "phase": "disposition_template", "proposal": {"schema_version": 1, "bindings": {"head": "h"}, "findings": [{"index": 0, "summary": "wrong", "response_disposition": "rebutted|parked", "reason": ""}]}}\\n' ;;
+     esac ;;
   "gate status --json") printf '{"slots": 4, "holders": [{"slot": 1}], "waiters": [], "load": [1, 2, 3]}\\n' ;;
   *) if [ -n "$QUEUE_SLEEP" ]; then exec sleep "$QUEUE_SLEEP"; fi
      if [ -n "$QUEUE_CRASH" ]; then echo "Traceback: $QUEUE_CRASH" >&2; exit 1; fi
@@ -755,6 +760,52 @@ class TheMove(Lane, BrowserSession):
         self.assertEqual((status, answer["ok"], answer["action"]), (200, True, "approve"))
         self.assertEqual(self.calls()[-1],
                          ["-C", str(self.checkout), "lane", "retry", "5", "--expected-head", "5" * 40, "--manual"])
+
+    REASON = "a.py:1 reads the value the finding says is missing"
+
+    def reject(self, item=14, reason=REASON, head=None):
+        return self.post("/api/queue/move", {"repo": str(self.checkout), "item": item, "action": "reject",
+                                             "revision": self.revision(), "head": head or self.merged, "reason": reason})
+
+    def test_reject_rebuts_each_blocking_finding_then_queues_the_entry_again(self):
+        """sd:9966: Reject and enqueue records a rebuttal of every lane review blocker, then lane retry."""
+        self.failed()
+        self.log.write_text("")
+        status, _, answer = self.reject()
+        self.assertEqual((status, answer["ok"], answer["action"]), (200, True, "reject"), answer)
+        calls = self.calls()
+        adjudicate = ["-C", str(self.checkout), "adjudicate", "--item", "14", "--expected-head", self.merged, "--json"]
+        self.assertEqual(calls[:2], [["-C", str(self.checkout), "lane", "list"], adjudicate])
+        self.assertEqual(calls[2][:len(adjudicate) + 1], [*adjudicate, "--dispositions-file"])
+        self.assertEqual(calls[3:], [["-C", str(self.checkout), "lane", "retry", "14", "--expected-head", self.merged]])
+        filled = json.loads(Path(f"{self.log}.dispositions").read_text())
+        self.assertEqual([(row["response_disposition"], row["reason"]) for row in filled["findings"]],
+                         [("rebutted", self.REASON)])
+        self.assertEqual(filled["bindings"], {"head": "h"})
+
+    def test_reject_refuses_an_entry_no_review_blocked_before_any_verb(self):
+        self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "merge_conflict"}}}))
+        self.log.write_text("")
+        status, _, answer = self.reject()
+        self.assertEqual(status, 400, answer)
+        self.assertIn("review", answer["error"])
+        self.assertEqual(self.calls(), [["-C", str(self.checkout), "lane", "list"]])
+
+    def test_reject_refuses_another_head_or_no_reason_before_any_verb(self):
+        self.failed()
+        for reason, head in (("", None), ("  \n ", None), ("x" * 4097, None), (self.REASON, "f" * 40)):
+            self.log.write_text("")
+            status, _, _ = self.reject(reason=reason, head=head)
+            self.assertEqual(status, 400)
+            self.assertEqual([c for c in self.calls() if "adjudicate" in c], [])
+
+    def test_a_refused_adjudication_queues_nothing(self):
+        self.failed()
+        self.log.write_text("")
+        with mock.patch.dict(os.environ, {"QUEUE_REFUSE": "disposition proposal does not bind the current review"}):
+            status, _, answer = self.reject()
+        self.assertEqual(status, 400, answer)
+        self.assertNotIn("retry", [word for call in self.calls() for word in call])
 
     def test_retry_or_approve_without_a_full_head_runs_nothing(self):
         for action, head in (("retry", None), ("approve", None), ("approve", "5" * 12), ("retry", "HEAD")):
@@ -2950,20 +3001,74 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
 
     NEXT = "Run `sd-ship adjudicate --item 14` to print each blocking finding in full; fix them."
 
+    def conflicted(self):
+        """Item 14 failed prepare on a merge conflict, not a review: Retry stays, as main may have fixed it."""
+        return self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "merge_conflict", "retryable": False},
+                                                                          "next_action": self.NEXT}}))
+
     def test_a_failed_entry_at_an_unchanged_head_says_retry_repeats_it_and_retry_asks_first(self):
-        """pack sd:8584: Retry on a head no commit moved repeated a review block silently; the row and the press say so."""
-        self.failed()
+        """pack sd:8584: Retry on a head no commit moved repeated a failure silently; the row and the press say so."""
+        self.conflicted()
         out = self.run_view("open('system'); R.html = ELS.queue.html;")
         self.assertIn("head unchanged since this failure: Retry repeats it unless the failure was transient", out["R"]["html"])
-        self.assertIn(f"review_blocking, not retryable · next: {self.NEXT}", out["R"]["html"])
+        self.assertIn(f"merge_conflict, not retryable · next: {self.NEXT}", out["R"]["html"])
         kept = self.confirmed("retry", 14, False, head=self.merged)
         self.assertEqual(kept["posts"], [])
         self.assertEqual(kept["asked"]["ok"], "Retry anyway")
         self.assertIn("No commit moved the head since this failure", kept["asked"]["body"])
-        self.assertIn("The lane marks review_blocking as not retryable", kept["asked"]["body"])
+        self.assertIn("The lane marks merge_conflict as not retryable", kept["asked"]["body"])
         self.assertIn(self.NEXT, kept["asked"]["body"])
         done = self.confirmed("retry", 14, True, head=self.merged)
         self.assertEqual((done["posts"][0][1]["action"], done["posts"][0][1]["head"]), ("retry", self.merged))
+
+    SAME = "same code, same review: send it to the builder"
+
+    def test_a_review_blocked_entry_offers_send_to_builder_and_reject_in_place_of_retry(self):
+        """sd:9966: Retry on mws sd:9214 re-ran prepare at an unchanged head and failed the same way."""
+        self.failed()
+        html = self.run_view("open('system'); R.html = ELS.queue.html;")["R"]["html"]
+        row = re.search(r'<tr class="child"[^>]*data-id="entry:[^"]*:14"[^>]*>([\s\S]*?)</tr>', html)[1]
+        self.assertNotIn('data-act="retry"', row)
+        self.assertRegex(row, rf'<button[^>]*disabled title="{self.SAME}"[^>]*>Retry</button>')
+        self.assertRegex(row, r'data-act="reject" data-item="14"[^>]*data-head="' + self.merged + '"[^>]*>Reject and enqueue…<')
+        self.assertRegex(row, r'data-act="fix" data-item="14"[^>]*>Send to builder…<')
+
+    def test_a_retryable_failure_keeps_retry_and_offers_no_reject(self):
+        self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "hub_unavailable", "retryable": True}}}))
+        html = self.run_view("open('system'); R.html = ELS.queue.html;")["R"]["html"]
+        self.assertRegex(html, r'data-act="retry" data-item="14"')
+        self.assertNotIn('data-act="reject"', html)
+        self.assertRegex(html, r'data-act="fix" data-item="14"[^>]*>Fix…<')
+
+    def reject_press(self, answer):
+        fields = json.dumps({"repo": str(self.checkout), "item": "14", "act": "reject", "head": self.merged})
+        return self.run_view(f"window.shell.ask = a => {{ OUT.asked = a; return Promise.resolve({json.dumps(answer)}); }};"
+                             f"open('system'); act('button[data-act]', {fields}); await flush(); await flush();"
+                             " R.said = ELS['queue-said'].textContent;")
+
+    def test_reject_asks_for_a_reason_then_posts_it_with_the_head(self):
+        self.failed()
+        reason = "a.py:1 reads the value the finding says is missing"
+        out = self.reject_press({"yes": True, "values": {"reason": f"  {reason}\n"}})
+        self.assertEqual(out["asked"]["ok"], "Reject and enqueue")
+        self.assertIn(f"adjudicate --item 14 --expected-head {self.merged}", out["asked"]["cli"])
+        posted = [p[1] for p in out["posts"] if p[0] == "/api/queue/move"]
+        self.assertEqual([(p["action"], p["item"], p["head"], p["reason"]) for p in posted],
+                         [("reject", 14, self.merged, reason)])
+        self.assertIn("sd:14 rebutted and queued again", out["R"]["said"])
+
+    def test_a_kept_or_empty_reject_posts_nothing(self):
+        self.failed()
+        for answer in ({"yes": False}, {"yes": True, "values": {"reason": "  "}}):
+            with self.subTest(answer=answer):
+                self.assertEqual(self.reject_press(answer)["posts"], [])
+
+    def test_the_palette_retry_on_a_review_blocked_entry_is_off_and_says_why(self):
+        self.failed()
+        out = self.run_view("open('system'); const c = REG.find(x => x.id === 'today.lane.retry');"
+                            f" R.off = c.when({{ head: {json.dumps(self.merged)}, failure: {{ code: 'review_blocking' }} }});"
+                            f" R.on = c.when({{ head: {json.dumps(self.merged)}, failure: {{ code: 'hub_unavailable' }} }});")
+        self.assertEqual((out["R"]["off"], out["R"]["on"]), (self.SAME, True))
 
     def test_a_failed_entry_whose_worktree_moved_says_retry_is_refused(self):
         self.failed()
