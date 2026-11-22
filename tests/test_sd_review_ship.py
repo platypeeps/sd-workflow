@@ -181,6 +181,26 @@ class FixReviewTests(ReviewFixture):
                                    FakeRunner(), self.environment(), self.chatgpt_home())
         self.assertIs(chained["remote_reviews"]["copilot"]["automatic"], True, "the fix tier dropped Copilot")
 
+    def test_a_verify_pass_routes_the_whole_branch_for_copilot(self):
+        """Review of sd:9769: two standard deltas that cross the deep line together still select Copilot."""
+        root, first = self.branch()
+        real = sd_review.sd_route.route
+
+        def route(paths, lines, draft, policy):
+            plan = real(paths, lines, draft, policy)
+            return plan._replace(tier="deep") if {"src.py", "fix.py"} <= set(paths) else plan._replace(tier="standard")
+
+        with patch.object(sd_review.sd_route, "route", route), patch.object(sd_review.sd_lib, "reported_copilot_policy", lambda *a: ("deep", "test")):
+            full = sd_review.review(root, namespace(scope="branch"), FakeRunner(), self.environment(), self.chatgpt_home())
+            self.assertIs(full["remote_reviews"]["copilot"]["automatic"], False)
+            report = self.tmp / "prior.json"
+            report.write_text(json.dumps(full))
+            self.commit(root, "fix.py", "fix = True\n")
+            chained = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)),
+                                       FakeRunner(), self.environment(), self.chatgpt_home())
+        self.assertIs(chained["remote_reviews"]["copilot"]["automatic"], True,
+                      "two standard deltas crossed the deep line and Copilot was not selected")
+
     def test_mismatched_or_malformed_previous_report_cannot_verify(self):
         root, first = self.branch()
         self.commit(root, "fix.py", "fix = True\n")

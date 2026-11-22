@@ -2311,11 +2311,16 @@ def review(
               "candidates": [{"name": provider.name, "recipient": str(sd_registry.recipient(provider))}
                              for provider in chosen]}
     timing["execution_seconds"] = SETUP_TIMEOUT_SECONDS + timing["slot_seconds"] + check_seconds + phase * len(chosen)
+    cover = covers_from(subject, args, previous, binding := sd_lib.lead_review_binding(root))
+    branch_plan = plan
+    if verify and cover:  # the pass stands for the whole branch, so Copilot routes it, not the delta (sd:9769)
+        whole = resolve_subject(root, "branch", base=cover)
+        branch_plan = sd_route.route(whole.paths, whole.lines, args.draft, policy)
     result: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
         "repo": str(root),
         "scope": args.scope,
-        "covers_from": covers_from(subject, args, previous, binding := sd_lib.lead_review_binding(root)),
+        "covers_from": cover,
         "verification_report_digest": hashlib.sha256(json.dumps(previous, sort_keys=True).encode()).hexdigest() if verify and previous else None,
         "resume_report_digest": hashlib.sha256(json.dumps(previous, sort_keys=True).encode()).hexdigest() if resume and previous else None,
         "item": item,
@@ -2334,7 +2339,7 @@ def review(
         "route": plan._asdict(),
         "remote_reviews": {
             "copilot": {
-                "automatic": sd_lib.copilot_automatic(copilot_word, plan.tier, plan.depth) or bool(  # the chain's (sd:9769)
+                "automatic": sd_lib.copilot_automatic(copilot_word, branch_plan.tier, branch_plan.depth) or bool(  # the chain's (sd:9769)
                     verify and (((previous or {}).get("remote_reviews") or {}).get("copilot") or {}).get("automatic")),
                 "tier": plan.tier,
                 "policy": copilot_word,
