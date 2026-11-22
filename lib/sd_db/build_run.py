@@ -431,6 +431,25 @@ def _read(argv: list[str], *, env: dict | None = None) -> str:
     return done.stdout
 
 
+# How far, and over how many lines naming one function, `called_from` walks back toward the changed code;
+# past either bound a blocker holds. ponytail: a name-based walk, no call graph; a language-aware one if it misses.
+CALL_DEPTH, CALL_HITS = 6, 200
+
+
+def _grep(argv: list[str], *, env: dict | None = None) -> str:
+    """`_read` for `git grep`, whose exit 1 with no output means no match: "" then (pack sd:9769)."""
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=READ_SECONDS, check=False,
+                              stdin=subprocess.DEVNULL, env=env)
+    except (OSError, subprocess.SubprocessError, UnicodeError) as error:
+        raise Unread(f"{argv[0]} gave no answer: {error}") from None
+    if done.returncode == 1 and not done.stdout and not done.stderr:
+        return ""
+    if done.returncode != 0:
+        raise Unread(f"{' '.join(argv[:4])} failed: exit {done.returncode}: {done.stderr.strip()[:200]}")
+    return done.stdout
+
+
 def _read_bytes(argv: list[str], *, env: dict | None = None) -> bytes:
     """`_read` for output in no known encoding: its stdout as bytes, `Unread` the same way."""
     try:
@@ -1558,16 +1577,49 @@ class Supervisor:
             # Or a plain word that is the name of a function the change defines (`export`).
             if callable_words(words) & functions[0] or set(re.findall(r"[A-Za-z_]\w*", words)) & functions[1]:
                 return True
-            # A place inside a function the changed code calls: a changed caller can break an unchanged callee
-            # (a crash on an empty value) whatever the finding's words name, so its path defers nothing.
-            if any(names is None or names & functions[0] for path, line in self.locations(row)
-                   for names in [self.enclosing(path, line, head, sources)]):
+            # A place inside a function the changed code calls, directly or through unchanged ones: a changed
+            # caller can break an unchanged callee (a crash on an empty value) whatever the finding's words
+            # name, so its path defers nothing.
+            if any(self.called_from(path, line, head, sources, functions[0]) for path, line in self.locations(row)):
                 return True
             # A name with a space or other character no word holds (`bin/my tool`), found literally and whole.
             return any(re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w/-]|\.\w)", words)
                        for name in names if re.search(r"[^\w./-]", name))
         new = [row for row in answer["blockers"] if not held(row)]
         return new, [row for row in answer["blockers"] if row not in new]
+
+    def called_from(self, path: str, line: int | None, head: str, sources: dict[str, list[str] | None],
+                    words: set[str]) -> bool:
+        """Whether the function around `path:line` is one the changed code's `words` name, or calls one of
+        them through `CALL_DEPTH` unchanged callers at `head`; an answer git cannot give, or a search past
+        its bounds, counts as called (pack sd:9769)."""
+        frontier, seen = self.enclosing(path, line, head, sources), set[str]()
+        for _depth in range(CALL_DEPTH):
+            if frontier is None or frontier & words:
+                return True
+            frontier -= seen
+            if not frontier:
+                return False
+            seen |= frontier
+            callers: set[str] = set()
+            for name in sorted(frontier):
+                try:  # `head:path\0line\0text` per line that names `name`, as a whole word
+                    hits = _grep([*self.tools.git, "-C", str(self.work), "grep", "-n", "-z", "-w", "-I", "-e", name,
+                                  head, "--"], env=self.env).split("\n")
+                except Unread:
+                    return True
+                if len(hits) > CALL_HITS + 1:
+                    return True
+                for hit in filter(None, hits):  # `split`, not `splitlines`: a form feed is no line end
+                    place, number, _text = (hit.split("\0", 2) + ["", ""])[:3]
+                    if not place.startswith(f"{head}:") or not number.isascii() or not number.isdigit():
+                        return True
+                    names = self.enclosing(place[len(head) + 1:], int(number), head, sources)
+                    if names is None:
+                        return True
+                    callers |= names
+            frontier = callers
+        return True
 
     def enclosing(self, path: str, line: int | None, head: str,
                   sources: dict[str, list[str] | None]) -> set[str] | None:

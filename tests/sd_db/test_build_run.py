@@ -15,6 +15,7 @@ import importlib
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import sqlite3
@@ -1575,7 +1576,8 @@ class Supervise(Case):
                  "instances": ["lib/parse.py:5"]},
                 {"path": "lib/parse.py", "line": None, "summary": "an empty value crashes this module"}]
         far = {"path": "lib/parse.py", "line": 9, "summary": "an old defect"}
-        with mock.patch.object(build_run, "_read", side_effect=show):
+        with mock.patch.object(build_run, "_read", side_effect=show), \
+                mock.patch.object(build_run, "_grep", return_value=""):
             _, kept = self.deferred([*rows, far], {"src/caller.py": {12}}, {"export", "parse_row", "row"},
                                     {"export"}, callees=True)
         self.assertEqual(kept["blockers"], rows, "a blocker in a callee of the changed caller was deferred")
@@ -1586,6 +1588,42 @@ class Supervise(Case):
         with mock.patch.object(build_run, "_read", side_effect=broken):
             _, kept = self.deferred([far], {"src/caller.py": {12}}, {"parse_row"}, {"export"}, callees=True)
         self.assertEqual(kept["blockers"], [far], "a callee git could not read deferred its blocker")
+
+    def test_a_blocker_in_a_transitive_callee_of_a_changed_caller_still_blocks(self):
+        """Review of sd:9769: a changed caller passes an empty value to an unchanged wrapper, which forwards
+        it to a parser that crashes; a finding naming only the parser is in scope through the wrapper."""
+        self.press()
+        head = "a" * 40
+        files = {"lib/parse.py": "def parse_row(value):\n    return value[0]\n\n\ndef old_reader():\n    return 1\n",
+                 "lib/wrap.py": "from lib.parse import parse_row\n\n\ndef wrap(value):\n    return parse_row(value)\n"}
+
+        def show(argv, **_kwargs):
+            path = argv[-1].removeprefix(f"{head}:")
+            if "show" in argv and path in files:
+                return files[path]
+            raise build_run.Unread("no such file")
+
+        def grep(argv, **_kwargs):  # `git grep -n -z -w`: `head:path\0line\0text`
+            name = argv[argv.index("-e") + 1]
+            return "".join(f"{head}:{path}\0{number}\0{text}\n" for path, body in files.items()
+                           for number, text in enumerate(body.splitlines(), 1)
+                           if re.search(rf"\b{re.escape(name)}\b", text))
+
+        deep = {"path": "lib/parse.py", "line": 2, "summary": "an empty value crashes the parser"}
+        far = {"path": "lib/parse.py", "line": 6, "summary": "an old defect"}
+        with mock.patch.object(build_run, "_read", side_effect=show), \
+                mock.patch.object(build_run, "_grep", side_effect=grep):
+            _, kept = self.deferred([deep, far], {"src/caller.py": {12}}, {"export", "wrap", "value"},
+                                    {"export"}, callees=True)
+        self.assertEqual(kept["blockers"], [deep], "a blocker in a transitive callee of the changed caller was deferred")
+
+        def lost(argv, **_kwargs):
+            raise build_run.Unread("git grep gave no answer")
+
+        with mock.patch.object(build_run, "_read", side_effect=show), \
+                mock.patch.object(build_run, "_grep", side_effect=lost):
+            _, kept = self.deferred([far], {"src/caller.py": {12}}, {"wrap"}, {"export"}, callees=True)
+        self.assertEqual(kept["blockers"], [far], "a caller search git could not answer deferred its blocker")
 
     def test_a_short_function_name_still_names_the_changed_caller(self):
         """Review of sd:9769: `go()` names a changed function; no length filter drops it."""
