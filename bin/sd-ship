@@ -562,10 +562,11 @@ def settled_followups(connection: sqlite3.Connection, item: int, message: str) -
     """The open followups on `item` a delivery settles (sd:9869).
 
     A lane blocker (`sd_lane.LANE_ENDED`), or one whose id `message` names
-    as `#<id>`. Any other followup waits on something the merge does not
+    as `followup #<id>`: a bare `#<id>` is as often a pull request or a URL
+    fragment. Any other followup waits on something the merge does not
     give, such as an outside reply, so it stays open.
     """
-    named = {int(found) for found in re.findall(r"#(\d+)\b", message)}
+    named = {int(found) for found in re.findall(r"\bfollowups?\s+#(\d+)\b", message, re.IGNORECASE)}
     return {row[0] for row in connection.execute(
         "SELECT id, body FROM note WHERE item = ? AND kind = 'followup' AND resolved_at IS NULL", (item,))
         if row[0] in named or str(row[1]).startswith(sd_lane.LANE_ENDED)}

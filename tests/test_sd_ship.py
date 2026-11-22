@@ -3194,14 +3194,18 @@ roles:
         named = sd_db.add_note(self.connection, self.item, "followup", "Rename the flag")
         self.connection.commit()
         body = self.directory / "body.md"
-        body.write_text(f"Renames the flag; settles followup #{named}.\n")
+        # An ordinary PR reference or URL fragment with the same number settles nothing.
+        unrelated = sd_db.add_note(self.connection, self.item, "followup", "Waits on PR 42's author")
+        self.connection.commit()
+        body.write_text(f"Renames the flag; settles followup #{named}.\nDepends on PR #{unrelated}; "
+                        f"see https://example.test/pull/1#{unrelated}.\n")
         self.unanswered("--deliver", "--title", "Rename", "--body-file", str(body)).prepare()
         with patch.object(ship.time, "sleep"):
             self.merge()
         self.assertEqual(self.status_of(self.item), "done")
         still = {row[0] for row in self.connection.execute(
             "SELECT id FROM note WHERE item = ? AND kind = 'followup' AND resolved_at IS NULL", (self.item,))}
-        self.assertEqual(still, {waiting})
+        self.assertEqual(still, {waiting, unrelated})
 
     def test_a_design_only_branch_cannot_deliver_its_build_item(self):
         """sd:3519. PR #260 changed docs/work/ and CLAUDE.md, merged with
