@@ -4315,18 +4315,20 @@ def fill_slots(items: Any, slots: int, run: Callable[[Any], Any], counted: Calla
     return [answers[index] for index in sorted(answers)]
 
 
-#: What makes `evidence` a repro (sd:9869 review), one copy for the gate
-#: and for `distinct_findings`: something a reader can run or check. A command or path
-#: (`path:line`, a file with an extension, a backticked span, `$ cmd`) or a failure's output (an error name,
-#: a traceback, an exit status, "failed", "expected ... got", a comparison); "See summary" names none.
-_REPRO = re.compile(r"[\w./-]+:\d+|\b[\w./-]+\.[A-Za-z]\w{0,4}\b|`[^`\n]+`|\$ \S|\b\w*(?:Error|Exception)\b"
-                   r"|Traceback|\bexit(?:ed)?(?: with)?(?: code| status)? \d+|\bfail(?:s|ed|ure|ing)?\b"
-                   r"|\bexpected\b.*\bgot\b|[!=]=", re.IGNORECASE)
+#: A repro (sd:9869 review) is two parts a reader can check: something run, and what it gave. Run: a
+#: backticked span, `$ cmd`, a call with its input `f(2)`, or a command word and its argument. Gave: an error
+#: name, a traceback, an exit status, "failed", "expected", a comparison, `->`, or "returns", "prints",
+#: "raises". A bare failure word or file name ("This fails.", "src.py is wrong") is one part, so none.
+_RUN = re.compile(r"`[^`\n]+`|\$ \S|\b\w+\([^()\n]*\)|\b(?:python3?|pytest|make|bash|sh|zsh|node|npm|npx|"
+                  r"cargo|go|git|curl|sqlite3|uv|ruby|java|sd(?:-[\w-]+)?|bin/[\w./-]+)\s+\S")
+_GAVE = re.compile(r"\b\w*(?:Error|Exception)\b|Traceback|\bexit(?:ed)?(?: with)?(?: code| status)? \d+"
+                   r"|\bfail(?:s|ed|ure|ing)?\b|\bexpected\b|[!=]=|->|\b(?:returns?|returned|prints?|printed"
+                   r"|raises?|raised|gives|gave|yields)\b", re.IGNORECASE)
 
 
 def reproduces(evidence: Any) -> bool:
-    """Whether a finding's `evidence` names a repro (`_REPRO`); a non-string names none."""
-    return isinstance(evidence, str) and bool(_REPRO.search(evidence))
+    """Whether a finding's `evidence` names a repro: something run (`_RUN`) and what it gave (`_GAVE`)."""
+    return isinstance(evidence, str) and bool(_RUN.search(evidence)) and bool(_GAVE.search(evidence))
 
 
 def distinct_findings(findings: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:

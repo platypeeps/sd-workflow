@@ -122,8 +122,9 @@ OPTIONAL_FINDING_KEYS = frozenset({"evidence"})
 EVIDENCE_CHARS = 1000
 REPEAT_NOTE = "[downgraded: repeats a rebutted finding, no evidence cited]"
 #: What a reader puts in `evidence` (pack sd:9867, amended by note #70162): a code finding without a repro blocks nothing.
-EVIDENCE_ASK = ("a failing input or command showing a failure this change causes, in code it "
-                "touched or an unchanged caller it breaks; a code finding without one blocks nothing.")
+EVIDENCE_ASK = ("the command or input you ran and what it gave (an error, exit status or wrong output), "
+                "showing a failure this change causes, in code it touched or an unchanged caller it breaks; "
+                "a code finding without both parts blocks nothing.")
 #: The note a finding at the floor gets when it cites no repro and so does not block (pack sd:9867).
 NO_REPRO_NOTE = "[advisory: no failing input or command cited]"
 CODEX_OUTPUT_SCHEMA: dict[str, Any] = {

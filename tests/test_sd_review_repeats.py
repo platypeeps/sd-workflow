@@ -245,7 +245,8 @@ def row(severity: str = "high", **extra: Any) -> dict[str, Any]:
 
 #: Evidence that does not count: absent, empty, blank, or not a string.
 UNCITED = (None, "", "   \n\t", 0, 7, [], ["cmd"], {}, {"command": "x", "output": "y"}, True)
-CITED = ("python3 src.py: Traceback", "src.py:1: x = 1")
+CITED = ("python3 src.py: Traceback", "`f(1)` returns 2, expected 1")
+REPRO = "python3 t.py: expected 1, got 2"
 
 
 def finding(evidence: Any = None, **extra: Any) -> dict[str, Any]:
@@ -273,13 +274,17 @@ class ReproRuleTests(unittest.TestCase):
     def test_evidence_that_names_no_input_or_command_is_no_repro(self) -> None:
         """sd:9869 review: "See summary" blocked as a repro. Evidence must name something a reader can run or
         check: a command, a path or `path:line`, a backticked span, or a failure's output."""
-        for evidence in ("See summary", "see above", "obviously broken", "This is a real bug.", "N/A", "-"):
+        for evidence in ("See summary", "see above", "obviously broken", "This is a real bug.", "N/A", "-",
+                         "This fails.", "src.py is wrong", "KeyError: 'state'", "exit 127", "bin/tool:3",
+                         "Traceback (most recent call last)", "expected 2, got 3", "it fails on main.py"):
             with self.subTest(evidence=evidence):
                 [record] = sd_review.dispose([finding(evidence)], "high", repro=True)
                 self.assertEqual((record["disposition"], record["summary"]),
                                  ("advisory", f"defect {sd_review.NO_REPRO_NOTE}"))
-        for evidence in ("make test: 1 failed", "`sd today --json` prints []", "exit 127", "bin/tool:3",
-                         "KeyError: 'state'", "Traceback (most recent call last)", "expected 2, got 3"):
+        # sd:9869 review: a repro is two parts, something run and what it gave: `This fails.` names neither.
+        for evidence in ("make test: 1 failed", "`sd today --json` prints []", "python3 src.py: exit 127",
+                         "bin/tool --x raises KeyError: 'state'", "$ pytest -k a: Traceback", "f(2) returns 3, expected 2",
+                         "`git diff` -> fatal error"):
             with self.subTest(evidence=evidence):
                 [record] = sd_review.dispose([finding(evidence)], "high", repro=True)
                 self.assertEqual(record["disposition"], "blocking")
@@ -287,15 +292,14 @@ class ReproRuleTests(unittest.TestCase):
     def test_a_duplicate_that_reproduces_keeps_the_finding_blocking(self) -> None:
         """sd:9869 review: two readers gave one finding, the first with "See summary", the second with a repro;
         deduplication kept the first's evidence, and the gate posted it as advisory."""
-        for first, second in (("See summary", "expected 1, got 2"), ("", "expected 1, got 2"),
-                              ("expected 1, got 2", "See summary")):
+        for first, second in (("See summary", REPRO), ("", REPRO), (REPRO, "See summary"), ("This fails.", REPRO)):
             with self.subTest(first=first, second=second):
                 result = {"severity_floor": "high", "requested_reviews": 2}
                 answers = [sd_review.Outcome(name, sd_review.FINDINGS, (finding(evidence),), "", (), ())
                            for name, evidence in (("one", first), ("two", second))]
                 sd_review.finish_review(result, answers, ["one", "two"], repro=True)
                 self.assertEqual(result["status"], "blocking")
-                self.assertEqual([row["evidence"] for row in result["findings"]], ["expected 1, got 2"])
+                self.assertEqual([row["evidence"] for row in result["findings"]], [REPRO])
 
     def test_a_reproduced_break_in_an_unchanged_caller_blocks(self) -> None:
         [record] = sd_review.dispose([finding("python3 reader.py: KeyError 'state'", path="reader.py")], "high",
@@ -433,7 +437,7 @@ class RepeatReviewTests(RepeatFixture):
         """A cited repeat blocks, though bin/tool.py is not in this change: note #70162 on sd:9867."""
         self.adjudication(("lane claim", "rebutted", "git 2.54 matches it literally"))
         fresh = row(summary="a first-time claim", evidence="python3 src.py: Traceback")
-        for evidence, status in ((None, "advisory"), ("bin/tool.py:3: glob = True", "blocking")):
+        for evidence, status in ((None, "advisory"), ("python3 bin/tool.py: glob = True raises TypeError", "blocking")):
             with self.subTest(evidence=evidence):
                 repeat = finding(evidence, path="bin/tool.py", line=3, summary="lane claim")
                 runner = FakeRunner({"sd-check": sd_review.Completed(0, "{}", ""),
