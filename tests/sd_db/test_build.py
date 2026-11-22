@@ -270,6 +270,20 @@ class Claim(Case):
         build.queue(self.db, [self.item(fields={"work_kind": "mechanical"})], who="operator")
         self.assertEqual(self.claim()["model"], "sonnet")
 
+    def test_a_build_model_setting_picks_every_bundles_model(self):
+        """sd:9942: a machine's sd.build_model runs its builders on that model, mechanical bundles too."""
+        folder = self.root / "config" / "sd-ai-command-pack"
+        folder.mkdir(parents=True, exist_ok=True)
+        config = folder / "config.json"
+        config.write_text(json.dumps({"config": {"sd": {"build_model": "fable"}}}))
+        build.queue(self.db, [self.item()], who="operator")
+        self.assertEqual(self.claim()["model"], "fable")
+        build.queue(self.db, [self.item(repo=B, fields={"work_kind": "mechanical"})], who="operator")
+        self.assertEqual(self.claim()["model"], "fable")
+        for bad in ("", "Opus", "opus --dangerously", "x" * 65, 3):
+            config.write_text(json.dumps({"config": {"sd": {"build_model": bad}}}))
+            self.assertIsNone(build.build_model(), f"{bad!r} reads as unset")
+
     def test_a_bundle_takes_at_most_three_and_the_best_repository_first(self):
         build.queue(self.db, [self.item(repo=B, priority=3)], who="operator")
         build.queue(self.db, [self.item(priority=2) for _ in range(4)], who="operator")

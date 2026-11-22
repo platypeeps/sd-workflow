@@ -258,9 +258,10 @@ def end(connection, ident: str, outcome: str, detail: str) -> dict | None:
 
     A `LOSSES` outcome retries once; `blocked` (an unparsed or failed reply)
     blocks the assignment, with no note, and holds the run until the reap
-    reads its supervisor gone.
+    reads its supervisor gone; `build.RATE_LIMITED` queues it again and
+    holds its host, as a build run's does (sd:9938).
     """
-    if outcome not in ("blocked", *LOSSES):
+    if outcome not in ("blocked", build.RATE_LIMITED, *LOSSES):
         raise build.BuildRefused(f"no draft outcome {outcome!r}")
     with transaction(connection):
         if connection.execute("UPDATE runner_run SET outcome = ?, detail = ?, updated_at = ? WHERE id = ? "
@@ -306,7 +307,18 @@ def _settle(connection, read: dict, *, block: str | None = None, quiet: bool = F
             return {"run": ident, "outcome": "blocked", "retry": None, "blocked": block}
         connection.execute("UPDATE runner_run SET released_at = ?, updated_at = ? WHERE id = ?", (stamp, stamp, ident))
         retry = None
-        if row["outcome"] in LOSSES and running:
+        if row["outcome"] == build.RATE_LIMITED and running:
+            # No loss and no block (sd:9938): the account stopped it. The draft queues again at its place,
+            # and its host drafts and builds nothing until the limit resets (`build.rate_hold`).
+            host = build.run_host(row["owner"]) or build.this_host()
+            until = build.hold_until(row["final"], stamp)
+            build.set_setting(connection, build.hold_key(host), until)
+            connection.execute("UPDATE assignment SET status = 'queued', started = NULL, ended = NULL, "
+                               "result = NULL WHERE id = ?", (assignment["id"],))
+            add_note(connection, assignment["item"], "comment",
+                     f"Draft run {ident} hit the builder account's usage limit; assignment {assignment['id']} "
+                     f"queued again; {host} drafts from {until}")
+        elif row["outcome"] in LOSSES and running:
             marks = ", ".join("?" for _ in LOSSES)
             losses = connection.execute(f"SELECT COUNT(*) FROM runner_run WHERE assignment = ? AND outcome IN ({marks})",
                                         (assignment["id"], *LOSSES)).fetchone()[0]
