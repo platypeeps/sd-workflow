@@ -1291,6 +1291,8 @@ class Supervisor:
             answer = self.review_answer(out, head)
             if answer is not None:
                 break
+            if prior:  # `sd-review` can refuse a verify plan (input past its bound): retry the branch in full
+                argv, prior = argv[:argv.index("--verify-report")], None  # verify args close the argv
         if answer is None:
             return self.finish("blocked", f"the review gave no answer twice at {head[:12]}; see {self.out('review')}")
         # `sd-review` runs no gate in an unmanaged checkout (sd:5953): the repository's own checks run here.

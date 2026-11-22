@@ -1005,6 +1005,18 @@ class Supervise(Case):
         self.assertEqual(self.supervisor().run()["step"], "enqueued")
         self.assertEqual(self.latest()["review_round"], 1)
 
+    def test_a_verify_review_with_no_answer_retries_in_full(self):
+        """Review of sd:9769: `sd-review` can refuse a verify plan (a prior finding's file past its input bound);
+        the retry reviews the branch in full instead of repeating the same refused plan."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1"], sd_review=["blocking", "garbage", "clean"])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued", self.latest()["detail"])
+        _first, verify, retry = [call["argv"] for call in self.calls("sd-review")]
+        self.assertIn("--verify-report", verify)
+        self.assertNotIn("--verify-report", retry, "the retry repeated the refused verify plan")
+        self.assertNotIn("--base", retry)
+
     def test_round_one_reviews_the_whole_branch_and_round_two_the_findings_and_delta(self):
         """Pack sd:9769: round 1 is the full branch review; round 2 verifies round 1's findings over the delta."""
         self.press()
