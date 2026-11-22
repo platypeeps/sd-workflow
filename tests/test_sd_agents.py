@@ -313,6 +313,18 @@ class SliceBuilderClaimsItems(unittest.TestCase):
         self.assertIn("sd task status N in_progress --reason", body)
 
 
+class SliceBuilderBeat(unittest.TestCase):
+    """sd:9915. Leads spawned builders with the Agent tool and registered no
+    run; each builder's beat exited 1 and the builder treated it as a failure.
+    A beat with no registered run is skipped, not a stop."""
+
+    def test_the_slice_builder_skips_the_beat_when_no_run_is_registered(self) -> None:
+        _, body = (AGENTS / "sd-slice-builder.md").read_text(encoding="utf-8").split("\n---\n", 1)
+        self.assertIn("sd assignments beat N", body)
+        self.assertIn("no open teammate run holds item", body)
+        self.assertIn("skip every later beat", body)
+
+
 class SliceBuilderTestPause(unittest.TestCase):
     """sd:3173. Lane gates timed out while builders ran their focused tests beside them;
     run through `sd gate run`, a builder's tests wait in the machine gate queue.

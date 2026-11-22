@@ -1928,19 +1928,22 @@
   // Pack sd:9702: a spend with a cap draws a window's bar, caution at 80 % and warning at 100 %, and its cycle end as
   // the days left to it, counted in this zone's calendar days.
   const days = iso => { const a = new Date(Date.now()), b = new Date(iso); return Math.round((Date.UTC(b.getFullYear(), b.getMonth(), b.getDate()) - Date.UTC(a.getFullYear(), a.getMonth(), a.getDate())) / 864e5); };
+  // Pack sd:9756: a bar's width stays within 0 to 100, and a share past a float's range is named, not "Infinity%".
+  const ubar = p => Math.max(0, Math.min(100, p));
+  const ushare = p => Number.isFinite(p) ? `${Math.round(p)}%` : p > 0 ? 'over 100%' : 'under 0%';
   const left = iso => { const n = iso ? days(iso) : -1; return n < 0 ? '' : ` · ${n} day${n === 1 ? '' : 's'} left`; };
   const money = (m, what) => {
     if (!m) return '';
     const fmt = n => m.unit === 'USD' || !m.unit ? usd(n) : `${n} ${m.unit}`;
     if (!m.limit) return html`<span class="w">${what} <b>${fmt(m.amount)}</b>${m.period && !m.resets_at ? ` ${m.period}` : ''}${left(m.resets_at)}</span>`;
     const used = m.amount / m.limit * 100;
-    return html`<span class="w"><span class="wl">${what}</span><svg class="track" viewBox="0 0 100 1" preserveAspectRatio="none" role="img" aria-label="${`${what} ${Math.round(used)}% of the cap`}"><rect class="fill${used >= 100 ? ' warning' : used >= 80 ? ' caution' : ''}" width="${Math.min(100, used)}" height="1"/></svg><b>${fmt(m.amount)}</b> of ${fmt(m.limit)}${left(m.resets_at)}</span>`;
+    return html`<span class="w"><span class="wl">${what}</span><svg class="track" viewBox="0 0 100 1" preserveAspectRatio="none" role="img" aria-label="${`${what} ${ushare(used)} of the cap`}"><rect class="fill${used >= 100 ? ' warning' : used >= 80 ? ' caution' : ''}" width="${ubar(used)}" height="1"/></svg><b>${fmt(m.amount)}</b> of ${fmt(m.limit)}${left(m.resets_at)}</span>`;
   };
   function usageRow(r) {
     const f = r.service;
     const flag = f && f.state !== 'ok' ? html`<a class="flag" href="${f.url && f.state !== 'unknown' ? f.url : '/fleet-health#view=status'}"${f.url && f.state !== 'unknown' ? html` target="_blank" rel="noopener noreferrer"` : ''}><span class="g-${f.state}" aria-hidden="true">${UGLYPH[f.state]}</span> ${f.name} ${f.status}${f.title ? `: ${f.title}` : ''}</a>` : '';
     const body = r.state === 'unknown' ? html`<span class="why">Unknown: ${r.why}</span>`
-      : html`${r.windows.map(w => html`<span class="w"><span class="wl">${w.label}</span><svg class="track" viewBox="0 0 100 1" preserveAspectRatio="none" role="img" aria-label="${`${w.label} window ${w.used}% used`}"><rect class="fill${w.used >= 100 ? ' warning' : w.used >= 80 ? ' caution' : ''}" width="${Math.min(100, w.used)}" height="1"/></svg><b>${Math.round(w.used)}%</b>${w.resets_at ? html` · resets <time datetime="${w.resets_at}">${zoned(w.resets_at)}</time>` : ''}${pace(w.pace)}</span>`)}${money(r.balance, 'balance')}${money(r.spend, 'spent')}`;
+      : html`${r.windows.map(w => html`<span class="w"><span class="wl">${w.label}</span><svg class="track" viewBox="0 0 100 1" preserveAspectRatio="none" role="img" aria-label="${`${w.label} window ${w.used}% used`}"><rect class="fill${w.used >= 100 ? ' warning' : w.used >= 80 ? ' caution' : ''}" width="${ubar(w.used)}" height="1"/></svg><b>${Math.round(w.used)}%</b>${w.resets_at ? html` · resets <time datetime="${w.resets_at}">${zoned(w.resets_at)}</time>` : ''}${pace(w.pace)}</span>`)}${money(r.balance, 'balance')}${money(r.spend, 'spent')}`;
     return html`<li data-state="${r.state}"><span class="nm"><span class="g-${r.state}" aria-hidden="true">${UGLYPH[r.state]}</span><span class="sr">${r.state} · </span>${r.label}${r.active ? html`<span class="act" title="active account" aria-hidden="true">◆</span><span class="sr"> · active account</span>` : ''}</span>
       <span class="ws">${body}</span>${flag}<span class="age">${r.read_at ? html`read <time class="rel" datetime="${r.read_at}"></time>` : 'not read'}</span></li>`;
   }
