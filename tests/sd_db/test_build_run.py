@@ -3942,6 +3942,28 @@ class Drafts(Case):
         self.assertEqual(draft.reap(self.db, probe=GoneProbe(alive=False, group=False)), [])
         self.assertIsNotNone(build.run(self.db, run["id"])["released_at"])
 
+    def test_a_usage_limit_requeues_the_draft_and_holds_this_host(self):
+        """sd:9938: a draft's 429 ended it blocked (sd:9907 left `drafting` out). It queues again, with no
+        block or followup, and this host drafts nothing until the limit's `resetsAt`."""
+        run = self.claimed()
+        self.plan(claude=["rate_limited"])
+        ended = self.drafter(run["id"]).run()
+        self.assertEqual((ended["outcome"], ended["retry"]), ("rate_limited", None))
+        self.assertEqual((self.assignment_status(), self.statuses()), ("queued", ["planning"]))
+        self.assertNotIn("followup", [note["kind"] for note in self.notes()])
+        self.assertIsNotNone(build.run(self.db, run["id"])["released_at"])
+        reset = datetime.fromtimestamp(int((self.plans / "reset.txt").read_text()), UTC)
+        until = reset.isoformat(timespec="seconds")
+        self.assertEqual(writes.read_settings(self.db, ["build.rate_hold.hub"]), {"build.rate_hold.hub": until})
+        room = build.room(self.db, load=1.0, load_cap=40.0, interactive=[])
+        self.assertIsNone(draft.claim(self.db, owner="fixture", available=room), "no draft before the reset")
+        later = (reset + timedelta(seconds=1)).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            room = build.room(self.db, load=1.0, load_cap=40.0, interactive=[])
+        again = draft.claim(self.db, owner="fixture", available=room)
+        assert again is not None
+        self.assertEqual((again["assignment"], again["run"]), (self.assignment, 2), "the same draft, again")
+
     def test_a_hung_draft_is_killed_and_retried_once(self):
         """Failure table, Drafting: the bound kills the group; a fresh run retries once, then a followup blocks it."""
         run = self.claimed()
