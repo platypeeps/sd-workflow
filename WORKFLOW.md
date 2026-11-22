@@ -374,7 +374,7 @@ Four roles share the work:
 
 Workers:
 
-- **Run at most 6 code-writing builders per machine, and one build bundle building per repository at a time.** A machine's `sd.repo_cap` raises the second only by the operator's ruling (sd:9172). More starve the gates and reviews they wait on,
+- **Run at most 6 code-writing builders per machine, and one build bundle building per repository at a time.** A machine's `sd.machine_cap` and `sd.repo_cap` raise them only by the operator's ruling (sd:9172, sd:9891). More starve the gates and reviews they wait on,
   and one serial lane lands about 3 at a time: the rest only queue and go stale against main (sd:5617).
   A repository's later items wait, and the next bundle takes them (sd:8158).
   A bundle in the lane frees its repository's slot: the lane stays serial, so the next bundle builds while it lands (sd:8277).
@@ -679,6 +679,8 @@ The reserved `sd` namespace declares these settings:
   less (sd:9109). It grants nothing.
 - `sd.lane_parallel`: how many lanes one hosted lane run runs at once on this machine, 1 to 8. Absence reads 5
   (sd:9323); the gate's slots and load limit still hold lanes back below it. It grants nothing.
+- `sd.machine_cap`: how many code-writing builders, drafts and interactive builders may run at once on this
+  machine, 1 to 16. Absence reads 6 (sd:8158, sd:9891); the load guard still holds builds back. It grants nothing.
 - `sd.repo_cap`: how many build bundles may build at once in one repository when this machine claims them,
   1 to 6. Absence reads 1, the one-bundle-per-repository rule (sd:8158, sd:9172). It grants nothing.
 - `sd.gate_load_max`: the gate queue starts a gate only while load1 is below this; `0` is no load condition.
