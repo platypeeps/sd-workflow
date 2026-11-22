@@ -57,7 +57,7 @@ case "$*" in
      if [ -z "$QUEUE_OLD_REQUEUE$QUEUE_OLD_RETRY" ]; then echo "  --expected-head  ...; a cancelled entry needs it (sd:3389)"; fi ;;
   *" adjudicate "*) case "$*" in
        *--dispositions-file*) if [ -n "$QUEUE_REFUSE" ]; then printf '{"ok": false, "error": "%s"}\\n' "$QUEUE_REFUSE"; exit 3; fi
-         eval "f=\${$#}"; cp "$f" "$QUEUE_LOG.dispositions"; printf '{"ok": true, "phase": "disposition_recorded"}\\n' ;;
+         eval "f=\\${$#}"; cp "$f" "$QUEUE_LOG.dispositions"; printf '{"ok": true, "phase": "disposition_recorded"}\\n' ;;
        *) printf '{"ok": true, "phase": "disposition_template", "proposal": {"schema_version": 1, "bindings": {"head": "h"}, "findings": [{"index": 1, "finding_digest": "%s", "raw_finding": {"summary": "wrong"}, "response_disposition": "rebutted|parked", "reason": ""}]}}\\n' "${QUEUE_DIGEST:-f1}" ;;
      esac ;;
   "gate status --json") printf '{"slots": 4, "holders": [{"slot": 1}], "waiters": [], "load": [1, 2, 3]}\\n' ;;
