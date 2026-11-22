@@ -235,6 +235,14 @@ class URLDiagnostics(ReviewFixture):
         self.assertEqual(self.run_response(self.envelope(json.dumps({"findings": [advisory]}))).status,
                          sd_review.FINDINGS, "a finding below high needs no instance")
 
+    def test_the_declared_schema_asks_every_finding_for_an_instance(self) -> None:
+        """Review of sd:9769: the parser refuses a high finding with `instances: []`, so the schema a strict reader
+        follows must not allow it, or a reader that found a real blocker counts as no answer."""
+        items = sd_review.CODEX_OUTPUT_SCHEMA["properties"]["findings"]["items"]
+        self.assertIn("instances", items["required"])
+        self.assertEqual(items["properties"]["instances"].get("minItems"), 1,
+                         "a strict reader may emit no instance the parser then refuses")
+
     def test_top_level_extra_keys_refuse_without_disclosing_them(self) -> None:
         unknown_key = "secret-marker" * 1000
         outcome = self.run_response(self.envelope(json.dumps({"findings": [], unknown_key: True})))
