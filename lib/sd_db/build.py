@@ -36,6 +36,7 @@ import uuid
 from collections.abc import Collection
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 
 from . import hub, paths, reads
 from .database import served_by, transaction
@@ -52,6 +53,7 @@ from .runner import (
 from .ship import this_host
 from .workflow import item_area, item_blocked_by
 from .writes import (
+    UNCHECKED,
     add_note,
     cancel_unwanted_blocked,
     create_assignment,
@@ -1196,9 +1198,10 @@ def pickup_state(connection, *, now: str | None = None) -> dict:
     return {"on": value == "on", "value": value, "since": row["timestamp"] if row else None}
 
 
-def set_pickup(connection, on: bool, *, now: str | None = None) -> dict:
-    """On writes "on"; Off writes none. The state after."""
-    set_setting(connection, AUTO_PICKUP, "on" if on else None)
+def set_pickup(connection, on: bool, *, now: str | None = None, before: Any = UNCHECKED) -> dict:
+    """On writes "on"; Off writes none. The state after. `before`, when given, is the value the caller read:
+    one that moved since is `SettingStale`, and nothing is written (pack sd:10001)."""
+    set_setting(connection, AUTO_PICKUP, "on" if on else None, before=before)
     return pickup_state(connection, now=now)
 
 
