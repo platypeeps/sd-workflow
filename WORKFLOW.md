@@ -377,6 +377,7 @@ Workers:
 - **Run at most 6 code-writing builders per machine, and one build bundle building per repository at a time.** A machine's `sd.machine_cap` and `sd.repo_cap` raise them only by the operator's ruling (sd:9172, sd:9891). More starve the gates and reviews they wait on,
   and one serial lane lands about 3 at a time: the rest only queue and go stale against main (sd:5617).
   A repository's later items wait, and the next bundle takes them (sd:8158).
+  A P1 item does not wait: it builds beside that bundle, alone or with the queued items of its own area, under the machine cap only (operator ruling #64744, sd:9700).
   A bundle in the lane frees its repository's slot: the lane stays serial, so the next bundle builds while it lands (sd:8277).
 - **Split a parked bundle by Retry, then build fresh.** A Retry naming two or more of its items, the lead among them,
   retries those alone; each item left out leaves the bundle, parked (pack sd:9581). The next run blocks if its branch or
@@ -397,8 +398,8 @@ Workers:
   `sd assignments beat <items> --start --worktree <path> --branch <branch> --budget <minutes>`; on its final report, `--end` before the lane enqueue, which refuses a held item. Only `--end` ends a run: silence and a done item do not.
 - **Fan out only when the targets are independent, share no mutable state, and are cheap to verify.**
 - **Keep one open bundle branch per repository**, one commit per row; rows that change the same files always group.
-  Open a second pull request only for a change that moves state in steps or when the bundle is already in the lane (pack sd:7737).
-  `--start` refuses a second open branch of the repository, naming the open one; `--into <branch>` starts a side branch that merges into it, and `--reason state-move|in-lane` opens a second one and notes why.
+  Open a second pull request only for a change that moves state in steps, when the bundle is already in the lane (pack sd:7737), or for a P1 item, alone or with items of its own area (sd:9700).
+  `--start` refuses a second open branch of the repository, naming the open one; `--into <branch>` starts a side branch that merges into it, and `--reason state-move|in-lane|p1` opens a second one and notes why; `p1` takes a P1 item first and only items of its area after it.
   Name every grouped row in the pull request. Where goldens exist, bless them once per bundle.
   Add a bundle's shadow columns in one schema migration, not one per feature (pack sd:6358).
   Bundling comes before parallel lanes: revisit them only when Metrics' Lane times median wait (pack sd:6006) passes 30 min (pack sd:7412).
