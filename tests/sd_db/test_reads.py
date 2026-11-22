@@ -87,6 +87,23 @@ class OpenFollowups(unittest.TestCase):
             add_note(connection, done, "followup", "Left behind")
             self.assertEqual([row["id"] for row in reads.open_followups(connection)], [owed])
 
+    def test_a_followup_a_delivery_kept_open_is_still_owed(self):
+        # sd:9869: a delivery closes its item but leaves a followup that waits on an outside reply;
+        # Today must still list it. One the delivery settled, or a hand close's, is gone.
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "sd.db"
+            initialise(path)
+            connection = connect(path)
+            self.addCleanup(connection.close)
+            item = create_item(connection, kind="task", title="Delivered", status="in_progress")
+            waiting = add_note(connection, item, "followup", "Waits on an outside reply")
+            settled = add_note(connection, item, "followup", "Rename the flag")
+            workflow.change_status(connection, item, "done", who="sd-ship", reason="delivered", followups={settled})
+            closed = create_item(connection, kind="task", title="Closed by hand", status="in_progress")
+            add_note(connection, closed, "followup", "Not owed after a hand close")
+            workflow.change_status(connection, closed, "done", who="operator", reason="test")
+            self.assertEqual([row["id"] for row in reads.open_followups(connection)], [waiting])
+
 
 class ParkedWritingReads(unittest.TestCase):
     def test_due_date_does_not_put_parked_writing_back_in_today(self):

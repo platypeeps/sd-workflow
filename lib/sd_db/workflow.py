@@ -20,7 +20,7 @@ from . import repos
 from .assets import item_asset
 from .database import transaction
 from .errors import SdDbError
-from .reads import IDEA_KINDS, item_by_id, item_notes
+from .reads import IDEA_KINDS, KEPT_OPEN, item_by_id, item_notes
 from .recurrence import (
     ANCHORS,
     MAX_LEAD_DAYS,
@@ -837,6 +837,12 @@ def change_status(
                 closed = (f"resolved open note{'s' if len(owed) > 1 else ''} "
                           + ", ".join(str(note) for note in owed))
                 reason = f"{reason}; {closed}" if reason else closed
+            # sd:9869: Today lists a done item's followup only when its close names it here.
+            kept = [note["id"] for note in state["notes"]
+                    if note["kind"] == "followup" and not note["resolved_at"] and note["id"] not in owed]
+            if kept:
+                held = f"{KEPT_OPEN} " + ", ".join(str(note) for note in kept)
+                reason = f"{reason}; {held}" if reason else held
         transition(connection, item, target, who=who, reason=reason, session=session)
         if target != "done" or row.get("recurrence") is None:
             return item_state(connection, item)

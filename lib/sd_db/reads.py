@@ -317,12 +317,26 @@ def repo_in(column: str, keep: set[str | None] | None) -> tuple[str, list[Any]]:
     return (f"({found} OR {column} IS NULL)" if None in keep else found), named
 
 
+#: What a delivery's done note says last, before the followups it leaves owed (sd:9869).
+KEPT_OPEN = "kept open notes"
+#: The item's latest done note names this followup after `KEPT_OPEN`, ids joined by ", ":
+#: matched whole, so note 4 is not note 42.
+_KEPT_OPEN = f"""EXISTS (
+    SELECT 1 FROM note AS closed
+     WHERE closed.id = (SELECT max(id) FROM note AS moved WHERE moved.item = note.item
+                         AND moved.kind = 'status_change' AND moved.body LIKE '%-> done by %')
+       AND instr(closed.body, '{KEPT_OPEN} ') > 0
+       AND instr(', ' || substr(closed.body, instr(closed.body, '{KEPT_OPEN} ') + {len(KEPT_OPEN) + 1}) || ',',
+                 ', ' || note.id || ',') > 0)"""
+
+
 def open_notes(connection: sqlite3.Connection, kind: str, *, limit: int | None = 200,
                batches: bool = True, repos: set[str | None] | None = None,
                without: Iterable[int] = ()) -> list[sqlite3.Row]:
     """Unresolved `kind` notes on items that are not parked, oldest first (sd:3501).
 
-    A followup on a done item is not owed, so only an open item's lists. A
+    A followup on a done item is not owed, so only an open item's lists,
+    unless the delivery that closed it kept it open (sd:9869). A
     question on a done item lists: closing an item answers none of its
     questions (pack sd:6329). A row moved to a Documents view keeps its open
     notes here (pack sd:6262): a question on it still waits on the operator.
@@ -348,7 +362,8 @@ def open_notes(connection: sqlite3.Connection, kind: str, *, limit: int | None =
             f"""
             SELECT note.*, item.title AS item_title, item.repo AS item_repo, item.status AS item_status
               FROM note JOIN item ON item.id = note.item
-             WHERE note.kind = ? AND note.resolved_at IS NULL AND (item.status != 'done' OR note.kind = 'question')
+             WHERE note.kind = ? AND note.resolved_at IS NULL
+               AND (item.status != 'done' OR note.kind = 'question' OR {_KEPT_OPEN})
                AND {_unparked_clause(connection, documents=True)} AND {"1" if batches else "NOT " + REVIEW_BATCH}
                AND {where}
              ORDER BY note.timestamp ASC, note.id ASC
