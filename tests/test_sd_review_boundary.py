@@ -1029,11 +1029,16 @@ class LineBudgetTests(unittest.TestCase):
         # +15 for `repo_spelling`, the one spelling `head_holds` now
         # shares, applied to findings, prior report rows and rebuttals
         # before any is matched. Measured: `sd-review` is 2931 here.
+        #
+        # 4901 -> 4907 is the lead's ruling after round 8: `bin/sd-review`
+        # +6 so `prior_evidence` matches file, line and summary together,
+        # and a prior blocker no finding repeats keeps uncited findings on
+        # its file blocking. Measured: `sd-review` is 2937 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4901,
+            4907,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

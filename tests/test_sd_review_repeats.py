@@ -317,16 +317,38 @@ class ReproRuleTests(unittest.TestCase):
                          [("blocking", REPRO), ("advisory", None)])
 
     def test_prior_evidence_goes_only_to_the_same_finding_in_any_spelling(self) -> None:
-        """build/sd-1423 review: matching by raw path alone gave an unrelated finding at `src.py:90` the old repro,
-        and left the real repeat at `./src.py:10` advisory. The finding must match by line or summary too, and
-        the path in any spelling the review accepts."""
+        """build/sd-1423 review, then the lead after round 8: evidence moves only to the same file, line and
+        summary, the file in any spelling the review accepts. Once one finding repeats the prior blocker, an
+        unrelated uncited finding on that file is advisory, as on any file."""
         prior = [dict(finding(REPRO, line=10, summary="the cache is never cleared"), disposition="blocking")]
         rows = [finding(path=path, line=line, summary=summary) for path, line, summary in (
-            ("./src.py", 10, "Cache never cleared"), ("/work/repo/src.py", 12, "the cache is never cleared"),
-            ("src.py", 90, "an unrelated defect"), ("other/src.py", 10, "Cache never cleared"))]
+            ("./src.py", 10, "The cache is  never cleared"), ("/work/repo/src.py", 12, "the cache is never cleared"),
+            ("src.py", 10, "an unrelated defect"), ("other/src.py", 10, "the cache is never cleared"))]
         disposed = sd_review.dispose(rows, "high", repro=True, prior=prior)
         self.assertEqual([(row["disposition"], row.get("evidence")) for row in disposed],
-                         [("blocking", REPRO), ("blocking", REPRO), ("advisory", None), ("advisory", None)])
+                         [("blocking", REPRO), ("advisory", None), ("advisory", None), ("advisory", None)])
+
+    def test_a_shifted_paraphrased_repeat_of_a_prior_blocker_still_blocks(self) -> None:
+        """Lead after round 8 (bin/sd-review:1797): a patch moved the blocker from line 10 to 12 and the reader
+        paraphrased it uncited; the matcher found nothing and it posted as advisory. A prior blocker no
+        finding matches keeps every uncited finding on its file blocking (fail closed), with no evidence."""
+        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking")]
+        rows = [finding(line=12, summary="An empty list raises IndexError"), finding(path="b.py")]
+        disposed = sd_review.dispose(rows, "high", repro=True, prior=prior)
+        self.assertEqual([(row["disposition"], row.get("evidence")) for row in disposed],
+                         [("blocking", None), ("advisory", None)])
+
+    def test_the_same_line_alone_gives_no_prior_evidence(self) -> None:
+        """Lead after round 8: the matcher gave the old repro to an unrelated cache finding at the same line."""
+        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking")]
+        [record] = sd_review.dispose([finding(line=10, summary="the cache is never cleared")], "high",
+                                     repro=True, prior=prior)
+        self.assertEqual((record["disposition"], record.get("evidence")), ("blocking", None))
+        repeat, other = sd_review.dispose([finding(line=10, summary="Empty input crashes"),
+                                           finding(line=10, summary="the cache is never cleared")],
+                                          "high", repro=True, prior=prior)
+        self.assertEqual([(row["disposition"], row.get("evidence")) for row in (repeat, other)],
+                         [("blocking", REPRO), ("advisory", None)])
 
     def test_a_reproduced_break_in_an_unchanged_caller_blocks(self) -> None:
         [record] = sd_review.dispose([finding("python3 reader.py: KeyError 'state'", path="reader.py")], "high",
