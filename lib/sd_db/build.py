@@ -867,13 +867,6 @@ def drop_writes(connection, plan: dict, *, who: str, note: str, left: str) -> li
         return queued + [{"id": row["id"], "item": row["item"], "status": row["status"]} for row in alone]
 
 
-def done_items(connection, ids) -> set[int]:
-    """Of `ids`, the items that are done: a commit citing one closes nothing open, so a drop may carry it, as the
-    first drop carried a done member's commits onto the branch a second drop reads (pack sd:9863)."""
-    items = reads.items_by_ids(connection, sorted(ids))
-    return {item for item in items if _done(items, item)}
-
-
 def drop_committed(connection, plan: dict) -> bool:
     """Whether `drop_writes` of `plan` committed: its dropped member reads cancelled out of this run's bundle. An
     interrupt after the commit must keep the branch the queued builds read (round 7)."""

@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import subprocess
 from pathlib import Path
-from typing import Callable
 
 import sd_lib
 import sd_ship_body
@@ -82,14 +81,14 @@ def _merges(work: str | Path, start: str, tip: str) -> None:
             raise DropRefused(f"merge {sha[:12]} resolves by hand what no cherry-pick carries; split it by hand")
 
 
-def drop_sides(work: str | Path, start: str, tip: str, item: int, aside: set[int], built: set[int],
-               closed: Callable[[set[int]], set[int]] = lambda ids: set()) -> tuple[list[str], list[str]]:
+def drop_sides(work: str | Path, start: str, tip: str, item: int, aside: set[int],
+               built: set[int]) -> tuple[list[str], list[str]]:
     """The non-merge commits of `start..tip`, oldest first, split into (kept, dropped) for dropping `item`. A commit
     citing an item of `aside`, `item` and the members cancelled out of the bundle before, is not kept (round 3).
     A commit that cites no item refuses the drop: paths cannot say whose it is, since a follow-up of the dropped
     item may edit only a file a kept commit touched (round 6). So does one citing an item the bundle did not build
-    (`built`): replayed on the kept branch, its `Closes:` would close that item at merge (round 15), unless `closed`
-    reads it done, which closes nothing (pack sd:9863)."""
+    (`built`): replayed on the kept branch, its `Closes:` would close that item at merge (round 15). A done item
+    refuses too: reopened before the lane reads it, the replayed commit would close it (pack sd:9863 review)."""
     shas = _out("rev-list", "--reverse", "--no-merges", f"{start}..{tip}", cwd=work).split()
     kept: list[str] = []
     dropped: list[str] = []
@@ -102,9 +101,8 @@ def drop_sides(work: str | Path, start: str, tip: str, item: int, aside: set[int
         cited = set(sd_ship_body.cited_ids("", [(sha, message)]))
         if not cited:
             raise DropRefused(f"commit {sha[:12]} cites no item, so nothing says whose it is; split it by hand")
-        outside = cited - built - closed(cited - built) if cited - built else set()
-        if outside:
-            raise DropRefused(f"commit {sha[:12]} cites {', '.join(f'sd:{n}' for n in sorted(outside))}, "
+        if cited - built:
+            raise DropRefused(f"commit {sha[:12]} cites {', '.join(f'sd:{n}' for n in sorted(cited - built))}, "
                               f"which this bundle did not build; split it by hand")
         if cited & aside and cited - aside:
             raise DropRefused(f"commit {sha[:12]} cites {', '.join(f'sd:{n}' for n in sorted(cited & aside))} and "
@@ -127,7 +125,7 @@ def _exists(repo: str | Path, ref: str) -> bool:
     return _has("rev-parse", "-q", "--verify", ref, cwd=repo, absent=1)
 
 
-def split_branch(plan: dict, done: dict, *, closed: Callable[[set[int]], set[int]] = lambda ids: set()) -> dict:
+def split_branch(plan: dict, done: dict) -> dict:
     """The kept commits on `plan["new_branch"]`, fresh from the base, in the new worktree `plan["new_work"]`; the
     old branch and worktree stay as they were, with the dropped item's work and files. Each step is recorded in the
     caller's `done` once it moved something, so the caller's one handler undoes exactly what moved (`undo_split`),
@@ -142,7 +140,7 @@ def split_branch(plan: dict, done: dict, *, closed: Callable[[set[int]], set[int
     fork = _out("merge-base", start, tip, cwd=work)
     _merges(work, fork, tip)
     aside = set(plan["aside"])
-    kept, dropped = drop_sides(work, fork, tip, item, aside, set(plan["built"]), closed)
+    kept, dropped = drop_sides(work, fork, tip, item, aside, set(plan["built"]))
     new_work, new_branch = Path(plan["new_work"]), plan["new_branch"]
     if new_work.exists() or _exists(repo, f"refs/heads/{new_branch}"):
         raise DropRefused(f"{new_work} or branch {new_branch} exists already")
@@ -218,7 +216,7 @@ def drop_item(connection, build, item: int, *, who: str) -> list[dict]:
         raise DropRefused(str(refusal)) from None
     done: dict = {}
     try:  # one handler from the split's first move to the writes' commit, Ctrl-C included (rounds 2 and 11)
-        split_branch(plan, done, closed=lambda ids: build.done_items(connection, ids))
+        split_branch(plan, done)
         return build.drop_writes(connection, plan, who=who, note=kept_note(done), left=dropped_note(done))
     except BaseException as error:
         # A COMMIT that failed outside the helper's rollback leaves the transaction open, its writes visible to

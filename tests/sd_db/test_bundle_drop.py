@@ -480,8 +480,8 @@ class DropRound10(Repo):
         old = git(work, "rev-parse", "HEAD")
         real = DROP.split_branch
 
-        def moved(plan, done, **kwargs):
-            real(plan, done, **kwargs)
+        def moved(plan, done):
+            real(plan, done)
             # Planning cancels its assignment; back to ready passes the press's own item check.
             writes.transition(self.db, items[2], "planning", who="operator")
             writes.transition(self.db, items[2], "ready", who="operator")
@@ -617,9 +617,9 @@ class DropRound14(Repo):
         other = self.item(repo=str(self.repo))
         real, taken = DROP.split_branch, list[int]()
 
-        def queued_meanwhile(plan, done, **kwargs):
+        def queued_meanwhile(plan, done):
             taken.extend(row["id"] for row in build.queue(self.db, [other], who="operator"))
-            return real(plan, done, **kwargs)
+            return real(plan, done)
 
         with mock.patch.object(DROP, "split_branch", side_effect=queued_meanwhile):
             queued = DROP.drop_item(self.db, build, items[1], who="operator")
@@ -1051,8 +1051,9 @@ class Advisories(Repo):
         self.assertEqual(self.files(new), ["README", "a.txt"])
         self.assertNotIn(f"sd:{items[1]}", self.closes(new))
 
-    def test_a_second_drop_keeps_a_done_members_carried_commit(self):
-        """A done member's commits ride the first drop's branch; a second drop must not read them as foreign."""
+    def test_a_second_drop_refuses_a_done_members_carried_commit(self):
+        """Build review: a done item reopened before enqueue would be closed by the carried commit, so a second
+        drop refuses a citation outside its bundle, done or not, as round 15 did."""
         config = self.root / "config" / "sd-ai-command-pack" / "config.json"
         config.parent.mkdir(parents=True, exist_ok=True)
         config.write_text('{"config": {"sd": {"bundle_max": "4"}}}')
@@ -1069,8 +1070,9 @@ class Advisories(Repo):
         again = self.claim()
         self.assertEqual([member["item"] for member in build.run(self.db, again["id"])["members"]], [items[0], items[2]])
         self.end(again)
-        new = self.drop(again, items[2])
-        self.assertEqual(self.files(new), ["0.txt", "1.txt", "README"])
+        with self.assertRaisesRegex(DROP.DropRefused, f"cites sd:{items[1]}, which this bundle did not build"):
+            DROP.drop_item(self.db, build, items[2], who="operator")
+        self.unmade(again)
 
     def test_dropping_a_done_lead_queues_the_kept_items_and_leaves_it_done(self):
         items, (lead, second, third), run = self.bundle()
