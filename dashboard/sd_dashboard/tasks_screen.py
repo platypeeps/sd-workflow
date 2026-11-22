@@ -439,6 +439,7 @@ def _details(connection, item: int, *, now: str) -> dict:
         "pull": _pull(connection, state),
         "documents": _documents(connection, state),
         "published": _published(connection, state),
+        "blocked_by": _blocked_by(connection, state),
         # `sd work relink` and `sd work cancel` availability, as the mutation checks it under its lock
         # (`progress.work_controls`), for a work item; None for any other kind (sd:2200).
         "work": progress.work_controls(connection, item) if state["item"]["kind"] == "work" else None,
@@ -492,6 +493,21 @@ def _published(connection, state) -> list[dict]:
             return out + [{"title": "Publication claims", "where": f"not read: {error}", "links": []}]
         out += [{"title": f"Publication claim {claim['id'][:8]}", "where": str(claim["phase"] or ""),
                  "links": [link("claim", str(claim["url"]))]} for claim in claims if claim["url"]]
+    return out
+
+
+def _blocked_by(connection, state) -> list[dict]:
+    """Each item the item waits on (pack sd:9570), in id order: its id, title, status and repo; None for an id no item
+    holds. Fields that cannot be read show as none here; a build still refuses them."""
+    try:
+        named = workflow.item_blocked_by(state["item"])
+    except ValueError:
+        return []
+    out = []
+    for other in named:
+        row = reads.item_by_id(connection, other)
+        out.append({"id": other, "title": row["title"] if row else None, "status": row["status"] if row else None,
+                    "repo": row["repo"] if row else None})
     return out
 
 

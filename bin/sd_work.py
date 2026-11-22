@@ -255,6 +255,10 @@ def _edit_changes(args: argparse.Namespace) -> dict[str, Any]:
         changes["area"] = args.area
     if args.clear_area:
         changes["area"] = None
+    if args.blocked_by is not None:
+        changes["blocked_by"] = args.blocked_by
+    if args.clear_blocked_by:
+        changes["blocked_by"] = None
     # The field `add` sets and nothing could change afterwards. It is not in
     # the loop above because the flag carries a path and the row carries a
     # checkout; `_belongs_to` is the one step between them, and `edit_item` --
@@ -434,6 +438,19 @@ def _area(row: dict[str, Any]) -> str | None:
     return item_area(row)
 
 
+def _blocked_by(row: dict[str, Any]) -> str:
+    """The items the row waits on, `edit --blocked-by`'s, as `sd:M, sd:N` (pack sd:9570); "" for none."""
+    if not row.get("fields"):
+        return ""
+    sd_lib.import_sd_db()
+    from sd_db.workflow import item_blocked_by
+
+    try:
+        return ", ".join(f"sd:{other}" for other in item_blocked_by(row))
+    except ValueError as error:
+        return f"unknown, {error}"
+
+
 def _print_rows(rows: list[dict[str, Any]], *, moved: bool = False, today: str | None = None) -> None:
     """One line per row, and its checkout, reference and rule; `today` marks a past due date `overdue` (sd:3501)."""
     here = _standing_in(rows)
@@ -452,6 +469,9 @@ def _print_rows(rows: list[dict[str, Any]], *, moved: bool = False, today: str |
         area = _area(row)
         if area:
             print(f"  area: {area}")
+        waits = _blocked_by(row)
+        if waits:
+            print(f"  waits on: {waits}")
         if row.get("recurrence"):
             lead = f", shows {row['recurrence_lead']}d early" if row.get("recurrence_lead") else ""
             opens = f" · opens {row['opens_on']}" if row.get("scheduled") else ""
@@ -1724,6 +1744,13 @@ def register(groups: Any, store: Any) -> None:
                            "home, hoa, personal or a dashboard.realms id")
     area.add_argument("--clear-area", action="store_true",
                       help="drop the item's own area, so its checkout places it again")
+    # pack sd:9570: the items this one waits on, kept in `fields.blocked_by`; a build waits until each is done.
+    waits = edit.add_mutually_exclusive_group()
+    waits.add_argument("--blocked-by", type=item_id, action="append", metavar="ITEM",
+                       help="an item this one waits on; repeat to name several. It replaces the set the item had. "
+                            "No build takes the item until each is done")
+    waits.add_argument("--clear-blocked-by", action="store_true",
+                       help="drop every item this one waits on")
     # `--belongs-to` and not `--repo`: see `_belongs_to`. `--no-repo` is the
     # word `add` already uses for the same idea, so the pair reads the same on
     # both verbs.

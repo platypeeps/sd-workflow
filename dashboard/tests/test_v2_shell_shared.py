@@ -2205,12 +2205,12 @@ class TheReadAgainButton(unittest.TestCase):
         script = "var window = globalThis;\n" + MARKUP_JS + r"""
 const { html, put } = window.markup;
 const ICON = n => html`<svg class="i" aria-hidden="true"><use href="#i-${n}"/></svg>`;
-var OUT = { toasts: [], gets: [], error: null }, R = {}, WIN = [], ELS = {}, location = { hash: "" };
+var OUT = { toasts: [], gets: [], error: null }, R = {}, WIN = [], ELS = {}, location = { hash: "" }, innerHeight = 900;
 const toast = m => OUT.toasts.push(m), flush = async () => { for (let i = 0; i < 50; i++) await null; };
 var ANSWER = { error: '', rows: [], nosource: [] };
 const getJSON = async path => { OUT.gets.push(path); if (typeof ANSWER === 'string') throw new Error(ANSWER); return typeof ANSWER === 'function' ? ANSWER() : ANSWER; };
 function addEventListener(t, f) { WIN.push([t, f]); }
-function El(id) { const e = { id, html: '', attrs: {}, dataset: {}, listeners: {}, setAttribute(k, v) { e.attrs[k] = v; }, removeAttribute(k) { delete e.attrs[k]; },
+function El(id) { const e = { id, html: '', attrs: {}, dataset: {}, listeners: {}, style: {}, getBoundingClientRect: () => ({ top: 60, bottom: 52 }), setAttribute(k, v) { e.attrs[k] = v; }, removeAttribute(k) { delete e.attrs[k]; },
   addEventListener(t, f) { (e.listeners[t] = e.listeners[t] || []).push(f); }, append(f) { e.html += f.parsed; }, replaceChildren(f) { e.html = f ? f.parsed : ''; } }; return e; }
 var HEAD = El('head'), SLOT = """ + ("El('slot')" if slot else "null") + r""";
 const main = { querySelector: s => s === '.head, .home-head' ? HEAD : null };
