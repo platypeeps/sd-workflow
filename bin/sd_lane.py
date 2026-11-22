@@ -4307,8 +4307,9 @@ def settle_gates(gates: list[SpeculativeGate], entry: dict[str, Any], row: dict[
     the top's gate is the landing after all, so it is waited for then.
     An entry that did not merge makes every prediction through it wrong,
     so those gates end and leave `gates`, and the next claim gates their
-    entries again (pack sd:7412). A queue that cannot be read waits as
-    before trains.
+    entries again (pack sd:7412). Only a queue read that names the
+    gate's entry next proves a wait: one that fails waits for no gate,
+    so a transient fault cannot spend the run's budget on it.
     """
     merged = row is not None and row.get("status") == "merged"
     up = next_up(queue)
@@ -4317,7 +4318,7 @@ def settle_gates(gates: list[SpeculativeGate], entry: dict[str, Any], row: dict[
             held.join(remaining(deadline, PREPARE_SECONDS))
     for held in [held for held in gates if entry["id"] in held.chain]:
         if merged and held.chain[-1] == entry["id"]:
-            if up in (UNREAD, held.follower[0]):
+            if up == held.follower[0]:
                 held.join(remaining(deadline, PREPARE_SECONDS))
         elif not merged:
             held.why = f"sd:{entry['item']} did not merge, so the landing this gate predicted will not happen"

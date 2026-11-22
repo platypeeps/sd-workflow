@@ -1732,6 +1732,18 @@ class Train(Trees):
         self.assertEqual(self.trains[0][0], self.third)
         self.assertTrue(self.seen["sd:2 prepared beside sd:3's gate"])
 
+    def test_an_unread_queue_after_a_merge_waits_for_no_gate(self) -> None:
+        """Lane prepare of sd:9899: a failed queue read waited for sd:3's gate with sd:2 still first.
+
+        Only a queue that names the gate's follower next proves the wait.
+        """
+        self.commit_files(self.second, {"one.txt": "not 1\n"}, "conflicts with first")
+        self.hold_train = True
+        self.queue_three()
+        with mock.patch.object(sd_lane, "next_up", lambda queue: sd_lane.UNREAD):
+            sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertTrue(self.seen["sd:2 prepared beside sd:3's gate"])
+
     def test_a_dropped_entry_that_fails_leaves_the_top_its_gate(self) -> None:
         """Lane round 3 of sd:9899: once sd:2 fails, sd:3's gate on sd:1 alone is the landing, so it is waited for."""
         self.commit_files(self.second, {"one.txt": "not 1\n"}, "conflicts with first")
