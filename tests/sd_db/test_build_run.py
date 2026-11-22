@@ -1577,6 +1577,34 @@ class Supervise(Case):
         _, kept = self.deferred([far], {"src/caller.py": {12}}, {"the", "parser", "value"}, {"export"})
         self.assertEqual(kept["blockers"], [], "a plain word that names no changed function held a blocker")
 
+    def test_every_definition_form_and_changed_line_name_reads_as_defined(self):
+        """Class pass, review of sd:9769: a caller defined by assignment (`const serialize = (row) => ...`),
+        by any language's keyword, or named on a changed line reads as a name the branch defines."""
+        repo = Path(tempfile.mkdtemp(dir=self.root))
+
+        def run(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.name=operator",
+                                   "-c", "user.email=operator@example.test", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        run("init", "-q")
+        body = ("const serialize = (row) => sink(row)\nlet render = function (x) { return x }\n"
+                "pick := func() {}\nloader = lambda path: open(path)\n")
+        (repo / "caller.js").write_text(body)
+        run("add", "-A")
+        run("commit", "-q", "-m", "base")
+        base = run("rev-parse", "HEAD")
+        (repo / "caller.js").write_text(body.replace("sink(row)", "sink(row, flush)"))
+        run("add", "-A")
+        run("commit", "-q", "-m", "change")
+        read = build_run.function_words(["git"], str(repo), base, run("rev-parse", "HEAD"))
+        assert read is not None, "git's function context did not read"
+        self.assertTrue({"serialize", "sink", "flush"} <= read[1], read[1])
+        for line in ("let render = function (x) {", "pick := func() {}", "loader = lambda path: open(path)",
+                     "export const build = async (a) => a", "fn emit(x: u8) {", "sub report {"):
+            with self.subTest(line=line):
+                self.assertTrue(build_run.defined_names(line), f"no name defined by {line!r}")
+
     def test_branch_words_hold_the_changed_function_and_what_it_calls(self):
         """Lead ruling on sd:9769: the branch's changed functions, read whole, name the caller and its callee."""
         repo = Path(tempfile.mkdtemp(dir=self.root))

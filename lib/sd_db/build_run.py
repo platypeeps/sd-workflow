@@ -516,12 +516,23 @@ def function_words(git: Collection[str], work: str, base: str, head: str, *,
                       "--no-textconv", base, head], env=env)
     except Unread:
         return None
-    lines = [line[1:] for line in diff.splitlines() if line[:1] in "+- " and not line.startswith(("+++", "---"))]
-    # `def x`, `function x`, `fn x`, `class x`, ...; a shell `x() {`; a method `x(a, b) {`.
-    defined = {name for line in lines for pair in re.findall(
-        r"\b(?:def|function|func|fn|class|sub|proc|struct|interface|type)\s+([A-Za-z_]\w*)"
-        r"|^\s*(?:async\s+|static\s+)*([A-Za-z_]\w*)\s*\([^()]*\)\s*\{", line) for name in pair if name}
+    lines = [line for line in diff.splitlines() if line[:1] in "+- " and not line.startswith(("+++", "---"))]
+    # Every name on a changed line, and each name a context line defines (`defined_names`).
+    defined = {name for line in lines for name in (re.findall(r"[A-Za-z_]\w*", line[1:]) if line[0] in "+-"
+                                                   else defined_names(line[1:]))}
     return set(re.findall(r"[A-Za-z_]\w*", diff)), defined
+
+
+def defined_names(line: str) -> set[str]:
+    """The names one source line defines, in any common form (pack sd:9769): a keyword (`def`, `function`,
+    `fn`, `func`, `class`, `sub`, ...), a declaration or assignment (`const x =`, `x := func`, `x = lambda`,
+    `x = (a) =>`), a shell `x() {` or a method `x(a) {`. A form it misses still counts when its line
+    changed: `function_words` takes every name on a changed line.
+    ponytail: a changed line's comment words count too, so prose holds more blockers, never fewer."""
+    keyword = r"\b(?:def|function|func|fn|class|sub|proc|struct|interface|type|module|trait|enum)\s+\*?\s*([A-Za-z_]\w*)"
+    assigned = r"\b([A-Za-z_]\w*)\s*(?::=|=(?!=)|:)\s*(?:async\s+)?(?:function\b|func\b|lambda\b|fn\b|\([^()]*\)\s*=>|[A-Za-z_]\w*\s*=>)"
+    method = r"^\s*(?:(?:async|static|public|private|protected|export|def)\s+)*([A-Za-z_]\w*)\s*\([^()]*\)\s*\{"
+    return {name for pattern in (keyword, assigned, method) for name in re.findall(pattern, line)}
 
 
 def callable_words(text: str) -> set[str]:
