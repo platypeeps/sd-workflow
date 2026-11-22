@@ -2339,13 +2339,14 @@ def catch_up_in(tree: pathlib.Path, ref: str, message: str) -> bool:
     return False
 
 
-def predict(ahead: list[dict[str, Any]], following: dict[str, Any]) -> dict[str, Any]:
+def predict(ahead: list[dict[str, Any]], following: dict[str, Any], deadline: float = math.inf) -> dict[str, Any]:
     """`{"head", "base"}` for `following`'s gate once the `ahead` entries land in order, or `{"skipped": why}`.
 
     `base` stands in for the last entry's squash merge: the chain of each
     entry's catch-up merge's tree, as a commit on the one before, from the
     fetched base branch (`landings`). `head` is `following`'s catch-up merge
     onto `base`, so its tree is the one `following`'s prepare will gate.
+    A fetch that crosses `deadline` builds nothing more.
     """
     import sd_gate_receipts  # noqa: PLC0415 -- the declaration reader loads only for a speculation
     root = pathlib.Path(following["worktree"])
@@ -2358,6 +2359,8 @@ def predict(ahead: list[dict[str, Any]], following: dict[str, Any]) -> dict[str,
         return {"skipped": "origin/HEAD names no base branch"}
     if scratch_git(root, "fetch", "--quiet", "--no-tags", "origin", f"refs/heads/{branch}:{remote}") is None:
         return {"skipped": f"origin/{branch} could not be fetched"}
+    if clock() >= deadline:
+        return {"skipped": OUT_OF_BUDGET}
     fork = lane_git(root, "rev-parse", "--verify", "--quiet", remote)
     with tempfile.TemporaryDirectory(prefix="sd-lane-speculate-") as parent:
         tree = pathlib.Path(parent) / "tree"
@@ -2417,7 +2420,9 @@ def speculate(entry: dict[str, Any], queue: Queue, gate: Gate,
     predicted. A follower one of `gates` already gated is skipped, so no
     entry is gated twice, and at most `DEPTH` gates run at once. Past
     `deadline` none is set up, and one whose setup crosses it starts no
-    gate: its machine time is prepare's (`OUT_OF_BUDGET`).
+    gate: its machine time is prepare's (`OUT_OF_BUDGET`). The clock is
+    read again before each prediction starts, after the queue read and
+    after the prediction before it.
     """
     if clock() >= deadline:
         return []
@@ -2462,8 +2467,10 @@ def speculate_one(chain: list[dict[str, Any]], following: dict[str, Any], queue:
     items = " or ".join(f"sd:{row['item']}" for row in [*chain, following])
     try:
         plan = ({"skipped": f"{DEPTH} earlier speculative gates still run"} if busy else
+                {"skipped": OUT_OF_BUDGET} if clock() >= deadline else
                 {"skipped": f"no worktree on this host for {items}; a lane worktree is made only when its entry runs"}
-                if not all(own_tree_here(row) for row in [*chain, following]) else predict(chain, following))
+                if not all(own_tree_here(row) for row in [*chain, following]) else
+                predict(chain, following, deadline))
     except Exception as error:  # a speculation that cannot be set up gates nothing; the lane goes on
         plan = {"skipped": f"{type(error).__name__}: {error}"[:600]}
     if "skipped" not in plan and clock() >= deadline:
@@ -2582,8 +2589,12 @@ OUT_OF_BUDGET = "the run's budget ran out during the setup, so its time left is 
 def train_stack(members: list[dict[str, Any]], deadline: float = math.inf) -> dict[str, Any]:
     """`{"fork", "placed", "dropped"}` for the members stacked on the fetched base, or `{"skipped": why}`.
 
-    A fetch or stack that crosses `deadline` skips the train.
+    Each costly step starts only before `deadline`: the members' read
+    may cross it before the fetch, and a fetch or stack that crosses it
+    skips the train.
     """
+    if clock() >= deadline:
+        return {"skipped": OUT_OF_BUDGET}
     import sd_gate_receipts  # noqa: PLC0415 -- the declaration reader loads only for a train
     root = pathlib.Path(members[0]["worktree"])
     remote = lane_git(root, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD") or ""

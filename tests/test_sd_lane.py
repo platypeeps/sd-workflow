@@ -1209,7 +1209,7 @@ class Reorder(Lane):
         sd_lane.set_hold(self.repo, 2, self.environ, held=True)
         sd_lane.update(self.store(), lambda rows: rows[0].update(status="running"))
         followers: list[int] = []
-        with mock.patch.object(sd_lane, "predict", lambda entry, following: followers.append(following["item"]) or
+        with mock.patch.object(sd_lane, "predict", lambda entry, following, deadline: followers.append(following["item"]) or
                                {"skipped": "recorded"}):
             sd_lane.speculate(self.entries()[0], self.store(), lambda *a: {})
         self.assertEqual(followers, [3])
@@ -1758,6 +1758,49 @@ class Train(Trees):
         with mock.patch.object(sd_lane, "clock", lambda: now[0]), mock.patch.object(sd_lane, "scratch_git", scratch):
             sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate, deadline=deadline)
         return calls
+
+    def setup_past_deadline(self, setup: Callable[[dict, float], Any], *, on_read: bool) -> list[tuple]:
+        """Run one setup on a fake clock that passes its deadline at the queue read, or else at the first fetch."""
+        self.queue_three()
+        [entry] = [row for row in self.entries() if row["item"] == 1]
+        now = [sd_lane.clock()]
+        deadline = now[0] + 100
+        real_git, real_read, calls = sd_lane.scratch_git, sd_lane.read_queue, []
+
+        def scratch(root: pathlib.Path, *argv: str) -> str | None:
+            calls.append(argv)
+            if not on_read and argv[0] == "fetch":
+                now[0] = max(now[0], deadline + 1)
+            return real_git(root, *argv)
+
+        def read(queue: Any) -> list[dict]:
+            rows = real_read(queue)
+            if on_read:
+                now[0] = deadline + 1
+            return rows
+        with mock.patch.object(sd_lane, "clock", lambda: now[0]), mock.patch.object(sd_lane, "scratch_git", scratch), \
+                mock.patch.object(sd_lane, "read_queue", read):
+            self.assertFalse(setup(entry, deadline))
+        return calls
+
+    def test_a_train_whose_queue_read_crosses_the_deadline_fetches_nothing(self) -> None:
+        """Review of sd:9899: the train started its fetch after the members' read crossed the deadline."""
+        calls = self.setup_past_deadline(
+            lambda entry, deadline: sd_lane.start_train(entry, self.store(), self.gate, self.environ, [], deadline),
+            on_read=True)
+        self.assertEqual(calls, [])
+
+    def test_a_speculation_whose_queue_read_crosses_the_deadline_predicts_nothing(self) -> None:
+        """Review of sd:9899: speculate started `predict` after a slow queue read crossed the deadline."""
+        calls = self.setup_past_deadline(
+            lambda entry, deadline: sd_lane.speculate(entry, self.store(), self.gate, [], deadline), on_read=True)
+        self.assertEqual(calls, [])
+
+    def test_a_prediction_that_crosses_the_deadline_starts_no_further_setup(self) -> None:
+        """Review of sd:9899: the next prediction, and the scratch worktree, started past the deadline."""
+        calls = self.setup_past_deadline(
+            lambda entry, deadline: sd_lane.speculate(entry, self.store(), self.gate, [], deadline), on_read=False)
+        self.assertEqual([argv[0] for argv in calls], ["fetch"])
 
     def test_a_train_whose_fetch_crosses_the_deadline_starts_no_gate(self) -> None:
         """Review of sd:9899: the train and the speculation started after the deadline, past the fetch."""
