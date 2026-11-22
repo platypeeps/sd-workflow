@@ -797,7 +797,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     const r = l.rows.find(x => x.state === 'blocked' && x.item === item) || {};
     const { yes, values } = await shell.ask({ title: `Reject the review blockers of sd:${item}${r.title ? ` · ${r.title}` : ''} in ${l.repo}?`,
       ok: 'Reject and enqueue', keep: 'Leave it blocked', danger: false,
-      body: `Each blocking finding of the lane's review, at the head its prepare log names, is recorded as rebutted with this reason through sd-ship adjudicate; then the entry is queued again at head ${head.slice(0, 12)}: prepare reuses that review and the rebuttal clears it.`,
+      // Every finding the review key covers, whole: the refusal's own text names only the first few (sd:9966).
+      body: `${(r.review_findings || []).length} blocking finding${(r.review_findings || []).length === 1 ? '' : 's'} of the lane's review, each whole: ${(r.review_findings || []).map((f, n) => `(${n + 1}) ${f}`).join(' ')} Each is recorded as rebutted with this reason through sd-ship adjudicate; then the entry is queued again at head ${head.slice(0, 12)}: prepare reuses that review and the rebuttal clears it.`,
       cli: `sd-ship -C ${shell.shq(l.path)} lane retry ${item} --expected-head ${head}`,
       fields: [{ name: 'reason', label: 'Reason a reader can check', required: true, multiline: true, value: '' }] });
     return yes ? String(values && values.reason || '').trim() : '';

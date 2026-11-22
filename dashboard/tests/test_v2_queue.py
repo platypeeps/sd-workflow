@@ -70,6 +70,10 @@ esac
 """
 
 
+#: sd:9966: the blocking finding a review-blocked prepare's answer names, whole, beside its digest.
+FOUND = [{"severity": "high", "path": "a.py", "line": 1, "summary": "wrong", "text": "wrong"}]
+
+
 def git(path, *args):
     return subprocess.run(["git", "-C", str(path), *args], capture_output=True, text=True, check=True).stdout.strip()
 
@@ -151,7 +155,7 @@ class Lane:
         """pack sd:8584: item 14 failed prepare at the checkout's head, enqueued here, its log in the lane's logs;
         `answer` is the log's stdout in place of prepare's JSON answer."""
         log = self.lane / "logs" / "prepare-14-20260906T100000.log"
-        prepared = json.dumps({"ok": False, "error": "local review blocking: 1/1 completed", "reviewed_head": self.merged, "finding_digests": ["f1"], "workflow": {
+        prepared = json.dumps({"ok": False, "error": "local review blocking: 1/1 completed", "reviewed_head": self.merged, "finding_digests": ["f1"], "findings": FOUND, "workflow": {
             "blocker": {"code": "review_blocking", "retryable": False},
             "next_action": "Run `sd-ship adjudicate --item 14` to print each blocking finding in full; fix them."}},
             indent=2)
@@ -800,7 +804,7 @@ class TheMove(Lane, BrowserSession):
     def test_reject_adjudicates_at_the_reviewed_head_and_retries_at_the_queued_one(self):
         """sd:9966 review: a catch-up moved the head before the review blocked; adjudicate refused the queued one."""
         reviewed = "e" * 40
-        self.caught_up({"reviewed_head": reviewed, "finding_digests": ["f1"]})
+        self.caught_up({"reviewed_head": reviewed, "finding_digests": ["f1"], "findings": FOUND})
         status, _, answer = self.reject()
         self.assertEqual(status, 200, answer)
         calls = self.calls()
@@ -812,7 +816,8 @@ class TheMove(Lane, BrowserSession):
         """An answer from before `reviewed_head` and `finding_digests` binds no review: nothing to reject."""
         for answer in ({"workflow": {"blocker": {"code": "review_blocking"}, "next_action":
                                      f"Run `sd-ship adjudicate --item 14 --expected-head {'d' * 40} --json`."}},
-                       {"reviewed_head": "d" * 40}, {"finding_digests": ["f1"]}):
+                       {"reviewed_head": "d" * 40}, {"finding_digests": ["f1"]},
+                       {"reviewed_head": "d" * 40, "finding_digests": ["f1", "f2"], "findings": FOUND}):
             with self.subTest(answer=answer):
                 self.caught_up(answer)
                 self.assertIsNone(self.shown())
@@ -820,11 +825,26 @@ class TheMove(Lane, BrowserSession):
                 self.assertEqual(status, 400, said)
                 self.assertEqual(self.calls(), [["-C", str(self.checkout), "lane", "list"]])
 
+    SIX = [{"severity": "high", "path": f"b{n}.py", "line": n, "summary": f"cut {n}...", "text": f"finding {n} whole"}
+           for n in range(1, 7)]
+
+    def test_a_review_blocked_row_names_every_finding_its_review_key_covers_in_full(self):
+        """sd:9966 review round 6: six blockers; the refusal's text names five, and Reject rebuts all six."""
+        row = self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "review_blocking"}},
+                                             "reviewed_head": self.merged, "finding_digests": [f"f{n}" for n in range(1, 7)],
+                                             "findings": self.SIX}))
+        self.assertEqual(row["review_findings"], [f"high b{n}.py:{n}: finding {n} whole" for n in range(1, 7)])
+        self.assertIsNotNone(row["review"])
+        other = self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "review_blocking"}},
+                                               "reviewed_head": self.merged, "finding_digests": [f"f{n}" for n in range(1, 7)],
+                                               "findings": [*self.SIX[:5], {**self.SIX[5], "text": "another"}]}))
+        self.assertNotEqual(other["review"], row["review"])  # the key binds the text the page shows
+
     def test_reject_refuses_a_review_other_than_the_one_the_page_showed(self):
         """sd:9966 review round 2: a newer prepare log names other findings than the page showed."""
         self.failed()
         seen = self.shown()
-        self.caught_up({"reviewed_head": self.merged, "finding_digests": ["f2"]})
+        self.caught_up({"reviewed_head": self.merged, "finding_digests": ["f2"], "findings": FOUND})
         status, _, answer = self.reject(review=seen)
         self.assertEqual(status, 409, answer)
         self.assertEqual(self.calls(), [["-C", str(self.checkout), "lane", "list"]])
@@ -3155,6 +3175,18 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                 self.assertIn(said, out["R"]["said"])
                 self.assertIn("rebuttal is recorded", out["R"]["said"])
                 self.assertNotIn("not rebutted", out["R"]["said"])
+
+    def test_reject_shows_every_finding_it_rebuts_before_the_reason(self):
+        """sd:9966 review round 6: the dialog names each finding the reason rebuts, whole, not the first five."""
+        six = [{"severity": "high", "path": f"b{n}.py", "line": n, "summary": "cut", "text": f"finding {n} whole"}
+               for n in range(1, 7)]
+        self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "review_blocking"}},
+                                       "reviewed_head": self.merged, "finding_digests": [f"f{n}" for n in range(1, 7)],
+                                       "findings": six}))
+        body = self.reject_press({"yes": False})["asked"]["body"]
+        for n in range(1, 7):
+            self.assertIn(f"high b{n}.py:{n}: finding {n} whole", body)
+        self.assertIn("6 blocking findings", body)
 
     def test_reject_is_off_on_a_row_whose_log_names_no_review(self):
         self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "review_blocking"}}}))

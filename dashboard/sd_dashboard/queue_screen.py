@@ -334,15 +334,26 @@ def _answer(entry: dict, lane: Path) -> dict:
 HEAD = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
-def review_of(answer: dict) -> tuple[str, list[str], str] | None:
+def review_of(answer: dict) -> tuple[str, list[str], list[str], str] | None:
     """sd:9966: the review a review-blocked prepare's answer names: the head it saw, the digest of each blocking
-    finding (`sd_ship_dispositions.blocking_refusal`), and the key a page binds Reject and enqueue to. None for an
-    answer that names neither, as one from before them: no review to bind."""
-    head, digests = answer.get("reviewed_head"), answer.get("finding_digests")
+    finding and each such finding whole (`sd_ship_dispositions.blocking_refusal`), and the key a page binds Reject
+    and enqueue to, over all three, so the reason applies only to findings the page showed. None for an answer
+    that names any of them not, as one from before them, or names a count of findings other than of digests."""
+    head, digests, rows = answer.get("reviewed_head"), answer.get("finding_digests"), answer.get("findings")
     if not (isinstance(head, str) and HEAD.fullmatch(head) and isinstance(digests, list) and digests
-            and all(isinstance(row, str) and row for row in digests)):
+            and all(isinstance(row, str) and row for row in digests) and isinstance(rows, list)
+            and len(rows) == len(digests) and all(isinstance(row, dict) for row in rows)):
         return None
-    return head, digests, hashlib.sha256(json.dumps([head, digests]).encode()).hexdigest()[:16]
+    shown = [f"{row.get('severity')} {row.get('path')}{'' if row.get('line') is None else ':' + str(row['line'])}: "
+             f"{row.get('text') or row.get('summary')}" for row in rows]
+    return head, digests, shown, hashlib.sha256(json.dumps([head, digests, shown]).encode()).hexdigest()[:16]
+
+
+def _review_fields(entry: dict, lane: Path) -> dict:
+    """A failed row's review key, and each finding it covers whole, for Reject's dialog; none for a review this
+    host cannot rebut: none named, or a worktree on another host (sd:9966)."""
+    review = review_of(_answer(entry, lane)) if _here(entry) else None
+    return {"review": review[-1], "review_findings": review[2]} if review else {"review": None, "review_findings": []}
 
 
 def _logged(entry: dict, lane: Path) -> dict:
@@ -490,7 +501,7 @@ def rows(entries: list[dict], *, path: str, lane: Path, now: float, done: frozen
                 # The log of the step that failed: a merge failure's prepare log is of a prepare that passed (sd:8601).
                 log = entry.get("merge_log" if entry.get("step") == "merge" else "prepare_log")
                 failed = {"branch": entry.get("branch"), "unchanged": _unchanged(entry), "failure": _failure(entry, lane),
-                          "log": str(log or "") or None, "review": ((review_of(_answer(entry, lane)) if _here(entry) else None) or [None])[-1]
+                          "log": str(log or "") or None, **_review_fields(entry, lane)
                           } if status == "failed" else {}
                 blocked.append({**base, "state": "blocked", "status": status, "step": entry.get("step"),
                                 "reason": reason, "who": who, "finished": entry.get("finished_at"),
@@ -775,7 +786,7 @@ def rebut(entry: dict | None, lane: Path, head: str, reason: str, shown: str) ->
     review = review_of(_answer(entry, lane))
     if review is None:
         raise ValueError(f"sd:{entry.get('item')}'s prepare log names no review to bind; rebut it with sd-ship adjudicate.")
-    seen, digests, key = review
+    seen, digests, _, key = review
     if key != shown:
         raise workflow.StaleItem(f"sd:{entry.get('item')}'s review changed since the page read it. Read it again, then retry.")
     base = [command("sd-ship"), "-C", str(entry["worktree"]), "adjudicate", "--item", str(entry["item"]),
