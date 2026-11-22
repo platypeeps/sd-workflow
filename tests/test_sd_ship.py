@@ -6418,6 +6418,16 @@ class SettlesLineTests(unittest.TestCase):
                 message = f"{fence}\nexample\n{closer}\n\nSettles: followup #42\n"
                 self.assertEqual(self.settled(message), {42})
 
+    def test_an_html_comment_or_quote_settles_nothing(self) -> None:
+        """GitHub hides a comment and shows a quote as someone else's words: neither is the author's line."""
+        for message in ("<!--\nSettles: followup #42\n-->\n", "<!-- Settles: followup #42 -->\n",
+                        "Text <!-- start\nSettles: followup #42\nend -->\n", "> Settles: followup #42\n",
+                        "<!--\nSettles: followup #42\n"):
+            with self.subTest(message=message):
+                self.assertEqual(self.settled(message), set())
+        self.assertEqual(self.settled("<!-- template -->\nSettles: followup #42\n"), {42})
+        self.assertEqual(self.settled("```\n<!--\n```\nSettles: followup #42\n"), {42})
+
     def test_an_indented_code_block_marker_is_no_fence(self) -> None:
         self.assertEqual(self.settled("    ```\nSettles: followup #42\n"), {42})
 

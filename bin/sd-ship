@@ -562,13 +562,13 @@ def settled_followups(connection: sqlite3.Connection, item: int, message: str) -
     """The open followups on `item` a delivery settles (sd:9869).
 
     A lane blocker (`sd_lane.LANE_ENDED`), or one a line of `message`
-    names as exactly `Settles: followup #<id>`, outside a code fence: the
-    pull-request body ends a paragraph before the trailers `sd-ship`
-    writes. Prose settles none: `#<id>` is as often a pull request or a
+    names as exactly `Settles: followup #<id>`, outside a code fence or an
+    HTML comment: the pull-request body ends a paragraph before the
+    trailers `sd-ship` writes. Prose settles none: `#<id>` is as often a pull request or a
     URL fragment, and "leave followup #<id> open" names one to keep. Any
     other followup waits on something the merge does not give.
     """
-    named, fence = set(), ""
+    named, fence, comment = set(), "", False
     for line in message.splitlines():
         # CommonMark: a fence opens on 3+ backticks or tildes indented 3 spaces at most, and closes
         # only on the same character, at least as long, with nothing after; unclosed, it runs to the end.
@@ -579,6 +579,10 @@ def settled_followups(connection: sqlite3.Connection, item: int, message: str) -
             continue
         if marker and not (marker[1][0] == "`" and "`" in marker[2]):
             fence = marker[1]
+            continue
+        # GitHub hides an HTML comment, so a line in one, as a template's example, is no author's line.
+        if comment or "<!--" in line:
+            comment = line.rfind("<!--") > line.rfind("-->") if "<!--" in line else "-->" not in line
             continue
         found = re.fullmatch(r" {0,3}Settles: followup #(\d+)\s*", line)
         if found:
