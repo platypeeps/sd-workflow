@@ -742,6 +742,16 @@ class Settings(unittest.TestCase):
         self.assertIsNone(taken)
         self.assertIn("gave up waiting for a gate slot", stream.getvalue())
 
+    def test_max_wait_zero_takes_a_free_slot(self):
+        """Review blocker: `sd gate run --max-wait 0` refused a free slot; the deadline skipped the first try."""
+        for rule in (None, sd_gate_slots.LoadRule(24.0, 0.0, "test")):
+            with self.subTest(rule=rule), tempfile.TemporaryDirectory() as tmp, \
+                    open(pathlib.Path(tmp) / "slot.1.lock", "a") as mine:
+                taken = sd_gate_slots.wait_for_slot(
+                    [mine.fileno()], pathlib.Path(tmp), poll=0.001, stream=io.StringIO(), deadline=0.0,
+                    clock=lambda: 0.0, rule=rule, loadavg=lambda: (1.0, 1.0, 1.0), busy=lambda: None)
+                self.assertEqual(taken, 0)
+
     def test_a_launcher_gone_during_the_cpu_sample_takes_no_slot(self):
         with tempfile.TemporaryDirectory() as tmp, open(pathlib.Path(tmp) / "slot.1.lock", "a") as mine:
             gone = [False]

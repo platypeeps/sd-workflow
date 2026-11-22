@@ -748,6 +748,11 @@ def place_line(ticket: Ticket | None, reason: str) -> str:
     return f"place {place[0]} of {place[1]} in the queue" + (f": {reason}" if place[0] == 1 else "")
 
 
+def sample_start(sampling: bool, deadline: float | None, clock: Callable[[], float]) -> float:
+    """When a CPU sample with a deadline to watch starts, or infinity: only that sample reads the clock."""
+    return clock() if sampling and deadline is not None else float("inf")
+
+
 def wait_for_slot(fds: Sequence[int], where: pathlib.Path, *, poll: float, stream: TextIO,
                   stop: Callable[[], bool] = lambda: False, deadline: float | None = None,
                   clock: Callable[[], float] = time.monotonic, rule: LoadRule | None = None,
@@ -780,13 +785,16 @@ def wait_for_slot(fds: Sequence[int], where: pathlib.Path, *, poll: float, strea
         while True:
             # The CPU sample may wait CPU_SAMPLE_SECONDS: take it before `stop` and the deadline are read, so
             # neither a launcher gone nor a wait run out during it takes a slot.
-            share = busy() if ticket is not None and rule.limit > 0 else None
+            # Only a sample reads the clock before it: a pass with none reads it once (sd:9946).
+            sampling = ticket is not None and rule.limit > 0
+            before = sample_start(sampling, deadline, clock)
+            share = busy() if sampling else None
             if stop():
                 raise LauncherExited()
-            # One clock read per pass: the attempt is quick, and its reports and deadline read this one.
+            # The attempt is quick: its reports and deadline read this one clock read.
             now = clock()
-            if ticket is not None and deadline is not None and now >= deadline:
-                taken = None  # the last attempt's reason is still why it waits
+            if deadline is not None and before < deadline <= now:
+                taken = None  # the deadline passed in the sample; the last attempt's reason stands
             elif ticket is None:
                 taken, reason = take_free(fds, markers, label, wall())
             else:
