@@ -1739,8 +1739,16 @@ def _recoverable(connection) -> list:
         f"ORDER BY assignment.run_count > 0 DESC, assignment.id DESC", (SCOPE, _BEAT_RESULT)).fetchall()
     rows = [row for row in rows if not _stranded(connection, row)
             and ((lead := _lead(row)) is None or _resumable(connection, lead, "blocked"))]
-    leads = {row["id"] for row in rows if row["parent"] is None}
-    return [row for row in rows if row["parent"] is None or row["parent"] in leads]
+    # A bundle that ran queues again whole or not at all: each blocked member the claim takes with its lead, its
+    # lead first. A member left out by any filter above (parked, its item owned by another build, not ready) keeps
+    # its commits on the lead's branch, so the claim would refuse the lead and replace the beat result, and no
+    # later tick could recover it (class pass, review round 23). A member whose item is done leaves, as in `retry`.
+    ids = {row["id"] for row in rows}
+    leads: set[int] = {lead for row in rows if (lead := _lead(row)) is not None}
+    whole = {lead for lead in leads
+             if lead in ids and all(member["id"] in ids for member in _members(connection, lead, "blocked")
+                                    if not _done(reads.items_by_ids(connection, [member["item"]]), member["item"]))}
+    return [row for row in rows if (lead := _lead(row)) is None or lead in whole]
 
 
 def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:

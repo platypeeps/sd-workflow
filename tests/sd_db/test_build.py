@@ -2874,6 +2874,48 @@ class Hosts(Case):
         self.assertIsNone(self.claim(hosts=WORK))
         self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE status = 'blocked'"), 2)
 
+    def _blocked_retry(self):
+        """A two-item retry on a satellite the hub blocked on its quiet beat: (items, lead, member)."""
+        items = [self.item(repo=SAT), self.item(repo=SAT)]
+        build.queue(self.db, items, who="operator")
+        first = self.claim(hosts=WORK)
+        self.retried(first)
+        lead = first["assignment"]
+        self.db.execute("UPDATE assignment SET status = 'queued' WHERE parent = ?", (lead,))
+        self.db.execute("UPDATE item SET status = 'ready'")
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        member = self.count("SELECT id FROM assignment WHERE parent = ?", lead)
+        return items, lead, member
+
+    def test_beat_recovery_requeues_no_lead_of_a_bundle_whose_member_is_parked(self):
+        """Class pass, review round 23: a member's item parked, so recovery left the member but queued the lead,
+        and the claim refused the lead (its branch holds the member's work), replacing the beat result: unpark
+        could not recover the bundle. A bundle that ran queues again whole or not at all."""
+        items, lead, member = self._blocked_retry()
+        self.db.execute("UPDATE item SET parked_at = ? WHERE id = ?", (build.clock(), items[1]))
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        self.claim(hosts=WORK)
+        self.assertEqual([self.count("SELECT status FROM assignment WHERE id = ?", row) for row in (lead, member)],
+                         ["blocked", "blocked"])
+        self.assertIn("lane runs on work, and", self.count("SELECT result FROM assignment WHERE id = ?", lead))
+        self.db.execute("UPDATE item SET parked_at = NULL WHERE id = ?", (items[1],))
+        run = self.claim(hosts=WORK)
+        assert run is not None
+        self.assertEqual(run["assignment"], lead)
+        self.assertEqual(sorted(entry["item"] for entry in run["members"]), sorted(items))
+
+    def test_beat_recovery_requeues_no_lead_of_a_bundle_whose_members_item_another_build_owns(self):
+        """Class pass, review round 23: another build of a member's item queued after the block, so recovery left
+        the member (`OWNING`) but queued the lead, whose branch holds that member's work too."""
+        items, lead, member = self._blocked_retry()
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        build.queue(self.db, [items[1]], who="operator")
+        self.claim(hosts=WORK)
+        self.assertEqual([self.count("SELECT status FROM assignment WHERE id = ?", row) for row in (lead, member)],
+                         ["blocked", "blocked"])
+        self.assertIn("lane runs on work, and", self.count("SELECT result FROM assignment WHERE id = ?", lead))
+
     def test_the_hub_blocks_a_row_whose_satellite_beat_comes_from_a_clock_ahead(self):
         """Pack sd:7955: a beat stamped more than STALE_SECONDS after now has no age to trust, so the claim blocks
         the row as for a stale beat, and its note names the skew, not a dead dispatcher."""
