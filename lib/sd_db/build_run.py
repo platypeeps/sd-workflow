@@ -1219,6 +1219,12 @@ class Supervisor:
                  "checking": self.checking, "cleaning": self.cleaning}
         if self.held is not None and self.held["name"] == "claude" and self.held.get("as") == self.fix_role():
             steps["fixing"] = self.fix  # a kept builder is the fix itself, not the review after it
+        elif step == "fixing" and self.fresh()["start_step"] == "fixing" and not self.blockers:
+            # A claim after a usage limit in a fix (`build.claim`): the fix runs again on the round's blockers,
+            # its round already counted (review of build/sd-1557).
+            self.blockers = self.noted_blockers()
+            if self.blockers:
+                steps["fixing"] = self.fix
         while step in steps:
             ended = steps[step]()
             if isinstance(ended, dict):
@@ -1400,8 +1406,12 @@ class Supervisor:
             return [f"the title at {self.title} or the body at {self.body} is not UTF-8 text"]
         refused = self.checked(self.work, self.base(), head, title.strip(), body) if self.checked else []
         if not build.unmanaged(self.db, self.row["repo"]):
-            refused += [text for item in [self.lead, *self.others]
-                        for text in undisposed(self.tools.ship, self.work, item, head, env=self.env)]
+            # Prepare reads the lane entry's item, the first one enqueue delivers (review of build/sd-1557).
+            cited = self.cited(self.work, self.base(), head, body)
+            delivered = [item for item in [self.lead, *self.others] if cited is not None and item in cited
+                         and not build.open_question(self.db, [item], self.row["created_at"])]
+            if delivered:
+                refused += undisposed(self.tools.ship, self.work, delivered[0], head, env=self.env)
         return refused + self.untabled(head, body)
 
     def untabled(self, head: str, body: str) -> list[str]:
@@ -1452,6 +1462,14 @@ class Supervisor:
         if rounds == REVIEW_ROUNDS and unasked:
             return self.fix(CLASS_PASS, rounds=rounds)
         return self.finish("blocked", f"{rounds} review rounds left blockers: {self.summary(self.blockers)}")
+
+    def noted_blockers(self) -> list[dict]:
+        """The last round's blockers as `blocked_round` noted them on the lead, one per line; [] for none."""
+        row = self.db.execute("SELECT body FROM note WHERE item = ? AND body LIKE ? ORDER BY timestamp DESC, id DESC "
+                              "LIMIT 1", (self.lead, build.ROUND_BLOCKERS + "%")).fetchone()
+        lines = row["body"][len(build.ROUND_BLOCKERS):].splitlines() if row else []
+        # Each line is `summary`'s "- path:line text"; the text alone keeps it, as `summary` prints it again.
+        return [{"path": "", "line": "", "summary": line.strip()[2:]} for line in lines if line.startswith("- ")]
 
     def count_round(self) -> None:
         if not build.write(self.db, self.ident, review_round=(self.fresh()["review_round"] or 0) + 1):
@@ -2000,7 +2018,9 @@ class Supervisor:
     @staticmethod
     def summary(blockers: list[dict], limit: int | None = 3) -> str:
         # `summary` is the text of an `sd-review --json` finding record.
-        lines = [f"{row.get('path', '?')}:{row.get('line', '?')} {row.get('summary') or ''}".strip() for row in blockers]
+        # A noted blocker (`noted_blockers`) carries its place in its summary already: path "" prints none.
+        lines = [(f"{row.get('path', '?')}:{row.get('line', '?')} " if row.get("path") != "" else "")
+                 + f"{row.get('summary') or ''}".strip() for row in blockers]
         return "; ".join(lines[:limit]) if limit else "\n".join(f"- {line}" for line in lines)
 
     def out(self, name: str) -> Path:

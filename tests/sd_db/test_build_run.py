@@ -237,8 +237,9 @@ FAKE = textwrap.dedent('''
         lane = plans / "lane.json"
         entries = json.loads(lane.read_text()) if lane.exists() else []
         _, args = real("sd-ship")
-        if adjudicating:  # no receipt unless plans/adjudicate.json holds the template's answer
-            said = plans / "adjudicate.json"
+        if adjudicating:  # no receipt unless plans/adjudicate[-<item>].json holds the template's answer
+            said = plans / f"adjudicate-{args.item}.json"
+            said = said if said.exists() else plans / "adjudicate.json"
             print(said.read_text() if said.exists() else json.dumps({"ok": False, "error": "no ship receipt"}))
             sys.exit(0 if said.exists() else 3)
         assert args.command == "lane", args
@@ -969,7 +970,7 @@ class Supervise(Case):
     def test_a_usage_limit_claim_resumes_the_step_session_and_round(self):
         """Advisory of PR #1960 (sd:9973): the claim after a usage limit opened at `claimed` with no session and
         round 0, so a bundle limited in its third fix round rebuilt from scratch with a fresh round budget. It
-        resumes as a loss retry does: the step (`RESUME`), the session and the round."""
+        resumes its session and round, and a fix its own step (review of build/sd-1557), not `RESUME`'s."""
         self.press()
         ident = self.bundle["id"]
         reset = int(datetime.now(UTC).timestamp()) + 60
@@ -982,7 +983,7 @@ class Supervise(Case):
                                 root=self.root / "worktrees")
         assert again is not None
         row = build.run(self.db, again["id"])
-        self.assertEqual((row["step"], row["session_id"], row["review_round"]), ("reviewing", "session-limited", 2))
+        self.assertEqual((row["step"], row["session_id"], row["review_round"]), ("fixing", "session-limited", 2))
 
     def test_a_fault_inside_the_usage_limit_end_writes_nothing_and_the_next_end_finishes(self):
         """Pack sd:9907, failure table row 2: the outcome, the release, the requeue and the hold are one
@@ -1861,6 +1862,39 @@ class Supervise(Case):
         self.assertIn(f"the lane's review of sd:{self.items[0]} at ", said)
         self.assertIn("a.py: the pin check is missing", said)
         self.assertIn("--dispositions-file", said)
+
+    def test_only_the_item_prepare_reads_is_checked_for_dispositions(self):
+        """Review of build/sd-1557: a skipped member's blocking receipt held back the delivered one. Prepare reads
+        the first delivered item's receipt, so only that one is checked."""
+        self.press(2)
+        self.write_pr()
+        (self.plans / f"adjudicate-{self.items[0]}.json").write_text(json.dumps({"ok": False}))
+        self.adjudicate(False)  # every other item's receipt blocks
+        self.plan(claude=["skip"], sd_review=["clean"])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        asked = [call["argv"] for call in self.calls("sd-ship") if "adjudicate" in call["argv"]]
+        self.assertEqual({argv[argv.index("--item") + 1] for argv in asked}, {str(self.items[0])})
+
+    def test_a_usage_limit_in_a_fix_resumes_that_fix_without_a_round(self):
+        """Review of build/sd-1557: a limit in the fix resumed at `reviewing`, which charged the same blockers
+        another round. The claim resumes the fix itself, with the round's blockers and session."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "rate_limited"], sd_review=["blocking"])
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.assertEqual(build.run(self.db, again["id"])["step"], "fixing")
+        self.plan(claude=["fix1"], sd_review=["clean"])
+        self.assertEqual(self.supervisor(again["id"]).run()["step"], "enqueued")
+        fix = [call["argv"] for call in self.calls("claude")][-1]
+        self.assertEqual(fix[fix.index("--resume") + 1], "session-fixture")
+        self.assertIn("- work.txt:1 a blocker", fix[fix.index("-p") + 1])
+        self.assertEqual(build.run(self.db, again["id"])["review_round"], 1, "the resumed fix charged no round")
 
     def test_a_recorded_disposition_enqueues(self):
         """sd:10010: once the dispositions are on file, the lane's prepare clears them: enqueue goes ahead."""

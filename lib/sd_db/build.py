@@ -1787,7 +1787,10 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
                 last = connection.execute("SELECT step, session_id, review_round, outcome FROM runner_run "
                                           "WHERE assignment = ? ORDER BY run DESC LIMIT 1", (lead,)).fetchone()
                 limited = last is not None and last["outcome"] == RATE_LIMITED and last["step"] not in LANE_STEPS
-                step = RESUME.get(last["step"] or "claimed", last["step"] or "claimed") if limited else "claimed"
+                # A limit in a fix resumes that fix, not the review after it: a review there would charge its
+                # blockers another round (review of build/sd-1557).
+                step = (last["step"] if last["step"] == "fixing" else RESUME.get(last["step"] or "claimed",
+                        last["step"] or "claimed")) if limited else "claimed"
                 ident = _open_run(connection, lead, repo=repo, owner=run_owner(owner, lanes[lead]),
                                   step=step,
                                   model=_model(connection, [row["item"] for row in bundle]),
