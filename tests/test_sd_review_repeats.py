@@ -443,6 +443,16 @@ class ReproRuleTests(unittest.TestCase):
         disposed = sd_review.dispose(rows, "high", repro=True, prior=prior)
         self.assertEqual([row["disposition"] for row in disposed], ["advisory", "blocking"])
 
+    def test_a_rebutted_prior_blocker_holds_no_other_finding(self) -> None:
+        """build/sd-1423 review (bin/sd-review:1814): with a listed rebuttal at src.py:10, an unrelated uncited
+        high finding at line 12 blocked: the rebuttal check read the new finding, the proximity check the
+        rebutted prior row. A rebutted prior blocker is answered and holds nothing."""
+        rebutted = listed(adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10))
+        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking")]
+        [record] = sd_review.dispose([finding(line=12, summary="the cache is never cleared")], "high", rebutted,
+                                     repro=True, prior=prior)
+        self.assertEqual(record["disposition"], "advisory")
+
     def test_the_same_line_alone_gives_no_prior_evidence(self) -> None:
         """Lead after round 8: the matcher gave the old repro to an unrelated cache finding at the same line."""
         prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking")]

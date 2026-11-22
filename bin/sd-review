@@ -1760,6 +1760,8 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
     threshold = BLOCKING_ORDER[floor]
     # Only a repeat that blocks at the floor answers a prior blocker (build/sd-1423 review: a medium copy cleared it).
     at_floor = [row for row in findings if 0 < BLOCKING_ORDER.get(str(row.get("severity", "unspecified")), 0) >= threshold]
+    # A rebutted prior blocker is answered, so it holds no other finding (build/sd-1423 review, bin/sd-review:1814).
+    prior = [old for old in prior if not getattr(recorded_at(rebutted, old.get("path"), old.get("summary"), old.get("line")), "listed", False)]
     disposed = []
     for finding in findings:
         severity = str(finding.get("severity", "unspecified"))

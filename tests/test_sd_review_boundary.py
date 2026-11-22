@@ -1062,11 +1062,15 @@ class LineBudgetTests(unittest.TestCase):
         # +2 so `moved_line` keeps a replaced line's offset and `prior_at`
         # records the replacing hunk's span for the fail-closed check.
         # Measured: `sd-review` is 2988 here.
+        #
+        # 4958 -> 4960 is the next build/sd-1423 review: `bin/sd-review`
+        # +2 so a rebutted prior blocker holds no other finding.
+        # Measured: `sd-review` is 2990 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4958,
+            4960,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
