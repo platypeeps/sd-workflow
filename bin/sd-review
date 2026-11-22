@@ -124,7 +124,7 @@ REPEAT_NOTE = "[downgraded: repeats a rebutted finding, no evidence cited]"
 #: What a reader puts in `evidence` (pack sd:9867, amended by note #70162): a code finding without a repro blocks nothing.
 EVIDENCE_ASK = ("the command or input you ran and what it gave (an error, exit status or wrong output), "
                 "showing a failure this change causes, in code it touched or an unchanged caller it breaks; "
-                "a code finding without both parts blocks nothing.")
+                "a code finding without one blocks nothing.")
 #: The note a finding at the floor gets when it cites no repro and so does not block (pack sd:9867).
 NO_REPRO_NOTE = "[advisory: no failing input or command cited]"
 CODEX_OUTPUT_SCHEMA: dict[str, Any] = {
@@ -1752,9 +1752,9 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
 
     Operator ruling on pack sd:9270: a repeat of a finding already rebutted on this branch (`recorded_at`)
     without evidence posts as advisory, its summary saying why. Operator ruling on pack sd:9867 (amended by
-    note #70162): with `repro`, a finding at the floor blocks only when its `evidence` names a failing input
-    or command (`sd_lib.reproduces`), in a touched file or an unchanged caller the change breaks; any other posts as advisory,
-    its summary saying why, for the lead to file. The lane's own blockers (`LANE_PATHS`) need none.
+    note #70162): with `repro`, a finding at the floor blocks only when it cites `evidence`; any other posts as
+    advisory, its summary saying why, for the lead to file. The gate reads whether evidence was given, not what
+    it says: a pattern over its prose downgraded real repros (sd:9869); the lead rebuts one that does not reproduce. The lane's own blockers (`LANE_PATHS`) need none.
     A planning review passes no `repro` and keeps the floor alone. The lane runs this through `sd-review` too.
     """
 
@@ -1772,7 +1772,7 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
         if blocking and not cited and getattr(recorded_at(rebutted, record.get("path"), record.get("summary"),
                                                           record.get("line")), "listed", False):
             note = REPEAT_NOTE
-        elif blocking and repro and not (cited and sd_lib.reproduces(evidence)) and path not in LANE_PATHS:
+        elif blocking and repro and not cited and path not in LANE_PATHS:
             note = NO_REPRO_NOTE
         if note:
             blocking = False

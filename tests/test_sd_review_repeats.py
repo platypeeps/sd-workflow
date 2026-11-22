@@ -271,28 +271,22 @@ class ReproRuleTests(unittest.TestCase):
                 self.assertEqual((record["disposition"], record["summary"]),
                                  ("advisory", f"defect {sd_review.NO_REPRO_NOTE}"))
 
-    def test_evidence_that_names_no_input_or_command_is_no_repro(self) -> None:
-        """sd:9869 review: "See summary" blocked as a repro. Evidence must name something a reader can run or
-        check: a command, a path or `path:line`, a backticked span, or a failure's output."""
-        for evidence in ("See summary", "see above", "obviously broken", "This is a real bug.", "N/A", "-",
-                         "This fails.", "src.py is wrong", "KeyError: 'state'", "exit 127", "bin/tool:3",
-                         "Traceback (most recent call last)", "expected 2, got 3", "it fails on main.py"):
+    def test_the_gate_reads_whether_evidence_was_given_not_what_it_says(self) -> None:
+        """sd:9869, class pass after round 7: a pattern over the evidence's prose downgraded a real repro
+        (`Input: ... Actual: ... status 1.`) and passed an unrun one. The gate now checks only that a reader
+        gave evidence; whether it reproduces is the lead's call, rebutted with a reason a reader can check."""
+        for evidence in ("Input: an empty JSON array. Actual: the process terminates with status 1.",
+                         "This fails.", "make test expected to work; never ran it", "python3 src.py: Traceback"):
             with self.subTest(evidence=evidence):
                 [record] = sd_review.dispose([finding(evidence)], "high", repro=True)
-                self.assertEqual((record["disposition"], record["summary"]),
-                                 ("advisory", f"defect {sd_review.NO_REPRO_NOTE}"))
-        # sd:9869 review: a repro is two parts, something run and what it gave: `This fails.` names neither.
-        for evidence in ("make test: 1 failed", "`sd today --json` prints []", "python3 src.py: exit 127",
-                         "bin/tool --x raises KeyError: 'state'", "$ pytest -k a: Traceback", "f(2) returns 3, expected 2",
-                         "`git diff` -> fatal error"):
-            with self.subTest(evidence=evidence):
-                [record] = sd_review.dispose([finding(evidence)], "high", repro=True)
-                self.assertEqual(record["disposition"], "blocking")
+                self.assertEqual((record["disposition"], record["summary"]), ("blocking", "defect"))
+        self.assertFalse(hasattr(sd_review.sd_lib, "reproduces"))
 
     def test_a_duplicate_that_reproduces_keeps_the_finding_blocking(self) -> None:
         """sd:9869 review: two readers gave one finding, the first with "See summary", the second with a repro;
-        deduplication kept the first's evidence, and the gate posted it as advisory."""
-        for first, second in (("See summary", REPRO), ("", REPRO), (REPRO, "See summary"), ("This fails.", REPRO)):
+        deduplication kept the first's evidence, and the gate posted it as advisory. A blank first copy
+        must not hide the second's."""
+        for first, second in (("", REPRO), (REPRO, "")):
             with self.subTest(first=first, second=second):
                 result = {"severity_floor": "high", "requested_reviews": 2}
                 answers = [sd_review.Outcome(name, sd_review.FINDINGS, (finding(evidence),), "", (), ())

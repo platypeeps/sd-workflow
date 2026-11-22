@@ -4315,38 +4315,20 @@ def fill_slots(items: Any, slots: int, run: Callable[[Any], Any], counted: Calla
     return [answers[index] for index in sorted(answers)]
 
 
-#: A repro (sd:9869 review) is two parts a reader can check: something run, and what it gave. Run: a
-#: backticked span, `$ cmd`, a call with its input `f(2)`, or a command word and its argument. Gave: an error
-#: name, a traceback, an exit status, "failed", "expected", a comparison, `->`, or "returns", "prints",
-#: "raises". A bare failure word or file name ("This fails.", "src.py is wrong") is one part, so none.
-_RUN = re.compile(r"`[^`\n]+`|\$ \S|\b\w+\([^()\n]*\)|\b(?:python3?|pytest|make|bash|sh|zsh|node|npm|npx|"
-                  r"cargo|go|git|curl|sqlite3|uv|ruby|java|sd(?:-[\w-]+)?|bin/[\w./-]+)\s+\S")
-_GAVE = re.compile(r"\b\w*(?:Error|Exception)\b|Traceback|\bexit(?:ed)?(?: with)?(?: code| status)? \d+"
-                   r"|\bfail(?:s|ed|ure|ing)?\b|\bexpected\b|[!=]=|->|\b(?:returns?|returned|prints?|printed"
-                   r"|raises?|raised|gives|gave|yields)\b", re.IGNORECASE)
-
-
-def reproduces(evidence: Any) -> bool:
-    """Whether a finding's `evidence` names a repro: something run (`_RUN`) and what it gave (`_GAVE`)."""
-    return isinstance(evidence, str) and bool(_RUN.search(evidence)) and bool(_GAVE.search(evidence))
-
-
 def distinct_findings(findings: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """sd:7519. Each finding once: one two readers both report keeps the first reader's `backend`.
 
     Identical means every key but `backend` and `evidence` is equal: two readers cite
     their checks in their own words (pack sd:9270). Adjudication takes a row per
     blocking finding, so a copy was a second row to dispute. The kept row takes
-    the first evidence any copy gives, so a bare first copy does not lose a cited one,
-    and the first that `reproduces`, so a vague first copy does not lose a repro (sd:9869).
+    the first evidence any copy gives, so a bare first copy does not lose a cited one.
     """
     seen: dict[str, dict[str, Any]] = {}
     for finding in findings:
         key = json.dumps({name: value for name, value in finding.items() if name not in ("backend", "evidence")},
                          sort_keys=True, default=str)
         kept = seen.setdefault(key, dict(finding))
-        if (finding.get("evidence") and not kept.get("evidence")
-                or reproduces(finding.get("evidence")) and not reproduces(kept.get("evidence"))):
+        if finding.get("evidence") and not kept.get("evidence"):
             kept["evidence"] = finding["evidence"]
     return list(seen.values())
 
