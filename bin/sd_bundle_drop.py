@@ -149,7 +149,7 @@ def split_branch(plan: dict, done: dict) -> dict:
     # Marked made first: a failed add may leave a half-made worktree or branch; undo removes both either way.
     _git("worktree", "add", "-q", "-b", new_branch, str(new_work), start, cwd=repo)
     done["onto"] = _replay(new_work, start, fork, kept)
-    check_branch(new_work, done["onto"], kept, aside)
+    check_branch(new_work, done["onto"], kept, aside, fork)
     done["head"] = _out("rev-parse", "HEAD", cwd=new_work)
     return done
 
@@ -172,8 +172,25 @@ def _replay(work: str | Path, start: str, fork: str, kept: list[str]) -> str:
     raise DropRefused(f"the kept commits apply on neither {start} nor the fork {fork[:12]}; {failed}")
 
 
-def check_branch(work: str | Path, start: str, kept: list[str], aside: set[int]) -> None:
-    """The new branch holds the kept commits alone: one commit each, no path past theirs, no `aside` citation."""
+def _renames(work: str | Path, old: str, new: str) -> dict[str, str]:
+    """The paths `old..new` renamed, old to new: a replay onto the base lands a kept edit on the new name."""
+    fields = _git("diff", "--find-renames", "--name-status", "-z", old, new, cwd=work).stdout.split("\0")
+    renamed: dict[str, str] = {}
+    index = 0
+    while index < len(fields) and fields[index]:
+        status = fields[index]
+        if status.startswith(("R", "C")):
+            if status.startswith("R"):
+                renamed[fields[index + 1]] = fields[index + 2]
+            index += 3
+        else:
+            index += 2
+    return renamed
+
+
+def check_branch(work: str | Path, start: str, kept: list[str], aside: set[int], fork: str) -> None:
+    """The new branch holds the kept commits alone: one commit each, no path past theirs, no `aside` citation.
+    A kept path main renamed since `fork` counts under its new name too (note #71874)."""
     shas = _out("rev-list", "--reverse", f"{start}..HEAD", cwd=work).split()
     if len(shas) != len(kept):
         raise DropRefused(f"the new branch holds {len(shas)} commits, not the {len(kept)} kept")
@@ -182,6 +199,9 @@ def check_branch(work: str | Path, start: str, kept: list[str], aside: set[int])
     if cited:
         raise DropRefused(f"the new branch still cites {', '.join(f'sd:{n}' for n in sorted(cited))}")
     allowed = set().union(*(_paths(work, sha) for sha in kept)) if kept else set()
+    if kept:
+        renamed = _renames(work, fork, start)
+        allowed |= {renamed[path] for path in allowed if path in renamed}
     changed = _names("diff", "--name-only", "-z", start, "HEAD", cwd=work)
     if changed - allowed:
         raise DropRefused(f"the new branch changes {', '.join(sorted(changed - allowed))}, which no kept commit does")

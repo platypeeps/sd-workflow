@@ -1135,6 +1135,29 @@ class Advisories(Repo):
         self.assertEqual(git(new, "rev-list", "--count", "HEAD..origin/main"), "0", "replayed onto main")
         self.assertNotIn(f"sd:{items[0]}", self.closes(new))
 
+    def test_a_kept_edit_of_a_file_main_renamed_still_drops(self):
+        """Lane review (note #71874): main renames a.txt to b.txt, a kept commit edits a.txt. The replay lands
+        the edit on b.txt, so the path check reads the rename, not the kept commit's old path."""
+        body = "".join(f"line {n}\n" for n in range(20))
+        self.main_moves("a.txt", body)
+        git(self.repo, "pull", "-q", "origin", "main")
+        items = [self.item(repo=str(self.repo)) for _ in range(2)]
+        build.queue(self.db, items, who="operator")
+        run = self.claim()
+        work = Path(run["work_path"])
+        git(self.repo, "worktree", "add", "-q", "-b", run["branch"], str(work), "origin/main")
+        self.commit(work, "d.txt", "dropped\n", f"feat: dropped\n\nCloses: sd:{items[0]}")
+        self.commit(work, "a.txt", body + "kept\n", f"feat: kept\n\nCloses: sd:{items[1]}")
+        self.end(run)
+        other = self.root / "other"
+        git(other, "mv", "a.txt", "b.txt")
+        git(other, "commit", "-q", "-m", "chore: rename a.txt")
+        git(other, "push", "-q", "origin", "HEAD:main")
+        new = self.drop(run, items[0])
+        self.assertEqual(self.files(new), ["README", "b.txt"])
+        self.assertEqual((new / "b.txt").read_text(), body + "kept\n")
+        self.assertEqual(git(new, "rev-list", "--count", "HEAD..origin/main"), "0", "replayed onto main")
+
 
 class GitConfigScope(unittest.TestCase):
     """pack sd:9863: command-scope config may redirect a child's remote (`url.*.insteadOf`), so it is stripped; only
