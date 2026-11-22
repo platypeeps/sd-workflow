@@ -307,6 +307,60 @@ class TheQueueGraph(DependencyCase):
         self.wait(second, fourth)
         self.assertEqual(self.drain(), [], "every queued run ran")
 
+    def reviewer_after(self, author):
+        """A reviewer run of a fresh item, queued with an explicit `after=author`: (item, run)."""
+        return self.lone(f"work/r-{author}", role="reviewer", after=author)
+
+    def test_a_wait_never_drops_an_explicit_after_edge(self):
+        """Lane review 7379bf9a: reviewer B queued after=A, then author A set to wait on B's item. The cycle
+        breaker dropped B's after=A, so B ran before A's delivery. The wait is refused, naming both."""
+        from sd_db import runner
+
+        first, author = self.lone("work/a")
+        second, reviewer = self.reviewer_after(author)
+        with self.assertRaisesRegex(WorkflowError, f"sd:{second}.*after.*sd:{first}"):
+            self.wait(first, second)
+        self.assertEqual(self.fields(first), None, "a refused wait writes nothing")
+        roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
+        self.assertIsNone(runner.claim(self.db, reviewer, owner="fixture", **roots), "B waits for A")
+
+    def test_an_explicit_after_that_closes_a_wait_cycle_is_refused_at_enqueue(self):
+        """Class pass: A waits on an item with no run yet; a reviewer run of that item queued after=A."""
+        from sd_db import runner
+
+        first, author = self.lone("work/a")
+        second = self.item()
+        self.db.execute("UPDATE item SET branch = 'work/r' WHERE id = ?", (second,))
+        self.wait(first, second)
+        with self.assertRaisesRegex(runner.RunnerRefused, f"sd:{second}.*after.*sd:{first}"):
+            runner.enqueue(self.db, [second], who="operator", role="reviewer", after=author)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE item = ?", second), 0)
+
+    def test_a_reopen_that_closes_a_cycle_through_an_explicit_after_blocks_the_later_run(self):
+        """Class pass: the wait is set while its item is done, so no edge; a reopen closes the cycle. The
+        claim ends the run queued after, naming both items, and the queue drains."""
+        from sd_db import runner
+
+        first, author = self.lone("work/a")
+        second, reviewer = self.reviewer_after(author)
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (second,))
+        self.wait(first, second)
+        self.db.execute("UPDATE item SET status = 'ready' WHERE id = ?", (second,))
+        roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
+        self.assertIsNone(runner.claim(self.db, reviewer, owner="fixture", **roots), "B never passes A")
+        state = runner.queue_state(self.db, reviewer)
+        self.assertEqual(state["status"], "blocked")
+        self.assertRegex(state["result"], f"sd:{second}.*after.*sd:{first}")
+
+    def test_an_explicit_after_names_a_run_of_another_role(self):
+        """Within one role, `after` is batch order, which a waiting run may pass; an explicit prerequisite
+        of the same role would read as one, so it is refused: queue the runs in one batch."""
+        from sd_db import runner
+
+        _, author = self.lone("work/a")
+        with self.assertRaisesRegex(runner.RunnerRefused, "one batch"):
+            self.lone("work/b", after=author)
+
 
     def test_every_queue_drains(self):
         import random
@@ -334,6 +388,57 @@ class TheQueueGraph(DependencyCase):
                     if named:
                         self.wait(item, *named)
                 self.assertEqual(self.drain(), [], f"seed {seed}: the queue stalled")
+
+    def test_every_queue_drains_and_keeps_each_explicit_prerequisite(self):
+        """Lane review 7379bf9a: random author batches, reviewer batches queued after= a random author run,
+        then random waits; a wait the queue cannot keep is refused. Every queue drains, and no run starts
+        before the run it is queued after is merged."""
+        import random
+
+        from sd_db import runner
+
+        roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
+        for seed in range(300):
+            with self.subTest(seed=seed):
+                if seed:
+                    self.setUp()
+                rng = random.Random(seed)
+                items: list[int] = []
+                authors: list[int] = []
+                branch = 0
+
+                def batch(rng=rng, items=items, **options):
+                    nonlocal branch
+                    made = [self.item() for _ in range(rng.randint(1, 3))]
+                    for item in made:
+                        branch += 1
+                        self.db.execute("UPDATE item SET branch = ? WHERE id = ?", (f"work/{branch}", item))
+                    items.extend(made)
+                    return [row["id"] for row in runner.enqueue(self.db, made, who="operator", **options)]
+
+                for _ in range(rng.randint(1, 3)):
+                    authors += batch(parallel=rng.random() < 0.4)
+                for _ in range(rng.randint(1, 2)):
+                    batch(role="reviewer", after=rng.choice(authors))
+                order = rng.sample(items, len(items))
+                for index, item in enumerate(order):
+                    named = [other for other in order[index + 1:] if rng.random() < 0.3]
+                    if named:
+                        try:
+                            self.wait(item, *named)
+                        except WorkflowError as error:
+                            self.assertIn("is queued after", str(error))
+                while queued := [row["id"] for row in runner.queued(self.db)]:
+                    started = [ident for ident in queued if runner.claim(self.db, ident, owner="fixture", **roots)]
+                    self.assertTrue(started, f"seed {seed}: the queue stalled")
+                    for ident in started:
+                        run = runner.queue_state(self.db, ident)
+                        # Only an explicit prerequisite holds; batch order within a role may yield.
+                        ahead = run["after"] and runner.queue_state(self.db, run["after"])
+                        if ahead and ahead["role"] != run["role"]:
+                            self.assertTrue(runner._merged(self.db, ahead),
+                                            f"seed {seed}: {ident} started before {ahead['id']} merged")
+                        self.finish(ident)
 
 
 class TheBuild(DependencyCase):

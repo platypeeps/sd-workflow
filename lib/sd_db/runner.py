@@ -134,16 +134,27 @@ def _reaches(graph: dict[int, set[int]], start: int, goal: int) -> bool:
 
 
 def _waits(connection) -> dict[int, set[int]]:
+    """The queue as a graph: each queued run and the unfinished runs it waits on."""
+    return _graph(connection)[0]
+
+
+def _graph(connection) -> tuple[dict[int, set[int]], list[tuple[int, int]]]:
     """The queue as a graph: each queued run and the unfinished runs it waits on (third lane blocker of
-    pack sd:9570). Pairwise yields missed cycles through several batches, so the graph is built whole.
+    pack sd:9570), and the explicit prerequisites a wait contradicts. Pairwise yields missed cycles
+    through several batches, so the graph is built whole.
 
     A dependency edge, kept always: an author run waits on each queued run of an open item its item
     waits on, directly or through other open items; the workflow refuses an item cycle, so these alone
-    make none. An order edge, kept unless it closes a cycle: a serial run waits on each run ahead of it
-    in its chain that is not merged, the whole chain; then a parallel author run waits
-    on each earlier queued serial or non-author run in its repository that has no order edge left. An
-    order edge that closes a cycle is dropped, so the run it held passes: the graph stays acyclic, and
-    an acyclic graph always has a run that waits on none, so every queue drains."""
+    make none. A prerequisite edge, kept always: a run waits on the first run up its chain of another
+    role, its batch's explicit `after` (`enqueue` refuses one of the same role). One that closes a
+    cycle is not added but returned as a (run, prerequisite) pair: a wait contradicts it, and only a
+    refusal or an ended run settles that, never a pass (lane review 7379bf9a). An order edge, kept
+    unless it closes a cycle: a serial run waits on each other run up its chain that is not merged,
+    the whole chain; then a parallel author run waits on each earlier queued serial or non-author run
+    in its repository that has no order edge left. An order edge that closes a cycle is dropped, so
+    the run it held passes: the graph stays acyclic, and an acyclic graph always has a run that waits
+    on none, so every queue drains once each contradicted prerequisite is settled."""
+
     from .workflow import item_blocked_by
 
     rows = {row["id"]: dict(row) for row in connection.execute(
@@ -188,17 +199,30 @@ def _waits(connection) -> dict[int, set[int]]:
         return True
 
     held: set[int] = set(outside)
+    contradicted: list[tuple[int, int]] = []
+    order: list[tuple[int, int]] = []
     for ident, row in rows.items():
-        predecessor = row["after"]
+        predecessor, crossed = row["after"], False
         while predecessor is not None:
             ahead = rows.get(predecessor) or connection.execute(
                 "SELECT * FROM assignment WHERE id = ?", (predecessor,)).fetchone()
             if ahead is None:
                 break
+            prerequisite = not crossed and ahead["role"] != row["role"]
+            crossed = crossed or prerequisite
             # A merged run ahead may have passed the ones before it, so the walk goes on past it.
-            if not _merged(connection, ahead) and add(ident, predecessor):
+            if _merged(connection, ahead):
+                pass
+            elif not prerequisite:
+                order.append((ident, predecessor))
+            elif add(ident, predecessor):
                 held.add(ident)
+            else:
+                contradicted.append((ident, predecessor))
             predecessor = ahead["after"]
+    for ident, predecessor in order:
+        if add(ident, predecessor):
+            held.add(ident)
     for ident, row in rows.items():
         if row["lane"] != "parallel" or row["role"] != "author":
             continue
@@ -208,7 +232,22 @@ def _waits(connection) -> dict[int, set[int]]:
             if before["repo"] == row["repo"] and earlier not in held and (
                     before["lane"] == "serial" or before["role"] != "author"):
                 add(ident, earlier)
-    return graph
+    return graph, contradicted
+
+
+def _contradiction(connection, run: int, prerequisite: int) -> str:
+    """The reason a wait cannot stand beside run `run`'s explicit `after=prerequisite`, naming both items."""
+    item, ahead = (connection.execute("SELECT item FROM assignment WHERE id = ?", (ident,)).fetchone()["item"]
+                   for ident in (run, prerequisite))
+    return (f"assignment {run} of sd:{item} is queued after assignment {prerequisite} of sd:{ahead}, "
+            f"which waits on sd:{item} through what its item waits on; neither could start")
+
+
+def queue_contradiction(connection) -> str | None:
+    """The first explicit prerequisite a wait contradicts, as a reason naming both items, or None. The
+    wait writers (`workflow.edit_item`) and `enqueue` refuse on it."""
+    contradicted = _graph(connection)[1]
+    return _contradiction(connection, *contradicted[0]) if contradicted else None
 
 
 def _acyclic(connection) -> None:
@@ -262,6 +301,12 @@ def enqueue(connection, items: list[int], *, parallel=False, role="author", scop
                 if item_state(connection, item)["revision"] != expected:
                     raise RunnerRefused(f"item {item} changed; refresh the selection")
         selected = [_item(connection, item, delivery=role == "merge") for item in items]
+        if after is not None:
+            ahead = connection.execute("SELECT role FROM assignment WHERE id = ?", (after,)).fetchone()
+            # Within one role `after` is batch order, which a waiting run may pass (`_graph`).
+            if ahead is not None and ahead["role"] == role:
+                raise RunnerRefused(f"after names {role} assignment {after}; queue {role} runs in one batch "
+                                    "to order them, or after a run of another role")
         if role == "author":
             # An author run builds the item, so it reads what the item waits on as the Build press does
             # (pack sd:9570). Read when the rule runs: `build` imports this module.
@@ -293,6 +338,8 @@ def enqueue(connection, items: list[int], *, parallel=False, role="author", scop
             if not parallel:
                 after = ident
         _acyclic(connection)
+        if contradiction := queue_contradiction(connection):
+            raise RunnerRefused(contradiction)
         return [queue_state(connection, ident) for ident in created]
 
 
@@ -314,6 +361,12 @@ def claim(connection, assignment: int, *, owner: str, work_root: Path, retention
         if restoration_pending(connection):
             raise RunnerRefused("database restore reimport is incomplete; queue dispatch is held")
         _acyclic(connection)
+        # A wait set while its item was done, then a reopen, can contradict an explicit prerequisite: the run
+        # queued after ends blocked naming both items, as one whose predecessor ended (lane review 7379bf9a).
+        for run, prerequisite in _graph(connection)[1]:
+            connection.execute("UPDATE assignment SET status = 'blocked', result = ?, ended = ? WHERE id = ?",
+                               (_contradiction(connection, run, prerequisite), now(), run))
+        request = queue_state(connection, assignment)
         if request["status"] != "queued" or _predecessor_ended(connection, request) or _waits(connection)[assignment]:
             return None
         item = _item(connection, request["item"], delivery=request["role"] == "merge")

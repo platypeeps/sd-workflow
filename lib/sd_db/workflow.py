@@ -645,6 +645,10 @@ def edit_item(
                 lines.append(f"Updated {', '.join(fields)} by {who}")
             if waits is not None:
                 lines.append(waits)
+                from .runner import queue_contradiction  # runner imports this module
+
+                if contradiction := queue_contradiction(connection):
+                    raise WorkflowError(f"item {item} cannot wait on that: {contradiction}")
             add_note(connection, item, "comment", "\n".join(lines), session=who)
         return item_state(connection, item)
 
