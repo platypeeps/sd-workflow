@@ -3187,7 +3187,8 @@ roles:
     def test_a_delivery_resolves_only_the_followups_it_names_or_the_lanes(self):
         """sd:9869. A merge closed an item and resolved two followups that
         still waited on an outside reply. A delivery resolves a followup its
-        message names as `#<id>`, and the lane's own blockers; others stay."""
+        message names on a line of its own as `Settles: followup #<id>`, and
+        the lane's own blockers; prose or a fenced example settles none."""
         self.task_item("task")
         waiting = sd_db.add_note(self.connection, self.item, "followup", "Waits on the reviewer's reply")
         sd_db.add_note(self.connection, self.item, "followup", "Lane failed in prepare: gate red")
@@ -3197,15 +3198,20 @@ roles:
         # An ordinary PR reference or URL fragment with the same number settles nothing.
         unrelated = sd_db.add_note(self.connection, self.item, "followup", "Waits on PR 42's author")
         self.connection.commit()
-        body.write_text(f"Renames the flag; settles followup #{named}.\nDepends on PR #{unrelated}; "
-                        f"see https://example.test/pull/1#{unrelated}.\n")
+        left = sd_db.add_note(self.connection, self.item, "followup", "Left open on purpose")
+        self.connection.commit()
+        body.write_text(f"Renames the flag.\nDepends on PR #{unrelated}; "
+                        f"see https://example.test/pull/1#{unrelated}.\n"
+                        f"Leave followup #{left} open until the reviewer replies.\n\n"
+                        f"```\nSettles: followup #{left}\n```\n\n"
+                        f"Settles: followup #{named}\n")
         self.unanswered("--deliver", "--title", "Rename", "--body-file", str(body)).prepare()
         with patch.object(ship.time, "sleep"):
             self.merge()
         self.assertEqual(self.status_of(self.item), "done")
         still = {row[0] for row in self.connection.execute(
             "SELECT id FROM note WHERE item = ? AND kind = 'followup' AND resolved_at IS NULL", (self.item,))}
-        self.assertEqual(still, {waiting, unrelated})
+        self.assertEqual(still, {waiting, unrelated, left})
 
     def test_a_design_only_branch_cannot_deliver_its_build_item(self):
         """sd:3519. PR #260 changed docs/work/ and CLAUDE.md, merged with
