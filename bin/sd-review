@@ -1215,8 +1215,8 @@ def _evidence(value: Any) -> str:
 
 
 def _instances(value: Any) -> list[str]:
-    """A finding's `instances`, stripped, nonempty, at most 50; a value not a list is none (pack sd:9769)."""
-    return [row.strip() for row in value if isinstance(row, str) and row.strip()][:50] if isinstance(value, list) else []
+    """A finding's `instances`, stripped, nonempty, every one; a value not a list is none (pack sd:9769)."""
+    return [row.strip() for row in value if isinstance(row, str) and row.strip()] if isinstance(value, list) else []
 
 
 def _cited(raw: dict[str, Any]) -> dict[str, Any]:

@@ -218,6 +218,14 @@ class URLDiagnostics(ReviewFixture):
                     for marker in ("credential-marker", "second-error-marker", "private"):
                         self.assertNotIn(marker, json.dumps(outcome.diagnostic))
 
+    def test_every_instance_survives_parsing(self) -> None:
+        """Review of sd:9769: the schema takes any number of instances; dropping those past the fiftieth lost
+        the one that touches the branch, so the build could defer a blocker the branch introduced."""
+        many = {**finding("high", "many"), "instances": [f"src.py:{n}" for n in range(1, 61)]}
+        outcome = self.run_response(self.envelope(json.dumps({"findings": [many]})))
+        self.assertEqual(outcome.status, sd_review.FINDINGS)
+        self.assertEqual(outcome.findings[0]["instances"][-1], "src.py:60", "an instance past the fiftieth was dropped")
+
     def test_a_blocking_finding_without_instances_is_refused(self) -> None:
         """Pack sd:9769: a high finding names its class (family) and lists every instance in the change."""
         listed = {**finding("high", "listed"), "instances": ["src.py:1", "src.py:9"]}
