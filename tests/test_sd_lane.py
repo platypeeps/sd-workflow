@@ -1709,6 +1709,32 @@ class Train(Trees):
         self.assertEqual(entries[1]["train"]["status"], "dropped")
         self.assertIn("it conflicts with", entries[1]["train"]["reason"])
 
+    def test_the_stack_is_built_before_the_train_thread_starts(self) -> None:
+        """Review of sd:9899: git work inside the thread ran on past a TERM or the deadline."""
+        built: list[str] = []
+        real = sd_lane.train_stack
+
+        def recorded(members: list[dict]) -> dict:
+            built.append(threading.current_thread().name)
+            return real(members)
+        self.queue_three()
+        with mock.patch.object(sd_lane, "train_stack", recorded):
+            sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertEqual(len(built), 1)
+        self.assertFalse(built[0].startswith("sd-lane-train-"), built)
+
+    def test_a_train_cancelled_before_its_gate_starts_runs_no_gate(self) -> None:
+        self.queue_three()
+        [entry] = [row for row in self.entries() if row["item"] == 1]
+        train = sd_lane.start_train(entry, self.store(), self.gate, self.environ, [])
+        self.assertIsNotNone(train)
+        train.signal_gate(signal.SIGTERM)
+        train.start()
+        train.join(30)
+        self.assertEqual(self.trains, [])
+        self.assertEqual(self.entries()[2]["train"]["status"], "cancelled")
+        self.assertEqual(self.entries()[2]["train"]["items"], [1, 2, 3])
+
     def test_a_train_of_one_gates_nothing_extra(self) -> None:
         with mock.patch.object(sd_lane, "TRAIN", 1):
             self.queue_three()

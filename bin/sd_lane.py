@@ -2502,7 +2502,7 @@ def train_members(entry: dict[str, Any], queue: Queue, size: int) -> list[dict[s
     if size < 2 or not tree_here(entry, host):
         return []
     members = [entry]
-    for row in (row for row in rows if runnable(row)):
+    for row in (row for row in rows if runnable(row) and row["id"] != entry["id"]):
         if len(members) >= size or merge_refusal(members[-1]) is not None or not tree_here(row, host):
             break
         members.append(row)
@@ -2580,66 +2580,73 @@ def train_stack(members: list[dict[str, Any]]) -> dict[str, Any]:
     return {"fork": fork, "placed": placed, "dropped": dropped}
 
 
-def gate_top(stacked: dict[str, Any], gate: Gate, thread: SpeculativeGate) -> dict[str, dict[str, Any]]:
-    """Gate the stack's top on the landing under it, as its prepare will gate it; each member's record by id.
+def gate_top(top: dict[str, Any], gate: Gate, thread: SpeculativeGate) -> dict[str, Any]:
+    """The top's `train` record once its gate ran on the landing under it, as its prepare will gate it.
 
     The gate's own receipt is the top's: no result is replayed under
     another binding, so a pass whose receipt the gate withheld leaves none.
-    A member below the top gets no record: its speculation and prepare
-    gate its own tree. `thread.chain` becomes the members placed below the
-    top, so a member that does not merge cancels the gate (`settle_gates`).
+    A train cancelled before its gate starts runs none.
     """
-    fields = {row["id"]: {"status": "dropped", "reason": f"{why}; it rides the next train"}
-              for row, why in stacked["dropped"]}
-    placed = stacked["placed"]
-    if len(placed) < 2:
-        return fields
-    top = placed[-1]
-    thread.chain = tuple(held["row"]["id"] for held in placed[:-1])
-    result = gate(pathlib.Path(top["row"]["worktree"]), top["head"], top["base"])
-    fields[top["row"]["id"]] = {"status": "cancelled" if thread.cancelled else result.get("status"),
-                                "after": list(thread.chain), "head": top["head"], "base": top["base"],
-                                "summary": str(result.get("summary"))[:300], "receipt": receipt_of(result),
-                                **({"reason": thread.why} if thread.cancelled else {})}
-    return fields
+    record = {"after": list(thread.chain), "head": top["head"], "base": top["base"]}
+    if thread.cancelled:
+        return {**record, "status": "cancelled", "reason": thread.why}
+    try:
+        result = gate(pathlib.Path(top["row"]["worktree"]), top["head"], top["base"])
+    except Exception as error:  # a gate that cannot run gates nothing; the top's prepare gates it
+        return {**record, "status": "error", "reason": f"{type(error).__name__}: {error}"[:600]}
+    return {**record, "status": "cancelled" if thread.cancelled else result.get("status"),
+            "summary": str(result.get("summary"))[:300], "receipt": receipt_of(result),
+            **({"reason": thread.why} if thread.cancelled else {})}
 
 
-def ride(members: list[dict[str, Any]], queue: Queue, gate: Gate, thread: SpeculativeGate) -> None:
-    """Stack the train's members and gate its top on the landings below it (sd:9899).
+def stacked_top(members: list[dict[str, Any]], queue: Queue) -> dict[str, Any] | None:
+    """The placed top of the members' stack, built here in the runner's thread, or None for no train gate.
 
-    A member that conflicts drops out, so the top is gated past it, where a
-    speculation stops at the conflict. What happened goes on the members
-    as `train`; any error marks them all, and each ships alone.
+    The git work runs where `predict` runs a speculation's, so a TERM ends
+    it and the gate never starts. A member that conflicts drops out, so the
+    top is gated past it, where a speculation stops at the conflict; a
+    member below the top gets no record, as its speculation and prepare
+    gate its own tree. What else happened goes on the members as `train`.
     """
     items = [row["item"] for row in members]
     try:
         stacked = train_stack(members)
-        fields = ({row["id"]: {"status": "skipped", "reason": stacked["skipped"]} for row in members}
-                  if "skipped" in stacked else gate_top(stacked, gate, thread))
-    except Exception as error:  # a train that cannot run gates nothing; each member ships alone
-        fields = {row["id"]: {"status": "error", "reason": f"{type(error).__name__}: {error}"[:600]} for row in members}
-    mark_train(queue, fields, items)
+    except Exception as error:  # a train that cannot stack gates nothing; each member ships alone
+        stacked = {"skipped": f"{type(error).__name__}: {error}"[:600]}
+    if "skipped" in stacked:
+        mark_train(queue, {row["id"]: {"status": "skipped", "reason": stacked["skipped"]} for row in members}, items)
+        return None
+    placed = stacked["placed"]
+    mark_train(queue, {row["id"]: {"status": "dropped", "reason": f"{why}; it rides the next train"}
+                       for row, why in stacked["dropped"]}, items)
+    return {**placed[-1], "below": tuple(held["row"]["id"] for held in placed[:-1])} if len(placed) > 1 else None
 
 
 def start_train(entry: dict[str, Any], queue: Queue, gate: Gate, environ: dict[str, str],
                 gates: list[SpeculativeGate]) -> SpeculativeGate | None:
-    """The train `entry` heads, as a gate thread not yet started, or None for a train of one (sd:9899).
+    """The train `entry` heads, as a gate thread not yet started, or None for no train gate (sd:9899).
 
-    Its `follower` is the planned top, so the speculation that starts after
-    it does not gate that entry twice; a top one of `gates` already holds
-    gets no second train.
+    The stack is built before the thread exists (`stacked_top`); the
+    thread runs only the gate, whose group a cancel ends. Its `follower`
+    is the top, so the speculation that starts after it does not gate that
+    entry twice, and a top one of `gates` already holds gets no second
+    train. Its `chain` is the members below, so one that does not merge
+    cancels the gate (`settle_gates`).
     """
     try:
         members = train_members(entry, queue, lane_train(environ))
     except LaneError:  # a hub fault: the claimed entry ships alone
         return None
-    if not members:
+    held = {gated.follower for gated in gates}
+    if not members or (members[-1]["id"], members[-1]["expected_head"]) in held:
         return None
-    top = members[-1]
-    if (top["id"], top["expected_head"]) in {held.follower for held in gates}:
+    top = stacked_top(members, queue)
+    if top is None or (top["row"]["id"], top["row"]["expected_head"]) in held:
         return None
-    thread = SpeculativeGate(lambda: ride(members, queue, gate, thread), f"sd-lane-train-{entry['item']}",
-                             (top["id"], top["expected_head"]), tuple(row["id"] for row in members[:-1]))
+    items = [row["item"] for row in members]
+    thread = SpeculativeGate(lambda: mark_train(queue, {top["row"]["id"]: gate_top(top, gate, thread)}, items),
+                             f"sd-lane-train-{entry['item']}", (top["row"]["id"], top["row"]["expected_head"]),
+                             top["below"])
     return thread
 
 

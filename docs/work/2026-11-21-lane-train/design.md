@@ -30,8 +30,11 @@ on this host. An entry the runner may not merge ends the train.
    will gate it. The gate's own receipt is the top's. No result is
    replayed under another binding, so a pass whose receipt the gate
    withheld leaves none.
-3. The train gate runs as a held gate beside the claimed entry's
-   prepare, as a speculation does. The speculation skips the top, so no
+3. The stack is built in the runner's thread before the gate thread
+   starts, where `predict` runs a speculation's git work, so a TERM or
+   the deadline ends it. The thread runs only the gate, and a gate
+   cancelled before it starts runs none. The train gate runs as a held
+   gate beside the claimed entry's prepare, as a speculation does. The speculation skips the top, so no
    entry is gated twice. A member below the top that does not merge
    cancels the train gate (`settle_gates`).
 4. Each member below the top gates its own tree, by its speculation or
@@ -79,7 +82,9 @@ together, which needs one push of main (below).
 | 3 stack | none | no tree key declared | members marked skipped; no gate | train_stack |
 | 4 train gate | the gate's own receipt | receipt withheld | none recorded; prepare gates | test_a_pass_whose_receipt_the_gate_withheld_leaves_none |
 | 4 train gate | none | gate fails | top marked failed; its prepare gates | test_one_red_entry_of_three_lands_the_other_two_and_reports_the_red_one |
-| 4 train gate | none | gate raises | members marked error; each ships alone | ride |
+| 3 stack | scratch commits | TERM or deadline mid-stack | stack runs in the runner's thread; it stops | test_the_stack_is_built_before_the_train_thread_starts |
+| 4 train gate | none | cancelled before the gate starts | no gate; top marked cancelled | test_a_train_cancelled_before_its_gate_starts_runs_no_gate |
+| 4 train gate | none | gate raises | top marked error; it ships alone | gate_top |
 | 4 train gate | none | member below does not merge, TERM, deadline | gate cancelled | settle_gates, cancel_gate |
 | 4 train gate | none | slow gate | prepare runs beside it | test_the_claimed_entry_prepares_beside_the_train_gate |
 | 5 lower member | its own receipt | A fails alone, A+B passes | A gates its own tree | test_the_top_is_gated_on_the_landings_below_it_and_nothing_twice |
