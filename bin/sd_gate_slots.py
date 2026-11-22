@@ -232,6 +232,12 @@ CPU_SAMPLE_SECONDS = 1.1
 CPU_SAMPLE_MAX_AGE = 60.0
 
 
+#: How far back `steady_busy` reads: the counted load falls no faster than this. One 1.1 s sample alone let
+#: load5 300 count 10 on 16 cores and erased the settle time load5 gives (sd:9946 lane review).
+CPU_SMOOTH_SECONDS = 60.0
+#: The busy readings `steady_busy` keeps, as JSON [[wall time, share or null], ...], in the gate directory.
+CPU_HISTORY = "cpu-busy.json"
+
 #: (monotonic time, ticks) of this process's previous `cpu_busy` sample.
 last_cpu_sample: tuple[float, tuple[int, int]] | None = None
 
@@ -296,6 +302,55 @@ def cpu_busy(ticks: Callable[[], tuple[int, int] | None] = cpu_ticks,
     return 1.0 - idle / total
 
 
+
+
+def busy_share(value: object) -> float | None:
+    """`value` as a busy share, 0 to 1, or None when it is not one."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
+        return None
+    return float(value)
+
+
+def busy_rows(text: bytes, now: float) -> list[tuple[float, float | None]]:
+    """The `CPU_HISTORY` rows of the last two `CPU_SMOOTH_SECONDS` up to `now`; a bad row is left out."""
+    try:
+        loaded = json.loads(text.decode("utf-8") or "[]")
+    except ValueError:
+        return []
+    rows = []
+    for row in loaded if isinstance(loaded, list) else []:
+        if isinstance(row, list) and len(row) == 2 and isinstance(row[0], (int, float)) \
+                and now - 2 * CPU_SMOOTH_SECONDS <= row[0] <= now:
+            rows.append((float(row[0]), busy_share(row[1])))
+    return rows
+
+
+def steady_busy(where: pathlib.Path, share: float | None, now: float) -> float | None:
+    """The highest busy share read under `where` over the last `CPU_SMOOTH_SECONDS`, `share` and `now` added.
+
+    None, so the load counts in full, until the readings reach that far back, or when one in that time is
+    unread. Every process that reads the load shares the readings; a bad row or the clock set back counts
+    as no reading. The readings are kept under a lock on their file, so two readers lose neither's row.
+    """
+    try:
+        where.mkdir(parents=True, exist_ok=True)
+        fd = os.open(where / CPU_HISTORY, os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        rows = [*busy_rows(os.pread(fd, os.fstat(fd).st_size, 0), now), (now, busy_share(share))]
+        os.ftruncate(fd, 0)
+        os.pwrite(fd, json.dumps([list(row) for row in rows]).encode("utf-8"), 0)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    anchors = [at for at, _ in rows if at <= now - CPU_SMOOTH_SECONDS]
+    window = [value for at, value in rows if anchors and at >= max(anchors)]
+    if not window or None in window:
+        return None
+    return max(value for value in window if value is not None)
 
 
 def counted_load(load: float, busy: float | None, cores: int | None = None) -> float:
@@ -474,7 +529,7 @@ class Queue:
         """
         # Sampled before the lock: the sample may wait CPU_SAMPLE_SECONDS, and enter, leave and status wait
         # on the lock; `now` is read after it, so the settle time counts from the admission itself.
-        share = busy() if rule.limit > 0 else None
+        share = steady_busy(self.where, busy(), wall()) if rule.limit > 0 else None
         with self.admission_lock():
             state = self.state()
             now = wall()
@@ -1039,7 +1094,7 @@ def snapshot(where: pathlib.Path, slots: int, rule: LoadRule, *,
         load = [round(float(value), 2) for value in tuple(loadavg())[:3]]
     except OSError:
         load = []
-    share = busy()
+    share = steady_busy(where, busy(), wall()) if where.is_dir() else None
     last = state.get("last_admitted")
     return {"directory": str(where), "slots": slots, "holders": holders, "waiters": waiters, "lane_gates": lanes,
             "load": load, "cpu_busy": None if share is None else round(share, 3),

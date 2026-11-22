@@ -371,7 +371,7 @@ class LoadRule(unittest.TestCase):
         ticket = self.queue.enter("gate", "/", wall=self.wall)
         self.load = (300.0, 300.0, 300.0)
         self.assertIsNone(self.admit(ticket, rule)[0], "an unread CPU keeps load5 as the fallback")
-        shares = iter([0.95, 0.63])
+        shares = iter([0.95, 0.63, 0.63])
 
         def admit():
             return self.queue.admit(ticket, [self.lock.fileno()], rule, loadavg=lambda: self.load,
@@ -379,7 +379,47 @@ class LoadRule(unittest.TestCase):
         # Pinned: on 40 cores 0.63 busy counts 25.2, over the limit of 24.
         with mock.patch.object(sd_gate_slots.os, "cpu_count", lambda: 16):
             self.assertIn("load 300.0", admit()[1])
+            self.wall.now += sd_gate_slots.CPU_SMOOTH_SECONDS
+            self.assertIn("load 300.0", admit()[1], "the 95% reading a minute ago")
+            self.wall.now += sd_gate_slots.CPU_SMOOTH_SECONDS
             self.assertEqual(admit()[0], 0)
+
+    def test_one_short_cpu_sample_does_not_drop_the_counted_load(self):
+        """Lane blocker: 16 cores, limit 24, load5 300, and one 63% sample admitted at once."""
+        rule = sd_gate_slots.LoadRule(limit=24.0, settle=0.0, source="test")
+        ticket = self.queue.enter("gate", "/", wall=self.wall)
+        self.load = (300.0, 300.0, 300.0)
+        shares = [0.63]
+
+        def admit():
+            return self.queue.admit(ticket, [self.lock.fileno()], rule, loadavg=lambda: self.load,
+                                    wall=self.wall, busy=lambda: shares[0])
+        with mock.patch.object(sd_gate_slots.os, "cpu_count", lambda: 16):
+            self.assertIn("load 300.0", admit()[1], "one sample")
+            self.wall.now += 30
+            self.assertIn("load 300.0", admit()[1], "30 s of samples")
+            shares[0] = 0.95
+            self.wall.now += 29
+            self.assertIn("load 300.0", admit()[1])
+            shares[0] = 0.63
+            self.wall.now += 31
+            self.assertIn("load 300.0", admit()[1], "a 95% reading 31 s ago")
+            self.wall.now += 60
+            self.assertEqual(admit()[0], 0, "a minute of 63% readings")
+
+    def test_the_busy_history_drops_bad_rows_and_a_clock_set_back(self):
+        now = 1_000_000.0
+        history = self.where / sd_gate_slots.CPU_HISTORY
+        history.write_text("[[" + str(now - 61) + ", 0.5], [\"x\", 0.2], [" + str(now - 30)
+                           + ", 2.0], [" + str(now + 5) + ", 0.1], 7]", encoding="utf-8")
+        self.assertIsNone(sd_gate_slots.steady_busy(self.where, 0.3, now), "a 200% reading counts unread")
+        history.write_text("not json\n", encoding="utf-8")
+        self.assertIsNone(sd_gate_slots.steady_busy(self.where, 0.3, now))
+        self.assertIsNone(sd_gate_slots.steady_busy(self.where, 0.3, now - 120), "the clock went back")
+        self.assertEqual(sd_gate_slots.steady_busy(self.where, 0.2, now - 60), 0.3)
+        self.assertIsNone(sd_gate_slots.steady_busy(self.where, None, now))
+        self.assertIsNone(sd_gate_slots.steady_busy(self.where, 0.2, now + 61), "an unread reading")
+        self.assertEqual(sd_gate_slots.steady_busy(self.where, 0.2, now + 122), 0.2)
 
     def test_the_cpu_sample_waits_outside_the_queue_lock(self):
         """Review finding: a 1.1 s sample under the admission lock held every enter, leave and status."""
@@ -467,8 +507,10 @@ class LoadRule(unittest.TestCase):
         sd_gate_slots.host_port.cache_clear()
 
     def test_status_reports_the_counted_load(self):
-        report = sd_gate_slots.snapshot(self.where, 1, sd_gate_slots.LoadRule(24.0, 0.0, "test"),
-                                        loadavg=lambda: (300.0, 300.0, 300.0), busy=lambda: 0.5)
+        for at in (self.wall.now - 60, self.wall.now):
+            report = sd_gate_slots.snapshot(self.where, 1, sd_gate_slots.LoadRule(24.0, 0.0, "test"),
+                                            loadavg=lambda: (300.0, 300.0, 300.0), busy=lambda: 0.5,
+                                            wall=lambda at=at: at)
         self.assertEqual((report["cpu_busy"], report["load_counted"]),
                          (0.5, round(0.5 * (os.cpu_count() or 1), 2)))
 

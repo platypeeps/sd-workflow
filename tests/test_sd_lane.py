@@ -1011,7 +1011,11 @@ class Runner(Lane):
         environ = {**self.environ, "SD_GATE_LOAD_MAX": "24"}
         with mock.patch.object(sd_lane.os, "getloadavg", lambda: (300.0, 300.0, 300.0)), \
                 mock.patch.object(sd_gate_slots.os, "cpu_count", lambda: 16):
-            with mock.patch.object(sd_gate_slots, "cpu_busy", lambda: 0.63):
+            now = [1_000_000.0]
+            with mock.patch.object(sd_gate_slots, "cpu_busy", lambda: 0.63), \
+                    mock.patch.object(sd_lane.time, "time", lambda: now[0]):
+                self.assertIn("load5 300.0", sd_lane.load_stop(environ) or "", "one sample")
+                now[0] += sd_gate_slots.CPU_SMOOTH_SECONDS
                 self.assertIsNone(sd_lane.load_stop(environ))
             for share in (0.95, None):
                 with mock.patch.object(sd_gate_slots, "cpu_busy", lambda share=share: share):

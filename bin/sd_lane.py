@@ -3939,7 +3939,7 @@ def load_stop(environ: dict[str, str]) -> str | None:
     The gate's own limit, `sd.gate_load_max` or `SD_GATE_LOAD_MAX`
     (`sd_gate_slots.load_rule`), read against load5 as
     `sd_gate_slots.counted_load` counts it: the CPU's own use while it is
-    not busy (sd:9946). Off while the limit is
+    not busy, the highest reading of the last minute (`steady_busy`, sd:9946). Off while the limit is
     0, as the gate queue's rule is. A limit or a load that cannot be read is
     no room: unknown is not low. A lane already running claims under any
     load; its gate waits in the gate queue (pack sd:7412).
@@ -3949,7 +3949,8 @@ def load_stop(environ: dict[str, str]) -> str | None:
         limit = sd_gate_slots.load_rule(environ, sd_lib.core_setting("gate_load_max", environ)).limit
         if limit <= 0:
             return None
-        load5 = sd_gate_slots.counted_load(float(os.getloadavg()[1]), sd_gate_slots.cpu_busy())
+        share = sd_gate_slots.steady_busy(sd_gate_slots.directory(environ), sd_gate_slots.cpu_busy(), time.time())
+        load5 = sd_gate_slots.counted_load(float(os.getloadavg()[1]), share)
     except (ValueError, OSError, sd_lib.ConfigError) as error:
         return f"cannot read the load average ({error}); the next run takes the pending entries"
     if load5 >= limit:
