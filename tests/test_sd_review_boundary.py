@@ -1034,11 +1034,16 @@ class LineBudgetTests(unittest.TestCase):
         # +6 so `prior_evidence` matches file, line and summary together,
         # and a prior blocker no finding repeats keeps uncited findings on
         # its file blocking. Measured: `sd-review` is 2937 here.
+        #
+        # 4907 -> 4913 is the next build/sd-1423 review: `bin/sd-review`
+        # +6 for `SHIFT_LINES`, so only a finding near an unmatched prior
+        # blocker fails closed, not any finding on its file. Measured:
+        # `sd-review` is 2943 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4907,
+            4913,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

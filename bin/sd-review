@@ -125,6 +125,8 @@ REPEAT_NOTE = "[downgraded: repeats a rebutted finding, no evidence cited]"
 EVIDENCE_ASK = ("input or command you ran and its result, showing a failure this change causes in code "
                 "it touched or a caller it breaks; a code finding without one blocks nothing.")
 NO_REPRO_NOTE = "[advisory: no failing input or command cited]"
+#: How far a patch may move an unmatched prior blocker and its uncited repeat still block (fail closed).
+SHIFT_LINES = 20  # ponytail: a fixed window, not a diff-mapped line; widen if real shifts exceed it
 CODEX_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -1783,8 +1785,8 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
 
 def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any], findings: Sequence[Any] = ()) -> str | None:
     """The evidence a prior report's blockers stored for `record`'s finding, one per line; "" when they stored
-    none, as a report from before sd:9867 may, or when a prior blocker on its file matches no finding in
-    `findings` (fail closed: a shifted, paraphrased repeat must not clear it); None otherwise.
+    none, as a report from before sd:9867 may, or when a prior blocker within `SHIFT_LINES` on its file matches no
+    finding in `findings` (fail closed: a shifted, paraphrased repeat must not clear it); None otherwise.
 
     A match is the same file, in any spelling the review accepts (`reviewed_paths`), the same line and the
     same `summary_key`: a line alone gave an unrelated finding the old repro (lead after round 8)."""
@@ -1803,7 +1805,11 @@ def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]
     matched = [old.get("evidence") for old in blockers if _same(old, record)]
     if matched:
         return "\n".join(dict.fromkeys(text for text in matched if isinstance(text, str) and text.strip()))
-    return "" if any(_file(old, record) and not any(_same(old, row) for row in findings) for old in blockers) else None
+    def _near(old: Mapping[str, Any]) -> bool:  # an unplaced line may be anywhere, so it fails closed
+        lines = [row.get("line") for row in (old, record)]
+        return not all(type(line) is int for line in lines) or abs(lines[0] - lines[1]) <= SHIFT_LINES
+    return "" if any(_file(old, record) and _near(old) and not any(_same(old, row) for row in findings)
+                     for old in blockers) else None
 
 
 # Pipeline

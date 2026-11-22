@@ -338,6 +338,16 @@ class ReproRuleTests(unittest.TestCase):
         self.assertEqual([(row["disposition"], row.get("evidence")) for row in disposed],
                          [("blocking", None), ("advisory", None)])
 
+    def test_a_fixed_prior_blocker_does_not_hold_an_unrelated_finding_far_away(self) -> None:
+        """build/sd-1423 review (bin/sd-review:1806): the blocker at src.py:10 was fixed, and an unrelated uncited
+        finding at src.py:90 blocked by the same-file fallback alone. Only a finding near the prior line can be
+        its shifted repeat; one with no line cannot be placed, so it stays blocking."""
+        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking")]
+        rows = [finding(line=90, summary="an unrelated defect"), finding(line=10 + sd_review.SHIFT_LINES),
+                finding(line=None, summary="unplaced")]
+        disposed = sd_review.dispose(rows, "high", repro=True, prior=prior)
+        self.assertEqual([row["disposition"] for row in disposed], ["advisory", "blocking", "blocking"])
+
     def test_the_same_line_alone_gives_no_prior_evidence(self) -> None:
         """Lead after round 8: the matcher gave the old repro to an unrelated cache finding at the same line."""
         prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking")]
