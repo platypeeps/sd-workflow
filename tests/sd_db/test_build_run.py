@@ -3039,6 +3039,27 @@ class Tick(Case):
         build.queue_again(self.db, [self.items[1]], who="operator")
         self.assertEqual(self.queued_builds(self.items[1]), 1, "B builds on its own")
 
+    def test_a_build_of_a_waiting_chain_frees_it_and_queues_only_its_runnable_member(self):
+        """Review of build/sd-1306: lead A waits on B and B on C, all members of a lane-failed bundle.
+        Selecting A, B, C freed B and C and queued C; the loop read B as left alone and queued it too, which
+        refused, as B waits on C, and rolled the split back. B is freed once and waits, in any order."""
+        import itertools
+
+        for number, order in enumerate(itertools.permutations(range(3))):
+            with self.subTest(order=order):
+                if number:
+                    self.setUp()
+                run = self.enqueued(3)
+                self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red"}
+                self.tick()
+                with self.db:
+                    for waiter, on in ((0, 1), (1, 2)):
+                        self.db.execute("UPDATE item SET fields = ? WHERE id = ?",
+                                        (json.dumps({"blocked_by": [self.items[on]]}), self.items[waiter]))
+                build.queue_again(self.db, [self.items[one] for one in order], who="operator")
+                self.assertEqual([self.queued_builds(item) for item in self.items], [0, 0, 1], "only C builds")
+                self.assertEqual(build.run(self.db, run["id"])["outcome"], "lane_failed")
+
     def build_rows(self):
         return self.db.execute("SELECT id, status, result FROM assignment ORDER BY id").fetchall()
 

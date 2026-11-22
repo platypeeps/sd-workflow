@@ -1056,6 +1056,10 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
         # the members it waits on): a later one of them is done, whatever the order (review of build/sd-1306).
         freed: dict[str, set[int]] = {}
         for item in items:
+            # The split this press made settled it: `_free` queued it if it waits on nothing, and the lead stays
+            # lane_failed for Fix. Read before `alone`, which the split itself sets (review of build/sd-1306).
+            if any(item in done for done in freed.values()):
+                continue
             row = connection.execute("SELECT id, parent, status FROM assignment WHERE item = ? AND scope = ? "
                                      "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
             # A member cancelled on its own left its bundle: building it is a fresh press, not the bundle's Retry.
@@ -1066,8 +1070,6 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             # refuses, such as an item moved back to ready, is a fresh press with that press's own check.
             # A member that left the bundle (`alone`) is a fresh press, never the bundle's Fix (review of build/sd-1306).
             if state and not alone and (state["run"] or {}).get("outcome") == "lane_failed":
-                if item in freed.get(state["run"]["id"], ()):
-                    continue  # the lead stays lane_failed for Fix once what it waits on is done
                 # The members its lead waits on leave first, so they build on their own (review of build/sd-1306).
                 sent = _sent_back(connection, state["run"])
                 ahead = _inside(connection, sent[0]["item"], sent)[0] if sent else []
