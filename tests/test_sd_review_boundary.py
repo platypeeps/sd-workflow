@@ -1066,11 +1066,16 @@ class LineBudgetTests(unittest.TestCase):
         # 4958 -> 4960 is the next build/sd-1423 review: `bin/sd-review`
         # +2 so a rebutted prior blocker holds no other finding.
         # Measured: `sd-review` is 2990 here.
+        #
+        # 4960 -> 4965 is the lead ruling of 2026-11-22: `bin/sd-review`
+        # +5 so `prior_at` maps each prior blocker from its own
+        # `prior_review.head`, not the aggregate's latest head.
+        # Measured: `sd-review` is 2995 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4960,
+            4965,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

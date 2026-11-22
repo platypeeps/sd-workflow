@@ -1835,23 +1835,28 @@ def moved_line(diff: str, line: int) -> tuple[int, bool]:
 
 
 def prior_at(root: pathlib.Path, old: str, new: str, rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
-    """Each prior blocker's line moved from the prior head `old` to `new` (build/sd-1423 review: an insertion above a
-    blocker moved its repeat past `SHIFT_LINES`), and its file through a rename; a line git cannot map stays as stored."""
-    fields, renamed = (sd_lib.git_output(["diff", "-M", "--name-status", "-z", old, new], root) or "").split("\0"), {}
-    while len(fields) > 2:  # `status\0path`, or `R<score>\0from\0to`: walked in order, a path is never a status
-        status, *fields = fields
-        if status[:1] == "R":
-            renamed[fields[0]], fields = fields[1], fields[2:]
-        else:
-            fields = fields[1:]
+    """Each prior blocker's line moved from its own `prior_review.head`, else the prior head `old`, to `new` (lead
+    2026-11-22: not the aggregate's latest head; build/sd-1423 review: an insertion above a blocker moved its repeat
+    past `SHIFT_LINES`), and its file through a rename; a line git cannot map stays as stored."""
+    def _renames(start: str) -> dict[str, str]:
+        fields, renamed = (sd_lib.git_output(["diff", "-M", "--name-status", "-z", start, new], root) or "").split("\0"), {}
+        while len(fields) > 2:  # `status\0path`, or `R<score>\0from\0to`: walked in order, a path is never a status
+            status, *fields = fields
+            if status[:1] == "R":
+                renamed[fields[0]], fields = fields[1], fields[2:]
+            else:
+                fields = fields[1:]
+        return renamed
 
     def _remapped(row: Mapping[str, Any]) -> dict[str, Any]:
         if row.get("disposition") != "blocking":
             return dict(row)
-        path = renamed.get(row["path"], row["path"])
+        found = row["prior_review"].get("head") if isinstance(row.get("prior_review"), dict) else None
+        start = found if isinstance(found, str) and re.fullmatch(r"[0-9a-f]{40,64}", found) else old
+        path = _renames(start).get(row["path"], row["path"])
         if type(row.get("line")) is not int:  # an unplaced blocker still follows its file (bin/sd-review:1846)
             return dict(row, path=path, line_kept=False)
-        diff = sd_lib.git_output(["diff", "-M", "-U0", "--no-color", "--no-ext-diff", old, new, "--",
+        diff = sd_lib.git_output(["diff", "-M", "-U0", "--no-color", "--no-ext-diff", start, new, "--",
                                   *dict.fromkeys(f":(literal){name}" for name in (row["path"], path))], root)
         line, kept = (row["line"], False) if diff is None else moved_line(diff, row["line"])
         return dict(row, path=path, line=line, line_kept=kept)

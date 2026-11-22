@@ -272,6 +272,28 @@ class PriorLineTests(RepeatFixture):
                                      repro=True, prior=moved)
         self.assertEqual(record["disposition"], "blocking")
 
+    def test_each_blocker_maps_from_the_head_it_was_found_at(self) -> None:
+        """Lead ruling 2026-11-22 (bin/sd-review:2496): a full-branch retry mapped every prior finding from the
+        aggregate's latest head, so a blocker found at line 10 on an older head, with 30 lines inserted above it
+        since, stayed at 10 and its uncited repeat at 40 posted as advisory. Each maps from `prior_review.head`."""
+        source = "".join(f"line{number}\n" for number in range(1, 41))
+        (self.root / "src.py").write_text(source, encoding="utf-8")
+        first = self.commit("add", "src.py") and self.commit("first")
+        (self.root / "src.py").write_text("".join(f"new{n}\n" for n in range(30)) + source, encoding="utf-8")
+        latest = self.commit("add", "src.py") and self.commit("latest")
+        (self.root / "other.py").write_text("x = 1\n", encoding="utf-8")
+        new = self.commit("add", "other.py") and self.commit("new")
+        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking",
+                      prior_review={"pass": 1, "head": first}),
+                 dict(finding(REPRO, line=40, summary="Empty input crashes"), disposition="blocking",
+                      prior_review={"pass": 2, "head": latest}),
+                 dict(finding(REPRO, line=5), disposition="blocking", prior_review={"head": "not-a-head"})]
+        moved = sd_review.prior_at(self.root, latest, new, prior)
+        self.assertEqual([row["line"] for row in moved], [40, 40, 5])
+        [record] = sd_review.dispose([finding(line=40, summary="An empty list raises IndexError")], "high",
+                                     repro=True, prior=moved)
+        self.assertEqual(record["disposition"], "blocking")
+
     def test_a_blocker_follows_its_file_through_a_rename(self) -> None:
         """build/sd-1423 review (bin/sd-review:1839): renaming src.py to renamed.py left the prior blocker on
         src.py, so an uncited repeat at renamed.py posted as advisory though the defect survived the rename."""
