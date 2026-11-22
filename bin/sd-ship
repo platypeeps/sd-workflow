@@ -560,7 +560,7 @@ def acceptance_row_answered(row: object) -> bool:
 def settled_followups(connection: sqlite3.Connection, item: int) -> set[int]:
     """The open followups on `item` a delivery settles (sd:9869): the lane's own blockers alone.
 
-    A blocker the lane wrote (`sd_lane.LANE_ENDED`) is what the merge
+    A blocker the lane wrote (`sd_lane.lane_note`) is what the merge
     answers. Every other followup waits on something the merge does not give,
     such as an outside reply, so it stays open for a hand close. The squash
     message is not read: each attempt to name followups in its text (a `#<id>`, a
@@ -570,7 +570,7 @@ def settled_followups(connection: sqlite3.Connection, item: int) -> set[int]:
     """
     return {row[0] for row in connection.execute(
         "SELECT id, body FROM note WHERE item = ? AND kind = 'followup' AND resolved_at IS NULL", (item,))
-        if str(row[1]).startswith(sd_lane.LANE_ENDED)}
+        if sd_lane.lane_note(row[1])}
 
 
 class Ship(SharedReview):

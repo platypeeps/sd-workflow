@@ -316,6 +316,16 @@ BLOCKED = ("failed", "skipped", "prepared")
 NOTED = ("failed", "skipped")
 #: How each `note_ended` body starts: a passing entry resolves the open followups that start so (sd:7357).
 LANE_ENDED = tuple(f"Lane {status} in " for status in NOTED)
+#: The whole `note_ended` opening, step and head included: an operator's note that only starts
+#: `Lane failed in` is not the lane's (review of build/sd-1423).
+_LANE_NOTE = re.compile(rf"(?:{'|'.join(map(re.escape, LANE_ENDED))})(?:[a-z_-]+|the lane) at "
+                        r"(?:[0-9a-f]{7,12}|an unrecorded head): ")
+
+
+def lane_note(body: object) -> bool:
+    """Whether `body` is a note `note_ended` wrote. Text alone marks it, so a hand note copying the
+    whole opening still matches; ponytail: a note column naming its writer if that happens."""
+    return _LANE_NOTE.match(str(body)) is not None
 
 
 class LaneError(RuntimeError):
@@ -3141,7 +3151,7 @@ def resolve_ended(row: dict[str, Any], queue: Queue) -> dict[str, str]:
             try:
                 open_ids = [found["id"] for found in connection.execute(
                     "SELECT id, body FROM note WHERE item = ? AND kind = 'followup' AND resolved_at IS NULL"
-                    " ORDER BY id", (item,)) if str(found["body"]).startswith(LANE_ENDED)]
+                    " ORDER BY id", (item,)) if lane_note(found["body"])]
                 for number in open_ids:
                     writes.resolve_note(connection, number)
                 if open_ids:

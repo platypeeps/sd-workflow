@@ -3191,7 +3191,7 @@ roles:
         resolves another (class pass after round 7)."""
         self.task_item("task")
         waiting = sd_db.add_note(self.connection, self.item, "followup", "Waits on the reviewer's reply")
-        sd_db.add_note(self.connection, self.item, "followup", "Lane failed in prepare: gate red")
+        sd_db.add_note(self.connection, self.item, "followup", "Lane failed in prepare at aaaaaaaaaaaa: gate red")
         named = sd_db.add_note(self.connection, self.item, "followup", "Rename the flag")
         self.connection.commit()
         body = self.directory / "body.md"
@@ -6402,14 +6402,23 @@ class SettledFollowupTests(unittest.TestCase):
         self.addCleanup(connection.close)
         connection.execute("CREATE TABLE note (id INTEGER, item INTEGER, kind TEXT, body TEXT, resolved_at TEXT)")
         connection.execute("INSERT INTO note VALUES (42, 1, 'followup', ?, NULL)", (body,))
-        connection.execute("INSERT INTO note VALUES (43, 1, 'followup', 'Lane failed in prepare: gate red', NULL)")
-        connection.execute("INSERT INTO note VALUES (44, 1, 'followup', 'Lane failed in gate: red', '2026-01-01')")
+        connection.execute("INSERT INTO note VALUES (43, 1, 'followup', ?, NULL)",
+                           ("Lane failed in prepare at aaaaaaaaaaaa: gate red; full text: prepare.log",))
+        connection.execute("INSERT INTO note VALUES (44, 1, 'followup', 'Lane failed in gate at bbbbbbbbbbbb: red',"
+                           " '2026-01-01')")
         return ship.settled_followups(connection, 1)
 
     def test_only_the_lanes_own_open_blockers_settle(self) -> None:
         self.assertEqual(self.settled("Waits on a reply"), {43})
-        self.assertEqual(self.settled("Lane skipped in gate: stale"), {42, 43})
+        self.assertEqual(self.settled("Lane skipped in the lane at an unrecorded head: stale"), {42, 43})
         self.assertEqual(self.settled("Note: Lane failed in prepare"), {43})
+
+    def test_an_operator_note_that_starts_like_the_lane_settles_nothing(self) -> None:
+        # Review of build/sd-1423: a prefix match resolved an operator's own
+        # followup on delivery, which hid the repair it waits on from Today.
+        self.assertEqual(self.settled(
+            "Lane failed in prepare because the remote runner needs a separate repair"), {43})
+        self.assertEqual(self.settled("Lane failed in prepare at noon: the runner was down"), {43})
 
 
 class ReviewWatchdogTests(unittest.TestCase):
