@@ -685,6 +685,7 @@ The reserved `sd` namespace declares these settings:
 - `sd.repo_cap`: how many build bundles may build at once in one repository when this machine claims them,
   1 to 6. Absence reads 1, the one-bundle-per-repository rule (sd:8158, sd:9172). It grants nothing.
 - `sd.gate_load_max`: the gate queue starts a gate only while load1 is below this; `0` is no load condition.
+  Below 90% CPU busy, load1 and load5 read busy times cores instead (sd:9946).
   Absence is no load condition (sd:2607). `SD_GATE_LOAD_MAX` overrides it for one run. It grants nothing.
 - `sd.gate_settle_seconds`: seconds between two gate starts, and of low load1 while load5 is high; `0` is none.
   Absence reads 45. `SD_GATE_SETTLE_SECONDS` overrides it for one run. It grants nothing.
