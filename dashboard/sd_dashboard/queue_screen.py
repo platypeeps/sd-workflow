@@ -351,9 +351,21 @@ def review_of(answer: dict) -> tuple[str, list[str], list[str], str] | None:
 
 def _review_fields(entry: dict, lane: Path) -> dict:
     """A failed row's review key, and each finding it covers whole, for Reject's dialog; none for a review this
-    host cannot rebut: none named, or a worktree on another host (sd:9966)."""
-    review = review_of(_answer(entry, lane)) if _here(entry) else None
-    return {"review": review[-1], "review_findings": review[2]} if review else {"review": None, "review_findings": []}
+    host cannot rebut: none named, or a worktree on another host (sd:9966). `held`: whether that review already
+    holds recorded dispositions, which a `lane retry` reuses: False only when adjudicate's template says none, so
+    Retry is off only then; None when not read here."""
+    tree = _here(entry)
+    if not (tree and _logged(entry, lane).get("code") == REVIEW_BLOCKING):
+        return {"review": None, "review_findings": [], "held": None}
+    review = review_of(_answer(entry, lane))
+    # One read-only template call, only on a review-blocked row: rebut's step 1, which writes nothing.
+    template = _run([command("sd-ship"), "-C", str(tree), "adjudicate", "--item", str(entry.get("item")),
+                     "--expected-head", review[0] if review else str(entry.get("expected_head") or ""), "--json"],
+                    LIST_SECONDS)
+    recorded = template.get("recorded_revision", False) if template.get("exit") == 0 else False
+    held = None if recorded is False else recorded is not None
+    return ({"review": review[-1], "review_findings": review[2], "held": held} if review
+            else {"review": None, "review_findings": [], "held": held})
 
 
 def _logged(entry: dict, lane: Path) -> dict:

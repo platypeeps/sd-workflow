@@ -258,7 +258,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
              failed: r.kind === 'job' && !!r.retry, retry: r.retry, job: job && job[1], service: r.service,
              exit: r.exit, revision: r.revision, capability: r.capability, repo: pr ? pr[1] : r.repo, number: pr && +pr[2], seen: r.seen,
              item: r.item, itemKind: r.item_kind, state: r.state, url: r.url, fieldsRead: r.fields_read, until: r.until, login: r.login, claim: r.claim,
-             repoPath: r.repo_path, repoKey: r.repo_key, laneRevision: r.lane_revision, head: r.expected_head, runnerMerge: r.runner_merge, unchanged: r.unchanged, failure: r.failure,
+             repoPath: r.repo_path, repoKey: r.repo_key, laneRevision: r.lane_revision, head: r.expected_head, runnerMerge: r.runner_merge, unchanged: r.unchanged, failure: r.failure, held: r.held,
              members: r.members && r.members.map(m => ({ id: m.id, seen: m.seen, until: m.until, item: m.item })), group: r.id,
              band: r.band, detail: r.detail, source: r.source };
   }
@@ -376,7 +376,10 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // builder (Fix) or Reject and enqueue, which rebuts each blocker with a reason and queues it again, take its place.
   const SAME = 'same code, same review: send it to the builder';
   const reviewed = r => !!r && (r.failure || {}).code === 'review_blocking';
-  const again = (r, manual) => !QV.lanes.retry ? '' : reviewed(r)
+  // Retry is off only where the review holds no recorded dispositions: a rebuttal whose queueing failed, or one
+  // made through the CLI, is reused by `lane retry`, which then clears the review (`held`, sd:9966 round 8).
+  const repeated = r => reviewed(r) && r.held === false;
+  const again = (r, manual) => !QV.lanes.retry ? '' : repeated(r)
     ? html`<div class="ctl" role="group" aria-label="Unblock sd:${String(r.item)}"><button class="btn quiet sm" type="button" disabled title="${SAME}" aria-label="Retry sd:${String(r.item)}: ${SAME}">Retry</button>${sb('reject', r, 'Reject and enqueue…', `Reject sd:${r.item}'s review blockers with a reason and queue it again`, r.review ? html` data-head="${r.expected_head}"` : html` disabled title="no review to rebut here: its prepare log names none, or its worktree is on another host; rebut it with sd-ship adjudicate in that worktree"`)}</div>`
     : html`<div class="ctl" role="group" aria-label="Unblock sd:${String(r.item)}">${sb('retry', r, r.unchanged === true ? 'Retry…' : 'Retry', `Retry sd:${r.item}: queue it again at the same head`, html` data-head="${r.expected_head}"`)}${manual ? sb('approve', r, 'Approve…', `Approve sd:${r.item}: queue it again with the merge granted`, html` data-head="${r.expected_head}"`) : ''}</div>`;
   // pack sd:8584: a failed entry's Fix sends the lane's finding to the build run that enqueued its branch; off says why.
@@ -1234,12 +1237,12 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       { id: 'today.lane.retry', on: 'lane entry', label: 'Retry', does: 'Queues the entry again at the head it ended at.', key: 'r', icon: 'rotate-ccw', risk: 'safe', primary: () => true,
         askFirst: o => o.unchanged === true, consequence: o => o.unchanged === true ? repeats(o) : '',
         cli: o => `sd-ship -C ${o.repoPath} lane retry ${o.item} --expected-head ${o.head}`, sends: () => 'POST /api/queue/move {action: retry}',
-        when: o => !o.head ? 'the entry recorded no head; retry it from Queue' : reviewed(o) ? SAME : true, run: o => lane('retry')(o).then(() => `Queued again · sd:${o.item}`) },
+        when: o => !o.head ? 'the entry recorded no head; retry it from Queue' : repeated(o) ? SAME : true, run: o => lane('retry')(o).then(() => `Queued again · sd:${o.item}`) },
       // Approve grants the merge, which nothing takes back, so it asks first as Queue's does; Retry runs at once there too.
       { id: 'today.lane.approve', on: 'lane entry', label: 'Approve', does: 'Asks first, then queues the entry again and lets the runner merge it.', key: 'p', risk: 'safe', askFirst: true,
         consequence: o => `The entry is queued again at head ${String(o.head).slice(0, 12)}, and the runner may merge it to the default branch. A merge is not taken back.`,
         cli: o => `sd-ship -C ${o.repoPath} lane retry ${o.item} --expected-head ${o.head} --manual`, sends: () => 'POST /api/queue/move {action: approve}',
-        when: o => o.runnerMerge !== 'manual' ? 'this repo merges automatically, so it needs no approval' : reviewed(o) ? SAME : true, run: o => lane('approve')(o).then(() => `Approved · sd:${o.item}`) },
+        when: o => o.runnerMerge !== 'manual' ? 'this repo merges automatically, so it needs no approval' : repeated(o) ? SAME : true, run: o => lane('approve')(o).then(() => `Approved · sd:${o.item}`) },
       { id: 'today.lane.queue', on: 'lane entry', label: 'Open in Queue', does: 'Opens its repo in the Queue view, where Cancel is.', key: 'q', risk: 'safe', executes: false,
         cli: o => `sd-ship -C ${o.repoPath} lane list`, run: o => { qOpen = repoKey(o.repoKey); shell.view.show('queue'); queueView(); return 'Queue opens'; } },
       // A new brief: Seen is the Today snooze held until the brief changes (sd:5752), the mark the place pages read too.

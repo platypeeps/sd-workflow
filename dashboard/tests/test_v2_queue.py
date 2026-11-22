@@ -900,6 +900,15 @@ class TheMove(Lane, BrowserSession):
                 self.assertIn("rebuttal is recorded", answer["error"])
                 Path(f"{self.log}.dispositions").unlink()
 
+    def test_a_row_says_whether_its_review_holds_dispositions(self):
+        """sd:9966 round 8: adjudicate's template, read only, says; a template that cannot say reads as not known."""
+        for env, held in (({}, False), ({"QUEUE_RECORDED": "7"}, True), ({"QUEUE_OLD_TEMPLATE": ""}, None)):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                row = self.failed()
+                self.assertIs(row["held"], held)
+                self.assertIsNotNone(row["review"])
+        self.assertIsNone(self.failed(enqueued_on="satellite-1")["held"])
+
     def test_reject_refuses_a_review_that_already_holds_dispositions(self):
         """sd:9966 class pass: the operator adjudicated through the CLI with reasons of their own or a parked risk
         after the lane's run; the log still shows the review, and a filled template would replace each one."""
@@ -3162,6 +3171,18 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertRegex(row, r'data-act="reject" data-item="14"[^>]*data-head="' + self.merged + '"[^>]*>Reject and enqueue…<')
         self.assertRegex(row, r'data-act="fix" data-item="14"[^>]*>Send to builder…<')
 
+    def test_a_review_that_holds_dispositions_keeps_retry_and_offers_no_reject(self):
+        """sd:9966 round 8: Reject recorded the rebuttal and queueing failed, or the operator adjudicated through
+        the CLI; the entry still reads review_blocking, and `lane retry` reuses the dispositions, so Retry stays."""
+        for env in ({"QUEUE_RECORDED": "7"}, {"QUEUE_OLD_TEMPLATE": ""}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                self.failed()
+                html = self.run_view("open('system'); R.html = ELS.queue.html;")["R"]["html"]
+                row = re.search(r'<tr class="child"[^>]*data-id="entry:[^"]*:14"[^>]*>([\s\S]*?)</tr>', html)[1]
+                self.assertRegex(row, r'data-act="retry" data-item="14"[^>]*data-head="' + self.merged + '"')
+                self.assertNotIn(self.SAME, row)
+                self.assertNotIn('data-act="reject"', row)
+
     def test_a_retryable_failure_keeps_retry_and_offers_no_reject(self):
         self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "hub_unavailable", "retryable": True}}}))
         html = self.run_view("open('system'); R.html = ELS.queue.html;")["R"]["html"]
@@ -3230,7 +3251,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
     def test_the_palette_retry_on_a_review_blocked_entry_is_off_and_says_why(self):
         self.failed()
         out = self.run_view("open('system'); const c = REG.find(x => x.id === 'today.lane.retry');"
-                            f" R.off = c.when({{ head: {json.dumps(self.merged)}, failure: {{ code: 'review_blocking' }} }});"
+                            f" R.off = c.when({{ head: {json.dumps(self.merged)}, failure: {{ code: 'review_blocking' }}, held: false }});"
                             f" R.on = c.when({{ head: {json.dumps(self.merged)}, failure: {{ code: 'hub_unavailable' }} }});")
         self.assertEqual((out["R"]["off"], out["R"]["on"]), (self.SAME, True))
 
