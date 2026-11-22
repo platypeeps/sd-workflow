@@ -2332,9 +2332,23 @@ def scratch_git(tree: pathlib.Path, *args: str) -> str | None:
         return None
 
 
-def catch_up_in(tree: pathlib.Path, ref: str, message: str) -> bool:
+class OutOfBudget(Exception):
+    """A setup step that would start past the run's deadline (`budget_git`); its setup skips with `OUT_OF_BUDGET`."""
+
+
+def budget_git(deadline: float, tree: pathlib.Path, *args: str) -> str | None:
+    """`scratch_git`, started only before `deadline`, else `OutOfBudget`: each step may take a minute (sd:9899).
+
+    Cleanup (`merge --abort`, `worktree remove`) calls `scratch_git` itself, so it runs past the deadline.
+    """
+    if clock() >= deadline:
+        raise OutOfBudget
+    return scratch_git(tree, *args)
+
+
+def catch_up_in(tree: pathlib.Path, ref: str, message: str, deadline: float = math.inf) -> bool:
     """Merge `ref` into the scratch worktree's HEAD as `sd-ship prepare --catch-up` does; False on a conflict."""
-    if scratch_git(tree, "merge", "--no-ff", "--no-edit", "--no-verify", "-m", message, ref) is not None:
+    if budget_git(deadline, tree, "merge", "--no-ff", "--no-edit", "--no-verify", "-m", message, ref) is not None:
         return True
     scratch_git(tree, "merge", "--abort")
     return False
@@ -2368,7 +2382,7 @@ def predict(ahead: list[dict[str, Any]], following: dict[str, Any], deadline: fl
         if not fork or scratch_git(root, "worktree", "add", "--quiet", "--detach", str(tree), fork) is None:
             return {"skipped": "the scratch worktree could not be made"}
         try:
-            landed = landings(tree, ahead, following, fork, branch)
+            landed = landings(tree, ahead, following, fork, branch, deadline)
             if "skipped" in landed:
                 return landed
             try:
@@ -2377,31 +2391,34 @@ def predict(ahead: list[dict[str, Any]], following: dict[str, Any], deadline: fl
                 return {"skipped": f"{sd_gate_receipts.REUSE_DECLARATION} cannot be read: {error}"}
             if not keyed:
                 return {"skipped": f"no tree key in {sd_gate_receipts.REUSE_DECLARATION}, so prepare could not reuse a pass"}
-            head = scratch_git(tree, "rev-parse", "HEAD")
+            head = budget_git(deadline, tree, "rev-parse", "HEAD")
+        except OutOfBudget:
+            return {"skipped": OUT_OF_BUDGET}
         finally:
             scratch_git(root, "worktree", "remove", "--force", str(tree))
     return {"head": head, "base": landed["base"]} if head else {"skipped": "the merged head could not be read"}
 
 
 def landings(tree: pathlib.Path, ahead: list[dict[str, Any]], following: dict[str, Any], fork: str,
-             branch: str) -> dict[str, Any]:
+             branch: str, deadline: float = math.inf) -> dict[str, Any]:
     """In the scratch `tree`, each `ahead` entry's landing as a commit on the one before, from `fork`.
 
     It leaves `following`'s catch-up onto the last landing checked out, and
     answers `{"base": that landing}`, or `{"skipped": why}` on a conflict.
+    A step that would start past `deadline` raises `OutOfBudget`.
     """
     landed, onto, message = fork, f"origin/{branch}", f"Merge origin/{branch}"
 
     def merged_onto(row: dict[str, Any], whose: str) -> str | None:
-        if scratch_git(tree, "checkout", "--quiet", "--detach", row["expected_head"]) is None:
+        if budget_git(deadline, tree, "checkout", "--quiet", "--detach", row["expected_head"]) is None:
             return "the predicted landing could not be built"
-        return None if catch_up_in(tree, landed, message) else f"{whose} conflicts with {onto}"
+        return None if catch_up_in(tree, landed, message, deadline) else f"{whose} conflicts with {onto}"
     for row in ahead:
         why = merged_onto(row, f"sd:{row['item']}")
         if why is not None:
             return {"skipped": why}
-        landed = scratch_git(tree, "commit-tree", "HEAD^{tree}", "-p", landed, "-m",
-                             f"sd-ship lane: sd:{row['item']} as predicted to land") or ""
+        landed = budget_git(deadline, tree, "commit-tree", "HEAD^{tree}", "-p", landed, "-m",
+                            f"sd-ship lane: sd:{row['item']} as predicted to land") or ""
         if not landed:
             return {"skipped": "the predicted landing could not be built"}
         onto = f"sd:{row['item']}'s predicted landing"
@@ -2546,23 +2563,22 @@ def stack(tree: pathlib.Path, members: list[dict[str, Any]], fork: str, branch: 
     Answers the placed members, each `{"row", "head", "base"}`: `head` is
     its catch-up merge, the tree its prepare gates, and `base` the landing
     under it, as `landings` predicts one. A member that conflicts with the
-    stack drops out with why; the next member stacks without it. Past
-    `deadline` it stacks no further member; `train_stack` then skips.
+    stack drops out with why; the next member stacks without it. A step
+    that would start past `deadline` raises `OutOfBudget`, and
+    `train_stack` skips.
     """
     landed, placed, dropped = fork, list[dict[str, Any]](), list[tuple[dict[str, Any], str]]()
     for row in members:
-        if clock() >= deadline:
-            break
         onto = f"sd:{placed[-1]['row']['item']}'s predicted landing" if placed else f"origin/{branch}"
-        if scratch_git(tree, "checkout", "--quiet", "--detach", "--force", row["expected_head"]) is None:
+        if budget_git(deadline, tree, "checkout", "--quiet", "--detach", "--force", row["expected_head"]) is None:
             dropped.append((row, "its queued head could not be checked out"))
             continue
-        if not catch_up_in(tree, landed, f"Merge origin/{branch}"):
+        if not catch_up_in(tree, landed, f"Merge origin/{branch}", deadline):
             dropped.append((row, f"it conflicts with {onto}"))
             continue
-        head = scratch_git(tree, "rev-parse", "HEAD")
-        after = scratch_git(tree, "commit-tree", "HEAD^{tree}", "-p", landed, "-m",
-                            f"sd-ship lane: sd:{row['item']} as predicted to land")
+        head = budget_git(deadline, tree, "rev-parse", "HEAD")
+        after = budget_git(deadline, tree, "commit-tree", "HEAD^{tree}", "-p", landed, "-m",
+                           f"sd-ship lane: sd:{row['item']} as predicted to land")
         if not head or not after:
             dropped.append((row, "its predicted landing could not be built"))
             continue
@@ -2619,6 +2635,8 @@ def train_stack(members: list[dict[str, Any]], deadline: float = math.inf) -> di
                 return {"skipped": f"no tree key in {sd_gate_receipts.REUSE_DECLARATION}, so prepare could not "
                                    "reuse a pass"}
             placed, dropped = stack(tree, members, fork, branch, deadline)
+        except OutOfBudget:
+            return {"skipped": OUT_OF_BUDGET}
         except sd_lib.DatabaseUnreadable as error:
             return {"skipped": f"{sd_gate_receipts.REUSE_DECLARATION} cannot be read: {error}"}
         finally:

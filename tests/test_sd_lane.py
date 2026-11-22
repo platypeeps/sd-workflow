@@ -1842,6 +1842,25 @@ class Train(Trees):
         self.assertEqual({entry["train"]["status"] for entry in entries}, {"skipped"})
         self.assertIn("budget", entries[0]["train"]["reason"])
 
+    def git_after_crossing(self, step: tuple[str, ...]) -> list[tuple]:
+        """The scratch git calls after the first `step` call crossed the deadline, but the worktree's removal."""
+        calls = self.run_past_deadline(lambda _, argv: argv[:len(step)] == step)
+        first = next(index for index, argv in enumerate(calls) if argv[:len(step)] == step)
+        return [argv for argv in calls[first + 1:] if argv[:2] != ("worktree", "remove")]
+
+    def test_a_member_whose_checkout_crosses_the_deadline_runs_no_more_git(self) -> None:
+        """Review of sd:9899: past the deadline, stack still merged and committed the member it checked out."""
+        self.assertEqual(self.git_after_crossing(("checkout",)), [])
+        self.assertEqual(self.trains, [])
+        self.assertIn("budget", self.entries()[0]["train"]["reason"])
+
+    def test_a_speculation_whose_worktree_add_crosses_the_deadline_runs_no_more_git(self) -> None:
+        """Review of sd:9899: past the deadline, landings still checked out, merged and committed."""
+        with mock.patch.object(sd_lane, "TRAIN", 1):
+            self.assertEqual(self.git_after_crossing(("worktree", "add")), [])
+        self.assertEqual(self.gates, [])
+        self.assertIn("budget", self.entries()[1]["speculation"]["reason"])
+
     def test_a_stack_that_crosses_the_deadline_stacks_no_further(self) -> None:
         """Review of sd:9899: the stack merged every member after the deadline passed."""
         calls = self.run_past_deadline(lambda _, argv: argv[0] == "merge")
