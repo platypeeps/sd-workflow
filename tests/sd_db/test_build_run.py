@@ -211,14 +211,14 @@ FAKE = textwrap.dedent('''
         if mode in ("offdelta", "offdelta_short"):  # pack sd:9769: a new blocker on a file nobody touched
             far = {**raw, "path": "far.txt", "instances": ["far.txt:1"], "summary": "an old defect"}
             print(json.dumps({"status": "blocking", "scope": "branch", "requested_reviews": 2,
-                              "completed_reviews": 1 if mode == "offdelta_short" else 2,
+                              "completed_reviews": 1 if mode == "offdelta_short" else 2, "covers_from": "c" * 40,
                               "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                               "findings": review.dispose([review._finding(far)], "high")}))
             sys.exit(0)
         if mode == "absolute":  # pack sd:9769: a blocker spelled as an absolute path inside the checkout
             findings = review.dispose([review._finding({**raw, "path": os.path.join(work, "work.txt")})], "high")
         print(json.dumps({"status": "blocking" if mode in ("blocking", "absolute") else "clean", "scope": "branch",
-                          "requested_reviews": 2, "completed_reviews": 2,
+                          "requested_reviews": 2, "completed_reviews": 2, "covers_from": "c" * 40,
                           "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                           "findings": findings if mode in ("blocking", "absolute") else []}))
     if role == "sd-ship":
@@ -1173,7 +1173,7 @@ class Supervise(Case):
                          {"a b.txt": {1}, "gone b.txt": {1}})
 
     PRIOR = {"subject": {"head": "b" * 40}, "findings": [{"path": "named.py", "line": 1}],
-             "requested_reviews": 2, "completed_reviews": 2}
+             "requested_reviews": 2, "completed_reviews": 2, "covers_from": "c" * 40}
 
     def test_a_blocker_on_a_line_the_branch_added_before_the_fix_still_blocks(self):
         """Class pass, sd:9769: deferral is for code the branch does not change, not code the fix did not touch."""
@@ -1202,6 +1202,17 @@ class Supervise(Case):
                 kept = supervisor.file_new_findings({"status": "blocking", "blockers": [row]},
                                                     {**self.PRIOR, **short}, "a" * 40)
                 self.assertEqual(kept["blockers"], [row], "a short prior report deferred a blocker")
+
+    def test_a_prior_report_covering_no_branch_defers_nothing(self):
+        """Review of sd:9769: a patch-only reader's pass completes every review yet `sd-review` clears its
+        `covers_from`; it read no whole file, so it proves no finding absent and every blocker holds."""
+        self.press()
+        supervisor = self.supervisor()
+        row = {"path": "far.py", "line": 1, "summary": "a"}
+        with mock.patch.object(supervisor, "branch_delta", return_value={}):
+            kept = supervisor.file_new_findings({"status": "blocking", "blockers": [row]},
+                                                {**self.PRIOR, "covers_from": None}, "a" * 40)
+        self.assertEqual(kept["blockers"], [row], "a prior report covering no branch deferred a blocker")
 
     def test_a_blocking_answer_short_of_its_policy_is_not_complete(self):
         """Class pass, sd:9769: the capped `requested_reviews` hides a chain shorter than the policy asked."""

@@ -1371,8 +1371,10 @@ class Supervisor:
         named = {path for row in prior["findings"] if isinstance(row, dict) for path, _ in self.locations(row)}
         changed = self.branch_delta(prior["subject"]["head"], head)
         if (not 1 <= int(prior.get("requested_reviews") or 0) <= int(prior.get("completed_reviews") or 0)
-                or prior.get("review_shortfall")):
-            changed = None  # a last round short of a reader proves no finding absent: hold every blocker
+                or prior.get("review_shortfall") or not prior.get("covers_from")):
+            # A last round short of a reader, or one that read patches only (no `covers_from`), proves no
+            # finding absent: hold every blocker.
+            changed = None
         # ponytail: location, not causation: a defect a new caller causes in unchanged code is filed, not held.
 
         def held(row: dict) -> bool:
