@@ -506,6 +506,28 @@ def changed_lines(git: Collection[str], work: str, base: str, head: str, *,
     return changed if changed or not diff.strip() else None  # output naming no file is unknown, not empty
 
 
+def function_words(git: Collection[str], work: str, base: str, head: str, *,
+                   env: dict | None = None) -> set[str] | None:
+    """Every identifier in the functions `base..head` changes, each read whole (`--function-context`), so a
+    finding naming the changed caller, or what it calls, by function ties to the branch (pack sd:9769);
+    None when git cannot answer. A function git cannot bound widens to more lines, never fewer."""
+    try:
+        diff = _read([*git, "-C", work, "diff", "--function-context", "--no-renames", "--no-color", "--no-ext-diff",
+                      "--no-textconv", base, head], env=env)
+    except Unread:
+        return None
+    return set(re.findall(r"[A-Za-z_]\w*", diff))
+
+
+def callable_words(text: str) -> set[str]:
+    """The identifiers a finding names as code: `name(`, a snake or camel name, or a backticked dotted name."""
+    words = set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", text))
+    words |= set(re.findall(r"\b(\w*[A-Za-z]_\w*[A-Za-z0-9]|[a-z][a-z0-9]*[A-Z]\w*)\b", text))
+    for span in re.findall(r"`([^`\n]+)`", text):
+        words |= set(re.findall(r"[A-Za-z_]\w*", span))
+    return {word for word in words if len(word) > 2}
+
+
 # Git's state for an operation a worktree has not finished; each can carry commits the tree does not show.
 UNFINISHED = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "BISECT_LOG")
 
@@ -1291,7 +1313,9 @@ class Supervisor:
             answer = self.review_answer(out, head)
             # A delta verdict stands for the branch only on a report that covers it (sd:9769): one that covers
             # nothing (another binding, a short round) is no pass, and the branch is reviewed in full.
-            if answer is not None and not (prior and answer["status"] in ("clean", "advisory") and not answer["covers"]):
+            # A skipped delta (docs only) read no code: it proves no prior code blocker fixed (sd:9769).
+            if answer is not None and not (prior and (answer["status"] == "skipped" or answer["status"] in (
+                    "clean", "advisory") and not answer["covers"])):
                 break
             if prior:  # `sd-review` can refuse a verify plan (input past its bound): retry the branch in full
                 argv, prior = argv[:argv.index("--verify-report")], None  # verify args close the argv
@@ -1299,7 +1323,8 @@ class Supervisor:
             return self.finish("blocked", f"the review gave no answer twice at {head[:12]}; see {self.out('review')}")
         # `sd-review` runs no gate in an unmanaged checkout (sd:5953): the repository's own checks run here.
         unmanaged, checked = build.unmanaged(self.db, self.row["repo"]), None
-        if prior and answer["status"] == "blocking" and answer.get("complete"):  # a short report blocks (sd:9769)
+        # A short report, or one `sd-review` cleared `covers_from` on (a binding change), blocks (sd:9769).
+        if prior and answer["status"] == "blocking" and answer.get("complete") and answer.get("covers"):
             new, blockers = self.deferred(answer, prior, head)
             if unmanaged and not blockers:  # before any rebuttal: a failed check means a fix round follows
                 checked = self.own_checks(head)
@@ -1474,12 +1499,14 @@ class Supervisor:
         # unless the finding's own words name a changed file (pack sd:9900 tracks the rest).
         # A changed path or its file name; a name shared with an unchanged file holds more, never less.
         names = {name for path in changed or () for name in (path, os.path.basename(path)) if name}
+        # The identifiers of the functions the branch changes, read whole: a caller named by function (sd:9769).
+        functions = self.branch_words(head) if changed is not None else None
 
         def held(row: dict) -> bool:
             # `<...>` names no file; an absolute or `..` path is outside the checkout no delta of it can clear.
             # A file the branch changes holds at every line: a cited line can be off by a few, and a change can
             # break unchanged code in a file it touches.
-            if changed is None or any(path.startswith(("<", "/", "../")) or path == ".." or path in named
+            if changed is None or functions is None or any(path.startswith(("<", "/", "../")) or path == ".." or path in named
                                       or path in changed for path, _line in self.locations(row)):
                 return True
             # A finding cited at unchanged code that names a changed file (a new caller) is the branch's own.
@@ -1488,11 +1515,22 @@ class Supervisor:
             spelled = {os.path.normpath(word.rstrip(".")) for word in re.findall(r"[\w./-]+", words) if word.rstrip(".")}
             if any(word in names or os.path.basename(word) in names for word in spelled):
                 return True
+            # A function or method the change touches, as `name(`, `a_b`, `camelCase` or `` `x.name` ``.
+            if callable_words(words) & functions:
+                return True
             # A name with a space or other character no word holds (`bin/my tool`), found literally and whole.
             return any(re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w/-]|\.\w)", words)
                        for name in names if re.search(r"[^\w./-]", name))
         new = [row for row in answer["blockers"] if not held(row)]
         return new, [row for row in answer["blockers"] if row not in new]
+
+    def branch_words(self, head: str) -> set[str] | None:
+        """The identifiers in each function the branch changes from its fork, read whole; None when unread."""
+        try:
+            fork = _read([*self.tools.git, "-C", str(self.work), "merge-base", self.base(), head], env=self.env).strip()
+        except Unread:
+            return None
+        return function_words(self.tools.git, str(self.work), fork, head, env=self.env) if fork else None
 
     def branch_delta(self, since: str, head: str) -> dict[str, set[int]] | None:
         """The lines the fix changed since `since` together with every line the branch changes from its fork:
@@ -2110,7 +2148,7 @@ class Supervisor:
             return {"status": status, "blockers": [row for row in findings
                                                    if isinstance(row, dict) and row.get("disposition") == "blocking"],
                     "complete": 1 <= int(answer.get("requested_reviews") or 0) <= int(answer.get("completed_reviews") or 0)
-                    and not answer.get("review_shortfall")}
+                    and not answer.get("review_shortfall"), "covers": bool(answer.get("covers_from"))}
         if status == "gate_failed":  # the review cleared and the repository's gate failed: the builder fixes it
             checks = (answer.get("check") or {}).get("checks") or []
             return {"status": status, "blockers": [

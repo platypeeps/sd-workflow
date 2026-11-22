@@ -209,11 +209,12 @@ FAKE = textwrap.dedent('''
                               "route": {"tier": "skip" if mode == "skip_route" else "cheap", "category": "docs"},
                               "subject": {"head": git("-C", work, "rev-parse", "HEAD")}}))
             sys.exit(0)
-        if mode in ("offdelta", "offdelta_short", "offdelta_held"):  # pack sd:9769: a blocker on a file nobody touched
+        if mode in ("offdelta", "offdelta_short", "offdelta_held", "offdelta_uncovered"):  # pack sd:9769: a blocker on a file nobody touched
             far = {**raw, "path": "far.txt", "instances": ["far.txt:1"], "summary": "an old defect"}
             held = [review._finding(raw)] if mode == "offdelta_held" else []  # and one the fix's file still holds
             print(json.dumps({"status": "blocking", "scope": "branch", "requested_reviews": 2,
-                              "completed_reviews": 1 if mode == "offdelta_short" else 2, "covers_from": "c" * 40,
+                              "completed_reviews": 1 if mode == "offdelta_short" else 2,
+                              "covers_from": None if mode == "offdelta_uncovered" else "c" * 40,
                               "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                               "findings": review.dispose([review._finding(far), *held], "high")}))
             sys.exit(0)
@@ -1029,6 +1030,30 @@ class Supervise(Case):
         self.assertIn("--verify-report", verify)
         self.assertNotIn("--verify-report", full, "a clean delta covering no branch was taken as the branch's pass")
 
+    def test_a_skipped_delta_after_a_blocking_round_reviews_in_full_and_stays_blocked(self):
+        """Lead ruling on sd:9769 (deferral eligibility): a docs-only fix delta the router skips proves no
+        prior code blocker fixed; the branch is reviewed in full, and its blocker still blocks."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1", "fix2"], sd_review=["blocking", "skip_route", "blocking", "clean"])
+        self.supervisor().run()
+        argvs = [call["argv"] for call in self.calls("sd-review")]
+        self.assertGreater(len(argvs), 2, "a skipped delta was taken as the branch's pass")
+        self.assertIn("--verify-report", argvs[1])
+        self.assertNotIn("--verify-report", argvs[2], "the skipped delta was not reviewed in full")
+        self.assertEqual(self.latest()["review_round"], 2, "the prior blocker did not stay blocked")
+
+    def test_a_complete_blocking_delta_that_covers_no_branch_defers_nothing(self):
+        """Lead ruling on sd:9769 (deferral eligibility): `sd-review` clears `covers_from` after a binding
+        change; a full reader count does not restore branch coverage, so no blocker is filed away."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1", "fix2"], sd_review=["blocking", "offdelta_uncovered", "clean"])
+        self.supervisor().run()
+        filed = self.db.execute("SELECT id FROM item WHERE title LIKE 'Review follow-up%'").fetchall()
+        self.assertEqual(filed, [], "a blocker from a delta covering no branch was filed as a follow-up")
+        self.assertEqual(self.latest()["review_round"], 2, "the uncovered blocker did not block")
+
     def test_round_one_reviews_the_whole_branch_and_round_two_the_findings_and_delta(self):
         """Pack sd:9769: round 1 is the full branch review; round 2 verifies round 1's findings over the delta."""
         self.press()
@@ -1462,10 +1487,11 @@ class Supervise(Case):
                 self.assertIsNone(supervisor.prior_review("a" * 40),
                                   "the older kept report stood in for a last report that failed its checks")
 
-    def deferred(self, blockers, changed):
+    def deferred(self, blockers, changed, words=frozenset()):
         """`file_new_findings` over `blockers` with the delta `changed`: the blockers it keeps."""
         supervisor = self.supervisor()
-        with mock.patch.object(supervisor, "branch_delta", return_value=changed):
+        with mock.patch.object(supervisor, "branch_delta", return_value=changed), \
+                mock.patch.object(supervisor, "branch_words", return_value=words):
             return supervisor, supervisor.file_new_findings({"status": "blocking", "blockers": blockers}, self.PRIOR,
                                                             "a" * 40)
 
@@ -1502,6 +1528,45 @@ class Supervise(Case):
         far = {"path": "lib/helper.py", "line": 3, "summary": "an old defect in parse()"}
         _, kept = self.deferred([far], {"src/caller.py": {12}})
         self.assertEqual(kept["blockers"], [], "a blocker naming no changed file was held")
+
+    def test_a_changed_caller_named_by_function_holds(self):
+        """Lead ruling on sd:9769 (deferral eligibility): a reviewer can name the changed caller by its function
+        alone; a name the branch's changed functions hold ties the blocker to the branch, so it is not filed."""
+        self.press()
+        rows = [{"path": "lib/helper.py", "line": 3, "summary": "review_plan now passes None to parse()"},
+                {"path": "lib/helper.py", "line": 4, "summary": "the new call in `Supervisor.plan` breaks this"},
+                {"path": "lib/helper.py", "line": 5, "summary": "buildPlan drops the default"}]
+        _, kept = self.deferred(rows, {"src/caller.py": {12}}, {"review_plan", "plan", "buildPlan", "parse"})
+        self.assertEqual(kept["blockers"], rows, "a blocker naming a changed caller by function was deferred")
+        far = {"path": "lib/helper.py", "line": 3, "summary": "an old defect in old_reader()"}
+        _, kept = self.deferred([far], {"src/caller.py": {12}}, {"review_plan"})
+        self.assertEqual(kept["blockers"], [], "a blocker naming no changed function was held")
+        _, kept = self.deferred([far], {"src/caller.py": {12}}, None)
+        self.assertEqual(kept["blockers"], [far], "a function context git could not read deferred a blocker")
+
+    def test_branch_words_hold_the_changed_function_and_what_it_calls(self):
+        """Lead ruling on sd:9769: the branch's changed functions, read whole, name the caller and its callee."""
+        repo = Path(tempfile.mkdtemp(dir=self.root))
+
+        def run(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.name=operator",
+                                   "-c", "user.email=operator@example.test", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        run("init", "-q")
+        body = "class Plan:\n    def review_plan(self):\n        x = 1\n        return parse_row(x)\n\n\n" \
+               "def untouched():\n    return 2\n"
+        (repo / "caller.py").write_text(body)
+        run("add", "-A")
+        run("commit", "-q", "-m", "base")
+        base = run("rev-parse", "HEAD")
+        (repo / "caller.py").write_text(body.replace("x = 1", "x = None"))
+        run("add", "-A")
+        run("commit", "-q", "-m", "change")
+        words = build_run.function_words(["git"], str(repo), base, run("rev-parse", "HEAD"))
+        assert words is not None, "git's function context did not read"
+        self.assertTrue({"review_plan", "parse_row"} <= words, words)
+        self.assertNotIn("untouched", words)
 
     def test_a_changed_caller_named_by_any_spelling_holds_and_a_lookalike_does_not(self):
         """Review of sd:9769: `./src/caller.py` or an absolute path names the changed caller and holds; a
@@ -1593,6 +1658,7 @@ class Supervise(Case):
         supervisor.db.outcome = mock.Mock(return_value="recorded")
         answer = {"status": "blocking", "blockers": rows}
         with mock.patch.object(supervisor, "branch_delta", return_value={}), \
+                mock.patch.object(supervisor, "branch_words", return_value=set()), \
                 mock.patch.object(supervisor, "file_follow_up", committed_then_lost):
             with self.assertRaises(remote.UnknownOutcome):
                 supervisor.file_new_findings(answer, self.PRIOR, "a" * 40)
