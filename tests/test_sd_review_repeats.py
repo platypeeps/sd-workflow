@@ -295,6 +295,15 @@ class ReproRuleTests(unittest.TestCase):
                 self.assertEqual(result["status"], "blocking")
                 self.assertEqual([row["evidence"] for row in result["findings"]], [REPRO])
 
+    def test_a_duplicate_keeps_every_readers_evidence_for_the_lead(self) -> None:
+        """sd:9869 class pass: the lead judges whether evidence reproduces, so a vague first copy must not hide a
+        second reader's repro; identical evidence is kept once."""
+        answers = [sd_review.Outcome(name, sd_review.FINDINGS, (finding(evidence),), "", (), ())
+                   for name, evidence in (("one", "See summary"), ("two", REPRO), ("three", REPRO))]
+        result = {"severity_floor": "high", "requested_reviews": 3}
+        sd_review.finish_review(result, answers, ["one", "two", "three"], repro=True)
+        self.assertEqual([row["evidence"] for row in result["findings"]], [f"See summary\n{REPRO}"])
+
     def test_a_reproduced_break_in_an_unchanged_caller_blocks(self) -> None:
         [record] = sd_review.dispose([finding("python3 reader.py: KeyError 'state'", path="reader.py")], "high",
                                      repro=True)
@@ -411,7 +420,7 @@ class RepeatRuleTests(unittest.TestCase):
         kept = sd_review.sd_lib.distinct_findings([dict(bare, backend="codex"), dict(cited, backend="second"),
                                                    dict(other, backend="third")])
         self.assertEqual(len(kept), 1)
-        self.assertEqual((kept[0]["backend"], kept[0]["evidence"]), ("codex", "src.py:1: x = 1"))
+        self.assertEqual((kept[0]["backend"], kept[0]["evidence"]), ("codex", "src.py:1: x = 1\npython3 src.py: wrong"))
         two = sd_review.sd_lib.distinct_findings([dict(row(), backend="codex"), dict(row(summary="other"), backend="x")])
         self.assertEqual(len(two), 2)
 
