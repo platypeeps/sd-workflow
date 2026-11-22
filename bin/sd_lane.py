@@ -957,6 +957,10 @@ def branch_commits(worktree: pathlib.Path, base: str, head: str) -> list[tuple[s
             (chunk.strip("\n").partition("\x1f") for chunk in raw.split("\x1e")) if sha.strip()]
 
 
+#: A revert's subject: `git revert`'s `Revert "..."`, or a Conventional `revert:` (sd:8373).
+REVERT_SUBJECT = re.compile(r"^(?:Revert\b|revert(?:\([^)]*\))?!?:)", re.IGNORECASE)
+
+
 def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]) -> list[tuple[str, str]]:
     """`commits` (newest first) less each cited one a later hand-written revert undid (sd:8373).
 
@@ -966,10 +970,9 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     subject is a revert and the files it changed read at `head` as before
     it. A read that fails keeps the commit, as before this check.
     """
-    import sd_ship_body  # noqa: PLC0415
     kept = []
     for index, (sha, message) in enumerate(commits):
-        if "Closes:" in message and any(sd_ship_body.REVERT_SUBJECT.match(later) for _, later in commits[:index]):
+        if "Closes:" in message and any(REVERT_SUBJECT.match(later) for _, later in commits[:index]):
             # NUL-separated and literal: git quotes a name with a tab or non-ASCII byte otherwise.
             files = publish_git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-z", "-r", sha)
             names = [name for name in files.stdout.split("\0") if name] if files and files.returncode == 0 else []
