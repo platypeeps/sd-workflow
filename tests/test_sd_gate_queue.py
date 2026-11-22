@@ -644,6 +644,34 @@ class Settings(unittest.TestCase):
         self.assertIsNone(taken)
         self.assertIn("load 55.0 is at or above 40", stream.getvalue())
 
+    def test_a_cpu_sample_past_the_deadline_takes_no_slot(self):
+        """Review finding: with --max-wait 0.5 the first 1.1 s CPU sample ran past the deadline, and a free
+        slot was taken before the deadline was read."""
+        with tempfile.TemporaryDirectory() as tmp, open(pathlib.Path(tmp) / "slot.1.lock", "a") as mine:
+            stream, now = io.StringIO(), [0.0]
+
+            def busy():
+                now[0] += 1.1
+                return 0.1
+            taken = sd_gate_slots.wait_for_slot(
+                [mine.fileno()], pathlib.Path(tmp), poll=0.001, stream=stream, deadline=0.5,
+                clock=lambda: now[0], rule=sd_gate_slots.LoadRule(24.0, 0.0, "test"),
+                loadavg=lambda: (1.0, 1.0, 1.0), busy=busy)
+        self.assertIsNone(taken)
+        self.assertIn("gave up waiting for a gate slot", stream.getvalue())
+
+    def test_a_launcher_gone_during_the_cpu_sample_takes_no_slot(self):
+        with tempfile.TemporaryDirectory() as tmp, open(pathlib.Path(tmp) / "slot.1.lock", "a") as mine:
+            gone = [False]
+
+            def busy():
+                gone[0] = True
+                return 0.1
+            with self.assertRaises(sd_gate_slots.LauncherExited):
+                sd_gate_slots.wait_for_slot(
+                    [mine.fileno()], pathlib.Path(tmp), poll=0.001, stream=io.StringIO(), stop=lambda: gone[0],
+                    rule=sd_gate_slots.LoadRule(24.0, 0.0, "test"), loadavg=lambda: (1.0, 1.0, 1.0), busy=busy)
+
 
 if __name__ == "__main__":
     unittest.main()

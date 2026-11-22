@@ -715,15 +715,23 @@ def wait_for_slot(fds: Sequence[int], where: pathlib.Path, *, poll: float, strea
         ticket = None
     started = clock()
     reported: float | None = None
+    reason = "the wait ran out during the CPU sample"  # until an attempt says why it waits
     try:
         while True:
+            # The CPU sample may wait CPU_SAMPLE_SECONDS: take it before `stop` and the deadline are read, so
+            # neither a launcher gone nor a wait run out during it takes a slot.
+            share = busy() if ticket is not None and rule.limit > 0 else None
             if stop():
                 raise LauncherExited()
-            if ticket is None:
+            if ticket is not None and deadline is not None and clock() >= deadline:
+                taken = None  # the last attempt's reason is still why it waits
+            elif ticket is None:
                 taken, reason = take_free(fds, markers, label, wall())
             else:
+                def sampled(value: float | None = share) -> float | None:
+                    return value
                 taken, reason = queue.admit(ticket, fds, rule, markers=markers, loadavg=loadavg, wall=wall,
-                                             busy=busy)
+                                             busy=sampled)
             if taken is not None:
                 if reported is not None:
                     stream.write(f"gate slot taken after {clock() - started:.0f}s under {where}\n")
