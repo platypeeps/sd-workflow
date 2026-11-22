@@ -951,6 +951,22 @@ class Reap(Case):
         self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", newer), "cancelled")
         self.assertEqual(self.claim()["assignment"], self.bundle["assignment"])
 
+    def test_build_by_item_builds_fresh_an_item_moved_away_from_its_bundles_repository(self):
+        """Review round 14 of sd:9788: the item moved to another repository after its bundle blocked, and a fresh
+        press there was cancelled before it ran. Build read the old bundle, whose branch is in the old repository;
+        the claim refused it, and every later press read it again. Build presses fresh in the new repository."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        old = {member["id"] for member in build.run(self.db, row["id"])["members"]}
+        self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (B, self.items[1]))
+        transition(self.db, self.items[1], "ready", who="operator")
+        newer = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (newer,))  # before its claim
+        queued = build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual(len(queued), 1)
+        self.assertNotIn(queued[0]["id"], old, "a fresh press, not Retry of the old repository's bundle")
+
     def test_build_by_item_resumes_a_newer_cancelled_bundle_that_ran(self):
         """Review round 2 of sd:9788: bundle A ends blocked; its item X builds fresh as bundle B, which the operator
         cancels mid-build. A cancelled bundle that ran keeps its worktree, so Build of X is Retry of B, not of A,
