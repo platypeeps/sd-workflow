@@ -1367,6 +1367,15 @@ class Supervise(Case):
         _, kept = self.deferred(rows, {"src.py": {5}})
         self.assertEqual(kept["blockers"], rows, "a blocker on changed code was deferred")
 
+    def test_a_blocker_on_an_unchanged_line_of_a_changed_file_still_blocks(self):
+        """Review of sd:9769: a reviewer's line can be off by a few, and a change can break unchanged code in a
+        file it touches; a file the branch changes is the change's own at every line."""
+        self.press()
+        rows = [{"path": "src.py", "line": 8, "summary": "two lines below the edit"},
+                {"path": "src.py", "line": 200, "summary": "an unchanged reader the edit broke"}]
+        _, kept = self.deferred(rows, {"src.py": {5, 6}})
+        self.assertEqual(kept["blockers"], rows, "a blocker in a changed file was deferred")
+
     def test_a_blocker_outside_the_checkout_still_blocks(self):
         """Class pass, sd:9769: no delta of this checkout can show a path outside it unchanged."""
         self.press()

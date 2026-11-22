@@ -1421,8 +1421,10 @@ class Supervisor:
 
         def held(row: dict) -> bool:
             # `<...>` names no file; an absolute or `..` path is outside the checkout no delta of it can clear.
-            return changed is None or any(path.startswith(("<", "/", "../")) or path == ".." or path in named or path in changed and (
-                line is None or not changed[path] or line in changed[path]) for path, line in self.locations(row))
+            # A file the branch changes holds at every line: a cited line can be off by a few, and a change can
+            # break unchanged code in a file it touches.
+            return changed is None or any(path.startswith(("<", "/", "../")) or path == ".." or path in named
+                                          or path in changed for path, _line in self.locations(row))
         new = [row for row in answer["blockers"] if not held(row)]
         for index, row in enumerate(new):
             self.once(f"followup:{head}:{index}", functools.partial(self.file_follow_up, row, head))
