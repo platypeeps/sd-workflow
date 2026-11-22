@@ -353,8 +353,6 @@ _REVERTS = re.compile(r"^This reverts commit ([0-9a-f]{7,40})\b(?:, reversing\s+
 
 #: A revert's subject: `git revert`'s `Revert "..."`, or a Conventional `revert:` (sd:8373).
 REVERT_SUBJECT = re.compile(r"^(?:Revert\b|revert(?:\([^)]*\))?!?:)", re.IGNORECASE)
-#: A list item, `- `, `* `, `+ `, `1. ` or `1) `, with what follows its marker (pack sd:9666).
-_BULLET = re.compile(r"^[ \t]*(?:[-*+]|[0-9]+[.)])[ \t]+(.*)$")
 #: An item a hand-written revert names an undone commit on: one that opens with a sha.
 _SHA_LED = re.compile(r"([0-9a-f]{7,40})\b")
 #: The line that opens a list of undone commits: its last sentence is exactly `Reverted commits:`,
@@ -372,16 +370,20 @@ def _listed_undone(message: str) -> list[str]:
     items indented past it, any other heading those at or past its indent.
     The innermost holder decides: a heading that says reverted undoes, a
     sha item passes on what holds it, and anything else undoes nothing.
-    An item inside a fence or an HTML comment names nothing.
+    An item inside a fence, an indented code block or an HTML comment
+    names nothing.
     """
     quoted, holders, found = quoted_lines(message), [], []  # holders: (indent, is an item, undoes)
+    items: list[int] = []  # open list items' text columns, as `quoted_lines` reads them
     for number, line in enumerate(message.split("\n"), start=1):
         line = line.rstrip("\r").expandtabs(4)
+        rest = _item_text(line, items, opens=False)
         if number in quoted or not line.strip():
             continue
         indent = len(line) - len(line.lstrip())
-        item = _BULLET.match(line)
-        text = (item[1] if item else line).strip()
+        # A marker four spaces past its list column starts no item: that is an indented code block.
+        item = _ITEM_MARKER.match(rest)
+        text = (_item_text(rest, items, opens=True) if item else line).strip()
         if item:
             while holders and (holders[-1][0] > indent or (holders[-1][0] == indent and holders[-1][1])):
                 holders.pop()  # the item dedented out of it, or is its sibling
@@ -434,10 +436,13 @@ def kept_commits(commits, parents=None) -> list:
     for sha, message in commits:
         if sha in undone:
             continue
+        trailed = set()
         for target, mainline in _REVERTS.findall(message):
+            trailed.add(full(target))
             undone |= ancestors(full(target)) - ancestors(full(mainline)) if mainline else {full(target)}
         if REVERT_SUBJECT.match(message):
-            for target in filter(None, map(only, _listed_undone(message))):
+            # git's trailer names a commit's mainline; listing that commit too adds nothing to it.
+            for target in set(filter(None, map(only, _listed_undone(message)))) - trailed:
                 # A listed merge undoes what it brought in over its first parent, as `git revert -m 1` would.
                 mainline = parents.get(target, ())[:1]
                 undone |= ancestors(target) - ancestors(mainline[0]) if mainline else {target}

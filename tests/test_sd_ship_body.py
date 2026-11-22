@@ -391,6 +391,17 @@ class CitedIdTests(unittest.TestCase):
         # Inside a list item the same indent opens a fence, and the item's end closes it.
         self.assertEqual(sd_ship_body.quoted_lines("- a\n    ```\n  b\nc\n"), {2, 3})
 
+    def test_an_indented_code_example_lists_nothing(self) -> None:
+        """pack sd:9666 review, round 6, instance 1: four spaces past the list column start an indented
+        code block, not a list item, yet `    - <sha> example` under `Reverted commits:` undid that commit."""
+        undone, quoted = "a" * 40, "c" * 40
+        work = [(quoted, "fix: other\n\nLane review fix, pack sd:5: y.\n\nCloses: sd:3\n"),
+                (undone, "feat: renew\n\nCloses: sd:2\n")]
+        for body in (f"Reverted commits:\n\n    - {quoted[:9]} example\n\n- {undone[:9]} renew\n",
+                     f"Reverted commits:\n\n- {undone[:9]} renew\n\n      - {quoted[:9]} example\n"):
+            with self.subTest(body=body):
+                self.assertEqual(sd_ship_body.cited_ids("", [self.revert_of(body), *work]), (3, 5))
+
     def test_a_fence_on_a_list_marker_line_is_an_example(self) -> None:
         """pack sd:9666 review, round 5, instance 2: `- ```text` opened no fence, so the sha bullet in the
         example undid a real commit and dropped its citations."""
@@ -432,6 +443,19 @@ class CitedIdTests(unittest.TestCase):
                    (base, "fix: base\n\nCloses: sd:5")]
         parents = {merge: (main, side), main: (base,), side: (base,), base: ()}
         self.assertEqual(sd_ship_body.cited_ids("", commits, parents), (4, 5))
+
+    def test_a_listed_merge_the_trailer_names_keeps_the_trailers_mainline(self) -> None:
+        """pack sd:9666 review, round 6, instance 2: a merge listed beside git's `This reverts commit
+        <merge>, reversing changes made to <parent two>` undid both sides, and the second parent's
+        commit lost its citations. The trailer names the mainline; the list adds nothing to it."""
+        base, side, main, merge = (c * 40 for c in "abce")
+        revert = self.revert_of(f"Reverted commits:\n\n- {merge[:9]} the side branch\n\n"
+                                f"This reverts commit {merge}, reversing\nchanges made to {side}.\n")
+        commits = [revert, (merge, "Merge branch 'side'"), (main, "fix: mainline\n\nCloses: sd:4"),
+                   (side, "fix: implement\n\nLane review fix, pack sd:3: y.\n\nCloses: sd:2\n"),
+                   (base, "fix: base\n\nCloses: sd:5")]
+        parents = {merge: (main, side), main: (base,), side: (base,), base: ()}
+        self.assertEqual(sd_ship_body.cited_ids("", commits, parents), (2, 5, 3))
 
     def test_an_ambiguous_listed_prefix_undoes_nothing(self) -> None:
         """pack sd:9666 review, round 3, instance 5: a short sha two branch commits share undid whichever came
