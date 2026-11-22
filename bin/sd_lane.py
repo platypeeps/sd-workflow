@@ -149,6 +149,16 @@ the one two ahead runs on. An entry that does not merge cancels each gate
 whose prediction ran through it, and the next claim gates those entries
 again. A stop, a TERM or the deadline cancels every gate.
 
+A train gates up to `sd.lane_train` entries once (sd:9899; unset 3, 1 is
+no train). The claimed entry and the pending ones after it, each with its
+worktree here, stack in a scratch worktree as `landings` predicts them; a
+member that conflicts drops to the next train and stays pending. One gate
+runs at the top against the fetched base. A pass leaves each member a
+receipt at its own tree and base (`default_cover`), which replays the
+train's report; prepare then reads it, and the speculation skips a member
+its train covered. A fail gates the first half again, down to one member,
+whose own prepare gates it. Each member still reviews and merges alone.
+
 After a merge the runner lands the entry (sd:2568). It deletes the remote
 branch with `--force-with-lease` while the worktree's tip is the merged head.
 It never removes a builder's worktree: no lock excludes its builder, and a
@@ -292,6 +302,10 @@ PLACES = ("up", "down", "top")
 Ship = Callable[[list[str], pathlib.Path], dict[str, Any]]
 #: `(root, head, base) -> the gate's result`: the next entry's gate on a predicted landing (sd:2586).
 Gate = Callable[[pathlib.Path, str, str], dict[str, Any]]
+#: `(root, head, base, the train gate's passing result) -> receipt answer`: a train member's receipt (sd:9899).
+Cover = Callable[[pathlib.Path, str, str, dict[str, Any]], dict[str, Any]]
+#: Entries one train gates at once when `sd.lane_train` is unset (sd:9899); 1 is the lane before trains.
+TRAIN = 3
 #: `(item, body, main checkout) -> what happened`: the landing's item note (sd:2568). `note_ended` also
 #: passes `kind=`, `comment` or `followup` (sd:7357).
 Note = Callable[..., str]
@@ -2395,16 +2409,19 @@ def speculate(entry: dict[str, Any], queue: Queue, gate: Gate,
     entry is gated twice, and at most `DEPTH` gates run at once.
     """
     try:
-        followers = [row for row in read_queue(queue) if runnable(row)][:DEPTH]
+        rows = read_queue(queue)
     except LaneError:  # a hub fault here left the claimed entry running under a runner that raised (sd:4184)
         return []
+    followers = [row for row in rows if runnable(row)][:DEPTH]
+    statuses = {row["id"]: row.get("status") for row in rows}
     gated = {held.follower for held in gates}
     running = sum(held.is_alive() for held in gates)
     chain, made = [entry], list[SpeculativeGate]()
     for following in followers:
         if merge_refusal(chain[-1]) is not None:
             break
-        if (following["id"], following["expected_head"]) not in gated:
+        if (following["id"], following["expected_head"]) not in gated and not covered(
+                following, statuses, [row["id"] for row in chain]):
             made += speculate_one(chain, following, queue, gate, busy=running + len(made) >= DEPTH)
         chain.append(following)
     return made
@@ -2429,7 +2446,7 @@ def speculate_one(chain: list[dict[str, Any]], following: dict[str, Any], queue:
         with contextlib.suppress(LaneError, OSError):  # a note that cannot be written stops nothing
             update(queue, on_follower)
     def own_tree_here(row: dict[str, Any]) -> bool:
-        return row.get("enqueued_on") == host and pathlib.Path(str(row.get("worktree") or "")).is_dir()
+        return tree_here(row, host)
     items = " or ".join(f"sd:{row['item']}" for row in [*chain, following])
     try:
         plan = ({"skipped": f"{DEPTH} earlier speculative gates still run"} if busy else
@@ -2459,6 +2476,231 @@ def speculate_one(chain: list[dict[str, Any]], following: dict[str, Any], queue:
     thread = SpeculativeGate(run_gate, f"sd-lane-speculate-{following['item']}",
                              (following["id"], following["expected_head"]), tuple(row["id"] for row in chain))
     return [thread]
+
+
+def tree_here(row: dict[str, Any], host: str) -> bool:
+    """Whether `row` was enqueued on `host` and its worktree is here: only then is it predicted (sd:3283)."""
+    return row.get("enqueued_on") == host and pathlib.Path(str(row.get("worktree") or "")).is_dir()
+
+
+def lane_train(environ: dict[str, str] | None = None) -> int:
+    """This machine's `sd.lane_train`, entries one train gates at once, 1 to 9; `TRAIN` when unset (sd:9899).
+
+    A value that does not match, or a config that cannot be read, is the
+    default, as `lane_parallel` reads: a bad file never stops a run.
+    """
+    try:
+        value = sd_lib.file_setting("lane_train", environ)
+    except sd_lib.ConfigError:
+        return TRAIN
+    return int(value) if value else TRAIN
+
+
+def covered(row: dict[str, Any], statuses: dict[str, Any], ahead: Iterable[str] = ()) -> bool:
+    """Whether `row`'s train receipts still name its landing (sd:9899).
+
+    The train covered it at its queued head, and each entry the train put
+    ahead of it merged or is in `ahead`, the chain a speculation predicts.
+    A landing that went otherwise makes another tree; its receipt then
+    misses, and prepare gates on its own.
+    """
+    train, ahead = row.get("train") or {}, set(ahead)
+    return (train.get("status") == "covered" and train.get("expected_head") == row.get("expected_head")
+            and all(statuses.get(before) == "merged" or before in ahead for before in train.get("after") or []))
+
+
+def train_members(entry: dict[str, Any], queue: Queue, size: int) -> list[dict[str, Any]]:
+    """`entry` and the pending entries after it one train gates, up to `size`, or none for a train of one.
+
+    Each member has its worktree on this host. An entry the runner may not
+    merge (`merge_refusal`) never lands, so it ends the train. An `entry`
+    an earlier train covered on landings that held rides no new train.
+    """
+    if size < 2:
+        return []
+    rows, host = read_queue(queue), this_host()
+    if covered(entry, {row["id"]: row.get("status") for row in rows}) or not tree_here(entry, host):
+        return []
+    members = [entry]
+    for row in (row for row in rows if runnable(row)):
+        if len(members) >= size or merge_refusal(members[-1]) is not None or not tree_here(row, host):
+            break
+        members.append(row)
+    return members if len(members) > 1 else []
+
+
+def stack(tree: pathlib.Path, members: list[dict[str, Any]], fork: str,
+          branch: str) -> tuple[list[dict[str, Any]], list[tuple[dict[str, Any], str]]]:
+    """In the scratch `tree`, each member's catch-up onto the landing before it, from `fork` (sd:9899).
+
+    Answers the placed members, each `{"row", "head", "base"}`: `head` is
+    its catch-up merge, the tree its prepare gates, and `base` the landing
+    under it, as `landings` predicts one. A member that conflicts with the
+    stack drops out with why; the next member stacks without it.
+    """
+    landed, placed, dropped = fork, list[dict[str, Any]](), list[tuple[dict[str, Any], str]]()
+    for row in members:
+        onto = f"sd:{placed[-1]['row']['item']}'s predicted landing" if placed else f"origin/{branch}"
+        if scratch_git(tree, "checkout", "--quiet", "--detach", "--force", row["expected_head"]) is None:
+            dropped.append((row, "its queued head could not be checked out"))
+            continue
+        if not catch_up_in(tree, landed, f"Merge origin/{branch}"):
+            dropped.append((row, f"it conflicts with {onto}"))
+            continue
+        head = scratch_git(tree, "rev-parse", "HEAD")
+        after = scratch_git(tree, "commit-tree", "HEAD^{tree}", "-p", landed, "-m",
+                            f"sd-ship lane: sd:{row['item']} as predicted to land")
+        if not head or not after:
+            dropped.append((row, "its predicted landing could not be built"))
+            continue
+        placed.append({"row": row, "head": head, "base": landed})
+        landed = after
+    return placed, dropped
+
+
+def default_cover(root: pathlib.Path, head: str, base: str, passed: dict[str, Any]) -> dict[str, Any]:
+    """The receipt a train member's prepare reads: the train gate's pass, bound at the member's own tree (sd:9899).
+
+    `sd_gate_run.check_in_worktree` binds `head` against `base` as prepare
+    will, and replays the train's `sd-check` report in place of a run. A
+    member whose own scope differs from the report's gets no receipt
+    (`receipt_skipped`), so its prepare gates it.
+    """
+    import sd_gate_run  # noqa: PLC0415 -- the gate loads only for a train
+    report = passed.get("report")
+    if not isinstance(report, dict):
+        return {"status": passed.get("status"), "receipt_skipped": "the train gate left no report"}
+    library = sd_lib.import_sd_db().module
+    if library is None:
+        raise LaneError("no sd_db library, so a train pass would leave no receipt")
+    output = json.dumps({**report, "train": passed.get("train")})
+    return sd_gate_run.check_in_worktree(root, head, base=base, database=library.default_path(os.environ.get("HOME")),
+                                         run=lambda *_: (0, output, ""))
+
+
+def receipt_of(result: dict[str, Any]) -> Any:
+    """What a gate or cover result says of its receipt, as a speculation records it."""
+    return ("recorded" if result.get("receipt_revision") is not None else
+            result.get("receipt_skipped") or result.get("receipt_error") or "none")
+
+
+def mark_train(queue: Queue, fields: dict[str, dict[str, Any]], items: list[int]) -> None:
+    """Write each member's `train` record from `fields`, by entry id; a write that fails stops nothing."""
+    def on_members(entries: list[dict[str, Any]]) -> None:
+        for row in entries:
+            if row["id"] in fields:
+                row["train"] = {"items": items, "at": stamp_now(), **fields[row["id"]]}
+    with contextlib.suppress(LaneError, OSError):
+        update(queue, on_members)
+
+
+def train_stack(members: list[dict[str, Any]]) -> dict[str, Any]:
+    """`{"fork", "placed", "dropped"}` for the members stacked on the fetched base, or `{"skipped": why}`."""
+    import sd_gate_receipts  # noqa: PLC0415 -- the declaration reader loads only for a train
+    root = pathlib.Path(members[0]["worktree"])
+    remote = lane_git(root, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD") or ""
+    branch = remote.removeprefix("refs/remotes/origin/")
+    if not branch or branch == remote or scratch_git(
+            root, "fetch", "--quiet", "--no-tags", "origin", f"refs/heads/{branch}:{remote}") is None:
+        return {"skipped": "origin/HEAD could not be fetched"}
+    fork = lane_git(root, "rev-parse", "--verify", "--quiet", remote)
+    with tempfile.TemporaryDirectory(prefix="sd-lane-train-") as parent:
+        tree = pathlib.Path(parent) / "tree"
+        if not fork or scratch_git(root, "worktree", "add", "--quiet", "--detach", str(tree), fork) is None:
+            return {"skipped": "the scratch worktree could not be made"}
+        try:
+            if not sd_gate_receipts.keyed_by_tree(tree):
+                return {"skipped": f"no tree key in {sd_gate_receipts.REUSE_DECLARATION}, so prepare could not "
+                                   "reuse a pass"}
+            placed, dropped = stack(tree, members, fork, branch)
+        except sd_lib.DatabaseUnreadable as error:
+            return {"skipped": f"{sd_gate_receipts.REUSE_DECLARATION} cannot be read: {error}"}
+        finally:
+            scratch_git(root, "worktree", "remove", "--force", str(tree))
+    return {"fork": fork, "placed": placed, "dropped": dropped}
+
+
+def gate_train(placed: list[dict[str, Any]], fork: str, gate: Gate, cover: Cover,
+               thread: SpeculativeGate) -> dict[str, dict[str, Any]]:
+    """Gate the stack's top against `fork`; on a pass cover each member, on a fail gate the first half again.
+
+    Answers each member's `train` record by entry id. A half of one runs no
+    train gate: its own prepare gates it.
+    """
+    fields: dict[str, dict[str, Any]] = {}
+    gates = 0
+    while len(placed) > 1 and not thread.cancelled:
+        top, gates = placed[-1], gates + 1
+        result = gate(pathlib.Path(top["row"]["worktree"]), top["head"], fork)
+        if result.get("status") == "success":
+            passed = {**result, "train": {"gated": top["head"], "items": [held["row"]["item"] for held in placed]}}
+            for number, held in enumerate(placed):
+                answer = cover(pathlib.Path(held["row"]["worktree"]), held["head"], held["base"], passed)
+                fields[held["row"]["id"]] = {"status": "covered", "expected_head": held["row"]["expected_head"],
+                                             "after": [ahead["row"]["id"] for ahead in placed[:number]],
+                                             "head": held["head"], "base": held["base"], "gates": gates,
+                                             "receipt": receipt_of(answer)}
+            return fields
+        named = ", ".join(f"sd:{held['row']['item']}" for held in placed)
+        kept = placed[:len(placed) // 2]
+        fields.update({held["row"]["id"]: {"status": "left", "gates": gates, "summary": str(result.get("summary"))[:300],
+                                           "reason": f"the train gate failed on {named}; it rides the next train"}
+                       for held in placed[len(kept):]})
+        placed = kept
+    if thread.cancelled:
+        fields.update({held["row"]["id"]: {"status": "cancelled", "reason": thread.why} for held in placed})
+    return fields
+
+
+def ride(members: list[dict[str, Any]], queue: Queue, gate: Gate, cover: Cover,
+         thread: SpeculativeGate) -> None:
+    """Stack the train's members, gate the stack once, and leave each member a receipt on a pass (sd:9899).
+
+    The gate runs at the top of the stack against the fetched base, so its
+    scope is the whole train (`gate_train`). A member that conflicts drops
+    to the next train. What happened goes on each member as `train`; any
+    error marks them all, and each ships alone.
+    """
+    items = [row["item"] for row in members]
+    try:
+        stacked = train_stack(members)
+        if "skipped" in stacked:
+            fields = {row["id"]: {"status": "skipped", "reason": stacked["skipped"]} for row in members}
+        else:
+            fields = {row["id"]: {"status": "dropped", "reason": f"{why}; it rides the next train"}
+                      for row, why in stacked["dropped"]}
+            fields.update(gate_train(stacked["placed"], stacked["fork"], gate, cover, thread))
+    except Exception as error:  # a train that cannot run gates nothing; each member ships alone
+        fields = {row["id"]: {"status": "error", "reason": f"{type(error).__name__}: {error}"[:600]} for row in members}
+    mark_train(queue, fields, items)
+
+
+def start_train(entry: dict[str, Any], queue: Queue, gate: Gate, cover: Cover,
+                environ: dict[str, str]) -> SpeculativeGate | None:
+    """The train `entry` heads, as a gate thread not yet started, or None for a train of one (sd:9899)."""
+    try:
+        members = train_members(entry, queue, lane_train(environ))
+    except LaneError:  # a hub fault: the claimed entry ships alone
+        return None
+    if not members:
+        return None
+    thread = SpeculativeGate(lambda: ride(members, queue, gate, cover, thread), f"sd-lane-train-{entry['item']}",
+                             (entry["id"], entry["expected_head"]))
+    return thread
+
+
+def run_train(entry: dict[str, Any], queue: Queue, gate: Gate, cover: Cover, environ: dict[str, str],
+              gates: list[SpeculativeGate], deadline: float) -> None:
+    """Run `entry`'s train to its end before the speculation, which then skips each member it covered (sd:9899)."""
+    train = start_train(entry, queue, gate, cover, environ)
+    if train is None:
+        return
+    gates.append(train)  # held before it starts: a TERM in its start ends it
+    train.start()
+    train.join(remaining(deadline, PREPARE_SECONDS))
+    if train.is_alive():
+        train.why = "the run's budget ran out, so it ended the train gate (sd:9899)"
+        train.cancel_gate()
 
 
 def default_note(item: int, body: str, main: pathlib.Path, kind: str = "comment") -> str:
@@ -3961,7 +4203,8 @@ def freeze_stop(queue: Queue) -> str | None:
 
 
 def run_lane(root: pathlib.Path, environ: dict[str, str], ship: Ship = default_ship,
-             gate: Gate = default_gate, note: Note | None = None, deadline: float | None = None) -> dict[str, Any]:
+             gate: Gate = default_gate, note: Note | None = None, deadline: float | None = None,
+             cover: Cover | None = None) -> dict[str, Any]:
     """Drain this repository's queue in order under its runner lock; never wait for the lock.
 
     It first imports the file queue and reclaims dead holders here
@@ -4010,6 +4253,7 @@ def run_lane(root: pathlib.Path, environ: dict[str, str], ship: Ship = default_s
                     entry, token = next_claim(queue, environ, deadline, answer)
                     if entry is None:
                         break
+                    run_train(entry, queue, gate, cover or default_cover, environ, gates, deadline)
                     for made in speculate(entry, queue, gate, gates):
                         gates.append(made)  # held before it starts: a TERM in its start ends it
                         made.start()

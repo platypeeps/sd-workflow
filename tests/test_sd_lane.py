@@ -64,6 +64,7 @@ TERMED_RUNNER = """import json, os, pathlib, sys, time
 from unittest import mock
 sys.path.insert(0, {bin!r})
 import sd_lane, sd_lib
+sd_lane.TRAIN = 1  # the lane before trains (sd:9899), as `Lane` patches it
 repo, environ, marks = pathlib.Path(sys.argv[1]), json.loads(sys.argv[2]), pathlib.Path(sys.argv[3])
 CHILD = "import os, pathlib, sys, time; pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)"
 end_group = sd_lane.end_group
@@ -137,6 +138,8 @@ class Lane(unittest.TestCase):
     checks_item = False
     #: Whether enqueue runs prepare's docs lint (sd:5989); most suites queue trees the lint never sees.
     lints_docs = False
+    #: `sd_lane.TRAIN` for the suite: most suites test the lane one entry at a time.
+    train = 1
 
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -183,6 +186,10 @@ class Lane(unittest.TestCase):
             patcher = mock.patch.object(sd_lane, "check_docs", lambda *args: None)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # A train of one is the lane before trains (sd:9899); the Train suite sets its own size.
+        patcher = mock.patch.object(sd_lane, "TRAIN", self.train)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         # And each runs as the hub would, which hosts every lane whose `repo.lane_host` is NULL (sd:3003).
         if importlib.util.find_spec("sd_db") is not None:
             patcher = mock.patch("sd_db.database.served_by", lambda target, home=None: None, create=True)
@@ -1612,6 +1619,131 @@ class Speculation(Trees):
         self.assertFalse(gate.is_alive())
         with self.assertRaises(ProcessLookupError):
             os.kill(int(marker.read_text()), 0)
+
+
+class Train(Trees):
+    """sd:9899: a train stacks up to `sd.lane_train` queued entries, gates the stack once and covers each.
+
+    The recorder's gate fails any stack that holds `red.txt`; `cover` stands in for the receipt each
+    member's prepare reads. Speculative gates share the recorder, so a train gate is told by its thread.
+    """
+
+    train = 3
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.third = self.branch("third", {"three.txt": "3\n"})
+        self.trains: list[tuple[pathlib.Path, str, str]] = []
+        self.covers: list[tuple[pathlib.Path, str, str]] = []
+
+    def gate(self, root: pathlib.Path, head: str, base: str) -> dict:
+        if threading.current_thread().name.startswith("sd-lane-train-"):
+            self.trains.append((root, head, base))
+        else:
+            self.gates.append((root, head, base))
+        red = "red.txt" in self.files(head)
+        return {"status": "failed" if red else "success", "summary": "sd-check", "report": {"status": "pass"}}
+
+    def cover(self, root: pathlib.Path, head: str, base: str, passed: dict) -> dict:
+        self.covers.append((root, head, base))
+        return {"status": "success", "receipt_revision": 1}
+
+    def queue_three(self) -> None:
+        for item, tree in enumerate((self.first, self.second, self.third), start=1):
+            sd_lane.enqueue_entry(tree, item, f"fix: {item}", self.body, self.environ, manual=True, claim="deliver")
+
+    def files(self, head: str) -> set[str]:
+        return set(git(self.repo, "ls-tree", "--name-only", head).split())
+
+    def test_three_green_entries_land_with_one_gate_run(self) -> None:
+        self.queue_three()
+        fork = git(self.repo, "rev-parse", "origin/main")
+        sd_lane.run_lane(self.repo, self.environ, super().ship, self.gate, cover=self.cover)
+        [(root, head, base)] = self.trains
+        self.assertEqual((root, base, self.gates), (self.third, fork, []))
+        self.assertLessEqual({"one.txt", "two.txt", "three.txt", "base.txt"}, self.files(head))
+        self.assertEqual([root for root, _, _ in self.covers], [self.first, self.second, self.third])
+        # Each member is covered on the landing under it: the first on the fetched main, the next on its landing.
+        self.assertEqual(self.covers[0][2], fork)
+        self.assertEqual(git(self.repo, "rev-parse", f"{self.covers[1][2]}^"), fork)
+        entries = self.entries()
+        self.assertEqual([entry["status"] for entry in entries], ["merged"] * 3)
+        self.assertEqual([entry["train"]["status"] for entry in entries], ["covered"] * 3)
+        self.assertEqual([len(entry["train"]["after"]) for entry in entries], [0, 1, 2])
+
+    def test_one_red_entry_of_three_lands_the_other_two_and_reports_the_red_one(self) -> None:
+        self.commit_files(self.second, {"red.txt": "r\n"}, "breaks the gate")
+        self.answers[(2, "prepare")] = {"ok": False, "workflow": {"blocker": {"code": "gate_failed",
+                                                                              "reason": "sd-check failed"}}}
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, super().ship, self.gate, cover=self.cover)
+        entries = self.entries()
+        self.assertEqual([entry["status"] for entry in entries], ["merged", "failed", "merged"])
+        # The stack of three failed, then the stack of sd:2 and sd:3; each half of one ships alone.
+        self.assertEqual([self.files(head) >= {"red.txt"} for _, head, _ in self.trains], [True, True])
+        self.assertEqual(self.covers, [])
+        self.assertIn(2, [item for item, _, _ in self.notes])
+        self.assertIn("the train gate failed on sd:2, sd:3", entries[2]["train"]["reason"])
+
+    def test_a_stack_conflict_requeues_only_the_conflicting_entry(self) -> None:
+        self.commit_files(self.second, {"one.txt": "not 1\n"}, "conflicts with first")
+        self.queue_three()
+
+        def landing(argv: list[str], log: pathlib.Path) -> dict:
+            """Entry 1 lands as GitHub's squash would, so sd:2 conflicts with main from then on."""
+            if (argv[2], argv[argv.index("--item") + 1]) == ("merge", "1"):
+                git(self.repo, "fetch", "-q", "origin")
+                tree = self.caught_up(git(self.first, "rev-parse", "HEAD"), "origin/main")
+                landed = git(self.repo, "commit-tree", tree, "-p", "origin/main", "-m", "one (#1)")
+                git(self.repo, "push", "-q", "origin", f"{landed}:refs/heads/main")
+            return super(Train, self).ship(argv, log)
+        sd_lane.run_lane(self.repo, self.environ, landing, self.gate, cover=self.cover)
+        [(root, head, _)] = self.trains
+        self.assertEqual(root, self.third)
+        self.assertNotIn("two.txt", self.files(head))
+        self.assertEqual([root for root, _, _ in self.covers], [self.first, self.third])
+        entries = self.entries()
+        self.assertEqual([entry["train"]["status"] for entry in entries], ["covered", "dropped", "covered"])
+        self.assertIn("it conflicts with", entries[1]["train"]["reason"])
+        self.assertEqual(entries[2]["train"]["after"], [entries[0]["id"]])
+
+    def test_a_train_of_one_gates_nothing_extra(self) -> None:
+        with mock.patch.object(sd_lane, "TRAIN", 1):
+            self.queue_three()
+            sd_lane.run_lane(self.repo, self.environ, super().ship, self.gate, cover=self.cover)
+        self.assertEqual((self.trains, self.covers), ([], []))
+        self.assertNotIn("train", self.entries()[0])
+
+    def test_lane_train_reads_the_machine_setting(self) -> None:
+        folder = self.tmp / ".config" / "sd-ai-command-pack"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "config.json").write_text(json.dumps({"config": {"sd": {"lane_train": "2"}}}))
+        self.assertEqual(sd_lane.lane_train(self.environ), 2)
+        (folder / "config.json").write_text(json.dumps({"config": {"sd": {"lane_train": "0"}}}))
+        self.assertEqual(sd_lane.lane_train(self.environ), sd_lane.TRAIN)
+
+
+class TrainCover(unittest.TestCase):
+    """sd:9899: `default_cover` binds a member at its own head and base and replays the train's report, no run."""
+
+    def test_the_cover_replays_the_train_report_as_a_passing_check(self) -> None:
+        import sd_gate_run
+        seen: dict = {}
+
+        def check(root: pathlib.Path, head: str, **options) -> dict:
+            seen.update(options, root=root, head=head)
+            code, output, errors = options["run"](["sd-check"], {}, root, 60)
+            return {"head": head, **sd_gate_run.check_reading(code, output, errors), "receipt_revision": 7}
+        passed = {"status": "success", "report": {"status": "pass", "checks": []}, "train": {"items": [1, 2]}}
+        with mock.patch.object(sd_gate_run, "check_in_worktree", check):
+            answer = sd_lane.default_cover(pathlib.Path("/repo"), "h2", "b1", passed)
+        self.assertEqual((seen["head"], seen["base"], answer["status"], sd_lane.receipt_of(answer)),
+                         ("h2", "b1", "success", "recorded"))
+        self.assertEqual(answer["report"]["train"], {"items": [1, 2]})
+
+    def test_a_pass_with_no_report_leaves_no_receipt(self) -> None:
+        answer = sd_lane.default_cover(pathlib.Path("/repo"), "h2", "b1", {"status": "success"})
+        self.assertEqual(sd_lane.receipt_of(answer), "the train gate left no report")
 
 
 class DepthTwo(Trees):

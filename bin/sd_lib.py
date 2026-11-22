@@ -155,6 +155,10 @@ CORE_CONFIG = {
                       "description": "How many lanes one hosted lane run runs at once on this machine, 1 to 8. "
                                      "Unset reads 5 (sd:9323); the gate's slots and load limit still hold lanes "
                                      "back below it. It grants nothing."},
+    "lane_train": {"pattern": "[1-9]",
+                   "description": "How many queued entries of one repository one lane run gates at once as a "
+                                  "stack, 1 to 9; 1 gates each entry alone. Unset reads 3 (sd:9899). It grants "
+                                  "nothing."},
     "review_slots": {"pattern": "[0-9]+",
                      "description": "How many reviews may run their reviewers at once on this machine; 0 is no cap. "
                                     "Unset reads 2; SD_REVIEW_SLOTS overrides it for one run."},
