@@ -1099,7 +1099,7 @@ def snapshot(where: pathlib.Path, slots: int, rule: LoadRule, *,
         load = [round(float(value), 2) for value in tuple(loadavg())[:3]]
     except OSError:
         load = []
-    share = steady_busy(where, busy(), wall()) if where.is_dir() else None
+    share = steady_busy(where, busy(), wall())  # creates `where`: status alone must build CPU rows
     last = state.get("last_admitted")
     return {"directory": str(where), "slots": slots, "holders": holders, "waiters": waiters, "lane_gates": lanes,
             "load": load, "cpu_busy": None if share is None else round(share, 3),

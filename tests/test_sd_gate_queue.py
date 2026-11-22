@@ -535,6 +535,16 @@ class LoadRule(unittest.TestCase):
             self.assertIsNone(REAL_CPU_TICKS())
         sd_gate_slots.host_port.cache_clear()
 
+    def test_status_on_a_fresh_machine_records_cpu_history(self):
+        """Review blocker: builders read gate status, which skipped the CPU rows with no gate directory."""
+        fresh = self.where / "fresh" / "gate-slots"
+        for seconds in (0, 60):
+            self.cpu.run(seconds, 0.5)
+            report = sd_gate_slots.snapshot(fresh, 1, sd_gate_slots.LoadRule(24.0, 0.0, "test"),
+                                            loadavg=lambda: (300.0, 300.0, 300.0), busy=lambda: 0.5,
+                                            wall=self.wall)
+        self.assertEqual(report["load_counted"], round(0.5 * (os.cpu_count() or 1), 2))
+
     def test_status_reports_the_counted_load(self):
         for seconds in (0, 60):
             self.cpu.run(seconds, 0.5)
