@@ -680,6 +680,8 @@ The reserved `sd` namespace declares these settings:
   less (sd:9109). It grants nothing.
 - `sd.lane_parallel`: how many lanes one hosted lane run runs at once on this machine, 1 to 8. Absence reads 5
   (sd:9323); the gate's slots and load limit still hold lanes back below it. It grants nothing.
+- `sd.lane_train`: how many queued entries of one repository one lane run gates at once as a stack, 1 to 9;
+  1 gates each entry alone. Absence reads 3 (sd:9899). It grants nothing.
 - `sd.machine_cap`: how many code-writing builders, drafts and interactive builders may run at once on this
   machine, 1 to 16. Absence reads 6 (sd:8158, sd:9891); the load guard still holds builds back. It grants nothing.
 - `sd.repo_cap`: how many build bundles may build at once in one repository when this machine claims them,
