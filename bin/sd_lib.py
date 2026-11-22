@@ -4315,20 +4315,36 @@ def fill_slots(items: Any, slots: int, run: Callable[[Any], Any], counted: Calla
     return [answers[index] for index in sorted(answers)]
 
 
+#: What makes `evidence` a repro (sd:9869 review), one copy for the gate
+#: and for `distinct_findings`: something a reader can run or check. A command or path
+#: (`path:line`, a file with an extension, a backticked span, `$ cmd`) or a failure's output (an error name,
+#: a traceback, an exit status, "failed", "expected ... got", a comparison); "See summary" names none.
+_REPRO = re.compile(r"[\w./-]+:\d+|\b[\w./-]+\.[A-Za-z]\w{0,4}\b|`[^`\n]+`|\$ \S|\b\w*(?:Error|Exception)\b"
+                   r"|Traceback|\bexit(?:ed)?(?: with)?(?: code| status)? \d+|\bfail(?:s|ed|ure|ing)?\b"
+                   r"|\bexpected\b.*\bgot\b|[!=]=", re.IGNORECASE)
+
+
+def reproduces(evidence: Any) -> bool:
+    """Whether a finding's `evidence` names a repro (`_REPRO`); a non-string names none."""
+    return isinstance(evidence, str) and bool(_REPRO.search(evidence))
+
+
 def distinct_findings(findings: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """sd:7519. Each finding once: one two readers both report keeps the first reader's `backend`.
 
     Identical means every key but `backend` and `evidence` is equal: two readers cite
     their checks in their own words (pack sd:9270). Adjudication takes a row per
     blocking finding, so a copy was a second row to dispute. The kept row takes
-    the first evidence any copy gives, so a bare first copy does not lose a cited one.
+    the first evidence any copy gives, so a bare first copy does not lose a cited one,
+    and the first that `reproduces`, so a vague first copy does not lose a repro (sd:9869).
     """
     seen: dict[str, dict[str, Any]] = {}
     for finding in findings:
         key = json.dumps({name: value for name, value in finding.items() if name not in ("backend", "evidence")},
                          sort_keys=True, default=str)
         kept = seen.setdefault(key, dict(finding))
-        if not kept.get("evidence") and finding.get("evidence"):
+        if (finding.get("evidence") and not kept.get("evidence")
+                or reproduces(finding.get("evidence")) and not reproduces(kept.get("evidence"))):
             kept["evidence"] = finding["evidence"]
     return list(seen.values())
 

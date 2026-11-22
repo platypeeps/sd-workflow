@@ -284,6 +284,19 @@ class ReproRuleTests(unittest.TestCase):
                 [record] = sd_review.dispose([finding(evidence)], "high", repro=True)
                 self.assertEqual(record["disposition"], "blocking")
 
+    def test_a_duplicate_that_reproduces_keeps_the_finding_blocking(self) -> None:
+        """sd:9869 review: two readers gave one finding, the first with "See summary", the second with a repro;
+        deduplication kept the first's evidence, and the gate posted it as advisory."""
+        for first, second in (("See summary", "expected 1, got 2"), ("", "expected 1, got 2"),
+                              ("expected 1, got 2", "See summary")):
+            with self.subTest(first=first, second=second):
+                result = {"severity_floor": "high", "requested_reviews": 2}
+                answers = [sd_review.Outcome(name, sd_review.FINDINGS, (finding(evidence),), "", (), ())
+                           for name, evidence in (("one", first), ("two", second))]
+                sd_review.finish_review(result, answers, ["one", "two"], repro=True)
+                self.assertEqual(result["status"], "blocking")
+                self.assertEqual([row["evidence"] for row in result["findings"]], ["expected 1, got 2"])
+
     def test_a_reproduced_break_in_an_unchanged_caller_blocks(self) -> None:
         [record] = sd_review.dispose([finding("python3 reader.py: KeyError 'state'", path="reader.py")], "high",
                                      repro=True)
