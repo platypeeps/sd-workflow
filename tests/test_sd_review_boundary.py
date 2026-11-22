@@ -1003,11 +1003,16 @@ class LineBudgetTests(unittest.TestCase):
         # for `reads_checkout`, the one fact that sets the launch directory
         # and lets a reader cite the head's files, and the planning rule.
         # Measured: `sd-review` is 2882 here.
+        #
+        # 4852 -> 4860 is sd:9867: `bin/sd-review` +8 for `EVIDENCE_ASK`,
+        # `NO_REPRO_NOTE` and the `repro` flag through `finish_review` to
+        # `dispose`, after trimming the docstrings. Measured: `sd-review`
+        # is 2890 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4852,
+            4860,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

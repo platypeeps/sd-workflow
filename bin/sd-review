@@ -121,11 +121,9 @@ OPTIONAL_FINDING_KEYS = frozenset({"evidence"})
 #: The most of one finding's evidence a report keeps, and the note an uncited repeat of a rebuttal gets (pack sd:9270).
 EVIDENCE_CHARS = 1000
 REPEAT_NOTE = "[downgraded: repeats a rebutted finding, no evidence cited]"
-#: What a reader puts in `evidence` (pack sd:9867, amended by note #70162): a code finding without a repro blocks nothing.
-EVIDENCE_ASK = ("the command or input you ran and what it gave (an error, exit status or wrong output), "
-                "showing a failure this change causes, in code it touched or an unchanged caller it breaks; "
-                "a code finding without one blocks nothing.")
-#: The note a finding at the floor gets when it cites no repro and so does not block (pack sd:9867).
+#: What a reader puts in `evidence`, and the note a finding without it gets (pack sd:9867, note #70162).
+EVIDENCE_ASK = ("input or command you ran and its result, showing a failure this change causes in code "
+                "it touched or a caller it breaks; a code finding without one blocks nothing.")
 NO_REPRO_NOTE = "[advisory: no failing input or command cited]"
 CODEX_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -1750,12 +1748,9 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
             rebutted: Sequence[Rebuttal] = (), *, repro: bool = False) -> list[dict[str, Any]]:
     """Label each finding `blocking` or `advisory` against the policy floor.
 
-    Operator ruling on pack sd:9270: a repeat of a finding already rebutted on this branch (`recorded_at`)
-    without evidence posts as advisory, its summary saying why. Operator ruling on pack sd:9867 (amended by
-    note #70162): with `repro`, a finding at the floor blocks only when it cites `evidence`; any other posts as
-    advisory, its summary saying why, for the lead to file. The gate reads whether evidence was given, not what
-    it says: a pattern over its prose downgraded real repros (sd:9869); the lead rebuts one that does not reproduce. The lane's own blockers (`LANE_PATHS`) need none.
-    A planning review passes no `repro` and keeps the floor alone. The lane runs this through `sd-review` too.
+    A finding at the floor posts as advisory, its summary saying why, when it cites no `evidence` and repeats
+    one rebutted on this branch (pack sd:9270), or, with `repro`, outside the lane's own `LANE_PATHS` (pack
+    sd:9867, note #70162). Only that evidence exists is read: the lead rebuts one that does not reproduce.
     """
 
     threshold = BLOCKING_ORDER[floor]
@@ -1766,14 +1761,11 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
         record = dict(finding)
         blocking = rank > 0 and rank >= threshold
         evidence = record.get("evidence")
-        cited = isinstance(evidence, str) and bool(evidence.strip())
-        path = str(record.get("path") or "").strip()
         note = None
-        if blocking and not cited and getattr(recorded_at(rebutted, record.get("path"), record.get("summary"),
-                                                          record.get("line")), "listed", False):
-            note = REPEAT_NOTE
-        elif blocking and repro and not cited and path not in LANE_PATHS:
-            note = NO_REPRO_NOTE
+        if blocking and not (isinstance(evidence, str) and evidence.strip()):
+            repeat = recorded_at(rebutted, record.get("path"), record.get("summary"), record.get("line"))
+            note = REPEAT_NOTE if getattr(repeat, "listed", False) else NO_REPRO_NOTE if repro and str(
+                record.get("path") or "").strip() not in LANE_PATHS else None
         if note:
             blocking = False
             record["summary"] = f"{str(record.get('summary') or '').strip()} {note}".strip()
@@ -2413,7 +2405,6 @@ def review(
         result["codex_skill_suppression"] = next((row for row in measures if row["state"] != SKILLS_SUPPRESSED), measures[-1]) if measures else skills
         outcomes = [outcome for _measured, attempts in answers for outcome in attempts]
         outcomes = [row._replace(status=FINDINGS if row.findings else CLEAN) if (row.diagnostic or {}).get("coverage") == "partial" and set(row.diagnostic["omitted_paths"]) <= {path["path"] for path in input_manifest.get("paths", ()) if path.get("media")} and any(other.status in (CLEAN, FINDINGS) for other in outcomes) else row for row in outcomes]
-        # pack sd:9867: a code finding blocks only with a repro; a plan has none to give.
         finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)],
                       rebutted, subject.scope != "planning")
     finally:
@@ -2586,9 +2577,7 @@ def partial(outcome: Outcome, unread: Sequence[str]) -> Outcome:
 
 def finish_review(result: dict[str, Any], outcomes: Sequence[Outcome], reviewed: list[str],
                   rebutted: Sequence[Rebuttal] = (), repro: bool = False) -> dict[str, Any]:
-    """Keep every distinct finding, once; only complete answers count toward required depth.
-
-    `repro` is `dispose`'s: a blocking finding must cite a failing input or command (pack sd:9867)."""
+    """Keep every distinct finding, once; only complete answers count toward required depth."""
     collected = sd_lib.distinct_findings(dict(finding, backend=outcome.backend) for outcome in outcomes for finding in outcome.findings)
     disposed = dispose(collected, result["severity_floor"], rebutted, repro=repro)
     incomplete = len(reviewed) < result["requested_reviews"]
