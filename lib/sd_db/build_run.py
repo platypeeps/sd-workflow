@@ -1386,7 +1386,10 @@ class Supervisor:
                     or not isinstance(answer.get("findings"), list)
                     # A round short of a reader read part of the patch: its delta proves nothing (sd:9769).
                     or not 1 <= int(answer.get("requested_reviews") or 0) <= int(answer.get("completed_reviews") or 0)
-                    or answer.get("review_shortfall")):
+                    or answer.get("review_shortfall")
+                    # A round that covers no branch (patch-only, another binding): a delta since it leaves the
+                    # earlier commits unreviewed (sd:9769).
+                    or not answer.get("covers_from")):
                 if path == last:
                     return None
                 continue

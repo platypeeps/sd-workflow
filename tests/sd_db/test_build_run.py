@@ -1341,6 +1341,21 @@ class Supervise(Case):
                     mock.patch.object(build_run, "_read", return_value=""):
                 self.assertIsNone(supervisor.prior_review("a" * 40), "a short blocking round seeded a delta review")
 
+    def test_a_round_covering_no_branch_is_no_prior_to_verify(self):
+        """Class pass, sd:9769: a last round with no `covers_from` (patch-only, or under another binding) stands
+        for no branch; a delta since it would leave the earlier commits unreviewed, so the next round is full."""
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        for status in ("blocking", "clean"):
+            supervisor.out("prior").write_text("", encoding="utf-8")
+            supervisor.out("review").write_text(json.dumps(
+                {**self.PRIOR, "covers_from": None, "status": status, "scope": "branch", "subject": {"head": "b" * 40}}),
+                encoding="utf-8")
+            with self.subTest(status=status), mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
+                    mock.patch.object(build_run, "_read", return_value=""):
+                self.assertIsNone(supervisor.prior_review("a" * 40), "a round covering no branch seeded a delta review")
+
     def test_a_skipped_last_round_is_no_prior_to_verify(self):
         """Review of sd:9769: `sd-review` refuses a `skipped` report as `--verify-report`; the next round
         reviews in full instead of parking on that refusal twice."""
@@ -1385,7 +1400,7 @@ class Supervise(Case):
                 self.assertIsNone(supervisor.prior_review("a" * 40), f"{path} was handed to --verify-report")
         supervisor.out("review").write_text(json.dumps(
             {"status": "blocking", "scope": "branch", "subject": {"head": "b" * 40},
-             "requested_reviews": 1, "completed_reviews": 1,
+             "requested_reviews": 1, "completed_reviews": 1, "covers_from": "c" * 40,
              "findings": [{"path": "src.py", "line": 1, "disposition": "blocking"}]}), encoding="utf-8")
         with mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
                 mock.patch.object(build_run, "_read", return_value="100644 blob 0123\tsrc.py\0"):
