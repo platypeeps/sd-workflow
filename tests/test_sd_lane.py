@@ -1842,6 +1842,35 @@ class Train(Trees):
         self.assertEqual(self.gates, [])
         self.assertIn("budget", self.entries()[1]["speculation"]["reason"])
 
+    def launch_past_deadline(self) -> list[dict]:
+        """Run the lane on a fake clock that passes the deadline as the first gate thread starts, after its setup."""
+        now = [sd_lane.clock()]
+        deadline = now[0] + 100
+        start = sd_lane.SpeculativeGate.start
+
+        def late(thread: sd_lane.SpeculativeGate) -> None:
+            now[0] = max(now[0], deadline + 1)
+            start(thread)
+        self.queue_three()
+        with mock.patch.object(sd_lane, "clock", lambda: now[0]), \
+                mock.patch.object(sd_lane.SpeculativeGate, "start", late):
+            sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate, deadline=deadline)
+        self.assertEqual((self.trains, self.gates), ([], []))
+        return self.entries()
+
+    def test_a_train_launched_past_the_deadline_runs_no_gate(self) -> None:
+        """Review of sd:9899: a train set up in time but launched past the deadline still ran its gate."""
+        entries = self.launch_past_deadline()
+        self.assertEqual(entries[2]["train"]["status"], "skipped")
+        self.assertIn("budget", entries[2]["train"]["reason"])
+
+    def test_a_speculation_launched_past_the_deadline_runs_no_gate(self) -> None:
+        """Review of sd:9899: with no train, sd:2's gate set up in time but launched past the deadline ran."""
+        with mock.patch.object(sd_lane, "TRAIN", 1):
+            entries = self.launch_past_deadline()
+        self.assertEqual(entries[1]["speculation"]["status"], "skipped")
+        self.assertIn("budget", entries[1]["speculation"]["reason"])
+
     def test_the_stack_is_built_before_the_train_thread_starts(self) -> None:
         """Review of sd:9899: git work inside the thread ran on past a TERM or the deadline."""
         built: list[str] = []

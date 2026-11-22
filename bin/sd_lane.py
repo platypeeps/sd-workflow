@@ -2218,9 +2218,10 @@ class SpeculativeGate(threading.Thread):
     """
 
     def __init__(self, target: Callable[[], None], name: str, follower: tuple[str, str] = ("", ""),
-                 chain: tuple[str, ...] = ()) -> None:
+                 chain: tuple[str, ...] = (), deadline: float = math.inf) -> None:
         super().__init__(target=target, name=name)
         self.follower, self.chain = follower, chain  # the gated entry's (id, head); the ids predicted to land first
+        self.deadline = deadline  # read as the gate launches: one past it runs none (sd:9899)
         self.why = "the run stopped, so it ended this gate (sd:3361)"
         self.cancelled = False
         self.group: int | None = None
@@ -2482,6 +2483,9 @@ def speculate_one(chain: list[dict[str, Any]], following: dict[str, Any], queue:
     record_speculation({"status": "running", **plan, "log": str(log), "log_host": this_host()})
 
     def run_gate() -> None:
+        if clock() >= thread.deadline:  # setup ended in time, but the launch came late
+            record_speculation({"status": "skipped", "reason": OUT_OF_BUDGET})
+            return
         try:
             result = gate(pathlib.Path(following["worktree"]), plan["head"], plan["base"])
             fields = {"status": result.get("status"), "summary": str(result.get("summary"))[:300],
@@ -2495,7 +2499,8 @@ def speculate_one(chain: list[dict[str, Any]], following: dict[str, Any], queue:
         log.write_text(json.dumps(result, indent=2, sort_keys=True, default=str) + "\n", encoding="utf-8")
         record_speculation({**plan, "log": str(log), "log_host": this_host(), **fields})
     thread = SpeculativeGate(run_gate, f"sd-lane-speculate-{following['item']}",
-                             (following["id"], following["expected_head"]), tuple(row["id"] for row in chain))
+                             (following["id"], following["expected_head"]), tuple(row["id"] for row in chain),
+                             deadline)
     return [thread]
 
 
@@ -2633,6 +2638,8 @@ def gate_top(top: dict[str, Any], gate: Gate, thread: SpeculativeGate) -> dict[s
     record = {"after": list(thread.chain), "head": top["head"], "base": top["base"]}
     if thread.cancelled:
         return {**record, "status": "cancelled", "reason": thread.why}
+    if clock() >= thread.deadline:  # setup ended in time, but the launch came late
+        return {**record, "status": "skipped", "reason": OUT_OF_BUDGET}
     try:
         result = gate(pathlib.Path(top["row"]["worktree"]), top["head"], top["base"])
     except Exception as error:  # a gate that cannot run gates nothing; the top's prepare gates it
@@ -2696,7 +2703,7 @@ def start_train(entry: dict[str, Any], queue: Queue, gate: Gate, environ: dict[s
     items = [row["item"] for row in members]
     thread = SpeculativeGate(lambda: mark_train(queue, {top["row"]["id"]: gate_top(top, gate, thread)}, items),
                              f"sd-lane-train-{entry['item']}", (top["row"]["id"], top["row"]["expected_head"]),
-                             top["below"])
+                             top["below"], deadline)
     return thread
 
 

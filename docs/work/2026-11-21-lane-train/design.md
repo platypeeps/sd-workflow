@@ -95,6 +95,7 @@ together, which needs one push of main (below).
 | 1-2 read, fetch | none | the members' read crosses the deadline | no fetch, no train | test_a_train_whose_queue_read_crosses_the_deadline_fetches_nothing |
 | speculation setup | none | the queue read or a prediction crosses the deadline | no further prediction or scratch worktree | test_a_speculation_whose_queue_read_crosses_the_deadline_predicts_nothing, test_a_prediction_that_crosses_the_deadline_starts_no_further_setup |
 | speculation setup | none | the deadline passes | no speculative gate | test_a_speculation_whose_fetch_crosses_the_deadline_starts_no_gate |
+| launch | none | setup ends in time; the thread starts past the deadline | no gate; marked skipped | test_a_train_launched_past_the_deadline_runs_no_gate, test_a_speculation_launched_past_the_deadline_runs_no_gate |
 | 5 lower member | its own receipt | A fails alone, A+B passes | A gates its own tree | test_the_top_is_gated_on_the_landings_below_it_and_nothing_twice |
 | config | none | sd.lane_train invalid | reads 3 | test_lane_train_reads_the_machine_setting |
 ```
