@@ -1019,11 +1019,16 @@ class LineBudgetTests(unittest.TestCase):
         # +11 so `prior_evidence` matches the finding (line or summary)
         # and its file in any accepted spelling. Measured: `sd-review` is
         # 2912 here.
+        #
+        # 4882 -> 4886 is the build/sd-1423 review after: `bin/sd-review`
+        # +4 so the rebuttal check runs before `prior_evidence`, and a
+        # prior blocker that stored no evidence still blocks. Measured:
+        # `sd-review` is 2916 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4882,
+            4886,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

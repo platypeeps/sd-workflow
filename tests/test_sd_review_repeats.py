@@ -342,6 +342,22 @@ class ReproRuleTests(unittest.TestCase):
         [record] = sd_review.dispose([finding()], "high", rebutted, repro=True)
         self.assertEqual((record["disposition"], record["summary"]), ("advisory", f"defect {sd_review.REPEAT_NOTE}"))
 
+    def test_a_repeat_of_a_prior_blocker_without_stored_evidence_still_blocks(self) -> None:
+        """build/sd-1423 review: a report from before sd:9867 stored no evidence, so the verifier's uncited
+        repeat found none to keep and cleared the unresolved blocker; a resumed review did the same."""
+        prior = [dict(finding(), disposition="blocking"), dict(finding(path="b.py"), disposition="advisory")]
+        disposed = sd_review.dispose([finding(), finding(path="b.py")], "high", repro=True, prior=prior)
+        self.assertEqual([row["disposition"] for row in disposed], ["blocking", "advisory"])
+
+    def test_an_uncited_repeat_of_a_rebutted_prior_blocker_stays_rebutted(self) -> None:
+        """build/sd-1423 review: the prior report's repro was copied on before the rebuttal check, so a repeat
+        of a blocker the lead rebutted blocked again on every verification pass."""
+        rebutted = listed(adjudicated(("src.py", "defect", "rebutted")))
+        prior = [dict(finding(REPRO), disposition="blocking")]
+        [record] = sd_review.dispose([finding()], "high", rebutted, repro=True, prior=prior)
+        self.assertEqual((record["disposition"], record["summary"], record.get("evidence")),
+                         ("advisory", f"defect {sd_review.REPEAT_NOTE}", None))
+
     def test_the_lanes_own_blockers_need_no_repro(self) -> None:
         parsed = sd_review.oversized_findings()
         assert parsed is not None
