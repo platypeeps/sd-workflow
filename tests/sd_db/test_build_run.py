@@ -1503,7 +1503,7 @@ class Supervise(Case):
         enclosing functions call nothing changed unless `callees` reads them from git."""
         supervisor = self.supervisor()
         with mock.patch.object(supervisor, "branch_delta", return_value=changed), \
-                (contextlib.nullcontext() if callees else mock.patch.object(supervisor, "enclosing", return_value=set())), \
+                (contextlib.nullcontext() if callees else mock.patch.object(supervisor, "scope", return_value=(set(), []))), \
                 mock.patch.object(supervisor, "branch_words",
                                   return_value=None if words is None else (set(words), set(defined))):
             return supervisor, supervisor.file_new_findings({"status": "blocking", "blockers": blockers}, self.PRIOR,
@@ -1624,6 +1624,37 @@ class Supervise(Case):
                 mock.patch.object(build_run, "_grep", side_effect=lost):
             _, kept = self.deferred([far], {"src/caller.py": {12}}, {"wrap"}, {"export"}, callees=True)
         self.assertEqual(kept["blockers"], [far], "a caller search git could not answer deferred its blocker")
+
+    def test_a_blocker_in_an_unchanged_consumer_of_a_changed_function_still_blocks(self):
+        """Review of sd:9769: a fix makes `lookup()` return None; the unchanged consumer at `lookup().name`
+        crashes, directly or through an unchanged helper, and a finding naming only the failing input is in
+        scope through what the consumer calls."""
+        self.press()
+        head = "a" * 40
+        files = {"lib/consume.py": "def show_name(key):\n    return lookup(key).name\n\n\n"
+                                   "def label(key):\n    return middle(key).name\n\n\ndef plain():\n    return 1\n",
+                 "lib/mid.py": "def middle(key):\n    return lookup(key)\n"}
+
+        def show(argv, **_kwargs):
+            path = argv[-1].removeprefix(f"{head}:")
+            if "show" in argv and path in files:
+                return files[path]
+            raise build_run.Unread("no such file")
+
+        def grep(argv, **_kwargs):
+            name = argv[argv.index("-e") + 1]
+            return "".join(f"{head}:{path}\0{number}\0{text}\n" for path, body in files.items()
+                           for number, text in enumerate(body.splitlines(), 1)
+                           if re.search(rf"\b{re.escape(name)}\b", text))
+
+        rows = [{"path": "lib/consume.py", "line": 2, "summary": "a missing key crashes here"},
+                {"path": "lib/consume.py", "line": 6, "summary": "a missing key crashes here"}]
+        far = {"path": "lib/consume.py", "line": 10, "summary": "an old defect"}
+        with mock.patch.object(build_run, "_read", side_effect=show), \
+                mock.patch.object(build_run, "_grep", side_effect=grep):
+            _, kept = self.deferred([*rows, far], {"lib/store.py": {3}}, {"lookup", "key", "None"},
+                                    {"lookup", "None"}, callees=True)
+        self.assertEqual(kept["blockers"], rows, "a blocker in a consumer of the changed function was deferred")
 
     def test_a_short_function_name_still_names_the_changed_caller(self):
         """Review of sd:9769: `go()` names a changed function; no length filter drops it."""
@@ -1845,7 +1876,7 @@ class Supervise(Case):
         answer = {"status": "blocking", "blockers": rows}
         with mock.patch.object(supervisor, "branch_delta", return_value={}), \
                 mock.patch.object(supervisor, "branch_words", return_value=(set(), set())), \
-                mock.patch.object(supervisor, "enclosing", return_value=set()), \
+                mock.patch.object(supervisor, "scope", return_value=(set(), [])), \
                 mock.patch.object(supervisor, "file_follow_up", committed_then_lost):
             with self.assertRaises(remote.UnknownOutcome):
                 supervisor.file_new_findings(answer, self.PRIOR, "a" * 40)

@@ -1580,7 +1580,10 @@ class Supervisor:
             # A place inside a function the changed code calls, directly or through unchanged ones: a changed
             # caller can break an unchanged callee (a crash on an empty value) whatever the finding's words
             # name, so its path defers nothing.
-            if any(self.called_from(path, line, head, sources, functions[0]) for path, line in self.locations(row)):
+            # Or a place whose function calls a changed one, directly or through unchanged ones: a fix that makes
+            # `lookup()` return None breaks the unchanged consumer at `lookup().name`.
+            if any(self.called_from(path, line, head, sources, functions[0])
+                   or self.calls_into(path, line, head, sources, functions[1]) for path, line in self.locations(row)):
                 return True
             # A name with a space or other character no word holds (`bin/my tool`), found literally and whole.
             return any(re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w/-]|\.\w)", words)
@@ -1603,29 +1606,77 @@ class Supervisor:
             seen |= frontier
             callers: set[str] = set()
             for name in sorted(frontier):
-                try:  # `head:path\0line\0text` per line that names `name`, as a whole word
-                    hits = _grep([*self.tools.git, "-C", str(self.work), "grep", "-n", "-z", "-w", "-I", "-e", name,
-                                  head, "--"], env=self.env).split("\n")
-                except Unread:
+                hits = self.naming(name, head)
+                if hits is None:
                     return True
-                if len(hits) > CALL_HITS + 1:
-                    return True
-                for hit in filter(None, hits):  # `split`, not `splitlines`: a form feed is no line end
-                    place, number, _text = (hit.split("\0", 2) + ["", ""])[:3]
-                    if not place.startswith(f"{head}:") or not number.isascii() or not number.isdigit():
-                        return True
-                    names = self.enclosing(place[len(head) + 1:], int(number), head, sources)
+                for place, number, _text in hits:
+                    names = self.enclosing(place, number, head, sources)
                     if names is None:
                         return True
                     callers |= names
             frontier = callers
         return True
 
+    def calls_into(self, path: str, line: int | None, head: str, sources: dict[str, list[str] | None],
+                   defined: set[str]) -> bool:
+        """Whether the function around `path:line` calls one the change `defined`, or reaches one through
+        `CALL_DEPTH` unchanged functions it calls at `head`; an answer git cannot give, or a search past its
+        bounds, counts as calling (pack sd:9769).
+        ponytail: a call is any `name(`, so a keyword before a parenthesis (`return (x)`) holds more."""
+        places: list[tuple[str, int | None]] = [(path, line)]
+        seen: set[str] = set()
+        for _depth in range(CALL_DEPTH):
+            called: set[str] = set()
+            for place, number in places:
+                if (found := self.scope(place, number, head, sources)) is None:
+                    return True
+                called |= set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", "\n".join(found[1])))
+            if called & defined:
+                return True
+            called -= seen
+            if not called:
+                return False
+            seen |= called
+            if len(seen) > CALL_HITS:
+                return True
+            places = []
+            for name in sorted(called):
+                hits = self.naming(name, head)
+                if hits is None:
+                    return True
+                places += [(place, number) for place, number, text in hits if name in defined_names(text)]
+        return True
+
+    def naming(self, name: str, head: str) -> list[tuple[str, int, str]] | None:
+        """Each `(path, line, text)` at `head` that names `name` as a whole word; None when git cannot say
+        or past `CALL_HITS` lines (pack sd:9769)."""
+        try:  # `head:path\0line\0text` per line
+            hits = _grep([*self.tools.git, "-C", str(self.work), "grep", "-n", "-z", "-w", "-I", "-e", name,
+                          head, "--"], env=self.env).split("\n")
+        except Unread:
+            return None
+        if len(hits) > CALL_HITS + 1:
+            return None
+        found = []
+        for hit in filter(None, hits):  # `split`, not `splitlines`: a form feed is no line end
+            place, number, text = (hit.split("\0", 2) + ["", ""])[:3]
+            if not place.startswith(f"{head}:") or not number.isascii() or not number.isdigit():
+                return None
+            found.append((place[len(head) + 1:], int(number), text))
+        return found
+
     def enclosing(self, path: str, line: int | None, head: str,
                   sources: dict[str, list[str] | None]) -> set[str] | None:
         """The names the function around `path:line` at `head` defines, or every name the file defines when the
         place has no line; none for a file `head` does not hold; None when git cannot say (lead ruling on pack
         sd:9769)."""
+        found = self.scope(path, line, head, sources)
+        return None if found is None else found[0]
+
+    def scope(self, path: str, line: int | None, head: str,
+              sources: dict[str, list[str] | None]) -> tuple[set[str], list[str]] | None:
+        """`enclosing`'s names and the lines of that function: from its definition to the next line indented no
+        deeper; the whole file for a place with no line, the cited line alone outside any function."""
         if path not in sources:
             try:
                 sources[path] = _read([*self.tools.git, "-C", str(self.work), "show", f"{head}:{path}"],
@@ -1640,11 +1691,14 @@ class Supervisor:
         if (lines := sources[path]) is None:
             return None
         if line is None:
-            return {name for text in lines for name in defined_names(text)}
-        for text in reversed(lines[:line]):
-            if names := defined_names(text):
-                return names
-        return set()
+            return {name for text in lines for name in defined_names(text)}, lines
+        for start in range(min(line, len(lines)) - 1, -1, -1):
+            if names := defined_names(lines[start]):
+                depth = len(lines[start]) - len(lines[start].lstrip())
+                end = next((index for index in range(start + 1, len(lines)) if lines[index].strip()
+                            and len(lines[index]) - len(lines[index].lstrip()) <= depth), len(lines))
+                return names, lines[start:end]
+        return set(), lines[max(line - 1, 0):line]
 
     def branch_words(self, head: str) -> tuple[set[str], set[str]] | None:
         """`function_words` of the branch from its fork: its identifiers and defined names; None when unread
