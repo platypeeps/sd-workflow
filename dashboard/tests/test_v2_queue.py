@@ -2053,6 +2053,50 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
             self.assertNotIn('data-run="r1"', html)
             self.assertIn('data-pr="7"', html)
 
+    def test_a_retryable_ended_build_keeps_its_row_beside_its_items_pr_wait(self):
+        """sd:9761 review: a blocked review-fix build whose item waits on its PR lost its Retry and Send to builder,
+        which the PR row does not offer; an ended build with those controls keeps its row."""
+        pr = {"item": 50, "title": "Fifty", "repo": "/repos/gamma", "url": "https://github.com/example/gamma/pull/50",
+              "lane": "awaiting_them", "on": "reviewers", "since": NOW, "waited": 60}
+        doc = queue_screen.document(self.connection, now=NOW)
+        doc["prs"] = {"error": "", "rows": [pr]}
+        out = self.run_view("open('gamma'); R.html = ELS.queue.html;", search="?show=ended",
+                            answers={"/api/queue": [200, doc]})
+        self.assertIn('data-pr="50"', out["R"]["html"])
+        self.assertIn('data-build="retry" data-run="r0"', out["R"]["html"])
+        self.assertIn('data-build="send" data-run="r0"', out["R"]["html"])
+
+    def test_an_item_with_an_open_lane_entry_is_one_row_with_every_filter_on(self):
+        """sd:9761: a handed-back cancelled entry, a failed one, the ended run and the open task drew 9748 twice."""
+        from sd_dashboard import tasks_screen
+        from sd_db import workflow
+        n = self.item("Stamp the files", kind="task", priority=3, repo=str(self.checkout))
+        workflow.change_status(self.connection, n, "in_progress", who="test", reason="test")
+        base = {"item": n, "title": "Stamp the files", "head": "abc1234", "expected_head": "abc1234" * 4,
+                "finished": NOW}
+        failed = {**base, "state": "blocked", "status": "failed", "step": "prepare", "reason": "review blocking",
+                  "who": "builder", "unchanged": True, "failure": None, "log": None, "branch": "build/sd-1"}
+        back = {**base, "state": "cancelled", "reason": "handed back to its builder by Fix"}
+        doc = queue_screen.document(self.connection, now=NOW)
+        doc["lanes"] = [*doc["lanes"], {"path": str(self.checkout), "key": str(self.checkout), "repo": "system",
+                                        "lane": "serial", "host": "hub", "runner_merge": "auto",
+                                        "rows": [failed, back]}]
+        ended = {**self.BUILDS["recent"][0], "run": "r9", "repo": str(self.checkout), "outcome": "done",
+                 "items": [{"item": n, "assignment": 9, "status": "done", "title": "Stamp the files"}],
+                 "retry": {**self.BUILDS["recent"][0]["retry"], "bundle": None}}
+        entry = f"entry:{self.checkout}:{n}"
+        out = self.run_view("open('system'); R.html = ELS.queue.html;"
+                            " act('button[data-entry]', { entry: " + json.dumps(entry) + " }); R.details = ELS.details.html;",
+                            search="?show=suggested,open,ended",
+                            answers={"/api/queue": [200, doc],
+                                     "/api/queue/builds?show=all": [200, {**self.BUILDS, "recent": [ended]}],
+                                     "/api/tasks": [200, tasks_screen.document(self.connection, now=NOW)]})
+        rows = re.findall(rf'<tr class="child"[^>]*>(?:(?!</tr>).)*#{n} Stamp the files', out["R"]["html"], re.S)
+        self.assertEqual(len(rows), 1, rows)
+        self.assertIn('data-type="blocked"', rows[0])
+        # Review of sd:9761: the hidden cancelled entry shares the drawn one's id; its Details must not replace it.
+        self.assertIn("Lane entry · blocked", out["R"]["details"])
+
     def test_a_run_not_in_the_lane_keeps_its_row_beside_its_items_pr_wait(self):
         """sd:9022 review: a builder fixing an open PR's review is working, not waiting; its row and Cancel stay."""
         lanes = queue_screen.document(self.connection, now=NOW)

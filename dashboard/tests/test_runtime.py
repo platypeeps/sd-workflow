@@ -1151,7 +1151,7 @@ class HealthWait(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="dashboard-none-") as home, \
                 patch.object(sys, "argv", ["runtime", "health", "--config", f"{home}/missing.json"]), \
                 patch.object(runtime, "health_check") as health, patch("sys.stderr"):
-            self.assertEqual(runtime.main(), 1)
+            self.assertEqual(runtime.main(), 3)  # sd:9920: no dashboard at that path
             health.assert_not_called()
 
     def test_no_wait_tries_once(self):
@@ -1210,6 +1210,24 @@ class ServedCommit(unittest.TestCase):
         code, _, err = self.health("a" * 40, "a" * 40, b"not a plist")
         self.assertEqual(code, 1)
         self.assertIn("does not read", err)
+
+    def test_no_config_exits_3_naming_no_dashboard_not_errno(self):
+        """sd:9920: a machine with no dashboard.json says so, exit 3, not an Errno 2 line."""
+        temporary = tempfile.TemporaryDirectory(prefix="dashboard-none-")
+        self.addCleanup(temporary.cleanup)
+        missing = Path(temporary.name) / "dashboard.json"
+        for target in (missing, Path(temporary.name) / "link.json"):
+            if target.name == "link.json":
+                target.symlink_to(missing)
+            err = io.StringIO()
+            with patch.object(sys, "argv", ["runtime", "health", "--config", str(target)]), \
+                    patch.object(runtime, "health_check") as probe, \
+                    patch("sys.stdout", io.StringIO()), patch("sys.stderr", err):
+                code = runtime.main()
+            self.assertEqual(code, 3)
+            self.assertIn("no dashboard on this machine", err.getvalue())
+            self.assertNotIn("Errno", err.getvalue())
+            probe.assert_not_called()
 
     def test_the_checkout_commit_passes_and_is_shown(self):
         code, out, err = self.health("a" * 40, "a" * 40)

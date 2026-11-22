@@ -283,7 +283,8 @@ usage: dashboard.sh tile <tab> | serve | preflight | install | health | grants |
                    the checkout's HEAD, naming the kickstart line, or when
                    the installed LaunchAgent's PATH no longer finds sd.
                    With no --config and no default config (a satellite),
-                   prints status not_configured and exits 0
+                   prints status not_configured and exits 0. Exits 3
+                   when a named config does not exist.
   koi-sync         one Koi water-change sync from Home Assistant into the
                    pond's log; prints {added}, exits 1 naming a refusal.
                    Not scheduled here: run it from a daily cron job

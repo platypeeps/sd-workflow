@@ -531,7 +531,7 @@ class ContextAndRecommendation(ReviewCase):
 
     def test_a_batch_filed_before_without_context_files_again(self):
         """pack sd:9479: the same file again, or that file once its filer adds the context, finds the batch filed
-        before context was required and writes nothing."""
+        before context was required and files no new note."""
         with mock.patch.object(review, "_require_context", lambda found: None):
             first = review.file(self.db, batch(context=None), who="tester")
         before = self.counts()
@@ -539,6 +539,29 @@ class ContextAndRecommendation(ReviewCase):
             again = review.file(self.db, found, who="tester")
             self.assertEqual((again["item"], again["created"]), (first["item"], False))
         self.assertEqual(self.counts(), before)
+
+    def test_a_legacy_batch_refiled_with_its_context_stores_it(self):
+        """pack sd:9649: a batch filed before pack sd:9479, filed again with its context, reported success
+        and stored nothing, so the Review page still showed bare questions."""
+        with mock.patch.object(review, "_require_context", lambda found: None):
+            first = review.file(self.db, batch(context=None), who="tester")
+        again = review.file(self.db, batch(), who="tester")
+        self.assertEqual((again["item"], again["created"]), (first["item"], False))
+        filed = review.read(self.db, first["item"])
+        self.assertEqual(filed["header"]["context"], CONTEXT)
+        self.assertEqual(len(filed["questions"]), again["filed"])
+        # The stored context binds: the same file finds the batch, and part of a context is refused.
+        self.assertEqual(review.file(self.db, batch(), who="tester")["item"], first["item"])
+        with self.assertRaisesRegex(review.ReviewError, r"context is"):
+            review.file(self.db, batch(context=None), who="tester")
+
+    def test_a_legacy_batch_refiled_with_part_of_its_context_is_refused(self):
+        """pack sd:9649: a refile that would store a context stores a whole one or none."""
+        with mock.patch.object(review, "_require_context", lambda found: None):
+            first = review.file(self.db, batch(context=None), who="tester")
+        part = {key: value for key, value in CONTEXT.items() if key != "feeds"}
+        with self.assertRaisesRegex(review.ReviewError, r"no Feeds line"):
+            review.file(self.db, batch(context=part), who="tester")
         self.assertIsNone(review.read(self.db, first["item"])["header"]["context"])
 
     def test_a_legacy_batch_refiled_with_context_and_a_change_names_the_change(self):
