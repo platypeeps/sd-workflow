@@ -548,10 +548,6 @@ class ARefusalSaysItStartedNothing(unittest.TestCase):
         self.assertEqual(build_run.GATE_NOT_STARTED, sd_gate_slots.NOT_STARTED)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class WorkerSetting(unittest.TestCase):
     """Build review of sd:9925: a bad `sd.gate_workers` must not drop the gate's own limits."""
 
@@ -565,3 +561,8 @@ class WorkerSetting(unittest.TestCase):
         self.assertEqual((values["gate_slots"], values["gate_load_max"], values["gate_settle_seconds"]),
                          ("1", "4", "90"))
         self.assertIsNone(values["gate_workers"])
+
+
+if __name__ == "__main__":
+    unittest.main()
+
