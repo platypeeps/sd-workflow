@@ -1916,6 +1916,27 @@ class Supervise(Case):
         self.assertIn("do one class pass", fix[fix.index("-p") + 1])
         self.assertEqual(build.run(self.db, again["id"])["review_round"], R)
 
+    def test_a_usage_limit_reclaim_refuses_a_worktree_on_another_branch(self):
+        """Review of build/sd-1557: the reclaim resumed at building or fixing, past the worktree step's branch
+        guard, so a checkout switched during the hold took the builder's commits. The guard runs first."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["rate_limited"])
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        support.git(Path(self.bundle["work_path"]), "checkout", "-q", "-b", "operator-side")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.assertEqual(build.run(self.db, again["id"])["step"], "building")
+        self.plan(claude=["pass"], sd_review=["clean"])
+        ended = self.supervisor(again["id"]).run()
+        self.assertEqual(ended["outcome"], "blocked")
+        self.assertIn("is on operator-side, not build/sd-", ended["blocked"])
+        self.assertEqual(len(self.calls("claude")), 1, "no builder ran on the switched checkout")
+
     def test_a_recorded_disposition_enqueues(self):
         """sd:10010: once the dispositions are on file, the lane's prepare clears them: enqueue goes ahead."""
         self.press()

@@ -1225,6 +1225,12 @@ class Supervisor:
             self.blockers = self.noted_blockers()
             if self.blockers:
                 steps["fixing"] = self.resume_fix
+        # A run that starts past the worktree step (a usage-limit reclaim, a loss retry) is guarded as that step
+        # guards a kept worktree first: the checkout may have moved while no run held it (review of build/sd-1557).
+        if step in ("building", "fixing", "reviewing") and self.fresh()["start_step"] == step:
+            refused = self.guarded()
+            if refused is not None:
+                return refused
         while step in steps:
             ended = steps[step]()
             if isinstance(ended, dict):
@@ -1255,14 +1261,7 @@ class Supervisor:
         self.enter("worktree")
         branch = self.row["branch"]
         if self.work.is_dir():
-            # The guard reads first: a stopped rebase detaches HEAD, and a block here would record no hold.
-            held = self.split_first()
-            if held:
-                return held
-            current = _read([*self.tools.git, "-C", str(self.work), "branch", "--show-current"], env=self.env).strip()
-            if current != branch:
-                return self.finish("blocked", f"worktree {self.work} is on {current or 'no branch'}, not {branch}")
-            return "building"
+            return self.guarded() or "building"
         if self.child([*self.tools.git, "-C", str(self.repo), "fetch", "-q", "origin"], cwd=self.repo,
                       name="worktree") != 0:
             return self.finish("blocked", f"git fetch in {self.repo} failed; see {self.out('worktree')}")
@@ -1274,6 +1273,21 @@ class Supervisor:
         if self.child([*self.tools.git, "-C", str(self.repo), *argv], cwd=self.repo, name="worktree") != 0:
             return self.finish("blocked", f"git worktree add {self.work} failed; see {self.out('worktree')}")
         return self.split_first() or "building"
+
+    def guarded(self) -> dict | None:
+        """The kept worktree's guard: the blocked end when a subset Retry's split holds it, or it is gone or on
+        another branch; None when the builder may work in it."""
+        branch = self.row["branch"]
+        if not self.work.is_dir():
+            return self.finish("blocked", f"worktree {self.work} is gone; the resumed run has no checkout")
+        # The guard reads first: a stopped rebase detaches HEAD, and a block here would record no hold.
+        held = self.split_first()
+        if held:
+            return held
+        current = _read([*self.tools.git, "-C", str(self.work), "branch", "--show-current"], env=self.env).strip()
+        if current != branch:
+            return self.finish("blocked", f"worktree {self.work} is on {current or 'no branch'}, not {branch}")
+        return None
 
     def split_first(self) -> dict | None:
         """The blocked end of a run whose bundle a subset Retry left a member out of while its branch or worktree
