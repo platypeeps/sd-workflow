@@ -1745,12 +1745,14 @@ def run_provider(
 
 
 def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
-            rebutted: Sequence[Rebuttal] = (), *, repro: bool = False) -> list[dict[str, Any]]:
+            rebutted: Sequence[Rebuttal] = (), *, repro: bool = False,
+            prior: Sequence[Mapping[str, Any]] = ()) -> list[dict[str, Any]]:
     """Label each finding `blocking` or `advisory` against the policy floor.
 
     A finding at the floor posts as advisory, its summary saying why, when it cites no `evidence` and repeats
     one rebutted on this branch (pack sd:9270), or, with `repro`, outside the lane's own `LANE_PATHS` (pack
     sd:9867, note #70162). Only that evidence exists is read: the lead rebuts one that does not reproduce.
+    An uncited repeat on a path a `prior` report's blocker cited keeps that evidence (build/sd-1423 review).
     """
 
     threshold = BLOCKING_ORDER[floor]
@@ -1762,6 +1764,8 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
         blocking = rank > 0 and rank >= threshold
         evidence = record.get("evidence")
         note = None
+        if blocking and not (isinstance(evidence, str) and evidence.strip()) and (stored := prior_evidence(prior, record)):
+            evidence = record["evidence"] = stored
         if blocking and not (isinstance(evidence, str) and evidence.strip()):
             repeat = recorded_at(rebutted, record.get("path"), record.get("summary"), record.get("line"))
             note = REPEAT_NOTE if getattr(repeat, "listed", False) else NO_REPRO_NOTE if repro and str(
@@ -1772,6 +1776,12 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
         record["disposition"] = "blocking" if blocking else "advisory"
         disposed.append(record)
     return disposed
+
+
+def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]) -> str:
+    """The evidence a prior report's blockers on `record`'s path stored, one per line, or ""."""
+    return "\n".join(dict.fromkeys(old["evidence"] for old in prior if old.get("disposition") == "blocking" and old.get(
+        "path") == record.get("path") and isinstance(old.get("evidence"), str) and old["evidence"].strip()))
 
 
 # Pipeline
@@ -2406,7 +2416,7 @@ def review(
         outcomes = [outcome for _measured, attempts in answers for outcome in attempts]
         outcomes = [row._replace(status=FINDINGS if row.findings else CLEAN) if (row.diagnostic or {}).get("coverage") == "partial" and set(row.diagnostic["omitted_paths"]) <= {path["path"] for path in input_manifest.get("paths", ()) if path.get("media")} and any(other.status in (CLEAN, FINDINGS) for other in outcomes) else row for row in outcomes]
         finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)],
-                      rebutted, subject.scope != "planning")
+                      rebutted, subject.scope != "planning", previous["findings"] if previous else ())
     finally:
         slot.give_back()  # sd:2523: on every exit; the gate below queues in its own pool
     # Shadow only (sd:2092): Jev's kind for each finding goes to its ledger and
@@ -2576,10 +2586,11 @@ def partial(outcome: Outcome, unread: Sequence[str]) -> Outcome:
 
 
 def finish_review(result: dict[str, Any], outcomes: Sequence[Outcome], reviewed: list[str],
-                  rebutted: Sequence[Rebuttal] = (), repro: bool = False) -> dict[str, Any]:
+                  rebutted: Sequence[Rebuttal] = (), repro: bool = False,
+                  prior: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
     """Keep every distinct finding, once; only complete answers count toward required depth."""
     collected = sd_lib.distinct_findings(dict(finding, backend=outcome.backend) for outcome in outcomes for finding in outcome.findings)
-    disposed = dispose(collected, result["severity_floor"], rebutted, repro=repro)
+    disposed = dispose(collected, result["severity_floor"], rebutted, repro=repro, prior=prior)
     incomplete = len(reviewed) < result["requested_reviews"]
     remaining = [outcome.backend for outcome in outcomes if outcome.status not in (CLEAN, FINDINGS)] if incomplete else []
     if any(record.get("disposition") == "blocking" for record in disposed):

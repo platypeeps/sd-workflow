@@ -1008,11 +1008,17 @@ class LineBudgetTests(unittest.TestCase):
         # `NO_REPRO_NOTE` and the `repro` flag through `finish_review` to
         # `dispose`, after trimming the docstrings. Measured: `sd-review`
         # is 2890 here.
+        #
+        # 4860 -> 4871 is the build/sd-1423 review: `bin/sd-review` +11 so
+        # an uncited repeat of a prior blocker keeps the prior report's
+        # evidence through `finish_review` to `dispose` (`prior_evidence`
+        # keeps `dispose` under the branch ceiling). Measured:
+        # `sd-review` is 2901 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4860,
+            4871,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

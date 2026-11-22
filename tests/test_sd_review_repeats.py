@@ -304,6 +304,18 @@ class ReproRuleTests(unittest.TestCase):
         sd_review.finish_review(result, answers, ["one", "two", "three"], repro=True)
         self.assertEqual([row["evidence"] for row in result["findings"]], [f"See summary\n{REPRO}"])
 
+    def test_a_repeated_prior_blocker_keeps_its_stored_evidence(self) -> None:
+        """build/sd-1423 review: fix verification asks a reader to repeat each unresolved prior blocker, and one
+        repeated without `evidence` posted as advisory at the head, so the unresolved blocker cleared. The prior
+        report's evidence for that path still stands; a finding elsewhere gains none."""
+        prior = [dict(finding(REPRO), disposition="blocking")]
+        result = {"severity_floor": "high", "requested_reviews": 1}
+        answers = [sd_review.Outcome("one", sd_review.FINDINGS, (finding(), finding(path="other.py")), "", (), ())]
+        sd_review.finish_review(result, answers, ["one"], repro=True, prior=prior)
+        self.assertEqual(result["status"], "blocking")
+        self.assertEqual([(row["disposition"], row.get("evidence")) for row in result["findings"]],
+                         [("blocking", REPRO), ("advisory", None)])
+
     def test_a_reproduced_break_in_an_unchanged_caller_blocks(self) -> None:
         [record] = sd_review.dispose([finding("python3 reader.py: KeyError 'state'", path="reader.py")], "high",
                                      repro=True)
