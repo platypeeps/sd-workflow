@@ -241,6 +241,20 @@ window.PAGE_LIST.clear(); click('intents', 'intent', 'fix'); R.fix = ids(); R.ch
         self.assertEqual(out["R"]["sel"], ["item:7"])
 
 
+class TheCleanUp(ReaderCase):
+    """sd:9759: Needs you's Clean up runs the nightly sweep's line; it asks first, then posts needs.sweep, nothing else."""
+
+    def test_the_button_names_the_command_and_it_asks_first_then_posts_the_sweep(self):
+        html = (V2 / "today.html").read_text(encoding="utf-8")
+        self.assertIn('data-cmd="needs.sweep" data-obj="needs">Clean up</button>', html)
+        out = self.run_page(TheConfirms.DECLINE + """const c = cmd('needs.sweep'), o = C.get('needs');
+R.on = [c.on, o.type, c.risk, c.cli(o)]; decline(c, o); await flush(); R.asked = OUT.confirms.slice();
+c.run(o); await flush();""")
+        self.assertEqual(out["R"]["on"], ["needs list", "needs list", "confirm", "sd reports sweep"])
+        self.assertEqual(out["R"]["asked"], ["needs.sweep"])
+        self.assertEqual([(path, body) for path, body, _ in out["posts"]], [("/api/actions/run", {"action": "needs.sweep"})])
+
+
 class TheConfirms(ReaderCase):
     """sd:5921 review: a Today act that moves state asks first where its home page does. Approve grants a manual repo's
     merge, so it asks as Queue's does; a group act on more members than the shell's bulk limit asks as a bulk act does.

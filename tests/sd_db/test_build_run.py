@@ -24,7 +24,7 @@ import textwrap
 import threading
 import time
 import unittest
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -37,6 +37,7 @@ from sd_db import (
     follow,
     hub,
     operations,
+    paths,
     remote,
     runner,
     sessions,
@@ -65,7 +66,8 @@ FAKE = textwrap.dedent('''
     from pathlib import Path
     role, plans = Path(sys.argv[0]).stem, Path(os.environ["FAKE_PLANS"])
     with open(plans / "calls.jsonl", "a") as log:
-        log.write(json.dumps({"role": role, "argv": sys.argv[1:], "cwd": os.getcwd()}) + "\\n")
+        log.write(json.dumps({"role": role, "argv": sys.argv[1:], "cwd": os.getcwd(),
+                             "run": os.environ.get("SD_BUILD_RUN")}) + "\\n")
     plan = plans / f"{role}.json"
     queue = json.loads(plan.read_text()) if plan.exists() else []
     # `gh repo view` (the visibility read) takes no plan: plans/visibility.txt answers it.
@@ -125,6 +127,14 @@ FAKE = textwrap.dedent('''
             time.sleep(3)
         if mode == "silent":
             sys.exit(0)
+        if mode == "rate_limited":  # pack sd:9907: the account's weekly limit, as Claude Code ended two builds
+            reset = int(time.time()) + 3 * 86400
+            (plans / "reset.txt").write_text(str(reset))
+            line({"type": "result", "subtype": "success", "is_error": True, "api_error_status": 429,
+                  "permission_denials": [], "session_id": session,
+                  "result": "You've hit your weekly limit \\u00b7 resets Nov 24 at 11am",
+                  "rate_limit_info": {"rateLimitType": "seven_day", "resetsAt": reset, "overageStatus": "disabled"}})
+            sys.exit(1)
         if mode == "asked-dirty":  # asked, then left an uncommitted file: a block the question did not cause
             Path("stray.txt").write_text("stray")
         if mode.startswith("asked"):  # skipped every item with a question: a passing reply, no commit (sd:9219)
@@ -193,6 +203,10 @@ FAKE = textwrap.dedent('''
             mode = "clean"
         if mode == "garbage":
             print("not json")
+            sys.exit(4)
+        if mode == "rate_limited":  # sd:9882: the provider's quota, which `sd-review` exits 4 on
+            print(json.dumps({"status": "rate_limited", "findings": [],
+                              "subject": {"head": git("-C", work, "rev-parse", "HEAD")}}))
             sys.exit(4)
         raw = {"path": "work.txt", "line": 1, "severity": "high", "summary": "a blocker", "family": "correctness"}
         findings = review.dispose([review._finding(raw)], "high")  # the record shape `--json` prints
@@ -501,6 +515,52 @@ class Judge(unittest.TestCase):
         self.assertEqual(build_run.judge(self.lines(), session="s9")["state"], "unknown")
         self.assertEqual(build_run.judge(self.lines(), session="s1")["state"], "pass")
 
+    def test_a_usage_limit_line_is_rate_limited(self):
+        """Pack sd:9907: builds bc013189 and 3d301374 ended in one turn on this line, and the run read it as a
+        plain failure, so each item blocked and parked. It is `rate_limited`, as `sd-review` classes it."""
+        weekly = self.lines(is_error=True, api_error_status=429,
+                            result="You've hit your weekly limit · resets Nov 24 at 11am",
+                            rate_limit_info={"rateLimitType": "seven_day", "resetsAt": 1795543200,
+                                             "overageStatus": "disabled"})
+        self.assertEqual(build_run.judge(weekly)["state"], "rate_limited")
+        marked = self.lines(is_error=True, result="Claude AI usage limit reached")
+        self.assertEqual(build_run.judge(marked)["state"], "rate_limited", "a marker sd-review knows, no status")
+        for final in ({"is_error": True, "api_error_status": 500}, {"is_error": True, "api_error_status": "429"},
+                      {"is_error": False, "api_error_status": 429, "subtype": "error_during_execution"},
+                      {"is_error": True, "result": "the build failed"}):
+            with self.subTest(final=final):
+                self.assertEqual(build_run.judge(self.lines(**final))["state"], "failed")
+
+    def test_the_hold_ends_at_a_sane_reset_or_in_an_hour(self):
+        """Pack sd:9907: the hold ends at the limit's `resetsAt` when it is ahead, within `HOLD_MAX_SECONDS`;
+        any other value, magnitude or shape holds `HOLD_SECONDS`, never forever and never not at all."""
+        stamp, hour = "2026-11-21T18:00:00+00:00", "2026-11-21T19:00:00+00:00"
+        start = int(datetime.fromisoformat(stamp).timestamp())
+        reset = 1795543200  # 2026-11-24T18:00:00Z, the line builds bc013189 and 3d301374 ended on
+
+        def final(value):
+            return json.dumps({"type": "result", "rate_limit_info": {"resetsAt": value}})
+
+        self.assertEqual(build.hold_until(final(reset), stamp), "2026-11-24T18:00:00+00:00")
+        self.assertEqual(build.hold_until(final(reset + 0.5), stamp), "2026-11-24T18:00:00+00:00")
+        for value in (None, True, False, 0, -1, 5e-324, 1e308, 10 ** 400, -(10 ** 400), float("inf"), float("-inf"),
+                      float("nan"), str(reset), [reset], {"at": reset}, reset * 1000, start, start - 86400,
+                      start + build.HOLD_MAX_SECONDS + 1):
+            with self.subTest(value=value):
+                self.assertEqual(build.hold_until(final(value), stamp), hour)
+        for text in (None, "", "not json", "[" * 100000, "]", json.dumps([1]), json.dumps({"rate_limit_info": 5}),
+                     final(reset)[:40]):
+            with self.subTest(text=text[:20] if text else text):
+                self.assertEqual(build.hold_until(text, stamp), hour)
+
+    def test_the_markers_are_sd_reviews(self):
+        """Pack sd:9907: one vocabulary; `sd-review`'s markers, read from its source, are the run's."""
+        import ast
+        tree = ast.parse((BIN / "sd-review").read_text(encoding="utf-8"))
+        found = [ast.literal_eval(node.value) for node in ast.walk(tree) if isinstance(node, ast.Assign)
+                 and any(isinstance(target, ast.Name) and target.id == "RATE_LIMIT_MARKERS" for target in node.targets)]
+        self.assertEqual([build_run.RATE_LIMIT_MARKERS], found)
+
 
 class Supervise(Case):
     def test_the_fakes_refuse_what_the_real_tools_refuse(self):
@@ -526,6 +586,25 @@ class Supervise(Case):
         self.assertEqual(env["OTEL_RESOURCE_ATTRIBUTES"], f"host.name=fixture,sd.build_run={self.bundle['id']},"
                          f"sd.items={self.items[0]};{self.items[1]}")
         self.assertNotIn("CLAUDE_CODE_ENABLE_TELEMETRY", {key for key in env if key not in os.environ})
+
+    def test_the_claude_child_env_names_the_run(self):
+        """pack sd:9715: machine hooks tell a headless builder by SD_BUILD_RUN."""
+        self.press(2)
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        runs = [call["run"] for call in self.calls("claude")]
+        self.assertTrue(runs)
+        self.assertEqual(set(runs), {self.bundle["id"]})
+
+    def test_the_supervisor_env_drops_a_hooks_git_location(self):
+        """pack sd:9709 round 26: the supervisor's git calls and the builder start from this env; a hook's
+        `GIT_DIR` or `GIT_WORK_TREE` would point them at the hook's repository, not the run's worktree."""
+        self.press(1)
+        self.env.update({"GIT_DIR": "/decoy/.git", "GIT_WORK_TREE": "/decoy", "GIT_INDEX_FILE": "/decoy/index"})
+        env = self.supervisor().env
+        self.assertEqual({key for key in env if key in paths.GIT_LOCAL}, set())
+        self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], self.env["GIT_CONFIG_NOSYSTEM"], "config isolation stays")
 
     def test_a_press_runs_to_the_lane(self):
         """Two items, one run, one branch, one lane entry; the members end done and the items stay in progress."""
@@ -845,6 +924,60 @@ class Supervise(Case):
         resumed = [call["argv"] for call in self.calls("claude")][-1]
         self.assertEqual(resumed[resumed.index("--resume") + 1], "session-fixture")
 
+    def test_a_usage_limit_requeues_the_bundle_and_holds_this_host(self):
+        """Pack sd:9907: a run that hit the account's usage limit blocked and parked its items, and each new
+        claim on that host died in one turn. It requeues the whole bundle, with no block, park or followup,
+        and this host claims nothing until the limit's `resetsAt`."""
+        self.press(2)
+        self.plan(claude=["rate_limited"])
+        ended = self.supervisor().run()
+        self.assertEqual((ended["outcome"], ended["retry"]), ("rate_limited", None))
+        self.assertEqual(self.statuses(), ["ready", "ready"])
+        rows = self.db.execute("SELECT status FROM assignment WHERE id IN (?, ?) ORDER BY id",
+                               (self.bundle["assignment"], self.bundle["members"][1]["id"])).fetchall()
+        self.assertEqual([row["status"] for row in rows], ["queued", "queued"])
+        self.assertEqual([item_state(self.db, item)["item"]["parked_at"] for item in self.items], [None, None])
+        kinds = {row["kind"] for row in self.db.execute(
+            f"SELECT kind FROM note WHERE item IN ({', '.join('?' for _ in self.items)})", self.items)}
+        self.assertNotIn("followup", kinds)
+        self.assertIsNotNone(build.run(self.db, self.bundle["id"])["released_at"])
+        reset = datetime.fromtimestamp(int((self.plans / "reset.txt").read_text()), UTC)
+        until = reset.isoformat(timespec="seconds")
+        self.assertEqual(writes.read_settings(self.db, ["build.rate_hold.hub"]), {"build.rate_hold.hub": until})
+        self.assertIsNone(build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                      root=self.root / "worktrees"), "this host claims nothing before the reset")
+        later = (reset + timedelta(seconds=1)).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.assertEqual((again["assignment"], again["work_path"], again["run"]),
+                         (self.bundle["assignment"], self.bundle["work_path"], 2), "the same bundle, in its worktree")
+
+    def test_a_fault_inside_the_usage_limit_end_writes_nothing_and_the_next_end_finishes(self):
+        """Pack sd:9907, failure table row 2: the outcome, the release, the requeue and the hold are one
+        transaction. A fault at its last write leaves the run open and its bundle running, as the
+        resumed supervisor finds it; its end then settles all of it."""
+        self.press(2)
+        ident = self.bundle["id"]
+        reset = int(datetime.now(UTC).timestamp()) + 7200
+        self.assertTrue(build.write(self.db, ident, step="building", final=json.dumps(
+            {"type": "result", "is_error": True, "api_error_status": 429, "rate_limit_info": {"resetsAt": reset}})))
+        with mock.patch.object(build, "set_setting", side_effect=sqlite3.OperationalError("disk I/O error")), \
+                self.assertRaises(sqlite3.OperationalError):
+            build.end(self.db, ident, build.RATE_LIMITED, "rate limited")
+        row = build.run(self.db, ident)
+        self.assertEqual((row["outcome"], row["released_at"]), (None, None))
+        self.assertEqual([member["status"] for member in row["members"]], ["running", "running"])
+        self.assertEqual((self.statuses(), writes.read_settings(self.db, ["build.rate_hold.hub"])),
+                         (["in_progress", "in_progress"], {}))
+        ended = build.end(self.db, ident, build.RATE_LIMITED, "rate limited")
+        assert ended is not None
+        self.assertEqual(ended["outcome"], "rate_limited")
+        self.assertEqual(self.statuses(), ["ready", "ready"])
+        self.assertEqual(writes.read_settings(self.db, ["build.rate_hold.hub"]),
+                         {"build.rate_hold.hub": datetime.fromtimestamp(reset, UTC).isoformat(timespec="seconds")})
+
     def test_a_pass_needs_a_clean_worktree_ahead(self):
         self.press()
         self.plan(claude=["pass"])
@@ -1003,6 +1136,24 @@ class Supervise(Case):
         self.assertEqual(len(self.calls("sd-review")), 2)
         self.assertIn("the review gave no answer twice", self.latest()["detail"])
 
+    def test_a_rate_limited_review_waits_and_asks_again(self):
+        """sd:9882: a rate limit blocked the build and parked its item; it waits the window out instead."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["rate_limited", "rate_limited", "clean"])
+        with mock.patch.object(build_run, "RATE_LIMIT_WAIT_SECONDS", 0.3):
+            self.assertEqual(self.supervisor().run().get("step"), "enqueued", self.latest()["detail"])
+        self.assertEqual(len(self.calls("sd-review")), 3)
+
+    def test_a_review_still_rate_limited_after_every_wait_blocks(self):
+        self.press()
+        waits = build_run.RATE_LIMIT_WAITS
+        self.plan(claude=["pass"], sd_review=["rate_limited"] * (waits + 1))
+        with mock.patch.object(build_run, "RATE_LIMIT_WAIT_SECONDS", 0.05):
+            self.assertEqual(self.supervisor().run()["outcome"], "blocked")
+        self.assertEqual(len(self.calls("sd-review")), waits + 1)
+        self.assertIn("the review stayed rate_limited", self.latest()["detail"])
+
     def test_cancel_before_enqueuing_wins(self):
         """Failure table, Enqueuing CAS: a cancel asked during reviewing wins; no `sd-ship`, nothing pushed."""
         self.press()
@@ -1018,8 +1169,9 @@ class Supervise(Case):
 
     def test_a_member_cancelled_on_its_own_is_neither_briefed_nor_delivered(self):
         """Review round 3 of sd:9222: run 1 commits `Closes:` for both items and ends cancelled; Retry queues both;
-        the operator cancels the child, then the lead; Retry of the lead runs again on the same branch. The brief
-        lists the lead alone, the enqueue delivers the lead alone, and run 1's trailer does not close the child."""
+        the operator cancels the child, then the lead; Retry of the lead runs again on the same branch. Since
+        pack sd:9709 round 21 the child's commits on that branch hold the run before a builder starts, as a
+        subset Retry's do, so neither its work nor its trailer ships with the lead; Build takes the lead fresh."""
         self.press(2)
         self.write_pr()
         self.plan(claude=["pass"], sd_review=["cancel"])
@@ -1036,21 +1188,13 @@ class Supervise(Case):
         assert again is not None
         self.bundle = again
         self.plan(claude=["pass"], sd_review=["clean"])
-        self.assertEqual(self.supervisor().run()["step"], "enqueued")
-        prompt = self.calls("claude")[-1]["argv"]
-        prompt = prompt[prompt.index("-p") + 1]
-        self.assertIn(f"- sd:{self.items[0]}", prompt)
-        self.assertNotIn(f"- sd:{self.items[1]}", prompt, "the brief lists no member cancelled on its own")
-        enqueue = next(call["argv"] for call in self.calls("sd-ship") if "enqueue" in call["argv"])
-        self.assertEqual([enqueue[n + 1] for n, arg in enumerate(enqueue) if arg == "--item"], [str(self.items[0])])
-        work = Path(self.bundle["work_path"])
-        head = enqueue[enqueue.index("--expected-head") + 1]
-        body = Path(enqueue[enqueue.index("--body-file") + 1]).read_text(encoding="utf-8")
-        self.assertNotIn("Refs:", body, "data keeps the child open, not a body line the lane may not read")
-        self.db.execute("UPDATE item SET status = 'in_progress' WHERE id = ?", (self.items[1],))
-        cited = LANE.cited_closes(self.db, self.items[0], body, LANE.branch_commits(work, "main", head), (),
-                                  branch=build.branch(self.bundle["assignment"]))
-        self.assertEqual([row["item"] for row in cited], [], "run 1's trailer must not close the child")
+        self.items = [self.items[0], self.items[0], self.items[1]]  # `assert_split_first` names the third
+        self.assert_split_first(self.supervisor())
+        self.assertNotIn("sd-ship", [call["argv"][0].rsplit("/", 1)[-1] for call in self.calls("sd-ship")
+                                     if "enqueue" in call["argv"]])
+        self.release_all()
+        fresh = build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertNotEqual([entry["id"] for entry in fresh], [lead], "Build takes the lead fresh")
 
     def left_out_of_a_retry(self, prepare=None, *, run=True):
         """A three-item bundle ends cancelled, `run` once its builder committed for all three, else before any
@@ -3573,6 +3717,56 @@ class Hosts(Case):
             self.assertEqual(self.tick()["why"], build.RESTORING)
         self.assertEqual(beat(), build.RESTORING)
 
+    def hold(self, host, seconds=3600):
+        """`host`'s usage-limit hold, `seconds` from now, as a rate-limited run of its own records it."""
+        until = (datetime.now(UTC) + timedelta(seconds=seconds)).isoformat(timespec="seconds")
+        writes.set_setting(self.db, f"build.rate_hold.{host}", until)
+        return until
+
+    def after(self, until):
+        """The build clock one second past `until`."""
+        later = (datetime.fromisoformat(until) + timedelta(seconds=1)).isoformat(timespec="seconds")
+        return mock.patch.object(build, "clock", return_value=later)
+
+    def test_a_held_host_claims_nothing_until_its_reset_and_others_claim(self):
+        """Pack sd:9907: the hub's usage-limit hold stops its claims, pickup and drafts and names the reset; the
+        satellite claims meanwhile, and the hub claims again once the reset passed."""
+        until = self.hold("hub")
+        hub_item, _ = self.both()
+        with self.on("hub"):
+            held = self.tick()
+            self.assertEqual(held["claimed"], [])
+            self.assertIn(f"hold until {until}", held["why"])
+            self.assertIn(f"hold until {until}", build.room(self.db, load=1.0, load_cap=40.0, interactive=[])["why"])
+        with self.on("work"):
+            work = self.tick()
+        self.assertEqual([build.run(self.db, ident)["repo"] for ident in work["claimed"]], [str(self.satellite)])
+        with self.on("hub"), self.after(until):
+            hub = self.tick()
+        self.assertEqual([build.run(self.db, ident)["members"][0]["item"] for ident in hub["claimed"]], [hub_item])
+
+    def test_a_held_satellite_is_not_stuck_and_its_press_queues(self):
+        """Pack sd:9907: a held satellite beats its hold for days; the hub must not read that as a stuck
+        dispatcher and block its rows (sd:8081), nor refuse its press, and the Builds panel names the reset."""
+        until = self.hold("work")
+        _, sat = self.both()
+        with self.on("work"):
+            for _ in range(build.STUCK_TICKS + 1):
+                self.assertIn(f"hold until {until}", self.tick()["why"])
+        with self.on("hub"):
+            self.assertEqual(len(self.tick()["claimed"]), 1, "the hub claims its own")
+            self.assertIn(f"hold until {until}", build.unclaimed(self.db)[str(self.queued(sat))])
+            later = create_item(self.db, kind="task", title="Later", repo=str(self.satellite), status="ready")
+            self.assertEqual(len(build.queue(self.db, [later], who="operator")), 1, "the press queues")
+        self.assertEqual(self.db.execute("SELECT status FROM assignment WHERE item = ?", (sat,)).fetchone()[0],
+                         "queued")
+        with self.on("work"), self.after(until):
+            taken = self.tick()["claimed"]
+        self.assertEqual([build.run(self.db, ident)["members"][0]["item"] for ident in taken], [sat])
+
+    def queued(self, item):
+        return self.db.execute("SELECT id FROM assignment WHERE item = ? AND status = 'queued'", (item,)).fetchone()[0]
+
     def test_each_tick_watches_only_its_own_runs(self):
         sat = create_item(self.db, kind="task", title="Satellite", repo=str(self.satellite), status="ready")
         build.queue(self.db, [sat], who="operator")
@@ -4377,7 +4571,7 @@ class ChildEnvironment(unittest.TestCase):
 
     def test_the_supervisor_env_holds_no_github_token_from_the_pat(self) -> None:
         """sd:8515: gh and its credential helper would act as the PAT, not the gh login."""
-        env = build_run._environ({"GITHUB_PERSONAL_ACCESS_TOKEN": "example-pat"})
+        env = build_run._environ({"GITHUB_PERSONAL_ACCESS_TOKEN": "example-pat"}, "run")
         self.assertIsNone(env.get("GITHUB_TOKEN"))
 
     def test_a_check_gets_github_token_from_the_pat(self) -> None:

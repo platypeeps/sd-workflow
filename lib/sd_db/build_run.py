@@ -73,6 +73,10 @@ BEAT_SECONDS = 30
 #: Reviews with blockers before the class pass and park (operator 2026-11-20,
 #: raised from 3: four-round parks re-queued by hand all day).
 REVIEW_ROUNDS = 7
+#: A rate-limited review waits this long, beating, then asks again, up to `RATE_LIMIT_WAITS` times before it
+#: blocks: a quota window passes, and a block parked the item for a manual Retry (sd:9882).
+RATE_LIMIT_WAIT_SECONDS = 900
+RATE_LIMIT_WAITS = 4
 MAX_TURNS = 300
 TITLE_MAX = 63
 #: A read (`git status`, `lane list`) that takes longer is unread.
@@ -86,6 +90,18 @@ HEARTBEAT = build.HEARTBEAT
 #: The lane entry states that end an `enqueued` run without a merge: the lane's `BLOCKED` ends, which
 #: `lane retry` queues again (`prepared` is a merge the lane refused), and a cancel.
 LANE_ENDED = ("failed", "skipped", "prepared", "cancelled")
+#: `bin/sd-review`'s markers of a rate-limited reply, one vocabulary: a test pins this copy to that one.
+RATE_LIMIT_MARKERS = (
+    "rate limit",
+    "rate-limit",
+    "rate_limit",
+    "usage limit",
+    "quota exceeded",
+    "too many requests",
+    "http 429",
+    "status 429",
+    " 429 ",
+)
 
 #: The builder's pre-approved calls: the brief's two commit forms (pack sd:6723). A prefix rule cannot pin
 #: the -F file inside the worktree; the brief does.
@@ -345,8 +361,8 @@ class Tools:
 def judge(lines: list[str], *, session: str | None = None) -> dict:
     """The builder's verdict from the stream-json lines one child wrote: the last line, never the exit code.
 
-    `state` is `pass`, `denied` (with `tools`), `max_turns`, `failed` or
-    `unknown`. A pass needs a `result` line of subtype `success`, `is_error`
+    `state` is `pass`, `denied` (with `tools`), `max_turns`,
+    `rate_limited`, `failed` or `unknown`. A pass needs a `result` line of subtype `success`, `is_error`
     false and an empty `permission_denials` list, in the session the run
     recorded (`session`), else the one its `init` line named: a line of
     another session is no evidence for this run.
@@ -386,6 +402,12 @@ def judge(lines: list[str], *, session: str | None = None) -> dict:
                 "calls": "; ".join(_denied_call(row) for row in denials)}
     if final.get("subtype") == "error_max_turns":
         return {**result, "state": "max_turns", "why": "the builder hit its turn limit"}
+    # `sd-review`'s rule for Claude's envelope (pack sd:9907): an error with status 429, or a marker in its text.
+    status, reply = final.get("api_error_status"), final.get("result")
+    said = reply if isinstance(reply, str) else ""
+    if final.get("is_error") is True and (type(status) is int and status == 429
+                                          or any(marker in said.lower() for marker in RATE_LIMIT_MARKERS)):
+        return {**result, "state": "rate_limited", "why": f"the builder's account is rate limited: {said[:300]}"}
     if final.get("subtype") != "success" or final.get("is_error") is not False:
         return {**result, "state": "failed", "why": f"the result is {final.get('subtype')}, is_error "
                                                     f"{final.get('is_error')}"}
@@ -611,7 +633,7 @@ def dispatch(connection, *, owner: str, load: float | None, load_cap: float | No
     # The beat carries why this tick claims nothing: the hub reads a satellite's beat as one that would claim a
     # press only when `why` is empty (`build.dispatcher_refusal`, review round 4).
     why = why or build.unread(load, load_cap, interactive) or (
-        build.RESTORING if build.restoration_pending(connection) else "")
+        build.RESTORING if build.restoration_pending(connection) else "") or build.rate_hold(connection)
     record_state(connection, "heartbeat", key=HEARTBEAT if hub else f"{HEARTBEAT}@{build.this_host()}",
                  body={"pid": os.getpid(), "owner": owner, "why": why,
                        "load": build.over_load(load, load_cap) if not build.unread(load, load_cap, []) else ""})
@@ -849,8 +871,12 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
     return moved
 
 
-def _environ(environ: dict | None) -> dict:
-    env = dict(os.environ if environ is None else environ)
+def _environ(environ: dict | None, ident: str) -> dict:
+    # The supervisor's `git -C` calls and the builder start here: a hook's `GIT_DIR` would point them at its own
+    # repository, not the run's worktree (pack sd:9709, round 26).
+    env = paths.git_env(os.environ if environ is None else environ)
+    # Machine hooks tell a headless builder from a session by this (pack sd:9715).
+    env["SD_BUILD_RUN"] = ident
     # The token reaches the child's environment only: no row or log holds it.
     if env.get("CUSTOM_CLAUDE_CODE_OAUTH_TOKEN"):
         env["CLAUDE_CODE_OAUTH_TOKEN"] = env["CUSTOM_CLAUDE_CODE_OAUTH_TOKEN"]
@@ -902,7 +928,7 @@ class Supervisor:
         self.reviewed: str | None = None
         self.blockers: list[dict] = []
         self.last_beat = 0.0
-        self.env = _environ(environ)
+        self.env = _environ(environ, ident)
         # Claude Code's own OTel, where the machine turns it on, names the run
         # by these (pack sd:6943); the switch and endpoint are system sd:6944's.
         self.env["OTEL_RESOURCE_ATTRIBUTES"] = ",".join(filter(None, (
@@ -1213,7 +1239,8 @@ class Supervisor:
         if refused:
             return self.blocked_round([{"path": "enqueue check", "line": "-", "summary": text} for text in refused])
         answer: dict | None = None
-        for _attempt in range(2):
+        unknown = waits = 0
+        while answer is None and unknown < 2:
             out = self.out("review")
             self.empty(out, "review")
             self.child([*self.tools.review, "-C", str(self.work), "--scope", "branch", "--json"], cwd=self.work,
@@ -1221,6 +1248,16 @@ class Supervisor:
             answer = self.review_answer(out, head)
             if answer is not None:
                 break
+            if not self.rate_limited(out):
+                unknown += 1
+            elif waits < RATE_LIMIT_WAITS:
+                waits += 1
+                self.note(self.lead, f"Build run {self.ident}: the review is rate_limited at {head[:12]}; "
+                                     f"asking again in {RATE_LIMIT_WAIT_SECONDS:g} s ({waits} of {RATE_LIMIT_WAITS})")
+                self.pause(RATE_LIMIT_WAIT_SECONDS)
+            else:
+                return self.finish("blocked", f"the review stayed rate_limited after {waits} waits of "
+                                              f"{RATE_LIMIT_WAIT_SECONDS:g} s at {head[:12]}; see {out}")
         if answer is None:
             return self.finish("blocked", f"the review gave no answer twice at {head[:12]}; see {self.out('review')}")
         if answer["status"] in ("clean", "advisory", "skipped"):
@@ -1627,8 +1664,14 @@ class Supervisor:
         A bundle queued again keeps its lead, so this run resumes the branch an earlier run left. Only a Send to
         builder note is the operator's; a REVIEWED note is the reviewer's text, and the brief says so.
         """
-        first = self.db.execute("SELECT MIN(created_at) FROM runner_run WHERE assignment = ?",
-                                (self.row["assignment"],)).fetchone()[0]
+        # Or since the lead was first queued, if that is earlier: a bundle drop notes its finding on a new lead
+        # before the lead's first run (round 14). The queue's note keeps that time; `queued_at` moves at each
+        # Retry, which lost the finding from the second run on (pack sd:9709, round 16).
+        lead = self.row["assignment"]
+        first = self.db.execute(
+            f"SELECT MIN(at) FROM (SELECT created_at AS at FROM runner_run WHERE assignment = ? UNION ALL "
+            f"SELECT timestamp FROM note WHERE item IN ({', '.join('?' for _ in items)}) AND body LIKE ?)",
+            (lead, *items, f"Build assignment {lead} queued %")).fetchone()[0]
 
         def listed(prefix: str, *, latest: bool = False) -> str:
             notes = self.db.execute(
@@ -1703,6 +1746,8 @@ class Supervisor:
             return self.finish("blocked", verdict["why"], question=self.denial_question(verdict))
         if verdict["state"] == "max_turns":
             return self.finish("error_max_turns", verdict["why"])
+        if verdict["state"] == "rate_limited":
+            return self.finish(build.RATE_LIMITED, f"{verdict['why']}; log {self.log}")
         return self.finish("blocked", f"{verdict['why']}; log {self.log}")
 
     def denial_question(self, verdict: dict) -> str:
@@ -1775,6 +1820,23 @@ class Supervisor:
 
     def head(self) -> str:
         return _read([*self.tools.git, "-C", str(self.work), "rev-parse", "HEAD"], env=self.env).strip()
+
+    @staticmethod
+    def rate_limited(out: Path) -> bool:
+        """Whether the review's answer is the provider's quota, which a wait outlasts (sd:9882)."""
+        try:
+            answer = json.loads(out.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        return isinstance(answer, dict) and answer.get("status") == "rate_limited"
+
+    def pause(self, seconds: float) -> None:
+        """Wait `seconds`, beating, so the reap keeps the run and a cancel still ends it.
+        ponytail: the run holds its slot while it waits; a not-before column on the queue frees it if that matters."""
+        stop = time.monotonic() + seconds
+        while (left := stop - time.monotonic()) > 0:
+            time.sleep(min(self.beat_seconds, left))
+            self.enter("reviewing")
 
     def review_answer(self, out: Path, head: str) -> dict | None:
         """The review's `status` and blockers, for this head; None for an unknown answer."""
@@ -2028,7 +2090,7 @@ class DraftSupervisor(Supervisor):
         self.item = self.db.execute("SELECT item FROM assignment WHERE id = ?",
                                        (self.row["assignment"],)).fetchone()["item"]
         self.last_beat = 0.0
-        self.env = _environ(environ)
+        self.env = _environ(environ, ident)
         self.reviewed: str | None = None
         self.take_resume(settle_seconds)
 

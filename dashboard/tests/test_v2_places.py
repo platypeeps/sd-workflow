@@ -1334,14 +1334,15 @@ for (const v of ['work', 'hoa', 'home', 'personal']) { await realm(v); R[v] = EL
         r = out["R"]
         # The tabs: Personal, each dashboard.realms realm, HOA and Home, each with its v key off l, b and m. pack sd:7216:
         # no All; every task sits in Personal or a realm.
-        self.assertEqual(r["views"], [["personal", "Personal", "p"], ["work", "Work", "w"], ["hoa", "HOA", "h"],
-                                      ["home", "Home", "o"]])
+        # Operator 2026-11-20: Work first, then each realm, Personal and Home; HOA last.
+        self.assertEqual(r["views"], [["work", "Work", "w"], ["personal", "Personal", "p"], ["home", "Home", "o"],
+                                      ["hoa", "HOA", "h"]])
         # Realm is no filter now: the bar holds Kind, Repo and the rest, in every tab.
         self.assertNotIn('data-pick="realm"', r["filters"])
         self.assertIn('data-pick="kind"', r["filters"])
-        # sd:5064: Personal, the first tab, is every row no realm claims: the one with no repo. pack sd:7687: the hoa
-        # checkout's row is realm hoa, so it sits in HOA alone, not in Personal too.
-        self.assertEqual([t in r["first"] for t in self.TITLES], [False, True, False])
+        # Operator 2026-11-20: Work, the first tab, opens first. sd:5064: Personal is every row no realm claims: the one
+        # with no repo. pack sd:7687: the hoa checkout's row is realm hoa, so it sits in HOA alone, not in Personal too.
+        self.assertEqual([t in r["first"] for t in self.TITLES], [False, False, True])
         self.assertEqual([t in r["work"] for t in self.TITLES], [False, False, True])
         self.assertEqual([t in r["hoa"] for t in self.TITLES], [True, False, False])
         self.assertEqual([t in r["home"] for t in self.TITLES], [False, True, False])
@@ -1401,7 +1402,8 @@ for (const v of ['work', 'hoa', 'home', 'personal']) { await realm(v); R[v] = EL
             with self.subTest(search=search, hash=hash_):
                 out = self.run_tasks("R.board = ELS['view-board'].html;", search=search, hash=hash_, prelude=prelude)
                 self.assertEqual([t in out["R"]["board"] for t in self.TITLES], shown)
-                self.assertEqual(out.get("replaced"), "#view=personal" if hash_ == "#view=all" else None)
+                # sd:9758: an unknown #view= opens Personal too, not Work, the first tab.
+                self.assertEqual(out.get("replaced"), "#view=personal" if hash_ in ("#view=all", "#view=nope") else None)
 
     def test_a_today_drilldown_with_realm_all_lists_every_realm_until_a_tab_is_picked(self):
         """pack sd:7216: Today's and Metrics' drilldowns count every realm and link ?realm=all. With no All tab the list
@@ -1429,14 +1431,14 @@ R.left = OUT.urls[OUT.urls.length - 1];""", search="?view=list&realm=all")
         prelude = ("globalThis.SHELL_REALMS = [{ id: 'all', label: 'Sneaky' }, { id: 'hoa', label: 'Hoa2' }, { id: 'list', label: 'List' },"
                    " { id: 'Bad id', label: 'Bad' }, { id: 'work', label: 'Work' }, { id: 'menu', label: 'Menu' }];\n")
         views = self.run_tasks("R.views = window.PAGE_VIEWS.map(v => v.id);", prelude=prelude)["R"]["views"]
-        self.assertEqual(views, ["personal", "work", "hoa", "home"])
+        self.assertEqual(views, ["work", "personal", "home", "hoa"])
 
     def test_without_realms_conf_personal_holds_every_row_but_hoas_and_says_why(self):
         # pack sd:7216: a row in no realm tab (no realm list read, or a realm with no tab) sits in Personal, not only All.
         # pack sd:7687: the hoa checkout's row is HOA's without a realm list too.
         with mock.patch.object(places, "REALMS_CONFIG", self.dir / "realms.conf"):
             self.doc, self.details = tasks_screen.document(self.connection, now=NOW), {}
-        r = self.run_tasks("R.board = ELS['view-board'].html; R.sub = ELS.subhead.html; await realm('work'); R.work = ELS['view-board'].html;")["R"]
+        r = self.run_tasks("R.board = ELS['view-board'].html; R.sub = ELS.subhead.html; await realm('work'); R.work = ELS['view-board'].html;", hash="#view=personal")["R"]
         self.assertEqual([t in r["board"] for t in self.TITLES], [False, True, True])
         self.assertEqual([t in r["work"] for t in self.TITLES], [False, False, False])
         self.assertIn("repos in no realm: no realm list; set dashboard.realms on Settings", r["sub"])
@@ -1457,7 +1459,7 @@ await realm('work'); R.work = ELS.subhead.html;
 await realm('hoa'); R.hoa = ELS.subhead.html;
 R.objects = [...OBJ.keys()].filter(k => k.startsWith('sweep:')); R.timers = TIMERS.slice();
 C.run(cmd('realm-sweep.run'), C.get('sweep:work')); await flush();
-C.run(cmd('realm-sweep.run'), C.get('sweep:personal')); await flush();""", answer=answer, prelude=prelude)
+C.run(cmd('realm-sweep.run'), C.get('sweep:personal')); await flush();""", answer=answer, prelude=prelude, hash="#view=personal")
         r = out["R"]
         self.assertIn('data-sweep="personal">Personal sweep not run yet', r["personal"])
         self.assertIn('data-sweep="work">Work sweep running since 11:30 UTC', r["work"])
@@ -1474,7 +1476,7 @@ C.run(cmd('realm-sweep.run'), C.get('sweep:personal')); await flush();""", answe
         done = {"running": False, "error": "", "command": "c",
                 "last": {"state": "done", "finished": "2026-09-06T11:40:00+00:00", "gaps": ["jira", "github"]}}
         self.doc["sweeps"] = {"personal": done, "work": {**done, "last": {**done["last"], "gaps": []}}}
-        r = self.run_tasks("R.personal = ELS.subhead.html; await realm('work'); R.work = ELS.subhead.html;")["R"]
+        r = self.run_tasks("R.personal = ELS.subhead.html; await realm('work'); R.work = ELS.subhead.html;", hash="#view=personal")["R"]
         self.assertIn("Personal sweep done 2026-09-06 11:40 UTC · not read: jira, github", r["personal"])
         self.assertIn("Work sweep done 2026-09-06 11:40 UTC ", r["work"])
         self.assertNotIn("not read", r["work"])
@@ -1545,15 +1547,18 @@ function run() {{ OUT.R = R; return JSON.stringify(OUT); }}
         r = self.run_script(f"""var window = globalThis, OUT = {{ error: null }}, R = {{}};
 window.SHELL_REALMS = {json.dumps(realms)};
 const PAGES = {{ Tasks: '/tasks', HOA: '/hoa', Home: '/home', Places: '/places' }};
-const GROUPS = [['Work', [['Tasks', 'list-todo', 'k']]], ['Places', [['HOA', 'droplets', 'h'], ['Home', 'house', 'o']]]];
+const GROUPS = [['Work', [['Tasks', 'list-todo', 'k']]], ['Places', [['Home', 'house', 'o'], ['HOA', 'droplets', 'h']]]];
 try {{
 {SHELL_PLACES.group(1)}
 R.places = GROUPS[1][1]; R.pages = PAGES;
 }} catch (e) {{ OUT.error = String(e) + ' ' + e.stack; }}
 function run() {{ OUT.R = R; return JSON.stringify(OUT); }}
 """)
-        self.assertEqual(r["places"], [["HOA", "droplets", "h"], ["Home", "house", "o"], ["Acme", "map", ""]])
+        # Operator 2026-11-20: realm places first, in dashboard.realms order; Home, then HOA last.
+        self.assertEqual(r["places"], [["Acme", "map", ""], ["Home", "house", "o"], ["HOA", "droplets", "h"]])
         self.assertEqual(r["pages"]["Acme"], "/places?realm=acme")
+        shell = (STATIC / "shell.js").read_text(encoding="utf-8")
+        self.assertIn("['Places',    [['Home', 'house', 'o'], ['HOA', 'droplets', 'h']]]", shell)
         self.assertEqual(r["pages"]["Tasks"], "/tasks")
 
     def test_place_js_sets_the_views_before_places_js_reads_them(self):
