@@ -382,6 +382,27 @@ class TheQueueGraph(DependencyCase):
                  for ident in (*ids, lone)]
         self.assertEqual(marks, [ids[0]] * 3 + [lone])
 
+    def test_a_merged_prerequisite_is_the_end_of_the_chain(self):
+        """Review of build/sd-1306: A and B in one batch, A waits on B, so B passes A and merges. A job
+        queued explicitly after B waits on B alone: A still queued holds it no longer, and A ending blocked
+        does not block it (`predecessor 1 ended blocked`)."""
+        from sd_db import runner
+
+        roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
+        for ends in (None, "blocked"):
+            with self.subTest(ends=ends):
+                if ends:
+                    self.setUp()
+                (first, second), (author, passer) = self.serial(2)
+                self.wait(first, second)
+                _, job = self.reviewer_after(passer)
+                self.assertTrue(runner.claim(self.db, passer, owner="fixture", **roots), "B passes A")
+                self.finish(passer)
+                if ends:
+                    self.db.execute("UPDATE assignment SET status = ? WHERE id = ?", (ends, author))
+                self.assertTrue(runner.claim(self.db, job, owner="fixture", **roots), "the job's B merged")
+                self.assertEqual(runner.queue_state(self.db, job)["status"], "running")
+
     def test_an_explicit_after_names_a_run_of_another_role(self):
         """Within one role, `after` is batch order, which a waiting run may pass; an explicit prerequisite
         of the same role would read as one, so it is refused: queue the runs in one batch."""

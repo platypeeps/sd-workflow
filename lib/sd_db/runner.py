@@ -104,20 +104,35 @@ def _merged(connection, row) -> bool:
         (row["item"],)).fetchone() is not None
 
 
-def _predecessor_ended(connection, assignment: dict) -> bool:
-    """Block `assignment` when a run ahead of it in its serial chain ended blocked or cancelled. The walk
-    takes the whole chain: a run ahead may have passed the ones before it (`_waits`), so a run that is
-    not queued says nothing of them (review of build/sd-1306)."""
-    predecessor = assignment["after"]
+def _chain(connection, row, rows: dict | None = None):
+    """The runs `row` waits on up its `after` chain, as (run, prerequisite) pairs: each run of its own
+    batch ahead of it (batch order), then the first run outside its batch, its explicit prerequisite,
+    where the chain ends. A run ahead in the batch may have passed the ones before it (`_waits`), so the
+    walk goes past one that is not queued; the prerequisite's own chain is its own, and it holds the
+    prerequisite, not `row` (review of build/sd-1306). A row saved before `batch` reads NULL: its
+    `after` is a prerequisite. A missing run refuses a claim (`rows` None) and ends the graph's walk."""
+    current, predecessor = row, row["after"]
     while predecessor is not None:
-        row = connection.execute("SELECT * FROM assignment WHERE id = ?", (predecessor,)).fetchone()
-        if row is None:
-            raise RunnerRefused(f"missing predecessor {predecessor}")
+        ahead = (rows or {}).get(predecessor) or connection.execute(
+            "SELECT * FROM assignment WHERE id = ?", (predecessor,)).fetchone()
+        if ahead is None:
+            if rows is None:
+                raise RunnerRefused(f"missing predecessor {predecessor}")
+            return
+        prerequisite = current["batch"] is None or current["batch"] != ahead["batch"]
+        yield ahead, prerequisite
+        if prerequisite:
+            return
+        current, predecessor = ahead, ahead["after"]
+
+
+def _predecessor_ended(connection, assignment: dict) -> bool:
+    """Block `assignment` when a run up its chain (`_chain`) ended blocked or cancelled."""
+    for row, _ in _chain(connection, assignment):
         if row["status"] in {"blocked", "cancelled"}:
             connection.execute("UPDATE assignment SET status = 'blocked', result = ?, ended = ? WHERE id = ?",
-                               (f"predecessor {predecessor} ended {row['status']}", now(), assignment["id"]))
+                               (f"predecessor {row['id']} ended {row['status']}", now(), assignment["id"]))
             return True
-        predecessor = row["after"]
     return False
 
 
@@ -150,8 +165,8 @@ def _graph(connection) -> tuple[dict[int, set[int]], list[tuple[int, int]]]:
     so its `after` is one, even of the same role (`enqueue` now refuses that). One that closes a
     cycle is not added but returned as a (run, prerequisite) pair: a wait contradicts it, and only a
     refusal or an ended run settles that, never a pass (lane review 7379bf9a). An order edge, kept
-    unless it closes a cycle: a serial run waits on each other run up its chain that is not merged,
-    the whole chain; then a parallel author run waits on each earlier queued serial or non-author run
+    unless it closes a cycle: a serial run waits on each run of its batch up its chain that is not
+    merged, up to its prerequisite (`_chain`); then a parallel author run waits on each earlier queued serial or non-author run
     in its repository that has no order edge left. An order edge that closes a cycle is dropped, so
     the run it held passes: the graph stays acyclic, and an acyclic graph always has a run that waits
     on none, so every queue drains once each contradicted prerequisite is settled."""
@@ -203,28 +218,15 @@ def _graph(connection) -> tuple[dict[int, set[int]], list[tuple[int, int]]]:
     contradicted: list[tuple[int, int]] = []
     order: list[tuple[int, int]] = []
     for ident, row in rows.items():
-        current, predecessor, crossed = row, row["after"], False
-        while predecessor is not None:
-            ahead = rows.get(predecessor) or connection.execute(
-                "SELECT * FROM assignment WHERE id = ?", (predecessor,)).fetchone()
-            if ahead is None:
-                break
-            # Batch order is a link within one `enqueue` call; a row saved before `batch` reads NULL, so its
-            # `after` stays a prerequisite, of the same role or not (review of build/sd-1306).
-            batched = current["batch"] is not None and current["batch"] == ahead["batch"]
-            prerequisite = not crossed and not batched
-            crossed = crossed or prerequisite
-            current = ahead
-            # A merged run ahead may have passed the ones before it, so the walk goes on past it.
+        for ahead, prerequisite in _chain(connection, row, rows):
             if _merged(connection, ahead):
-                pass
-            elif not prerequisite:
-                order.append((ident, predecessor))
-            elif add(ident, predecessor):
+                continue
+            if not prerequisite:
+                order.append((ident, ahead["id"]))
+            elif add(ident, ahead["id"]):
                 held.add(ident)
             else:
-                contradicted.append((ident, predecessor))
-            predecessor = ahead["after"]
+                contradicted.append((ident, ahead["id"]))
     for ident, predecessor in order:
         if add(ident, predecessor):
             held.add(ident)
