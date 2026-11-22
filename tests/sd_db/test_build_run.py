@@ -220,7 +220,8 @@ FAKE = textwrap.dedent('''
         if mode == "absolute":  # pack sd:9769: a blocker spelled as an absolute path inside the checkout
             findings = review.dispose([review._finding({**raw, "path": os.path.join(work, "work.txt")})], "high")
         print(json.dumps({"status": "blocking" if mode in ("blocking", "absolute") else "clean", "scope": "branch",
-                          "requested_reviews": 2, "completed_reviews": 2, "covers_from": "c" * 40,
+                          "requested_reviews": 2, "completed_reviews": 2,
+                          "covers_from": None if mode == "clean_uncovered" else "c" * 40,
                           "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                           "findings": findings if mode in ("blocking", "absolute") else []}))
     if role == "sd-ship":
@@ -1016,6 +1017,17 @@ class Supervise(Case):
         self.assertIn("--verify-report", verify)
         self.assertNotIn("--verify-report", retry, "the retry repeated the refused verify plan")
         self.assertNotIn("--base", retry)
+
+    def test_a_clean_delta_that_covers_no_branch_reviews_in_full(self):
+        """Class pass, sd:9769 (a delta verdict stands for the branch only on a report that covers it): a clean
+        verify whose own report covers nothing (another binding, a short round) is not the branch's pass."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1"], sd_review=["blocking", "clean_uncovered", "clean"])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued", self.latest()["detail"])
+        _first, verify, full = [call["argv"] for call in self.calls("sd-review")]
+        self.assertIn("--verify-report", verify)
+        self.assertNotIn("--verify-report", full, "a clean delta covering no branch was taken as the branch's pass")
 
     def test_round_one_reviews_the_whole_branch_and_round_two_the_findings_and_delta(self):
         """Pack sd:9769: round 1 is the full branch review; round 2 verifies round 1's findings over the delta."""

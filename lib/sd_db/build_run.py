@@ -1289,7 +1289,9 @@ class Supervisor:
             self.empty(out, "review")
             self.child(argv, cwd=self.work, name="review")
             answer = self.review_answer(out, head)
-            if answer is not None:
+            # A delta verdict stands for the branch only on a report that covers it (sd:9769): one that covers
+            # nothing (another binding, a short round) is no pass, and the branch is reviewed in full.
+            if answer is not None and not (prior and answer["status"] in ("clean", "advisory") and not answer["covers"]):
                 break
             if prior:  # `sd-review` can refuse a verify plan (input past its bound): retry the branch in full
                 argv, prior = argv[:argv.index("--verify-report")], None  # verify args close the argv
@@ -2103,7 +2105,7 @@ class Supervisor:
         findings = findings if isinstance(findings, list) else []
         # A route skip (a docs-only change) is the router's deliberate answer; any other skip stays unknown (pack sd:8291).
         if status in ("clean", "advisory") or status == "skipped" and (answer.get("route") or {}).get("tier") == "skip":
-            return {"status": status, "blockers": []}
+            return {"status": status, "blockers": [], "covers": bool(answer.get("covers_from"))}
         if status == "blocking":
             return {"status": status, "blockers": [row for row in findings
                                                    if isinstance(row, dict) and row.get("disposition") == "blocking"],
