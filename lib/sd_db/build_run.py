@@ -1676,7 +1676,8 @@ class Supervisor:
     def scope(self, path: str, line: int | None, head: str,
               sources: dict[str, list[str] | None]) -> tuple[set[str], list[str]] | None:
         """`enclosing`'s names and the lines of that function: from its definition to the next line indented no
-        deeper; the whole file for a place with no line, the cited line alone outside any function."""
+        deeper, the first that holds the cited line; the whole file for a place with no line, the cited line
+        alone outside every function."""
         if path not in sources:
             try:
                 sources[path] = _read([*self.tools.git, "-C", str(self.work), "show", f"{head}:{path}"],
@@ -1692,12 +1693,14 @@ class Supervisor:
             return None
         if line is None:
             return {name for text in lines for name in defined_names(text)}, lines
+        # The nearest definition whose lines hold the cited one: a line below a function's end is not its own.
         for start in range(min(line, len(lines)) - 1, -1, -1):
             if names := defined_names(lines[start]):
                 depth = len(lines[start]) - len(lines[start].lstrip())
                 end = next((index for index in range(start + 1, len(lines)) if lines[index].strip()
                             and len(lines[index]) - len(lines[index].lstrip()) <= depth), len(lines))
-                return names, lines[start:end]
+                if line <= end:
+                    return names, lines[start:end]
         return set(), lines[max(line - 1, 0):line]
 
     def branch_words(self, head: str) -> tuple[set[str], set[str]] | None:

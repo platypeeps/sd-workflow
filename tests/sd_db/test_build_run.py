@@ -1656,6 +1656,31 @@ class Supervise(Case):
                                     {"lookup", "None"}, callees=True)
         self.assertEqual(kept["blockers"], rows, "a blocker in a consumer of the changed function was deferred")
 
+    def test_a_module_level_line_below_a_function_is_not_inside_it(self):
+        """Review of sd:9769: a changed API starts returning None; an unchanged module-level
+        `result = changed_api().value` below an unrelated function is not that function's line, so the
+        finding there holds through what the line calls."""
+        self.press()
+        head = "a" * 40
+        body = "def unrelated():\n    return 1\n\n\nresult = changed_api().value\n"
+
+        def show(argv, **_kwargs):
+            if "show" in argv and argv[-1] == f"{head}:lib/mod.py":
+                return body
+            raise build_run.Unread("no such file")
+
+        supervisor = self.supervisor()
+        with mock.patch.object(build_run, "_read", side_effect=show):
+            self.assertEqual(supervisor.scope("lib/mod.py", 5, head, {}), (set(), ["result = changed_api().value"]),
+                             "a module-level line read as part of the function above it")
+            self.assertEqual(supervisor.scope("lib/mod.py", 2, head, {})[0], {"unrelated"})
+        row = {"path": "lib/mod.py", "line": 5, "summary": "a None value crashes here"}
+        with mock.patch.object(build_run, "_read", side_effect=show), \
+                mock.patch.object(build_run, "_grep", return_value=""):
+            _, kept = self.deferred([row], {"lib/api.py": {3}}, {"changed_api", "None"}, {"changed_api", "None"},
+                                    callees=True)
+        self.assertEqual(kept["blockers"], [row], "a module-level consumer of the changed API was deferred")
+
     def test_a_short_function_name_still_names_the_changed_caller(self):
         """Review of sd:9769: `go()` names a changed function; no length filter drops it."""
         self.press()
