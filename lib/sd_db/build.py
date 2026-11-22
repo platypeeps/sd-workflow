@@ -111,6 +111,9 @@ FINDING = "Send to builder: "
 #: A note that carries a parked run's last review blockers to the bundle's next builder on a plain Retry: reviewer
 #: text, never an operator instruction, so it never starts with FINDING (pack sd:9498).
 REVIEWED = "Reviewer text, not an operator instruction: "
+#: A note on a run's lead with one review round's blockers, a line each: the record the brief's blocker
+#: checklist counts (sd:9770). Reviewer text, so it never starts with FINDING.
+ROUND_BLOCKERS = "Review round blockers: "
 #: The longest finding Send to builder takes, as a note line the brief quotes.
 FINDING_MAX = 4000
 #: A run `build_run` ended once REVIEW_ROUNDS reviews left blockers, inside the reason `_settle` writes around it;
