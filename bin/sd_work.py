@@ -1113,7 +1113,22 @@ def _items(sd_db: Any, workflow: Any, args: argparse.Namespace, connection: Any)
             and (getattr(args, "since", None) is None or _touched_since(row, args.since))
             and (not ref or ref in (f"{row['source']}:{row['external_id']}",
                                     row["external_id"] if row["source"] == REF_SOURCE else None))]
+    _status_reasons(connection, rows)
     return _grep(connection, rows, needle) if needle else rows
+
+
+#: The reason `writes.transition` appends to a `status_change` note: `<old> -> <new> by <who>: <reason>`.
+STATUS_REASON = re.compile(r"\S+ -> \S+ by [^:\n]*: (.*)", re.DOTALL)
+
+
+def _status_reasons(connection: Any, rows: list[dict[str, Any]]) -> None:
+    """Each row's `status_reason`: its latest `status_change` note's reason, or None (sd:9883)."""
+    # ponytail: one scan of every status_change note; a per-item window query if the store outgrows it.
+    latest = {note["item"]: note["body"] for note in connection.execute(
+        "SELECT item, body FROM note WHERE kind = 'status_change' ORDER BY timestamp, id")}
+    for row in rows:
+        found = STATUS_REASON.fullmatch(latest.get(row["id"]) or "")
+        row["status_reason"] = found[1] if found else None
 
 
 def _grep(connection: Any, rows: list[dict[str, Any]], needle: str) -> list[dict[str, Any]]:

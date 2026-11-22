@@ -673,6 +673,9 @@ The reserved `sd` namespace declares these settings:
   this machine; `0` is no cap. Absence reads a quarter of the cores. `SD_GATE_SLOTS` overrides it
   for one run. It grants nothing;
   see [Parallel work](#parallel-work).
+- `sd.gate_workers`: how many test workers one local run of the pack's tests starts, 1 to 99.
+  Absence reads the cores over the gate cap, so the gates together hold the cores. `TEST_WORKERS` overrides it for one run.
+  It grants nothing.
 - `sd.review_slots`: how many reviews may run their reviewers at once on this machine; `0` is no cap.
   Absence reads 2. `SD_REVIEW_SLOTS` overrides it for one run. It grants nothing.
 - `sd.bundle_max`: how many items one build bundle takes when this machine claims it, a mechanical item half
