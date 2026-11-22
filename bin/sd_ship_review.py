@@ -663,6 +663,9 @@ class SharedReview:
                                   getattr(self.args, "review_timeout", None) or sd_lib.GATE_CHECK_SECONDS,
                                   slot_timeout=getattr(self.args, "slot_timeout", None) or sd_lib.GATE_SLOT_SECONDS)
         passes = self.history.native(self.state)
+        flake = self.gate_flake(check, head) if check["status"] != "pass" else None
+        if flake is not None:
+            check = flake
         if check["status"] != "pass":
             self.save(review_preflight_error={"kind": "gate_failed", "stage": "check", "head": head,
                                               "exit_code": check.get("exit_code"),
@@ -675,8 +678,73 @@ class SharedReview:
         passes[-1].update(exit_code=0, report={**report, "status": report["cleared_status"], "check": check,
                                                "failed_check": report["check"]})
         self.save(passes=passes, reviewed_head=head, review_preflight_error=None,
-                  **({"review_carry_forward": carried} if carried else {}))
+                  **({"review_carry_forward": carried} if carried else {}), **flake_record(check))
         self.check_review(head)
+
+    def flaked(self, report: dict, head: str, passes: list[dict], exit_code: int) -> dict:
+        """The cleared report a flake stands for (sd:9768); without one, the gate failure refuses as before."""
+        flake = self.gate_flake(report.get("check") or {}, head) if kept_gate_failure(report) else None
+        if flake is None:
+            self.release_gate_failure(report, head, passes, exit_code)
+        return {**report, "status": report["cleared_status"], "check": flake, "failed_check": report["check"]}
+
+    def gate_flake(self, check: dict, head: str) -> dict | None:
+        """Rerun a failed gate's failing tests once, alone; the passing check that stands for the gate, or None
+        (sd:9768).
+
+        None, and the gate fails as before, unless every failure is a unittest test (`failed_tests`), this
+        receipt took no flake at `head` already (once per entry), and no test failed a rerun in the last
+        `FLAKE_DAYS` days. A rerun that passes is noted on the item and as a comment on the suite's flake
+        item, the list the lane already files (sd:6739). It leaves no gate receipt: the merge runs its own gate.
+        """
+        item = getattr(self.identity, "item", None)
+        tests = failed_tests(check)
+        if self.connection is None or item is None or not tests or (self.state.get("gate_flake") or {}).get("head") == head:
+            return None
+        since = (datetime.now(timezone.utc) - timedelta(days=FLAKE_DAYS)).isoformat(timespec="seconds")
+        for test in tests:
+            failed = f"{RERUN_FAILED_NOTE}{test} at "
+            if self.connection.execute("SELECT 1 FROM note WHERE timestamp >= ? AND substr(body, 1, ?) = ?",
+                                       (since, len(failed), failed)).fetchone():
+                print(f"sd-ship: {test} failed a rerun in the last {FLAKE_DAYS} days; no flake retry", file=sys.stderr)
+                return None
+        code, out, err = rerun_tests(self.root, head, tests)
+        if code == 0 and FAILING_OUTCOME.search(f"{out}\n{err}"):
+            code = None  # a skipped or unexpectedly passing rerun is no pass, and bars nothing
+        sd_lib.import_sd_db()
+        from sd_db.database import transaction  # noqa: PLC0415
+        from sd_db.writes import add_note  # noqa: PLC0415
+        if code != 0:
+            # Only a test the rerun ran and saw fail is barred: one that did not load or run is not (sd:9768).
+            # A header the parser cannot read bars every test it reran: the omitted one may be any of them.
+            parsed = named_failures(f"{out}\n{err}") if code is not None else []
+            named = set(tests) if parsed is None else {paren if paren.endswith(f".{name}") else f"{paren}.{name}"
+                                                       for name, paren in parsed}
+            with transaction(self.connection):
+                for test in tests:
+                    if test in named:
+                        add_note(self.connection, item, "comment",
+                                 f"{RERUN_FAILED_NOTE}{test} at {head[:12]}: it failed alone too (sd:9768)")
+            print(f"sd-ship: the failing tests failed again alone ({rerun_reason(code, out, err)}); "
+                  "the gate failure stands",
+                  file=sys.stderr)
+            return None
+        flake = {"head": head, "tests": tests, "recorded_at": self.runtime.clock()}
+        import sd_lane  # noqa: PLC0415 -- the flake list is the lane's
+        with transaction(self.connection):
+            repo = self.connection.execute("SELECT repo FROM item WHERE id = ?", (item,)).fetchone()
+            for test in tests:
+                said = f"{test} failed the gate at {head[:12]} and passed alone on a rerun"
+                add_note(self.connection, item, "comment", f"{FLAKE_NOTE}{said}; prepare went on (sd:9768)")
+                if repo is not None and repo[0]:
+                    flaky = sd_lane.flake_item(self.connection, test_suite(test), repo[0], self.repository)
+                    add_note(self.connection, flaky, "comment", f"Gate flake in {self.repository}: {said} "
+                             f"(sd:{item}). Fix the suite at its root with a test that fails first.")
+        # No save here: each caller saves `gate_flake` with the cleared review in one write, so a stop between
+        # them leaves the retry unspent rather than spent with nothing to reuse it.
+        print(f"sd-ship: {', '.join(tests)} passed alone on a rerun; recorded as a flake, prepare goes on",
+              file=sys.stderr)
+        return {"status": "pass", "exit_code": 0, "detail": f"flake: {', '.join(tests)} passed alone", "flake": flake}
 
     def adjudicate(self) -> dict:
         return sd_ship_dispositions.adjudicate(self)
@@ -1402,13 +1470,15 @@ class SharedReview:
             self.release_moved_request(report, head, passes, result.returncode)
         reserved = head
         head = self.covered_head(passes[-1], report)
-        if released_gate_failure(report, result.returncode):
-            self.release_gate_failure(report, head, passes, result.returncode)
-        if request and unreviewed(report, result.returncode):
-            self.release_unreviewed_request(report, head, passes, result.returncode)
+        code, flake = result.returncode, {}
+        if released_gate_failure(report, code):
+            report, code = self.flaked(report, head, passes, code), 0
+            flake = flake_record(report["check"])
+        if request and unreviewed(report, code):
+            self.release_unreviewed_request(report, head, passes, code)
         passes[-1]["report"] = report
-        passes[-1]["exit_code"] = result.returncode
-        self.save(passes=passes, reviewed_head=head if result.returncode == 0 else None, phase="reviewed")
+        passes[-1]["exit_code"] = code
+        self.save(passes=passes, reviewed_head=head if code == 0 else None, phase="reviewed", **flake)
         try:
             validate_provider_selection(report, passes[-1].get("requested_provider"), completed=completed_depth(report))
         except Refusal:
@@ -1421,7 +1491,7 @@ class SharedReview:
                           next_action=f"Keep one writer in this checkout while prepare runs, then prepare again: at "
                                       f"{head[:12]} it reuses this review, and a head that cannot reach "
                                       f"{head[:12]}, as after an amend, is refused with the --restart-review remedy.")
-        if result.returncode:
+        if code:
             # sd:2605. A review that refuses the head stops before the gate; say so,
             # so nobody reads a refusal with no gate failure in it as tests that passed.
             unrun = (report.get("check") or {}).get("status") == GATE_NOT_RUN
@@ -1652,6 +1722,243 @@ def gate_code(check: dict) -> str:
     """The refusal code of a failed gate: `GATE_SLOT_WAIT` when its slot wait ran out and no check ran, which the
     lane puts back (pack sd:7412); else `GATE_FAILED`, which it does not."""
     return GATE_SLOT_WAIT if check.get("slot_ran_out") is True else GATE_FAILED
+
+
+#: A unittest failure header, `FAIL: test_x (tests.mod.Class.test_x)`, or before 3.11 `(tests.mod.Class)` (sd:9768).
+FAILED_TEST = re.compile(r"^(?:FAIL|ERROR): (\w+) \(([\w.]+)\)", re.M)
+#: Every unittest failure header, parsed or not: a name `FAILED_TEST` cannot read must not drop out unseen.
+FAILURE_HEADER = re.compile(r"^(?:FAIL|ERROR): ", re.M)
+#: A unittest run's failure summary: `FAILED (failures=N, errors=M, ...)`.
+FAILED_SUMMARY = re.compile(r"^FAILED \(([^)]*)\)$", re.M)
+#: The most failing tests a gate may name and be rerun as a flake: more is a real break.
+FLAKE_TESTS = 5
+#: A unittest outcome other than FAIL and ERROR that fails a gate or a rerun by itself: a skip, which `make test`
+#: refuses, and an unexpected success, which fails the run.
+FAILING_OUTCOME = re.compile(r"skipped=[1-9]|unexpected successes=[1-9]|^UNEXPECTED SUCCESS:", re.M)
+#: A fault of the gate's runner, not a test, outside every shard block: `run-tests.sh`'s `error:` lines
+#: (a log it could not assemble, results it could not publish) and `make test`'s skip refusal.
+RUNNER_FAULT = re.compile(r"^(?:error: |fatal: |Tests skipped locally)", re.M)
+#: A constant guard `run-tests.sh` exports to its shards: Jev off, git maintenance off.
+RUNNER_GUARD = re.compile(r"^export ((?:JEV|GIT_CONFIG)_\w+)=([\w.-]*)$", re.M)
+#: A shard's start and complete end lines in `run-tests.sh` output; unittest exits 1 when a test failed.
+SHARD_START = re.compile(r"^shard (\S+): start$", re.M)
+#: The shard count `run-tests.sh` planned; a shard `xargs` never launched leaves no log, so no start line.
+SHARDS_PLANNED = re.compile(r"^test runner: workers=\d+ shards=(\d+)$", re.M)
+SHARD_END = re.compile(r"^shard (\S+): \d+s exit=(\d+)$", re.M)
+UNITTEST_FAILED = "1"
+#: The paths, under the tree, a shard of these tests puts on PYTHONPATH (`run-tests.sh`); `()` for none. Every
+#: other test runs with none here: the runner adds only its coverage hook, which the rerun does not use.
+SHARD_PATHS = {"dashboard.tests.": ("dashboard", "lib", "dashboard/tests"), "tests.sd_db.": ()}
+#: One shard's block of `run-tests.sh` output, from its start line to its end line.
+SHARD_BLOCK = re.compile(r"^shard (\S+): start$.*?^shard \1: \d+s exit=\d+$", re.M | re.S)
+#: How long a test that failed its rerun stays out of the flake retry (sd:9768).
+FLAKE_DAYS = 7
+#: The note a flake writes on the entry's item, and the one a failed rerun writes: one test each, then " at ".
+FLAKE_NOTE, RERUN_FAILED_NOTE = "Gate flake: ", "Gate rerun failed: "
+
+
+def failed_tests(check: dict) -> list[str]:
+    """The unittest ids a failed gate names when failing tests are all that failed; [] otherwise (sd:9768).
+
+    Every failing check's steps must be test shards or `make target test`, none unfinished, and every failed
+    shard's block of the whole output must hold a FAIL or ERROR header: a shard that crashed with none, a
+    lint, or a timeout is no flake. More than `FLAKE_TESTS` ids, or a module that did not load, is none either.
+    """
+    rows = [row for row in shard_lines(check.get("checks")) if isinstance(row, dict) and row.get("status") == "fail"]
+    if not rows or check.get("slot_ran_out"):
+        return []
+    ids: list[str] = []
+    for row in rows:
+        found = row_tests(row)
+        if not found:
+            return []
+        ids += found
+    ids = list(dict.fromkeys(ids))
+    return ids if len(ids) <= FLAKE_TESTS and not any(test.startswith("unittest.") for test in ids) else []
+
+
+def exited_failing(row: dict[str, Any]) -> bool:
+    """Whether `row`'s check exited on its own with a failure: a timeout or a check that could not start
+    (`exit_code` None, a `reason`) never finished its work, so no test in it is known to be the only fault."""
+    code = row.get("exit_code")
+    return isinstance(code, int) and not isinstance(code, bool) and code != 0 and not row.get("reason")
+
+
+def row_tests(row: dict) -> list[str]:
+    """The unittest ids one failing check row names when failing tests are all that failed in it; [] otherwise."""
+    if not exited_failing(row):
+        return []
+    steps = [str(step) for step in shard_lines(row.get("failed_steps"))]
+    text = whole_output(row)
+    failing = unittest_failed_shards(text)
+    # A skip or an unexpected success anywhere fails the gate by itself; a failing shard only ends
+    # `make test` before it says so.
+    if RUNNER_FAULT.search(SHARD_BLOCK.sub("", text)) or FAILING_OUTCOME.search(text):
+        return []
+    found = [paren if paren.endswith(f".{name}") else f"{paren}.{name}" for name, paren in named_failures(text) or []]
+    if not steps or not failing or not all(test_step(step, failing) for step in steps):
+        return []
+    return found
+
+
+def unittest_failed_shards(text: str) -> set[str]:
+    """The shards in `run-tests.sh` output `text` that finished with unittest's own failure exit and printed a FAIL
+    or ERROR header; empty when any shard did not write its complete end line (killed or hung), ended with any
+    other non-zero exit (137 for a kill), or failed with no header: then more than a test failed."""
+    started = SHARD_START.findall(text)
+    ended = {match.group(1): match for match in SHARD_END.finditer(text)}
+    planned = SHARDS_PLANNED.findall(text)
+    # Every planned shard finished: one that never launched left no log to count (review of sd:9768).
+    if any(name not in ended for name in started) or planned != [str(len(ended))]:
+        return set()
+    failing = {name for name, match in ended.items() if match.group(2) != "0"}
+    for name in failing:
+        match = ended[name]
+        opened = text.rfind(f"shard {name}: start\n", 0, match.start())
+        if match.group(2) != UNITTEST_FAILED or opened < 0 or not read_failures(text[opened:match.start()]):
+            return set()
+    return failing
+
+
+def named_failures(text: str) -> list[tuple[str, str]] | None:
+    """The `(name, parent)` of each unittest failure header in `text`, or None when any header does not parse:
+    a valid name with a combining mark escapes `FAILED_TEST` (review of sd:9768)."""
+    named = FAILED_TEST.findall(text)
+    return named if len(named) == len(FAILURE_HEADER.findall(text)) else None
+
+
+def read_failures(block: str) -> bool:
+    """Whether one shard's output names every failure it counts: each header parses, and they add up to its
+    `FAILED (failures=N, errors=M)` summary; one it cannot read is a failure no rerun would clear."""
+    named = named_failures(block)
+    summaries = FAILED_SUMMARY.findall(block)
+    if not named or len(summaries) != 1:
+        return False
+    return sum(int(count) for count in re.findall(r"(?:^|, )(?:failures|errors)=(\d+)", summaries[0])) == len(named)
+
+
+def test_step(step: str, failing: set[str]) -> bool:
+    """`make target test`, or one complete `shard X: Ns exit=1` line of a shard in `failing`: a listed step that
+    only starts like one (`exit=1` of `exit=137`) or names an unfinished shard is not a test failure."""
+    if step == "make target test":
+        return True
+    match = SHARD_END.fullmatch(step)
+    return match is not None and match.group(2) == UNITTEST_FAILED and match.group(1) in failing
+
+
+def whole_output(row: dict) -> str:
+    """A failing check's whole output where `sd-check` kept it (sd:2558), else "": an excerpt or a tail can leave
+    out the runner error or skip summary that would show more than tests failed."""
+    path = row.get("output_path")
+    if isinstance(path, str) and path:
+        try:
+            return pathlib.Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            pass
+    return ""
+
+
+def flake_record(check: dict) -> dict:
+    """The `gate_flake` state update a flake check carries, saved with the cleared review it stands for."""
+    flake = check.get("flake") if isinstance(check, dict) else None
+    return {"gate_flake": flake} if isinstance(flake, dict) else {}
+
+
+def test_suite(test: str) -> str:
+    """The module of a unittest id, as the gate's shards name a suite: the parts before the first class name."""
+    parts = test.split(".")
+    at = next((n for n, part in enumerate(parts) if part[:1].isupper()), len(parts) - 1)
+    return ".".join(parts[:at]) or test
+
+
+def runner_guards(tree: pathlib.Path) -> dict[str, str]:
+    """The constant `JEV_*` and `GIT_CONFIG_*` exports of `tree`'s `run-tests.sh`, as its shards get them, read at
+    the rerun's head so they never drift; `JEV_ENABLED=0` even without the file: no rerun sends a live, metered
+    Jev call (sd:2136)."""
+    try:
+        text = (tree / ".github/scripts/run-tests.sh").read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        text = ""
+    return {"JEV_ENABLED": "0", **dict(RUNNER_GUARD.findall(text))}
+
+
+def shard_environment(environment: dict[str, str], tree: pathlib.Path, test: str) -> dict[str, str]:
+    """`environment` with the PYTHONPATH `run-tests.sh` gives the shard `test` runs in (`SHARD_PATHS`)."""
+    env = {key: value for key, value in environment.items() if key != "PYTHONPATH"}
+    paths = next((paths for prefix, paths in SHARD_PATHS.items() if test.startswith(prefix)), ())
+    if paths:
+        env["PYTHONPATH"] = os.pathsep.join(str(tree / path) for path in paths)
+    return env
+
+
+def gate_python(tree: pathlib.Path, environment: dict[str, str]) -> str | None:
+    """The interpreter `make test` runs at `tree` under `environment`, or None: the Makefile's `VENV_PYTHON`,
+    after its `$(GATE_ENV)` prerequisite, which in gate mode builds the worktree's own `.venv` as the gate does."""
+    probe = "sd-rerun-python: $(GATE_ENV)\n\t@echo $(abspath $(VENV_PYTHON))\n"
+    try:  # as a group: at the deadline no provisioning child outlives `make` into the removed worktree
+        done = sd_lib.run_group(["make", "-s", "--no-print-directory", "-f", "Makefile", "-f", "-", "sd-rerun-python"],
+                                cwd=tree, env=environment, input_text=probe, timeout=sd_lib.GATE_CHECK_SECONDS)
+    except (OSError, subprocess.SubprocessError, sd_lib.GroupTimeout):
+        return None
+    lines = done.stdout.strip().splitlines()
+    python = lines[-1] if done.returncode == 0 and lines else ""
+    return python if python and os.access(python, os.X_OK) else None
+
+
+def rerun_reason(code: int | None, out: str, err: str) -> str:
+    """A failed rerun's exit code; with none, why it stopped: in words for a skip or an unexpected success, never
+    unittest's own summary, which `make test`'s skip check would read in the gate's log as a skip of its own."""
+    if code is not None:
+        return f"exit {code}"
+    if FAILING_OUTCOME.search(f"{out}\n{err}"):
+        return "the rerun skipped a test or passed one unexpectedly"
+    return (err.strip().splitlines() or ["no clean pass"])[-1]
+
+
+def rerun_tests(root: pathlib.Path, head: str, tests: list[str]) -> tuple[int | None, str, str]:
+    """The gate's interpreter `-m unittest` on `tests` alone in a clean detached worktree of `head`, as the gate ran them
+    (sd:9768): no uncommitted or untracked file in `root` reaches the rerun. None for the exit code when the
+    worktree could not be made or the rerun did not finish.
+
+    ponytail: no gate slot, as a handful of tests is not a gate; take one if reruns ever grow.
+    """
+    import sd_gate_cache  # noqa: PLC0415
+    import sd_gate_run  # noqa: PLC0415
+
+    with tempfile.TemporaryDirectory(**sd_gate_cache.worktree_place(root, head)) as parent:
+        tree = pathlib.Path(parent) / "tree"
+        try:
+            sd_gate_run.gate_git(root, "worktree", "add", "--detach", str(tree), head)
+        except sd_gate_run.GateError as error:
+            return None, "", f"no worktree of {head[:12]} for the rerun: {error}"
+        try:
+            if sd_gate_run.gate_git(tree, "rev-parse", "HEAD") != head:
+                return None, "", f"the rerun's worktree is not at {head[:12]}"
+            # The runner's git entries replace the gate's; fsmonitor stays off on top of them.
+            environment = sd_lib.without_fsmonitor({**sd_gate_run.gate_environment(tree), **runner_guards(tree)})
+            python = gate_python(tree, environment)
+            if python is None:
+                return None, "", f"no gate interpreter (the Makefile's VENV_PYTHON) at {head[:12]}"
+            # The Makefile reads SD_LOCAL_GATE and unexports it from its recipes: the tests see a plain checkout.
+            environment.pop(sd_gate_run.GATE_VARIABLE, None)
+            # As `make test` and `run-tests.sh` give every shard: no real review or gate slot to wait on.
+            environment.update(SD_REVIEW_SLOTS="0", SD_GATE_SLOTS="0", SD_AI_COMMAND_PACK_PYTHON=python)
+            outputs: list[tuple[str, str]] = []
+            code: int | None = 0
+            for test in tests:  # one child per test, each with its own shard's path
+                ran, out, err = sd_gate_run.run_child([python, "-m", "unittest", test],
+                                                      shard_environment(environment, tree, test), tree,
+                                                      sd_lib.GATE_CHECK_SECONDS)
+                if ran is None:
+                    # `out` says why it did not finish: it ends the errors. An earlier failure keeps its code.
+                    outputs.append((err, out))
+                    code = code or None
+                    break
+                outputs.append((out, err))
+                code = code or ran
+            return code, "\n".join(out for out, _ in outputs), "\n".join(err for _, err in outputs)
+        finally:
+            sd_lib.git_output(["worktree", "remove", "--force", str(tree)], root)
 
 
 #: The statuses a review clears a head with; `cleared_status` is one of them when the gate failed after it.

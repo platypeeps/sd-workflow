@@ -34,7 +34,7 @@ import subprocess
 import time
 import uuid
 from collections.abc import Collection
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import hub, paths, reads
@@ -68,7 +68,8 @@ SCOPE = "build"
 DRAFT = "draft"
 #: Code-writing builders per machine, the operator's standing rule, and bundles building per repository at once.
 #: One: later items wait and the next bundle takes them (sd:8158); a bundle in the lane frees it (sd:8277).
-#: `REPO_CAP` is the default of the machine setting `sd.repo_cap` (`repo_cap`, sd:9172).
+#: `REPO_CAP` is the default of the machine setting `sd.repo_cap` (`repo_cap`, sd:9172), and `MACHINE_CAP`
+#: of `sd.machine_cap` (`machine_cap`, sd:9891).
 MACHINE_CAP = 6
 REPO_CAP = 1
 #: Items per bundle, so a bundle fits one 120-minute run (lead, note #29482): the default of the machine
@@ -110,6 +111,9 @@ FINDING = "Send to builder: "
 #: A note that carries a parked run's last review blockers to the bundle's next builder on a plain Retry: reviewer
 #: text, never an operator instruction, so it never starts with FINDING (pack sd:9498).
 REVIEWED = "Reviewer text, not an operator instruction: "
+#: A note on a run's lead with one review round's blockers, a line each: the record the brief's blocker
+#: checklist counts (sd:9770). Reviewer text, so it never starts with FINDING.
+ROUND_BLOCKERS = "Review round blockers: "
 #: The longest finding Send to builder takes, as a note line the brief quotes.
 FINDING_MAX = 4000
 #: A run `build_run` ended once REVIEW_ROUNDS reviews left blockers, inside the reason `_settle` writes around it;
@@ -184,6 +188,14 @@ AUTO_PICKUP = "build.auto_pickup"
 PICKUP = "auto-pickup"
 #: The title prefix of the item a failed health check after an auto-pickup merge files; the push reads it.
 HEALTH = "Auto-pickup off: health failed after the merge of "
+#: A run whose builder hit its account's usage limit (pack sd:9907): no loss and no block. `_settle` queues
+#: the bundle again and holds the run's host, the setting `HOLD` + `hold_key`, until the limit resets.
+RATE_LIMITED = "rate_limited"
+HOLD = "build.rate_hold."
+#: How long a hold lasts with no `resetsAt` ahead, and the furthest one may read: a weekly limit, and a day.
+HOLD_SECONDS, HOLD_MAX_SECONDS = 3600, 8 * 86400
+#: Why a held host claims nothing: the tick's beat, `room` and the Builds panel name it with its end.
+RATE_HELD = "the builder's Claude account hit its usage limit; builds on this host hold until "
 
 
 class BuildRefused(SdDbError):
@@ -299,7 +311,8 @@ def dispatcher_refusal(connection, host: str) -> str | None:
     if gone:
         return gone
     why = dispatcher_why(connection, host)
-    return f"{HEARTBEAT}@{host} claims nothing: {why}" if why and not why.startswith(UNREAD) else None
+    # A usage-limit hold names its end, so its press queues and builds then (pack sd:9907).
+    return f"{HEARTBEAT}@{host} claims nothing: {why}" if why and not why.startswith((*UNREAD, RATE_HELD)) else None
 
 
 def dispatcher_stuck(connection, host: str) -> str | None:
@@ -311,7 +324,8 @@ def dispatcher_stuck(connection, host: str) -> str | None:
     rows = connection.execute("SELECT body FROM state WHERE kind = 'heartbeat' AND key = ? ORDER BY id DESC LIMIT ?",
                               (f"{HEARTBEAT}@{host}", STUCK_TICKS)).fetchall()
     whys = [_why(row) for row in rows]
-    if len(whys) < STUCK_TICKS or not all(whys):
+    # A usage-limit hold is a tick that works and waits for a known end, not a stuck one (pack sd:9907).
+    if len(whys) < STUCK_TICKS or not all(whys) or str(whys[0]).startswith(RATE_HELD):
         return None
     return f"{HEARTBEAT}@{host} claimed nothing for {STUCK_TICKS} ticks: {whys[0]}"
 
@@ -1189,6 +1203,46 @@ def over_load(load: float, cap: float) -> str:
     return f"the five-minute load is {load:g}, above the cap of {cap:g}" if 0 < cap < load else ""
 
 
+def hold_key(host: str) -> str:
+    """The setting that holds `host`'s builds after a usage limit: `HOLD` and the host as a key segment."""
+    name = re.sub(r"[^a-z0-9_]", "_", host.lower())
+    return HOLD + (name if name[:1].isalpha() else f"h_{name}")
+
+
+def hold_until(final: str | None, stamp: str) -> str:
+    """When a hold that starts at `stamp` ends, read from the run's result line `final`: its
+    `rate_limit_info.resetsAt`, epoch seconds, when that is after `stamp` and at most `HOLD_MAX_SECONDS` on;
+    any other value or shape holds `HOLD_SECONDS` (pack sd:9907)."""
+    start = datetime.fromisoformat(stamp)
+    try:
+        line = json.loads(final or "null")
+    except (ValueError, RecursionError):
+        line = None
+    info = line.get("rate_limit_info") if isinstance(line, dict) else None
+    reset = info.get("resetsAt") if isinstance(info, dict) else None
+    if isinstance(reset, (int, float)) and not isinstance(reset, bool):
+        try:
+            at = datetime.fromtimestamp(reset, UTC)
+        except (OverflowError, OSError, ValueError):
+            at = None
+        if at is not None and start < at <= start + timedelta(seconds=HOLD_MAX_SECONDS):
+            return at.isoformat(timespec="seconds")
+    return (start + timedelta(seconds=HOLD_SECONDS)).isoformat(timespec="seconds")
+
+
+def rate_hold(connection, *, now: str | None = None) -> str:
+    """Why this host claims nothing after a usage limit (`RATE_HELD` and its end), or "" when no hold is ahead.
+    A hold that does not read holds: an unread value says nothing about the limit."""
+    key = hold_key(this_host())
+    try:
+        until = read_settings(connection, [key]).get(key)
+        if not until or datetime.fromisoformat(until) <= datetime.fromisoformat(now or clock()):
+            return ""
+    except (SdDbError, ValueError, TypeError) as error:
+        return f"{RATE_HELD}an unknown time: {key} does not read ({error}); unset it or set an ISO time"
+    return f"{RATE_HELD}{until} ({key}; unset it to build sooner)"
+
+
 def room(connection, *, load: float | None, load_cap: float | None, interactive: list[dict] | None,
          hosts: Collection[str | None] | None = None) -> dict:
     """Builders that may start now: `machine`, `used` and `held` by repository, and `why` there is none.
@@ -1233,11 +1287,13 @@ def room(connection, *, load: float | None, load_cap: float | None, interactive:
         if repo:
             used[repo] = used.get(repo, 0) + 1
     held = sorted({row["repo"] for row in leases if row["scope"] != SCOPE and (row["exclusive"] or row["quarantine"])})
-    machine = MACHINE_CAP - len(builds) - len(drafts) - len(others)
+    cap = machine_cap()
+    machine = cap - len(builds) - len(drafts) - len(others)
     if not why and isinstance(load, (int, float)) and isinstance(load_cap, (int, float)):
         why = over_load(load, load_cap)
+    why = why or rate_hold(connection)
     if not why and machine <= 0:
-        why = f"{MACHINE_CAP - machine} builders run already; the cap is {MACHINE_CAP}"
+        why = f"{cap - machine} builders run already; the cap is {cap}"
     return {"machine": 0 if why else machine, "used": used, "held": held, "why": why}
 
 
@@ -1282,6 +1338,11 @@ def _machine_setting(key: str, pattern: str, default: int, environ: dict[str, st
 def bundle_max(environ: dict[str, str] | None = None) -> int:
     """This machine's `sd.bundle_max`, 1 to 99; `BUNDLE_MAX` when unset (sd:9109)."""
     return _machine_setting("bundle_max", "[1-9][0-9]?", BUNDLE_MAX, environ)
+
+
+def machine_cap(environ: dict[str, str] | None = None) -> int:
+    """This machine's `sd.machine_cap`, builders at once, 1 to 16; `MACHINE_CAP` when unset (sd:9891)."""
+    return _machine_setting("machine_cap", "[1-9]|1[0-6]", MACHINE_CAP, environ)
 
 
 def repo_cap(environ: dict[str, str] | None = None) -> int:
@@ -1864,9 +1925,10 @@ def end(connection, ident: str, outcome: str, detail: str, *, question: str | No
     transaction: `cancelled` ends the bundle and moves its items to ready, parked,
     a `LOSSES` outcome retries once at the `RESUME` step, `blocked` blocks
     the bundle with `detail` (held until a reap reads the supervisor gone),
-    and `done` releases it. `question` adds a question note on each item.
+    `RATE_LIMITED` queues it again and holds its host, and `done` releases
+    it. `question` adds a question note on each item.
     """
-    if outcome not in ("cancelled", "blocked", "done", *LOSSES):
+    if outcome not in ("cancelled", "blocked", "done", RATE_LIMITED, *LOSSES):
         raise BuildRefused(f"no supervisor outcome {outcome!r}")
     with transaction(connection):
         if connection.execute("UPDATE runner_run SET outcome = ?, detail = ?, updated_at = ? WHERE id = ? "
@@ -2523,6 +2585,19 @@ def _settle(connection, read: dict, *, block: str | None = None) -> dict | None:
                 _move(connection, member["item"], "ready", f"build run {ident} {row['detail']}; worktree {row['work_path']} kept")
                 # Parked, so auto-pickup does not queue it again on its next tick (sd:9222).
                 park(connection, member["item"], ("ready",), stamp, CANCEL_PARKED.format(run=ident))
+        elif row["outcome"] == RATE_LIMITED:
+            # No loss and no block (pack sd:9907): the account, not the work, stopped it. The bundle queues again
+            # as it was, its place kept, and its host claims nothing until the limit resets (`rate_hold`).
+            host = run_host(row["owner"]) or this_host()
+            until = hold_until(row["final"], stamp)
+            set_setting(connection, hold_key(host), until)
+            for member in members:
+                connection.execute("UPDATE assignment SET status = 'queued', started = NULL, ended = NULL, "
+                                   "result = NULL WHERE id = ?", (member["id"],))
+                _move(connection, member["item"], "ready", f"build run {ident} hit the usage limit; queued again")
+                add_note(connection, member["item"], "comment",
+                         f"Build run {ident} hit the builder account's usage limit at step {row['step']}; "
+                         f"assignment {member['id']} queued again; {host} builds from {until}")
         elif row["outcome"] in LOSSES:
             marks = ", ".join("?" for _ in LOSSES)
             losses = connection.execute(f"SELECT COUNT(*) FROM runner_run WHERE assignment = ? AND step IS ? "
