@@ -1381,7 +1381,10 @@ class Supervisor:
             # `sd-review` verifies only these statuses: a `skipped` round has no prior to verify (sd:2721).
             if (not isinstance(reviewed, str) or answer.get("scope") != "branch"
                     or answer.get("status") not in ("clean", "advisory", "blocking", "gate_failed")
-                    or not isinstance(answer.get("findings"), list)):
+                    or not isinstance(answer.get("findings"), list)
+                    # A round short of a reader read part of the patch: its delta proves nothing (sd:9769).
+                    or not 1 <= int(answer.get("requested_reviews") or 0) <= int(answer.get("completed_reviews") or 0)
+                    or answer.get("review_shortfall")):
                 if path == last:
                     return None
                 continue

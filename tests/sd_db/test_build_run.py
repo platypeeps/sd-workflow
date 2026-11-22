@@ -1312,6 +1312,23 @@ class Supervise(Case):
                 self.assertEqual((chosen or {}).get("subject", {}).get("head"), expected,
                                  "a replay held at the checks lost the delta review's prior")
 
+    def test_a_short_blocking_round_is_no_prior_to_verify(self):
+        """Review of sd:9769: a blocking round short of a reader read part of the patch; the next round reviews
+        the branch in full, not the delta since it."""
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        for short in ({"requested_reviews": 1, "completed_reviews": 1,
+                       "review_shortfall": {"requested": 2, "eligible": 1}},
+                      {"requested_reviews": 2, "completed_reviews": 1}):
+            supervisor.out("prior").write_text("", encoding="utf-8")
+            supervisor.out("review").write_text(json.dumps(
+                {**self.PRIOR, **short, "status": "blocking", "scope": "branch", "subject": {"head": "b" * 40}}),
+                encoding="utf-8")
+            with self.subTest(short=short), mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
+                    mock.patch.object(build_run, "_read", return_value=""):
+                self.assertIsNone(supervisor.prior_review("a" * 40), "a short blocking round seeded a delta review")
+
     def test_a_skipped_last_round_is_no_prior_to_verify(self):
         """Review of sd:9769: `sd-review` refuses a `skipped` report as `--verify-report`; the next round
         reviews in full instead of parking on that refusal twice."""
