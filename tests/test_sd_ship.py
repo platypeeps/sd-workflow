@@ -3191,7 +3191,8 @@ roles:
         resolves another (class pass after round 7)."""
         self.task_item("task")
         waiting = sd_db.add_note(self.connection, self.item, "followup", "Waits on the reviewer's reply")
-        sd_db.add_note(self.connection, self.item, "followup", "Lane failed in prepare at aaaaaaaaaaaa: gate red")
+        sd_db.add_note(self.connection, self.item, "followup", "Lane failed in prepare at aaaaaaaaaaaa: gate red",
+                       session=ship.sd_lane.LANE_SESSION)
         named = sd_db.add_note(self.connection, self.item, "followup", "Rename the flag")
         self.connection.commit()
         body = self.directory / "body.md"
@@ -6397,20 +6398,22 @@ class SettledFollowupTests(unittest.TestCase):
     A delivery now settles only the lane's own blockers, by the prefix the lane writes; the end-to-end
     `test_a_delivery_resolves_only_the_lanes_own_followups` shows a `Settles:` trailer settles none."""
 
-    def settled(self, body: str) -> set[int]:
+    def settled(self, body: str, session: str | None = "operator") -> set[int]:
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
-        connection.execute("CREATE TABLE note (id INTEGER, item INTEGER, kind TEXT, body TEXT, resolved_at TEXT)")
-        connection.execute("INSERT INTO note VALUES (42, 1, 'followup', ?, NULL)", (body,))
-        connection.execute("INSERT INTO note VALUES (43, 1, 'followup', ?, NULL)",
-                           ("Lane failed in prepare at aaaaaaaaaaaa: gate red; full text: prepare.log",))
+        connection.execute("CREATE TABLE note (id INTEGER, item INTEGER, kind TEXT, body TEXT, resolved_at TEXT,"
+                           " session TEXT)")
+        connection.execute("INSERT INTO note VALUES (42, 1, 'followup', ?, NULL, ?)", (body, session))
+        connection.execute("INSERT INTO note VALUES (43, 1, 'followup', ?, NULL, ?)",
+                           ("Lane failed in prepare at aaaaaaaaaaaa: gate red", ship.sd_lane.LANE_SESSION))
         connection.execute("INSERT INTO note VALUES (44, 1, 'followup', 'Lane failed in gate at bbbbbbbbbbbb: red',"
-                           " '2026-01-01')")
+                           " '2026-01-01', ?)", (ship.sd_lane.LANE_SESSION,))
         return ship.settled_followups(connection, 1)
 
     def test_only_the_lanes_own_open_blockers_settle(self) -> None:
         self.assertEqual(self.settled("Waits on a reply"), {43})
-        self.assertEqual(self.settled("Lane skipped in the lane at an unrecorded head: stale"), {42, 43})
+        self.assertEqual(self.settled("Lane skipped in the lane at an unrecorde: stale", ship.sd_lane.LANE_SESSION),
+                         {42, 43})
         self.assertEqual(self.settled("Note: Lane failed in prepare"), {43})
 
     def test_an_operator_note_that_starts_like_the_lane_settles_nothing(self) -> None:
@@ -6419,6 +6422,8 @@ class SettledFollowupTests(unittest.TestCase):
         self.assertEqual(self.settled(
             "Lane failed in prepare because the remote runner needs a separate repair"), {43})
         self.assertEqual(self.settled("Lane failed in prepare at noon: the runner was down"), {43})
+        # build/sd-1423 review: the whole header pasted by hand is still the operator's.
+        self.assertEqual(self.settled("Lane failed in prepare at aaaaaaaaaaaa: gate red"), {43})
 
 
 class ReviewWatchdogTests(unittest.TestCase):
