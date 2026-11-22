@@ -3002,7 +3002,8 @@ class Tick(Case):
         """Review of build/sd-1306: the lead waits on its member. Fix refused the bundle until the member was
         done, and a Build of the member refused the same way. The member leaves and builds on its own."""
         run = self.lane_failed_bundle(0, 1)
-        build.queue_again(self.db, [self.items[pressed]], who="operator")
+        build.queue_again(self.db, [self.items[one] for one in ([pressed] if type(pressed) is int else pressed)],
+                          who="operator")
         self.assertEqual(self.queued_builds(self.items[1]), 1, "the member builds")
         self.assertEqual(self.queued_builds(self.items[0]), 0, "the lead waits")
         self.assertEqual(build.run(self.db, run["id"])["outcome"], "lane_failed")
@@ -3013,6 +3014,15 @@ class Tick(Case):
 
     def test_a_build_of_a_lane_failed_lead_that_waits_on_its_member_builds_the_member(self):
         self.lead_waits_on_its_member(0)
+
+    def test_a_build_of_the_lead_and_its_member_frees_the_member_in_either_order(self):
+        """Review of build/sd-1306: selecting B then A freed B, then refused A as it waits on B, and rolled
+        both back. The lead's run freed once stays lane_failed for Fix, whatever the order."""
+        for order in ([0, 1], [1, 0]):
+            with self.subTest(order=order):
+                if order[0]:
+                    self.setUp()
+                self.lead_waits_on_its_member(order)
 
     def test_a_freed_member_that_waited_builds_once_its_own_dependency_is_done(self):
         """Review of build/sd-1306: A waits on B, B on C outside the bundle. A Build of A freed B without

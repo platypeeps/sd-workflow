@@ -1052,6 +1052,9 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
     with transaction(connection):
         leads, fixes, fresh = [], [], []
         named: dict[int, set[int]] = {}
+        # Each lane-failed run this press freed members of, and the items whose press that was (the lead and
+        # the members it waits on): a later one of them is done, whatever the order (review of build/sd-1306).
+        freed: dict[str, set[int]] = {}
         for item in items:
             row = connection.execute("SELECT id, parent, status FROM assignment WHERE item = ? AND scope = ? "
                                      "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
@@ -1063,6 +1066,8 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             # refuses, such as an item moved back to ready, is a fresh press with that press's own check.
             # A member that left the bundle (`alone`) is a fresh press, never the bundle's Fix (review of build/sd-1306).
             if state and not alone and (state["run"] or {}).get("outcome") == "lane_failed":
+                if item in freed.get(state["run"]["id"], ()):
+                    continue  # the lead stays lane_failed for Fix once what it waits on is done
                 # The members its lead waits on leave first, so they build on their own (review of build/sd-1306).
                 sent = _sent_back(connection, state["run"])
                 ahead = _inside(connection, sent[0]["item"], sent)[0] if sent else []
@@ -1078,6 +1083,7 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                         raise BuildRefused(f"its lead sd:{lead_item} waits on {names}; Build sd:{lead_item} or "
                                            f"{names} to build those first, then Fix the bundle")
                     fresh += _free(connection, ahead, who=who, run=state["run"]["id"], lead=lead_item)
+                    freed[state["run"]["id"]] = {lead_item, *(member["item"] for member in ahead)}
                     continue
                 try:
                     members = lane_fix_check(connection, state["run"]["id"])[0]
