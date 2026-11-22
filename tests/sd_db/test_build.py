@@ -271,8 +271,8 @@ class Claim(Case):
         self.assertEqual(self.claim()["model"], "sonnet")
 
     def test_a_bundle_takes_at_most_three_and_the_best_repository_first(self):
-        build.queue(self.db, [self.item(repo=B, priority=2)], who="operator")
-        build.queue(self.db, [self.item(priority=1) for _ in range(4)], who="operator")
+        build.queue(self.db, [self.item(repo=B, priority=3)], who="operator")
+        build.queue(self.db, [self.item(priority=2) for _ in range(4)], who="operator")
         first = self.claim()
         self.assertEqual((first["repo"], len(first["members"])), (A, 3))
         second = self.claim()
@@ -325,7 +325,7 @@ class Claim(Case):
         self.assertEqual(build.bundle_max(), 3)
         self.bundle_max("5")
         self.assertEqual(build.bundle_max(), 5)
-        build.queue(self.db, [self.item(priority=1) for _ in range(6)], who="operator")
+        build.queue(self.db, [self.item(priority=2) for _ in range(6)], who="operator")
         self.assertEqual(len(self.claim()["members"]), 5)
         for bad in ("0", "abc", 7):
             self.bundle_max(bad)
@@ -335,10 +335,10 @@ class Claim(Case):
         """sd:9109 review: the budget read the machine's cap at supervisor start, so a cap of 1 cut one full item to
         40 minutes, and a cap changed after the claim changed a claimed bundle's budget."""
         self.bundle_max("1")
-        build.queue(self.db, [self.item(priority=1)], who="operator")
+        build.queue(self.db, [self.item(priority=2)], who="operator")
         self.assertEqual(build.run(self.db, self.claim()["id"])["budget_minutes"], 120, "never below 120")
         self.bundle_max("5")
-        build.queue(self.db, [self.item(repo=B, priority=1) for _ in range(5)], who="operator")
+        build.queue(self.db, [self.item(repo=B, priority=2) for _ in range(5)], who="operator")
         five = self.claim()
         self.assertEqual(build.run(self.db, five["id"])["budget_minutes"], 200, "120 per 3 slots")
         self.bundle_max("2")
@@ -349,7 +349,7 @@ class Claim(Case):
     def test_a_long_queue_of_small_items_fills_a_bigger_bundle(self):
         """sd:8992: a bundle took three items however small; a mechanical item now weighs half a slot."""
         small = {"work_kind": "mechanical"}
-        build.queue(self.db, [self.item(priority=1), *(self.item(priority=2, fields=small) for _ in range(6))],
+        build.queue(self.db, [self.item(priority=2), *(self.item(priority=3, fields=small) for _ in range(6))],
                     who="operator")
         self.assertEqual(len(self.claim()["members"]), 5, "one whole slot and four half ones")
         self.assertEqual([build.bundled(self.db, items) for items in ([], [self.item()] * 4)], [0, 3])
@@ -361,6 +361,68 @@ class Claim(Case):
         available = build.room(self.db, **IDLE)
         self.assertEqual(build.room_for(available, A), 0)
         self.assertEqual(build.room_for(available, B), 1)
+
+    def test_a_p1_item_builds_beside_the_repositorys_running_bundle(self):
+        """sd:9700, operator ruling #64744: a P1 item builds alone beside the repository's one bundle, and the
+        bundle it builds beside leaves the next ordinary bundle waiting as before."""
+        build.queue(self.db, [self.item(priority=2), self.item(priority=3)], who="operator")
+        ordinary = self.claim()
+        urgent, other_urgent, later = self.item(priority=1), self.item(priority=1), self.item(priority=2)
+        build.queue(self.db, [later, urgent, other_urgent], who="operator")
+        first, second = self.claim(), self.claim()
+        self.assertEqual([[m["item"] for m in run["members"]] for run in (first, second)],
+                         [[urgent], [other_urgent]], "each P1 item alone, beside the running bundle")
+        self.assertIsNone(self.claim(), "the ordinary item waits for the ordinary bundle")
+        available = build.room(self.db, **IDLE)
+        self.assertEqual((build.room_for(available, A), build.room_for(available, A, p1=True)), (0, 3))
+        build.end(self.db, ordinary["id"], "cancelled", "the operator cancelled it")
+        self.assertEqual([m["item"] for m in self.claim()["members"]], [later], "P1 runs hold no ordinary slot")
+
+    def test_a_running_bundle_keeps_the_slot_its_claim_gave_it(self):
+        """Review of build/sd-1306: `room` read the running lead's priority now, so a lead raised to P1 during its
+        run freed its repository's slot and a second ordinary bundle started; one lowered from P1 took the slot.
+        The slot is the claim's: a priority edit during the run moves no run."""
+        ordinary = self.item(priority=2)
+        build.queue(self.db, [ordinary], who="operator")
+        self.claim()
+        self.db.execute("UPDATE item SET priority = 1 WHERE id = ?", (ordinary,))
+        build.queue(self.db, [self.item(priority=2)], who="operator")
+        self.assertIsNone(self.claim(), "the raised lead still holds its repository's slot")
+        self.assertEqual(build.room_for(build.room(self.db, **IDLE), A), 0)
+        urgent = self.item(repo=B, priority=1)
+        build.queue(self.db, [urgent], who="operator")
+        self.claim()
+        self.db.execute("UPDATE item SET priority = 2 WHERE id = ?", (urgent,))
+        self.assertEqual(build.room_for(build.room(self.db, **IDLE), B), 1, "the lowered P1 run holds no slot")
+
+    def test_a_retried_bundle_takes_room_by_its_leads_priority(self):
+        """Review of build/sd-1306: a member raised to P1 made its ordinary retried bundle bypass the repository
+        cap, in the claim and in pickup's queued-work check. The bundle's lead decides, as `room` counts it."""
+        lead, member = self.item(priority=2), self.item(priority=2)
+        build.queue(self.db, [lead, member], who="operator")
+        run = self.claim()
+        build.write(self.db, run["id"], step="building")
+        build.end(self.db, run["id"], "blocked", "the builder stopped")
+        for table in ("runner_run", "runner_lease"):
+            self.db.execute(f"UPDATE {table} SET released_at = ? WHERE {'id' if table == 'runner_run' else 'run'} = ?",
+                            ("2026-01-01T00:00:00Z", run["id"]))
+        build.queue(self.db, [self.item(priority=3)], who="operator")
+        self.claim()
+        build.retry(self.db, run["assignment"], who="operator")
+        self.db.execute("UPDATE item SET priority = 1 WHERE id = ?", (member,))
+        self.assertIsNone(self.claim(), "the ordinary bundle waits for the repository's running one")
+        build.set_pickup(self.db, True)
+        self.item(repo=B, priority=2)
+        self.assertEqual(len(build.pickup(self.db, build.room(self.db, **IDLE))), 1,
+                         "a press with no room holds nothing")
+
+    def test_a_p1_item_bundles_only_with_items_of_its_own_area(self):
+        """sd:9700: a P1 item with an area takes the queued items of that area, whatever their priority."""
+        home = {"area": "home"}
+        urgent, kin, stranger = self.item(priority=1, fields=home), self.item(priority=3, fields=home), self.item()
+        build.queue(self.db, [stranger, kin, urgent], who="operator")
+        self.assertEqual([m["item"] for m in self.claim()["members"]], [urgent, kin])
+        self.assertEqual([m["item"] for m in self.claim()["members"]], [stranger])
 
     def test_claim_race_respects_repo_cap(self):
         """Failure table, Claim: `BEGIN IMMEDIATE` serializes claims; the later ones see the earlier leases."""
@@ -2161,8 +2223,8 @@ class Pickup(Case):
         self.assertFalse(build.pickup_state(self.db, now=self.NOW)["on"], "the old build's key is not read")
 
     def test_pickup_fills_the_room_by_priority_while_on(self):
-        a = [self.item(priority=n) for n in (1, 2, 3, 4)]
-        b = self.item(repo=B, priority=5)
+        a = [self.item(priority=n) for n in (2, 3, 4, 5)]
+        b = self.item(repo=B, priority=6)
         self.item(status="planning", priority=0)
         self.assertEqual(build.pickup(self.db, self.room(), now=self.NOW), [], "off picks nothing")
         self.on()
@@ -2174,7 +2236,7 @@ class Pickup(Case):
         self.assertEqual([len(build.run(self.db, self.claim()["id"])["members"]) for _ in range(2)], [3, 1])
 
     def test_pickup_keeps_to_the_room(self):
-        items = [self.item(priority=n) for n in range(5)]
+        items = [self.item(priority=n) for n in range(2, 7)]
         self.on()
         self.assertEqual(build.pickup(self.db, self.room(load=50.0), now=self.NOW), [], "no room, no pickup")
         self.assertEqual(build.pickup(self.db, self.room(interactive=[{"repo": B, "session_id": None}] * 5),
@@ -2191,11 +2253,25 @@ class Pickup(Case):
         self.assertEqual(build.pickup(self.db, busy, now=self.NOW), [b], "A's waiting press holds nothing in B")
         self.assertEqual(build.pickup(self.db, self.room(), now=self.NOW), [], "a press with room is claimed first")
 
+    def test_pickup_picks_a_p1_item_beside_a_full_repository(self):
+        """sd:9700: a P1 item is picked, alone or with its area, while the repository's one bundle runs."""
+        build.queue(self.db, [self.item(priority=2)], who="operator")
+        self.claim()
+        home = {"area": "home"}
+        urgent, kin, alone, ordinary = (self.item(priority=1, fields=home), self.item(priority=3, fields=home),
+                                        self.item(priority=1), self.item(priority=2))
+        self.on()
+        self.assertEqual(build.pickup(self.db, self.room(), now=self.NOW), [urgent, alone, kin])
+        self.assertEqual([[m["item"] for m in self.claim()["members"]] for _ in range(2)], [[urgent, kin], [alone]])
+        self.assertIsNone(self.claim())
+        self.assertEqual(item_state(self.db, ordinary)["item"]["status"], "ready")
+
     def end(self, status):
         item = self.item()
         lead = build.queue(self.db, [item], who=build.PICKUP)[0]["id"]
-        self.db.execute("UPDATE assignment SET status = ?, ended = ? WHERE id = ?",
-                        (status, later(build.clock(), self.count("SELECT COUNT(*) FROM assignment")), lead))
+        stamp = later(build.clock(), self.count("SELECT COUNT(*) FROM assignment"))
+        self.db.execute("UPDATE assignment SET status = ?, started = ?, ended = ? WHERE id = ?",
+                        (status, stamp, stamp, lead))
         return item
 
     def test_two_blocked_runs_turn_off(self):
@@ -2207,7 +2283,7 @@ class Pickup(Case):
         self.assertIsNone(build.stop_on_blocks(self.db, now=self.NOW), "a done between breaks the row")
         operator = self.item()
         lead = build.queue(self.db, [operator], who="operator")[0]["id"]
-        self.db.execute("UPDATE assignment SET status = 'blocked', ended = ? WHERE id = ?",
+        self.db.execute("UPDATE assignment SET status = 'blocked', started = ?1, ended = ?1 WHERE id = ?2",
                         (later(build.clock(), 90), lead))
         self.assertIsNone(build.stop_on_blocks(self.db, now=self.NOW), "a pressed build is not auto-pickup's")
         last = self.end("blocked")

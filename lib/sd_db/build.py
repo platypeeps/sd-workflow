@@ -50,6 +50,7 @@ from .runner import (
     restoration_pending,
 )
 from .ship import this_host
+from .workflow import item_area, item_blocked_by
 from .writes import (
     add_note,
     cancel_unwanted_blocked,
@@ -77,6 +78,9 @@ REPO_CAP = 1
 #: of the bundle it claimed, never less (`budget_minutes`).
 BUNDLE_MAX = 3
 BUDGET_MINUTES = 120
+#: A P1 item builds beside its repository's bundle, alone or with the queued items of its own area, under the
+#: machine cap only; every other item keeps one bundle per repository (operator ruling #64744, sd:9700).
+BESIDE_PRIORITY = 1
 #: A supervisor beats every 30 s; one silent this long, or unspawned this long after its claim, is lost.
 #: 600, not 180: a beat a held lock skips no longer ends a long build (pack sd:6741).
 STALE_SECONDS = 600
@@ -90,8 +94,43 @@ STUCK_TICKS = 3
 RETRIES = 1
 # The note on an item a blocked run parked (pack sd:6132).
 PARKED = "Parked: build run {run} ended blocked; Retry on the Builds panel unparks it"
+# The note on an item whose retried bundle a reopened dependency held at its claim (review of sd:9570).
+WAIT_PARKED = "Parked: build assignment {lead}'s bundle waits ({held}); Retry on the Builds panel unparks it"
 # The note on an item a cancelled run parked: auto-pickup takes unparked items only (sd:9222).
 CANCEL_PARKED = "Parked: build run {run} was cancelled; Unpark to build it again"
+
+
+def beside(row) -> bool:
+    """Whether a row's item is P1, so builds beside its repository's bundle (`BESIDE_PRIORITY`, sd:9700)."""
+    return type(row["priority"]) is int and row["priority"] <= BESIDE_PRIORITY
+
+
+#: A queued build row's bundle lead's item priority: a retried bundle takes room by its lead, as `room` counts its
+#: run, never by a member raised to P1 since (review of sd:9700).
+LEAD_PRIORITY = ("(SELECT lead.priority FROM assignment AS head JOIN item AS lead ON lead.id = head.item "
+                 "WHERE head.id = COALESCE(assignment.parent, assignment.id)) AS lead_priority")
+
+
+#: The lead item's `fields` key that keeps the slot its claim took, `beside` or `bundle`: `room` reads it, not the
+#: priority now, so a priority edit during the run moves no run (review of build/sd-1306).
+SLOT = "build_slot"
+
+
+def _holds_slot(row) -> bool:
+    """Whether a running build's lease holds its repository's slot: as its claim classified it (`SLOT`), or, for a
+    run claimed before the key, by its lead's priority now."""
+    return row["slot"] == "bundle" if row["slot"] in ("beside", "bundle") else not beside(row)
+
+
+def _leads_beside(row) -> bool:
+    """Whether a queued build row's bundle builds beside its repository's bundle: its lead is P1 (sd:9700)."""
+    return beside({"priority": row["lead_priority"]})
+
+
+def kin(lead, row) -> bool:
+    """Whether `row` builds in the P1 `lead`'s bundle: an item of the lead's own area, never of none (sd:9700)."""
+    area = item_area(lead)
+    return area is not None and item_area(row) == area
 
 
 def _in_group(alias: str = "assignment") -> str:
@@ -465,6 +504,9 @@ def _item(connection, item: int, *, lead: int | None = None) -> dict:
                            f"{', '.join(RUNNABLE_KINDS[:-1])} and {RUNNABLE_KINDS[-1]} items")
     if row["status"] != "ready" and not (row["status"] == "blocked" and split_held(connection, item)):
         raise BuildRefused(f"item {item} is {row['status']}; a build takes a ready item")
+    waiting = waiting_on(connection, row)
+    if waiting:
+        raise BuildRefused(f"item {item} {waiting}")
     refused = _repo_refusal(row, connection)
     if refused:
         raise BuildRefused(refused)
@@ -483,6 +525,26 @@ def _item(connection, item: int, *, lead: int | None = None) -> dict:
     if held:
         raise BuildRefused(held)
     return dict(row)
+
+
+def waiting_on(connection, row) -> str:
+    """What the item `row` waits on, as "waits on sd:M", or "" (pack sd:9570): each item its `fields.blocked_by`
+    names that is not done. Read where a build is chosen, so nothing runs on a done. Fails closed: fields that cannot
+    be read, or a named item gone, hold it too."""
+    try:
+        named = item_blocked_by(row)
+    except ValueError as error:
+        return f"may wait on an item: its {error}"
+    if not named:
+        return ""
+    marks = ", ".join("?" for _ in named)
+    found = {other["id"]: other["status"] for other in connection.execute(
+        f"SELECT id, status FROM item WHERE id IN ({marks})", named)}
+    gone = [other for other in named if other not in found]
+    if gone:
+        return f"waits on sd:{gone[0]}, which no longer exists; clear it with sd task edit --blocked-by"
+    held = [other for other in named if found[other] != "done"]
+    return f"waits on {', '.join(f'sd:{other}' for other in held)}" if held else ""
 
 
 #: A status change into a wait that gave its reason: `<from> -> <to> by <who>: <reason>` (writes.transition).
@@ -655,18 +717,34 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
         if current["scope"] != SCOPE:
             raise BuildRefused(f"assignment {assignment} is not a build")
         last = current["run"]
-        state = retry_state(connection, last) if last else {"allowed": False, "reason": "it never ran"}
+        # A drop's kept lead never ran; its worktree is the split's, so a Retry of it held resumes that (review of
+        # build/sd-1306). It names the ended run whose work it keeps, and it retries whole.
+        resumes = None if last or current["parent"] is not None else _resumable(
+            connection, assignment, current["item"], current["status"])
+        if last:
+            state = retry_state(connection, last)
+        elif resumes and current["status"] in AGAIN and only is None:
+            state = {"allowed": True}
+        else:
+            state = {"allowed": False, "reason": "it never ran" if not resumes or only is None else
+                     "it never ran since its bundle drop; Retry it whole"}
         if not state["allowed"]:
             raise BuildRefused(f"Retry refused: {state['reason']}")
+        ran = last["id"] if last else resumes[0] if resumes else ""
         members = _members(connection, assignment, current["status"])
         if not members:
-            raise BuildRefused(f"Retry refused: build run {last['id']} has no {current['status']} member")
+            raise BuildRefused(f"Retry refused: build run {ran} has no {current['status']} member")
         # Who leaves is read from the members the retried run built (`run`), not from this filtered view: a member
         # whose item moved to done or planning (its blocked assignment cancelled, `UNBUILT`) or that is done since
         # by another build (sd:9015) is left out too, as one `only` omits, so the split guard reads the branch for
         # its earlier work. A member an operator cancelled on its own (`ALONE`) left already (sd:9222), and one
         # Retry would not end (not `AGAIN`, as a member delivered `done` beside a skipped lead) stays as it is.
-        built = [member for member in run(connection, last["id"])["members"][1:]
+        # A drop's kept lead that never ran has no run to read them from: its members in its status are what the
+        # split branch holds, so one this Retry omits is marked left out too (review of build/sd-1306).
+        built = [member for member in (run(connection, last["id"])["members"][1:] if last else [
+                     dict(row) for row in connection.execute(
+                         "SELECT id, item, status, result FROM assignment WHERE parent = ? AND status = ? "
+                         "AND scope = ? ORDER BY id", (assignment, current["status"], SCOPE))])
                  if member["status"] in AGAIN and not (member["result"] or "").startswith(ALONE)]
         items = reads.items_by_ids(connection, [current["item"], *(member["item"] for member in members + built)])
         # A done lead refuses: the claim would lead with a member, on a new branch and worktree.
@@ -677,28 +755,43 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
                                f"whose worktree holds its work")
         members = [member for member in members if (only is None or member["item"] in only)
                    and not _done(items, member["item"])]
-        kept = {member["id"] for member in members}
         stamp = clock()
+        # A dependency inside the bundle (`_inside`, review of build/sd-1306): a lead that waits on its members
+        # cannot retry, so they leave and build fresh on their own branch while the lead stays ended; a member
+        # that waits on another item of the bundle leaves this Retry, parked.
+        ahead, behind = _inside(connection, current["item"],
+                                [member for member in members if _current(connection, member)])
+        if ahead:
+            if finding:  # these build fresh, with no builder to send it to; the lane-failed path refuses it too
+                names = ", ".join("sd:" + str(member["item"]) for member in ahead)
+                raise BuildRefused(f"Retry refused: its lead sd:{current['item']} waits on {names}, which would "
+                                   "build fresh; send the finding once they are done")
+            free = _free(connection, ahead, who=who, run=ran, lead=current["item"])
+            fresh = queue(connection, free, who=who) if free else []
+            return {"run": ran, "queued": [{"id": row["id"], "item": row["item"], "status": row["status"]}
+                                                 for row in fresh]}
+        members = [member for member in members if member not in behind]
+        kept = {member["id"] for member in members}
         for member in [member for member in built if member["id"] not in kept]:
             owns = _current(connection, member)  # read before this row's own write below
             connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
-                               (stamp, f"{ALONE}{who}: {LEFT_OUT}{last['id']}", member["id"]))
+                               (stamp, f"{ALONE}{who}: {LEFT_OUT}{ran}", member["id"]))
             if not owns:  # a newer build owns the item: its state is that build's, not this bundle's
                 continue
             if member["item"] in items and items[member["item"]]["status"] == "blocked":
                 transition(connection, member["item"], "ready", who=who,
-                           reason=f"left out of a Retry of build run {last['id']}")
+                           reason=f"left out of a Retry of build run {ran}")
             park(connection, member["item"], ("ready",), stamp,
-                 f"Build assignment {member['id']} left its bundle: a Retry of build run {last['id']} by {who} "
+                 f"Build assignment {member['id']} left its bundle: a Retry of build run {ran} by {who} "
                  f"named other items; item parked; Build it to build it fresh")
         newer = [member for member in members if not _current(connection, member)]
         if newer:
             owner = connection.execute("SELECT id FROM assignment WHERE item = ? AND scope = ? ORDER BY id DESC "
                                        "LIMIT 1", (newer[0]["item"], SCOPE)).fetchone()["id"]
             raise BuildRefused(f"Retry refused: sd:{newer[0]['item']} has a newer build, assignment {owner}")
-        parked = "" if finding else parked_finding(last.get("detail"))
-        how = f"{'Send to builder' if finding else 'Retry'} of build run {last['id']}"
-        return {"run": last["id"], "queued": _queue_members(connection, members, items, lead=assignment, who=who,
+        parked = "" if finding or not last else parked_finding(last.get("detail"))
+        how = f"{'Send to builder' if finding else 'Retry'} of build run {ran}"
+        return {"run": ran, "queued": _queue_members(connection, members, items, lead=assignment, who=who,
                                                              finding=finding, parked=parked, how=how, verb="Retry")}
 
 
@@ -897,8 +990,10 @@ def left_out(connection, lead: int) -> list[tuple[int, int]]:
     for row in connection.execute(
             "SELECT item, result FROM assignment WHERE parent = ? AND scope = ? AND result LIKE ? ORDER BY id",
             (lead, SCOPE, f"{ALONE}%: {LEFT_OUT}%")):
-        retried = connection.execute("SELECT run FROM runner_run WHERE id = ?",
-                                     (row["result"].rsplit(LEFT_OUT, 1)[1],)).fetchone()
+        # A run of another assignment, the ended run a drop's kept lead keeps the work of, reads as run 0: the
+        # lead's first run is the first after the Retry (review of build/sd-1306).
+        retried = connection.execute("SELECT run FROM runner_run WHERE id = ? AND assignment = ?",
+                                     (row["result"].rsplit(LEFT_OUT, 1)[1], lead)).fetchone()
         left.append((row["item"], retried["run"] if retried else 0))
     return left
 
@@ -978,7 +1073,14 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
     with transaction(connection):
         leads, fixes, fresh = [], [], []
         named: dict[int, set[int]] = {}
+        # Each lane-failed run this press split, and every member of its bundle: the split settled each, so a
+        # later one of them is done, whatever the order (review of build/sd-1306).
+        freed: dict[str, set[int]] = {}
         for item in items:
+            # The split this press made settled it: `_free` queued it if it waits on nothing, and the lead stays
+            # lane_failed for Fix. Read before `alone`, which the split itself sets (review of build/sd-1306).
+            if any(item in done for done in freed.values()):
+                continue
             row = _retry_row(connection, item)
             # A member cancelled on its own left its bundle: building it is a fresh press, not the bundle's Retry.
             alone = row is not None and row["parent"] is not None and _alone(connection, row["id"])
@@ -986,10 +1088,36 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             state = queue_state(connection, lead) if lead else None
             # A bundle whose lane entry failed is the panel's Fix when its check passes (pack sd:8791); a state Fix
             # refuses, such as an item moved back to ready, is a fresh press with that press's own check.
-            if state and (state["run"] or {}).get("outcome") == "lane_failed":
+            # A member that left the bundle (`alone`) is a fresh press, never the bundle's Fix (review of build/sd-1306).
+            if state and not alone and (state["run"] or {}).get("outcome") == "lane_failed":
+                # The members its lead waits on leave first, so they build on their own (review of build/sd-1306).
+                sent = _sent_back(connection, state["run"])
+                ahead = _inside(connection, sent[0]["item"], sent)[0] if sent else []
+                if ahead:
+                    # Refuse before `_free` writes, as `retry` does (lead triage of build/sd-1306): a finding has
+                    # no builder to go to, and only the lead or a member it waits on frees what it needs.
+                    lead_item = sent[0]["item"]
+                    names = ", ".join("sd:" + str(member["item"]) for member in ahead)
+                    if finding:
+                        raise BuildRefused(f"--finding goes to a Retry or a Fix; its lead sd:{lead_item} waits on "
+                                           f"{names}, which would build fresh; send the finding once they are done")
+                    # The selection, not this item, decides: with the lead or a member it waits on in it, the
+                    # split settles every selected member of the bundle (review of build/sd-1306).
+                    if not set(items) & {lead_item, *(member["item"] for member in ahead)}:
+                        raise BuildRefused(f"its lead sd:{lead_item} waits on {names}; Build sd:{lead_item} or "
+                                           f"{names} to build those first, then Fix the bundle")
+                    # A lane entry sent back to the lane is the lane's again: the bundle's PR may still merge, so
+                    # no member leaves it, as Fix reads it (`_lane_entry`, review of build/sd-1306).
+                    entry = LANE_ENTRY.match(state["run"]["detail"] or "")
+                    _lane_entry(connection, state["run"]["branch"], entry.group(1) if entry else None, actor="Build")
+                    fresh += _free(connection, ahead, who=who, run=state["run"]["id"], lead=lead_item)
+                    freed[state["run"]["id"]] = {member["item"] for member in sent}
+                    continue
                 try:
                     members = lane_fix_check(connection, state["run"]["id"])[0]
                 except BuildRefused:
+                    if _waiting(connection, _sent_back(connection, state["run"])):
+                        raise  # a Fix that waits on a dependency is no fresh press either
                     members = []
                 if item in [member["item"] for member in members]:
                     fixes += [] if state["run"] in fixes else [state["run"]]
@@ -1002,9 +1130,11 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             if split_held(connection, item):  # its branch may hold a left item's work: a fresh press, new branch
                 fresh.append(item)
                 continue
-            if (state and state["status"] in AGAIN and state["run"] is not None
-                    and row["status"] == state["status"] and not alone
-                    and not (state["run"]["outcome"] is None and state["run"]["step"] in LANE_STEPS)
+            # A drop's kept lead never ran, and its Retry resumes the split branch (`retry`, review of build/sd-1306).
+            if (state and state["status"] in AGAIN and row["status"] == state["status"] and not alone
+                    and (state["run"] is not None
+                         or _resumable(connection, lead, state["item"], state["status"]) is not None)
+                    and not (state["run"] and state["run"]["outcome"] is None and state["run"]["step"] in LANE_STEPS)
                     and not _done(reads.items_by_ids(connection, [state["item"]]), state["item"])):
                 leads += [] if lead in leads else [lead]
                 named.setdefault(lead, set()).add(item)
@@ -1028,6 +1158,7 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                 state = item_state(connection, item)
                 if state["item"]["status"] == "planning":
                     change_status(connection, item, "ready", who=who, expected_revision=state["revision"])
+        fresh = list(dict.fromkeys(fresh))
         return queued + (queue(connection, fresh, who=who) if fresh else [])
 
 
@@ -1043,10 +1174,10 @@ def _retry_row(connection, item: int):
         ran = next((row for row in rows[1:] if row["run_count"]), None)
         # Only a bundle Retry can take: every member it would queue owns its item (`_current`), or Retry refuses the
         # whole press and Build reads a fresh one instead (class pass, review round 7); and every member in the
-        # work's repository (`_resumable`), or the claim refuses it and every later press reads it again (round 14).
+        # work's repository (`_in_work_repo`), or the claim refuses it and every later press reads it again (round 14).
         if ran is not None and ran["status"] in AGAIN and not _alone(connection, ran["id"]):
             lead: int = ran["parent"] or ran["id"]
-            if (queue_state(connection, lead)["status"] == ran["status"] and _resumable(connection, lead, ran["status"])
+            if (queue_state(connection, lead)["status"] == ran["status"] and _in_work_repo(connection, lead, ran["status"])
                     and all(_current(connection, member) for member in _members(connection, lead, ran["status"]))):
                 return ran
     return rows[0] if rows else None
@@ -1077,7 +1208,8 @@ def eligible(connection, *, now: str | None = None) -> list[dict]:
             continue
         if lane_of(connection, taken["lane_host"]) not in hosts:
             continue
-        found.append({"id": row["id"], "title": row["title"], "repo": row["repo"], "priority": row["priority"]})
+        found.append({"id": row["id"], "title": row["title"], "repo": row["repo"], "priority": row["priority"],
+                      "fields": row["fields"]})
     return found
 
 
@@ -1122,18 +1254,31 @@ def pickup(connection, available: dict, *, now: str | None = None) -> list[int]:
     hosts = lane_hosts(connection)
     with transaction(connection):  # a build blocked on a quiet beat is this host's press again (sd:9775)
         _requeue_beat_blocked(connection, hosts)
-    if any(_route(connection, row["lane_host"], _lead(row)) in hosts and room_for(available, row["repo"]) > 0
+    if any(_route(connection, row["lane_host"], _lead(row)) in hosts
+           and room_for(available, row["repo"], p1=_leads_beside(row)) > 0
            for row in connection.execute(
-            "SELECT assignment.id, assignment.parent, assignment.run_count, item.repo, repo.lane_host FROM assignment JOIN item ON item.id = assignment.item "
+            f"SELECT assignment.id, assignment.parent, assignment.run_count, item.repo, {LEAD_PRIORITY}, "
+            "repo.lane_host "
+            "FROM assignment JOIN item ON item.id = assignment.item "
             "LEFT JOIN repo ON repo.path = item.repo WHERE assignment.status = 'queued' AND assignment.scope = ?",
             (SCOPE,))):
         return []
     slots, chosen = available["machine"], []
     bundles: dict[str, list[list[int]]] = {}
+    urgent: list[tuple[dict, list[int]]] = []  # each P1 bundle's lead and items, as the claim forms them
     for row in eligible(connection, now=now):
         repo = row["repo"]
         taken = bundles.setdefault(repo, [])
-        if taken and bundled(connection, [*taken[-1], row["id"]]) > len(taken[-1]):
+        near = next((items for lead, items in urgent if lead["repo"] == repo and kin(lead, row)
+                     and bundled(connection, [*items, row["id"]]) > len(items)), None)
+        if near is not None:
+            near.append(row["id"])
+        elif beside(row):
+            if slots <= 0 or room_for(available, repo, p1=True) <= 0:
+                continue
+            urgent.append((row, [row["id"]]))
+            slots -= 1
+        elif taken and bundled(connection, [*taken[-1], row["id"]]) > len(taken[-1]):
             taken[-1].append(row["id"])
         elif slots > 0 and len(taken) < room_for(available, repo):
             taken.append([row["id"]])
@@ -1155,15 +1300,17 @@ def stop_on_blocks(connection, *, now: str | None = None) -> str | None:
 
     A bundle ends `done` (it reached the lane) or `blocked`; a blocked run,
     a second loss and a denied run each end it blocked. A cancel is the
-    operator's and does not count. The note on the latest one's item says
-    why. The reason, or None.
+    operator's and does not count, nor does a build the claim refused before
+    it started (`started` NULL): a dependency wait, a moved item or a quiet
+    lane is no build failure (review of pack sd:9570). The note on the
+    latest one's item says why. The reason, or None.
     """
     state = pickup_state(connection, now=now)
     if not state["on"]:
         return None
     rows = connection.execute(
         "SELECT id, item, status FROM assignment WHERE scope = ? AND parent IS NULL AND status IN ('done', 'blocked') "
-        "AND ended >= ? ORDER BY ended DESC, id DESC", (SCOPE, state["since"])).fetchall()
+        "AND started IS NOT NULL AND ended >= ? ORDER BY ended DESC, id DESC", (SCOPE, state["since"])).fetchall()
     ended = [row for row in rows if picked(connection, row["id"])][:2]
     if len(ended) < 2 or any(row["status"] != "blocked" for row in ended):
         return None
@@ -1289,9 +1436,11 @@ def room(connection, *, load: float | None, load_cap: float | None, interactive:
     hosts = lane_hosts(connection) if hosts is None else hosts
     why = unread(load, load_cap, interactive)
     leases = connection.execute(
-        "SELECT lease.repo, lease.exclusive, run.quarantine, run.session_id, run.owner, assignment.scope "
-        "FROM runner_lease lease JOIN runner_run run ON run.id = lease.run "
-        "LEFT JOIN assignment ON assignment.id = run.assignment WHERE lease.released_at IS NULL").fetchall()
+        "SELECT lease.repo, lease.exclusive, run.quarantine, run.session_id, run.owner, assignment.scope, "
+        f"item.priority, json_extract(CASE WHEN json_valid(item.fields) THEN item.fields END, '$.{SLOT}') "
+        "AS slot FROM runner_lease lease JOIN runner_run run ON run.id = lease.run "
+        "LEFT JOIN assignment ON assignment.id = run.assignment LEFT JOIN item ON item.id = assignment.item "
+        "WHERE lease.released_at IS NULL").fetchall()
     builds = [row for row in leases if row["scope"] == SCOPE and mine(row, hosts)]
     drafts = [row for row in connection.execute(
         "SELECT runner_run.session_id, runner_run.owner FROM runner_run JOIN assignment "
@@ -1307,9 +1456,10 @@ def room(connection, *, load: float | None, load_cap: float | None, interactive:
         (SCOPE, *LANE_STEPS)).fetchall() if mine(row, hosts)]
     headless = {row["session_id"] for row in [*builds, *drafts, *lane] if row["session_id"]}
     used: dict[str, int] = {}
-    # Every host's builds hold a repository's slot: the hub may build a satellite's lane (sd:8991).
+    # Every host's builds hold a repository's slot: the hub may build a satellite's lane (sd:8991). A P1-led
+    # run builds beside the bundle and holds none (sd:9700).
     for row in leases:
-        if row["scope"] == SCOPE:
+        if row["scope"] == SCOPE and _holds_slot(row):
             used[row["repo"]] = used.get(row["repo"], 0) + 1
     others = [entry for entry in interactive or [] if not (entry.get("session_id") and entry["session_id"] in headless)]
     for entry in others:
@@ -1327,10 +1477,15 @@ def room(connection, *, load: float | None, load_cap: float | None, interactive:
     return {"machine": 0 if why else machine, "used": used, "held": held, "why": why}
 
 
-def room_for(available: dict, repo: str) -> int:
-    """`room`'s answer for one repository: at most `repo_cap()` builders there, and none while it is held."""
+def room_for(available: dict, repo: str, *, p1: bool = False) -> int:
+    """`room`'s answer for one repository: at most `repo_cap()` builders there, and none while it is held.
+
+    `p1` asks for a P1 bundle, which builds beside the repository's own under the machine cap alone (sd:9700).
+    """
     if available["why"] or repo in available["held"]:
         return 0
+    if p1:
+        return available["machine"]
     return max(0, min(available["machine"], repo_cap() - available["used"].get(repo, 0)))
 
 
@@ -1482,7 +1637,8 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
         _requeue_beat_blocked(connection, hosts)
         queued = connection.execute(
             "SELECT assignment.id, assignment.item, assignment.parent, assignment.run_count, item.repo, "
-            "repo.lane_host FROM assignment JOIN item ON item.id = assignment.item "
+            f"item.priority, item.fields, {LEAD_PRIORITY}, repo.lane_host "
+            "FROM assignment JOIN item ON item.id = assignment.item "
             "LEFT JOIN repo ON repo.path = item.repo "
             "WHERE assignment.status = 'queued' AND assignment.scope = ? AND item.repo IS NOT NULL "
             "ORDER BY item.priority IS NULL, item.priority, assignment.queued_at, assignment.id", (SCOPE,)).fetchall()
@@ -1511,10 +1667,10 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
         # A bundle drop's new lead has no run, so it routes by the lane as it reads now; its kept work is in a
         # worktree on the host that ran the ended run. A lane moved since would build it there fresh (round 16).
         for row in queued:
-            held = _kept_host(connection, row)
-            if held is not None and lanes[row["id"]] in hosts and lanes[row["id"]] != lane_of(connection, held[1]):
-                _refuse(connection, row, f"its kept work is in a worktree on {held[1] or 'the hub'}, which ran build "
-                                         f"run {held[0]}, but its lane moved; drop or Build its items again there")
+            kept = _kept_host(connection, row)
+            if kept is not None and lanes[row["id"]] in hosts and lanes[row["id"]] != lane_of(connection, kept[1]):
+                _refuse(connection, row, f"its kept work is in a worktree on {kept[1] or 'the hub'}, which ran build "
+                                         f"run {kept[0]}, but its lane moved; drop or Build its items again there")
         queued = [row for row in queued if lanes[row["id"]] in hosts and not _refused_repo(connection, row)]
         # A bundle's work is on its lead's branch in the repository of the run that made it, not wherever its item
         # reads now: a lead moved since would build fresh there, and a member moved since would still be briefed and
@@ -1546,14 +1702,7 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             home = _work_repo(connection, row) if row["parent"] is None else None
             if home is None:
                 continue
-            found = [one for one in connection.execute(
-                "SELECT member.id, member.item, member.status, item.repo FROM assignment member "
-                "JOIN item ON item.id = member.item JOIN assignment lead ON lead.id = member.parent "
-                "WHERE member.parent = ? AND member.scope = ? "
-                "AND member.queued_at >= lead.queued_at AND item.status != 'done' "
-                "AND COALESCE(member.result, '') NOT LIKE ? ORDER BY member.id",
-                (row["id"], SCOPE, f"%: {LEFT_OUT}%")).fetchall()
-                if one["status"] != "queued" or one["repo"] is None or not paths.same(home, one["repo"])]
+            found = _strays(connection, row["id"], home, ("queued",))
             for one in found:
                 if one["status"] == "queued":
                     _refuse(connection, one, f"item {one['item']} has no repository; set one, then Build it again"
@@ -1577,10 +1726,60 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
                                          f"{row['repo']}, and its branch {branch(row['parent'])} holds the "
                                          f"bundle's work")
         queued = [row for row in queued if row["parent"] is None or leads.get(row["parent"]) == row["repo"]]
-        repo = next((row["repo"] for row in queued if room_for(available, row["repo"]) > 0), None)
-        if repo is None:
+        best = next((row for row in queued if room_for(available, row["repo"], p1=_leads_beside(row)) > 0), None)
+        if best is None:
             return None
-        bundle = _bundle(connection, [row for row in queued if row["repo"] == repo])
+        repo = best["repo"]
+        others = [row for row in queued if row["repo"] == repo and row["id"] != best["id"]]
+        if best["parent"] is None and not best["run_count"]:
+            # A fresh P1 lead takes its own area's items; an ordinary one leaves P1 items to their own (sd:9700).
+            others = [row for row in others if kin(best, row)] if beside(best) else [
+                row for row in others if not beside(row)]
+        bundle = _bundle(connection, [best, *others])
+        # A dependency reopened since the press holds the build: dispatch's start reads it too (pack sd:9570).
+        waiting = [(row, why) for row in bundle if (why := waiting_on(connection, connection.execute(
+            "SELECT id, fields FROM item WHERE id = ?", (row["item"],)).fetchone()))]
+        # Ran before means work to resume: a run, a drop's kept work, or members on the lead's branch. A drop's
+        # solo row counts a run with no run row (`drop_writes`); held as a retry it would park with nothing for
+        # Retry to resume, so it holds as a fresh build does (review of build/sd-1306).
+        resumable = (queue_state(connection, bundle[0]["id"])["run"] is not None
+                     or _kept_host(connection, bundle[0]) is not None)
+        retried = bool(waiting) and (resumable or any(row["parent"] is not None for row in bundle))
+        held = "; ".join(f"item {row['item']} {why}" for row, why in waiting)
+        stamp = clock()
+        if retried:
+            # A member the waiting ones need leaves the bundle, as a subset Retry leaves one out (`LEFT_OUT`):
+            # held with them it could never build, and its Build would retry this bundle (review of sd:9570).
+            # It leaves before any row is refused, so one that waits itself leaves too (review of build/sd-1306).
+            # A drop's kept lead that never ran leaves its member too: its Retry resumes the split branch once the
+            # member is done (review of build/sd-1306).
+            needed = _needed(connection, [row["item"] for row, _ in waiting])
+            # A kept lead's marker names the kept run, which `left_out` reads as run 0. Unlike a member that leaves
+            # before the claim (round 21), this one may be marked done by hand, and the lead then resumes the
+            # split branch: only the marker makes its first run check that branch (review of build/sd-1306).
+            mark = left_mark(connection, bundle[0]["id"]) or (
+                f": {LEFT_OUT}{kept[0]}" if (kept := _kept_host(connection, bundle[0])) else ": its lead waits on it")
+            for row in bundle[1:]:
+                if row["item"] in needed and resumable and connection.execute(
+                        "UPDATE assignment SET status = 'cancelled', ended = ?, result = ? "
+                        "WHERE id = ? AND status = 'queued'",
+                        (stamp, f"{ALONE}build{mark}", row["id"])).rowcount:
+                    add_note(connection, row["item"], "comment",
+                             f"Build assignment {row['id']} left its bundle: its lead waits on it ({held}); "
+                             f"Build it to build it on its own")
+        for row, why in waiting:
+            if not _alone(connection, row["id"]):
+                _refuse(connection, row, f"item {row['item']} {why}")
+        if retried:
+            # A bundle that ran before holds whole: a member left queued would lead a new branch and worktree, and
+            # Retry would lose the checkout it resumes (review of sd:9570).
+            for row in [row for row in bundle if not _alone(connection, row["id"])]:
+                _refuse(connection, row, f"its bundle waits: {held}")
+                # Parked, as a blocked run parks its items: auto-pickup takes unparked items only, so no member is
+                # built alone on a new branch; Retry unparks them onto this one (review of sd:9570).
+                park(connection, row["item"], ("ready",), stamp, WAIT_PARKED.format(lead=bundle[0]["id"], held=held))
+        if waiting:
+            return None
         lead = bundle[0]["id"]
         ids = [row["id"] for row in bundle]
         marks = ", ".join("?" for _ in ids)
@@ -1604,6 +1803,10 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
                     transition(connection, row["item"], "in_progress", who="build",
                                reason=f"build run {ident} claimed assignment {row['id']}")
                     set_item_fields(connection, row["item"], branch=branch(lead))
+                # The slot this claim took, kept on the lead for `room` (`SLOT`): a P1 edit later moves no run.
+                connection.execute(f"UPDATE item SET fields = json_set(COALESCE(fields, '{{}}'), '$.{SLOT}', ?) "
+                                   "WHERE id = ? AND json_valid(COALESCE(fields, '{}'))",
+                                   ("beside" if _leads_beside(best) else "bundle", bundle[0]["item"]))
         except _Moved:
             moved = connection.execute(
                 f"SELECT assignment.id, assignment.item, item.status FROM assignment JOIN item ON item.id = assignment.item "
@@ -1638,6 +1841,48 @@ def _bundle(connection, rows: list) -> list:
         fresh = [row for row in rows if row["parent"] is None and not row["run_count"]]
         return fresh[:bundled(connection, [row["item"] for row in fresh])]
     return sorted((row for row in rows if group in (row["id"], row["parent"])), key=lambda row: row["id"] != group)
+
+
+def _needed(connection, items: list[int]) -> set[int]:
+    """The open items `items` wait on, directly or through other open items (pack sd:9570)."""
+    needed: set[int] = set()
+    pending = list(items)
+    while pending:
+        row = connection.execute("SELECT fields FROM item WHERE id = ?", (pending.pop(),)).fetchone()
+        try:
+            named = item_blocked_by(row) if row else []
+        except ValueError:
+            continue
+        for other in named:
+            status = connection.execute("SELECT status FROM item WHERE id = ?", (other,)).fetchone()
+            if other not in needed and status is not None and status["status"] != "done":
+                needed.add(other)
+                pending.append(other)
+    return needed
+
+
+def _strays(connection, lead: int, home: str, keep: tuple[str, ...]) -> list:
+    """The members that left build `lead`'s bundle after it queued, with work on its branch: each whose item is
+    open, not left out by a Retry (`LEFT_OUT`), and not in `keep` or away from the work's repository `home`
+    (round 21). The claim keeps only queued ones; a Retry of a drop's kept lead keeps its held ones too."""
+    return [one for one in connection.execute(
+        "SELECT member.id, member.item, member.status, item.repo FROM assignment member "
+        "JOIN item ON item.id = member.item JOIN assignment lead ON lead.id = member.parent "
+        "WHERE member.parent = ? AND member.scope = ? "
+        "AND member.queued_at >= lead.queued_at AND item.status != 'done' "
+        "AND COALESCE(member.result, '') NOT LIKE ? ORDER BY member.id",
+        (lead, SCOPE, f"%: {LEFT_OUT}%")).fetchall()
+        if one["status"] not in keep or one["repo"] is None or not paths.same(home, one["repo"])]
+
+
+def _resumable(connection, lead: int, item: int, status: str) -> tuple[str, str | None] | None:
+    """(run, host) of the ended run a drop's kept lead `lead` that never ran resumes the split branch of, or None:
+    none when a member left its bundle with work on it (`_strays`), which Build takes fresh (round 21; review of
+    build/sd-1306)."""
+    row = {"id": lead, "item": item, "parent": None}
+    kept = _kept_host(connection, row)
+    home = _work_repo(connection, row) if kept else None
+    return kept if home is not None and not _strays(connection, lead, home, ("queued", status)) else None
 
 
 def _kept_host(connection, row) -> tuple[str, str | None] | None:
@@ -1712,7 +1957,7 @@ def _stranded(connection, row) -> bool:
     return _ran_on(connection, lead) != away
 
 
-def _resumable(connection, lead: int, status: str) -> bool:
+def _in_work_repo(connection, lead: int, status: str) -> bool:
     """Whether the claim resumes build `lead`'s bundle in `status` where its work is: every member's item reads the
     repository of that work (`_work_repo`), as the claim checks, which refuses the lead or drops the member
     otherwise. The rule each resume selector shares, Build by item's and recovery's (class pass, review round 15)."""
@@ -1738,7 +1983,7 @@ def _recoverable(connection) -> list:
         f"WHERE {_BEAT_BLOCKED} AND item.status = 'ready' AND item.parked_at IS NULL "
         f"ORDER BY assignment.run_count > 0 DESC, assignment.id DESC", (SCOPE, _BEAT_RESULT)).fetchall()
     rows = [row for row in rows if not _stranded(connection, row)
-            and ((lead := _lead(row)) is None or _resumable(connection, lead, "blocked"))]
+            and ((lead := _lead(row)) is None or _in_work_repo(connection, lead, "blocked"))]
     # A bundle that ran queues again whole or not at all: each blocked member the claim takes with its lead, its
     # lead first. A member left out by any filter above (parked, its item owned by another build, not ready) keeps
     # its commits on the lead's branch, so the claim would refuse the lead and replace the beat result, and no
@@ -2140,12 +2385,17 @@ def _rebuild(connection, read: dict, reason: str, stamp: str, base: str, entry: 
     The branch's newest lane entry, the one the watch read (`entry`), is handed back to the builder as Fix hands
     it, so `lane retry` refuses it while the builder holds the worktree (pack sd:8601). One not read, another
     entry since, or none: no rebuild, and a note on the lead's item says why."""
-    members = _sent_back(connection, read)
+    members, behind = _sendable(connection, read)
     if not members:
         return
     done = connection.execute("SELECT COUNT(*) FROM note WHERE item = ? AND body LIKE ?",
                               (members[0]["item"], REBUILD + "%")).fetchone()[0]
     if done >= CONFLICT_REBUILDS:
+        return
+    if waiting := _waiting(connection, members):
+        add_note(connection, members[0]["item"], "comment",
+                 f"Build run {read['id']}: no rebuild after the lane's merge of {base} conflicted, since {waiting}. "
+                 "Fix it on Queue once that is done.")
         return
     finding = (f"{REBUILD}{base} conflicted. Merge {base} into {read['branch']}, resolve each conflict, run the tests the "
                f"conflict touched, and commit the merge; the lane said: {reason}"[:2000])
@@ -2159,18 +2409,77 @@ def _rebuild(connection, read: dict, reason: str, stamp: str, base: str, entry: 
                  f"entry was not handed back: {refusal}. Retry or Fix it on Queue.")
         return
     _hand_back(connection, key, found, read["id"], who="build", by="a conflict rebuild", stamp=stamp)
+    _leave(connection, behind, who="build", run=read["id"], parked=True,
+           note=f"left the rebuild of build run {read['id']}: it waits on an item of its bundle")
     _send_back(connection, members, finding, stamp, who="build",
                why=f"build run {read['id']}: the lane's merge of {base} conflicted", result=reason,
                said=f"rebuild {done + 1} of {CONFLICT_REBUILDS} after the lane's merge of {base} conflicted")
 
 
+def _inside(connection, lead: int, members: list[dict]) -> tuple[list[dict], list[dict]]:
+    """A dependency inside an ended bundle whose lead's item is `lead` (review of build/sd-1306): `ahead`, the
+    members the lead waits on, directly or through other open items, and `behind`, every other member that
+    waits on an item of the bundle. Neither can build in it: `ahead` leaves to build on its own (`_free`), and
+    `behind` leaves the send-back, parked, as a subset Retry leaves one out."""
+    bundle = {member["item"] for member in members}
+    needed = _needed(connection, [lead])
+    ahead = [member for member in members if member["item"] != lead and member["item"] in needed]
+    behind = [member for member in members if member["item"] != lead and member not in ahead
+              and _needed(connection, [member["item"]]) & bundle]
+    return ahead, behind
+
+
+def _leave(connection, members: list[dict], *, who: str, run: str, note: str, parked: bool) -> None:
+    """Each of `members` leaves its bundle, as a subset Retry leaves one out (`ALONE` with `LEFT_OUT`, so the split
+    guard reads the lead's branch for its work): its item `ready`, parked or not, with `note` on it."""
+    stamp = clock()
+    for member in members:
+        connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
+                           (stamp, f"{ALONE}{who}: {LEFT_OUT}{run}", member["id"]))
+        status = connection.execute("SELECT status FROM item WHERE id = ?", (member["item"],)).fetchone()["status"]
+        if status in ("blocked", "in_progress"):
+            transition(connection, member["item"], "ready", who=who, reason=note)
+        if parked:
+            park(connection, member["item"], ("ready",), stamp, f"Build assignment {member['id']} {note}; item parked")
+        else:
+            unpark(connection, member["item"])
+        add_note(connection, member["item"], "comment", f"Build assignment {member['id']} {note}")
+
+
+def _free(connection, ahead: list[dict], *, who: str, run: str, lead: int) -> list[int]:
+    """`ahead` leaves its bundle unparked (`_leave`); the items of it free to build now, each that waits on nothing.
+    One that waits stays ready, so auto-pickup or a Build takes it once its own dependency is done."""
+    _leave(connection, ahead, who=who, run=run, parked=False,
+           note=f"left its bundle: its lead sd:{lead} waits on it; it builds on its own")
+    return [member["item"] for member in ahead if not waiting_on(connection, connection.execute(
+        "SELECT id, fields FROM item WHERE id = ?", (member["item"],)).fetchone())]
+
+
+def _sendable(connection, read: dict) -> tuple[list[dict], list[dict]]:
+    """The members a send-back of `read`'s bundle queues again (`_sent_back`), less `behind` (`_inside`), and
+    `behind`: Fix, its check and a conflict rebuild read the same split."""
+    members = _sent_back(connection, read)
+    behind = _inside(connection, members[0]["item"], members)[1] if members else []
+    return [member for member in members if member not in behind], behind
+
+
+def _waiting(connection, members: list[dict]) -> str:
+    """What a send-back's members wait on, as Retry's `_item` reads it, or "": dispatch would block and park a
+    bundle sent back while a dependency is open (review of pack sd:9570)."""
+    return "; ".join(f"item {member['item']} {why}" for member in members if (why := waiting_on(
+        connection, connection.execute("SELECT id, fields FROM item WHERE id = ?", (member["item"],)).fetchone())))
+
+
 def _sent_back(connection, read: dict) -> list[dict]:
     """The members of `read`'s bundle a send-back queues again: each `done` one whose item is still `in_progress`,
-    the lead first; none without the lead, since the claim would then pick a child's branch and worktree."""
+    the lead first; none without the lead, since the claim would then pick a child's branch and worktree.
+    A member whose item a newer build owns (`_current`) is that build's: its `in_progress` is not this bundle's,
+    so Fix, a conflict rebuild and the Build path's split never move or park it (review of build/sd-1306)."""
     lead = read["assignment"]
     members = [member for member in _members(connection, lead, "done")
                if connection.execute("SELECT status FROM item WHERE id = ?",
-                                     (member["item"],)).fetchone()["status"] == "in_progress"]
+                                     (member["item"],)).fetchone()["status"] == "in_progress"
+               and _current(connection, member)]
     return members if members and members[0]["id"] == lead else []
 
 
@@ -2217,9 +2526,11 @@ def lane_fix_check(connection, run: str) -> tuple[list[dict], str, dict]:
                            "back only a bundle whose lane entry failed")
     if status is None or status[0] != "done":
         raise BuildRefused(f"the bundle is {status[0] if status else 'gone'} again")
-    members = _sent_back(connection, dict(read))
+    members = _sendable(connection, dict(read))[0]
     if not members:
         raise BuildRefused("its lead item moved on since the lane failed; build it from Tasks")
+    if waiting := _waiting(connection, members):
+        raise BuildRefused(f"{waiting}; Fix sends the bundle back once that is done")
     named = LANE_ENTRY.match(read["detail"] or "")
     return members, *_lane_entry(connection, read["branch"], named.group(1) if named else None)
 
@@ -2230,6 +2541,9 @@ def lane_fix(connection, run: str, finding: str, *, who: str) -> list[int]:
     handed back to the builder first. The caller holds the transaction and checked the lead's revision. A state
     `lane_fix_check` refuses is `BuildRefused` and writes nothing."""
     members, key, entry = lane_fix_check(connection, run)
+    _leave(connection, _sendable(connection, dict(connection.execute("SELECT * FROM runner_run WHERE id = ?",
+                                                                     (run,)).fetchone()))[1],
+           who=who, run=run, parked=True, note=f"left Fix of build run {run}: it waits on an item of its bundle")
     stamp = clock()
     _hand_back(connection, key, entry, run, who=who, by="Fix", stamp=stamp)
     said = f"Fix of build run {run}'s failed lane entry"
