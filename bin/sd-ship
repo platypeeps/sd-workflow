@@ -568,10 +568,19 @@ def settled_followups(connection: sqlite3.Connection, item: int, message: str) -
     URL fragment, and "leave followup #<id> open" names one to keep. Any
     other followup waits on something the merge does not give.
     """
-    named, fenced = set(), False
+    named, fence = set(), ""
     for line in message.splitlines():
-        fenced ^= line.lstrip().startswith(("```", "~~~"))
-        found = None if fenced else re.fullmatch(r"Settles: followup #(\d+)", line.strip())
+        # CommonMark: a fence opens on 3+ backticks or tildes indented 3 spaces at most, and closes
+        # only on the same character, at least as long, with nothing after; unclosed, it runs to the end.
+        marker = re.match(r" {0,3}(`{3,}|~{3,})(.*)$", line)
+        if fence:
+            if marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence) and not marker[2].strip():
+                fence = ""
+            continue
+        if marker and not (marker[1][0] == "`" and "`" in marker[2]):
+            fence = marker[1]
+            continue
+        found = re.fullmatch(r" {0,3}Settles: followup #(\d+)\s*", line)
         if found:
             named.add(int(found[1]))
     return {row[0] for row in connection.execute(

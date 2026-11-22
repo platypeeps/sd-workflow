@@ -6391,6 +6391,37 @@ roles:
         self.assertIsNone(state.get("reviewed_head"))
 
 
+class SettlesLineTests(unittest.TestCase):
+    """sd:9869 review: a `Settles: followup #<id>` line settles a followup only outside a
+    code fence, and a fence closes only on its own character, at least as long (CommonMark)."""
+
+    def settled(self, message: str) -> set[int]:
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute("CREATE TABLE note (id INTEGER, item INTEGER, kind TEXT, body TEXT, resolved_at TEXT)")
+        connection.execute("INSERT INTO note VALUES (42, 1, 'followup', 'Waits on a reply', NULL)")
+        return ship.settled_followups(connection, 1, message)
+
+    def test_a_fenced_example_settles_nothing(self) -> None:
+        for fence, inner in (("````", "```"), ("```", "~~~"), ("~~~~", "~~~"), ("   ```", "````x"),
+                             ("```python", "```python")):
+            with self.subTest(fence=fence, inner=inner):
+                message = f"Body.\n\n{fence}\n{inner}\nSettles: followup #42\n{fence.strip()[:3]}\n"
+                self.assertEqual(self.settled(message), set())
+
+    def test_an_unclosed_fence_runs_to_the_end(self) -> None:
+        self.assertEqual(self.settled("```\nSettles: followup #42\n"), set())
+
+    def test_a_line_after_a_closed_fence_settles(self) -> None:
+        for fence, closer in (("````", "`````"), ("~~~", "~~~  "), ("```sh", "```")):
+            with self.subTest(fence=fence, closer=closer):
+                message = f"{fence}\nexample\n{closer}\n\nSettles: followup #42\n"
+                self.assertEqual(self.settled(message), {42})
+
+    def test_an_indented_code_block_marker_is_no_fence(self) -> None:
+        self.assertEqual(self.settled("    ```\nSettles: followup #42\n"), {42})
+
+
 class ReviewWatchdogTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
