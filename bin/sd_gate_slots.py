@@ -723,7 +723,9 @@ def wait_for_slot(fds: Sequence[int], where: pathlib.Path, *, poll: float, strea
             share = busy() if ticket is not None and rule.limit > 0 else None
             if stop():
                 raise LauncherExited()
-            if ticket is not None and deadline is not None and clock() >= deadline:
+            # One clock read per pass: the attempt is quick, and its reports and deadline read this one.
+            now = clock()
+            if ticket is not None and deadline is not None and now >= deadline:
                 taken = None  # the last attempt's reason is still why it waits
             elif ticket is None:
                 taken, reason = take_free(fds, markers, label, wall())
@@ -737,7 +739,6 @@ def wait_for_slot(fds: Sequence[int], where: pathlib.Path, *, poll: float, strea
                     stream.write(f"gate slot taken after {clock() - started:.0f}s under {where}\n")
                     stream.flush()
                 return taken
-            now = clock()
             if reported is None:
                 stream.write(f"waiting for a gate slot: {reason} under {where}{held_by(queue)}\n")
                 stream.flush()
