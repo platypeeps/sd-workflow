@@ -1536,20 +1536,31 @@ def flake_items(connection: Any, repository: str, path: str, *, now: float, days
                     "SELECT 1 FROM note WHERE item = ? AND kind = 'comment' AND instr(body, ?) > 0",
                     (found["id"], mark)).fetchone():
                 continue
-            if found is None:
-                item = writes.create_item(connection, kind="task", title=f"Flaky suite {suite}: make it hermetic",
-                                          repo=path, priority=2, source="task-ref", external_id=key)
-            else:
-                item = found["id"]
-                if found["status"] == "done":
-                    writes.transition(connection, item, "planning", who="sd-lane",
-                                      reason=f"{suite} flaked again in {repository}")
+            item = flake_item(connection, suite, path, repository)
             failing = [line for line in str(failure.get("reason")).splitlines() if line.startswith("failing: ")][:2]
             written.append(writes.add_note(connection, item, "comment", (
                 f"Gate flake in {repository}: {suite} {mark} (sd:{failure.get('item')}, {failure['finished_at']}) "
                 f"and passed at the same head (sd:{entry.get('item')}, {entry['finished_at']}). Fix the suite at "
                 "its root with a test that fails first." + "".join(f"\n{line}" for line in failing))))
     return written
+
+
+def flake_item(connection: Any, suite: str, path: str, repository: str) -> int:
+    """The flake item of `suite`, `task-ref` `flake:<suite>`: opened in `path`'s repo the first time, reopened when
+    done (pack sd:6739); `sd-ship`'s flake retry notes on it too (sd:9768)."""
+    require_sd_db()
+    from sd_db import writes  # noqa: PLC0415
+
+    key = f"flake:{suite}"
+    found = connection.execute("SELECT id, status FROM item WHERE source = 'task-ref' AND external_id = ?",
+                               (key,)).fetchone()
+    if found is None:
+        return writes.create_item(connection, kind="task", title=f"Flaky suite {suite}: make it hermetic",
+                                  repo=path, priority=2, source="task-ref", external_id=key)
+    if found["status"] == "done":
+        writes.transition(connection, found["id"], "planning", who="sd-lane",
+                          reason=f"{suite} flaked again in {repository}")
+    return found["id"]
 
 
 def file_flakes(checkout: pathlib.Path, path: str, environ: dict[str, str]) -> dict[str, Any] | None:
