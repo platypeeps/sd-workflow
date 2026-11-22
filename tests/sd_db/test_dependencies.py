@@ -352,6 +352,36 @@ class TheQueueGraph(DependencyCase):
         self.assertEqual(state["status"], "blocked")
         self.assertRegex(state["result"], f"sd:{second}.*after.*sd:{first}")
 
+    def test_a_saved_same_role_after_is_never_dropped(self):
+        """Review of build/sd-1306: before this branch, `enqueue` took an explicit `after=A` naming a run
+        of the same role. Such a saved row is no batch order: A's wait on B's item is refused, naming
+        both, and a claim of B holds it behind A, never `({1: {2}, 2: set()}, [])`."""
+        from sd_db import runner
+
+        first, author = self.lone("work/a")
+        second, later = self.lone("work/b")
+        # A row saved before `enqueue` refused it: B after A, queued apart, so no batch order.
+        self.db.execute("UPDATE assignment SET after = ? WHERE id = ?", (author, later))
+        with self.assertRaisesRegex(WorkflowError, f"sd:{second}.*after.*sd:{first}"):
+            self.wait(first, second)
+        # The wait set while B's item was done, then a reopen: the claim ends B blocked, naming both.
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (second,))
+        self.wait(first, second)
+        self.db.execute("UPDATE item SET status = 'ready' WHERE id = ?", (second,))
+        roots = {"work_root": Path("/w/work"), "retention_root": Path("/w/retained")}
+        self.assertIsNone(runner.claim(self.db, later, owner="fixture", **roots), "B never passes A")
+        state = runner.queue_state(self.db, later)
+        self.assertEqual(state["status"], "blocked")
+        self.assertRegex(state["result"], f"sd:{second}.*after.*sd:{first}")
+
+    def test_a_batch_marks_its_runs_and_a_lone_run_its_own(self):
+        """`enqueue` writes one `batch` per call, its first run's id: the mark `_graph` reads batch order by."""
+        _, ids = self.serial(3)
+        _, lone = self.lone("work/z")
+        marks = [self.db.execute("SELECT batch FROM assignment WHERE id = ?", (ident,)).fetchone()[0]
+                 for ident in (*ids, lone)]
+        self.assertEqual(marks, [ids[0]] * 3 + [lone])
+
     def test_an_explicit_after_names_a_run_of_another_role(self):
         """Within one role, `after` is batch order, which a waiting run may pass; an explicit prerequisite
         of the same role would read as one, so it is refused: queue the runs in one batch."""

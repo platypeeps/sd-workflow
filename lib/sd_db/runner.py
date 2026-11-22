@@ -145,8 +145,9 @@ def _graph(connection) -> tuple[dict[int, set[int]], list[tuple[int, int]]]:
 
     A dependency edge, kept always: an author run waits on each queued run of an open item its item
     waits on, directly or through other open items; the workflow refuses an item cycle, so these alone
-    make none. A prerequisite edge, kept always: a run waits on the first run up its chain of another
-    role, its batch's explicit `after` (`enqueue` refuses one of the same role). One that closes a
+    make none. A prerequisite edge, kept always: a run waits on the first run up its chain outside its
+    batch (`assignment.batch`), its batch's explicit `after`; a row saved before `batch` has none,
+    so its `after` is one, even of the same role (`enqueue` now refuses that). One that closes a
     cycle is not added but returned as a (run, prerequisite) pair: a wait contradicts it, and only a
     refusal or an ended run settles that, never a pass (lane review 7379bf9a). An order edge, kept
     unless it closes a cycle: a serial run waits on each other run up its chain that is not merged,
@@ -202,14 +203,18 @@ def _graph(connection) -> tuple[dict[int, set[int]], list[tuple[int, int]]]:
     contradicted: list[tuple[int, int]] = []
     order: list[tuple[int, int]] = []
     for ident, row in rows.items():
-        predecessor, crossed = row["after"], False
+        current, predecessor, crossed = row, row["after"], False
         while predecessor is not None:
             ahead = rows.get(predecessor) or connection.execute(
                 "SELECT * FROM assignment WHERE id = ?", (predecessor,)).fetchone()
             if ahead is None:
                 break
-            prerequisite = not crossed and ahead["role"] != row["role"]
+            # Batch order is a link within one `enqueue` call; a row saved before `batch` reads NULL, so its
+            # `after` stays a prerequisite, of the same role or not (review of build/sd-1306).
+            batched = current["batch"] is not None and current["batch"] == ahead["batch"]
+            prerequisite = not crossed and not batched
             crossed = crossed or prerequisite
+            current = ahead
             # A merged run ahead may have passed the ones before it, so the walk goes on past it.
             if _merged(connection, ahead):
                 pass
@@ -325,13 +330,14 @@ def enqueue(connection, items: list[int], *, parallel=False, role="author", scop
             active = connection.execute(f"SELECT id FROM assignment WHERE item = ? AND status IN {OWNING}", (item["id"],)).fetchone()
             if held or active:
                 raise RunnerRefused(f"item {item['id']} already has queued work or a retained lease")
-        created = []
+        created: list[int] = []
         for item in selected:
             ident = create_assignment(connection, item=item["id"], role=role, status="queued",
                                       lane="parallel" if parallel else "serial", budget_minutes=budget_minutes,
                                       budget_usd=budget_usd, after=after)
-            connection.execute("UPDATE assignment SET scope = ?, queued_at = ?, started = NULL WHERE id = ?",
-                               (scope, now(), ident))
+            # One `batch` per call, its first run's id: `_graph` reads batch order by it.
+            connection.execute("UPDATE assignment SET scope = ?, queued_at = ?, started = NULL, batch = ? "
+                               "WHERE id = ?", (scope, now(), created[0] if created else ident, ident))
             add_note(connection, item["id"], "comment", f"Assignment {ident} queued by {who}; {role}, {scope}, {budget_minutes} minutes"
                      + (f", budget {budget_usd:.2f} USD" if budget_usd is not None else ""))
             created.append(ident)
