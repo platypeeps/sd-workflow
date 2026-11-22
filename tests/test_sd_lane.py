@@ -1641,7 +1641,8 @@ class Train(Trees):
             self.trains.append((root, head, base))
         else:
             self.gates.append((root, head, base))
-        red = "red.txt" in self.files(head)
+        files = self.files(head)
+        red = "red.txt" in files and "fix.txt" not in files
         return {"status": "failed" if red else "success", "summary": "sd-check", "report": {"status": "pass"}}
 
     def cover(self, root: pathlib.Path, head: str, base: str, passed: dict) -> dict:
@@ -1655,20 +1656,22 @@ class Train(Trees):
     def files(self, head: str) -> set[str]:
         return set(git(self.repo, "ls-tree", "--name-only", head).split())
 
-    def test_three_green_entries_land_with_one_gate_run(self) -> None:
+    def test_three_green_entries_land_with_one_gate_run_for_the_stack(self) -> None:
+        """The top's receipt comes from the one train gate; each member below is gated on its own tree."""
         self.queue_three()
         fork = git(self.repo, "rev-parse", "origin/main")
         sd_lane.run_lane(self.repo, self.environ, super().ship, self.gate, cover=self.cover)
         [(root, head, base)] = self.trains
-        self.assertEqual((root, base, self.gates), (self.third, fork, []))
+        self.assertEqual((root, base), (self.third, fork))
         self.assertLessEqual({"one.txt", "two.txt", "three.txt", "base.txt"}, self.files(head))
-        self.assertEqual([root for root, _, _ in self.covers], [self.first, self.second, self.third])
-        # Each member is covered on the landing under it: the first on the fetched main, the next on its landing.
-        self.assertEqual(self.covers[0][2], fork)
-        self.assertEqual(git(self.repo, "rev-parse", f"{self.covers[1][2]}^"), fork)
+        [(covered, top, under)] = self.covers
+        self.assertEqual((covered, top), (self.third, head))
+        self.assertEqual(git(self.repo, "rev-parse", f"{under}^^"), fork)
+        # sd:2 gets its speculative gate on sd:1's landing; sd:3 rides the train's pass.
+        self.assertEqual([root for root, _, _ in self.gates], [self.second])
         entries = self.entries()
         self.assertEqual([entry["status"] for entry in entries], ["merged"] * 3)
-        self.assertEqual([entry["train"]["status"] for entry in entries], ["covered"] * 3)
+        self.assertEqual([entry["train"]["status"] for entry in entries], ["stacked", "stacked", "covered"])
         self.assertEqual([len(entry["train"]["after"]) for entry in entries], [0, 1, 2])
 
     def test_one_red_entry_of_three_lands_the_other_two_and_reports_the_red_one(self) -> None:
@@ -1701,11 +1704,26 @@ class Train(Trees):
         [(root, head, _)] = self.trains
         self.assertEqual(root, self.third)
         self.assertNotIn("two.txt", self.files(head))
-        self.assertEqual([root for root, _, _ in self.covers], [self.first, self.third])
+        self.assertEqual([root for root, _, _ in self.covers], [self.third])
         entries = self.entries()
-        self.assertEqual([entry["train"]["status"] for entry in entries], ["covered", "dropped", "covered"])
+        self.assertEqual([entry["train"]["status"] for entry in entries], ["stacked", "dropped", "covered"])
         self.assertIn("it conflicts with", entries[1]["train"]["reason"])
         self.assertEqual(entries[2]["train"]["after"], [entries[0]["id"]])
+
+    def test_a_pass_at_the_top_covers_no_lower_tree_it_never_gated(self) -> None:
+        """Review of sd:9899: A breaks the gate and B fixes it, so A+B passes and A alone fails.
+
+        A receipt at A's tree would let A merge ungated if B then stopped; only the gated top is covered.
+        """
+        self.commit_files(self.first, {"red.txt": "r\n"}, "breaks the gate")
+        self.commit_files(self.second, {"fix.txt": "f\n"}, "fixes the gate")
+        for item, tree in enumerate((self.first, self.second), start=1):
+            sd_lane.enqueue_entry(tree, item, f"fix: {item}", self.body, self.environ, manual=True, claim="deliver")
+        sd_lane.run_lane(self.repo, self.environ, super().ship, self.gate, cover=self.cover)
+        self.assertEqual([root for root, _, _ in self.covers], [self.second])
+        first = self.entries()[0]["train"]
+        self.assertNotEqual(first["status"], "covered")
+        self.assertNotIn("receipt", first)
 
     def test_a_train_of_one_gates_nothing_extra(self) -> None:
         with mock.patch.object(sd_lane, "TRAIN", 1):

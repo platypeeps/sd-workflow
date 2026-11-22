@@ -153,11 +153,14 @@ A train gates up to `sd.lane_train` entries once (sd:9899; unset 3, 1 is
 no train). The claimed entry and the pending ones after it, each with its
 worktree here, stack in a scratch worktree as `landings` predicts them; a
 member that conflicts drops to the next train and stays pending. One gate
-runs at the top against the fetched base. A pass leaves each member a
-receipt at its own tree and base (`default_cover`), which replays the
-train's report; prepare then reads it, and the speculation skips a member
-its train covered. A fail gates the first half again, down to one member,
-whose own prepare gates it. Each member still reviews and merges alone.
+runs at the top against the fetched base. A pass leaves the top a
+receipt at its tree and base (`default_cover`), which replays the train's
+report; its prepare then reads it, and the speculation skips it. Only
+that tree ran the gate: a member below it may pass only with the top's
+change and may merge while the top stops, so it gets no receipt, and its
+speculation and prepare gate it. A fail gates the first half again, down
+to one member, whose own prepare gates it. Each member still reviews and
+merges alone.
 
 After a merge the runner lands the entry (sd:2568). It deletes the remote
 branch with `--force-with-lease` while the worktree's tip is the merged head.
@@ -2496,16 +2499,18 @@ def lane_train(environ: dict[str, str] | None = None) -> int:
     return int(value) if value else TRAIN
 
 
-def covered(row: dict[str, Any], statuses: dict[str, Any], ahead: Iterable[str] = ()) -> bool:
-    """Whether `row`'s train receipts still name its landing (sd:9899).
+def covered(row: dict[str, Any], statuses: dict[str, Any], ahead: Iterable[str] = (),
+            kinds: tuple[str, ...] = ("covered",)) -> bool:
+    """Whether `row`'s train record, of one of `kinds`, still names its landing (sd:9899).
 
-    The train covered it at its queued head, and each entry the train put
+    The train placed it at its queued head, and each entry the train put
     ahead of it merged or is in `ahead`, the chain a speculation predicts.
     A landing that went otherwise makes another tree; its receipt then
-    misses, and prepare gates on its own.
+    misses, and prepare gates on its own. Only `covered`, the gated top,
+    holds a receipt; a `stacked` member below it holds none.
     """
     train, ahead = row.get("train") or {}, set(ahead)
-    return (train.get("status") == "covered" and train.get("expected_head") == row.get("expected_head")
+    return (train.get("status") in kinds and train.get("expected_head") == row.get("expected_head")
             and all(statuses.get(before) == "merged" or before in ahead for before in train.get("after") or []))
 
 
@@ -2519,7 +2524,8 @@ def train_members(entry: dict[str, Any], queue: Queue, size: int) -> list[dict[s
     if size < 2:
         return []
     rows, host = read_queue(queue), this_host()
-    if covered(entry, {row["id"]: row.get("status") for row in rows}) or not tree_here(entry, host):
+    if covered(entry, {row["id"]: row.get("status") for row in rows}, kinds=("covered", "stacked")) or not tree_here(
+            entry, host):
         return []
     members = [entry]
     for row in (row for row in rows if runnable(row)):
@@ -2559,7 +2565,7 @@ def stack(tree: pathlib.Path, members: list[dict[str, Any]], fork: str,
 
 
 def default_cover(root: pathlib.Path, head: str, base: str, passed: dict[str, Any]) -> dict[str, Any]:
-    """The receipt a train member's prepare reads: the train gate's pass, bound at the member's own tree (sd:9899).
+    """The receipt the train's top reads: the train gate's pass, bound at the top's base as prepare binds it (sd:9899).
 
     `sd_gate_run.check_in_worktree` binds `head` against `base` as prepare
     will, and replays the train's `sd-check` report in place of a run. A
@@ -2622,10 +2628,13 @@ def train_stack(members: list[dict[str, Any]]) -> dict[str, Any]:
 
 def gate_train(placed: list[dict[str, Any]], fork: str, gate: Gate, cover: Cover,
                thread: SpeculativeGate) -> dict[str, dict[str, Any]]:
-    """Gate the stack's top against `fork`; on a pass cover each member, on a fail gate the first half again.
+    """Gate the stack's top against `fork`; on a pass cover the top, on a fail gate the first half again.
 
-    Answers each member's `train` record by entry id. A half of one runs no
-    train gate: its own prepare gates it.
+    Answers each member's `train` record by entry id. Only the top's tree
+    ran the gate, so only the top gets a receipt (`cover`). A member below
+    it is `stacked`: a pass above does not show it passes alone, and it may
+    merge while the top stops, so its speculation and prepare gate it.
+    A half of one runs no train gate: its own prepare gates it.
     """
     fields: dict[str, dict[str, Any]] = {}
     gates = 0
@@ -2635,11 +2644,11 @@ def gate_train(placed: list[dict[str, Any]], fork: str, gate: Gate, cover: Cover
         if result.get("status") == "success":
             passed = {**result, "train": {"gated": top["head"], "items": [held["row"]["item"] for held in placed]}}
             for number, held in enumerate(placed):
-                answer = cover(pathlib.Path(held["row"]["worktree"]), held["head"], held["base"], passed)
-                fields[held["row"]["id"]] = {"status": "covered", "expected_head": held["row"]["expected_head"],
+                fields[held["row"]["id"]] = {"status": "stacked", "expected_head": held["row"]["expected_head"],
                                              "after": [ahead["row"]["id"] for ahead in placed[:number]],
-                                             "head": held["head"], "base": held["base"], "gates": gates,
-                                             "receipt": receipt_of(answer)}
+                                             "head": held["head"], "base": held["base"], "gates": gates}
+            answer = cover(pathlib.Path(top["row"]["worktree"]), top["head"], top["base"], passed)
+            fields[top["row"]["id"]].update(status="covered", receipt=receipt_of(answer))
             return fields
         named = ", ".join(f"sd:{held['row']['item']}" for held in placed)
         kept = placed[:len(placed) // 2]
@@ -2654,7 +2663,7 @@ def gate_train(placed: list[dict[str, Any]], fork: str, gate: Gate, cover: Cover
 
 def ride(members: list[dict[str, Any]], queue: Queue, gate: Gate, cover: Cover,
          thread: SpeculativeGate) -> None:
-    """Stack the train's members, gate the stack once, and leave each member a receipt on a pass (sd:9899).
+    """Stack the train's members, gate the stack once, and leave its top a receipt on a pass (sd:9899).
 
     The gate runs at the top of the stack against the fetched base, so its
     scope is the whole train (`gate_train`). A member that conflicts drops

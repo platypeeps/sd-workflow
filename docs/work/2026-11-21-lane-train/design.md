@@ -28,21 +28,26 @@ on this host. An entry the runner may not merge ends the train.
    stays pending at its place and carries `train.status: dropped`.
 2. Gate once: `sd gate check`'s gate at the top of the stack, against
    the fetched base, so its scope is the whole train.
-3. On a pass, cover each member (`default_cover`).
-   `sd_gate_run.check_in_worktree` binds the member at its own catch-up
+3. On a pass, cover the top only (`default_cover`).
+   `sd_gate_run.check_in_worktree` binds the top at its own catch-up
    merge and the landing under it, as its prepare will. It replays the
    train's `sd-check` report in place of a run. The report names the
-   train. A member whose own scope differs from the report gets no
-   receipt, so its prepare gates it.
+   train. If the top's own scope differs from the report, the top gets
+   no receipt, so its prepare gates it. A member below the top is
+   `stacked` and gets no receipt. A pass above it does not show that it
+   passes alone: A can break a check that B fixes. It can also merge
+   while the top stops. So its speculation and prepare gate it.
 4. On a fail, gate the first half again, down to one member. The second
    half carries `train.status: left`. A half of one runs no train gate:
    its own prepare gates it and reports the failure as today.
 5. Each member then ships through the existing prepare and merge, one at
-   a time. Prepare and the merge gate read the cover's receipt. The
-   merge gate posts `sd/local-gate` on each head.
+   a time. The top's prepare and merge gate read its receipt. Each
+   lower member's tree runs its own gate, at most `DEPTH` of them early
+   as speculations. The merge gate posts `sd/local-gate` on each head.
 
-A speculation skips a member its train covered on the same chain
-(`covered`). A claimed entry whose cover still holds rides no new train.
+A speculation skips the top its train covered on the same chain
+(`covered`). A claimed member whose train record still holds rides no
+new train.
 A cover holds while each member ahead of it merged. A landing that went
 otherwise makes another tree, the receipt misses, and prepare gates.
 
@@ -69,9 +74,10 @@ otherwise makes another tree, the receipt misses, and prepare gates.
 | 4 train gate | gate receipt at the top on the fork | gate fails | bisect the first half; the rest left | test_one_red_entry_of_three_lands_the_other_two_and_reports_the_red_one |
 | 4 train gate | none | gate raises | members marked error; each ships alone | start_train run_train except |
 | 4 train gate | none | run budget or TERM | thread cancelled; members marked cancelled | cancel_gate, as a speculative gate |
-| 5 cover | one receipt per member | scope differs, binding moved | receipt_skipped; prepare gates | test_the_cover_replays_the_train_report_as_a_passing_check |
+| 5 cover | one receipt, the top's | scope differs, binding moved | receipt_skipped; prepare gates | test_the_cover_replays_the_train_report_as_a_passing_check |
+| 5 cover | none below the top | A fails alone, A+B passes | no receipt for A; A gates alone | test_a_pass_at_the_top_covers_no_lower_tree_it_never_gated |
 | 6 ship members | PR merged, item delivered | a member ahead fails | its followers' receipts miss; each gates | covered(): after must be merged |
-| 6 ship members | PR merged | all pass | one train gate for N entries | test_three_green_entries_land_with_one_gate_run |
+| 6 ship members | PR merged | all pass | one train gate for the stack | test_three_green_entries_land_with_one_gate_run_for_the_stack |
 | config | none | sd.lane_train invalid | reads 3 | test_lane_train_reads_the_machine_setting |
 ```
 
