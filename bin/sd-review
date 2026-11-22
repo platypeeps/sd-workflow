@@ -2074,6 +2074,13 @@ def metered_bills(
     return lines, faults
 
 
+def repository_path(root: pathlib.Path, name: str) -> str:
+    """sd:9962. A full path under the checkout, a spelling `reviewed_paths` accepts, as its repository path."""
+    prefix = next((prefix for prefix in (f"{root.as_posix()}/", f"{root.resolve().as_posix()}/")
+                   if name.startswith(prefix)), "")
+    return name[len(prefix):]
+
+
 def prepared_prompt(root: pathlib.Path, subject: Subject, args: argparse.Namespace,
                     previous: dict[str, Any] | None, env: Mapping[str, str], checklist: str) -> tuple[str, bool, list[dict[str, Any]]]:
     conventions = local_conventions(root)
@@ -2087,7 +2094,8 @@ def prepared_prompt(root: pathlib.Path, subject: Subject, args: argparse.Namespa
                    "against the fix and current code, including findings outside changed hunks. Repeat "
                    "every unresolved blocker; an unrelated clean diff does not resolve it. Prior findings:\n" + evidence)
         required = len(prompt.encode())
-        for name in sorted({row["path"] for row in previous["findings"] if row.get("disposition") == "blocking"}):
+        for name in sorted({repository_path(root, str(row["path"]))
+                            for row in previous["findings"] if row.get("disposition") == "blocking"}):
             path = pathlib.Path(name)
             if path.is_absolute() or ".." in path.parts or not (root / path).resolve().is_relative_to(root.resolve()):
                 raise UsageError("prior blocking finding path is outside this repository")

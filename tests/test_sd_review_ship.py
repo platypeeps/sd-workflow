@@ -177,6 +177,32 @@ class FixReviewTests(ReviewFixture):
                     self.fail(f"unsafe source entered reviewer prompt: {marker in json.dumps(runner.calls, default=str)}")
                 self.assertEqual(runner.calls, [])
 
+    def test_an_absolute_prior_path_under_the_checkout_reads_as_its_repository_path(self):
+        # REGRESSION sd:9962: a reader printed the full path, `reviewed_paths` accepted it, and the
+        # verification refused it as outside this repository.
+        root, first = self.branch()
+        report = self.tmp / "prior.json"
+        for name in (f"{root}/src.py", f"{root.resolve()}/src.py"):
+            row = {"path": name, "line": 1, "disposition": "blocking", "summary": "original finding"}
+            report.write_text(json.dumps({"scope": "branch", "subject": {"head": first}, "findings": [row]}))
+            runner = FakeRunner()
+            with self.subTest(path=name):
+                sd_review.review(root, namespace(scope="branch", resume_report=str(report)), runner,
+                                 self.environment(), self.chatgpt_home())
+                self.assertIn("the_original_defect = True", json.dumps(runner.calls, default=str))
+
+    def test_an_absolute_prior_path_outside_the_checkout_still_refuses(self):
+        root, first = self.branch()
+        report = self.tmp / "prior.json"
+        for name in ("/etc/hosts", f"{root}/../outside.py", f"{root}/.git/config"):
+            row = {"path": name, "line": 1, "disposition": "blocking", "summary": "original finding"}
+            report.write_text(json.dumps({"scope": "branch", "subject": {"head": first}, "findings": [row]}))
+            runner = FakeRunner()
+            with self.subTest(path=name), self.assertRaises(sd_review.UsageError):
+                sd_review.review(root, namespace(scope="branch", resume_report=str(report)), runner,
+                                 self.environment(), self.chatgpt_home())
+            self.assertEqual(runner.calls, [])
+
     def test_prior_source_uses_exact_committed_regular_blob_not_worktree_replacement(self):
         root, first = self.branch()
         report = self.tmp / "prior.json"
