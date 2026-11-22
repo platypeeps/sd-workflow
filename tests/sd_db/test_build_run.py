@@ -196,6 +196,10 @@ FAKE = textwrap.dedent('''
         if mode == "garbage":
             print("not json")
             sys.exit(4)
+        if mode == "rate_limited":  # sd:9882: the provider's quota, which `sd-review` exits 4 on
+            print(json.dumps({"status": "rate_limited", "findings": [],
+                              "subject": {"head": git("-C", work, "rev-parse", "HEAD")}}))
+            sys.exit(4)
         raw = {"path": "work.txt", "line": 1, "severity": "high", "summary": "a blocker", "family": "correctness"}
         findings = review.dispose([review._finding(raw)], "high")  # the record shape `--json` prints
         if mode == "gate_failed":
@@ -1023,6 +1027,24 @@ class Supervise(Case):
         self.assertEqual(self.supervisor().run()["outcome"], "blocked")
         self.assertEqual(len(self.calls("sd-review")), 2)
         self.assertIn("the review gave no answer twice", self.latest()["detail"])
+
+    def test_a_rate_limited_review_waits_and_asks_again(self):
+        """sd:9882: a rate limit blocked the build and parked its item; it waits the window out instead."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["rate_limited", "rate_limited", "clean"])
+        with mock.patch.object(build_run, "RATE_LIMIT_WAIT_SECONDS", 0.3):
+            self.assertEqual(self.supervisor().run().get("step"), "enqueued", self.latest()["detail"])
+        self.assertEqual(len(self.calls("sd-review")), 3)
+
+    def test_a_review_still_rate_limited_after_every_wait_blocks(self):
+        self.press()
+        waits = build_run.RATE_LIMIT_WAITS
+        self.plan(claude=["pass"], sd_review=["rate_limited"] * (waits + 1))
+        with mock.patch.object(build_run, "RATE_LIMIT_WAIT_SECONDS", 0.05):
+            self.assertEqual(self.supervisor().run()["outcome"], "blocked")
+        self.assertEqual(len(self.calls("sd-review")), waits + 1)
+        self.assertIn("the review stayed rate_limited", self.latest()["detail"])
 
     def test_cancel_before_enqueuing_wins(self):
         """Failure table, Enqueuing CAS: a cancel asked during reviewing wins; no `sd-ship`, nothing pushed."""
