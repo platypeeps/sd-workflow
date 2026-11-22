@@ -1224,7 +1224,7 @@ class Supervisor:
             # its round already counted (review of build/sd-1557).
             self.blockers = self.noted_blockers()
             if self.blockers:
-                steps["fixing"] = self.fix
+                steps["fixing"] = self.resume_fix
         while step in steps:
             ended = steps[step]()
             if isinstance(ended, dict):
@@ -1470,6 +1470,11 @@ class Supervisor:
         lines = row["body"][len(build.ROUND_BLOCKERS):].splitlines() if row else []
         # Each line is `summary`'s "- path:line text"; the text alone keeps it, as `summary` prints it again.
         return [{"path": "", "line": "", "summary": line.strip()[2:]} for line in lines if line.startswith("- ")]
+
+    def resume_fix(self) -> str | dict:
+        """The interrupted fix again, with its own brief: the last round's is the class pass (`blocked_round`)."""
+        rounds = self.fresh()["review_round"] or 0
+        return self.fix(CLASS_PASS, rounds=rounds) if rounds == REVIEW_ROUNDS else self.fix()
 
     def count_round(self) -> None:
         if not build.write(self.db, self.ident, review_round=(self.fresh()["review_round"] or 0) + 1):

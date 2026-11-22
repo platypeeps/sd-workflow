@@ -1896,6 +1896,26 @@ class Supervise(Case):
         self.assertIn("- work.txt:1 a blocker", fix[fix.index("-p") + 1])
         self.assertEqual(build.run(self.db, again["id"])["review_round"], 1, "the resumed fix charged no round")
 
+    def test_a_usage_limit_in_the_class_pass_resumes_the_class_pass(self):
+        """Review of build/sd-1557: a limit in the last round's class pass resumed with the plain FIX brief, so
+        the class pass never ran before the bound parked the run. It resumes with CLASS_PASS."""
+        R = build_run.REVIEW_ROUNDS
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R)), "rate_limited"], sd_review=["blocking"] * R)
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.plan(claude=["fixc"], sd_review=["clean"])
+        self.assertEqual(self.supervisor(again["id"]).run()["step"], "enqueued")
+        fix = [call["argv"] for call in self.calls("claude")][-1]
+        self.assertIn("do one class pass", fix[fix.index("-p") + 1])
+        self.assertEqual(build.run(self.db, again["id"])["review_round"], R)
+
     def test_a_recorded_disposition_enqueues(self):
         """sd:10010: once the dispositions are on file, the lane's prepare clears them: enqueue goes ahead."""
         self.press()
