@@ -121,6 +121,13 @@ class DispositionTests(unittest.TestCase):
         self.assertEqual(state["binding"], ship.binding(self.root))
         self.assertEqual(state["review_binding_kept"][0]["changed"], [["sd_route.py", "verdict"]])
 
+    def test_the_template_says_whether_dispositions_are_recorded(self):
+        """sd:10010: a supervisor reads `recorded` before enqueue; true only once a filled template is on file."""
+        self.blocked()
+        self.assertIs(json.loads(self.command().stdout)["recorded"], False)
+        self.accepted()
+        self.assertIs(json.loads(self.command().stdout)["recorded"], True)
+
     def test_a_blocking_refusal_bounds_its_message_and_names_a_no_item_record(self):
         """sd:2102. Five findings are named, a line-less one by path, and `findings` carries every one."""
         rows = [{"disposition": "blocking", "severity": "high", "path": f"f{n}.py", "line": n, "summary": "x " * 200}
