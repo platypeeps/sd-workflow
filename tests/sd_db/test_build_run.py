@@ -3786,6 +3786,23 @@ class Archive(Case):
         self.db.commit()
         return path, build_run.log_dir(self.logs, str(self.repo)) / path.name
 
+    def test_a_rate_limited_bundles_files_wait_for_its_resume(self):
+        """Review of build/sd-1557: a usage limit releases the run and queues the bundle again; the archive
+        moved its blockers file, so the resumed fix found none and reviewed again, charging another round."""
+        path, target = self.ended("sd-{assignment}.blockers.json")
+        paths = [path, *(path.with_name(f"sd-{self.bundle['assignment']}.{name}") for name in ("body.md", "title"))]
+        for each in paths[1:]:
+            each.write_text("x")
+            os.utime(each, (0, 0))
+        self.db.execute("UPDATE runner_run SET outcome = ? WHERE id = ?", (build.RATE_LIMITED, self.bundle["id"]))
+        self.db.commit()
+        self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs), [])
+        self.assertTrue(all(each.exists() for each in paths), "the resume reads the local files")
+        self.db.execute("UPDATE runner_run SET outcome = 'done' WHERE id = ?", (self.bundle["id"],))
+        self.db.commit()
+        self.assertEqual(sorted(build_run.archive(self.db, self.root / "local", self.logs)),
+                         sorted(str(target.with_name(each.name)) for each in paths))
+
     def test_notes_and_end_messages_name_the_archived_log(self):
         """sd:8275: the move rewrote only `log_path`; a note or end message still named the local file it removed."""
         path, target = self.ended("{run}.jsonl")

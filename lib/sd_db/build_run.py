@@ -818,6 +818,13 @@ def _released(connection, path: Path) -> bool:
     rows = connection.execute(ended + "assignment = ?", (int(owner[1]),)) if owner \
         else connection.execute(ended + "id = ?", (path.name.split(".", 1)[0],))
     released = [row[0] for row in rows]
+    # A usage limit releases its run and queues the bundle again: the resume reads these files locally
+    # (`Supervisor.round_blockers`, the body), so they wait while the last run is that one (review of build/sd-1557).
+    if owner and released:
+        last = connection.execute("SELECT outcome FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
+                                  (int(owner[1]),)).fetchone()
+        if last is not None and last[0] == build.RATE_LIMITED:
+            return False
     return bool(released) and all(released)
 
 
@@ -843,8 +850,8 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
             deadline: float = ARCHIVE_DEADLINE_SECONDS) -> list[str]:
     """Move each file of an ended run from `local` to the same place under `bulk`; the new paths.
 
-    `sd-<assignment>.title`, `.body.md` and `.blockers.json` move once every run of that assignment ended and was released,
-    the rest once the run their name starts with was: an outcome alone leaves a blocked or abandoned run's
+    `sd-<assignment>.title`, `.body.md` and `.blockers.json` move once every run of that assignment ended and was
+    released and its last did not end at a usage limit, which resumes on them; the rest once the run their name starts with was: an outcome alone leaves a blocked or abandoned run's
     groups alive until the reap releases it, and they may still write. A file no run owns, one written in the
     last `settle` seconds or one whose copy fails stays for a later tick.
 
