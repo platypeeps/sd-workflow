@@ -3184,11 +3184,11 @@ roles:
         with patch.object(ship.time, "sleep"):
             self.assert_closed_by_merge(self.merge())
 
-    def test_a_delivery_resolves_only_the_followups_it_names_or_the_lanes(self):
+    def test_a_delivery_resolves_only_the_lanes_own_followups(self):
         """sd:9869. A merge closed an item and resolved two followups that
-        still waited on an outside reply. A delivery resolves a followup its
-        message names on a line of its own as `Settles: followup #<id>`, and
-        the lane's own blockers; prose or a fenced example settles none."""
+        still waited on an outside reply. A delivery resolves only the lane's
+        own blockers; no line of its message, a `Settles:` trailer included,
+        resolves another (class pass after round 7)."""
         self.task_item("task")
         waiting = sd_db.add_note(self.connection, self.item, "followup", "Waits on the reviewer's reply")
         sd_db.add_note(self.connection, self.item, "followup", "Lane failed in prepare: gate red")
@@ -3211,7 +3211,7 @@ roles:
         self.assertEqual(self.status_of(self.item), "done")
         still = {row[0] for row in self.connection.execute(
             "SELECT id FROM note WHERE item = ? AND kind = 'followup' AND resolved_at IS NULL", (self.item,))}
-        self.assertEqual(still, {waiting, unrelated, left})
+        self.assertEqual(still, {waiting, unrelated, left, named})
 
     def test_a_design_only_branch_cannot_deliver_its_build_item(self):
         """sd:3519. PR #260 changed docs/work/ and CLAUDE.md, merged with
@@ -6391,71 +6391,25 @@ roles:
         self.assertIsNone(state.get("reviewed_head"))
 
 
-class SettlesLineTests(unittest.TestCase):
-    """sd:9869 review: a `Settles: followup #<id>` line settles a followup only outside a
-    code fence, and a fence closes only on its own character, at least as long (CommonMark)."""
+class SettledFollowupTests(unittest.TestCase):
+    """sd:9869, class pass after round 7: every reading of the squash message's text to pick the followups a
+    delivery settles drew a new case (fences, comments, `<pre>`, `--><pre>`, `Context: <!--` above a trailer).
+    A delivery now settles only the lane's own blockers, by the prefix the lane writes; the end-to-end
+    `test_a_delivery_resolves_only_the_lanes_own_followups` shows a `Settles:` trailer settles none."""
 
-    def settled(self, message: str) -> set[int]:
+    def settled(self, body: str) -> set[int]:
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
         connection.execute("CREATE TABLE note (id INTEGER, item INTEGER, kind TEXT, body TEXT, resolved_at TEXT)")
-        connection.execute("INSERT INTO note VALUES (42, 1, 'followup', 'Waits on a reply', NULL)")
-        return ship.settled_followups(connection, 1, message)
+        connection.execute("INSERT INTO note VALUES (42, 1, 'followup', ?, NULL)", (body,))
+        connection.execute("INSERT INTO note VALUES (43, 1, 'followup', 'Lane failed in prepare: gate red', NULL)")
+        connection.execute("INSERT INTO note VALUES (44, 1, 'followup', 'Lane failed in gate: red', '2026-01-01')")
+        return ship.settled_followups(connection, 1)
 
-    def test_a_fenced_example_settles_nothing(self) -> None:
-        for fence, inner in (("````", "```"), ("```", "~~~"), ("~~~~", "~~~"), ("   ```", "````x"),
-                             ("```python", "```python")):
-            with self.subTest(fence=fence, inner=inner):
-                message = f"Body.\n\n{fence}\n{inner}\nSettles: followup #42\n{fence.strip()[:3]}\n"
-                self.assertEqual(self.settled(message), set())
-
-    def test_an_unclosed_fence_runs_to_the_end(self) -> None:
-        self.assertEqual(self.settled("```\nSettles: followup #42\n"), set())
-
-    def test_a_line_after_a_closed_fence_settles(self) -> None:
-        for fence, closer in (("````", "`````"), ("~~~", "~~~  "), ("```sh", "```")):
-            with self.subTest(fence=fence, closer=closer):
-                message = f"{fence}\nexample\n{closer}\n\nSettles: followup #42\n"
-                self.assertEqual(self.settled(message), {42})
-
-    def test_an_html_comment_or_quote_settles_nothing(self) -> None:
-        """GitHub hides a comment and shows a quote as someone else's words: neither is the author's line."""
-        for message in ("<!--\nSettles: followup #42\n-->\n", "<!-- Settles: followup #42 -->\n",
-                        "Text <!-- start\nSettles: followup #42\nend -->\n", "> Settles: followup #42\n",
-                        "<!--\nSettles: followup #42\n"):
-            with self.subTest(message=message):
-                self.assertEqual(self.settled(message), set())
-        self.assertEqual(self.settled("<!-- template -->\n\nSettles: followup #42\n"), {42})
-        self.assertEqual(self.settled("```\n<!--\n```\n\nSettles: followup #42\n"), {42})
-
-    def test_markers_on_one_line_are_read_left_to_right(self) -> None:
-        """sd:9869 review: `--><pre>` closed a comment and opened a block, but only the comment was read. Every
-        raw HTML block CommonMark keeps (pre, script, style, textarea) hides its lines."""
-        for opening in ("<!-- a --><pre>", "<!--\nx --><pre>", "</pre><pre>", "<!-- --> <script>", "<STYLE>",
-                        "<textarea rows=2>", "<pre><!-- --></pre><pre>", "<pre>```"):
-            with self.subTest(opening=opening):
-                self.assertTrue(ship.left_open(f"Body.\n{opening}\nexample"))
-        for closed in ("<!-- a --><pre></pre>", "<pre><!--</pre>", "<pre>\n```\n</pre>", "<!--\n```\n-->",
-                       "`<pre>` is a tag", "<preview>", "<!-- <pre> -->```"):
-            with self.subTest(closed=closed):
-                self.assertFalse(ship.left_open(f"Body.\n{closed}\n"))
-        self.assertEqual(self.settled("<!-- a --><pre>\n\nSettles: followup #42\n"), set())
-
-    def test_only_a_trailer_paragraph_settles(self) -> None:
-        """sd:9869 review: a `<pre>` example settled note 42, and a fence inside a hidden comment hid a real
-        line after it. A Settles line counts only in a paragraph of trailers, the body's last or the
-        squash's, with no fence, comment or `<pre>` left open before it."""
-        for message in ("<pre>\nSettles: followup #42\n</pre>\n", "<pre>\n\nSettles: followup #42\n",
-                        "```\n\nSettles: followup #42\n", "<!--\n\nSettles: followup #42\n",
-                        "Settles: followup #42\n\nMore prose.\n\nItem: sd:1\n",
-                        "Prose.\nSettles: followup #42\n"):
-            with self.subTest(message=message):
-                self.assertEqual(self.settled(message), set())
-        for message in ("<!--\n```\n-->\n\nSettles: followup #42\n",
-                        "Body.\n\nSettles: followup #42\n\nItem: sd:1\nDelivers: sd:1\n",
-                        "Body.\n\nItem: sd:1\nSettles: followup #42\n"):
-            with self.subTest(message=message):
-                self.assertEqual(self.settled(message), {42})
+    def test_only_the_lanes_own_open_blockers_settle(self) -> None:
+        self.assertEqual(self.settled("Waits on a reply"), {43})
+        self.assertEqual(self.settled("Lane skipped in gate: stale"), {42, 43})
+        self.assertEqual(self.settled("Note: Lane failed in prepare"), {43})
 
 
 class ReviewWatchdogTests(unittest.TestCase):

@@ -557,82 +557,21 @@ def acceptance_row_answered(row: object) -> bool:
     return row.get("passed") is False and "waived" in row and isinstance(criterion, str) and bool(criterion.strip())
 
 
+def settled_followups(connection: sqlite3.Connection, item: int) -> set[int]:
+    """The open followups on `item` a delivery settles (sd:9869): the lane's own blockers alone.
 
-#: A marker `left_open` reads inside a line: a comment's ends, or a raw HTML block's tag (CommonMark type 1).
-_MARKUP = re.compile(r"<!--|-->|<(/?)(pre|script|style|textarea)(?=[\s>/]|$)", re.IGNORECASE)
-
-
-def left_open(text: str) -> bool:
-    """Whether `text` ends inside a code fence, an HTML comment or a raw HTML block (sd:9869 review).
-
-    One scan, each line's markers read left to right, so `--><pre>` closes
-    a comment and opens a block. A fence is CommonMark's: 3+ backticks or
-    tildes at a line's start, indented 3 spaces at most, closed by the same
-    character, at least as long, with nothing after it. A raw block is a
-    `pre`, `script`, `style` or `textarea`, closed by its own end tag. In a
-    fence, comment or block, the other markers are text; outside them, a
-    backticked span is text too. Anything unclosed runs to the end.
+    A blocker the lane wrote (`sd_lane.LANE_ENDED`) is what the merge
+    answers. Every other followup waits on something the merge does not give,
+    such as an outside reply, so it stays open for a hand close. The squash
+    message is not read: each attempt to name followups in its text (a `#<id>`, a
+    `Settles:` line, past fences, comments and raw HTML) drew a new case that
+    resolved hidden work, over seven review rounds. A missed settlement
+    leaves a followup open, which is safe; a false one hides work.
     """
-    fence, comment, raw = "", False, ""
-    for line in text.splitlines():
-        marker = re.match(r" {0,3}(`{3,}|~{3,})(.*)$", line)
-        if fence:
-            fence = "" if _closes_fence(marker, fence) else fence
-            continue
-        if not (comment or raw):
-            if marker and not (marker[1][0] == "`" and "`" in marker[2]):
-                fence = marker[1]
-                continue
-            line = re.sub(r"(`+)(?!`).*?(?<!`)\1(?!`)", "", line)
-        comment, raw = _read_markup(line, comment, raw)
-    return bool(fence) or comment or bool(raw)
-
-
-def _closes_fence(marker: re.Match[str] | None, fence: str) -> bool:
-    """Whether a fence-marker line closes `fence`: the same character, at least as long, nothing after."""
-    return bool(marker) and marker[1][0] == fence[0] and len(marker[1]) >= len(fence) and not marker[2].strip()
-
-
-def _read_markup(line: str, comment: bool, raw: str) -> tuple[bool, str]:
-    """`left_open`'s comment and raw-block state after `line`'s markers, read left to right."""
-    for found in _MARKUP.finditer(line):
-        token, closing, tag = found[0], found[1], (found[2] or "").lower()
-        if comment:
-            comment = token != "-->"
-        elif raw:
-            raw = "" if closing and tag == raw else raw
-        elif token == "<!--":
-            comment = True
-        elif tag and not closing:
-            raw = tag
-    return comment, raw
-
-
-def settled_followups(connection: sqlite3.Connection, item: int, message: str) -> set[int]:
-    """The open followups on `item` a delivery settles (sd:9869).
-
-    A lane blocker (`sd_lane.LANE_ENDED`), or one a `Settles: followup #<id>`
-    trailer names. It counts only in the run of trailer paragraphs
-    (`sd_lib.trailer_block`) that ends the message: the body's last ones and
-    the `Work:` and `Item:` paragraphs `sd-ship` adds after them; and only
-    when no fence, comment or raw HTML block is left open before it.
-    Prose, an example or a hidden template line settles none: a missed
-    settlement leaves a followup open, which is safe; a false one hides work.
-    """
-    paragraphs = [part for part in re.split(r"\n[ \t]*\n", message.strip()) if part.strip()]
-    named, index = set(), len(paragraphs)
-    while index and sd_lib.trailer_block(paragraphs[index - 1].strip()).strip() == paragraphs[index - 1].strip():
-        index -= 1
-    if left_open("\n\n".join(paragraphs[:index])):
-        return set()
-    for part in paragraphs[index:]:
-        for line in part.splitlines():
-            found = re.fullmatch(r"Settles: followup #(\d+)\s*", line)
-            if found:
-                named.add(int(found[1]))
     return {row[0] for row in connection.execute(
         "SELECT id, body FROM note WHERE item = ? AND kind = 'followup' AND resolved_at IS NULL", (item,))
-        if row[0] in named or str(row[1]).startswith(sd_lane.LANE_ENDED)}
+        if str(row[1]).startswith(sd_lane.LANE_ENDED)}
+
 
 class Ship(SharedReview):
     #: What the last `merge_ownership` read found: the authority record when
@@ -2280,7 +2219,7 @@ class Ship(SharedReview):
         from sd_db.progress import waived_suffix
         change_status(self.connection, number, "done", who="sd-ship",
                       reason=f"delivered at {commit} on {ref}{waived_suffix(waived or [])}",
-                      followups=settled_followups(self.connection, number, message))
+                      followups=settled_followups(self.connection, number))
 
     def require_copilot_abandonment_authority(self) -> None:
         if self.args.abandon_copilot_review is not None and not self.args.manual:
