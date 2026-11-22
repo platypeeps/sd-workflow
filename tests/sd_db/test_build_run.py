@@ -1446,6 +1446,19 @@ class Supervise(Case):
         _, kept = self.deferred([far], {"src/caller.py": {12}})
         self.assertEqual(kept["blockers"], [], "a blocker naming no changed file was held")
 
+    def test_a_changed_caller_named_by_any_spelling_holds_and_a_lookalike_does_not(self):
+        """Review of sd:9769: `./src/caller.py` or an absolute path names the changed caller and holds; a
+        `src/caller.py.bak` is another file and does not."""
+        self.press()
+        work = str(self.supervisor().work)
+        rows = [{"path": "lib/helper.py", "line": 3, "summary": "./src/caller.py now passes None to parse()"},
+                {"path": "lib/helper.py", "line": 4, "summary": f"{work}/src/caller.py passes None."}]
+        _, kept = self.deferred(rows, {"src/caller.py": {12}})
+        self.assertEqual(kept["blockers"], rows, "a blocker naming a changed caller by another spelling was deferred")
+        far = {"path": "lib/helper.py", "line": 5, "summary": "src/caller.py.bak still holds the old parse()"}
+        _, kept = self.deferred([far], {"src/caller.py": {12}})
+        self.assertEqual(kept["blockers"], [], "a lookalike file name held a blocker")
+
     def test_a_blocker_outside_the_checkout_still_blocks(self):
         """Class pass, sd:9769: no delta of this checkout can show a path outside it unchanged."""
         self.press()

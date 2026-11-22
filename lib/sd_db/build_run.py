@@ -1473,8 +1473,10 @@ class Supervisor:
                                       or path in changed for path, _line in self.locations(row)):
                 return True
             # A finding cited at unchanged code that names a changed file (a new caller) is the branch's own.
+            # Each path-like word, as `./x`, `a/../x` or an absolute path spells it: whole names, not substrings.
             words = " ".join(str(value) for key, value in row.items() if key not in ("path", "line", "instances"))
-            return any(re.search(rf"(?<![\w./-]){re.escape(name)}(?![\w-])", words) for name in names)
+            spelled = {os.path.normpath(word.rstrip(".")) for word in re.findall(r"[\w./-]+", words) if word.rstrip(".")}
+            return any(word in names or os.path.basename(word) in names for word in spelled)
         new = [row for row in answer["blockers"] if not held(row)]
         return new, [row for row in answer["blockers"] if row not in new]
 
