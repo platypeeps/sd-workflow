@@ -383,6 +383,36 @@ class CitedIdTests(unittest.TestCase):
         body = f"- Reverted commits:\n  - {undone[:9]} renew\n- {later[:9]} later\n"
         self.assertEqual(sd_ship_body.cited_ids("", [self.revert_of(body), *work]), (4, 6))
 
+    def test_a_fence_opens_only_inside_its_list_item_indent(self) -> None:
+        """pack sd:9666 review, round 5, instance 1: four spaces and a fence at the top level start an
+        indented code block, not a fence; reading a fence there quoted the citations after it."""
+        self.assertEqual(sd_ship_body.quoted_lines("a\n    ```\nb\n"), set())
+        self.assertEqual(sd_ship_body.cited_ids("    ```\nLane review fix, pack sd:5: y.\n", []), (5,))
+        # Inside a list item the same indent opens a fence, and the item's end closes it.
+        self.assertEqual(sd_ship_body.quoted_lines("- a\n    ```\n  b\nc\n"), {2, 3})
+
+    def test_a_fence_on_a_list_marker_line_is_an_example(self) -> None:
+        """pack sd:9666 review, round 5, instance 2: `- ```text` opened no fence, so the sha bullet in the
+        example undid a real commit and dropped its citations."""
+        undone, quoted = "a" * 40, "c" * 40
+        work = [(quoted, "fix: other\n\nLane review fix, pack sd:5: y.\n\nCloses: sd:3\n"),
+                (undone, "feat: renew\n\nCloses: sd:2\n")]
+        for fence in ("  ```\n", ""):  # closed, or closed by the item's end
+            with self.subTest(fence=fence):
+                revert = self.revert_of(f"Reverted commits:\n\n- ```text\n  - {quoted[:9]} example\n"
+                                        f"{fence}- {undone[:9]} renew\n")
+                self.assertEqual(sd_ship_body.cited_ids("", [revert, *work]), (3, 5))
+
+    def test_a_prose_bullet_holds_the_items_nested_under_it(self) -> None:
+        """pack sd:9666 review, round 5, instance 3: an item nested under `- I kept the following commit`
+        still read the `Reverted commits:` heading above, and the retained commit lost its citations."""
+        undone, kept = "a" * 40, "b" * 40
+        work = [(kept, "fix: shared\n\nLane review fix, pack sd:5: y.\n\nCloses: sd:4\n"),
+                (undone, "feat: renew\n\nCloses: sd:2\n")]
+        revert = self.revert_of(f"Reverted commits:\n\n- {undone[:9]} renew\n- I kept the following commit\n"
+                                f"  - {kept[:9]} retained\n")
+        self.assertEqual(sd_ship_body.cited_ids("", [revert, *work]), (4, 5))
+
     def test_every_list_marker_under_a_reverted_heading_undoes(self) -> None:
         """pack sd:9666 review, round 3, instance 3: a `+` or numbered list under `Reverted commits:` undid
         nothing, so the reverted work still closed its item."""
