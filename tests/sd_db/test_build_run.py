@@ -137,8 +137,9 @@ FAKE = textwrap.dedent('''
                   "result": "denied", "permission_denials": [{"tool_name": "Bash",
                                                               "tool_input": {"command": "git push"}}]})
             sys.exit(3)
-        Path("work.txt").write_text(Path("work.txt").read_text() + mode + "\\n" if Path("work.txt").exists()
-                                    else mode + "\\n")
+        # A function per round: a change outside any function holds every later blocker (sd:9769).
+        added = f"def {mode}(): pass\\n"
+        Path("work.txt").write_text(Path("work.txt").read_text() + added if Path("work.txt").exists() else added)
         git("add", "work.txt")
         # `extra`: plans/extra.json adds files (name to hex bytes) and message lines, as a builder may write.
         extra = json.loads((plans / "extra.json").read_text()) if mode == "extra" else {}
@@ -1643,6 +1644,36 @@ class Supervise(Case):
         self.assertNotIn("parse_row", defined, "a called name read as a defined one")
         self.assertTrue({"review_plan", "parse_row"} <= words, words)
         self.assertNotIn("untouched", words)
+
+    def test_a_change_outside_any_function_reads_as_no_function_words(self):
+        """Class pass on sd:9769: a changed config value, module constant, binary or mode leaves a consumer's
+        finding nothing to name, so the branch's words do not read and every blocker holds."""
+        body = "def f():\n    return LIMIT\n"
+        for name, before, after in (("conf.yaml", "items:\n  - a\nother: 1\n", "items: []\nother: 1\n"),
+                                    ("mod.py", f"import os\nLIMIT = 3\n\n\n{body}",
+                                     f"import os\nLIMIT = 0\n\n\n{body}"),
+                                    ("blob.bin", b"\x00\x01", b"\x00\x02"), ("run.sh", "echo\n", None)):
+            with self.subTest(name=name):
+                repo = Path(tempfile.mkdtemp(dir=self.root))
+
+                def run(*args, repo=repo):
+                    return subprocess.run(["git", "-C", str(repo), "-c", "user.name=operator",
+                                           "-c", "user.email=operator@example.test", *args],
+                                          check=True, capture_output=True, text=True).stdout.strip()
+
+                run("init", "-q")
+                path = repo / name
+                path.write_bytes(before) if isinstance(before, bytes) else path.write_text(before)
+                run("add", "-A")
+                run("commit", "-q", "-m", "base")
+                base = run("rev-parse", "HEAD")
+                if after is None:
+                    path.chmod(0o755)
+                else:
+                    path.write_bytes(after) if isinstance(after, bytes) else path.write_text(after)
+                run("commit", "-q", "-am", "change")
+                self.assertIsNone(build_run.function_words(["git"], str(repo), base, run("rev-parse", "HEAD")),
+                                  "a change outside any function let a consumer's blocker be filed")
 
     def test_a_changed_caller_named_by_any_spelling_holds_and_a_lookalike_does_not(self):
         """Review of sd:9769: `./src/caller.py` or an absolute path names the changed caller and holds; a

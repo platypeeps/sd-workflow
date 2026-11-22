@@ -510,12 +510,21 @@ def function_words(git: Collection[str], work: str, base: str, head: str, *,
                    env: dict | None = None) -> tuple[set[str], set[str]] | None:
     """Every identifier in the functions `base..head` changes, each read whole (`--function-context`), and the
     names those lines define, so a finding naming the changed caller, or what it calls, ties to the branch
-    (pack sd:9769); None when git cannot answer. A function git cannot bound widens to more lines, never fewer."""
+    (pack sd:9769); None when git cannot answer. A function git cannot bound widens to more lines, never fewer.
+
+    None too for a change outside any function, a hunk that defines no name or a file with no hunk (a config
+    value, a module constant, a binary, a mode): a consumer it breaks gives its finding nothing to name.
+    ponytail: a language `defined_names` misses (C) holds every blocker; a per-language reader if that costs."""
     try:
-        diff = _read([*git, "-C", work, "diff", "--function-context", "--no-renames", "--no-color", "--no-ext-diff",
-                      "--no-textconv", base, head], env=env)
+        diff = _read([*git, "-C", work, "diff", "-U0", "--function-context", "--no-renames", "--no-color",
+                      "--no-ext-diff", "--no-textconv", base, head], env=env)
     except Unread:
         return None
+    for section in re.split(r"^diff --git .*$", diff, flags=re.M)[1:]:
+        hunks = re.split(r"^@@.*$", section, flags=re.M)[1:]
+        if not hunks or any(not any(defined_names(line[1:]) for line in hunk.splitlines() if line[:1] in "+- ")
+                            for hunk in hunks):
+            return None
     lines = [line for line in diff.splitlines() if line[:1] in "+- " and not line.startswith(("+++", "---"))]
     # Every name on a changed line, and each name a context line defines (`defined_names`).
     defined = {name for line in lines for name in (re.findall(r"[A-Za-z_]\w*", line[1:]) if line[0] in "+-"
@@ -1545,7 +1554,8 @@ class Supervisor:
         return new, [row for row in answer["blockers"] if row not in new]
 
     def branch_words(self, head: str) -> tuple[set[str], set[str]] | None:
-        """`function_words` of the branch from its fork: its identifiers and defined names; None when unread."""
+        """`function_words` of the branch from its fork: its identifiers and defined names; None when unread
+        or when the branch changes code outside any function (every blocker holds)."""
         try:
             fork = _read([*self.tools.git, "-C", str(self.work), "merge-base", self.base(), head], env=self.env).strip()
         except Unread:
