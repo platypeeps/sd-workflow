@@ -257,7 +257,15 @@ def machine_settings(environ: Mapping[str, str], *, stream: TextIO | None = None
             value = mine.get(key) if isinstance(mine, dict) else None
             if value is not None:
                 text = value if isinstance(value, str) else repr(value)
-                check(text, f"sd.{key}")
+                try:
+                    check(text, f"sd.{key}")
+                except ValueError as error:
+                    # A worker typo reads 8 workers; it must not drop the gate's own limits (sd:9925 review).
+                    if key != "gate_workers":
+                        raise
+                    if stream is not None:
+                        stream.write(f"warning: {error}; using {DEFAULT_WORKERS} workers\n")
+                    continue
                 values[key] = text
     except FileNotFoundError:
         pass

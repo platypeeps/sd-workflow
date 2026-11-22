@@ -550,3 +550,18 @@ class ARefusalSaysItStartedNothing(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkerSetting(unittest.TestCase):
+    """Build review of sd:9925: a bad `sd.gate_workers` must not drop the gate's own limits."""
+
+    def test_a_bad_worker_count_keeps_the_gate_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            config = pathlib.Path(tmp) / "sd-ai-command-pack" / "config.json"
+            config.parent.mkdir(parents=True)
+            config.write_text(json.dumps({"config": {"sd": {"gate_workers": "0", "gate_slots": "1",
+                                                            "gate_load_max": "4", "gate_settle_seconds": "90"}}}))
+            values = sd_gate_slots.machine_settings({"XDG_CONFIG_HOME": tmp}, stream=io.StringIO())
+        self.assertEqual((values["gate_slots"], values["gate_load_max"], values["gate_settle_seconds"]),
+                         ("1", "4", "90"))
+        self.assertIsNone(values["gate_workers"])
