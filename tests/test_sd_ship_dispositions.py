@@ -87,6 +87,14 @@ class DispositionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
         self.assertEqual(list(self.connection.execute("SELECT * FROM state")), before)
 
+    def test_a_blocking_refusal_names_the_head_its_review_saw(self):
+        """sd:9966 review: prepare's catch-up moves the head past the queued one, and adjudicate takes only the
+        reviewed head, so the answer names it for Reject and enqueue."""
+        self.blocked()
+        with self.assertRaises(ship.Refusal) as caught:
+            self.prepare()
+        self.assertEqual(caught.exception.details["reviewed_head"], self.head)
+
     def test_the_command_a_blocking_refusal_names_prints_each_finding_whole(self):
         """sd:2102. `next_action` is only useful if the command it names runs and shows the findings."""
         self.blocked()

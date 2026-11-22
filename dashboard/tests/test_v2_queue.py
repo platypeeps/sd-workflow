@@ -150,7 +150,7 @@ class Lane:
         """pack sd:8584: item 14 failed prepare at the checkout's head, enqueued here, its log in the lane's logs;
         `answer` is the log's stdout in place of prepare's JSON answer."""
         log = self.lane / "logs" / "prepare-14-20260906T100000.log"
-        prepared = json.dumps({"ok": False, "error": "local review blocking: 1/1 completed", "workflow": {
+        prepared = json.dumps({"ok": False, "error": "local review blocking: 1/1 completed", "reviewed_head": self.merged, "workflow": {
             "blocker": {"code": "review_blocking", "retryable": False},
             "next_action": "Run `sd-ship adjudicate --item 14` to print each blocking finding in full; fix them."}},
             indent=2)
@@ -782,6 +782,38 @@ class TheMove(Lane, BrowserSession):
         self.assertEqual([(row["response_disposition"], row["reason"]) for row in filled["findings"]],
                          [("rebutted", self.REASON)])
         self.assertEqual(filled["bindings"], {"head": "h"})
+
+    def caught_up(self, answer):
+        """Item 14's prepare merged main onto the queued head, then its review blocked at that merge."""
+        self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "review_blocking"}, **answer}}
+                                      if "reviewed_head" not in answer else
+                                      {"ok": False, "workflow": {"blocker": {"code": "review_blocking"}}, **answer}))
+        self.log.write_text("")
+
+    def test_reject_adjudicates_at_the_reviewed_head_and_retries_at_the_queued_one(self):
+        """sd:9966 review: a catch-up moved the head before the review blocked; adjudicate refused the queued one."""
+        reviewed = "e" * 40
+        self.caught_up({"reviewed_head": reviewed})
+        status, _, answer = self.reject()
+        self.assertEqual(status, 200, answer)
+        calls = self.calls()
+        self.assertEqual(calls[1], ["-C", str(self.checkout), "adjudicate", "--item", "14", "--expected-head", reviewed,
+                                    "--json"])
+        self.assertEqual(calls[-1], ["-C", str(self.checkout), "lane", "retry", "14", "--expected-head", self.merged])
+
+    def test_reject_reads_the_reviewed_head_from_an_older_answers_next_action(self):
+        reviewed = "d" * 40
+        self.caught_up({"next_action": f"Run `sd-ship adjudicate --item 14 --expected-head {reviewed} --json` to "
+                                       "print each blocking finding in full."})
+        status, _, answer = self.reject()
+        self.assertEqual(status, 200, answer)
+        self.assertEqual(self.calls()[1][6], reviewed)
+
+    def test_reject_refuses_an_answer_that_names_no_reviewed_head(self):
+        self.caught_up({"next_action": "fix them"})
+        status, _, answer = self.reject()
+        self.assertEqual(status, 400, answer)
+        self.assertEqual(self.calls(), [["-C", str(self.checkout), "lane", "list"]])
 
     def test_reject_refuses_an_entry_no_review_blocked_before_any_verb(self):
         self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "merge_conflict"}}}))
@@ -3051,7 +3083,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         reason = "a.py:1 reads the value the finding says is missing"
         out = self.reject_press({"yes": True, "values": {"reason": f"  {reason}\n"}})
         self.assertEqual(out["asked"]["ok"], "Reject and enqueue")
-        self.assertIn(f"adjudicate --item 14 --expected-head {self.merged}", out["asked"]["cli"])
+        self.assertIn(f"lane retry 14 --expected-head {self.merged}", out["asked"]["cli"])
         posted = [p[1] for p in out["posts"] if p[0] == "/api/queue/move"]
         self.assertEqual([(p["action"], p["item"], p["head"], p["reason"]) for p in posted],
                          [("reject", 14, self.merged, reason)])

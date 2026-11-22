@@ -315,10 +315,9 @@ def _failure(entry: dict, lane: Path) -> dict:
     return _logged(entry, lane) or ({"code": code} if isinstance(code, str) and code else {})
 
 
-def _logged(entry: dict, lane: Path) -> dict:
-    """pack sd:8584: a failed prepare's answer from its log in the lane's `logs/`: the blocker's `code`, whether the
-    lane marks it `retryable`, and its `next_action`. `{}` for a failure at another step or a log not read here: a log
-    on another host, outside `logs/`, cut short or with no answer."""
+def _answer(entry: dict, lane: Path) -> dict:
+    """pack sd:8584: a failed prepare's JSON answer from its log in the lane's `logs/`; `{}` for a failure at another
+    step or a log not read here: a log on another host, outside `logs/`, cut short or with no answer."""
     log = Path(str(entry.get("prepare_log") or ""))
     if entry.get("step") != "prepare" or log.parent != lane / "logs":
         return {}
@@ -329,7 +328,29 @@ def _logged(entry: dict, lane: Path) -> dict:
         answer = json.loads(text.partition("\n")[2].partition("\n--- stderr ---\n")[0])
     except (OSError, ValueError):
         return {}
-    workflow = answer.get("workflow") if isinstance(answer, dict) else None
+    return answer if isinstance(answer, dict) else {}
+
+
+#: The adjudicate command a review block's `next_action` names, for an answer from before `reviewed_head` (sd:9966).
+NAMED_HEAD = re.compile(r"`sd-ship adjudicate [^`]*--expected-head ([0-9a-f]{40}|[0-9a-f]{64}) [^`]*`")
+
+
+def reviewed_head(answer: dict) -> str | None:
+    """The head a review-blocked prepare's review saw: its `reviewed_head`, else the head its `next_action` names."""
+    head = answer.get("reviewed_head")
+    if isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", head):
+        return head
+    workflow = answer.get("workflow")
+    found = NAMED_HEAD.search(str(workflow.get("next_action") or "")) if isinstance(workflow, dict) else None
+    return found[1] if found else None
+
+
+def _logged(entry: dict, lane: Path) -> dict:
+    """pack sd:8584: a failed prepare's answer from its log in the lane's `logs/`: the blocker's `code`, whether the
+    lane marks it `retryable`, and its `next_action`. `{}` for a failure at another step or a log not read here: a log
+    on another host, outside `logs/`, cut short or with no answer."""
+    answer = _answer(entry, lane)
+    workflow = answer.get("workflow")
     blocker = workflow.get("blocker") if isinstance(workflow, dict) else None
     if not isinstance(blocker, dict):
         return {}
@@ -705,8 +726,13 @@ def rebut(entry: dict | None, lane: Path, head: str, reason: str) -> str | None:
         raise ValueError("Reject and enqueue takes a lane entry whose prepare a review blocked, its log read here.")
     if entry.get("expected_head") != head:
         raise ValueError(f"sd:{entry.get('item')} failed at another head than the page showed. Read it again.")
+    # Adjudicate binds the head the review saw, which prepare's catch-up may have moved past the queued `head`;
+    # `lane retry` still checks the queued one (sd:9966 review).
+    seen = reviewed_head(_answer(entry, lane))
+    if seen is None:
+        raise ValueError(f"sd:{entry.get('item')}'s prepare log names no reviewed head; rebut it with sd-ship adjudicate.")
     base = [command("sd-ship"), "-C", str(entry["worktree"]), "adjudicate", "--item", str(entry["item"]),
-            "--expected-head", head, "--json"]
+            "--expected-head", seen, "--json"]
     template = _run(base, WRITE_SECONDS)
     proposal = template.get("proposal")
     if not (template.get("exit") == 0 and isinstance(proposal, dict) and isinstance(proposal.get("findings"), list)
