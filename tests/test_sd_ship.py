@@ -6425,11 +6425,24 @@ class SettlesLineTests(unittest.TestCase):
                         "<!--\nSettles: followup #42\n"):
             with self.subTest(message=message):
                 self.assertEqual(self.settled(message), set())
-        self.assertEqual(self.settled("<!-- template -->\nSettles: followup #42\n"), {42})
-        self.assertEqual(self.settled("```\n<!--\n```\nSettles: followup #42\n"), {42})
+        self.assertEqual(self.settled("<!-- template -->\n\nSettles: followup #42\n"), {42})
+        self.assertEqual(self.settled("```\n<!--\n```\n\nSettles: followup #42\n"), {42})
 
-    def test_an_indented_code_block_marker_is_no_fence(self) -> None:
-        self.assertEqual(self.settled("    ```\nSettles: followup #42\n"), {42})
+    def test_only_a_trailer_paragraph_settles(self) -> None:
+        """sd:9869 review: a `<pre>` example settled note 42, and a fence inside a hidden comment hid a real
+        line after it. A Settles line counts only in a paragraph of trailers, the body's last or the
+        squash's, with no fence, comment or `<pre>` left open before it."""
+        for message in ("<pre>\nSettles: followup #42\n</pre>\n", "<pre>\n\nSettles: followup #42\n",
+                        "```\n\nSettles: followup #42\n", "<!--\n\nSettles: followup #42\n",
+                        "Settles: followup #42\n\nMore prose.\n\nItem: sd:1\n",
+                        "Prose.\nSettles: followup #42\n"):
+            with self.subTest(message=message):
+                self.assertEqual(self.settled(message), set())
+        for message in ("<!--\n```\n-->\n\nSettles: followup #42\n",
+                        "Body.\n\nSettles: followup #42\n\nItem: sd:1\nDelivers: sd:1\n",
+                        "Body.\n\nItem: sd:1\nSettles: followup #42\n"):
+            with self.subTest(message=message):
+                self.assertEqual(self.settled(message), {42})
 
 
 class ReviewWatchdogTests(unittest.TestCase):

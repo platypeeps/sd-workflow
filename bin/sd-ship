@@ -558,35 +558,58 @@ def acceptance_row_answered(row: object) -> bool:
 
 
 
-def settled_followups(connection: sqlite3.Connection, item: int, message: str) -> set[int]:
-    """The open followups on `item` a delivery settles (sd:9869).
+def left_open(text: str) -> bool:
+    """Whether `text` ends inside a code fence, an HTML comment or a `<pre>` block (sd:9869 review).
 
-    A lane blocker (`sd_lane.LANE_ENDED`), or one a line of `message`
-    names as exactly `Settles: followup #<id>`, outside a code fence or an
-    HTML comment: the pull-request body ends a paragraph before the
-    trailers `sd-ship` writes. Prose settles none: `#<id>` is as often a pull request or a
-    URL fragment, and "leave followup #<id> open" names one to keep. Any
-    other followup waits on something the merge does not give.
+    One scan, so a fence marker inside a comment and a comment marker inside
+    a fence are both text. A fence is CommonMark's: 3+ backticks or tildes
+    indented 3 spaces at most, closed by the same character, at least as
+    long, with nothing after it. An unclosed one runs to the end.
     """
-    named, fence, comment = set(), "", False
-    for line in message.splitlines():
-        # CommonMark: a fence opens on 3+ backticks or tildes indented 3 spaces at most, and closes
-        # only on the same character, at least as long, with nothing after; unclosed, it runs to the end.
+    fence, comment, pre = "", False, False
+    for line in text.splitlines():
+        if comment:
+            comment = "-->" not in line
+            continue
         marker = re.match(r" {0,3}(`{3,}|~{3,})(.*)$", line)
         if fence:
             if marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence) and not marker[2].strip():
                 fence = ""
             continue
+        if pre:
+            pre = "</pre" not in line.lower()
+            continue
         if marker and not (marker[1][0] == "`" and "`" in marker[2]):
             fence = marker[1]
-            continue
-        # GitHub hides an HTML comment, so a line in one, as a template's example, is no author's line.
-        if comment or "<!--" in line:
-            comment = line.rfind("<!--") > line.rfind("-->") if "<!--" in line else "-->" not in line
-            continue
-        found = re.fullmatch(r" {0,3}Settles: followup #(\d+)\s*", line)
-        if found:
-            named.add(int(found[1]))
+        elif "<!--" in line:
+            comment = line.rfind("<!--") > line.rfind("-->")
+        elif "<pre" in line.lower():
+            pre = line.lower().rfind("<pre") > line.lower().rfind("</pre")
+    return bool(fence) or comment or pre
+
+
+def settled_followups(connection: sqlite3.Connection, item: int, message: str) -> set[int]:
+    """The open followups on `item` a delivery settles (sd:9869).
+
+    A lane blocker (`sd_lane.LANE_ENDED`), or one a `Settles: followup #<id>`
+    trailer names. It counts only in the run of trailer paragraphs
+    (`sd_lib.trailer_block`) that ends the message: the body's last ones and
+    the `Work:` and `Item:` paragraphs `sd-ship` adds after them; and only
+    when no fence, comment or `<pre>` is left open before that run.
+    Prose, an example or a hidden template line settles none: a missed
+    settlement leaves a followup open, which is safe; a false one hides work.
+    """
+    paragraphs = [part for part in re.split(r"\n[ \t]*\n", message.strip()) if part.strip()]
+    named, index = set(), len(paragraphs)
+    while index and sd_lib.trailer_block(paragraphs[index - 1].strip()).strip() == paragraphs[index - 1].strip():
+        index -= 1
+    if left_open("\n\n".join(paragraphs[:index])):
+        return set()
+    for part in paragraphs[index:]:
+        for line in part.splitlines():
+            found = re.fullmatch(r"Settles: followup #(\d+)\s*", line)
+            if found:
+                named.add(int(found[1]))
     return {row[0] for row in connection.execute(
         "SELECT id, body FROM note WHERE item = ? AND kind = 'followup' AND resolved_at IS NULL", (item,))
         if row[0] in named or str(row[1]).startswith(sd_lane.LANE_ENDED)}
