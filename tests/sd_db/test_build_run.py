@@ -1325,6 +1325,30 @@ class Supervise(Case):
                 mock.patch.object(build_run, "_read", return_value=""):
             self.assertIsNone(supervisor.prior_review("a" * 40), "the older report stood in for this head's")
 
+    def test_a_last_report_that_fails_its_checks_drops_to_a_full_review(self):
+        """Review of sd:9769: a last report off the ancestry (an amended fix) or with two JSON objects (a
+        replay) must not hand the round to the older kept report, which omits the last round's blockers."""
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        report = {"status": "blocking", "scope": "branch", "findings": []}
+        supervisor.out("prior").write_text(json.dumps({**report, "subject": {"head": "b" * 40}}),
+                                           encoding="utf-8")
+        last = json.dumps({**report, "subject": {"head": "c" * 40}})
+
+        def ancestor(argv, **_kwargs):
+            if "--is-ancestor" in argv and "c" * 40 in argv:
+                raise build_run.Unread("not an ancestor")
+            return ""
+
+        for text, why in ((last, "an amended fix"), (last + "\n" + last, "two JSON objects")):
+            with self.subTest(why=why), \
+                    mock.patch.object(supervisor, "fresh", return_value={"review_round": 2}), \
+                    mock.patch.object(build_run, "_read", side_effect=ancestor):
+                supervisor.out("review").write_text(text, encoding="utf-8")
+                self.assertIsNone(supervisor.prior_review("a" * 40),
+                                  "the older kept report stood in for a last report that failed its checks")
+
     def deferred(self, blockers, changed):
         """`file_new_findings` over `blockers` with the delta `changed`: the blockers it keeps."""
         supervisor = self.supervisor()

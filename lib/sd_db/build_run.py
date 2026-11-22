@@ -1334,8 +1334,18 @@ class Supervisor:
         last, kept = self.out("review"), self.out("prior")
         for path in (last, kept):
             try:
-                answer = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if not text.strip():
+                continue  # no last report: the kept one is the last round's
+            # A last report that fails a check below falls through to None, never to the older kept report,
+            # which omits that round's blockers (an amended fix, two JSON objects after a replay).
+            try:
+                answer = json.loads(text)
+            except ValueError:
+                if path == last:
+                    return None
                 continue
             reviewed = (answer.get("subject") or {}).get("head") if isinstance(answer, dict) else None
             if reviewed == head:  # a fix with no commit: an older report would omit this round's blockers
@@ -1344,11 +1354,15 @@ class Supervisor:
             if (not isinstance(reviewed, str) or answer.get("scope") != "branch"
                     or answer.get("status") not in ("clean", "advisory", "blocking", "gate_failed")
                     or not isinstance(answer.get("findings"), list)):
+                if path == last:
+                    return None
                 continue
             try:
                 _read([*self.tools.git, "-C", str(self.work), "merge-base", "--is-ancestor", reviewed, head],
                       env=self.env)
             except Unread:
+                if path == last:
+                    return None
                 continue
             for row in answer["findings"]:  # `sd-review` refuses an absolute prior path, even inside the checkout
                 if isinstance(row, dict) and isinstance(row.get("path"), str) and os.path.isabs(row["path"]):
