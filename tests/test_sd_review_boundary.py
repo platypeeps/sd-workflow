@@ -1045,11 +1045,15 @@ class LineBudgetTests(unittest.TestCase):
         # blocker's line through `git diff -U0` from the prior head, so a
         # blocker an insertion moved still holds its repeat. Measured:
         # `sd-review` is 2972 here.
+        #
+        # 4942 -> 4944 is the next build/sd-1423 review: `bin/sd-review`
+        # +2 so only a repeat that blocks at the floor answers a prior
+        # blocker. Measured: `sd-review` is 2974 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4942,
+            4944,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

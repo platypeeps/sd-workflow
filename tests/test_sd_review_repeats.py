@@ -373,6 +373,16 @@ class ReproRuleTests(unittest.TestCase):
         disposed = sd_review.dispose(rows, "high", repro=True, prior=prior)
         self.assertEqual([row["disposition"] for row in disposed], ["advisory", "blocking", "blocking"])
 
+    def test_a_repeat_below_the_floor_does_not_clear_the_fallback(self) -> None:
+        """build/sd-1423 review (bin/sd-review:1811): one reader's exact repeat at medium, under a high floor,
+        counted as the prior blocker's match, so another reader's nearby high paraphrase posted as advisory and
+        the unresolved blocker cleared. Only a repeat that blocks at the floor answers a prior blocker."""
+        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking")]
+        rows = [finding(severity="medium", line=10, summary="Empty input crashes"),
+                finding(line=12, summary="An empty list raises IndexError")]
+        disposed = sd_review.dispose(rows, "high", repro=True, prior=prior)
+        self.assertEqual([row["disposition"] for row in disposed], ["advisory", "blocking"])
+
     def test_the_same_line_alone_gives_no_prior_evidence(self) -> None:
         """Lead after round 8: the matcher gave the old repro to an unrelated cache finding at the same line."""
         prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking")]
