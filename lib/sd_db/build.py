@@ -1178,7 +1178,7 @@ def _retry_row(connection, item: int):
         if ran is not None and ran["status"] in AGAIN and not _alone(connection, ran["id"]):
             lead: int = ran["parent"] or ran["id"]
             if (queue_state(connection, lead)["status"] == ran["status"] and _in_work_repo(connection, lead, ran["status"])
-                    and all(_current(connection, member) for member in _members(connection, lead, ran["status"]))):
+                    and all(_current(connection, member) for member in _open_members(connection, lead, ran["status"]))):
                 return ran
     return rows[0] if rows else None
 
@@ -1966,7 +1966,7 @@ def _in_work_repo(connection, lead: int, status: str) -> bool:
     if home is None:
         return True
     repos = [connection.execute("SELECT repo FROM item WHERE id = ?", (member["item"],)).fetchone()["repo"]
-             for member in _members(connection, lead, status)]
+             for member in _open_members(connection, lead, status)]
     return all(repo is not None and paths.same(home, repo) for repo in repos)
 
 
@@ -2059,6 +2059,14 @@ def _open_run(connection, lead: int, *, repo: str, owner: str, step: str, model:
         connection.execute("INSERT INTO runner_lease (run, repo, branch, exclusive, acquired_at) VALUES (?, ?, ?, 0, ?)",
                            (ident, repo, branch(lead), stamp))
     return ident
+
+
+def _open_members(connection, lead: int, status: str) -> list[dict]:
+    """`_members` but a done item's: Retry skips a delivered member, so no resume selector reads it (review of
+    sd:9788)."""
+    members = _members(connection, lead, status)
+    items = reads.items_by_ids(connection, [member["item"] for member in members])
+    return [member for member in members if not _done(items, member["item"])]
 
 
 def _members(connection, lead: int, status: str = "running") -> list[dict]:

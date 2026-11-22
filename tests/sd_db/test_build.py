@@ -1094,6 +1094,32 @@ class Reap(Case):
         self.assertEqual([entry["item"] for entry in queued], [self.items[1]])
         self.assertGreater(queued[0]["id"], cancelled, "a fresh build")
 
+    def test_build_by_item_retries_its_bundle_past_a_member_a_newer_build_delivered(self):
+        """Review of sd:9788: bundle A ends blocked; its second item is delivered by a newer build, its first gets
+        a newer build cancelled before its claim. Build of the first read the delivered member's newer build as
+        an owner and built fresh from main; Retry skips a done member, so A's Retry resumes the first item."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        transition(self.db, self.items[1], "ready", who="operator")
+        delivered = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'done', run_count = 1 WHERE id = ?", (delivered,))
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (self.items[1],))
+        transition(self.db, self.items[0], "ready", who="operator")
+        cancelled = build.queue(self.db, [self.items[0]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (cancelled,))
+        with self.subTest("a done sibling moved to another repository"):
+            self.db.execute("SAVEPOINT moved")
+            try:
+                self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (B, self.items[1]))
+                self.assertLess(build._retry_row(self.db, self.items[0])["id"], cancelled)
+            finally:
+                self.db.execute("ROLLBACK TO moved")
+                self.db.execute("RELEASE moved")
+        queued = build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertTrue(all(entry["id"] < cancelled for entry in queued), "Retry of the bundle, not a fresh build")
+        self.assertEqual(self.claim()["assignment"], self.bundle["assignment"])
+
     def test_build_by_item_skips_a_blocked_build_that_never_ran(self):
         """Review of sd:9788: a fresh build the claim refused never ran, then a newer one was cancelled before its
         claim. Build of the item read the refused one, a fresh press from main; the bundle that ran, whose
