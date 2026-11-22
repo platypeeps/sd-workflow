@@ -270,6 +270,20 @@ class ReproRuleTests(unittest.TestCase):
                 self.assertEqual((record["disposition"], record["summary"]),
                                  ("advisory", f"defect {sd_review.NO_REPRO_NOTE}"))
 
+    def test_evidence_that_names_no_input_or_command_is_no_repro(self) -> None:
+        """sd:9869 review: "See summary" blocked as a repro. Evidence must name something a reader can run or
+        check: a command, a path or `path:line`, a backticked span, or a failure's output."""
+        for evidence in ("See summary", "see above", "obviously broken", "This is a real bug.", "N/A", "-"):
+            with self.subTest(evidence=evidence):
+                [record] = sd_review.dispose([finding(evidence)], "high", repro=True)
+                self.assertEqual((record["disposition"], record["summary"]),
+                                 ("advisory", f"defect {sd_review.NO_REPRO_NOTE}"))
+        for evidence in ("make test: 1 failed", "`sd today --json` prints []", "exit 127", "bin/tool:3",
+                         "KeyError: 'state'", "Traceback (most recent call last)", "expected 2, got 3"):
+            with self.subTest(evidence=evidence):
+                [record] = sd_review.dispose([finding(evidence)], "high", repro=True)
+                self.assertEqual(record["disposition"], "blocking")
+
     def test_a_reproduced_break_in_an_unchanged_caller_blocks(self) -> None:
         [record] = sd_review.dispose([finding("python3 reader.py: KeyError 'state'", path="reader.py")], "high",
                                      repro=True)
