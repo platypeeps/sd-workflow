@@ -147,13 +147,29 @@ def split_branch(plan: dict, done: dict) -> dict:
     done.update({"plan": plan, "tip": tip, "made": True, "base": start, "fork": fork, "kept": kept,
                  "dropped": dropped})
     # Marked made first: a failed add may leave a half-made worktree or branch; undo removes both either way.
-    # From the fork, where the kept commits were made, so each applies; the lane merges the base (pack sd:9863).
-    _git("worktree", "add", "-q", "-b", new_branch, str(new_work), fork, cwd=repo)
-    for sha in kept:
-        _git("cherry-pick", "--allow-empty", sha, cwd=new_work)
-    check_branch(new_work, fork, kept, aside)
+    _git("worktree", "add", "-q", "-b", new_branch, str(new_work), start, cwd=repo)
+    done["onto"] = _replay(new_work, start, fork, kept)
+    check_branch(new_work, done["onto"], kept, aside)
     done["head"] = _out("rev-parse", "HEAD", cwd=new_work)
     return done
+
+
+def _replay(work: str | Path, start: str, fork: str, kept: list[str]) -> str:
+    """Cherry-pick `kept` onto the base, else onto the fork; the commit it applied on. The base first: a helper the
+    dropped commit added and main landed too is there for a kept edit (lane review). The fork when main moved a
+    kept file, where the kept commits were made, so each applies; the lane merges the base (pack sd:9863)."""
+    failed = ""
+    for onto in dict.fromkeys((_out("rev-parse", start, cwd=work), fork)):
+        _git("reset", "-q", "--hard", onto, cwd=work)
+        for sha in kept:
+            done = _git("cherry-pick", "--allow-empty", sha, cwd=work, check=False)
+            if done.returncode != 0:
+                failed = f"cherry-pick {sha[:12]} onto {onto[:12]}: {(done.stderr or done.stdout).strip()}"
+                _git("cherry-pick", "--abort", cwd=work, check=False)
+                break
+        else:
+            return onto
+    raise DropRefused(f"the kept commits apply on neither {start} nor the fork {fork[:12]}; {failed}")
 
 
 def check_branch(work: str | Path, start: str, kept: list[str], aside: set[int]) -> None:
@@ -195,8 +211,8 @@ def kept_note(done: dict) -> str:
     """The finding the kept items' next builder reads."""
     plan = done["plan"]
     return (f"Bundle drop: sd:{plan['item']} left this bundle. {plan['new_branch']} now holds only the kept items' "
-            f"{len(done['kept'])} commits, cherry-picked onto {done['fork'][:12]}, where it forked from "
-            f"{done['base']}. Check the kept work still stands "
+            f"{len(done['kept'])} commits, cherry-picked onto {done['onto'][:12]} "
+            f"({done['base']} or where it forked from it). Check the kept work still stands "
             f"without sd:{plan['item']}, fix what it needs, and enqueue.")
 
 

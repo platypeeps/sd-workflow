@@ -1118,6 +1118,23 @@ class Advisories(Repo):
         self.assertEqual((new / "a.txt").read_text(), "lead fixed\n")
         self.assertEqual(git(new, "rev-list", "--count", "HEAD..origin/main"), "1", "main is the lane's to merge")
 
+    def test_a_kept_edit_of_a_helper_main_already_landed_still_drops(self):
+        """Lane review: the dropped commit adds a helper a kept commit edits, and main landed the same helper.
+        Replayed onto main the kept edit applies; onto the fork the helper is missing, so main goes first."""
+        items = [self.item(repo=str(self.repo)) for _ in range(2)]
+        build.queue(self.db, items, who="operator")
+        run = self.claim()
+        work = Path(run["work_path"])
+        git(self.repo, "worktree", "add", "-q", "-b", run["branch"], str(work), "origin/main")
+        self.commit(work, "h.txt", "helper\n", f"feat: helper\n\nCloses: sd:{items[0]}")
+        self.commit(work, "h.txt", "helper v2\n", f"feat: edit helper\n\nCloses: sd:{items[1]}")
+        self.end(run)
+        self.main_moves("h.txt", "helper\n")
+        new = self.drop(run, items[0])
+        self.assertEqual((new / "h.txt").read_text(), "helper v2\n")
+        self.assertEqual(git(new, "rev-list", "--count", "HEAD..origin/main"), "0", "replayed onto main")
+        self.assertNotIn(f"sd:{items[0]}", self.closes(new))
+
 
 class GitConfigScope(unittest.TestCase):
     """pack sd:9863: command-scope config may redirect a child's remote (`url.*.insteadOf`), so it is stripped; only
