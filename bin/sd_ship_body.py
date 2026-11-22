@@ -264,9 +264,6 @@ _REFS = re.compile(r"^Refs[ \t]*:(.*)$", re.IGNORECASE)
 #: The kinds a merge closes (`close_items`) and the statuses it would close from.
 _CLOSABLE_KINDS = ("work", "task", "followup")
 _OPEN_STATUSES = ("planning", "ready", "in_progress", "ready_to_send")
-#: A commit's own `Closes:` trailer closes a parked item too: one waiting on the bundle that carries it (sd:9918).
-#: A review fix line does not: it names an item, and a parked one may be unrelated work.
-_TRAILER_STATUSES = (*_OPEN_STATUSES, "blocked")
 #: How `cited_sources` names a `Closes:` trailer citation; `trailer_cited` reads it back.
 TRAILER_SOURCE = "Closes trailer of commit "
 
@@ -432,27 +429,36 @@ def _left(connection, item: int, body: str, named, numbers, branch: str) -> set[
     return referenced_ids(body) | {item, *named} | build.left(connection, branch, numbers)
 
 
-def open_cited(connection, item: int, repo: str, cited, named, body: str, branch: str = "",
-               trailers=()) -> tuple[int, ...]:
-    """Of `cited`, the items a merge of `item` should close beyond `named`, its later `--item` list (sd:5999).
-
-    An item counts when it belongs to `repo`, is a kind a merge closes, and
-    is open, or blocked and in `trailers`, the ids a `Closes:` trailer
-    cites: a parked item waits on the commit that closes it (sd:9918).
-    A `Refs:` line of `body` keeps one open, as does the data
-    `_left` reads.
-    """
+def _cited_rows(connection, item: int, repo: str, cited, named, body: str, branch: str, statuses) -> tuple[int, ...]:
+    """Of `cited`, this repository's closable items in one of `statuses`, less those `_left` keeps open."""
     left = _left(connection, item, body, named, cited, branch)
     kept = []
     for number in cited:
         if number in left:
             continue
         row = connection.execute("SELECT repo, kind, status FROM item WHERE id = ?", (number,)).fetchone()
-        if row is not None and row["repo"] == repo and row["kind"] in _CLOSABLE_KINDS \
-                and (row["status"] in _OPEN_STATUSES
-                     or number in trailers and row["status"] in _TRAILER_STATUSES):
+        if row is not None and row["repo"] == repo and row["kind"] in _CLOSABLE_KINDS and row["status"] in statuses:
             kept.append(number)
     return tuple(kept)
+
+
+def blocked_cited(connection, item: int, repo: str, trailers, named, body: str, branch: str = "") -> tuple[int, ...]:
+    """Of `trailers`, the ids a branch commit's `Closes:` trailer cites, the blocked items the merge would leave
+    open unseen (sd:9918). A block may hold for a reason the commit does not settle, a followup the operator
+    left, so the lane closes none on its own: enqueue refuses until `--item` names each or a `Refs:` line
+    keeps it."""
+    return _cited_rows(connection, item, repo, trailers, named, body, branch, ("blocked",))
+
+
+def open_cited(connection, item: int, repo: str, cited, named, body: str, branch: str = "") -> tuple[int, ...]:
+    """Of `cited`, the items a merge of `item` should close beyond `named`, its later `--item` list (sd:5999).
+
+    An item counts when it belongs to `repo`, is a kind a merge closes, and
+    is open, as `refuse_left_open` reads them; a `Refs:` line of `body`
+    keeps one open, as does the data `_left` reads. A blocked one is
+    `blocked_cited`'s.
+    """
+    return _cited_rows(connection, item, repo, cited, named, body, branch, _OPEN_STATUSES)
 
 
 def refuse_left_open(connection, item: int, repo: str, names, title: str, body: str, named, deliver: bool,
