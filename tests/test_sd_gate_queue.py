@@ -726,9 +726,9 @@ class Settings(unittest.TestCase):
         self.assertIsNone(taken)
         self.assertIn("load 55.0 is at or above 40", stream.getvalue())
 
-    def test_a_cpu_sample_past_the_deadline_takes_no_slot(self):
-        """Review finding: with --max-wait 0.5 the first 1.1 s CPU sample ran past the deadline, and a free
-        slot was taken before the deadline was read."""
+    def test_the_first_cpu_sample_past_the_deadline_still_takes_a_free_slot(self):
+        """Review blocker: with --max-wait 0.5 the first 1.1 s CPU sample used up the deadline, and a free
+        slot under low load was refused, while --max-wait 0 took it. The first pass always tries."""
         with tempfile.TemporaryDirectory() as tmp, open(pathlib.Path(tmp) / "slot.1.lock", "a") as mine:
             stream, now = io.StringIO(), [0.0]
 
@@ -739,7 +739,26 @@ class Settings(unittest.TestCase):
                 [mine.fileno()], pathlib.Path(tmp), poll=0.001, stream=stream, deadline=0.5,
                 clock=lambda: now[0], rule=sd_gate_slots.LoadRule(24.0, 0.0, "test"),
                 loadavg=lambda: (1.0, 1.0, 1.0), busy=busy)
-        self.assertIsNone(taken)
+        self.assertEqual(taken, 0, stream.getvalue())
+
+    def test_a_retry_sample_past_the_deadline_takes_no_slot(self):
+        """A retry whose 1.1 s CPU sample ran past the deadline takes no slot freed during it."""
+        with tempfile.TemporaryDirectory() as tmp, open(pathlib.Path(tmp) / "slot.1.lock", "a") as mine, \
+                open(pathlib.Path(tmp) / "slot.1.lock", "a") as other:
+            fcntl.flock(other, fcntl.LOCK_EX)
+            stream, now, samples = io.StringIO(), [0.0], []
+
+            def busy():
+                samples.append(now[0])
+                if len(samples) > 1:
+                    fcntl.flock(other, fcntl.LOCK_UN)
+                now[0] += 1.1
+                return 0.1
+            taken = sd_gate_slots.wait_for_slot(
+                [mine.fileno()], pathlib.Path(tmp), poll=0.001, stream=stream, deadline=2.0,
+                clock=lambda: now[0], rule=sd_gate_slots.LoadRule(24.0, 0.0, "test"),
+                loadavg=lambda: (1.0, 1.0, 1.0), busy=busy)
+        self.assertEqual((taken, len(samples)), (None, 2))
         self.assertIn("gave up waiting for a gate slot", stream.getvalue())
 
     def test_max_wait_zero_takes_a_free_slot(self):

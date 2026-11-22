@@ -794,10 +794,11 @@ def wait_for_slot(fds: Sequence[int], where: pathlib.Path, *, poll: float, strea
     limit = math.inf if deadline is None else deadline
     try:
         while True:
-            # The CPU sample may wait CPU_SAMPLE_SECONDS: take it before `stop` and the deadline are read, so
-            # neither a launcher gone nor a wait run out during it takes a slot.
-            # A retry at or past the deadline gives up before it samples; the first pass always tries, so
-            # --max-wait 0 takes a free slot. Only a sample reads the clock twice in a pass (sd:9946).
+            # The CPU sample may wait CPU_SAMPLE_SECONDS: take it before `stop` is read, so a launcher gone
+            # during it takes no slot.
+            # The first pass always tries, even when its sample ran past the deadline: --max-wait 0 and
+            # 0.5 both take a free slot. A retry at or past the deadline gives up before it samples, and
+            # one whose sample ran past it tries no more. Only a sample reads the clock twice (sd:9946).
             before = clock()
             expired = retry and before >= limit
             sampling = ticket is not None and rule.limit > 0 and not expired
@@ -805,7 +806,7 @@ def wait_for_slot(fds: Sequence[int], where: pathlib.Path, *, poll: float, strea
             if stop():
                 raise LauncherExited()
             now = clock() if sampling else before
-            if expired or before < limit <= now:
+            if retry and (expired or before < limit <= now):
                 taken = None  # the last attempt's reason is still why it waits
             elif ticket is None:
                 taken, reason = take_free(fds, markers, label, wall())
