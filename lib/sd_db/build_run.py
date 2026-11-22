@@ -980,6 +980,8 @@ class Supervisor:
     #: run` starts its command in a new group), each with its leader's start: `end_group` ends one that
     #: outlived its parent only while it is still that group. None for every other child.
     groups: dict[int, str] | None = None
+    #: The files the last `deferred` judged against, the branch's own: a rebuttal lapses once one changes.
+    judged: tuple[str, ...] = ()
 
     def __init__(self, connection, ident: str, *, tools: Tools, log_root: Path,
                  cited: Callable[[Path, str, str, str], Collection[int] | None], environ: dict | None = None,
@@ -1511,6 +1513,7 @@ class Supervisor:
             # A last round short of a reader, or one that read patches only (no `covers_from`), proves no
             # finding absent: hold every blocker.
             changed = None
+        self.judged = tuple(sorted(changed or ()))
         # ponytail: location, not causation: a defect a new caller causes in unchanged code is filed, not held,
         # unless the finding's own words name a changed file (pack sd:9900 tracks the rest).
         # A changed path or its file name; a name shared with an unchanged file holds more, never less.
@@ -1581,8 +1584,9 @@ class Supervisor:
                                                 f"blocker (pack sd:9769): {self.summary([row], None)}")
             if repository and rebut:  # no GitHub origin: `sd-review` reads no rebuttal there either
                 # Every instance too: the lane drops the rebuttal once any file the finding names changes.
+                # And each file the branch changes: a lane gate fix to its own caller lapses it (sd:9769).
                 raw = {"path": self.locations(row)[0][0], "summary": row.get("summary"), "line": row.get("line"),
-                       "instances": [str(entry) for entry in row.get("instances") or []]}
+                       "instances": [str(entry) for entry in row.get("instances") or []] + list(self.judged)}
                 record_state(self.db, "checkpoint", key=f"ship-adjudication:build-run:{self.ident}:{filed}", body={
                     "decision": "accepted", "proposal": {
                         "bindings": {"repository": repository, "branch": self.row["branch"], "head": head},

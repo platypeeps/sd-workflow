@@ -1566,6 +1566,18 @@ class Supervise(Case):
         raw = json.loads(body[0])["proposal"]["findings"][0]["raw_finding"]
         self.assertEqual(raw.get("instances"), ["far.py:2", "other.py:7"], "the rebuttal dropped the instances")
 
+    def test_a_deferred_rebuttal_names_every_file_the_branch_changes(self):
+        """Review of sd:9769: a managed build files a rebuttal before the lane gate runs; a gate fix that
+        changes only the branch's own caller must lapse it, so the rebuttal names each file it was judged on."""
+        self.press()
+        self.db.execute("UPDATE repo SET remote = 'https://github.com/example/repo.git'")
+        _, kept = self.deferred([{"path": "far.py", "line": 2, "summary": "a"}], {"src/caller.py": {12}})
+        self.assertEqual(kept["blockers"], [])
+        body = self.db.execute("SELECT body FROM state WHERE key LIKE 'ship-adjudication:build-run:%'").fetchone()
+        self.assertIsNotNone(body, "no rebuttal was recorded")
+        raw = json.loads(body[0])["proposal"]["findings"][0]["raw_finding"]
+        self.assertIn("src/caller.py", raw.get("instances"), "a fix to the branch's caller keeps the rebuttal")
+
     def test_a_changed_function_named_in_plain_words_holds(self):
         """Review of sd:9769: a reviewer can name the changed caller as a plain word (`export`); a plain word
         that is the name of a function the branch changes ties the blocker to the branch."""
