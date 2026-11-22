@@ -1104,6 +1104,10 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                     if not set(items) & {lead_item, *(member["item"] for member in ahead)}:
                         raise BuildRefused(f"its lead sd:{lead_item} waits on {names}; Build sd:{lead_item} or "
                                            f"{names} to build those first, then Fix the bundle")
+                    # A lane entry sent back to the lane is the lane's again: the bundle's PR may still merge, so
+                    # no member leaves it, as Fix reads it (`_lane_entry`, review of build/sd-1306).
+                    entry = LANE_ENTRY.match(state["run"]["detail"] or "")
+                    _lane_entry(connection, state["run"]["branch"], entry.group(1) if entry else None, actor="Build")
                     fresh += _free(connection, ahead, who=who, run=state["run"]["id"], lead=lead_item)
                     freed[state["run"]["id"]] = {member["item"] for member in sent}
                     continue

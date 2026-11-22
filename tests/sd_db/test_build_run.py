@@ -3144,6 +3144,20 @@ class Tick(Case):
             build.queue_again(self.db, [self.items[0]], who="operator")
         self.assert_newer_build_owns_member(newer)
 
+    def test_a_build_frees_no_member_while_the_lane_entry_is_back_in_the_lane(self):
+        """Review of build/sd-1306: lead A waits on member B of a lane-failed bundle, and the operator sent the
+        lane entry back to the lane. Build A freed and queued B while the bundle's PR ran in the lane. It
+        refuses, as Fix does, and writes nothing."""
+        for status in ("pending", "running"):
+            with self.subTest(status=status):
+                self.setUp()
+                run = self.lane_failed_bundle(0, 1)
+                self.store({"id": "e1", "status": status}, run["branch"])
+                with self.assertRaisesRegex(build.BuildRefused, f"the lane holds branch .* again \\({status}\\)"):
+                    build.queue_again(self.db, [self.items[0]], who="operator")
+                self.assertEqual([self.queued_builds(item) for item in self.items], [0, 0])
+                self.assertEqual(self.statuses(), ["in_progress", "in_progress"])
+
     def build_rows(self):
         return self.db.execute("SELECT id, status, result FROM assignment ORDER BY id").fetchall()
 
