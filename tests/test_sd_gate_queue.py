@@ -752,6 +752,30 @@ class Settings(unittest.TestCase):
                     clock=lambda: 0.0, rule=rule, loadavg=lambda: (1.0, 1.0, 1.0), busy=lambda: None)
                 self.assertEqual(taken, 0)
 
+    def test_a_retry_woken_at_the_deadline_takes_no_slot(self):
+        """Review blocker: the poll sleep woke at the 2.0 s deadline, the retry sampled the CPU, and took a
+        slot freed meanwhile at 3.1 s."""
+        with tempfile.TemporaryDirectory() as tmp, open(pathlib.Path(tmp) / "slot.1.lock", "a") as mine, \
+                open(pathlib.Path(tmp) / "slot.1.lock", "a") as other:
+            fcntl.flock(other, fcntl.LOCK_EX)
+            now, samples = [0.0], []
+
+            def busy():
+                samples.append(now[0])
+                if len(samples) > 1:
+                    fcntl.flock(other, fcntl.LOCK_UN)
+                now[0] += 1.1
+                return 0.1
+
+            def sleep(seconds):
+                now[0] += seconds
+            with mock.patch.object(sd_gate_slots.time, "sleep", sleep):
+                taken = sd_gate_slots.wait_for_slot(
+                    [mine.fileno()], pathlib.Path(tmp), poll=5.0, stream=io.StringIO(), deadline=2.0,
+                    clock=lambda: now[0], rule=sd_gate_slots.LoadRule(24.0, 0.0, "test"),
+                    loadavg=lambda: (1.0, 1.0, 1.0), busy=busy)
+        self.assertEqual((taken, samples), (None, [0.0]), "an expired retry gives up before it samples")
+
     def test_a_launcher_gone_during_the_cpu_sample_takes_no_slot(self):
         with tempfile.TemporaryDirectory() as tmp, open(pathlib.Path(tmp) / "slot.1.lock", "a") as mine:
             gone = [False]

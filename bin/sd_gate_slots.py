@@ -80,6 +80,7 @@ import datetime
 import fcntl
 import functools
 import json
+import math
 import os
 import pathlib
 import re
@@ -748,9 +749,17 @@ def place_line(ticket: Ticket | None, reason: str) -> str:
     return f"place {place[0]} of {place[1]} in the queue" + (f": {reason}" if place[0] == 1 else "")
 
 
-def sample_start(sampling: bool, deadline: float | None, clock: Callable[[], float]) -> float:
-    """When a CPU sample with a deadline to watch starts, or infinity: only that sample reads the clock."""
-    return clock() if sampling and deadline is not None else float("inf")
+def report_wait(stream: TextIO, queue: Queue, reason: str, now: float, started: float,
+                reported: float | None) -> float | None:
+    """Say why the waiter waits at once and every `REPORT_EVERY_SECONDS` after; returns when it last said."""
+    if reported is None:
+        stream.write(f"waiting for a gate slot: {reason} under {queue.where}{held_by(queue)}\n")
+    elif now - reported >= REPORT_EVERY_SECONDS:
+        stream.write(f"still waiting for a gate slot after {now - started:.0f}s: {reason}{held_by(queue)}\n")
+    else:
+        return reported
+    stream.flush()
+    return now
 
 
 def wait_for_slot(fds: Sequence[int], where: pathlib.Path, *, poll: float, stream: TextIO,
@@ -781,20 +790,23 @@ def wait_for_slot(fds: Sequence[int], where: pathlib.Path, *, poll: float, strea
     started = clock()
     reported: float | None = None
     reason = "the wait ran out during the CPU sample"  # until an attempt says why it waits
+    retry = False
+    limit = math.inf if deadline is None else deadline
     try:
         while True:
             # The CPU sample may wait CPU_SAMPLE_SECONDS: take it before `stop` and the deadline are read, so
             # neither a launcher gone nor a wait run out during it takes a slot.
-            # Only a sample reads the clock before it: a pass with none reads it once (sd:9946).
-            sampling = ticket is not None and rule.limit > 0
-            before = sample_start(sampling, deadline, clock)
+            # A retry at or past the deadline gives up before it samples; the first pass always tries, so
+            # --max-wait 0 takes a free slot. Only a sample reads the clock twice in a pass (sd:9946).
+            before = clock()
+            expired = retry and before >= limit
+            sampling = ticket is not None and rule.limit > 0 and not expired
             share = busy() if sampling else None
             if stop():
                 raise LauncherExited()
-            # The attempt is quick: its reports and deadline read this one clock read.
-            now = clock()
-            if deadline is not None and before < deadline <= now:
-                taken = None  # the deadline passed in the sample; the last attempt's reason stands
+            now = clock() if sampling else before
+            if expired or before < limit <= now:
+                taken = None  # the last attempt's reason is still why it waits
             elif ticket is None:
                 taken, reason = take_free(fds, markers, label, wall())
             else:
@@ -807,20 +819,14 @@ def wait_for_slot(fds: Sequence[int], where: pathlib.Path, *, poll: float, strea
                     stream.write(f"gate slot taken after {clock() - started:.0f}s under {where}\n")
                     stream.flush()
                 return taken
-            if reported is None:
-                stream.write(f"waiting for a gate slot: {reason} under {where}{held_by(queue)}\n")
-                stream.flush()
-                reported = now
-            elif now - reported >= REPORT_EVERY_SECONDS:
-                stream.write(f"still waiting for a gate slot after {now - started:.0f}s: {reason}{held_by(queue)}\n")
-                stream.flush()
-                reported = now
-            if deadline is not None and now >= deadline:
+            reported = report_wait(stream, queue, reason, now, started, reported)
+            if now >= limit:
                 stream.write(f"gave up waiting for a gate slot after {now - started:.0f}s at "
                              f"{place_line(ticket, reason)}{held_by(queue)}\n")
                 stream.flush()
                 return None
-            time.sleep(poll if deadline is None else max(0.0, min(poll, deadline - now)))
+            retry = True
+            time.sleep(max(0.0, min(poll, limit - now)))
     finally:
         if ticket is not None:
             queue.leave(ticket)
