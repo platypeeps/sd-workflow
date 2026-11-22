@@ -652,6 +652,21 @@ class Claim(Case):
         self.assertEqual(build.room_for(available, A), build.REPO_CAP - 1)
 
 
+class OpenQuestion(Case):
+    def test_a_withdrawn_ruling_leaves_its_reopened_question_pending(self):
+        """Advisory of PR #1940 (sd:9973): a review withdrawal reopens a question (`resolved_at` cleared) and
+        keeps its ruling note, so the pending read found no question and the run waited on none."""
+        item = self.item()
+        asked = add_note(self.db, item, "question", "Which?\nOption: A (Recommended)\nOption: B")
+        ruling = add_note(self.db, item, "decision", f"Ruling on note #{asked}: A")
+        since = "2000-01-01T00:00:00+00:00"
+        self.assertIsNone(build.open_question(self.db, [item], since, pending=True), "a standing ruling answers it")
+        add_note(self.db, item, "decision", f"Withdrawn: ruling #{ruling} on note #{asked}")
+        found = build.open_question(self.db, [item], since, pending=True)
+        self.assertEqual(found and found["id"], asked)
+        self.assertIsNone(build.open_question(self.db, [item], since), "the skip evidence reads as before")
+
+
 class Writes(Case):
     def setUp(self):
         super().setUp()

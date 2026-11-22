@@ -966,6 +966,24 @@ class Supervise(Case):
         self.assertEqual((again["assignment"], again["work_path"], again["run"]),
                          (self.bundle["assignment"], self.bundle["work_path"], 2), "the same bundle, in its worktree")
 
+    def test_a_usage_limit_claim_resumes_the_step_session_and_round(self):
+        """Advisory of PR #1960 (sd:9973): the claim after a usage limit opened at `claimed` with no session and
+        round 0, so a bundle limited in its third fix round rebuilt from scratch with a fresh round budget. It
+        resumes as a loss retry does: the step (`RESUME`), the session and the round."""
+        self.press()
+        ident = self.bundle["id"]
+        reset = int(datetime.now(UTC).timestamp()) + 60
+        self.assertTrue(build.write(self.db, ident, step="fixing", session_id="session-limited", review_round=2,
+                                    final=json.dumps({"rate_limit_info": {"resetsAt": reset}})))
+        build.end(self.db, ident, build.RATE_LIMITED, "rate limited")
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        row = build.run(self.db, again["id"])
+        self.assertEqual((row["step"], row["session_id"], row["review_round"]), ("reviewing", "session-limited", 2))
+
     def test_a_fault_inside_the_usage_limit_end_writes_nothing_and_the_next_end_finishes(self):
         """Pack sd:9907, failure table row 2: the outcome, the release, the requeue and the hold are one
         transaction. A fault at its last write leaves the run open and its bundle running, as the
