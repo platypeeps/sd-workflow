@@ -47,6 +47,10 @@ class RuntimeRefused(Exception):
     pass
 
 
+class NoDashboard(RuntimeRefused):
+    """No dashboard.json: this machine runs no dashboard (sd:9920); `main` exits 3."""
+
+
 def jev_command():
     """The system checkout's `local-jev/jev.sh`, else `jev` on PATH, else None.
 
@@ -84,6 +88,8 @@ def read_config(path):
     path = Path(path).expanduser().resolve()
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise NoDashboard(f"no dashboard on this machine: {path} does not exist") from error
     except (OSError, ValueError) as error:
         raise RuntimeRefused(f"cannot read dashboard config {path}: {error}") from error
     if not isinstance(config, dict):
@@ -700,6 +706,9 @@ def main():
             result = preflight(args.config)
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
+    except NoDashboard as error:
+        print(f"dashboard: {error}", file=sys.stderr)
+        return 3
     except (RuntimeRefused, ImportError, ValueError) as error:
         print(f"dashboard: {error}", file=sys.stderr)
         return 1
