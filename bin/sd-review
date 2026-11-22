@@ -1811,8 +1811,8 @@ def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]
         return "\n".join(dict.fromkeys(text for text in matched if isinstance(text, str) and text.strip()))
     def _near(old: Mapping[str, Any]) -> bool:  # only a blocker whose own code `prior_at` found unchanged holds
         lines = [row.get("line") for row in (old, record)]
-        return old.get("line_kept") is True and (not all(type(line) is int for line in lines)
-                                                 or abs(lines[0] - lines[1]) <= SHIFT_LINES)
+        return old.get("line_kept") is True and all(type(line) is int for line in lines) and abs(
+            lines[0] - lines[1]) <= SHIFT_LINES  # an unplaced line compares no code, so it holds nothing
     return "" if any(_file(old, record) and _near(old) and not any(_same(old, row) for row in findings)
                      for old in blockers) else None
 
@@ -1850,7 +1850,7 @@ def prior_at(root: pathlib.Path, old: str, new: str, rows: Sequence[Mapping[str,
             return dict(row)
         path = renamed.get(row["path"], row["path"])
         if type(row.get("line")) is not int:  # an unplaced blocker still follows its file (bin/sd-review:1846)
-            return dict(row, path=path)
+            return dict(row, path=path, line_kept=False)
         diff = sd_lib.git_output(["diff", "-M", "-U0", "--no-color", "--no-ext-diff", old, new, "--",
                                   *dict.fromkeys(f":(literal){name}" for name in (row["path"], path))], root)
         line, kept = (row["line"], False) if diff is None else moved_line(diff, row["line"])
