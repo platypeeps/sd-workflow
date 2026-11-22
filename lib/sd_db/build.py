@@ -739,8 +739,13 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
         # by another build (sd:9015) is left out too, as one `only` omits, so the split guard reads the branch for
         # its earlier work. A member an operator cancelled on its own (`ALONE`) left already (sd:9222), and one
         # Retry would not end (not `AGAIN`, as a member delivered `done` beside a skipped lead) stays as it is.
-        built = [member for member in run(connection, last["id"])["members"][1:]
-                 if member["status"] in AGAIN and not (member["result"] or "").startswith(ALONE)] if last else []
+        # A drop's kept lead that never ran has no run to read them from: its members in its status are what the
+        # split branch holds, so one this Retry omits is marked left out too (review of build/sd-1306).
+        built = [member for member in (run(connection, last["id"])["members"][1:] if last else [
+                     dict(row) for row in connection.execute(
+                         "SELECT id, item, status, result FROM assignment WHERE parent = ? AND status = ? "
+                         "AND scope = ? ORDER BY id", (assignment, current["status"], SCOPE))])
+                 if member["status"] in AGAIN and not (member["result"] or "").startswith(ALONE)]
         items = reads.items_by_ids(connection, [current["item"], *(member["item"] for member in members + built)])
         # A done lead refuses: the claim would lead with a member, on a new branch and worktree.
         if _done(items, current["item"]):
@@ -985,8 +990,10 @@ def left_out(connection, lead: int) -> list[tuple[int, int]]:
     for row in connection.execute(
             "SELECT item, result FROM assignment WHERE parent = ? AND scope = ? AND result LIKE ? ORDER BY id",
             (lead, SCOPE, f"{ALONE}%: {LEFT_OUT}%")):
-        retried = connection.execute("SELECT run FROM runner_run WHERE id = ?",
-                                     (row["result"].rsplit(LEFT_OUT, 1)[1],)).fetchone()
+        # A run of another assignment, the ended run a drop's kept lead keeps the work of, reads as run 0: the
+        # lead's first run is the first after the Retry (review of build/sd-1306).
+        retried = connection.execute("SELECT run FROM runner_run WHERE id = ? AND assignment = ?",
+                                     (row["result"].rsplit(LEFT_OUT, 1)[1], lead)).fetchone()
         left.append((row["item"], retried["run"] if retried else 0))
     return left
 

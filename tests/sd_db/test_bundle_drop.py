@@ -1056,3 +1056,23 @@ class DropWait(Repo):
         self.assertEqual([entry["id"] for entry in queued], [lead])
         again = self.claim()
         self.assertEqual((Path(again["work_path"]), again["branch"]), (new, f"build/sd-{lead}"))
+
+    def test_a_retry_of_a_kept_lead_marks_the_member_it_leaves_out(self):
+        """Review of build/sd-1306: kept lead A and member B, B set to wait on A before the split branch's first
+        claim. Retry queued A alone and never marked B left out, as the lead had no run to read members from:
+        the split guard had no marker and A's run would ship B's commits."""
+        import json
+
+        items, _, run = self.bundle()
+        self.drop(run, items[2])
+        lead, member = (self.db.execute("SELECT id FROM assignment WHERE item = ? ORDER BY id DESC LIMIT 1",
+                                        (item,)).fetchone()["id"] for item in (items[0], items[1]))
+        self.db.execute("UPDATE item SET fields = ? WHERE id = ?",
+                        (json.dumps({"blocked_by": [items[0]]}), items[1]))
+        self.assertIsNone(self.claim(), "B waits on A")
+        queued = build.queue_again(self.db, [items[0]], who="operator")
+        self.assertEqual([entry["id"] for entry in queued], [lead])
+        self.assertEqual(build.left_out(self.db, lead), [(items[1], 0)], "B is left out of A's next run")
+        self.assertIn(build.LEFT_OUT, runner.queue_state(self.db, member)["result"])
+        self.assertEqual(self.claim()["assignment"], lead)
+        self.assertEqual(build.split(self.db, lead), "unread", "A's first run reads its branch for B's work")
