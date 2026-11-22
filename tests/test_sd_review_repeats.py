@@ -342,6 +342,20 @@ class ReproRuleTests(unittest.TestCase):
         [record] = sd_review.dispose([finding()], "high", rebutted, repro=True)
         self.assertEqual((record["disposition"], record["summary"]), ("advisory", f"defect {sd_review.REPEAT_NOTE}"))
 
+    def test_a_relative_repeat_of_an_absolute_prior_blocker_still_blocks(self) -> None:
+        """build/sd-1423 class pass: a prior blocker at `/work/repo/src.py`, repeated uncited as `src.py`,
+        posted as advisory: the suffix match ran one way only."""
+        prior = [dict(finding(REPRO, path="/work/repo/src.py"), disposition="blocking")]
+        [record] = sd_review.dispose([finding()], "high", repro=True, prior=prior)
+        self.assertEqual((record["disposition"], record.get("evidence")), ("blocking", REPRO))
+
+    def test_one_spelling_for_every_accepted_form(self) -> None:
+        root = pathlib.Path("/work/repo")
+        spelled = sd_review.repo_spelling(root)
+        self.assertEqual([spelled(path) for path in ("/work/repo/src.py", "./src.py", " src.py ", "src.py",
+                                                     "<review-response>", "/elsewhere/src.py", None)],
+                         ["src.py"] * 4 + ["<review-response>", "/elsewhere/src.py", None])
+
     def test_a_repeat_of_a_prior_blocker_without_stored_evidence_still_blocks(self) -> None:
         """build/sd-1423 review: a report from before sd:9867 stored no evidence, so the verifier's uncited
         repeat found none to keep and cleared the unresolved blocker; a resumed review did the same."""

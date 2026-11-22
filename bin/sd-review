@@ -1792,7 +1792,8 @@ def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]
 
     def _same(old: Mapping[str, Any]) -> bool:
         mine, theirs = _place(record.get("path")), _place(old.get("path"))
-        return bool(mine and theirs) and (mine == theirs or mine.startswith("/") and mine.endswith(f"/{theirs}")) and (
+        return bool(mine and theirs) and (mine == theirs or mine.startswith("/") and mine.endswith(f"/{theirs}")
+                                          or theirs.startswith("/") and theirs.endswith(f"/{mine}")) and (
             type(old.get("line")) is int and old.get("line") == record.get("line")
             or summary_key(old.get("summary")) == summary_key(record.get("summary")))
     matched = [old.get("evidence") for old in prior if old.get("disposition") == "blocking" and _same(old)]
@@ -2430,8 +2431,11 @@ def review(
         result["codex_skill_suppression"] = next((row for row in measures if row["state"] != SKILLS_SUPPRESSED), measures[-1]) if measures else skills
         outcomes = [outcome for _measured, attempts in answers for outcome in attempts]
         outcomes = [row._replace(status=FINDINGS if row.findings else CLEAN) if (row.diagnostic or {}).get("coverage") == "partial" and set(row.diagnostic["omitted_paths"]) <= {path["path"] for path in input_manifest.get("paths", ()) if path.get("media")} and any(other.status in (CLEAN, FINDINGS) for other in outcomes) else row for row in outcomes]
+        spelled = repo_spelling(root)  # build/sd-1423: one spelling per finding before any is matched
+        outcomes = [row._replace(findings=tuple(dict(found, path=spelled(found["path"])) for found in row.findings)) for row in outcomes]
         finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)],
-                      rebutted, subject.scope != "planning", previous["findings"] if previous else ())
+                      [row._replace(path=spelled(row.path)) for row in rebutted], subject.scope != "planning",
+                      [dict(row, path=spelled(row["path"])) for row in previous["findings"]] if previous else ())
     finally:
         slot.give_back()  # sd:2523: on every exit; the gate below queues in its own pool
     # Shadow only (sd:2092): Jev's kind for each finding goes to its ledger and
@@ -2535,6 +2539,17 @@ def reviewed_paths(root: pathlib.Path, subject: Subject, previous: Mapping[str, 
                      | {f"./{name}" for name in names} | LANE_PATHS)
 
 
+def repo_spelling(root: pathlib.Path) -> Callable[[Any], Any]:
+    """The one repository-relative spelling of a path in any form `reviewed_paths` accepts (build/sd-1423): a
+    finding is matched across readers, reports and rebuttals on it, and the report records it."""
+    prefixes = (f"{pathlib.Path(root).as_posix()}/", f"{pathlib.Path(root).resolve().as_posix()}/", "./")
+    def spelled(path: Any) -> Any:
+        name = path.strip() if isinstance(path, str) else ""
+        name = next((name[len(prefix):] for prefix in prefixes if name.startswith(prefix)), name)
+        return name or path
+    return spelled
+
+
 def head_holds(root: pathlib.Path, ref: str) -> Callable[[str], bool]:
     """sd:9536. Whether a cited path is a file the repository holds at `ref`.
 
@@ -2542,9 +2557,9 @@ def head_holds(root: pathlib.Path, ref: str) -> Callable[[str], bool]:
     passes were voided. Spellings are those `reviewed_paths` accepts; a
     directory, a path outside the repository or a failed git read is not held,
     nor one git cannot take (a NUL, a lone surrogate, over 1024 characters)."""
-    prefixes = (f"{pathlib.Path(root).as_posix()}/", f"{pathlib.Path(root).resolve().as_posix()}/", "./")
+    spelled = repo_spelling(root)
     def file_at_head(path: str) -> bool:
-        name = next((path[len(prefix):] for prefix in prefixes if path.startswith(prefix)), path)
+        name = spelled(path)
         if not name or len(name) > 1024 or "\0" in name or name.startswith(("/", "../")) or not name.isprintable():
             return False
         return sd_lib.git_output(["cat-file", "-t", f"{ref}:{name}"], root) == "blob"

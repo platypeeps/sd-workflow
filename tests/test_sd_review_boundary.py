@@ -1024,11 +1024,16 @@ class LineBudgetTests(unittest.TestCase):
         # +4 so the rebuttal check runs before `prior_evidence`, and a
         # prior blocker that stored no evidence still blocks. Measured:
         # `sd-review` is 2916 here.
+        #
+        # 4886 -> 4901 is the build/sd-1423 class pass: `bin/sd-review`
+        # +15 for `repo_spelling`, the one spelling `head_holds` now
+        # shares, applied to findings, prior report rows and rebuttals
+        # before any is matched. Measured: `sd-review` is 2931 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4886,
+            4901,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
