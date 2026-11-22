@@ -813,7 +813,7 @@ def _same_copy(path: Path, target: Path) -> tuple[int, int, int] | None:
 def _released(connection, path: Path) -> bool:
     """Whether every run that owns `path` ended and was released: all of the assignment's for its
     `sd-N.title` or `.body.md`, else the run its name starts with."""
-    owner = re.fullmatch(r"sd-(\d+)\.(?:title|body\.md)", path.name)
+    owner = re.fullmatch(r"sd-(\d+)\.(?:title|body\.md|blockers\.json)", path.name)
     ended = "SELECT outcome IS NOT NULL AND released_at IS NOT NULL FROM runner_run WHERE "
     rows = connection.execute(ended + "assignment = ?", (int(owner[1]),)) if owner \
         else connection.execute(ended + "id = ?", (path.name.split(".", 1)[0],))
@@ -843,7 +843,7 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
             deadline: float = ARCHIVE_DEADLINE_SECONDS) -> list[str]:
     """Move each file of an ended run from `local` to the same place under `bulk`; the new paths.
 
-    `sd-<assignment>.title` and `.body.md` move once every run of that assignment ended and was released,
+    `sd-<assignment>.title`, `.body.md` and `.blockers.json` move once every run of that assignment ended and was released,
     the rest once the run their name starts with was: an outcome alone leaves a blocked or abandoned run's
     groups alive until the reap releases it, and they may still write. A file no run owns, one written in the
     last `settle` seconds or one whose copy fails stays for a later tick.
@@ -999,6 +999,8 @@ class Supervisor:
         lead_id = self.row["assignment"]
         self.title = self.logs / f"sd-{lead_id}.title"
         self.body = self.logs / f"sd-{lead_id}.body.md"
+        # The last blocking round's findings whole, for a fix a usage limit interrupted (`walk`).
+        self.round_file = self.logs / f"sd-{lead_id}.blockers.json"
         self.log = self.logs / f"{ident}.jsonl"
         self.reviewed: str | None = None
         self.blockers: list[dict] = []
@@ -1222,7 +1224,7 @@ class Supervisor:
         elif step == "fixing" and self.fresh()["start_step"] == "fixing" and not self.blockers:
             # A claim after a usage limit in a fix (`build.claim`): the fix runs again on the round's blockers,
             # its round already counted (review of build/sd-1557).
-            self.blockers = self.noted_blockers()
+            self.blockers = self.round_blockers()
             if self.blockers:
                 steps["fixing"] = self.resume_fix
         # A run that starts past the worktree step (a usage-limit reclaim, a loss retry) is guarded as that step
@@ -1459,6 +1461,10 @@ class Supervisor:
 
     def blocked_round(self, blockers: list[dict]) -> str | dict:
         self.blockers = blockers
+        # Whole, as the fix reads them: the lead's note is cut at FINDING_MAX (review of build/sd-1557).
+        part = self.round_file.with_name(f".{self.round_file.name}.{os.getpid()}.part")
+        part.write_text(json.dumps(blockers))
+        os.replace(part, self.round_file)
         # Once per child that blocked: a fault after this write re-walks the held review, which is the same review.
         child = (self.last or {}).get("pid")
         self.once(f"round:{child}", self.count_round)
@@ -1477,13 +1483,13 @@ class Supervisor:
             return self.fix(CLASS_PASS, rounds=rounds)
         return self.finish("blocked", f"{rounds} review rounds left blockers: {self.summary(self.blockers)}")
 
-    def noted_blockers(self) -> list[dict]:
-        """The last round's blockers as `blocked_round` noted them on the lead, one per line; [] for none."""
-        row = self.db.execute("SELECT body FROM note WHERE item = ? AND body LIKE ? ORDER BY timestamp DESC, id DESC "
-                              "LIMIT 1", (self.lead, build.ROUND_BLOCKERS + "%")).fetchone()
-        lines = row["body"][len(build.ROUND_BLOCKERS):].splitlines() if row else []
-        # Each line is `summary`'s "- path:line text"; the text alone keeps it, as `summary` prints it again.
-        return [{"path": "", "line": "", "summary": line.strip()[2:]} for line in lines if line.startswith("- ")]
+    def round_blockers(self) -> list[dict]:
+        """The last blocking round's findings as `blocked_round` kept them; [] for none or an unreadable file."""
+        try:
+            rows = json.loads(self.round_file.read_text())
+        except (OSError, ValueError):
+            return []
+        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
     def resume_fix(self) -> str | dict:
         """The interrupted fix again, with its own brief: the last round's is the class pass (`blocked_round`)."""
@@ -2037,9 +2043,7 @@ class Supervisor:
     @staticmethod
     def summary(blockers: list[dict], limit: int | None = 3) -> str:
         # `summary` is the text of an `sd-review --json` finding record.
-        # A noted blocker (`noted_blockers`) carries its place in its summary already: path "" prints none.
-        lines = [(f"{row.get('path', '?')}:{row.get('line', '?')} " if row.get("path") != "" else "")
-                 + f"{row.get('summary') or ''}".strip() for row in blockers]
+        lines = [f"{row.get('path', '?')}:{row.get('line', '?')} {row.get('summary') or ''}".strip() for row in blockers]
         return "; ".join(lines[:limit]) if limit else "\n".join(f"- {line}" for line in lines)
 
     def out(self, name: str) -> Path:

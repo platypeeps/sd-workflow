@@ -217,6 +217,13 @@ FAKE = textwrap.dedent('''
                               "subject": {"head": git("-C", work, "rev-parse", "HEAD")}}))
             sys.exit(4)
         raw = {"path": "work.txt", "line": 1, "severity": "high", "summary": "a blocker", "family": "correctness"}
+        if mode == "blocking-long":  # two findings past a note's 4000 characters, the first over three lines
+            first = dict(raw, summary="a long blocker\\n- an example bullet\\n" + "x" * 4500)
+            second = dict(raw, path="later.txt", line=9, summary="a later blocker")
+            findings = review.dispose([review._finding(first), review._finding(second)], "high")
+            print(json.dumps({"status": "blocking", "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
+                              "findings": findings}))
+            sys.exit(0)
         findings = review.dispose([review._finding(raw)], "high")  # the record shape `--json` prints
         if mode == "gate_failed":
             print(json.dumps({"status": "gate_failed", "cleared_status": "clean", "findings": [],
@@ -1895,6 +1902,28 @@ class Supervise(Case):
         self.assertEqual(fix[fix.index("--resume") + 1], "session-fixture")
         self.assertIn("- work.txt:1 a blocker", fix[fix.index("-p") + 1])
         self.assertEqual(build.run(self.db, again["id"])["review_round"], 1, "the resumed fix charged no round")
+
+    def test_a_resumed_fix_keeps_every_blocker_whole(self):
+        """Review of build/sd-1557: the resumed fix read its blockers back from the 4000-character note, so a
+        multiline finding lost its tail, its bullet read as a blocker of its own and a later finding was cut.
+        The resumed prompt is the interrupted one."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "rate_limited"], sd_review=["blocking-long"])
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.plan(claude=["fix1"], sd_review=["clean"])
+        self.assertEqual(self.supervisor(again["id"]).run()["step"], "enqueued")
+        limited, resumed = ([call["argv"] for call in self.calls("claude")][n] for n in (1, 2))
+        said = resumed[resumed.index("-p") + 1]
+        self.assertIn("later.txt:9 a later blocker", said)
+        self.assertIn("x" * 4500, said)
+        self.assertEqual(said, limited[limited.index("-p") + 1], "the same brief as the interrupted fix")
 
     def test_a_usage_limit_in_the_class_pass_resumes_the_class_pass(self):
         """Review of build/sd-1557: a limit in the last round's class pass resumed with the plain FIX brief, so
