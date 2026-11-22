@@ -65,7 +65,8 @@
     ['Now',       [['Today', 'sunrise', 't'], ['Decide', 'list-checks', 'l'], ['Briefs', 'inbox', 'i']]],
     ['Work',      [['Tasks', 'list-todo', 'k'], ['GitHub', 'git-branch', 'b'], ['Issues', 'circle-dot', 'u'], ['Writing', 'pen-line', 'w'], ['Research', 'flask-conical', 'r'], ['Contributions', 'git-pull-request', 'c']]],
     ['Knowledge', [['Documents', 'file-text', 'd'], ['Notes', 'notebook-pen', 'n'], ['Watches', 'eye', 'y'], ['Studio', 'mic', 'z']]],
-    ['Places',    [['HOA', 'droplets', 'h'], ['Home', 'house', 'o']]],
+    // Operator 2026-11-20: realm places first (places:start below), then Home; HOA last.
+    ['Places',    [['Home', 'house', 'o'], ['HOA', 'droplets', 'h']]],
     ['Fleet',     [['Skills', 'sparkles', 's'], ['Metrics', 'chart-no-axes-column', 'm'], ['Management', 'settings', 'g'], ['Health', 'heart-pulse', 'e'], ['Activity', 'activity', 'a'], ['Reports', 'clipboard-list', 'p'], ['Designs', 'palette', 'x'], ['Settings', 'sun-moon', 'v']]],
   ];
   // build: a page that is built sets window.SHELL_PAGES; a section missing from it shows as not built yet.
@@ -76,10 +77,11 @@
   // sd:5663: a realm with a report family of its own id is a place (SHELL_REALMS place, the family's icon, from
   // /ui/sections.js). It joins Places with no g key, at /places?realm=<id>. A label a section holds, or one with a quote or a
   // backslash (the rail finds an entry by [data-section="<label>"]), is left out.
+  let placeAt = 0;
   for (const r of window.SHELL_REALMS || []) {
     if (!r.place || !/^[a-z0-9][a-z0-9-]*$/.test(r.id) || !/^[a-z0-9-]+$/.test(r.place) || PAGES[r.label] || /["\\]/.test(r.label)) continue;
     PAGES[r.label] = `/places?realm=${r.id}`;
-    GROUPS.find(([g]) => g === 'Places')[1].push([r.label, r.place, '']);
+    GROUPS.find(([g]) => g === 'Places')[1].splice(placeAt++, 0, [r.label, r.place, '']);
   }
   // places:end
   const hrefOf = name => PAGES[name] || CLASSIC[name];

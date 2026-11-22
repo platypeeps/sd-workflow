@@ -94,6 +94,40 @@ class TheSections(TodayCase):
                           (failed, "o/s", "failed", None)])
         self.assertIsNone(found["gate"])
 
+    def test_a_bundle_entrys_closes_supersede_a_members_older_entry(self):
+        """Pack sd:9694: a member's older failed entry hides once a newer bundle entry closes it."""
+        lead, merged, queued, dropped = (self.item(title) for title in ("Lead", "Merged", "Queued", "Dropped"))
+        self.lane("o/r", "e0", item=merged, status="failed", position=1)
+        self.lane("o/r", "e1", item=queued, status="failed", position=2)
+        self.lane("o/r", "e2", item=dropped, status="failed", position=3)
+        self.lane("o/r", "e3", item=lead, closes=[merged], status="merged", position=4)
+        self.lane("o/r", "e4", item=lead, closes=[queued], status="pending", position=5)
+        self.lane("o/r", "e5", item=lead, closes=[dropped], status="cancelled", position=6)
+        found = today.landing(self.connection)["entries"]
+        self.assertEqual([(row["id"], row["status"]) for row in found], [(lead, "pending"), (dropped, "failed")])
+
+    def test_a_malformed_closes_or_item_is_counted_not_raised(self):
+        """Class pass on sd:9694: a `closes` member or an `item` that is no item id hides no other row."""
+        healthy = self.item("Healthy")
+        self.lane("o/r", "e1", item=healthy, status="running", position=1, closes=[{}, "x", 1.5, [2]])
+        self.lane("o/r", "e2", item=[3], status="failed", position=2)
+        self.lane("o/r", "e3", item={}, status="failed", position=3)
+        found = today.landing(self.connection)
+        self.assertEqual([row["id"] for row in found["entries"]], [healthy])
+        self.assertEqual(found["unread"], 2)
+
+    def test_a_bundle_hides_only_a_members_failed_history_not_its_live_entry(self):
+        """Class pass on sd:9694: the lane tracks a member's own pending, running or prepared entry by its item,
+        so a newer bundle that closes the member hides only its failed or skipped entries."""
+        lead, pending, running, skipped = (self.item(title) for title in ("Lead", "Pending", "Running", "Skipped"))
+        self.lane("o/r", "e0", item=pending, status="pending", position=1)
+        self.lane("o/r", "e1", item=running, status="running", position=2)
+        self.lane("o/r", "e2", item=skipped, status="skipped", position=3)
+        self.lane("o/r", "e3", item=lead, closes=[pending, running, skipped], status="pending", position=4)
+        found = today.landing(self.connection)["entries"]
+        self.assertEqual(sorted((row["id"], row["status"]) for row in found),
+                         [(lead, "pending"), (pending, "pending"), (running, "running")])
+
     def test_landing_gives_exact_times_and_no_estimate(self):
         """The lane records no ETA: `since` is when the entry started, else when the hub queued it."""
         running, waiting = self.item("Running", repo=APP), self.item("Waiting", repo=APP)
@@ -148,6 +182,14 @@ class TheSections(TodayCase):
                           ("lane", landing, "failed", "prepare")])
         self.assertEqual([row["id"] for row in today.queues(self.connection, repos=[LIB], now=NOW)], [stuck])
         self.assertEqual(today.sections(self.connection, now=NOW)["summary"]["queues"], 5)
+
+    def test_a_ready_item_that_waits_names_what_it_waits_on(self):
+        """Pack sd:9570: a ready item whose `blocked_by` names an open item says so in its Queues detail."""
+        first = self.item("First", repo=APP, status="planning")
+        waits = self.item("Waits", repo=APP, status="ready", priority=2, fields={"blocked_by": [first]})
+        rows = today.queues(self.connection, now=NOW)
+        self.assertEqual([(row["id"], row["detail"]) for row in rows if row["queue"] == "ready"],
+                         [(waits, f"P2 · waits on sd:{first}")])
 
     def test_a_failure_is_due_for_a_push_once_and_a_success_never(self):
         """Pack sd:6946: a push only when a lane entry or a build fails or blocks, once per entry."""

@@ -269,6 +269,16 @@ class TheRefusals(FixCase):
                 self.assertIn(says, answer["error"])
         self.assertEqual(self.calls(), [])
 
+    def test_a_task_that_waits_on_an_open_item_launches_nothing(self):
+        """pack sd:9570 class pass: Fix starts a builder; like the Build press it refuses while a dependency is open."""
+        self.running()
+        first, item = self.task("First"), self.task()
+        workflow.edit_item(self.connection, item, {"blocked_by": [first]}, who="test")
+        status, _, answer = self.fix(item)
+        self.assertEqual(status, 400)
+        self.assertIn(f"waits on sd:{first}", answer["error"])
+        self.assertEqual(self.calls(), [])
+
     def test_a_bad_body_a_missing_item_and_a_bad_origin_launch_nothing(self):
         self.running()
         item = self.task()

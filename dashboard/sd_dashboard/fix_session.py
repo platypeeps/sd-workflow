@@ -55,7 +55,7 @@ import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
-from sd_db import operations, paths, workflow
+from sd_db import build, operations, paths, workflow
 from sd_db.config import system_checkout
 from sd_db.errors import SdDbError
 
@@ -165,6 +165,9 @@ def start(connection, item: int, *, expected_revision: str, who: str, grill: str
         directory = checkout(row)
         session = ({"ask": "grill", "apply": "apply-answers"}.get(grill)
                    or ("apply-review" if apply else "debug" if row["kind"] == "report" else "builder"))
+        # A builder session builds the item, so it waits as the Build press does (pack sd:9570).
+        if session == "builder" and (waiting := build.waiting_on(connection, row)):
+            raise workflow.WorkflowError(f"item {item} {waiting}; Fix starts no builder until it is done")
         pane = _launch(directory, f"sd-{item}", prompt(row["kind"], item, grill=grill, apply=apply))
         if isinstance(pane, tuple):
             return _noted(connection, item, who, *pane)

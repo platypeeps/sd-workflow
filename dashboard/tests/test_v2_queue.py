@@ -2992,6 +2992,40 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                                                                                       "finding": finding, "run": "r9"}]])
         self.assertIn("system: sd:14 sent to its builder with the lane's finding", out["R"]["said"])
 
+    FIXED = {"allowed": True, "reason": "", "assignment": 832, "revision": "c" * 64, "run": "r9"}
+
+    def fix_press(self, fix, answer, item=14, ask=True):
+        """pack sd:9705: press Fix on item `item`; R.busy is the row while the post runs, R.row the row after."""
+        doc = self.fix_doc(fix)
+        yes = "{ yes: true, values: { finding: a.fields[0].value } }" if ask else "{ yes: false }"
+        row = (r'const ROW = () => { const m = ELS.queue.html.match(/<tr class="child"[^>]*data-id="entry:[^"]*:14"'
+               r'[^>]*>([\s\S]*?)<\/tr>/); return m ? m[1] : null; };')
+        return self.run_view(f"{row} window.shell.ask = a => Promise.resolve({yes});"
+                             " const P0 = window.shell.post; window.shell.post = (p, b) => { R.busy = ROW(); return P0(p, b); };"
+                             f"open('system'); act('button[data-act]', {{ repo: {json.dumps(str(self.checkout))}, item: '{item}', act: 'fix' }});"
+                             " await flush(); await flush(); await flush(); R.row = ROW(); R.said = ELS['queue-said'].textContent;",
+                             answers={"/api/queue": [200, doc], "/api/queue/builds/retry": answer})
+
+    def test_fix_shows_busy_then_sent_on_the_row_itself(self):
+        out = self.fix_press(self.FIXED, [200, {"run": "r9", "queued": [{"id": 832, "item": 14, "status": "queued"}]}])
+        self.assertIn("sending to its builder", out["R"]["busy"])
+        self.assertRegex(out["R"]["busy"], r'data-act="fix"[^>]* disabled')
+        self.assertIn("sent to builder; build #832 queued", out["R"]["row"])
+
+    def test_fix_refused_says_why_on_the_row(self):
+        out = self.fix_press(self.FIXED, [409, {"error": "Fix refused: build run r9 is not the latest run"}])
+        self.assertIn("not sent: Fix refused: build run r9 is not the latest run", out["R"]["row"])
+
+    def test_fix_not_allowed_says_why_on_the_row(self):
+        out = self.fix_press({**self.FIXED, "allowed": False, "reason": "its build run still runs"}, None, ask=False)
+        self.assertEqual(out["posts"], [])
+        self.assertIn("not sent: its build run still runs", out["R"]["row"])
+
+    def test_fix_on_a_row_no_longer_blocked_says_why(self):
+        out = self.fix_press(self.FIXED, None, item=99, ask=False)
+        self.assertEqual(out["posts"], [])
+        self.assertIn("sd:99 is not blocked in this read; nothing sent. Read again.", out["R"]["said"])
+
     def test_fix_on_a_merge_failure_sends_the_merge_log(self):
         """pack sd:8601: the finding names the log of the step that failed, never a prepare log that passed."""
         self.failed(step="merge", merge_log=f"{self.lane}/logs/merge-14.log")

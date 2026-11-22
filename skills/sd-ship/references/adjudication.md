@@ -13,6 +13,7 @@ For itemless records, replace `--item ID` below with `--no-item --review-id ID`.
    Save the returned `proposal` outside the checkout.
    Preserve its bindings and every indexed raw finding.
 2. Fill each blocking finding's `response_disposition` and `reason`.
+   The template holds `rebutted|parked`: replace it with one of the two.
    A finding names a defect class, not only a line: before you fix or rebut it, check every sibling site of the same shape.
    A fix at the reported line alone leaves the class live at its siblings.
    Use `rebutted` for a rejection, with a reason a reader can check.
