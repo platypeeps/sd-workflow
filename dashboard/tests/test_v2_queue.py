@@ -3056,6 +3056,22 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertRegex(out["R"]["busy"], r'data-act="fix"[^>]* disabled')
         self.assertIn("sent to builder; build #832 queued", out["R"]["row"])
 
+    def test_fix_feedback_leaves_a_later_failure_of_the_item(self):
+        """pack sd:9863: the word is the failed head's; the builder's new head that fails again shows none."""
+        doc = self.fix_doc(self.FIXED)
+        row = (r'const ROW = () => { const m = ELS.queue.html.match(/<tr class="child"[^>]*data-id="entry:[^"]*:14"'
+               r'[^>]*>([\s\S]*?)<\/tr>/); return m ? m[1] : null; };')
+        out = self.run_view(f"{row} window.shell.ask = a => Promise.resolve({{ yes: true, values: {{ finding: 'f' }} }});"
+                            "window.shell.view.current = () => 'queue';"
+                            f"open('system'); act('button[data-act]', {{ repo: {json.dumps(str(self.checkout))}, item: '14', act: 'fix' }});"
+                            " await flush(); await flush(); await flush(); R.sent = ROW();"
+                            " QDOCS['/api/queue'][1].lanes[0].rows.find(r => r.item === 14).head = 'f'.repeat(40);"
+                            " await window.PAGE_AGAIN.run(); await flush(); await flush(); R.again = ROW();",
+                            answers={"/api/queue": [200, doc],
+                                     "/api/queue/builds/retry": [200, {"run": "r9", "queued": []}]})
+        self.assertIn("sent to builder; build #832 queued", out["R"]["sent"])
+        self.assertNotIn("sent to builder", out["R"]["again"])
+
     def test_fix_refused_says_why_on_the_row(self):
         out = self.fix_press(self.FIXED, [409, {"error": "Fix refused: build run r9 is not the latest run"}])
         self.assertIn("not sent: Fix refused: build run r9 is not the latest run", out["R"]["row"])

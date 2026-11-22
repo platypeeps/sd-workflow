@@ -607,9 +607,16 @@ class Supervise(Case):
         """pack sd:9709 round 26: the supervisor's git calls and the builder start from this env; a hook's
         `GIT_DIR` or `GIT_WORK_TREE` would point them at the hook's repository, not the run's worktree."""
         self.press(1)
-        self.env.update({"GIT_DIR": "/decoy/.git", "GIT_WORK_TREE": "/decoy", "GIT_INDEX_FILE": "/decoy/index"})
+        self.env.update({"GIT_DIR": "/decoy/.git", "GIT_WORK_TREE": "/decoy", "GIT_INDEX_FILE": "/decoy/index",
+                         "GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "url.file:///decoy.git.insteadOf",
+                         "GIT_CONFIG_VALUE_0": "origin", "GIT_CONFIG_KEY_1": "maintenance.auto",
+                         "GIT_CONFIG_VALUE_1": "false"})
         env = self.supervisor().env
-        self.assertEqual({key for key in env if key in paths.GIT_LOCAL}, set())
+        # Only the suite's maintenance keys ride on, renumbered; a one-off `insteadOf` does not (pack sd:9863).
+        self.assertEqual({key for key in env if key in paths.GIT_LOCAL} - {"GIT_CONFIG_COUNT"}, set())
+        self.assertEqual((env["GIT_CONFIG_COUNT"], env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_VALUE_0"]),
+                         ("1", "maintenance.auto", "false"))
+        self.assertNotIn("GIT_CONFIG_KEY_1", env)
         self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], self.env["GIT_CONFIG_NOSYSTEM"], "config isolation stays")
 
     def test_a_press_runs_to_the_lane(self):
