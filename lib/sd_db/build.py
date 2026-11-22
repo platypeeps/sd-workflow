@@ -499,32 +499,41 @@ def _item(connection, item: int, *, lead: int | None = None) -> dict:
     row = connection.execute(_REPO, (item,)).fetchone()
     if row is None:
         raise BuildRefused(f"no item {item}")
-    if row["kind"] not in RUNNABLE_KINDS:
-        raise BuildRefused(f"item {item} is a {row['kind']} item; a build takes only "
-                           f"{', '.join(RUNNABLE_KINDS[:-1])} and {RUNNABLE_KINDS[-1]} items")
+    if row["kind"] not in RUNNABLE_KINDS:  # named before the status, as a press of a chore reads it
+        raise BuildRefused(_press_refusal(connection, row))
     if row["status"] != "ready" and not (row["status"] == "blocked" and split_held(connection, item)):
         raise BuildRefused(f"item {item} is {row['status']}; a build takes a ready item")
-    waiting = waiting_on(connection, row)
-    if waiting:
-        raise BuildRefused(f"item {item} {waiting}")
-    refused = _repo_refusal(row, connection)
+    refused = _press_refusal(connection, row, lead=lead)
     if refused:
         raise BuildRefused(refused)
+    return dict(row)
+
+
+def _press_refusal(connection, row, *, lead: int | None = None) -> str | None:
+    """Why the press refuses the item `row` once it is ready, or None: `_item`'s checks past its status, a read
+    only, so Build by item asks it of each member Retry would queue (`_retry_row`, class pass, review of sd:9788)."""
+    item = row["id"]
+    if row["kind"] not in RUNNABLE_KINDS:
+        return (f"item {item} is a {row['kind']} item; a build takes only "
+                f"{', '.join(RUNNABLE_KINDS[:-1])} and {RUNNABLE_KINDS[-1]} items")
+    waiting = waiting_on(connection, row)
+    if waiting:
+        return f"item {item} {waiting}"
+    refused = _repo_refusal(row, connection)
+    if refused:
+        return refused
     away = _route(connection, row["lane_host"], lead)
     gone = dispatcher_refusal(connection, away) if away else None
     if away and gone:
         # Nothing claims a satellite's press until its own dispatcher ticks, and the press locks the item. A beat
         # too far ahead names the skew alone: its dispatcher may well tick (pack sd:7955).
         dead = "" if _ahead(connection, away) is not None else ": no dispatcher there would claim it"
-        raise BuildRefused(f"item {item}'s lane runs on {away}, and {gone}{dead}")
+        return f"item {item}'s lane runs on {away}, and {gone}{dead}"
     active = connection.execute(
         f"SELECT id, status FROM assignment WHERE item = ? AND status IN {OWNING} LIMIT 1", (item,)).fetchone()
     if active:
-        raise BuildRefused(f"item {item} has {active['status']} assignment {active['id']}")
-    held = _held(connection, item)
-    if held:
-        raise BuildRefused(held)
-    return dict(row)
+        return f"item {item} has {active['status']} assignment {active['id']}"
+    return _held(connection, item)
 
 
 def waiting_on(connection, row) -> str:
@@ -1178,9 +1187,24 @@ def _retry_row(connection, item: int):
         if ran is not None and ran["status"] in AGAIN and not _alone(connection, ran["id"]):
             lead: int = ran["parent"] or ran["id"]
             if (queue_state(connection, lead)["status"] == ran["status"] and _in_work_repo(connection, lead, ran["status"])
-                    and all(_current(connection, member) for member in _open_members(connection, lead, ran["status"]))):
+                    and _retry_takes(connection, lead, ran["status"])):
                 return ran
     return rows[0] if rows else None
+
+
+def _retry_takes(connection, lead: int, status: str) -> bool:
+    """Whether Retry queues build `lead`'s bundle in `status`, read, not tried: its lead's item is not done, and
+    each member it would queue (`_open_members`) owns its item (`_current`) and passes the press's check once
+    ready (`_press_refusal`), as `retry` and its `_queue_members` refuse otherwise (class pass, review of sd:9788).
+    Build by item reads a fresh press instead of a bundle whose Retry refuses."""
+    row = connection.execute("SELECT item FROM assignment WHERE id = ?", (lead,)).fetchone()
+    if row is None or _done(reads.items_by_ids(connection, [row["item"]]), row["item"]):
+        return False
+    members = _open_members(connection, lead, status)
+    return bool(members) and all(
+        _current(connection, member)
+        and _press_refusal(connection, connection.execute(_REPO, (member["item"],)).fetchone(), lead=lead) is None
+        for member in members)
 
 
 def eligible(connection, *, now: str | None = None) -> list[dict]:

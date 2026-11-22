@@ -1120,6 +1120,41 @@ class Reap(Case):
         self.assertTrue(all(entry["id"] < cancelled for entry in queued), "Retry of the bundle, not a fresh build")
         self.assertEqual(self.claim()["assignment"], self.bundle["assignment"])
 
+    def test_build_by_item_presses_the_lead_fresh_when_a_member_waits_on_outside_work(self):
+        """Class pass, last round of sd:9788: bundle A ends blocked after a run, a fresh build of its lead is
+        cancelled before its claim, then its other member gains an unfinished dependency. Build of the lead read A,
+        whose Retry refused the waiting member and rolled back, on every press. Build reads only a bundle Retry
+        queues (`_retry_takes`), so it presses the lead fresh, as before this branch."""
+        from sd_db.workflow import edit_item
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        old = {member["id"] for member in build.run(self.db, row["id"])["members"]}
+        transition(self.db, self.items[0], "ready", who="operator")
+        cancelled = build.queue(self.db, [self.items[0]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (cancelled,))
+        outside = self.item(status="planning")
+        edit_item(self.db, self.items[1], {"blocked_by": [outside]}, who="operator")
+        queued = build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [self.items[0]])
+        self.assertNotIn(queued[0]["id"], old, "a fresh press, not Retry of the bundle")
+
+    def test_build_by_item_reads_no_bundle_whose_lead_is_done(self):
+        """Class pass, last round of sd:9788: Retry refuses a bundle whose lead's item is done. Bundle A ends
+        blocked, its lead is delivered by a newer build, and a fresh build of the member is cancelled before its
+        claim: `_retry_row`, which `split_held` and the Tasks page read too, chose A. It reads the newest row."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        transition(self.db, self.items[0], "ready", who="operator")
+        delivered = build.queue(self.db, [self.items[0]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'done', run_count = 1 WHERE id = ?", (delivered,))
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (self.items[0],))
+        transition(self.db, self.items[1], "ready", who="operator")
+        cancelled = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (cancelled,))
+        self.assertEqual(build._retry_row(self.db, self.items[1])["id"], cancelled)
+
     def test_build_by_item_skips_a_blocked_build_that_never_ran(self):
         """Review of sd:9788: a fresh build the claim refused never ran, then a newer one was cancelled before its
         claim. Build of the item read the refused one, a fresh press from main; the bundle that ran, whose
