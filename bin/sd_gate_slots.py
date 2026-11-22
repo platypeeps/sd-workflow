@@ -219,9 +219,9 @@ def load_rule(environ: Mapping[str, str], limit_setting: str | None = None,
     return LoadRule(limit, settle, ", ".join(sources) or "default")
 
 
-#: Test workers one local gate runs, whatever the cores or the cap (sd:9925): cores over a cap of 8 gave 2
-#: and doubled the pack gate, 28 to 51 minutes, with the CPU half idle. `sd.gate_workers` overrides it.
-DEFAULT_WORKERS = 8
+#: `sd.gate_workers` (sd:9925): the test workers one local gate runs, set by hand over `run-tests.sh`'s slot
+#: rule, which keeps the pool at the cores. Cores over a cap of 8 gave 2 and doubled the pack gate, 28 to 51
+#: minutes; a fixed 8 let eight gates start 64 workers on 16 cores (build review round 7).
 WORKERS_PATTERN = re.compile(r"[1-9][0-9]?")
 
 
@@ -260,11 +260,11 @@ def machine_settings(environ: Mapping[str, str], *, stream: TextIO | None = None
                 try:
                     check(text, f"sd.{key}")
                 except ValueError as error:
-                    # A worker typo reads 8 workers; it must not drop the gate's own limits (sd:9925 review).
+                    # A worker typo keeps the slot rule; it must not drop the gate's own limits (sd:9925 review).
                     if key != "gate_workers":
                         raise
                     if stream is not None:
-                        stream.write(f"warning: {error}; using {DEFAULT_WORKERS} workers\n")
+                        stream.write(f"warning: {error}; keeping the slot rule\n")
                     continue
                 values[key] = text
     except FileNotFoundError:
@@ -1040,7 +1040,7 @@ def slot_command(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command_name", required=True)
     commands.add_parser("directory", help="print the slot directory")
     commands.add_parser("count", help="print how many slots this machine has (0: no cap)")
-    commands.add_parser("workers", help="print how many test workers one local gate runs (sd.gate_workers)")
+    commands.add_parser("workers", help="print sd.gate_workers, or nothing when unset")
     wait = commands.add_parser("wait", help="queue, then lock one of the inherited slot descriptors")
     wait.add_argument("--pid", type=int, required=True, help="the gate's pid")
     wait.add_argument("--ppid", type=int, required=True, help="the gate's parent when it started")
@@ -1052,7 +1052,7 @@ def slot_command(argv: list[str] | None = None) -> int:
         print(directory(os.environ))
         return 0
     if args.command_name == "workers":
-        print(machine_settings(os.environ, stream=sys.stderr)["gate_workers"] or DEFAULT_WORKERS)
+        print(machine_settings(os.environ, stream=sys.stderr)["gate_workers"] or "", end="")
         return 0
     try:
         settings = machine_settings(os.environ, stream=sys.stderr)

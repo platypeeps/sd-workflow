@@ -209,40 +209,59 @@ class SplitModuleFixtures(unittest.TestCase):
         return subprocess.run(["bash", str(self.root / ".github/scripts/run-tests.sh")], cwd=self.root,
                               env=env, text=True, capture_output=True, timeout=300)
 
-    def test_ci_uses_all_cores_and_local_uses_a_fixed_count(self) -> None:
-        """sd:9925. Locally 8 workers whatever the cores; CI takes every core."""
-        for environment, workers in (({}, 8), ({"FIXTURE_CORES": "5"}, 8), ({"FIXTURE_CORES": "16"}, 8),
+    def test_ci_uses_all_cores_and_local_uses_half(self) -> None:
+        """sd:1955. Two gate slots at half the cores each fill the machine and no more."""
+        for environment, workers in (({}, 2), ({"FIXTURE_CORES": "5"}, 2), ({"FIXTURE_CORES": "16"}, 8),
                                      ({"CI": "1"}, 4), ({"GITHUB_ACTIONS": "true"}, 4)):
             with self.subTest(environment=environment):
                 result = self.run_harness(workers=None, environment=environment)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f"test runner: workers={workers} ", result.stdout)
 
-    def test_local_workers_ignore_the_gate_cap(self) -> None:
-        """sd:9925: a cap of 8 gave 2 workers and doubled the pack gate; the cap no longer sets them."""
-        for pool in ("1", "2", "4", "8", "64", "0"):
-            environment = {"FIXTURE_CORES": "16", "SD_GATE_POOL_SIZE": pool, "SD_GATE_SLOTS": "0"}
-            with self.subTest(pool=pool):
+    def test_local_workers_follow_the_gate_cap_so_the_pool_holds_the_cores(self) -> None:
+        """sd:2607, sd:6823: the cap a holder names, else this run's own, sets the workers; CI and an explicit count win."""
+        for environment, workers in (({"FIXTURE_CORES": "16", "SD_GATE_POOL_SIZE": "4", "SD_GATE_SLOTS": "0"}, 4),
+                                     ({"FIXTURE_CORES": "16", "SD_GATE_POOL_SIZE": "3", "SD_GATE_SLOTS": "0"}, 5),
+                                     ({"FIXTURE_CORES": "16", "SD_GATE_POOL_SIZE": "2", "SD_GATE_SLOTS": "0"}, 8),
+                                     ({"FIXTURE_CORES": "16", "SD_GATE_POOL_SIZE": "8", "SD_GATE_SLOTS": "0"}, 2),
+                                     ({"FIXTURE_CORES": "16", "SD_GATE_POOL_SIZE": "1", "SD_GATE_SLOTS": "0"}, 16),
+                                     ({"FIXTURE_CORES": "16", "SD_GATE_POOL_SIZE": "64", "SD_GATE_SLOTS": "0"}, 1),
+                                     ({"FIXTURE_CORES": "16", "SD_GATE_POOL_SIZE": "0", "SD_GATE_SLOTS": "0"}, 8),
+                                     ({"FIXTURE_CORES": "16", "SD_GATE_POOL_SIZE": "4", "CI": "1"}, 16)):
+            with self.subTest(environment=environment):
                 result = self.run_harness(workers=None, environment=environment)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-                self.assertIn("test runner: workers=8 ", result.stdout)
+                self.assertIn(f"test runner: workers={workers} ", result.stdout)
 
     def test_local_workers_read_sd_gate_workers(self) -> None:
-        """sd:9925: `sd.gate_workers` sets the local count; a bad value warns and reads 8; CI and TEST_WORKERS win."""
+        """sd:9925: a set `sd.gate_workers` overrides the slot rule; a bad value warns and keeps it; CI and
+        TEST_WORKERS win. Build review round 7: unset keeps the slot rule, so eight gates on 16 cores stay at 16."""
         (self.root / "bin").mkdir()
         shutil.copy2(REPO_ROOT / "bin/sd_gate_slots.py", self.root / "bin/sd_gate_slots.py")
         config = self.root / "config/sd-ai-command-pack/config.json"
         config.parent.mkdir(parents=True)
-        for value, workers, environment in (("3", "3", {}), ("12", "12", {}), ("0", "8", {}), ("many", "8", {}),
-                                            ("3", "4", {"CI": "1"}), ("3", "2", {"TEST_WORKERS": "2"})):
-            config.write_text(json.dumps({"config": {"sd": {"gate_workers": value}}}))
+        capped = {"FIXTURE_CORES": "16", "SD_GATE_POOL_SIZE": "8", "SD_GATE_SLOTS": "0"}
+        for value, workers, environment in ((None, "2", capped), ("3", "3", {}), ("12", "12", capped),
+                                            ("0", "2", capped), ("many", "2", {}), ("3", "4", {"CI": "1"}),
+                                            ("3", "2", {"TEST_WORKERS": "2"})):
+            config.write_text(json.dumps({"config": {"sd": {} if value is None else {"gate_workers": value}}}))
             with self.subTest(value=value, environment=environment):
+                environment = dict(environment)
                 result = self.run_harness(workers=environment.pop("TEST_WORKERS", None),
                                           environment={"XDG_CONFIG_HOME": str(self.root / "config"), **environment})
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f"test runner: workers={workers} ", result.stdout)
-                if workers == "8":
+                if value in ("0", "many"):
                     self.assertIn("sd.gate_workers", result.stderr)
+
+    def test_a_failing_worker_helper_keeps_the_slot_rule(self) -> None:
+        """Build review round 7: the helper failing reads the slot rule, not a fixed count."""
+        (self.root / "bin").mkdir()
+        (self.root / "bin/sd_gate_slots.py").write_text("raise SystemExit(1)\n")
+        result = self.run_harness(workers=None, environment={"FIXTURE_CORES": "16", "SD_GATE_POOL_SIZE": "8",
+                                                             "SD_GATE_SLOTS": "0"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("test runner: workers=2 ", result.stdout)
 
     def test_shards_skip_the_xcrun_trampoline_for_the_git_it_would_start(self) -> None:
         """sd:3179. `/usr/bin/git` starts xcrun, then the git xcrun names; shards start that git directly.
@@ -296,8 +315,7 @@ class SplitModuleFixtures(unittest.TestCase):
         self.assertEqual(len(re.findall(r"^Ran 2 tests", result.stdout, re.MULTILINE)), 6, result.stdout)
 
     def test_single_or_zero_reported_cores_still_get_one_worker(self) -> None:
-        """In CI, where the cores set the count; locally they set nothing (sd:9925)."""
-        for cores, ci in (("0", "1"), ("1", "1")):
+        for cores, ci in (("0", "1"), ("1", "1"), ("0", ""), ("1", "")):
             with self.subTest(cores=cores, ci=ci):
                 result = self.run_harness(workers=None, environment={"CI": ci, "FIXTURE_CORES": cores})
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

@@ -562,6 +562,13 @@ class WorkerSetting(unittest.TestCase):
                          ("1", "4", "90"))
         self.assertIsNone(values["gate_workers"])
 
+    def test_workers_prints_nothing_when_unset(self):
+        """Build review round 7: unset leaves the count to `run-tests.sh`'s slot rule."""
+        with tempfile.TemporaryDirectory() as tmp:
+            result = subprocess.run([sys.executable, str(SLOTS), "workers"], capture_output=True, text=True,
+                                    env=clean_environment(XDG_CONFIG_HOME=tmp), timeout=60)
+        self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
+
 
 if __name__ == "__main__":
     unittest.main()

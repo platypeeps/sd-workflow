@@ -14,18 +14,24 @@
 # Env:
 #   PYTHON_BIN     interpreter to run (default: python3)
 #   TEST_WORKERS   workers (default: all CPUs in CI; locally sd.gate_workers,
-#                  else 8)
+#                  else the CPUs over the machine's gate cap, at least one;
+#                  half the CPUs with no cap)
 #
 # sd:1955. Locally the shards also run at `nice -n 10`, so the runner daemon,
 # the dashboard and the sessions run first. CI gets every CPU at normal
 # priority: nothing else runs on a CI runner.
 #
-# sd:9925. The local count is fixed, not the CPUs over the gate cap (sd:2607,
-# sd:6823). With `sd.gate_slots` at 8 that rule gave each gate 2 workers on 16
-# cores, and the pack gate went from 28 to 51 minutes with the CPU 50-60% idle
-# (2026-11-21): the shards' git, bash and python children wait, not compute.
-# The slot count bounds how many gates run at once; `sd.gate_workers` (read by
-# `bin/sd_gate_slots.py workers`) sets each one's workers, 8 when unset.
+# sd:2607, sd:6823. Unset, the local count follows the gate cap, so the pool's
+# full load is the CPUs in workers whatever the cap: 4 each at a cap of 4 on 16
+# CPUs, 8 at a cap of 2. Twice the CPUs (30 workers under three gates) read a
+# load of 115.6 on 2026-10-30; under such load the runner daemon's heartbeat
+# missed (sd:1941, sd:1950). The cap is the one
+# the gate took its slot under: SD_GATE_POOL_SIZE from a holder such as
+# `sd-check`, else this run's own SD_GATE_SLOTS. It is the cap and not the slots
+# in use, because the shards are planned once, here.
+# sd:9925. `sd.gate_workers` (read by `bin/sd_gate_slots.py workers`) sets the
+# count by hand: at a cap of 8 the rule gives 2 each, and the pack gate went
+# from 28 to 51 minutes with the CPU half idle (2026-11-21).
 set -uo pipefail
 
 REPO_ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -72,10 +78,18 @@ else
   if [ -n "${CI:-}" ] || [ -n "${GITHUB_ACTIONS:-}" ]; then
     TEST_WORKERS="$cores"
   else
-    TEST_WORKERS=8
+    pool="${SD_GATE_POOL_SIZE:-${SD_GATE_SLOTS:-0}}"
+    case "$pool" in
+      '' | *[!0-9]*) pool=0 ;;
+    esac
+    if [ "$pool" -gt 0 ]; then
+      TEST_WORKERS=$((cores / pool))
+    else
+      TEST_WORKERS=$((cores / 2))
+    fi
     if [ -f "$REPO_ROOT/bin/sd_gate_slots.py" ]; then
-      TEST_WORKERS="$("$toolchain_python" "$REPO_ROOT/bin/sd_gate_slots.py" workers)" || TEST_WORKERS=8
-      case "$TEST_WORKERS" in '' | *[!0-9]*) TEST_WORKERS=8 ;; esac
+      set_workers="$("$toolchain_python" "$REPO_ROOT/bin/sd_gate_slots.py" workers)" || set_workers=
+      case "$set_workers" in '' | *[!0-9]*) ;; *) TEST_WORKERS="$set_workers" ;; esac
     fi
   fi
   [ "$TEST_WORKERS" -ge 1 ] || TEST_WORKERS=1
