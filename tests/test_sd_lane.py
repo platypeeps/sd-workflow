@@ -1991,6 +1991,88 @@ class SettleReordered(unittest.TestCase):
         self.assertIn("sd:2", gate.why)
 
 
+class SettlePrerequisite(unittest.TestCase):
+    """Lane prepare of sd:9899 (note #72581): C is gated on A and B; A merges, then B is in each state, X fails.
+
+    Settlement may wait for C's gate only once every entry it predicted
+    landed, in its order; a prerequisite that cannot land first ends it.
+    """
+
+    def gate_on(self, chain: tuple[str, ...]) -> sd_lane.SpeculativeGate:
+        gate: sd_lane.SpeculativeGate
+
+        def target() -> None:
+            while not gate.cancelled:
+                time.sleep(0.01)
+        gate = sd_lane.SpeculativeGate(target, "C on its chain", ("C", "h"), chain)
+        gate.start()
+        self.addCleanup(gate.cancel_gate)
+        return gate
+
+    def settle(self, gates: list, rows: list[dict], entry: dict, status: str) -> float:
+        started = time.monotonic()
+        with mock.patch.object(sd_lane, "read_queue", lambda queue: rows):
+            sd_lane.settle_gates(gates, entry, {"status": status}, sd_lane.clock() + 3, object())
+        return time.monotonic() - started
+
+    def after_x_fails(self, b: dict | None) -> tuple[list, sd_lane.SpeculativeGate, float]:
+        rows = [{"id": "A", "item": 1, "status": "merged"}, {"id": "X", "item": 4, "status": "pending"},
+                *([b] if b is not None else []), {"id": "C", "item": 3, "status": "pending"}]
+        gate = self.gate_on(("A", "B"))
+        gates = [gate]
+        self.settle(gates, rows, {"id": "A", "item": 1}, "merged")
+        rows[1]["status"] = "failed"
+        return gates, gate, self.settle(gates, rows, {"id": "X", "item": 4}, "failed")
+
+    def test_a_prerequisite_that_cannot_land_first_ends_the_gate_unwaited(self) -> None:
+        for name, b in [("held", {"status": "pending", "held": True}), ("cancelled", {"status": "cancelled"}),
+                        ("failed", {"status": "failed"}), ("skipped", {"status": "skipped"}),
+                        ("prepared", {"status": "prepared"}), ("merged elsewhere", {"status": "merged"}),
+                        ("removed", None)]:
+            with self.subTest(name):
+                gates, gate, waited = self.after_x_fails(None if b is None else {"id": "B", "item": 2, **b})
+                self.assertLess(waited, 1, f"{name}: X's settlement waited for C's gate")
+                self.assertEqual(gates, [], f"{name}: C's gate was kept")
+                self.assertTrue(gate.cancelled)
+                self.assertIn("(B)" if b is None else "sd:2", gate.why)
+
+    def test_a_running_prerequisite_keeps_the_gate_unwaited(self) -> None:
+        gates, gate, waited = self.after_x_fails({"id": "B", "item": 2, "status": "running"})
+        self.assertLess(waited, 1, "X's settlement waited for C's gate with B still running")
+        self.assertEqual(gates, [gate])
+        self.assertFalse(gate.cancelled)
+
+    def test_a_pending_prerequisite_ahead_keeps_the_gate_unwaited(self) -> None:
+        gates, gate, waited = self.after_x_fails({"id": "B", "item": 2, "status": "pending"})
+        self.assertLess(waited, 1)
+        self.assertEqual(gates, [gate])
+        self.assertFalse(gate.cancelled)
+
+    def test_a_prerequisite_merged_out_of_order_ends_the_gate(self) -> None:
+        rows = [{"id": "B", "item": 2, "status": "merged"}, {"id": "C", "item": 3, "status": "pending"},
+                {"id": "A", "item": 1, "status": "pending", "held": True}]
+        gate = self.gate_on(("A", "B"))
+        gates = [gate]
+        waited = self.settle(gates, rows, {"id": "B", "item": 2}, "merged")
+        self.assertLess(waited, 1, "B's settlement waited for C's gate with A not landed")
+        self.assertEqual(gates, [])
+        self.assertTrue(gate.cancelled)
+
+    def test_every_prerequisite_landed_in_order_is_waited_for(self) -> None:
+        rows = [{"id": "A", "item": 1, "status": "merged"}, {"id": "B", "item": 2, "status": "pending"},
+                {"id": "C", "item": 3, "status": "pending"}]
+        gate = sd_lane.SpeculativeGate(lambda: None, "C on A and B", ("C", "h"), ("A", "B"))
+        joined: list[float] = []
+        gate.join = lambda timeout=None: joined.append(timeout)  # type: ignore[method-assign]
+        gates = [gate]
+        self.settle(gates, rows, {"id": "A", "item": 1}, "merged")
+        self.assertEqual(joined, [])
+        rows[1]["status"] = "merged"
+        self.settle(gates, rows, {"id": "B", "item": 2}, "merged")
+        self.assertEqual(len(joined), 1)
+        self.assertEqual(gates, [gate])
+
+
 class DepthTwo(Trees):
     """pack sd:7412, slice 2: the entry after next is gated on both predicted landings, chained.
 

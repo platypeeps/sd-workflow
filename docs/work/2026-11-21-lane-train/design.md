@@ -92,6 +92,14 @@ together, which needs one push of main (below).
 | 5 settle | none | a dropped member merges outside the top chain | the top gate is cancelled | test_a_merge_outside_the_train_chain_cancels_its_gate |
 | 5 settle | none | queue read fails | no wait; the next prepare gates anew | test_an_unread_queue_after_a_merge_waits_for_no_gate |
 | 5 settle | none | a move puts the gated entry ahead of a pending prerequisite | gate cancelled; no wait | test_a_follower_moved_ahead_of_a_pending_prerequisite_is_waited_for_by_no_one |
+| 5 settle | none | a prerequisite is held | gate cancelled; no wait | test_a_prerequisite_that_cannot_land_first_ends_the_gate_unwaited [held] |
+| 5 settle | none | a prerequisite is cancelled, failed, skipped or prepared | gate cancelled; no wait | test_a_prerequisite_that_cannot_land_first_ends_the_gate_unwaited [cancelled, failed, skipped, prepared] |
+| 5 settle | none | a prerequisite merged outside this run | gate cancelled; no wait | test_a_prerequisite_that_cannot_land_first_ends_the_gate_unwaited [merged elsewhere] |
+| 5 settle | none | a prerequisite left the queue (removed) | gate cancelled; no wait | test_a_prerequisite_that_cannot_land_first_ends_the_gate_unwaited [removed] |
+| 5 settle | none | a prerequisite still runs | gate kept; no wait | test_a_running_prerequisite_keeps_the_gate_unwaited |
+| 5 settle | none | a prerequisite is pending ahead of the gated entry | gate kept; no wait | test_a_pending_prerequisite_ahead_keeps_the_gate_unwaited |
+| 5 settle | none | prerequisites merge out of the predicted order | gate cancelled; no wait | test_a_prerequisite_merged_out_of_order_ends_the_gate |
+| 5 settle | none | every prerequisite merged in order | the gate is waited for | test_every_prerequisite_landed_in_order_is_waited_for |
 | 2-3 fetch, stack | scratch commits, unreferenced | the deadline passes | no further member, no train gate | test_a_train_whose_fetch_crosses_the_deadline_starts_no_gate, test_a_stack_that_crosses_the_deadline_stacks_no_further |
 | 1 members read | none | `DEPTH` gates still run | no train; members marked skipped | test_a_train_waits_while_depth_gates_still_run |
 | 1-2 read, fetch | none | the members' read crosses the deadline | no fetch, no train | test_a_train_whose_queue_read_crosses_the_deadline_fetches_nothing |

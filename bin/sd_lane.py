@@ -2224,6 +2224,7 @@ class SpeculativeGate(threading.Thread):
         self.deadline = deadline  # read as the gate launches: one past it runs none (sd:9899)
         self.why = "the run stopped, so it ended this gate (sd:3361)"
         self.cancelled = False
+        self.landed: list[str] = []  # the chain's ids this run saw merge, in order (note #72581)
         self.group: int | None = None
         self.below: dict[int, sd_lib.Table | None] = {}  # each group's read before its first signal (pack sd:9392)
         self.guard = threading.RLock()  # `signal_gate` may run in a SIGTERM handler while this thread holds it
@@ -4340,42 +4341,54 @@ def settle_gates(gates: list[SpeculativeGate], entry: dict[str, Any], row: dict[
     dropped train member does, so that gate ends as well. So does a gate
     whose entry the queue now holds ahead of a pending entry it predicted
     to land first: a move put it there, and its receipt binds a tree its
-    prepare will not see (note #71950).
+    prepare will not see (note #71950). A wait needs every entry the gate
+    predicted merged, in its order; one held, ended or gone ends the gate
+    (`gate_stale`, note #72581).
     """
     merged = row is not None and row.get("status") == "merged"
     rows = queue_rows(queue)
     up = next_up(rows)
-    cancel_overtaken(gates, rows)
-    for held in [held for held in gates if entry["id"] not in held.chain]:
-        if not merged and up == held.follower[0]:
-            held.join(remaining(deadline, PREPARE_SECONDS))
-        elif merged and held.follower[0] != entry["id"]:
-            held.why = f"sd:{entry['item']} merged outside the landing this gate predicted"
-            if not held.is_alive() or held.cancel_gate():
-                gates.remove(held)
-    for held in [held for held in gates if entry["id"] in held.chain]:
-        if merged and held.chain[-1] == entry["id"]:
-            if up == held.follower[0]:
-                held.join(remaining(deadline, PREPARE_SECONDS))
-        elif not merged:
-            held.why = f"sd:{entry['item']} did not merge, so the landing this gate predicted will not happen"
-            if not held.is_alive() or held.cancel_gate():
-                gates.remove(held)
-
-
-def cancel_overtaken(gates: list[SpeculativeGate], rows: list[dict[str, Any]] | None) -> None:
-    """End each gate whose entry `rows` hold ahead of a pending entry it predicted to land first (note #71950).
-
-    Unread rows (None) prove nothing, so they end no gate.
-    """
-    pending = [queued for queued in rows or [] if queued.get("status") == "pending"]
-    ids = [queued["id"] for queued in pending]
     for held in list(gates):
-        after = pending[ids.index(held.follower[0]) + 1:] if held.follower[0] in ids else []
-        if passed := [queued for queued in after if queued["id"] in held.chain]:
-            held.why = f"sd:{passed[0]['item']} now lands after the entry this gate predicted on it"
+        if merged and entry["id"] in held.chain:
+            held.landed.append(entry["id"])
+        if why := gate_stale(held, entry, merged, rows):
+            held.why = why
             if not held.is_alive() or held.cancel_gate():
                 gates.remove(held)
+        elif held.landed == list(held.chain) and up == held.follower[0]:
+            held.join(remaining(deadline, PREPARE_SECONDS))
+
+
+def gate_stale(held: SpeculativeGate, entry: dict[str, Any], merged: bool,
+               rows: list[dict[str, Any]] | None) -> str | None:
+    """Why `held` predicts a landing that will not happen once `entry` ended, or None while it still may.
+
+    Each predicted entry must land, in the gate's order, before its
+    follower is claimed. One that did not merge, merged out of that
+    order, or that `rows` hold neither pending nor running, held, or
+    pending behind the follower, cannot (notes #71950, #72581). Unread
+    rows (None) prove nothing.
+    """
+    if merged and entry["id"] not in held.chain and entry["id"] != held.follower[0]:
+        return f"sd:{entry['item']} merged outside the landing this gate predicted"
+    if not merged and entry["id"] in held.chain:
+        return f"sd:{entry['item']} did not merge, so the landing this gate predicted will not happen"
+    if held.landed != list(held.chain[:len(held.landed)]):
+        return f"sd:{entry['item']} merged out of the order this gate predicted"
+    if rows is None:
+        return None
+    order = [queued["id"] for queued in rows if queued.get("status") == "pending"]
+    by_id = {queued["id"]: queued for queued in rows}
+    for wanted in held.chain[len(held.landed):]:
+        queued = by_id.get(wanted)
+        if queued is None:
+            return f"an entry this gate predicted ({wanted}) left the queue, so it cannot land first"
+        if queued.get("status") not in ("pending", "running") or queued.get("held"):
+            state = "held" if queued.get("held") else queued.get("status")
+            return f"sd:{queued['item']} is {state}, so it cannot land before this gate's entry"
+        if held.follower[0] in order and wanted in order[order.index(held.follower[0]) + 1:]:
+            return f"sd:{queued['item']} now lands after the entry this gate predicted on it"
+    return None
 
 
 #: The next claim when the queue cannot be read.
