@@ -472,7 +472,8 @@ def _read_bytes(argv: list[str], *, env: dict | None = None) -> bytes:
 def kept_files(git: Collection[str], work: str, *, env: dict | None = None) -> str:
     """The status lines of `work` that `git worktree remove` would lose: changes, untracked and ignored
     files, those config hides too, less the ignored ones under a `DISPOSABLE` folder; "" when it may go."""
-    lines = _read([*git, "-C", work, "status", "--porcelain", "--ignored", "--untracked-files=all"], env=env)
+    lines = _read([*git, "-C", work, "-c", "core.quotePath=false", "status", "--porcelain", "--ignored",
+                   "--untracked-files=all"], env=env)
     return "\n".join(line for line in lines.splitlines() if line.strip() and not (
         # Folder parts only: git ends an ignored folder with "/", so a file of that name is no cache.
         line.startswith("!! ") and DISPOSABLE.intersection(line[3:].strip('"').split("/")[:-1])))
@@ -1344,12 +1345,14 @@ class Supervisor:
         design.md, or the body, holds a failure table (`failure_table`): a header and a data row.
         """
         git = [*self.tools.git, "-C", str(self.work)]
-        changed = _read([*git, "diff", "--name-only", "--diff-filter=d", f"{self.base()}...{head}", "--",
-                         "docs/work"], env=self.env).splitlines()
+        # NUL-split, so git quotes no path (a non-ASCII one under core.quotePath; lane review of 0e395efb).
+        changed = _read([*git, "diff", "--name-only", "-z", "--diff-filter=d", f"{self.base()}...{head}", "--",
+                         "docs/work"], env=self.env).split("\0")
         named = re.compile(r"^item:\s*sd:(" + "|".join(str(item) for item in [self.lead, *self.others]) + r")\b", re.M)
         # The committed head, as the clean review worktree holds it: no uncommitted or ignored file counts.
         texts = {}
-        for path in _read([*git, "ls-tree", "-r", "--name-only", head, "--", "docs/work"], env=self.env).splitlines():
+        for path in _read([*git, "ls-tree", "-r", "-z", "--name-only", head, "--", "docs/work"],
+                          env=self.env).split("\0"):
             if re.fullmatch(r"docs/work/[^/]+/design\.md", path):
                 text = _read_bytes([*git, "cat-file", "blob", f"{head}:{path}"], env=self.env).decode("utf-8", "replace")
                 if path in changed or named.search(text):

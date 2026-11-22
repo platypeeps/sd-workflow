@@ -1049,6 +1049,12 @@ class Supervise(Case):
         self.assertIn("docs/work/2026-11-21-b/design.md", detail)
         self.assertNotIn("docs/work/2026-11-21-a/design.md", detail)
 
+    def test_a_non_ascii_design_path_needs_its_failure_table(self):
+        """Lane review of sd:9770: git quotes a non-ASCII path in its listings unless told not to; a design in
+        a folder named with one is still read, and blocks without a table."""
+        detail = self.designs_block({"docs/work/2026-11-21-café/design.md": "# Café\n\nSteps move state.\n"})
+        self.assertIn("docs/work/2026-11-21-café/design.md", detail)
+
     def test_a_body_table_covers_a_bundles_design_only_when_it_names_it(self):
         """Review of sd:9770: with two designs, the body's table covers only the design it names."""
         body = f"## Summary\n\nx\n\ndocs/work/2026-11-21-a\n\n```\n{self.TABLE}```\n\n## Test plan\n\ny\n"
@@ -3104,6 +3110,16 @@ class Sweep(Case):
         exclude(work, ".pytest_cache\n")
         (work / ".pytest_cache").write_text("notes\n")
         self.assertEqual(build_run.kept_files(("git",), str(work)), "!! .pytest_cache")
+
+    def test_a_kept_non_ascii_path_reads_as_its_name(self):
+        """Lane review of 0e395efb, class pass: git quotes a non-ASCII path unless told not to; the kept
+        line names the file, and a cache folder beside it is still disposable."""
+        work = self.blocked()
+        exclude(work, "__pycache__/\n")
+        (work / "café" / "__pycache__").mkdir(parents=True)
+        (work / "café" / "__pycache__" / "x.pyc").write_bytes(b"x")
+        (work / "café" / "notes.txt").write_text("x\n")
+        self.assertEqual(build_run.kept_files(("git",), str(work)), "?? café/notes.txt")
 
     def test_an_untracked_file_hidden_by_config_keeps_the_worktree(self):
         work = self.blocked()
