@@ -527,6 +527,17 @@ class ReproRuleTests(unittest.TestCase):
                                      repro=True, prior=prior)
         self.assertEqual([row["disposition"] for row in disposed], ["advisory", "blocking"])
 
+    def test_the_same_summary_on_a_nearby_caller_repeats_the_blocker(self) -> None:
+        """build/sd-1423 review (bin/sd-review:1816): a reader cited the unresolved blocker's own summary at a
+        caller, line 14, though it mapped to line 10, and the repeat posted as advisory. The same file and
+        summary at another line is the repeat when no finding repeats it at its own line; it keeps the repro."""
+        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking")]
+        disposed = sd_review.dispose([finding(line=14, summary="empty input  crashes"),
+                                      finding(path="b.py", line=10, summary="Empty input crashes")], "high",
+                                     repro=True, prior=prior)
+        self.assertEqual([(row["disposition"], row.get("evidence")) for row in disposed],
+                         [("blocking", REPRO), ("advisory", None)])
+
     def test_a_line_that_cannot_be_placed_holds_nothing(self) -> None:
         """build/sd-1423 class pass: an uncited finding with no line, or a prior blocker with none, held the
         fallback as if near, though no code can be compared. Only an exact repeat or fresh evidence blocks."""
