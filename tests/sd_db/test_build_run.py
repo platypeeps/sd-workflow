@@ -1225,6 +1225,27 @@ class Supervise(Case):
         self.assertFalse(supervisor.review_answer(out, "a" * 40)["complete"],
                          "a round one reader short of its policy counts as complete")
 
+    def test_a_replayed_delta_review_keeps_its_verify_arguments(self):
+        """Review of sd:9769: a hub fault after a delta review wrote its report replays the step. The report at
+        HEAD must not read as a fix with no commit: the held review's own arguments run, so it answers from its
+        record instead of a full review appending a second JSON object."""
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        head, earlier = "a" * 40, "b" * 40
+        prior = {**self.PRIOR, "status": "blocking", "scope": "branch", "subject": {"head": earlier}}
+        supervisor.out("prior").write_text(json.dumps(prior), encoding="utf-8")
+        supervisor.out("review").write_text(json.dumps(
+            {**prior, "status": "advisory", "subject": {"head": head}}), encoding="utf-8")
+        argv = [*supervisor.tools.review, "-C", str(supervisor.work), "--scope", "branch", "--json",
+                "--verify-report", str(supervisor.out("prior")), "--base", earlier]
+        supervisor.held = {"name": "review", "argv": argv, "exit": 0}
+        with mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
+                mock.patch.object(build_run, "_read", return_value=""):
+            planned, chosen = supervisor.review_plan(head)
+        self.assertEqual(planned, argv, "a replayed delta review dropped its verify arguments")
+        self.assertEqual(chosen["subject"]["head"], earlier)
+
     def test_a_skipped_last_round_is_no_prior_to_verify(self):
         """Review of sd:9769: `sd-review` refuses a `skipped` report as `--verify-report`; the next round
         reviews in full instead of parking on that refusal twice."""

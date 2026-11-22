@@ -1269,15 +1269,11 @@ class Supervisor:
         if refused:
             return self.blocked_round([{"path": "enqueue check", "line": "-", "summary": text} for text in refused])
         answer: dict | None = None
-        prior = self.prior_review(head)
-        # Pack sd:9769: round 1 reviews the whole branch; a later one verifies the last round's findings over
-        # the lines changed since its head.
-        verify = ["--verify-report", str(self.out("prior")), "--base", prior["subject"]["head"]] if prior else []
+        argv, prior = self.review_plan(head)
         for _attempt in range(2):
             out = self.out("review")
             self.empty(out, "review")
-            self.child([*self.tools.review, "-C", str(self.work), "--scope", "branch", "--json", *verify],
-                       cwd=self.work, name="review")
+            self.child(argv, cwd=self.work, name="review")
             answer = self.review_answer(out, head)
             if answer is not None:
                 break
@@ -1295,6 +1291,30 @@ class Supervisor:
             self.reviewed = head
             return "enqueuing"
         return self.blocked_round(answer["blockers"])
+
+    def review_plan(self, head: str) -> tuple[list[str], dict | None]:
+        """This round's `sd-review` argv and the prior report it verifies, if any.
+
+        Pack sd:9769: round 1 reviews the whole branch; a later one verifies the last round's findings over
+        the lines changed since its head.
+        """
+        held = self.held
+        if held is not None and held["name"] == "review":
+            # A replay after the review wrote its report: that report sits at `head` and would read as a fix
+            # with no commit. The held review's own arguments decide, so it answers from its record.
+            prior = self.kept_prior() if "--verify-report" in held["argv"] else None
+        else:
+            prior = self.prior_review(head)
+        verify = ["--verify-report", str(self.out("prior")), "--base", prior["subject"]["head"]] if prior else []
+        return [*self.tools.review, "-C", str(self.work), "--scope", "branch", "--json", *verify], prior
+
+    def kept_prior(self) -> dict | None:
+        """The prior report `prior_review` kept for this round's verification; None when it does not read."""
+        try:
+            answer = json.loads(self.out("prior").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return answer if isinstance(answer, dict) and isinstance((answer.get("subject") or {}).get("head"), str) else None
 
     def prior_review(self, head: str) -> dict | None:
         """The last round's review answer, kept as `prior`, when a fix round followed it; None for round 1.
