@@ -1061,9 +1061,8 @@ class Advisories(Repo):
         self.assertEqual(self.files(new), ["README", "a.txt"])
         self.assertNotIn(f"sd:{items[1]}", self.closes(new))
 
-    def test_a_second_drop_refuses_a_done_members_carried_commit(self):
-        """Build review: a done item reopened before enqueue would be closed by the carried commit, so a second
-        drop refuses a citation outside its bundle, done or not, as round 15 did."""
+    def four(self):
+        """Four items built on one branch, one commit each, ended blocked: (items, run)."""
         config = self.root / "config" / "sd-ai-command-pack" / "config.json"
         config.parent.mkdir(parents=True, exist_ok=True)
         config.write_text('{"config": {"sd": {"bundle_max": "4"}}}')
@@ -1075,14 +1074,28 @@ class Advisories(Repo):
         for index, item in enumerate(items):
             self.commit(work, f"{index}.txt", f"{index}\n", f"feat: {index}\n\nCloses: sd:{item}")
         self.end(run)
+        return items, run
+
+    def test_a_done_member_of_a_held_retry_stays_off_the_kept_branch(self):
+        """Build review round 6: Retry A, B and C of four, the split holds, B is done, drop C. Carried onto the
+        kept branch, B's `Closes:` would close B again if it reopened before enqueue."""
+        items, run = self.four()
+        lead = build.run(self.db, run["id"])["members"][0]["id"]
+        build.retry(self.db, lead, who="operator", only=items[:3])
+        self.end(self.claim(), f"{build.SPLIT}fixture")
+        self.assertEqual(build.split(self.db, lead), "held")
         self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[1],))
-        DROP.drop_item(self.db, build, items[3], who="operator")
-        again = self.claim()
-        self.assertEqual([member["item"] for member in build.run(self.db, again["id"])["members"]], [items[0], items[2]])
-        self.end(again)
-        with self.assertRaisesRegex(DROP.DropRefused, f"cites sd:{items[1]}, which this bundle did not build"):
-            DROP.drop_item(self.db, build, items[2], who="operator")
-        self.unmade(again)
+        new = self.drop(run, items[2])
+        self.assertEqual(self.files(new), ["0.txt", "README"])
+        self.assertNotIn(f"sd:{items[1]}", self.closes(new))
+
+    def test_a_done_member_stays_off_the_kept_branch(self):
+        """Class pass, build review round 6: every done member's commits stay aside, held split or not."""
+        items, run = self.four()
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[1],))
+        new = self.drop(run, items[3])
+        self.assertEqual(self.files(new), ["0.txt", "2.txt", "README"])
+        self.assertNotIn(f"sd:{items[1]}", self.closes(new))
 
     def test_dropping_a_done_lead_queues_the_kept_items_and_leaves_it_done(self):
         items, (lead, second, third), run = self.bundle()

@@ -784,18 +784,14 @@ def drop_plan(connection, item: int) -> dict:
                            f"{last['id']} ran on {ran_on or 'the hub'}, which holds their work; Retry it whole")
     # Every item the bundle built that is not kept, as Retry reads who leaves from the run's membership: a member
     # cancelled out before (`ALONE`, round 3) or moved to planning (`UNBUILT`, round 8). Its commits stay on the old
-    # branch, and the split must not carry them. A done member's commits may stay, unless it was cancelled out:
-    # one a held Retry left out could be reopened before enqueue, and its replayed `Closes:` would close it again
-    # (pack sd:9863 review).
-    rows = connection.execute("SELECT item, result FROM assignment WHERE (id = ? OR parent = ?) AND scope = ?",
-                              (lead, lead, SCOPE)).fetchall()
-    built = [one["item"] for one in rows]
-    states = reads.items_by_ids(connection, built)
-    gone = {one["item"] for one in rows if not _done(states, one["item"]) or (one["result"] or "").startswith(ALONE)}
+    # branch, and the split must not carry them. Nor a done member's: reopened before enqueue, its replayed
+    # `Closes:` would close it again (pack sd:9863 review).
+    built = [one["item"] for one in connection.execute(
+        "SELECT item FROM assignment WHERE (id = ? OR parent = ?) AND scope = ?", (lead, lead, SCOPE))]
     # The stored repo is a key (`~/...`); git needs the disk path, as `Supervisor` expands it (round 3).
     repo, work = paths.expand(last["repo"]), Path(last["work_path"])
     return {"item": item, "assignment": row["id"], "lead": lead, "kept": kept, "run": last["id"],
-            "aside": sorted(gone - {member["item"] for member in kept} | {item}), "built": sorted(set(built)),
+            "aside": sorted(set(built) - {member["item"] for member in kept} | {item}), "built": sorted(set(built)),
             "revision": current["revision"], "repo": str(repo), "work": str(work), "branch": last["branch"]}
 
 

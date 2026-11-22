@@ -87,8 +87,8 @@ def drop_sides(work: str | Path, start: str, tip: str, item: int, aside: set[int
     citing an item of `aside`, `item` and the members cancelled out of the bundle before, is not kept (round 3).
     A commit that cites no item refuses the drop: paths cannot say whose it is, since a follow-up of the dropped
     item may edit only a file a kept commit touched (round 6). So does one citing an item the bundle did not build
-    (`built`): replayed on the kept branch, its `Closes:` would close that item at merge (round 15). A done item
-    refuses too: reopened before the lane reads it, the replayed commit would close it (pack sd:9863 review)."""
+    (`built`): replayed on the kept branch, its `Closes:` would close that item at merge (round 15). A done member
+    is in `aside`: reopened before the lane reads it, a replayed commit would close it (pack sd:9863 review)."""
     shas = _out("rev-list", "--reverse", "--no-merges", f"{start}..{tip}", cwd=work).split()
     kept: list[str] = []
     dropped: list[str] = []
