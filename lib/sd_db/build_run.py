@@ -1563,7 +1563,9 @@ class Supervisor:
                                                 f"found this on code its fix did not change, so it is filed, not a "
                                                 f"blocker (pack sd:9769): {self.summary([row], None)}")
             if repository and rebut:  # no GitHub origin: `sd-review` reads no rebuttal there either
-                raw = {"path": self.locations(row)[0][0], "summary": row.get("summary"), "line": row.get("line")}
+                # Every instance too: the lane drops the rebuttal once any file the finding names changes.
+                raw = {"path": self.locations(row)[0][0], "summary": row.get("summary"), "line": row.get("line"),
+                       "instances": [str(entry) for entry in row.get("instances") or []]}
                 record_state(self.db, "checkpoint", key=f"ship-adjudication:build-run:{self.ident}:{filed}", body={
                     "decision": "accepted", "proposal": {
                         "bindings": {"repository": repository, "branch": self.row["branch"], "head": head},

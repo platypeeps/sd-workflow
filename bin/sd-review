@@ -781,9 +781,8 @@ def _bounded(value: Any, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 3].rstrip() + "..."
 
 
-def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any]]]:
-    """The receipt head and (path, summary, line, disposition, reason) of each finding an accepted adjudication
-    answered; a malformed one has none."""
+def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tuple[str, ...]]]]:
+    """The receipt head and (path, summary, line, disposition, reason, instance files) per accepted finding; malformed: none."""
     try:
         value = json.loads(body) if isinstance(body, (str, bytes)) else None
     except (ValueError, RecursionError):
@@ -792,7 +791,8 @@ def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any]]]:
     rows = proposal.get("findings") if isinstance(proposal, dict) else None
     bindings = proposal.get("bindings") if isinstance(proposal, dict) else None
     return (bindings.get("head") if isinstance(bindings, dict) else None), [
-        (raw.get("path"), raw.get("summary"), raw.get("line"), row.get("response_disposition"), row.get("reason"))
+        (raw.get("path"), raw.get("summary"), raw.get("line"), row.get("response_disposition"), row.get("reason"),
+         tuple(re.sub(r":\d+$", "", entry) for entry in raw.get("instances") or [] if isinstance(entry, str) and entry))
         for row in rows if isinstance(row, dict) and isinstance(raw := row.get("raw_finding"), dict)
     ] if isinstance(rows, list) else []
 
@@ -817,11 +817,11 @@ class Rebuttal(NamedTuple):
     place: str
     text: str
     reason: str
+    instances: tuple[str, ...] = ()  # each instance's file: a change to any lapses the rebuttal (sd:9769)
 
 
 def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: Mapping[str, str]) -> list[Rebuttal]:
     """This branch's rebutted findings, read-only (pack sd:9270): the prompt lists them and the gate matches them.
-
     A rebuttal counts only from a receipt whose head is the base or in base..head: a reused branch name inherits
     nothing from
     a merged or abandoned branch. No cutoff at the head's commit time: a retry at the same head must read the
@@ -884,16 +884,16 @@ def rebuttals(rows: Sequence[Sequence[Any]], on_branch: Callable[[str], bool],
     The lane's own blockers (`LANE_PATHS`) are never recorded: a later truncated review must still block."""
     records = [Rebuttal(head, path, summary_key(summary), line if type(line) is int else None, disposition == "rebutted",
                         _bounded(path or "?", 120), _bounded(summary, REBUTTED_SUMMARY_CHARS),
-                        _bounded(reason, REBUTTED_REASON_CHARS))
+                        _bounded(reason, REBUTTED_REASON_CHARS), instances)
                for body, *_rest in rows for head, found in [_adjudicated(body)]
                if isinstance(head, str) and on_branch(head)
-               for path, summary, line, disposition, reason in found
+               for path, summary, line, disposition, reason, instances in found
                if summary_key(summary) and str(path).strip() not in LANE_PATHS]
     shown = 0
     for index, record in enumerate(records):
         own = (record.listed and shown < REBUTTED_LINES and recorded_at(records, record.path, record.summary,
                                                                         record.line) is record
-               and unchanged(record.head, record.path))
+               and all(unchanged(record.head, path) for path in (record.path, *record.instances)))
         shown += own
         records[index] = record._replace(listed=own)
     return records

@@ -1552,6 +1552,19 @@ class Supervise(Case):
         _, kept = self.deferred(rows, {"src/caller.py": {12}}, {"go"})
         self.assertEqual(kept["blockers"], rows, "a blocker naming a short changed function was deferred")
 
+    def test_a_rebuttal_records_every_instance_of_the_finding(self):
+        """Review of sd:9769: the lane holds a rebuttal back once any file the finding names changes, so the
+        rebuttal carries each instance, not the primary path alone."""
+        self.press()
+        supervisor = self.supervisor()
+        self.db.execute("UPDATE repo SET remote = 'https://github.com/example/repo.git'")
+        row = {"path": "far.py", "line": 2, "summary": "a", "instances": ["far.py:2", "other.py:7"]}
+        supervisor.file_follow_up(row, "a" * 40)
+        body = self.db.execute("SELECT body FROM state WHERE key LIKE 'ship-adjudication:build-run:%'").fetchone()
+        self.assertIsNotNone(body, "no rebuttal was recorded")
+        raw = json.loads(body[0])["proposal"]["findings"][0]["raw_finding"]
+        self.assertEqual(raw.get("instances"), ["far.py:2", "other.py:7"], "the rebuttal dropped the instances")
+
     def test_branch_words_hold_the_changed_function_and_what_it_calls(self):
         """Lead ruling on sd:9769: the branch's changed functions, read whole, name the caller and its callee."""
         repo = Path(tempfile.mkdtemp(dir=self.root))

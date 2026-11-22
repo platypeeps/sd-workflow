@@ -71,7 +71,7 @@ class RepeatFixture(ReviewFixture):
         """One `sd-ship adjudicate` record: each (summary, disposition, reason) a blocking finding's answer,
         at the reviewed head unless `head` names another."""
         findings = [{"index": index, "finding_digest": "0" * 64, "response_disposition": answer, "reason": reason,
-                     "raw_finding": {"path": "bin/tool.py", "line": line, "severity": "high", "instances": ["src.py:1"], "summary": summary,
+                     "raw_finding": {"path": "bin/tool.py", "line": line, "severity": "high", "instances": [f"bin/tool.py:{line}"], "summary": summary,
                                      "family": "correctness", "disposition": "blocking"}}
                     for index, (summary, answer, reason) in enumerate(rows, 1)]
         bindings = {"repository": repository, "branch": branch, "head": head if head != "" else self.head}
@@ -437,6 +437,13 @@ class RebuttalIdentityTests(unittest.TestCase):
         section = sd_review.rebuttal_section(listed(*bodies))
         self.assertEqual(section.count("\n- "), sd_review.REBUTTED_LINES)
         self.assertNotIn(oldest, section)
+
+    def test_a_rebuttal_lapses_when_an_instance_file_changes(self) -> None:
+        """Review of sd:9769: a later commit can turn an instance, not the primary file, into the branch's own
+        regression; a rebuttal holds only while every file the finding names is unchanged."""
+        body = adjudicated(("bin/tool.py", "defect", "rebutted"))  # its instance: src.py:1
+        seen = sd_review.rebuttals([(body,)], {ON_BRANCH}.__contains__, lambda _head, path: path != "src.py")
+        self.assertEqual([entry.listed for entry in seen], [False], "a changed instance file kept the rebuttal")
 
     def test_the_lanes_own_blockers_are_never_rebutted(self) -> None:
         parsed = sd_review.oversized_findings()
