@@ -315,6 +315,41 @@ _CLOSES = re.compile(rf"^{re.escape(sd_lib.CLOSES_TRAILER)} sd:([0-9]+)[ \t]*$")
 _REVERTS = re.compile(r"^This reverts commit ([0-9a-f]{7,40})\b(?:, reversing\s+changes made to ([0-9a-f]{7,40}))?",
                       re.MULTILINE)
 
+#: A revert's subject: `git revert`'s `Revert "..."`, or a Conventional `revert:` (sd:8373).
+REVERT_SUBJECT = re.compile(r"^(?:Revert\b|revert(?:\([^)]*\))?!?:)", re.IGNORECASE)
+#: A list item, `- `, `* `, `+ `, `1. ` or `1) `, with what follows its marker (pack sd:9666).
+_BULLET = re.compile(r"^[ \t]*(?:[-*+]|[0-9]+[.)])[ \t]+(.*)$")
+#: An item a hand-written revert names an undone commit on: one that opens with a sha.
+_SHA_LED = re.compile(r"([0-9a-f]{7,40})\b")
+#: The line that opens a list of undone commits: its last sentence is exactly `Reverted commits:`,
+#: `Reverted:` or `Reverts:`. A substring match let `Commits not reverted:` undo its list (pack sd:9666).
+_REVERTED_INTRO = re.compile(r"(?:^|[.!?][ \t]+)(?:reverted(?:[ \t]+commits)?|reverts):[ \t]*$", re.IGNORECASE)
+
+
+def _listed_undone(message: str) -> list[str]:
+    """The shas a hand-written revert lists as undone (pack sd:9666).
+
+    A list item that opens with a sha, under a heading such as `Reverted
+    commits:`. A heading is a line that ends with a colon, bare, indented or
+    itself a list item, or any line at column zero that is no list item;
+    the nearest one above an item decides. An item under any other heading
+    (`Kept commits:`), or inside a fence or an HTML comment, names a commit
+    the revert did not undo.
+    """
+    quoted, intro, found = quoted_lines(message), "", []
+    for number, line in enumerate(message.split("\n"), start=1):
+        line = line.rstrip("\r")
+        if number in quoted or not line.strip():
+            continue
+        item = _BULLET.match(line)
+        text = (item[1] if item else line).strip()
+        if item and (sha := _SHA_LED.match(text)):
+            if _REVERTED_INTRO.search(intro):
+                found.append(sha[1])
+        elif text.endswith(":") or not (item or line[0].isspace()):  # an indented line continues an item
+            intro = text
+    return found
+
 
 def kept_commits(commits, parents=None) -> list:
     """`commits`, newest first, less each one a later commit of them reverts (sd:5999 lane review, rounds 2 and 3).
@@ -322,12 +357,20 @@ def kept_commits(commits, parents=None) -> list:
     A revert of a merge also undoes each commit the merge brought in over
     the mainline parent its message names, read from `parents` (sha to
     parent shas, the range's `git rev-list --parents`). A revert that is
-    itself reverted undoes nothing, so its target stays.
+    itself reverted undoes nothing, so its target stays. A hand-written
+    revert (`REVERT_SUBJECT`) also undoes each commit its list of reverted
+    commits names (`_listed_undone`): a split listed its commits by short
+    sha, and the squash closed the items they cited (pack sd:9666).
     """
     parents = parents or {}
 
     def full(prefix: str) -> str:
         return next((sha for sha, _ in commits if sha.startswith(prefix)), prefix)
+
+    def only(prefix: str) -> str | None:
+        """The one branch commit `prefix` names; None when it names none or several, as git refuses."""
+        named = [sha for sha, _ in commits if sha.startswith(prefix)]
+        return named[0] if len(named) == 1 else None
 
     def ancestors(start: str) -> set[str]:
         seen, todo = set(), [start]
@@ -345,6 +388,11 @@ def kept_commits(commits, parents=None) -> list:
             continue
         for target, mainline in _REVERTS.findall(message):
             undone |= ancestors(full(target)) - ancestors(full(mainline)) if mainline else {full(target)}
+        if REVERT_SUBJECT.match(message):
+            for target in filter(None, map(only, _listed_undone(message))):
+                # A listed merge undoes what it brought in over its first parent, as `git revert -m 1` would.
+                mainline = parents.get(target, ())[:1]
+                undone |= ancestors(target) - ancestors(mainline[0]) if mainline else {target}
         kept.append((sha, message))
     return kept
 
