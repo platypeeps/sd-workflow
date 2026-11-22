@@ -445,6 +445,13 @@ class RebuttalIdentityTests(unittest.TestCase):
         seen = sd_review.rebuttals([(body,)], {ON_BRANCH}.__contains__, lambda _head, path: path != "src.py")
         self.assertEqual([entry.listed for entry in seen], [False], "a changed instance file kept the rebuttal")
 
+    def test_a_finding_that_names_a_new_instance_file_is_not_the_rebutted_one(self) -> None:
+        """Review of sd:9769: a fix that spreads the defect to `new.py` keeps the primary place and summary;
+        the rebuttal named no `new.py`, so it is a new finding and blocks."""
+        body = adjudicated(("src.py", "defect", "rebutted"))  # its instance: src.py:1
+        self.assertEqual(gate([row(instances=["src.py:1", "new.py:4"])], body), ["blocking"])
+        self.assertEqual(gate([row(instances=["src.py:1"])], body), ["advisory"])
+
     def test_the_lanes_own_blockers_are_never_rebutted(self) -> None:
         parsed = sd_review.oversized_findings()
         body = adjudicated(*((finding["path"], finding["summary"], "rebutted") for finding in parsed.findings))

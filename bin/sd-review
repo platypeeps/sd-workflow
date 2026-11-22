@@ -868,10 +868,10 @@ def summary_key(summary: Any) -> str:
     return _folded(str(summary).replace(REPEAT_NOTE, "") if isinstance(summary, str) else summary)
 
 
-def recorded_at(records: Sequence[Rebuttal], path: Any, summary: Any, line: Any) -> Rebuttal | None:
-    """The newest recorded disposition at a finding's exact place: the same path, `summary_key` and line."""
-    place = (path, summary_key(summary), line if type(line) is int else None)
-    return next((record for record in records if (record.path, record.summary, record.line) == place), None)
+def recorded_at(records: Sequence[Rebuttal], path: Any, summary: Any, line: Any, instances: Any = ()) -> Rebuttal | None:
+    """The newest recorded disposition at a finding's exact place: the same path, `summary_key` and line, naming no instance file the record did not (sd:9769)."""
+    place, files = (path, summary_key(summary), line if type(line) is int else None), {re.sub(r":\d+$", "", entry) for entry in (instances if isinstance(instances, list) else []) if isinstance(entry, str) and entry}
+    return next((record for record in records if (record.path, record.summary, record.line) == place and all(file in (record.path, *record.instances) for file in files)), None)
 
 
 def rebuttals(rows: Sequence[Sequence[Any]], on_branch: Callable[[str], bool],
@@ -1772,7 +1772,7 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
         blocking = rank > 0 and rank >= threshold
         evidence = record.get("evidence")
         if (blocking and not (isinstance(evidence, str) and evidence.strip())
-                and getattr(recorded_at(rebutted, record.get("path"), record.get("summary"), record.get("line")), "listed", False)):
+                and getattr(recorded_at(rebutted, record.get("path"), record.get("summary"), record.get("line"), record.get("instances")), "listed", False)):
             blocking = False
             record["summary"] = f"{str(record.get('summary') or '').strip()} {REPEAT_NOTE}".strip()
         record["disposition"] = "blocking" if blocking else "advisory"
