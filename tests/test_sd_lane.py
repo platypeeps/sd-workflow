@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import unittest
+from collections.abc import Callable
 from typing import Any
 from unittest import mock
 
@@ -64,6 +65,7 @@ TERMED_RUNNER = """import json, os, pathlib, sys, time
 from unittest import mock
 sys.path.insert(0, {bin!r})
 import sd_lane, sd_lib
+sd_lane.TRAIN = 1  # the lane before trains (sd:9899), as `Lane` patches it
 repo, environ, marks = pathlib.Path(sys.argv[1]), json.loads(sys.argv[2]), pathlib.Path(sys.argv[3])
 CHILD = "import os, pathlib, sys, time; pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)"
 end_group = sd_lane.end_group
@@ -137,6 +139,8 @@ class Lane(unittest.TestCase):
     checks_item = False
     #: Whether enqueue runs prepare's docs lint (sd:5989); most suites queue trees the lint never sees.
     lints_docs = False
+    #: `sd_lane.TRAIN` for the suite: most suites test the lane one entry at a time.
+    train = 1
 
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -183,6 +187,10 @@ class Lane(unittest.TestCase):
             patcher = mock.patch.object(sd_lane, "check_docs", lambda *args: None)
             patcher.start()
             self.addCleanup(patcher.stop)
+        # A train of one is the lane before trains (sd:9899); the Train suite sets its own size.
+        patcher = mock.patch.object(sd_lane, "TRAIN", self.train)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         # And each runs as the hub would, which hosts every lane whose `repo.lane_host` is NULL (sd:3003).
         if importlib.util.find_spec("sd_db") is not None:
             patcher = mock.patch("sd_db.database.served_by", lambda target, home=None: None, create=True)
@@ -1201,7 +1209,7 @@ class Reorder(Lane):
         sd_lane.set_hold(self.repo, 2, self.environ, held=True)
         sd_lane.update(self.store(), lambda rows: rows[0].update(status="running"))
         followers: list[int] = []
-        with mock.patch.object(sd_lane, "predict", lambda entry, following: followers.append(following["item"]) or
+        with mock.patch.object(sd_lane, "predict", lambda entry, following, deadline: followers.append(following["item"]) or
                                {"skipped": "recorded"}):
             sd_lane.speculate(self.entries()[0], self.store(), lambda *a: {})
         self.assertEqual(followers, [3])
@@ -1612,6 +1620,457 @@ class Speculation(Trees):
         self.assertFalse(gate.is_alive())
         with self.assertRaises(ProcessLookupError):
             os.kill(int(marker.read_text()), 0)
+
+
+class Train(Trees):
+    """sd:9899: a train stacks up to `sd.lane_train` queued entries and gates the top on the landings below it.
+
+    The recorder's gate fails any tree that holds `red.txt`. Speculative gates share the recorder, so a
+    train gate is told by its thread.
+    """
+
+    train = 3
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.third = self.branch("third", {"three.txt": "3\n"})
+        self.trains: list[tuple[pathlib.Path, str, str]] = []
+        self.answer: dict = {}
+        self.hold_train = False
+        self.train_until_cancel = False
+        self.events.update({name: threading.Event() for name in ("prepare 2", "train done")})
+
+    def gate(self, root: pathlib.Path, head: str, base: str) -> dict:
+        if threading.current_thread().name.startswith("sd-lane-train-"):
+            self.trains.append((root, head, base))
+            self.seen["prepare 1 ran beside the train gate"] = self.events["landed"].wait(10)
+            if self.hold_train:  # the conflict repro: the train gate ends only once sd:2 prepares, or after 5 s
+                self.seen["sd:2 prepared beside sd:3's gate"] = self.events["prepare 2"].wait(5)
+                time.sleep(0.5)
+                self.events["train done"].set()
+            for _ in range(100) if self.train_until_cancel else ():  # a long gate: it runs until cancelled, or 5 s
+                if getattr(threading.current_thread(), "cancelled", False):
+                    break
+                time.sleep(0.05)
+        else:
+            self.gates.append((root, head, base))
+        red = "red.txt" in self.files(head)
+        return {"status": "failed" if red else "success", "summary": "sd-check", "receipt_revision": 1,
+                **self.answer}
+
+    def ship(self, argv: list[str], log: pathlib.Path) -> dict:
+        if (argv[2], argv[argv.index("--item") + 1]) == ("prepare", "1"):
+            self.events["landed"].set()
+        if (argv[2], argv[argv.index("--item") + 1]) == ("prepare", "2"):
+            self.events["prepare 2"].set()
+        if (argv[2], argv[argv.index("--item") + 1]) == ("prepare", "3"):
+            self.seen["train gate done before prepare 3"] = self.events["train done"].is_set()
+        return super().ship(argv, log)
+
+    def queue_three(self) -> None:
+        for item, tree in enumerate((self.first, self.second, self.third), start=1):
+            sd_lane.enqueue_entry(tree, item, f"fix: {item}", self.body, self.environ, manual=True, claim="deliver")
+
+    def files(self, head: str) -> set[str]:
+        return set(git(self.repo, "ls-tree", "--name-only", head).split())
+
+    def test_the_top_is_gated_on_the_landings_below_it_and_nothing_twice(self) -> None:
+        """Review of sd:9899: the gate binds the top as its prepare will, so its receipt is the gate's own."""
+        self.queue_three()
+        fork = git(self.repo, "rev-parse", "origin/main")
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        [(root, head, base)] = self.trains
+        self.assertEqual(root, self.third)
+        self.assertLessEqual({"one.txt", "two.txt", "three.txt", "base.txt"}, self.files(head))
+        self.assertEqual(git(self.repo, "rev-parse", f"{base}^^"), fork)
+        # sd:2 gets its speculative gate on sd:1's landing; sd:3 is gated once, by the train.
+        self.assertEqual([root for root, _, _ in self.gates], [self.second])
+        entries = self.entries()
+        self.assertEqual([entry["status"] for entry in entries], ["merged"] * 3)
+        self.assertEqual({key: entries[2]["train"][key] for key in ("status", "after", "receipt")},
+                         {"status": "success", "after": [entries[0]["id"], entries[1]["id"]], "receipt": "recorded"})
+        self.assertNotIn("train", entries[0])
+
+    def test_the_claimed_entry_prepares_beside_the_train_gate(self) -> None:
+        """Review of sd:9899: the train gate held the first prepare back for a whole gate, or the budget."""
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertTrue(self.seen["prepare 1 ran beside the train gate"])
+
+    def test_a_pass_whose_receipt_the_gate_withheld_leaves_none(self) -> None:
+        """Review of sd:9899: a cover replayed such a pass under a fresh binding and recorded it."""
+        self.answer = {"receipt_revision": None, "receipt_skipped": "moved during the run: tools"}
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertEqual(self.entries()[2]["train"]["receipt"], "moved during the run: tools")
+
+    def test_one_red_entry_of_three_lands_the_other_two_and_reports_the_red_one(self) -> None:
+        self.commit_files(self.second, {"red.txt": "r\n"}, "breaks the gate")
+        self.answers[(2, "prepare")] = {"ok": False, "workflow": {"blocker": {"code": "gate_failed",
+                                                                              "reason": "sd-check failed"}}}
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        entries = self.entries()
+        self.assertEqual([entry["status"] for entry in entries], ["merged", "failed", "merged"])
+        self.assertIn(2, [item for item, _, _ in self.notes])
+
+    def test_a_stack_conflict_requeues_only_the_conflicting_entry(self) -> None:
+        self.commit_files(self.second, {"one.txt": "not 1\n"}, "conflicts with first")
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        root, head, _ = self.trains[0]
+        self.assertEqual(root, self.third)
+        self.assertNotIn("two.txt", self.files(head))
+        entries = self.entries()
+        self.assertEqual(entries[1]["train"]["status"], "dropped")
+        self.assertIn("it conflicts with", entries[1]["train"]["reason"])
+
+    def test_a_dropped_entry_still_first_is_claimed_beside_the_top_gate(self) -> None:
+        """Lane round 3 of sd:9899: with sd:2 dropped, sd:1's settlement waited for sd:3's gate.
+
+        sd:3 is gated on sd:1 alone; sd:2 is the next claim, so the runner claims it at once.
+        """
+        self.commit_files(self.second, {"one.txt": "not 1\n"}, "conflicts with first")
+        self.hold_train = True
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertEqual(self.trains[0][0], self.third)
+        self.assertTrue(self.seen["sd:2 prepared beside sd:3's gate"])
+
+    def test_a_merge_outside_the_train_chain_cancels_its_gate(self) -> None:
+        """Review of sd:9899: sd:3 gated on sd:1 alone ran on after the dropped sd:2 merged.
+
+        sd:3 lands on sd:2 now, so that gate predicts a landing that will not happen.
+        """
+        self.commit_files(self.second, {"one.txt": "not 1\n"}, "conflicts with first")
+        self.train_until_cancel = True
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        top = self.entries()[2]["train"]
+        self.assertEqual(top["status"], "cancelled")
+        self.assertIn("sd:2 merged", top["reason"])
+
+    def test_an_unread_queue_after_a_merge_waits_for_no_gate(self) -> None:
+        """Lane prepare of sd:9899: a failed queue read waited for sd:3's gate with sd:2 still first.
+
+        Only a queue that names the gate's follower next proves the wait.
+        """
+        self.commit_files(self.second, {"one.txt": "not 1\n"}, "conflicts with first")
+        self.hold_train = True
+        self.queue_three()
+        with mock.patch.object(sd_lane, "queue_rows", lambda queue: None):
+            sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertTrue(self.seen["sd:2 prepared beside sd:3's gate"])
+
+    def test_a_dropped_entry_that_fails_leaves_the_top_its_gate(self) -> None:
+        """Lane round 3 of sd:9899: once sd:2 fails, sd:3's gate on sd:1 alone is the landing, so it is waited for."""
+        self.commit_files(self.second, {"one.txt": "not 1\n"}, "conflicts with first")
+        self.answers[(2, "prepare")] = {"ok": False, "workflow": {"blocker": {"code": "gate_failed",
+                                                                              "reason": "sd-check failed"}}}
+        self.hold_train = True
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertEqual([entry["status"] for entry in self.entries()], ["merged", "failed", "merged"])
+        self.assertTrue(self.seen["train gate done before prepare 3"])
+
+    def run_past_deadline(self, cross: Callable[[str, tuple], bool]) -> list[tuple]:
+        """Run the lane on a fake clock that passes the deadline at the first git call `cross` names."""
+        now = [sd_lane.clock()]
+        deadline = now[0] + 100
+        real, calls = sd_lane.scratch_git, []
+
+        def scratch(root: pathlib.Path, *argv: str) -> str | None:
+            calls.append(argv)
+            if now[0] < deadline and cross(threading.current_thread().name, argv):
+                now[0] = deadline + 1
+            return real(root, *argv)
+        self.queue_three()
+        with mock.patch.object(sd_lane, "clock", lambda: now[0]), mock.patch.object(sd_lane, "scratch_git", scratch):
+            sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate, deadline=deadline)
+        return calls
+
+    def setup_past_deadline(self, setup: Callable[[dict, float], Any], *, on_read: bool) -> list[tuple]:
+        """Run one setup on a fake clock that passes its deadline at the queue read, or else at the first fetch."""
+        self.queue_three()
+        [entry] = [row for row in self.entries() if row["item"] == 1]
+        now = [sd_lane.clock()]
+        deadline = now[0] + 100
+        real_git, real_read, calls = sd_lane.scratch_git, sd_lane.read_queue, []
+
+        def scratch(root: pathlib.Path, *argv: str) -> str | None:
+            calls.append(argv)
+            if not on_read and argv[0] == "fetch":
+                now[0] = max(now[0], deadline + 1)
+            return real_git(root, *argv)
+
+        def read(queue: Any) -> list[dict]:
+            rows = real_read(queue)
+            if on_read:
+                now[0] = deadline + 1
+            return rows
+        with mock.patch.object(sd_lane, "clock", lambda: now[0]), mock.patch.object(sd_lane, "scratch_git", scratch), \
+                mock.patch.object(sd_lane, "read_queue", read):
+            self.assertFalse(setup(entry, deadline))
+        return calls
+
+    def test_a_train_whose_queue_read_crosses_the_deadline_fetches_nothing(self) -> None:
+        """Review of sd:9899: the train started its fetch after the members' read crossed the deadline."""
+        calls = self.setup_past_deadline(
+            lambda entry, deadline: sd_lane.start_train(entry, self.store(), self.gate, self.environ, [], deadline),
+            on_read=True)
+        self.assertEqual(calls, [])
+
+    def test_a_speculation_whose_queue_read_crosses_the_deadline_predicts_nothing(self) -> None:
+        """Review of sd:9899: speculate started `predict` after a slow queue read crossed the deadline."""
+        calls = self.setup_past_deadline(
+            lambda entry, deadline: sd_lane.speculate(entry, self.store(), self.gate, [], deadline), on_read=True)
+        self.assertEqual(calls, [])
+
+    def test_a_prediction_that_crosses_the_deadline_starts_no_further_setup(self) -> None:
+        """Review of sd:9899: the next prediction, and the scratch worktree, started past the deadline."""
+        calls = self.setup_past_deadline(
+            lambda entry, deadline: sd_lane.speculate(entry, self.store(), self.gate, [], deadline), on_read=False)
+        self.assertEqual([argv[0] for argv in calls], ["fetch"])
+
+    def test_a_train_whose_fetch_crosses_the_deadline_starts_no_gate(self) -> None:
+        """Review of sd:9899: the train and the speculation started after the deadline, past the fetch."""
+        calls = self.run_past_deadline(lambda _, argv: argv[0] == "fetch")
+        self.assertEqual((self.trains, self.gates), ([], []))
+        self.assertNotIn("add", [argv[1] for argv in calls if argv[0] == "worktree"])
+        entries = self.entries()
+        self.assertEqual(entries[0]["status"], "merged")
+        self.assertEqual({entry["train"]["status"] for entry in entries}, {"skipped"})
+        self.assertIn("budget", entries[0]["train"]["reason"])
+
+    def git_after_crossing(self, step: tuple[str, ...]) -> list[tuple]:
+        """The scratch git calls after the first `step` call crossed the deadline, but the worktree's removal."""
+        calls = self.run_past_deadline(lambda _, argv: argv[:len(step)] == step)
+        first = next(index for index, argv in enumerate(calls) if argv[:len(step)] == step)
+        return [argv for argv in calls[first + 1:] if argv[:2] != ("worktree", "remove")]
+
+    def test_a_member_whose_checkout_crosses_the_deadline_runs_no_more_git(self) -> None:
+        """Review of sd:9899: past the deadline, stack still merged and committed the member it checked out."""
+        self.assertEqual(self.git_after_crossing(("checkout",)), [])
+        self.assertEqual(self.trains, [])
+        self.assertIn("budget", self.entries()[0]["train"]["reason"])
+
+    def test_a_speculation_whose_worktree_add_crosses_the_deadline_runs_no_more_git(self) -> None:
+        """Review of sd:9899: past the deadline, landings still checked out, merged and committed."""
+        with mock.patch.object(sd_lane, "TRAIN", 1):
+            self.assertEqual(self.git_after_crossing(("worktree", "add")), [])
+        self.assertEqual(self.gates, [])
+        self.assertIn("budget", self.entries()[1]["speculation"]["reason"])
+
+    def test_a_stack_that_crosses_the_deadline_stacks_no_further(self) -> None:
+        """Review of sd:9899: the stack merged every member after the deadline passed."""
+        calls = self.run_past_deadline(lambda _, argv: argv[0] == "merge")
+        self.assertEqual([argv for argv in calls if argv[0] == "merge"][1:], [])
+        self.assertEqual((self.trains, self.gates), ([], []))
+
+    def test_a_speculation_whose_fetch_crosses_the_deadline_starts_no_gate(self) -> None:
+        """Review of sd:9899: a speculation set up past the deadline still started its gate."""
+        fetches = []
+
+        def second_fetch(_: str, argv: tuple) -> bool:
+            fetches.append(argv[0] == "fetch")
+            return fetches.count(True) == 2
+        self.run_past_deadline(second_fetch)
+        self.assertEqual(len(self.trains), 1)
+        self.assertEqual(self.gates, [])
+        self.assertIn("budget", self.entries()[1]["speculation"]["reason"])
+
+    def launch_past_deadline(self) -> list[dict]:
+        """Run the lane on a fake clock that passes the deadline as the first gate thread starts, after its setup."""
+        now = [sd_lane.clock()]
+        deadline = now[0] + 100
+        start = sd_lane.SpeculativeGate.start
+
+        def late(thread: sd_lane.SpeculativeGate) -> None:
+            now[0] = max(now[0], deadline + 1)
+            start(thread)
+        self.queue_three()
+        with mock.patch.object(sd_lane, "clock", lambda: now[0]), \
+                mock.patch.object(sd_lane.SpeculativeGate, "start", late):
+            sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate, deadline=deadline)
+        self.assertEqual((self.trains, self.gates), ([], []))
+        return self.entries()
+
+    def test_a_train_launched_past_the_deadline_runs_no_gate(self) -> None:
+        """Review of sd:9899: a train set up in time but launched past the deadline still ran its gate."""
+        entries = self.launch_past_deadline()
+        self.assertEqual(entries[2]["train"]["status"], "skipped")
+        self.assertIn("budget", entries[2]["train"]["reason"])
+
+    def test_a_speculation_launched_past_the_deadline_runs_no_gate(self) -> None:
+        """Review of sd:9899: with no train, sd:2's gate set up in time but launched past the deadline ran."""
+        with mock.patch.object(sd_lane, "TRAIN", 1):
+            entries = self.launch_past_deadline()
+        self.assertEqual(entries[1]["speculation"]["status"], "skipped")
+        self.assertIn("budget", entries[1]["speculation"]["reason"])
+
+    def test_the_stack_is_built_before_the_train_thread_starts(self) -> None:
+        """Review of sd:9899: git work inside the thread ran on past a TERM or the deadline."""
+        built: list[str] = []
+        real = sd_lane.train_stack
+
+        def recorded(members: list[dict], deadline: float) -> dict:
+            built.append(threading.current_thread().name)
+            return real(members, deadline)
+        self.queue_three()
+        with mock.patch.object(sd_lane, "train_stack", recorded):
+            sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertEqual(len(built), 1)
+        self.assertFalse(built[0].startswith("sd-lane-train-"), built)
+
+    def test_a_train_cancelled_before_its_gate_starts_runs_no_gate(self) -> None:
+        self.queue_three()
+        [entry] = [row for row in self.entries() if row["item"] == 1]
+        train = sd_lane.start_train(entry, self.store(), self.gate, self.environ, [])
+        self.assertIsNotNone(train)
+        train.signal_gate(signal.SIGTERM)
+        train.start()
+        train.join(30)
+        self.assertEqual(self.trains, [])
+        self.assertEqual(self.entries()[2]["train"]["status"], "cancelled")
+        self.assertEqual(self.entries()[2]["train"]["items"], [1, 2, 3])
+
+    def test_a_train_waits_while_depth_gates_still_run(self) -> None:
+        """Review of sd:9899: each claim started a train past `DEPTH` gates already running."""
+        self.queue_three()
+        [entry] = [row for row in self.entries() if row["item"] == 1]
+        hold = threading.Event()
+        self.addCleanup(hold.set)
+        running = [sd_lane.SpeculativeGate(lambda: hold.wait(30), f"held-{n}", (f"other-{n}", "h")) for n in (1, 2)]
+        for held in running:
+            held.start()
+        with mock.patch.object(sd_lane, "train_stack", side_effect=AssertionError("stacked")):
+            self.assertIsNone(sd_lane.start_train(entry, self.store(), self.gate, self.environ, running))
+        self.assertEqual({row["train"]["status"] for row in self.entries()}, {"skipped"})
+        self.assertIn(f"{sd_lane.DEPTH} earlier", self.entries()[0]["train"]["reason"])
+
+    def test_a_train_of_one_gates_nothing_extra(self) -> None:
+        with mock.patch.object(sd_lane, "TRAIN", 1):
+            self.queue_three()
+            sd_lane.run_lane(self.repo, self.environ, super().ship, self.gate)
+        self.assertEqual(self.trains, [])
+        self.assertNotIn("train", self.entries()[0])
+
+    def test_lane_train_reads_the_machine_setting(self) -> None:
+        folder = self.tmp / ".config" / "sd-ai-command-pack"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / "config.json").write_text(json.dumps({"config": {"sd": {"lane_train": "2"}}}))
+        self.assertEqual(sd_lane.lane_train(self.environ), 2)
+        (folder / "config.json").write_text(json.dumps({"config": {"sd": {"lane_train": "0"}}}))
+        self.assertEqual(sd_lane.lane_train(self.environ), sd_lane.TRAIN)
+
+
+class SettleReordered(unittest.TestCase):
+    """Lane prepare of sd:9899 (note #71950): X and C move ahead of B while A runs; C is gated on A and B."""
+
+    def test_a_follower_moved_ahead_of_a_pending_prerequisite_is_waited_for_by_no_one(self) -> None:
+        rows = [{"id": "A", "item": 1, "status": "running"}, {"id": "X", "item": 4, "status": "pending"},
+                {"id": "C", "item": 3, "status": "pending"}, {"id": "B", "item": 2, "status": "pending"}]
+        gate: sd_lane.SpeculativeGate
+
+        def target() -> None:
+            while not gate.cancelled:
+                time.sleep(0.01)
+        gate = sd_lane.SpeculativeGate(target, "C on A and B", ("C", "h"), ("A", "B"))
+        gate.start()
+        self.addCleanup(gate.cancel_gate)
+        gates = [gate]
+        with mock.patch.object(sd_lane, "read_queue", lambda queue: rows):
+            rows[0]["status"] = "merged"
+            sd_lane.settle_gates(gates, {"id": "A", "item": 1}, {"status": "merged"}, sd_lane.clock() + 3, object())
+            rows[1]["status"] = "failed"
+            started = time.monotonic()
+            sd_lane.settle_gates(gates, {"id": "X", "item": 4}, {"status": "failed"}, sd_lane.clock() + 3, object())
+        self.assertLess(time.monotonic() - started, 1, "the failed X waited for C's gate with B still pending")
+        self.assertEqual(gates, [])
+        self.assertTrue(gate.cancelled)
+        self.assertIn("sd:2", gate.why)
+
+
+class SettlePrerequisite(unittest.TestCase):
+    """Lane prepare of sd:9899 (note #72581): C is gated on A and B; A merges, then B is in each state, X fails.
+
+    Settlement may wait for C's gate only once every entry it predicted
+    landed, in its order; a prerequisite that cannot land first ends it.
+    """
+
+    def gate_on(self, chain: tuple[str, ...]) -> sd_lane.SpeculativeGate:
+        gate: sd_lane.SpeculativeGate
+
+        def target() -> None:
+            while not gate.cancelled:
+                time.sleep(0.01)
+        gate = sd_lane.SpeculativeGate(target, "C on its chain", ("C", "h"), chain)
+        gate.start()
+        self.addCleanup(gate.cancel_gate)
+        return gate
+
+    def settle(self, gates: list, rows: list[dict], entry: dict, status: str) -> float:
+        started = time.monotonic()
+        with mock.patch.object(sd_lane, "read_queue", lambda queue: rows):
+            sd_lane.settle_gates(gates, entry, {"status": status}, sd_lane.clock() + 3, object())
+        return time.monotonic() - started
+
+    def after_x_fails(self, b: dict | None) -> tuple[list, sd_lane.SpeculativeGate, float]:
+        rows = [{"id": "A", "item": 1, "status": "merged"}, {"id": "X", "item": 4, "status": "pending"},
+                *([b] if b is not None else []), {"id": "C", "item": 3, "status": "pending"}]
+        gate = self.gate_on(("A", "B"))
+        gates = [gate]
+        self.settle(gates, rows, {"id": "A", "item": 1}, "merged")
+        rows[1]["status"] = "failed"
+        return gates, gate, self.settle(gates, rows, {"id": "X", "item": 4}, "failed")
+
+    def test_a_prerequisite_that_cannot_land_first_ends_the_gate_unwaited(self) -> None:
+        for name, b in [("held", {"status": "pending", "held": True}), ("cancelled", {"status": "cancelled"}),
+                        ("failed", {"status": "failed"}), ("skipped", {"status": "skipped"}),
+                        ("prepared", {"status": "prepared"}), ("merged elsewhere", {"status": "merged"}),
+                        ("removed", None)]:
+            with self.subTest(name):
+                gates, gate, waited = self.after_x_fails(None if b is None else {"id": "B", "item": 2, **b})
+                self.assertLess(waited, 1, f"{name}: X's settlement waited for C's gate")
+                self.assertEqual(gates, [], f"{name}: C's gate was kept")
+                self.assertTrue(gate.cancelled)
+                self.assertIn("(B)" if b is None else "sd:2", gate.why)
+
+    def test_a_running_prerequisite_keeps_the_gate_unwaited(self) -> None:
+        gates, gate, waited = self.after_x_fails({"id": "B", "item": 2, "status": "running"})
+        self.assertLess(waited, 1, "X's settlement waited for C's gate with B still running")
+        self.assertEqual(gates, [gate])
+        self.assertFalse(gate.cancelled)
+
+    def test_a_pending_prerequisite_ahead_keeps_the_gate_unwaited(self) -> None:
+        gates, gate, waited = self.after_x_fails({"id": "B", "item": 2, "status": "pending"})
+        self.assertLess(waited, 1)
+        self.assertEqual(gates, [gate])
+        self.assertFalse(gate.cancelled)
+
+    def test_a_prerequisite_merged_out_of_order_ends_the_gate(self) -> None:
+        rows = [{"id": "B", "item": 2, "status": "merged"}, {"id": "C", "item": 3, "status": "pending"},
+                {"id": "A", "item": 1, "status": "pending", "held": True}]
+        gate = self.gate_on(("A", "B"))
+        gates = [gate]
+        waited = self.settle(gates, rows, {"id": "B", "item": 2}, "merged")
+        self.assertLess(waited, 1, "B's settlement waited for C's gate with A not landed")
+        self.assertEqual(gates, [])
+        self.assertTrue(gate.cancelled)
+
+    def test_every_prerequisite_landed_in_order_is_waited_for(self) -> None:
+        rows = [{"id": "A", "item": 1, "status": "merged"}, {"id": "B", "item": 2, "status": "pending"},
+                {"id": "C", "item": 3, "status": "pending"}]
+        gate = sd_lane.SpeculativeGate(lambda: None, "C on A and B", ("C", "h"), ("A", "B"))
+        joined: list[float] = []
+        gate.join = lambda timeout=None: joined.append(timeout)  # type: ignore[method-assign]
+        gates = [gate]
+        self.settle(gates, rows, {"id": "A", "item": 1}, "merged")
+        self.assertEqual(joined, [])
+        rows[1]["status"] = "merged"
+        self.settle(gates, rows, {"id": "B", "item": 2}, "merged")
+        self.assertEqual(len(joined), 1)
+        self.assertEqual(gates, [gate])
 
 
 class DepthTwo(Trees):
