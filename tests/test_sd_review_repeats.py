@@ -451,6 +451,8 @@ class RebuttalIdentityTests(unittest.TestCase):
         body = adjudicated(("src.py", "defect", "rebutted"))  # its instance: src.py:1
         self.assertEqual(gate([row(instances=["src.py:1", "new.py:4"])], body), ["blocking"])
         self.assertEqual(gate([row(instances=["src.py:1"])], body), ["advisory"])
+        # Review of sd:9769: a new occurrence in a file the rebuttal named is still not adjudicated.
+        self.assertEqual(gate([row(instances=["src.py:1", "src.py:60"])], body), ["blocking"])
 
     def test_the_lanes_own_blockers_are_never_rebutted(self) -> None:
         parsed = sd_review.oversized_findings()

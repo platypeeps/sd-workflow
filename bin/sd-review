@@ -782,7 +782,7 @@ def _bounded(value: Any, limit: int) -> str:
 
 
 def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tuple[str, ...]]]]:
-    """The receipt head and (path, summary, line, disposition, reason, instance files) per accepted finding; malformed: none."""
+    """The receipt head and (path, summary, line, disposition, reason, `path:line` instances) per accepted finding; malformed: none."""
     try:
         value = json.loads(body) if isinstance(body, (str, bytes)) else None
     except (ValueError, RecursionError):
@@ -792,7 +792,7 @@ def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tu
     bindings = proposal.get("bindings") if isinstance(proposal, dict) else None
     return (bindings.get("head") if isinstance(bindings, dict) else None), [
         (raw.get("path"), raw.get("summary"), raw.get("line"), row.get("response_disposition"), row.get("reason"),
-         tuple(re.sub(r":\d+$", "", entry) for entry in raw.get("instances") or [] if isinstance(entry, str) and entry))
+         tuple(entry.strip() for entry in (raw["instances"] if isinstance(raw.get("instances"), list) else []) if isinstance(entry, str) and entry.strip()))
         for row in rows if isinstance(row, dict) and isinstance(raw := row.get("raw_finding"), dict)
     ] if isinstance(rows, list) else []
 
@@ -817,7 +817,7 @@ class Rebuttal(NamedTuple):
     place: str
     text: str
     reason: str
-    instances: tuple[str, ...] = ()  # each instance's file: a change to any lapses the rebuttal (sd:9769)
+    instances: tuple[str, ...] = ()  # each `path:line` it answered; a change to any one's file lapses it (sd:9769)
 
 
 def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: Mapping[str, str]) -> list[Rebuttal]:
@@ -869,9 +869,9 @@ def summary_key(summary: Any) -> str:
 
 
 def recorded_at(records: Sequence[Rebuttal], path: Any, summary: Any, line: Any, instances: Any = ()) -> Rebuttal | None:
-    """The newest recorded disposition at a finding's exact place: the same path, `summary_key` and line, naming no instance file the record did not (sd:9769)."""
-    place, files = (path, summary_key(summary), line if type(line) is int else None), {re.sub(r":\d+$", "", entry) for entry in (instances if isinstance(instances, list) else []) if isinstance(entry, str) and entry}
-    return next((record for record in records if (record.path, record.summary, record.line) == place and all(file in (record.path, *record.instances) for file in files)), None)
+    """The newest recorded disposition at a finding's exact place: the same path, `summary_key` and line, naming no `path:line` instance the record did not (sd:9769)."""
+    place, named = (path, summary_key(summary), line if type(line) is int else None), {entry.strip() for entry in (instances if isinstance(instances, list) else []) if isinstance(entry, str) and entry.strip()}
+    return next((record for record in records if (record.path, record.summary, record.line) == place and all(entry in (record.path if record.line is None else f"{record.path}:{record.line}", *record.instances) for entry in named)), None)
 
 
 def rebuttals(rows: Sequence[Sequence[Any]], on_branch: Callable[[str], bool],
@@ -893,7 +893,7 @@ def rebuttals(rows: Sequence[Sequence[Any]], on_branch: Callable[[str], bool],
     for index, record in enumerate(records):
         own = (record.listed and shown < REBUTTED_LINES and recorded_at(records, record.path, record.summary,
                                                                         record.line) is record
-               and all(unchanged(record.head, path) for path in (record.path, *record.instances)))
+               and all(unchanged(record.head, path) for path in (record.path, *(re.sub(r":\d+$", "", entry) for entry in record.instances))))
         shown += own
         records[index] = record._replace(listed=own)
     return records
