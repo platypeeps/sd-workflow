@@ -1417,14 +1417,21 @@ class Supervisor:
             # A last round short of a reader, or one that read patches only (no `covers_from`), proves no
             # finding absent: hold every blocker.
             changed = None
-        # ponytail: location, not causation: a defect a new caller causes in unchanged code is filed, not held.
+        # ponytail: location, not causation: a defect a new caller causes in unchanged code is filed, not held,
+        # unless the finding's own words name a changed file (pack sd:9900 tracks the rest).
+        # A changed path or its file name; a name shared with an unchanged file holds more, never less.
+        names = {name for path in changed or () for name in (path, os.path.basename(path)) if name}
 
         def held(row: dict) -> bool:
             # `<...>` names no file; an absolute or `..` path is outside the checkout no delta of it can clear.
             # A file the branch changes holds at every line: a cited line can be off by a few, and a change can
             # break unchanged code in a file it touches.
-            return changed is None or any(path.startswith(("<", "/", "../")) or path == ".." or path in named
-                                          or path in changed for path, _line in self.locations(row))
+            if changed is None or any(path.startswith(("<", "/", "../")) or path == ".." or path in named
+                                      or path in changed for path, _line in self.locations(row)):
+                return True
+            # A finding cited at unchanged code that names a changed file (a new caller) is the branch's own.
+            words = " ".join(str(value) for key, value in row.items() if key not in ("path", "line", "instances"))
+            return any(re.search(rf"(?<![\w./-]){re.escape(name)}(?![\w-])", words) for name in names)
         new = [row for row in answer["blockers"] if not held(row)]
         for index, row in enumerate(new):
             self.once(f"followup:{head}:{index}", functools.partial(self.file_follow_up, row, head))

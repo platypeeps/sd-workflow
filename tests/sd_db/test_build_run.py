@@ -1376,6 +1376,20 @@ class Supervise(Case):
         _, kept = self.deferred(rows, {"src.py": {5, 6}})
         self.assertEqual(kept["blockers"], rows, "a blocker in a changed file was deferred")
 
+    def test_a_blocker_at_an_unchanged_callee_naming_a_changed_caller_still_blocks(self):
+        """Class pass, sd:9769 (deferral by location, not causation): a reviewer that cites an unchanged callee
+        but names the changed caller in its own words ties the defect to the branch, so it holds."""
+        self.press()
+        rows = [{"path": "lib/helper.py", "line": 3, "summary": "src/caller.py now passes None to parse()"},
+                {"path": "lib/helper.py", "line": 7, "summary": "the new call in caller.py breaks this contract"},
+                {"path": "lib/helper.py", "line": 9, "summary": "the branch's change breaks this",
+                 "message": "src/caller.py:12 drops the default"}]
+        _, kept = self.deferred(rows, {"src/caller.py": {12}})
+        self.assertEqual(kept["blockers"], rows, "a blocker naming a changed caller was deferred")
+        far = {"path": "lib/helper.py", "line": 3, "summary": "an old defect in parse()"}
+        _, kept = self.deferred([far], {"src/caller.py": {12}})
+        self.assertEqual(kept["blockers"], [], "a blocker naming no changed file was held")
+
     def test_a_blocker_outside_the_checkout_still_blocks(self):
         """Class pass, sd:9769: no delta of this checkout can show a path outside it unchanged."""
         self.press()
