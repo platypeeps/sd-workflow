@@ -2124,6 +2124,21 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         # Re-review of sd:9425: the entry's own actions, its Details among them, stay with it.
         self.assertIn(f'data-acts="entry:{self.checkout}:{made}"', row(made))
 
+    def test_a_parked_items_failed_entry_opens_its_lane_entry_details_from_the_parked_row(self):
+        """sd:9657: a click on the Parked row selects the task, and the entry's menu holds no command that opens
+        Lane entry Details, so the parked row keeps a Details button that selects the entry."""
+        made, answers = self.parked_answers(self.checkout)
+        self.list(self.entries() + [{"item": made, "title": "Set aside", "status": "failed", "step": "prepare",
+                                     "reason": "gate failed", "finished_at": NOW}])
+        entry = f"entry:{self.checkout}:{made}"
+        out = self.run_view(self.TILE + " open('system'); tile('system', 'parked'); R.tiled = ELS.queue.html;"
+                            " act('button[data-entry]', { entry: " + json.dumps(entry) + " });"
+                            " R.details = ELS.details.html; R.row = location.search;", answers=answers, search="")
+        row = out["R"]["tiled"].split(f'data-type="parked" data-item="{made}"')[1].split("</tr>")[0]
+        self.assertIn(f'data-entry="{entry}"', row)
+        self.assertIn("Lane entry · blocked", out["R"]["details"])
+        self.assertIn(f"#{made} Set aside", out["R"]["details"])
+
     def test_a_repo_whose_only_rows_are_parked_still_shows_its_parked_box(self):
         """Review of sd:9247: a repo with nothing but parked tasks drew no row, so its box was unreachable."""
         solo = self.checkout.parent / "solo"
@@ -2976,6 +2991,40 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertEqual([p[:2] for p in out["posts"]], [["/api/queue/builds/retry", {"assignment": 832, "revision": "c" * 64,
                                                                                       "finding": finding, "run": "r9"}]])
         self.assertIn("system: sd:14 sent to its builder with the lane's finding", out["R"]["said"])
+
+    FIXED = {"allowed": True, "reason": "", "assignment": 832, "revision": "c" * 64, "run": "r9"}
+
+    def fix_press(self, fix, answer, item=14, ask=True):
+        """pack sd:9705: press Fix on item `item`; R.busy is the row while the post runs, R.row the row after."""
+        doc = self.fix_doc(fix)
+        yes = "{ yes: true, values: { finding: a.fields[0].value } }" if ask else "{ yes: false }"
+        row = (r'const ROW = () => { const m = ELS.queue.html.match(/<tr class="child"[^>]*data-id="entry:[^"]*:14"'
+               r'[^>]*>([\s\S]*?)<\/tr>/); return m ? m[1] : null; };')
+        return self.run_view(f"{row} window.shell.ask = a => Promise.resolve({yes});"
+                             " const P0 = window.shell.post; window.shell.post = (p, b) => { R.busy = ROW(); return P0(p, b); };"
+                             f"open('system'); act('button[data-act]', {{ repo: {json.dumps(str(self.checkout))}, item: '{item}', act: 'fix' }});"
+                             " await flush(); await flush(); await flush(); R.row = ROW(); R.said = ELS['queue-said'].textContent;",
+                             answers={"/api/queue": [200, doc], "/api/queue/builds/retry": answer})
+
+    def test_fix_shows_busy_then_sent_on_the_row_itself(self):
+        out = self.fix_press(self.FIXED, [200, {"run": "r9", "queued": [{"id": 832, "item": 14, "status": "queued"}]}])
+        self.assertIn("sending to its builder", out["R"]["busy"])
+        self.assertRegex(out["R"]["busy"], r'data-act="fix"[^>]* disabled')
+        self.assertIn("sent to builder; build #832 queued", out["R"]["row"])
+
+    def test_fix_refused_says_why_on_the_row(self):
+        out = self.fix_press(self.FIXED, [409, {"error": "Fix refused: build run r9 is not the latest run"}])
+        self.assertIn("not sent: Fix refused: build run r9 is not the latest run", out["R"]["row"])
+
+    def test_fix_not_allowed_says_why_on_the_row(self):
+        out = self.fix_press({**self.FIXED, "allowed": False, "reason": "its build run still runs"}, None, ask=False)
+        self.assertEqual(out["posts"], [])
+        self.assertIn("not sent: its build run still runs", out["R"]["row"])
+
+    def test_fix_on_a_row_no_longer_blocked_says_why(self):
+        out = self.fix_press(self.FIXED, None, item=99, ask=False)
+        self.assertEqual(out["posts"], [])
+        self.assertIn("sd:99 is not blocked in this read; nothing sent. Read again.", out["R"]["said"])
 
     def test_fix_on_a_merge_failure_sends_the_merge_log(self):
         """pack sd:8601: the finding names the log of the step that failed, never a prepare log that passed."""

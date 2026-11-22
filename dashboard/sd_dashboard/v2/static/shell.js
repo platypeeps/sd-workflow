@@ -65,7 +65,8 @@
     ['Now',       [['Today', 'sunrise', 't'], ['Decide', 'list-checks', 'l'], ['Briefs', 'inbox', 'i']]],
     ['Work',      [['Tasks', 'list-todo', 'k'], ['GitHub', 'git-branch', 'b'], ['Issues', 'circle-dot', 'u'], ['Writing', 'pen-line', 'w'], ['Research', 'flask-conical', 'r'], ['Contributions', 'git-pull-request', 'c']]],
     ['Knowledge', [['Documents', 'file-text', 'd'], ['Notes', 'notebook-pen', 'n'], ['Watches', 'eye', 'y'], ['Studio', 'mic', 'z']]],
-    ['Places',    [['HOA', 'droplets', 'h'], ['Home', 'house', 'o']]],
+    // Operator 2026-11-20: realm places first (places:start below), then Home; HOA last.
+    ['Places',    [['Home', 'house', 'o'], ['HOA', 'droplets', 'h']]],
     ['Fleet',     [['Skills', 'sparkles', 's'], ['Metrics', 'chart-no-axes-column', 'm'], ['Management', 'settings', 'g'], ['Health', 'heart-pulse', 'e'], ['Activity', 'activity', 'a'], ['Reports', 'clipboard-list', 'p'], ['Designs', 'palette', 'x'], ['Settings', 'sun-moon', 'v']]],
   ];
   // build: a page that is built sets window.SHELL_PAGES; a section missing from it shows as not built yet.
@@ -76,10 +77,11 @@
   // sd:5663: a realm with a report family of its own id is a place (SHELL_REALMS place, the family's icon, from
   // /ui/sections.js). It joins Places with no g key, at /places?realm=<id>. A label a section holds, or one with a quote or a
   // backslash (the rail finds an entry by [data-section="<label>"]), is left out.
+  let placeAt = 0;
   for (const r of window.SHELL_REALMS || []) {
     if (!r.place || !/^[a-z0-9][a-z0-9-]*$/.test(r.id) || !/^[a-z0-9-]+$/.test(r.place) || PAGES[r.label] || /["\\]/.test(r.label)) continue;
     PAGES[r.label] = `/places?realm=${r.id}`;
-    GROUPS.find(([g]) => g === 'Places')[1].push([r.label, r.place, '']);
+    GROUPS.find(([g]) => g === 'Places')[1].splice(placeAt++, 0, [r.label, r.place, '']);
   }
   // places:end
   const hrefOf = name => PAGES[name] || CLASSIC[name];
@@ -1923,7 +1925,17 @@
   const usd = n => `$${Number(n).toFixed(2)}`;
   const zoned = iso => new Date(iso).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
   const pace = p => p === null || p === undefined ? '' : Math.abs(p) < 3 ? ' · on pace' : ` · ${Math.abs(p)} pts ${p > 0 ? 'over' : 'under'} pace`;
-  const money = (m, what) => m ? html`<span class="w">${what} <b>${m.unit === 'USD' || !m.unit ? usd(m.amount) : `${m.amount} ${m.unit}`}</b>${m.period ? ` ${m.period}` : ''}</span>` : '';
+  // Pack sd:9702: a spend with a cap draws a window's bar, caution at 80 % and warning at 100 %, and its cycle end as
+  // the days left to it, counted in this zone's calendar days.
+  const days = iso => { const a = new Date(Date.now()), b = new Date(iso); return Math.round((Date.UTC(b.getFullYear(), b.getMonth(), b.getDate()) - Date.UTC(a.getFullYear(), a.getMonth(), a.getDate())) / 864e5); };
+  const left = iso => { const n = iso ? days(iso) : -1; return n < 0 ? '' : ` · ${n} day${n === 1 ? '' : 's'} left`; };
+  const money = (m, what) => {
+    if (!m) return '';
+    const fmt = n => m.unit === 'USD' || !m.unit ? usd(n) : `${n} ${m.unit}`;
+    if (!m.limit) return html`<span class="w">${what} <b>${fmt(m.amount)}</b>${m.period && !m.resets_at ? ` ${m.period}` : ''}${left(m.resets_at)}</span>`;
+    const used = m.amount / m.limit * 100;
+    return html`<span class="w"><span class="wl">${what}</span><svg class="track" viewBox="0 0 100 1" preserveAspectRatio="none" role="img" aria-label="${`${what} ${Math.round(used)}% of the cap`}"><rect class="fill${used >= 100 ? ' warning' : used >= 80 ? ' caution' : ''}" width="${Math.min(100, used)}" height="1"/></svg><b>${fmt(m.amount)}</b> of ${fmt(m.limit)}${left(m.resets_at)}</span>`;
+  };
   function usageRow(r) {
     const f = r.service;
     const flag = f && f.state !== 'ok' ? html`<a class="flag" href="${f.url && f.state !== 'unknown' ? f.url : '/fleet-health#view=status'}"${f.url && f.state !== 'unknown' ? html` target="_blank" rel="noopener noreferrer"` : ''}><span class="g-${f.state}" aria-hidden="true">${UGLYPH[f.state]}</span> ${f.name} ${f.status}${f.title ? `: ${f.title}` : ''}</a>` : '';

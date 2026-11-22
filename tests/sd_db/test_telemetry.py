@@ -98,6 +98,7 @@ class Spans(Case):
             "ended at step building: permission denied: Bash": "denied_tool",
             "3 review rounds left blockers: a.py:1 merge conflict handling": "review_blockers",
             "the review gave no answer twice at d67de91c0b40": "review_no_answer",
+            "the review stayed rate_limited after 4 waits of 900 s at d67de91c0b40": "review_no_answer",
             "the repository gate failed after the review cleared": "gate_failed",
             "the builder left no commit on build/sd-1": "no_commit",
             "gh: Server Error (HTTP 502)": "other",

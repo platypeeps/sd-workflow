@@ -96,21 +96,165 @@ def _item(connection, item: int, *, delivery=False) -> dict:
     return result
 
 
-def _eligible_after(connection, assignment: dict) -> bool:
-    predecessor = assignment["after"]
-    if predecessor is None:
-        return True
-    row = connection.execute("SELECT status, item FROM assignment WHERE id = ?", (predecessor,)).fetchone()
-    if row is None:
-        raise RunnerRefused(f"missing predecessor {predecessor}")
-    if row["status"] in {"blocked", "cancelled"}:
-        connection.execute("UPDATE assignment SET status = 'blocked', result = ?, ended = ? WHERE id = ?",
-                           (f"predecessor {predecessor} ended {row['status']}", now(), assignment["id"]))
-        return False
-    # A successful provider exit is completion; only a verified merge is delivery.
+def _merged(connection, row) -> bool:
+    """Whether the run `row` is delivered: done, with its item's merge done. A successful provider exit
+    is completion; only a verified merge is delivery."""
     return row["status"] == "done" and connection.execute(
         "SELECT 1 FROM assignment WHERE item = ? AND role = 'merge' AND status = 'done' AND phase = 'merged'",
         (row["item"],)).fetchone() is not None
+
+
+def _chain(connection, row, rows: dict | None = None):
+    """The runs `row` waits on up its `after` chain, as (run, prerequisite) pairs: each run of its own
+    batch ahead of it (batch order), then the first run outside its batch, its explicit prerequisite,
+    where the chain ends. A run ahead in the batch may have passed the ones before it (`_waits`), so the
+    walk goes past one that is not queued; the prerequisite's own chain is its own, and it holds the
+    prerequisite, not `row` (review of build/sd-1306). A row saved before `batch` reads NULL: its
+    `after` is a prerequisite. A missing run refuses a claim (`rows` None) and ends the graph's walk."""
+    current, predecessor = row, row["after"]
+    while predecessor is not None:
+        ahead = (rows or {}).get(predecessor) or connection.execute(
+            "SELECT * FROM assignment WHERE id = ?", (predecessor,)).fetchone()
+        if ahead is None:
+            if rows is None:
+                raise RunnerRefused(f"missing predecessor {predecessor}")
+            return
+        prerequisite = current["batch"] is None or current["batch"] != ahead["batch"]
+        yield ahead, prerequisite
+        if prerequisite:
+            return
+        current, predecessor = ahead, ahead["after"]
+
+
+def _predecessor_ended(connection, assignment: dict) -> bool:
+    """Block `assignment` when a run up its chain (`_chain`) ended blocked or cancelled."""
+    for row, _ in _chain(connection, assignment):
+        if row["status"] in {"blocked", "cancelled"}:
+            connection.execute("UPDATE assignment SET status = 'blocked', result = ?, ended = ? WHERE id = ?",
+                               (f"predecessor {row['id']} ended {row['status']}", now(), assignment["id"]))
+            return True
+    return False
+
+
+def _reaches(graph: dict[int, set[int]], start: int, goal: int) -> bool:
+    seen, pending = set(), [start]
+    while pending:
+        node = pending.pop()
+        if node == goal:
+            return True
+        if node not in seen:
+            seen.add(node)
+            pending.extend(graph.get(node, ()))
+    return False
+
+
+def _waits(connection) -> dict[int, set[int]]:
+    """The queue as a graph: each queued run and the unfinished runs it waits on."""
+    return _graph(connection)[0]
+
+
+def _graph(connection) -> tuple[dict[int, set[int]], list[tuple[int, int]]]:
+    """The queue as a graph: each queued run and the unfinished runs it waits on (third lane blocker of
+    pack sd:9570), and the explicit prerequisites a wait contradicts. Pairwise yields missed cycles
+    through several batches, so the graph is built whole.
+
+    A dependency edge, kept always: an author run waits on each queued run of an open item its item
+    waits on, directly or through other open items; the workflow refuses an item cycle, so these alone
+    make none. A prerequisite edge, kept always: a run waits on the first run up its chain outside its
+    batch (`assignment.batch`), its batch's explicit `after`; a row saved before `batch` has none,
+    so its `after` is one, even of the same role (`enqueue` now refuses that). One that closes a
+    cycle is not added but returned as a (run, prerequisite) pair: a wait contradicts it, and only a
+    refusal or an ended run settles that, never a pass (lane review 7379bf9a). An order edge, kept
+    unless it closes a cycle: a serial run waits on each run of its batch up its chain that is not
+    merged, up to its prerequisite (`_chain`); then a parallel author run waits on each earlier queued serial or non-author run
+    in its repository that has no order edge left. An order edge that closes a cycle is dropped, so
+    the run it held passes: the graph stays acyclic, and an acyclic graph always has a run that waits
+    on none, so every queue drains once each contradicted prerequisite is settled."""
+
+    from .workflow import item_blocked_by
+
+    rows = {row["id"]: dict(row) for row in connection.execute(
+        "SELECT assignment.*, item.repo FROM assignment LEFT JOIN item ON item.id = assignment.item "
+        "WHERE assignment.status = 'queued' ORDER BY assignment.id")}
+    graph: dict[int, set[int]] = {ident: set() for ident in rows}
+    by_item: dict[int, list[int]] = {}
+    # A run that waits on an open item with no queued run waits outside the queue, for as long as that item
+    # stays open: it is no barrier a parallel run waits behind (review of build/sd-1306). So does one whose
+    # wait the claim holds on and the graph cannot follow: a named item gone, or fields it cannot read.
+    outside: set[int] = set()
+    for ident, row in rows.items():
+        by_item.setdefault(row["item"], []).append(ident)
+    for ident, row in rows.items():
+        if row["role"] != "author":
+            continue
+        seen: set[int] = set()
+        pending = [row["item"]]
+        while pending:
+            found = connection.execute("SELECT fields FROM item WHERE id = ?", (pending.pop(),)).fetchone()
+            try:
+                named = item_blocked_by(found) if found else []
+            except ValueError:
+                outside.add(ident)  # the claim's `waiting_on` holds it on fields it cannot read
+                continue
+            for other in named:
+                status = connection.execute("SELECT status FROM item WHERE id = ?", (other,)).fetchone()
+                if status is None:
+                    outside.add(ident)  # and on a named item that is gone
+                if other in seen or status is None or status["status"] == "done":
+                    continue
+                seen.add(other)
+                pending.append(other)
+                graph[ident].update(by_item.get(other, ()))
+                if other not in by_item:
+                    outside.add(ident)
+
+    def add(source: int, target: int) -> bool:
+        if _reaches(graph, target, source):
+            return False
+        graph[source].add(target)
+        return True
+
+    held: set[int] = set(outside)
+    contradicted: list[tuple[int, int]] = []
+    order: list[tuple[int, int]] = []
+    for ident, row in rows.items():
+        for ahead, prerequisite in _chain(connection, row, rows):
+            if _merged(connection, ahead):
+                continue
+            if not prerequisite:
+                order.append((ident, ahead["id"]))
+            elif add(ident, ahead["id"]):
+                held.add(ident)
+            else:
+                contradicted.append((ident, ahead["id"]))
+    for ident, predecessor in order:
+        if add(ident, predecessor):
+            held.add(ident)
+    for ident, row in rows.items():
+        if row["lane"] != "parallel" or row["role"] != "author":
+            continue
+        for earlier, before in rows.items():
+            if earlier >= ident:
+                break
+            if before["repo"] == row["repo"] and earlier not in held and (
+                    before["lane"] == "serial" or before["role"] != "author"):
+                add(ident, earlier)
+    return graph, contradicted
+
+
+def _contradiction(connection, run: int, prerequisite: int) -> str:
+    """The reason a wait cannot stand beside run `run`'s explicit `after=prerequisite`, naming both items."""
+    item, ahead = (connection.execute("SELECT item FROM assignment WHERE id = ?", (ident,)).fetchone()["item"]
+                   for ident in (run, prerequisite))
+    return (f"assignment {run} of sd:{item} is queued after assignment {prerequisite} of sd:{ahead}, "
+            f"which waits on sd:{item} through what its item waits on; neither could start")
+
+
+def queue_contradiction(connection) -> str | None:
+    """The first explicit prerequisite a wait contradicts, as a reason naming both items, or None. The
+    wait writers (`workflow.edit_item`) and `enqueue` refuse on it."""
+    contradicted = _graph(connection)[1]
+    return _contradiction(connection, *contradicted[0]) if contradicted else None
 
 
 def _acyclic(connection) -> None:
@@ -164,6 +308,20 @@ def enqueue(connection, items: list[int], *, parallel=False, role="author", scop
                 if item_state(connection, item)["revision"] != expected:
                     raise RunnerRefused(f"item {item} changed; refresh the selection")
         selected = [_item(connection, item, delivery=role == "merge") for item in items]
+        if after is not None:
+            ahead = connection.execute("SELECT role FROM assignment WHERE id = ?", (after,)).fetchone()
+            # Within one role `after` is batch order, which a waiting run may pass (`_graph`).
+            if ahead is not None and ahead["role"] == role:
+                raise RunnerRefused(f"after names {role} assignment {after}; queue {role} runs in one batch "
+                                    "to order them, or after a run of another role")
+        if role == "author":
+            # An author run builds the item, so it reads what the item waits on as the Build press does
+            # (pack sd:9570). Read when the rule runs: `build` imports this module.
+            from .build import waiting_on
+
+            for chosen in selected:
+                if waiting := waiting_on(connection, chosen):
+                    raise RunnerRefused(f"item {chosen['id']} {waiting}")
         pairs = {}
         for item in selected:
             pair = item["repo"], item["branch"]
@@ -174,19 +332,22 @@ def enqueue(connection, items: list[int], *, parallel=False, role="author", scop
             active = connection.execute(f"SELECT id FROM assignment WHERE item = ? AND status IN {OWNING}", (item["id"],)).fetchone()
             if held or active:
                 raise RunnerRefused(f"item {item['id']} already has queued work or a retained lease")
-        created = []
+        created: list[int] = []
         for item in selected:
             ident = create_assignment(connection, item=item["id"], role=role, status="queued",
                                       lane="parallel" if parallel else "serial", budget_minutes=budget_minutes,
                                       budget_usd=budget_usd, after=after)
-            connection.execute("UPDATE assignment SET scope = ?, queued_at = ?, started = NULL WHERE id = ?",
-                               (scope, now(), ident))
+            # One `batch` per call, its first run's id: `_graph` reads batch order by it.
+            connection.execute("UPDATE assignment SET scope = ?, queued_at = ?, started = NULL, batch = ? "
+                               "WHERE id = ?", (scope, now(), created[0] if created else ident, ident))
             add_note(connection, item["id"], "comment", f"Assignment {ident} queued by {who}; {role}, {scope}, {budget_minutes} minutes"
                      + (f", budget {budget_usd:.2f} USD" if budget_usd is not None else ""))
             created.append(ident)
             if not parallel:
                 after = ident
         _acyclic(connection)
+        if contradiction := queue_contradiction(connection):
+            raise RunnerRefused(contradiction)
         return [queue_state(connection, ident) for ident in created]
 
 
@@ -208,22 +369,28 @@ def claim(connection, assignment: int, *, owner: str, work_root: Path, retention
         if restoration_pending(connection):
             raise RunnerRefused("database restore reimport is incomplete; queue dispatch is held")
         _acyclic(connection)
-        if request["status"] != "queued" or not _eligible_after(connection, request):
+        # A wait set while its item was done, then a reopen, can contradict an explicit prerequisite: the run
+        # queued after ends blocked naming both items, as one whose predecessor ended (lane review 7379bf9a).
+        for run, prerequisite in _graph(connection)[1]:
+            connection.execute("UPDATE assignment SET status = 'blocked', result = ?, ended = ? WHERE id = ?",
+                               (_contradiction(connection, run, prerequisite), now(), run))
+        request = queue_state(connection, assignment)
+        if request["status"] != "queued" or _predecessor_ended(connection, request) or _waits(connection)[assignment]:
             return None
         item = _item(connection, request["item"], delivery=request["role"] == "merge")
+        if request["role"] == "author":
+            # A dependency reopened since the enqueue holds the run queued, as dispatch's start
+            # holds a build; it starts once the dependency is done again (review of pack sd:9570).
+            from .build import waiting_on
+
+            if waiting_on(connection, item):
+                return None
         leases = connection.execute("SELECT runner_lease.*, runner_run.quarantine FROM runner_lease "
             "JOIN runner_run ON runner_run.id = runner_lease.run WHERE runner_lease.repo = ? "
             "AND runner_lease.released_at IS NULL", (item["repo"],)).fetchall()
         exclusive = request["lane"] != "parallel" or request["role"] != "author"
         if any(row["quarantine"] or exclusive or row["exclusive"] or row["branch"] == item["branch"] for row in leases):
             return None
-        if not exclusive:
-            earlier = connection.execute("SELECT assignment.* FROM assignment JOIN item ON item.id = assignment.item "
-                "WHERE item.repo = ? AND assignment.status = 'queued' AND assignment.id < ? "
-                "AND (assignment.lane = 'serial' OR assignment.role != 'author') ORDER BY assignment.id",
-                (item["repo"], assignment)).fetchall()
-            if any(_eligible_after(connection, dict(row)) for row in earlier):
-                return None
         run = request["run_count"] + 1
         ident = uuid.uuid4().hex
         stamp = now()

@@ -39,6 +39,23 @@ from .errors import SdDbError
 PREFIX = "~/"
 
 
+#: What points git at another repository than the one `-C` names: the variables `git rev-parse --local-env-vars`
+#: lists. A hook exports `GIT_DIR` and `GIT_WORK_TREE`, and a child that inherits them reads and writes the hook's
+#: repository and its origin (pack sd:9709, round 26).
+GIT_LOCAL = frozenset({
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
+    "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
+    "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX", "GIT_SHALLOW_FILE",
+    "GIT_COMMON_DIR"})
+
+
+def git_env(environ=None) -> dict[str, str]:
+    """`environ`, this process's when None, less `GIT_LOCAL`: the environment a `git -C DIR` child, or a child
+    that starts one, runs in, so `DIR` alone names the repository."""
+    return {key: value for key, value in (os.environ if environ is None else environ).items()
+            if key not in GIT_LOCAL}
+
+
 class PathRefused(SdDbError):
     """A value that cannot be a repository path, and why."""
 

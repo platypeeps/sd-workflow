@@ -3307,5 +3307,26 @@ class TheHomeAssetTable(SchemaCase):
         self.assertNotIn("home_asset", tables(raw))
 
 
+class TheAssignmentBatch(SchemaCase):
+    """Migration 50 (pack sd:9570): `assignment.batch` arrives NULL on every saved row, so a saved
+    `after` stays a prerequisite, and the hand-run reverse returns the file to 49."""
+
+    def test_saved_rows_read_no_batch_and_the_reverse_drops_the_column(self):
+        self.migrate_through(49)
+        raw = sqlite3.connect(self.path, isolation_level=None)
+        self.addCleanup(raw.close)
+        raw.execute("INSERT INTO assignment (id, role, status) VALUES (1, 'author', 'queued')")
+        raw.execute("INSERT INTO assignment (id, role, status, after) VALUES (2, 'author', 'queued', 1)")
+        result = self.migrate_through(50)
+        self.assertEqual((result.before, result.applied), (49, [50]))
+        self.assertEqual(raw.execute("SELECT id, after, batch FROM assignment ORDER BY id").fetchall(),
+                         [(1, None, None), (2, 1, None)])
+        text = dict(schema_module.migrations())[50].read_text(encoding="utf-8")
+        reverse = "\n".join(line[len("--   "):] for line in text.splitlines() if line.startswith("--   "))
+        raw.executescript(reverse)
+        self.assertEqual(schema_version(raw), 49)
+        self.assertNotIn("batch", [row[1] for row in raw.execute("PRAGMA table_info(assignment)")])
+
+
 if __name__ == "__main__":
     unittest.main()

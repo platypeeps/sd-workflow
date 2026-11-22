@@ -374,7 +374,11 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   }
   const again = (r, manual) => !QV.lanes.retry ? '' : html`<div class="ctl" role="group" aria-label="Unblock sd:${String(r.item)}">${sb('retry', r, r.unchanged === true ? 'Retry…' : 'Retry', `Retry sd:${r.item}: queue it again at the same head`, html` data-head="${r.expected_head}"`)}${manual ? sb('approve', r, 'Approve…', `Approve sd:${r.item}: queue it again with the merge granted`, html` data-head="${r.expected_head}"`) : ''}</div>`;
   // pack sd:8584: a failed entry's Fix sends the lane's finding to the build run that enqueued its branch; off says why.
-  const mendBtn = r => !r.fix ? '' : html`<div class="ctl" role="group" aria-label="Fix sd:${String(r.item)}">${sb('fix', r, 'Fix…', `Fix sd:${r.item}: send the lane's finding to its builder`, r.fix.allowed ? '' : html` disabled title="${r.fix.reason}"`)}</div>`;
+  // pack sd:9705: a Fix press's outcome shows on its own row: busy while it posts, then sent or why not.
+  const QMEND = new Map(); // `${lane}:${item}` -> { busy, ok, text }
+  const mendSaid = m => !m ? '' : html` <span class="said" role="${m.ok === false ? 'alert' : 'status'}">${m.text}</span>`;
+  const mendBtn = r => { const m = QMEND.get(`${r.lane}:${r.item}`); return !r.fix ? (m ? html`<div class="ctl">${mendSaid(m)}</div>` : '')
+    : html`<div class="ctl" role="group" aria-label="Fix sd:${String(r.item)}">${sb('fix', r, m && m.busy ? 'Sending…' : 'Fix…', `Fix sd:${r.item}: send the lane's finding to its builder`, r.fix.allowed ? '' : html` disabled title="${r.fix.reason}"`)}${mendSaid(m)}</div>`; };
   // pack sd:8584: what a failed entry's facts add: whether a commit moved its head since, and what prepare answered.
   const moved = r => r.unchanged === true ? ' · head unchanged since this failure: Retry repeats it unless the failure was transient'
     : r.unchanged === false ? ' · the worktree moved past this head: enqueue the new head; Retry is refused' : '';
@@ -410,6 +414,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // waits on a person's review, so the row leads with that wait and keeps its Retry and Approve.
   // A blocked entry's Retry, Approve and Fix, on its own row or, with its Details, on its item's Parked row (pack sd:9425).
   const unblock = (l, r) => { const e = { ...r, lane: l.path }; return html`${again(e, l.runner_merge === 'manual')}${mendBtn(e)}`; };
+  // sd:9657: a click on that Parked row selects the task, so its Details button selects the entry.
+  const entryBtn = (l, r) => html`<button class="btn quiet sm" type="button" data-entry="${entryId(l, r)}" aria-label="Show lane entry sd:${String(r.item)} in Details">Details</button>`;
   function entryRow(l, r, p) {
     const [s0, type, facts] = ENTRY[r.state](r), last = l.rows.filter(x => x.state === 'next').length, e = { ...r, lane: l.path };
     const s = p ? (p.on === 'you' ? 'warning' : 'queued') : s0;
@@ -575,7 +581,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     (QV.lanes ? QV.lanes.lanes : []).forEach(l => { l.rows.forEach(r => {
       const p = r.state === 'blocked' && r.status === 'prepared' ? waitOf.get(Number(r.item)) : undefined;
       if (p) drawn.add(p);
-      if (r.state === 'blocked' && !p && aside(r.item, `lane ${r.status}${r.step ? ` at ${r.step}` : ''} · ${r.reason}`, html`${unblock(l, r)}${shell.commands.rowActions(entryId(l, r))}`)) return;
+      if (r.state === 'blocked' && !p && aside(r.item, `lane ${r.status}${r.step ? ` at ${r.step}` : ''} · ${r.reason}`, html`${unblock(l, r)}${entryBtn(l, r)}${shell.commands.rowActions(entryId(l, r))}`)) return;
       add(l.key, entryRow(l, r, p)); });
       if (G.has(repoKey(l.key))) G.get(repoKey(l.key)).host = l.host; });
     prs.filter(p => !drawn.has(p)).forEach(p => add(p.repo, prRow(p)));
@@ -779,27 +785,35 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   }
   // Fix (pack sd:8584): Send to builder on the build run that enqueued the entry, its finding the lane's, edited first.
   async function mend(l, item) {
-    const r = l.rows.find(x => x.state === 'blocked' && x.item === item);
-    if (!r || !r.fix || !r.fix.allowed) return;
+    const r = l.rows.find(x => x.state === 'blocked' && x.item === item), key = `${l.path}:${item}`;
+    if (!r) { qSaid = { ok: false, text: `${l.repo}: sd:${item} is not blocked in this read; nothing sent. Read again.` }; return queueView(); }
+    if (!r.fix || !r.fix.allowed) {
+      QMEND.set(key, { ok: false, text: `not sent: ${(r.fix && r.fix.reason) || 'no build run enqueued this entry'}` });
+      return queueView();
+    }
     const { yes, values } = await shell.ask({ title: `Fix sd:${item}${r.title ? ` · ${r.title}` : ''} in ${l.repo}?`, ok: 'Send to builder', keep: 'Cancel', danger: false,
       body: `The finding goes on the item as a note, and build run ${r.fix.run}'s bundle queues again. Its next builder resumes ${r.worktree || 'the same worktree'} on ${r.branch}, fixes the finding first and enqueues the new head.`,
       fields: [{ name: 'finding', label: 'Finding', required: true, multiline: true, value: finding(r) }] });
     const text = (values && values.finding || '').trim();
     if (!yes || !text) return;
-    QV.busy = true; queueView();
+    QV.busy = true; QMEND.set(key, { busy: true, text: 'sending to its builder…' }); queueView();
     try {
       await shell.post('/api/queue/builds/retry', { assignment: r.fix.assignment, revision: r.fix.revision, finding: text, run: r.fix.run });
       qSaid = { ok: true, text: `${l.repo}: sd:${item} sent to its builder with the lane's finding; its build queues again.` };
+      QMEND.set(key, { ok: true, text: `sent to builder; build #${r.fix.assignment} queued` });
     } catch (err) {
-      qSaid = { ok: false, text: err.status >= 400 && err.status < 500 ? `${l.repo}: sd:${item} not sent to its builder: ${err.message}`
+      const refused = err.status >= 400 && err.status < 500;
+      qSaid = { ok: false, text: refused ? `${l.repo}: sd:${item} not sent to its builder: ${err.message}`
         : `${l.repo}: not known whether sd:${item} was sent to its builder: ${err.message} Read the view before you act again.` };
+      QMEND.set(key, { ok: false, text: refused ? `not sent: ${err.message}` : `not known whether sent: ${err.message} Read again before you act again.` });
     }
     QV.busy = false;
     await loadQueue();
   }
   async function laneAct(b) {
     const l = QV.lanes && QV.lanes.lanes.find(x => x.path === b.dataset.repo);
-    if (!l || QV.busy) return;
+    if (QV.busy) return;
+    if (!l) { qSaid = { ok: false, text: `sd:${b.dataset.item}: its lane is not in this read; nothing done. Read again.` }; return queueView(); }
     const item = Number(b.dataset.item), action = b.dataset.act, head = b.dataset.head || '', claim = b.dataset.claim || '';
     if (action === 'fix') return mend(l, item);
     if (action === 'retry' && !(await anyway(l, item, head))) return;
@@ -1017,7 +1031,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     document.body.dataset.observed = doc.now;
     const items = [...[...SUGG].map(([id, r]) => SROW.has(id) ? TD.objectOf(SROW.get(id)) : { id, type: 'item', label: `#${r.id} ${r.title}`, item: r.id }),
       ...[...OPENI.keys(), ...PARKI.keys()].map(k => TD.objectOf(taskOf(k)))];
-    return { objects: [...[...ALL.values()].map(objectOf), ...[...OTHER].map(([id, o]) => ({ id, ...o.obj })), ...items, ...SNOOZED.map(window.snooze.object)],
+    return { objects: [...[...ALL.values()].map(objectOf), ...[...OTHER].map(([id, o]) => ({ id, ...o.obj })), ...items, ...SNOOZED.map(window.snooze.object),
+                       { id: 'needs', type: 'needs list', label: 'Needs you' }],
              state: doc.snooze_error ? window.snooze.unread(doc.snooze_error, '/api/now') : null };
   }
   function clear(err) { DOC = null; NEEDS = []; ALL = new Map(); OTHER = new Map(); SUGG = new Map(); OPENI = new Map(); PARKI = new Map(); TASKS = new Map(); SROW.clear(); SNOOZED = []; ACTIVE = null; failed = err.message; delete document.body.dataset.observed; }
@@ -1118,6 +1133,13 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     const found = o => taskOf(o.id) || (SUGG.has(o.id) ? { id: SUGG.get(o.id).id, status: SUGG.get(o.id).status, repo: SUGG.get(o.id).repo, repo_path: SUGG.get(o.id).repo, kind: SUGG.get(o.id).kind, assignment: null } : null);
     // sd:8565: a live assignment the queue read holds the row as a Tasks row's does, and the press is said on the queue's line.
     const ready = o => { const t = found(o), a = t && runFor(t.id); return t && a && !t.assignment ? { ...t, assignment: a.status } : t; };
+    // sd:9759: Clean up runs the sweep the nightly job runs: it closes each row that no longer needs you, with a note
+    // naming why, and keeps any it cannot prove; Details shows what it closed, and Today reads again.
+    C.register({ id: 'needs.sweep', on: 'needs list', label: 'Clean up', icon: 'sparkles', risk: 'confirm', executes: true,
+      does: 'Closes each row that no longer needs you, naming why.',
+      consequence: () => 'This closes each alert that cleared, pull alert no read sees, answered question and done item\'s followup, with a note naming why. A row it cannot prove stays open. Details lists what closed.',
+      cli: () => 'sd reports sweep', sends: () => 'POST /api/actions/run {action: needs.sweep}',
+      run: o => window.commands.runAction(o, 'needs.sweep').then(said => reading.reread().then(() => said)) });
     C.register(K.build({ row: ready, reread: () => reading.reread(), primary: () => true,
       said: (text, ok) => { qSaid = { ok, text }; queueView(); } }));
     TD = window.taskDetails.attach({ details: $('details'), rows: () => [...new Map([...OPENI, ...PARKI, ...SROW]).values()], byKey: taskOf, selected: sel,
@@ -1269,6 +1291,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       const w = e.target.closest('button[data-act]'); if (w) { if (!w.disabled) laneAct(w); return; }
       const b = e.target.closest('button[data-build]'); if (b) { if (!b.disabled) buildAct(b); return; }
       const g = e.target.closest('button[data-asg]'); if (g) { if (!g.disabled) asgAct(g); return; }
+      const d = e.target.closest('button[data-entry]'); if (d) { select(d.dataset.entry, true); return; }
       // pack sd:8138: a box opens its repo filtered to its rows; a second press clears, another switches. No disclosure toggle.
       const t = e.target.closest('button[data-tile]');
       if (t) { if (t.disabled) return; const { repo, tile: box } = t.dataset, same = qOpen === repo && qTile && qTile.box === box;

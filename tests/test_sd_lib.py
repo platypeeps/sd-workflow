@@ -2488,6 +2488,24 @@ class KillReachTests(unittest.TestCase):
                     sd_lib.end_group(leader)
                 self.assert_killed(leader)
 
+    def test_a_python_without_waitid_waits_out_the_grace_unreaped(self) -> None:
+        """Lane review of sd:9600: macOS Python 3.11 and 3.12 lack `os.waitid`, so the grace raised
+        AttributeError. It now waits out the deadline and leaves the leader unreaped."""
+        leader = subprocess.Popen([sys.executable, "-c", ""], start_new_session=True)
+        self.addCleanup(leader.wait)
+        time.sleep(0.3)  # the leader has exited, unreaped
+        saved = getattr(os, "waitid", None)
+        if saved is not None:
+            del os.waitid
+        try:
+            start = time.monotonic()
+            sd_lib.wait_empty(leader.pid, start + 0.3, leader=leader.pid)
+        finally:
+            if saved is not None:
+                os.waitid = saved
+        self.assertGreaterEqual(time.monotonic() - start, 0.3)
+        self.assertIsNone(leader.returncode, "the leader stays unreaped")
+
     def test_an_interrupted_grace_in_end_group_still_kills(self) -> None:
         """Round 5, R2: a KeyboardInterrupt in the grace left the workers to finish with no SIGKILL."""
         with tempfile.TemporaryDirectory() as scratch:
@@ -2570,6 +2588,152 @@ class KillReachTests(unittest.TestCase):
                 unittest.mock.patch.object(os, "killpg") as killpg:
             sd_lib.end_group(process)
         self.assertNotIn(unittest.mock.call(4242, signal.SIGKILL), killpg.call_args_list)
+
+    def test_a_term_deaf_replacement_in_a_timed_out_group_is_killed(self) -> None:
+        """pack sd:9600, sd_lib.py:4212: the grace reaped the leader, the read members all left, and a
+        TERM-deaf worker one of them forked on the TERM held the group with no witness, so no SIGKILL."""
+        replacing = (
+            "import os, pathlib, signal, sys, time\n"
+            "mark = pathlib.Path(sys.argv[1])\n"
+            "if os.fork() == 0:\n"
+            "    def replace(*_):\n"
+            "        if os.fork() == 0:\n"
+            "            signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "            pathlib.Path(f'{mark}.deaf').write_text(str(os.getpid()))\n"
+            "            time.sleep(30)\n"
+            "        os._exit(0)\n"
+            "    signal.signal(signal.SIGTERM, replace)\n"
+            "    mark.write_text(str(os.getpid()))\n"
+            "    while True:\n"
+            "        time.sleep(1)\n"
+            "time.sleep(60)\n")
+        with tempfile.TemporaryDirectory() as scratch:
+            mark = pathlib.Path(scratch) / "worker.pid"
+            leader = sd_lib.spawn_group([sys.executable, "-c", replacing, str(mark)])
+            sd_lib.release_term()
+            self.addCleanup(end_session, leader.pid)
+            wait_for_pid(mark)
+            with unittest.mock.patch.object(sd_lib, "GROUP_CLEANUP_SECONDS", 0.5):
+                sd_lib.end_group(leader)
+            deaf = wait_for_pid(pathlib.Path(f"{mark}.deaf"))
+            self.addCleanup(end_session, deaf)
+            self.assertTrue(gone(deaf), "the TERM-deaf replacement outlived end_group")
+
+    def test_an_unread_table_before_the_term_kills_no_reaped_leaders_number(self) -> None:
+        """pack sd:9600 review: with no read before the TERM and the leader reaped, the fallback SIGKILL
+        went to the bare number, which another group may hold by then."""
+        process = unittest.mock.Mock(pid=4242, returncode=0, stdin=None, stdout=None, stderr=None)
+        with unittest.mock.patch.object(sd_lib, "process_table", return_value=None), \
+                unittest.mock.patch.object(sd_lib, "group_alive", return_value=True), \
+                unittest.mock.patch.object(sd_lib, "wait_empty"), \
+                unittest.mock.patch("sys.stderr", new_callable=io.StringIO), \
+                unittest.mock.patch.object(os, "killpg") as killpg:
+            sd_lib.end_group(process)
+        self.assertNotIn(unittest.mock.call(4242, signal.SIGKILL), killpg.call_args_list)
+
+    def test_an_unread_table_still_kills_a_timed_out_leaders_term_deaf_worker(self) -> None:
+        """pack sd:9600, sd_lib.py:3821: a `ps` that failed before the TERM, with the leader reaped in the
+        grace, skipped the group SIGKILL; the leader now stays unreaped, so its number is its own."""
+        with tempfile.TemporaryDirectory() as scratch:
+            mark = pathlib.Path(scratch) / "worker.pid"
+            worker = ("import os, pathlib, signal, sys, time\n"
+                      "if os.fork() == 0:\n"
+                      "    signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+                      "    pathlib.Path(sys.argv[1]).write_text(str(os.getpid()))\n"
+                      "    time.sleep(30)\n"
+                      "    os._exit(0)\n"
+                      "time.sleep(60)\n")
+            leader = sd_lib.spawn_group([sys.executable, "-c", worker, str(mark)])
+            sd_lib.release_term()
+            self.addCleanup(end_session, leader.pid)
+            deaf = wait_for_pid(mark)
+            with unittest.mock.patch.object(sd_lib, "process_table", return_value=None), \
+                    unittest.mock.patch.object(sd_lib, "GROUP_CLEANUP_SECONDS", 0.5), \
+                    unittest.mock.patch("sys.stderr", new_callable=io.StringIO):
+                sd_lib.end_group(leader)
+            self.assertTrue(gone(deaf), "the TERM-deaf worker outlived end_group with no table read")
+
+    def test_a_session_a_surviving_detached_gate_started_is_killed(self) -> None:
+        """pack sd:9600, sd_lib.py:4214: the second walk ran from the root alone; a detached gate whose
+        parent had exited started a session after the first read, and only the gate got the SIGKILL."""
+        earlier = {100: (1, 100, "Thu Jan  1 00:00:00 1970"), 200: (100, 200, "Thu Jan  1 00:00:01 1970")}
+        now = {200: (1, 200, "Thu Jan  1 00:00:01 1970"), 300: (200, 300, "Thu Jan  1 00:00:02 1970")}
+        with unittest.mock.patch.object(os, "killpg") as killpg:
+            sd_lib.kill_below(100, earlier, now)
+        self.assertEqual(sorted(call.args[0] for call in killpg.call_args_list), [200, 300])
+
+    def test_a_sigterm_handler_reentering_the_groups_lock_does_not_deadlock(self) -> None:
+        """pack sd:9600 class pass: `term_ends_group` runs `end_groups` in the handler, on the main
+        thread; it took `_lock` again where the interrupted code held it, and waited forever. Every
+        `with self._lock` in `ThreadGroups` runs on that thread: the hook, `reopen_groups`,
+        `holding_threads` and `end_groups`' snapshot, grace and KILL."""
+        groups = sd_lib.ThreadGroups()
+
+        def reenter() -> None:
+            with groups._lock:  # where any of those blocks holds it
+                groups.end_groups()
+        thread = threading.Thread(target=reenter, daemon=True)
+        thread.start()
+        thread.join(5)
+        self.assertFalse(thread.is_alive(), "end_groups waited on the lock its own thread held")
+
+    def test_a_sigterm_in_end_groups_kill_loop_finishes_the_kills(self) -> None:
+        """pack sd:9600 class pass, sd_lib.py:4016: a SIGTERM while the KILL loop held `_lock` ran
+        `end_groups` again on the same thread, which waited on that lock."""
+        groups = sd_lib.ThreadGroups()
+        hook = groups.group_hook()
+        hook(4242)
+        sent: list[tuple[int, int]] = []
+
+        def record(pid: int, number: int) -> None:
+            sent.append((pid, number))
+            if number == signal.SIGKILL and len([n for _, n in sent if n == signal.SIGKILL]) == 1:
+                groups.end_groups()  # the handler's `first`, on this thread
+        table = {4242: (1, 4242, "Thu Jan  1 00:00:00 1970")}
+
+        def run() -> None:
+            with unittest.mock.patch.object(sd_lib, "process_table", return_value=table), \
+                    unittest.mock.patch.object(sd_lib, "signal_group", side_effect=record), \
+                    unittest.mock.patch.object(sd_lib, "GROUP_CLEANUP_SECONDS", 0.1):
+                groups.end_groups()
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        thread.join(10)
+        self.assertFalse(thread.is_alive(), "the handler's end_groups deadlocked the KILL loop")
+
+    def test_a_reentrant_stderr_write_stops_no_kill(self) -> None:
+        """pack sd:9600 class pass: the handler's diagnostic line re-entered the stderr writer the main
+        thread was in, which raises RuntimeError, and the SIGKILLs below never went out."""
+        class Busy(io.StringIO):
+            def write(self, text: str) -> int:
+                raise RuntimeError("reentrant call inside <_io.BufferedWriter name='<stderr>'>")
+        earlier = {100: (1, 100, "Thu Jan  1 00:00:00 1970"), 200: (100, 200, "Thu Jan  1 00:00:01 1970")}
+        with unittest.mock.patch.object(sd_lib, "_group_of", side_effect=lambda pid: pid), \
+                unittest.mock.patch("sys.stderr", new=Busy()), \
+                unittest.mock.patch.object(os, "killpg") as killpg:
+            sd_lib.kill_below(100, earlier, None)
+        self.assertIn(unittest.mock.call(200, signal.SIGKILL), killpg.call_args_list)
+
+    def test_a_group_that_left_the_set_during_the_kill_read_gets_no_sigkill(self) -> None:
+        """pack sd:9600, sd_lib.py:4014: the set was read before the up to 3 s KILL read; a group whose
+        run_group ended it and reaped its leader in that read still had its bare number signalled."""
+        groups = sd_lib.ThreadGroups()
+        hook = groups.group_hook()
+        hook(4242)
+        table = {4242: (1, 4242, "Thu Jan  1 00:00:00 1970")}
+        count = [0]
+
+        def read() -> Any:
+            count[0] += 1
+            if count[0] == 2:
+                hook(None)  # its run_group began ending it during the KILL read
+            return table
+        sent: list[tuple[int, int]] = []
+        with unittest.mock.patch.object(sd_lib, "process_table", side_effect=read), \
+                unittest.mock.patch.object(sd_lib, "signal_group", side_effect=lambda *args: sent.append(args)), \
+                unittest.mock.patch.object(sd_lib, "GROUP_CLEANUP_SECONDS", 0.1):
+            groups.end_groups()
+        self.assertNotIn((4242, signal.SIGKILL), sent)
 
 
 class TermEndsGroupTests(unittest.TestCase):

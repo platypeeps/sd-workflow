@@ -183,6 +183,18 @@ class TaskCLI(unittest.TestCase):
                 self.assertIn("give YYYY-MM-DD (00:00 UTC) or a duration such as 90m, 6h, 2d or 1w",
                               " ".join(refused.stderr.split()))
 
+    def test_store_items_parked_lists_the_parked_items_only(self):
+        """sd:9729: `store items` hid a parked item silently; `--parked` lists it, with parked_at."""
+        kept = json.loads(self.call("task", "add", "--priority", "3", "Kept", "--json").stdout)["item"]["id"]
+        parked = json.loads(self.call("task", "add", "--priority", "3", "Parked", "--json").stdout)["item"]["id"]
+        with database(sd_db.default_path(self.home), write=True) as connection:
+            connection.execute("UPDATE item SET parked_at = '2026-01-02T00:00:00+00:00' WHERE id = ?", (parked,))
+            connection.commit()
+        listed = json.loads(self.call("store", "items", "--json").stdout)
+        self.assertEqual([row["id"] for row in listed], [kept])
+        listed = json.loads(self.call("store", "items", "--parked", "--json").stdout)
+        self.assertEqual([(row["id"], row["parked_at"]) for row in listed], [(parked, "2026-01-02T00:00:00+00:00")])
+
     def test_task_show_reads_what_store_item_reads(self):
         """sd:1112. `sd task show` is a read alias; `sd store item` stays canonical.
 
@@ -798,6 +810,26 @@ class TaskCLI(unittest.TestCase):
         cleared = json.loads(self.call("task", "edit", item, "--clear-area", "--json").stdout)
         self.assertIsNone(cleared["item"]["fields"])
         self.assertNotIn("area:", self.call("task", "show", item).stdout)
+
+    def test_edit_blocked_by_sets_the_set_shows_it_and_clears_it(self):
+        """pack sd:9570. `--blocked-by M`, repeated, sets the items one waits on; `--clear-blocked-by` drops them;
+        a done changes no status: the build reads the set."""
+        add = lambda title: json.loads(self.call("task", "add", "--priority", "3", title, "--json").stdout)["item"]["id"]  # noqa: E731
+        first, second, item = add("First"), add("Second"), add("Waits")
+        self.call("task", "edit", item, "--blocked-by", 5, "--clear-blocked-by", code=2)
+        self.assertIn(f"item {item} cannot wait on itself",
+                      self.call("task", "edit", item, "--blocked-by", item, code=1).stderr)
+        state = json.loads(self.call("task", "edit", item, "--blocked-by", f"sd:{second}", "--blocked-by", first,
+                                     "--json").stdout)
+        self.assertEqual(json.loads(state["item"]["fields"]), {"blocked_by": [first, second]})
+        shown = self.call("task", "show", item).stdout
+        self.assertIn(f"  waits on: sd:{first}, sd:{second}\n", shown)
+        self.assertIn(f"Waits on sd:{first}, sd:{second}; set by", shown)
+        self.call("task", "status", first, "done")
+        self.assertIn("  planning  Waits", self.call("task", "show", item).stdout, "a done moves no dependent")
+        cleared = json.loads(self.call("task", "edit", item, "--clear-blocked-by", "--json").stdout)
+        self.assertIsNone(cleared["item"]["fields"])
+        self.assertNotIn("waits on:", self.call("task", "show", item).stdout)
 
     def test_edit_area_takes_personal_and_the_realm_ids_the_setting_names(self):
         """pack sd:8062. `--area` takes home, hoa, personal and each

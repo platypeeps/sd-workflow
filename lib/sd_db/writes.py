@@ -438,6 +438,12 @@ def _transition(
         note = f"{current} -> {target} by {who}"
         if reason:
             note += f": {reason}"
+        if current == "done":
+            # Read when the rule runs: `workflow` imports this module.
+            from .workflow import reopen_waits
+
+            if waits := reopen_waits(connection, item, stamp):
+                note += f"; {waits}"
         connection.execute(
             "INSERT INTO note (item, timestamp, kind, body, session) VALUES (?, ?, ?, ?, ?)",
             (item, stamp, STATUS_CHANGE, note, session or who),

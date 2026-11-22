@@ -31,7 +31,7 @@ CLASSES = (
     ("lost_run", re.compile(r"supervisor lost|lost at step|lost .* a second time")),
     ("timed_out", re.compile(r"ran past \d+ s")),
     ("review_blockers", re.compile(r"review rounds left blockers|local review blocking")),
-    ("review_no_answer", re.compile(r"review gave no answer")),
+    ("review_no_answer", re.compile(r"review gave no answer|review stayed rate_limited")),
     ("db_locked", re.compile(r"database is locked|did not answer", re.I)),
     ("conflict", re.compile(r"conflict")),
     ("line_too_long", re.compile(r"lines? too long|\(limit 72\)")),

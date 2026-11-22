@@ -127,6 +127,8 @@ def _rows(connection, rows, found, *, now: str) -> list[dict]:
 
     `found` is `places.realms`, the realm rules each row's `realm` follows.
     """
+    from sd_db import build
+
     from .hoa_screen import checkout
     from .places import area_of, realm_of, report_realm
     from .screens import _repo_labels
@@ -165,6 +167,8 @@ def _rows(connection, rows, found, *, now: str) -> list[dict]:
             "allowed": workflow.allowed_statuses(connection, row["id"], state=state),
             "edit": _edit_capability(row),
             "parked": row["parked_at"],
+            # Build takes a blocked item whose bundle a split holds (pack sd:9581); its Retry refuses.
+            "split_held": row["status"] == "blocked" and build.split_held(connection, row["id"]),
             # The place Tasks' Realm HOA and Home filter on: the HOA and Home pages' Tasks rule (`places.area_of`).
             # pack sd:8010: an item's own area (`fields.area`) wins, and `area_set` says so: such a row sits in its
             # area's tab alone, not in Personal or a realm tab.
@@ -435,6 +439,7 @@ def _details(connection, item: int, *, now: str) -> dict:
         "pull": _pull(connection, state),
         "documents": _documents(connection, state),
         "published": _published(connection, state),
+        "blocked_by": _blocked_by(connection, state),
         # `sd work relink` and `sd work cancel` availability, as the mutation checks it under its lock
         # (`progress.work_controls`), for a work item; None for any other kind (sd:2200).
         "work": progress.work_controls(connection, item) if state["item"]["kind"] == "work" else None,
@@ -488,6 +493,21 @@ def _published(connection, state) -> list[dict]:
             return out + [{"title": "Publication claims", "where": f"not read: {error}", "links": []}]
         out += [{"title": f"Publication claim {claim['id'][:8]}", "where": str(claim["phase"] or ""),
                  "links": [link("claim", str(claim["url"]))]} for claim in claims if claim["url"]]
+    return out
+
+
+def _blocked_by(connection, state) -> list[dict]:
+    """Each item the item waits on (pack sd:9570), in id order: its id, title, status and repo; None for an id no item
+    holds. Fields that cannot be read show as none here; a build still refuses them."""
+    try:
+        named = workflow.item_blocked_by(state["item"])
+    except ValueError:
+        return []
+    out = []
+    for other in named:
+        row = reads.item_by_id(connection, other)
+        out.append({"id": other, "title": row["title"] if row else None, "status": row["status"] if row else None,
+                    "repo": row["repo"] if row else None})
     return out
 
 
