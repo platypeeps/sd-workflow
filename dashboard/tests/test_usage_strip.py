@@ -236,6 +236,7 @@ const ICON = n => html`<svg class="i" aria-hidden="true"><use href="#i-${n}"/></
 const toLocal = Date.prototype.toLocaleString;
 Date.prototype.toLocaleString = function (_, options) { return toLocal.call(this, 'en-US', options); };
 var OUT = { gets: [], error: null }, R = {}, ANSWER = """ + json.dumps(answer) + r""";
+var setInterval = () => 0;
 const getJSON = async path => { OUT.gets.push(path); if (typeof ANSWER === 'string') throw new Error(ANSWER); return ANSWER; };
 const flush = async () => { for (let i = 0; i < 50; i++) await null; };
 (async () => { try {
@@ -418,6 +419,29 @@ for (const [view, key] of [[1000, 'tall'], [400, 'short']]) {
         self.assertEqual(out["R"]["short"], "324px")
         css = re.sub(r"/\*.*?\*/", "", (V2 / "static" / "shell.css").read_text(encoding="utf-8"), flags=re.S)
         self.assertRegex(re.search(r"\.fpick-menu \{([^}]*)\}", css).group(1), r"overflow-y:\s*auto")
+
+    def test_an_open_page_reads_the_strip_again_on_a_timer_while_visible(self):
+        """Advisory of PR #1950 (sd:9973): the summary was read only at load, an open and Read again, so a page
+        left open kept a state the strip had long left. A timer reads it again, but not on a hidden page."""
+        body = r"""
+const EL = {}, TIMERS = [];
+['usage-drop', 'usage-menu', 'usage-sum'].forEach(id => { EL[id] = { id, style: {}, dataset: {}, listeners: {},
+  addEventListener(t, f) { this.listeners[t] = f; }, getBoundingClientRect: () => ({ top: 60 }) }; });
+globalThis.document = { getElementById: id => EL[id] || null, visibilityState: 'visible' };
+globalThis.location = { hash: '' };
+globalThis.setInterval = (f, ms) => { TIMERS.push([f, ms]); return TIMERS.length; };
+usageWire(); await flush();
+R.timers = TIMERS.map(([, ms]) => ms);
+R.loaded = OUT.gets.length;
+TIMERS.forEach(([f]) => f()); await flush();
+R.visible = OUT.gets.length;
+document.visibilityState = 'hidden';
+TIMERS.forEach(([f]) => f()); await flush();
+R.hidden = OUT.gets.length;
+"""
+        out = run_usage(body, answer={"rows": [], "nosource": []})
+        self.assertEqual(out["R"]["timers"], [5 * 60 * 1000])
+        self.assertEqual((out["R"]["loaded"], out["R"]["visible"], out["R"]["hidden"]), (1, 2, 2))
 
     def test_the_kiosk_gives_the_usage_summary_read_again_s_touch_size(self):
         """Lead review of 8f483c6: Home's kiosk enlarged #read-again to 4rem but left the Usage summary beside it small."""
