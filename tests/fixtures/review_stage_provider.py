@@ -39,7 +39,7 @@ if mode == "finding":
                     {
                         "path": "src/app.py",
                         "line": 2,
-                        "severity": "high",
+                        "severity": "high", "instances": ["src.py:1"],
                         "summary": "validate state",
                         "family": "boundary-validation",
                     }
@@ -90,7 +90,7 @@ elif mode == "markdown-fenced-quotes":
                     {
                         "path": "docs/prd.md",
                         "line": line,
-                        "severity": "high",
+                        "severity": "high", "instances": ["src.py:1"],
                         "summary": summary,
                         "family": "boundary-validation",
                     }
@@ -138,7 +138,7 @@ elif mode == "mixed-severity":
                     {
                         "path": "src/app.py",
                         "line": 3,
-                        "severity": "high",
+                        "severity": "high", "instances": ["src.py:1"],
                         "summary": "mixed real defect",
                         "family": "boundary-validation",
                     },

@@ -14,8 +14,8 @@ from tests.test_sd_review import FakeClient, FakeRunner, ReviewFixture, sd_revie
 
 
 def finding(severity: str = "low", summary: str = "defect") -> dict:
-    return {"path": "src.py", "line": 1, "severity": severity,
-            "summary": summary, "family": "correctness"}
+    return {"path": "src.py", "line": 1, "severity": severity, "summary": summary, "family": "correctness",
+            **({"instances": ["src.py:1"]} if severity == "high" else {})}
 
 
 class ResponseRegressions(unittest.TestCase):
@@ -218,6 +218,39 @@ class URLDiagnostics(ReviewFixture):
                     for marker in ("credential-marker", "second-error-marker", "private"):
                         self.assertNotIn(marker, json.dumps(outcome.diagnostic))
 
+    def test_every_instance_survives_parsing(self) -> None:
+        """Review of sd:9769: the schema takes any number of instances; dropping those past the fiftieth lost
+        the one that touches the branch, so the build could defer a blocker the branch introduced."""
+        many = {**finding("high", "many"), "instances": [f"src.py:{n}" for n in range(1, 61)]}
+        outcome = self.run_response(self.envelope(json.dumps({"findings": [many]})))
+        self.assertEqual(outcome.status, sd_review.FINDINGS)
+        self.assertEqual(outcome.findings[0]["instances"][-1], "src.py:60", "an instance past the fiftieth was dropped")
+
+    def test_a_blocking_finding_without_instances_is_refused(self) -> None:
+        """Pack sd:9769: a high finding names its class (family) and lists every instance in the change."""
+        listed = {**finding("high", "listed"), "instances": ["src.py:1", "src.py:9"]}
+        outcome = self.run_response(self.envelope(json.dumps({"findings": [listed]})))
+        self.assertEqual(outcome.status, sd_review.FINDINGS)
+        self.assertEqual(outcome.findings[0]["instances"], ["src.py:1", "src.py:9"])
+        for bare in ({k: v for k, v in listed.items() if k != "instances"}, {**listed, "instances": []},
+                     {**listed, "instances": [" "]}):
+            with self.subTest(bare=bare):
+                outcome = self.run_response(self.envelope(json.dumps({"findings": [bare]})))
+                self.assertEqual(outcome.status, sd_review.UNAVAILABLE)
+                self.assertEqual(outcome.diagnostic["validation_error"], "response violates the findings schema: "
+                                 "findings[0].instances: a high finding lists no instance")
+        advisory = finding("medium", "unlisted")
+        self.assertEqual(self.run_response(self.envelope(json.dumps({"findings": [advisory]}))).status,
+                         sd_review.FINDINGS, "a finding below high needs no instance")
+
+    def test_the_declared_schema_asks_every_finding_for_an_instance(self) -> None:
+        """Review of sd:9769: the parser refuses a high finding with `instances: []`, so the schema a strict reader
+        follows must not allow it, or a reader that found a real blocker counts as no answer."""
+        items = sd_review.CODEX_OUTPUT_SCHEMA["properties"]["findings"]["items"]
+        self.assertIn("instances", items["required"])
+        self.assertEqual(items["properties"]["instances"].get("minItems"), 1,
+                         "a strict reader may emit no instance the parser then refuses")
+
     def test_top_level_extra_keys_refuse_without_disclosing_them(self) -> None:
         unknown_key = "secret-marker" * 1000
         outcome = self.run_response(self.envelope(json.dumps({"findings": [], unknown_key: True})))
@@ -287,7 +320,7 @@ class URLDiagnostics(ReviewFixture):
         self.assertIn("omitted", outcome.findings[0]["summary"])
 
     def test_integer_conversion_limit_is_a_nonpassing_redacted_diagnostic(self) -> None:
-        content = '{"findings":[{"path":"src.py","line":' + "1" * 5000 + ',"severity":"high","summary":"private-marker","family":"correctness"}]}'
+        content = '{"findings":[{"path":"src.py","line":' + "1" * 5000 + ',"severity":"high","instances":["src.py:1"],"summary":"private-marker","family":"correctness"}]}'
         for fenced in (False, True):
             with self.subTest(fenced=fenced):
                 outcome = self.run_response(self.envelope("```json\n" + content + "\n```" if fenced else content))

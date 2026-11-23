@@ -481,6 +481,18 @@ def git_output(args: list[str], root: pathlib.Path) -> str | None:
     return _git(args, root)
 
 
+def instance_files(instances: Any) -> list[str]:
+    """The file of each `path:line` in a finding's `instances`; a value not a list names none (sd:9769)."""
+    return [re.sub(r":[0-9]+$", "", entry.strip()) for entry in (instances if isinstance(instances, list) else [])
+            if isinstance(entry, str) and entry.strip()]
+
+
+def blocking_places(findings: list[Any]) -> list[str]:
+    """Each file a prior blocking finding names: its path and each instance's (sd:9769)."""
+    return sorted({place for row in findings if isinstance(row, dict) and row.get("disposition") == "blocking"
+                   for place in (row["path"], *instance_files(row.get("instances")))})
+
+
 #: One github.com repository as `origin` names it. An owner cannot contain `.`.
 GITHUB_ORIGIN = re.compile(r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)"
                            r"([\w-]+)/([\w.-]+?)(?:\.git)?/?")
@@ -4335,18 +4347,21 @@ def fill_slots(items: Any, slots: int, run: Callable[[Any], Any], counted: Calla
 def distinct_findings(findings: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """sd:7519. Each finding once: one two readers both report keeps the first reader's `backend`.
 
-    Identical means every key but `backend` and `evidence` is equal: two readers cite
-    their checks in their own words (pack sd:9270). Adjudication takes a row per
+    Identical means every key but `backend`, `evidence` and `instances` is equal: two
+    readers cite their checks and list instances in their own words (pack sd:9270, sd:9769). Adjudication takes a row per
     blocking finding, so a copy was a second row to dispute. The kept row takes
-    the first evidence any copy gives, so a bare first copy does not lose a cited one.
+    the first evidence any copy gives, so a bare first copy does not lose a cited one,
+    and every instance any copy lists.
     """
     seen: dict[str, dict[str, Any]] = {}
     for finding in findings:
-        key = json.dumps({name: value for name, value in finding.items() if name not in ("backend", "evidence")},
+        key = json.dumps({name: value for name, value in finding.items() if name not in ("backend", "evidence", "instances")},
                          sort_keys=True, default=str)
         kept = seen.setdefault(key, dict(finding))
         if not kept.get("evidence") and finding.get("evidence"):
             kept["evidence"] = finding["evidence"]
+        if finding.get("instances"):  # each copy's instances, once: the build matches blockers by them (sd:9769)
+            kept["instances"] = list(dict.fromkeys([*(kept.get("instances") or []), *finding["instances"]]))
     return list(seen.values())
 
 

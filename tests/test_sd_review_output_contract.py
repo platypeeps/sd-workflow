@@ -37,7 +37,7 @@ class URLContractTests(ReviewFixture):
         (root / "src.py").write_text("# first input marker\n" + "value = '完整'\n" * 10000 + "# final input marker\n")
         self.commit(root)
         prior = {"scope": "branch", "subject": {"head": base},
-                 "findings": [{"path": "prior.py", "line": 2, "severity": "high", "family": "correctness",
+                 "findings": [{"path": "prior.py", "line": 2, "severity": "high", "instances": ["src.py:1"], "family": "correctness",
                                "summary": "unresolved original blocker", "disposition": "blocking"}]}
         report = self.tmp / "prior.json"
         report.write_text(json.dumps(prior))
@@ -114,7 +114,7 @@ class URLContractTests(ReviewFixture):
         self.assertEqual(len(parsed.findings), 1)
 
     def test_summary_guidance_does_not_silently_truncate_findings(self):
-        row = {"path": "src.py", "line": 1, "severity": "high", "family": "correctness",
+        row = {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness",
                "summary": ("meaningful defect " * 100).strip()}
         parsed = sd_review.parse_findings(json.dumps({"findings": [row]}))
         self.assertFalse(parsed.error)
