@@ -585,6 +585,22 @@ def bound_names(line: str) -> set[str]:
     return set(re.findall(r"[A-Za-z_]\w*", found[1])) if found else set()
 
 
+def statement(lines: list[str], index: int) -> list[str]:
+    """The lines of the statement that holds `lines[index]`: back to the last line no bracket is open at,
+    on to the line that closes the brackets left open, so a table written over lines is one statement
+    (pack sd:9769). ponytail: brackets inside strings count, which only widens the statement."""
+    depths, depth = [], 0
+    for text in lines:
+        depths.append(depth)
+        depth = max(0, depth + sum(text.count(mark) for mark in "([{") - sum(text.count(mark) for mark in ")]}"))
+    depths.append(depth)
+    if index >= len(lines):
+        return []
+    start = next(row for row in range(index, -1, -1) if depths[row] == 0)
+    end = next((row for row in range(index + 1, len(depths)) if depths[row] == 0), len(lines))
+    return lines[start:end]
+
+
 def callable_words(text: str) -> set[str]:
     """The identifiers a finding names as code: `name(`, a snake or camel name, or a backticked dotted name."""
     words = set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", text))
@@ -1709,8 +1725,8 @@ class Supervisor:
     def scope(self, path: str, line: int | None, head: str,
               sources: dict[str, list[str] | None]) -> tuple[set[str], list[str]] | None:
         """`enclosing`'s names and the lines of that function: from its definition to the next line indented no
-        deeper, the first that holds the cited line; the whole file for a place with no line, the cited line
-        alone outside every function."""
+        deeper, the first that holds the cited line; the whole file for a place with no line, and the cited
+        line's whole statement outside every function."""
         if path not in sources:
             try:
                 sources[path] = _read([*self.tools.git, "-C", str(self.work), "show", f"{head}:{path}"],
@@ -1737,7 +1753,7 @@ class Supervisor:
                             and len(lines[index]) - len(lines[index].lstrip()) <= depth), len(lines))
                 if line <= end:
                     return names, lines[start:end]
-        return set(), lines[max(line - 1, 0):line]
+        return set(), statement(lines, max(line - 1, 0))
 
     def branch_words(self, head: str) -> tuple[set[str], set[str]] | None:
         """`function_words` of the branch from its fork: its identifiers and defined names; None when unread

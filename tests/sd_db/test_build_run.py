@@ -1776,6 +1776,24 @@ class Supervise(Case):
         self.assertEqual(self.edges(files, rows, {"lib/handlers.py": {3}}, {"handler_a"}, {"handler_a"}), rows,
                          "a dispatcher reaching the changed handler through a table was deferred")
 
+    def test_a_statement_outside_any_function_spans_its_open_brackets(self):
+        """Class pass, review of sd:9769: a table written over several lines is one statement; the scope of
+        any of its lines is the whole statement, so the entry naming the changed handler is read."""
+        self.press()
+        files = {"lib/dispatch.py": "HANDLERS = {\n    \"a\": handler_a,\n    \"b\": handler_b,\n}\n\n\n"
+                                    "def dispatch(key):\n    return HANDLERS[key]().name\n"}
+        supervisor = self.supervisor()
+        head = "a" * 40
+        with mock.patch.object(build_run, "_read", return_value=files["lib/dispatch.py"]):
+            self.assertEqual(supervisor.scope("lib/dispatch.py", 1, head, {}),
+                             (set(), files["lib/dispatch.py"].splitlines()[:4]),
+                             "a statement over several lines read as its first line")
+            self.assertEqual(supervisor.scope("lib/dispatch.py", 3, head, {})[1][0], "HANDLERS = {",
+                             "a line inside a table read without its statement")
+        rows = [{"path": "lib/dispatch.py", "line": 8, "summary": "a missing result crashes here"}]
+        self.assertEqual(self.edges(files, rows, {"lib/handlers.py": {3}}, {"handler_a"}, {"handler_a"}), rows,
+                         "a dispatcher reaching the changed handler through a multiline table was deferred")
+
     def test_a_short_function_name_still_names_the_changed_caller(self):
         """Review of sd:9769: `go()` names a changed function; no length filter drops it."""
         self.press()
