@@ -17,7 +17,7 @@
 # the behaviour it had before this hook.
 #
 # `SD_SKIP_HOOKS=1` does not skip it. That variable exists because the
-# pre-commit tier costs seconds; this one costs one git call.
+# pre-commit tier costs seconds; this one costs at most four git calls.
 # `--no-verify` still skips it, as it skips every commit-msg hook.
 #
 # Installed by `make hooks` beside the pre-commit tier, as the link
@@ -58,11 +58,57 @@ def main(argv: list[str]) -> int:
     sys.path.insert(0, str(pack_bin))
     try:
         import sd_lib
+        import sd_ship_body
     except Exception as error:  # the hook must name why it could not read, not crash
-        print(f"commit-msg: unchecked, cannot import {pack_bin / 'sd_lib.py'}: {error}",
+        print(f"commit-msg: unchecked, cannot import from {pack_bin}: {error}",
               file=sys.stderr)
         return 1
     message = message_file.read_text(encoding="utf-8", errors="replace")
+    # pack sd:10212: the lane refuses a line over the limit at enqueue, after a full review; refuse it here.
+    # The hook cannot see the message git saves, so it refuses only a line git certainly keeps.
+    # A merge, revert, cherry-pick, rebase or squash merge replays git's own message (sd-ship's
+    # catch-up merge runs this hook too); the lane still measures what lands.
+    gitdir = (sd_lib.git_output(["rev-parse", "--path-format=absolute", "--git-dir"], root) or "").strip()
+    replaying = bool(gitdir) and any(
+        (pathlib.Path(gitdir) / name).exists()
+        for name in ("MERGE_HEAD", "REVERT_HEAD", "CHERRY_PICK_HEAD", "SQUASH_MSG",
+                     "rebase-merge", "rebase-apply"))
+    # A fixup, squash or amend commit carries git's `<kind>! <subject>`, and autosquash removes it.
+    if not replaying and not message.startswith(("fixup! ", "squash! ", "amend! ")):
+        # Comment lines: any char git's `auto` may pick, or the configured string; a verbose diff
+        # sits below a scissors line in that char. ponytail: such a line is skipped even where git
+        # keeps it (-m/-F); the lane refuses it (filed with the --body-only advisory).
+        # Read raw: git_output strips stdout, and a comment string may start with spaces.
+        configured = (subprocess.run(["git", "config", "--get", key], cwd=root, capture_output=True,
+                                     text=True, check=False).stdout.rstrip("\n")
+                      for key in ("core.commentString", "core.commentChar"))
+        prefixes = tuple("#;@!$%^&|:") + tuple(value for value in configured if value not in ("", "auto"))
+        lines = message.split("\n")
+        cut = next((at for at, line in enumerate(lines)
+                    if line.startswith(prefixes) and line.endswith(" " + "-" * 24 + " >8 " + "-" * 24)),
+                   len(lines))
+        # Git keeps comment lines under -m/-F and drops its one comment char's lines in the editor,
+        # and either can change the block structure (a fence opens or closes). A line is refused
+        # only when it is long in every reading: all lines kept, and each candidate char dropped.
+        # Git strips only ASCII trailing whitespace.
+        # Prefixes match the raw line (a comment string may end in a space); length reads the stripped one.
+        raw = lines[:cut]
+        kept = [line.rstrip(" \t\r\v\f") for line in raw]
+        refused = None
+        for drop in (None, *prefixes):
+            index = [at for at, line in enumerate(raw) if drop is None or not line.startswith(drop)]
+            found = {index[number - 1] for number, _ in
+                     sd_ship_body.long_lines("\n".join(kept[at] for at in index))}
+            refused = found if refused is None else refused & found
+        long = [(at + 1, len(kept[at])) for at in sorted(refused or ())
+                if not raw[at].startswith(prefixes)]
+        if long:
+            for number, length in long:
+                print(f"commit-msg: refused, a line is {length} characters (limit {sd_ship_body.LINE_LIMIT}): "
+                      f"{kept[number - 1][:40]}...", file=sys.stderr)
+            print("Rewrap it; a fenced code line or a bare URL line is exempt. "
+                  "The rejected message is kept in .git/COMMIT_EDITMSG.", file=sys.stderr)
+            return 1
     if not sd_lib.unread_trailers(message, ""):  # states none of the checked trailers
         return 0
     parsed = sd_lib.git_output(
