@@ -1416,7 +1416,7 @@ class Supervise(Case):
             loader.exec_module(review)
         finally:
             sys.path.remove(bin_dir)
-        recorded = review.rebuttals(bodies, lambda head: True, lambda head, path: True)
+        recorded = review.rebuttals(bodies, lambda head: True, lambda head, path, line: (line,))
         far = {"path": "far.txt", "line": 1, "severity": "high", "instances": ["far.txt:1"],
                "summary": "an old defect", "family": "correctness"}
         self.assertEqual([row["disposition"] for row in review.dispose([far], "high", recorded)], ["advisory"],

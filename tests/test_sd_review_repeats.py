@@ -1237,7 +1237,7 @@ def adjudicated(*rows: tuple[Any, ...], decision: str = "accepted", line: Any = 
 
 def listed(*bodies: str) -> list[Any]:
     """The rebuttals in `bodies`, newest first, as the prompt lists them."""
-    return sd_review.rebuttals([(body,) for body in bodies], {ON_BRANCH}.__contains__, lambda _head, _path: True)
+    return sd_review.rebuttals([(body,) for body in bodies], {ON_BRANCH}.__contains__, lambda _head, _path, line: (line,))
 
 
 def gate(findings: list[dict[str, Any]], *bodies: str) -> list[str]:
@@ -1286,7 +1286,7 @@ class RebuttalIdentityTests(unittest.TestCase):
         """Review of sd:9769: a later commit can turn an instance, not the primary file, into the branch's own
         regression; a rebuttal holds only while every file the finding names is unchanged."""
         body = adjudicated(("bin/tool.py", "defect", "rebutted"), instances=["bin/tool.py:1", "src.py:1"])
-        seen = sd_review.rebuttals([(body,)], {ON_BRANCH}.__contains__, lambda _head, path: path != "src.py")
+        seen = sd_review.rebuttals([(body,)], {ON_BRANCH}.__contains__, lambda _head, path, line: None if path == "src.py" else (line,))
         self.assertEqual([entry.listed for entry in seen], [False], "a changed instance file kept the rebuttal")
 
     def test_a_finding_that_names_a_new_instance_file_is_not_the_rebutted_one(self) -> None:
@@ -1446,6 +1446,55 @@ class RebuttalScopeTests(RepeatFixture):
                 seen = sd_review.rebutted_findings(self.root, sd_review.resolve_subject(self.root, scope), None,
                                                    self.environment())
                 self.assertEqual([entry.text for entry in seen if entry.listed], [])
+
+    def test_a_ruling_holds_while_a_later_change_leaves_its_hunk_alone(self) -> None:
+        """sd:10191: a catch-up merge of main that edits the ruled file elsewhere keeps the ruling, at the line
+        its code moved to; an edit within `SHIFT_LINES` of that line lapses it, as does one at an instance."""
+        tool, other = self.root / "bin/tool.py", self.root / "lib.py"
+        tool.parent.mkdir()
+        tool.write_text("".join(f"line_{n} = {n}\n" for n in range(1, 31)), encoding="utf-8")
+        other.write_text("".join(f"line_{n} = {n}\n" for n in range(1, 31)), encoding="utf-8")
+        self.commit("add", "bin/tool.py", "lib.py")
+        ruled = self.commit("the ruled code")
+        self.adjudication(("lane claim", "rebutted", "x"), head=ruled, line=20, instances=["bin/tool.py:20", "lib.py:10"])
+
+        def seen() -> list[tuple[str, int | None, tuple[str, ...]]]:
+            found = sd_review.rebutted_findings(self.root, sd_review.resolve_subject(self.root, "branch"), None,
+                                                self.environment())
+            return [(entry.text, entry.line, entry.instances) for entry in found if entry.listed]
+
+        text = tool.read_text(encoding="utf-8").replace("line_2 = 2\n", "line_2 = 22\nadded = 1\nadded = 2\n")
+        tool.write_text(text, encoding="utf-8")
+        self.commit("add", "bin/tool.py")
+        self.commit("a catch-up merge edits line 2")
+        self.assertEqual(seen(), [("lane claim", 22, ("bin/tool.py:22", "lib.py:10"))])
+        other.write_text(other.read_text(encoding="utf-8").replace("line_12 = 12", "line_12 = 0"), encoding="utf-8")
+        self.commit("add", "lib.py")
+        self.commit("an edit two lines from the instance")
+        self.assertEqual(seen(), [], "an edit at an instance's hunk kept the ruling")
+
+    def test_a_ruling_lapses_when_its_own_hunk_changes(self) -> None:
+        tool = self.root / "bin/tool.py"
+        tool.parent.mkdir()
+        tool.write_text("".join(f"line_{n} = {n}\n" for n in range(1, 31)), encoding="utf-8")
+        self.commit("add", "bin/tool.py")
+        ruled = self.commit("the ruled code")
+        self.adjudication(("lane claim", "rebutted", "x"), head=ruled, line=20)
+        tool.write_text(tool.read_text(encoding="utf-8").replace("line_23 = 23", "line_23 = 0"), encoding="utf-8")
+        self.commit("add", "bin/tool.py")
+        self.commit("an edit three lines below the ruling")
+        found = sd_review.rebutted_findings(self.root, sd_review.resolve_subject(self.root, "branch"), None,
+                                            self.environment())
+        self.assertEqual([entry.listed for entry in found], [False])
+
+    def test_hunk_kept_holds_on_doubt(self) -> None:
+        """A ruling without a line, or a diff with no hunk (binary, mode), lapses; a hunk past the window moves it."""
+        self.assertIsNone(sd_review.hunk_kept("@@ -1 +1 @@\n-a\n+b", None))
+        self.assertIsNone(sd_review.hunk_kept("Binary files a/x and b/x differ", 20))
+        self.assertIsNone(sd_review.hunk_kept("@@ -17,0 +18,2 @@\n+a\n+b", 20))
+        self.assertEqual(sd_review.hunk_kept("@@ -16,0 +17,2 @@\n+a\n+b", 20), (22,))
+        self.assertEqual(sd_review.hunk_kept("@@ -24,2 +23,0 @@\n-a\n-b", 20), (20,))
+        self.assertIsNone(sd_review.hunk_kept("@@ -23,2 +22,0 @@\n-a\n-b", 20))
 
     def test_a_diff_git_cannot_run_holds_the_rebuttal_back(self) -> None:
         self.adjudication(("lane claim", "rebutted", "x"))

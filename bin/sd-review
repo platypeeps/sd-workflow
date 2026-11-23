@@ -855,14 +855,34 @@ def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: 
         print(f"sd-review: reviewing without the rebutted findings: {type(error).__name__}: {error}", file=sys.stderr)
         return []
 
-    def unchanged(receipt: str, path: Any) -> bool:
-        """No change to `path` since the receipt's head, the worktree included at worktree scope; hold on doubt:
-        a failed diff is a change."""
-        reads = [["diff", "--quiet", receipt, span[0]]] if subject.scope != "worktree" else [
-            ["diff", "--quiet", receipt], ["ls-files", "--others", "--exclude-standard"]]
-        return isinstance(path, str) and all(sd_lib.git_output(["--literal-pathspecs", *args, "--", path], root) == ""
-                                             for args in reads)
-    return rebuttals(rows, span[2].__contains__, unchanged)
+    def ruled_place(receipt: str, path: Any, line: int | None) -> tuple[int | None] | None:
+        """The ruling's line at the reviewed head, the worktree included at worktree scope, while no change since
+        the receipt's head touched its hunk (`hunk_kept`); None once one did. Hold on doubt: a failed diff, or an
+        untracked file at worktree scope, is a change."""
+        if not isinstance(path, str):
+            return None
+        ends = [receipt, span[0]] if subject.scope != "worktree" else [receipt]
+        if subject.scope == "worktree" and sd_lib.git_output(
+                ["--literal-pathspecs", "ls-files", "--others", "--exclude-standard", "--", path], root) != "":
+            return None
+        diff = sd_lib.git_output(["--literal-pathspecs", "diff", "-U0", "--no-color", "--no-ext-diff", *ends,
+                                  "--", path], root)
+        return None if diff is None else (line,) if diff == "" else hunk_kept(diff, line)
+    return rebuttals(rows, span[2].__contains__, ruled_place)
+
+
+def hunk_kept(diff: str, line: int | None) -> tuple[int | None] | None:
+    """`line` moved past the hunks of one file's `git diff -U0`, or None when a hunk changed a line within
+    `SHIFT_LINES` of it (sd:10191: a catch-up merge that edits the file elsewhere keeps the ruling). A ruling
+    with no line, or a diff with no hunk (a binary or mode change), holds on doubt: None."""
+    hunks = [tuple(int(value) if value else 1 for value in match.groups()) for match in _HUNK.finditer(diff)]
+    if line is None or not hunks:
+        return None
+    low, high = line - SHIFT_LINES, line + SHIFT_LINES
+    if any(low <= start + count - 1 and start <= high if count else low <= start <= high
+           for start, count, _new, _added in hunks):
+        return None
+    return (moved_line(diff, line),)
 
 
 def _folded(value: Any) -> str:
@@ -889,11 +909,11 @@ def recorded_at(records: Sequence[Rebuttal], path: Any, summary: Any, line: Any,
 
 
 def rebuttals(rows: Sequence[Sequence[Any]], on_branch: Callable[[str], bool],
-              unchanged: Callable[[str, Any], bool]) -> list[Rebuttal]:
+              kept: Callable[[str, Any, int | None], tuple[int | None] | None]) -> list[Rebuttal]:
     """Every disposition in adjudication bodies newest first, from receipts `on_branch`. A rebuttal is listed when
-    it is the newest record at its place and its file is `unchanged` since its receipt, up to `REBUTTED_LINES`;
-    the prompt shows exactly those, and the gate holds back a finding only when the newest record at its exact
-    place is one of them.
+    it is the newest record at its place and `kept` finds each place it names unchanged since its receipt, up to
+    `REBUTTED_LINES`, and is listed at the lines `kept` moved them to; the prompt shows exactly those, and the gate
+    holds back a finding only when the newest record at its exact place is one of them.
 
     The lane's own blockers (`LANE_PATHS`) are never recorded: a later truncated review must still block."""
     records = [Rebuttal(head, path, summary_key(summary), line if type(line) is int else None, disposition == "rebutted",
@@ -903,13 +923,24 @@ def rebuttals(rows: Sequence[Sequence[Any]], on_branch: Callable[[str], bool],
                if isinstance(head, str) and on_branch(head)
                for path, summary, line, disposition, reason, instances in found
                if summary_key(summary) and str(path).strip() not in LANE_PATHS]
-    shown = 0
-    for index, record in enumerate(records):
-        own = (record.listed and shown < REBUTTED_LINES and recorded_at(records, record.path, record.summary,
-                                                                        record.line) is record
-               and all(unchanged(record.head, path) for path in (record.path, *(re.sub(r":\d+$", "", entry) for entry in record.instances))))
-        shown += own
-        records[index] = record._replace(listed=own)
+
+    def _moved(record: Rebuttal) -> Rebuttal | None:
+        """The record at its places at the reviewed head; None when any place lapsed."""
+        line = kept(record.head, record.path, record.line)
+        instances = []
+        for entry in record.instances if line is not None else ():
+            found = re.fullmatch(r"(.*):(\d+)", entry)
+            at = kept(record.head, found[1], int(found[2])) if found else kept(record.head, entry, None)
+            if at is None:
+                return None
+            instances.append(f"{found[1]}:{at[0]}" if found else entry)
+        return None if line is None else record._replace(line=line[0], instances=tuple(instances))
+    stored, shown = tuple(records), 0
+    for index, record in enumerate(stored):
+        moved = (_moved(record) if record.listed and shown < REBUTTED_LINES
+                 and recorded_at(stored, record.path, record.summary, record.line) is record else None)
+        shown += moved is not None
+        records[index] = record._replace(listed=False) if moved is None else moved
     return records
 
 
