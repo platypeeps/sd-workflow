@@ -53,6 +53,13 @@ CHECK_FILES = (
 #: make an unchanged verdict when one of these moved, so a moved binding that
 #: names one re-reviews instead of replaying `--explain` (sd:1397, option A).
 FINDING_FILES = ("sd-review", "sd_opencode.py", "sd_registry.py")
+#: The definitions of a `FINDING_FILES` member that judge findings: the provider run, the output schema and
+#: parser, the rebuttals and prior blockers held against them, the floor and the disposition (sd:10191).
+#: `finding_hash` covers them and every module-level name they reach; a change elsewhere in the file, the
+#: prompt and route included, goes to the `--explain` replay, which covers what the reviewers are asked.
+#: A member not named here is judged whole.
+FINDING_ROOTS = {"sd-review": ("CODEX_OUTPUT_SCHEMA", "run_provider", "parse_findings", "rebutted_findings",
+                               "prior_at", "unlocated", "dispose", "finish_review")}
 #: Imported by a review tool but never on the review path.
 IMPORT_EXEMPT = {
     "sd_setup_github.py": "sd-review imports it only for the `setup-github` subcommand",
@@ -96,8 +103,8 @@ def file_hash(path: pathlib.Path) -> str:
     return ABSENT if data is None else hashlib.sha256(data).hexdigest()
 
 
-def normalized_source(data: bytes) -> str | None:
-    """The source's syntax tree without comments, docstrings or layout; None when it does not parse."""
+def stripped_tree(data: bytes) -> ast.Module | None:
+    """The source's syntax tree without docstrings; None when it does not parse."""
     try:
         tree = ast.parse(data)
     except (SyntaxError, ValueError):
@@ -107,7 +114,13 @@ def normalized_source(data: bytes) -> str | None:
             body = node.body
             if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
                 node.body = body[1:] or [ast.Pass()]
-    return ast.dump(tree, include_attributes=False)
+    return tree
+
+
+def normalized_source(data: bytes) -> str | None:
+    """The source's syntax tree without comments, docstrings or layout; None when it does not parse."""
+    tree = stripped_tree(data)
+    return None if tree is None else ast.dump(tree, include_attributes=False)
 
 
 #: `normalized_hash` answers by the sha256 of the bytes it read (sd:1615). The
@@ -129,6 +142,71 @@ def normalized_hash(path: pathlib.Path) -> str:
         known = "raw:" + raw if source is None else "ast:" + hashlib.sha256(source.encode()).hexdigest()
         _NORMALIZED[raw] = known
     return known
+
+
+def defined_names(node: ast.stmt) -> list[str]:
+    """The module-level names a statement binds; none for one that binds no plain name."""
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+        return [node.name]
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return [alias.asname or alias.name.split(".")[0] for alias in node.names]
+    targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(
+        node, (ast.AnnAssign, ast.AugAssign)) else []
+    return [name.id for target in targets for name in ast.walk(target) if isinstance(name, ast.Name)]
+
+
+def finding_hash(path: pathlib.Path, roots: tuple[str, ...]) -> str:
+    """The `roots` of `path` and every module-level name they reach, docstrings dropped, in source order.
+
+    Any other module-level statement (an `if`, a `try`, a bare call) is always in it, and a root that is not
+    defined, or a file that does not parse, hashes the whole file: on doubt the binding moves."""
+    data = read_bound(path)
+    if data is None:
+        return ABSENT
+    key = hashlib.sha256(data).hexdigest() + "\0" + "\0".join(roots)  # by content, as `_NORMALIZED` (sd:1615)
+    if key not in _FINDING:
+        _FINDING[key] = _finding_hash(data, roots)
+    return _FINDING[key]
+
+
+_FINDING: dict[str, str] = {}
+
+
+def _finding_hash(data: bytes, roots: tuple[str, ...]) -> str:
+    tree = stripped_tree(data)
+    defined: dict[str, list[int]] = {}
+    for index, node in enumerate(tree.body if tree is not None else ()):
+        for name in defined_names(node):
+            defined.setdefault(name, []).append(index)
+    if tree is None or any(root not in defined for root in roots):
+        return "raw:" + hashlib.sha256(data).hexdigest()
+    kept = {index for index, node in enumerate(tree.body) if not defined_names(node)}
+    reached, pending = set(), list(roots)
+    while pending:
+        name = pending.pop()
+        if name in reached or name not in defined:
+            continue
+        reached.add(name)
+        for index in defined[name]:
+            kept.add(index)
+            pending += [node.id for node in ast.walk(tree.body[index]) if isinstance(node, ast.Name)]
+    source = "\n".join(ast.dump(tree.body[index], include_attributes=False) for index in sorted(kept))
+    return "ast:" + hashlib.sha256(source.encode()).hexdigest()
+
+
+def finding_manifest() -> dict:
+    return {name: finding_hash(BIN / name, roots) for name, roots in FINDING_ROOTS.items()}
+
+
+def finding_kept(name: str, stored: object, current: dict) -> bool:
+    """Whether a moved `verdict` entry leaves the code that judges findings as it was: true for a file not in
+    `FINDING_FILES`; for one in `FINDING_ROOTS`, its `finding_hash` in both manifests, equal and present. A
+    receipt from before sd:10191 has none, so its member re-reviews as before."""
+    if name not in FINDING_FILES:
+        return True
+    before = (stored.get("finding") if isinstance(stored, dict) else None) or {}
+    after = current.get("finding") or {}
+    return name in FINDING_ROOTS and before.get(name) not in (None, ABSENT) and before.get(name) == after.get(name)
 
 
 def tool_manifest() -> dict:
@@ -160,7 +238,8 @@ def policy_files(root: pathlib.Path) -> dict:
 
 def binding_manifest(root: pathlib.Path) -> dict:
     """What a receipt stores beside its digest, so a moved binding can name what moved."""
-    return {"schema": 2, "normalizer": NORMALIZER, **tool_manifest(), "policy": policy_files(root)}
+    return {"schema": 2, "normalizer": NORMALIZER, **tool_manifest(), "policy": policy_files(root),
+            "finding": finding_manifest()}
 
 
 def manifest_digest(manifest: dict) -> str:

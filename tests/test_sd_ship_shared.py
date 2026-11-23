@@ -333,6 +333,45 @@ class SharedBindingTests(unittest.TestCase):
         self.assertEqual(set(getattr(bindings, "FINDING_FILES", ())), {"sd-review", "sd_opencode.py", "sd_registry.py"})
         self.assertLessEqual(set(bindings.FINDING_FILES), set(bindings.VERDICT_FILES))
 
+    def test_a_pack_merge_that_leaves_the_finding_code_keeps_the_receipt(self):
+        """sd:10191. A pack merge that edits `sd-review` outside the code that judges findings goes to the
+        replay, as any other verdict file does; one inside it, or a receipt stored before the finding
+        fingerprint, re-reviews."""
+        self.operation.state["passes"][-1]["review_request"] = {"sha256": "asked", "verify": None, "resume": None}
+        stored = {key: self.operation.state[key] for key in ("binding", "binding_manifest")}
+        elsewhere = b"\ndef a_helper_the_finding_code_never_calls():\n    return 1\n"
+        calls = self.replaying("asked")
+        with self.edited(bindings.BIN / "sd-review", elsewhere):
+            self.assertEqual(self.operation.review_inputs(self.head), self.report)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual([row["changed"] for row in self.operation.state["review_binding_kept"]],
+                         [[["sd-review", "verdict"]]])
+        for case, suffix in (("finding code", b"\ndef dispose(findings, floor, rebutted=()):\n    return []\n"),
+                             ("a name it reaches", b"\nSHIFT_LINES = 9\n"), ("legacy", elsewhere)):
+            self.operation.state.update(stored)
+            if case == "legacy":
+                self.operation.state["binding_manifest"] = {
+                    key: value for key, value in stored["binding_manifest"].items() if key != "finding"}
+            calls = self.replaying("asked")
+            with self.subTest(case=case), self.edited(bindings.BIN / "sd-review", suffix):
+                with self.assertRaisesRegex(ship.Refusal, "changed after review: sd-review \\(verdict\\)$"):
+                    self.operation.review_inputs(self.head)
+            self.assertEqual(calls, [], case)
+
+    def test_the_finding_hash_holds_on_doubt(self):
+        """sd:10191. A root that is gone, or a file that does not parse, hashes the whole file."""
+        source = bindings.BIN / "sd-review"
+        whole = "raw:" + hashlib.sha256(source.read_bytes()).hexdigest()
+        self.assertTrue(bindings.finding_hash(source, ("dispose",)).startswith("ast:"))
+        self.assertEqual(bindings.finding_hash(source, ("dispose", "no_such_definition")), whole)
+        with self.edited(source, b"\ndef (\n"):
+            self.assertTrue(bindings.finding_hash(source, ("dispose",)).startswith("raw:"))
+        self.assertEqual(bindings.finding_hash(bindings.BIN / "sd-no-such-file", ("dispose",)), bindings.ABSENT)
+        self.assertFalse(bindings.finding_kept("sd-review", {"finding": {"sd-review": bindings.ABSENT}},
+                                               {"finding": {"sd-review": bindings.ABSENT}}))
+        self.assertFalse(bindings.finding_kept("sd_registry.py", {"finding": {}}, {"finding": {}}))
+        self.assertTrue(bindings.finding_kept("sd_route.py", None, {}))
+
     def test_a_policy_change_is_never_kept_by_a_replay(self):
         """Policy stays byte-exact (sd:1834 operator decision); no replay is even asked."""
         self.operation.state["passes"][-1]["review_request"] = {"sha256": "asked", "verify": None, "resume": None}
