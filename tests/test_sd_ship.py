@@ -6739,10 +6739,20 @@ roles:
         self.assertEqual(self.remote.pull(1).state, "MERGED")  # GitHub took the PUT
 
     def test_land_train_whose_read_back_is_malformed_after_the_put_answers_unknown(self):
-        """Review of sd:9923: `base: "main"` raised AttributeError past the unknown outcome."""
+        """Review of sd:9923: `base: "main"` raised AttributeError past the unknown outcome.
+
+        The PUT's answer is lost, as a confirmed PUT alone counts as landed."""
         tip = self.joined_tip()
         remote = sys.modules["sd_ship_remote"]
         real = remote.GitHub.pull
+        saved = self.double._route
+
+        def route(method, path, body):
+            answer = saved(method, path, body)
+            if method == "PUT" and path.endswith("/merge"):
+                raise RemoteRefusal(502, "the merge answer was lost")
+            return answer
+        self.double._route = route
 
         def pull(api, number):
             if any(call.method == "PUT" for call in self.remote.calls):
@@ -6766,6 +6776,22 @@ roles:
         with patch.object(remote.GitHub, "pull", pull):
             landed, _ = self.landed_by_lane(tip)
         self.assertEqual((landed["status"], landed["merge_commit"]), ("merged", "c" * 40))
+
+    def test_land_train_whose_put_merged_and_read_back_is_stale_counts_as_landed(self):
+        """Review of sd:9923: the PUT answer was dropped, so a stale `merged: false` read failed the train."""
+        tip = self.joined_tip()
+        remote = sys.modules["sd_ship_remote"]
+        real = remote.GitHub.pull
+
+        def pull(api, number):
+            answer = real(api, number)
+            if any(call.method == "PUT" for call in self.remote.calls):
+                return {**answer, "merged": False, "merge_commit_sha": None}
+            return answer
+        with patch.object(remote.GitHub, "pull", pull):
+            landed, _ = self.landed_by_lane(tip)
+        self.assertEqual(landed["status"], "merged")
+        self.assertEqual(landed["merge_commit"], _git(self.remote.path, "rev-parse", "main"))
 
     def test_land_train_whose_member_is_cancelled_during_the_final_fetch_sends_no_merge(self):
         """Review of sd:9923: the last queue read ran before the final base fetch under the lock."""
