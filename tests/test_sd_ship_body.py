@@ -607,6 +607,28 @@ class CitedIdTests(unittest.TestCase):
         # A comment opened on a wrapped line ends with its item, as one on an indented line does.
         self.assertEqual(sd_ship_body.quoted_lines("- a\nx <!-- y\n- b\nLane review fix, pack sd:5\n"), set())
 
+    def test_comment_scope_is_commonmarks_whatever_the_revert_list_reads(self) -> None:
+        """pack sd:9666 review, round 16: the revert list's plain-text rules (a colon line ends its item;
+        `2.` opens an item under a paragraph) also moved where a comment ends, for every citation. A
+        comment's scope is CommonMark's for both readers; only the revert list reads the plain rules."""
+        a = "a" * 7
+        fix = "Lane review fix, pack sd:5\n"
+        cited = {f"- a\nx <!-- y:\n- b\n{fix}": (5,),  # blocker 1
+                 f"Notes\n2. <!--\n{fix}-->\n": ()}  # blocker 2
+        for body, ids in cited.items():
+            with self.subTest(body=body):
+                self.assertEqual(sd_ship_body.cited_ids(body, []), ids)
+        listed = {
+            f"- note\nx <!-- y. Reverted commits:\n- {a} renew\n": [a],  # the comment ends with `- note`
+            f"Reverted commits:\n2. <!--\n3. {a} example\n-->\n": [],  # `2.` is text: the comment holds on
+            f"Reverted commits:\n2. {a} renew\n": [a],  # yet the revert list reads `2.` as an item
+            f"See `x\nReverted commits:\n2. {a} example\nend` here.\n": [],  # lines in a wrapped code span
+            f"Reverted commits:\n\n- {a} renew\nKept commits:\n- {'b' * 7} retained\n": [a],
+        }
+        for message, found in listed.items():
+            with self.subTest(message=message):
+                self.assertEqual(sd_ship_body._listed_undone(message), found)
+
     def test_markers_on_one_line_open_an_empty_parent(self) -> None:
         """pack sd:9666 review, round 12, blocker 3: `- - <sha>` under `Reverted commits:` undid the
         commit, though the empty parent item holds it, as it does across two lines."""
