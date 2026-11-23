@@ -581,6 +581,32 @@ class CitedIdTests(unittest.TestCase):
         lazy = f"Reverted commits:\n\n- {a} renew\nwrapped on\n- {c} renew\n"
         self.assertEqual(sd_ship_body._listed_undone(lazy), [a, c])
 
+    def test_a_paragraph_rule_for_spans_leaves_headings_and_items_alone(self) -> None:
+        """pack sd:9666 review, round 15: the round 14 paragraph rules (a lazy line continues its item; a
+        marker that cannot interrupt a paragraph is text) decide where a code span ends, yet they also
+        moved the headings and items a revert's list is read by. A line that ends with a colon is a
+        heading wherever it sits; wrapped text heads nothing; a marker opens an item unless a span is open."""
+        a, b, c = "a" * 7, "b" * 7, "c" * 7
+        head = "Reverted commits:\n"
+        cases = {
+            f"{head}\n- {a} reverted\nKept commits:\n- {b} retained\n": [a],  # blocker 1
+            f"Revert x\n\n- reason one\n{head}- {a}\n": [a],  # blocker 2, case 1
+            f"{head}- {a}\nKept commits:\n- {b}\n": [a],  # blocker 2, case 2
+            f"{head}\n- {a} renew\nwrapped on\n  - {c}\n": [a, c],  # blocker 2, case 3
+            f"{head}\n- {a} renew\nwrapped on\n- {c} renew\n": [a, c],  # wrapped text ends no section
+            f"{head}\n- {a} reverted\nKept commits:\n  - {b} retained\n": [a],
+            f"{head}\n- {a}\n  - {c}\n Kept commits:\n  - {b}\n": [a, c],  # a heading one space in
+            f"{head}2. {a} renew\n3. {c} renew\n": [a, c],  # a list numbered past 1, no blank line
+            f"Notes.\n{head}7) {a} renew\n": [a],
+            f"- reason\n{head}===\n- {a}\n": [a],  # an underline under a heading that follows an item
+            f"- `x\ny <!-- z`:\n\n{head}\n- {a} renew\n": [a],  # in an open span a colon heads nothing
+        }
+        for message, found in cases.items():
+            with self.subTest(message=message):
+                self.assertEqual(sd_ship_body._listed_undone(message), found)
+        # A comment opened on a wrapped line ends with its item, as one on an indented line does.
+        self.assertEqual(sd_ship_body.quoted_lines("- a\nx <!-- y\n- b\nLane review fix, pack sd:5\n"), set())
+
     def test_markers_on_one_line_open_an_empty_parent(self) -> None:
         """pack sd:9666 review, round 12, blocker 3: `- - <sha>` under `Reverted commits:` undid the
         commit, though the empty parent item holds it, as it does across two lines."""

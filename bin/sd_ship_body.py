@@ -95,7 +95,8 @@ def _blocks(body: str, comments: bool = True):
 
     Yields `(number, kind, opened, depth, text, line)`: `kind` is `fence`,
     `comment`, `code`, `setext` (an underline that makes the line above
-    it a heading) or `text`; `opened` counts the list items the line's
+    it a heading), `wrapped` (text indented less than the list item whose
+    paragraph it continues) or `text`; `opened` counts the list items the line's
     markers open, even when a fence or code follows them; `depth` counts
     the items open after them; `text` is the line past their text column.
 
@@ -118,7 +119,7 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]]):
     items: list[int] = []  # the text column of each open list item, outermost first
     for number, line in enumerate(body.split("\n"), start=1):
         line = line.rstrip("\r").expandtabs(4)
-        rest, lazy = _continues(line, items, paragraph=not loose and not commented)
+        rest, lazy = _continues(line, items, not loose and not commented, bool(ticks))
         commented = commented and len(items) >= comment_depth  # a comment ends with the list item that holds it
         if fence and len(items) >= fence_depth:
             fence = "" if _closes(_FENCE_RE.match(rest), fence) else fence
@@ -126,7 +127,8 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]]):
             rows.append((number, "fence", 0, len(items), rest, line))
             continue
         fence = ""  # the list item that held the fence ended, and the fence with it
-        kind, opened, text = ("text", 0, rest) if lazy else _kind(rest, items, loose, commented, len(items) != depth)
+        kind, opened, text = ("text", 0, rest) if lazy else _kind(rest, items, loose, commented, len(items) != depth,
+                                                                    bool(ticks))
         alone = _stands_alone(kind, text, line)
         if ticks and _ends_paragraph(kind, opened, alone, len(items) != depth):
             return rows, span_at  # the paragraph ended with the span open: its opener is text
@@ -140,7 +142,7 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]]):
                 return rows, span_at  # a heading is one line: a span it opens ends with it
         loose = alone
         depth = len(items)  # a heading or a break is one line, no paragraph; `depth` finds a lazy line
-        rows.append((number, kind, opened, len(items), text, line))
+        rows.append((number, "wrapped" if lazy else kind, opened, len(items), text, line))
     return rows, (span_at if ticks else None)
 
 
@@ -151,16 +153,19 @@ def _inline(line: str, number: int, commented: bool, ticks: str, span_at: tuple[
     return commented, ticks, (number, column) if ticks and column >= 0 else span_at
 
 
-def _continues(line: str, items: list[int], paragraph: bool) -> tuple[str, bool]:
+def _continues(line: str, items: list[int], paragraph: bool, spanned: bool) -> tuple[str, bool]:
     """`line` past its list column, popping each item it ends, and whether it is a lazy line.
 
     A line indented less than its list item continues the item's open
     `paragraph` (CommonMark's lazy continuation) unless a block starts on
-    it: any list marker, or a block that interrupts a paragraph.
+    it: any list marker, or a block that interrupts a paragraph. A line
+    that ends with a colon is a heading to `_listed_undone`, so it ends
+    the item too, unless it starts in an open code span (`spanned`).
     """
     ended = items.copy()
     rest = _item_text(line, ended, opens=False)
-    if paragraph and len(ended) < len(items) and not (_ITEM_MARKER.match(rest) or _interrupts(rest)):
+    if paragraph and len(ended) < len(items) and not (_ITEM_MARKER.match(rest) or _interrupts(rest)) \
+            and (spanned or not _heading(rest).endswith(":")):
         return line.strip(), True
     items[:] = ended
     return rest, False
@@ -199,13 +204,15 @@ def _stands_alone(kind: str, text: str, line: str) -> bool:
     return kind in ("fence", "code", "setext") or not line.strip() or bool(_ATX.match(text) or _BREAK.match(text))
 
 
-def _kind(rest: str, items: list[int], loose: bool, commented: bool, lazy: bool = False) -> tuple[str, int, str]:
+def _kind(rest: str, items: list[int], loose: bool, commented: bool, lazy: bool = False,
+          spanned: bool = False) -> tuple[str, int, str]:
     """The block `rest`, a line past its list column, starts, the list items it opens onto `items`, and its text.
 
     An HTML comment open at its start holds it. Four spaces in after no
     paragraph, or after the markers it opens, start indented code. A
     thematic break or a setext underline outranks a list marker; a line
-    that ended a list item (`lazy`) underlines nothing.
+    that ended a list item (`lazy`) underlines nothing. In an open code
+    span (`spanned`) a marker that cannot interrupt a paragraph is text.
     """
     if commented:
         return "comment", 0, rest
@@ -213,8 +220,9 @@ def _kind(rest: str, items: list[int], loose: bool, commented: bool, lazy: bool 
         return "code", 0, rest
     if not loose and not lazy and _SETEXT.match(rest):
         return "setext", 0, rest
-    if _BREAK.match(rest) or (not loose and not lazy and _ITEM_MARKER.match(rest) and not _interrupts(rest)):
-        return "text", 0, rest  # an empty item or one numbered past 1 cannot interrupt a paragraph
+    if _BREAK.match(rest) or (spanned and not loose and not lazy and _ITEM_MARKER.match(rest)
+                              and not _interrupts(rest)):
+        return "text", 0, rest  # an empty item or one numbered past 1 cannot interrupt a span's paragraph
     before = len(items)
     text = _item_text(rest, items, opens=True)
     opened = len(items) - before
@@ -517,6 +525,10 @@ def _listed_undone(message: str) -> list[str]:
     A list item that opens with a sha, under a heading such as `Reverted
     commits:`. A heading is a line that ends with a colon, bare, indented or
     itself a list item, or any line at column zero that is no list item.
+    One exception: a line with no colon that runs on from a list item's
+    text with no blank line between is that item's wrapped text, and
+    heads nothing; the same words could be either, and a wrapped entry is
+    the likelier one, since the heading that undoes must carry its colon.
     The top level and each open list item, as `_blocks` reads them,
     hold the last heading in them: a list item's own text is its first.
     A sha item undoes when the heading of what holds it says reverted, and
