@@ -147,7 +147,8 @@ CORE_CONFIG = {
                                     "TEST_WORKERS overrides it for one run. It grants nothing."},
     "gate_load_max": {"pattern": r"[0-9]+(\.[0-9]+)?",
                       "description": "The gate queue starts a gate only while load1 is below this; 0 is no load "
-                                     "condition. Unset is none; SD_GATE_LOAD_MAX overrides it for one run."},
+                                     "condition. Below 90% CPU busy, load1 reads busy times cores (sd:9946). "
+                                     "Unset is none; SD_GATE_LOAD_MAX overrides it for one run."},
     "bundle_max": {"pattern": "[1-9][0-9]?",
                    "description": "How many items one build bundle takes when this machine claims it, a mechanical "
                                   "item half of one; the claim gives a child 120 minutes per 3 slots it took, never less. "
