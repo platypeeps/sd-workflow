@@ -2581,19 +2581,22 @@ class Hosts(Case):
         self.assertIsNotNone(run, "the hub claims the moved lane's retry")
         self.assertEqual(run["owner"], "fixture")
 
-    def test_the_hub_requeues_a_row_blocked_on_a_satellite_its_lane_left(self):
-        """sd:8991 review round 3: a row blocked on a quiet satellite stayed blocked once its lane moved to the hub,
-        as `_requeue_beat_blocked` put back only a row whose lane still ran on the host the block names."""
-        build.queue(self.db, [self.item(repo=SAT)], who="operator")
+    def test_the_hub_leaves_a_satellites_beat_blocked_retry_once_its_lane_moved_to_the_hub(self):
+        """Pack sd:9964 (reversing sd:8991 review round 3): a retry blocked on a quiet satellite was put back once
+        its lane moved to the hub, and the hub rebuilt it from base in a hub worktree, its work left on the
+        satellite. It stays blocked, `_stranded`, and the hub's pickup builds the item fresh."""
+        item = self.item(repo=SAT)
+        build.queue(self.db, [item], who="operator")
         retry = self.claim(hosts=WORK)
         self.retried(retry)
         self.stale()
         self.assertIsNone(self.claim(hosts=HUB))
         self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", retry["assignment"]), "blocked")
         self.db.execute("UPDATE repo SET lane_host = NULL WHERE path = ?", (SAT,))
-        run = self.claim(hosts=HUB)
-        self.assertIsNotNone(run, "put back and claimed by the hub")
-        self.assertEqual(run["assignment"], retry["assignment"])
+        self.assertIsNone(self.claim(hosts=HUB), "not put back on the hub")
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", retry["assignment"]), "blocked")
+        build.set_pickup(self.db, True, now=Pickup.NOW)
+        self.assertEqual(build.pickup(self.db, build.room(self.db, **IDLE, hosts=HUB), now=Pickup.NOW), [item])
 
     def fallback_retried(self):
         """A bundle the hub built for the busy satellite's lane, ended blocked and released; its run."""
@@ -3374,6 +3377,15 @@ class LoadCap(unittest.TestCase):
                              "the five-minute load is 50, above the cap of 24")
         with mock.patch.object(build.os, "cpu_count", return_value=None):
             self.assertEqual(build.unread(1.0, build.load_cap(), []), build.UNREAD[0])
+
+    def test_the_cap_reads_the_counted_load_the_gate_gives(self):
+        """sd:9946: load5 277 with the CPU 37% idle paused every claim; the gate's counted load stands in."""
+        self.assertEqual(build.counted({"load": [1, 277.0, 1], "load_counted": 10.1}, 277.0), 10.1)
+        for answer in ({}, {"load_counted": None}, {"load_counted": True}, {"load_counted": float("nan")},
+                       {"load_counted": -1}, {"load_counted": "3"},
+                       {"load_counted": 10**400}):
+            self.assertEqual(build.counted(answer, 277.0), 277.0, answer)
+        self.assertEqual(build.counted({"load_counted": 400.0}, 277.0), 277.0)
 
 
 if __name__ == "__main__":

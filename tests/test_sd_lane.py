@@ -1013,6 +1013,26 @@ class Runner(Lane):
             sd_lane.run_lane(self.repo, environ, self.ship)
         self.assertEqual([row["status"] for row in self.entries()], ["prepared", "prepared"])
 
+    def test_a_second_lane_starts_under_a_load_the_cpu_does_not_carry(self) -> None:
+        """sd:9946: load5 277-458 with the CPU 37% idle stopped every lane start."""
+        import sd_gate_slots  # noqa: PLC0415 -- as load_stop imports it
+        environ = {**self.environ, "SD_GATE_LOAD_MAX": "24"}
+        with mock.patch.object(sd_lane.os, "getloadavg", lambda: (300.0, 300.0, 300.0)), \
+                mock.patch.object(sd_gate_slots.os, "cpu_count", lambda: 16):
+            now = [1_000_000.0]
+            idle = [lambda: int(now[0] * 37)]  # 63% busy
+            with mock.patch.object(sd_gate_slots, "cpu_ticks", lambda: (idle[0](), int(now[0] * 100))), \
+                    mock.patch.object(sd_lane.time, "time", lambda: now[0]):
+                self.assertIn("load5 300.0", sd_lane.load_stop(environ) or "", "one probe")
+                now[0] += 300
+                self.assertIsNone(sd_lane.load_stop(environ), "a probe five minutes later")
+                since, base = now[0], idle[0]()
+                idle[0] = lambda: base + int((now[0] - since) * 5)  # 95% busy from here
+                now[0] += 300
+                self.assertIn("load5 300.0", sd_lane.load_stop(environ) or "", "95% busy")
+            with mock.patch.object(sd_gate_slots, "cpu_ticks", lambda: None):
+                self.assertIn("load5 300.0", sd_lane.load_stop(environ) or "", "unread ticks")
+
     def test_prepare_waits_for_a_slot_no_longer_than_the_runs_budget(self) -> None:
         """pack sd:7412, failure table row 2: an unbounded slot wait ran into the job's TERM, which spends a reclaim."""
         sd_lane.enqueue_entry(self.feature, 1, "fix: one", self.body, self.environ, claim="deliver")
@@ -3961,6 +3981,27 @@ class CitedCloses(SharedQueue):
         self.body.write_text("Words.\n", encoding="utf-8")
         entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
         self.assertEqual(entry["closes"], [c])
+
+    def test_a_listed_merge_reverted_against_parent_two_keeps_the_second_parents_work(self) -> None:
+        """pack sd:9666 review, round 8: a hand-written revert that lists a merge, made with `-m 2`, undid
+        the second parent's work by a first-parent guess and closed the first parent's reverted work."""
+        a, c, *_ = self.open
+        tree, _ = self.committed("topic-merge-two")
+        git(tree, "switch", "-q", "-c", "side")
+        (tree / "side.txt").write_text("side\n", encoding="utf-8")
+        git(tree, "add", "side.txt")
+        git(tree, "commit", "-q", "-m", f"fix: implement\n\nCloses: sd:{a}")
+        git(tree, "switch", "-q", "topic-merge-two")
+        (tree / "main.txt").write_text("main\n", encoding="utf-8")
+        git(tree, "add", "main.txt")
+        git(tree, "commit", "-q", "-m", f"fix: mainline\n\nCloses: sd:{c}")
+        git(tree, "merge", "-q", "--no-ff", "--no-edit", "side")
+        merge = git(tree, "rev-parse", "--short=9", "HEAD").strip()
+        git(tree, "revert", "--no-commit", "-m", "2", "HEAD")
+        git(tree, "commit", "-q", "-m", f"revert: drop the mainline half\n\nReverted commits:\n\n- {merge} the merge\n")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [a])
 
     def test_a_range_the_branch_reverts_closes_nothing(self) -> None:
         """Lane review of sd:5999, round 3: `git revert A..B` writes one revert per commit, each naming it."""

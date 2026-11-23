@@ -8,6 +8,7 @@ import pwd
 import subprocess
 from unittest.mock import patch
 
+from tests.clean_env import clean_environment
 from tests.test_sd_review import (
     FakeRunner,
     ReviewFixture,
@@ -42,7 +43,7 @@ class FixReviewTests(ReviewFixture):
     def test_unchanged_blocker_and_source_reach_the_fix_reviewer(self):
         root, first = self.branch()
         blocking = json.dumps({"findings": [{"path": "src.py", "line": 1, "summary": "original unresolved defect",
-                                            "family": "correctness", "severity": "high"}]})
+                                            "family": "correctness", "severity": "high", "instances": ["src.py:1"]}]})
         prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": sd_review.Completed(0, blocking, "")}),
                                  self.environment(), self.chatgpt_home())
         report = self.tmp / "prior.json"
@@ -58,13 +59,36 @@ class FixReviewTests(ReviewFixture):
         self.assertIn("the_original_defect = True", handed)
         self.assertTrue(result["verification_report_digest"])
 
+    def test_a_grouped_blocker_hands_the_reviewer_every_instance_file(self):
+        """Lead ruling on sd:9769 (15:20 MST): a fix to the primary file alone must not clear a blocker whose
+        second instance sits in another file; the verifier gets each listed file's current source and is told
+        the blocker clears only when every instance is fixed."""
+        root, _ = self.branch()
+        first = self.commit(root, "second.py", "the_second_instance = True\n")
+        blocking = json.dumps({"findings": [{"path": "src.py", "line": 1, "summary": "grouped unresolved defect",
+                                            "family": "correctness", "severity": "high",
+                                            "instances": ["src.py:1", "second.py:1"]}]})
+        prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": sd_review.Completed(0, blocking, "")}),
+                                 self.environment(), self.chatgpt_home())
+        report = self.tmp / "prior.json"
+        report.write_text(json.dumps(prior))
+        self.commit(root, "src.py", "the_original_defect = False\n")
+        runner = FakeRunner({"codex": sd_review.Completed(0, blocking, "")})
+        result = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)), runner,
+                                  self.environment(), self.chatgpt_home())
+        handed = json.dumps(runner.calls, default=str)
+        self.assertIn("Current source for prior finding second.py", handed, "an instance file's source was not attached")
+        self.assertIn("the_second_instance = True", handed)
+        self.assertIn("every listed instance", handed, "the verifier was not told each instance must be fixed")
+        self.assertEqual(result["status"], "blocking")
+
     def test_a_reader_that_raises_after_a_prior_report_ends_with_its_own_error(self):
         """sd:7569. The prior finding's source is read in the main thread
         through `subprocess_runner`, which registers that thread as a group
         holder; the cleanup after a failed reader must not join it."""
         root, first = self.branch()
         blocking = json.dumps({"findings": [{"path": "src.py", "line": 1, "summary": "original unresolved defect",
-                                            "family": "correctness", "severity": "high"}]})
+                                            "family": "correctness", "severity": "high", "instances": ["src.py:1"]}]})
         prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": sd_review.Completed(0, blocking, "")}),
                                  self.environment(), self.chatgpt_home())
         report = self.tmp / "prior.json"
@@ -81,6 +105,139 @@ class FixReviewTests(ReviewFixture):
             with self.subTest(mode=sorted(mode)), self.assertRaises(ReaderBroke):
                 sd_review.review(root, namespace(scope="branch", **mode), FakeRunner({"codex": broken_reader}),
                                  self.environment(), self.chatgpt_home())
+
+    def test_a_docs_only_fix_still_verifies_the_prior_code_blockers(self):
+        """Review of sd:9769: a delta the router would skip must not clear blockers nobody checked."""
+        root, first = self.branch()
+        blocking = json.dumps({"findings": [{"path": "src.py", "line": 1, "summary": "original unresolved defect",
+                                            "family": "correctness", "severity": "high", "instances": ["src.py:1"]}]})
+        prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": sd_review.Completed(0, blocking, "")}),
+                                 self.environment(), self.chatgpt_home())
+        self.assertEqual(prior["status"], "blocking")
+        report = self.tmp / "prior.json"
+        report.write_text(json.dumps(prior))
+        self.commit(root, "notes.md", "a note\n")
+        runner = FakeRunner({"codex": sd_review.Completed(0, blocking, "")})
+        result = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)), runner,
+                                  self.environment(), self.chatgpt_home())
+        self.assertEqual(result["status"], "blocking", "a docs-only delta skipped the prior blockers")
+
+    def test_a_verify_pass_carries_the_base_its_chain_covers(self):
+        """Review of sd:9769: a verify pass covers from where its first full pass started, and no further."""
+        root, first = self.branch()
+        full = sd_review.review(root, namespace(scope="branch"), FakeRunner(), self.environment(), self.chatgpt_home())
+        self.assertEqual(full["covers_from"], full["subject"]["base"])
+        report = self.tmp / "prior.json"
+        report.write_text(json.dumps(full))
+        second = self.commit(root, "fix.py", "fix = True\n")
+        chained = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)),
+                                   FakeRunner(), self.environment(), self.chatgpt_home())
+        self.assertEqual(chained["covers_from"], full["subject"]["base"])
+        narrow = {**full, "subject": {**full["subject"], "base": first, "head": second}}  # delta-only, no covers_from
+        narrow.pop("covers_from")
+        report.write_text(json.dumps(narrow))
+        self.commit(root, "more.py", "more = True\n")
+        unchained = sd_review.review(root, namespace(scope="branch", base=second, verify_report=str(report)),
+                                     FakeRunner(), self.environment(), self.chatgpt_home())
+        self.assertIsNone(unchained["covers_from"], "a narrow prior report was read as a full pass")
+
+    def test_a_verify_pass_under_another_binding_covers_nothing(self):
+        """Review of sd:9769: a policy changed between rounds never reviewed the branch the chain stands for."""
+        root, first = self.branch()
+        full = sd_review.review(root, namespace(scope="branch"), FakeRunner(), self.environment(), self.chatgpt_home())
+        report = self.tmp / "prior.json"
+        report.write_text(json.dumps({**full, "binding": {"review_declaration": {"severity_floor": "high"}}}))
+        self.commit(root, "fix.py", "fix = True\n")
+        chained = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)),
+                                   FakeRunner(), self.environment(), self.chatgpt_home())
+        self.assertIsNone(chained["covers_from"], "a pass under another policy extended the chain")
+
+    def test_an_unreadable_binding_seeds_no_chain_and_extends_none(self):
+        """Review of sd:9767: two unreadable bindings (None) are not one binding; a pass under no binding
+        covers nothing, full or delta."""
+        root, first = self.branch()
+        with patch.object(sd_review.sd_lib, "lead_review_binding", return_value=None):
+            full = sd_review.review(root, namespace(scope="branch"), FakeRunner(), self.environment(),
+                                    self.chatgpt_home())
+            self.assertIsNone(full["covers_from"], "a full pass under no binding covers the branch")
+            report = self.tmp / "prior.json"
+            report.write_text(json.dumps({**full, "covers_from": full["subject"]["base"]}))
+            self.commit(root, "fix.py", "fix = True\n")
+            chained = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)),
+                                       FakeRunner(), self.environment(), self.chatgpt_home())
+        self.assertIsNone(chained["covers_from"], "a delta under no binding inherited coverage")
+
+    def test_a_verify_report_from_a_sibling_branch_is_refused(self):
+        """Review of sd:9767: a report whose head is not an ancestor of HEAD never chains."""
+        root, first = self.branch()
+        full = sd_review.review(root, namespace(scope="branch"), FakeRunner(), self.environment(), self.chatgpt_home())
+        report = self.tmp / "prior.json"
+        report.write_text(json.dumps(full))
+        subprocess.run(["git", "checkout", "-b", "sibling", full["subject"]["base"]], cwd=root,
+                       capture_output=True, check=True, env=clean_environment())
+        self.commit(root, "src.py", "the_original_defect = True\n", message="same change\n\nAuthored-with: other")
+        with self.assertRaisesRegex(sd_review.UsageError, "ancestor of HEAD"):
+            sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)),
+                             FakeRunner(), self.environment(), self.chatgpt_home())
+
+    def test_a_pass_the_lane_would_not_record_seeds_no_chain(self):
+        """Review of sd:9769: a --draft or --provider pass must not hand its coverage to a verify pass."""
+        root, first = self.branch()
+        for option in ({"draft": True}, {"provider": "codex"}):
+            with self.subTest(option=option):
+                full = sd_review.review(root, namespace(scope="branch", **option), FakeRunner(),
+                                        self.environment(), self.chatgpt_home())
+                self.assertIsNone(full["covers_from"], "an unrecordable pass covers the branch")
+
+    def test_a_blocking_pass_short_of_its_depth_covers_nothing(self):
+        """Review of sd:9769: a pass one reader short must not seed a chain the lane trusts."""
+        blocker = {"path": "src.py", "line": 1, "summary": "defect", "family": "correctness",
+                   "severity": "high", "instances": ["src.py:1"]}
+        answered = sd_review.Outcome("codex", sd_review.FINDINGS, (blocker,), "", (), ())
+        missing = sd_review.Outcome("claude", sd_review.UNAVAILABLE, (), "no answer", (), ())
+        result = sd_review.finish_review({"severity_floor": "medium", "requested_reviews": 2, "covers_from": "a" * 40},
+                                         [answered, missing], ["codex"])
+        self.assertEqual(result["status"], "blocking")
+        self.assertIsNone(result["covers_from"], "a pass one reader short still covers the branch")
+
+    def test_a_pass_short_of_its_policy_depth_covers_nothing(self):
+        """Review of sd:9769: `requested_reviews` is capped to the readers left; the shortfall is not a full pass."""
+        answered = sd_review.Outcome("codex", sd_review.CLEAN, (), "", (), ())
+        result = sd_review.finish_review({"severity_floor": "medium", "requested_reviews": 1, "covers_from": "a" * 40,
+                                          "review_shortfall": {"requested": 2, "eligible": 1}}, [answered], ["codex"])
+        self.assertIsNone(result["covers_from"], "a pass one provider short of its policy covers the branch")
+
+    def test_a_verify_pass_keeps_the_branch_s_copilot_requirement(self):
+        """Review of sd:9769: a small fix's tier must not drop the Copilot review the branch's tier required."""
+        root, first = self.branch()
+        full = sd_review.review(root, namespace(scope="branch"), FakeRunner(), self.environment(), self.chatgpt_home())
+        full["remote_reviews"]["copilot"]["automatic"] = True  # the deep branch's own requirement
+        report = self.tmp / "prior.json"
+        report.write_text(json.dumps(full))
+        self.commit(root, "fix.py", "fix = True\n")
+        chained = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)),
+                                   FakeRunner(), self.environment(), self.chatgpt_home())
+        self.assertIs(chained["remote_reviews"]["copilot"]["automatic"], True, "the fix tier dropped Copilot")
+
+    def test_a_verify_pass_routes_the_whole_branch_for_copilot(self):
+        """Review of sd:9769: two standard deltas that cross the deep line together still select Copilot."""
+        root, first = self.branch()
+        real = sd_review.sd_route.route
+
+        def route(paths, lines, draft, policy):
+            plan = real(paths, lines, draft, policy)
+            return plan._replace(tier="deep") if {"src.py", "fix.py"} <= set(paths) else plan._replace(tier="standard")
+
+        with patch.object(sd_review.sd_route, "route", route), patch.object(sd_review.sd_lib, "reported_copilot_policy", lambda *a: ("deep", "test")):
+            full = sd_review.review(root, namespace(scope="branch"), FakeRunner(), self.environment(), self.chatgpt_home())
+            self.assertIs(full["remote_reviews"]["copilot"]["automatic"], False)
+            report = self.tmp / "prior.json"
+            report.write_text(json.dumps(full))
+            self.commit(root, "fix.py", "fix = True\n")
+            chained = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)),
+                                       FakeRunner(), self.environment(), self.chatgpt_home())
+        self.assertIs(chained["remote_reviews"]["copilot"]["automatic"], True,
+                      "two standard deltas crossed the deep line and Copilot was not selected")
 
     def test_mismatched_or_malformed_previous_report_cannot_verify(self):
         root, first = self.branch()
@@ -112,7 +269,7 @@ class FixReviewTests(ReviewFixture):
     def test_resume_reviews_full_branch_and_repeats_prior_blockers(self):
         root, first = self.branch()
         blocking = json.dumps({"findings": [{"path": "src.py", "line": 1, "summary": "original unresolved defect",
-                                            "family": "correctness", "severity": "high"}]})
+                                            "family": "correctness", "severity": "high", "instances": ["src.py:1"]}]})
         prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": sd_review.Completed(0, blocking, "")}),
                                  self.environment(), self.chatgpt_home())
         prior["completed_reviews"] = 0
@@ -135,7 +292,7 @@ class FixReviewTests(ReviewFixture):
     def test_explain_refuses_oversized_resume_report_and_current_source(self):
         root, first = self.branch()
         report = self.tmp / "prior.json"
-        row = {"path": "src.py", "line": 1, "severity": "high", "family": "correctness",
+        row = {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness",
                "disposition": "blocking", "summary": "x" * (sd_review.MAX_OUTPUT_BYTES + 1)}
         prior = {"scope": "branch", "subject": {"head": first}, "findings": [row]}
         for oversized in ("report", "source"):
@@ -390,7 +547,7 @@ class FixReviewTests(ReviewFixture):
         self.assertNotIn("OTHER_KEY", result)
 
     def test_native_auth_error_is_reported_while_structured_blocker_survives(self):
-        findings = {"findings": [{"path": "src.py", "line": 1, "summary": "blocker", "family": "correctness", "severity": "high"}]}
+        findings = {"findings": [{"path": "src.py", "line": 1, "summary": "blocker", "family": "correctness", "severity": "high", "instances": ["src.py:1"]}]}
         result, parsed = sd_review.claude_answer(sd_review.Completed(0, json.dumps({"type": "result", "subtype": "error",
                                  "is_error": True, "result": "Not logged in", "structured_output": findings}), ""))
         self.assertEqual(result.exit_code, 1)

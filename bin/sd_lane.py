@@ -541,12 +541,20 @@ def on_hub(queue: Queue, work: Callable[[Any], Any], *, write: bool = True) -> A
                       code=HUB_UNAVAILABLE) from None
 
 
+def _key_range(prefix: str) -> tuple[str, str]:
+    """The bounds of the keys that start with `prefix`, which ends in `:`: `;` sorts right after `:`.
+
+    A range uses the `state_by_kind_key` index; `substr(key, ...)` scanned every checkpoint row (pack sd:10077).
+    """
+    return prefix, prefix[:-1] + ";"
+
+
 def stored(connection: Any, repository: str) -> list[dict[str, Any]]:
     """The latest row of each of `repository`'s entry keys, in queue order; older rows are each entry's history."""
     prefix = f"{KEY_PREFIX}{repository}:"
     rows = connection.execute(
         "SELECT body FROM state WHERE id IN (SELECT MAX(id) FROM state WHERE kind = 'checkpoint' "
-        "AND substr(key, 1, ?) = ? GROUP BY key)", (len(prefix), prefix)).fetchall()
+        "AND key >= ? AND key < ? GROUP BY key)", _key_range(prefix)).fetchall()
     return sorted((json.loads(row["body"]) for row in rows), key=lambda row: (row.get("position") or 0, row["id"]))
 
 
@@ -979,10 +987,6 @@ def branch_commits(worktree: pathlib.Path, base: str, head: str) -> list[tuple[s
             (chunk.strip("\n").partition("\x1f") for chunk in raw.split("\x1e")) if sha.strip()]
 
 
-#: A revert's subject: `git revert`'s `Revert "..."`, or a Conventional `revert:` (sd:8373).
-REVERT_SUBJECT = re.compile(r"^(?:Revert\b|revert(?:\([^)]*\))?!?:)", re.IGNORECASE)
-
-
 def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]) -> list[tuple[str, str]]:
     """`commits` (newest first) less each cited one a later hand-written revert undid (sd:8373).
 
@@ -992,9 +996,10 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     subject is a revert and the files it changed read at `head` as before
     it. A read that fails keeps the commit, as before this check.
     """
+    import sd_ship_body  # noqa: PLC0415
     kept = []
     for index, (sha, message) in enumerate(commits):
-        if "Closes:" in message and any(REVERT_SUBJECT.match(later) for _, later in commits[:index]):
+        if "Closes:" in message and any(sd_ship_body.REVERT_SUBJECT.match(later) for _, later in commits[:index]):
             # NUL-separated and literal: git quotes a name with a tab or non-ASCII byte otherwise.
             files = publish_git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-z", "-r", sha)
             names = [name for name in files.stdout.split("\0") if name] if files and files.returncode == 0 else []
@@ -1366,8 +1371,8 @@ def enqueue_order(connection: Any, repository: str) -> dict[str, int]:
     """Each entry id's first row id: the order the hub took the entries in, which no clock and no `move` changes."""
     prefix = f"{KEY_PREFIX}{repository}:"
     return {row["key"][len(prefix):]: row["first"] for row in connection.execute(
-        "SELECT key, MIN(id) AS first FROM state WHERE kind = 'checkpoint' AND substr(key, 1, ?) = ? GROUP BY key",
-        (len(prefix), prefix)).fetchall()}
+        "SELECT key, MIN(id) AS first FROM state WHERE kind = 'checkpoint' AND key >= ? AND key < ? GROUP BY key",
+        _key_range(prefix)).fetchall()}
 
 
 #: The days the Queue page's wait and gate times read back (pack sd:6006).
@@ -1450,8 +1455,8 @@ def entry_times(connection: Any, repository: str, *, now: float, days: int = TIM
         "json_extract(body, '$.enqueued_at') AS enqueued, json_extract(body, '$.started_at') AS started, "
         "json_extract(body, '$.finished_at') AS finished, json_extract(body, '$.speculation.status') AS speculation "
         "FROM state WHERE kind = 'checkpoint' AND key IN (SELECT key FROM state WHERE kind = 'checkpoint' "
-        "AND substr(key, 1, ?) = ? AND timestamp >= ?) ORDER BY id",
-        (len(prefix), prefix, time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(start)))).fetchall()
+        "AND key >= ? AND key < ? AND timestamp >= ?) ORDER BY id",
+        (*_key_range(prefix), time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(start)))).fetchall()
     history: dict[str, list[Any]] = {}
     for row in rows:
         history.setdefault(row["key"], []).append(row)
@@ -4634,7 +4639,9 @@ def load_stop(environ: dict[str, str]) -> str | None:
     """Why a second lane may not start under this load, or None (`lane_room`, sd:3479).
 
     The gate's own limit, `sd.gate_load_max` or `SD_GATE_LOAD_MAX`
-    (`sd_gate_slots.load_rule`), read against load5. Off while the limit is
+    (`sd_gate_slots.load_rule`), read against load5 as
+    `sd_gate_slots.counted_load` counts it: the CPU's own use while it is
+    not busy, averaged over at least a minute (`steady_busy`, sd:9946). Off while the limit is
     0, as the gate queue's rule is. A limit or a load that cannot be read is
     no room: unknown is not low. A lane already running claims under any
     load; its gate waits in the gate queue (pack sd:7412).
@@ -4644,7 +4651,8 @@ def load_stop(environ: dict[str, str]) -> str | None:
         limit = sd_gate_slots.load_rule(environ, sd_lib.core_setting("gate_load_max", environ)).limit
         if limit <= 0:
             return None
-        load5 = float(os.getloadavg()[1])
+        share = sd_gate_slots.steady_busy(sd_gate_slots.directory(environ), time.time())
+        load5 = sd_gate_slots.counted_load(float(os.getloadavg()[1]), share)
     except (ValueError, OSError, sd_lib.ConfigError) as error:
         return f"cannot read the load average ({error}); the next run takes the pending entries"
     if load5 >= limit:

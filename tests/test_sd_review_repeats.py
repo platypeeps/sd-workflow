@@ -71,7 +71,7 @@ class RepeatFixture(ReviewFixture):
         """One `sd-ship adjudicate` record: each (summary, disposition, reason) a blocking finding's answer,
         at the reviewed head unless `head` names another."""
         findings = [{"index": index, "finding_digest": "0" * 64, "response_disposition": answer, "reason": reason,
-                     "raw_finding": {"path": "bin/tool.py", "line": line, "severity": "high", "summary": summary,
+                     "raw_finding": {"path": "bin/tool.py", "line": line, "severity": "high", "instances": [f"bin/tool.py:{line}"], "summary": summary,
                                      "family": "correctness", "disposition": "blocking"}}
                     for index, (summary, answer, reason) in enumerate(rows, 1)]
         bindings = {"repository": repository, "branch": branch, "head": head if head != "" else self.head}
@@ -295,7 +295,9 @@ class RepeatRuleTests(unittest.TestCase):
             self.assertEqual([record["disposition"] for record in limit], ["blocking"])
 
     def test_the_parser_carries_evidence_and_reads_an_answer_without_it(self) -> None:
-        parsed = sd_review.parse_findings(json.dumps({"findings": [row(evidence="  make test: 1 failed  "), row()]}))
+        listed = {"instances": ["src.py:1"]}  # pack sd:9769: a high finding lists its instances
+        parsed = sd_review.parse_findings(json.dumps({"findings": [row(evidence="  make test: 1 failed  ", **listed),
+                                                                   row(**listed)]}))
         assert parsed is not None
         self.assertEqual(parsed.error, "")
         self.assertEqual(parsed.findings[0]["evidence"], "make test: 1 failed")
@@ -311,7 +313,7 @@ class RepeatRuleTests(unittest.TestCase):
         """Round 12: a reader that sends `"evidence": null`, or another type, cites nothing and breaks nothing."""
         for evidence in (None, 0, 7, True, [], ["cmd"], {}, {"command": {"argv": ["git"]}}):
             with self.subTest(evidence=evidence):
-                parsed = sd_review.parse_findings(json.dumps({"findings": [row(evidence=evidence)]}))
+                parsed = sd_review.parse_findings(json.dumps({"findings": [row(evidence=evidence, instances=["src.py:1"])]}))
                 assert parsed is not None
                 self.assertEqual(parsed.error, "")
                 self.assertNotIn("evidence", parsed.findings[0])
@@ -340,6 +342,12 @@ class RepeatRuleTests(unittest.TestCase):
         self.assertEqual((kept[0]["backend"], kept[0]["evidence"]), ("codex", "src.py:1: x = 1"))
         two = sd_review.sd_lib.distinct_findings([dict(row(), backend="codex"), dict(row(summary="other"), backend="x")])
         self.assertEqual(len(two), 2)
+
+    def test_one_finding_from_two_readers_keeps_every_instance(self) -> None:
+        """Review of sd:9769: the build matches a blocker by its instances, so a dropped list ships a blocker."""
+        kept = sd_review.sd_lib.distinct_findings([dict(row(), backend="codex", instances=["src.py:1"]),
+                                                   dict(row(), backend="second", instances=["src.py:1", "far.py:9"])])
+        self.assertEqual(kept[0]["instances"], ["src.py:1", "far.py:9"])
 
 
 class RepeatReviewTests(RepeatFixture):
@@ -378,7 +386,7 @@ def adjudicated(*rows: tuple[Any, ...], decision: str = "accepted", line: Any = 
     """One adjudication body at `ON_BRANCH`: each (path, summary, disposition[, line]) a blocking finding's answer."""
     return json.dumps({"decision": decision, "proposal": {"bindings": {"head": ON_BRANCH}, "findings": [
         {"response_disposition": answer, "reason": "a reason",
-         "raw_finding": {"path": path, "line": (*rest, line)[0], "severity": "high", "summary": summary,
+         "raw_finding": {"path": path, "line": (*rest, line)[0], "severity": "high", "instances": ["src.py:1"], "summary": summary,
                          "family": "correctness"}}
         for path, summary, answer, *rest in rows]}})
 
@@ -429,6 +437,22 @@ class RebuttalIdentityTests(unittest.TestCase):
         section = sd_review.rebuttal_section(listed(*bodies))
         self.assertEqual(section.count("\n- "), sd_review.REBUTTED_LINES)
         self.assertNotIn(oldest, section)
+
+    def test_a_rebuttal_lapses_when_an_instance_file_changes(self) -> None:
+        """Review of sd:9769: a later commit can turn an instance, not the primary file, into the branch's own
+        regression; a rebuttal holds only while every file the finding names is unchanged."""
+        body = adjudicated(("bin/tool.py", "defect", "rebutted"))  # its instance: src.py:1
+        seen = sd_review.rebuttals([(body,)], {ON_BRANCH}.__contains__, lambda _head, path: path != "src.py")
+        self.assertEqual([entry.listed for entry in seen], [False], "a changed instance file kept the rebuttal")
+
+    def test_a_finding_that_names_a_new_instance_file_is_not_the_rebutted_one(self) -> None:
+        """Review of sd:9769: a fix that spreads the defect to `new.py` keeps the primary place and summary;
+        the rebuttal named no `new.py`, so it is a new finding and blocks."""
+        body = adjudicated(("src.py", "defect", "rebutted"))  # its instance: src.py:1
+        self.assertEqual(gate([row(instances=["src.py:1", "new.py:4"])], body), ["blocking"])
+        self.assertEqual(gate([row(instances=["src.py:1"])], body), ["advisory"])
+        # Review of sd:9769: a new occurrence in a file the rebuttal named is still not adjudicated.
+        self.assertEqual(gate([row(instances=["src.py:1", "src.py:60"])], body), ["blocking"])
 
     def test_the_lanes_own_blockers_are_never_rebutted(self) -> None:
         parsed = sd_review.oversized_findings()

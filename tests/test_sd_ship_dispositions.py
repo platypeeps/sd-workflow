@@ -40,7 +40,7 @@ class DispositionTests(unittest.TestCase):
                     {
                         "path": "src.py",
                         "line": 1,
-                        "severity": "high",
+                        "severity": "high", "instances": ["src.py:1"],
                         "family": "correctness",
                         "summary": "fixture disputed finding",
                     }
@@ -123,7 +123,7 @@ class DispositionTests(unittest.TestCase):
 
     def test_a_blocking_refusal_bounds_its_message_and_names_a_no_item_record(self):
         """sd:2102. Five findings are named, a line-less one by path, and `findings` carries every one."""
-        rows = [{"disposition": "blocking", "severity": "high", "path": f"f{n}.py", "line": n, "summary": "x " * 200}
+        rows = [{"disposition": "blocking", "severity": "high", "instances": ["src.py:1"], "path": f"f{n}.py", "line": n, "summary": "x " * 200}
                 for n in range(7)] + [{"disposition": "advisory", "severity": "low", "path": "a.py", "line": 1,
                                        "summary": "advice"}]
         rows[0]["line"] = None
@@ -143,7 +143,7 @@ class DispositionTests(unittest.TestCase):
     def test_a_blocking_refusal_keeps_the_full_finding_text_in_its_record(self):
         """pack sd:7133. The refusal's `summary` is cut; `text` keeps the whole finding for the prepare log."""
         long = "Dating the answer from arrival assumes fresh observations. " * 8
-        row = {"disposition": "blocking", "severity": "high", "path": "a.py", "line": 3, "summary": long}
+        row = {"disposition": "blocking", "severity": "high", "instances": ["src.py:1"], "path": "a.py", "line": 3, "summary": long}
         review = SimpleNamespace(args=SimpleNamespace(no_item=False, review_id=None, item=7))
         refusal = sd_ship_dispositions.blocking_refusal(review, "abc123", {"findings": [row]}, "local review blocking")
         [finding] = ship.failure("prepare", refusal)["findings"]

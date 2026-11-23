@@ -245,9 +245,16 @@ def carry_forward(root: pathlib.Path, reviewed: str, head: str, base_ref: str) -
     return {"from": reviewed, "to": head, "patch_id": before, "merges": merges}
 
 
+#: The `sd-review` statuses a lead record may carry: no blocking finding (sd:9767).
+PASSING_LEAD_REVIEWS = ("clean", "advisory")
+
+
 def lead_review(connection: Any, root: pathlib.Path, repository: str, branch: str, head: str, base: str,
                 binding: dict | None) -> tuple[dict | None, str]:
-    """sd:5988. The clean `sd-review --scope branch` pass recorded for `branch` that covers `head`, and why.
+    """sd:5988. The passing `sd-review --scope branch` pass recorded for `branch` that covers `head`, and why.
+
+    A pass is clean or advisory only (sd:9767): a build's review that cleared
+    stands for the lane's at the same head; a blocking one is never recorded.
 
     It covers `head` when it reviewed `head`, or when `carry_forward` carries
     it across clean merges of `origin/<base>` alone, and only when it diffed
@@ -266,7 +273,7 @@ def lead_review(connection: Any, root: pathlib.Path, repository: str, branch: st
     if record is None:
         return None, f"none recorded for {branch}"
     reviewed = record.get("head") if isinstance(record, dict) else None
-    if (not isinstance(reviewed, str) or record.get("status") != "clean"
+    if (not isinstance(reviewed, str) or record.get("status") not in PASSING_LEAD_REVIEWS
             or (record.get("repository"), record.get("branch")) != (repository, branch)):
         return None, "it names another subject"
     if binding is None or record.get("binding") != binding:
@@ -281,7 +288,7 @@ def lead_review(connection: Any, root: pathlib.Path, repository: str, branch: st
     if record.get("base") != fork:
         return None, f"it reviewed from {str(record.get('base'))[:12]}, not the fork from origin/{base}"
     if reviewed == head:
-        return record, f"the clean pass of {head[:12]} covers it"
+        return record, f"the {record['status']} pass of {head[:12]} covers it"
     try:
         carried = carry_forward(root, reviewed, head, f"refs/remotes/origin/{base}")
     except Refusal:
@@ -289,7 +296,7 @@ def lead_review(connection: Any, root: pathlib.Path, repository: str, branch: st
     if carried is None:
         return None, f"it changed more than a clean merge of origin/{base} since {reviewed[:12]}"
     return ({**record, "carry_forward": carried},
-            f"the clean pass of {reviewed[:12]} covers it; {head[:12]} only merges origin/{base} since")
+            f"the {record['status']} pass of {reviewed[:12]} covers it; {head[:12]} only merges origin/{base} since")
 
 
 #: How much younger than its reserved pass a process may read and still be its reviewer: `ps` rounds to seconds.
