@@ -2914,8 +2914,9 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
     member merged at its own merge. A refused or lost merge answer is read
     back once; any other failure lands nothing. The branch is deleted
     whatever happened, which also closes a train PR left open. After the
-    gate, `ready` decides again: a member held or cancelled, a freeze or
-    a claim lost during the gate sends no merge.
+    gate, `ready` and a fresh fetch of the base decide again: a member
+    held, a claim lost, or a base that moved during the gate sends no
+    merge, since GitHub would land a combination the gate never saw.
     """
     import sd_local_gate  # noqa: PLC0415 -- the GitHub client loads only for a train landing
     import sd_ship_remote  # noqa: PLC0415
@@ -2929,7 +2930,7 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
         if gate.get("status") != "success":
             return {"status": "failed", "reason": f"the train gate at {tip} did not pass: {gate.get('summary')}"[:600]}
         pull = train_pull(api, branch, base, f"chore(lane): land the train of {names}")
-        why = ready()
+        why = ready() or base_moved(root, tip, base)
         if why is not None:
             return {"status": "failed", "pull": pull, "reason": why[:600]}
         with contextlib.suppress(sd_ship_remote.Refusal):  # a lost answer is read back below, never sent twice
@@ -2944,6 +2945,16 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
         return {"status": "failed", "reason": str(error)[:600]}
     finally:
         scratch_git(root, "push", "--quiet", "origin", "--delete", branch)
+
+
+def base_moved(root: pathlib.Path, tip: str, base: str) -> str | None:
+    """Why `origin/<base>` fetched now is not inside `tip`, or None when the gate saw it."""
+    if scratch_git(root, "fetch", "--quiet", "--no-tags", "origin", f"refs/heads/{base}:refs/remotes/origin/{base}") \
+            is None:
+        return f"origin/{base} could not be fetched after the train gate"
+    if scratch_git(root, "merge-base", "--is-ancestor", f"refs/remotes/origin/{base}", tip) is None:
+        return f"origin/{base} moved during the train gate; the train lands nothing"
+    return None
 
 
 def train_pull(api: Any, branch: str, base: str, title: str) -> int:

@@ -6566,6 +6566,28 @@ roles:
         self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
         self.assertEqual(self.train_branches(), [])
 
+    def test_land_train_whose_base_moved_during_the_gate_dispatches_nothing(self):
+        """Review of sd:9923: main advanced during the gate, and GitHub merged an untested combination."""
+        tip = self.joined_tip()
+        landed, _ = self.landed_by_lane(tip, during=lambda: self.remote.commit_on(
+            "main", "raced\n\nAuthored-with: human", files={"raced.py": "r = 1\n"}))
+        self.assertEqual(landed["status"], "failed")
+        self.assertIn("moved during the train gate", landed["reason"])
+        self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
+        self.assertEqual(self.remote.pull(1).state, "OPEN")
+
+    def test_a_train_merged_onto_a_base_its_gate_never_saw_holds_delivery(self):
+        """Review of sd:9923: main advanced between the last read and the PUT; reconcile delivered anyway."""
+        tip = self.joined_tip()
+        self.remote.commit_on("main", "raced\n\nAuthored-with: human", files={"raced.py": "r = 1\n"})
+        self.land_train(tip)
+        merged = self.merge()
+        self.assertEqual((merged["phase"], merged["merge_commit"]), ("merged", tip))
+        self.assertTrue(merged["delivery_pending"])
+        self.assertEqual(merged["workflow"]["blocker"]["code"], "base_advanced_at_merge")
+        self.assertEqual(self.connection.execute("SELECT status FROM item WHERE id=?", (self.item,)).fetchone()[0],
+                         "in_progress")
+
     def test_land_train_that_github_refuses_lands_nothing(self):
         tip = self.joined_tip()
         saved = self.double._route

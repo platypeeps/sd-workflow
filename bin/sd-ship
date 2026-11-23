@@ -2490,7 +2490,7 @@ class Ship(SharedReview):
         self.state["title"] = squash_title(observed, self.state["title"])
         return self.squash_message(reviewed)
 
-    def landed_hold(self, commit: str) -> tuple[str, bool]:
+    def landed_hold(self, commit: str, tip: str) -> tuple[str, bool]:
         """The base `commit` landed on and whether it is held there (#1179).
 
         A rebase lands N commits, and `commit` is the last: its base is its
@@ -2505,6 +2505,8 @@ class Ship(SharedReview):
                                     lambda count: git(self.root, "rev-parse", f"{commit}~{count}"))
         if held is None:
             held = sd_lib.git_output(["merge-base", "--is-ancestor", parent, self.state["reviewed_head"]], self.root) is None
+        if self.state.get("train_commit"):
+            held = held or not train_landed_tested(self.root, commit, tip)
         return parent, held
 
     def merge_method(self) -> str:
@@ -2846,7 +2848,7 @@ class Ship(SharedReview):
         # contain the base; a squash parent outside it means the base advanced
         # in between, and the landed tree is a combination nobody reviewed or
         # checked. The merge is a fact to record; delivery is not (sd:1089).
-        parent, held = self.landed_hold(commit)
+        parent, held = self.landed_hold(commit, tip)
         if held and not self.args.no_item:
             answer = self.hold_at_merge(commit, parent, evidence)
             if answer is not None:
@@ -3025,6 +3027,21 @@ def refuse_demoted(body: str) -> None:
             "without it; move the line into the message's last paragraph, "
             "contiguously with the other trailers, or take it out of the body"
         )
+
+
+def train_landed_tested(root: pathlib.Path, commit: str, tip: str) -> bool:
+    """Whether the train landing that brought `commit` onto `tip`'s branch merged onto a base the train held.
+
+    The landing is the oldest first-parent commit of the branch above
+    `commit`. GitHub merges the train pull request onto the base it holds at
+    the `PUT`; a first parent outside the train tip means the base moved
+    after the gate, and the landed tree is one no gate ran (sd:9923).
+    """
+    chain = sd_lib.git_output(["rev-list", "--first-parent", "--ancestry-path", f"{commit}..{tip}"], root)
+    if not chain:
+        return False
+    parents = git(root, "rev-list", "--parents", "-n", "1", chain.split()[-1]).split()[1:]
+    return len(parents) == 2 and is_ancestor(root, parents[0], parents[1])
 
 
 def refuse_train_mismatch(commit: str, joined: str | None) -> None:
