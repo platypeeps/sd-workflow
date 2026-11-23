@@ -2036,7 +2036,7 @@ class Supervisor:
         # One class-pass round past the bound (sd:9263). None when every member waits on a question no fix answers;
         # a question on one member leaves the others to fix, as enqueue delivers them without it.
         unasked = [item for item in [self.lead, *self.others]
-                   if not build.open_question(self.db, [item], self.row["created_at"])]
+                   if not build.open_question(self.db, [item], self.row["asked_since"])]
         if rounds == REVIEW_ROUNDS and unasked:
             return self.fix(CLASS_PASS, rounds=rounds)
         return self.finish("blocked", f"{rounds} review rounds left blockers: {self.summary(self.blockers)}")
@@ -2110,7 +2110,7 @@ class Supervisor:
         delivered = [item for item in [self.lead, *self.others] if item in cited]
         # A retry's branch keeps the lost run's trailers: a member this run's builder skipped with a question
         # waits on it (pack sd:6571).
-        asked = [item for item in delivered if build.open_question(self.db, [item], self.row["created_at"])]
+        asked = [item for item in delivered if build.open_question(self.db, [item], self.row["asked_since"])]
         delivered = [item for item in delivered if item not in asked]
         if not delivered and asked:
             return self.finish("blocked", f"every cited item has an open question since the run started: "
@@ -2479,7 +2479,7 @@ class Supervisor:
             # commit on purpose: the run waits on the answers (sd:9219).
             items = [self.lead, *self.others]
             if problem.startswith("the builder left no commit") and all(
-                    build.open_question(self.db, [item], self.row["created_at"], pending=True) for item in items):
+                    build.open_question(self.db, [item], self.row["asked_since"], pending=True) for item in items):
                 problem = f"{build.ASKED}{', '.join(f'sd:{item}' for item in sorted(items))}"
             return self.finish("blocked", problem) if problem else then
         if verdict["state"] == "denied":

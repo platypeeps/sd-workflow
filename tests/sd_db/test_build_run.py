@@ -1020,6 +1020,30 @@ class Supervise(Case):
         row = build.run(self.db, again["id"])
         self.assertEqual((row["step"], row["session_id"], row["review_round"]), ("fixing", "session-limited", 2))
 
+    def test_a_usage_limit_claim_keeps_the_question_cutoff(self):
+        """Lane review of build/sd-1557: the reclaim's new run moved the time open questions are read from, so a
+        member skipped with a question asked before the limit returned to planning, its question unseen."""
+        self.press(2)
+        ident = self.bundle["id"]
+        member = self.items[1]
+        reset = int(datetime.now(UTC).timestamp()) + 60
+        self.assertTrue(build.write(self.db, ident, step="fixing", session_id="session-limited", review_round=1,
+                                    final=json.dumps({"rate_limit_info": {"resetsAt": reset}})))
+        add_note(self.db, member, "question", "skipped: which parser?\nOption: a (Recommended)\nOption: b")
+        self.db.execute("UPDATE note SET timestamp = ? WHERE item = ? AND kind = 'question'",
+                        (build.run(self.db, ident)["created_at"], member))
+        self.db.commit()
+        build.end(self.db, ident, build.RATE_LIMITED, "rate limited")
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.assertTrue(build.enqueued(self.db, again["id"], [self.items[0]]))
+        status = self.db.execute("SELECT status FROM assignment WHERE item = ? AND id <> ? ORDER BY id DESC",
+                                 (member, self.bundle["assignment"])).fetchone()["status"]
+        self.assertEqual(status, "blocked", "the question asked before the limit still holds the member")
+
     def test_a_usage_limit_claim_refuses_a_bundle_whose_lane_moved_off_its_host(self):
         """Review of build/sd-1557: the claim after a usage limit resumed the old session on whichever host now
         runs the lane, though the worktree and session stay where the run ran: it refuses, naming that host."""
