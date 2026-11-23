@@ -1037,6 +1037,18 @@ class TheMove(Lane, BrowserSession):
                 self.assertFalse(Path(f"{self.log}.dispositions").exists())
                 self.assertNotIn("retry", [word for call in self.calls() for word in call])
 
+    def test_findings_that_differ_only_in_whitespace_print_apart(self):
+        """sd:9966 lead review: the dialog is HTML, which folds a run of spaces and shows a no-break or zero-width
+        space as nothing or a space, so two findings could read alike. Each prints apart and still as its JSON."""
+        def fold(text):
+            return re.sub(r"\s+", " ", re.sub("[\u200b-\u200d\u2060\ufeff]", "", text))  # what HTML shows
+        base = {"summary": "a b", "path": "x.py"}
+        for other in ("a  b", "a\u00a0b", "a\u200bb", " a b", "a b ", "a\u2028b"):
+            with self.subTest(other=other):
+                line = queue_screen._line({**base, "summary": other})
+                self.assertNotEqual(fold(line), fold(queue_screen._line(base)))
+                self.assertEqual(json.loads(line), {**base, "summary": other})
+
     def test_a_finding_that_is_no_object_offers_no_reject_and_refuses_one(self):
         """sd:9966 class pass: a finding that is no object names nothing the page can print; its row binds no
         review. Any object prints whole (`_line`), whatever its fields hold."""
@@ -1065,7 +1077,7 @@ class TheMove(Lane, BrowserSession):
                "evidence": "line one\n\tline two", "instances": [" dir/ü b.py:3 "]}
         with mock.patch.dict(os.environ, {"QUEUE_RAW": json.dumps(raw)}):
             row = self.failed()
-        self.assertEqual(row["review_findings"], [json.dumps(raw, ensure_ascii=False, sort_keys=True)])
+        self.assertEqual([json.loads(line) for line in row["review_findings"]], [raw])
         self.assertIn("é" * 5000, row["review_findings"][0])
         self.assertIsNotNone(row["review"])
 

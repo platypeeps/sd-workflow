@@ -89,6 +89,7 @@ import subprocess
 import tempfile
 import threading
 import time
+import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -365,8 +366,14 @@ def _line(raw: object) -> str | None:
     """One blocking finding as Reject's dialog prints it: the finding adjudicate's template carries, every field,
     as exact JSON. A folded or partial print let two findings read alike, another failing input or affected path
     among them, so Reject rebutted one the operator never saw (sd:9966 review round 3). None for a finding that is
-    no object: no review the page can name."""
-    return json.dumps(raw, ensure_ascii=False, sort_keys=True) if isinstance(raw, dict) and raw else None
+    no object: no review the page can name. HTML folds a run of spaces and hides a no-break or zero-width space, so
+    every such character, and every space beside another, prints escaped, still valid JSON (sd:9966 lead review)."""
+    if not (isinstance(raw, dict) and raw):
+        return None
+    def hidden(c):
+        return c != " " and (c.isspace() or unicodedata.category(c) in ("Cf", "Zs", "Zl", "Zp"))
+    text = "".join(f"\\u{ord(c):04x}" if hidden(c) else c for c in json.dumps(raw, ensure_ascii=False, sort_keys=True))
+    return re.sub(r" (?= )|(?<= ) ", r"\\u0020", text)
 
 
 def shown_review(review: tuple[str, list[str]], template: dict) -> tuple[list[str], str] | None:
