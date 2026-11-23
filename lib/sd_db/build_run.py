@@ -1368,6 +1368,12 @@ class Supervisor:
                  "checking": self.checking, "cleaning": self.cleaning}
         if self.held is not None and self.held["name"] == "claude" and self.held.get("as") == self.fix_role():
             steps["fixing"] = self.fix  # a kept builder is the fix itself, not the review after it
+        # A run that opens past `worktree` (a usage-limit claim, a loss retry, a walk after a hub fault) skips that
+        # step's branch check: the worktree may have moved while the bundle waited (review of build/sd-1654).
+        if step in ("building", "reviewing", "fixing"):
+            wrong = self.off_branch()
+            if wrong:
+                return self.finish("blocked", wrong)
         while step in steps:
             ended = steps[step]()
             if isinstance(ended, dict):
@@ -1402,10 +1408,8 @@ class Supervisor:
             held = self.split_first()
             if held:
                 return held
-            current = _read([*self.tools.git, "-C", str(self.work), "branch", "--show-current"], env=self.env).strip()
-            if current != branch:
-                return self.finish("blocked", f"worktree {self.work} is on {current or 'no branch'}, not {branch}")
-            return "building"
+            wrong = self.off_branch()
+            return self.finish("blocked", wrong) if wrong else "building"
         if self.child([*self.tools.git, "-C", str(self.repo), "fetch", "-q", "origin"], cwd=self.repo,
                       name="worktree") != 0:
             return self.finish("blocked", f"git fetch in {self.repo} failed; see {self.out('worktree')}")
@@ -1417,6 +1421,14 @@ class Supervisor:
         if self.child([*self.tools.git, "-C", str(self.repo), *argv], cwd=self.repo, name="worktree") != 0:
             return self.finish("blocked", f"git worktree add {self.work} failed; see {self.out('worktree')}")
         return self.split_first() or "building"
+
+    def off_branch(self) -> str:
+        """Why the worktree is not on the run's branch, or "" when it is."""
+        if not self.work.is_dir():
+            return f"worktree {self.work} is gone; the run's branch is {self.row['branch']}"
+        current = _read([*self.tools.git, "-C", str(self.work), "branch", "--show-current"], env=self.env).strip()
+        return "" if current == self.row["branch"] else \
+            f"worktree {self.work} is on {current or 'no branch'}, not {self.row['branch']}"
 
     def split_first(self) -> dict | None:
         """The blocked end of a run whose bundle a subset Retry left a member out of while its branch or worktree
