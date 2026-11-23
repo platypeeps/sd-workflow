@@ -459,6 +459,21 @@ class DropRound9(Repo):
         self.assertEqual(self.statuses(items), ["blocked"] * 3)
 
 
+    def test_a_kept_list_form_revert_refuses_the_drop(self):
+        """pack sd:9666 review, round 9: a hand-written revert that lists the sha it undid was replayed with
+        that sha stale, so the replayed commit's `Closes:` closed the item the revert undid."""
+        items, ids, run = self.bundle()
+        work = Path(run["work_path"])
+        lead = git(work, "log", "--format=%H", "-1", "--grep", f"Closes: sd:{items[0]}")
+        git(work, "rm", "-q", "a.txt")
+        git(work, "commit", "-q", "-m", f"revert: drop the lead\n\nReverted commits:\n\n- `{lead[:9]}` lead\n\n"
+            f"Lane review fix, repo sd:{items[2]}")
+        head = git(work, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(DROP.DropRefused, "reverts"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), head)
+        self.assertEqual(self.statuses(items), ["blocked"] * 3)
+
 class DropRound10(Repo):
     """Review round 10 of pack sd:9709: a lead drop reparented the kept members, so the ended run lost them and the
     sweeper could remove its worktree while their items stayed open; and the writes rechecked only the lead's

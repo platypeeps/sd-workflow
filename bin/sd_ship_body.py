@@ -372,8 +372,9 @@ _REVERTS = re.compile(r"^This reverts commit ([0-9a-f]{7,40})\b(?:, reversing\s+
 
 #: A revert's subject: `git revert`'s `Revert "..."`, or a Conventional `revert:` (sd:8373).
 REVERT_SUBJECT = re.compile(r"^(?:Revert\b|revert(?:\([^)]*\))?!?:)", re.IGNORECASE)
-#: An item a hand-written revert names an undone commit on: one that opens with a sha.
-_SHA_LED = re.compile(r"([0-9a-f]{7,40})\b")
+#: An item a hand-written revert names an undone commit on: one that opens with a sha, bare or in a code
+#: span, emphasis or a link's text (pack sd:9666). No letter, digit or `_` may follow the sha.
+_SHA_LED = re.compile(r"[`*_\[]*([0-9a-f]{7,40})(?![0-9A-Za-z])(?!_[0-9A-Za-z])")
 #: The line that opens a list of undone commits: its last sentence is exactly `Reverted commits:`,
 #: `Reverted:` or `Reverts:`. A substring match let `Commits not reverted:` undo its list (pack sd:9666).
 _REVERTED_INTRO = re.compile(r"(?:^|[.!?][ \t]+)(?:reverted(?:[ \t]+commits)?|reverts):[ \t]*$", re.IGNORECASE)

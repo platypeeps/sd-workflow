@@ -439,6 +439,20 @@ class CitedIdTests(unittest.TestCase):
                 revert = self.revert_of(f"{heading}\n\n  - {undone[:9]} actual revert\n")
                 self.assertEqual(sd_ship_body.cited_ids("", [revert, (undone, "feat: x\n\nCloses: sd:2\n")]), ())
 
+    def test_a_wrapped_sha_is_listed(self) -> None:
+        """pack sd:9666 review, round 9: a sha in a code span, emphasis or a link under `Reverted commits:`
+        named no target, so the reverted commit still closed its item. A longer word is no sha."""
+        undone = "a" * 40
+        cited = (undone, "feat: x\n\nCloses: sd:2\n")
+        for entry in (f"`{undone[:9]}`", f"**{undone[:9]}**", f"_{undone[:9]}_", f"[{undone[:9]}](https://example.test)"):
+            with self.subTest(entry=entry):
+                revert = self.revert_of(f"Reverted commits:\n\n- {entry} renew\n")
+                self.assertEqual(sd_ship_body.cited_ids("", [revert, cited]), ())
+        for entry in (f"{undone[:9]}x", f"{undone[:9]}_x"):
+            with self.subTest(entry=entry):
+                revert = self.revert_of(f"Reverted commits:\n\n- {entry} renew\n")
+                self.assertEqual(sd_ship_body.cited_ids("", [revert, cited]), (2,))
+
     def test_a_fence_on_a_list_marker_line_is_an_example(self) -> None:
         """pack sd:9666 review, round 5, instance 2: `- ```text` opened no fence, so the sha bullet in the
         example undid a real commit and dropped its citations."""
