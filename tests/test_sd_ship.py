@@ -5190,6 +5190,49 @@ roles:
             with self.subTest(fresh=fresh):
                 self.assertEqual(ship.stale_criteria(fresh, old), [])
 
+    def test_structured_evidence_respaced_reordered_or_rewrapped_is_the_old_evidence(self):
+        """Round 10 of sd:9268: the fold read evidence text only, so a list, a nested value or a text wrapped
+        in a list passed whatever its spacing or order. Evidence is compared as its set of folded leaves."""
+        old = {"criteria": [{"criterion": "actual scope", "passed": True,
+                             "evidence": ["fixture check pass", {"run": "suite ok", "count": 3}]}]}
+
+        def renewed(evidence):
+            return {"criteria": [{**old["criteria"][0], "evidence": evidence}]}
+
+        for stale in (["fixture check pass ", {"run": "suite ok", "count": 3}],
+                      [{"count": 3, "run": "suite\nok"}, "fixture check pass"],
+                      [["fixture check pass"], [{"log": "suite ok"}], 3, "fixture  check pass", " "],
+                      ("\uff46ixture check pass", "suite ok", "3")):
+            with self.subTest(stale=stale):
+                self.assertTrue(ship.stale_criteria(renewed(stale), old))
+        text = {"criteria": [{"criterion": "actual scope", "passed": True, "evidence": "fixture check pass"}]}
+        self.assertTrue(ship.stale_criteria(renewed(["fixture check pass "]), text))
+        for fresh in (["fixture check pass", {"run": "suite ok", "count": 4}],
+                      ["fixture check pass", "suite ok", 3, "at 2b7e5560"]):
+            with self.subTest(fresh=fresh):
+                self.assertEqual(ship.stale_criteria(renewed(fresh), old), [])
+
+    def test_a_waiver_reason_respaced_inside_a_structure_is_the_old_waiver(self):
+        """The waiver's reason folds the same way as evidence, whatever shape the row gives it."""
+        def waived(reason):
+            return {"criteria": [{"criterion": "actual scope", "passed": False, "evidence": "none",
+                                  "waived": {"reason": reason, "decision": 7}}]}
+
+        self.assertTrue(ship.stale_criteria(waived(["out of  scope "]), waived(["out of scope"])))
+        self.assertEqual(ship.stale_criteria(waived(["descoped by the operator"]), waived(["out of scope"])), [])
+
+    def test_evidence_with_no_text_in_it_does_not_answer_a_criterion(self):
+        """Blank evidence in a structure was truthy, so it answered a row and read as proof the old claim
+        did not hold."""
+        for blank in (" ", [" "], [[], {"log": "\n"}], {"log": ""}, [None]):
+            with self.subTest(blank=blank):
+                self.assertFalse(ship.acceptance_row_answered(
+                    {"criterion": "actual scope", "passed": True, "evidence": blank}))
+        for held in ("fixture check pass", ["fixture check pass"], 3, [0], {"exit": 0}):
+            with self.subTest(held=held):
+                self.assertTrue(ship.acceptance_row_answered(
+                    {"criterion": "actual scope", "passed": True, "evidence": held}))
+
     def test_a_renewal_whose_claim_has_no_evidence_still_renews(self):
         """A task's claim is the verified merge alone, so its renewal has no evidence to go stale."""
         from sd_db import set_item_fields

@@ -564,26 +564,47 @@ def edited_waivers(claim: object, stored: object) -> list[int]:
                    if isinstance(row.get("waived"), dict) and row != old})
 
 
+def leaves(value: object) -> list[str]:
+    """The text a value holds, whatever its shape: each leaf once, folded, in sorted order (sd:9268 round 10).
+
+    Text is folded to its Unicode compatibility form with its spacing
+    collapsed, a number or a flag reads as its JSON form, and a list or an
+    object gives the leaves of its values. A blank text and a null hold
+    nothing, so spacing, order, nesting, a repeat or an object's key tell
+    no two values apart.
+    """
+    def walk(node: object):
+        if isinstance(node, str):
+            yield " ".join(unicodedata.normalize("NFKC", node).split())
+        elif isinstance(node, dict):
+            for inner in node.values():
+                yield from walk(inner)
+        elif isinstance(node, (list, tuple)):
+            for inner in node:
+                yield from walk(inner)
+        elif node is not None:
+            yield json.dumps(node, sort_keys=True, default=str)
+
+    return sorted({leaf for leaf in walk(value) if leaf})
+
+
 def evidence_of(row: object) -> str:
     """What an acceptance row proves, as one string: its evidence, result and waiver.
 
     Any other field, such as a comment, and the waiving note's body, which
     the claim copies from the database, prove nothing (sd:9268 review).
-    Nor does the criterion's name, and text is compared with its Unicode
-    compatibility forms and spacing folded: a renamed criterion, a trailing
-    space or a line break over the old evidence is the old evidence
-    (sd:9268 round 8).
+    Nor does the criterion's name, and evidence and a waiver's reason are
+    compared as their `leaves`: a renamed criterion, a trailing space, a
+    line break or another order or nesting of the old evidence is the old
+    evidence (sd:9268 rounds 8 and 10).
     """
-    def folded(value: object) -> object:
-        return " ".join(unicodedata.normalize("NFKC", value).split()) if isinstance(value, str) else value
-
     if not isinstance(row, dict):
-        return json.dumps(row, sort_keys=True)
+        return json.dumps(leaves(row))
     waived = row.get("waived")
     if isinstance(waived, dict):
-        waived = {"reason": folded(waived.get("reason")), "decision": waived.get("decision")}
-    return json.dumps({"evidence": folded(row.get("evidence")), "passed": row.get("passed"), "waived": waived},
-                      sort_keys=True)
+        waived = {"reason": leaves(waived.get("reason")), "decision": waived.get("decision")}
+    return json.dumps({"evidence": leaves(row.get("evidence")), "passed": row.get("passed"), "waived": waived},
+                      sort_keys=True, default=str)
 
 
 def stale_criteria(claim: object, stored: object) -> list[str]:
@@ -608,8 +629,11 @@ def acceptance_row_answered(row: object) -> bool:
 
     A passed row may not also claim a waiver, and a waived criterion must be
     text: delivery records only the waived rows, by their criterion.
+    Evidence with no text in it, such as a list of blanks, names none
+    (sd:9268 round 10).
     """
-    if not isinstance(row, dict) or not row.get("criterion") or not row.get("evidence"):
+    if (not isinstance(row, dict) or not row.get("criterion") or not row.get("evidence")
+            or not leaves(row["evidence"])):
         return False
     if row.get("passed") is True:
         return "waived" not in row
