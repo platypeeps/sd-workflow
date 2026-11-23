@@ -2705,21 +2705,12 @@ def receipt_of(result: dict[str, Any]) -> Any:
             result.get("receipt_skipped") or result.get("receipt_error") or "none")
 
 
-def mark_train(queue: Queue, fields: dict[str, dict[str, Any]], items: list[int],
-               heads: dict[str, tuple[str, str]] | None = None) -> None:
-    """Write each member's `train` record from `fields`, by entry id; a write that fails stops nothing.
-
-    `heads` moves a member's `expected_head` from the queued head to the
-    catch-up its train prepare pushed, as a put-back does, only while the
-    row still queues that head: a re-enqueue in between wins.
-    """
+def mark_train(queue: Queue, fields: dict[str, dict[str, Any]], items: list[int]) -> None:
+    """Write each member's `train` record from `fields`, by entry id; a write that fails stops nothing."""
     def on_members(entries: list[dict[str, Any]]) -> None:
         for row in entries:
             if row["id"] in fields:
                 row["train"] = {"items": items, "at": stamp_now(), **fields[row["id"]]}
-            old, new = (heads or {}).get(row["id"], ("", ""))
-            if new and row.get("status") == "pending" and row.get("expected_head") == old:
-                row["expected_head"] = new
     with contextlib.suppress(LaneError, OSError):
         update(queue, on_members)
 
@@ -2890,16 +2881,13 @@ def land_as_train(entry: dict[str, Any], queue: Queue, ship: Ship, head: str, lo
         return {"status": "skipped", "reason": f"sd:{entry['item']} did not join: {why}"}
     joined: list[Joined] = [(entry, tree, head, base[1], onto)]
     record: dict[str, dict[str, Any]] = {}
-    heads: dict[str, tuple[str, str]] = {}
     for row in members[1:]:
         if clock() >= deadline:
             record[row["id"]] = {"status": "skipped", "reason": OUT_OF_BUDGET}
             break
         renewed()
         placed, why = prepared_member(row, queue, ship, logs, renewed, deadline)
-        moved = pushed_catch_up(pathlib.Path(row["worktree"]), str(row.get("branch") or ""), row["expected_head"])
-        if moved != row["expected_head"]:  # its next claim starts there, not one more link behind (sd:3283)
-            heads[row["id"]] = (row["expected_head"], moved)
+        row = follow_prepare(queue, row, placed)  # now: a train that stops later still leaves the row there
         if placed is not None:
             landing, why = join_member(row, pathlib.Path(row["worktree"]), placed, onto, ship, logs)
         if placed is None or landing is None:
@@ -2908,7 +2896,7 @@ def land_as_train(entry: dict[str, Any], queue: Queue, ship: Ship, head: str, lo
         joined.append((row, pathlib.Path(row["worktree"]), placed, onto, landing))
         onto = landing
     answer = land_joined(joined, queue, ship, onto, base[0], logs, record, renewed, fence)
-    mark_train(queue, record, items, heads)
+    mark_train(queue, record, items)
     return answer
 
 
@@ -3034,6 +3022,76 @@ def prepared_member(row: dict[str, Any], queue: Queue, ship: Ship, logs: pathlib
     if stopped is not None:
         return None, f"its prepare stopped: {stopped.get('reason') or stopped.get('status')}"
     return str(prepared.get("head")), ""
+
+
+def follow_prepare(queue: Queue, row: dict[str, Any], placed: str | None) -> dict[str, Any]:
+    """`row` queued at the head its train prepare left, so its own claim starts there (class pass of sd:9923).
+
+    The train prepares a member it has not claimed, and that prepare moves
+    the branch: a catch-up merge, or under a rebase policy a rewrite that
+    is force-pushed. A row left at the old head skips `HEAD_MOVED` on its
+    next claim. The row moves only while it is pending at the head the
+    train read, so a re-enqueue in between wins; a write that fails moves
+    nothing, and the row the train carries stays the one the queue holds.
+    """
+    old = row["expected_head"]
+    new = prepared_head(pathlib.Path(row["worktree"]), str(row.get("branch") or ""), old, placed)
+    if new == old:
+        return row
+
+    def on_row(entries: list[dict[str, Any]]) -> bool:
+        mine = next((each for each in entries if each["id"] == row["id"]), None)
+        if mine is None or mine.get("status") != "pending" or mine.get("expected_head") != old:
+            return False
+        mine["expected_head"] = new
+        return True
+    try:
+        return {**row, "expected_head": new} if update(queue, on_row) else row
+    except Stop:
+        raise
+    except (LaneError, OSError):
+        return row
+
+
+def prepared_head(tree: pathlib.Path, branch: str, expected: str, placed: str | None) -> str:
+    """The head a member's train prepare left for `expected`, or `expected` when it made none the lane can name.
+
+    In order: the catch-up merge prepare pushed (`pushed_catch_up`); the
+    worktree's HEAD when it is the head `sd-ship prepare` answered ready,
+    which it reviewed and pushed; that HEAD when it is prepare's rebase of
+    `expected` (`rebase_of`), pushed or not, for a prepare that refused
+    after its rewrite. A read that fails keeps `expected`.
+    """
+    pushed = pushed_catch_up(tree, branch, expected)
+    if pushed != expected:
+        return pushed
+    try:
+        head = read_git(tree, "rev-parse", "HEAD").stdout.strip()
+        return head if head and head != expected and (head == placed or rebase_of(tree, head, expected)) else expected
+    except LaneError:
+        return expected
+
+
+def rebase_of(tree: pathlib.Path, commit: str, expected: str) -> bool:
+    """Whether `commit` is `expected` as a rebase policy's prepare rewrites it (sd:6790).
+
+    That prepare makes the branch linear on `origin`'s default branch and
+    amends messages, so no parent links the two heads. It is read by what
+    it holds: a chain with no merge from a commit on the default branch,
+    whose tree is the clean merge of that commit and `expected`. A commit
+    that adds or drops a change, a merge in the chain, or a base that never
+    landed is no rewrite. Only the train asks, right after its own prepare
+    of a member: an amend a builder made is still a move (sd:3413).
+    """
+    # ponytail: a clean rebase whose tree differs from the three-way merge reads as no rewrite, and the
+    # member then skips as moved; compare patch ids per commit if a rebase repository ever meets it.
+    found = read_git(tree, "merge-base", commit, origin_default(tree)[1], ok=(0, 1))
+    base = found.stdout.strip()
+    if found.returncode != 0 or not base or base == commit:
+        return False
+    if read_git(tree, "rev-list", "--min-parents=2", "--max-count=1", f"{base}..{commit}").stdout.strip():
+        return False
+    return clean_merge(tree, commit, base, expected)
 
 
 def join_member(row: dict[str, Any], tree: pathlib.Path, head: str, onto: str, ship: Ship,

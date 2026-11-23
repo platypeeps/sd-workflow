@@ -107,6 +107,10 @@ from 2 to 6 fails, each member ships alone, as after sd:9899: a later
 | Step | State moved | Failure | Recovery | Test |
 | --- | --- | --- | --- | --- |
 | 1 prepare | each member's PR and receipt | a member's prepare stops | it leaves the train; the rest join | lane: a member that fails prepare |
+| 1 prepare | a pending member's branch: a catch-up merge, or a rebase policy's rewrite | the train does not land, or stops | the row moves to that head right after the prepare; its own claim starts there | lane: member caught up / rebased in a train |
+| 1 prepare | a pending member's worktree, rewritten, not pushed | its prepare refused after the rewrite | the row follows the rewrite read by what it holds; its own claim reports its own end | lane: train prepare refused after its rebase |
+| 1 prepare | none | the member was enqueued again or cancelled during its prepare | that write wins; the row is not moved | lane: member enqueued again during its prepare |
+| 1 prepare | a pending member's branch, rewritten | the run dies inside that prepare | the row keeps the old head; its claim skips head_moved and names the worktree to enqueue again | none: the lone lane's rule, unchanged |
 | 2 join | an unreferenced commit | a member conflicts | refused train_conflict; it drops, stays pending | ship: train conflict |
 | 2 join | receipt train_joined | run twice | a second join writes the same M_i | ship: join twice |
 | 2 join | none | allow_merge_commit off | refused; each ships alone | ship: no merge commits |
@@ -129,3 +133,6 @@ from 2 to 6 fails, each member ships alone, as after sd:9899: a later
 
 - One combined review: each member keeps its own (sd:9899).
 - Landing across repositories: a train is one repository's queue.
+- A claimed entry put back in a rebase-policy repository keeps its
+  pre-prepare head: the lone lane's rule, which a train lead put back
+  at `step: train` meets too (sd:10223).

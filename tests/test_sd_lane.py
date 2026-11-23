@@ -2395,6 +2395,76 @@ class TrainLanding(Trees):
         self.assertEqual((second["status"], second["expected_head"]),
                          ("merged", git(self.second, "rev-parse", "HEAD")))
 
+    def rebased_in_the_train(self, landing: str, pushed: bool = True) -> str:
+        """Main moves, and sd:2's train prepare rebases it as a rebase policy's does; the rewritten head.
+
+        `pushed` False is a prepare that refused after the rewrite and before its push.
+        """
+        self.landing = {"status": landing, "pull": 9, "merge_commit": "c" * 40, "reason": "the train gate failed"}
+        done: list[str] = []
+
+        def ship(argv: list[str], log: pathlib.Path) -> dict:
+            if argv[2] == "prepare" and argv[argv.index("--item") + 1] == "2" and not done:
+                self.commit_files(self.repo, {"later.txt": "l\n"}, "main moved again")
+                git(self.repo, "push", "-q", "origin", "main")
+                git(self.second, "fetch", "-q", "origin")
+                git(self.second, "rebase", "-q", "origin/main")
+                git(self.second, "commit", "-q", "--amend", "-m", "second\n\nDelivers: sd:2")
+                done.append(git(self.second, "rev-parse", "HEAD"))
+                self.calls.append(argv)
+                if not pushed:
+                    return {"ok": False, "phase": "review", "error": "local review blocking"}
+                git(self.second, "push", "-q", "--force", "origin", "HEAD:refs/heads/second")
+                return {"ok": True, "phase": "ready_to_send", "head": done[0]}
+            return self.ship(argv, log)
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, ship, self.gate)
+        return done[0]
+
+    def test_a_member_rebased_in_a_train_that_did_not_land_runs_on_its_next_claim(self) -> None:
+        """Class pass of sd:9923: a rebase policy's prepare rewrites the branch, and the row kept the old head."""
+        head = self.rebased_in_the_train("failed")
+        second = self.entries()[1]
+        self.assertNotEqual(second.get("code"), sd_lane.HEAD_MOVED, second.get("reason"))
+        self.assertEqual((second["status"], second["expected_head"]), ("merged", head))
+
+    def test_a_member_rebased_in_a_train_that_landed_reconciles(self) -> None:
+        self.rebased_in_the_train("merged")
+        self.assertEqual([entry["status"] for entry in self.entries()], ["merged"] * 3)
+
+    def test_a_member_whose_train_prepare_refused_after_its_rebase_is_claimed_at_the_rewrite(self) -> None:
+        """The rewrite is in the worktree only; the member's own claim prepares it and reports its own end."""
+        self.rebased_in_the_train("failed", pushed=False)
+        second = self.entries()[1]
+        self.assertNotEqual(second.get("code"), sd_lane.HEAD_MOVED, second.get("reason"))
+        self.assertEqual(second["status"], "merged")  # the recorder's second prepare passes
+
+    def test_a_members_row_follows_its_prepare_before_the_train_gate(self) -> None:
+        """A train that stops in its gate or merge writes no train record; the row must have moved by then."""
+        seen: list[tuple[str, str]] = []
+        self.during_gate = lambda: seen.append((self.entries()[1]["expected_head"],
+                                                git(self.second, "rev-parse", "HEAD")))
+        queued = git(self.second, "rev-parse", "HEAD")
+        head = self.rebased_in_the_train("failed")
+        self.assertEqual((seen[0], head != queued), ((head, head), True))
+
+    def test_a_member_enqueued_again_during_its_train_prepare_keeps_the_head_it_queued(self) -> None:
+        """The row moves only while it is pending at the head the train read; any other write wins."""
+        self.queue_three()
+        row = self.entries()[1]
+        self.commit_files(self.second, {"more.txt": "m\n"}, "more")
+        head = git(self.second, "rev-parse", "HEAD")
+        for change in ({"expected_head": "f" * 40}, {"status": "cancelled"}):
+            with self.subTest(change=change):
+                sd_lane.update(self.store(), lambda rows, change=change: rows[1].update(
+                    {"status": "pending", "expected_head": row["expected_head"], **change}))
+                self.assertIs(sd_lane.follow_prepare(self.store(), row, head), row)
+                self.assertEqual({key: self.entries()[1][key] for key in change}, change)
+        sd_lane.update(self.store(), lambda rows: rows[1].update(status="pending", expected_head=row["expected_head"]))
+        self.assertEqual((sd_lane.follow_prepare(self.store(), row, head)["expected_head"],
+                          self.entries()[1]["expected_head"]), (head, head))
+        self.assertIs(sd_lane.follow_prepare(self.store(), row, None), row)  # no head it can name: nothing moves
+
     def test_a_member_caught_up_in_a_train_that_landed_reconciles(self) -> None:
         self.caught_up_in_the_train("merged")
         self.assertEqual([entry["status"] for entry in self.entries()], ["merged"] * 3)
@@ -5372,6 +5442,50 @@ class AnyHost(SharedQueue):
         [merge] = self.catch_ups("unit", queued, 1)
         git(tree, "reset", "-q", "--hard", merge)
         self.assertEqual((sd_lane.at_head(tree, queued), sd_lane.caught_up(tree, queued)), (True, merge))
+
+    def commit_file(self, tree: pathlib.Path, name: str) -> str:
+        (tree / name).write_text(f"{name}\n", encoding="utf-8")
+        git(tree, "add", name)
+        git(tree, "commit", "-q", "-m", f"add {name}")
+        return git(tree, "rev-parse", "HEAD")
+
+    def rebased(self, tree: pathlib.Path) -> str:
+        """`tree`'s branch as a rebase policy's prepare leaves it on a main that moved; the new HEAD."""
+        self.commit_file(self.repo, "base.txt")
+        git(self.repo, "push", "-q", "origin", "main")
+        git(tree, "rebase", "-q", "main")
+        git(tree, "commit", "-q", "--amend", "-m", "the tip\n\nDelivers: sd:1")
+        return git(tree, "rev-parse", "HEAD")
+
+    def test_a_rebase_of_the_queued_head_is_read_by_what_it_holds(self) -> None:
+        """Class pass of sd:9923: a rebase policy's prepare rewrites the branch, so no parent links the heads.
+
+        `rebase_of` reads the rewrite: linear on origin's default branch, holding the queued head's change
+        and nothing else. Only the train asks it, after its own prepare: the lane's head rule is unchanged.
+        """
+        tree = self.worktree("unit")
+        queued = self.commit_file(tree, "change.txt")
+        head = self.rebased(tree)
+        self.assertEqual((sd_lane.rebase_of(tree, head, queued), sd_lane.at_head(tree, queued)), (True, False))
+        self.assertEqual(sd_lane.prepared_head(tree, "unit", queued, None), head)  # in the worktree only
+        git(tree, "push", "-q", "--force", "origin", "HEAD:refs/heads/unit")
+        self.assertEqual(sd_lane.prepared_head(tree, "unit", queued, None), head)
+        main = git(tree, "rev-parse", "main")
+        for commit, expected in ((main, queued), (head, main), (queued, head)):
+            with self.subTest(commit=commit, expected=expected):  # the base alone; another head's; the reverse
+                self.assertFalse(sd_lane.rebase_of(tree, commit, expected))
+        extra = self.commit_file(tree, "unreviewed.txt")  # a commit no review saw
+        self.assertEqual((sd_lane.rebase_of(tree, extra, queued), sd_lane.prepared_head(tree, "unit", queued, None)),
+                         (False, queued))
+        self.assertEqual(sd_lane.prepared_head(tree, "unit", queued, extra), extra)  # the head prepare answered
+        git(tree, "reset", "-q", "--hard", head)
+        self.assertFalse(sd_lane.rebase_of(tree, self.foreign_merge(tree), queued))  # a merge in the chain
+        git(tree, "reset", "-q", "--hard", queued)
+        other = self.tmp / "aside"
+        git(self.repo, "worktree", "add", "-q", "-b", "aside", str(other), "main")
+        self.commit_file(other, "aside.txt")  # not on the default branch
+        git(tree, "rebase", "-q", "aside")
+        self.assertFalse(sd_lane.rebase_of(tree, git(tree, "rev-parse", "HEAD"), queued))
 
     def test_a_merged_back_reviewed_catch_up_is_a_catch_up(self) -> None:
         """sd:4925: prepare merges back a reviewed catch-up the queued head lacks, then maybe the base again.
