@@ -13,6 +13,7 @@ import pathlib
 import posixpath
 import re
 import socket
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -869,12 +870,22 @@ class SharedReview:
             self.save(**rebound)
         return True
 
+    def receipts_through(self) -> int | None:
+        """The newest state row id, the rebuttal receipts a pass reads (pack sd:9973); None when unread."""
+        try:
+            return self.connection.execute("SELECT COALESCE(MAX(id), 0) FROM state").fetchone()[0]
+        except (AttributeError, sqlite3.Error):
+            return None
+
     def replayed_request(self, passes: list[dict], request: dict) -> str | None:
         """The request digest `--explain` gives now for the last pass; None when it cannot be rebuilt."""
         last = passes[-1]
         argv = sd_review_request.review_argv(self.runtime.bin_dir, self.database,
                                              SimpleNamespace(provider=last.get("requested_provider")), last.get("base"))
         wanted = request.get("verify") or request.get("resume")
+        through = request.get("rebutted_through")
+        if type(through) is int:  # the receipts the pass read, not those recorded since (pack sd:9973)
+            argv += ["--rebutted-through", str(through)]
         with tempfile.TemporaryDirectory(prefix="sd-ship-replay-") as directory:
             if wanted:
                 # The prior is rebuilt the two ways `review` builds it, and used only if it is the one handed over.
@@ -1304,6 +1315,9 @@ class SharedReview:
 
     def execute_review(self, argv: list[str], head: str, passes: list[dict]) -> subprocess.CompletedProcess:
         stage = "planning"
+        # pack sd:9973. The pass reads the rebuttal receipts recorded up to now, and a replay reads the same.
+        through = self.receipts_through()
+        argv = argv if through is None else [*argv, "--rebutted-through", str(through)]
         try:
             planned = self.runtime.process(self.root, argv + ["--explain"], timeout=self.runtime.setup_seconds)
             try:
@@ -1317,7 +1331,8 @@ class SharedReview:
             explained = json.loads(planned.stdout)
             passes[-1]["review_request"] = {"sha256": explained.get("request_sha256"),
                                             "verify": explained.get("verification_report_digest"),
-                                            "resume": explained.get("resume_report_digest")}
+                                            "resume": explained.get("resume_report_digest"),
+                                            "rebutted_through": through}
             # What dispatch overwrites, so a released gate failure can put it back.
             self.superseded = {key: self.state.get(key, ABSENT) for key in DISPATCH_FIELDS}
             bound: dict[str, Any] = {"binding": self.runtime.binding(self.root)}

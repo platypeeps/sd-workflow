@@ -1267,6 +1267,7 @@ roles:
         self.assertEqual(state["binding_manifest"], ship.binding_manifest(self.root))
         self.assertEqual(state["review_binding_kept"][0]["changed"], [["sd_route.py", "verdict"]])
         self.assertEqual(state["review_binding_kept"][0]["request_sha256"], state["passes"][0]["review_request"]["sha256"])
+        self.assertIn("rebutted_through", state["passes"][0]["review_request"], "the cap a replay reads (sd:9973)")
         land()
         self.assertEqual(self.merge()["phase"], "merged")
 

@@ -768,7 +768,7 @@ REBUTTED_ROWS = 200
 #: The rows only: a body is ASCII JSON, while a field `json_extract` decodes may not be UTF-8 and failed the whole read.
 REBUTTED_QUERY = (
     "SELECT a.body FROM state AS a WHERE a.kind = 'checkpoint' AND (a.key LIKE 'ship-adjudication:%' OR a.key LIKE"
-    " 'ship-adjudication-no-item:%') AND a.timestamp >= ?1 AND lower(json_extract(CASE WHEN"
+    " 'ship-adjudication-no-item:%') AND a.timestamp >= ?1 AND (?5 IS NULL OR a.id <= ?5) AND lower(json_extract(CASE WHEN"
     " json_valid(a.body) THEN a.body END, '$.proposal.bindings.repository')) = ?2 AND json_extract(CASE WHEN"
     " json_valid(a.body) THEN a.body END, '$.proposal.bindings.branch') = ?3 ORDER BY a.id DESC LIMIT ?4")
 
@@ -820,11 +820,10 @@ class Rebuttal(NamedTuple):
     instances: tuple[str, ...] = ()  # each `path:line` it answered; a change to any one's file lapses it (sd:9769)
 
 
-def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: Mapping[str, str]) -> list[Rebuttal]:
+def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: Mapping[str, str], through: int | None = None) -> list[Rebuttal]:
     """This branch's rebutted findings, read-only (pack sd:9270): the prompt lists them and the gate matches them.
     A rebuttal counts only from a receipt whose head is the base or in base..head: a reused branch name inherits
-    nothing from
-    a merged or abandoned branch. No cutoff at the head's commit time: a retry at the same head must read the
+    nothing from a merged or abandoned branch. `through`, sd-ship's cap, reads no receipt id past it (sd:9973). No cutoff at the head's commit time: a retry at the same head must read the
     receipt recorded after it; the same receipts still ask the same request (sd:1397). A failed read says so on
     stderr and reviews without them; a planning subject, a detached HEAD, no GitHub origin and no database have
     nothing."""
@@ -842,7 +841,7 @@ def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: 
         if not target.exists():
             return []
         with contextlib.closing(imported.module.connect(target, write=False)) as connection:
-            rows = connection.execute(REBUTTED_QUERY, (since, "/".join(origin[:2]), branch, REBUTTED_ROWS)).fetchall()
+            rows = connection.execute(REBUTTED_QUERY, (since, "/".join(origin[:2]), branch, REBUTTED_ROWS, through)).fetchall()
     except Exception as error:  # a failed read is unknown, not empty: say so, and review without it
         print(f"sd-review: reviewing without the rebutted findings: {type(error).__name__}: {error}", file=sys.stderr)
         return []
@@ -2248,7 +2247,7 @@ def review(
             raise UsageError("cannot establish the refreshed target boundary for item authorship")
         authored_subject = subject if target_base == subject.head else subject._replace(base=target_base)
     database = getattr(args, "database", None)
-    rebutted = [] if preflight else rebutted_findings(root, subject, database, env)
+    rebutted = [] if preflight else rebutted_findings(root, subject, database, env, getattr(args, "rebutted_through", None))
     checklist = "" if preflight else blocker_checklist(root, subject, database, env) + rebuttal_section(rebutted)
     prompt, prepended, context = ("", False, []) if preflight else prepared_prompt(root, subject, args, previous, env, checklist)
     try:
@@ -2810,6 +2809,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--dry-run", action="store_true", help="print the invocations, run nothing")
     parser.add_argument("--json", action="store_true", help="emit one JSON object")
     parser.add_argument("--expected-timing", help=argparse.SUPPRESS)
+    parser.add_argument("--rebutted-through", type=int, help=argparse.SUPPRESS)  # sd-ship's receipt cap (sd:9973)
     # No network call means draft state cannot be read from GitHub; it is stated.
     parser.add_argument("--draft", action="store_true", help="review as a draft pull request")
     parser.add_argument(
