@@ -2948,7 +2948,8 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
     whatever happened, which also closes a train PR left open. After the
     gate, `ready` and a fresh fetch of the base decide again: a member
     held, a claim lost, or a base that moved during the gate sends no
-    merge, since GitHub would land a combination the gate never saw.
+    merge, since GitHub would land a combination the gate never saw. The
+    pull request opens or is found only then, and only onto `base`.
     """
     import sd_local_gate  # noqa: PLC0415 -- the GitHub client loads only for a train landing
     import sd_ship_remote  # noqa: PLC0415
@@ -2961,17 +2962,17 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
         gate = sd_local_gate.local_gate(api, root, tip, base=base)
         if gate.get("status") != "success":
             return {"status": "failed", "reason": f"the train gate at {tip} did not pass: {gate.get('summary')}"[:600]}
-        pull = train_pull(api, branch, base, f"chore(lane): land the train of {names}")
-        why = base_moved(root, tip, base) or ready()  # `ready` last: it ends in the lane host's fence
+        why = base_moved(root, tip, base) or ready()  # `ready` ends in the lane host's fence
         if why is not None:
-            return {"status": "failed", "pull": pull, "reason": why[:600]}
+            return {"status": "failed", "reason": why[:600]}
+        pull = train_pull(api, branch, base, f"chore(lane): land the train of {names}")
         with contextlib.suppress(sd_ship_remote.Refusal):  # a lost answer is read back below, never sent twice
             api.api(f"{api.prefix}/pulls/{pull}/merge", method="PUT",
                     body={"sha": tip, "merge_method": "merge", "commit_title": f"chore(lane): train of {names} (#{pull})",
                           "commit_message": "Each member's own merge carries its trailers."})
         merged = api.pull(pull)
-        if merged.get("merged") is not True:
-            return {"status": "failed", "pull": pull, "reason": f"GitHub did not merge train pull request #{pull}"}
+        if merged.get("merged") is not True or (merged.get("base") or {}).get("ref") != base:
+            return {"status": "failed", "pull": pull, "reason": f"GitHub did not merge train pull request #{pull} onto {base}"}
         return {"status": "merged", "pull": pull, "merge_commit": merged.get("merge_commit_sha")}
     except sd_ship_remote.Refusal as error:
         return {"status": "failed", "reason": str(error)[:600]}
@@ -2990,7 +2991,11 @@ def base_moved(root: pathlib.Path, tip: str, base: str) -> str | None:
 
 
 def train_pull(api: Any, branch: str, base: str, title: str) -> int:
-    """The number of the train pull request from `branch`, opened now or found from an earlier try."""
+    """The number of the train pull request from `branch` onto `base`, opened now or found from an earlier try.
+
+    A pull request found from `branch` onto another base was retargeted; it
+    is refused, since the gate ran against `base` alone (review of sd:9923).
+    """
     import sd_ship_remote  # noqa: PLC0415
     owner = api.repository.split("/")[0]
     try:
@@ -2999,13 +3004,15 @@ def train_pull(api: Any, branch: str, base: str, title: str) -> int:
             "body": "The lane lands these members together. Each member's own pull request holds its review."})
     except sd_ship_remote.Refusal:  # one exists, or the answer was lost: read it
         made = None
-    if isinstance(made, dict) and isinstance(made.get("number"), int) and made.get("head", {}).get("ref") == branch:
+    def ours(pull: Any) -> bool:
+        return isinstance(pull, dict) and isinstance(pull.get("number"), int) and \
+            (pull.get("head") or {}).get("ref") == branch and (pull.get("base") or {}).get("ref") == base
+    if ours(made):
         return made["number"]
     found = api.api(f"{api.prefix}/pulls?head={owner}:{branch}&state=open")
-    numbers = [pull["number"] for pull in found if isinstance(pull, dict) and isinstance(pull.get("number"), int)
-               and (pull.get("head") or {}).get("ref") == branch] if isinstance(found, list) else []
+    numbers = [pull["number"] for pull in found if ours(pull)] if isinstance(found, list) else []
     if len(numbers) != 1:
-        raise sd_ship_remote.Refusal(f"no single open train pull request from {branch}")
+        raise sd_ship_remote.Refusal(f"no single open train pull request from {branch} onto {base}")
     return numbers[0]
 
 

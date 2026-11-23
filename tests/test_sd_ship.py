@@ -6579,6 +6579,21 @@ roles:
         self.assertEqual((landed["status"], landed["pull"]), ("merged", 2))
         self.assertEqual(sorted(self.remote.pull_requests), [1, 2])
 
+    def test_land_train_merges_no_recovered_pull_request_retargeted_off_the_base(self):
+        """Review of sd:9923: the recovery read matched the head ref only, so a train PR moved to `release` merged."""
+        tip = self.joined_tip()
+        self.remote.commit_on("release", "release\n\nAuthored-with: human", files={"release.txt": "r\n"})
+        real = self.remote.open_pull_request
+
+        def retargeted(head, *, base=None, title="", body=""):
+            return real(head, base="release" if head.startswith("sd-train/") else base, title=title, body=body)
+        self.double.lose_create = True
+        with patch.object(self.remote, "open_pull_request", retargeted):
+            landed, _ = self.landed_by_lane(tip)
+        self.assertEqual(landed["status"], "failed")
+        self.assertIn("onto main", landed["reason"])
+        self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
+
     def test_land_train_whose_members_changed_during_the_gate_dispatches_nothing(self):
         """Review of sd:9923: eligibility read before the gate was used after it."""
         tip = self.joined_tip()
