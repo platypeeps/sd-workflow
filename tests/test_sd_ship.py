@@ -6474,6 +6474,86 @@ roles:
         self.assertEqual(len([call for call in self.remote.calls if call.method == "PUT"]), 1)
 
 
+    def joined_tip(self):
+        """A delivering member joined onto an earlier landing: the train tip `land_train` lands."""
+        self.delivering()
+        _main, earlier = self.landing_before()
+        return self.join(earlier)["train_commit"]
+
+    def landed_by_lane(self, tip, gate="success"):
+        gates = []
+
+        def local_gate(api, root, head, *, base=None, database=None):
+            gates.append((head, base))
+            return {"status": gate, "summary": f"sd-check {gate}"}
+        with patch.object(ship.sd_local_gate, "local_gate", local_gate):
+            landed = ship.sd_lane.land_train(self.root, tip, "main", [self.item])
+        return landed, gates
+
+    def train_branches(self):
+        return [name for name in self.remote.branches() if name.startswith("sd-train/")]
+
+    def test_land_train_gates_the_tip_once_and_merges_one_train_pull_request(self):
+        tip = self.joined_tip()
+        landed, gates = self.landed_by_lane(tip)
+        self.assertEqual(landed["status"], "merged")
+        self.assertEqual(gates, [(tip, "main")])
+        [put] = [call for call in self.remote.calls if call.method == "PUT"]
+        self.assertEqual((put.body["sha"], put.body["merge_method"]), (tip, "merge"))
+        train = self.remote.pull(landed["pull"])
+        self.assertEqual((train.state, train.head), ("MERGED", f"sd-train/{tip[:12]}"))
+        self.assertEqual(_git(self.remote.path, "rev-parse", "main^2"), tip)
+        self.assertEqual((self.remote.pull(1).state, self.remote.pull(1).merge_commit_sha), ("MERGED", tip))
+        self.assertEqual(self.train_branches(), [])
+        self.assertEqual(self.merge()["merge_commit"], tip)
+
+    def test_land_train_whose_gate_fails_opens_no_pull_request(self):
+        tip = self.joined_tip()
+        landed, _ = self.landed_by_lane(tip, gate="failure")
+        self.assertEqual(landed["status"], "failed")
+        self.assertIn("did not pass", landed["reason"])
+        self.assertEqual(sorted(self.remote.pull_requests), [1])
+        self.assertEqual(self.train_branches(), [])
+        self.assertEqual(self.remote.pull(1).state, "OPEN")
+
+    def test_land_train_reads_back_a_lost_merge_answer(self):
+        tip = self.joined_tip()
+        saved = self.double._route
+
+        def route(method, path, body):
+            answer = saved(method, path, body)
+            if method == "PUT" and path.endswith("/merge"):
+                raise RemoteRefusal(502, "merge answer lost")
+            return answer
+        self.double._route = route
+        landed, _ = self.landed_by_lane(tip)
+        self.assertEqual(landed["status"], "merged")
+        self.assertEqual(len([call for call in self.remote.calls if call.method == "PUT"]), 1)
+
+    def test_land_train_finds_a_train_pull_request_whose_create_answer_was_lost(self):
+        tip = self.joined_tip()
+        self.double.lose_create = True
+        landed, _ = self.landed_by_lane(tip)
+        self.assertEqual((landed["status"], landed["pull"]), ("merged", 2))
+        self.assertEqual(sorted(self.remote.pull_requests), [1, 2])
+
+    def test_land_train_that_github_refuses_lands_nothing(self):
+        tip = self.joined_tip()
+        saved = self.double._route
+
+        def route(method, path, body):
+            if method == "PUT" and path.endswith("/merge"):
+                raise RemoteRefusal(405, "Required status check is expected")
+            return saved(method, path, body)
+        self.double._route = route
+        main = _git(self.remote.path, "rev-parse", "main")
+        landed, _ = self.landed_by_lane(tip)
+        self.assertEqual(landed["status"], "failed")
+        self.assertEqual(_git(self.remote.path, "rev-parse", "main"), main)
+        self.assertEqual(self.train_branches(), [])
+        self.assertEqual(self.remote.pull(1).state, "OPEN")
+
+
 class ReviewWatchdogTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

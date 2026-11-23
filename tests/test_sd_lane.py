@@ -1964,6 +1964,131 @@ class Train(Trees):
         self.assertEqual(sd_lane.lane_train(self.environ), sd_lane.TRAIN)
 
 
+
+class TrainLanding(Trees):
+    """sd:9923: a ready train lands as one train pull request, gated once on the joined tree.
+
+    `sd-ship merge --train-onto` answers a joined commit named for its item; `land_train` is the recorder's.
+    """
+
+    train = 3
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.third = self.branch("third", {"three.txt": "3\n"})
+        self.joins: list[tuple[int, str]] = []
+        self.landed: list[tuple[pathlib.Path, str, str, list[int]]] = []
+        self.landing = {"status": "merged", "pull": 9, "merge_commit": "c" * 40}
+        self.on_join: dict[int, Callable[[], None]] = {}
+        patcher = mock.patch.object(sd_lane, "land_train", self.land)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def gate(self, root: pathlib.Path, head: str, base: str) -> dict:
+        return {"status": "success", "summary": "sd-check", "receipt_revision": 1}
+
+    def ship(self, argv: list[str], log: pathlib.Path) -> dict:
+        item = int(argv[argv.index("--item") + 1])
+        if "--train-onto" in argv:
+            self.calls.append(argv)
+            self.joins.append((item, argv[argv.index("--train-onto") + 1]))
+            self.on_join.get(item, lambda: None)()
+            return self.answers.get((item, "join"), {"ok": True, "phase": "train_joined",
+                                                     "train_commit": f"{item}" * 40})
+        return super().ship(argv, log)
+
+    def land(self, root: pathlib.Path, tip: str, base: str, items: list[int]) -> dict:
+        """The recorder's landing; once merged, a member's next prepare reconciles, as `sd-ship` does."""
+        self.landed.append((root, tip, base, items))
+        trees = {1: self.first, 2: self.second, 3: self.third}
+        for item in items[1:] if self.landing["status"] == "merged" else ():
+            self.answers[(item, "prepare")] = {"ok": True, "phase": "merged", "merge_commit": f"{item}" * 40,
+                                               "head": git(trees[item], "rev-parse", "HEAD")}
+        return self.landing
+
+    def queue_three(self) -> None:
+        for item, tree in enumerate((self.first, self.second, self.third), start=1):
+            sd_lane.enqueue_entry(tree, item, f"fix: {item}", self.body, self.environ, manual=True, claim="deliver")
+
+    def merges(self) -> list[int]:
+        """The items each plain `sd-ship merge` named, in order: a lone merge, or a train member's reconcile."""
+        return [int(argv[argv.index("--item") + 1]) for argv in self.calls
+                if argv[2] == "merge" and "--train-onto" not in argv]
+
+    def test_three_ready_entries_land_in_one_train_pull_request(self) -> None:
+        self.queue_three()
+        fork = git(self.repo, "rev-parse", "origin/main")
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertEqual(self.joins[:3], [(1, fork), (2, "1" * 40), (3, "2" * 40)])
+        [(root, tip, base, items)] = self.landed
+        self.assertEqual((root, tip, base, items), (self.first, "3" * 40, "main", [1, 2, 3]))
+        self.assertEqual(self.merges(), [2, 3, 1])  # the members reconcile, then the claimed entry
+        entries = self.entries()
+        self.assertEqual([entry["status"] for entry in entries], ["merged"] * 3)
+        self.assertEqual({key: entries[0]["train_landing"][key] for key in ("status", "pull", "items")},
+                         {"status": "merged", "pull": 9, "items": [1, 2, 3]})
+        self.assertEqual([entries[index]["train"]["status"] for index in (1, 2)], ["landed", "landed"])
+        self.assertEqual([entries[index]["merge_commit"] for index in (1, 2)], ["2" * 40, "3" * 40])
+
+    def test_a_member_that_does_not_join_drops_and_the_rest_land(self) -> None:
+        self.answers[(2, "join")] = {"ok": False, "error": "conflicts with the train landing", "code": "train_conflict"}
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertEqual(self.joins[2], (3, "1" * 40))
+        self.assertEqual(self.landed[0][1:], ("3" * 40, "main", [1, 3]))
+        dropped = self.entries()[1]["train"]
+        self.assertEqual(dropped["status"], "dropped")
+        self.assertIn("conflicts with the train landing", dropped["reason"])
+
+    def test_a_member_whose_prepare_stops_drops_out(self) -> None:
+        self.answers[(2, "prepare")] = {"ok": False, "workflow": {"blocker": {"code": "gate_failed"}},
+                                        "error": "sd-check failed"}
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertEqual(self.landed[0][3], [1, 3])
+        self.assertIn("its prepare stopped", self.entries()[1]["train"]["reason"])
+
+    def test_a_claimed_entry_that_cannot_join_prepares_no_other_member(self) -> None:
+        self.answers[(1, "join")] = {"ok": False, "error": "merge merging is disabled"}
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        prepared = [int(argv[argv.index("--item") + 1]) for argv in self.calls if argv[2] == "prepare"]
+        self.assertEqual(prepared[:2], [1, 2])  # sd:2's own claim is the next prepare
+        self.assertEqual(self.entries()[0]["train_landing"]["status"], "skipped")
+        self.assertIn("merge merging is disabled", self.entries()[0]["train_landing"]["reason"])
+
+    def test_a_train_that_does_not_land_merges_each_entry_alone(self) -> None:
+        self.landing = {"status": "failed", "reason": "the train gate did not pass"}
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertEqual(self.merges()[0], 1)  # no member reconciled inside sd:1's run
+        entries = self.entries()
+        self.assertEqual(entries[0]["train_landing"]["status"], "failed")
+        self.assertEqual(entries[1]["train"]["status"], "failed")
+        self.assertEqual([entry["status"] for entry in entries], ["merged"] * 3)
+
+    def test_a_landing_that_raises_leaves_the_claimed_entry_to_merge_alone(self) -> None:
+        def broken(*args: object) -> dict:
+            raise KeyError("number")
+        self.queue_three()
+        with mock.patch.object(sd_lane, "land_train", broken):
+            sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        entries = self.entries()
+        self.assertEqual(entries[0]["train_landing"]["status"], "error")
+        self.assertEqual([entry["status"] for entry in entries], ["merged"] * 3)
+
+    def test_a_member_cancelled_during_the_train_lands_nothing(self) -> None:
+        def cancel_second() -> None:
+            sd_lane.update(self.store(), lambda rows: rows[1].update(status="cancelled"))
+        self.on_join[3] = cancel_second
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertEqual(self.landed, [])
+        landing = self.entries()[0]["train_landing"]
+        self.assertEqual(landing["status"], "skipped")
+        self.assertIn("sd:2 left the queue or moved", landing["reason"])
+
+
 class SettleReordered(unittest.TestCase):
     """Lane prepare of sd:9899 (note #71950): X and C move ahead of B while A runs; C is gated on A and B."""
 

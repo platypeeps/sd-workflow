@@ -156,8 +156,16 @@ member that conflicts drops to the next train and stays pending. The top
 is gated on the landings below it, as its prepare will gate it, beside the
 claimed entry's prepare and the speculation, which skips the top. Its
 receipt is the gate's own. Each member below gates its own tree: a pass
-above does not show that a lower tree passes, and members land one at a
-time. Each member still reviews and merges alone.
+above does not show that a lower tree passes. Each member still reviews
+alone.
+
+A ready train lands as one train pull request (sd:9923). Once the
+claimed entry is prepared, it and each pending member after it join in
+turn (`sd-ship merge --train-onto`), each a merge commit onto the
+landing before it; `land_train` gates the tip once and merges the train
+PR with a merge commit, so GitHub marks each member merged at its own
+merge and each reconciles. A train that does not land lands nothing:
+each entry merges alone (`land_as_train`).
 
 After a merge the runner lands the entry (sd:2568). It deletes the remote
 branch with `--force-with-lease` while the worktree's tip is the merged head.
@@ -2101,6 +2109,14 @@ def process(entry: dict[str, Any], queue: Queue, ship: Ship, advance: Callable[[
     if refused is not None:
         return {**fields, "status": "prepared", **refused}
     advance()
+    try:
+        landing = land_as_train(entry, queue, ship, str(prepared.get("head")), logs / stamp, renewed, deadline)
+    except Stop:
+        raise
+    except Exception as error:  # a train that breaks lands nothing it did not record; the merge below decides
+        landing = {"status": "error", "reason": f"{type(error).__name__}: {error}"[:REASON_CHARS]}
+    if landing is not None:  # landed, its merge below reconciles; else it merges alone (sd:9923)
+        fields["train_landing"] = landing
     merge_log = logs / f"merge-{item}-{stamp}.log"
     merged = ship(["-C", str(worktree), "merge", "--item", str(item), "--expected-head", str(prepared.get("head")),
                    "--manual", "--watch", "--wait-seconds", str(MERGE_WAIT_SECONDS), "--json"], merge_log)
@@ -2734,6 +2750,190 @@ def start_train(entry: dict[str, Any], queue: Queue, gate: Gate, environ: dict[s
                              f"sd-lane-train-{entry['item']}", (top["row"]["id"], top["row"]["expected_head"]),
                              top["below"], deadline)
     return thread
+
+
+#: The branch a train pull request lands from, named by its tip (sd:9923).
+TRAIN_BRANCH = "sd-train/{}"
+
+
+def land_as_train(entry: dict[str, Any], queue: Queue, ship: Ship, head: str, logs: pathlib.Path,
+                  renewed: Callable[[], None], deadline: float = math.inf) -> dict[str, Any] | None:
+    """Land `entry` and the pending entries after it as one train pull request, or None for no train (sd:9923).
+
+    `entry` is prepared at `head`. It joins first, onto the fetched base,
+    and a join it cannot make ends the train before any other prepare.
+    Each member after it prepares as its own claim would, then joins onto
+    the landing before it; one that stops or refuses drops out and stays
+    pending. With two or more joined, each still pending at its queued
+    head, `land_train` gates the tip once and merges the train pull
+    request, and each member after `entry` reconciles at once. Anything
+    short of that lands nothing: `entry` merges alone, and each member's
+    next claim prepares it again. Each member's `train` record says how
+    it went; the answer goes on `entry`.
+    """
+    try:
+        members = train_members(entry, queue, lane_train(queue.environ))
+    except LaneError:  # a hub fault: the claimed entry merges alone
+        return None
+    members = members[:next((index for index, row in enumerate(members) if merge_refusal(row)), len(members))]
+    if len(members) < 2:
+        return None
+    if clock() >= deadline:  # the time left is the claimed entry's merge
+        return {"status": "skipped", "reason": OUT_OF_BUDGET}
+    items, tree = [row["item"] for row in members], pathlib.Path(entry["worktree"])
+    base = train_base(tree)
+    if base is None:
+        return {"status": "skipped", "reason": "origin/HEAD could not be fetched"}
+    joined = [(entry, tree, head)]
+    onto, why = join_member(entry, tree, head, base[1], ship, logs)
+    if onto is None:
+        return {"status": "skipped", "reason": f"sd:{entry['item']} did not join: {why}"}
+    record: dict[str, dict[str, Any]] = {}
+    for row in members[1:]:
+        if clock() >= deadline:
+            record[row["id"]] = {"status": "skipped", "reason": OUT_OF_BUDGET}
+            break
+        renewed()
+        placed, why = prepared_member(row, queue, ship, logs, renewed, deadline)
+        if placed is not None:
+            landing, why = join_member(row, pathlib.Path(row["worktree"]), placed, onto, ship, logs)
+        if placed is None or landing is None:
+            record[row["id"]] = {"status": "dropped", "reason": f"{why}; it rides the next train"}
+            continue
+        onto = landing
+        joined.append((row, pathlib.Path(row["worktree"]), placed))
+    answer = land_joined(joined, queue, ship, onto, base[0], logs, record)
+    mark_train(queue, record, items)
+    return answer
+
+
+def land_joined(joined: list[tuple[dict[str, Any], pathlib.Path, str]], queue: Queue, ship: Ship, tip: str,
+                branch: str, logs: pathlib.Path, record: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    """`land_as_train`'s landing of the joined members at `tip`, each member's outcome written into `record`."""
+    items = [row["item"] for row, _, _ in joined]
+    if len(joined) < 2:
+        return {"status": "skipped", "items": items, "reason": "fewer than two members joined"}
+    try:
+        rows = {row["id"]: row for row in read_queue(queue)}
+    except LaneError as error:
+        return {"status": "skipped", "items": items, "reason": f"the queue could not be read again: {error}"}
+    gone = [row["item"] for row, _, _ in joined[1:]
+            if not runnable(rows.get(row["id"]) or {}) or rows[row["id"]].get("expected_head") != row["expected_head"]]
+    if gone:
+        return {"status": "skipped", "items": items,
+                "reason": f"{', '.join(f'sd:{item}' for item in gone)} left the queue or moved during the train"}
+    landed = land_train(joined[0][1], tip, branch, items)
+    if landed.get("status") != "merged":
+        for row, _, _ in joined[1:]:
+            record[row["id"]] = {"status": "failed", "reason": str(landed.get("reason"))[:REASON_CHARS]}
+        return {**landed, "items": items, "tip": tip}
+    for row, tree, head in joined[1:]:  # each reconciles now; a stop here leaves it to its next claim's prepare
+        merged = ship(["-C", str(tree), "merge", "--item", str(row["item"]), "--expected-head", head, "--manual",
+                       "--json"], logs.with_name(f"train-merge-{row['item']}-{logs.name}.log"))
+        record[row["id"]] = {"status": "landed", "pull": landed.get("pull"), "merge_commit": merged.get("merge_commit"),
+                             "reconciled": bool(merged.get("ok") and merged.get("phase") == "merged")}
+    return {**landed, "items": items, "tip": tip}
+
+
+def train_base(tree: pathlib.Path) -> tuple[str, str] | None:
+    """`(branch, commit)` of `origin/HEAD` fetched now, or None."""
+    remote = lane_git(tree, "symbolic-ref", "--quiet", "refs/remotes/origin/HEAD") or ""
+    branch = remote.removeprefix("refs/remotes/origin/")
+    if not branch or branch == remote or scratch_git(
+            tree, "fetch", "--quiet", "--no-tags", "origin", f"refs/heads/{branch}:{remote}") is None:
+        return None
+    commit = lane_git(tree, "rev-parse", "--verify", "--quiet", remote)
+    return (branch, commit) if commit else None
+
+
+def prepared_member(row: dict[str, Any], queue: Queue, ship: Ship, logs: pathlib.Path,
+                    renewed: Callable[[], None], deadline: float) -> tuple[str | None, str]:
+    """A pending member's prepared head, as its own claim would prepare it, or None with why not."""
+    tree = pathlib.Path(row["worktree"])
+    try:
+        if not at_head(tree, row["expected_head"]):
+            return None, "its worktree moved from the queued head"
+    except LaneError as error:
+        return None, str(error)
+    try:
+        left = left_stop(row, queue, "merge")
+    except LaneError as error:
+        return None, str(error)
+    if left is not None:
+        return None, str(left.get("reason"))
+    prepared, _ = prepare_step(row, tree, logs.with_name(f"train-prepare-{row['item']}-{logs.name}"), ship,
+                               renewed, deadline)
+    stopped = prepare_stop(row, tree, prepared)
+    if stopped is not None:
+        return None, f"its prepare stopped: {stopped.get('reason') or stopped.get('status')}"
+    return str(prepared.get("head")), ""
+
+
+def join_member(row: dict[str, Any], tree: pathlib.Path, head: str, onto: str, ship: Ship,
+                logs: pathlib.Path) -> tuple[str | None, str]:
+    """The member's merge onto `onto` that `sd-ship merge --train-onto` wrote, or None with its refusal."""
+    joined = ship(["-C", str(tree), "merge", "--item", str(row["item"]), "--expected-head", head, "--manual",
+                   "--train-onto", onto, "--json"], logs.with_name(f"train-join-{row['item']}-{logs.name}.log"))
+    commit = joined.get("train_commit")
+    if joined.get("ok") and joined.get("phase") == "train_joined" and isinstance(commit, str) and \
+            re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        return commit, ""
+    return None, str(joined.get("error") or joined.get("code") or joined.get("phase") or "no join")[:REASON_CHARS]
+
+
+def land_train(root: pathlib.Path, tip: str, base: str, items: list[int]) -> dict[str, Any]:
+    """One train pull request at `tip`: pushed, gated once, merged with a merge commit (sd:9923).
+
+    A direct push of the base is refused under protection; a pull request
+    whose head is the train tip merges inside it, and GitHub marks each
+    member merged at its own merge. A refused or lost merge answer is read
+    back once; any other failure lands nothing. The branch is deleted
+    whatever happened, which also closes a train PR left open.
+    """
+    import sd_local_gate  # noqa: PLC0415 -- the GitHub client loads only for a train landing
+    import sd_ship_remote  # noqa: PLC0415
+    branch, names = TRAIN_BRANCH.format(tip[:12]), ", ".join(f"sd:{item}" for item in items)
+    if scratch_git(root, "push", "--quiet", "origin", f"{tip}:refs/heads/{branch}") is None:
+        return {"status": "failed", "reason": f"the push of {branch} failed"}
+    try:
+        api = sd_ship_remote.GitHub(root, sd_ship_remote.slug(lane_git(root, "config", "--get", "remote.origin.url")
+                                                              or ""))
+        gate = sd_local_gate.local_gate(api, root, tip, base=base)
+        if gate.get("status") != "success":
+            return {"status": "failed", "reason": f"the train gate at {tip} did not pass: {gate.get('summary')}"[:600]}
+        pull = train_pull(api, branch, base, f"chore(lane): land the train of {names}")
+        with contextlib.suppress(sd_ship_remote.Refusal):  # a lost answer is read back below, never sent twice
+            api.api(f"{api.prefix}/pulls/{pull}/merge", method="PUT",
+                    body={"sha": tip, "merge_method": "merge", "commit_title": f"chore(lane): train of {names} (#{pull})",
+                          "commit_message": "Each member's own merge carries its trailers."})
+        merged = api.pull(pull)
+        if merged.get("merged") is not True:
+            return {"status": "failed", "pull": pull, "reason": f"GitHub did not merge train pull request #{pull}"}
+        return {"status": "merged", "pull": pull, "merge_commit": merged.get("merge_commit_sha")}
+    except sd_ship_remote.Refusal as error:
+        return {"status": "failed", "reason": str(error)[:600]}
+    finally:
+        scratch_git(root, "push", "--quiet", "origin", "--delete", branch)
+
+
+def train_pull(api: Any, branch: str, base: str, title: str) -> int:
+    """The number of the train pull request from `branch`, opened now or found from an earlier try."""
+    import sd_ship_remote  # noqa: PLC0415
+    owner = api.repository.split("/")[0]
+    try:
+        made = api.api(f"{api.prefix}/pulls", method="POST", body={
+            "title": title, "head": branch, "base": base,
+            "body": "The lane lands these members together. Each member's own pull request holds its review."})
+    except sd_ship_remote.Refusal:  # one exists, or the answer was lost: read it
+        made = None
+    if isinstance(made, dict) and isinstance(made.get("number"), int) and made.get("head", {}).get("ref") == branch:
+        return made["number"]
+    found = api.api(f"{api.prefix}/pulls?head={owner}:{branch}&state=open")
+    numbers = [pull["number"] for pull in found if isinstance(pull, dict) and isinstance(pull.get("number"), int)
+               and (pull.get("head") or {}).get("ref") == branch] if isinstance(found, list) else []
+    if len(numbers) != 1:
+        raise sd_ship_remote.Refusal(f"no single open train pull request from {branch}")
+    return numbers[0]
 
 
 def default_note(item: int, body: str, main: pathlib.Path, kind: str = "comment") -> str:
