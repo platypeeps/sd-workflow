@@ -611,7 +611,7 @@ class CitedIdTests(unittest.TestCase):
     def test_comment_scope_is_commonmarks_whatever_the_revert_list_reads(self) -> None:
         """pack sd:9666 review, round 16: the revert list's plain-text rules (a colon line ends its item;
         `2.` opens an item under a paragraph) also moved where a comment ends, for every citation. A
-        comment's scope is CommonMark's for both readers; only the revert list reads the plain rules."""
+        citation's comment scope is CommonMark's; the revert list reads both scopes (round 18)."""
         a = "a" * 7
         fix = "Lane review fix, pack sd:5\n"
         cited = {f"- a\nx <!-- y:\n- b\n{fix}": (5,),  # blocker 1
@@ -621,8 +621,10 @@ class CitedIdTests(unittest.TestCase):
                 self.assertEqual(sd_ship_body.cited_ids(body, []), ids)
         listed = {
             f"- note\nx <!-- y. Reverted commits:\n- {a} renew\n": [a],  # the comment ends with `- note`
-            f"Reverted commits:\n2. <!--\n3. {a} example\n-->\n": [],  # `2.` is text: the comment holds on
-            f"Reverted commits:\n2. {a} renew\n": [a],  # yet the revert list reads `2.` as an item
+            # Two roles: `2.` is text to CommonMark and the comment holds on; the revert list reads an
+            # item, which ends the comment. Round 16 chose CommonMark's; since round 18 either read lists.
+            f"Reverted commits:\n2. <!--\n3. {a} example\n-->\n": [a],
+            f"Reverted commits:\n2. {a} renew\n": [a],  # the revert list reads `2.` as an item
             f"See `x\nReverted commits:\n2. {a} example\nend` here.\n": [],  # lines in a wrapped code span
             f"Reverted commits:\n\n- {a} renew\nKept commits:\n- {'b' * 7} retained\n": [a],
         }
@@ -639,23 +641,46 @@ class CitedIdTests(unittest.TestCase):
         listed = {
             f"{head}text:\n  end`\n  - {a}\n": [a],  # the blocker: a colon line in the span
             f"{head}  2. more\n     end`\n     - {a}\n": [a],  # its sibling: a marker in the span
+            f"{head}  text:\n  end`\n  - {a}\n": [a],  # a colon line in the span, indented, heads nothing
             f"text\n2. Reverted commits:\n   see <!-- note\nhidden\n-->\n   - {a} renew\n": [a],  # a comment's line
             f"{head}- more\n  end`\n  - {a}\n": [],  # a real item ends the span, and holds what nests in it
         }
         for message, found in listed.items():
             with self.subTest(message=message):
                 self.assertEqual(sd_ship_body._listed_undone(message), found)
-        # The property: a revert reads the same with a hidden line as without it.
+        # The property: a revert reads the same with a line either grammar hides as without it.
         inner = ("text:", "  2. more", "Kept commits:", "     words", "  1.", "  3) x")
         wraps = (("  See `example", "     end`"), ("  see <!-- note", "  -->"))
-        for (opener, closer), *lines in itertools.chain(itertools.product(wraps, inner), itertools.product(wraps, inner, inner)):
+        cases = itertools.chain(itertools.product(wraps, inner), itertools.product(wraps, inner, inner))
+        for ((opener, closer), *lines), plain in itertools.product(cases, (False, True)):
             message = ["- Reverted commits:", opener, *lines, closer, f"     - {a}"]
-            for number, (_, hidden) in sd_ship_body._scope("\n".join(message)).items():
-                if hidden and 2 < number <= 2 + len(lines):
-                    with self.subTest(message=message, without=number):
+            for number, kind, *_, spanned in sd_ship_body._blocks("\n".join(message), plain=plain):
+                if (spanned or kind == "comment") and 2 < number <= 2 + len(lines):
+                    with self.subTest(message=message, without=number, plain=plain):
                         without = message[:number - 1] + message[number:]
                         self.assertEqual(sd_ship_body._listed_undone("\n".join(message)),
                                          sd_ship_body._listed_undone("\n".join(without)))
+
+    def test_a_line_with_two_roles_is_read_both_ways(self) -> None:
+        """pack sd:9666 review, round 18: the revert list took from the citation read which lines a code
+        span or a comment hides, and left them out. The two grammars can give one line two roles: the
+        fence a `10.` item opens is a code span to CommonMark, so the fence's closing line was left
+        out and the open fence held the heading and the sha. Rounds 14 to 17 each chose one role;
+        now the list is read both ways, and a commit either read lists is undone."""
+        a = "a" * 7
+        tail = f"    Reverted commits:\n    - {a}\n"
+        listed = {
+            f"Revert: split\n\nNotes\n10. ```\n    example\n    ```\n{tail}": [a],  # the blocker: a span, or a fence
+            f"Revert: split\n\nNotes\n10. ~~~\n    <!-- example\n    ~~~\n{tail}": [a],  # a comment, or a fence's text
+            # The other role, which the revert list's own grammar alone drops (round 17 listed these):
+            # the colon line ends `1. one` there, so the span runs over `2.`; CommonMark reads an item.
+            f"  1. one\n  Reverts:\n    end`\n2. {a}\n      + `y\n": [a],
+            f"* x\nReverted commits:\n  x <!-- y\n\n2. {a}\n": [a],  # the same, with a comment
+            f"Reverted commits:\n- {a} renew\n- {a} again\n": [a, a],  # one read's repeats stay; the second adds no copy
+        }
+        for message, found in listed.items():
+            with self.subTest(message=message):
+                self.assertEqual(sd_ship_body._listed_undone(message), found)
 
     def test_markers_on_one_line_open_an_empty_parent(self) -> None:
         """pack sd:9666 review, round 12, blocker 3: `- - <sha>` under `Reverted commits:` undid the
