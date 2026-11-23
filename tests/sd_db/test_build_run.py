@@ -5796,6 +5796,29 @@ class HubFaults(Case):
         self.assertEqual(len(self.calls("claude")), 1, "the result was not paid for twice")
         self.assertIsNotNone(self.row()["final"])
 
+    def test_a_hub_fault_in_a_resumed_fix_resumes_the_fix(self):
+        """Review of build/sd-1557: a fault before a resumed fix's child started walked again with its blockers
+        already read, so the walk took the review for the fix: the fix never ran and a round was spent."""
+        self.plan(claude=["pass", "rate_limited"], sd_review=["blocking"])
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.plan(claude=["fix1", "fix2"], sd_review=["clean", "clean"])
+        before = len(self.calls("claude"))
+        patch, fired = self.faults_once("write", self.UNREACHABLE, fields=("step",),
+                                        where=lambda kwargs: kwargs.get("step") == "fixing")
+        with patch:
+            ended = self.supervisor(again["id"]).run()
+        self.assertEqual((fired, ended.get("step")), (["write"], "enqueued"))
+        fixes = [call["argv"] for call in self.calls("claude")][before:]
+        self.assertEqual(len(fixes), 1, "the resumed fix did not run once")
+        self.assertIn("- work.txt:1 a blocker", fixes[0][fixes[0].index("-p") + 1])
+        self.assertEqual(len(self.calls("sd-review")), 2, "a review ran in place of the fix")
+
     def test_a_mismatch_after_the_child_replays_its_result_in_the_new_image(self):
         self.plan(claude=["pass"], sd_review=["clean"])
         patch, fired = self.faults_once("write", self.MISMATCH, fields=("final",))

@@ -1386,10 +1386,11 @@ class Supervisor:
                  "checking": self.checking, "cleaning": self.cleaning}
         if self.held is not None and self.held["name"] == "claude" and self.held.get("as") == self.fix_role():
             steps["fixing"] = self.fix  # a kept builder is the fix itself, not the review after it
-        elif step == "fixing" and self.fresh()["start_step"] == "fixing" and not self.blockers:
+        elif step == "fixing" and self.fresh()["start_step"] == "fixing":
             # A claim after a usage limit in a fix (`build.claim`): the fix runs again on the round's blockers,
-            # its round already counted (review of build/sd-1557).
-            self.blockers = self.round_blockers()
+            # its round already counted (review of build/sd-1557). A walk again after a hub fault keeps the ones
+            # it read: blockers already held are no sign the fix ran (review of build/sd-1557).
+            self.blockers = self.blockers or self.round_blockers()
             if self.blockers:
                 steps["fixing"] = self.resume_fix
         # A run that starts past the worktree step (a usage-limit reclaim, a loss retry) is guarded as that step
