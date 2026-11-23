@@ -508,6 +508,44 @@ class CitedIdTests(unittest.TestCase):
                 revert = self.revert_of(f"{opener}\n    <!--\n## Reverted commits:\n- {undone[:9]} actual revert\n")
                 self.assertEqual(sd_ship_body.cited_ids("", [revert, cited]), ())
 
+    def test_a_setext_underline_makes_the_line_above_the_heading(self) -> None:
+        """pack sd:9666 review, round 12, blocker 1: `====` under an indented `Kept commits` left the
+        revert section in force, and `====` under `Reverted commits:` cleared it."""
+        undone, kept = "a" * 40, "b" * 40
+        work = [(kept, "fix: shared\n\nLane review fix, pack sd:5: y.\n\nCloses: sd:4\n"),
+                (undone, "feat: renew\n\nCloses: sd:2\n")]
+        for underline in ("====", "----"):
+            with self.subTest(underline=underline):
+                revert = self.revert_of(f"Reverted commits:\n\n  Kept commits\n  {underline}\n\n"
+                                        f"- {kept[:9]} retained\n")
+                self.assertCountEqual(sd_ship_body.cited_ids("", [revert, *work]), (2, 4, 5))
+                revert = self.revert_of(f"Reverted commits:\n{underline}\n\n- {undone[:9]} renew\n")
+                self.assertEqual(sd_ship_body.cited_ids("", [revert, *work]), (4, 5))
+
+    def test_a_comment_opens_outside_a_code_span_and_ends_with_its_item(self) -> None:
+        """pack sd:9666 review, round 12, blocker 2: `<!--` in a code span opened a comment, and a
+        comment opened in a list item ran on into its siblings; both hid the real revert."""
+        undone = "a" * 40
+        cited = (undone, "feat: x\n\nCloses: sd:2\n")
+        for opener in ("A `<!--` example.\n\nReverted commits:\n\n", "Reverted commits:\n\n- see `<!--`\n",
+                       "Reverted commits:\n\n- ``a `<!--` b``\n", "Reverted commits:\n\n- <!-- scratch note\n"):
+            with self.subTest(opener=opener):
+                revert = self.revert_of(f"{opener}- {undone[:9]} renew\n")
+                self.assertEqual(sd_ship_body.cited_ids("", [revert, cited]), ())
+        self.assertEqual(sd_ship_body.quoted_lines("- <!-- a\n  b\n- c\n"), {2})
+        self.assertEqual(sd_ship_body.quoted_lines("x `<!--` y\nz\n"), set())
+        self.assertEqual(sd_ship_body.quoted_lines("x ` <!-- y\nz\n"), {2, 3})
+
+    def test_markers_on_one_line_open_an_empty_parent(self) -> None:
+        """pack sd:9666 review, round 12, blocker 3: `- - <sha>` under `Reverted commits:` undid the
+        commit, though the empty parent item holds it, as it does across two lines."""
+        kept = "b" * 40
+        cited = (kept, "fix: shared\n\nLane review fix, pack sd:5: y.\n\nCloses: sd:4\n")
+        for entry in (f"- - {kept[:9]} retained", f"1. - {kept[:9]} retained", f"-\n  - {kept[:9]} retained"):
+            with self.subTest(entry=entry):
+                revert = self.revert_of(f"Reverted commits:\n\n{entry}\n")
+                self.assertEqual(sd_ship_body.cited_ids("", [revert, cited]), (4, 5))
+
     def test_a_fence_on_a_list_marker_line_is_an_example(self) -> None:
         """pack sd:9666 review, round 5, instance 2: `- ```text` opened no fence, so the sha bullet in the
         example undid a real commit and dropped its citations."""

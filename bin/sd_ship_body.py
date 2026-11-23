@@ -94,43 +94,51 @@ def _blocks(body: str, comments: bool = True):
     """Each line of `body` with the Markdown block it sits in, read once for every reader (pack sd:9666).
 
     Yields `(number, kind, opened, depth, text, line)`: `kind` is `fence`,
-    `comment`, `code` or `text`; `opened` counts the list items the line's
+    `comment`, `code`, `setext` (an underline that makes the line above
+    it a heading) or `text`; `opened` counts the list items the line's
     markers open, even when a fence or code follows them; `depth` counts
     the items open after them; `text` is the line past their text column.
     """
-    fence, fence_depth, commented, loose = "", 0, False, True  # loose: no paragraph runs into this line
+    fence, fence_depth, commented, comment_depth, loose = "", 0, False, 0, True  # loose: no paragraph runs on
+    depth = 0
     items: list[int] = []  # the text column of each open list item, outermost first
     for number, line in enumerate(body.split("\n"), start=1):
         line = line.rstrip("\r").expandtabs(4)
         rest = _item_text(line, items, opens=False)
+        commented = commented and len(items) >= comment_depth  # a comment ends with the list item that holds it
         if fence and len(items) >= fence_depth:
             fence = "" if _closes(_FENCE_RE.match(rest), fence) else fence
             loose = True  # a fence is no paragraph: indented code may follow its closing line
             yield number, "fence", 0, len(items), rest, line
             continue
         fence = ""  # the list item that held the fence ended, and the fence with it
-        kind, opened, text = _kind(rest, items, loose, commented)
-        if kind == "fence":
-            fence, fence_depth = _FENCE_RE.match(text)["fence"], len(items)
+        kind, opened, text = _kind(rest, items, loose, commented, lazy=len(items) != depth)
+        if kind == "fence" and (opener := _FENCE_RE.match(text)):  # `_kind` matched it already
+            fence, fence_depth = opener["fence"], len(items)
         elif kind != "code":
+            was = commented
             commented = comments and _comment_open(line, commented)
-        loose = kind in ("fence", "code") or not line.strip() or bool(_ATX.match(text) or _BREAK.match(text)) \
-            or (not loose and bool(_SETEXT.match(text)))  # a heading or a break is one line, no paragraph
+            comment_depth = len(items) if commented and not was else comment_depth
+        loose = kind in ("fence", "code", "setext") or not line.strip() or bool(_ATX.match(text) or _BREAK.match(text))
+        depth = len(items)  # a heading or a break is one line, no paragraph; `depth` finds a lazy line
         yield number, kind, opened, len(items), text, line
 
 
-def _kind(rest: str, items: list[int], loose: bool, commented: bool) -> tuple[str, int, str]:
+def _kind(rest: str, items: list[int], loose: bool, commented: bool, lazy: bool = False) -> tuple[str, int, str]:
     """The block `rest`, a line past its list column, starts, the list items it opens onto `items`, and its text.
 
     An HTML comment open at its start holds it. Four spaces in after no
     paragraph, or after the markers it opens, start indented code. A
-    thematic break or a setext underline outranks a list marker.
+    thematic break or a setext underline outranks a list marker; a line
+    that ended a list item (`lazy`) underlines nothing.
     """
     if commented:
         return "comment", 0, rest
     if loose and rest.startswith("    ") and rest.strip():
         return "code", 0, rest
-    if _BREAK.match(rest) or (not loose and _SETEXT.match(rest)):
+    if not loose and not lazy and _SETEXT.match(rest):
+        return "setext", 0, rest
+    if _BREAK.match(rest):
         return "text", 0, rest
     before = len(items)
     text = _item_text(rest, items, opens=True)
@@ -167,19 +175,32 @@ def _item_text(line: str, items: list[int], opens: bool) -> str:
     return line[items[-1]:] if items else line
 
 
+#: The next `<!--`, or a backtick run that may open a code span, which holds a `<!--` as text.
+_COMMENT_OR_TICKS = re.compile(r"<!--|`+")
+
+
 def _comment_open(line: str, commented: bool) -> bool:
-    """Whether an HTML comment is open after `line`, given whether one was open before it."""
+    """Whether an HTML comment is open after `line`, given whether one was open before it.
+
+    Outside a comment a code span outranks it: `<!--` between two backtick
+    runs of one length is text. A run with no closer on the line is text.
+    """
+    # ponytail: a code span read on one line; one that wraps across lines is not seen.
     while True:
         if commented:
             end = line.find("-->")
             if end < 0:
                 return True
             commented, line = False, line[end + 3:]
-        else:
-            start = line.find("<!--")
-            if start < 0:
-                return False
-            commented, line = True, line[start + 4:]
+            continue
+        match = _COMMENT_OR_TICKS.search(line)
+        if match is None:
+            return False
+        if match[0] == "<!--":
+            commented, line = True, line[match.end():]
+            continue
+        close = re.compile(r"(?<!`)" + match[0] + r"(?!`)").search(line, match.end())
+        line = line[close.end():] if close else line[match.end():]
 
 
 def owned_lines(body: str) -> list[OwnedLine]:
@@ -422,19 +443,23 @@ def _listed_undone(message: str) -> list[str]:
     does not say reverted, undoes nothing. An item inside a fence, an
     indented code block or an HTML comment names nothing.
     """
-    found, undoes = [], [False]  # undoes: per open list item, the top level first, whether its heading says reverted
+    found, undoes, previous = [], [False], ""  # undoes: per open list item, the top level first, whether its heading says reverted
     for _, kind, opened, depth, raw, line in _blocks(message):
         del undoes[depth - opened + 1:]  # the items this line ended take their headings with them
         holder, text = undoes[-1], raw.strip()
         if opened:  # an item, even one that opens with a fence or code, holds what nests in it
+            holder = holder and opened == 1  # each outer item of `- - x` is empty: its heading says nothing
             if kind == "text" and (sha := _SHA_LED.match(text)):
                 found += [sha[1] or sha[2]] if holder else []
             else:
                 holder = kind == "text" and bool(_REVERTED_INTRO.search(_heading(text)))
-            undoes += [holder] * opened
+            undoes += [False] * (opened - 1) + [holder]
+        elif kind == "setext":  # the underline makes the line above it the heading
+            undoes[-1] = bool(_REVERTED_INTRO.search(_heading(previous)))
         elif kind == "text" and text and (_heading(text).endswith(":") or not line[0].isspace() or _ATX.match(raw)):
             # Any other indented line continues an item.
             undoes[-1] = bool(_REVERTED_INTRO.search(_heading(text)))
+        previous = text
     return found
 
 
