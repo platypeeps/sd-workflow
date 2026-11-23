@@ -989,18 +989,6 @@ class TheMove(Lane, BrowserSession):
                 self.assertIsNotNone(row["review"])
         self.assertIsNone(self.failed(enqueued_on="satellite-1")["held"])
 
-    def test_a_default_branch_past_the_reviewed_head_keeps_retry(self):
-        """sd:9966 lead review: once origin's default branch moved past the reviewed head, a retry merges it and
-        reviews other code, so Retry stays on; a default branch at the reviewed head, or none read, keeps it off."""
-        self.assertIs(self.failed()["held"], False)
-        git(self.checkout, "update-ref", "refs/remotes/origin/main", self.merged)
-        git(self.checkout, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
-        self.assertIs(self.failed()["held"], False)
-        git(self.checkout, "-c", "user.name=t", "-c", "user.email=t@example.test", "commit", "-q", "--allow-empty",
-            "-m", "fix: the blocker")
-        git(self.checkout, "update-ref", "refs/remotes/origin/main", "HEAD")
-        self.assertIsNone(self.failed()["held"])
-
     def test_a_review_run_again_at_the_same_head_offers_retry_not_reject(self):
         """sd:9966 lane review: the review at that head ran again with other findings; the prepare log still
         names the old ones, so Reject would rebut findings no longer there. Retry reads the live review."""
@@ -3386,13 +3374,14 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
 
     SAME = "same code, same review: send it to the builder"
 
-    def test_a_review_blocked_entry_offers_send_to_builder_and_reject_in_place_of_retry(self):
-        """sd:9966: Retry on mws sd:9214 re-ran prepare at an unchanged head and failed the same way."""
+    def test_a_review_blocked_entry_offers_send_to_builder_and_reject_beside_a_warned_retry(self):
+        """sd:9966: Retry on mws sd:9214 re-ran prepare at an unchanged head and failed the same way. The page
+        cannot tell whether the default branch moved (lane review), so Retry stays on, asks first and warns."""
         self.failed()
         html = self.run_view("open('system'); R.html = ELS.queue.html;")["R"]["html"]
         row = re.search(r'<tr class="child"[^>]*data-id="entry:[^"]*:14"[^>]*>([\s\S]*?)</tr>', html)[1]
-        self.assertNotIn('data-act="retry"', row)
-        self.assertRegex(row, rf'<button[^>]*disabled title="{self.SAME}"[^>]*>Retry</button>')
+        self.assertRegex(row, r'data-act="retry" data-item="14"[^>]*data-head="' + self.merged + '"[^>]*>Retry…<')
+        self.assertNotRegex(row, r'<button[^>]*disabled[^>]*>Retry</button>')
         self.assertRegex(row, r'data-act="reject" data-item="14"[^>]*data-head="' + self.merged + '"[^>]*>Reject and enqueue…<')
         self.assertRegex(row, r'data-act="fix" data-item="14"[^>]*>Send to builder…<')
 
@@ -3481,12 +3470,13 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
             with self.subTest(answer=answer):
                 self.assertEqual(self.reject_press(answer)["posts"], [])
 
-    def test_the_palette_retry_on_a_review_blocked_entry_is_off_and_says_why(self):
+    def test_the_palette_retry_on_a_review_blocked_entry_asks_first_and_warns(self):
         self.failed()
         out = self.run_view("open('system'); const c = REG.find(x => x.id === 'today.lane.retry');"
-                            f" R.off = c.when({{ head: {json.dumps(self.merged)}, failure: {{ code: 'review_blocking' }}, held: false }});"
-                            f" R.on = c.when({{ head: {json.dumps(self.merged)}, failure: {{ code: 'hub_unavailable' }} }});")
-        self.assertEqual((out["R"]["off"], out["R"]["on"]), (self.SAME, True))
+                            f" const o = {{ head: {json.dumps(self.merged)}, failure: {{ code: 'review_blocking' }}, held: false }};"
+                            " R.on = c.when(o); R.ask = c.askFirst(o); R.said = c.consequence(o);")
+        self.assertEqual((out["R"]["on"], out["R"]["ask"]), (True, True))
+        self.assertIn(self.SAME, out["R"]["said"])
 
     def test_a_failed_entry_whose_worktree_moved_says_retry_is_refused(self):
         self.failed()

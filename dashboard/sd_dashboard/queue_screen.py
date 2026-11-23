@@ -396,7 +396,7 @@ def _review_fields(entry: dict, lane: Path) -> dict:
     """A failed row's review key, and each finding it covers whole, for Reject's dialog; none for a review this
     host cannot rebut: none named, a worktree on another host, or a template `shown_review` cannot print
     (sd:9966). `held`: whether that review already holds recorded dispositions, which a `lane retry` reuses:
-    False only when adjudicate's template says none, so Retry is off only then; None when not read here."""
+    False only when adjudicate's template says none, so Retry asks first only then; None when not read here."""
     tree = _here(entry)
     if not (tree and _logged(entry, lane).get("code") == REVIEW_BLOCKING):
         return {"review": None, "review_findings": [], "held": None}
@@ -407,11 +407,6 @@ def _review_fields(entry: dict, lane: Path) -> dict:
                     LIST_SECONDS)
     recorded = template.get("recorded_revision", False) if template.get("exit") == 0 else False
     held = None if recorded is False else recorded is not None
-    # origin's default branch moved past the reviewed head: a retry merges it and reviews other code, so Retry
-    # stays on (sd:9966 lead review). One local ref read; a branch not read here keeps the review's answer.
-    ahead = _git(tree, "rev-list", "--count", f"{review[0]}..refs/remotes/origin/HEAD") if review else None
-    if held is False and ahead not in (None, "0"):
-        held = None
     shown = shown_review(review, template) if review else None
     if shown:
         return {"review": shown[1], "review_findings": shown[0], "held": held}
