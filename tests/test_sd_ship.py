@@ -4674,7 +4674,7 @@ roles:
             with self.subTest(status=status):
                 sd_lane.store(self.connection, ship.slug(REMOTE_URL), {**entry, "status": status})
                 self.connection.commit()
-                with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}):
+                with self.as_lane():
                     with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed.*by hand"):
                         self.prepare("--deliver", "--acceptance-file", str(acceptance))
                 self.assertEqual(self.operation().state["acceptance"]["item_scope"], old)
@@ -4699,6 +4699,7 @@ roles:
             self.prepare("--deliver", "--acceptance-file", renewal)
         before = self.operation().state["acceptance"]
         entry = {"id": "e1", "position": 1, "item": self.item, "status": "running", "step": "prepare",
+                 "body": self.operation().state["body"],  # an entry holds the body it was enqueued with
                  "holder": {"host": sd_lane.this_host(), "pid": os.getppid(), "token": "t"}}
         sd_lane.store(self.connection, ship.slug(REMOTE_URL), entry)
         self.connection.commit()
@@ -4724,7 +4725,7 @@ roles:
             self.prepare("--deliver", "--acceptance-file", acceptance)
         before = self.operation().state["acceptance"]
         set_note_body(self.connection, note, "Ruling: no rig here, still.\nWaive: runs offline")
-        with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}):
+        with self.as_lane():
             with self.assertRaisesRegex(ship.Refusal, rf"only decision note #{note} changed.*by hand") as caught:
                 self.prepare("--deliver", "--acceptance-file", acceptance)
         self.assertNotIn("enqueue again", str(caught.exception))
@@ -4733,7 +4734,7 @@ roles:
         retry = re.search(r"`(sd-ship lane retry[^`]*)`", str(caught.exception))[1]
         self.assertEqual(ship.parser().parse_args(shlex.split(retry)[1:]).item, self.item)
         self.prepare("--deliver", "--acceptance-file", acceptance)  # the refresh by hand
-        with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}):
+        with self.as_lane():
             self.prepare("--deliver", "--acceptance-file", acceptance)  # the retried entry, same file
         self.assertIn("still.", self.operation().state["acceptance"]["claim"]["criteria"][2]["waived"]["note"]["body"])
 
@@ -4762,7 +4763,7 @@ roles:
         set_item_fields(self.connection, self.item, title="retitled scope")
         with contextlib.redirect_stderr(io.StringIO()):
             self.prepare("--deliver", "--item", str(kept))  # the renewal by hand drops one
-        with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}):
+        with self.as_lane():
             with self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other items") as caught:
                 self.prepare("--deliver", "--item", str(kept), "--item", str(dropped))
             self.assertEqual(caught.exception.workflow["blocker"]["code"], "delivery_claim_renewed")
@@ -4772,77 +4773,140 @@ roles:
                 self.prepare("--deliver", "--item", str(kept))  # an entry with the renewal's items proceeds
         self.assertEqual(self.operation().state["closing"]["items"], [kept])
 
+    def lane_runs(self, body: str, status: str = "running") -> None:
+        """The entry the lane holds while it prepares this item, with the `body` it was enqueued with."""
+        sd_lane = ship.sd_lane
+        sd_lane.store(self.connection, ship.slug(REMOTE_URL), {
+            "id": "e-running", "position": 1, "item": self.item, "status": status, "step": "prepare",
+            "body": body, "holder": {"host": sd_lane.this_host(), "pid": os.getppid(), "token": "t"}})
+        self.connection.commit()
+
+    @contextlib.contextmanager
+    def as_lane(self, body: str | None = None):
+        """A prepare inside is the lane's: the runner's mark and its running entry, enqueued with `body`, or
+        with the published body. The entry ends with the block, as a runner's does."""
+        body = (self.operation().state.get("body") or "") if body is None else body
+        self.lane_runs(body)
+        try:
+            with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}):
+                yield
+        finally:
+            self.lane_runs(body, "failed")
+
+    def lane_prepare(self, entry: str, shots: tuple[str, ...] = ()) -> dict:
+        """A lane prepare of an entry enqueued with body `entry`, the lane having drawn `shots`."""
+        body = self.directory / "lane-body.md"
+        body.write_text(ship.sd_lane.with_shots(entry, list(shots)) if shots else entry)
+        with self.as_lane(entry), contextlib.redirect_stderr(io.StringIO()):
+            return self.prepare("--deliver", "--body-file", str(body))
+
+    def renewed_by_hand(self, first: str, renewal: str | None) -> None:
+        """A task published with body `first`, retitled, then renewed by hand with body `renewal`; with None
+        the lane published it, and the renewal has no body file, so it takes the pull request's own body."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        body = self.directory / "hand-body.md"
+        body.write_text(first)
+        if renewal is None:  # the lane opens the pull request, its Screenshots section in the body
+            self.assertEqual(self.lane_prepare(first, ("queue-dark-1280.png",))["phase"], "ready_to_send")
+        else:
+            self.prepare("--deliver", "--body-file", str(body))
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        body.write_text(renewal or "")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", *(("--body-file", str(body)) if renewal is not None else ()))
+        state = self.operation().state
+        self.assertTrue(state["acceptance"].get("renewed"))
+        self.assertTrue(renewal is not None or "## Screenshots" in state["body"])
+
+    def test_a_stale_entry_cannot_restore_the_screenshots_a_renewal_removed(self):
+        """Review of build/sd-1636, the class: the check told the lane's section from the entry's words by the
+        text, so an entry enqueued with a copy of a published body, section and all, passed against a renewal
+        that had removed the section, and published it again. The entry's body is read from its queue row, and
+        every byte of it is the entry's."""
+        copy = ship.sd_lane.with_shots("Body B.\n", ["queue-dark-1280.png"])
+        self.renewed_by_hand(copy, "Body B.\n")
+        published = self.operation().state["body"]
+        with self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body") as caught:
+            self.lane_prepare(copy)
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "delivery_claim_renewed")
+        state = self.operation().state
+        self.assertEqual((state["body"], state.get("pending")), (published, None))
+
+    def test_a_retry_of_the_renewals_body_proceeds_whatever_the_lane_draws(self):
+        """Review of build/sd-1636, the class: a lane prepare saved its Screenshots section in the published body,
+        so a retry of the same entry refused when the capture failed or drew other variants. The basis is the
+        entry's body, which no capture changes."""
+        self.renewed_by_hand("Body A.\n", "Body B.\n")
+        for shots in (("queue-dark-1280.png",), (), ("queue-light-390.png", "health-dark-1280.png")):
+            with self.subTest(shots=shots):
+                self.assertEqual(self.lane_prepare("Body B.\n", shots)["phase"], "ready_to_send")
+
+    def test_a_renewal_of_a_body_the_lane_published_keeps_the_entrys_basis(self):
+        """The class, from the code: the scope refusal advises `sd-ship prepare --deliver` by hand, with no body
+        file, so the renewal publishes the pull request's body, the lane's section in it. The entry that
+        published it still retries: a body published again keeps the basis it was published from."""
+        self.renewed_by_hand("Body B.\n", None)
+        for shots in ((), ("queue-dark-1280.png",)):
+            with self.subTest(shots=shots):
+                self.assertEqual(self.lane_prepare("Body B.\n", shots)["phase"], "ready_to_send")
+        with self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body"):
+            self.lane_prepare("Body A.\n")
+
+    def test_a_lane_prepare_whose_body_is_not_its_running_entrys_refuses(self):
+        """The class, from the code: the entry's body is read from the queue, so a prepare that outlived its
+        runner must not borrow a newer entry's. Its own body has to be that entry's, the lane's section apart."""
+        self.renewed_by_hand("Body A.\n", "Body B.\n")
+        self.lane_runs("Body B.\n")  # a newer entry's row, while an orphaned prepare still carries body A
+        stale = self.directory / "stale.md"
+        for text in ("Body A.\n", "Body B.\n\nMore words.\n"):
+            stale.write_text(text)
+            with self.subTest(text=text), patch.dict(os.environ, {"SD_LANE_CHILD": "1"}), \
+                    self.assertRaisesRegex(ship.Refusal, "not the body of the one running lane entry") as caught:
+                self.prepare("--deliver", "--body-file", str(stale))
+            self.assertEqual(caught.exception.workflow["blocker"]["code"], "lane_unknown")
+
     def test_a_lane_retry_with_the_body_a_renewal_replaced_refuses(self):
         """Review of build/sd-1636: a task's claim has no evidence rows, so a lane retry of an entry enqueued with
         body A passed the evidence and item checks against a renewal by hand with body B, published body A
-        again, and merge squashed it. A lane prepare on a renewed claim also needs the published body."""
-        from sd_db import set_item_fields
-        self.task_item("task")
-        old, new = self.directory / "old.md", self.directory / "new.md"
-        old.write_text("Body A, the enqueue's.\n")
-        new.write_text("Body B, the renewal's.\n")
-        self.prepare("--deliver", "--body-file", str(old))
-        set_item_fields(self.connection, self.item, title="retitled scope")
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.prepare("--deliver", "--body-file", str(new))  # the renewal by hand
+        again, and merge squashed it. A lane prepare on a renewed claim also needs the renewal's body."""
+        self.renewed_by_hand("Body A, the enqueue's.\n", "Body B, the renewal's.\n")
         published = self.operation().state["body"]
         self.assertIn("Body B", published)
-        with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}):
-            with contextlib.redirect_stderr(io.StringIO()), \
-                    self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body") as caught:
-                self.prepare("--deliver", "--body-file", str(old))
-            self.assertEqual(caught.exception.workflow["blocker"]["code"], "delivery_claim_renewed")
-            state = self.operation().state
-            self.assertEqual((state["body"], state.get("pending")), (published, None))
-            with contextlib.redirect_stderr(io.StringIO()):
-                self.prepare("--deliver", "--body-file", str(new))  # an entry with the renewal's body proceeds
+        with self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body") as caught:
+            self.lane_prepare("Body A, the enqueue's.\n")
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "delivery_claim_renewed")
+        state = self.operation().state
+        self.assertEqual((state["body"], state.get("pending")), (published, None))
+        self.lane_prepare("Body B, the renewal's.\n")  # an entry with the renewal's body proceeds
         self.assertEqual(self.operation().state["body"], published)
 
     def test_a_lane_body_differs_from_a_renewals_in_any_byte_but_the_lanes_own_section(self):
         """Review of build/sd-1636: the body check stripped every Screenshots-shaped block, fenced examples too,
-        and folded blank-line runs, so a stale entry that differed only there passed. Only the one section the
-        lane appends at the end, and the `Work:` line after it, are not the entry's body."""
+        and folded blank-line runs, so a stale entry that differed only there passed. The entry's body is
+        compared whole; only what the lane appended to it at this run is not the entry's."""
         with_shots = ship.sd_lane.with_shots
-        fence = "Before\n\n```\n" + with_shots("x", ["queue-dark-1280.png"]) + "```\n\nAfter"
-        other = fence.replace("queue: dark 1280", "queue: light 390")
-        work = f"\n\n{ship.sd_lib.WORK_TRAILER} sd:7\n"
-        renewal = fence + work
-        for stale in (other + work, "line\n\n\nkept" + work):
-            with self.subTest(stale=stale):
-                self.assertFalse(ship.lane_body_matches(with_shots(stale, ["queue-dark-1280.png"]), renewal))
-        self.assertFalse(ship.lane_body_matches("line\n\n\nkept" + work, "line\n\nkept" + work))
-        for body in (renewal, fence):
-            with self.subTest(body=body[-12:]):
-                self.assertTrue(ship.lane_body_matches(with_shots(fence, ["queue-dark-1280.png"]) + work, renewal))
-                self.assertTrue(ship.lane_body_matches(renewal, renewal))
+        fence = "Before\n\n```\n" + with_shots("x\n\ny", ["queue-dark-1280.png"]) + "```\n\nAfter\n"
+        self.renewed_by_hand("Body A.\n", fence)
+        for stale in (fence.replace("queue: dark 1280", "queue: light 390"), fence.replace("x\n\ny", "x\n\n\ny"),
+                      with_shots(fence, ["queue-dark-1280.png"])):
+            with self.subTest(stale=stale), self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body"):
+                self.lane_prepare(stale, ("queue-dark-1280.png",))
+        self.assertEqual(self.lane_prepare(fence, ("queue-dark-1280.png",))["phase"], "ready_to_send")
 
     def test_a_lane_entry_with_the_renewals_body_and_the_lanes_screenshots_proceeds(self):
         """Review of build/sd-1636: the lane appends a Screenshots section to a dashboard change's body before
         prepare, so an entry enqueued with the renewal's exact body refused as another body, and the advice to
-        enqueue again failed the same way. The lane's section is not the entry's body; the published body,
-        given back as the body file, is the renewal's too."""
-        from sd_db import set_item_fields
-        self.task_item("task")
-        old, new = self.directory / "old.md", self.directory / "new.md"
-        old.write_text("Body A, the enqueue's.\n")
-        new.write_text("Body B, the renewal's.\n")
-        self.prepare("--deliver", "--body-file", str(old))
-        set_item_fields(self.connection, self.item, title="retitled scope")
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.prepare("--deliver", "--body-file", str(new))
-        shot = self.directory / "shot.md"
-        republished = self.directory / "republished.md"
-        republished.write_text(self.operation().state["body"])
-        stale = self.directory / "stale.md"
-        stale.write_text(ship.sd_lane.with_shots(old.read_text(), ["queue-dark-1280.png"]))
-        with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}):
-            for body in (new, republished):
-                shot.write_text(ship.sd_lane.with_shots(body.read_text(), ["queue-dark-1280.png", "queue-light-390.png"]))
-                with self.subTest(body=body.name), contextlib.redirect_stderr(io.StringIO()):
-                    self.assertEqual(self.prepare("--deliver", "--body-file", str(shot))["phase"], "ready_to_send")
-            with contextlib.redirect_stderr(io.StringIO()), \
-                    self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body"):
-                self.prepare("--deliver", "--body-file", str(stale))
+        enqueue again failed the same way. The lane's section is not the entry's body; the body the renewal
+        published, given back as the body file, is the renewal's too."""
+        self.renewed_by_hand("Body A, the enqueue's.\n", "Body B, the renewal's.\n")
+        republished = self.operation().state["body"]
+        shots = ("queue-dark-1280.png", "queue-light-390.png")
+        for entry in ("Body B, the renewal's.\n", republished):
+            with self.subTest(entry=entry):
+                self.assertEqual(self.lane_prepare(entry, shots)["phase"], "ready_to_send")
+        with self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body"):
+            self.lane_prepare("Body A, the enqueue's.\n", shots)
 
     def test_a_lane_retry_with_the_renewals_items_in_another_order_proceeds(self):
         """Lead review of sd:9268: the lane compared the closing lists in order, so a retry naming the renewal's
@@ -4854,7 +4918,7 @@ roles:
         set_item_fields(self.connection, self.item, title="retitled scope")
         with contextlib.redirect_stderr(io.StringIO()):
             self.prepare("--deliver", "--item", str(first), "--item", str(second))
-        with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}), contextlib.redirect_stderr(io.StringIO()):
+        with self.as_lane(), contextlib.redirect_stderr(io.StringIO()):
             self.prepare("--deliver", "--item", str(second), "--item", str(first))
         self.assertEqual(sorted(self.operation().state["closing"]["items"]), sorted([first, second]))
 
@@ -5155,7 +5219,7 @@ roles:
         self.prepare("--deliver", *bundle)
         set_item_fields(self.connection, self.item, title="retitled scope")
         for step in ("lane prepare", "merge"):
-            with self.subTest(step=step), patch.dict(os.environ, {"SD_LANE_CHILD": "1"}):
+            with self.subTest(step=step), self.as_lane():
                 with self.assertRaisesRegex(ship.Refusal, "acceptance scope changed") as caught:
                     self.prepare("--deliver", *bundle) if step == "lane prepare" else self.merge()
                 command = re.search(r"`(sd-ship prepare [^`]*)`", str(caught.exception))[1]

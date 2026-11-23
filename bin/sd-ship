@@ -586,19 +586,6 @@ def evidence_of(row: object) -> str:
                       sort_keys=True)
 
 
-def lane_body_matches(lane: object, published: object) -> bool:
-    """Whether a lane prepare's body is the published one, byte for byte, but for the lane's own additions.
-
-    Each side loses the `Work:` line `sd_ship_body.published` ends it with;
-    the lane's body may also end with the Screenshots section it appended
-    (`sd_lane.without_shots`) after the entry's body, which `with_shots`
-    strips of trailing space. Nothing else is folded (sd:9335).
-    """
-    work = re.compile(rf"\n\n{re.escape(sd_lib.WORK_TRAILER)} sd:\d+\n\Z")
-    lane, published = (work.sub("", str(text or "")) for text in (lane, published))
-    return lane == published or sd_lane.without_shots(lane) == published.rstrip()
-
-
 def stale_criteria(claim: object, stored: object) -> list[str]:
     """The criteria of `claim` when not one of its rows proves anything `stored`'s did not, or [] (sd:9268 review).
 
@@ -896,7 +883,7 @@ class Ship(SharedReview):
         pending, publishing, self.publishing = self.state.get("pending"), self.publishing, False
         return {**(pending if publishing and pending else {}), **({"pending": None} if pending else {})}
 
-    def renewal(self, claim: dict | None, body: str) -> tuple[dict | None, dict | None, str | None]:
+    def renewal(self, claim: dict | None, basis: tuple[str | None, bool]) -> tuple[dict | None, dict | None, str | None]:
         """The claim to save, the one `assert_scope` reads in place of the stored one, and the line saying so.
 
         Only a prepare the lane did not start renews a claim the item
@@ -917,7 +904,7 @@ class Ship(SharedReview):
         if not (changed or stored.get("renewed")):
             return claim, None, None
         if self.lane_started():
-            return self.lane_renewal(claim, stored, changed, body), None, None
+            return self.lane_renewal(claim, stored, changed, basis), None, None
         claim = {**claim, "renewed": True}
         if not changed:
             return claim, None, None
@@ -925,13 +912,14 @@ class Ship(SharedReview):
         return claim, claim, (f"--deliver renews the delivery claim of sd:{self.args.item}: item scope "
                               f"{str(stored.get('item_scope'))[:12]} is now {claim['item_scope'][:12]}")
 
-    def lane_renewal(self, claim: dict, stored: dict, changed: bool, body: str) -> dict:
+    def lane_renewal(self, claim: dict, stored: dict, changed: bool, basis: tuple[str | None, bool]) -> dict:
         """The claim a lane prepare saves, or a refusal when its entry is older than a renewal by hand.
 
         A retry of an entry enqueued before the renewal carries the old
         items, evidence and body; the scope now matches, so each must equal
         the renewal's, or the retry would publish what it replaced (sd:9335).
-        The title is `assert_title_matches`'s.
+        The body is the entry's own (`body_basis`), not the text this prepare
+        publishes. The title is `assert_title_matches`'s.
         """
         self.refuse_held_by_lane_row(changed)
         items = list(self.closing(tuple(dict.fromkeys(self.args.closes)), self.args.deliver))
@@ -961,13 +949,73 @@ class Ship(SharedReview):
                           f"the renewal does; enqueue again with the renewal's acceptance file",
                           code="delivery_claim_renewed", boundary="input", state="operator_decision",
                           next_action="Enqueue the item again with the acceptance file the renewal used.")
-        if stored.get("renewed") and not changed and not lane_body_matches(body, self.state.get("body")):
-            raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this lane entry "
-                          f"carries another body, as a retry of an entry enqueued before the renewal does; "
-                          f"the renewal's body stands: enqueue again with it as the body file",
-                          code="delivery_claim_renewed", boundary="input", state="operator_decision",
-                          next_action="Enqueue the item again with the body the renewal published.")
+        if stored.get("renewed") and not changed:
+            self.refuse_other_body(*basis)
         return {**claim, "renewed": True} if stored.get("renewed") else claim
+
+    def refuse_other_body(self, basis: str | None, tied: bool) -> None:
+        """Refuse a lane prepare on a renewed claim whose entry was enqueued with another body than the renewal's."""
+        if not tied:
+            raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this prepare's body is "
+                          f"not the body of the one running lane entry for the item on this host, the lane's "
+                          f"Screenshots section apart, so it cannot be checked against the renewal's; nothing "
+                          f"was saved: `sd-ship lane retry {self.args.item}` once no other prepare of the item "
+                          f"runs", code="lane_unknown", boundary="runtime", state="retryable_failure")
+        if basis != self.published_basis():
+            raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this lane entry was "
+                          f"enqueued with another body, as a retry of an entry enqueued before the renewal is; "
+                          f"the renewal's body stands: enqueue again with the body file the renewal used, or "
+                          f"make this entry's body the renewal's with `{self.renew_command()} --body-file FILE` "
+                          f"by hand, then `sd-ship lane retry {self.args.item}`",
+                          code="delivery_claim_renewed", boundary="input", state="operator_decision",
+                          next_action="Enqueue the item again with the body the renewal used, or prepare by "
+                                      "hand with this entry's body, then retry.")
+
+    def bases_with(self, body: str, basis: str | None) -> dict:
+        """The receipt's `body_bases` with this prepare's body: the digest of each text a prepare published, to
+        the digest of the words it was made from (`body_basis`)."""
+        return {**(self.state.get("body_bases") or {}), digest(self.normal(body)): basis}
+
+    def published_basis(self) -> str:
+        """The basis of the published body: the one recorded for its text, or that text's own digest."""
+        text = digest(self.normal(self.state.get("body")))
+        return (self.state.get("body_bases") or {}).get(text, text)
+
+    def normal(self, body: object) -> str:
+        """`body` as `sd_ship_body.normalize` leaves it: no owned line, no trailing space; "" when it refuses."""
+        try:
+            return sd_ship_body.normalize(re.sub(r"\r\n?", "\n", str(body or "")), self.args.item)[0]
+        except Refusal:
+            return ""
+
+    def body_basis(self, body: str) -> tuple[str | None, bool]:
+        """The digest of the words this prepare's body was made from, and whether a lane entry's row gave them.
+
+        A published body is no record of its author's words: a lane prepare
+        appends a Screenshots section drawn at that run, and the pull request
+        keeps the body it was opened with. Text alone cannot tell the lane's
+        section from an entry's copy of one, so nothing here reads a body to
+        guess (sd:9335 class pass).
+
+        A lane prepare's words are its running entry's body, read from the
+        queue row, when this prepare's body is that body with nothing but the
+        lane's section after it; that tie keeps a prepare that outlived its
+        runner from borrowing a newer entry's row. Any other prepare's words
+        are its body, or, when a prepare published this very text before, the
+        words that one was made from (`body_bases`).
+        """
+        if self.args.no_item:
+            return None, False
+        given = self.normal(body)
+        try:
+            rows = self.running_entries() if self.lane_started() else None
+        except Refusal:  # a queue that does not read: `renewal` refuses where the answer matters
+            rows = [] if os.environ.get(sd_lane.LANE_CHILD) else None
+        if rows is not None and len(rows) == 1:
+            entry = self.normal(rows[0].get("body"))
+            if given.startswith(entry) and sd_lane.only_shots(given[len(entry):]):
+                return digest(entry), True
+        return (self.state.get("body_bases") or {}).get(digest(given), digest(given)), False
 
     def refuse_held_by_lane_row(self, changed: bool) -> None:
         """Refuse a scope change in a prepare `lane_started` counted by a running row, naming that row.
@@ -1010,6 +1058,12 @@ class Ship(SharedReview):
         """
         if os.environ.get(sd_lane.LANE_CHILD):
             return True
+        rows = self.running_entries()
+        self.lane_row = rows[0] if rows else None
+        return self.lane_row is not None
+
+    def running_entries(self) -> list[dict]:
+        """This item's running lane entries held on this host; a queue that does not read refuses `lane_unknown`."""
         sd_lib.import_sd_db()  # the gateway first, as for every sd_db import here
         from sd_db.errors import SdDbError
         try:
@@ -1019,10 +1073,8 @@ class Ship(SharedReview):
                           f"prepare is unknown, and sd:{self.args.item}'s delivery claim is not renewed; prepare "
                           f"again once the queue reads", code="lane_unknown", boundary="database",
                           state="retryable_failure") from None
-        self.lane_row = next((row for row in rows if row.get("item") == self.args.item
-                              and row.get("status") == "running"
-                              and (row.get("holder") or {}).get("host") == host), None)
-        return self.lane_row is not None
+        return [row for row in rows if row.get("item") == self.args.item and row.get("status") == "running"
+                and (row.get("holder") or {}).get("host") == host]
 
     def body_input(self, default: str) -> tuple[str, str]:
         """The body to publish and where it came from (sd:1870).
@@ -1813,7 +1865,8 @@ class Ship(SharedReview):
             self.assert_title_matches(title)
             if not self.args.no_item and self.state.get("deliver") != deliver:
                 raise Refusal("existing PR delivery claim differs; reconcile the prepared scope first")
-        claim, renewed, renewal_line = self.renewal(claim, body)
+        basis = self.body_basis(body)
+        claim, renewed, renewal_line = self.renewal(claim, basis)
         self.assert_scope(renewed)
         closing: dict | None = None
         closing_warnings: list[str] = []
@@ -1833,7 +1886,8 @@ class Ship(SharedReview):
             self.save(repository=self.repository, branch=self.branch, item=self.args.item, phase="new")
         self.persist_copilot_direction()
         fields = {"title": title, "body": body,
-                  **({} if self.args.no_item else {"deliver": deliver, "acceptance": claim, "closing": closing})}
+                  **({} if self.args.no_item else {"deliver": deliver, "acceptance": claim, "closing": closing,
+                                                   "body_bases": self.bases_with(body, basis[0])})}
         # Once a pull request is published, what merge squashes and closes with stays in force until this
         # prepare publishes again: its title, body, claim and closing set wait as `pending`, which only
         # `ready_to_send` promotes, so merge, reconcile and every other reader see the published ones after

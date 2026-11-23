@@ -28,6 +28,10 @@ and when a stored claim, body or flag goes stale. Two rules answer it.
   with text folded (NFKC, spacing). A comment, a waiving note's body
   or a criterion's name proves nothing. A renewal whose rows prove
   nothing new refuses.
+- A body's basis is the words it was made from, recorded, never
+  inferred. A lane prepare appends a Screenshots section per run, so
+  the entry's body is read from its queue row (`body_basis`), and the
+  receipt maps each published text to its basis (`body_bases`).
 - The published closing set is bound to the head it was read at.
   Reconcile refuses to deliver or close a merge of another head.
 - A `pending` set is stale for merge. Merge refuses `prepare_required`
@@ -67,7 +71,8 @@ the `renewed` mark in `bin/sd-ship`. Tests are in
 | reconcile of another head | `merged` recorded | a reprepare pushed a tip, then refused; GitHub merged that tip | refuses `closing_set_stale`; nothing delivered or closed; deliver by hand | `test_a_reconcile_of_a_head_the_published_closing_set_was_not_read_at_refuses` |
 | hand prepare under a lane row | none | a running row with no lane mark counts it as the lane's | refuses `lane_entry_running`, naming the row and `sd-ship lane cancel` | `test_a_hand_prepare_held_by_a_running_lane_row_names_that_row` |
 | lane retry after a renewal | none | old items, evidence or body | refuses `delivery_claim_renewed` before any save | `test_a_lane_retry_of_an_entry_older_than_a_renewal_refuses`, `test_a_lane_retry_with_the_items_a_renewal_dropped_refuses`, `test_a_lane_retry_with_the_body_a_renewal_replaced_refuses` |
-| lane prepare of a dashboard change | none | the lane's Screenshots section reads as another body; a fenced copy or blank lines differ | `lane_body_matches` drops only the section ending the body and the `Work:` line, nothing else | `test_a_lane_entry_with_the_renewals_body_and_the_lanes_screenshots_proceeds`, `test_a_lane_body_differs_from_a_renewals_in_any_byte_but_the_lanes_own_section` |
+| lane prepare on a renewed claim | none | the published body mixes the entry's words with the lane's Screenshots section, drawn per run, and the pull request keeps the body it was opened with | the entry's body is read from its running queue row and tied to this prepare's body; `body_bases` records the words each published text was made from; no text is read to guess | `test_a_stale_entry_cannot_restore_the_screenshots_a_renewal_removed`, `test_a_retry_of_the_renewals_body_proceeds_whatever_the_lane_draws`, `test_a_renewal_of_a_body_the_lane_published_keeps_the_entrys_basis`, `test_a_lane_body_differs_from_a_renewals_in_any_byte_but_the_lanes_own_section` |
+| lane prepare that outlived its runner | none | it reads a newer entry's row as its own | untied body refuses `lane_unknown` before any save | `test_a_lane_prepare_whose_body_is_not_its_running_entrys_refuses` |
 | `renewed` mark | kept on every later claim | a new enqueue with new evidence refuses too | sd:9580, next PR; no fix here (ruling #64736) | `test_a_lane_retry_of_an_entry_older_than_a_renewal_refuses` |
 
 ## Acceptance criteria

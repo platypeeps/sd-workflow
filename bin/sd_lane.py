@@ -2154,7 +2154,7 @@ def draw_shots(worktree: pathlib.Path, out: pathlib.Path) -> dict[str, Any]:
     return {"shots": files} if files else {}
 
 
-#: The Screenshots section's head `with_shots` writes; `without_shots` finds it by this text alone.
+#: The head of the Screenshots section `with_shots` writes and `only_shots` reads.
 SHOTS_HEAD = "## Screenshots\n\nThe lane drew each changed dashboard page.\nThe Queue row links the PNGs.\n\n"
 
 
@@ -2168,16 +2168,14 @@ def with_shots(body: str, files: list[str]) -> str:
     return f"{body.rstrip()}\n\n{SHOTS_HEAD}" + "\n".join(lines) + "\n"
 
 
-def without_shots(body: str) -> str:
-    """`body` without the one Screenshots section `with_shots` appended at its end, or `body` as it is.
+def only_shots(text: str) -> bool:
+    """Whether `text` is nothing, or the one Screenshots section `with_shots` adds and nothing else.
 
-    Only a section that ends the body, every line after its head a page
-    bullet (`normalize` may drop the last newline), is the lane's; a
-    fenced example, or a section that text follows, is the entry's
-    (sd:9335).
+    `sd-ship` asks it of what follows an entry's own body in the body the
+    lane gave it, never of a body whose author is unknown: text alone
+    cannot tell the lane's section from an entry's copy of one (sd:9335).
     """
-    found = re.fullmatch(r"(.*)\n\n" + re.escape(SHOTS_HEAD) + r"(?:- [^\n]*\n)*- [^\n]*\n?", body, flags=re.S)
-    return found[1] if found else body
+    return not text or re.fullmatch(r"\s*" + re.escape(SHOTS_HEAD) + r"(?:- [^\n]*\n)*- [^\n]*\n?", text) is not None
 
 
 def prepare_step(entry: dict[str, Any], worktree: pathlib.Path, log: pathlib.Path, ship: Ship,
