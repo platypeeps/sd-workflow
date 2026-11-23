@@ -2109,6 +2109,17 @@ class CancelParks(Case):
         fresh = build.queue_again(self.db, [items[2]], who="operator")
         self.assertNotIn(fresh[0]["id"], (lead, kept, left))
 
+    def test_a_subset_naming_a_done_member_retries_only_the_named_part(self):
+        """Review of build/sd-1654 (build.py:1209): Build A C of blocked bundle A, B, C whose item C is done
+        since, its row still blocked. `_part` counted only open members, so it named one item, A, and the press
+        retried the whole bundle, B too. Two bundle items named is a part: A queues and B leaves the bundle."""
+        items, (lead, other, finished) = self.blocked_bundle()
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[2],))
+        self.db.commit()
+        queued = build.queue_again(self.db, [items[0], items[2]], who="operator")
+        self.assertEqual([entry["id"] for entry in queued], [lead])
+        self.assertEqual(runner.queue_state(self.db, other)["status"], "cancelled")
+
     def test_a_subset_build_resumes_its_bundle_past_an_unselected_member_a_newer_build_owns(self):
         """Pack sd:9936: bundle A, B, C ended blocked; newer presses of A and B were cancelled before a claim, and C
         has a newer build that ran. Build A B read every member's ownership, C's too, and built A and B fresh from

@@ -1205,8 +1205,9 @@ def _part(connection, lead: int, status: str, selected: Collection[int]) -> set[
     it names whose row Build reads for the item (`_reads`), when two or more; None, the whole bundle, otherwise.
     One named item is the row's Retry of its whole bundle, and a part must name the lead (pack sd:9581).
     `_retry_takes` reads it and `queue_again` writes it, with the same inputs, so the press runs the Retry its
-    read chose (lane cases 1 to 3, review of build/sd-1654)."""
-    named = {member["item"] for member in _open_members(connection, lead, status)
+    read chose (lane cases 1 to 3, review of build/sd-1654). A done member counts as named: `retry` skips it, but
+    the press named a part, so an unnamed open member must not ride along (review of build/sd-1654, build.py:1209)."""
+    named = {member["item"] for member in _members(connection, lead, status)
              if member["item"] in set(selected) and _reads(connection, member)}
     return named if len(named) > 1 else None
 
