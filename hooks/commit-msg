@@ -78,9 +78,11 @@ def main(argv: list[str]) -> int:
         # Comment lines: any char git's `auto` may pick, or the configured string; a verbose diff
         # sits below a scissors line in that char. ponytail: such a line is skipped even where git
         # keeps it (-m/-F); the lane refuses it (filed with the --body-only advisory).
-        prefixes = tuple("#;@!$%^&|:") + tuple(
-            value.strip() for key in ("core.commentString", "core.commentChar")
-            if (value := sd_lib.git_output(["config", key], root) or "").strip() not in ("", "auto"))
+        # Read raw: git_output strips stdout, and a comment string may start with spaces.
+        configured = (subprocess.run(["git", "config", "--get", key], cwd=root, capture_output=True,
+                                     text=True, check=False).stdout.rstrip("\n")
+                      for key in ("core.commentString", "core.commentChar"))
+        prefixes = tuple("#;@!$%^&|:") + tuple(value for value in configured if value not in ("", "auto"))
         lines = message.split("\n")
         cut = next((at for at, line in enumerate(lines)
                     if line.startswith(prefixes) and line.endswith(" " + "-" * 24 + " >8 " + "-" * 24)),

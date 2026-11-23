@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -233,6 +234,17 @@ class TheHook(HookFixture):
         result = self.verbose("core.commentString=//")
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_a_comment_string_with_leading_spaces_is_read_whole(self):
+        """Review round 6: git_output strips stdout, so `  //` read as `//` and missed the editor's comments."""
+        draft = self.root.parent / f"{self.root.name}-spaced"
+        draft.write_text("fix: a subject\n\n  // " + "c" * 80 + "\n", encoding="utf-8")
+        self.addCleanup(draft.unlink)
+        result = subprocess.run(["git", "-c", "core.commentString=  //", "commit", "-q", "--allow-empty", "-e",
+                                 "-m", "x"], cwd=self.root,
+                                env=clean_environment(GIT_EDITOR=f"cp {shlex.quote(str(draft))}"),
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_a_fixup_of_a_long_subject_commits(self):
         """Review round 4: `fixup! <subject>` is git's line, and autosquash removes it."""
         self.assertEqual(self.commit("fix: " + "f" * 67 + "\n").returncode, 0)
@@ -322,7 +334,7 @@ class TheHook(HookFixture):
         draft.write_text("fix: a subject\n\n- item\n  ```\n# H\n  " + "i" * 80 + "\n", encoding="utf-8")
         self.addCleanup(draft.unlink)
         result = subprocess.run(["git", "commit", "-q", "--allow-empty", "-e", "-m", "x"], cwd=self.root,
-                                env=clean_environment(GIT_EDITOR=f"cp {draft}"), capture_output=True,
+                                env=clean_environment(GIT_EDITOR=f"cp {shlex.quote(str(draft))}"), capture_output=True,
                                 text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
 
