@@ -3060,9 +3060,10 @@ def read_back(merged: Any, pull: int, base: str) -> dict[str, Any]:
     if not (shaped and merged.get("merged") is True and isinstance(commit, str)
             and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)):
         return {"status": "unknown", "pull": pull, "reason": f"train pull request #{pull} read back unreadable"}
-    if merged["base"].get("ref") != base:
+    ref = merged["base"].get("ref")  # a ref left out of the answer is no other base: the train landed
+    if isinstance(ref, str) and ref and ref != base:
         return {"status": "failed", "pull": pull, "reason": f"train pull request #{pull} merged onto "
-                                                            f"{merged['base'].get('ref')}, not {base}"}
+                                                            f"{ref}, not {base}"}
     return {"status": "merged", "pull": pull, "merge_commit": commit}
 
 

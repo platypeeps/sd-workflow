@@ -6612,6 +6612,20 @@ roles:
         self.assertEqual(landed["status"], "unknown")
         self.assertEqual(self.train_branches(), [])
 
+    def test_land_train_read_back_merged_with_an_empty_base_counts_as_landed(self):
+        """Lead ruling, round 8 of sd:9923: `base: {}` read as failed, so the lead merged alone."""
+        tip = self.joined_tip()
+        remote = sys.modules["sd_ship_remote"]
+        real = remote.GitHub.pull
+
+        def pull(api, number):
+            if any(call.method == "PUT" for call in self.remote.calls):
+                return {"merged": True, "base": {}, "merge_commit_sha": "c" * 40}
+            return real(api, number)
+        with patch.object(remote.GitHub, "pull", pull):
+            landed, _ = self.landed_by_lane(tip)
+        self.assertEqual((landed["status"], landed["merge_commit"]), ("merged", "c" * 40))
+
     def assert_unread_member_trailers_send_no_merge(self, failing):
         """Review of sd:9923: a git read that failed dropped trailers from a train that still merged."""
         tip = self.joined_tip()
