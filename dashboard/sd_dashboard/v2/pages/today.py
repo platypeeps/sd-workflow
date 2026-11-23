@@ -20,7 +20,7 @@ from . import Api, Page
 def _read(read):
     from ... import queue_screen
 
-    return queue_screen.document(read.connection, now=read.now)
+    return queue_screen.shared(read.connection, now=read.now)
 
 
 def _builds(read):

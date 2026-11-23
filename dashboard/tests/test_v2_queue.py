@@ -46,6 +46,8 @@ from test_workflow_actions import BrowserSession
 
 V2 = Path(v2.__file__).resolve().parent
 CLOCK = queue_screen._when(NOW)
+#: Today's real lane read: `ScreenCase` stands a fixture in for it in each case.
+REAL_LANES = now_screen._lanes
 
 STUB = """#!/bin/sh
 # A stand-in for sd-ship and sd: log the arguments, answer from the fixture.
@@ -173,6 +175,67 @@ class TheRows(Lane, ScreenCase):
 
     def doc(self):
         return queue_screen.document(self.connection, now=NOW)
+
+    def test_one_page_load_builds_the_queue_document_once(self):
+        """pack sd:10077: Today's /api/now and its Queue view's /api/queue each built the ~1 s document."""
+        from sd_dashboard.v2.pages import Read, today
+
+        with mock.patch.object(queue_screen, "document", wraps=queue_screen.document) as built:
+            queue = today._read(Read(connection=self.connection, now=NOW))
+            lamps = REAL_LANES(self.connection, NOW)
+        self.assertEqual(built.call_count, 1)
+        self.assertEqual(queue, lamps)
+        queue["lanes"].clear()
+        self.assertTrue(queue_screen.shared(self.connection, now=NOW)["lanes"], "each reader gets its own copy")
+
+    def test_reads_that_come_at_once_wait_for_the_one_build(self):
+        import threading
+
+        def slow(connection, *, now=""):
+            time.sleep(0.2)
+            return {"lanes": []}
+
+        found = []
+
+        def read():
+            # Each request has its own connection to the one database file, as the server opens them.
+            connection = sqlite3.connect(self.path)
+            try:
+                found.append(queue_screen.shared(connection, now=NOW))
+            finally:
+                connection.close()
+
+        with mock.patch.object(queue_screen, "document", side_effect=slow) as built:
+            readers = [threading.Thread(target=read) for _ in range(2)]
+            for reader in readers:
+                reader.start()
+            for reader in readers:
+                reader.join()
+        self.assertEqual((built.call_count, found), (1, [{"lanes": []}] * 2))
+
+    def test_the_shared_document_is_built_again_once_it_is_old_or_dropped(self):
+        with mock.patch.object(queue_screen, "document", return_value={"lanes": []}) as built:
+            queue_screen.shared(self.connection, now=NOW)
+            queue_screen.forget()
+            queue_screen.shared(self.connection, now=NOW)
+            with mock.patch.object(queue_screen.time, "monotonic", return_value=time.monotonic() + 60):
+                queue_screen.shared(self.connection, now=NOW)
+        self.assertEqual(built.call_count, 3)
+
+    def test_a_build_that_raises_keeps_nothing(self):
+        with mock.patch.object(queue_screen, "document", side_effect=[OSError("gone"), {"lanes": []}]) as built:
+            with self.assertRaises(OSError):
+                queue_screen.shared(self.connection, now=NOW)
+            self.assertEqual(queue_screen.shared(self.connection, now=NOW), {"lanes": []})
+        self.assertEqual(built.call_count, 2)
+
+    def test_the_retry_probe_runs_once_and_a_failed_probe_is_asked_again(self):
+        """pack sd:10077: each read ran `sd-ship lane retry --help`, a subprocess of ~0.1 s."""
+        with mock.patch.dict(os.environ, {"QUEUE_NO_RETRY": "1"}):
+            self.assertIs(queue_screen.retry_help()["retry"], False)
+        self.assertIs(queue_screen.retry_help()["retry"], True)
+        self.assertIs(queue_screen.retry_help()["retry"], True)
+        self.assertEqual(self.calls().count(["lane", "retry", "--help"]), 2)
 
     def test_each_lane_carries_its_checkouts_realm(self):
         """pack sd:6016: the realm tab a lane shows under is places.realm_of over its checkout; unread rules give None."""
@@ -712,6 +775,15 @@ class TheMove(Lane, BrowserSession):
             payload["head"] = head
         return self.post("/api/queue/move", payload, **headers)
 
+    def test_a_move_drops_the_shared_document_so_the_next_read_is_fresh(self):
+        """pack sd:10077: the read after the page's own write shows it, not the document shared before it."""
+        queue_screen.shared(self.connection, now=NOW)
+        status, _, _ = self.move("up")
+        self.assertEqual(status, 200)
+        self.list([entry for entry in self.entries() if entry["item"] != 12])
+        rows = queue_screen.shared(self.connection, now=NOW)["lanes"][0]["rows"]
+        self.assertNotIn(12, [row.get("item") for row in rows])
+
     def test_a_reorder_calls_exactly_lane_move_with_the_item_place_and_revision(self):
         status, _, answer = self.move("up")
         self.assertEqual((status, answer["ok"]), (200, True))
@@ -1075,6 +1147,15 @@ class ThePrCheck(BrowserSession):
         self.assertEqual((self.notes(21), self.notes(22)), ([f"PR {pull}21 merged at {'9' * 40}"], []))
         closed = self.contributions.snapshot(self.connection, f"github:{pull}22")
         self.assertEqual(closed["observation"]["state"], "closed")
+
+    def test_a_check_drops_the_shared_document(self):
+        """pack sd:10077: Read again posts the check, then reads /api/queue, which must build again."""
+        with mock.patch.object(queue_screen, "document", return_value={"lanes": []}) as built:
+            queue_screen.shared(self.connection, now=NOW)
+            status, _, answer = self.post("/api/queue/prs/check", {"items": [self.items[21]]})
+            self.assertEqual(status, 200, answer)
+            queue_screen.shared(self.connection, now=NOW)
+        self.assertEqual(built.call_count, 2)
 
     def test_a_second_check_adds_no_second_note(self):
         for _ in range(2):
