@@ -158,6 +158,19 @@ class WorkCompletion(ProgressCase):
         with self.assertRaises(WorkflowError):
             cancel_work(self.db, self.item, reason="Cannot rewrite delivery", who="operator")
 
+    def test_a_delivered_work_item_keeps_its_open_followup_in_today(self):
+        """sd:9869 round 9: a merge marked work done without `kept_followups`, so Today hid
+        a followup the delivery does not answer. sd-ship's primary and co-delivered work both
+        deliver here."""
+        from sd_db import reads
+        from sd_db.writes import add_note
+        waiting = add_note(self.db, self.item, "followup", "Waits on an outside reply")
+        self.remote()
+        commit = self.commit(f"Delivers: sd:{self.item}")
+        self.git("push", "origin", "main")
+        deliver_work(self.db, self.item, commit, who="sd-ship")
+        self.assertEqual([row["id"] for row in reads.open_followups(self.db)], [waiting])
+
     def notes(self, kind="status_change"):
         return [row["body"] for row in self.db.execute(
             "SELECT body FROM note WHERE item = ? AND kind = ? ORDER BY id", (self.item, kind))]

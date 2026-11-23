@@ -27,6 +27,7 @@ from tests.test_sd_review import (
 def finding(severity: str = "high") -> str:
     return json.dumps({"findings": [{"path": "src.py", "line": 1,
                                     "severity": severity, "summary": "defect", "family": "correctness",
+                                    "evidence": "python3 src.py: Traceback",
                                     **({"instances": ["src.py:1"]} if severity == "high" else {})}]})
 
 
@@ -176,11 +177,15 @@ class FallbackTests(ReviewRunFixture):
 
     def test_invalid_review_evidence_survives_a_clean_fallback(self) -> None:
         root = self.prepare()
-        for payload in (finding("HIGH"), '{"findings":[{"severity":"high","instances":["src.py:1"],"summary":"blocker with missing location"}]}', json.dumps({"findings":
-                json.loads(finding("low"))["findings"] * 50 + json.loads(finding())["findings"]})):
+        # sd:9867: the finding with no location cites no repro in a changed file, so it survives as advisory.
+        for payload, status in ((finding("HIGH"), "blocking"),
+                                ('{"findings":[{"severity":"high","instances":["src.py:1"],"summary":"blocker with missing location"}]}',
+                                 "advisory"),
+                                (json.dumps({"findings": json.loads(finding("low"))["findings"] * 50
+                                             + json.loads(finding())["findings"]}), "blocking")):
             with self.subTest(payload=payload[:100]):
                 result = self.run_review(root, FakeRunner({"codex": sd_review.Completed(0, payload, "")}))
-                self.assertEqual(result["status"], "blocking")
+                self.assertEqual(result["status"], status)
                 self.assertEqual(result["reviewed_by"], ["second"])
                 self.assertEqual(result["outcomes"][0]["status"], sd_review.UNAVAILABLE)
                 self.assertTrue(any(row["severity"] == "high" for row in result["findings"]))

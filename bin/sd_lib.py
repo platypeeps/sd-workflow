@@ -436,7 +436,7 @@ def _git(args: list[str], cwd: pathlib.Path) -> str | None:
             # No sd tool can answer a credential prompt: a remote read fails instead (sd:3495).
             env={**without_fsmonitor(os.environ), "GIT_TERMINAL_PROMPT": "0"},
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, ValueError):  # non-UTF-8 output or a NUL argument: no answer (sd:9867)
         return None
     answer = completed.stdout.strip() if completed.returncode == 0 else None
     if memo is not None:
@@ -4350,16 +4350,19 @@ def distinct_findings(findings: Iterable[Mapping[str, Any]]) -> list[dict[str, A
     Identical means every key but `backend`, `evidence` and `instances` is equal: two
     readers cite their checks and list instances in their own words (pack sd:9270, sd:9769). Adjudication takes a row per
     blocking finding, so a copy was a second row to dispute. The kept row takes
-    the first evidence any copy gives, so a bare first copy does not lose a cited one,
+    every distinct evidence its copies give, one per line, so the lead who judges it sees each repro (sd:9869),
     and every instance any copy lists.
     """
     seen: dict[str, dict[str, Any]] = {}
+    cited: dict[str, list[str]] = {}
     for finding in findings:
         key = json.dumps({name: value for name, value in finding.items() if name not in ("backend", "evidence", "instances")},
                          sort_keys=True, default=str)
         kept = seen.setdefault(key, dict(finding))
-        if not kept.get("evidence") and finding.get("evidence"):
-            kept["evidence"] = finding["evidence"]
+        evidence, parts = finding.get("evidence"), cited.setdefault(key, [])
+        if isinstance(evidence, str) and evidence.strip() and evidence not in parts:
+            parts.append(evidence)
+            kept["evidence"] = "\n".join(parts)
         if finding.get("instances"):  # each copy's instances, once: the build matches blockers by them (sd:9769)
             kept["instances"] = list(dict.fromkeys([*(kept.get("instances") or []), *finding["instances"]]))
     return list(seen.values())
