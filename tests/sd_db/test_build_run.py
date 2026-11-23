@@ -2659,6 +2659,13 @@ class Supervise(Case):
         """Row 25: a cancelled bundle keeps the member's assignment, but the done filter drops it."""
         self.assert_split_first(self.moved_then_retried("done", cancelled=True, retried=1))
 
+    def test_a_whole_retry_of_a_cancelled_bundle_with_a_planning_member_splits(self):
+        """pack sd:10113: a cancelled bundle keeps a member moved to planning in its view, and Retry refused
+        'item N is planning'; it leaves the bundle as a done one does, and stays planning."""
+        self.assert_split_first(self.moved_then_retried("planning", cancelled=True, retried=1))
+        self.assertEqual(self.db.execute("SELECT status FROM item WHERE id = ?", (self.items[2],)).fetchone()[0],
+                         "planning")
+
     def test_a_rebased_branch_after_a_split_cannot_be_retried(self):
         """Round 6, row 10: a rebase onto newer main gives the earlier commits new ids and keeps their changes, so
         no git state proves a split; once the guard found earlier work, Retry of that bundle refuses."""

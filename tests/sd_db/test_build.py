@@ -1312,12 +1312,12 @@ class Reap(Case):
         self.assertEqual(self.statuses([self.items[0]]), ["blocked"])
         self.assertEqual(runner.queue_state(self.db, lead)["status"], "blocked")
 
-    def cancelled_with_a_done_item(self, done):
+    def cancelled_with_a_done_item(self, done, status="done"):
         build.write(self.db, self.bundle["id"], step="building")
         build.end(self.db, self.bundle["id"], "cancelled", "operator cancel")
         lead, member = sorted(member["id"] for member in build.run(self.db, self.bundle["id"])["members"])
         self.assertEqual(self.statuses(self.items), ["ready", "ready"])
-        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (self.items[done],))
+        self.db.execute("UPDATE item SET status = ? WHERE id = ?", (status, self.items[done]))
         self.db.execute("UPDATE runner_run SET released_at = COALESCE(released_at, '2026-01-01T00:00:00Z')")
         return lead, member
 
@@ -1331,6 +1331,27 @@ class Reap(Case):
         again = self.claim()
         self.assertEqual((again["assignment"], again["branch"], again["work_path"]),
                          (lead, self.bundle["branch"], self.bundle["work_path"]))
+
+    def test_build_again_on_a_cancelled_bundle_skips_a_member_back_in_planning(self):
+        """pack sd:10113: Retry refused 'item N is planning' for the whole bundle; the ready lead now
+        resumes its branch alone and the planning member stays planning."""
+        lead, member = self.cancelled_with_a_done_item(1, "planning")
+        queued = build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertEqual([(entry["id"], entry["item"]) for entry in queued], [(lead, self.items[0])])
+        self.assertEqual(self.statuses(self.items), ["ready", "planning"])
+        again = self.claim()
+        self.assertEqual((again["assignment"], again["branch"]), (lead, self.bundle["branch"]))
+
+    def test_build_again_on_a_cancelled_bundle_whose_lead_is_back_in_planning_presses_fresh(self):
+        """pack sd:10113: with the lead in planning, Retry would claim under the member; it refuses, and
+        `sd assignments build` presses the ready member fresh."""
+        lead, member = self.cancelled_with_a_done_item(0, "planning")
+        with self.assertRaisesRegex(build.BuildRefused, f"its lead sd:{self.items[0]} is planning"):
+            build.retry(self.db, lead, who="operator")
+        queued = build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual([(entry["item"], entry["status"]) for entry in queued], [(self.items[1], "queued")])
+        self.assertNotIn(queued[0]["id"], (lead, member))
+        self.assertEqual(self.statuses(self.items), ["planning", "ready"])
 
     def test_build_again_on_a_cancelled_bundle_whose_lead_is_done_presses_fresh(self):
         """sd:9015 review: Retry without its lead would claim under a member, on a new branch and worktree, and

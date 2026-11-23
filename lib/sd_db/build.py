@@ -760,14 +760,16 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
                          "AND scope = ? ORDER BY id", (assignment, current["status"], SCOPE))])
                  if member["status"] in AGAIN and not (member["result"] or "").startswith(ALONE)]
         items = reads.items_by_ids(connection, [current["item"], *(member["item"] for member in members + built)])
-        # A done lead refuses: the claim would lead with a member, on a new branch and worktree.
-        if _done(items, current["item"]):
-            raise BuildRefused(f"Retry refused: its lead sd:{current['item']} is done")
+        # A done or planning lead refuses: the claim would lead with a member, on a new branch and worktree.
+        if _unbuilt(items, current["item"]):
+            raise BuildRefused(f"Retry refused: its lead sd:{current['item']} is {items[current['item']]['status']}")
         if only is not None and current["item"] not in only and {member["item"] for member in members} - set(only):
             raise BuildRefused(f"Retry refused: a retry of part of the bundle names its lead sd:{current['item']}, "
                                f"whose worktree holds its work")
+        # A member whose item wants no build (`UNBUILT`) leaves as one `only` omits: a cancelled bundle keeps a
+        # member moved to planning in its view, and queueing it refused the whole Retry (pack sd:10113).
         members = [member for member in members if (only is None or member["item"] in only)
-                   and not _done(items, member["item"])]
+                   and not _unbuilt(items, member["item"])]
         stamp = clock()
         # A dependency inside the bundle (`_inside`, review of build/sd-1306): a lead that waits on its members
         # cannot retry, so they leave and build fresh on their own branch while the lead stays ended; a member
@@ -1083,6 +1085,11 @@ def _done(items: dict, item: int) -> bool:
     return item in items and items[item]["status"] == "done"
 
 
+def _unbuilt(items: dict, item: int) -> bool:
+    """Whether `item` wants no build (`UNBUILT`): done, or back in planning (pack sd:10113)."""
+    return item in items and items[item]["status"] in UNBUILT
+
+
 def queue_again(connection, items: list[int], *, who: str, finding: str = "") -> list[dict]:
     """`sd assignments build`: an item whose latest build bundle ran and ended blocked or cancelled is Retry of that
     bundle (`retry`, its assignments and worktree kept); one whose lane entry failed is Fix (`lane_fix`, pack sd:8791);
@@ -1158,7 +1165,7 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                     and (state["run"] is not None
                          or _resumable(connection, lead, state["item"], state["status"]) is not None)
                     and not (state["run"] and state["run"]["outcome"] is None and state["run"]["step"] in LANE_STEPS)
-                    and not _done(reads.items_by_ids(connection, [state["item"]]), state["item"])):
+                    and not _unbuilt(reads.items_by_ids(connection, [state["item"]]), state["item"])):
                 leads += [] if lead in leads else [lead]
                 named.setdefault(lead, set()).add(item)
             else:
