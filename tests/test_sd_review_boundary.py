@@ -1089,11 +1089,17 @@ class LineBudgetTests(unittest.TestCase):
         # `bin/sd-review` +15, `unresolved` keeps only blockers still open
         # at the last completed pass (pack sd:10008), and ECHO_LINES bounds
         # a summary's repeat. Measured: `sd-review` is 3014 here.
+        #
+        # 4984 -> 5027 is the build/sd-1423 class pass on a prior
+        # blocker's place: `bin/sd-review` +43, `diff_lines` and
+        # `prior_at._moved` follow code moved unfixed within or across
+        # files, plus one line for a nearby repeat answering its blocker.
+        # Measured: `sd-review` is 3057 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4984,
+            5027,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

@@ -1854,10 +1854,36 @@ def moved_line(diff: str, line: int) -> int:
     return line + offset
 
 
+def diff_lines(diff: str) -> tuple[dict[tuple[str, int], str], list[tuple[str, int, str]]]:
+    """`git diff -U0` read into its removed lines, by old path and line, and its added ones, as new path, line and
+    text. A quoted path, as git writes an odd name, is read as no path and so matches nothing."""
+    removed: dict[tuple[str, int], str] = {}
+    added: list[tuple[str, int, str]] = []
+    gone = came = ""
+    at = [0, 0]
+    header = False
+    for text in diff.split("\n"):
+        hunk = _HUNK.match(text)
+        if text.startswith("diff --git "):
+            header = True
+        elif hunk:
+            header, at = False, [int(hunk[1]), int(hunk[3])]
+        elif header and text[:4] in ("--- ", "+++ "):
+            name = text[6:] if text[4:6] in ("a/", "b/") else ""
+            gone, came = (name, came) if text[0] == "-" else (gone, name)
+        elif not header and text[:1] == "-":
+            removed[(gone, at[0])], at[0] = text[1:], at[0] + 1
+        elif not header and text[:1] == "+":
+            added.append((came, at[1], text[1:]))
+            at[1] += 1
+    return removed, added
+
+
 def prior_at(root: pathlib.Path, old: str, new: str, rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Each prior blocker's line moved from its own `prior_review.head`, else the prior head `old`, to `new` (lead
     2026-11-22: not the aggregate's latest head; build/sd-1423 review: an insertion above a blocker moved its repeat
-    past `SHIFT_LINES`), and its file through a rename; a line git cannot map stays as stored."""
+    past `SHIFT_LINES`), its file through a rename, and its line with its code when the code moved unchanged
+    (`_moved`); a line git cannot map stays as stored."""
     def _renames(start: str) -> dict[str, str]:
         fields, renamed = (sd_lib.git_output(["diff", "-M", "--name-status", "-z", start, new], root) or "").split("\0"), {}
         while len(fields) > 2:  # `status\0path`, or `R<score>\0from\0to`: walked in order, a path is never a status
@@ -1867,6 +1893,20 @@ def prior_at(root: pathlib.Path, old: str, new: str, rows: Sequence[Mapping[str,
             else:
                 fields = fields[1:]
         return renamed
+
+    trees: dict[str, tuple[dict[tuple[str, int], str], list[tuple[str, int, str]]]] = {}
+    def _moved(start: str, path: str, line: int, renamed: str) -> tuple[str, int] | None:
+        """Where the blocker's own line went when a hunk removed it and its exact text, stripped, came back once:
+        in its own file first, else anywhere in the tree (bin/sd-review:1852: code moved unfixed keeps its
+        blocker). An edited line, or one added in several places, stays at its hunk offset."""
+        if start not in trees:
+            trees[start] = diff_lines(sd_lib.git_output(["-c", "core.quotePath=false", "diff", "-M", "-U0", "--no-color",
+                                                         "--no-ext-diff", start, new], root) or "")
+        removed, added = trees[start]
+        text = removed.get((path, line), "").strip()
+        places = [(name, number) for name, number, body in added if text and body.strip() == text]
+        own = [place for place in places if place[0] == renamed]
+        return own[0] if len(own) == 1 else places[0] if len(places) == 1 else None
 
     def _remapped(row: Mapping[str, Any]) -> dict[str, Any]:
         if row.get("disposition") != "blocking":
@@ -1878,6 +1918,9 @@ def prior_at(root: pathlib.Path, old: str, new: str, rows: Sequence[Mapping[str,
             return dict(row, path=path)
         diff = sd_lib.git_output(["diff", "-M", "-U0", "--no-color", "--no-ext-diff", start, new, "--",
                                   *dict.fromkeys(f":(literal){name}" for name in (row["path"], path))], root)
+        moved = _moved(start, row["path"], row["line"], path) if diff else None
+        if moved:
+            return dict(row, path=moved[0], line=moved[1])
         return dict(row, path=path, line=row["line"] if diff is None else moved_line(diff, row["line"]))
     return [_remapped(row) for row in rows]
 

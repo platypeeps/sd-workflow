@@ -294,6 +294,42 @@ class PriorLineTests(RepeatFixture):
                                      repro=True, prior=moved)
         self.assertEqual(record["disposition"], "blocking")
 
+    def test_a_blocker_follows_its_code_moved_within_its_file(self) -> None:
+        """build/sd-1423 review (bin/sd-review:1852), class pass: moving `broken_call()` unfixed from line 10 to
+        line 100 left the blocker at line 9, so an uncited repeat at 100 posted as advisory. A removed line whose
+        exact text is added once elsewhere follows it; an edited or ambiguous line keeps its hunk offset."""
+        body = ["".join(f"line{n}\n" for n in range(1, 10)), "    broken_call()\n",
+                "".join(f"line{n}\n" for n in range(11, 101))]
+        (self.root / "src.py").write_text("".join(body), encoding="utf-8")
+        old = self.commit("add", "src.py") and self.commit("old")
+        (self.root / "src.py").write_text(body[0] + body[2] + "broken_call()\n", encoding="utf-8")
+        new = self.commit("add", "src.py") and self.commit("moved")
+        prior = [dict(finding(REPRO, line=10, summary="broken_call crashes"), disposition="blocking")]
+        moved = sd_review.prior_at(self.root, old, new, prior)
+        self.assertEqual([(row["path"], row["line"]) for row in moved], [("src.py", 100)])
+        [record] = sd_review.dispose([finding(line=100, summary="broken_call crashes")], "high",
+                                     repro=True, prior=moved)
+        self.assertEqual((record["disposition"], record.get("evidence")), ("blocking", REPRO))
+        # Fixed while moved: the text differs, so the blocker keeps its offset and its repeat needs evidence.
+        (self.root / "src.py").write_text(body[0] + body[2] + "fixed_call()\n", encoding="utf-8")
+        fixed = self.commit("add", "src.py") and self.commit("fixed")
+        self.assertEqual([row["line"] for row in sd_review.prior_at(self.root, old, fixed, prior)], [9])
+
+    def test_a_blocker_follows_its_code_moved_to_another_file(self) -> None:
+        """Class pass on bin/sd-review:1852: the same move into another file, not a rename, left the blocker
+        on src.py, so the repeat at helpers.py posted as advisory."""
+        body = "".join(f"line{n}\n" for n in range(1, 10)) + "    broken_call()\n" + "tail\n"
+        (self.root / "src.py").write_text(body, encoding="utf-8")
+        (self.root / "helpers.py").write_text("".join(f"h{n}\n" for n in range(1, 30)), encoding="utf-8")
+        old = self.commit("add", "src.py", "helpers.py") and self.commit("old")
+        (self.root / "src.py").write_text(body.replace("    broken_call()\n", ""), encoding="utf-8")
+        (self.root / "helpers.py").write_text("".join(f"h{n}\n" for n in range(1, 30)) + "    broken_call()\n",
+                                              encoding="utf-8")
+        new = self.commit("add", "src.py", "helpers.py") and self.commit("moved")
+        prior = [dict(finding(REPRO, line=10, summary="broken_call crashes"), disposition="blocking")]
+        moved = sd_review.prior_at(self.root, old, new, prior)
+        self.assertEqual([(row["path"], row["line"]) for row in moved], [("helpers.py", 30)])
+
     def test_a_blocker_follows_its_file_through_a_rename(self) -> None:
         """build/sd-1423 review (bin/sd-review:1839): renaming src.py to renamed.py left the prior blocker on
         src.py, so an uncited repeat at renamed.py posted as advisory though the defect survived the rename."""
