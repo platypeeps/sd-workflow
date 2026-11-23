@@ -17,7 +17,7 @@
 # the behaviour it had before this hook.
 #
 # `SD_SKIP_HOOKS=1` does not skip it. That variable exists because the
-# pre-commit tier costs seconds; this one costs one git call.
+# pre-commit tier costs seconds; this one costs at most four git calls.
 # `--no-verify` still skips it, as it skips every commit-msg hook.
 #
 # Installed by `make hooks` beside the pre-commit tier, as the link
@@ -68,8 +68,9 @@ def main(argv: list[str]) -> int:
     # The hook cannot see the message git saves, so it refuses only a line git certainly keeps.
     # A merge, revert, cherry-pick, rebase or squash merge replays git's own message (sd-ship's
     # catch-up merge runs this hook too); the lane still measures what lands.
-    replaying = any(
-        (path := sd_lib.git_output(["rev-parse", "--git-path", name], root)) and (root / path).exists()
+    gitdir = (sd_lib.git_output(["rev-parse", "--path-format=absolute", "--git-dir"], root) or "").strip()
+    replaying = bool(gitdir) and any(
+        (pathlib.Path(gitdir) / name).exists()
         for name in ("MERGE_HEAD", "REVERT_HEAD", "CHERRY_PICK_HEAD", "SQUASH_MSG",
                      "rebase-merge", "rebase-apply"))
     # A fixup, squash or amend commit carries git's `<kind>! <subject>`, and autosquash removes it.
@@ -84,8 +85,19 @@ def main(argv: list[str]) -> int:
         cut = next((at for at, line in enumerate(lines)
                     if line.startswith(prefixes) and line.endswith(" " + "-" * 24 + " >8 " + "-" * 24)),
                    len(lines))
-        kept = [line.rstrip() for line in lines[:cut] if not line.startswith(prefixes)]
-        long = sd_ship_body.long_lines("\n".join(kept))
+        # Git keeps comment lines under -m/-F and drops its one comment char's lines in the editor,
+        # and either can change the block structure (a fence opens or closes). A line is refused
+        # only when it is long in every reading: all lines kept, and each candidate char dropped.
+        # Git strips only ASCII trailing whitespace.
+        kept = [line.rstrip(" \t\r\v\f") for line in lines[:cut]]
+        refused = None
+        for drop in (None, *prefixes):
+            index = [at for at, line in enumerate(kept) if drop is None or not line.startswith(drop)]
+            found = {index[number - 1] for number, _ in
+                     sd_ship_body.long_lines("\n".join(kept[at] for at in index))}
+            refused = found if refused is None else refused & found
+        long = [(at + 1, len(kept[at])) for at in sorted(refused or ())
+                if not kept[at].startswith(prefixes)]
         if long:
             for number, length in long:
                 print(f"commit-msg: refused, a line is {length} characters (limit {sd_ship_body.LINE_LIMIT}): "

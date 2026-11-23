@@ -311,6 +311,21 @@ class TheHook(HookFixture):
                                 env=clean_environment(), capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def test_a_kept_heading_does_not_unfence_a_code_line(self):
+        """Review round 5: under -F git keeps `# H`, which keeps the line fenced; dropping it unfenced it."""
+        result = self.commit("fix: a subject\n\n- item\n# H\n  ```\n" + "i" * 80 + "\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_an_edited_heading_git_drops_does_not_close_a_fence(self):
+        """The editor path drops `# H`, which keeps the list's fence open; keeping it closed the fence."""
+        draft = self.root.parent / f"{self.root.name}-draft"
+        draft.write_text("fix: a subject\n\n- item\n  ```\n# H\n  " + "i" * 80 + "\n", encoding="utf-8")
+        self.addCleanup(draft.unlink)
+        result = subprocess.run(["git", "commit", "-q", "--allow-empty", "-e", "-m", "x"], cwd=self.root,
+                                env=clean_environment(GIT_EDITOR=f"cp {draft}"), capture_output=True,
+                                text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_a_long_bare_url_or_fenced_line_still_commits(self):
         url = "https://example.test/" + "a" * 80
         result = self.commit(f"fix: a subject\n\n{url}\n\n```\n{'y' * 90}\n```\n")
@@ -320,7 +335,7 @@ class TheHook(HookFixture):
         """pack sd:10212: 19 clones linked a retired pack path, and git skipped the hook silently."""
         link = self.root / ".git" / "hooks" / "commit-msg"
         link.unlink()
-        link.symlink_to("/nonexistent/sd-ai-command-pack/hooks/commit-msg")
+        link.symlink_to(self.root / "gone" / "sd-ai-command-pack" / "hooks" / "commit-msg")
         made = subprocess.run(["make", "hooks"], cwd=self.root, env=clean_environment(),
                               capture_output=True, text=True, check=False)
         self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
