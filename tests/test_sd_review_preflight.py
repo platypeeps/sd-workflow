@@ -161,7 +161,7 @@ class ProviderPreflight(PreflightFixture):
 
     def test_fabricated_findings_fail_the_fixed_empty_protocol_probe(self):
         body = {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({"findings": [
-            {"severity": "high", "family": "correctness", "path": "invented.py", "line": 1,
+            {"severity": "high", "instances": ["src.py:1"], "family": "correctness", "path": "invented.py", "line": 1,
              "summary": "A fabricated finding without any supplied repository."}]})}}]}
         self.client = FakeClient(default=(0, json.dumps(body), "", True))
         result = self.probe()

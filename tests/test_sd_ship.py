@@ -967,7 +967,7 @@ roles:
         """The fixture's reviewer answers one high finding from now on: (program, payload)."""
         program = self.programs / "review-fixture"
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "family": "correctness", "summary": "value is wrong"}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "value is wrong"}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         return program, payload
 
@@ -2400,7 +2400,7 @@ roles:
         self.enable_automatic_copilot()
         provider = self.programs / "review-fixture"
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [{
-            "path": "src.py", "line": 1, "severity": "high",
+            "path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"],
             "family": "correctness", "summary": "value is wrong",
         }]}}
         provider.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
@@ -4214,7 +4214,7 @@ roles:
         answered "there is no durable pull-request receipt to observe"."""
         program = self.programs / "review-fixture"
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "family": "correctness", "summary": "sd2021 finding"}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "sd2021 finding"}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         with self.assertRaises(ship.Refusal):
             self.prepare()
@@ -4714,7 +4714,7 @@ roles:
         program = self.programs / "review-fixture"
         long = "the value is wrong " * 40
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "family": "correctness", "summary": long}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": long}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         head = _git(self.root, "rev-parse", "HEAD")
         for attempt in ("review", "reuse"):
@@ -4734,7 +4734,7 @@ roles:
     def test_fix_verifications_keep_prior_findings_and_refuse_a_pass_past_the_cap(self):
         program = self.programs / "review-fixture"
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "family": "correctness", "summary": "value is wrong"}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "value is wrong"}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         with self.assertRaisesRegex(ship.Refusal, "local review blocking"):
             self.prepare()
@@ -4773,7 +4773,7 @@ roles:
         """
         program = self.programs / "review-fixture"
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "family": "correctness", "summary": "value is wrong"}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "value is wrong"}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         with self.assertRaisesRegex(ship.Refusal, "local review blocking"):
             self.prepare()
@@ -4814,7 +4814,7 @@ roles:
         _git(self.root, "commit", "-m", "change\n\nAuthored-with: human")
         program = self.programs / "review-fixture"
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "family": "correctness", "summary": "value is wrong"}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "value is wrong"}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         with self.assertRaisesRegex(ship.Refusal, "local review blocking"):
             self.prepare()
@@ -4881,7 +4881,7 @@ roles:
         """sd:2600: a restart is for an orphaned review, not a way to drop live findings."""
         program = self.programs / "review-fixture"
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "family": "correctness", "summary": "value is wrong"}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "value is wrong"}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         with self.assertRaisesRegex(ship.Refusal, "local review blocking"):
             self.prepare()
@@ -5133,8 +5133,28 @@ roles:
     def test_a_lead_record_naming_another_repository_is_not_reused(self):
         self.assert_other_subject("it names another subject", repository="fixture/other")
 
-    def test_a_lead_record_that_is_not_clean_is_not_reused(self):
-        self.assert_other_subject("it names another subject", status="advisory")
+    def test_a_blocking_lead_record_is_not_reused(self):
+        self.assert_other_subject("it names another subject", status="blocking")
+
+    def test_an_advisory_build_review_of_the_head_runs_the_gate_only(self):
+        # sd:9767: a build's review that cleared with advisory findings alone
+        # stands for the lane review at the same head; only the gate runs.
+        calls = self.lead_reviewed_branch()
+        self.rewrite_lead_record(status="advisory")
+        head = _git(self.root, "rev-parse", "HEAD")
+        with contextlib.redirect_stderr(io.StringIO()) as said:
+            result = self.prepare()
+        self.assertEqual(result["review_skipped"], "lead-review")
+        self.assertIn(f"lead review reused: the advisory pass of {head[:12]} covers it", said.getvalue())
+        self.assertFalse(calls.exists(), "a reader was called for a head the build's pass covers")
+        self.assertEqual(self.operation().state["review_skipped"]["check"]["status"], "pass")
+
+    def test_an_advisory_build_review_of_a_moved_head_reviews(self):
+        calls = self.lead_reviewed_branch()
+        self.rewrite_lead_record(status="advisory")
+        (self.root / "src.py").write_text("value = 3\n")
+        _git(self.root, "commit", "-qam", "code\n\nAuthored-with: human")
+        self.assert_full_review(calls, "it changed more than a clean merge of origin/main")
 
     def test_a_lead_review_from_a_local_only_base_is_not_reused(self):
         # A missing origin/HEAD makes sd-review diff from local main, which may
@@ -5178,20 +5198,77 @@ roles:
         review = ship.sd_lib.sibling("sd_review_lead_record", "sd-review")
         args = review.build_parser().parse_args(["--scope", "branch"])
         head = _git(self.root, "rev-parse", "HEAD")
-        result = {"status": "advisory", "requested_reviews": 1, "completed_reviews": 1,
-                  "subject": {"base": head, "head": head}}
-        review.record_lead_review(self.root, args, result, dict(os.environ))
-        self.assertIsNone(self.lead_record(), "an advisory pass was recorded")
+        result = {"status": "advisory", "requested_reviews": 1, "completed_reviews": 1, "covers_from": head,
+                  "subject": {"base": head, "head": head}, "binding": review.sd_lib.lead_review_binding(self.root)}
+        with contextlib.redirect_stderr(io.StringIO()) as said:
+            review.record_lead_review(self.root, args, {**result, "binding": {"review_declaration": "older"}},
+                                      dict(os.environ))
+        self.assertIsNone(self.lead_record(), "a pass under another binding was stamped with the current one")
+        review.record_lead_review(self.root, args, {**result, "status": "blocking"}, dict(os.environ))
+        self.assertIsNone(self.lead_record(), "a blocking pass was recorded")
+        with contextlib.redirect_stderr(io.StringIO()):
+            review.record_lead_review(self.root, args, result, dict(os.environ))
+        self.assertEqual(self.lead_record()["status"], "advisory", "an advisory pass was not recorded (sd:9767)")
+        self.connection.execute("DELETE FROM state WHERE key = ?", (self.LEAD_KEY,))
+        self.connection.commit()
         moved = {**result, "status": "clean", "subject": {"base": head, "head": "0" * 40}}
         with contextlib.redirect_stderr(io.StringIO()) as said:
             review.record_lead_review(self.root, args, moved, dict(os.environ))
         self.assertIsNone(self.lead_record(), "a pass of a head HEAD moved from was recorded")
         self.assertIn("not recorded for lane prepare: Refusal: HEAD moved", said.getvalue())
+        short = {**result, "status": "clean", "review_shortfall": {"requested": 2, "eligible": 1}}
+        review.record_lead_review(self.root, args, short, dict(os.environ))
+        self.assertIsNone(self.lead_record(), "a pass one reader short of its policy was recorded")
         with patch.object(review.sd_lib, "import_sd_db", side_effect=OSError("disk full")), \
                 contextlib.redirect_stderr(io.StringIO()) as said:
             review.record_lead_review(self.root, args, {**result, "status": "clean"}, dict(os.environ))
         self.assertIn("sd-review: the clean pass was not recorded for lane prepare: OSError: disk full",
                       said.getvalue())
+
+    def test_a_build_s_passing_verify_round_is_recorded_from_the_fork(self):
+        """Pack sd:9769 with sd:9767: a build's later round verifies over the delta, after a full round 1; its
+        pass stands for the branch, recorded from the fork from origin/main, so the lane reuses it."""
+        self.tiered_branch({"src.py": "value = 2\n"})
+        review = ship.sd_lib.sibling("sd_review_lead_record", "sd-review")
+        head = _git(self.root, "rev-parse", "HEAD")
+        prior = _git(self.root, "rev-parse", "HEAD~1")
+        args = review.build_parser().parse_args(["--scope", "branch", "--verify-report", "prior.json", "--base", prior])
+        fork = _git(self.root, "merge-base", head, "origin/main")
+        result = {"status": "clean", "requested_reviews": 2, "completed_reviews": 2,
+                  "subject": {"base": prior, "head": head}, "binding": review.sd_lib.lead_review_binding(self.root)}
+        for narrow in (None, "0" * 40):  # review of sd:9769: a chain that covers less than the fork stands for nothing
+            with contextlib.redirect_stderr(io.StringIO()):
+                review.record_lead_review(self.root, args, {**result, "covers_from": narrow}, dict(os.environ))
+            self.assertIsNone(self.lead_record(), f"a verify pass covering from {narrow} was recorded")
+        real = review.sd_lib.git_output  # an unread fork and no chain are not one base (None == None)
+        with contextlib.redirect_stderr(io.StringIO()), patch.object(
+                review.sd_lib, "git_output", side_effect=lambda argv, root: None if argv[0] == "merge-base"
+                else real(argv, root)):
+            review.record_lead_review(self.root, args, {**result, "covers_from": None}, dict(os.environ))
+        self.assertIsNone(self.lead_record(), "a verify pass with no chain was recorded against an unread fork")
+        with contextlib.redirect_stderr(io.StringIO()):
+            review.record_lead_review(self.root, args, {**result, "covers_from": fork}, dict(os.environ))
+        record = self.lead_record()
+        self.assertIsNotNone(record, "a build's passing verify round was not recorded")
+        self.assertEqual(record["base"], fork)
+        self.assertEqual(record["head"], head)
+
+    def test_a_plain_pass_that_covers_no_branch_is_not_recorded(self):
+        """Review of sd:9767: `sd-review` clears `covers_from` for a patch-only reader's pass; an advisory
+        answer from it must not let lane prepare run the gate alone."""
+        self.tiered_branch({"src.py": "value = 2\n"})
+        review = ship.sd_lib.sibling("sd_review_lead_record", "sd-review")
+        head = _git(self.root, "rev-parse", "HEAD")
+        args = review.build_parser().parse_args(["--scope", "branch"])
+        base = _git(self.root, "merge-base", head, "origin/main")
+        result = {"status": "advisory", "requested_reviews": 2, "completed_reviews": 2, "covers_from": None,
+                  "subject": {"base": base, "head": head}, "binding": review.sd_lib.lead_review_binding(self.root)}
+        with contextlib.redirect_stderr(io.StringIO()):
+            review.record_lead_review(self.root, args, result, dict(os.environ))
+        self.assertIsNone(self.lead_record(), "a pass covering no branch was recorded for lane reuse")
+        with contextlib.redirect_stderr(io.StringIO()):
+            review.record_lead_review(self.root, args, {**result, "covers_from": base}, dict(os.environ))
+        self.assertIsNotNone(self.lead_record(), "a full pass covering the branch was not recorded")
 
     def assert_tier_reviews(self, files: dict[str, str], policy: str | None = None) -> None:
         calls = self.tiered_branch(files, policy=policy)
@@ -5526,7 +5603,7 @@ roles:
         for index in range(CAP):
             if blockers:
                 payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-                    {"path": "src.py", "line": 1, "severity": "high", "family": "correctness",
+                    {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness",
                      "summary": f"unresolved from pass {index + 1}"}]}}
                 provider.write_text("#!/usr/bin/env python3\nprint(" + repr(json.dumps(payload)) + ")\n")
                 if index:
@@ -6228,7 +6305,7 @@ roles:
         _, _, prior = self.spent_reviews()
         operation = self.operation()
         prior[0]["report"]["findings"] = [{"path": "src.py", "line": 1, "summary": "x" * (sd_review.MAX_OUTPUT_BYTES - 10000),
-                                             "disposition": "blocking", "severity": "high", "family": "correctness"}]
+                                             "disposition": "blocking", "severity": "high", "instances": ["src.py:1"], "family": "correctness"}]
         operation.save(passes=prior, review_preflight_error={"stage": "planning", "kind": "old"})
         head = _git(self.root, "rev-parse", "HEAD")
         operation = self.operation("prepare", "--additional-review-for", head, "--request-reason", "fixture")
@@ -6292,7 +6369,7 @@ roles:
                 if any(str(a).endswith("/sd-check") for a in command):
                     return sd_review.Completed(0, "{}", "")
                 payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-                    {"path": "src.py", "line": 1, "severity": "high", "family": "correctness", "summary": "captured timeout blocker"}]}}
+                    {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "captured timeout blocker"}]}}
                 return sd_review.Completed(0, json.dumps(payload), "")
             report = sd_review.review(root, args, canned, self.environment)
             raise ship.ReviewTimeout({"kind": "watchdog_expired", "allowed_seconds": kwargs["timeout"], "captured_report": report})
