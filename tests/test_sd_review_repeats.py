@@ -561,17 +561,20 @@ class ReproRuleTests(unittest.TestCase):
                                              repro=True, prior=prior)
                 self.assertEqual((record["disposition"], record.get("evidence")), expected)
 
-    def test_a_line_that_cannot_be_placed_holds_its_file(self) -> None:
-        """build/sd-1423 review (bin/sd-review:1821): a reader repeated the empty-input crash at line 10,
-        paraphrased, with the permitted `line: null` and no evidence, and it posted as advisory. A line that
-        cannot be placed may be the blocker's, so on its file it holds (fail closed); another file is free."""
-        for prior_line, line in ((10, None), (None, 12), (None, None)):
+    def test_a_line_that_cannot_be_placed_holds_no_nearby_finding(self) -> None:
+        """build/sd-1423 review (bin/sd-review:1813): a prior blocker with `line: null` made an unrelated,
+        uncited finding at line 200 of its file block after the defect was fixed. A proximity hold needs two
+        placed lines that overlap (lead after round 8), so an unplaced line on either side holds nothing; the
+        blocker's own summary still repeats it and keeps the repro."""
+        for prior_line, line in ((None, 200), (None, 12), (10, None), (None, None)):
             with self.subTest(prior=prior_line, line=line):
                 prior = [dict(finding(REPRO, line=prior_line, summary="Empty input crashes"),
                               disposition="blocking")]
-                disposed = sd_review.dispose([finding(line=line, summary="An empty list raises IndexError"),
-                                              finding(path="b.py", line=line)], "high", repro=True, prior=prior)
-                self.assertEqual([row["disposition"] for row in disposed], ["blocking", "advisory"])
+                unrelated, repeat = sd_review.dispose([finding(line=line, summary="the cache is never cleared"),
+                                                       finding(line=line, summary="empty input crashes")],
+                                                      "high", repro=True, prior=prior)
+                self.assertEqual([(row["disposition"], row.get("evidence")) for row in (unrelated, repeat)],
+                                 [("advisory", None), ("blocking", REPRO)])
 
     def test_a_repeat_below_the_floor_does_not_clear_the_fallback(self) -> None:
         """build/sd-1423 review (bin/sd-review:1811): one reader's exact repeat at medium, under a high floor,
