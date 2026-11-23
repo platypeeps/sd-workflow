@@ -1749,6 +1749,19 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             if kept is not None and lanes[row["id"]] in hosts and lanes[row["id"]] != lane_of(connection, kept[1]):
                 _refuse(connection, row, f"its kept work is in a worktree on {kept[1] or 'the hub'}, which ran build "
                                          f"run {kept[0]}, but its lane moved; drop or Build its items again there")
+        # A bundle a usage limit queued again resumes its worktree and session (below), which stay on the host
+        # that ran it: a lane moved since would claim it where neither is, so the whole bundle blocks, saying
+        # where its work is (review of build/sd-1557).
+        for row in queued:
+            lead = _lead(row)
+            last = connection.execute("SELECT id, owner, step, outcome FROM runner_run WHERE assignment = ? "
+                                      "ORDER BY run DESC LIMIT 1", (lead,)).fetchone() if lead else None
+            if (last is not None and last["outcome"] == RATE_LIMITED and last["step"] not in LANE_STEPS
+                    and lanes[row["id"]] in hosts and lanes[row["id"]] != lane_of(connection, run_host(last["owner"]))):
+                ran_on = run_host(last["owner"]) or "the hub"
+                _refuse(connection, row, f"build run {last['id']} hit the usage limit on {ran_on}, whose worktree "
+                                         f"and session it resumes, but its lane moved; move its lane back to "
+                                         f"{ran_on} and Retry it, or Build its items again here")
         queued = [row for row in queued if lanes[row["id"]] in hosts and not _refused_repo(connection, row)]
         # A bundle's work is on its lead's branch in the repository of the run that made it, not wherever its item
         # reads now: a lead moved since would build fresh there, and a member moved since would still be briefed and
@@ -1873,10 +1886,21 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
                     raise _Moved
                 connection.execute("UPDATE assignment SET budget_minutes = ? WHERE id = ?",
                                    (budget_minutes(connection, [row["item"] for row in bundle]), lead))
+                # A bundle a usage limit queued again resumes as a loss retry does: its step, session and round
+                # (advisory of pack sd:9907, sd:9973). Any other claim starts fresh.
+                last = connection.execute("SELECT step, session_id, review_round, outcome FROM runner_run "
+                                          "WHERE assignment = ? ORDER BY run DESC LIMIT 1", (lead,)).fetchone()
+                limited = last is not None and last["outcome"] == RATE_LIMITED and last["step"] not in LANE_STEPS
+                # A limit in a fix resumes that fix, not the review after it: a review there would charge its
+                # blockers another round (review of build/sd-1557).
+                step = (last["step"] if last["step"] == "fixing" else RESUME.get(last["step"] or "claimed",
+                        last["step"] or "claimed")) if limited else "claimed"
                 ident = _open_run(connection, lead, repo=repo, owner=run_owner(owner, lanes[lead]),
-                                  step="claimed",
+                                  step=step,
                                   model=_model(connection, [row["item"] for row in bundle]),
-                                  work=worktree(repo, lead, root=root), stamp=stamp)
+                                  work=worktree(repo, lead, root=root), stamp=stamp,
+                                  session_id=last["session_id"] if limited else None,
+                                  review_round=last["review_round"] if limited else None)
                 for row in bundle:
                     transition(connection, row["item"], "in_progress", who="build",
                                reason=f"build run {ident} claimed assignment {row['id']}")
@@ -2169,6 +2193,7 @@ def run(connection, ident: str) -> dict:
     if row is None:
         raise BuildRefused(f"no build run {ident}")
     result = dict(row)
+    result["asked_since"] = asked_since(connection, row["assignment"], row["run"])
     result["budget_minutes"] = connection.execute("SELECT budget_minutes FROM assignment WHERE id = ?",
                                                   (row["assignment"],)).fetchone()[0]
     result["members"] = [dict(member) for member in connection.execute(
@@ -2176,6 +2201,19 @@ def run(connection, ident: str) -> dict:
         f"AND ({_in_group()} OR (run_count >= ? AND ? IS NOT NULL)) ORDER BY id = ? DESC, id",
         (row["assignment"], row["assignment"], SCOPE, row["run"], row["released_at"], row["assignment"]))]
     return result
+
+
+def asked_since(connection, lead: int, number: int) -> str:
+    """When run `number` of `lead` reads open questions from: the creation of the fresh claim it resumes, past
+    each loss retry and usage-limit reclaim, as a question asked before a resume still holds its item (lane
+    review of build/sd-1557)."""
+    since = ""
+    for row in connection.execute("SELECT start_step, created_at FROM runner_run WHERE assignment = ? AND run <= ? "
+                                  "ORDER BY run DESC", (lead, number)):
+        since = row["created_at"]
+        if row["start_step"] == "claimed":
+            break
+    return since
 
 
 def open_runs(connection, hosts: Collection[str | None] | None = None) -> list[dict]:
@@ -2247,10 +2285,15 @@ def open_question(connection, items: list[int], since: str, *, pending: bool = F
     if not items:
         return None
     marks = ", ".join("?" for _ in items)
+    # A review withdrawal reopens the question and keeps its ruling (`review.withdraw`): pending, a withdrawn
+    # ruling answers nothing (advisory of PR #1940, sd:9973).
+    withdrawn = ("AND NOT EXISTS (SELECT 1 FROM note pulled WHERE pulled.item = asked.item AND pulled.kind = "
+                 "'decision' AND pulled.body LIKE 'Withdrawn: ruling #' || ruling.id || ' on note #' || asked.id || "
+                 "'%') " if pending else "")
     row = connection.execute(
         f"SELECT asked.id, asked.item FROM note asked WHERE asked.kind = 'question' AND asked.item IN ({marks}) "
         f"AND asked.timestamp >= ? {'AND asked.resolved_at IS NULL' if pending else ''} AND NOT EXISTS (SELECT 1 FROM note ruling WHERE ruling.item = asked.item "
-        f"AND ruling.kind = 'decision' AND ruling.body LIKE 'Ruling on note #' || asked.id || ':%') "
+        f"AND ruling.kind = 'decision' AND ruling.body LIKE 'Ruling on note #' || asked.id || ':%' {withdrawn}) "
         f"ORDER BY asked.id LIMIT 1", (*items, since)).fetchone()
     return dict(row) if row else None
 
@@ -2329,8 +2372,9 @@ def enqueued(connection, ident: str, delivered: Collection[int] | None = None, *
                 f"AND outcome IS NULL AND cancel_requested IS NULL AND (step IS NULL OR step NOT IN ({marks}))",
                 (stamp, ident, *LANE_STEPS)).rowcount != 1:
             return False
-        run = connection.execute("SELECT assignment, created_at FROM runner_run WHERE id = ?", (ident,)).fetchone()
+        run = connection.execute("SELECT assignment, run FROM runner_run WHERE id = ?", (ident,)).fetchone()
         lead = run["assignment"]
+        since = asked_since(connection, lead, run["run"])
         connection.execute("UPDATE runner_lease SET released_at = ? WHERE run = ? AND released_at IS NULL", (stamp, ident))
         members = _members(connection, lead)
         skipped = [member for member in members if delivered is not None and member["item"] not in delivered]
@@ -2340,7 +2384,7 @@ def enqueued(connection, ident: str, delivered: Collection[int] | None = None, *
                                    (stamp, f"build run {ident} enqueued in {held_by}", member["id"]))
         for member in skipped:
             missing = f"build run {ident} enqueued no commit with a `Closes: sd:{member['item']}` trailer"
-            if open_question(connection, [member["item"]], run["created_at"]):
+            if open_question(connection, [member["item"]], since):
                 _block(connection, [member], f"{missing}, so the merge leaves this item open", stamp)
             else:
                 connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",
