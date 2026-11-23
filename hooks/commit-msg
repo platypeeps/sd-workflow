@@ -64,30 +64,35 @@ def main(argv: list[str]) -> int:
               file=sys.stderr)
         return 1
     message = message_file.read_text(encoding="utf-8", errors="replace")
-    # pack sd:10212: the lane refuses a line over the limit at enqueue, after a full review; warn here.
-    # A merge, revert, cherry-pick or rebase replays git's own message (sd-ship's catch-up merge runs
-    # this hook too), so it is not measured; the lane still measures what lands.
+    # pack sd:10212: the lane refuses a line over the limit at enqueue, after a full review; refuse it here.
+    # The hook cannot see the message git saves, so it refuses only a line git certainly keeps.
+    # A merge, revert, cherry-pick, rebase or squash merge replays git's own message (sd-ship's
+    # catch-up merge runs this hook too); the lane still measures what lands.
     replaying = any(
         (path := sd_lib.git_output(["rev-parse", "--git-path", name], root)) and (root / path).exists()
-        for name in ("MERGE_HEAD", "REVERT_HEAD", "CHERRY_PICK_HEAD", "rebase-merge", "rebase-apply"))
-    if not replaying:
-        # Git drops comment lines, a verbose commit's diff below the scissors and trailing spaces
-        # after this hook runs. The refusal quotes the line, since that cleanup can renumber lines.
-        # ponytail: comment lines are skipped though git keeps them under -m/-F, and commentChar=auto
-        # reads as `#`; the lane still refuses such a line (filed with the --body-only advisory).
-        char = (sd_lib.git_output(["config", "core.commentChar"], root) or "").strip()
-        char = char if char and char != "auto" else "#"
-        above = message.split(f"\n{char} " + "-" * 24 + " >8 " + "-" * 24 + "\n", 1)[0]
-        kept = [line.rstrip() for line in above.split("\n") if not line.startswith(char)]
+        for name in ("MERGE_HEAD", "REVERT_HEAD", "CHERRY_PICK_HEAD", "SQUASH_MSG",
+                     "rebase-merge", "rebase-apply"))
+    # A fixup, squash or amend commit carries git's `<kind>! <subject>`, and autosquash removes it.
+    if not replaying and not message.startswith(("fixup! ", "squash! ", "amend! ")):
+        # Comment lines: any char git's `auto` may pick, or the configured string; a verbose diff
+        # sits below a scissors line in that char. ponytail: such a line is skipped even where git
+        # keeps it (-m/-F); the lane refuses it (filed with the --body-only advisory).
+        prefixes = tuple("#;@!$%^&|:") + tuple(
+            value.strip() for key in ("core.commentString", "core.commentChar")
+            if (value := sd_lib.git_output(["config", key], root) or "").strip() not in ("", "auto"))
+        lines = message.split("\n")
+        cut = next((at for at, line in enumerate(lines)
+                    if line.startswith(prefixes) and line.endswith(" " + "-" * 24 + " >8 " + "-" * 24)),
+                   len(lines))
+        kept = [line.rstrip() for line in lines[:cut] if not line.startswith(prefixes)]
         long = sd_ship_body.long_lines("\n".join(kept))
-        # A warning, not a refusal: the hook cannot see the message git saves (comment string, fixup,
-        # cleanup mode), and four review rounds each found a valid commit it refused. The lane refuses.
-        for number, length in long:
-            print(f"commit-msg: warning, a line is {length} characters (limit {sd_ship_body.LINE_LIMIT}): "
-                  f"{kept[number - 1][:40]}...", file=sys.stderr)
         if long:
-            print("sd-ship refuses it at enqueue; reword now with `git commit --amend` (before any review). "
-                  "A fenced code line or a bare URL line is exempt.", file=sys.stderr)
+            for number, length in long:
+                print(f"commit-msg: refused, a line is {length} characters (limit {sd_ship_body.LINE_LIMIT}): "
+                      f"{kept[number - 1][:40]}...", file=sys.stderr)
+            print("Rewrap it; a fenced code line or a bare URL line is exempt. "
+                  "The rejected message is kept in .git/COMMIT_EDITMSG.", file=sys.stderr)
+            return 1
     if not sd_lib.unread_trailers(message, ""):  # states none of the checked trailers
         return 0
     parsed = sd_lib.git_output(

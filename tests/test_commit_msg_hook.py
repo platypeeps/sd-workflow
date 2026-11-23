@@ -208,16 +208,50 @@ class TheHook(HookFixture):
         self.assertEqual("sd:7", git(
             "log", "-1", "--format=%(trailers:key=Delivers,valueonly)", cwd=self.root).strip())
 
-    def test_a_line_over_72_characters_warns_at_commit_time(self):
-        """pack sd:10212: 27 lane refusals in 7 days named a commit line; the hook warns, the lane refuses.
-
-        A warning, not a refusal: the hook cannot see the message git saves (comment string, fixup,
-        cleanup mode), and four review rounds each found a valid commit it refused (lead, round 4).
-        """
+    def test_a_line_over_72_characters_is_refused_at_commit_time(self):
+        """pack sd:10212: 27 lane refusals in 7 days named a commit line the hook let through (operator: hard limit)."""
         result = self.commit("fix: a subject\n\n" + "x" * 73 + "\n")
+        self.assertNotEqual(result.returncode, 0, "the commit went through")
+        self.assertIn("commit-msg: refused, a line is 73 characters (limit 72): xxxx", result.stderr)
+        self.assertEqual(0, self.commits(), "a commit landed")
+
+    def verbose(self, *config: str) -> subprocess.CompletedProcess[str]:
+        (self.root / "wide.txt").write_text("w" * 90 + "\n", encoding="utf-8")
+        git("add", "wide.txt", cwd=self.root)
+        flags = [arg for pair in config for arg in ("-c", pair)]
+        return subprocess.run(["git", *flags, "commit", "-q", "-v", "-e", "-m", "fix: a", "-m", "#hash body"],
+                              cwd=self.root, env=clean_environment(GIT_EDITOR="true"), capture_output=True,
+                              text=True, check=False)
+
+    def test_a_verbose_commit_with_an_auto_comment_char_commits(self):
+        """Review round 4: `auto` picks another char when a line starts with `#`; the scissors move with it."""
+        result = self.verbose("core.commentChar=auto")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("commit-msg: warning, a line is 73 characters (limit 72): xxxx", result.stderr)
-        self.assertIn("sd-ship refuses it at enqueue", result.stderr)
+
+    def test_a_verbose_commit_with_a_comment_string_commits(self):
+        """Review round 4: core.commentString (git 2.45+) is not core.commentChar."""
+        result = self.verbose("core.commentString=//")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_fixup_of_a_long_subject_commits(self):
+        """Review round 4: `fixup! <subject>` is git's line, and autosquash removes it."""
+        self.assertEqual(self.commit("fix: " + "f" * 67 + "\n").returncode, 0)
+        result = subprocess.run(["git", "commit", "-q", "--allow-empty", "--fixup", "HEAD"], cwd=self.root,
+                                env=clean_environment(), capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_squash_merge_commit_commits(self):
+        """Review round 4: `git merge --squash` then `git commit` keeps git's SQUASH_MSG."""
+        self.assertEqual(self.commit("fix: base\n").returncode, 0)
+        git("checkout", "-q", "-b", "side", cwd=self.root)
+        (self.root / "s.txt").write_text("s\n", encoding="utf-8")
+        git("add", "s.txt", cwd=self.root)
+        self.assertEqual(self.commit("fix: " + "s" * 67 + "\n").returncode, 0)
+        git("checkout", "-q", "-", cwd=self.root)
+        git("merge", "-q", "--squash", "side", cwd=self.root)
+        result = subprocess.run(["git", "commit", "-q", "--no-edit"], cwd=self.root,
+                                env=clean_environment(), capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_a_verbose_commit_is_measured_above_the_scissors_only(self):
         """`git commit -v` appends the diff below a scissors line, and git drops it after the hook runs."""
@@ -236,7 +270,6 @@ class TheHook(HookFixture):
     def test_the_refusal_quotes_the_line_it_measured(self):
         result = self.commit("fix: a subject\n\n\n\n" + "q" * 73 + "\n")
         self.assertIn("qqqqqqqqqq", result.stderr)
-        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_a_merge_commit_is_not_measured(self):
         """Review round 2: git runs commit-msg for `git merge`; sd-ship's catch-up merge must not abort."""
