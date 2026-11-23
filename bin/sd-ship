@@ -970,9 +970,10 @@ class Ship(SharedReview):
         gave it. It is the renewal's when it is the published body itself, as
         an entry enqueued with that body is, or when its words are the
         recorded basis of the published body. A published body with no
-        recorded basis, one a prepare took from the pull request or from a
-        receipt older than the record, has no words to hold the entry to: the
-        entry then has to be that body, the lane's section apart.
+        recorded basis, one a prepare took from a pull request edited on
+        GitHub or from a receipt older than the record, is not guessed at:
+        the entry proceeds only when the lane recorded drawing exactly that
+        body from an entry of these words (`drawn_by_lane`).
         """
         if entry is None:
             raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this prepare's body is "
@@ -983,8 +984,7 @@ class Ship(SharedReview):
                           state="retryable_failure")
         published = self.normal(self.state.get("body"))
         recorded = (self.state.get("body_bases") or {}).get(digest(published))
-        if entry == published or (basis == recorded if recorded else
-                                  published.startswith(entry) and sd_lane.only_shots(published[len(entry):])):
+        if entry == published or (basis == recorded if recorded else self.drawn_by_lane(entry, published)):
             return
         raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this lane entry was "
                       f"enqueued with another body, as a retry of an entry enqueued before the renewal is; "
@@ -994,6 +994,18 @@ class Ship(SharedReview):
                       code="delivery_claim_renewed", boundary="input", state="operator_decision",
                       next_action="Enqueue the item again with the body the renewal published, or prepare by "
                                   "hand with this entry's body, then retry.")
+
+    def drawn_by_lane(self, entry: str, published: str) -> bool:
+        """Whether `published` is a body the lane recorded making from an entry whose body is `entry`.
+
+        Each ended entry's row keeps the PNGs its run drew (`shots`), so the
+        body that run gave prepare is its body with `sd_lane.with_shots` of
+        them: a record, where the section's shape is a guess that also fits
+        a bullet someone edited on GitHub. No such row is no match.
+        """
+        return any(published == self.normal(sd_lane.with_shots(str(row.get("body") or ""), row["shots"]))
+                   for row in self.lane_entries()[0]
+                   if isinstance(row.get("shots"), list) and row["shots"] and self.normal(row.get("body")) == entry)
 
     def bases_with(self, body: str, basis: str | None) -> dict:
         """The receipt's `body_bases` with this prepare's body: the digest of each text a prepare published, to
@@ -1023,23 +1035,31 @@ class Ship(SharedReview):
         nothing but the lane's section after it; a prepare that outlived its
         runner has neither, and borrows no newer entry's row.
 
-        A body file's words are its text, whatever an earlier prepare
+        Any other lane prepare, one no row vouches for or whose queue does
+        not read, records no words: its body file may hold the lane's section.
+
+        A body file by hand is its text, whatever an earlier prepare
         published. A body this prepare took from the pull request or the
         receipt has the words recorded for that text (`body_bases`), and None
         when no prepare recorded any, as on a receipt older than the record.
+        Where None is recorded, `refuse_other_body` asks the lane's own
+        record of its runs, and never guesses.
         """
         if self.args.no_item:
             return None, None
         given = self.normal(body)
         try:
-            rows = self.running_entries() if self.lane_started() else []
+            lane = self.lane_started()
+            rows = self.running_entries() if lane else []
         except Refusal:  # a queue that does not read: `renewal` refuses where the answer matters
-            rows = []
+            lane, rows = True, []
         rows = [row for row in rows if (row.get("holder") or {}).get("pid") == os.getppid()]
         if len(rows) == 1:
             entry = self.normal(rows[0].get("body"))
             if given.startswith(entry) and sd_lane.only_shots(given[len(entry):]):
                 return digest(entry), entry
+        if lane:  # the lane's body file may hold its section, and no row says which words are the entry's
+            return None, None
         if self.body_source == "file":
             return digest(given), None
         return (self.state.get("body_bases") or {}).get(digest(given)), None
@@ -1091,6 +1111,13 @@ class Ship(SharedReview):
 
     def running_entries(self) -> list[dict]:
         """This item's running lane entries held on this host; a queue that does not read refuses `lane_unknown`."""
+        rows, host = self.lane_entries()
+        return [row for row in rows if row.get("status") == "running"
+                and (row.get("holder") or {}).get("host") == host]
+
+    def lane_entries(self) -> tuple[list[dict], str]:
+        """This item's lane entries, ended ones too, and this host's name; a queue that does not read refuses
+        `lane_unknown`."""
         sd_lib.import_sd_db()  # the gateway first, as for every sd_db import here
         from sd_db.errors import SdDbError
         try:
@@ -1100,8 +1127,7 @@ class Ship(SharedReview):
                           f"prepare is unknown, and sd:{self.args.item}'s delivery claim is not renewed; prepare "
                           f"again once the queue reads", code="lane_unknown", boundary="database",
                           state="retryable_failure") from None
-        return [row for row in rows if row.get("item") == self.args.item and row.get("status") == "running"
-                and (row.get("holder") or {}).get("host") == host]
+        return [row for row in rows if row.get("item") == self.args.item], host
 
     def body_input(self, default: str) -> tuple[str, str]:
         """The body to publish and where it came from (sd:1870).

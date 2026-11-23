@@ -4774,32 +4774,38 @@ roles:
                 self.prepare("--deliver", "--item", str(kept))  # an entry with the renewal's items proceeds
         self.assertEqual(self.operation().state["closing"]["items"], [kept])
 
-    def lane_runs(self, body: str, status: str = "running", pid: int | None = None) -> None:
+    def lane_runs(self, body: str, status: str = "running", pid: int | None = None, entry: str = "e-running",
+                  shots: tuple[str, ...] = ()) -> None:
         """The entry the lane holds while it prepares this item, with the `body` it was enqueued with; its
-        runner is this prepare's parent, as the lane's is, or `pid`."""
+        runner is this prepare's parent, as the lane's is, or `pid`. An ended entry keeps the `shots` its run
+        drew, as the lane's does."""
         sd_lane = ship.sd_lane
         sd_lane.store(self.connection, ship.slug(REMOTE_URL), {
-            "id": "e-running", "position": 1, "item": self.item, "status": status, "step": "prepare",
-            "body": body, "holder": {"host": sd_lane.this_host(), "pid": pid or os.getppid(), "token": "t"}})
+            "id": entry, "position": 1, "item": self.item, "status": status, "step": "prepare",
+            "body": body, "holder": {"host": sd_lane.this_host(), "pid": pid or os.getppid(), "token": "t"},
+            **({"shots": list(shots)} if shots else {})})
         self.connection.commit()
 
     @contextlib.contextmanager
-    def as_lane(self, body: str | None = None):
+    def as_lane(self, body: str | None = None, shots: tuple[str, ...] = ()):
         """A prepare inside is the lane's: the runner's mark and its running entry, enqueued with `body`, or
-        with the published body. The entry ends with the block, as a runner's does."""
+        with the published body. The entry is a new one each time, as a retry's is, and ends with the block,
+        as a runner's does, the `shots` its run drew on its row."""
         body = (self.operation().state.get("body") or "") if body is None else body
-        self.lane_runs(body)
+        self.lane_entries = getattr(self, "lane_entries", 0) + 1
+        entry = f"e-{self.lane_entries}"
+        self.lane_runs(body, entry=entry)
         try:
             with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}):
                 yield
         finally:
-            self.lane_runs(body, "failed")
+            self.lane_runs(body, "failed", entry=entry, shots=shots)
 
     def lane_prepare(self, entry: str, shots: tuple[str, ...] = ()) -> dict:
         """A lane prepare of an entry enqueued with body `entry`, the lane having drawn `shots`."""
         body = self.directory / "lane-body.md"
         body.write_text(ship.sd_lane.with_shots(entry, list(shots)) if shots else entry)
-        with self.as_lane(entry), contextlib.redirect_stderr(io.StringIO()):
+        with self.as_lane(entry, shots), contextlib.redirect_stderr(io.StringIO()):
             return self.prepare("--deliver", "--body-file", str(body))
 
     def renewed_by_hand(self, first: str, renewal: str | None, lane: bool = False) -> None:
@@ -4901,6 +4907,46 @@ roles:
         self.assertIn("## Screenshots", state["body"])
         with self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body"):
             self.lane_prepare("Body A.\n")
+        self.assertEqual(self.lane_prepare("Body B.\n", ("queue-light-390.png",))["phase"], "ready_to_send")
+
+    def test_a_section_edited_on_the_pull_request_is_not_the_lanes(self):
+        """Review of build/sd-1636, the class (a missing record answered by a guess): a renewal took a body
+        edited on GitHub, which no prepare had recorded, and the check then read any bullets under the lane's
+        heading as the lane's, so the old entry retried and replaced the operator's edit. With no record of
+        the body's words, the entry proceeds only when the published body is that entry with the very
+        Screenshots section a lane run recorded drawing for it."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        self.assertEqual(self.lane_prepare("Body B.\n", ("queue-dark-1280.png",))["phase"], "ready_to_send")
+        pull = self.remote.pull(1)
+        self.assertIn("- queue: dark 1280", pull.body)
+        pull.body = pull.body.replace("- queue: dark 1280", "- queue: dark 1280, checked by hand")
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver")
+        state = self.operation().state
+        self.assertTrue(state["acceptance"].get("renewed"))
+        self.assertIn("checked by hand", state["body"])
+        for shots in ((), ("queue-dark-1280.png",)):
+            with self.subTest(shots=shots), self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body"):
+                self.lane_prepare("Body B.\n", shots)
+        self.assertIn("checked by hand", self.operation().state["body"])
+
+    def test_a_lane_body_no_row_vouched_for_is_recorded_as_nobodys_words(self):
+        """The class, from the code: a lane prepare whose queue read failed recorded its body file, the lane's
+        section in it, as its own words, so a later renewal took that record and refused the unchanged entry.
+        A lane's body is its entry's words only when a row says so; with none, nothing is recorded, and the
+        lane's own record of the run answers."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        with patch.object(ship.sd_lane, "stored", side_effect=ValueError("queue down")):
+            self.assertEqual(self.lane_prepare("Body B.\n", ("queue-dark-1280.png",))["phase"], "ready_to_send")
+        state = self.operation().state
+        self.assertEqual(list(state["body_bases"].values()), [None])
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver")
+        self.assertTrue(self.operation().state["acceptance"].get("renewed"))
         self.assertEqual(self.lane_prepare("Body B.\n", ("queue-light-390.png",))["phase"], "ready_to_send")
 
     def test_an_entry_enqueued_with_the_published_body_proceeds(self):
