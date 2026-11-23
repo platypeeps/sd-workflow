@@ -2113,9 +2113,12 @@ def process(entry: dict[str, Any], queue: Queue, ship: Ship, advance: Callable[.
     refused = merge_refusal(entry)
     if refused is not None:
         return {**fields, "status": "prepared", **refused}
-    landing = train_landing(entry, queue, ship, str(prepared.get("head")), logs / stamp, renewed, deadline, advance)
+    landing, refused = train_landing(entry, queue, ship, str(prepared.get("head")), logs / stamp, renewed, deadline,
+                                     advance)
     if landing is not None:  # landed, its merge below reconciles; else it merges alone (sd:9923)
         fields["train_landing"] = landing
+    if refused is not None:
+        return {**fields, "status": "prepared", **refused}
     merge_log = logs / f"merge-{item}-{stamp}.log"
     merged = ship(["-C", str(worktree), "merge", "--item", str(item), "--expected-head", str(prepared.get("head")),
                    "--manual", "--watch", "--wait-seconds", str(MERGE_WAIT_SECONDS), "--json"], merge_log)
@@ -2131,8 +2134,13 @@ def process(entry: dict[str, Any], queue: Queue, ship: Ship, advance: Callable[.
 
 
 def train_landing(entry: dict[str, Any], queue: Queue, ship: Ship, head: str, logs: pathlib.Path,
-                  renewed: Callable[[], None], deadline: float, advance: Callable[..., None]) -> dict[str, Any] | None:
-    """`land_as_train`'s answer, then `step: merge` unless the train landed and the merge after it only reconciles."""
+                  renewed: Callable[[], None], deadline: float,
+                  advance: Callable[..., None]) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """`land_as_train`'s answer, then `step: merge` unless the train landed and the merge after it only reconciles.
+
+    A train takes minutes, so the entry's merge authority is read again
+    before it merges alone; the second value is its refusal (sd:9923).
+    """
     try:
         landing = land_as_train(entry, queue, ship, head, logs, renewed, deadline, lambda: advance("train"))
     except Stop:
@@ -2140,8 +2148,11 @@ def train_landing(entry: dict[str, Any], queue: Queue, ship: Ship, head: str, lo
     except Exception as error:  # a train that breaks lands nothing it did not record; the merge after decides
         landing = {"status": "error", "reason": f"{type(error).__name__}: {error}"[:REASON_CHARS]}
     if (landing or {}).get("status") != "merged":
+        refused = merge_refusal(entry)
+        if refused is not None:
+            return landing, refused
         advance()
-    return landing
+    return landing, None
 
 
 def draw_shots(worktree: pathlib.Path, out: pathlib.Path) -> dict[str, Any]:
@@ -2860,6 +2871,9 @@ def train_stop(joined: list[Joined], queue: Queue,
         if frozen is not None:
             return frozen
         rows = {row["id"]: row for row in read_queue(queue)}
+        refused = merge_refusal(joined[0][0])
+        if refused is not None:
+            return f"sd:{joined[0][0]['item']}: {refused['reason']}"
         gone = [row["item"] for row, *_ in joined[1:]
                 if not runnable(rows.get(row["id"]) or {}) or merge_refusal(rows[row["id"]]) is not None
                 or rows[row["id"]].get("expected_head") != row["expected_head"]]

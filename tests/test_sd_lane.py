@@ -2184,6 +2184,27 @@ class TrainLanding(Trees):
         self.assertEqual(seen, [("train", "pending")])
         self.assertEqual(self.entries()[0]["status"], "merged")
 
+    def assert_authority_withdrawn_during_the_gate_lands_nothing(self, manual: tuple[bool, bool, bool]) -> None:
+        """Review of sd:9923: `repo.runner_merge` turned manual during the gate, and the lead was not read again."""
+        setting = ["auto"]
+        self.during_gate = lambda: setting.__setitem__(0, "manual")
+        with mock.patch.object(sd_lane, "default_runner_merge", lambda root: setting[0]):
+            for item, tree, by_hand in zip((1, 2, 3), (self.first, self.second, self.third), manual, strict=True):
+                sd_lane.enqueue_entry(tree, item, f"fix: {item}", self.body, self.environ, manual=by_hand,
+                                      claim="deliver")
+            sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertEqual(self.landed[0][3], [1, 2, 3])
+        lead = self.entries()[0]
+        self.assertEqual(lead["train_landing"]["status"], "failed")
+        self.assertNotIn(1, self.merges())  # no train landing and no lone merge for the lead
+        self.assertEqual(lead["status"], "prepared")
+
+    def test_a_lead_whose_authority_ends_during_the_gate_lands_no_train(self) -> None:
+        self.assert_authority_withdrawn_during_the_gate_lands_nothing((False, True, True))
+
+    def test_a_lead_whose_train_stopped_on_authority_does_not_merge_alone(self) -> None:
+        self.assert_authority_withdrawn_during_the_gate_lands_nothing((False, False, True))
+
     def test_a_member_cancelled_during_the_train_lands_nothing(self) -> None:
         def cancel_second() -> None:
             sd_lane.update(self.store(), lambda rows: rows[1].update(status="cancelled"))
