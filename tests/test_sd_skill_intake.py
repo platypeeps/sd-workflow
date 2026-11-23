@@ -62,7 +62,7 @@ class IntakeCase(unittest.TestCase):
         self.home = base / "home"
         for folder in (self.upstream, self.root / "skills", self.root / "contrib", self.home / ".claude" / "skills"):
             folder.mkdir(parents=True)
-        self.write(self.root / "skills" / "sd-plan", PLANNER.replace("planner", "sd-plan"))
+        self.write(self.root / "skills" / "sd-example", PLANNER.replace("planner", "sd-example"))
         self.git("init", "-q", "-b", "main")
         self.write(self.upstream / "skills" / "ledger", GOOD)
         self.write(self.upstream / "skills" / "installer", RISKY,
@@ -134,7 +134,7 @@ class TheVerdict(IntakeCase):
 
     def test_a_close_match_folds_into_the_installed_skill(self) -> None:
         report = self.intake(URL.format("planner"))
-        self.assertEqual(report["match"][0]["skill"], "sd-plan")
+        self.assertEqual(report["match"][0]["skill"], "sd-example")
         self.assertEqual(report["verdict"]["action"], "fold")
 
     def test_a_failed_fetch_is_an_error_not_a_verdict(self) -> None:
@@ -361,8 +361,8 @@ class TheReimport(IntakeCase):
         self.assertEqual(self.installed.stat().st_mode & 0o777, 0o755)
 
     def test_a_name_with_no_recorded_source_is_refused(self) -> None:
-        with self.assertRaisesRegex(intake.IntakeError, "no installed skill sd-plan"):
-            self.intake("sd-plan")
+        with self.assertRaisesRegex(intake.IntakeError, "no installed skill sd-example"):
+            self.intake("sd-example")
 
 
 class TheSteps(IntakeCase):
@@ -579,7 +579,7 @@ class TheRollback(RollbackCase):
         self.assertEqual(os.readlink(self.installed / "guide.md"), "SKILL.md")
         self.rollback()  # unchanged: the plan names the link as it landed
         (self.installed / "guide.md").unlink()
-        (self.installed / "guide.md").symlink_to("../sd-plan/SKILL.md")
+        (self.installed / "guide.md").symlink_to("../sd-example/SKILL.md")
         self.assert_refused()
 
     def test_an_empty_folder_or_a_fifo_added_is_refused(self) -> None:
@@ -606,8 +606,8 @@ class TheRollback(RollbackCase):
         self.assertEqual(self.tree(), before)
 
     def test_a_skill_with_no_kept_copy_is_refused(self) -> None:
-        with self.assertRaisesRegex(intake.IntakeError, "no kept copy of sd-plan"):
-            self.rollback("sd-plan")
+        with self.assertRaisesRegex(intake.IntakeError, "no kept copy of sd-example"):
+            self.rollback("sd-example")
 
     def test_a_stop_between_the_swaps_puts_the_installed_copy_back(self) -> None:
         report = self.rollback()

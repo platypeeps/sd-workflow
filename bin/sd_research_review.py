@@ -20,7 +20,7 @@ mechanically separable, and a check that fires on correct behaviour teaches
 people to ignore the output.
 
 Checked here but owned elsewhere: work items under `docs/work/`. They follow
-`sd-plan`, not the research conventions, and `sd-docs-lint` is their linter —
+the workflow's work-item rules, not the research conventions, and `sd-docs-lint` is their linter —
 but a repository following both standards used to get "Mechanical checks pass"
 from this tool while the other one was failing, so the lint is run when the
 directory exists.
@@ -115,7 +115,7 @@ def work_items(repo):
     """Work items belong to `sd-docs-lint`; saying nothing about them is the bug.
 
     A repository can follow both standards at once: `sd-research-repo` governs
-    the documents named in `research.conf.py`, `sd-plan` governs the items under
+    the documents named in `research.conf.py`, the workflow governs the items under
     `docs/work/`. Nothing connected the two linters, so `review` could print
     "Mechanical checks pass" in a repository whose work items were failing
     `sd-docs-lint` — a sentence true about this tool's own scope and false about

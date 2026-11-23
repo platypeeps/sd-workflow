@@ -1,8 +1,9 @@
 """Retired skills: their directories are gone and nothing live names them.
 
 sd-presentation and sd-publish went in sd:8286. The contrib skills below
-were never used once and went in sd:9062 (grill system sd:9044);
-reinstate one from git history when a need appears.
+were never used once and went in sd:9062 (grill system sd:9044); the
+last group, unused for 60 days, went in sd:10156. Reinstate one from git
+history when a need appears.
 """
 
 import re
@@ -69,6 +70,17 @@ RETIRED = (
     "sd-typed-holes",
     "sd-video-notes",
     "sd-weekly-review",
+    "sd-author",
+    "sd-brief",
+    "sd-decide",
+    "sd-digest",
+    "sd-explain",
+    "sd-plan",
+    "sd-proposal",
+    "sd-prose-lint",
+    "sd-receive-review",
+    "sd-spec",
+    "sd-technical-editor",
 )
 #: Any name, not followed by more of a name (`sd-publish` is not `sd-publish-x`).
 PATTERN = r"(^|[^-_[:alnum:]])(" + "|".join(re.escape(name) for name in RETIRED) + r")([^-_[:alnum:]]|$)"

@@ -2182,7 +2182,7 @@ def run_check(root: pathlib.Path, runner: Runner, env: Mapping[str, str], timeou
 
 #: Scopes that earn a reviewer whatever the tier said. `planning` is here
 #: because a work item is documentation by path, `docs_skip` routes it to tier
-#: `skip`, and `sd-plan` gates `planning -> ready` on this lane: without the
+#: `skip`, and a planning review gates `planning -> ready` on this lane: without the
 #: floor the gate would pass by asking nobody. The tier decides how deep a
 #: change is read; a scope decides that it is read at all, by both readers (sd:7519).
 FLOOR_SCOPES = ("planning",)
@@ -2384,7 +2384,7 @@ def review(
     policy, source = load_policy(root)
     item = getattr(args, "item", None)
     subject = resolve_subject(root, "branch" if preflight else args.scope, item, getattr(args, "base", None))
-    # `sd-plan` step 4 routes the triad here and step 5 gates `planning -> ready` on this
+    # A planning review routes the triad here and gates `planning -> ready` on this
     # lane, so this is where a `mode: guest` checkout finds out; `sd_lib` owns the rule.
     if subject.scope == "planning" and (refusal := sd_lib.guest_artifact_refusal(root, subject.paths)):
         raise UsageError(refusal)

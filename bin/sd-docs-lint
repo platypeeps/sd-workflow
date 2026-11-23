@@ -549,7 +549,7 @@ def repo_relative(repo: pathlib.Path, value: str) -> tuple[str, str]:
     2's row database are rooted at the checkout the caller is standing in, so
     honouring it would mean re-rooting those rules at a foreign repository --
     a different feature, and one this
-    flag's own contract already denies: skills/sd-plan/SKILL.md calls it a
+    flag's own contract already denies: the retired planning skill called it a
     root within this repository, this parser's help calls it repo-relative,
     and tests/test_verb_inventory.py records that it is not one of the
     options that hand a command a repository other than the caller's.

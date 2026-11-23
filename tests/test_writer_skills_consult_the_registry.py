@@ -13,10 +13,9 @@ live-row id, lands as the rows do and is held by leg a in
 `WRITES_A_FILE` gives over every tracked `skills/*/SKILL.md`, less the names
 `NOT_WRITERS` holds with a reason each. The predicate is a write verb within
 one clause of a file noun, which is how the audit of `8548d512` read the
-skills -- sd-plan "Write from the templates", sd-spec "Rewrites the spec
-pages", sd-debug "Edits in the tree", sd-handoff "writing any file the
+skills -- two since-retired planning and spec skills, sd-debug "Edits in the tree", sd-handoff "writing any file the
 packet's `files[]` lists", sd-humanizer "rewrite the file in place",
-sd-technical-editor "Edit mode authorizes only the supplied draft". It is
+and a since-retired editor skill. It is
 looser than the audit's reading, on purpose: a predicate tight enough to match
 only the six would be the list again, spelled as a regex. So it also matches
 a skill that declares itself read-only in the negative ("It does not

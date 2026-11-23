@@ -65,12 +65,12 @@ PREFIX = "sd-"
 # a missing file for a directory that is correct as it stands.
 SHARED_DIR = "_shared"
 
-# The eight commands, spelled here rather than imported: this tool refuses a
+# The six commands, spelled here rather than imported: this tool refuses a
 # collision with one of them, and it must be able to do that while standing in
 # some other repository entirely, where the pack's own `skills/` is not on disk.
 COMMANDS = frozenset({
-    "sd-plan", "sd-check", "sd-review", "sd-ship", "sd-spec", "sd-status",
-    "sd-skill-adopt", "sd-handoff",
+    "sd-check", "sd-review", "sd-ship", "sd-status", "sd-skill-adopt",
+    "sd-handoff",
 })
 
 MARKER = "disable-model-invocation"

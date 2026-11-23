@@ -483,11 +483,11 @@ class OneShapeOnDisk(WriteCase):
         self.assertEqual(stamp("2026-09-06T14:11:39-05:00"), "2026-09-06T19:11:39+00:00")
 
     def test_a_trial_expiry_lands_normalized(self):
-        start_trial(self.connection, "sd-decide", "2099-01-01T00:00:00Z")
+        start_trial(self.connection, "sd-example-a", "2099-01-01T00:00:00Z")
         self.assertEqual(trials(self.connection)[0]["expires"], "2099-01-01T00:00:00+00:00")
 
     def test_a_use_timestamp_lands_normalized(self):
-        record_skill_use(self.connection, "sd-decide", timestamp="2026-01-01T00:00:00Z")
+        record_skill_use(self.connection, "sd-example-a", timestamp="2026-01-01T00:00:00Z")
         row = self.connection.execute("SELECT timestamp FROM skill_use").fetchone()
         self.assertEqual(row["timestamp"], "2026-01-01T00:00:00+00:00")
 
@@ -499,29 +499,29 @@ class OneShapeOnDisk(WriteCase):
         normalization it did not, because `+00:00` < `Z` put the use before
         its own trial.
         """
-        start_trial(self.connection, "sd-decide", "2099-01-01T00:00:00Z")
+        start_trial(self.connection, "sd-example-a", "2099-01-01T00:00:00Z")
         started = trials(self.connection)[0]["started"]
         zulu = started.replace("+00:00", "Z")
         self.assertNotEqual(zulu, started)
-        record_skill_use(self.connection, "sd-decide", timestamp=zulu)
-        self.assertEqual(skill_use_since(self.connection, "sd-decide", started), 1)
+        record_skill_use(self.connection, "sd-example-a", timestamp=zulu)
+        self.assertEqual(skill_use_since(self.connection, "sd-example-a", started), 1)
 
     def test_active_trials_compares_a_passed_moment_in_the_same_shape(self):
-        start_trial(self.connection, "sd-decide", "2026-10-06T00:00:00+00:00")
+        start_trial(self.connection, "sd-example-a", "2026-10-06T00:00:00+00:00")
         # The same instant as the expiry, spelled the other way. Neither
         # spelling may make an expired trial look active.
         self.assertEqual(active_trials(self.connection, "2026-10-06T00:00:00Z"), [])
-        self.assertEqual(active_trials(self.connection, "2026-10-05T23:59:59Z")[0]["skill"], "sd-decide")
+        self.assertEqual(active_trials(self.connection, "2026-10-05T23:59:59Z")[0]["skill"], "sd-example-a")
 
     def test_a_naive_stamp_is_refused_and_says_why(self):
         with self.assertRaises(SdDbError) as caught:
-            start_trial(self.connection, "sd-decide", "2099-01-01T00:00:00")
+            start_trial(self.connection, "sd-example-a", "2099-01-01T00:00:00")
         self.assertIn("carries no timezone", str(caught.exception))
         self.assertEqual(trials(self.connection), [])
 
     def test_something_that_is_not_a_timestamp_is_refused(self):
         with self.assertRaises(SdDbError) as caught:
-            record_skill_use(self.connection, "sd-decide", timestamp="thursday")
+            record_skill_use(self.connection, "sd-example-a", timestamp="thursday")
         self.assertIn("is not an ISO-8601 timestamp", str(caught.exception))
 
 
@@ -535,25 +535,25 @@ class TrialsAndUse(WriteCase):
     """
 
     def test_an_active_trial_is_the_one_that_has_not_expired(self):
-        start_trial(self.connection, "sd-decide", "2099-01-01T00:00:00Z")
-        start_trial(self.connection, "sd-proposal", "2001-01-01T00:00:00Z")
+        start_trial(self.connection, "sd-example-a", "2099-01-01T00:00:00Z")
+        start_trial(self.connection, "sd-example-b", "2001-01-01T00:00:00Z")
         self.assertEqual(
-            [row["skill"] for row in active_trials(self.connection)], ["sd-decide"]
+            [row["skill"] for row in active_trials(self.connection)], ["sd-example-a"]
         )
         # Both are still rows. The installer needs the expired one to remove it,
         # so the unfiltered read has to keep answering with it.
         self.assertEqual(
-            [row["skill"] for row in trials(self.connection)], ["sd-decide", "sd-proposal"]
+            [row["skill"] for row in trials(self.connection)], ["sd-example-a", "sd-example-b"]
         )
 
     def test_the_moment_is_the_callers_to_choose(self):
-        start_trial(self.connection, "sd-decide", "2026-10-06T00:00:00Z")
+        start_trial(self.connection, "sd-example-a", "2026-10-06T00:00:00Z")
         self.assertEqual(len(active_trials(self.connection, "2026-09-06T00:00:00Z")), 1)
         self.assertEqual(len(active_trials(self.connection, "2026-11-06T00:00:00Z")), 0)
 
     def test_a_trial_starting_again_replaces_its_expiry_and_adds_no_row(self):
-        start_trial(self.connection, "sd-decide", "2026-10-06T00:00:00Z")
-        start_trial(self.connection, "sd-decide", "2026-12-06T00:00:00Z")
+        start_trial(self.connection, "sd-example-a", "2026-10-06T00:00:00Z")
+        start_trial(self.connection, "sd-example-a", "2026-12-06T00:00:00Z")
         rows = trials(self.connection)
         self.assertEqual(len(rows), 1)
         # Normalized on the way in, so the row is the shape `now()` writes.
@@ -564,25 +564,25 @@ class TrialsAndUse(WriteCase):
         # use written in the same second as the trial began cannot be told from
         # one written after it. The parse of `~/.codex/sessions` needs the same
         # parameter for a real reason, so the test uses the real API.
-        record_skill_use(self.connection, "sd-decide", timestamp="2026-01-01T00:00:00Z")
-        start_trial(self.connection, "sd-decide", "2099-01-01T00:00:00Z")
+        record_skill_use(self.connection, "sd-example-a", timestamp="2026-01-01T00:00:00Z")
+        start_trial(self.connection, "sd-example-a", "2099-01-01T00:00:00Z")
         row = trials(self.connection)[0]
         # The use above happened before the trial began. Counted from the
         # trial's own start it is not evidence the trial earned anything.
-        self.assertEqual(skill_use_since(self.connection, "sd-decide", row["started"]), 0)
-        record_skill_use(self.connection, "sd-decide")
-        self.assertEqual(skill_use_since(self.connection, "sd-decide", row["started"]), 1)
+        self.assertEqual(skill_use_since(self.connection, "sd-example-a", row["started"]), 0)
+        record_skill_use(self.connection, "sd-example-a")
+        self.assertEqual(skill_use_since(self.connection, "sd-example-a", row["started"]), 1)
 
     def test_use_by_another_skill_is_not_this_skills_use(self):
-        start_trial(self.connection, "sd-decide", "2099-01-01T00:00:00Z")
-        record_skill_use(self.connection, "sd-proposal")
+        start_trial(self.connection, "sd-example-a", "2099-01-01T00:00:00Z")
+        record_skill_use(self.connection, "sd-example-b")
         row = trials(self.connection)[0]
-        self.assertEqual(skill_use_since(self.connection, "sd-decide", row["started"]), 0)
+        self.assertEqual(skill_use_since(self.connection, "sd-example-a", row["started"]), 0)
 
     def test_ending_a_trial_says_whether_there_was_one(self):
-        start_trial(self.connection, "sd-decide", "2099-01-01T00:00:00Z")
-        self.assertTrue(end_trial(self.connection, "sd-decide"))
+        start_trial(self.connection, "sd-example-a", "2099-01-01T00:00:00Z")
+        self.assertTrue(end_trial(self.connection, "sd-example-a"))
         self.assertEqual(trials(self.connection), [])
         # The second call has nothing to remove, and says so rather than
         # letting a caller print "removed" twice.
-        self.assertFalse(end_trial(self.connection, "sd-decide"))
+        self.assertFalse(end_trial(self.connection, "sd-example-a"))

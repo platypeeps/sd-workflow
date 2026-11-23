@@ -3094,7 +3094,7 @@ _DISCLOSED_RE = re.compile(r"(?<![\w./-])bin/(?P<tool>[A-Za-z0-9][A-Za-z0-9_-]*)
 #: skill writing the true path `bin/sd_handoff_rows.py` discloses the tool
 #: `sd_handoff_rows`, and a literal test for that name finds nothing. Named
 #: here rather than folded into the regex so the trailing period of an English
-#: sentence -- `see bin/sd-plan.` -- cannot be read as an extension.
+#: sentence -- `see bin/sd-tool.` -- cannot be read as an extension.
 _MODULE_SUFFIX = ".py"
 
 
@@ -3173,8 +3173,8 @@ def _tool_candidates(tool: str) -> tuple[str, ...]:
 
     The deeper reason it cannot come back: under it, whether a roadmap note is
     reported turns on whether an unrelated module happens to share a stem.
-    Someone adding `bin/sd_plan.py` as an implementation detail would silently
-    drop the `bin/sd-plan` finding, with nothing in a `sd-status` diff to show
+    Someone adding `bin/sd_tool.py` as an implementation detail would silently
+    drop the `bin/sd-tool` finding, with nothing in a `sd-status` diff to show
     for it. A check whose correctness rests on unrelated naming is the defect
     this class exists to catch, not a resolution strategy.
     """

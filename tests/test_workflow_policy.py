@@ -334,7 +334,6 @@ class ConditionalObligations(unittest.TestCase):
 
     SITES = (
         ".claude/sd-ai-command-pack/planning-adversarial-review.md",
-        "contrib/sd-receive-review/SKILL.md",
     )
 
     def test_every_site_naming_the_ledger_names_the_gate(self):

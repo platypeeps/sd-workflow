@@ -343,13 +343,9 @@ ACTIVE_PRD = "---\nbranch: topic\n---\n\n- [ ] one\n"
 class TheArchiveIsAScopeBoundary(unittest.TestCase):
     """Criterion 21: a `planning` item under `archive/` is seen by nothing.
 
-    The criterion names three readers -- `sd-status`, `sd-plan` and
-    `sd-review --scope planning`. Two are executables and are run below. The
-    third is a skill page with no enumeration of its own: step 4 of
-    `skills/sd-plan/SKILL.md` runs `sd-review --scope planning`, so the
-    third reader is the second one. The last test is what keeps that true.
-    If the skill ever grows its own way of finding items, that test fails
-    and this class stops silently claiming to cover a reader it does not.
+    The criterion named three readers -- `sd-status`, a planning skill page
+    and `sd-review --scope planning`. The skill page retired (sd:10156); the
+    two executables are run below.
 
     The fixture holds two `planning` items differing in one respect: where
     they live. Asserting only that the archived one is absent would pass
@@ -454,24 +450,6 @@ class TheArchiveIsAScopeBoundary(unittest.TestCase):
 
         self.assertEqual(work["active"], 1)
         self.assertEqual(work["counts"]["planning"], 1)
-
-    def test_the_plan_skill_enumerates_through_sd_review_and_not_on_its_own(self) -> None:
-        """The third reader has no third enumeration, and must not grow one.
-
-        `sd-plan` is a skill page, not an executable, so "sd-plan sees no
-        item there" is not directly runnable. What makes it true is that the
-        page delegates: it runs `sd-review --scope planning` rather than
-        walking `docs/work` itself. This asserts both halves of that -- the
-        delegation is present, and no walk sits beside it.
-        """
-        page = (REPO_ROOT / "contrib" / "sd-plan" / "SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("sd-review --scope planning", page)
-        for walk in ("glob(", "iterdir", "os.walk", "find docs/work", "ls docs/work"):
-            self.assertNotIn(
-                walk, page,
-                f"contrib/sd-plan/SKILL.md enumerates items itself via {walk!r}, "
-                "so sd-review --scope planning no longer covers it",
-            )
 
 
 

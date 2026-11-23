@@ -6,7 +6,7 @@ Two questions, and the suite is organised by them.
 one shape: a guard that answered a question about form where the question was
 about substance. Here the shape is a missing database or a missing row read as
 "no row, so the item is open", which hands delivered work back to
-`sd-review --scope planning` and `sd-plan` to be done again. The two are given
+`sd-review --scope planning` and planning to be done again. The two are given
 two different meanings on purpose, and each one is asserted:
 
     no database at all      the designed database-free case -- ask git alone

@@ -1963,7 +1963,7 @@ class TheSeparatorIsNarrowedByAParenthesis(unittest.TestCase):
         """Verbatim from `docs/work/.../implement.md`: three files, listed."""
 
         self.assertIsNone(PAREN_PAIR.search(
-            "returns three files: `AGENTS.md:14`, `skills/sd-plan/SKILL.md:40` and"))
+            "returns three files: `AGENTS.md:14`, `skills/sd-check/SKILL.md:40` and"))
 
     def test_a_real_list_inside_a_parenthesis_anchors_on_no_symbol(self) -> None:
         """Verbatim from `design.md`. `PAREN_PAIR` matches it; the anchor rule declines it.
@@ -2979,7 +2979,7 @@ class StableSourceCitationTests(unittest.TestCase):
 #: per-skill. A skill is installed to the platform home and read with the
 #: reader's cwd in whatever checkout encloses it (R10-D6); nothing makes that
 #: checkout this one. `sd-research-repo` is read from a research repo,
-#: `sd-plan`/`sd-review`/`sd-ship` from whatever repository is being developed.
+#: `sd-review`/`sd-ship` from whatever repository is being developed.
 #: So a rule path any of them cites resolves against a checkout that need not
 #: have the file. No skill is exempt, so no skill has to be remembered, and
 #: both ends of this scan are walked from the filesystem: the documents from
@@ -3082,7 +3082,7 @@ def sentence_ends(flat: str) -> list[int]:
 #: The one way the next sentence may carry the qualifier: by opening on the
 #: file just cited. "`<path>` gives the cap. That file lives only in the
 #: sd-workflow checkout" is one claim in two sentences, and
-#: `skills/sd-plan` writes it that way.
+#: a skill page writes it that way.
 BACK_REFERENCE = re.compile(r"\s*(?:(?:that|this|the)\s+(?:rule\s+)?file|it)\b", re.IGNORECASE)
 
 #: A blank line ends a paragraph, and nothing in the next one is about this

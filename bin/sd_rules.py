@@ -329,7 +329,7 @@ RULES: tuple[Rule, ...] = (
     ),
     #: The store and plugin contract, taught from one section of
     #: `skills/sd-check/SKILL.md`; it moved there from `sd-help` (sd:6357),
-    #: then from `sd-plan` when that skill retired (pack sd:7368). `R11-D14` closed the kind
+    #: then from the planning skill when it retired (pack sd:7368). `R11-D14` closed the kind
     #: vocabulary at the eight keys `KIND_KEYS` holds and made a ninth a decision record;
     #: what enforces it is `validate_kind`, once, by name, and the subject
     #: names the constant and the count rather than the keys, because the

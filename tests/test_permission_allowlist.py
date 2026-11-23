@@ -37,7 +37,7 @@ what shipped was the `python3` rule alone.
 Some of the shipped surfaces name a `bin/` command that does not exist yet, and
 the skill is expected to declare that rather than read as a command you can
 run. This docstring used to carry the list and the count. It said six and
-listed six, omitting `sd-spec`; it was then corrected to seven and named
+listed six, omitting one; it was then corrected to seven and named
 `sd-ship`, which has shipped a binary since -- the ordinary fate of a count
 kept by hand next to a list kept by hand, twice over, in the paragraph arguing
 against the practice. The list is gone and no number replaces it:
@@ -87,8 +87,8 @@ DESTRUCTIVE = ("Remove", "Delete", "Uninstall", "Drop")
 # does is a derivation that will be quietly wrong instead of loudly.
 #
 # `[^|\n]`, not `[^|]`. The first draft of the widening used `[^|]`, which
-# matches newlines, so it ran from the `sd-plan` row down through four more
-# rows to the first `Read-only:` in the table and reported that `sd-plan` was
+# matches newlines, so it ran from the first row down through four more
+# rows to the first `Read-only:` in the table and reported that the first command was
 # the read-only surface. A pattern that skips columns must not also skip rows:
 # that failure grants a wildcard to the wrong command, which is worse than
 # granting none.
@@ -283,7 +283,7 @@ class PermissionAllowlistTests(unittest.TestCase):
 
         It passes just as happily when the pattern skips rows instead of
         columns, which is what the first draft of the column-tolerant version
-        did: `[^|]` matches newlines, so it ran from `sd-plan` down to the
+        did: `[^|]` matches newlines, so it ran from the first row down to the
         first `Read-only:` five rows below and credited the adjective to a
         command that does not carry it -- handing a whole-flag-space wildcard
         to the wrong entrypoint. Non-circular because it re-reads README to

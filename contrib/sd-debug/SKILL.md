@@ -25,7 +25,7 @@ obvious. An obvious cause is a hypothesis with a head start, not a conclusion.
 
 Do not use it to run this repository's own checks (`sd-check`), to
 review a diff for defects that have not manifested (`sd-review`), or to plan
-the work the fix turns into (`sd-plan`). Those are handoffs; report an
+the work the fix turns into (`sd task add`). Those are handoffs; report an
 unavailable sibling rather than implying it ran.
 
 ## Arguments
@@ -189,7 +189,7 @@ fix.
 - **Edits in the tree** — every file changed and whether it is a verified fix or
   an experiment awaiting revert;
 - **Closing state** — `fixed`, `diagnosed`, or `stalled`, and what ended it; and
-- **Handoffs** — proposed `sd-plan` or `sd-review` work, each `not run` or
+- **Handoffs** — proposed `sd task add` or `sd-review` work, each `not run` or
   `unavailable`, plus the statement that
   nothing was committed, branched, or pushed.
 

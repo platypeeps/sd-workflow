@@ -17,7 +17,7 @@ Both a shallow clone and an unreachable remote produce `unknown`, never `no`.
 A checkout with no remote produces `no`, because it has all the history there
 is. Getting that backwards does not fail loudly: a `no` where the answer is
 `unknown` silently reopens a delivered item, and every reader that picks work
--- `sd-review --scope planning`, `sd-plan` -- picks it again and redoes it. So
+-- `sd-review --scope planning`, a planning skill -- picks it again and redoes it. So
 three of the cases below assert `no` is *never* the answer, as well as
 asserting what the answer is; an implementation that answered `no` on an
 unreachable remote would pass a bare `assertEqual(..., "unknown")` suite the

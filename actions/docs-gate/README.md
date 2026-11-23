@@ -36,5 +36,5 @@ A consumer that checked this pack out into its own workspace had to move the che
 Both refs are full SHAs, as everything in this repository's own workflows is.
 
 `review` runs `sd-docs-lint` over `docs/work/` only in a repository that also has `research.conf.py`.
-`sd_research_review.check()` returns success at `source:bin/sd_research_review.py::check` when that file is absent, before it reaches the work items, so a checkout that follows `sd-plan` and not `sd-research-repo` is not linted by this action and should call `sd-docs-lint` directly.
+`sd_research_review.check()` returns success at `source:bin/sd_research_review.py::check` when that file is absent, before it reaches the work items, so a checkout that follows the workflow's work items and not `sd-research-repo` is not linted by this action and should call `sd-docs-lint` directly.
 A research repository with no `docs/work/` never pays for the lint.

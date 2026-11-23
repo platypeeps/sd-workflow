@@ -2,7 +2,7 @@
 
 `WORKFLOW.md` stated the refusal as a mechanical property: "every writing skill
 refuses the upstream tree". Nothing refused anything. The rule existed once, as
-a bullet in `skills/sd-plan/SKILL.md` addressed to an agent, and no code path
+a bullet in the planning skill page addressed to an agent, and no code path
 consulted `sd_lib.mode()` before a planning artifact was written -- which is how
 two checkouts that resolve to `guest` came to carry 162 committed `prd.md` files
 between them with nothing objecting on any of those occasions.
@@ -10,7 +10,7 @@ between them with nothing objecting on any of those occasions.
 These tests are that refusal. The unit half asserts the sentence `sd_lib` hands
 back through the injected `ask` seam, so no case here reaches the network. The
 end-to-end half runs `bin/sd-review --scope planning` -- the one command
-`sd-plan`'s sequence puts between writing the triad and promoting it -- as a
+the planning sequence puts between writing the triad and promoting it -- as a
 real process against a real repository holding a real `prd.md`, with a `gh` stub
 on `PATH` answering for the remote, and asserts exit 2 and one sentence rather
 than a traceback.
@@ -123,7 +123,7 @@ class Fixture(unittest.TestCase):
         )
 
     def write_item(self, root: pathlib.Path, slug: str = "2026-01-01-a-thing") -> pathlib.Path:
-        """A real planning artifact on disk, the shape `sd-plan` step 2 writes."""
+        """A real planning artifact on disk, the shape a planning step writes."""
 
         item = root / sd_lib.WORK_DIR / slug
         item.mkdir(parents=True)
@@ -257,9 +257,9 @@ class TheDecisionsOptOut(Fixture):
 
 
 class TheReviewGate(Fixture):
-    """End to end: the write path `sd-plan` mandates, refused as a process.
+    """End to end: the write path planning mandates, refused as a process.
 
-    `sd-plan` step 4 runs `sd-review --scope planning` over the triad in the
+    A planning review runs `sd-review --scope planning` over the triad in the
     working tree and step 5 gates `planning -> ready` on that lane, so this is
     where a guest-mode checkout finds out before the artifact is promoted or
     committed. Red against `origin/main`, where `sd-review` consulted no mode.

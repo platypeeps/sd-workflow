@@ -192,18 +192,18 @@ class TheExpiry(TrialCase):
         )
 
     def test_an_expired_trial_with_no_use_is_removed_and_named(self):
-        sd_db.start_trial(self.connection, "sd-decide", "2001-01-01T00:00:00Z")
+        sd_db.start_trial(self.connection, "sd-watchlist", "2001-01-01T00:00:00Z")
         out = io.StringIO()
         removed = sd_install.expire_trials(self.connection, out)
-        self.assertEqual(removed, ["sd-decide"])
-        self.assertIn("sd-decide", out.getvalue())
+        self.assertEqual(removed, ["sd-watchlist"])
+        self.assertIn("sd-watchlist", out.getvalue())
         self.assertIn("no use", out.getvalue())
         self.assertEqual(sd_db.trials(self.connection), [])
 
     def test_an_expired_trial_that_earned_use_is_kept(self):
-        sd_db.start_trial(self.connection, "sd-decide", "2001-01-01T00:00:00Z")
+        sd_db.start_trial(self.connection, "sd-watchlist", "2001-01-01T00:00:00Z")
         row = sd_db.trials(self.connection)[0]
-        sd_db.record_skill_use(self.connection, "sd-decide", timestamp=row["started"])
+        sd_db.record_skill_use(self.connection, "sd-watchlist", timestamp=row["started"])
         out = io.StringIO()
         self.assertEqual(sd_install.expire_trials(self.connection, out), [])
         self.assertEqual(out.getvalue(), "")
@@ -216,13 +216,13 @@ class TheExpiry(TrialCase):
         the trial. Counting the old rows would keep it installed on the
         strength of the usage that made somebody curious in the first place.
         """
-        sd_db.record_skill_use(self.connection, "sd-decide", timestamp="2000-01-01T00:00:00Z")
-        sd_db.start_trial(self.connection, "sd-decide", "2001-01-01T00:00:00Z")
+        sd_db.record_skill_use(self.connection, "sd-watchlist", timestamp="2000-01-01T00:00:00Z")
+        sd_db.start_trial(self.connection, "sd-watchlist", "2001-01-01T00:00:00Z")
         out = io.StringIO()
-        self.assertEqual(sd_install.expire_trials(self.connection, out), ["sd-decide"])
+        self.assertEqual(sd_install.expire_trials(self.connection, out), ["sd-watchlist"])
 
     def test_an_unexpired_trial_is_left_alone_however_unused(self):
-        sd_db.start_trial(self.connection, "sd-decide", "2099-01-01T00:00:00Z")
+        sd_db.start_trial(self.connection, "sd-watchlist", "2099-01-01T00:00:00Z")
         out = io.StringIO()
         self.assertEqual(sd_install.expire_trials(self.connection, out), [])
         self.assertEqual(len(sd_db.trials(self.connection)), 1)
@@ -237,8 +237,8 @@ class TheExpiry(TrialCase):
         real schema, the checkout is this repository, and only `$HOME` is
         scratch.
         """
-        sd_db.start_trial(self.connection, "sd-decide", "2099-01-01T00:00:00Z")
-        sd_db.start_trial(self.connection, "sd-explain", "2001-01-01T00:00:00Z")
+        sd_db.start_trial(self.connection, "sd-watchlist", "2099-01-01T00:00:00Z")
+        sd_db.start_trial(self.connection, "sd-effort-calibrate", "2001-01-01T00:00:00Z")
         self.connection.commit()
 
         out = io.StringIO()
@@ -251,27 +251,27 @@ class TheExpiry(TrialCase):
         # PATH -- and in this context it never is.
         self.assertNotIn("trials unavailable", report)
         self.assertNotIn("no database at", report)
-        self.assertIn("sd-explain", report)
+        self.assertIn("sd-effort-calibrate", report)
         self.assertIn("no use", report)
 
         claude = self.home / ".claude" / "skills"
-        self.assertTrue((claude / "sd-decide" / sd_install.SKILL_FILE).is_file())
-        self.assertFalse((claude / "sd-explain").exists())
+        self.assertTrue((claude / "sd-watchlist" / sd_install.SKILL_FILE).is_file())
+        self.assertFalse((claude / "sd-effort-calibrate").exists())
         self.assertTrue((claude / "sd-check" / sd_install.SKILL_FILE).is_file())
 
         remaining = {row["skill"] for row in sd_db.trials(self.connection)}
-        self.assertEqual(remaining, {"sd-decide"})
+        self.assertEqual(remaining, {"sd-watchlist"})
 
     def test_the_install_run_renders_an_active_trial_from_contrib(self):
-        sd_db.start_trial(self.connection, "sd-decide", "2099-01-01T00:00:00Z")
+        sd_db.start_trial(self.connection, "sd-watchlist", "2099-01-01T00:00:00Z")
         names = [
             surface.name
             for surface in sd_install.discover_surfaces(
                 REPO_ROOT, [row["skill"] for row in sd_db.active_trials(self.connection)]
             )
         ]
-        self.assertIn("sd-decide", names)
-        self.assertNotIn("sd-decide", sd_install.named_skills(REPO_ROOT))
+        self.assertIn("sd-watchlist", names)
+        self.assertNotIn("sd-watchlist", sd_install.named_skills(REPO_ROOT))
 
 
 class RenderingInstallsNothing(unittest.TestCase):

@@ -357,7 +357,7 @@ class WorkItemCoverageTests(unittest.TestCase):
     """`review` used to pass a repository whose work items were failing.
 
     The research conventions govern the documents in `research.conf.py`;
-    `sd-plan` governs the items under `docs/work/`. A repository can follow both
+    the workflow governs the items under `docs/work/`. A repository can follow both
     at once, and until the two linters were connected this one printed
     "Mechanical checks pass" while `sd-docs-lint` returned 1 in the same
     directory -- true about this tool's scope, false about the repository.

@@ -155,17 +155,6 @@ else is. Its executables write these paths, and no others:
   `## Local overrides of the shared template` section records the disagreements
   that are deliberate.
 
-Two `contrib/` skills add paths of their own, both tracked, once `sd skill try`
-brings one back (pack sd:7368 retired both). Invoking either is the approval
-to write, and neither writes anywhere else:
-
-- `sd-plan` — a work item is a row (`sd task add`); it writes
-  `docs/work/<YYYY-MM-DD>-<slug>/design.md` only for a change that moves state in steps.
-  `--work-dir` selects a root other than `docs/work`; `--decision`
-  writes `docs/decisions/<YYYY-MM-DD>-<slug>.md` instead of a work item.
-- `sd-spec` — `docs/spec/**`, rewritten in place on the branch so the
-  correction lands with the change, plus the learnings page under `--retro`.
-
 Every other skill either edits documents that are already yours or reads only.
 
 Everything else the pack writes lands outside the repository entirely.
@@ -505,7 +494,7 @@ rest safe:
 
 ## Commands
 
-There are eight named surfaces, all commands.
+There are six named surfaces, all commands.
 All platforms preserve Markdown bodies.
 Codex invocation metadata uses the [adapter](#codex-invocation-metadata).
 Each surface has one `SKILL.md` file under `skills/` or `contrib/`.
@@ -516,27 +505,21 @@ knowledge and procedure with no standing side-effect authority, loaded when
 relevant rather than invoked. They are not listed here: `sd skill list`
 reads both roots, which are the only two inventories that cannot go stale.
 
-`sd-plan`, `sd-spec` and `sd-skill-adopt` are the named surfaces in `contrib/`.
-They install with `sd skill try` instead of the default installer.
-They remain commands because they authorize side effects.
-Each of the eight commands sets `disable-model-invocation`.
+`sd-skill-adopt` is the named surface in `contrib/`.
+It installs with `sd skill try` instead of the default installer.
+It remains a command because it authorizes side effects.
+Each of the six commands sets `disable-model-invocation`.
 Every other surface omits that marker.
 
 **Runs as** identifies the execution form.
 `bin/` means the pack ships an executable entry point.
-**prose** means an agent follows the skill without a runner.
-For prose surfaces, the skill is the implementation.
-Two of the eight are prose.
-Each prose skill has a "State of the tooling" section.
 `tests/test_skill_frontmatter.py` checks each claim against the filesystem.
 
 | Command | Runs as | Purpose |
 |---|---|---|
-| `sd-plan` | prose | Interview into a work item under `docs/work/`, review it, open its branch |
 | `sd-check` | `bin/` | Deterministic runner over the repo's own entrypoints |
 | `sd-review` | `bin/` | Local review on the exact diff; findings dispositioned locally, never posted |
 | `sd-ship` | `bin/` | Review committed work, prepare its PR, verify merge authority, and reconcile delivery |
-| `sd-spec` | prose | Update `docs/spec/**` on the PR branch |
 | `sd-status` | `bin/` | Read-only: derived status, open PRs, branch-protection gaps and the states this repo accepts (its `status` declaration) |
 | `sd-skill-adopt` | `bin/` | Safety pre-screen, lint, and canonical transform for an incoming skill |
 | `sd-handoff` | `bin/` | Write the local session packet for this directory; `/clear` restores it |

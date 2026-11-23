@@ -2038,7 +2038,7 @@ class ScopeProvidersOverASkipTier(unittest.TestCase):
             sd_review.review_depth(self.skip, challenge=False, scope="planning"), 1,
             "scope=planning earned no reviewer at tier skip. Either `review_depth`"
             " stopped honouring FLOOR_SCOPES, or `planning` left it -- and"
-            " `sd-plan` gates `planning -> ready` on a lane that now asks nobody.")
+            " a planning review gates `planning -> ready` on a lane that now asks nobody.")
 
     def test_challenge_asks_a_provider_even_at_tier_skip(self) -> None:
         """The same seam, reached by the other role that uses it."""

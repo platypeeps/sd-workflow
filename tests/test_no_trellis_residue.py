@@ -98,8 +98,6 @@ HELD: frozenset[tuple[str, str]] = frozenset()
 #: unless this set is edited too, which is the point.
 HELD_BOUND = frozenset({
     ("bin/sd", "`.makemd`, `.trellis`), so the rule is the generalisation rather than the"),
-    ("contrib/sd-plan/SKILL.md",
-     "No unrelated rows, `.claude/`, `.trellis/`, hooks, labels, managed gitignore"),
 })
 
 #: Lines #995 (fix-10-sweep) adds to `tests/test_archive_untouched.py`: the

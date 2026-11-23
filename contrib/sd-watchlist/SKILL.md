@@ -21,7 +21,7 @@ Use for a configured set of channels, playlists, searches, feeds, podcasts,
 authors, or saved collections when the user wants material new items since a
 dated checkpoint.
 
-Use `sd-brief` for broad catch-up without a bounded watchlist checkpoint.
+A broad catch-up without a bounded watchlist checkpoint is out of scope.
 General subject-state comparison and prioritizing a saved-item backlog are out
 of scope. Persistence and scheduling remain owned by the host.
 
@@ -118,7 +118,7 @@ identify them before reading sources, state, or profile data.
     and bounded `pendingItems`. Do not advance a source boundary across
     unavailable, stale, truncated, or unresolved coverage. Output it only; do
     not write, persist, or schedule it.
-14. Propose precise read-only handoffs for selected items to `sd-brief` or
+14. Propose precise read-only handoffs for selected items to `sd-research` or
     `sd-fact-check`. Include the item, evidence,
     purpose, and limitations; mark every handoff `not run` or `unavailable`.
 15. Audit the report against the source inventory, checkpoint, item ledger,
@@ -162,7 +162,7 @@ identify them before reading sources, state, or profile data.
   and counted filtered noise;
 - **Next monitor state** — minimized `sd-monitor-state/v1` output or exact
   validation error plus a separately labeled replacement-baseline proposal;
-- **Downstream handoffs** — proposed `sd-brief` and `sd-fact-check` payloads, each `not run` or `unavailable`; and
+- **Downstream handoffs** — proposed `sd-research` and `sd-fact-check` payloads, each `not run` or `unavailable`; and
 - **Capability status** — persistence, scheduling, subscriptions, downloads,
   notifications, collection changes, downstream workflows, and all external
   writes marked `not run`.

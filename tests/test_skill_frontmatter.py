@@ -14,10 +14,10 @@ mechanism in use, not a design aspiration. The exception has a measured
 precedent too: `se-help`, this surface's predecessor and still installed at
 `~/.claude/skills/se-help`, carries no marker. It is named here as evidence for
 the rule, not as a surface this suite asserts -- everything below is `sd-*`,
-where the eight commands are the named surfaces.
+where the six commands are the named surfaces.
 
 These run without an installer. That is the point: step 3e builds the renderer
-that consumes this tree, so without these assertions the eight surfaces would
+that consumes this tree, so without these assertions the six surfaces would
 sit unverified until then, and a missing marker would surface as a command that
 silently invokes itself.
 
@@ -25,7 +25,7 @@ Since 5-iii the tree also holds the sixty-four folded skills, so the inventory
 claim had to change shape. It used to be "the tree is exactly these surfaces",
 which is a list -- and a list of every surface is precisely what stops being
 maintainable at seventy-six. What survives is the half that is actually load-
-bearing: the *commands* are exactly these eight, and every other surface in the
+bearing: the *commands* are exactly these six, and every other surface in the
 tree is a skill,
 which is a property each file carries rather than a roster this file recites. A
 sixty-fifth skill needs no edit here; a twelfth command still fails, which is
@@ -49,14 +49,14 @@ SKILLS = REPO_ROOT / "skills"
 CONTRIB = REPO_ROOT / "contrib"
 ROOTS = (SKILLS, CONTRIB)
 
-# The eight commands, the surfaces the design names. Pinned deliberately: the verb
+# The six commands, the surfaces the design names. Pinned deliberately: the verb
 # inventory is a CI-tested invariant, so a thirteenth surface fails here until
 # the design record grows to justify it. The dependency-triage command left
 # the roster when sd:10 requirement 13 cut its `contrib/` skill. The suggest
 # skill left it in sd:3040; the `sd suggest` verb stays.
 COMMANDS = frozenset({
-    "sd-plan", "sd-check", "sd-review", "sd-ship", "sd-spec", "sd-status",
-    "sd-skill-adopt", "sd-handoff",
+    "sd-check", "sd-review", "sd-ship", "sd-status", "sd-skill-adopt",
+    "sd-handoff",
 })
 EXPECTED = COMMANDS
 
@@ -137,18 +137,7 @@ class InventoryTests(unittest.TestCase):
                 self.assertNotIn(f'"{name}"', paths)
                 self.assertNotIn(f"`{name}`", readme)
 
-    def test_a_skill_retired_to_contrib_is_out_of_the_paths(self) -> None:
-        """pack sd:7368: `sd skill try` can still reach these; the installer
-        renders none of them, and the design template other repositories
-        cite keeps a path outside any skill."""
-        paths = (SKILLS / "paths.json").read_text(encoding="utf-8")
-        for name in ("sd-plan", "sd-receive-review", "sd-spec"):
-            with self.subTest(skill=name):
-                self.assertNotIn(f'"{name}"', paths)
-                self.assertEqual(skill_file(name), CONTRIB / name / "SKILL.md")
-        self.assertTrue((REPO_ROOT / "templates" / "design.md").is_file())
-
-    def test_the_ten_named_surfaces_are_all_present(self) -> None:
+    def test_the_named_surfaces_are_all_present(self) -> None:
         found = {p.parent.name for p in surfaces()}
         self.assertEqual(set(EXPECTED) - found, set(), "a named surface left the tree")
 
@@ -180,13 +169,13 @@ class InventoryTests(unittest.TestCase):
         A floor, deliberately, and not the exact count: 5-iii folded sixty-four,
         and pinning that number would put back the roster this file just stopped
         keeping -- retiring one skill would fail here rather than where the
-        retirement is decided. sd:9062 retired the never-used ones; the floor
-        is fifteen -- close enough to the real number that losing a meaningful
+        retirement is decided. sd:9062 retired the never-used ones and sd:10156
+        those unused for 60 days; the floor is six -- close enough to the real number that losing a meaningful
         part of what is left fails, loose enough that ordinary movement in
         either direction does not.
         """
 
-        self.assertGreaterEqual(len(surfaces()) - len(EXPECTED), 15)
+        self.assertGreaterEqual(len(surfaces()) - len(EXPECTED), 6)
 
     def test_no_surface_kept_a_retired_prefix(self) -> None:
         for path in surfaces():
@@ -261,7 +250,7 @@ class KindMarkerTests(unittest.TestCase):
                 )
 
     def test_skills_do_not(self) -> None:
-        """Every surface that is not one of the eight commands.
+        """Every surface that is not one of the six commands.
 
         Scoped by exclusion rather than by a roster, which is what lets the
         sixty-four folded skills be covered without being named. A folded skill
@@ -303,7 +292,7 @@ class DocumentedFlagTests(unittest.TestCase):
     def implemented(self) -> list[tuple[str, pathlib.Path, pathlib.Path]]:
         found = []
         for path in surfaces():
-            # The eight only. A folded skill is a procedure, not a CLI, and a
+            # The six only. A folded skill is a procedure, not a CLI, and a
             # folded name that happened to match a `bin/` file would otherwise
             # be dragged into a flag contract it was never written against.
             if path.parent.name not in EXPECTED:
@@ -397,55 +386,6 @@ class DocumentedFlagTests(unittest.TestCase):
                         )
 
 
-class UnbuiltSurfaceTests(unittest.TestCase):
-    """A skill for a tool that does not exist must say so.
-
-    Some of the eight surfaces have no `bin/` implementation yet -- which ones,
-    and how many, is `unbuilt()` below, derived from `bin/` at run time and
-    deliberately not written down here. Their skills are written from the
-    design, and a reader -- human or model -- who takes one at face value will
-    try to run a command that is not there. Saying "not built yet" once is the
-    whole requirement; this test only checks it is said.
-
-    Scoped to those eight. The folded skills name no `bin/` tool at all -- they
-    are procedures the model follows, so there is nothing for them to disclose,
-    and requiring the sentence would be requiring a denial of a claim never made.
-    """
-
-    DISCLOSURES = (
-        "not implemented",
-        "does not exist yet",
-        "not built",
-        "when it exists",
-        "no `bin/",
-        "lands in a later",
-        "lands in a separate",
-    )
-
-    def unbuilt(self) -> list[pathlib.Path]:
-        return [
-            path
-            for path in surfaces()
-            if path.parent.name in EXPECTED
-            and not (REPO_ROOT / "bin" / path.parent.name).is_file()
-        ]
-
-    def test_there_are_unbuilt_surfaces_to_check(self) -> None:
-        # If every surface gets built this guard fires and the test is deleted,
-        # rather than passing forever over an empty list.
-        self.assertGreater(len(self.unbuilt()), 0)
-
-    def test_unbuilt_surfaces_disclose_it(self) -> None:
-        for path in self.unbuilt():
-            body = path.read_text(encoding="utf-8").lower()
-            with self.subTest(surface=path.parent.name):
-                self.assertTrue(
-                    any(phrase in body for phrase in self.DISCLOSURES),
-                    f"{path.parent.name} documents a tool that does not exist in "
-                    f"bin/ without saying so anywhere in the skill",
-                )
-
-
 class RunsAsColumn(unittest.TestCase):
     """README's **Runs as** column is derived from `bin/`, not maintained.
 
@@ -470,24 +410,16 @@ class RunsAsColumn(unittest.TestCase):
 
     WORDS = {"Two": 2, "Three": 3, "Four": 4, "Five": 5, "Six": 6, "Seven": 7, "Eight": 8, "Nine": 9,
              "Ten": 10, "Eleven": 11, "Twelve": 12, "Thirteen": 13}
-    SENTENCE = re.compile(
-        r"\b([A-Z][a-z]+) of the ([a-z]+) are\s+\n?prose", re.M)
+    SENTENCE = re.compile(r"^There are ([a-z]+) named surfaces", re.M)
 
-    def sentence_counts(self) -> tuple[int, int]:
-        """The two numbers README states in prose: prose count, and total."""
+    def stated_total(self) -> int:
+        """The number of commands README states in prose."""
         readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
         m = self.SENTENCE.search(readme)
-        self.assertIsNotNone(m, "README no longer states an X-of-Y prose count")
-        # Assert before indexing. `WORDS[...]` on an unlisted spelling raises a
-        # KeyError, which CI reports as an error with a traceback into this
-        # helper -- true, and useless to whoever changed the README sentence.
-        for word in (m.group(1), m.group(2).capitalize()):
-            self.assertIn(
-                word, self.WORDS,
-                f"README's prose-count sentence spells a number this test "
-                f"cannot read: {word!r}. Add it to WORDS.",
-            )
-        return self.WORDS[m.group(1)], self.WORDS[m.group(2).capitalize()]
+        self.assertIsNotNone(m, "README no longer states how many named surfaces there are")
+        word = m.group(1).capitalize()
+        self.assertIn(word, self.WORDS, f"README spells a number this test cannot read: {word!r}")
+        return self.WORDS[word]
 
     def test_the_table_is_found_at_all(self) -> None:
         """Guards the derivation, not the data.
@@ -495,15 +427,14 @@ class RunsAsColumn(unittest.TestCase):
         Every other test here passes vacuously on zero rows, so a table that
         grows a column and silently stops matching would read as a clean run.
         """
-        _, total = self.sentence_counts()
         self.assertEqual(
-            len(self.rows()), total,
+            len(self.rows()), self.stated_total(),
             "README's command table did not parse into the number of rows its "
             "own sentence claims -- if a column moved, fix this pattern rather "
             "than letting the checks below pass on nothing",
         )
 
-    # README: "each of the eight commands sets `disable-model-invocation`, so
+    # README: "each of the six commands sets `disable-model-invocation`, so
     # invoking it is a deliberate act; every other surface
     # does not." So the table is `COMMANDS`, which is `EXPECTED`, and the
     # table is checked against it.
@@ -542,7 +473,7 @@ class RunsAsColumn(unittest.TestCase):
         return set(EXPECTED)
 
     def test_the_marker_agrees_with_the_pinned_roster(self) -> None:
-        """The filesystem and the design record name the same eight commands.
+        """The filesystem and the design record name the same six commands.
 
         `COMMANDS` is a roster, and a roster drifts. This is the check that it
         has not: every skill setting the marker is a pinned command, and every
@@ -603,15 +534,6 @@ class RunsAsColumn(unittest.TestCase):
                     f"README calls `{name}` {label}, but bin/{name} "
                     f"{'exists' if shipped else 'does not exist'}",
                 )
-
-    def test_the_prose_count_in_the_sentence_above_is_derived(self) -> None:
-        """The sentence naming a number is the part that rots first."""
-        stated, _ = self.sentence_counts()
-        actual = sum(1 for _, label in self.rows() if label == "prose")
-        self.assertEqual(
-            stated, actual,
-            f"{actual} rows say prose; README's sentence says {stated}",
-        )
 
 
 class BinaryClaims(unittest.TestCase):

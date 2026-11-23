@@ -445,7 +445,7 @@ REFRESHED = {"url": REPO, "branch": "main", "commit": "c" * 40, "result": "1 cha
 APPLIED = dict(REFRESHED, result="1 changed, 1 unchanged, 1 failed; 1 updated",
                applied=[{"skill": "sd-example", "scope": "pack", "url": URL, "commit": "c" * 40, "installed_commit": "a" * 40,
                          "revision": REVISION}],
-               skipped=[{"skill": "sd-folded", "scope": "pack", "why": "verdict fold: into sd-plan: overlap 0.9"}])
+               skipped=[{"skill": "sd-folded", "scope": "pack", "why": "verdict fold: into sd-example: overlap 0.9"}])
 
 
 class TheTrackingRoute(StubSd):
@@ -1058,7 +1058,7 @@ R.err = ELS['ad-err'].textContent;""")
         self.assertNotIn("nothing installed", refresh)
         self.assertRegex(refresh, r"sd-example · updated to c{12}.*<button[^>]*data-rollback-skill=\"0\"[^>]*>Rollback</button>")
         self.assertIn("sd-folded · left as is", refresh)
-        self.assertIn("verdict fold: into sd-plan", refresh)
+        self.assertIn("verdict fold: into sd-example", refresh)
         self.assertEqual(out["posts"][2], ["/api/skills/intake", {"source": "sd-example", "scope": "pack", "rollback": True}, 64])
         self.assertEqual(out["toasts"][1], [f"Refreshed {REPO}: 1 skill updated", False])
 

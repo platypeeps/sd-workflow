@@ -3310,7 +3310,7 @@ class LowYieldProducerTests(InventoryFixture):
     def test_a_bin_inside_another_path_is_not_a_disclosure(self) -> None:
         """`.venv/bin/python` names a virtualenv's interpreter, not `bin/python`.
 
-        `skills/sd-plan` writes `.venv/bin/python`, and the unanchored pattern
+        A skill page writes `.venv/bin/python`, and the unanchored pattern
         reported it as an unbuilt tool (k5245). The pack's `bin/` starts a path,
         so a `bin/` after a path segment is someone else's.
         """
@@ -3370,7 +3370,7 @@ class LowYieldProducerTests(InventoryFixture):
         -- see `_tool_candidates` for why the transform cannot come back.
         """
         self.assertEqual(
-            list(status._tool_candidates("sd-plan")), ["sd-plan", "sd-plan.py"]
+            list(status._tool_candidates("sd-example")), ["sd-example", "sd-example.py"]
         )
         self.assertEqual(
             list(status._tool_candidates("sd_plan")), ["sd_plan", "sd_plan.py"]
@@ -3378,7 +3378,7 @@ class LowYieldProducerTests(InventoryFixture):
         # Stated as a property too, so a third candidate cannot be added
         # later in a spelling this pin happens not to name.
         self.assertTrue(
-            all("_" not in name for name in status._tool_candidates("sd-plan"))
+            all("_" not in name for name in status._tool_candidates("sd-example"))
         )
 
 

@@ -175,27 +175,27 @@ class WhatCountsAsAUse(CodexCase):
         costs a branch rather than a module to be ready for it.
         """
         self.transcript("2026-09-01", "aaa", meta("/a"),
-                        typed("/sd-brief the thing", "2026-09-01T09:01:00.000Z"))
+                        typed("/sd-example the thing", "2026-09-01T09:01:00.000Z"))
         self.scan()
         self.assertEqual(self.rows(), [
-            ("sd-brief", "codex", "direct", "/a", "2026-09-01T09:01:00+00:00")])
+            ("sd-example", "codex", "direct", "/a", "2026-09-01T09:01:00+00:00")])
 
     def test_the_other_user_turn_shape_is_read_too(self):
         self.transcript("2026-09-01", "aaa", meta("/a"),
-                        spoken("/sd-brief", "2026-09-01T09:01:00.000Z"))
+                        spoken("/sd-example", "2026-09-01T09:01:00.000Z"))
         self.scan()
         self.assertEqual([row[2] for row in self.rows()], ["direct"])
 
     def test_one_session_can_produce_both_modes(self):
         self.transcript(
             "2026-09-01", "aaa", meta("/a"),
-            typed("/sd-brief", "2026-09-01T09:01:00.000Z"),
+            typed("/sd-example", "2026-09-01T09:01:00.000Z"),
             opened("sd-review", "2026-09-01T09:02:00.000Z"),
         )
         self.scan()
         self.assertEqual(
             [(row[0], row[2]) for row in self.rows()],
-            [("sd-brief", "direct"), ("sd-review", "path")],
+            [("sd-example", "direct"), ("sd-review", "path")],
         )
 
 

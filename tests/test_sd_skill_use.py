@@ -107,22 +107,22 @@ class WhatCountsAsAUse(Fixture):
         """
 
         connection = self.database()
-        where = str(self.home / ".claude" / "skills" / "sd-decide" / "SKILL.md")
+        where = str(self.home / ".claude" / "skills" / "sd-example" / "SKILL.md")
         self.fire(payload(
             hook_event_name="PreToolUse", tool_name="Read",
             tool_input={"file_path": where}))
         self.assertEqual(
             [(r["skill"], r["mode"]) for r in self.rows(connection)],
-            [("sd-decide", "path")],
+            [("sd-example", "path")],
         )
 
     def test_a_slash_prompt_is_a_direct_use(self) -> None:
         connection = self.database()
         self.fire(payload(
-            hook_event_name="UserPromptSubmit", prompt="/sd-plan the next item"))
+            hook_event_name="UserPromptSubmit", prompt="/sd-example the next item"))
         self.assertEqual(
             [(r["skill"], r["mode"]) for r in self.rows(connection)],
-            [("sd-plan", "direct")],
+            [("sd-example", "direct")],
         )
 
     def test_the_cwd_recorded_is_the_checkout_and_not_the_subdirectory(self) -> None:

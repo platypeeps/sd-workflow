@@ -360,10 +360,10 @@ class LineBudgetTests(unittest.TestCase):
         #
         # 2123 -> 2127 is sd:405. `WORKFLOW.md` claimed "every writing
         # skill refuses the upstream tree" and nothing refused anything: the
-        # rule was a bullet in `skills/sd-plan/SKILL.md` addressed to an agent,
+        # rule was a bullet in the planning skill page addressed to an agent,
         # and 162 committed `prd.md` files across two `guest` checkouts went
         # unremarked. What lands in this lane is the call and a two-line comment
-        # saying why this lane performs it: `sd-plan` step 4 routes the triad
+        # saying why this lane performs it: a planning review routes the triad
         # here and step 5 gates `planning -> ready` on it. The rule itself, the
         # mode resolution and the sentence are `sd_lib.guest_artifact_refusal`,
         # outside this lane, so nothing else is spent here.

@@ -2206,7 +2206,7 @@ def work_items(root: pathlib.Path, work_dir: str = WORK_DIR) -> list[WorkItem]:
     """Every work item, enumerated from the tree rather than from an index.
 
     The one place the database is opened for an enumeration, so every reader
-    that picks an item -- `sd-review`, `sd-plan`, `sd-status` -- comes through
+    that picks an item -- `sd-review`, `sd-status` -- comes through
     here and none of them restates where a status comes from.
     """
     statuses = Statuses.of(root)
@@ -3054,7 +3054,7 @@ def guest_artifact_refusal(root: pathlib.Path, paths: Any, *, ask: Asker = gh_ap
 
     `WORKFLOW.md` states the refusal as a mechanical property -- "every writing
     skill refuses the upstream tree" -- and until this existed the only copy of
-    the rule was a bullet in `skills/sd-plan/SKILL.md` addressed to an agent. A
+    the rule was a bullet in the planning skill page addressed to an agent. A
     sentence an agent may skip is not a refusal, and two repositories reached
     `guest` carrying 162 committed `prd.md` files between them with nothing
     objecting at write time.
