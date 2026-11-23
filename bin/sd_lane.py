@@ -2802,27 +2802,22 @@ def land_as_train(entry: dict[str, Any], queue: Queue, ship: Ship, head: str, lo
             continue
         onto = landing
         joined.append((row, pathlib.Path(row["worktree"]), placed))
-    answer = land_joined(joined, queue, ship, onto, base[0], logs, record)
+    answer = land_joined(joined, queue, ship, onto, base[0], logs, record, renewed)
     mark_train(queue, record, items)
     return answer
 
 
 def land_joined(joined: list[tuple[dict[str, Any], pathlib.Path, str]], queue: Queue, ship: Ship, tip: str,
-                branch: str, logs: pathlib.Path, record: dict[str, dict[str, Any]]) -> dict[str, Any]:
+                branch: str, logs: pathlib.Path, record: dict[str, dict[str, Any]],
+                renewed: Callable[[], None] = lambda: None) -> dict[str, Any]:
     """`land_as_train`'s landing of the joined members at `tip`, each member's outcome written into `record`."""
     items = [row["item"] for row, _, _ in joined]
     if len(joined) < 2:
         return {"status": "skipped", "items": items, "reason": "fewer than two members joined"}
-    try:
-        rows = {row["id"]: row for row in read_queue(queue)}
-    except LaneError as error:
-        return {"status": "skipped", "items": items, "reason": f"the queue could not be read again: {error}"}
-    gone = [row["item"] for row, _, _ in joined[1:]
-            if not runnable(rows.get(row["id"]) or {}) or rows[row["id"]].get("expected_head") != row["expected_head"]]
-    if gone:
-        return {"status": "skipped", "items": items,
-                "reason": f"{', '.join(f'sd:{item}' for item in gone)} left the queue or moved during the train"}
-    landed = land_train(joined[0][1], tip, branch, items)
+    why = train_stop(joined, queue, renewed)
+    if why is not None:
+        return {"status": "skipped", "items": items, "reason": why}
+    landed = land_train(joined[0][1], tip, branch, items, lambda: train_stop(joined, queue, renewed))
     if landed.get("status") != "merged":
         for row, _, _ in joined[1:]:
             record[row["id"]] = {"status": "failed", "reason": str(landed.get("reason"))[:REASON_CHARS]}
@@ -2833,6 +2828,35 @@ def land_joined(joined: list[tuple[dict[str, Any], pathlib.Path, str]], queue: Q
         record[row["id"]] = {"status": "landed", "pull": landed.get("pull"), "merge_commit": merged.get("merge_commit"),
                              "reconciled": bool(merged.get("ok") and merged.get("phase") == "merged")}
     return {**landed, "items": items, "tip": tip}
+
+
+def train_stop(joined: list[tuple[dict[str, Any], pathlib.Path, str]], queue: Queue,
+                renewed: Callable[[], None]) -> str | None:
+    """Why the joined train may not land now, or None: read again before the gate and right before the merge.
+
+    A gate takes minutes, and a hold, cancel, freeze or lost claim that
+    starts inside it must stop the merge it was gating (review of sd:9923).
+    """
+    try:
+        renewed()
+        frozen = freeze_stop(queue)
+        if frozen is not None:
+            return frozen
+        rows = {row["id"]: row for row in read_queue(queue)}
+        gone = [row["item"] for row, _, _ in joined[1:]
+                if not runnable(rows.get(row["id"]) or {}) or merge_refusal(rows[row["id"]]) is not None
+                or rows[row["id"]].get("expected_head") != row["expected_head"]]
+        if gone:
+            return f"{', '.join(f'sd:{item}' for item in gone)} left the queue, moved or is held during the train"
+        for row, _, _ in joined:
+            left = left_stop(row, queue, "merge")
+            if left is not None:
+                return f"sd:{row['item']}: {left.get('reason')}"
+    except Stop:
+        raise
+    except LaneError as error:
+        return f"the train could not be read again: {error}"
+    return None
 
 
 def train_base(tree: pathlib.Path) -> tuple[str, str] | None:
@@ -2881,14 +2905,17 @@ def join_member(row: dict[str, Any], tree: pathlib.Path, head: str, onto: str, s
     return None, str(joined.get("error") or joined.get("code") or joined.get("phase") or "no join")[:REASON_CHARS]
 
 
-def land_train(root: pathlib.Path, tip: str, base: str, items: list[int]) -> dict[str, Any]:
+def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
+               ready: Callable[[], str | None] = lambda: None) -> dict[str, Any]:
     """One train pull request at `tip`: pushed, gated once, merged with a merge commit (sd:9923).
 
     A direct push of the base is refused under protection; a pull request
     whose head is the train tip merges inside it, and GitHub marks each
     member merged at its own merge. A refused or lost merge answer is read
     back once; any other failure lands nothing. The branch is deleted
-    whatever happened, which also closes a train PR left open.
+    whatever happened, which also closes a train PR left open. After the
+    gate, `ready` decides again: a member held or cancelled, a freeze or
+    a claim lost during the gate sends no merge.
     """
     import sd_local_gate  # noqa: PLC0415 -- the GitHub client loads only for a train landing
     import sd_ship_remote  # noqa: PLC0415
@@ -2902,6 +2929,9 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int]) -> dic
         if gate.get("status") != "success":
             return {"status": "failed", "reason": f"the train gate at {tip} did not pass: {gate.get('summary')}"[:600]}
         pull = train_pull(api, branch, base, f"chore(lane): land the train of {names}")
+        why = ready()
+        if why is not None:
+            return {"status": "failed", "pull": pull, "reason": why[:600]}
         with contextlib.suppress(sd_ship_remote.Refusal):  # a lost answer is read back below, never sent twice
             api.api(f"{api.prefix}/pulls/{pull}/merge", method="PUT",
                     body={"sha": tip, "merge_method": "merge", "commit_title": f"chore(lane): train of {names} (#{pull})",

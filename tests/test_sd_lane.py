@@ -1980,6 +1980,7 @@ class TrainLanding(Trees):
         self.landed: list[tuple[pathlib.Path, str, str, list[int]]] = []
         self.landing = {"status": "merged", "pull": 9, "merge_commit": "c" * 40}
         self.on_join: dict[int, Callable[[], None]] = {}
+        self.during_gate: Callable[[], None] = lambda: None
         patcher = mock.patch.object(sd_lane, "land_train", self.land)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -1997,9 +1998,17 @@ class TrainLanding(Trees):
                                                      "train_commit": f"{item}" * 40})
         return super().ship(argv, log)
 
-    def land(self, root: pathlib.Path, tip: str, base: str, items: list[int]) -> dict:
-        """The recorder's landing; once merged, a member's next prepare reconciles, as `sd-ship` does."""
+    def land(self, root: pathlib.Path, tip: str, base: str, items: list[int],
+             ready: Callable[[], str | None] = lambda: None) -> dict:
+        """The recorder's landing; once merged, a member's next prepare reconciles, as `sd-ship` does.
+
+        `during_gate` runs where the train gate runs; `ready` is read after it, as `land_train` reads it.
+        """
         self.landed.append((root, tip, base, items))
+        self.during_gate()
+        why = ready()
+        if why is not None:
+            return {"status": "failed", "reason": why}
         trees = {1: self.first, 2: self.second, 3: self.third}
         for item in items[1:] if self.landing["status"] == "merged" else ():
             self.answers[(item, "prepare")] = {"ok": True, "phase": "merged", "merge_commit": f"{item}" * 40,
@@ -2077,6 +2086,36 @@ class TrainLanding(Trees):
         self.assertEqual(entries[0]["train_landing"]["status"], "error")
         self.assertEqual([entry["status"] for entry in entries], ["merged"] * 3)
 
+    def assert_gate_change_lands_nothing(self, change: Callable[[], None], said: str) -> None:
+        """Review of sd:9923: eligibility read before the gate was used after it, so the train merged anyway."""
+        self.during_gate = change
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertEqual(len(self.landed), 1)
+        landing = self.entries()[0]["train_landing"]
+        self.assertEqual(landing["status"], "failed")
+        self.assertIn(said, landing["reason"])
+        self.assertEqual(self.merges()[0], 1)  # no member reconciled inside sd:1's run
+
+    def test_a_member_held_during_the_train_gate_lands_nothing(self) -> None:
+        self.assert_gate_change_lands_nothing(
+            lambda: sd_lane.update(self.store(), lambda rows: rows[1].update(held=True)), "sd:2")
+
+    def test_a_member_cancelled_during_the_train_gate_lands_nothing(self) -> None:
+        self.assert_gate_change_lands_nothing(
+            lambda: sd_lane.update(self.store(), lambda rows: rows[2].update(status="cancelled")), "sd:3")
+
+    def test_a_freeze_that_starts_during_the_train_gate_lands_nothing(self) -> None:
+        def freeze() -> None:
+            import sd_db
+            connection = sd_db.connect(home=self.tmp)
+            try:
+                sd_db.set_freeze(connection, self.store().repository, "2099-01-01T00:00:00Z", "release",
+                                 now="2098-12-31T00:00:00Z")
+            finally:
+                connection.close()
+        self.assert_gate_change_lands_nothing(freeze, "frozen")
+
     def test_a_member_cancelled_during_the_train_lands_nothing(self) -> None:
         def cancel_second() -> None:
             sd_lane.update(self.store(), lambda rows: rows[1].update(status="cancelled"))
@@ -2086,7 +2125,7 @@ class TrainLanding(Trees):
         self.assertEqual(self.landed, [])
         landing = self.entries()[0]["train_landing"]
         self.assertEqual(landing["status"], "skipped")
-        self.assertIn("sd:2 left the queue or moved", landing["reason"])
+        self.assertIn("sd:2 left the queue, moved or is held", landing["reason"])
 
 
 class SettleReordered(unittest.TestCase):

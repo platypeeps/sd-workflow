@@ -6499,14 +6499,15 @@ roles:
         _main, earlier = self.landing_before()
         return self.join(earlier)["train_commit"]
 
-    def landed_by_lane(self, tip, gate="success"):
+    def landed_by_lane(self, tip, gate="success", during=lambda: None, ready=lambda: None):
         gates = []
 
         def local_gate(api, root, head, *, base=None, database=None):
             gates.append((head, base))
+            during()
             return {"status": gate, "summary": f"sd-check {gate}"}
         with patch.object(ship.sd_local_gate, "local_gate", local_gate):
-            landed = ship.sd_lane.land_train(self.root, tip, "main", [self.item])
+            landed = ship.sd_lane.land_train(self.root, tip, "main", [self.item], ready)
         return landed, gates
 
     def train_branches(self):
@@ -6555,6 +6556,15 @@ roles:
         landed, _ = self.landed_by_lane(tip)
         self.assertEqual((landed["status"], landed["pull"]), ("merged", 2))
         self.assertEqual(sorted(self.remote.pull_requests), [1, 2])
+
+    def test_land_train_whose_members_changed_during_the_gate_dispatches_nothing(self):
+        """Review of sd:9923: eligibility read before the gate was used after it."""
+        tip = self.joined_tip()
+        landed, _ = self.landed_by_lane(tip, ready=lambda: "sd:2 was held during the train gate")
+        self.assertEqual(landed["status"], "failed")
+        self.assertIn("sd:2 was held", landed["reason"])
+        self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
+        self.assertEqual(self.train_branches(), [])
 
     def test_land_train_that_github_refuses_lands_nothing(self):
         tip = self.joined_tip()
