@@ -208,12 +208,16 @@ class TheHook(HookFixture):
         self.assertEqual("sd:7", git(
             "log", "-1", "--format=%(trailers:key=Delivers,valueonly)", cwd=self.root).strip())
 
-    def test_a_line_over_72_characters_is_refused_at_commit_time(self):
-        """pack sd:10212: 27 lane refusals in 7 days named a commit line the hook let through."""
+    def test_a_line_over_72_characters_warns_at_commit_time(self):
+        """pack sd:10212: 27 lane refusals in 7 days named a commit line; the hook warns, the lane refuses.
+
+        A warning, not a refusal: the hook cannot see the message git saves (comment string, fixup,
+        cleanup mode), and four review rounds each found a valid commit it refused (lead, round 4).
+        """
         result = self.commit("fix: a subject\n\n" + "x" * 73 + "\n")
-        self.assertNotEqual(result.returncode, 0, "the commit went through")
-        self.assertIn("commit-msg: refused, a line is 73 characters (limit 72): xxxx", result.stderr)
-        self.assertEqual(0, self.commits(), "a commit landed")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("commit-msg: warning, a line is 73 characters (limit 72): xxxx", result.stderr)
+        self.assertIn("sd-ship refuses it at enqueue", result.stderr)
 
     def test_a_verbose_commit_is_measured_above_the_scissors_only(self):
         """`git commit -v` appends the diff below a scissors line, and git drops it after the hook runs."""
@@ -232,6 +236,7 @@ class TheHook(HookFixture):
     def test_the_refusal_quotes_the_line_it_measured(self):
         result = self.commit("fix: a subject\n\n\n\n" + "q" * 73 + "\n")
         self.assertIn("qqqqqqqqqq", result.stderr)
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_a_merge_commit_is_not_measured(self):
         """Review round 2: git runs commit-msg for `git merge`; sd-ship's catch-up merge must not abort."""
