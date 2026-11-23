@@ -1779,28 +1779,25 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
     """
 
     threshold = BLOCKING_ORDER[floor]
-    # Only a repeat that blocks at the floor answers a prior blocker (build/sd-1423 review: a medium copy cleared it).
-    at_floor = instance_rows(*(row for row in findings if 0 < BLOCKING_ORDER.get(str(row.get("severity", "unspecified")), 0) >= threshold))
-    # A rebutted prior place holds no other finding (build/sd-1423 review, bin/sd-review:1814). One row per place: each is decided alone.
-    prior = [old for old in instance_rows(*prior)
-             if not getattr(recorded_at(rebutted, old.get("path"), old.get("summary"), old.get("line")), "listed", False)]
-    disposed = []
+    def _floor(row: Mapping[str, Any]) -> bool:
+        return 0 < BLOCKING_ORDER.get(str(row.get("severity", "unspecified")), 0) >= threshold
+    def _rebutted(row: Mapping[str, Any]) -> bool:  # the newest record at every place it names is a listed rebuttal
+        return getattr(recorded_at(rebutted, row.get("path"), row.get("summary"), row.get("line"), row.get("instances")), "listed", False)
+    def _repeat(row: Mapping[str, Any]) -> bool:  # an uncited repeat of a rebutted finding: the rebuttal is read first (build/sd-1423 review)
+        return _floor(row) and not (isinstance(row.get("evidence"), str) and row["evidence"].strip()) and _rebutted(row)
+    def _prior(old: dict[str, Any]) -> dict[str, Any]:  # a rebutted place holds and lends nothing (sd-review:1814); it stays: a repeat on it is its own
+        return dict(old, disposition="rebutted") if old.get("disposition") == "blocking" and _rebutted(old) else old
+    # Only a finding that blocks releases a hold: not a medium copy (build/sd-1423 review), not a rebutted repeat (sd-review:1783).
+    at_floor = instance_rows(*(row for row in findings if _floor(row) and not _repeat(row)))
+    prior, disposed = [*map(_prior, instance_rows(*prior))], []
     for finding in findings:
-        severity = str(finding.get("severity", "unspecified"))
-        rank = BLOCKING_ORDER.get(severity, 0)
-        record = dict(finding)
-        blocking = rank > 0 and rank >= threshold
-        evidence = record.get("evidence")
-        note = None
-        if blocking and not (isinstance(evidence, str) and evidence.strip()):
-            # The rebuttal first: a rebutted prior blocker's old repro must not revive it (build/sd-1423 review).
-            repeat = getattr(recorded_at(rebutted, record.get("path"), record.get("summary"), record.get("line"),
-                                         record.get("instances")), "listed", False)
-            stored = None if repeat else prior_evidence(prior, record, at_floor)
+        record, blocking = dict(finding), _floor(finding)
+        evidence, note = record.get("evidence"), REPEAT_NOTE if _repeat(finding) else None
+        if blocking and not note and not (isinstance(evidence, str) and evidence.strip()):
+            stored = prior_evidence(prior, record, at_floor)
             if stored:
                 record["evidence"] = stored
-            note = REPEAT_NOTE if repeat else NO_REPRO_NOTE if stored is None and repro and str(
-                record.get("path") or "").strip() not in LANE_PATHS else None
+            note = NO_REPRO_NOTE if stored is None and repro and str(record.get("path") or "").strip() not in LANE_PATHS else None
         if note:
             blocking = False
             record["summary"] = f"{str(record.get('summary') or '').strip()} {note}".strip()
@@ -1834,18 +1831,21 @@ def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]
     def _echo(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:  # its summary at a nearby caller (sd-review:1809)
         return _file(old, new) and summary_key(old.get("summary")) == summary_key(new.get("summary")) and _near(
             old, new, ECHO_LINES, True)
-    def _gap(old: Mapping[str, Any], new: Mapping[str, Any]) -> int:  # an unplaced line is as far as an echo reaches
+    def _gap(old: Mapping[str, Any], new: Mapping[str, Any]) -> int:  # an unplaced line is farther than an echo reaches
         mine, theirs = old.get("line"), new.get("line")
-        return abs(mine - theirs) if type(mine) is int and type(theirs) is int else ECHO_LINES
-    def _repeats(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:  # the nearest place `new` echoes: one finding place answers one (sd-review:1838)
-        return _echo(old, new) and not any(_echo(other, new) and _gap(other, new) < _gap(old, new) for other in blockers)
-    def _held(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:  # fail closed: beside a prior place no finding repeats
-        return _file(old, new) and _near(old, new) and not any(_repeats(old, row) for row in findings)
+        return abs(mine - theirs) if type(mine) is int and type(theirs) is int else ECHO_LINES + 1
+    def _echoes(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:  # `old` is a nearest prior place `new` echoes: `new` takes its repro
+        return _echo(old, new) and not any(_echo(other, new) and _gap(other, new) < _gap(old, new) for other in places)
+    def _answers(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:  # and the only one: a tie releases neither hold (sd-review:1841)
+        return _echoes(old, new) and not any(_echoes(other, new) and other.get("line") != old.get("line") for other in places)
+    def _held(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:  # fail closed: beside a prior place no blocking finding repeats
+        return _file(old, new) and _near(old, new) and not any(_answers(old, row) for row in findings)
     def _mine(relation: Callable[[Any, Any], bool], old: Mapping[str, Any]) -> bool:  # at any place `record` names
         return any(relation(old, at) for at in instance_rows(record))
-    blockers = [old for old in prior if old.get("disposition") == "blocking"]
+    places = [old for old in prior if old.get("disposition") in ("blocking", "rebutted")]  # a rebutted place only takes its own repeat
+    blockers = [old for old in places if old["disposition"] == "blocking"]
     matched = [old.get("evidence") for old in blockers if _mine(_same, old)] or [
-        old.get("evidence") for old in blockers if _mine(_repeats, old) and not any(_same(old, row) for row in findings)]
+        old.get("evidence") for old in blockers if _mine(_echoes, old) and not any(_same(old, row) for row in findings)]
     if matched:
         return "\n".join(dict.fromkeys(text for text in matched if isinstance(text, str) and text.strip()))
     return "" if any(_mine(_held, old) for old in blockers) else None

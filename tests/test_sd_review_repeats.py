@@ -352,6 +352,24 @@ class PriorLineTests(RepeatFixture):
         self.assertEqual([(row["disposition"], row.get("evidence")) for row in (repeat, other)],
                          [("blocking", REPRO), ("blocking", None)])
 
+    def test_a_repeat_midway_between_a_hunk_and_its_moved_text_releases_neither(self) -> None:
+        """build/sd-1623 review (bin/sd-review:1982): `broken_call()` moved from line 10 to line 19 of one file.
+        The blocker holds line 9, its hunk, and line 19; a repeat at line 14 is as near one as the other and
+        answered both, so a paraphrase beside either posted as advisory."""
+        lines = [f"line{n}\n" for n in range(1, 31)]
+        (self.root / "src.py").write_text("".join(lines[:9]) + "    broken_call()\n" + "".join(lines[9:]), encoding="utf-8")
+        old = self.commit("add", "src.py") and self.commit("old")
+        (self.root / "src.py").write_text("".join(lines[:18]) + "    broken_call()\n" + "".join(lines[18:]), encoding="utf-8")
+        new = self.commit("add", "src.py") and self.commit("moved")
+        moved = sd_review.prior_at(self.root, old, new, [dict(finding(REPRO, line=10, summary="broken_call crashes"),
+                                                              disposition="blocking")])
+        self.assertEqual([row["line"] for row in moved], [9, 19])
+        disposed = sd_review.dispose([finding(line=14, summary="broken_call crashes"),
+                                      finding(line=8, summary="the cache is never cleared"),
+                                      finding(line=20, summary="the cache is never cleared")], "high", repro=True, prior=moved)
+        self.assertEqual([(row["disposition"], row.get("evidence")) for row in disposed],
+                         [("blocking", REPRO), ("blocking", None), ("blocking", None)])
+
     def test_each_instance_maps_to_this_head_on_its_own(self) -> None:
         """Class pass on bin/sd-review:1838: `prior_at` takes a blocker as stored and maps each place it names
         through its own file's diff; no row keeps the list of places as the prior head spelled them."""
@@ -808,6 +826,77 @@ class ReproRuleTests(unittest.TestCase):
                     disposed = sd_review.dispose(repeats + beside, "high", repro=True, prior=[blocker])
                     self.assertEqual([row["disposition"] for row in disposed], ["blocking"] * len(repeats) + [
                         "advisory" if place in repeated else "blocking" for place in places])
+
+    def test_one_finding_place_releases_at_most_one_hold(self) -> None:
+        """build/sd-1623 review (bin/sd-review:1841), class pass: with a.py:10 and a.py:14 recorded, a repeat at
+        line 12 is as near one as the other, and it answered both, so a paraphrase at line 15 posted as
+        advisory. Property over every repeat line: it releases the hold of the one place strictly nearest it,
+        within `ECHO_LINES`, and of neither on a tie; it blocks wherever it echoes a place."""
+        blocker = dict(finding(REPRO, path="a.py", line=10, summary="Empty input crashes",
+                               instances=["a.py:10", "a.py:14"]), disposition="blocking")
+        for line in [None, *range(-2, 30)]:
+            with self.subTest(line=line):
+                repeat, low, high = sd_review.dispose([
+                    finding(path="a.py", line=line, summary="Empty input crashes"),
+                    finding(path="a.py", line=9, summary="An empty list raises IndexError"),
+                    finding(path="a.py", line=15, summary="An empty list raises IndexError")],
+                    "high", repro=True, prior=[blocker])
+                gaps = [abs(line - place) if line is not None else 99 for place in (10, 14)]
+                echoes = line is None or min(gaps) <= sd_review.ECHO_LINES
+                self.assertEqual((repeat["disposition"], repeat.get("evidence")),
+                                 ("blocking", REPRO) if echoes else ("advisory", None))
+                self.assertEqual([low["disposition"], high["disposition"]], [
+                    "advisory" if echoes and mine < other else "blocking" for mine, other in (gaps, gaps[::-1])])
+
+    def test_only_a_finding_that_blocks_releases_a_hold(self) -> None:
+        """build/sd-1623 review (bin/sd-review:1783), class pass: a.py:10 and a.py:14 recorded, line 10 alone
+        rebutted. The repeat at line 10 posted as advisory, yet with its own place dropped it echoed line 14
+        and answered it, so a paraphrase at line 15 posted as advisory and the review passed. A rebutted repeat
+        answers nothing, and a rebutted place is still the place a repeat on it repeats."""
+        rebutted = listed(adjudicated(("a.py", "Empty input crashes", "rebutted"), line=10))
+        prior = [dict(finding(REPRO, path="a.py", line=10, summary="Empty input crashes",
+                              instances=["a.py:10", "a.py:14"]), disposition="blocking")]
+        paraphrase = finding(path="a.py", line=15, summary="An empty list raises IndexError")
+        for name, repeat, expected in (
+                ("uncited", finding(path="a.py", line=10, summary="Empty input crashes"), "advisory"),
+                ("cited", finding("python3 t.py: fails", path="a.py", line=10, summary="Empty input crashes"), "blocking"),
+                ("shifted", finding(path="a.py", line=11, summary="Empty input crashes"), "blocking")):
+            with self.subTest(repeat=name):
+                disposed = sd_review.dispose([repeat, paraphrase], "high", rebutted, repro=True, prior=prior)
+                self.assertEqual([row["disposition"] for row in disposed], [expected, "blocking"])
+        # A repeat at the open place releases it; the rebutted place's repro is never lent.
+        repeat, other = sd_review.dispose([finding(path="a.py", line=14, summary="Empty input crashes"), paraphrase],
+                                          "high", rebutted, repro=True, prior=prior)
+        self.assertEqual([repeat["disposition"], repeat.get("evidence"), other["disposition"]], ["blocking", REPRO, "advisory"])
+
+    def test_every_released_hold_has_a_blocking_repeat_of_its_own(self) -> None:
+        """Property for the class of bin/sd-review:1841 and :1783, over random places, repeats, citations and
+        rebuttals in one file: a hold is released when an uncited probe on its line posts as advisory. The
+        released lines of a summary never outnumber the blocking finding places of that summary, and each has
+        one within `ECHO_LINES`; so no repeat releases two holds, and none that does not block releases one."""
+        random = __import__("random").Random(9867)
+        for case in range(400):
+            summaries = ["Empty input crashes", "Missing null check"]
+            prior = [dict(finding(REPRO, path="a.py", line=random.randint(1, 30), summary=random.choice(summaries)),
+                          disposition="blocking") for _ in range(random.randint(1, 4))]
+            rebutted = listed(*(adjudicated(("a.py", row["summary"], "rebutted"), line=row["line"])
+                                for row in prior if random.random() < 0.3))
+            rows = [finding(*(["python3 t.py: fails"] if random.random() < 0.3 else []), path="a.py",
+                            line=random.choice([None, *range(1, 31)]), summary=random.choice(summaries))
+                    for _ in range(random.randint(0, 4))]
+            blocking = [row for row in sd_review.dispose(rows, "high", rebutted, repro=True, prior=prior)
+                        if row["disposition"] == "blocking"]
+            for summary in summaries:
+                repeats = [row["line"] for row in blocking if sd_review.summary_key(row["summary"]) == sd_review.summary_key(summary)]
+                held = {row["line"] for row in prior if row["summary"] == summary and not any(
+                    record.listed and (record.path, record.line, record.summary) == ("a.py", row["line"], sd_review.summary_key(summary))
+                    for record in rebutted)}
+                released = {line for line in held if sd_review.dispose(
+                    [*rows, finding(path="a.py", line=line, summary="a probe of this line")], "high", rebutted,
+                    repro=True, prior=prior)[-1]["disposition"] == "advisory"}
+                self.assertLessEqual(len(released), len(repeats), (case, prior, rows))
+                for line in released:
+                    self.assertTrue(any(at is None or abs(at - line) <= sd_review.ECHO_LINES for at in repeats), (case, line))
 
     def test_a_finding_repeats_a_prior_blocker_at_any_place_it_names(self) -> None:
         """Class pass on bin/sd-review:1838: the matcher read a finding's reported place alone, so an uncited
