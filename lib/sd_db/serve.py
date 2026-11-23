@@ -256,8 +256,10 @@ class Log:
         self.transactions = 0
 
     def line(self, text: str) -> None:
+        # Local time and zone first: a satellite's timeout names a minute, and an untimed line matched none (sd:10221).
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(time.time()))
         with self.guard:
-            self.stream.write(f"sd-db serve: {text}\n")
+            self.stream.write(f"{stamp} sd-db serve: {text}\n")
             self.stream.flush()
 
     def transaction(self, session: int, frames: int, gap: float, wall: float, after: str) -> None:
