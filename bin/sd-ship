@@ -56,6 +56,7 @@ from sd_ship_review import (
     SharedReview,
     adjudicated_check,
     carry_forward,
+    commit_absent,
     dropped_catch_up,
     failing_check_tails,
     gate_code,
@@ -3129,10 +3130,13 @@ def train_landed_tested(root: pathlib.Path, commit: str, tip: str) -> bool:
 
 
 def train_on_base(root: pathlib.Path, joined: str, tip: str) -> bool:
-    """Whether the recorded train merge `joined` is in the fetched base at `tip`; a missing object is not (sd:9923)."""
-    if sd_lib.git_output(["cat-file", "-e", f"{joined}^{{commit}}"], root) is None:
-        return False
-    return is_ancestor(root, joined, tip)
+    """Whether the recorded train merge `joined` is in the fetched base at `tip` (sd:9923).
+
+    An object the store does not hold did not land. A git that cannot
+    answer raises, as `is_ancestor` does: that is no proof the train did
+    not land, and a False here drops the train record or lets a merge go.
+    """
+    return not commit_absent(root, joined) and is_ancestor(root, joined, tip)
 
 
 def refuse_train_mismatch(commit: str, joined: str | None) -> None:

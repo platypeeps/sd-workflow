@@ -6690,6 +6690,16 @@ roles:
             self.join(_git(self.remote.path, "rev-parse", "main"))
         self.assert_train_landed_refusal(caught, commit)
 
+    def test_a_git_that_cannot_answer_is_no_proof_the_train_did_not_land(self):
+        """Class pass of sd:9923: a failed `cat-file` read as "not on the base", which dropped the train
+        record in reconcile and would let the landed-train guard pass."""
+        head = _git(self.root, "rev-parse", "HEAD")
+        self.assertTrue(ship.train_on_base(self.root, head, head))
+        self.assertFalse(ship.train_on_base(self.root, "0" * 39 + "1", head))  # an absent object did not land
+        with self.assertRaises(ship.Refusal) as caught:
+            ship.train_on_base(self.root / "no-checkout-here", head, head)
+        self.assertTrue(caught.exception.workflow["blocker"]["retryable"])
+
     def test_a_train_member_merged_at_another_commit_refuses(self):
         self.prepare()
         _main, earlier = self.landing_before()
