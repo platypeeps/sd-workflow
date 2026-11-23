@@ -2873,10 +2873,17 @@ def land_joined(joined: list[Joined], queue: Queue, ship: Ship, tip: str,
                                  "reason": str(landed.get("reason"))[:REASON_CHARS]}
         return {**landed, "items": items, "tip": tip}
     for row, tree, head, *_ in joined[1:]:  # each reconciles now; a stop here leaves it to its next claim's prepare
-        merged = ship(["-C", str(tree), "merge", "--item", str(row["item"]), "--expected-head", head, "--manual",
-                       "--json"], logs.with_name(f"train-merge-{row['item']}-{logs.name}.log"))
-        record[row["id"]] = {"status": "landed", "pull": landed.get("pull"), "merge_commit": merged.get("merge_commit"),
-                             "reconciled": bool(merged.get("ok") and merged.get("phase") == "merged")}
+        record[row["id"]] = {"status": "landed", "pull": landed.get("pull"), "reconciled": False}
+        try:  # a member's failure is its own: the landed train stays the claimed entry's answer
+            merged = ship(["-C", str(tree), "merge", "--item", str(row["item"]), "--expected-head", head, "--manual",
+                           "--json"], logs.with_name(f"train-merge-{row['item']}-{logs.name}.log"))
+        except Stop:
+            raise
+        except Exception as error:
+            record[row["id"]]["reason"] = f"{type(error).__name__}: {error}"[:REASON_CHARS]
+            continue
+        record[row["id"]].update(merge_commit=merged.get("merge_commit"),
+                                 reconciled=bool(merged.get("ok") and merged.get("phase") == "merged"))
     return {**landed, "items": items, "tip": tip}
 
 

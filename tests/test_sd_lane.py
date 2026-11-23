@@ -2185,6 +2185,29 @@ class TrainLanding(Trees):
         self.assertEqual(seen, [("train", "pending")])
         self.assertEqual(self.entries()[0]["status"], "merged")
 
+    def test_a_members_reconcile_that_raises_keeps_the_landed_train(self) -> None:
+        """Review of sd:9923: a log write that failed in a later member's reconcile discarded the landed train,
+        so the claimed entry went on at `step: merge`, which a kill there fails."""
+        seen: list[tuple[str, str]] = []
+        real = self.ship
+
+        def ship(argv: list[str], log: pathlib.Path) -> dict:
+            item = int(argv[argv.index("--item") + 1])
+            if argv[2] == "merge" and "--train-onto" not in argv:
+                if item == 3:
+                    raise OSError(28, "No space left on device")
+                if item == 1:
+                    seen.append(self.lead_step())
+            return real(argv, log)
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, ship, self.gate)
+        entries = self.entries()
+        self.assertEqual(entries[0]["train_landing"]["status"], "merged")
+        self.assertEqual(seen, [("train", "pending")])
+        self.assertEqual(entries[1]["train"]["reconciled"], True)
+        self.assertEqual(entries[2]["train"]["reconciled"], False)
+        self.assertIn("No space left on device", entries[2]["train"]["reason"])
+
     def assert_authority_withdrawn_during_the_gate_lands_nothing(self, manual: tuple[bool, bool, bool]) -> None:
         """Review of sd:9923: `repo.runner_merge` turned manual during the gate, and the lead was not read again."""
         setting = ["auto"]
