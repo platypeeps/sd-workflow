@@ -2155,10 +2155,10 @@ class CancelParks(Case):
         self.press_unran(items[1], "blocked")
         self.assert_fresh(build.queue_again(self.db, items[:2], who="operator"), items[:2], old)
 
-    def test_a_subset_build_without_the_lead_reads_the_whole_bundle(self):
+    def test_a_subset_build_without_the_lead_builds_fresh(self):
         """Class pass, review of build/sd-1654: Build B C of bundle A, B, C whose lead A a newer build owns. A part
-        without the lead is no Retry (`retry` refuses it), so the read is the whole bundle's, which A's newer
-        build refuses: B and C build fresh, as before pack sd:9936. The read narrowed to B and C and refused."""
+        without the lead is no Retry (`retry` refuses it), so B and C build fresh, as before pack sd:9936. The
+        read narrowed to B and C and refused."""
         items, old = self.blocked_bundle()
         self.newer_build(items[0])
         for item in items[1:]:
@@ -2173,6 +2173,38 @@ class CancelParks(Case):
         for item in items[1:]:
             self.press_unran(item, "blocked")
         self.assert_fresh(build.queue_again(self.db, items[1:], who="operator"), items[1:], old)
+
+    def assert_whole_retry(self, queued, old):
+        """`queued` is the `old` bundle's Retry, each member queued once, and nothing else."""
+        self.assertEqual(sorted(entry["id"] for entry in queued), sorted(old))
+        self.assertEqual({runner.queue_state(self.db, ident)["status"] for ident in old}, {"queued"})
+
+    def test_a_mixed_selection_queues_a_member_its_bundle_retry_takes_once(self):
+        """Lane case 1, review of build/sd-1654: Build A B of blocked bundle A, B, C whose B has a newer press
+        refused before a claim. A reads its bundle, B its refused press: one bundle item named, so its Retry is
+        the whole bundle's, which takes B too; then the press queued B fresh and refused. B goes with the Retry."""
+        items, old = self.blocked_bundle()
+        self.press_unran(items[1], "blocked")
+        self.assert_whole_retry(build.queue_again(self.db, items[:2], who="operator"), old)
+
+    def test_a_subset_without_the_lead_whose_presses_were_cancelled_builds_fresh(self):
+        """Lane case 2, review of build/sd-1654: Build B C of blocked bundle A, B, C, each with a newer press
+        cancelled before a claim. The read took the whole bundle, but the press handed `retry` B and C alone,
+        which refuses a part without its lead (pack sd:9581). The read is that part's, no Retry: both build
+        fresh."""
+        items, old = self.blocked_bundle()
+        for item in items[1:]:
+            self.press_unran(item)
+        self.assert_fresh(build.queue_again(self.db, items[1:], who="operator"), items[1:], old)
+
+    def test_a_refused_press_as_a_named_items_newest_row_leaves_one_plan(self):
+        """Lane case 3, review of build/sd-1654: as case 1, but A's newer press was cancelled before a claim, so
+        A reads its bundle past it. `_reads` drops B from the narrowing, so the press retried the whole bundle,
+        then queued B fresh and refused with a cause it made itself. B goes with the Retry."""
+        items, old = self.blocked_bundle()
+        self.press_unran(items[0])
+        self.press_unran(items[1], "blocked")
+        self.assert_whole_retry(build.queue_again(self.db, items[:2], who="operator"), old)
 
     def test_a_subset_build_reads_the_held_split_of_the_bundle_it_narrowed_to(self):
         """Class pass, review of build/sd-1654: bundle A, B, C is held after a subset Retry left D out, and a newer

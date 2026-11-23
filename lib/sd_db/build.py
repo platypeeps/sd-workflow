@@ -1104,7 +1104,6 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
     finding = finding.strip()
     with transaction(connection):
         leads, fixes, fresh = [], [], []
-        named: dict[int, set[int]] = {}
         # Each lane-failed run this press split, and every member of its bundle: the split settled each, so a
         # later one of them is done, whatever the order (review of build/sd-1306).
         freed: dict[str, set[int]] = {}
@@ -1170,16 +1169,22 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                     and not (state["run"] and state["run"]["outcome"] is None and state["run"]["step"] in LANE_STEPS)
                     and not _done(reads.items_by_ids(connection, [state["item"]]), state["item"])):
                 leads += [] if lead in leads else [lead]
-                named.setdefault(lead, set()).add(item)
             else:
                 fresh.append(item)
+        # The plan, read before any Retry writes: each lead's part (`_part`, the rule `_retry_takes` read), and a
+        # named item a whole-bundle Retry takes goes with it, not fresh, or the press queues it twice and refuses
+        # with a cause it made itself (lane cases 1 and 3, review of build/sd-1654).
+        parts = {}
+        for lead in leads:
+            state = queue_state(connection, lead)
+            parts[lead] = _part(connection, lead, state["status"], items)
+            takes = {member["item"] for member in _open_members(connection, lead, state["status"])}
+            fresh = [item for item in fresh if parts[lead] is not None or item not in takes]
         if finding and fresh:
             raise BuildRefused(f"--finding goes to a Retry or a Fix; {', '.join(f'sd:{item}' for item in fresh)} "
                                "would be a fresh build, with no builder to send it to")
-        # One named item is the row's Retry of its whole bundle; two or more name the part to retry (pack sd:9581).
         queued = [entry for lead in leads for entry in retry(
-            connection, lead, who=who, finding=finding,
-            only=named[lead] if len(named[lead]) > 1 else None)["queued"]]
+            connection, lead, who=who, finding=finding, only=parts[lead])["queued"]]
         for run in fixes:
             fixed = lane_fix(connection, run["id"],
                              finding or f"the lane entry failed; fix what it names: {run['detail']}"[:2000], who=who)
@@ -1193,6 +1198,17 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                     change_status(connection, item, "ready", who=who, expected_revision=state["revision"])
         fresh = list(dict.fromkeys(fresh))
         return queued + (queue(connection, fresh, who=who) if fresh else [])
+
+
+def _part(connection, lead: int, status: str, selected: Collection[int]) -> set[int] | None:
+    """The `only` a Build press of `selected` hands `retry` for build `lead`'s bundle in `status`: the bundle items
+    it names whose row Build reads for the item (`_reads`), when two or more; None, the whole bundle, otherwise.
+    One named item is the row's Retry of its whole bundle, and a part must name the lead (pack sd:9581).
+    `_retry_takes` reads it and `queue_again` writes it, with the same inputs, so the press runs the Retry its
+    read chose (lane cases 1 to 3, review of build/sd-1654)."""
+    named = {member["item"] for member in _open_members(connection, lead, status)
+             if member["item"] in set(selected) and _reads(connection, member)}
+    return named if len(named) > 1 else None
 
 
 def _past_cancel(rows: list):
@@ -1248,15 +1264,17 @@ def _retry_takes(connection, lead: int, status: str, selected: Collection[int] =
     own, and a member that waits on another bundle item leaves parked, so neither is press-checked (sd:10022).
     A press naming two or more of the bundle's items retries those alone (`retry`'s `only`): a member it leaves
     out leaves the bundle, so its newer build refuses nothing (pack sd:9936). The read names the set `queue_again`
-    hands `retry`, by `retry`'s own rules, or Build picks a Retry that refuses (class pass, review of
-    build/sd-1654): only a member whose row Build reads for its item counts (`_reads`), and a part that leaves
-    the lead out is no Retry, so it reads the whole bundle."""
+    hands `retry`, `_part`, or Build picks a Retry that refuses (class pass, review of build/sd-1654): only a
+    member whose row Build reads for its item counts (`_reads`), and a part that leaves the lead out is no
+    Retry, so Build reads a fresh press."""
     row = connection.execute("SELECT item FROM assignment WHERE id = ?", (lead,)).fetchone()
     if row is None or _done(reads.items_by_ids(connection, [row["item"]]), row["item"]):
         return False
     members = _open_members(connection, lead, status)
-    named = [member for member in members if member["item"] in set(selected) and _reads(connection, member)]
-    members = named if len(named) > 1 and row["item"] in {member["item"] for member in named} else members
+    part = _part(connection, lead, status, selected)
+    if part is not None and row["item"] not in part:
+        return False  # Retry refuses a part without its lead: Build reads a fresh press (lane case 2)
+    members = [member for member in members if part is None or member["item"] in part]
     if not members or not all(_current(connection, member) for member in members):
         return False
     ahead, behind = _inside(connection, row["item"], members)
