@@ -1144,8 +1144,8 @@ class Supervise(Case):
         self.assertEqual(self.statuses(), ["blocked"])
 
     def test_fix_rounds_past_the_third_escalate(self):
-        """Pack sd:9264: fix rounds 1-3 run on the bundle's model; round 4 on runs on the strongest model at high
-        effort, its brief naming the repeating blockers' class; the park still comes after REVIEW_ROUNDS."""
+        """Pack sd:9264: early fix rounds run on the bundle's model; the class-pass round runs on the strongest
+        model at medium effort (sd:10192), its brief naming the blockers' class; the park stays."""
         R = build_run.REVIEW_ROUNDS
         self.press()
         self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1))], sd_review=["blocking"] * (R + 1))
@@ -1158,7 +1158,7 @@ class Supervise(Case):
         self.assertLess(E, R, "no fix escalates before the park (sd:10111)")
         self.assertEqual(models[:E], [("opus", False)] * E, "an early round escalated")
         self.assertEqual(models[E:], [(build_run.STRONGEST, True)] * (R - E), "a late round did not escalate")
-        self.assertEqual(fixes[E][fixes[E].index("--effort") + 1], "high")
+        self.assertEqual(fixes[E][fixes[E].index("--effort") + 1], "medium", "sd:10192")
         prompts = [argv[argv.index("-p") + 1] for argv in fixes]
         self.assertNotIn("name the class", prompts[E - 1])
         self.assertIn("name the class", prompts[E])
