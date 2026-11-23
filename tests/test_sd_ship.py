@@ -6592,6 +6592,21 @@ roles:
         self.assertEqual(landed["status"], "unknown")
         self.assertEqual(self.remote.pull(1).state, "MERGED")  # GitHub took the PUT
 
+    def test_land_train_whose_read_back_is_malformed_after_the_put_answers_unknown(self):
+        """Review of sd:9923: `base: "main"` raised AttributeError past the unknown outcome."""
+        tip = self.joined_tip()
+        remote = sys.modules["sd_ship_remote"]
+        real = remote.GitHub.pull
+
+        def pull(api, number):
+            if any(call.method == "PUT" for call in self.remote.calls):
+                return {"merged": True, "base": "main", "merge_commit_sha": "c" * 40}
+            return real(api, number)
+        with patch.object(remote.GitHub, "pull", pull):
+            landed, _ = self.landed_by_lane(tip)
+        self.assertEqual(landed["status"], "unknown")
+        self.assertEqual(self.train_branches(), [])
+
     def test_land_train_whose_gate_fails_opens_no_pull_request(self):
         tip = self.joined_tip()
         landed, _ = self.landed_by_lane(tip, gate="failure")

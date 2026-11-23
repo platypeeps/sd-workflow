@@ -3013,14 +3013,31 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
             api.api(f"{api.prefix}/pulls/{pull}/merge", method="PUT",
                     body={"sha": tip, "merge_method": "merge", "commit_title": f"chore(lane): train of {names} (#{pull})",
                           "commit_message": train_message(root, tip, base)})
-        merged = api.pull(pull)
-        if merged.get("merged") is not True or (merged.get("base") or {}).get("ref") != base:
-            return {"status": "failed", "pull": pull, "reason": f"GitHub did not merge train pull request #{pull} onto {base}"}
-        return {"status": "merged", "pull": pull, "merge_commit": merged.get("merge_commit_sha")}
+        return read_back(api.pull(pull), pull, base)
     except sd_ship_remote.Refusal as error:
         return {"status": "unknown" if sent else "failed", "reason": str(error)[:600]}
     finally:
         scratch_git(root, "push", "--quiet", "origin", "--delete", branch)
+
+
+def read_back(merged: Any, pull: int, base: str) -> dict[str, Any]:
+    """The train pull request's state read after its PUT: merged onto `base`, not merged, or unknown (sd:9923).
+
+    Only a well-formed answer decides. `merged: false` is GitHub's word that
+    nothing landed; any other shape may hide a merge, so it is unknown, and
+    the claimed entry reconciles on its next prepare instead of merging alone.
+    """
+    shaped = isinstance(merged, dict) and isinstance(merged.get("base"), dict)
+    if shaped and merged.get("merged") is False:
+        return {"status": "failed", "pull": pull, "reason": f"GitHub did not merge train pull request #{pull}"}
+    commit = merged.get("merge_commit_sha") if shaped else None
+    if not (shaped and merged.get("merged") is True and isinstance(commit, str)
+            and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)):
+        return {"status": "unknown", "pull": pull, "reason": f"train pull request #{pull} read back unreadable"}
+    if merged["base"].get("ref") != base:
+        return {"status": "failed", "pull": pull, "reason": f"train pull request #{pull} merged onto "
+                                                            f"{merged['base'].get('ref')}, not {base}"}
+    return {"status": "merged", "pull": pull, "merge_commit": commit}
 
 
 def train_message(root: pathlib.Path, tip: str, base: str) -> str:
