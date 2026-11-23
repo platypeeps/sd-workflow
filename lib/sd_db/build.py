@@ -438,13 +438,19 @@ def _route(connection, lane_host: str | None, lead: int | None) -> str | None:
     """`lane_of` the host whose dispatcher claims a build of the repository whose lane is `lane_host`, for the
     bundle `lead` leads (None when it never ran): its lane now, as a retry follows `repo.lane_host`, except a bundle
     the hub built under the overload fallback for a satellite's lane, whose commits sit in the hub's worktree: that
-    one builds on the hub again (sd:8991). The one rule for a claim, Retry, pickup and the Builds panel."""
+    one builds on the hub again (sd:8991) while it may hold unpushed commits, or while its lane host is busy or
+    quiet. Once its last run reached the lane, which pushed its head (`LANE_STEPS`), and the lane host's beat is
+    fresh and under its cap, it goes home, its worktree started from the pushed branch (sd:10143). The one rule for
+    a claim, Retry, pickup and the Builds panel."""
     lane = lane_of(connection, lane_host)
     if lane is None or lead is None:
         return lane
-    ran = connection.execute("SELECT owner FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
+    ran = connection.execute("SELECT owner, step FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
                              (lead,)).fetchone()
-    return None if ran and lane_of(connection, run_host(ran["owner"])) is None else lane
+    if not ran or lane_of(connection, run_host(ran["owner"])) is not None:
+        return lane
+    home = ran["step"] in LANE_STEPS and not dispatcher_gone(connection, lane) and not overloaded(connection, lane)
+    return lane if home else None
 
 
 def run_owner(owner: str, lane_host: str | None) -> str:

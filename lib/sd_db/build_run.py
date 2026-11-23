@@ -1437,7 +1437,13 @@ class Supervisor:
             _read([*self.tools.git, "-C", str(self.repo), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], env=self.env)
             argv = ["worktree", "add", str(self.work), branch]
         except Unread:
-            argv = ["worktree", "add", "-b", branch, str(self.work), self.base()]
+            # A retry the hub built and the lane pushed starts from that push on its lane host (sd:10143).
+            try:
+                start = _read([*self.tools.git, "-C", str(self.repo), "rev-parse", "--verify", "--quiet",
+                               f"refs/remotes/origin/{branch}"], env=self.env).strip()
+            except Unread:
+                start = self.base()
+            argv = ["worktree", "add", "-b", branch, str(self.work), start]
         if self.child([*self.tools.git, "-C", str(self.repo), *argv], cwd=self.repo, name="worktree") != 0:
             return self.finish("blocked", f"git worktree add {self.work} failed; see {self.out('worktree')}")
         return self.split_first() or "building"

@@ -2585,6 +2585,23 @@ class Hosts(Case):
         self.assertIsNone(self.claim(hosts=WORK), "the hub's fallback retry waits for the hub")
         self.assertEqual(self.claim(hosts=HUB)["owner"], "fixture")
 
+    def test_a_pushed_fallback_retry_goes_back_to_its_lane_host_under_its_cap(self):
+        """sd:10143: every retry of a bundle the hub built for a busy satellite stayed on the hub, on a cold
+        checkout, while the satellite sat idle. Once the lane pushed its branch and the satellite's beat is fresh
+        and under its cap, the satellite builds the retry; while it is busy or quiet, the hub keeps it."""
+        build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
+        fallback = self.claim(hosts=HUB)
+        self.retried(fallback)
+        self.db.execute("UPDATE runner_run SET step = 'enqueued', outcome = 'lane_failed' WHERE id = ?",
+                        (fallback["id"],))
+        self.assertIsNone(self.claim(hosts=WORK), "busy: the hub keeps it")
+        self.stale()
+        self.assertIsNone(self.claim(hosts=WORK), "quiet: the hub keeps it")
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        self.assertIsNone(self.claim(hosts=HUB), "the pushed retry waits for its lane host")
+        self.assertEqual(self.claim(hosts=WORK)["owner"], "fixture@work")
+
     def test_a_retry_follows_its_lane_moved_from_a_quiet_satellite_to_the_hub(self):
         """sd:8991 review round 3: `_ran_on` kept every retry on the host of its last run, so a Retry whose lane
         the operator moved from a down satellite to the hub was blocked on that satellite's quiet beat."""

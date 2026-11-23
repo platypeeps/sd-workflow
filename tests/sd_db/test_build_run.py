@@ -3066,6 +3066,23 @@ class Supervise(Case):
         self.assertIn("do one class pass", fix[fix.index("-p") + 1])
         self.assertEqual(build.run(self.db, again["id"])["review_round"], R)
 
+    def test_a_retry_with_no_local_branch_starts_from_the_pushed_one(self):
+        """sd:10143: a retry the hub built and the lane pushed goes back to its lane host, whose checkout has no
+        such branch; the worktree started it from the base, without the bundle's commits. It starts from the push."""
+        self.press()
+        other = support.repository(self.root / "elsewhere")
+        support.git(other, "remote", "add", "origin", str(self.root / "origin.git"))
+        support.git(other, "fetch", "-q", "origin")
+        support.git(other, "checkout", "-q", "-b", self.bundle["branch"], "origin/main")
+        (other / "work.txt").write_text("built on the hub\n", encoding="utf-8")
+        support.git(other, "add", "work.txt")
+        support.git(other, "commit", "-qm", "feat: hub work")
+        pushed = support.git(other, "rev-parse", "HEAD")
+        support.git(other, "push", "-q", "origin", self.bundle["branch"])
+        self.write_pr()  # the run's log folder
+        self.assertEqual(self.supervisor().worktree(), "building")
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), pushed)
+
     def test_a_usage_limit_reclaim_refuses_a_worktree_on_another_branch(self):
         """Review of build/sd-1557: the reclaim resumed at building or fixing, past the worktree step's branch
         guard, so a checkout switched during the hold took the builder's commits. The guard runs first."""
