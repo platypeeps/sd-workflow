@@ -622,7 +622,7 @@ class ReproRuleTests(unittest.TestCase):
             with self.subTest(label):
                 previous = {"findings": [dict(blocker, **({"prior_review": found} if found else {}))],
                             **({"history": history} if history else {})}
-                [record] = sd_review.dispose([new], "high", repro=True, prior=sd_review.still_open(previous))
+                [record] = sd_review.dispose([new], "high", repro=True, prior=sd_review.unresolved(previous))
                 self.assertEqual(record["disposition"], expected)
 
     def test_a_reproduced_break_in_an_unchanged_caller_blocks(self) -> None:

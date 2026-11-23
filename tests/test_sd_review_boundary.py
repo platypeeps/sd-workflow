@@ -1084,11 +1084,16 @@ class LineBudgetTests(unittest.TestCase):
         # 4964 -> 4969 is the next build/sd-1423 review: `bin/sd-review`
         # +5 so a blocker's own summary cited at another line of its
         # file repeats it. Measured: `sd-review` is 2999 here.
+        #
+        # 4969 -> 4984 is lane round 2 and the next build/sd-1423 review:
+        # `bin/sd-review` +15, `unresolved` keeps only blockers still open
+        # at the last completed pass (pack sd:10008), and ECHO_LINES bounds
+        # a summary's repeat. Measured: `sd-review` is 3014 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4969,
+            4984,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
