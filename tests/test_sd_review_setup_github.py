@@ -17,7 +17,9 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import os
 import pathlib
+import socket
 import subprocess
 import sys
 import tempfile
@@ -322,6 +324,12 @@ def head_check_script() -> str:
     return textwrap.dedent("\n".join(lines[start:])) + "\n"
 
 
+def run_head_check(root: pathlib.Path, env: dict[str, str]) -> subprocess.CompletedProcess:
+    """Run the head check as the lane does, with no stdin: a socket there makes bash read ~/.bashrc."""
+    return subprocess.run(["bash", "-e", "-c", head_check_script()], cwd=str(root), env=env,
+                          stdin=subprocess.DEVNULL, capture_output=True, text=True)
+
+
 class HeadCheckTests(SetupFixture):
     """sd:1818. The checkout reads `refs/pull/N/head`, so a re-run of an
     older run checks out the newer head while it reports on the SHA its
@@ -346,10 +354,28 @@ class HeadCheckTests(SetupFixture):
                               capture_output=True, text=True).stdout.strip()
         for sha, code in ((head, 0), ("f" * 40, 1)):
             with self.subTest(sha=sha):
-                done = subprocess.run(["bash", "-e", "-c", head_check_script()], cwd=str(root),
-                                      env={"PATH": "/usr/bin:/bin", "HEAD_SHA": sha},
-                                      capture_output=True, text=True)
+                done = run_head_check(root, {"PATH": "/usr/bin:/bin", "HEAD_SHA": sha})
                 self.assertEqual(done.returncode, code, done.stdout + done.stderr)
+        self.assertIn(f"but this run reports on {'f' * 40}", done.stdout)
+
+    def test_a_socket_on_stdin_reads_no_bashrc(self) -> None:
+        """pack sd:10110: with a socket on stdin, bash 3.2 runs as a remote shell and reads ~/.bashrc; an
+        operator's ~/.bashrc looped with no HOME until bash crashed. The run hands bash no stdin."""
+        root = self.make_repo()
+        home = self.tmp / "home"
+        home.mkdir()
+        (home / ".bashrc").write_text("exit 3\n", encoding="utf-8")
+        ours, theirs = socket.socketpair()
+        saved = os.dup(0)
+        try:
+            os.dup2(theirs.fileno(), 0)
+            done = run_head_check(root, {"PATH": "/usr/bin:/bin", "HEAD_SHA": "f" * 40, "HOME": str(home)})
+        finally:
+            os.dup2(saved, 0)
+            os.close(saved)
+            ours.close()
+            theirs.close()
+        self.assertEqual(done.returncode, 1, done.stdout + done.stderr)  # the check's own failure, not .bashrc's
         self.assertIn(f"but this run reports on {'f' * 40}", done.stdout)
 
     def test_remove_takes_a_lane_written_before_the_head_check_without_force(self) -> None:
