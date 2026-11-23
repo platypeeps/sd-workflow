@@ -462,6 +462,17 @@ class PriorVerdictTests(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual(len(sd_review.carried(prior, [self.answer()], rebutted)), count)
 
+    def test_a_failed_readers_open_verdict_outlives_a_fallbacks_fixed(self) -> None:
+        """build/sd-1675 review: a reviewer that failed after a valid `open` verdict, and a fallback that
+        said `fixed`, cleared the blocker, since only the readers that completed were read."""
+        raw = json.dumps({"findings": [], "verdicts": [verdict("open", "python3 t.py []: IndexError")]})
+        failed = sd_review._answer("one", sd_review.Completed(1, raw, "crash"), sd_review.parse_findings(raw))
+        self.assertEqual(failed.verdicts, (verdict("open", "python3 t.py []: IndexError"),))
+        result = self.settle(failed, self.answer(verdicts=[verdict("fixed")], name="two"), reviewed=["two"])
+        self.assertEqual(result["status"], "blocking")
+        self.assertEqual(self.carried(result),
+                         [("blocking", "one: python3 t.py []: IndexError", {"id": "B1", "verdict": "open"})])
+
     def test_no_completed_reader_carries_nothing(self) -> None:
         failed = sd_review.Outcome("one", sd_review.UNAVAILABLE, (), "", (), ())
         result = self.settle(failed, reviewed=[])

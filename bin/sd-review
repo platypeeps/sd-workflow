@@ -1452,7 +1452,8 @@ def _answer(
         # A failing process can still report a real defect. A fallback must
         # never erase those findings or turn its partial answer into a pass.
         detail = f"{failed.detail}; {parsed.error}" if parsed is not None and parsed.error else failed.detail
-        return failed._replace(findings=findings, detail=detail)
+        # build/sd-1675 review: an `open` verdict it gave keeps a prior blocker open, whatever a fallback says.
+        return failed._replace(findings=findings, detail=detail, verdicts=parsed.verdicts if parsed is not None else ())
     status, detail = FINDINGS if findings else CLEAN, f"{len(findings)} finding(s)"
     return Outcome(backend, status, tuple(findings), detail, tuple(argv), tuple(scrubbed), verdicts=parsed.verdicts)
 
@@ -1838,20 +1839,21 @@ def carried(prior: Sequence[Mapping[str, Any]], outcomes: Sequence[Outcome],
             rebutted: Sequence[Rebuttal] = ()) -> list[dict[str, Any]]:
     """Each prior blocker this pass did not clear, as a blocking row (sd:10087). It clears only when every reader
     that answered returned `fixed` for its `id` with evidence; `open`, no verdict, a blank one or a conflicting
-    one carries it, with each `open` verdict's evidence, else its own. A rebutted blocker is answered: none.
+    one carries it, with each `open` verdict's evidence, else its own; so does a failed reader's `open`. A rebutted blocker is answered: none.
     With no reader answered nothing is carried: the review is incomplete and blocks on that."""
     answered = [outcome for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)]
     open_rows = [old for old in prior if answered and old.get("disposition") == "blocking" and not is_rebutted(rebutted, old)]
-    return [row for old in open_rows if (row := _carry(old, answered)) is not None]
+    return [row for old in open_rows if (row := _carry(old, answered, outcomes)) is not None]
 
 
-def _carry(old: Mapping[str, Any], answered: Sequence[Outcome]) -> dict[str, Any] | None:
-    """`old` as a carried blocking row, or None when every reader in `answered` said `fixed` with evidence."""
-    said = [(outcome.backend, row) for outcome in answered for row in outcome.verdicts if row["id"] == old.get("id")]
+def _carry(old: Mapping[str, Any], answered: Sequence[Outcome], outcomes: Sequence[Outcome]) -> dict[str, Any] | None:
+    """`old` as a carried blocking row, or None when every reader in `answered` said `fixed` with evidence and
+    no reader, a failed one included, said `open` (build/sd-1675 review: a fallback cleared a failed one's)."""
+    said = [(outcome.backend, row) for outcome in outcomes for row in outcome.verdicts if row["id"] == old.get("id")]
     def _fixed(name: str) -> bool:
         mine = [row for backend, row in said if backend == name]
         return bool(mine) and all(row["verdict"] == "fixed" and row["evidence"].strip() for row in mine)
-    if all(_fixed(outcome.backend) for outcome in answered):
+    if all(_fixed(outcome.backend) for outcome in answered) and not any(row["verdict"] == "open" for _name, row in said):
         return None
     opened = [f"{name}: {row['evidence'].strip()}" for name, row in said if row["verdict"] == "open" and row["evidence"].strip()]
     stored = old.get("evidence") if isinstance(old.get("evidence"), str) else ""
