@@ -3027,6 +3027,9 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
         # As a lone merge does, the PUT goes out under the ship lock, after the hold it serializes with.
         with store.repository_lock(database, api.repository, holder={"command": f"sd lane train {names}",
                                                                      "item": items[0], "review": None}):
+            why = base_moved(root, tip, base)  # again here, as a lone merge reads it right before its PUT
+            if why is not None:
+                return {"status": "failed", "pull": pull, "reason": why[:600]}
             hold = sd_ship_hold.standing(database, api.repository)
             if hold is not None and set(items) != {hold["item"]}:
                 return {"status": "failed", "pull": pull,

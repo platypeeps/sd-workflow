@@ -6568,12 +6568,16 @@ roles:
         _git(self.root, "fetch", "-q", "origin", "main")
         self.assertTrue(ship.sd_lib._closed_by(self.root, "FETCH_HEAD", f"sd:{self.item}"))
 
-    def test_a_train_merged_onto_a_base_that_moved_before_the_put_delivers_nothing_in_git(self):
+    def test_a_train_merged_onto_a_base_that_moved_at_the_put_delivers_nothing_in_git(self):
         tip = self.joined_tip()
+        saved = self.double._route
 
-        def race():
-            self.remote.commit_on("main", "raced\n\nAuthored-with: human", files={"raced.py": "r = 1\n"})
-        landed, _ = self.landed_by_lane(tip, ready=race)
+        def route(method, path, body):  # GitHub's own moment: after every read the lane takes
+            if method == "PUT" and path.endswith("/merge"):
+                self.remote.commit_on("main", "raced\n\nAuthored-with: human", files={"raced.py": "r = 1\n"})
+            return saved(method, path, body)
+        self.double._route = route
+        landed, _ = self.landed_by_lane(tip)
         self.assertEqual(landed["status"], "merged")
         _git(self.root, "fetch", "-q", "origin", "main")
         self.assertFalse(ship.sd_lib._closed_by(self.root, "FETCH_HEAD", f"sd:{self.item}"))
@@ -6707,12 +6711,23 @@ roles:
         """Review of sd:9923: the train PUT neither read the repository hold nor took the ship lock that
         serializes holds with merges, so a hold taken after the last join did not stop it."""
         tip = self.joined_tip()
-        main = _git(self.remote.path, "rev-parse", "main")
-        landed, _ = self.landed_by_lane(tip, ready=lambda: take() and None)
+        main = []
+
+        def taken():
+            take()
+            main.append(_git(self.remote.path, "rev-parse", "main"))  # as it stands once taken: the PUT moves it
+        landed, _ = self.landed_by_lane(tip, ready=taken)
         self.assertEqual(landed["status"], "failed")
         self.assertIn(reason, landed["reason"])
         self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
-        self.assertEqual(_git(self.remote.path, "rev-parse", "main"), main)
+        self.assertEqual([_git(self.remote.path, "rev-parse", "main")], main)
+
+    def test_land_train_whose_base_moved_after_the_fence_sends_no_merge(self):
+        """Review of sd:9923: a lone merge under a declared gap reads the base again right before its PUT;
+        the train read it only after the gate, so a base that moved after that landed untested."""
+        self.assert_taken_before_the_put_sends_no_merge(
+            lambda: self.remote.commit_on("main", "raced\n\nAuthored-with: human", files={"raced.py": "r = 1\n"}),
+            "moved")
 
     def test_land_train_under_a_repository_hold_sends_no_merge(self):
         other = create_item(self.connection, kind="work", title="held work", status="in_progress",
