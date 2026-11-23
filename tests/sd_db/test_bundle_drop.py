@@ -1074,8 +1074,9 @@ class Advisories(Repo):
         build.retry(self.db, lead, who="operator", only=[items[0], items[2]])
         self.end(self.claim(), f"{build.SPLIT}fixture")
         self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[1],))
+        self.delivers(items[1], "b.txt", "second\n")
         new = self.drop(run, items[2])
-        self.assertEqual(self.files(new), ["README", "a.txt"])
+        self.assertEqual(self.files(new), ["README", "a.txt", "b.txt"])
         self.assertNotIn(f"sd:{items[1]}", self.closes(new))
 
     def four(self):
@@ -1102,17 +1103,50 @@ class Advisories(Repo):
         self.end(self.claim(), f"{build.SPLIT}fixture")
         self.assertEqual(build.split(self.db, lead), "held")
         self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[1],))
+        self.delivers(items[1])
         new = self.drop(run, items[2])
-        self.assertEqual(self.files(new), ["0.txt", "README"])
+        self.assertEqual(self.files(new), ["0.txt", "1.txt", "README"])
         self.assertNotIn(f"sd:{items[1]}", self.closes(new))
 
     def test_a_done_member_stays_off_the_kept_branch(self):
         """Class pass, build review round 6: every done member's commits stay aside, held split or not."""
         items, run = self.four()
         self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[1],))
+        self.delivers(items[1])
         new = self.drop(run, items[3])
-        self.assertEqual(self.files(new), ["0.txt", "2.txt", "README"])
+        self.assertEqual(self.files(new), ["0.txt", "1.txt", "2.txt", "README"])
         self.assertNotIn(f"sd:{items[1]}", self.closes(new))
+
+    def delivers(self, item, name="1.txt", text="1\n"):
+        """origin/main lands `item`'s work in a squash whose trailer delivers it, as `sd-ship` writes one."""
+        self.main_moves(name, text)
+        other = self.root / "other"
+        git(other, "commit", "-q", "--amend", "-m", f"feat: landed (#1)\n\nDelivers: sd:{item}")
+        git(other, "push", "-q", "-f", "origin", "HEAD:main")
+        git(self.repo, "fetch", "-q", "origin")
+
+    def test_a_done_member_main_never_delivered_refuses_the_drop(self):
+        """sd:10021: B marked done by hand, its work only on the bundle branch, then drop D. B's commits stayed
+        aside, so a kept commit that needs B's file replayed cleanly onto a branch without it. The drop refuses."""
+        items, run = self.four()
+        work = Path(run["work_path"])
+        old = git(work, "rev-parse", "HEAD")
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[1],))
+        with self.assertRaisesRegex(DROP.DropRefused, f"work of sd:{items[1]}, which is done but which"):
+            DROP.drop_item(self.db, build, items[3], who="operator")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), old)
+        self.unmade(run)
+
+    def test_a_done_member_cited_only_in_prose_on_main_still_refuses(self):
+        """A main commit that names B outside its trailer block delivers nothing."""
+        items, run = self.four()
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[1],))
+        self.main_moves("x.txt", "x\n")
+        other = self.root / "other"
+        git(other, "commit", "-q", "--amend", "-m", f"feat: x\n\nCloses: sd:{items[1]} is next\n\nRefs: x")
+        git(other, "push", "-q", "-f", "origin", "HEAD:main")
+        with self.assertRaisesRegex(DROP.DropRefused, f"work of sd:{items[1]}"):
+            DROP.drop_item(self.db, build, items[3], who="operator")
 
     def test_dropping_a_done_lead_queues_the_kept_items_and_leaves_it_done(self):
         items, (lead, second, third), run = self.bundle()

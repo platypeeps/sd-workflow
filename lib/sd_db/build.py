@@ -904,8 +904,12 @@ def drop_plan(connection, item: int) -> dict:
         "SELECT item FROM assignment WHERE (id = ? OR parent = ?) AND scope = ?", (lead, lead, SCOPE))]
     # The stored repo is a key (`~/...`); git needs the disk path, as `Supervisor` expands it (round 3).
     repo, work = paths.expand(last["repo"]), Path(last["work_path"])
+    states = reads.items_by_ids(connection, built)
     return {"item": item, "assignment": row["id"], "lead": lead, "kept": kept, "run": last["id"],
             "aside": sorted(set(built) - {member["item"] for member in kept} | {item}), "built": sorted(set(built)),
+            # A done member's commits stay aside only once the base delivers it (`sd_bundle_drop`, sd:10021).
+            "done": sorted(one for one in set(built) - {member["item"] for member in kept} - {item}
+                           if one in states and states[one]["status"] == "done"),
             "revision": current["revision"], "repo": str(repo), "work": str(work), "branch": last["branch"]}
 
 
