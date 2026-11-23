@@ -61,7 +61,8 @@ pinned = "--hostname" in sys.argv
 print("false" if os.environ.get("GH_HOST") and not pinned else {private!r})
 """
 
-FINDING = {"path": "src.py", "line": 1, "severity": "high", "summary": "bad, really", "family": "correctness"}
+FINDING = {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "summary": "bad, really",
+           "family": "correctness", "evidence": "python3 src.py: Traceback"}
 
 
 class Stubs:

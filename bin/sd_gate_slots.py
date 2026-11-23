@@ -78,6 +78,7 @@ import argparse
 import contextlib
 import datetime
 import fcntl
+import functools
 import json
 import os
 import pathlib
@@ -87,6 +88,7 @@ import signal
 import subprocess
 import sys
 import time
+import typing
 from typing import Callable, Iterator, Mapping, NamedTuple, Sequence, TextIO
 
 #: How many gates may run at once; `0` means no cap. A holder exports `0`.
@@ -219,9 +221,141 @@ def load_rule(environ: Mapping[str, str], limit_setting: str | None = None,
     return LoadRule(limit, settle, ", ".join(sources) or "default")
 
 
+#: At or above this CPU busy share the load average counts in full; below it a load limit reads the CPU's own
+#: use, busy times cores, instead (sd:9946): on 2026-11-22 a booted simulator held load5 at 277-458 with the
+#: CPU 37% idle, and the load limits paused every build claim and lane start.
+CPU_BUSY_MAX = 0.9
+#: The least span of the recent CPU average `steady_busy` reads: macOS updates its ticks every ~1.004 s, so
+#: a shorter span often read no change (8 polls 0.25 s apart: 4 unread).
+CPU_SAMPLE_SECONDS = 1.1
+
+
+#: The least span `steady_busy` averages the CPU over: the counted load falls no faster than this. One 1.1 s
+#: sample alone let load5 300 count 10 on 16 cores and erased the settle time load5 gives (sd:9946 review).
+CPU_SMOOTH_SECONDS = 60.0
+#: The oldest row `steady_busy` averages from, as far back as load5 reaches and twice over, so probes five
+#: minutes apart still read the CPU between them.
+CPU_HISTORY_SECONDS = 600.0
+#: The least gap between two rows `steady_busy` keeps: a poller every 0.25 s would grow the file.
+CPU_ROW_SECONDS = 5.0
+#: The CPU tick rows `steady_busy` keeps, as JSON [[wall time, idle, total], ...], in the gate directory.
+CPU_HISTORY = "cpu-busy.json"
+
+
+@functools.lru_cache(maxsize=1)
+def host_port() -> tuple[typing.Any, int]:
+    """libSystem and this host's port, taken once: each `mach_host_self()` call adds a reference to the
+    port, and a gate wait samples the CPU on every poll for hours."""
+    import ctypes  # noqa: PLC0415 -- only the darwin path needs it
+    system = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+    system.mach_host_self.restype = ctypes.c_uint
+    return system, system.mach_host_self()
+
+
+def cpu_ticks() -> tuple[int, int] | None:
+    """(idle, total) CPU ticks since boot, or None where they cannot be read: macOS
+    `host_statistics(HOST_CPU_LOAD_INFO)`, Linux `/proc/stat`. A disk wait counts as idle."""
+    try:
+        if sys.platform == "darwin":
+            import ctypes  # noqa: PLC0415 -- only the darwin path needs it
+            system, port = host_port()
+            info, count = (ctypes.c_uint * 4)(), ctypes.c_uint(4)
+            if system.host_statistics(port, 3, info, ctypes.byref(count)) != 0:
+                return None
+            user, kernel, idle, nice = info
+            return idle, user + kernel + idle + nice
+        fields = pathlib.Path("/proc/stat").read_text(encoding="ascii").splitlines()[0].split()
+        if fields[0] != "cpu" or len(fields) < 6:
+            return None
+        ticks = [int(value) for value in fields[1:]]
+        return ticks[3] + ticks[4], sum(ticks[:8])
+    except (OSError, ValueError, IndexError, AttributeError, ImportError):
+        return None
+
+
+def busy_rows(text: bytes, now: float) -> list[tuple[float, int, int]]:
+    """The `CPU_HISTORY` rows of the last `CPU_HISTORY_SECONDS` up to `now`; a bad row is left out."""
+    try:
+        loaded = json.loads(text.decode("utf-8") or "[]")
+    except ValueError:
+        return []
+    rows = []
+    for row in loaded if isinstance(loaded, list) else []:
+        if (isinstance(row, list) and len(row) == 3 and isinstance(row[0], (int, float))
+                and all(type(value) is int and value >= 0 for value in row[1:]) and row[1] <= row[2]
+                and now - CPU_HISTORY_SECONDS <= row[0] <= now):
+            rows.append((float(row[0]), row[1], row[2]))
+    return rows
+
+
+def busy_since(ticks: tuple[int, int], row: tuple[float, int, int]) -> float | None:
+    """The CPU's busy share from `row`'s ticks to `ticks`, or None when they fell (a reboot) or did not move."""
+    idle, total = ticks[0] - row[1], ticks[1] - row[2]
+    if total <= 0 or not 0 <= idle <= total:
+        return None
+    return 1.0 - idle / total
+
+
+def steady_busy(where: pathlib.Path, now: float, *, record: bool = True) -> float | None:
+    """The busy share a load limit counts, read from the CPU tick rows under `where` without waiting (sd:9946).
+
+    The higher of two averages up to the ticks now: since the newest row at least `CPU_SMOOTH_SECONDS`
+    old, which covers every second since, read or not, and since the newest row at least
+    `CPU_SAMPLE_SECONDS` old, so a burst in the last seconds counts. None, so the load counts in full,
+    while the ticks are unread, no row is old enough, or the ticks fell (a reboot). Every process that
+    reads the load adds a row, under a lock on their file; a bad row or the clock set back counts as none.
+    With `record` false (`sd today`, `sd-status`: read-only) it reads the rows that exist and writes nothing.
+    """
+    ticks = cpu_ticks()
+    try:
+        if record:
+            where.mkdir(parents=True, exist_ok=True)
+        fd = os.open(where / CPU_HISTORY, os.O_RDWR | os.O_CREAT if record else os.O_RDONLY, 0o644)
+    except OSError:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX if record else fcntl.LOCK_SH)
+        rows = busy_rows(os.pread(fd, os.fstat(fd).st_size, 0), now)
+        if record and ticks is not None and (not rows or now - rows[-1][0] >= CPU_ROW_SECONDS):
+            os.ftruncate(fd, 0)
+            os.pwrite(fd, json.dumps([list(row) for row in [*rows, (now, *ticks)]]).encode("utf-8"), 0)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    anchors = [row for row in rows if row[0] <= now - CPU_SMOOTH_SECONDS]
+    if ticks is None or not anchors:
+        return None
+    recent = [row for row in rows if row[0] <= now - CPU_SAMPLE_SECONDS][-1]
+    shares = [busy_since(ticks, anchors[-1]), busy_since(ticks, recent)]
+    return None if None in shares else max(share for share in shares if share is not None)
+
+
+def counted_load(load: float, busy: float | None, cores: int | None = None) -> float:
+    """The load a load limit reads (sd:9946): `load` while the CPU is at least `CPU_BUSY_MAX` busy or its
+    use is unread; otherwise the CPU's own use, busy times cores, when that is lower."""
+    count = cores if cores is not None else os.cpu_count()
+    if busy is None or not count or not 0 <= busy < CPU_BUSY_MAX:
+        return load
+    return min(load, busy * count)
+
+#: `sd.gate_workers` (sd:9925): the test workers one local gate runs, set by hand over `run-tests.sh`'s slot
+#: rule, which keeps the pool at the cores. Cores over a cap of 8 gave 2 and doubled the pack gate, 28 to 51
+#: minutes; a fixed 8 let eight gates start 64 workers on 16 cores (build review round 7).
+WORKERS_PATTERN = re.compile(r"[1-9][0-9]?")
+
+
+def parse_workers(text: str, source: str) -> int:
+    """A worker count of 1 to 99, or a `ValueError` naming where it came from."""
+    if not WORKERS_PATTERN.fullmatch(text):
+        raise ValueError(f"{source} must be a whole number from 1 to 99 (got '{text[:40]}')")
+    return int(text)
+
+
 #: The machine settings the stdlib entry points read, with the check each value passes.
 MACHINE_SETTINGS: tuple[tuple[str, Callable[[str, str], object]], ...] = (
-    ("gate_slots", parse_count), ("gate_load_max", parse_number), ("gate_settle_seconds", parse_number))
+    ("gate_slots", parse_count), ("gate_load_max", parse_number), ("gate_settle_seconds", parse_number),
+    ("gate_workers", parse_workers))
 
 
 def machine_settings(environ: Mapping[str, str], *, stream: TextIO | None = None) -> dict[str, str | None]:
@@ -243,7 +377,15 @@ def machine_settings(environ: Mapping[str, str], *, stream: TextIO | None = None
             value = mine.get(key) if isinstance(mine, dict) else None
             if value is not None:
                 text = value if isinstance(value, str) else repr(value)
-                check(text, f"sd.{key}")
+                try:
+                    check(text, f"sd.{key}")
+                except ValueError as error:
+                    # A worker typo keeps the slot rule; it must not drop the gate's own limits (sd:9925 review).
+                    if key != "gate_workers":
+                        raise
+                    if stream is not None:
+                        stream.write(f"warning: {error}; keeping the slot rule\n")
+                    continue
                 values[key] = text
     except FileNotFoundError:
         pass
@@ -383,6 +525,8 @@ class Queue:
         ticket leaves the queue in the same step, and a lane ticket locks the
         slot's `markers` entry in that step too (sd:5078).
         """
+        # Read before the lock: status and the lane read the rows under their own lock, never this one.
+        share = steady_busy(self.where, wall()) if rule.limit > 0 else None
         with self.admission_lock():
             state = self.state()
             now = wall()
@@ -397,6 +541,7 @@ class Queue:
                 # Only the head samples, under its own rule: callers may run
                 # different rules, and one waiter's sample must not count for another's.
                 load1, load5 = (float(value) for value in tuple(loadavg())[:2])
+                load1, load5 = counted_load(load1, share), counted_load(load5, share)
                 record_sample(state, rule, load1, now)
                 held = load_hold(state, rule, load1, load5, now)
                 if held:
@@ -913,7 +1058,7 @@ def held_by(queue: Queue) -> str:
                    + (f" in {entry['cwd']}" if entry["cwd"] else "") for entry in holders)
 
 
-def snapshot(where: pathlib.Path, slots: int, rule: LoadRule, *,
+def snapshot(where: pathlib.Path, slots: int, rule: LoadRule, *, record: bool = True,
              loadavg: Callable[[], Sequence[float]] = os.getloadavg, wall: Callable[[], float] = time.time) -> dict:
     """Who holds a slot (`read_holders`), who waits and in which place, the lane gates among them (sd:5078),
     and the load rule; read under `queue.lock`."""
@@ -934,9 +1079,12 @@ def snapshot(where: pathlib.Path, slots: int, rule: LoadRule, *,
         load = [round(float(value), 2) for value in tuple(loadavg())[:3]]
     except OSError:
         load = []
+    # `sd gate status` creates `where` and adds a CPU row; `sd today` and `sd-status` only read.
+    share = steady_busy(where, wall(), record=record)
     last = state.get("last_admitted")
     return {"directory": str(where), "slots": slots, "holders": holders, "waiters": waiters, "lane_gates": lanes,
-            "load": load,
+            "load": load, "cpu_busy": None if share is None else round(share, 3),
+            "load_counted": round(counted_load(load[1], share), 2) if len(load) > 1 else None,
             "load_max": rule.limit, "settle_seconds": rule.settle, "rule_source": rule.source,
             "last_admitted": utc_stamp(last) if isinstance(last, (int, float)) else None, "now": utc_stamp(wall())}
 
@@ -950,7 +1098,7 @@ def machine_snapshot(environ: Mapping[str, str]) -> dict | str:
         settings = machine_settings(environ)
         slots, _ = configured(environ, settings["gate_slots"])
         rule = load_rule(environ, settings["gate_load_max"], settings["gate_settle_seconds"])
-        return snapshot(directory(environ), slots, rule)
+        return snapshot(directory(environ), slots, rule, record=False)
     except (OSError, ValueError) as error:
         return str(error)
 
@@ -1018,6 +1166,7 @@ def slot_command(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command_name", required=True)
     commands.add_parser("directory", help="print the slot directory")
     commands.add_parser("count", help="print how many slots this machine has (0: no cap)")
+    commands.add_parser("workers", help="print sd.gate_workers, or nothing when unset")
     wait = commands.add_parser("wait", help="queue, then lock one of the inherited slot descriptors")
     wait.add_argument("--pid", type=int, required=True, help="the gate's pid")
     wait.add_argument("--ppid", type=int, required=True, help="the gate's parent when it started")
@@ -1027,6 +1176,9 @@ def slot_command(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command_name == "directory":
         print(directory(os.environ))
+        return 0
+    if args.command_name == "workers":
+        print(machine_settings(os.environ, stream=sys.stderr)["gate_workers"] or "", end="")
         return 0
     try:
         settings = machine_settings(os.environ, stream=sys.stderr)

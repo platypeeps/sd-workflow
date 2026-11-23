@@ -61,6 +61,23 @@ class Times(unittest.TestCase):
         if ended is not None:
             self.row(entry, ended, **{**running, "status": status, "step": "merge", "finished_at": at(ended)})
 
+    def test_each_read_ranges_over_the_key_index(self):
+        """Each lane read finds one repository's keys by an index range, not a kind scan (pack sd:10077)."""
+        self.entry("e1", 1, enqueued=50, claimed=40, merge=35, ended=30)
+        self.connection.execute("INSERT INTO state(kind, key, timestamp, body) VALUES ('checkpoint', ?, ?, ?)",
+                                (f"{sd_lane.KEY_PREFIX}{REPOSITORY}2:x", "2026-09-10T11:00:00+00:00", "{}"))
+        statements: list[str] = []
+        self.connection.set_trace_callback(statements.append)
+        self.assertEqual([row["id"] for row in sd_lane.stored(self.connection, REPOSITORY)], ["e1"])
+        self.assertEqual(list(sd_lane.enqueue_order(self.connection, REPOSITORY)), ["e1"])
+        self.assertEqual(len(sd_lane.entry_times(self.connection, REPOSITORY, now=NOW)), 1)
+        self.connection.set_trace_callback(None)
+        reads = [sql for sql in statements if sql.lstrip().upper().startswith("SELECT")]
+        self.assertEqual(len(reads), 3)
+        for sql in reads:
+            plan = " | ".join(row[3] for row in self.connection.execute(f"EXPLAIN QUERY PLAN {sql}"))
+            self.assertIn("state_by_kind_key (kind=? AND key>? AND key<?)", plan, sql)
+
     def test_each_entry_has_its_wait_gate_and_total(self):
         # Waited 30 min; a 20 min speculative gate, then 5 min of prepare; ended 2 min after the merge step.
         self.entry("e1", 1, enqueued=100, claimed=70, merge=65, ended=63, speculated=(95, 75))

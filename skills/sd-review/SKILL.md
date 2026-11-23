@@ -78,10 +78,9 @@ Do not substitute another diff or copy a cap into this procedure.
    Explicit `--reuse-check` can reuse eligible full-check evidence; a reused receipt runs no gate.
    A failing gate fails the review.
 
-Reviewing tiers ask two independent local reviews: the first two entries on the reviewer order, run at once.
-With one eligible reader, the review asks one, and `review_shortfall` and a `shortfall` line say so.
+Reviewing tiers ask one local review: the first eligible entry on the reviewer order (sd:10193).
 The `claude-json` reader's prompt adds the ranked instruction: trace callers and config readers, findings in production-impact order.
-Skip requires none, subject to the planning, lens and challenge floor of two.
+Skip requires none; planning, lens and challenge reviews ask the same one reader.
 Enabled reviewers outside the order `sd providers list` shows require explicit `--provider NAME` selection and the same eligibility checks.
 Copilot never fills the local slot.
 Shipping may request it afterward through the configured `deep` tier or explicit task direction.

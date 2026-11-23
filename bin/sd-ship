@@ -557,6 +557,22 @@ def acceptance_row_answered(row: object) -> bool:
     return row.get("passed") is False and "waived" in row and isinstance(criterion, str) and bool(criterion.strip())
 
 
+def settled_followups(connection: sqlite3.Connection, item: int) -> set[int]:
+    """The open followups on `item` a delivery settles (sd:9869): the lane's own blockers alone.
+
+    A blocker the lane wrote (`sd_lane.lane_note`) is what the merge
+    answers. Every other followup waits on something the merge does not give,
+    such as an outside reply, so it stays open for a hand close. The squash
+    message is not read: each attempt to name followups in its text (a `#<id>`, a
+    `Settles:` line, past fences, comments and raw HTML) drew a new case that
+    resolved hidden work, over seven review rounds. A missed settlement
+    leaves a followup open, which is safe; a false one hides work.
+    """
+    return {row[0] for row in connection.execute(
+        "SELECT id, session, body FROM note WHERE item = ? AND kind = 'followup' AND resolved_at IS NULL", (item,))
+        if sd_lane.lane_note(row[1], row[2])}
+
+
 class Ship(SharedReview):
     #: What the last `merge_ownership` read found: the authority record when
     #: the repository row overrode co-ownership, `None` when ownership alone
@@ -1314,7 +1330,7 @@ class Ship(SharedReview):
 
     def gate_only(self, head: str) -> bool:
         """Run the gate alone for a branch `review_tier` calls docs-only or a pin bump (sd:2998),
-        or one the lead's recorded clean branch review covers (`lead_reviewed`, sd:5988).
+        or one the lead's recorded passing branch review covers (`lead_reviewed`, sd:5988).
 
         Only before any review pass and with no review flag: a branch already
         reviewed keeps verifying its fixes. The record is `review_skipped` in
@@ -1348,7 +1364,7 @@ class Ship(SharedReview):
         return True
 
     def lead_reviewed(self, head: str, tiered: dict) -> dict:
-        """sd:5988. A code branch's tier as `lead-review` when the lead's clean pass covers `head`, else `{}`.
+        """sd:5988. A code branch's tier as `lead-review` when the lead's passing review covers `head`, else `{}`.
 
         Says which path prepare takes. The gate still runs: the record stands
         for the review, not for the gate.
@@ -2196,12 +2212,14 @@ class Ship(SharedReview):
             raise ValueError(f"item {number} is done without delivery evidence for {commit}; "
                              f"reopen it, then run sd-ship reconcile")
         wanted = f"sd:{number}"
-        block = sd_lib.trailer_block(git(self.root, "show", "-s", "--format=%B", commit)).splitlines()
+        message = git(self.root, "show", "-s", "--format=%B", commit)
+        block = sd_lib.trailer_block(message).splitlines()
         if not any(line.partition(":")[0] == "Delivers" and line.partition(":")[2].strip() == wanted for line in block):
             raise ValueError(f"{commit} carries no `Delivers: {wanted}` trailer")
         from sd_db.progress import waived_suffix
         change_status(self.connection, number, "done", who="sd-ship",
-                      reason=f"delivered at {commit} on {ref}{waived_suffix(waived or [])}")
+                      reason=f"delivered at {commit} on {ref}{waived_suffix(waived or [])}",
+                      followups=settled_followups(self.connection, number))
 
     def require_copilot_abandonment_authority(self) -> None:
         if self.args.abandon_copilot_review is not None and not self.args.manual:

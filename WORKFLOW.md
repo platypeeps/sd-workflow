@@ -534,13 +534,12 @@ sentence.
 The provider registry maps roles to providers.
 Reusable skill procedures name roles; operator policy owns preferred entries.
 
-Cheap, standard, and deep changes ask two independent local reviews (sd:7519).
-With one eligible reader, the review asks one and its result names the shortfall (`review_shortfall`).
-The first two readers on the reviewer order run at once: with the shipped order, codex and Claude.
+Cheap, standard, and deep changes ask one local review (sd:10193): codex raised 120 of 129 blockers in 7 days.
+The reader is the first eligible entry on the reviewer order: with the shipped order, codex, else Claude.
 A reader that fails gives its slot to the next entry; the receipt keeps the registry order.
 Claude's reader also gets the ranked addition: trace callers and config readers, rank by production impact.
-Skip requires none; planning, lensed and challenged reviews keep a floor of two, so a research brief gets both.
-Tier selection still follows repository policy; the tier never adds a third reader.
+Skip requires none; planning, lensed and challenged reviews ask the same one reader.
+Tier selection still follows repository policy; the tier never adds a second reader.
 Complete local review before any Copilot request; [Standing authorization](#standing-authorization) holds the policy.
 A completed Copilot review must cover the merge head, or an ancestor whose diff to it touches only skippable `docs/` paths.
 
@@ -673,6 +672,9 @@ The reserved `sd` namespace declares these settings:
   this machine; `0` is no cap. Absence reads a quarter of the cores. `SD_GATE_SLOTS` overrides it
   for one run. It grants nothing;
   see [Parallel work](#parallel-work).
+- `sd.gate_workers`: how many test workers one local run of the pack's tests starts, 1 to 99.
+  Absence reads the cores over the gate cap, so the gates together hold the cores. `TEST_WORKERS` overrides it for one run.
+  It grants nothing.
 - `sd.review_slots`: how many reviews may run their reviewers at once on this machine; `0` is no cap.
   Absence reads 2. `SD_REVIEW_SLOTS` overrides it for one run. It grants nothing.
 - `sd.bundle_max`: how many items one build bundle takes when this machine claims it, a mechanical item half
@@ -690,6 +692,7 @@ The reserved `sd` namespace declares these settings:
 - `sd.repo_cap`: how many build bundles may build at once in one repository when this machine claims them,
   1 to 6. Absence reads 1, the one-bundle-per-repository rule (sd:8158, sd:9172). It grants nothing.
 - `sd.gate_load_max`: the gate queue starts a gate only while load1 is below this; `0` is no load condition.
+  Below 90% CPU busy, averaged over at least the last minute and over the last few seconds, load1 and load5 read busy times cores instead (sd:9946).
   Absence is no load condition (sd:2607). `SD_GATE_LOAD_MAX` overrides it for one run. It grants nothing.
 - `sd.gate_settle_seconds`: seconds between two gate starts, and of low load1 while load5 is high; `0` is none.
   Absence reads 45. `SD_GATE_SETTLE_SECONDS` overrides it for one run. It grants nothing.

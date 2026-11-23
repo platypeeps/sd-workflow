@@ -10,10 +10,12 @@ refuse fails here too.
 """
 import contextlib
 import dataclasses
+import hashlib
 import importlib
 import io
 import json
 import os
+import re
 import shutil
 import signal
 import sqlite3
@@ -146,8 +148,9 @@ FAKE = textwrap.dedent('''
                   "result": "denied", "permission_denials": [{"tool_name": "Bash",
                                                               "tool_input": {"command": "git push"}}]})
             sys.exit(3)
-        Path("work.txt").write_text(Path("work.txt").read_text() + mode + "\\n" if Path("work.txt").exists()
-                                    else mode + "\\n")
+        # A function per round: a change outside any function holds every later blocker (sd:9769).
+        added = f"def {mode}(): pass\\n"
+        Path("work.txt").write_text(Path("work.txt").read_text() + added if Path("work.txt").exists() else added)
         git("add", "work.txt")
         # `extra`: plans/extra.json adds files (name to hex bytes) and message lines, as a builder may write.
         extra = json.loads((plans / "extra.json").read_text()) if mode == "extra" else {}
@@ -214,7 +217,14 @@ FAKE = textwrap.dedent('''
             print(json.dumps({"status": "rate_limited", "findings": [],
                               "subject": {"head": git("-C", work, "rev-parse", "HEAD")}}))
             sys.exit(4)
-        raw = {"path": "work.txt", "line": 1, "severity": "high", "summary": "a blocker", "family": "correctness"}
+        raw = {"path": "work.txt", "line": 1, "severity": "high", "instances": ["src.py:1"], "summary": "a blocker", "family": "correctness"}
+        if mode == "blocking-long":  # two findings past a note's 4000 characters, the first over three lines
+            first = dict(raw, summary="a long blocker\\n- an example bullet\\n" + "x" * 4500)
+            second = dict(raw, path="later.txt", line=9, summary="a later blocker")
+            findings = review.dispose([review._finding(first), review._finding(second)], "high")
+            print(json.dumps({"status": "blocking", "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
+                              "findings": findings}))
+            sys.exit(0)
         findings = review.dispose([review._finding(raw)], "high")  # the record shape `--json` prints
         if mode == "gate_failed":
             print(json.dumps({"status": "gate_failed", "cleared_status": "clean", "findings": [],
@@ -228,9 +238,22 @@ FAKE = textwrap.dedent('''
                               "route": {"tier": "skip" if mode == "skip_route" else "cheap", "category": "docs"},
                               "subject": {"head": git("-C", work, "rev-parse", "HEAD")}}))
             sys.exit(0)
-        print(json.dumps({"status": "blocking" if mode == "blocking" else "clean",
+        if mode in ("offdelta", "offdelta_short", "offdelta_held", "offdelta_uncovered"):  # pack sd:9769: a blocker on a file nobody touched
+            far = {**raw, "path": "far.txt", "instances": ["far.txt:1"], "summary": "an old defect"}
+            held = [review._finding(raw)] if mode == "offdelta_held" else []  # and one the fix's file still holds
+            print(json.dumps({"status": "blocking", "scope": "branch", "requested_reviews": 2,
+                              "completed_reviews": 1 if mode == "offdelta_short" else 2,
+                              "covers_from": None if mode == "offdelta_uncovered" else "c" * 40,
+                              "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
+                              "findings": review.dispose([review._finding(far), *held], "high")}))
+            sys.exit(0)
+        if mode == "absolute":  # pack sd:9769: a blocker spelled as an absolute path inside the checkout
+            findings = review.dispose([review._finding({**raw, "path": os.path.join(work, "work.txt")})], "high")
+        print(json.dumps({"status": "blocking" if mode in ("blocking", "absolute") else "clean", "scope": "branch",
+                          "requested_reviews": 2, "completed_reviews": 2,
+                          "covers_from": None if mode == "clean_uncovered" else "c" * 40,
                           "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
-                          "findings": findings if mode == "blocking" else []}))
+                          "findings": findings if mode in ("blocking", "absolute") else []}))
     if role == "sd-ship":
         lane = plans / "lane.json"
         entries = json.loads(lane.read_text()) if lane.exists() else []
@@ -362,6 +385,18 @@ def group_gone(pgid):
     except OSError:
         return False
     return False
+
+
+def fake_grep(files: dict[str, str], head: str, argv: list[str]) -> str:
+    """`git grep -n -z` over `files` at `head`: `-w -e NAME` as a whole word, or `-E` with each `-e` pattern
+    in POSIX classes; `head:path\0line\0text` per matching line."""
+    patterns = [argv[index + 1] for index, arg in enumerate(argv) if arg == "-e"]
+    if "-E" in argv:
+        tests = [re.compile(pattern.replace("[^[:alnum:]_]", r"\W").replace("[[:space:]]", r"\s").replace("[[:alnum:]_]", r"\w")) for pattern in patterns]
+    else:
+        tests = [re.compile(rf"\b{re.escape(pattern)}\b") for pattern in patterns]
+    return "".join(f"{head}:{path}\0{number}\0{text}\n" for path, body in files.items()
+                   for number, text in enumerate(body.splitlines(), 1) if any(test.search(text) for test in tests))
 
 
 def exclude(work: Path, patterns: str) -> None:
@@ -607,9 +642,16 @@ class Supervise(Case):
         """pack sd:9709 round 26: the supervisor's git calls and the builder start from this env; a hook's
         `GIT_DIR` or `GIT_WORK_TREE` would point them at the hook's repository, not the run's worktree."""
         self.press(1)
-        self.env.update({"GIT_DIR": "/decoy/.git", "GIT_WORK_TREE": "/decoy", "GIT_INDEX_FILE": "/decoy/index"})
+        self.env.update({"GIT_DIR": "/decoy/.git", "GIT_WORK_TREE": "/decoy", "GIT_INDEX_FILE": "/decoy/index",
+                         "GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "url.file:///decoy.git.insteadOf",
+                         "GIT_CONFIG_VALUE_0": "origin", "GIT_CONFIG_KEY_1": "maintenance.auto",
+                         "GIT_CONFIG_VALUE_1": "false"})
         env = self.supervisor().env
-        self.assertEqual({key for key in env if key in paths.GIT_LOCAL}, set())
+        # Only the suite's maintenance keys ride on, renumbered; a one-off `insteadOf` does not (pack sd:9863).
+        self.assertEqual({key for key in env if key in paths.GIT_LOCAL} - {"GIT_CONFIG_COUNT"}, set())
+        self.assertEqual((env["GIT_CONFIG_COUNT"], env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_VALUE_0"]),
+                         ("1", "maintenance.auto", "false"))
+        self.assertNotIn("GIT_CONFIG_KEY_1", env)
         self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], self.env["GIT_CONFIG_NOSYSTEM"], "config isolation stays")
 
     def test_a_press_runs_to_the_lane(self):
@@ -960,6 +1002,70 @@ class Supervise(Case):
         self.assertEqual((again["assignment"], again["work_path"], again["run"]),
                          (self.bundle["assignment"], self.bundle["work_path"], 2), "the same bundle, in its worktree")
 
+    def test_a_usage_limit_claim_resumes_the_step_session_and_round(self):
+        """Advisory of PR #1960 (sd:9973): the claim after a usage limit opened at `claimed` with no session and
+        round 0, so a bundle limited in its third fix round rebuilt from scratch with a fresh round budget. It
+        resumes its session and round, and a fix its own step (review of build/sd-1557), not `RESUME`'s."""
+        self.press()
+        ident = self.bundle["id"]
+        reset = int(datetime.now(UTC).timestamp()) + 60
+        self.assertTrue(build.write(self.db, ident, step="fixing", session_id="session-limited", review_round=2,
+                                    final=json.dumps({"rate_limit_info": {"resetsAt": reset}})))
+        build.end(self.db, ident, build.RATE_LIMITED, "rate limited")
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        row = build.run(self.db, again["id"])
+        self.assertEqual((row["step"], row["session_id"], row["review_round"]), ("fixing", "session-limited", 2))
+
+    def test_a_usage_limit_claim_keeps_the_question_cutoff(self):
+        """Lane review of build/sd-1557: the reclaim's new run moved the time open questions are read from, so a
+        member skipped with a question asked before the limit returned to planning, its question unseen."""
+        self.press(2)
+        ident = self.bundle["id"]
+        member = self.items[1]
+        reset = int(datetime.now(UTC).timestamp()) + 60
+        self.assertTrue(build.write(self.db, ident, step="fixing", session_id="session-limited", review_round=1,
+                                    final=json.dumps({"rate_limit_info": {"resetsAt": reset}})))
+        add_note(self.db, member, "question", "skipped: which parser?\nOption: a (Recommended)\nOption: b")
+        self.db.execute("UPDATE note SET timestamp = ? WHERE item = ? AND kind = 'question'",
+                        (build.run(self.db, ident)["created_at"], member))
+        self.db.commit()
+        build.end(self.db, ident, build.RATE_LIMITED, "rate limited")
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.assertTrue(build.enqueued(self.db, again["id"], [self.items[0]]))
+        status = self.db.execute("SELECT status FROM assignment WHERE item = ? AND id <> ? ORDER BY id DESC",
+                                 (member, self.bundle["assignment"])).fetchone()["status"]
+        self.assertEqual(status, "blocked", "the question asked before the limit still holds the member")
+
+    def test_a_usage_limit_claim_refuses_a_bundle_whose_lane_moved_off_its_host(self):
+        """Review of build/sd-1557: the claim after a usage limit resumed the old session on whichever host now
+        runs the lane, though the worktree and session stay where the run ran: it refuses, naming that host."""
+        self.press(2)
+        ident = self.bundle["id"]
+        reset = int(datetime.now(UTC).timestamp()) + 60
+        self.assertTrue(build.write(self.db, ident, step="fixing", session_id="session-limited", review_round=1,
+                                    final=json.dumps({"rate_limit_info": {"resetsAt": reset}})))
+        build.end(self.db, ident, build.RATE_LIMITED, "rate limited")
+        # It ran on the satellite `work`; the lane moved to the hub during the hold.
+        self.db.execute("UPDATE runner_run SET owner = 'fixture@work' WHERE id = ?", (ident,))
+        self.db.commit()
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            self.assertIsNone(build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                          root=self.root / "worktrees"))
+        rows = self.db.execute("SELECT status, result FROM assignment WHERE id = ? OR parent = ? ORDER BY id",
+                               (self.bundle["assignment"], self.bundle["assignment"])).fetchall()
+        self.assertEqual([row["status"] for row in rows], ["blocked", "blocked"])
+        self.assertIn(f"build run {ident} hit the usage limit on work", rows[0]["result"])
+        self.assertIn("move its lane back to work", rows[0]["result"])
+
     def test_a_fault_inside_the_usage_limit_end_writes_nothing_and_the_next_end_finishes(self):
         """Pack sd:9907, failure table row 2: the outcome, the release, the requeue and the hold are one
         transaction. A fault at its last write leaves the run open and its bundle running, as the
@@ -1037,9 +1143,33 @@ class Supervise(Case):
         self.assertIn("- work.txt:1 a blocker", prompts[-1])
         self.assertEqual(self.statuses(), ["blocked"])
 
-    def test_review_rounds_cap_is_seven(self):
-        """Operator 2026-11-20: seven rounds with blockers, then the class pass, before a build parks."""
-        self.assertEqual(build_run.REVIEW_ROUNDS, 7)
+    def test_fix_rounds_past_the_third_escalate(self):
+        """Pack sd:9264: early fix rounds run on the bundle's model; the class-pass round runs on the strongest
+        model at medium effort (sd:10192), its brief naming the blockers' class; the park stays."""
+        R = build_run.REVIEW_ROUNDS
+        self.press()
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1))], sd_review=["blocking"] * (R + 1))
+        ended = self.supervisor().run()
+        self.assertEqual(ended["outcome"], "blocked")
+        self.assertEqual(len(self.calls("sd-review")), R + 1, "the park moved")
+        fixes = [call["argv"] for call in self.calls("claude")][1:]
+        models = [(argv[argv.index("--model") + 1], "--effort" in argv) for argv in fixes]
+        E = build_run.ESCALATE_AFTER
+        self.assertLess(E, R, "no fix escalates before the park (sd:10111)")
+        self.assertEqual(models[:E], [("opus", False)] * E, "an early round escalated")
+        self.assertEqual(models[E:], [(build_run.STRONGEST, True)] * (R - E), "a late round did not escalate")
+        self.assertEqual(fixes[E][fixes[E].index("--effort") + 1], "medium", "sd:10192")
+        prompts = [argv[argv.index("-p") + 1] for argv in fixes]
+        self.assertNotIn("name the class", prompts[E - 1])
+        self.assertIn("name the class", prompts[E])
+        escalated = [body for (body,) in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))
+                     if "escalated" in body]
+        self.assertEqual(len(escalated), 1, "the escalation is not recorded once on the run's item")
+
+    def test_review_rounds_cap_is_two(self):
+        """Operator 2026-11-23 (sd:10128): two rounds with blockers, then the class pass: a park after 3 reviews."""
+        self.assertEqual(build_run.REVIEW_ROUNDS, 2)
+        self.assertEqual(build_run.ESCALATE_AFTER, 1)
 
     def test_review_rounds_rule_reaches_the_builder(self):
         """Pack sd:9584: the brief asks for a failure table on a parser or event matching; the class pass keeps scope."""
@@ -1081,7 +1211,7 @@ class Supervise(Case):
         self.assertEqual(ended.get("step"), "enqueued", ended)
         notes = [body for (body,) in self.db.execute("SELECT body FROM note WHERE item = ? AND body LIKE ?",
                                                      (self.items[0], build.ROUND_BLOCKERS + "%"))]
-        self.assertEqual(notes, [build.ROUND_BLOCKERS + "- work.txt:1 a blocker"])
+        self.assertEqual(notes, [build.ROUND_BLOCKERS + "- work.txt:1 a blocker (class correctness; instances: src.py:1)"])
 
     def design(self, body):
         """A builder commit that adds a docs/work design.md with no failure table, and `body` as the PR body."""
@@ -1266,6 +1396,1056 @@ class Supervise(Case):
         self.plan(claude=["pass", "fix1"], sd_review=["blocking", "clean"])
         self.assertEqual(self.supervisor().run()["step"], "enqueued")
         self.assertEqual(self.latest()["review_round"], 1)
+
+    def test_a_verify_review_with_no_answer_retries_in_full(self):
+        """Review of sd:9769: `sd-review` can refuse a verify plan (a prior finding's file past its input bound);
+        the retry reviews the branch in full instead of repeating the same refused plan."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1"], sd_review=["blocking", "garbage", "clean"])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued", self.latest()["detail"])
+        _first, verify, retry = [call["argv"] for call in self.calls("sd-review")]
+        self.assertIn("--verify-report", verify)
+        self.assertNotIn("--verify-report", retry, "the retry repeated the refused verify plan")
+        self.assertNotIn("--base", retry)
+
+    def test_a_clean_delta_that_covers_no_branch_reviews_in_full(self):
+        """Class pass, sd:9769 (a delta verdict stands for the branch only on a report that covers it): a clean
+        verify whose own report covers nothing (another binding, a short round) is not the branch's pass."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1"], sd_review=["blocking", "clean_uncovered", "clean"])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued", self.latest()["detail"])
+        _first, verify, full = [call["argv"] for call in self.calls("sd-review")]
+        self.assertIn("--verify-report", verify)
+        self.assertNotIn("--verify-report", full, "a clean delta covering no branch was taken as the branch's pass")
+
+    def test_a_skipped_delta_after_a_blocking_round_reviews_in_full_and_stays_blocked(self):
+        """Lead ruling on sd:9769 (deferral eligibility): a docs-only fix delta the router skips proves no
+        prior code blocker fixed; the branch is reviewed in full, and its blocker still blocks."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1", "fix2"], sd_review=["blocking", "skip_route", "blocking", "clean"])
+        self.supervisor().run()
+        argvs = [call["argv"] for call in self.calls("sd-review")]
+        self.assertGreater(len(argvs), 2, "a skipped delta was taken as the branch's pass")
+        self.assertIn("--verify-report", argvs[1])
+        self.assertNotIn("--verify-report", argvs[2], "the skipped delta was not reviewed in full")
+        self.assertEqual(self.latest()["review_round"], 2, "the prior blocker did not stay blocked")
+
+    def test_a_complete_blocking_delta_that_covers_no_branch_defers_nothing(self):
+        """Lead ruling on sd:9769 (deferral eligibility): `sd-review` clears `covers_from` after a binding
+        change; a full reader count does not restore branch coverage, so no blocker is filed away."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1", "fix2"], sd_review=["blocking", "offdelta_uncovered", "clean"])
+        self.supervisor().run()
+        filed = self.db.execute("SELECT id FROM item WHERE title LIKE 'Review follow-up%'").fetchall()
+        self.assertEqual(filed, [], "a blocker from a delta covering no branch was filed as a follow-up")
+        self.assertEqual(self.latest()["review_round"], 2, "the uncovered blocker did not block")
+
+    def test_round_one_reviews_the_whole_branch_and_round_two_the_findings_and_delta(self):
+        """Pack sd:9769: round 1 is the full branch review; round 2 verifies round 1's findings over the delta."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1"], sd_review=["blocking", "clean"])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        first, second = [call["argv"] for call in self.calls("sd-review")]
+        self.assertNotIn("--base", first, "round 1 is not the full branch review")
+        self.assertNotIn("--verify-report", first)
+        prior = json.loads(Path(second[second.index("--verify-report") + 1]).read_text(encoding="utf-8"))
+        self.assertEqual(prior["status"], "blocking", "round 2 does not verify round 1's findings")
+        self.assertEqual(second[second.index("--base") + 1], prior["subject"]["head"],
+                         "round 2 does not review the delta since the last reviewed head")
+        fix = [call["argv"] for call in self.calls("claude")][1]
+        self.assertIn("instances: src.py:1", fix[fix.index("-p") + 1], "the fix brief lacks the instance list")
+
+    def test_a_new_round_two_finding_on_unchanged_code_files_a_follow_up(self):
+        """Pack sd:9769: a later round's finding off the delta and off the earlier findings is filed, not a block."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1"], sd_review=["blocking", "offdelta"])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued", "an off-delta finding blocked")
+        self.assertEqual(self.latest()["review_round"], 1)
+        filed = self.db.execute("SELECT id, title, repo FROM item WHERE title LIKE 'Review follow-up%'").fetchall()
+        self.assertEqual(len(filed), 1, "no follow-up item was filed")
+        self.assertIn("far.txt:1", filed[0]["title"])
+
+    def test_a_filed_follow_up_is_a_rebuttal_the_lane_review_honours(self):
+        """Review of sd:9769: the lane reviews the branch again; the same finding must not block it there."""
+        import importlib.machinery
+        import types
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1"], sd_review=["blocking", "offdelta"])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        bodies = [(row["body"],) for row in self.db.execute(
+            "SELECT body FROM state WHERE kind = 'checkpoint' AND key LIKE 'ship-adjudication:%'")]
+        bin_dir = str(Path(build_run.__file__).resolve().parents[2] / "bin")
+        sys.path.insert(0, bin_dir)
+        try:
+            loader = importlib.machinery.SourceFileLoader("sd_review_lane", os.path.join(bin_dir, "sd-review"))
+            review = types.ModuleType(loader.name)
+            review.__file__ = loader.path
+            loader.exec_module(review)
+        finally:
+            sys.path.remove(bin_dir)
+        recorded = review.rebuttals(bodies, lambda head: True, lambda head, path: True)
+        far = {"path": "far.txt", "line": 1, "severity": "high", "instances": ["far.txt:1"],
+               "summary": "an old defect", "family": "correctness"}
+        self.assertEqual([row["disposition"] for row in review.dispose([far], "high", recorded)], ["advisory"],
+                         "the lane would block on the finding the build filed")
+
+    def test_a_round_that_still_blocks_records_no_rebuttal(self):
+        """Review of sd:9769: a fix round follows a round that holds a blocker; a rebuttal written there would
+        outlive the code its deferral judged, so the follow-up is filed and the lane review stays free to block."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1", "fix2"], sd_review=["blocking", "offdelta_held", "clean"])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        filed = self.db.execute("SELECT title FROM item WHERE title LIKE 'Review follow-up%'").fetchall()
+        self.assertEqual(len(filed), 1, "the deferred blocker was not filed")
+        rebuttals = self.db.execute(
+            "SELECT COUNT(*) FROM state WHERE kind = 'checkpoint' AND key LIKE 'ship-adjudication:%'").fetchone()[0]
+        self.assertEqual(rebuttals, 0, "a round that still blocked recorded a rebuttal a later fix outlives")
+
+    def test_a_short_blocking_report_is_never_made_advisory(self):
+        """Review of sd:9769: a blocking report missing a reader's answer blocks, whatever the delta."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1", "fix2"], sd_review=["blocking", "offdelta_short", "clean"])
+        self.supervisor().run()
+        self.assertEqual(len(self.calls("sd-review")), 3, "a short report was taken as a pass")
+
+    def test_an_absolute_blocker_path_reaches_the_next_round_relative(self):
+        """Review of sd:9769: `sd-review` refuses an absolute prior path, so the kept report holds it relative."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1"], sd_review=["absolute", "clean"])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        second = self.calls("sd-review")[1]["argv"]
+        prior = json.loads(Path(second[second.index("--verify-report") + 1]).read_text(encoding="utf-8"))
+        self.assertEqual(prior["findings"][0]["path"], "work.txt", "an absolute path reached the next round")
+
+    def scratch_repo(self, **config):
+        """A throwaway repository with `config` set in it, and a `git` runner over it."""
+        repo = Path(tempfile.mkdtemp(dir=self.root))
+
+        def run(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.name=operator",
+                                   "-c", "user.email=operator@example.test", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        run("init", "-q")
+        for name, value in config.items():
+            run("config", name.replace("_", "."), value)
+        return repo, run
+
+    def test_an_external_diff_or_textconv_does_not_reach_the_delta(self):
+        """Class pass, sd:9769: the operator's diff.external or a textconv driver must not shape the delta."""
+        repo, run = self.scratch_repo(diff_external="true", diff_drop_textconv="sed 1d")
+        (repo / ".gitattributes").write_text("conv.txt diff=drop\n")
+        (repo / "plain.txt").write_text("a\nb\n")
+        (repo / "conv.txt").write_text("a\nb\nc\n")
+        run("add", "-A")
+        run("commit", "-q", "-m", "base")
+        base = run("rev-parse", "HEAD")
+        (repo / "plain.txt").write_text("a\nB\n")
+        (repo / "conv.txt").write_text("a\nb\nC\n")
+        run("commit", "-qam", "change")
+        self.assertEqual(build_run.changed_lines(["git"], str(repo), base, run("rev-parse", "HEAD")),
+                         {"plain.txt": {2}, "conv.txt": {3}})
+
+    def test_the_operator_s_diff_prefixes_do_not_reach_the_delta(self):
+        """Class pass, sd:9769: diff.noprefix or diff.mnemonicPrefix must not make the delta unreadable."""
+        for config in ({"diff_noprefix": "true"}, {"diff_mnemonicPrefix": "true"}):
+            with self.subTest(config=config):
+                repo, run = self.scratch_repo(**config)
+                (repo / "a.txt").write_text("a\n")
+                run("add", "-A")
+                run("commit", "-q", "-m", "base")
+                base = run("rev-parse", "HEAD")
+                (repo / "a.txt").write_text("b\n")
+                run("commit", "-qam", "change")
+                self.assertEqual(build_run.changed_lines(["git"], str(repo), base, run("rev-parse", "HEAD")),
+                                 {"a.txt": {1}})
+
+    def test_output_with_no_file_header_reads_as_unknown(self):
+        """Class pass, sd:9769: git output the parser names no file in is unknown, never an empty delta."""
+        with mock.patch.object(build_run, "_read", return_value="some driver's own rendering\n"):
+            self.assertIsNone(build_run.changed_lines(["git"], "work", "a" * 40, "b" * 40))
+        with mock.patch.object(build_run, "_read", return_value=""):
+            self.assertEqual(build_run.changed_lines(["git"], "work", "a" * 40, "b" * 40), {})
+
+    def test_a_diff_in_a_legacy_encoding_reads_as_unknown(self):
+        """Review of sd:9769: a raw Latin-1 byte in a hunk is an unknown delta that holds every blocker,
+        never a decode error that stops the supervisor."""
+        latin1 = [sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'diff --git a/x b/x\\n+caf\\xe9\\n')"]
+        self.assertIsNone(build_run.changed_lines(latin1, "work", "a" * 40, "b" * 40))
+
+    def test_a_mode_or_binary_change_reads_as_the_whole_file(self):
+        """Review of sd:9769: git gives a mode-only or binary change no line range; any line of it is changed."""
+        repo = Path(tempfile.mkdtemp(dir=self.root))
+
+        def run(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.name=operator",
+                                   "-c", "user.email=operator@example.test", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        run("init", "-q")
+        (repo / "run.sh").write_text("#!/bin/sh\necho\n")
+        (repo / "run.sh").chmod(0o755)
+        (repo / "blob.bin").write_bytes(b"\0one")
+        run("add", "-A")
+        run("commit", "-q", "-m", "base")
+        base = run("rev-parse", "HEAD")
+        (repo / "run.sh").chmod(0o644)
+        (repo / "blob.bin").write_bytes(b"\0two")
+        run("add", "-A")
+        run("commit", "-q", "-m", "mode")
+        self.assertEqual(build_run.changed_lines(["git"], str(repo), base, run("rev-parse", "HEAD")),
+                         {"run.sh": set(), "blob.bin": set()})
+        self.press()
+        _, kept = self.deferred([{"path": "run.sh", "line": 2, "summary": "lost its executable bit"}],
+                                {"run.sh": set()})
+        self.assertEqual(len(kept["blockers"]), 1, "a blocker on a mode change was deferred")
+
+    def test_a_mode_change_with_a_content_hunk_reads_as_the_whole_file(self):
+        """Review of sd:9769: a fix that edits a script and drops its executable bit changes every line of it,
+        not only the edited ones: a blocker on the unchanged shebang is the change's own."""
+        repo = Path(tempfile.mkdtemp(dir=self.root))
+
+        def run(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.name=operator",
+                                   "-c", "user.email=operator@example.test", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        run("init", "-q")
+        (repo / "run.sh").write_text("#!/bin/sh\necho one\n")
+        (repo / "run.sh").chmod(0o755)
+        run("add", "-A")
+        run("commit", "-q", "-m", "base")
+        base = run("rev-parse", "HEAD")
+        (repo / "run.sh").write_text("#!/bin/sh\necho two\n")
+        (repo / "run.sh").chmod(0o644)
+        run("add", "-A")
+        run("commit", "-q", "-m", "edit and mode")
+        self.assertEqual(build_run.changed_lines(["git"], str(repo), base, run("rev-parse", "HEAD")),
+                         {"run.sh": set()}, "a mode change with a content hunk lost whole-file coverage")
+
+    def test_a_path_with_a_space_reads_without_git_s_tab(self):
+        """Review of sd:9769: git ends a header naming a path with a space with a tab."""
+        repo = Path(tempfile.mkdtemp(dir=self.root))
+
+        def run(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.name=operator",
+                                   "-c", "user.email=operator@example.test", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        run("init", "-q")
+        (repo / "a b.txt").write_text("x\n")
+        (repo / "gone b.txt").write_text("y\n")
+        run("add", "-A")
+        run("commit", "-q", "-m", "base")
+        base = run("rev-parse", "HEAD")
+        (repo / "a b.txt").write_text("z\n")
+        (repo / "gone b.txt").unlink()
+        run("add", "-A")
+        run("commit", "-q", "-m", "change")
+        self.assertEqual(build_run.changed_lines(["git"], str(repo), base, run("rev-parse", "HEAD")),
+                         {"a b.txt": {1}, "gone b.txt": {1}})
+
+    PRIOR = {"subject": {"head": "b" * 40}, "findings": [{"path": "named.py", "line": 1}],
+             "requested_reviews": 2, "completed_reviews": 2, "covers_from": "c" * 40}
+
+    def test_a_blocker_on_a_line_the_branch_added_before_the_fix_still_blocks(self):
+        """Class pass, sd:9769: deferral is for code the branch does not change, not code the fix did not touch."""
+        self.press()
+        supervisor = self.supervisor()
+        early = {"path": "early.py", "line": 5, "summary": "round one's own defect"}
+
+        def delta(_git, _work, base, _head, env=None):
+            return {} if base == "b" * 40 else {"early.py": {5}, "whole.bin": set()}
+        with mock.patch.object(build_run, "changed_lines", side_effect=delta), \
+                mock.patch.object(build_run, "_read", return_value="f" * 40):  # the fork reads
+            self.assertEqual(supervisor.branch_delta("b" * 40, "a" * 40),
+                             {"early.py": {5}, "whole.bin": set()}, "the branch's own lines are not in the delta")
+            kept = supervisor.file_new_findings({"status": "blocking", "blockers": [early]}, self.PRIOR, "a" * 40)
+        self.assertEqual(kept["blockers"], [early], "a blocker on the branch's own line was deferred")
+
+    def test_a_short_prior_report_defers_nothing(self):
+        """Class pass, sd:9769: deferral trusts the last round's findings; a round short of a reader proves none."""
+        self.press()
+        supervisor = self.supervisor()
+        row = {"path": "far.py", "line": 1, "summary": "a"}
+        for short in ({"completed_reviews": 1}, {"requested_reviews": 0, "completed_reviews": 0},
+                      {"requested_reviews": 1, "completed_reviews": 1,
+                       "review_shortfall": {"requested": 2, "eligible": 1}}):
+            with self.subTest(short=short), mock.patch.object(supervisor, "branch_delta", return_value={}):
+                kept = supervisor.file_new_findings({"status": "blocking", "blockers": [row]},
+                                                    {**self.PRIOR, **short}, "a" * 40)
+                self.assertEqual(kept["blockers"], [row], "a short prior report deferred a blocker")
+
+    def test_a_prior_report_covering_no_branch_defers_nothing(self):
+        """Review of sd:9769: a patch-only reader's pass completes every review yet `sd-review` clears its
+        `covers_from`; it read no whole file, so it proves no finding absent and every blocker holds."""
+        self.press()
+        supervisor = self.supervisor()
+        row = {"path": "far.py", "line": 1, "summary": "a"}
+        with mock.patch.object(supervisor, "branch_delta", return_value={}):
+            kept = supervisor.file_new_findings({"status": "blocking", "blockers": [row]},
+                                                {**self.PRIOR, "covers_from": None}, "a" * 40)
+        self.assertEqual(kept["blockers"], [row], "a prior report covering no branch deferred a blocker")
+
+    def test_a_blocking_answer_short_of_its_policy_is_not_complete(self):
+        """Class pass, sd:9769: the capped `requested_reviews` hides a chain shorter than the policy asked."""
+        self.press()
+        supervisor = self.supervisor()
+        out = Path(tempfile.mkdtemp(dir=self.root)) / "review.out"
+        out.write_text(json.dumps({"status": "blocking", "requested_reviews": 1, "completed_reviews": 1,
+                                   "review_shortfall": {"requested": 2, "eligible": 1},
+                                   "subject": {"head": "a" * 40}, "findings": []}), encoding="utf-8")
+        self.assertFalse(supervisor.review_answer(out, "a" * 40)["complete"],
+                         "a round one reader short of its policy counts as complete")
+
+    def test_a_replayed_delta_review_keeps_its_verify_arguments(self):
+        """Review of sd:9769: a hub fault after a delta review wrote its report replays the step. The report at
+        HEAD must not read as a fix with no commit: the held review's own arguments run, so it answers from its
+        record instead of a full review appending a second JSON object."""
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        head, earlier = "a" * 40, "b" * 40
+        prior = {**self.PRIOR, "status": "blocking", "scope": "branch", "subject": {"head": earlier}}
+        supervisor.out("prior").write_text(json.dumps(prior), encoding="utf-8")
+        supervisor.out("review").write_text(json.dumps(
+            {**prior, "status": "advisory", "subject": {"head": head}}), encoding="utf-8")
+        argv = [*supervisor.tools.review, "-C", str(supervisor.work), "--scope", "branch", "--json",
+                "--verify-report", str(supervisor.out("prior")), "--base", earlier]
+        supervisor.held = {"name": "review", "argv": argv, "exit": 0}
+        with mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
+                mock.patch.object(build_run, "_read", return_value=""):
+            planned, chosen = supervisor.review_plan(head)
+        self.assertEqual(planned, argv, "a replayed delta review dropped its verify arguments")
+        self.assertEqual(chosen["subject"]["head"], earlier)
+
+    def test_a_replay_held_at_the_checks_keeps_the_delta_review_s_prior(self):
+        """Review of sd:9769: a hub fault during an unmanaged repo's checks replays the review step. The review's
+        report sits at HEAD; the prior it verified must still decide, or deferred findings go back to the
+        builder. A full review's report (no verified digest) keeps no prior."""
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        head, earlier = "a" * 40, "b" * 40
+        prior = {**self.PRIOR, "status": "blocking", "scope": "branch", "subject": {"head": earlier}}
+        supervisor.out("prior").write_text(json.dumps(prior), encoding="utf-8")
+        digest = hashlib.sha256(json.dumps(prior, sort_keys=True).encode()).hexdigest()
+        supervisor.held = {"name": "checks", "argv": ["checks"], "exit": 1}
+        for verified, expected in ((digest, earlier), (None, None)):
+            supervisor.out("review").write_text(json.dumps(
+                {**prior, "subject": {"head": head}, "verification_report_digest": verified}), encoding="utf-8")
+            with self.subTest(verified=bool(verified)), \
+                    mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
+                    mock.patch.object(build_run, "_read", return_value=""):
+                _planned, chosen = supervisor.review_plan(head)
+                self.assertEqual((chosen or {}).get("subject", {}).get("head"), expected,
+                                 "a replay held at the checks lost the delta review's prior")
+
+    def test_a_short_blocking_round_is_no_prior_to_verify(self):
+        """Review of sd:9769: a blocking round short of a reader read part of the patch; the next round reviews
+        the branch in full, not the delta since it."""
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        for short in ({"requested_reviews": 1, "completed_reviews": 1,
+                       "review_shortfall": {"requested": 2, "eligible": 1}},
+                      {"requested_reviews": 2, "completed_reviews": 1}):
+            supervisor.out("prior").write_text("", encoding="utf-8")
+            supervisor.out("review").write_text(json.dumps(
+                {**self.PRIOR, **short, "status": "blocking", "scope": "branch", "subject": {"head": "b" * 40}}),
+                encoding="utf-8")
+            with self.subTest(short=short), mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
+                    mock.patch.object(build_run, "_read", return_value=""):
+                self.assertIsNone(supervisor.prior_review("a" * 40), "a short blocking round seeded a delta review")
+
+    def test_a_round_covering_no_branch_is_no_prior_to_verify(self):
+        """Class pass, sd:9769: a last round with no `covers_from` (patch-only, or under another binding) stands
+        for no branch; a delta since it would leave the earlier commits unreviewed, so the next round is full."""
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        for status in ("blocking", "clean"):
+            supervisor.out("prior").write_text("", encoding="utf-8")
+            supervisor.out("review").write_text(json.dumps(
+                {**self.PRIOR, "covers_from": None, "status": status, "scope": "branch", "subject": {"head": "b" * 40}}),
+                encoding="utf-8")
+            with self.subTest(status=status), mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
+                    mock.patch.object(build_run, "_read", return_value=""):
+                self.assertIsNone(supervisor.prior_review("a" * 40), "a round covering no branch seeded a delta review")
+
+    def test_a_skipped_last_round_is_no_prior_to_verify(self):
+        """Review of sd:9769: `sd-review` refuses a `skipped` report as `--verify-report`; the next round
+        reviews in full instead of parking on that refusal twice."""
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        supervisor.out("review").write_text(json.dumps(
+            {"status": "skipped", "scope": "branch", "subject": {"head": "b" * 40}, "findings": [],
+             "route": {"tier": "skip"}}), encoding="utf-8")
+        with mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
+                mock.patch.object(build_run, "_read", return_value=""):
+            self.assertIsNone(supervisor.prior_review("a" * 40), "a skipped report was chosen to verify")
+
+    def test_a_prior_report_past_sd_reviews_bound_drops_to_a_full_review(self):
+        """Review of sd:9769: `sd-review` refuses a prior report over its 2 MB input bound before it writes any
+        JSON; the next round reviews in full rather than failing twice on that refusal."""
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        supervisor.out("review").write_text(json.dumps(
+            {"status": "advisory", "scope": "branch", "subject": {"head": "b" * 40},
+             "findings": [{"path": "src.py", "line": 1, "summary": "x" * 2_000_000}]}), encoding="utf-8")
+        with mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
+                mock.patch.object(build_run, "_read", return_value=""):
+            self.assertTrue(supervisor.prior_review("a" * 40) is None, "a report sd-review refuses was chosen to verify")
+
+    def test_a_prior_blocker_sd_review_would_refuse_drops_to_a_full_review(self):
+        """Review of sd:9769: `sd-review` refuses a prior blocking path outside the checkout or not a tracked
+        regular file; the next round reviews in full rather than failing twice on that refusal."""
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+
+        def read(argv, env=None):
+            return "040000 tree 0123\tsub\0" if "ls-tree" in argv and argv[-1].endswith("sub") else ""
+        for path in ("/elsewhere/x.py", "../up.py", "sub"):
+            supervisor.out("review").write_text(json.dumps(
+                {"status": "blocking", "scope": "branch", "subject": {"head": "b" * 40},
+                 "findings": [{"path": path, "line": 1, "disposition": "blocking"}]}), encoding="utf-8")
+            with self.subTest(path=path), mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
+                    mock.patch.object(build_run, "_read", side_effect=read):
+                self.assertIsNone(supervisor.prior_review("a" * 40), f"{path} was handed to --verify-report")
+        supervisor.out("review").write_text(json.dumps(
+            {"status": "blocking", "scope": "branch", "subject": {"head": "b" * 40},
+             "requested_reviews": 1, "completed_reviews": 1, "covers_from": "c" * 40,
+             "findings": [{"path": "src.py", "line": 1, "disposition": "blocking"}]}), encoding="utf-8")
+        with mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
+                mock.patch.object(build_run, "_read", return_value="100644 blob 0123\tsrc.py\0"):
+            self.assertIsNotNone(supervisor.prior_review("a" * 40), "a tracked file's blocker dropped the chain")
+        # Each instance's file too: `sd-review` attaches and checks every one (lead ruling on sd:9769).
+        supervisor.out("review").write_text(json.dumps(
+            {"status": "blocking", "scope": "branch", "subject": {"head": "b" * 40},
+             "requested_reviews": 1, "completed_reviews": 1, "covers_from": "c" * 40,
+             "findings": [{"path": "src.py", "line": 1, "disposition": "blocking",
+                           "instances": ["src.py:1", "/elsewhere/x.py:2"]}]}), encoding="utf-8")
+        with mock.patch.object(supervisor, "fresh", return_value={"review_round": 1}), \
+                mock.patch.object(build_run, "_read", return_value="100644 blob 0123\tsrc.py\0"):
+            self.assertIsNone(supervisor.prior_review("a" * 40), "an instance outside the checkout was handed on")
+
+    def test_a_non_ascii_digit_line_reads_as_no_line(self):
+        """Review of sd:9769: `str.isdigit` takes `²`, which `int` refuses; the place reads with no line."""
+        self.press()
+        self.assertEqual(self.supervisor().locations({"path": "src/file.py", "line": 1, "instances": ["src/file.py:\u00b2"]}),
+                         [("src/file.py", 1), ("src/file.py:\u00b2", None)])
+
+    def test_a_last_round_at_this_head_drops_to_a_full_review(self):
+        """Review of sd:9769: a fix round with no commit leaves the last report at this head; the older kept
+        report omits that round's blockers, so the next round reviews in full."""
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        for name, reviewed in (("review", "a" * 40), ("prior", "b" * 40)):
+            supervisor.out(name).write_text(json.dumps(
+                {"status": "blocking", "scope": "branch", "subject": {"head": reviewed}, "findings": []}),
+                encoding="utf-8")
+        with mock.patch.object(supervisor, "fresh", return_value={"review_round": 2}), \
+                mock.patch.object(build_run, "_read", return_value=""):
+            self.assertIsNone(supervisor.prior_review("a" * 40), "the older report stood in for this head's")
+
+    def test_a_last_report_that_fails_its_checks_drops_to_a_full_review(self):
+        """Review of sd:9769: a last report off the ancestry (an amended fix) or with two JSON objects (a
+        replay) must not hand the round to the older kept report, which omits the last round's blockers."""
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        report = {"status": "blocking", "scope": "branch", "findings": []}
+        supervisor.out("prior").write_text(json.dumps({**report, "subject": {"head": "b" * 40}}),
+                                           encoding="utf-8")
+        last = json.dumps({**report, "subject": {"head": "c" * 40}})
+
+        def ancestor(argv, **_kwargs):
+            if "--is-ancestor" in argv and "c" * 40 in argv:
+                raise build_run.Unread("not an ancestor")
+            return ""
+
+        for text, why in ((last, "an amended fix"), (last + "\n" + last, "two JSON objects")):
+            with self.subTest(why=why), \
+                    mock.patch.object(supervisor, "fresh", return_value={"review_round": 2}), \
+                    mock.patch.object(build_run, "_read", side_effect=ancestor):
+                supervisor.out("review").write_text(text, encoding="utf-8")
+                self.assertIsNone(supervisor.prior_review("a" * 40),
+                                  "the older kept report stood in for a last report that failed its checks")
+
+    def deferred(self, blockers, changed, words=frozenset(), defined=frozenset(), callees=False):
+        """`file_new_findings` over `blockers` with the delta `changed`: the blockers it keeps. The places'
+        enclosing functions call nothing changed unless `callees` reads them from git."""
+        supervisor = self.supervisor()
+        with mock.patch.object(supervisor, "branch_delta", return_value=changed), \
+                (contextlib.nullcontext() if callees else mock.patch.object(supervisor, "scope", return_value=(set(), []))), \
+                mock.patch.object(supervisor, "branch_words",
+                                  return_value=None if words is None else (set(words), set(defined))):
+            return supervisor, supervisor.file_new_findings({"status": "blocking", "blockers": blockers}, self.PRIOR,
+                                                            "a" * 40)
+
+    def test_a_blocker_on_a_changed_line_by_any_spelling_or_instance_still_blocks(self):
+        """Review of sd:9769: an instance on the delta, `./` or an absolute spelling of a changed path, blocks."""
+        self.press()
+        work = str(self.supervisor().work)
+        rows = [{"path": "far.py", "line": 9, "summary": "a", "instances": ["far.py:9", "src.py:5"]},
+                {"path": "./src.py", "line": 5, "summary": "b"},
+                {"path": f"{work}/src.py", "line": 5, "summary": "c"},
+                {"path": "./named.py", "line": 40, "summary": "d"}]
+        _, kept = self.deferred(rows, {"src.py": {5}})
+        self.assertEqual(kept["blockers"], rows, "a blocker on changed code was deferred")
+
+    def test_a_blocker_on_an_unchanged_line_of_a_changed_file_still_blocks(self):
+        """Review of sd:9769: a reviewer's line can be off by a few, and a change can break unchanged code in a
+        file it touches; a file the branch changes is the change's own at every line."""
+        self.press()
+        rows = [{"path": "src.py", "line": 8, "summary": "two lines below the edit"},
+                {"path": "src.py", "line": 200, "summary": "an unchanged reader the edit broke"}]
+        _, kept = self.deferred(rows, {"src.py": {5, 6}})
+        self.assertEqual(kept["blockers"], rows, "a blocker in a changed file was deferred")
+
+    def test_a_blocker_at_an_unchanged_callee_naming_a_changed_caller_still_blocks(self):
+        """Class pass, sd:9769 (deferral by location, not causation): a reviewer that cites an unchanged callee
+        but names the changed caller in its own words ties the defect to the branch, so it holds."""
+        self.press()
+        rows = [{"path": "lib/helper.py", "line": 3, "summary": "src/caller.py now passes None to parse()"},
+                {"path": "lib/helper.py", "line": 7, "summary": "the new call in caller.py breaks this contract"},
+                {"path": "lib/helper.py", "line": 9, "summary": "the branch's change breaks this",
+                 "message": "src/caller.py:12 drops the default"}]
+        _, kept = self.deferred(rows, {"src/caller.py": {12}})
+        self.assertEqual(kept["blockers"], rows, "a blocker naming a changed caller was deferred")
+        far = {"path": "lib/helper.py", "line": 3, "summary": "an old defect in parse()"}
+        _, kept = self.deferred([far], {"src/caller.py": {12}})
+        self.assertEqual(kept["blockers"], [], "a blocker naming no changed file was held")
+
+    def test_a_conversion_broken_by_a_dropped_check_holds_on_its_repro(self):
+        """Sd:9900 (ruling #68857): a fix drops validation in lib/check.py, and the unchanged conversion in
+        lib/convert.py, which no call ties to it, raises. The reviewer cites the conversion; its `evidence`
+        repro (pack sd:9867) routes the failing input through the dropped check, so the blocker holds."""
+        self.press()
+        row = {"path": "lib/convert.py", "line": 12, "severity": "high", "family": "correctness",
+               "summary": "int(row[1]) raises ValueError on a non-numeric count",
+               "evidence": "input count='abc' passes lib/check.py:4, where the fix dropped the digit check, "
+                           "then lib/convert.py:12 int(row[1]) raises ValueError",
+               "instances": ["lib/convert.py:12"]}
+        _, kept = self.deferred([row], {"lib/check.py": {4}})
+        self.assertEqual(kept["blockers"], [row], "a conversion the dropped check breaks was filed")
+        uncited = dict(row, evidence="input count='abc': lib/convert.py:12 int(row[1]) raises ValueError")
+        _, kept = self.deferred([uncited], {"lib/check.py": {4}})
+        self.assertEqual(kept["blockers"], [], "a repro whose route skips the change held")
+
+    def test_a_changed_caller_named_by_function_holds(self):
+        """Lead ruling on sd:9769 (deferral eligibility): a reviewer can name the changed caller by its function
+        alone; a name the branch's changed functions hold ties the blocker to the branch, so it is not filed."""
+        self.press()
+        rows = [{"path": "lib/helper.py", "line": 3, "summary": "review_plan now passes None to parse()"},
+                {"path": "lib/helper.py", "line": 4, "summary": "the new call in `Supervisor.plan` breaks this"},
+                {"path": "lib/helper.py", "line": 5, "summary": "buildPlan drops the default"}]
+        _, kept = self.deferred(rows, {"src/caller.py": {12}}, {"review_plan", "plan", "buildPlan", "parse"})
+        self.assertEqual(kept["blockers"], rows, "a blocker naming a changed caller by function was deferred")
+        far = {"path": "lib/helper.py", "line": 3, "summary": "an old defect in old_reader()"}
+        _, kept = self.deferred([far], {"src/caller.py": {12}}, {"review_plan"})
+        self.assertEqual(kept["blockers"], [], "a blocker naming no changed function was held")
+        _, kept = self.deferred([far], {"src/caller.py": {12}}, None)
+        self.assertEqual(kept["blockers"], [far], "a function context git could not read deferred a blocker")
+
+    def test_a_blocker_in_an_unchanged_callee_of_a_changed_caller_still_blocks(self):
+        """Lead ruling on sd:9769 (15:20 MST): a changed caller can break an unchanged callee, as a crash on
+        an empty value; a finding cited inside a function the changed code calls is in scope, even when its
+        words name only the failing input, so its path does not defer it."""
+        self.press()
+        source = ("import os\n\n\ndef parse_row(value):\n    return value[0]\n\n\n"
+                  "def old_reader():\n    return 1\n")
+
+        def show(argv, **_kwargs):
+            if "show" in argv and argv[-1] == f"{'a' * 40}:lib/parse.py":
+                return source
+            raise build_run.Unread("no such file")
+
+        rows = [{"path": "lib/parse.py", "line": 5, "summary": "an empty value crashes here"},
+                {"path": "lib/other.py", "line": 1, "summary": "an empty value crashes here",
+                 "instances": ["lib/parse.py:5"]},
+                {"path": "lib/parse.py", "line": None, "summary": "an empty value crashes this module"}]
+        far = {"path": "lib/parse.py", "line": 9, "summary": "an old defect"}
+        with mock.patch.object(build_run, "_read", side_effect=show), \
+                mock.patch.object(build_run, "_grep", return_value=""):
+            _, kept = self.deferred([*rows, far], {"src/caller.py": {12}}, {"export", "parse_row", "row"},
+                                    {"export"}, callees=True)
+        self.assertEqual(kept["blockers"], rows, "a blocker in a callee of the changed caller was deferred")
+
+        def broken(argv, **_kwargs):
+            raise build_run.Unread("git gave no answer")
+
+        with mock.patch.object(build_run, "_read", side_effect=broken):
+            _, kept = self.deferred([far], {"src/caller.py": {12}}, {"parse_row"}, {"export"}, callees=True)
+        self.assertEqual(kept["blockers"], [far], "a callee git could not read deferred its blocker")
+
+    def test_a_blocker_in_a_transitive_callee_of_a_changed_caller_still_blocks(self):
+        """Review of sd:9769: a changed caller passes an empty value to an unchanged wrapper, which forwards
+        it to a parser that crashes; a finding naming only the parser is in scope through the wrapper."""
+        self.press()
+        head = "a" * 40
+        files = {"lib/parse.py": "def parse_row(value):\n    return value[0]\n\n\ndef old_reader():\n    return 1\n",
+                 "lib/wrap.py": "from lib.parse import parse_row\n\n\ndef wrap(value):\n    return parse_row(value)\n"}
+
+        def show(argv, **_kwargs):
+            path = argv[-1].removeprefix(f"{head}:")
+            if "show" in argv and path in files:
+                return files[path]
+            raise build_run.Unread("no such file")
+
+        def grep(argv, **_kwargs):  # `git grep -n -z -w`: `head:path\0line\0text`
+            return fake_grep(files, head, argv)
+
+        deep = {"path": "lib/parse.py", "line": 2, "summary": "an empty value crashes the parser"}
+        far = {"path": "lib/parse.py", "line": 6, "summary": "an old defect"}
+        with mock.patch.object(build_run, "_read", side_effect=show), \
+                mock.patch.object(build_run, "_grep", side_effect=grep):
+            _, kept = self.deferred([deep, far], {"src/caller.py": {12}}, {"export", "wrap", "value"},
+                                    {"export"}, callees=True)
+        self.assertEqual(kept["blockers"], [deep], "a blocker in a transitive callee of the changed caller was deferred")
+
+        def lost(argv, **_kwargs):
+            raise build_run.Unread("git grep gave no answer")
+
+        with mock.patch.object(build_run, "_read", side_effect=show), \
+                mock.patch.object(build_run, "_grep", side_effect=lost):
+            _, kept = self.deferred([far], {"src/caller.py": {12}}, {"wrap"}, {"export"}, callees=True)
+        self.assertEqual(kept["blockers"], [far], "a caller search git could not answer deferred its blocker")
+
+    def test_a_blocker_in_an_unchanged_consumer_of_a_changed_function_still_blocks(self):
+        """Review of sd:9769: a fix makes `lookup()` return None; the unchanged consumer at `lookup().name`
+        crashes, directly or through an unchanged helper, and a finding naming only the failing input is in
+        scope through what the consumer calls."""
+        self.press()
+        head = "a" * 40
+        files = {"lib/consume.py": "def show_name(key):\n    return lookup(key).name\n\n\n"
+                                   "def label(key):\n    return middle(key).name\n\n\ndef plain():\n    return 1\n",
+                 "lib/mid.py": "def middle(key):\n    return lookup(key)\n"}
+
+        def show(argv, **_kwargs):
+            path = argv[-1].removeprefix(f"{head}:")
+            if "show" in argv and path in files:
+                return files[path]
+            raise build_run.Unread("no such file")
+
+        def grep(argv, **_kwargs):
+            return fake_grep(files, head, argv)
+
+        rows = [{"path": "lib/consume.py", "line": 2, "summary": "a missing key crashes here"},
+                {"path": "lib/consume.py", "line": 6, "summary": "a missing key crashes here"}]
+        far = {"path": "lib/consume.py", "line": 10, "summary": "an old defect"}
+        with mock.patch.object(build_run, "_read", side_effect=show), \
+                mock.patch.object(build_run, "_grep", side_effect=grep):
+            _, kept = self.deferred([*rows, far], {"lib/store.py": {3}}, {"lookup", "key", "None"},
+                                    {"lookup", "None"}, callees=True)
+        self.assertEqual(kept["blockers"], rows, "a blocker in a consumer of the changed function was deferred")
+
+    def test_a_module_level_line_below_a_function_is_not_inside_it(self):
+        """Review of sd:9769: a changed API starts returning None; an unchanged module-level
+        `result = changed_api().value` below an unrelated function is not that function's line, so the
+        finding there holds through what the line calls."""
+        self.press()
+        head = "a" * 40
+        body = "def unrelated():\n    return 1\n\n\nresult = changed_api().value\n"
+
+        def show(argv, **_kwargs):
+            if "show" in argv and argv[-1] == f"{head}:lib/mod.py":
+                return body
+            raise build_run.Unread("no such file")
+
+        supervisor = self.supervisor()
+        with mock.patch.object(build_run, "_read", side_effect=show):
+            self.assertEqual(supervisor.scope("lib/mod.py", 5, head, {}), (set(), ["result = changed_api().value"]),
+                             "a module-level line read as part of the function above it")
+            self.assertEqual(supervisor.scope("lib/mod.py", 2, head, {})[0], {"unrelated"})
+        row = {"path": "lib/mod.py", "line": 5, "summary": "a None value crashes here"}
+        with mock.patch.object(build_run, "_read", side_effect=show), \
+                mock.patch.object(build_run, "_grep", return_value=""):
+            _, kept = self.deferred([row], {"lib/api.py": {3}}, {"changed_api", "value"}, {"changed_api"},
+                                    callees=True)
+        self.assertEqual(kept["blockers"], [row], "a module-level consumer of the changed API was deferred")
+
+    def test_an_import_alias_links_a_changed_function_both_ways(self):
+        """Review of sd:9769: `from parser import parse as decode` hides the link between `decode()` and the
+        changed `parse()`; the walk down from a consumer and the walk up from a callee both follow it."""
+        self.press()
+        head = "a" * 40
+        files = {"lib/consume.py": "from parser import parse as decode\n\n\ndef show(text):\n    return decode(text).name\n",
+                 "lib/rebind.py": "def show(text):\n    return load(text).name\n\n\nload = parse\n",
+                 "lib/parser.py": "def parse(text):\n    return text[0]\n"}
+
+        def show(argv, **_kwargs):
+            path = argv[-1].removeprefix(f"{head}:")
+            if "show" in argv and path in files:
+                return files[path]
+            raise build_run.Unread("no such file")
+
+        def grep(argv, **_kwargs):
+            return fake_grep(files, head, argv)
+
+        consumers = [{"path": "lib/consume.py", "line": 5, "summary": "a None result crashes here"},
+                     {"path": "lib/rebind.py", "line": 2, "summary": "a None result crashes here"}]
+        with mock.patch.object(build_run, "_read", side_effect=show), \
+                mock.patch.object(build_run, "_grep", side_effect=grep):
+            _, kept = self.deferred(consumers, {"lib/store.py": {3}}, {"parse", "text"}, {"parse"}, callees=True)
+        self.assertEqual(kept["blockers"], consumers, "a consumer calling the changed function by alias was deferred")
+        callee = {"path": "lib/parser.py", "line": 2, "summary": "an empty value crashes here"}
+        with mock.patch.object(build_run, "_read", side_effect=show), \
+                mock.patch.object(build_run, "_grep", side_effect=grep):
+            _, kept = self.deferred([callee], {"src/caller.py": {12}}, {"decode", "value"}, {"export"},
+                                    callees=True)
+        self.assertEqual(kept["blockers"], [callee], "a callee the changed code calls by alias was deferred")
+
+    def test_a_multiline_signature_does_not_end_the_function(self):
+        """Review of sd:9769: a Python signature split over lines closes with `):` at the definition's own
+        indent; the function runs on past it, so `value = lookup(item)` above `return value.name` counts."""
+        self.press()
+        head = "a" * 40
+        body = "def show(\n    item,\n):\n    value = lookup(item)\n    return value.name\n"
+
+        def show(argv, **_kwargs):
+            if "show" in argv and argv[-1] == f"{head}:lib/consume.py":
+                return body
+            raise build_run.Unread("no such file")
+
+        supervisor = self.supervisor()
+        with mock.patch.object(build_run, "_read", side_effect=show):
+            names, lines = supervisor.scope("lib/consume.py", 5, head, {})
+        self.assertEqual((names, lines[-1]), ({"show"}, "    return value.name"),
+                         "a multiline signature ended the function at its closing line")
+        row = {"path": "lib/consume.py", "line": 5, "summary": "a missing item crashes here"}
+        with mock.patch.object(build_run, "_read", side_effect=show), \
+                mock.patch.object(build_run, "_grep", return_value=""):
+            _, kept = self.deferred([row], {"lib/store.py": {3}}, {"lookup", "key"}, {"lookup"}, callees=True)
+        self.assertEqual(kept["blockers"], [row], "a consumer with a multiline signature was deferred")
+
+    def edges(self, files, rows, changed, words, defined):
+        """`deferred` over `rows` with `git show` and `git grep` answered from `files` at one head."""
+        head = "a" * 40
+
+        def show(argv, **_kwargs):
+            path = argv[-1].removeprefix(f"{head}:")
+            if "show" in argv and path in files:
+                return files[path]
+            raise build_run.Unread("no such file")
+
+        with mock.patch.object(build_run, "_read", side_effect=show), \
+                mock.patch.object(build_run, "_grep", side_effect=lambda argv, **_: fake_grep(files, head, argv)):
+            return self.deferred(rows, changed, words, defined, callees=True)[1]["blockers"]
+
+    def test_a_changed_function_passed_as_a_value_is_an_edge(self):
+        """Class pass, review of sd:9769 (a missed edge read as independence): a consumer that passes the
+        changed handler as a value (`apply(rows, handler_a)`, `getattr(mod, "handler_a")`) depends on it."""
+        self.press()
+        files = {"lib/run.py": "def run(rows):\n    return apply(rows, handler_a).name\n\n\n"
+                               "def named(mod):\n    return getattr(mod, \"handler_a\")().name\n"}
+        rows = [{"path": "lib/run.py", "line": 2, "summary": "a missing result crashes here"},
+                {"path": "lib/run.py", "line": 6, "summary": "a missing result crashes here"}]
+        self.assertEqual(self.edges(files, rows, {"lib/handlers.py": {3}}, {"handler_a"}, {"handler_a"}), rows,
+                         "a consumer referencing the changed function as a value was deferred")
+
+    def test_a_table_bound_by_assignment_is_an_edge(self):
+        """Class pass, review of sd:9769: `HANDLERS[key]()` reaches the changed handler through a table an
+        assignment binds; the walk follows the assignment as it follows a definition."""
+        self.press()
+        files = {"lib/table.py": "HANDLERS = {\"a\": handler_a}\n",
+                 "lib/dispatch.py": "def dispatch(key):\n    return HANDLERS[key]().name\n"}
+        rows = [{"path": "lib/dispatch.py", "line": 2, "summary": "a missing result crashes here"}]
+        self.assertEqual(self.edges(files, rows, {"lib/handlers.py": {3}}, {"handler_a"}, {"handler_a"}), rows,
+                         "a dispatcher reaching the changed handler through a table was deferred")
+
+    def test_a_statement_outside_any_function_spans_its_open_brackets(self):
+        """Class pass, review of sd:9769: a table written over several lines is one statement; the scope of
+        any of its lines is the whole statement, so the entry naming the changed handler is read."""
+        self.press()
+        files = {"lib/dispatch.py": "HANDLERS = {\n    \"a\": handler_a,\n    \"b\": handler_b,\n}\n\n\n"
+                                    "def dispatch(key):\n    return HANDLERS[key]().name\n"}
+        supervisor = self.supervisor()
+        head = "a" * 40
+        with mock.patch.object(build_run, "_read", return_value=files["lib/dispatch.py"]):
+            self.assertEqual(supervisor.scope("lib/dispatch.py", 1, head, {}),
+                             (set(), files["lib/dispatch.py"].splitlines()[:4]),
+                             "a statement over several lines read as its first line")
+            self.assertEqual(supervisor.scope("lib/dispatch.py", 3, head, {})[1][0], "HANDLERS = {",
+                             "a line inside a table read without its statement")
+        rows = [{"path": "lib/dispatch.py", "line": 8, "summary": "a missing result crashes here"}]
+        self.assertEqual(self.edges(files, rows, {"lib/handlers.py": {3}}, {"handler_a"}, {"handler_a"}), rows,
+                         "a dispatcher reaching the changed handler through a multiline table was deferred")
+
+    def test_a_reference_outside_any_function_passes_on_what_it_binds(self):
+        """Class pass, review of sd:9769: walking up from an unchanged handler, a table entry outside any
+        function names no caller; the name the table binds does, so the walk reaches the changed dispatcher."""
+        self.press()
+        files = {"lib/handlers.py": "def handler_a():\n    return lookup()\n",
+                 "lib/table.py": "HANDLERS = {\n    \"a\": handler_a,\n}\n",
+                 "lib/dispatch.py": "def dispatch(key):\n    return HANDLERS[key]().name\n"}
+        rows = [{"path": "lib/handlers.py", "line": 2, "summary": "an empty value crashes here"}]
+        self.assertEqual(self.edges(files, rows, {"lib/dispatch.py": {2}}, {"dispatch", "key"}, {"export"}), rows,
+                         "a handler the changed dispatcher reaches through a table was deferred")
+
+    def test_a_table_filled_by_mutation_is_an_edge(self):
+        """Class pass, review of sd:9769: `HANDLERS["a"] = handler_a` or `HANDLERS.update(...)` fills the table
+        `HANDLERS[key]()` reads; both walks follow the statement that mutates it, as one that binds it."""
+        self.press()
+        files = {"lib/table.py": "HANDLERS = {}\nHANDLERS[\"a\"] = handler_a\nHANDLERS.update({\"b\": handler_b})\n",
+                 "lib/handlers.py": "def handler_b():\n    return lookup()\n",
+                 "lib/dispatch.py": "def dispatch(key):\n    return HANDLERS[key]().name\n"}
+        down = [{"path": "lib/dispatch.py", "line": 2, "summary": "a missing result crashes here"}]
+        self.assertEqual(self.edges(files, down, {"lib/handlers.py": {3}}, {"handler_a"}, {"handler_a"}), down,
+                         "a dispatcher reaching the changed handler through a mutated table was deferred")
+        up = [{"path": "lib/handlers.py", "line": 2, "summary": "an empty value crashes here"}]
+        self.assertEqual(self.edges(files, up, {"lib/dispatch.py": {2}}, {"dispatch", "key"}, {"export"}), up,
+                         "a handler the changed dispatcher reaches through a mutated table was deferred")
+
+    def test_a_short_function_name_still_names_the_changed_caller(self):
+        """Review of sd:9769: `go()` names a changed function; no length filter drops it."""
+        self.press()
+        rows = [{"path": "lib/helper.py", "line": 3, "summary": "go() now passes None here"},
+                {"path": "lib/helper.py", "line": 4, "summary": "the new call in `go` crashes this"}]
+        _, kept = self.deferred(rows, {"src/caller.py": {12}}, {"go"})
+        self.assertEqual(kept["blockers"], rows, "a blocker naming a short changed function was deferred")
+
+    def test_a_rebuttal_records_every_instance_of_the_finding(self):
+        """Review of sd:9769: the lane holds a rebuttal back once any file the finding names changes, so the
+        rebuttal carries each instance, not the primary path alone."""
+        self.press()
+        supervisor = self.supervisor()
+        self.db.execute("UPDATE repo SET remote = 'https://github.com/example/repo.git'")
+        row = {"path": "far.py", "line": 2, "summary": "a", "instances": ["far.py:2", "other.py:7"]}
+        supervisor.file_follow_up(row, "a" * 40)
+        body = self.db.execute("SELECT body FROM state WHERE key LIKE 'ship-adjudication:build-run:%'").fetchone()
+        self.assertIsNotNone(body, "no rebuttal was recorded")
+        raw = json.loads(body[0])["proposal"]["findings"][0]["raw_finding"]
+        self.assertEqual(raw.get("instances"), ["far.py:2", "other.py:7"], "the rebuttal dropped the instances")
+
+    def test_a_deferred_rebuttal_names_every_file_the_branch_changes(self):
+        """Review of sd:9769: a managed build files a rebuttal before the lane gate runs; a gate fix that
+        changes only the branch's own caller must lapse it, so the rebuttal names each file it was judged on."""
+        self.press()
+        self.db.execute("UPDATE repo SET remote = 'https://github.com/example/repo.git'")
+        _, kept = self.deferred([{"path": "far.py", "line": 2, "summary": "a"}], {"src/caller.py": {12}})
+        self.assertEqual(kept["blockers"], [])
+        body = self.db.execute("SELECT body FROM state WHERE key LIKE 'ship-adjudication:build-run:%'").fetchone()
+        self.assertIsNotNone(body, "no rebuttal was recorded")
+        raw = json.loads(body[0])["proposal"]["findings"][0]["raw_finding"]
+        self.assertIn("src/caller.py", raw.get("instances"), "a fix to the branch's caller keeps the rebuttal")
+
+    def test_a_changed_function_named_in_plain_words_holds(self):
+        """Review of sd:9769: a reviewer can name the changed caller as a plain word (`export`); a plain word
+        that is the name of a function the branch changes ties the blocker to the branch."""
+        self.press()
+        rows = [{"path": "lib/parse.py", "line": 3, "summary": "export now passes an empty value; the parser crashes"}]
+        _, kept = self.deferred(rows, {"src/caller.py": {12}}, {"export", "value"}, {"export"})
+        self.assertEqual(kept["blockers"], rows, "a blocker naming a changed function in plain words was deferred")
+        far = {"path": "lib/parse.py", "line": 3, "summary": "the parser crashes on an empty value"}
+        _, kept = self.deferred([far], {"src/caller.py": {12}}, {"the", "parser", "value"}, {"export"})
+        self.assertEqual(kept["blockers"], [], "a plain word that names no changed function held a blocker")
+
+    def test_every_definition_form_and_changed_line_name_reads_as_defined(self):
+        """Class pass, review of sd:9769: a caller defined by assignment (`const serialize = (row) => ...`),
+        by any language's keyword, or named on a changed line reads as a name the branch defines."""
+        repo = Path(tempfile.mkdtemp(dir=self.root))
+
+        def run(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.name=operator",
+                                   "-c", "user.email=operator@example.test", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        run("init", "-q")
+        body = ("const serialize = (row) => sink(row)\nlet render = function (x) { return x }\n"
+                "pick := func() {}\nloader = lambda path: open(path)\n")
+        (repo / "caller.js").write_text(body)
+        run("add", "-A")
+        run("commit", "-q", "-m", "base")
+        base = run("rev-parse", "HEAD")
+        (repo / "caller.js").write_text(body.replace("sink(row)", "sink(row, flush)"))
+        run("add", "-A")
+        run("commit", "-q", "-m", "change")
+        read = build_run.function_words(["git"], str(repo), base, run("rev-parse", "HEAD"))
+        assert read is not None, "git's function context did not read"
+        self.assertTrue({"serialize", "sink", "flush"} <= read[1], read[1])
+        for line in ("let render = function (x) {", "pick := func() {}", "loader = lambda path: open(path)",
+                     "export const build = async (a) => a", "fn emit(x: u8) {", "sub report {"):
+            with self.subTest(line=line):
+                self.assertTrue(build_run.defined_names(line), f"no name defined by {line!r}")
+
+    def test_branch_words_hold_the_changed_function_and_what_it_calls(self):
+        """Lead ruling on sd:9769: the branch's changed functions, read whole, name the caller and its callee."""
+        repo = Path(tempfile.mkdtemp(dir=self.root))
+
+        def run(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.name=operator",
+                                   "-c", "user.email=operator@example.test", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        run("init", "-q")
+        body = "class Plan:\n    def review_plan(self):\n        x = 1\n        return parse_row(x)\n\n\n" \
+               "def untouched():\n    return 2\n"
+        (repo / "caller.py").write_text(body)
+        run("add", "-A")
+        run("commit", "-q", "-m", "base")
+        base = run("rev-parse", "HEAD")
+        (repo / "caller.py").write_text(body.replace("x = 1", "x = None"))
+        run("add", "-A")
+        run("commit", "-q", "-m", "change")
+        read = build_run.function_words(["git"], str(repo), base, run("rev-parse", "HEAD"))
+        assert read is not None, "git's function context did not read"
+        words, defined = read
+        self.assertIn("review_plan", defined, "the changed function's own name is not a defined name")
+        self.assertNotIn("parse_row", defined, "a called name read as a defined one")
+        self.assertTrue({"review_plan", "parse_row"} <= words, words)
+        self.assertNotIn("untouched", words)
+
+    def test_a_change_outside_any_function_reads_as_no_function_words(self):
+        """Class pass on sd:9769: a changed config value, module constant, binary or mode leaves a consumer's
+        finding nothing to name, so the branch's words do not read and every blocker holds."""
+        body = "def f():\n    return LIMIT\n"
+        for name, before, after in (("conf.yaml", "items:\n  - a\nother: 1\n", "items: []\nother: 1\n"),
+                                    ("mod.py", f"import os\nLIMIT = 3\n\n\n{body}",
+                                     f"import os\nLIMIT = 0\n\n\n{body}"),
+                                    ("blob.bin", b"\x00\x01", b"\x00\x02"), ("run.sh", "echo\n", None)):
+            with self.subTest(name=name):
+                repo = Path(tempfile.mkdtemp(dir=self.root))
+
+                def run(*args, repo=repo):
+                    return subprocess.run(["git", "-C", str(repo), "-c", "user.name=operator",
+                                           "-c", "user.email=operator@example.test", *args],
+                                          check=True, capture_output=True, text=True).stdout.strip()
+
+                run("init", "-q")
+                path = repo / name
+                path.write_bytes(before) if isinstance(before, bytes) else path.write_text(before)
+                run("add", "-A")
+                run("commit", "-q", "-m", "base")
+                base = run("rev-parse", "HEAD")
+                if after is None:
+                    path.chmod(0o755)
+                else:
+                    path.write_bytes(after) if isinstance(after, bytes) else path.write_text(after)
+                run("commit", "-q", "-am", "change")
+                self.assertIsNone(build_run.function_words(["git"], str(repo), base, run("rev-parse", "HEAD")),
+                                  "a change outside any function let a consumer's blocker be filed")
+
+    def test_a_changed_caller_named_by_any_spelling_holds_and_a_lookalike_does_not(self):
+        """Review of sd:9769: `./src/caller.py` or an absolute path names the changed caller and holds; a
+        `src/caller.py.bak` is another file and does not."""
+        self.press()
+        work = str(self.supervisor().work)
+        rows = [{"path": "lib/helper.py", "line": 3, "summary": "./src/caller.py now passes None to parse()"},
+                {"path": "lib/helper.py", "line": 4, "summary": f"{work}/src/caller.py passes None."}]
+        _, kept = self.deferred(rows, {"src/caller.py": {12}})
+        self.assertEqual(kept["blockers"], rows, "a blocker naming a changed caller by another spelling was deferred")
+        spaced = [{"path": "lib/parse.py", "line": 2, "summary": "bin/my tool now passes None to parse()"},
+                  {"path": "lib/parse.py", "line": 3, "summary": f"{work}/bin/my tool passes None."}]
+        _, kept = self.deferred(spaced, {"bin/my tool": {4}})
+        self.assertEqual(kept["blockers"], spaced, "a blocker naming a changed caller with a space was deferred")
+        _, kept = self.deferred([{"path": "lib/parse.py", "line": 2, "summary": "bin/my tool.bak is stale"}],
+                                {"bin/my tool": {4}})
+        self.assertEqual(kept["blockers"], [], "a lookalike of a spaced name held a blocker")
+        far = {"path": "lib/helper.py", "line": 5, "summary": "src/caller.py.bak still holds the old parse()"}
+        _, kept = self.deferred([far], {"src/caller.py": {12}})
+        self.assertEqual(kept["blockers"], [], "a lookalike file name held a blocker")
+
+    def test_a_blocker_outside_the_checkout_still_blocks(self):
+        """Class pass, sd:9769: no delta of this checkout can show a path outside it unchanged."""
+        self.press()
+        rows = [{"path": "/elsewhere/x.py", "line": 1, "summary": "a"}, {"path": "../up.py", "line": 2, "summary": "b"},
+                {"path": "src.py", "line": 9, "summary": "c", "instances": ["/elsewhere/y.py:3"]}]
+        _, kept = self.deferred(rows, {})
+        self.assertEqual(kept["blockers"], rows, "a blocker outside the checkout was deferred")
+
+    def test_a_quoted_path_in_the_delta_reads_as_unknown(self):
+        """Review of sd:9769: a non-ASCII path reads as itself; one git still quotes reads as unknown."""
+        repo = Path(tempfile.mkdtemp(dir=self.root))
+
+        def run(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.name=operator",
+                                   "-c", "user.email=operator@example.test", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        run("init", "-q")
+        run("commit", "-q", "--allow-empty", "-m", "base")
+        base = run("rev-parse", "HEAD")
+        (repo / "na\u00efve.txt").write_text("x\n")
+        run("add", "-A")
+        run("commit", "-q", "-m", "plain")
+        plain = run("rev-parse", "HEAD")
+        self.assertEqual(build_run.changed_lines(["git"], str(repo), base, plain), {"na\u00efve.txt": {1}})
+        (repo / 'q"uote.txt').write_text("y\n")
+        run("add", "-A")
+        run("commit", "-q", "-m", "quoted")
+        self.assertIsNone(build_run.changed_lines(["git"], str(repo), base, run("rev-parse", "HEAD")),
+                          "a quoted path was read")
+
+    def test_a_deletion_marks_the_surviving_line_and_a_deleted_file(self):
+        """Review of sd:9769: git's zero-length range names the line before a deletion; a deleted file's
+        new path is /dev/null; a deleted line reading `-- x` is not a header."""
+        repo = Path(tempfile.mkdtemp(dir=self.root))
+
+        def run(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.name=operator",
+                                   "-c", "user.email=operator@example.test", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        run("init", "-q")
+        (repo / "kept.txt").write_text("one\ntwo\n-- x\nfour\n")
+        (repo / "gone.txt").write_text("a\nb\n")
+        run("add", "-A")
+        run("commit", "-q", "-m", "base")
+        base = run("rev-parse", "HEAD")
+        (repo / "kept.txt").write_text("one\ntwo\nfour\n")
+        (repo / "gone.txt").unlink()
+        run("add", "-A")
+        run("commit", "-q", "-m", "delete")
+        self.assertEqual(build_run.changed_lines(["git"], str(repo), base, run("rev-parse", "HEAD")),
+                         {"kept.txt": {2, 3}, "gone.txt": {1, 2}})
+
+    def test_each_follow_up_is_its_own_write(self):
+        """Review of sd:9769: a lost answer on the first follow-up must not stand for the second."""
+        rows = [{"path": "a.txt", "line": 1, "summary": "first"}, {"path": "b.txt", "line": 2, "summary": "second"}]
+        self.press()
+        supervisor = self.supervisor()
+        real, lost = supervisor.file_follow_up, list[dict]()
+
+        def committed_then_lost(row, head, **options):  # the first follow-up's transaction commits; its answer is lost
+            real(row, head, **options)
+            if not lost:
+                lost.append(row)
+                raise remote.UnknownOutcome("r" * 26, "the answer to COMMIT was lost")
+
+        supervisor.db.outcome = mock.Mock(return_value="recorded")
+        answer = {"status": "blocking", "blockers": rows}
+        with mock.patch.object(supervisor, "branch_delta", return_value={}), \
+                mock.patch.object(supervisor, "branch_words", return_value=(set(), set())), \
+                mock.patch.object(supervisor, "scope", return_value=(set(), [])), \
+                mock.patch.object(supervisor, "file_follow_up", committed_then_lost):
+            with self.assertRaises(remote.UnknownOutcome):
+                supervisor.file_new_findings(answer, self.PRIOR, "a" * 40)
+            kept = supervisor.file_new_findings(answer, self.PRIOR, "a" * 40)
+        self.assertEqual(kept["status"], "advisory")
+        titles = [row[0] for row in self.db.execute("SELECT title FROM item WHERE title LIKE 'Review follow-up%'")]
+        self.assertEqual(len(titles), 2, f"a deferred blocker was never filed: {titles}")
+
+    def test_a_round_two_repeat_of_a_round_one_finding_still_blocks(self):
+        self.press()
+        self.plan(claude=["pass", "fix1", "fix2"], sd_review=["blocking", "blocking", "clean"])
+        self.write_pr()
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        self.assertEqual(self.latest()["review_round"], 2, "a repeated blocker did not block")
 
     def test_a_failed_gate_goes_back_to_the_builder(self):
         """A review that cleared over a failed gate is a blocker to fix, not an unknown answer (runs 155-203)."""
@@ -1539,7 +2719,7 @@ class Supervise(Case):
         self.release_all()
         self.db.execute("UPDATE item SET status = 'ready' WHERE id = ?", (item,))
         newer = build.queue(self.db, [item], who="operator")[0]["id"]
-        self.db.execute("UPDATE assignment SET status = 'blocked' WHERE id = ?", (newer,))
+        self.db.execute("UPDATE assignment SET status = 'blocked', run_count = 1 WHERE id = ?", (newer,))
         self.db.execute("UPDATE item SET status = 'blocked' WHERE id = ?", (item,))
         return newer
 
@@ -1814,6 +2994,113 @@ class Supervise(Case):
         self.assertIn("body line 3 is 80 characters (limit 72)", fix[fix.index("-p") + 1])
         self.assertIn("Fence each failure table", build_run.BRIEF)
         self.assertIn("`example.test`", build_run.BRIEF)
+
+    def test_a_lane_blocker_with_no_disposition_is_left_to_prepare(self):
+        """Lane review of build/sd-1557: a preflight disposition read spent fix rounds on a finding main may
+        fix, as prepare's catch-up moves the head. Prepare alone, at the final head, checks dispositions."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        ended = self.supervisor().run()
+        self.assertEqual(ended.get("step"), "enqueued", ended.get("outcome"))
+        # The fake `sd-ship` answers only `lane`: a disposition read would fail the run.
+        self.assertEqual([call for call in self.calls("sd-ship") if "adjudicate" in call["argv"]], [])
+
+    def test_a_usage_limit_in_a_fix_resumes_that_fix_without_a_round(self):
+        """Review of build/sd-1557: a limit in the fix resumed at `reviewing`, which charged the same blockers
+        another round. The claim resumes the fix itself, with the round's blockers and session."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "rate_limited"], sd_review=["blocking"])
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.assertEqual(build.run(self.db, again["id"])["step"], "fixing")
+        self.plan(claude=["fix1"], sd_review=["clean"])
+        self.assertEqual(self.supervisor(again["id"]).run()["step"], "enqueued")
+        fix = [call["argv"] for call in self.calls("claude")][-1]
+        self.assertEqual(fix[fix.index("--resume") + 1], "session-fixture")
+        self.assertIn("- work.txt:1 a blocker", fix[fix.index("-p") + 1])
+        self.assertEqual(build.run(self.db, again["id"])["review_round"], 1, "the resumed fix charged no round")
+
+    def test_a_resumed_fix_keeps_every_blocker_whole(self):
+        """Review of build/sd-1557: the resumed fix read its blockers back from the 4000-character note, so a
+        multiline finding lost its tail, its bullet read as a blocker of its own and a later finding was cut.
+        The resumed prompt is the interrupted one."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "rate_limited"], sd_review=["blocking-long"])
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.plan(claude=["fix1"], sd_review=["clean"])
+        self.assertEqual(self.supervisor(again["id"]).run()["step"], "enqueued")
+        limited, resumed = ([call["argv"] for call in self.calls("claude")][n] for n in (1, 2))
+        said = resumed[resumed.index("-p") + 1]
+        self.assertIn("later.txt:9 a later blocker", said)
+        self.assertIn("x" * 4500, said)
+        self.assertEqual(said, limited[limited.index("-p") + 1], "the same brief as the interrupted fix")
+
+    def test_a_usage_limit_in_the_class_pass_resumes_the_class_pass(self):
+        """Review of build/sd-1557: a limit in the last round's class pass resumed with the plain FIX brief, so
+        the class pass never ran before the bound parked the run. It resumes with CLASS_PASS."""
+        R = build_run.REVIEW_ROUNDS
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R)), "rate_limited"], sd_review=["blocking"] * R)
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.plan(claude=["fixc"], sd_review=["clean"])
+        self.assertEqual(self.supervisor(again["id"]).run()["step"], "enqueued")
+        fix = [call["argv"] for call in self.calls("claude")][-1]
+        self.assertIn("do one class pass", fix[fix.index("-p") + 1])
+        self.assertEqual(build.run(self.db, again["id"])["review_round"], R)
+
+    def test_a_usage_limit_reclaim_refuses_a_worktree_on_another_branch(self):
+        """Review of build/sd-1557: the reclaim resumed at building or fixing, past the worktree step's branch
+        guard, so a checkout switched during the hold took the builder's commits. The guard runs first."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["rate_limited"])
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        support.git(Path(self.bundle["work_path"]), "checkout", "-q", "-b", "operator-side")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.assertEqual(build.run(self.db, again["id"])["step"], "building")
+        self.plan(claude=["pass"], sd_review=["clean"])
+        ended = self.supervisor(again["id"]).run()
+        self.assertEqual(ended["outcome"], "blocked")
+        self.assertIn("is on operator-side, not build/sd-", ended["blocked"])
+        self.assertEqual(len(self.calls("claude")), 1, "no builder ran on the switched checkout")
+
+    def test_a_sent_finding_briefs_how_to_record_a_rejection(self):
+        """sd:10010: a Send to builder note may reject a review finding; the brief says how to record it."""
+        self.press()
+        add_note(self.db, self.items[0], "comment", "Send to builder: reject a.py:2, the pin is checked in b.py:9")
+        # Noted before this run started, as a Send to builder's note is.
+        self.db.execute("UPDATE note SET timestamp = (SELECT created_at FROM runner_run WHERE id = ?) "
+                        "WHERE body LIKE 'Send to builder: reject%'", (self.bundle["id"],))
+        prompt = build_run.BRIEF.format(**self.supervisor().brief())
+        self.assertIn("reject a.py:2", prompt)
+        self.assertIn(f"adjudicate --item {self.items[0]} --expected-head <HEAD> --json", prompt)
+        self.assertIn("`--dispositions-file /dev/stdin`", prompt)
 
     def test_the_leak_guard_is_checked_before_the_review(self):
         """Pack sd:6926: the pre-push leak guard refused a test's real first name only at enqueue."""
@@ -2234,6 +3521,20 @@ class Unmanaged(Case):
         self.assertIn("exit 1", fix[fix.index("-p") + 1])
         self.assertEqual(build.run(self.db, self.bundle["id"])["review_round"], 1)
         self.assertEqual(len(self.pulls()), 1)
+
+    def test_a_failing_check_after_a_deferral_records_no_rebuttal(self):
+        """Review of sd:9769: an unmanaged repository's own check runs after the review; when it fails, a fix
+        round follows, so the round's deferral records no rebuttal that the fix would outlive."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "mend", "fix"], sd_review=["blocking", "offdelta", "clean"])
+        self.assertEqual(self.supervisor(checks=lambda work: [CHECK]).run()["step"], "enqueued")
+        self.assertEqual(len(self.calls("claude")), 3, "the failing check did not go back to the builder")
+        filed = self.db.execute("SELECT title FROM item WHERE title LIKE 'Review follow-up%'").fetchall()
+        self.assertEqual(len(filed), 1, "the deferred blocker was not filed")
+        rebuttals = self.db.execute(
+            "SELECT COUNT(*) FROM state WHERE kind = 'checkpoint' AND key LIKE 'ship-adjudication:%'").fetchone()[0]
+        self.assertEqual(rebuttals, 0, "a round whose check failed recorded a rebuttal a later fix outlives")
 
     def test_a_check_that_edits_a_tracked_file_is_a_failure_not_a_pass(self):
         """Lane review of b64873f13: a check that rewrites a tracked file and exits 0 tested a tree the head does
@@ -3614,6 +4915,23 @@ class Archive(Case):
         self.db.commit()
         return path, build_run.log_dir(self.logs, str(self.repo)) / path.name
 
+    def test_a_rate_limited_bundles_files_wait_for_its_resume(self):
+        """Review of build/sd-1557: a usage limit releases the run and queues the bundle again; the archive
+        moved its blockers file, so the resumed fix found none and reviewed again, charging another round."""
+        path, target = self.ended("sd-{assignment}.blockers.json")
+        paths = [path, *(path.with_name(f"sd-{self.bundle['assignment']}.{name}") for name in ("body.md", "title"))]
+        for each in paths[1:]:
+            each.write_text("x")
+            os.utime(each, (0, 0))
+        self.db.execute("UPDATE runner_run SET outcome = ? WHERE id = ?", (build.RATE_LIMITED, self.bundle["id"]))
+        self.db.commit()
+        self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs), [])
+        self.assertTrue(all(each.exists() for each in paths), "the resume reads the local files")
+        self.db.execute("UPDATE runner_run SET outcome = 'done' WHERE id = ?", (self.bundle["id"],))
+        self.db.commit()
+        self.assertEqual(sorted(build_run.archive(self.db, self.root / "local", self.logs)),
+                         sorted(str(target.with_name(each.name)) for each in paths))
+
     def test_notes_and_end_messages_name_the_archived_log(self):
         """sd:8275: the move rewrote only `log_path`; a note or end message still named the local file it removed."""
         path, target = self.ended("{run}.jsonl")
@@ -4480,6 +5798,29 @@ class HubFaults(Case):
         self.assertEqual((fired, ended["step"]), (["write"], "enqueued"))
         self.assertEqual(len(self.calls("claude")), 1, "the result was not paid for twice")
         self.assertIsNotNone(self.row()["final"])
+
+    def test_a_hub_fault_in_a_resumed_fix_resumes_the_fix(self):
+        """Review of build/sd-1557: a fault before a resumed fix's child started walked again with its blockers
+        already read, so the walk took the review for the fix: the fix never ran and a round was spent."""
+        self.plan(claude=["pass", "rate_limited"], sd_review=["blocking"])
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.plan(claude=["fix1", "fix2"], sd_review=["clean", "clean"])
+        before = len(self.calls("claude"))
+        patch, fired = self.faults_once("write", self.UNREACHABLE, fields=("step",),
+                                        where=lambda kwargs: kwargs.get("step") == "fixing")
+        with patch:
+            ended = self.supervisor(again["id"]).run()
+        self.assertEqual((fired, ended.get("step")), (["write"], "enqueued"))
+        fixes = [call["argv"] for call in self.calls("claude")][before:]
+        self.assertEqual(len(fixes), 1, "the resumed fix did not run once")
+        self.assertIn("- work.txt:1 a blocker", fixes[0][fixes[0].index("-p") + 1])
+        self.assertEqual(len(self.calls("sd-review")), 2, "a review ran in place of the fix")
 
     def test_a_mismatch_after_the_child_replays_its_result_in_the_new_image(self):
         self.plan(claude=["pass"], sd_review=["clean"])

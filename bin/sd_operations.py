@@ -361,7 +361,7 @@ def gate_load() -> tuple[float | None, float | None]:
     if not (isinstance(load, list) and len(load) >= 2 and isinstance(load[1], (int, float)) and math.isfinite(load[1])
             and math.isfinite(cap)):
         return None, None
-    return float(load[1]), float(cap)
+    return build.counted(answer, float(load[1])), float(cap)
 
 
 def interactive_builders(connection: Any, now: str, key: Any) -> tuple[list[dict] | None, str]:

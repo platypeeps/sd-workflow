@@ -99,7 +99,8 @@ elif provider == "codex":
                 {
                     "path": "src/app.py",
                     "line": 2,
-                    "severity": "high",
+                    "severity": "high", "instances": ["src.py:1"],
+                    "evidence": "python3 src/app.py: Traceback",
                     "summary": "Codex finding",
                     "family": "correctness",
                 }

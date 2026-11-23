@@ -10,6 +10,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -38,7 +40,7 @@ class Repo(Case):
         super().setUp()
         # Every git child, the fixture's and the drop's own, inherits this process's environment: a hook's
         # `GIT_DIR` or `GIT_WORK_TREE` would point them at the operator's repository and its origin (round 25).
-        kept = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        kept = paths.git_env()
         env = mock.patch.dict("os.environ", {**kept, **IDENTITY}, clear=True)
         env.start()
         self.addCleanup(env.stop)
@@ -224,7 +226,8 @@ class DropReview(Repo):
     def test_a_kept_item_with_a_newer_build_refuses(self):
         items, ids, run = self.bundle()
         newer = create_assignment(self.db, role="author", status="blocked", item=items[2])
-        self.db.execute("UPDATE assignment SET scope = ? WHERE id = ?", (build.SCOPE, newer))
+        # A newer build that ran: one that never ran owns nothing (`_current`, sd:9788).
+        self.db.execute("UPDATE assignment SET scope = ?, run_count = 1 WHERE id = ?", (build.SCOPE, newer))
         work = Path(run["work_path"])
         old = git(work, "rev-parse", "HEAD")
         with self.assertRaisesRegex(DROP.DropRefused, f"sd:{items[2]} has a newer build, assignment {newer}"):
@@ -458,6 +461,21 @@ class DropRound9(Repo):
         self.assertEqual(git(work, "rev-parse", "HEAD"), head)
         self.assertEqual(self.statuses(items), ["blocked"] * 3)
 
+
+    def test_a_kept_list_form_revert_refuses_the_drop(self):
+        """pack sd:9666 review, round 9: a hand-written revert that lists the sha it undid was replayed with
+        that sha stale, so the replayed commit's `Closes:` closed the item the revert undid."""
+        items, ids, run = self.bundle()
+        work = Path(run["work_path"])
+        lead = git(work, "log", "--format=%H", "-1", "--grep", f"Closes: sd:{items[0]}")
+        git(work, "rm", "-q", "a.txt")
+        git(work, "commit", "-q", "-m", f"revert: drop the lead\n\nReverted commits:\n\n- `{lead[:9]}` lead\n\n"
+            f"Lane review fix, repo sd:{items[2]}")
+        head = git(work, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(DROP.DropRefused, "reverts"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), head)
+        self.assertEqual(self.statuses(items), ["blocked"] * 3)
 
 class DropRound10(Repo):
     """Review round 10 of pack sd:9709: a lead drop reparented the kept members, so the ended run lost them and the
@@ -1031,6 +1049,202 @@ class GitPolicy(Repo):
         self.unmade(run)
 
 
+class Advisories(Repo):
+    """pack sd:9863: the review advisories on bundle drop (pack sd:9709)."""
+
+    def end(self, run, detail="fixture"):
+        build.write(self.db, run["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START)
+        build.end(self.db, run["id"], "blocked", detail)
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+
+    def test_a_held_split_still_drops(self):
+        """Drop checks every commit's citation itself, so a held split's earlier work stays aside."""
+        items, (lead, second, third), run = self.bundle()
+        build.retry(self.db, lead, who="operator", only=[items[0], items[2]])
+        self.end(self.claim(), f"{build.SPLIT}fixture")
+        self.assertEqual(build.split(self.db, lead), "held")
+        new = self.drop(run, items[2])
+        self.assertEqual(self.files(new), ["README", "a.txt"])
+        self.assertNotIn(f"sd:{items[1]}", self.closes(new))
+
+    def test_a_done_member_a_held_retry_left_out_stays_off_the_kept_branch(self):
+        """Build review: a member a subset Retry left out is aside, done or not; reopened before enqueue, its
+        replayed `Closes:` would close it again."""
+        items, (lead, second, third), run = self.bundle()
+        build.retry(self.db, lead, who="operator", only=[items[0], items[2]])
+        self.end(self.claim(), f"{build.SPLIT}fixture")
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[1],))
+        new = self.drop(run, items[2])
+        self.assertEqual(self.files(new), ["README", "a.txt"])
+        self.assertNotIn(f"sd:{items[1]}", self.closes(new))
+
+    def four(self):
+        """Four items built on one branch, one commit each, ended blocked: (items, run)."""
+        config = self.root / "config" / "sd-ai-command-pack" / "config.json"
+        config.parent.mkdir(parents=True, exist_ok=True)
+        config.write_text('{"config": {"sd": {"bundle_max": "4"}}}')
+        items = [self.item(repo=str(self.repo)) for _ in range(4)]
+        build.queue(self.db, items, who="operator")
+        run = self.claim()
+        work = Path(run["work_path"])
+        git(self.repo, "worktree", "add", "-q", "-b", run["branch"], str(work), "origin/main")
+        for index, item in enumerate(items):
+            self.commit(work, f"{index}.txt", f"{index}\n", f"feat: {index}\n\nCloses: sd:{item}")
+        self.end(run)
+        return items, run
+
+    def test_a_done_member_of_a_held_retry_stays_off_the_kept_branch(self):
+        """Build review round 6: Retry A, B and C of four, the split holds, B is done, drop C. Carried onto the
+        kept branch, B's `Closes:` would close B again if it reopened before enqueue."""
+        items, run = self.four()
+        lead = build.run(self.db, run["id"])["members"][0]["id"]
+        build.retry(self.db, lead, who="operator", only=items[:3])
+        self.end(self.claim(), f"{build.SPLIT}fixture")
+        self.assertEqual(build.split(self.db, lead), "held")
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[1],))
+        new = self.drop(run, items[2])
+        self.assertEqual(self.files(new), ["0.txt", "README"])
+        self.assertNotIn(f"sd:{items[1]}", self.closes(new))
+
+    def test_a_done_member_stays_off_the_kept_branch(self):
+        """Class pass, build review round 6: every done member's commits stay aside, held split or not."""
+        items, run = self.four()
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[1],))
+        new = self.drop(run, items[3])
+        self.assertEqual(self.files(new), ["0.txt", "2.txt", "README"])
+        self.assertNotIn(f"sd:{items[1]}", self.closes(new))
+
+    def test_dropping_a_done_lead_queues_the_kept_items_and_leaves_it_done(self):
+        items, (lead, second, third), run = self.bundle()
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[0],))
+        lead_id = self.next_lead()
+        queued = DROP.drop_item(self.db, build, items[0], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], items[1:])
+        self.assertEqual(queued[0]["id"], lead_id)
+        self.assertEqual(self.db.execute("SELECT status FROM item WHERE id = ?", (items[0],)).fetchone()[0], "done")
+        latest = self.db.execute("SELECT id, status FROM assignment WHERE item = ? AND scope = ? ORDER BY id DESC "
+                                 "LIMIT 1", (items[0], build.SCOPE)).fetchone()
+        self.assertEqual((latest["id"], latest["status"]), (lead, "cancelled"))
+
+    def test_dropping_a_lead_marked_done_by_its_transition_queues_the_kept_items(self):
+        """Lead review: the done transition cancels the lead's blocked assignment (`cancel_unwanted_blocked`)
+        and leaves its members blocked; the drop read members by the lead's status and found none to keep."""
+        items, (lead, second, third), run = self.bundle()
+        writes.transition(self.db, items[0], "done", who="operator", reason="landed by hand")
+        self.assertEqual(self.db.execute("SELECT status FROM assignment WHERE id = ?", (lead,)).fetchone()[0],
+                         "cancelled")
+        queued = DROP.drop_item(self.db, build, items[0], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], items[1:])
+        self.assertEqual(self.db.execute("SELECT status FROM item WHERE id = ?", (items[0],)).fetchone()[0], "done")
+
+    def test_a_member_gone_to_planning_stays_out_when_the_done_lead_drops(self):
+        """Its transition cancels the member's blocked row too, the status the done lead's row now has."""
+        items, ids, run = self.bundle()
+        writes.transition(self.db, items[2], "planning", who="operator", reason="not now")
+        writes.transition(self.db, items[0], "done", who="operator", reason="landed by hand")
+        queued = DROP.drop_item(self.db, build, items[0], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [items[1]])
+
+    def test_a_member_cancelled_by_planning_and_back_to_ready_stays_out_when_the_done_lead_drops(self):
+        """Lead review: its old row stays cancelled after planning and back to ready, unqueued. The done lead's
+        cancelled row must not admit it: the drop would replay its commits and queue it with the kept."""
+        items, ids, run = self.bundle()
+        writes.transition(self.db, items[2], "planning", who="operator", reason="not now")
+        writes.transition(self.db, items[2], "ready", who="operator", reason="back")
+        writes.transition(self.db, items[0], "done", who="operator", reason="landed by hand")
+        lead = self.next_lead()
+        queued = DROP.drop_item(self.db, build, items[0], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [items[1]])
+        new = Path(run["work_path"]).parent / f"repo-build-{lead}"
+        self.assertEqual(self.files(new), ["README", "b.txt"])
+
+    def test_a_done_lead_with_only_a_member_back_from_planning_refuses(self):
+        """No blocked member is left to keep: the old cancelled row is not one, so nothing replays."""
+        items, ids, run = self.bundle()
+        for item in items[1:]:
+            writes.transition(self.db, item, "planning", who="operator", reason="not now")
+            writes.transition(self.db, item, "ready", who="operator", reason="back")
+        writes.transition(self.db, items[0], "done", who="operator", reason="landed by hand")
+        with self.assertRaisesRegex(DROP.DropRefused, "only open item"):
+            DROP.drop_item(self.db, build, items[0], who="operator")
+        self.unmade(run)
+
+    def test_main_moving_a_kept_file_still_drops(self):
+        """The new branch starts at the bundle's fork, so each kept commit applies; the lane merges main."""
+        items, ids, run = self.bundle()
+        self.main_moves("a.txt", "main\n")
+        new = self.drop(run, items[1])
+        self.assertEqual(self.files(new), ["README", "a.txt", "c.txt"])
+        self.assertEqual((new / "a.txt").read_text(), "lead fixed\n")
+        self.assertEqual(git(new, "rev-list", "--count", "HEAD..origin/main"), "1", "main is the lane's to merge")
+
+    def test_a_kept_edit_of_a_helper_main_already_landed_still_drops(self):
+        """Lane review: the dropped commit adds a helper a kept commit edits, and main landed the same helper.
+        Replayed onto main the kept edit applies; onto the fork the helper is missing, so main goes first."""
+        items = [self.item(repo=str(self.repo)) for _ in range(2)]
+        build.queue(self.db, items, who="operator")
+        run = self.claim()
+        work = Path(run["work_path"])
+        git(self.repo, "worktree", "add", "-q", "-b", run["branch"], str(work), "origin/main")
+        self.commit(work, "h.txt", "helper\n", f"feat: helper\n\nCloses: sd:{items[0]}")
+        self.commit(work, "h.txt", "helper v2\n", f"feat: edit helper\n\nCloses: sd:{items[1]}")
+        self.end(run)
+        self.main_moves("h.txt", "helper\n")
+        new = self.drop(run, items[0])
+        self.assertEqual((new / "h.txt").read_text(), "helper v2\n")
+        self.assertEqual(git(new, "rev-list", "--count", "HEAD..origin/main"), "0", "replayed onto main")
+        self.assertNotIn(f"sd:{items[0]}", self.closes(new))
+
+    def test_a_kept_edit_of_a_file_main_renamed_still_drops(self):
+        """Lane review (note #71874): main renames a.txt to b.txt, a kept commit edits a.txt. The replay lands
+        the edit on b.txt, so the path check reads the rename, not the kept commit's old path."""
+        body = "".join(f"line {n}\n" for n in range(20))
+        self.main_moves("a.txt", body)
+        git(self.repo, "pull", "-q", "origin", "main")
+        items = [self.item(repo=str(self.repo)) for _ in range(2)]
+        build.queue(self.db, items, who="operator")
+        run = self.claim()
+        work = Path(run["work_path"])
+        git(self.repo, "worktree", "add", "-q", "-b", run["branch"], str(work), "origin/main")
+        self.commit(work, "d.txt", "dropped\n", f"feat: dropped\n\nCloses: sd:{items[0]}")
+        self.commit(work, "a.txt", body + "kept\n", f"feat: kept\n\nCloses: sd:{items[1]}")
+        self.end(run)
+        other = self.root / "other"
+        git(other, "mv", "a.txt", "b.txt")
+        git(other, "commit", "-q", "-m", "chore: rename a.txt")
+        git(other, "push", "-q", "origin", "HEAD:main")
+        new = self.drop(run, items[0])
+        self.assertEqual(self.files(new), ["README", "b.txt"])
+        self.assertEqual((new / "b.txt").read_text(), body + "kept\n")
+        self.assertEqual(git(new, "rev-list", "--count", "HEAD..origin/main"), "0", "replayed onto main")
+
+
+class GitConfigScope(unittest.TestCase):
+    """pack sd:9863: command-scope config may redirect a child's remote (`url.*.insteadOf`), so it is stripped; only
+    the auto-maintenance keys the suite sets ride on, renumbered."""
+
+    def test_git_env_keeps_only_the_maintenance_config(self):
+        given = {"GIT_DIR": "/elsewhere/.git", "GIT_CONFIG_COUNT": "3",
+                 "GIT_CONFIG_KEY_0": "url.file:///example.test/x.git.insteadOf", "GIT_CONFIG_VALUE_0": "origin",
+                 "GIT_CONFIG_KEY_1": "maintenance.auto", "GIT_CONFIG_VALUE_1": "false",
+                 "GIT_CONFIG_KEY_2": "gc.auto", "GIT_CONFIG_VALUE_2": "0",
+                 "GIT_CONFIG_PARAMETERS": "'url.file:///example.test/y.git.insteadof'='origin'", "PATH": "/bin"}
+        self.assertEqual(paths.git_env(given), {
+            "PATH": "/bin", "GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "maintenance.auto",
+            "GIT_CONFIG_VALUE_0": "false", "GIT_CONFIG_KEY_1": "gc.auto", "GIT_CONFIG_VALUE_1": "0"})
+
+    def test_git_env_without_maintenance_config_sets_none(self):
+        given = {"GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "url.a.insteadOf", "GIT_CONFIG_VALUE_0": "b",
+                 "PATH": "/bin"}
+        self.assertEqual(paths.git_env(given), {"PATH": "/bin"})
+
+    def test_a_bad_count_keeps_nothing(self):
+        for count in ("x", "-1", "9" * 30):
+            with self.subTest(count=count):
+                self.assertEqual(paths.git_env({"GIT_CONFIG_COUNT": count, "GIT_CONFIG_KEY_0": "gc.auto",
+                                                "GIT_CONFIG_VALUE_0": "0"}), {})
+
+
 class DropWait(Repo):
     """Review of build/sd-1306: a drop's kept lead counts a run it never had. Its lead set to wait on its kept
     member before dispatch, the claim held both, parked (`parked=[1, 2], detached=[]`); Retry refused, as it never
@@ -1114,3 +1328,38 @@ class DropWait(Repo):
         self.assertIn(build.LEFT_OUT, runner.queue_state(self.db, member)["result"])
         self.assertEqual(self.claim()["assignment"], lead)
         self.assertEqual(build.split(self.db, lead), "unread", "A's first run reads its branch for B's work")
+
+
+class DropLaneMove(Repo):
+    """Pack sd:9964: a drop's kept lead has no run of its own, so beat recovery read it as ran nowhere. Its lane
+    moved to another satellite whose beat went quiet; once that beat came back, that satellite queued the lead,
+    its claim refused it for the kept host and replaced the beat result, and moving the lane back recovered
+    nothing. Recovery reads the kept host as the lead's worktree host."""
+
+    def test_recovery_leaves_a_drops_kept_lead_to_the_host_holding_its_work(self):
+        items, ids, run = self.bundle()
+        self.db.execute("UPDATE runner_run SET owner = 'fixture@sat-a' WHERE id = ?", (run["id"],))
+        self.db.execute("UPDATE repo SET lane_host = 'sat-a' WHERE path = ?", (str(self.repo),))
+        for host in ("sat-a", "sat-b"):
+            record_state(self.db, "heartbeat", key=f"build-dispatch@{host}", body={})
+        def on(host):
+            return mock.patch.multiple(build, lane_hosts=mock.Mock(return_value=frozenset({host})),
+                                       hub_host=mock.Mock(return_value="hub"))
+        with on("sat-a"):
+            lead = DROP.drop_item(self.db, build, items[1], who="operator")[0]["id"]
+        self.db.execute("UPDATE repo SET lane_host = 'sat-b' WHERE path = ?", (str(self.repo),))
+        stamp = (datetime.fromisoformat(build.clock()) - timedelta(seconds=build.STALE_SECONDS + 1)).isoformat()
+        record_state(self.db, "heartbeat", key="build-dispatch@sat-b", timestamp=stamp, body={})
+        self.assertIsNone(self.claim(hosts=frozenset({None, "hub"})))
+        result = "SELECT status || ': ' || result FROM assignment WHERE id = ?"
+        self.assertIn("blocked: item", self.count(result, lead))
+        record_state(self.db, "heartbeat", key="build-dispatch@sat-b", body={})
+        with on("sat-b"):
+            claimed = [self.claim(hosts=frozenset({"sat-b"})) for _ in range(3)]
+        self.assertNotIn(lead, [one["assignment"] for one in claimed if one])
+        self.assertIn("lane runs on sat-b", self.count(result, lead), "the beat block stands")
+        self.db.execute("UPDATE repo SET lane_host = 'sat-a' WHERE path = ?", (str(self.repo),))
+        with on("sat-a"):
+            build._requeue_beat_blocked(self.db, frozenset({"sat-a"}))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", lead), "queued",
+                         "the host holding the work recovers it")

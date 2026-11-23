@@ -87,15 +87,17 @@ def drop_sides(work: str | Path, start: str, tip: str, item: int, aside: set[int
     citing an item of `aside`, `item` and the members cancelled out of the bundle before, is not kept (round 3).
     A commit that cites no item refuses the drop: paths cannot say whose it is, since a follow-up of the dropped
     item may edit only a file a kept commit touched (round 6). So does one citing an item the bundle did not build
-    (`built`): replayed on the kept branch, its `Closes:` would close that item at merge (round 15)."""
+    (`built`): replayed on the kept branch, its `Closes:` would close that item at merge (round 15). A done member
+    is in `aside`: reopened before the lane reads it, a replayed commit would close it (pack sd:9863 review)."""
     shas = _out("rev-list", "--reverse", "--no-merges", f"{start}..{tip}", cwd=work).split()
     kept: list[str] = []
     dropped: list[str] = []
     for sha in shas:
         message = _out("log", "-1", "--format=%B", sha, cwd=work)
         # A cherry-picked revert still names the old sha, so the lane would not pair it with the replayed commit,
-        # whose `Closes:` would close an item the revert undid (round 9).
-        if sd_ship_body._REVERTS.search(message):
+        # whose `Closes:` would close an item the revert undid (round 9). A hand-written revert's list of shas
+        # goes stale the same way, in whatever form it writes them, so any revert subject refuses (pack sd:9666).
+        if sd_ship_body._REVERTS.search(message) or sd_ship_body.REVERT_SUBJECT.match(message):
             raise DropRefused(f"commit {sha[:12]} reverts another commit; split it by hand")
         cited = set(sd_ship_body.cited_ids("", [(sha, message)]))
         if not cited:
@@ -143,18 +145,53 @@ def split_branch(plan: dict, done: dict) -> dict:
     new_work, new_branch = Path(plan["new_work"]), plan["new_branch"]
     if new_work.exists() or _exists(repo, f"refs/heads/{new_branch}"):
         raise DropRefused(f"{new_work} or branch {new_branch} exists already")
-    done.update({"plan": plan, "tip": tip, "made": True, "base": start, "kept": kept, "dropped": dropped})
+    done.update({"plan": plan, "tip": tip, "made": True, "base": start, "fork": fork, "kept": kept,
+                 "dropped": dropped})
     # Marked made first: a failed add may leave a half-made worktree or branch; undo removes both either way.
     _git("worktree", "add", "-q", "-b", new_branch, str(new_work), start, cwd=repo)
-    for sha in kept:
-        _git("cherry-pick", "--allow-empty", sha, cwd=new_work)
-    check_branch(new_work, start, kept, aside)
+    done["onto"] = _replay(new_work, start, fork, kept)
+    check_branch(new_work, done["onto"], kept, aside, fork)
     done["head"] = _out("rev-parse", "HEAD", cwd=new_work)
     return done
 
 
-def check_branch(work: str | Path, start: str, kept: list[str], aside: set[int]) -> None:
-    """The new branch holds the kept commits alone: one commit each, no path past theirs, no `aside` citation."""
+def _replay(work: str | Path, start: str, fork: str, kept: list[str]) -> str:
+    """Cherry-pick `kept` onto the base, else onto the fork; the commit it applied on. The base first: a helper the
+    dropped commit added and main landed too is there for a kept edit (lane review). The fork when main moved a
+    kept file, where the kept commits were made, so each applies; the lane merges the base (pack sd:9863)."""
+    failed = ""
+    for onto in dict.fromkeys((_out("rev-parse", start, cwd=work), fork)):
+        _git("reset", "-q", "--hard", onto, cwd=work)
+        for sha in kept:
+            done = _git("cherry-pick", "--allow-empty", sha, cwd=work, check=False)
+            if done.returncode != 0:
+                failed = f"cherry-pick {sha[:12]} onto {onto[:12]}: {(done.stderr or done.stdout).strip()}"
+                _git("cherry-pick", "--abort", cwd=work, check=False)
+                break
+        else:
+            return onto
+    raise DropRefused(f"the kept commits apply on neither {start} nor the fork {fork[:12]}; {failed}")
+
+
+def _renames(work: str | Path, old: str, new: str) -> dict[str, str]:
+    """The paths `old..new` renamed, old to new: a replay onto the base lands a kept edit on the new name."""
+    fields = _git("diff", "--find-renames", "--name-status", "-z", old, new, cwd=work).stdout.split("\0")
+    renamed: dict[str, str] = {}
+    index = 0
+    while index < len(fields) and fields[index]:
+        status = fields[index]
+        if status.startswith(("R", "C")):
+            if status.startswith("R"):
+                renamed[fields[index + 1]] = fields[index + 2]
+            index += 3
+        else:
+            index += 2
+    return renamed
+
+
+def check_branch(work: str | Path, start: str, kept: list[str], aside: set[int], fork: str) -> None:
+    """The new branch holds the kept commits alone: one commit each, no path past theirs, no `aside` citation.
+    A kept path main renamed since `fork` counts under its new name too (note #71874)."""
     shas = _out("rev-list", "--reverse", f"{start}..HEAD", cwd=work).split()
     if len(shas) != len(kept):
         raise DropRefused(f"the new branch holds {len(shas)} commits, not the {len(kept)} kept")
@@ -163,6 +200,9 @@ def check_branch(work: str | Path, start: str, kept: list[str], aside: set[int])
     if cited:
         raise DropRefused(f"the new branch still cites {', '.join(f'sd:{n}' for n in sorted(cited))}")
     allowed = set().union(*(_paths(work, sha) for sha in kept)) if kept else set()
+    if kept:
+        renamed = _renames(work, fork, start)
+        allowed |= {renamed[path] for path in allowed if path in renamed}
     changed = _names("diff", "--name-only", "-z", start, "HEAD", cwd=work)
     if changed - allowed:
         raise DropRefused(f"the new branch changes {', '.join(sorted(changed - allowed))}, which no kept commit does")
@@ -192,7 +232,8 @@ def kept_note(done: dict) -> str:
     """The finding the kept items' next builder reads."""
     plan = done["plan"]
     return (f"Bundle drop: sd:{plan['item']} left this bundle. {plan['new_branch']} now holds only the kept items' "
-            f"{len(done['kept'])} commits, cherry-picked onto {done['base']}. Check the kept work still stands "
+            f"{len(done['kept'])} commits, cherry-picked onto {done['onto'][:12]} "
+            f"({done['base']} or where it forked from it). Check the kept work still stands "
             f"without sd:{plan['item']}, fix what it needs, and enqueue.")
 
 

@@ -32,6 +32,9 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "bin"))
 
 import sd_lane  # noqa: E402
+
+#: The real writer, before a fixture replaces it: the round trip below runs it.
+REAL_NOTE = sd_lane.default_note
 import sd_ship_body  # noqa: E402
 
 from tests.clean_env import clean_environment  # noqa: E402
@@ -1012,6 +1015,26 @@ class Runner(Lane):
             sd_lane.enqueue_entry(self.worktree("second"), 2, "fix: two", self.body, self.environ, claim="deliver")
             sd_lane.run_lane(self.repo, environ, self.ship)
         self.assertEqual([row["status"] for row in self.entries()], ["prepared", "prepared"])
+
+    def test_a_second_lane_starts_under_a_load_the_cpu_does_not_carry(self) -> None:
+        """sd:9946: load5 277-458 with the CPU 37% idle stopped every lane start."""
+        import sd_gate_slots  # noqa: PLC0415 -- as load_stop imports it
+        environ = {**self.environ, "SD_GATE_LOAD_MAX": "24"}
+        with mock.patch.object(sd_lane.os, "getloadavg", lambda: (300.0, 300.0, 300.0)), \
+                mock.patch.object(sd_gate_slots.os, "cpu_count", lambda: 16):
+            now = [1_000_000.0]
+            idle = [lambda: int(now[0] * 37)]  # 63% busy
+            with mock.patch.object(sd_gate_slots, "cpu_ticks", lambda: (idle[0](), int(now[0] * 100))), \
+                    mock.patch.object(sd_lane.time, "time", lambda: now[0]):
+                self.assertIn("load5 300.0", sd_lane.load_stop(environ) or "", "one probe")
+                now[0] += 300
+                self.assertIsNone(sd_lane.load_stop(environ), "a probe five minutes later")
+                since, base = now[0], idle[0]()
+                idle[0] = lambda: base + int((now[0] - since) * 5)  # 95% busy from here
+                now[0] += 300
+                self.assertIn("load5 300.0", sd_lane.load_stop(environ) or "", "95% busy")
+            with mock.patch.object(sd_gate_slots, "cpu_ticks", lambda: None):
+                self.assertIn("load5 300.0", sd_lane.load_stop(environ) or "", "unread ticks")
 
     def test_prepare_waits_for_a_slot_no_longer_than_the_runs_budget(self) -> None:
         """pack sd:7412, failure table row 2: an unbounded slot wait ran into the job's TERM, which spends a reclaim."""
@@ -3563,6 +3586,27 @@ class CitedCloses(SharedQueue):
         self.body.write_text("Words.\n", encoding="utf-8")
         entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
         self.assertEqual(entry["closes"], [c])
+
+    def test_a_listed_merge_reverted_against_parent_two_keeps_the_second_parents_work(self) -> None:
+        """pack sd:9666 review, round 8: a hand-written revert that lists a merge, made with `-m 2`, undid
+        the second parent's work by a first-parent guess and closed the first parent's reverted work."""
+        a, c, *_ = self.open
+        tree, _ = self.committed("topic-merge-two")
+        git(tree, "switch", "-q", "-c", "side")
+        (tree / "side.txt").write_text("side\n", encoding="utf-8")
+        git(tree, "add", "side.txt")
+        git(tree, "commit", "-q", "-m", f"fix: implement\n\nCloses: sd:{a}")
+        git(tree, "switch", "-q", "topic-merge-two")
+        (tree / "main.txt").write_text("main\n", encoding="utf-8")
+        git(tree, "add", "main.txt")
+        git(tree, "commit", "-q", "-m", f"fix: mainline\n\nCloses: sd:{c}")
+        git(tree, "merge", "-q", "--no-ff", "--no-edit", "side")
+        merge = git(tree, "rev-parse", "--short=9", "HEAD").strip()
+        git(tree, "revert", "--no-commit", "-m", "2", "HEAD")
+        git(tree, "commit", "-q", "-m", f"revert: drop the mainline half\n\nReverted commits:\n\n- {merge} the merge\n")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [a])
 
     def test_a_range_the_branch_reverts_closes_nothing(self) -> None:
         """Lane review of sd:5999, round 3: `git revert A..B` writes one revert per commit, each naming it."""
@@ -7112,8 +7156,11 @@ class FailureNotes(SharedQueue):
         items = self.register_items(2)
         connection = sd_db.connect(home=self.tmp)
         try:
-            notes = [sd_db.add_note(connection, item, "followup", body) for item in items
-                     for body in ("Lane failed in prepare at aaaaaaaaaaaa: a blocking finding", "Chase the vendor")]
+            # The lane's note carries its session; the other repeats its text by hand (build/sd-1423 review).
+            notes = [sd_db.add_note(connection, item, "followup", body, session=session) for item in items
+                     for body, session in (("Lane failed in prepare at aaaaaaaaaaaa: a blocking finding",
+                                            sd_lane.LANE_SESSION),
+                                           ("Lane failed in prepare at aaaaaaaaaaaa: a separate repair", None))]
         finally:
             connection.close()
         return items, dict.fromkeys(notes)
@@ -7126,6 +7173,43 @@ class FailureNotes(SharedQueue):
                                                (number,)).fetchone()[0] is not None for number in notes}
         finally:
             connection.close()
+
+    def test_a_note_the_lane_writes_reads_back_as_the_lanes(self) -> None:
+        """Round trip (build/sd-1423 review): `note_ended` through the real `sd task note`, with no head
+        recorded, reads back as the lane's; the same text written by hand does not."""
+        import sd_db
+        [item] = self.register_items(1)
+        row = {"status": "failed", "step": "runner", "reason": "runner pid 7 is gone", "item": item}
+        with mock.patch.dict(os.environ, {"HOME": str(self.tmp)}), \
+                mock.patch.object(sd_lane, "ended_kind", lambda queue: "followup"):
+            self.assertEqual(sd_lane.note_ended(row, self.repo, REAL_NOTE, queue=None), {f"sd:{item}": "written"})
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            [(body, session)] = connection.execute("SELECT body, session FROM note WHERE item = ? AND kind = "
+                                                   "'followup'", (item,)).fetchall()
+            sd_db.add_note(connection, item, "followup", body)
+            written = connection.execute(
+                "SELECT session, body FROM note WHERE item = ? AND kind = 'followup' ORDER BY id", (item,)).fetchall()
+        finally:
+            connection.close()
+        self.assertIn("at an unrecorde", body)
+        self.assertEqual([sd_lane.lane_note(*found) for found in written], [True, False])
+
+    def test_a_passing_run_leaves_the_lanes_post_merge_and_release_followups_open(self) -> None:
+        """build/sd-1423 review: `default_note` also writes `Post-merge:` and `Release:` followups as the lane;
+        a later pass answers neither, so only `note_ended`'s blockers resolve."""
+        import sd_db
+        items = self.register_items(1)
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            kept = {sd_db.add_note(connection, items[0], "followup", body, session=sd_lane.LANE_SESSION): False
+                    for body in ("Post-merge: make deploy failed", "Release: the tag push was refused")}
+        finally:
+            connection.close()
+        sd_lane.enqueue_entry(self.feature, items[0], "fix: one", self.body, self.environ, claim="deliver")
+        sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertIn(self.entries()[0]["status"], sd_lane.GATE_PASSED)
+        self.assertEqual(self.resolved(dict.fromkeys(kept)), kept)
 
     def test_a_passing_run_resolves_only_the_lanes_open_followups(self) -> None:
         """Failure table S2 session resolves: a later pass closes the lane's followups on each item it carries."""

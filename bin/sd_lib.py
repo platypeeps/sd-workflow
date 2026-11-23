@@ -141,9 +141,14 @@ CORE_CONFIG = {
                    "description": "How many gates (sd-check runs, sd gate run, the pack's make test) may run at once on this "
                                   "machine; 0 is no cap. Unset reads a quarter of the cores; SD_GATE_SLOTS overrides it "
                                   "for one run."},
+    "gate_workers": {"pattern": "[1-9][0-9]?",
+                     "description": "How many test workers one local run of the pack's tests starts, 1 to 99, "
+                                    "over the slot rule. Unset reads the cores over the gate cap (sd:9925); "
+                                    "TEST_WORKERS overrides it for one run. It grants nothing."},
     "gate_load_max": {"pattern": r"[0-9]+(\.[0-9]+)?",
                       "description": "The gate queue starts a gate only while load1 is below this; 0 is no load "
-                                     "condition. Unset is none; SD_GATE_LOAD_MAX overrides it for one run."},
+                                     "condition. Below 90% CPU busy, load1 reads busy times cores (sd:9946). "
+                                     "Unset is none; SD_GATE_LOAD_MAX overrides it for one run."},
     "bundle_max": {"pattern": "[1-9][0-9]?",
                    "description": "How many items one build bundle takes when this machine claims it, a mechanical "
                                   "item half of one; the claim gives a child 120 minutes per 3 slots it took, never less. "
@@ -431,7 +436,7 @@ def _git(args: list[str], cwd: pathlib.Path) -> str | None:
             # No sd tool can answer a credential prompt: a remote read fails instead (sd:3495).
             env={**without_fsmonitor(os.environ), "GIT_TERMINAL_PROMPT": "0"},
         )
-    except (OSError, subprocess.SubprocessError):
+    except (OSError, subprocess.SubprocessError, ValueError):  # non-UTF-8 output or a NUL argument: no answer (sd:9867)
         return None
     answer = completed.stdout.strip() if completed.returncode == 0 else None
     if memo is not None:
@@ -474,6 +479,18 @@ def git_output(args: list[str], root: pathlib.Path) -> str | None:
     (timeout, no shell, failure-is-None). Most are reads; `delivered` fetches.
     """
     return _git(args, root)
+
+
+def instance_files(instances: Any) -> list[str]:
+    """The file of each `path:line` in a finding's `instances`; a value not a list names none (sd:9769)."""
+    return [re.sub(r":[0-9]+$", "", entry.strip()) for entry in (instances if isinstance(instances, list) else [])
+            if isinstance(entry, str) and entry.strip()]
+
+
+def blocking_places(findings: list[Any]) -> list[str]:
+    """Each file a prior blocking finding names: its path and each instance's (sd:9769)."""
+    return sorted({place for row in findings if isinstance(row, dict) and row.get("disposition") == "blocking"
+                   for place in (row["path"], *instance_files(row.get("instances")))})
 
 
 #: One github.com repository as `origin` names it. An owner cannot contain `.`.
@@ -4330,18 +4347,24 @@ def fill_slots(items: Any, slots: int, run: Callable[[Any], Any], counted: Calla
 def distinct_findings(findings: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """sd:7519. Each finding once: one two readers both report keeps the first reader's `backend`.
 
-    Identical means every key but `backend` and `evidence` is equal: two readers cite
-    their checks in their own words (pack sd:9270). Adjudication takes a row per
+    Identical means every key but `backend`, `evidence` and `instances` is equal: two
+    readers cite their checks and list instances in their own words (pack sd:9270, sd:9769). Adjudication takes a row per
     blocking finding, so a copy was a second row to dispute. The kept row takes
-    the first evidence any copy gives, so a bare first copy does not lose a cited one.
+    every distinct evidence its copies give, one per line, so the lead who judges it sees each repro (sd:9869),
+    and every instance any copy lists.
     """
     seen: dict[str, dict[str, Any]] = {}
+    cited: dict[str, list[str]] = {}
     for finding in findings:
-        key = json.dumps({name: value for name, value in finding.items() if name not in ("backend", "evidence")},
+        key = json.dumps({name: value for name, value in finding.items() if name not in ("backend", "evidence", "instances")},
                          sort_keys=True, default=str)
         kept = seen.setdefault(key, dict(finding))
-        if not kept.get("evidence") and finding.get("evidence"):
-            kept["evidence"] = finding["evidence"]
+        evidence, parts = finding.get("evidence"), cited.setdefault(key, [])
+        if isinstance(evidence, str) and evidence.strip() and evidence not in parts:
+            parts.append(evidence)
+            kept["evidence"] = "\n".join(parts)
+        if finding.get("instances"):  # each copy's instances, once: the build matches blockers by them (sd:9769)
+            kept["instances"] = list(dict.fromkeys([*(kept.get("instances") or []), *finding["instances"]]))
     return list(seen.values())
 
 

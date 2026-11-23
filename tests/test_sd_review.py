@@ -715,7 +715,7 @@ class SubjectTests(ReviewFixture):
 class DispositionTests(unittest.TestCase):
     def test_the_floor_decides_blocking_from_advisory(self) -> None:
         findings = [
-            {"severity": "high", "summary": "a"},
+            {"severity": "high", "instances": ["src.py:1"], "summary": "a"},
             {"severity": "medium", "summary": "b"},
             {"severity": "low", "summary": "c"},
             {"severity": "unspecified", "summary": "d"},
@@ -737,7 +737,7 @@ class ParseTests(unittest.TestCase):
     def test_the_codex_shape_and_the_prism_shape_both_normalise(self) -> None:
         flat = sd_review.parse_findings(
             json.dumps(
-                {"findings": [{"path": "a.py", "line": 3, "severity": "high", "summary": "s", "family": "f"}]}
+                {"findings": [{"path": "a.py", "line": 3, "severity": "high", "instances": ["src.py:1"], "summary": "s", "family": "f"}]}
             )
         )
         assert flat is not None
@@ -864,7 +864,8 @@ class PipelineTests(ReviewFixture):
         root = self.make_repo()
         self.prepare(root)
         payload = json.dumps(
-            {"findings": [{"path": "src.py", "line": 1, "severity": "high", "summary": "bad", "family": "correctness"}]}
+            {"findings": [{"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "summary": "bad",
+                           "family": "correctness", "evidence": "python3 src.py: Traceback"}]}
         )
         runner = FakeRunner({"sd-check": sd_review.Completed(0, "{}", ""), "codex": sd_review.Completed(0, payload, "")})
         result = self.run_review(root, runner)
@@ -1165,7 +1166,8 @@ class PipelineTests(ReviewFixture):
         root = self.make_repo()
         self.prepare(root)
         payload = json.dumps(
-            {"findings": [{"path": "src.py", "line": 1, "severity": "high", "summary": "bad", "family": "correctness"}]}
+            {"findings": [{"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "summary": "bad",
+                           "family": "correctness", "evidence": "python3 src.py: Traceback"}]}
         )
         runner = FakeRunner(
             {"sd-check": sd_review.Completed(0, "{}", ""), "codex": sd_review.Completed(0, payload, "")}
@@ -1325,6 +1327,9 @@ class PipelineTests(ReviewFixture):
         result = self.run_review(root, FakeRunner(), dry_run=True, scope="branch")
         prompt = [row for row in result["planned_invocations"] if row["would_run"]][0]["stdin"]
         self.assertIn(f"{result['subject']['base']}..{result['subject']['head']}", prompt)
+        # Pack sd:9769: a full branch review, a build's round 1, reads each touched file whole.
+        self.assertIn("Read every file the change touches in full", prompt)
+        self.assertIn("feature.py", prompt.split("Read every file the change touches in full", 1)[1][:400])
 
     def test_a_docs_only_change_routes_to_skip_and_asks_nobody(self) -> None:
         root = self.make_repo()
@@ -1888,7 +1893,8 @@ class TheUrlEntryRunsTests(ReviewFixture):
             {
                 "remote": chat_answer(
                     '<think>a</think>{"findings": [{"path": "src.py", "line": 1, '
-                    '"severity": "high", "summary": "wrong", "family": "correctness"}]}'
+                    '"severity": "high", "instances": ["src.py:1"], "summary": "wrong", "family": "correctness", '
+                    '"evidence": "python3 src.py: Traceback"}]}'
                 )
             }
         )
@@ -2029,7 +2035,7 @@ class ScopeProvidersOverASkipTier(unittest.TestCase):
 
     def test_planning_scope_asks_a_provider_even_at_tier_skip(self) -> None:
         self.assertEqual(
-            sd_review.review_depth(self.skip, challenge=False, scope="planning"), 2,
+            sd_review.review_depth(self.skip, challenge=False, scope="planning"), 1,
             "scope=planning earned no reviewer at tier skip. Either `review_depth`"
             " stopped honouring FLOOR_SCOPES, or `planning` left it -- and"
             " `sd-plan` gates `planning -> ready` on a lane that now asks nobody.")
@@ -2038,7 +2044,7 @@ class ScopeProvidersOverASkipTier(unittest.TestCase):
         """The same seam, reached by the other role that uses it."""
 
         self.assertEqual(
-            sd_review.review_depth(self.skip, challenge=True, scope="worktree"), 2)  # both readers (sd:7519)
+            sd_review.review_depth(self.skip, challenge=True, scope="worktree"), 1)  # one reader (operator 2026-11-23)
 
     def test_an_ordinary_scope_at_tier_skip_asks_nobody(self) -> None:
         """The control. Without it the two above pass on a floor that is never
@@ -2158,6 +2164,7 @@ class TimingPlanTests(ReviewFixture):
         return root, args, report
 
     def test_all_fallbacks_receive_an_allowance_without_changing_depth(self):
+        self.one_reader_per_tier(2)  # the allowance for a two-reader chain; the shipped depth is 1
         root, args, planned = self.planned()
         self.assertEqual(planned["requested_reviews"], 2)  # sd:7519
         self.assertEqual(planned["fallback_candidates"], ["p2", "p3"])

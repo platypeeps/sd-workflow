@@ -40,6 +40,8 @@ The hub's tick and each satellite's act only on their own lanes' runs
 from __future__ import annotations
 
 import contextlib
+import functools
+import hashlib
 import json
 import os
 import re
@@ -63,16 +65,20 @@ from .database import Patient, transaction
 from .errors import SchemaTooNew
 from .ship import this_host
 from .workflow import WorkflowError
-from .writes import add_note, now, record_cost, record_state
+from .writes import add_note, create_item, now, record_cost, record_state
 
 #: A child past this many seconds is ended: TERM to its group, `GRACE_SECONDS`, KILL. The floor; a supervisor
 #: reads the budget its claim fixed (`build.budget_minutes`, sd:9109).
 TIMEOUT_SECONDS = build.BUDGET_MINUTES * 60
 GRACE_SECONDS = 20
 BEAT_SECONDS = 30
-#: Reviews with blockers before the class pass and park (operator 2026-11-20,
-#: raised from 3: four-round parks re-queued by hand all day).
-REVIEW_ROUNDS = 7
+#: Reviews with blockers before the class pass and park: 2, so a park comes after 3
+#: reviews (operator 2026-11-23, sd:10128; sd:10111 had set 4).
+REVIEW_ROUNDS = 2
+#: Fix rounds past this many blocked reviews run on the strongest model at medium effort (operator
+#: 2026-11-23, sd:10192), the brief asking for the blockers' class (pack sd:9264); the park stays.
+ESCALATE_AFTER = 1  # with REVIEW_ROUNDS 2, the class-pass fix escalates (sd:10128)
+STRONGEST, ESCALATED_EFFORT = "fable", "medium"
 #: A rate-limited review waits this long, beating, then asks again, up to `RATE_LIMIT_WAITS` times before it
 #: blocks: a quota window passes, and a block parked the item for a manual Retry (sd:9882).
 RATE_LIMIT_WAIT_SECONDS = 900
@@ -213,10 +219,25 @@ Rules:
 Your final message is your report: the commits, the tests run with their result lines, and anything not done.
 """
 
+#: A sent finding that rejects a review finding: the lane's prepare refuses its blocker until a disposition is
+#: recorded at the reviewed head, so the builder records it (sd:10010). Prepare alone checks it, at the final
+#: head its catch-up merge may move (lane review of build/sd-1557).
+ADJUDICATE = """A finding that rejects a review finding adds no commit; record its disposition instead, at the
+reviewed head: `sd-ship -C {worktree} adjudicate --item {item} --expected-head <HEAD> --json` prints the
+template; set each rejected row's `response_disposition` to `rebutted` and `reason` to the ruling's reason,
+then record it with the same command plus `--dispositions-file /dev/stdin`, the filled JSON on stdin.
+"""
+
 FIX = """The review of branch {branch} found these blockers. Fix each one fail-first as a new commit in
 {worktree}, then update the body at {body}. Never push. Your final message is your report.
 
 {blockers}
+"""
+
+# sd:9264: added to each fix brief past ESCALATE_AFTER rounds.
+ESCALATED = """
+These blockers repeat after {rounds} review rounds. Before you fix them, name the class they share and
+enumerate every instance of it in this change, from the code, not from the findings; fix each instance.
 """
 
 # sd:9263: the round after the last, once. The Review rounds rule's class pass, sent instead of another single-finding fix.
@@ -359,6 +380,10 @@ class Adopted:
         return code
 
 
+#: `sd-review`'s bound on a prior report (its MAX_OUTPUT_BYTES); a larger one it refuses (pack sd:9769).
+PRIOR_REPORT_BYTES = 2_000_000
+
+
 class Unread(Exception):
     """A read gave no answer: an unknown result, never a negative one."""
 
@@ -467,12 +492,32 @@ def _denied_call(row) -> str:
 
 
 def _read(argv: list[str], *, env: dict | None = None) -> str:
-    """A short read-only command's stdout; `Unread` when it fails or gives no answer in `READ_SECONDS`."""
+    """A short read-only command's stdout; `Unread` when it fails, gives undecodable output or no answer in
+    `READ_SECONDS`."""
     try:
         done = subprocess.run(argv, capture_output=True, text=True, timeout=READ_SECONDS, check=False,
                               stdin=subprocess.DEVNULL, env=env)
-    except (OSError, subprocess.SubprocessError) as error:
+    except (OSError, subprocess.SubprocessError, UnicodeError) as error:  # bytes in no locale encoding: no answer
         raise Unread(f"{argv[0]} gave no answer: {error}") from None
+    if done.returncode != 0:
+        raise Unread(f"{' '.join(argv[:4])} failed: exit {done.returncode}: {done.stderr.strip()[:200]}")
+    return done.stdout
+
+
+# How far, and over how many lines naming one function, `called_from` walks back toward the changed code;
+# past either bound a blocker holds. ponytail: a name-based walk, no call graph; a language-aware one if it misses.
+CALL_DEPTH, CALL_HITS = 6, 200
+
+
+def _grep(argv: list[str], *, env: dict | None = None) -> str:
+    """`_read` for `git grep`, whose exit 1 with no output means no match: "" then (pack sd:9769)."""
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=READ_SECONDS, check=False,
+                              stdin=subprocess.DEVNULL, env=env)
+    except (OSError, subprocess.SubprocessError, UnicodeError) as error:
+        raise Unread(f"{argv[0]} gave no answer: {error}") from None
+    if done.returncode == 1 and not done.stdout and not done.stderr:
+        return ""
     if done.returncode != 0:
         raise Unread(f"{' '.join(argv[:4])} failed: exit {done.returncode}: {done.stderr.strip()[:200]}")
     return done.stdout
@@ -499,6 +544,149 @@ def kept_files(git: Collection[str], work: str, *, env: dict | None = None) -> s
     return "\n".join(line for line in lines.splitlines() if line.strip() and not (
         # Folder parts only: git ends an ignored folder with "/", so a file of that name is no cache.
         line.startswith("!! ") and DISPOSABLE.intersection(line[3:].strip('"').split("/")[:-1])))
+
+
+def changed_lines(git: Collection[str], work: str, base: str, head: str, *,
+                  env: dict | None = None) -> dict[str, set[int]] | None:
+    """Each path `base..head` changes, with the new-side lines its hunks touch, or no lines for a change git
+    gives no range (a binary file) or whose mode changes, which stands for the whole file; None when git
+    cannot answer.
+
+    A hunk that only deletes names the lines on both sides of where the deletion now sits; a deleted file
+    keeps its old path and old lines (pack sd:9769). `---`/`+++` are headers only before a file's first hunk.
+    Non-ASCII paths read as themselves; a path git still quotes (a quote, a control character) makes the
+    delta unknown.
+    """
+    try:
+        diff = _read([*git, "-C", work, "-c", "core.quotePath=false", "diff", "-U0", "--no-renames", "--no-color",
+                      "--no-ext-diff", "--no-textconv", "--src-prefix=a/", "--dst-prefix=b/", base, head],
+                     env=env)  # git's own lines and prefixes, whatever the operator's diff config says
+    except Unread:
+        return None
+    changed: dict[str, set[int]] = {}
+    path = gone = None
+    named = ""
+    header = deleted = False
+    whole: set[str] = set()  # a mode change alters the whole file, whatever hunks it also has
+    for line in diff.splitlines():
+        if line.startswith("diff --git "):
+            header, path, rest = True, None, line[len("diff --git "):]
+            half = (len(rest) - 5) // 2  # `a/P b/P`: renames are off, so both sides name one path
+            if not (rest.startswith("a/") and rest[2 + half:] == f" b/{rest[2:2 + half]}"):
+                return None  # a quoted or unparseable path: the delta is unknown
+            named = rest[2:2 + half]
+            changed.setdefault(named, set())  # no hunk (mode, binary): the whole file changed
+        elif header and line.startswith(("old mode ", "new mode ")):
+            whole.add(named)
+        elif header and line.startswith(('--- "', '+++ "')):
+            return None
+        elif header and line.startswith("--- "):
+            gone = line[6:].removesuffix("\t") if line.startswith("--- a/") else None  # git's tab after a space
+        elif header and line.startswith("+++ "):
+            deleted = line == "+++ /dev/null"
+            path = gone if deleted else line[6:].removesuffix("\t") if line.startswith("+++ b/") else None
+            if path is not None:
+                changed.setdefault(path, set())
+        elif line.startswith("@@") and path is not None:
+            header = False
+            hunk = re.match(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", line)
+            if hunk:
+                at, size = (hunk[1], hunk[2]) if deleted else (hunk[3], hunk[4])
+                start, count = int(at), int(size if size is not None else 1)
+                changed[path].update(range(max(start, 1), start + max(count, 1) + (count == 0)))
+    for name in whole:
+        changed[name] = set()
+    return changed if changed or not diff.strip() else None  # output naming no file is unknown, not empty
+
+
+def function_words(git: Collection[str], work: str, base: str, head: str, *,
+                   env: dict | None = None) -> tuple[set[str], set[str]] | None:
+    """Every identifier in the functions `base..head` changes, each read whole (`--function-context`), and the
+    names those lines define, so a finding naming the changed caller, or what it calls, ties to the branch
+    (pack sd:9769); None when git cannot answer. A function git cannot bound widens to more lines, never fewer.
+
+    None too for a change outside any function, a hunk that defines no name or a file with no hunk (a config
+    value, a module constant, a binary, a mode): a consumer it breaks gives its finding nothing to name.
+    ponytail: a language `defined_names` misses (C) holds every blocker; a per-language reader if that costs."""
+    try:
+        diff = _read([*git, "-C", work, "diff", "-U0", "--function-context", "--no-renames", "--no-color",
+                      "--no-ext-diff", "--no-textconv", base, head], env=env)
+    except Unread:
+        return None
+    for section in re.split(r"^diff --git .*$", diff, flags=re.M)[1:]:
+        hunks = re.split(r"^@@.*$", section, flags=re.M)[1:]
+        if not hunks or any(not any(defined_names(line[1:]) for line in hunk.splitlines() if line[:1] in "+- ")
+                            for hunk in hunks):
+            return None
+    lines = [line for line in diff.splitlines() if line[:1] in "+- " and not line.startswith(("+++", "---"))]
+    # Every name on a changed line, and each name a context line defines (`defined_names`).
+    defined = {name for line in lines for name in (re.findall(r"[A-Za-z_]\w*", line[1:]) if line[0] in "+-"
+                                                   else defined_names(line[1:]))}
+    return set(re.findall(r"[A-Za-z_]\w*", diff)), defined
+
+
+def defined_names(line: str) -> set[str]:
+    """The names one source line defines, in any common form (pack sd:9769): a keyword (`def`, `function`,
+    `fn`, `func`, `class`, `sub`, ...), a declaration or assignment (`const x =`, `x := func`, `x = lambda`,
+    `x = (a) =>`), a shell `x() {` or a method `x(a) {`. A form it misses still counts when its line
+    changed: `function_words` takes every name on a changed line.
+    ponytail: a changed line's comment words count too, so prose holds more blockers, never fewer."""
+    keyword = r"\b(?:def|function|func|fn|class|sub|proc|struct|interface|type|module|trait|enum)\s+\*?\s*([A-Za-z_]\w*)"
+    assigned = r"\b([A-Za-z_]\w*)\s*(?::=|=(?!=)|:)\s*(?:async\s+)?(?:function\b|func\b|lambda\b|fn\b|\([^()]*\)\s*=>|[A-Za-z_]\w*\s*=>)"
+    method = r"^\s*(?:(?:async|static|public|private|protected|export|def)\s+)*([A-Za-z_]\w*)\s*\([^()]*\)\s*\{"
+    return {name for pattern in (keyword, assigned, method) for name in re.findall(pattern, line)}
+
+
+def instance_files(instances: Any) -> list[str]:
+    """The file of each `path:line` in a finding's `instances`, as `sd-review` reads it; a value not a list
+    names none (pack sd:9769)."""
+    return [re.sub(r":[0-9]+$", "", entry.strip()) for entry in (instances if isinstance(instances, list) else [])
+            if isinstance(entry, str) and entry.strip()]
+
+
+def aliases(text: str) -> set[tuple[str, str]]:
+    """Each `(name, alias)` a line binds: `parse as decode` (an import, a `use`) or `decode = parse`.
+    ponytail: by line, so prose (`such as x`) binds more names, never fewer; no destructuring."""
+    return (set(re.findall(r"\b([A-Za-z_]\w*)\s+as\s+([A-Za-z_]\w*)", text))
+            | {(name, alias) for alias, name in re.findall(r"\b([A-Za-z_]\w*)\s*:?=\s*([A-Za-z_]\w*)\s*;?\s*$", text)})
+
+
+def bound_names(line: str) -> set[str]:
+    """The names an assignment at the start of `line` binds: `x = ...`, `a, b = ...`, `x: T = ...`,
+    `const x = ...`, `x := ...`, or the name a statement mutates: `x[k] = ...`, `x.update(...)` (pack
+    sd:9769). ponytail: any `x.` or `x[` start counts, so a read (`x.get(k)`) binds more, never fewer."""
+    found = re.match(r"\s*(?:export\s+)?(?:(?:const|let|var)\s+)?([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)"
+                     r"\s*(?::[^=]*)?:?=(?!=)", line)
+    if found:
+        return set(re.findall(r"[A-Za-z_]\w*", found[1]))
+    # A statement that mutates a name binds what it adds: `HANDLERS["a"] = h`, `HANDLERS.update(...)`.
+    mutated = re.match(r"\s*([A-Za-z_]\w*)\s*[.[]", line)
+    return {mutated[1]} if mutated else set()
+
+
+def statement(lines: list[str], index: int) -> list[str]:
+    """The lines of the statement that holds `lines[index]`: back to the last line no bracket is open at,
+    on to the line that closes the brackets left open, so a table written over lines is one statement
+    (pack sd:9769). ponytail: brackets inside strings count, which only widens the statement."""
+    depths, depth = [], 0
+    for text in lines:
+        depths.append(depth)
+        depth = max(0, depth + sum(text.count(mark) for mark in "([{") - sum(text.count(mark) for mark in ")]}"))
+    depths.append(depth)
+    if index >= len(lines):
+        return []
+    start = next(row for row in range(index, -1, -1) if depths[row] == 0)
+    end = next((row for row in range(index + 1, len(depths)) if depths[row] == 0), len(lines))
+    return lines[start:end]
+
+
+def callable_words(text: str) -> set[str]:
+    """The identifiers a finding names as code: `name(`, a snake or camel name, or a backticked dotted name."""
+    words = set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", text))
+    words |= set(re.findall(r"\b(\w*[A-Za-z]_\w*[A-Za-z0-9]|[a-z][a-z0-9]*[A-Z]\w*)\b", text))
+    for span in re.findall(r"`([^`\n]+)`", text):
+        words |= set(re.findall(r"[A-Za-z_]\w*", span))
+    return words  # no length floor: `go()` names a function as surely as a long name does
 
 
 # Git's state for an operation a worktree has not finished; each can carry commits the tree does not show.
@@ -781,11 +969,18 @@ def _same_copy(path: Path, target: Path) -> tuple[int, int, int] | None:
 def _released(connection, path: Path) -> bool:
     """Whether every run that owns `path` ended and was released: all of the assignment's for its
     `sd-N.title` or `.body.md`, else the run its name starts with."""
-    owner = re.fullmatch(r"sd-(\d+)\.(?:title|body\.md)", path.name)
+    owner = re.fullmatch(r"sd-(\d+)\.(?:title|body\.md|blockers\.json)", path.name)
     ended = "SELECT outcome IS NOT NULL AND released_at IS NOT NULL FROM runner_run WHERE "
     rows = connection.execute(ended + "assignment = ?", (int(owner[1]),)) if owner \
         else connection.execute(ended + "id = ?", (path.name.split(".", 1)[0],))
     released = [row[0] for row in rows]
+    # A usage limit releases its run and queues the bundle again: the resume reads these files locally
+    # (`Supervisor.round_blockers`, the body), so they wait while the last run is that one (review of build/sd-1557).
+    if owner and released:
+        last = connection.execute("SELECT outcome FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
+                                  (int(owner[1]),)).fetchone()
+        if last is not None and last[0] == build.RATE_LIMITED:
+            return False
     return bool(released) and all(released)
 
 
@@ -811,8 +1006,8 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
             deadline: float = ARCHIVE_DEADLINE_SECONDS) -> list[str]:
     """Move each file of an ended run from `local` to the same place under `bulk`; the new paths.
 
-    `sd-<assignment>.title` and `.body.md` move once every run of that assignment ended and was released,
-    the rest once the run their name starts with was: an outcome alone leaves a blocked or abandoned run's
+    `sd-<assignment>.title`, `.body.md` and `.blockers.json` move once every run of that assignment ended and was
+    released and its last did not end at a usage limit, which resumes on them; the rest once the run their name starts with was: an outcome alone leaves a blocked or abandoned run's
     groups alive until the reap releases it, and they may still write. A file no run owns, one written in the
     last `settle` seconds or one whose copy fails stays for a later tick.
 
@@ -941,6 +1136,8 @@ class Supervisor:
     #: run` starts its command in a new group), each with its leader's start: `end_group` ends one that
     #: outlived its parent only while it is still that group. None for every other child.
     groups: dict[int, str] | None = None
+    #: The files the last `deferred` judged against, the branch's own: a rebuttal lapses once one changes.
+    judged: tuple[str, ...] = ()
 
     def __init__(self, connection, ident: str, *, tools: Tools, log_root: Path,
                  cited: Callable[[Path, str, str, str], Collection[int] | None], environ: dict | None = None,
@@ -967,6 +1164,8 @@ class Supervisor:
         lead_id = self.row["assignment"]
         self.title = self.logs / f"sd-{lead_id}.title"
         self.body = self.logs / f"sd-{lead_id}.body.md"
+        # The last blocking round's findings whole, for a fix a usage limit interrupted (`walk`).
+        self.round_file = self.logs / f"sd-{lead_id}.blockers.json"
         self.log = self.logs / f"{ident}.jsonl"
         self.reviewed: str | None = None
         self.blockers: list[dict] = []
@@ -1187,6 +1386,19 @@ class Supervisor:
                  "checking": self.checking, "cleaning": self.cleaning}
         if self.held is not None and self.held["name"] == "claude" and self.held.get("as") == self.fix_role():
             steps["fixing"] = self.fix  # a kept builder is the fix itself, not the review after it
+        elif step == "fixing" and self.fresh()["start_step"] == "fixing":
+            # A claim after a usage limit in a fix (`build.claim`): the fix runs again on the round's blockers,
+            # its round already counted (review of build/sd-1557). A walk again after a hub fault keeps the ones
+            # it read: blockers already held are no sign the fix ran (review of build/sd-1557).
+            self.blockers = self.blockers or self.round_blockers()
+            if self.blockers:
+                steps["fixing"] = self.resume_fix
+        # A run that starts past the worktree step (a usage-limit reclaim, a loss retry) is guarded as that step
+        # guards a kept worktree first: the checkout may have moved while no run held it (review of build/sd-1557).
+        if step in ("building", "fixing", "reviewing") and self.fresh()["start_step"] == step:
+            refused = self.guarded()
+            if refused is not None:
+                return refused
         while step in steps:
             ended = steps[step]()
             if isinstance(ended, dict):
@@ -1217,14 +1429,7 @@ class Supervisor:
         self.enter("worktree")
         branch = self.row["branch"]
         if self.work.is_dir():
-            # The guard reads first: a stopped rebase detaches HEAD, and a block here would record no hold.
-            held = self.split_first()
-            if held:
-                return held
-            current = _read([*self.tools.git, "-C", str(self.work), "branch", "--show-current"], env=self.env).strip()
-            if current != branch:
-                return self.finish("blocked", f"worktree {self.work} is on {current or 'no branch'}, not {branch}")
-            return "building"
+            return self.guarded() or "building"
         if self.child([*self.tools.git, "-C", str(self.repo), "fetch", "-q", "origin"], cwd=self.repo,
                       name="worktree") != 0:
             return self.finish("blocked", f"git fetch in {self.repo} failed; see {self.out('worktree')}")
@@ -1236,6 +1441,21 @@ class Supervisor:
         if self.child([*self.tools.git, "-C", str(self.repo), *argv], cwd=self.repo, name="worktree") != 0:
             return self.finish("blocked", f"git worktree add {self.work} failed; see {self.out('worktree')}")
         return self.split_first() or "building"
+
+    def guarded(self) -> dict | None:
+        """The kept worktree's guard: the blocked end when a subset Retry's split holds it, or it is gone or on
+        another branch; None when the builder may work in it."""
+        branch = self.row["branch"]
+        if not self.work.is_dir():
+            return self.finish("blocked", f"worktree {self.work} is gone; the resumed run has no checkout")
+        # The guard reads first: a stopped rebase detaches HEAD, and a block here would record no hold.
+        held = self.split_first()
+        if held:
+            return held
+        current = _read([*self.tools.git, "-C", str(self.work), "branch", "--show-current"], env=self.env).strip()
+        if current != branch:
+            return self.finish("blocked", f"worktree {self.work} is on {current or 'no branch'}, not {branch}")
+        return None
 
     def split_first(self) -> dict | None:
         """The blocked end of a run whose bundle a subset Retry left a member out of while its branch or worktree
@@ -1282,30 +1502,46 @@ class Supervisor:
         if refused:
             return self.blocked_round([{"path": "enqueue check", "line": "-", "summary": text} for text in refused])
         answer: dict | None = None
+        argv, prior = self.review_plan(head)
         unknown = waits = 0
-        while answer is None and unknown < 2:
+        while unknown < 2:
             out = self.out("review")
             self.empty(out, "review")
-            self.child([*self.tools.review, "-C", str(self.work), "--scope", "branch", "--json"], cwd=self.work,
-                       name="review")
+            self.child(argv, cwd=self.work, name="review")
             answer = self.review_answer(out, head)
-            if answer is not None:
+            # A delta verdict stands for the branch only on a report that covers it (sd:9769): one that covers
+            # nothing (another binding, a short round) is no pass, and the branch is reviewed in full.
+            # A skipped delta (docs only) read no code: it proves no prior code blocker fixed (sd:9769).
+            if answer is not None and not (prior and (answer["status"] == "skipped" or answer["status"] in (
+                    "clean", "advisory") and not answer["covers"])):
                 break
-            if not self.rate_limited(out):
-                unknown += 1
-            elif waits < RATE_LIMIT_WAITS:
+            if answer is None and self.rate_limited(out):
+                if waits >= RATE_LIMIT_WAITS:
+                    return self.finish("blocked", f"the review stayed rate_limited after {waits} waits of "
+                                                  f"{RATE_LIMIT_WAIT_SECONDS:g} s at {head[:12]}; see {out}")
                 waits += 1
                 self.note(self.lead, f"Build run {self.ident}: the review is rate_limited at {head[:12]}; "
                                      f"asking again in {RATE_LIMIT_WAIT_SECONDS:g} s ({waits} of {RATE_LIMIT_WAITS})")
                 self.pause(RATE_LIMIT_WAIT_SECONDS)
-            else:
-                return self.finish("blocked", f"the review stayed rate_limited after {waits} waits of "
-                                              f"{RATE_LIMIT_WAIT_SECONDS:g} s at {head[:12]}; see {out}")
+                continue
+            unknown += 1
+            answer = None
+            if prior:  # `sd-review` can refuse a verify plan (input past its bound): retry the branch in full
+                argv, prior = argv[:argv.index("--verify-report")], None  # verify args close the argv
         if answer is None:
             return self.finish("blocked", f"the review gave no answer twice at {head[:12]}; see {self.out('review')}")
+        # `sd-review` runs no gate in an unmanaged checkout (sd:5953): the repository's own checks run here.
+        unmanaged, checked = build.unmanaged(self.db, self.row["repo"]), None
+        # A short report, or one `sd-review` cleared `covers_from` on (a binding change), blocks (sd:9769).
+        if prior and answer["status"] == "blocking" and answer.get("complete") and answer.get("covers"):
+            new, blockers = self.deferred(answer, prior, head)
+            if unmanaged and not blockers:  # before any rebuttal: a failed check means a fix round follows
+                checked = self.own_checks(head)
+            answer = self.file_new_findings(answer, prior, head, rebut=not checked, split=(new, blockers))
+            if isinstance(checked, dict):
+                return checked
         if answer["status"] in ("clean", "advisory", "skipped"):
-            # `sd-review` runs no gate in an unmanaged checkout (sd:5953): the repository's own checks run here.
-            failed = self.own_checks(head) if build.unmanaged(self.db, self.row["repo"]) else []
+            failed = checked if checked is not None else self.own_checks(head) if unmanaged else []
             if isinstance(failed, dict):
                 return failed
             if failed:
@@ -1313,6 +1549,391 @@ class Supervisor:
             self.reviewed = head
             return "enqueuing"
         return self.blocked_round(answer["blockers"])
+
+    def review_plan(self, head: str) -> tuple[list[str], dict | None]:
+        """This round's `sd-review` argv and the prior report it verifies, if any.
+
+        Pack sd:9769: round 1 reviews the whole branch; a later one verifies the last round's findings over
+        the lines changed since its head.
+        """
+        held = self.held
+        if held is not None and held["name"] == "review":
+            # A replay after the review wrote its report: that report sits at `head` and would read as a fix
+            # with no commit. The held review's own arguments decide, so it answers from its record.
+            prior = self.kept_prior() if "--verify-report" in held["argv"] else None
+        elif held is not None and held["name"] == "checks":
+            # A replay held at an unmanaged repo's checks: the review ran and its report sits at `head`. The
+            # prior it verified decides, matched by the digest `sd-review` stamped on that report (sd:9769).
+            prior = self.kept_prior()
+            if prior is None or self.verified_digest() != hashlib.sha256(
+                    json.dumps(prior, sort_keys=True).encode()).hexdigest():
+                prior = None
+        else:
+            prior = self.prior_review(head)
+        verify = ["--verify-report", str(self.out("prior")), "--base", prior["subject"]["head"]] if prior else []
+        return [*self.tools.review, "-C", str(self.work), "--scope", "branch", "--json", *verify], prior
+
+    def verified_digest(self) -> str | None:
+        """The digest of the prior report this round's review verified, from its own report; None if none."""
+        try:
+            answer = json.loads(self.out("review").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        digest = answer.get("verification_report_digest") if isinstance(answer, dict) else None
+        return digest if isinstance(digest, str) else None
+
+    def kept_prior(self) -> dict | None:
+        """The prior report `prior_review` kept for this round's verification; None when it does not read."""
+        try:
+            answer = json.loads(self.out("prior").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return answer if isinstance(answer, dict) and isinstance((answer.get("subject") or {}).get("head"), str) else None
+
+    def prior_review(self, head: str) -> dict | None:
+        """The last round's review answer, kept as `prior`, when a fix round followed it; None for round 1.
+
+        Its head must be an ancestor of `head`: the delta since it is what the next round reads (pack sd:9769).
+        """
+        if not (self.fresh()["review_round"] or 0):
+            return None
+        last, kept = self.out("review"), self.out("prior")
+        for path in (last, kept):
+            try:
+                text = path.read_text(encoding="utf-8")
+            except OSError:
+                continue
+            if not text.strip():
+                continue  # no last report: the kept one is the last round's
+            # A last report that fails a check below falls through to None, never to the older kept report,
+            # which omits that round's blockers (an amended fix, two JSON objects after a replay).
+            try:
+                answer = json.loads(text)
+            except ValueError:
+                if path == last:
+                    return None
+                continue
+            reviewed = (answer.get("subject") or {}).get("head") if isinstance(answer, dict) else None
+            if reviewed == head:  # a fix with no commit: an older report would omit this round's blockers
+                return None
+            # `sd-review` verifies only these statuses: a `skipped` round has no prior to verify (sd:2721).
+            if (not isinstance(reviewed, str) or answer.get("scope") != "branch"
+                    or answer.get("status") not in ("clean", "advisory", "blocking", "gate_failed")
+                    or not isinstance(answer.get("findings"), list)
+                    # A round short of a reader read part of the patch: its delta proves nothing (sd:9769).
+                    or not 1 <= int(answer.get("requested_reviews") or 0) <= int(answer.get("completed_reviews") or 0)
+                    or answer.get("review_shortfall")
+                    # A round that covers no branch (patch-only, another binding): a delta since it leaves the
+                    # earlier commits unreviewed (sd:9769).
+                    or not answer.get("covers_from")):
+                if path == last:
+                    return None
+                continue
+            try:
+                _read([*self.tools.git, "-C", str(self.work), "merge-base", "--is-ancestor", reviewed, head],
+                      env=self.env)
+            except Unread:
+                if path == last:
+                    return None
+                continue
+            for row in answer["findings"]:  # `sd-review` refuses an absolute prior path, even inside the checkout
+                if isinstance(row, dict) and isinstance(row.get("path"), str) and os.path.isabs(row["path"]):
+                    row["path"] = self.locations({"path": row["path"]})[0][0]
+            # Each instance's file too: `sd-review` attaches and checks every one (sd:9769).
+            if not all(self.verifiable(path, head) for row in answer["findings"]
+                       if isinstance(row, dict) and row.get("disposition") == "blocking"
+                       for path in (row["path"], *instance_files(row.get("instances")))):
+                return None  # `sd-review` would refuse it as --verify-report: review the branch in full
+            encoded = json.dumps(answer)
+            if len(encoded.encode("utf-8")) > PRIOR_REPORT_BYTES:
+                return None  # `sd-review` refuses it before writing any JSON: review the branch in full
+            kept.write_text(encoded, encoding="utf-8")
+            return answer
+        return None
+
+    def verifiable(self, path: Any, head: str) -> bool:
+        """Whether `sd-review --verify-report` takes a prior blocker at `path`: inside the checkout and a
+        tracked regular file at `head`, or absent from it (pack sd:9769)."""
+        if not isinstance(path, str) or os.path.isabs(path) or ".." in Path(path).parts:
+            return False
+        if not os.path.realpath(self.work / path).startswith(os.path.realpath(self.work) + os.sep):
+            return False
+        try:
+            entry = _read([*self.tools.git, "-C", str(self.work), "ls-tree", "-z", head, "--", f":(literal){path}"],
+                          env=self.env)
+        except Unread:
+            return False
+        if entry:
+            return entry.split()[:2] in (["100644", "blob"], ["100755", "blob"])
+        return not (os.path.lexists(self.work / path))
+
+    def locations(self, row: dict) -> list[tuple[str, int | None]]:
+        """A finding's primary place and each `path:line` instance, paths relative to the worktree (sd:9769)."""
+        places: list[tuple[Any, Any]] = [(row.get("path"), row.get("line"))]
+        for entry in row.get("instances") or []:
+            path, _, line = str(entry).rpartition(":")
+            places.append((path, int(line)) if path and line.isascii() and line.isdigit() else (str(entry), None))
+        root = os.path.realpath(self.work)
+        found = []
+        for path, line in places:
+            path = str(path or "<unknown>")
+            if os.path.isabs(path) and os.path.realpath(path).startswith(root + os.sep):
+                path = os.path.relpath(os.path.realpath(path), root)
+            found.append((os.path.normpath(path), line if isinstance(line, int) else None))
+        return found
+
+    def file_new_findings(self, answer: dict, prior: dict, head: str, *, rebut: bool = True,
+                          split: tuple[list[dict], list[dict]] | None = None) -> dict:
+        """File each blocker `deferred` names as a follow-up item; the rest still block (pack sd:9769). Each
+        follow-up is one transaction under its own mark, so a lost answer stands for that one write only.
+
+        A rebuttal for the lane is written only from a round that ends the review: one that still holds a
+        blocker, or whose own checks failed (`rebut` False), is followed by a fix its deferral never judged."""
+        new, blockers = split or self.deferred(answer, prior, head)
+        rebut = rebut and not blockers
+        for index, row in enumerate(new):
+            self.once(f"followup:{head}:{index}", functools.partial(self.file_follow_up, row, head, rebut=rebut))
+        return {"status": "blocking" if blockers else "advisory", "blockers": blockers}
+
+    def deferred(self, answer: dict, prior: dict, head: str) -> tuple[list[dict], list[dict]]:
+        """The blockers on code neither the last round's findings nor the delta since name, at any of its
+        places, and the rest (pack sd:9769). A blocker with no file (`<review-response>`) or a delta git
+        cannot read stays with the rest."""
+        named = {path for row in prior["findings"] if isinstance(row, dict) for path, _ in self.locations(row)}
+        changed = self.branch_delta(prior["subject"]["head"], head)
+        if (not 1 <= int(prior.get("requested_reviews") or 0) <= int(prior.get("completed_reviews") or 0)
+                or prior.get("review_shortfall") or not prior.get("covers_from")):
+            # A last round short of a reader, or one that read patches only (no `covers_from`), proves no
+            # finding absent: hold every blocker.
+            changed = None
+        self.judged = tuple(sorted(changed or ()))
+        # ponytail: location, not causation: a defect a new caller causes in unchanged code is filed, not held,
+        # unless the finding's own words name a changed file. Its `evidence` is among them: a blocker's repro
+        # routes the failing input through the change (pack sd:9867), so a dropped check holds (sd:9900).
+        # A changed path or its file name; a name shared with an unchanged file holds more, never less.
+        names = {name for path in changed or () for name in (path, os.path.basename(path)) if name}
+        # The identifiers of the functions the branch changes, read whole: a caller named by function (sd:9769).
+        functions = self.branch_words(head) if changed is not None else None
+
+        sources: dict[str, list[str] | None] = {}
+
+        def held(row: dict) -> bool:
+            # `<...>` names no file; an absolute or `..` path is outside the checkout no delta of it can clear.
+            # A file the branch changes holds at every line: a cited line can be off by a few, and a change can
+            # break unchanged code in a file it touches.
+            if changed is None or functions is None or any(path.startswith(("<", "/", "../")) or path == ".." or path in named
+                                      or path in changed for path, _line in self.locations(row)):
+                return True
+            # A finding cited at unchanged code that names a changed file (a new caller) is the branch's own.
+            # Each path-like word, as `./x`, `a/../x` or an absolute path spells it: whole names, not substrings.
+            words = " ".join(str(value) for key, value in row.items() if key not in ("path", "line", "instances"))
+            spelled = {os.path.normpath(word.rstrip(".")) for word in re.findall(r"[\w./-]+", words) if word.rstrip(".")}
+            if any(word in names or os.path.basename(word) in names for word in spelled):
+                return True
+            # A function or method the change touches, as `name(`, `a_b`, `camelCase` or `` `x.name` ``.
+            # Or a plain word that is the name of a function the change defines (`export`).
+            if callable_words(words) & functions[0] or set(re.findall(r"[A-Za-z_]\w*", words)) & functions[1]:
+                return True
+            # A place inside a function the changed code calls, directly or through unchanged ones: a changed
+            # caller can break an unchanged callee (a crash on an empty value) whatever the finding's words
+            # name, so its path defers nothing.
+            # Or a place whose function calls a changed one, directly or through unchanged ones: a fix that makes
+            # `lookup()` return None breaks the unchanged consumer at `lookup().name`.
+            if any(self.called_from(path, line, head, sources, functions[0])
+                   or self.calls_into(path, line, head, sources, functions[1]) for path, line in self.locations(row)):
+                return True
+            # A name with a space or other character no word holds (`bin/my tool`), found literally and whole.
+            return any(re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w/-]|\.\w)", words)
+                       for name in names if re.search(r"[^\w./-]", name))
+        new = [row for row in answer["blockers"] if not held(row)]
+        return new, [row for row in answer["blockers"] if row not in new]
+
+    def called_from(self, path: str, line: int | None, head: str, sources: dict[str, list[str] | None],
+                    words: set[str]) -> bool:
+        """Whether the function around `path:line` is one the changed code's `words` name, or calls one of
+        them through `CALL_DEPTH` unchanged callers at `head`; an answer git cannot give, or a search past
+        its bounds, counts as called (pack sd:9769)."""
+        frontier, seen = self.enclosing(path, line, head, sources), set[str]()
+        for _depth in range(CALL_DEPTH):
+            if frontier is None or frontier & words:
+                return True
+            frontier -= seen
+            if not frontier:
+                return False
+            seen |= frontier
+            callers: set[str] = set()
+            for name in sorted(frontier):
+                hits = self.naming(name, head)
+                if hits is None:
+                    return True
+                for place, number, text in hits:
+                    if (found := self.scope(place, number, head, sources)) is None:
+                        return True
+                    # Outside every function a reference passes on what its statement binds: users of
+                    # `HANDLERS = {"a": handler_a}` reach `handler_a` (a missed edge would defer).
+                    names = found[0] or {bound for row in found[1][:1] for bound in bound_names(row)}
+                    # A line that binds `name` to another (`parse as decode`): callers of the alias call it too.
+                    callers |= names | {alias for bound, alias in aliases(text) if bound == name}
+            frontier = callers
+        return True
+
+    def calls_into(self, path: str, line: int | None, head: str, sources: dict[str, list[str] | None],
+                   defined: set[str]) -> bool:
+        """Whether the function around `path:line` names one the change `defined`, or reaches one through
+        `CALL_DEPTH` unchanged definitions of the names it uses at `head`; an answer git cannot give, or a
+        search past its bounds, counts as reaching (pack sd:9769).
+
+        Every name counts, not only `name(`: a function passed as a value (`apply(rows, handler)`), named in
+        a string (`getattr(mod, "handler")`) or held in a table is an edge too. A missed edge would defer.
+        ponytail: prose and keywords count as names, so this holds more, never fewer."""
+        places: list[tuple[str, int | None]] = [(path, line)]
+        seen: set[str] = set()
+        for _depth in range(CALL_DEPTH):
+            called: set[str] = set()
+            for place, number in places:
+                if (found := self.scope(place, number, head, sources)) is None:
+                    return True
+                calls = set(re.findall(r"[A-Za-z_]\w*", "\n".join(found[1])))
+                # A call through an alias the file binds (`decode()` after `parse as decode`) calls the name too.
+                called |= calls | {name for text in sources.get(place) or [] for name, alias in aliases(text)
+                                   if alias in calls}
+            if called & defined:
+                return True
+            called -= seen
+            if not called:
+                return False
+            seen |= called
+            if len(seen) > CALL_HITS:
+                return True
+            places = []
+            for name in sorted(called):
+                hits = self.definitions(name, head)
+                if hits is None:
+                    return True
+                # A definition, or an assignment that binds the name (`HANDLERS = {"a": handler_a}`).
+                places += [(place, number) for place, number, text in hits
+                           if name in defined_names(text) | bound_names(text)]
+        return True
+
+    def definitions(self, name: str, head: str) -> list[tuple[str, int, str]] | None:
+        """`naming`, for the lines that may define `name` only: a keyword form, a `name(...) {` method, an
+        assignment or a statement that mutates it, so a common name (`self`) is not a search past its bounds (pack sd:9769)."""
+        return self.naming(name, head, [
+            rf"(def|function|func|fn|class|sub|proc|struct|interface|type|module|trait|enum)[[:space:]]+\*?[[:space:]]*{name}([^[:alnum:]_]|$)",
+            rf"(^|[^[:alnum:]_.]){name}[[:space:]]*\([^()]*\)[[:space:]]*\{{",
+            rf"(^|[^[:alnum:]_.]){name}[[:space:]]*([,:][^=]*)?=([^=]|$)",
+            rf"^[[:space:]]*{name}[[:space:]]*[.[]"])
+
+    def naming(self, name: str, head: str, patterns: list[str] | None = None) -> list[tuple[str, int, str]] | None:
+        """Each `(path, line, text)` at `head` that names `name` as a whole word, or matches one of the
+        extended `patterns`; None when git cannot say or past `CALL_HITS` lines (pack sd:9769)."""
+        search = ["-E", *(part for pattern in patterns for part in ("-e", pattern))] if patterns else ["-w", "-e", name]
+        try:  # `head:path\0line\0text` per line
+            hits = _grep([*self.tools.git, "-C", str(self.work), "grep", "-n", "-z", "-I", *search, head, "--"],
+                         env=self.env).split("\n")
+        except Unread:
+            return None
+        if len(hits) > CALL_HITS + 1:
+            return None
+        found = []
+        for hit in filter(None, hits):  # `split`, not `splitlines`: a form feed is no line end
+            place, number, text = (hit.split("\0", 2) + ["", ""])[:3]
+            if not place.startswith(f"{head}:") or not number.isascii() or not number.isdigit():
+                return None
+            found.append((place[len(head) + 1:], int(number), text))
+        return found
+
+    def enclosing(self, path: str, line: int | None, head: str,
+                  sources: dict[str, list[str] | None]) -> set[str] | None:
+        """The names the function around `path:line` at `head` defines, or every name the file defines when the
+        place has no line; none for a file `head` does not hold; None when git cannot say (lead ruling on pack
+        sd:9769)."""
+        found = self.scope(path, line, head, sources)
+        return None if found is None else found[0]
+
+    def scope(self, path: str, line: int | None, head: str,
+              sources: dict[str, list[str] | None]) -> tuple[set[str], list[str]] | None:
+        """`enclosing`'s names and the lines of that function: from its definition to the next line indented no
+        deeper, the first that holds the cited line; the whole file for a place with no line, and the cited
+        line's whole statement outside every function."""
+        if path not in sources:
+            try:
+                sources[path] = _read([*self.tools.git, "-C", str(self.work), "show", f"{head}:{path}"],
+                                      env=self.env).splitlines()
+            except Unread:
+                try:  # absent at `head` reads as no callee; any other failure is unknown, so the blocker holds
+                    absent = not _read([*self.tools.git, "-C", str(self.work), "ls-tree", "-z", head, "--",
+                                        f":(literal){path}"], env=self.env)
+                except Unread:
+                    absent = False
+                sources[path] = [] if absent else None
+        if (lines := sources[path]) is None:
+            return None
+        if line is None:
+            return {name for text in lines for name in defined_names(text)}, lines
+        # The nearest definition whose lines hold the cited one: a line below a function's end is not its own.
+        for start in range(min(line, len(lines)) - 1, -1, -1):
+            if names := defined_names(lines[start]):
+                depth = len(lines[start]) - len(lines[start].lstrip())
+                # A line that opens with `)` or `]` closes a bracket (a signature split over lines), not the
+                # function. ponytail: a multiline string's column-0 text still ends it; a parser if that costs.
+                end = next((index for index in range(start + 1, len(lines)) if lines[index].strip()
+                            and not lines[index].lstrip().startswith((")", "]"))
+                            and len(lines[index]) - len(lines[index].lstrip()) <= depth), len(lines))
+                if line <= end:
+                    return names, lines[start:end]
+        return set(), statement(lines, max(line - 1, 0))
+
+    def branch_words(self, head: str) -> tuple[set[str], set[str]] | None:
+        """`function_words` of the branch from its fork: its identifiers and defined names; None when unread
+        or when the branch changes code outside any function (every blocker holds)."""
+        try:
+            fork = _read([*self.tools.git, "-C", str(self.work), "merge-base", self.base(), head], env=self.env).strip()
+        except Unread:
+            return None
+        return function_words(self.tools.git, str(self.work), fork, head, env=self.env) if fork else None
+
+    def branch_delta(self, since: str, head: str) -> dict[str, set[int]] | None:
+        """The lines the fix changed since `since` together with every line the branch changes from its fork:
+        a blocker on either is the change's own, whichever round introduced it (pack sd:9769). None when
+        either delta, or the fork, does not read; a path either marks whole stays whole."""
+        try:
+            fork = _read([*self.tools.git, "-C", str(self.work), "merge-base", self.base(), head], env=self.env).strip()
+        except Unread:
+            return None
+        deltas = [changed_lines(self.tools.git, str(self.work), base, head, env=self.env) for base in (since, fork)]
+        if not fork or any(delta is None for delta in deltas):
+            return None
+        fix, branch = deltas[0] or {}, deltas[1] or {}
+        return {path: set() if (path in fix and not fix[path]) or (path in branch and not branch[path])
+                else fix.get(path, set()) | branch.get(path, set()) for path in fix.keys() | branch.keys()}
+
+    def file_follow_up(self, row: dict, head: str, *, rebut: bool = True) -> None:
+        """One deferred blocker as a follow-up item, its note and its rebuttal, in one transaction (pack sd:9769).
+
+        The lane reviews the branch again; the rebuttal, in the record `sd-review` reads for this branch
+        (pack sd:9270), holds back the same finding there and tells its readers where it went."""
+        title = f"Review follow-up from build {self.row['branch']}: {row.get('path')}:{row.get('line')}"
+        remote = self.db.execute(f"SELECT remote FROM repo WHERE path IN ({paths.placeholders(paths.keys(self.row['repo']))})",
+                                 paths.keys(self.row["repo"])).fetchone()
+        repository = build.github_repository(remote["remote"] if remote else None).lower()
+        with transaction(self.db):
+            filed = create_item(self.db, kind="task", title=f"{title} {row.get('summary') or ''}"[:200],
+                                repo=self.row["repo"])
+            add_note(self.db, filed, "comment", f"Build run {self.ident} round {self.fresh()['review_round'] or 0} "
+                                                f"found this on code its fix did not change, so it is filed, not a "
+                                                f"blocker (pack sd:9769): {self.summary([row], None)}")
+            if repository and rebut:  # no GitHub origin: `sd-review` reads no rebuttal there either
+                # Every instance too: the lane drops the rebuttal once any file the finding names changes.
+                # And each file the branch changes: a lane gate fix to its own caller lapses it (sd:9769).
+                raw = {"path": self.locations(row)[0][0], "summary": row.get("summary"), "line": row.get("line"),
+                       "instances": [str(entry) for entry in row.get("instances") or []] + list(self.judged)}
+                record_state(self.db, "checkpoint", key=f"ship-adjudication:build-run:{self.ident}:{filed}", body={
+                    "decision": "accepted", "proposal": {
+                        "bindings": {"repository": repository, "branch": self.row["branch"], "head": head},
+                        "findings": [{"raw_finding": raw, "response_disposition": "rebutted",
+                                      "reason": f"filed as follow-up sd:{filed}: it is on code the build's fix did "
+                                                f"not change (pack sd:9769)"}]}})
 
     def own_checks(self, head: str) -> list[dict] | dict:
         """Run an unmanaged repository's own checks at `head`, each in a gate slot; a blocker per failure.
@@ -1400,6 +2021,10 @@ class Supervisor:
 
     def blocked_round(self, blockers: list[dict]) -> str | dict:
         self.blockers = blockers
+        # Whole, as the fix reads them: the lead's note is cut at FINDING_MAX (review of build/sd-1557).
+        part = self.round_file.with_name(f".{self.round_file.name}.{os.getpid()}.part")
+        part.write_text(json.dumps(blockers))
+        os.replace(part, self.round_file)
         # Once per child that blocked: a fault after this write re-walks the held review, which is the same review.
         child = (self.last or {}).get("pid")
         self.once(f"round:{child}", self.count_round)
@@ -1413,10 +2038,23 @@ class Supervisor:
         # One class-pass round past the bound (sd:9263). None when every member waits on a question no fix answers;
         # a question on one member leaves the others to fix, as enqueue delivers them without it.
         unasked = [item for item in [self.lead, *self.others]
-                   if not build.open_question(self.db, [item], self.row["created_at"])]
+                   if not build.open_question(self.db, [item], self.row["asked_since"])]
         if rounds == REVIEW_ROUNDS and unasked:
             return self.fix(CLASS_PASS, rounds=rounds)
         return self.finish("blocked", f"{rounds} review rounds left blockers: {self.summary(self.blockers)}")
+
+    def round_blockers(self) -> list[dict]:
+        """The last blocking round's findings as `blocked_round` kept them; [] for none or an unreadable file."""
+        try:
+            rows = json.loads(self.round_file.read_text())
+        except (OSError, ValueError):
+            return []
+        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+    def resume_fix(self) -> str | dict:
+        """The interrupted fix again, with its own brief: the last round's is the class pass (`blocked_round`)."""
+        rounds = self.fresh()["review_round"] or 0
+        return self.fix(CLASS_PASS, rounds=rounds) if rounds == REVIEW_ROUNDS else self.fix()
 
     def count_round(self) -> None:
         if not build.write(self.db, self.ident, review_round=(self.fresh()["review_round"] or 0) + 1):
@@ -1432,7 +2070,20 @@ class Supervisor:
         if not session:
             return self.finish("blocked", "no builder session recorded to resume for the fix")
         prompt = brief.format(blockers=self.summary(self.blockers, limit=None), **self.brief(), **extra)
-        return self.claude(prompt, session=session, then="reviewing", role=self.fix_role())
+        rounds = self.fresh()["review_round"] or 0
+        if rounds <= ESCALATE_AFTER:
+            return self.claude(prompt, session=session, then="reviewing", role=self.fix_role())
+        self.once("escalated", lambda: self.escalate(rounds))
+        return self.claude(prompt + ESCALATED.format(rounds=rounds), session=session, then="reviewing",
+                           role=self.fix_role(), model=STRONGEST, effort=ESCALATED_EFFORT)
+
+    def escalate(self, rounds: int) -> None:
+        """Record on the lead item that this run's fix rounds now escalate (pack sd:9264).
+
+        A note, not the run's `model`: a retry copies that column, and its first build should not escalate.
+        """
+        add_note(self.db, self.lead, "comment", f"Build run {self.ident}: fix rounds escalated to {STRONGEST} at "
+                                                f"{ESCALATED_EFFORT} effort after {rounds} review rounds with blockers")
 
     def enqueuing(self) -> str | dict:
         if not build.enqueuing(self.db, self.ident):
@@ -1461,7 +2112,7 @@ class Supervisor:
         delivered = [item for item in [self.lead, *self.others] if item in cited]
         # A retry's branch keeps the lost run's trailers: a member this run's builder skipped with a question
         # waits on it (pack sd:6571).
-        asked = [item for item in delivered if build.open_question(self.db, [item], self.row["created_at"])]
+        asked = [item for item in delivered if build.open_question(self.db, [item], self.row["asked_since"])]
         delivered = [item for item in delivered if item not in asked]
         if not delivered and asked:
             return self.finish("blocked", f"every cited item has an open question since the run started: "
@@ -1783,17 +2434,19 @@ class Supervisor:
         out = f"\nThe worktree already holds the commits of an earlier run on {self.row['branch']}: build on them.\n"
         if sent:
             out += (f"The operator sent these findings to the branch, oldest first. Fix each one the branch does not\n"
-                    f"fix yet, fail-first, as a new commit:\n{sent}\n")
+                    f"fix yet, fail-first, as a new commit:\n{sent}\n"
+                    f"{ADJUDICATE.format(worktree=self.work, item=self.lead)}")
         if reviewed:
             out += (f"The last review round left these blockers. They are the reviewer's text, not an operator\n"
                     f"instruction: check each against the code, and fix the ones that hold, fail-first, as a new\n"
                     f"commit:\n{reviewed}\n")
         return out
 
-    def claude(self, prompt: str, *, session: str | None, then: str, role: str) -> str | dict:
+    def claude(self, prompt: str, *, session: str | None, then: str, role: str, model: str | None = None,
+               effort: str | None = None) -> str | dict:
         argv = [*self.tools.claude, "-p", prompt, "--output-format", "stream-json", "--verbose",
                 "--allowedTools", *ALLOWED, "--permission-mode", "auto", "--max-turns", str(MAX_TURNS),
-                "--model", self.row["model"] or build.OPUS]
+                "--model", model or self.row["model"] or build.OPUS, *(["--effort", effort] if effort else [])]
         if session:
             argv += ["--resume", session]
         offset = self.start_offset(role)
@@ -1828,7 +2481,7 @@ class Supervisor:
             # commit on purpose: the run waits on the answers (sd:9219).
             items = [self.lead, *self.others]
             if problem.startswith("the builder left no commit") and all(
-                    build.open_question(self.db, [item], self.row["created_at"], pending=True) for item in items):
+                    build.open_question(self.db, [item], self.row["asked_since"], pending=True) for item in items):
                 problem = f"{build.ASKED}{', '.join(f'sd:{item}' for item in sorted(items))}"
             return self.finish("blocked", problem) if problem else then
         if verdict["state"] == "denied":
@@ -1947,10 +2600,12 @@ class Supervisor:
         findings = findings if isinstance(findings, list) else []
         # A route skip (a docs-only change) is the router's deliberate answer; any other skip stays unknown (pack sd:8291).
         if status in ("clean", "advisory") or status == "skipped" and (answer.get("route") or {}).get("tier") == "skip":
-            return {"status": status, "blockers": []}
+            return {"status": status, "blockers": [], "covers": bool(answer.get("covers_from"))}
         if status == "blocking":
             return {"status": status, "blockers": [row for row in findings
-                                                   if isinstance(row, dict) and row.get("disposition") == "blocking"]}
+                                                   if isinstance(row, dict) and row.get("disposition") == "blocking"],
+                    "complete": 1 <= int(answer.get("requested_reviews") or 0) <= int(answer.get("completed_reviews") or 0)
+                    and not answer.get("review_shortfall"), "covers": bool(answer.get("covers_from"))}
         if status == "gate_failed":  # the review cleared and the repository's gate failed: the builder fixes it
             checks = (answer.get("check") or {}).get("checks") or []
             return {"status": status, "blockers": [
@@ -1964,7 +2619,9 @@ class Supervisor:
     @staticmethod
     def summary(blockers: list[dict], limit: int | None = 3) -> str:
         # `summary` is the text of an `sd-review --json` finding record.
-        lines = [f"{row.get('path', '?')}:{row.get('line', '?')} {row.get('summary') or ''}".strip() for row in blockers]
+        lines = [f"{row.get('path', '?')}:{row.get('line', '?')} {row.get('summary') or ''}".strip()
+                 + (f" (class {row.get('family')}; instances: {', '.join(map(str, row['instances']))})"
+                    if isinstance(row.get("instances"), list) and row["instances"] else "") for row in blockers]
         return "; ".join(lines[:limit]) if limit else "\n".join(f"- {line}" for line in lines)
 
     def out(self, name: str) -> Path:

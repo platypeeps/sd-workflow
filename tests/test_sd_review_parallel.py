@@ -73,6 +73,10 @@ def review_session(argv: Any) -> bool:
 
 
 class ParallelFixture(ReviewFixture):
+    #: Operator 2026-11-23 cut every tier to one reader; these classes pin two to
+    #: keep the parallel path (both readers, dedup, fallback beside a running one) tested.
+    reviewing_depth = 2
+
     def prepare(self, registry: str | None = None, consent: str | None = None) -> pathlib.Path:
         if registry is not None:
             (self.registry_home / ".local/share/sd/providers.yaml").write_text(registry, encoding="utf-8")
@@ -90,12 +94,17 @@ class ParallelFixture(ReviewFixture):
         return sd_review.review(root, namespace(**options), runner, self.environment(), self.chatgpt_home())
 
 
-class TwoReadersAtOnce(ParallelFixture):
-    def test_every_reviewing_tier_asks_two_readers(self) -> None:
+class ShippedDepth(unittest.TestCase):
+    def test_every_reviewing_tier_asks_one_reader(self) -> None:
+        """Operator 2026-11-23: codex alone; claude only when codex is not eligible."""
         for tier in ("cheap", "standard", "deep"):
             with self.subTest(tier=tier):
-                self.assertEqual(sd_review.sd_route.TIER_DEPTH[tier], 2)
+                self.assertEqual(sd_review.sd_route.TIER_DEPTH[tier], 1)
+        self.assertEqual(sd_review.sd_route.DEFAULT_DEPTH, 1)
         self.assertEqual(sd_review.sd_route.TIER_DEPTH["skip"], 0)
+
+
+class TwoReadersAtOnce(ParallelFixture):
 
     def test_a_lensed_brief_that_routes_to_skip_still_asks_two_readers(self) -> None:
         root = self.prepare()
@@ -173,7 +182,8 @@ class TwoReadersAtOnce(ParallelFixture):
 
         def answer(*summaries: str) -> sd_review.Completed:
             return sd_review.Completed(0, json.dumps({"findings": [
-                {"path": "src.py", "line": 1, "severity": "high", "family": "correctness", "summary": text}
+                {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": text,
+                 "evidence": "python3 src.py: Traceback"}
                 for text in summaries]}), "")
 
         def codex(argv: Any, env: Any, cwd: Any, timeout: int) -> Any:

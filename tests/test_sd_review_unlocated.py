@@ -44,8 +44,14 @@ def answer(*rows: dict) -> sd_review.Completed:
     return sd_review.Completed(0, json.dumps({"findings": list(rows)}), "")
 
 
-def row(path: str, severity: str = "unspecified", summary: str = "a finding") -> dict:
-    return {"path": path, "line": None, "severity": severity, "summary": summary, "family": "verification"}
+def row(path: str, severity: str = "unspecified", summary: str = "a finding", evidence: str | None = None) -> dict:
+    found = {"path": path, "line": None, "severity": severity, "summary": summary, "family": "verification",
+             **({"instances": [path]} if severity == "high" else {})}
+    return found if evidence is None else {**found, "evidence": evidence}
+
+
+#: A high finding blocks only with cited evidence (sd:9867), so a blocking fixture carries some.
+REPRO = "python3 src.py: expected 0, got 1"
 
 
 BLIND_AT_ROOT = answer(row("/", summary="The diff could not be accessed."))
@@ -93,7 +99,7 @@ class AnAnswerThatCitesNothingReviewedIsNotAdvice(ReviewRunFixture):
         """A failed answer's evidence survives a clean fallback (the lane's
         rule), but advice that cites nothing reviewed is not evidence."""
         rows = [row("src.py", "low", "located advice"), row("/", "low", "unlocated advice"),
-                row("/", "high", "unlocated blocker")]
+                row("/", "high", "unlocated blocker", REPRO)]
         failed = sd_review.Completed(0, json.dumps({"findings": rows, "extra": 1}), "")
         result = self.review_with({"codex": failed})
         self.assertEqual(result["outcomes"][0]["status"], "unavailable")
@@ -115,7 +121,7 @@ class AnAnswerThatCitesNothingReviewedIsNotAdvice(ReviewRunFixture):
         root = self.prepare()
         for path in (f"{root}/src.py", f"{root.resolve()}/src.py", "./src.py"):
             with self.subTest(path=path):
-                runner = FakeRunner({**CHECK, "codex": answer(row(path, "high"))}, default=CLEAN)
+                runner = FakeRunner({**CHECK, "codex": answer(row(path, "high", evidence=REPRO))}, default=CLEAN)
                 result = self.run_review(root, runner)
                 self.assertEqual(result["status"], "blocking")
                 self.assertEqual(result["reviewed_by"], ["codex"])
@@ -245,6 +251,17 @@ class AFileTheRepositoryHoldsIsLocated(ReviewRunFixture):
         self.assertEqual(result["outcomes"][0]["status"], "unavailable")
         self.assertIn("'README.md': a finding", result["outcomes"][0]["detail"])
         self.assertEqual(result["reviewed_by"], ["second"])
+
+    def test_a_url_reader_s_branch_pass_covers_nothing(self) -> None:
+        """Review of sd:9769: a URL reader gets patches, not whole files, so its pass seeds no chain."""
+        registry = self.registry_home / ".local/share/sd/providers.yaml"
+        registry.write_text(FIXTURE_REGISTRY.replace('codex:  { start: "codex exec", vendor: openai, bill: first,',
+                                                     'codex:  { url: "https://codex.example.test/v1", model: fixture, '
+                                                     'vendor: openai, bill: first, env: [REMOTE_KEY],', 1))
+        client = FakeClient({"codex": chat_answer(json.dumps({"findings": []}))})
+        result = self.review(None, client=client, scope="branch")
+        self.assertIn("codex", result["reviewed_by"], "the premise: the URL reader completed")
+        self.assertIsNone(result["covers_from"], "a patch-only pass covers the branch")
 
     def test_only_a_reader_launched_in_the_checkout_reads_it(self) -> None:
         def entry(**fields) -> sd_review.sd_registry.Provider:
