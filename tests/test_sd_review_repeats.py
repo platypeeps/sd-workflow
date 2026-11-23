@@ -306,7 +306,7 @@ class PriorLineTests(RepeatFixture):
         new = self.commit("add", "src.py") and self.commit("moved")
         prior = [dict(finding(REPRO, line=10, summary="broken_call crashes"), disposition="blocking")]
         moved = sd_review.prior_at(self.root, old, new, prior)
-        self.assertEqual([(row["path"], row["line"]) for row in moved], [("src.py", 100)])
+        self.assertEqual([(row["path"], row["line"]) for row in moved], [("src.py", 9), ("src.py", 100)])
         [record] = sd_review.dispose([finding(line=100, summary="broken_call crashes")], "high",
                                      repro=True, prior=moved)
         self.assertEqual((record["disposition"], record.get("evidence")), ("blocking", REPRO))
@@ -328,7 +328,26 @@ class PriorLineTests(RepeatFixture):
         new = self.commit("add", "src.py", "helpers.py") and self.commit("moved")
         prior = [dict(finding(REPRO, line=10, summary="broken_call crashes"), disposition="blocking")]
         moved = sd_review.prior_at(self.root, old, new, prior)
-        self.assertEqual([(row["path"], row["line"]) for row in moved], [("helpers.py", 30)])
+        self.assertEqual([(row["path"], row["line"]) for row in moved], [("src.py", 9), ("helpers.py", 30)])
+
+    def test_a_blocker_whose_line_was_edited_keeps_its_place_when_its_text_appears_elsewhere(self) -> None:
+        """build/sd-1623 review (bin/sd-review:2612, :1921): `return None` at src.py:10 replaced by another
+        expression that keeps the defect, and `return None` added once in an unrelated helpers.py. The mapper
+        moved the blocker to helpers.py, so an uncited repeat at the still-broken src.py:10 posted as advisory.
+        A moved blocker now also holds the place its hunk maps to (fail closed)."""
+        body = "".join(f"line{n}\n" for n in range(1, 10)) + "    return None\n" + "tail\n"
+        (self.root / "src.py").write_text(body, encoding="utf-8")
+        (self.root / "helpers.py").write_text("h1\n", encoding="utf-8")
+        old = self.commit("add", "src.py", "helpers.py") and self.commit("old")
+        (self.root / "src.py").write_text(body.replace("return None", "return None if x else None"), encoding="utf-8")
+        (self.root / "helpers.py").write_text("h1\n    return None\n", encoding="utf-8")
+        new = self.commit("add", "src.py", "helpers.py") and self.commit("edited")
+        prior = [dict(finding(REPRO, line=10, summary="returns None on empty input"), disposition="blocking")]
+        moved = sd_review.prior_at(self.root, old, new, prior)
+        self.assertIn(("src.py", 10), [(row["path"], row["line"]) for row in moved])
+        [record] = sd_review.dispose([finding(line=10, summary="returns None on empty input")], "high",
+                                     repro=True, prior=moved)
+        self.assertEqual((record["disposition"], record.get("evidence")), ("blocking", REPRO))
 
     def test_a_blocker_follows_its_file_through_a_rename(self) -> None:
         """build/sd-1423 review (bin/sd-review:1839): renaming src.py to renamed.py left the prior blocker on
@@ -647,12 +666,30 @@ class ReproRuleTests(unittest.TestCase):
         """build/sd-1623 review (bin/sd-review:1833): odd entries name no place and never raise."""
         blocker = dict(finding(REPRO, line=10, summary="s"), disposition="blocking", instances=[
             "src.py:10", "b.py:40", "b.py:40", " c.py ", "d.py:\u0663", "e.py:4\n", "", "  ", None, 7, ["x"],
-            "f.py:" + "9" * 40, "g\u00e9.py:2", "h.py:0"])
+            "f.py:" + "9" * 4301, "g\u00e9.py:2", "h.py:0"])
         self.assertEqual([(row["path"], row["line"]) for row in sd_review.instance_rows(blocker)],
                          [("src.py", 10), ("b.py", 40), ("c.py", None), ("d.py:\u0663", None), ("e.py", 4),
-                          ("f.py", int("9" * 40)), ("g\u00e9.py", 2), ("h.py", 0)])
+                          ("f.py:" + "9" * 4301, None), ("g\u00e9.py", 2), ("h.py", 0)])
         self.assertEqual(sd_review.instance_rows(dict(blocker, disposition="advisory")), [dict(blocker, disposition="advisory")])
         self.assertEqual(sd_review.instance_rows(dict(blocker, instances="src.py:1")), [dict(blocker, instances="src.py:1")])
+        # build/sd-1623 review (bin/sd-review:1844): a stored place that is not JSON-scalar is no key error.
+        odd = dict(blocker, path=["src.py"], line=[], instances=["b.py:40"])
+        self.assertEqual([row["path"] for row in sd_review.instance_rows(odd)], [["src.py"], "b.py"])
+
+    def test_a_rebuttal_covering_an_instance_answers_its_repeat_there(self) -> None:
+        """build/sd-1623 review (bin/sd-review:1779, :1791): a rebuttal at src.py:10 that answered both
+        src.py:10 and b.py:40. An uncited repeat at b.py:40 blocked with the old repro: the expanded prior row
+        and the finding sit at b.py:40, and the rebuttal was matched at its reported place alone."""
+        body = json.dumps({"decision": "accepted", "proposal": {"bindings": {"head": ON_BRANCH}, "findings": [
+            {"response_disposition": "rebutted", "reason": "a reason", "raw_finding": {
+                "path": "src.py", "line": 10, "severity": "high", "instances": ["src.py:10", "b.py:40"],
+                "summary": "Empty input crashes", "family": "correctness"}}]}})
+        both = {"instances": ["src.py:10", "b.py:40"]}
+        blocker = dict(finding(REPRO, line=10, summary="Empty input crashes", **both), disposition="blocking")
+        [record] = sd_review.dispose([finding(path="b.py", line=40, summary="Empty input crashes",
+                                              instances=["b.py:40"])], "high", listed(body), repro=True,
+                                     prior=sd_review.instance_rows(blocker))
+        self.assertEqual((record["disposition"], record.get("evidence")), ("advisory", None))
 
     def test_a_rebuttal_that_misses_an_instance_leaves_the_prior_blocker(self) -> None:
         """build/sd-1623 review (bin/sd-review:1779): a rebuttal at src.py:10, then a cited blocker with one more
@@ -935,13 +972,13 @@ class RepeatReviewTests(RepeatFixture):
 ON_BRANCH = "c" * 40
 
 
-def adjudicated(*rows: tuple[Any, ...], decision: str = "accepted", line: Any = 1) -> str:
+def adjudicated(*rows: tuple[Any, ...], decision: str = "accepted", line: Any = 1, instances: Any = None) -> str:
     """One adjudication body at `ON_BRANCH`: each (path, summary, disposition[, line]) a blocking finding's answer."""
     return json.dumps({"decision": decision, "proposal": {"bindings": {"head": ON_BRANCH}, "findings": [
         {"response_disposition": answer, "reason": "a reason",
-         "raw_finding": {"path": path, "line": (*rest, line)[0], "severity": "high", "instances": ["src.py:1"], "summary": summary,
-                         "family": "correctness"}}
-        for path, summary, answer, *rest in rows]}})
+         "raw_finding": {"path": path, "line": at, "severity": "high", "summary": summary, "family": "correctness",
+                         "instances": instances or [f"{path}:{at}" if type(at) is int else str(path)]}}  # its own place
+        for path, summary, answer, *rest in rows for at in [(*rest, line)[0]]]}})
 
 
 def listed(*bodies: str) -> list[Any]:
@@ -994,7 +1031,7 @@ class RebuttalIdentityTests(unittest.TestCase):
     def test_a_rebuttal_lapses_when_an_instance_file_changes(self) -> None:
         """Review of sd:9769: a later commit can turn an instance, not the primary file, into the branch's own
         regression; a rebuttal holds only while every file the finding names is unchanged."""
-        body = adjudicated(("bin/tool.py", "defect", "rebutted"))  # its instance: src.py:1
+        body = adjudicated(("bin/tool.py", "defect", "rebutted"), instances=["bin/tool.py:1", "src.py:1"])
         seen = sd_review.rebuttals([(body,)], {ON_BRANCH}.__contains__, lambda _head, path: path != "src.py")
         self.assertEqual([entry.listed for entry in seen], [False], "a changed instance file kept the rebuttal")
 

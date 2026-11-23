@@ -1114,11 +1114,16 @@ class LineBudgetTests(unittest.TestCase):
         # `instance_rows`, so each place a prior blocker's `instances` name
         # holds it, and the rebuttal filter reads those instances.
         # Measured: `sd-review` is 3118 here.
+        #
+        # 5088 -> 5092 is the next build/sd-1623 review: `bin/sd-review` +4
+        # so `recorded_at` matches a rebuttal at any place it answered and a
+        # moved blocker also holds its hunk's place. Measured: `sd-review`
+        # is 3122 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5088,
+            5092,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
