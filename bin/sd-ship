@@ -882,9 +882,11 @@ class Ship(SharedReview):
         pending = self.state.get("pending")
         if pending and (self.args.abandon_copilot_review is None
                         or any(self.state.get(key) != value for key, value in pending.items())):
+            owed = ("; that prepare asks again for the Copilot review an earlier one could not request, and "
+                    "`--copilot-review skip` withdraws it" if self.state.get("copilot_review_owed") else "")
             raise Refusal("the last prepare did not finish, as one whose Copilot request failed: it saved a "
                           "title, body or delivery claim and did not publish them; "
-                          "nothing merged: prepare again, then merge", code="prepare_required",
+                          f"nothing merged: prepare again, then merge{owed}", code="prepare_required",
                           state="operator_decision",
                           next_action="Run sd-ship prepare again with the same identity, then merge.")
 
@@ -1074,11 +1076,12 @@ class Ship(SharedReview):
             raise Refusal(f"item acceptance scope changed after the delivery claim; a running lane entry "
                           f"for sd:{self.args.item} (step {self.lane_row.get('step')}, pid "
                           f"{(self.lane_row.get('holder') or {}).get('pid')}) holds the item on this host, so "
-                          f"this prepare counts as the lane's and does not renew it: let that entry end, or "
-                          f"release it with `sd-ship lane cancel {self.args.item}`, then run "
-                          f"`{self.renew_command()}` by hand", code="lane_entry_running", boundary="input",
-                          state="operator_decision",
-                          next_action="Let the running lane entry end or cancel it, then prepare by hand.")
+                          f"this prepare counts as the lane's and does not renew it: let that entry end, or, "
+                          f"when its runner is gone, release it with `sd-ship lane cancel {self.args.item}` (a "
+                          f"cancel refuses a live runner), then run `{self.renew_command()}` by hand",
+                          code="lane_entry_running", boundary="input", state="operator_decision",
+                          next_action="Let the running lane entry end, or cancel it once its runner is gone, "
+                                      "then prepare by hand.")
 
     def refuse_stale_evidence(self, claim: dict, stored: dict) -> None:
         """Refuse a renewal whose evidence is the old claim's (`stale_criteria`), before anything is saved."""
@@ -1426,24 +1429,39 @@ class Ship(SharedReview):
         return copilot.get("automatic") is True
 
     def persist_copilot_direction(self) -> None:
+        """Record the operator's explicit direction before any step that can fail.
+
+        `request` stays owed until a request is recorded: a prepare whose
+        request GitHub refused is retried without the flag, as merge advises,
+        and that retry must not choose again and publish without the review
+        (sd:9268 review). `skip` withdraws it.
+        """
         suppressed = self.state.get("copilot_review_suppressed", False)
         if type(suppressed) is not bool:
             raise Refusal("Copilot review suppression receipt is malformed")
         if self.args.copilot_review == "skip" and not suppressed:
             self.save(copilot_review_suppressed=True)
+        owed = self.args.copilot_review == "request"
+        if self.args.copilot_review != "auto" and bool(self.state.get("copilot_review_owed")) != owed:
+            self.save(copilot_review_owed=owed)
 
     def clear_copilot_suppression(self) -> None:
         suppressed = self.state.get("copilot_review_suppressed", False)
         if type(suppressed) is not bool:
             raise Refusal("Copilot review suppression receipt is malformed")
-        if self.args.copilot_review == "request" and suppressed:
+        owed = bool(self.state.get("copilot_review_owed"))  # recorded now, so paid, with what it was to lift
+        if (self.args.copilot_review == "request" or owed) and suppressed:
             self.save(copilot_review_suppressed=False)
+        if owed:
+            self.save(copilot_review_owed=False)
 
     def copilot_selection(self, pull: dict, mode: str) -> tuple[str, bool, dict | None]:
         selection = self.args.copilot_review
         suppressed = self.state.get("copilot_review_suppressed", False)
         if type(suppressed) is not bool:
             raise Refusal("Copilot review suppression receipt is malformed")
+        if selection == "auto" and self.state.get("copilot_review_owed"):
+            selection = "request"  # the explicit request an earlier prepare could not record
         if selection == "skip":
             return selection, False, {"decision": "skipped", "reason": "task-scoped suppression"}
         if selection == "auto" and suppressed:
@@ -2463,18 +2481,29 @@ class Ship(SharedReview):
         A reprepare that pushed and reviewed `head`, then refused, left its own
         set pending; a merge on GitHub at `head` lands what the published set
         and claim do not describe (sd:9268 round 8). The merge is recorded.
+
+        A hand delivery of the claimed item at `commit` is the operator's
+        answer, as for a scope change after the merge. No prepare can read the
+        set again once the pull request merged, so the answer binds an empty
+        set to `head`: reconcile closes none of the items it could not vouch
+        for, an item the operator left open stays open, and the receipt
+        settles (owed closes, cleanup).
         """
         stored = self.state.get("closing")
         if self.args.no_item or stored is None or stored.get("head") == head:
             return
         if not (self.state.get("deliver") or stored.get("items")):
             return
+        if self.state.get("deliver") and self.delivered_at(commit):
+            self.save(closing={"head": head, "items": []})
+            return
         raise Refusal(f"the pull request merged at {commit[:12]} from head {head[:12]}, and the published closing "
                       f"set and delivery claim were read at {str(stored.get('head'))[:12]}; nothing is delivered "
-                      f"or closed: check the merged change against each item, then {self.by_hand(commit)}, and "
-                      f"close each item it delivers the same way", code="closing_set_stale", boundary="input",
-                      state="operator_decision",
-                      next_action="Deliver or close each item the merged change delivers by hand.")
+                      f"or closed: check the merged change against each item, then {self.by_hand(commit)}, "
+                      f"close each item it delivers the same way, then run `sd-ship reconcile`, which closes no "
+                      f"other item", code="closing_set_stale", boundary="input", state="operator_decision",
+                      next_action="Deliver or close each item the merged change delivers by hand, then run "
+                                  "sd-ship reconcile.")
 
     def item_status(self, number: int) -> str | None:
         row = self.connection.execute("SELECT status FROM item WHERE id = ?", (number,)).fetchone()

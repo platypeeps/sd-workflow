@@ -46,6 +46,13 @@ and when a stored claim, body or flag goes stale. Two rules answer it.
   `prepare_required` while one waits, in every mode (`merge_scope`).
   The Copilot request is outside the set, so an equal set merges only
   with `--abandon-copilot-review`, which needs a request receipt.
+- A refusal's printed way out must clear it, and must not pass its own
+  guard by another door. An explicit Copilot request stays owed on the
+  receipt (`copilot_review_owed`) until a request is recorded or
+  `--copilot-review skip` withdraws it, so the retry merge advises asks
+  again. A hand delivery at the merge commit answers a reconcile of an
+  unbound closing set: it binds an empty set to the merged head, and
+  reconcile closes no item it could not vouch for.
 
 Rejected: check the closing head for `--no-item` merges. It covers one
 mode; a pending body can wait in any mode.
@@ -79,7 +86,12 @@ the `renewed` mark in `bin/sd-ship`. Tests are in
 | reconcile read of scope | `merged`, the closing set | the item changed after the merge | refuses; the advice delivers by hand | `test_a_scope_change_after_the_merge_gives_the_merged_advice` |
 | renewal evidence text | none | old evidence with a trailing space, line break or renamed criterion | folded the same; refuses before any save | `test_a_renewal_whose_evidence_differs_only_in_spacing_or_its_criterion_name_refuses` |
 | reconcile of another head | `merged` recorded | a reprepare pushed a tip, then refused; GitHub merged that tip | refuses `closing_set_stale`; nothing delivered or closed; deliver by hand | `test_a_reconcile_of_a_head_the_published_closing_set_was_not_read_at_refuses` |
-| hand prepare under a lane row | none | a running row with no lane mark counts it as the lane's | refuses `lane_entry_running`, naming the row and `sd-ship lane cancel` | `test_a_hand_prepare_held_by_a_running_lane_row_names_that_row` |
+| reconcile after that hand delivery | `closing` bound to the merged head, no items | the refusal had no hand-delivery escape and no prepare runs after a merge, so it never cleared: no owed close paid, no cleanup | the claimed item delivered at the commit is the answer; reconcile closes no other item and settles | `test_a_hand_delivery_settles_a_reconcile_of_an_unbound_closing_set` |
+| hand prepare under a lane row | none | a running row with no lane mark counts it as the lane's | refuses `lane_entry_running`, naming the row; the entry ends, or `sd-ship lane cancel` releases one whose runner is gone; then the prepare by hand renews | `test_a_hand_prepare_held_by_a_running_lane_row_names_that_row` |
+| explicit Copilot request | `copilot_review_owed` set before any step that can fail | GitHub refuses the request; the retry merge advises ran without the flag, chose `not_selected` and published without the review, on a first prepare too | the retry asks again; a recorded request pays it and lifts the suppression it was to lift; `--copilot-review skip` withdraws it | `test_a_plain_retry_after_a_failed_explicit_copilot_request_still_owes_it`, `test_a_first_prepare_whose_explicit_copilot_request_failed_still_owes_it`, `test_an_owed_copilot_request_outlasts_the_suppression_it_was_to_lift`, `test_an_explicit_skip_withdraws_an_owed_copilot_request` |
+| scope refusal before a merge | none | the printed renewal was never followed in a test | the printed command, run by hand with fresh evidence, renews; merge lands | `test_a_scope_change_before_the_merge_says_nothing_merged` |
+| body refusal, the entry's body by hand | `body_bases` maps the entry's body to itself | that way out was never followed in a test | a prepare by hand with the entry's body, then a retry of the entry, proceeds | `test_a_lane_retry_with_the_body_a_renewal_replaced_refuses` |
+| untied lane prepare, the retry | none | the retry it names was never followed in a test | once the running entry ended, a retried entry proceeds | `test_a_lane_prepare_whose_body_is_not_its_running_entrys_refuses` |
 | lane retry after a renewal | none | old items, evidence or body | refuses `delivery_claim_renewed` before any save | `test_a_lane_retry_of_an_entry_older_than_a_renewal_refuses`, `test_a_lane_retry_with_the_items_a_renewal_dropped_refuses`, `test_a_lane_retry_with_the_body_a_renewal_replaced_refuses` |
 | lane prepare on a renewed claim | none | the published body mixes the entry's words with the lane's Screenshots section, drawn per run, and the pull request keeps the body it was opened with | the entry's body is read from its running queue row and tied to this prepare's body; `body_bases` records the words each published text was made from; no text is read to guess | `test_a_stale_entry_cannot_restore_the_screenshots_a_renewal_removed`, `test_a_retry_of_the_renewals_body_proceeds_whatever_the_lane_draws`, `test_a_renewal_of_a_body_the_lane_published_keeps_the_entrys_basis`, `test_a_lane_body_differs_from_a_renewals_in_any_byte_but_the_lanes_own_section` |
 | lane prepare that outlived its runner | none | it reads a newer entry's row as its own | a row another runner holds, or an untied body, refuses `lane_unknown` before any save | `test_a_lane_prepare_whose_body_is_not_its_running_entrys_refuses`, `test_a_lane_prepare_its_runner_does_not_hold_the_entry_of_refuses` |
@@ -106,6 +118,15 @@ the `renewed` mark in `bin/sd-ship`. Tests are in
   prints one unrelated help line. The branch was never pushed, and the
   serving checkout is pinned to main. The second case also has the same
   recorded bytes as a body the lane published, which must retry.
+
+## Ceilings
+
+- A hand delivery is the only answer to a merged pull request whose
+  claim reconcile cannot vouch for (scope changed, base advanced, or
+  another head). An operator who finds the claimed item undelivered has
+  no command that settles the receipt; this holds on main for the first
+  two. A settle-without-delivery verb would be a new mechanism, so it
+  is not built here.
 
 ## Risks
 
