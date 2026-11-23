@@ -536,6 +536,28 @@ class CitedIdTests(unittest.TestCase):
         self.assertEqual(sd_ship_body.quoted_lines("x `<!--` y\nz\n"), set())
         self.assertEqual(sd_ship_body.quoted_lines("x ` <!-- y\nz\n"), {2, 3})
 
+    def test_an_escape_or_a_wrapped_span_decides_a_comment(self) -> None:
+        """pack sd:9666 review, round 13: an escaped backtick opened a code span that hid a real `<!--`,
+        and a code span wrapped onto the next line did not hide the `<!--` inside it."""
+        a, b, c = "a" * 7, "b" * 7, "c" * 7
+        escaped = (f"Reverted commits:\n\n- {a} renew\n  \\` example <!-- `\n  - {b} retained\n"
+                   f"- {c} renew\n")
+        self.assertEqual(sd_ship_body._listed_undone(escaped), [a, c])
+        wrapped = f"A `span\n<!-- inside` end.\n\nReverted commits:\n\n- {a} renew\n"
+        self.assertEqual(sd_ship_body._listed_undone(wrapped), [a])
+        cases = {
+            "x \\<!-- y\nz\n": set(),  # an escaped `<` opens no comment
+            "x \\\\`a <!-- b`\nz\n": set(),  # an escaped backslash leaves the span's backtick
+            "x `a\n<!-- b`\nz\n": set(),  # a span closes on the paragraph's next line
+            "x `a <!-- b\nz\n": {2, 3},  # no closer in the paragraph: the backtick is text
+            "x `a\n\n<!-- b`\nz\n": {4, 5},  # a blank line ends the paragraph and the span
+            "x `a\n- <!-- b`\n  c\n- z\n": {3},  # an item ends the paragraph and the span
+            "x `a\n- `b\n  <!-- c`\n": set(),  # the item's own span wraps inside the item
+        }
+        for body, quoted in cases.items():
+            with self.subTest(body=body):
+                self.assertEqual(sd_ship_body.quoted_lines(body), quoted)
+
     def test_markers_on_one_line_open_an_empty_parent(self) -> None:
         """pack sd:9666 review, round 12, blocker 3: `- - <sha>` under `Reverted commits:` undid the
         commit, though the empty parent item holds it, as it does across two lines."""

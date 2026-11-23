@@ -98,9 +98,23 @@ def _blocks(body: str, comments: bool = True):
     it a heading) or `text`; `opened` counts the list items the line's
     markers open, even when a fence or code follows them; `depth` counts
     the items open after them; `text` is the line past their text column.
+
+    A code span may wrap onto the next lines of its paragraph. An opening
+    backtick run that no line of the paragraph closes is text, so the read
+    runs again with that run taken as text, until every span closes.
     """
+    literal: set[tuple[int, int]] = set()
+    while True:
+        rows, unclosed = _blocks_once(body, comments, literal)
+        if unclosed is None:
+            return rows
+        literal.add(unclosed)  # ponytail: a reread per unclosed run; a commit message has few
+
+
+def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]]):
+    """`_blocks` once, each backtick run in `literal` taken as text; with the opener of a span left unclosed."""
     fence, fence_depth, commented, comment_depth, loose = "", 0, False, 0, True  # loose: no paragraph runs on
-    depth = 0
+    depth, ticks, span_at, rows = 0, "", (0, 0), []
     items: list[int] = []  # the text column of each open list item, outermost first
     for number, line in enumerate(body.split("\n"), start=1):
         line = line.rstrip("\r").expandtabs(4)
@@ -109,19 +123,36 @@ def _blocks(body: str, comments: bool = True):
         if fence and len(items) >= fence_depth:
             fence = "" if _closes(_FENCE_RE.match(rest), fence) else fence
             loose = True  # a fence is no paragraph: indented code may follow its closing line
-            yield number, "fence", 0, len(items), rest, line
+            rows.append((number, "fence", 0, len(items), rest, line))
             continue
         fence = ""  # the list item that held the fence ended, and the fence with it
         kind, opened, text = _kind(rest, items, loose, commented, lazy=len(items) != depth)
+        alone = _stands_alone(kind, text, line)
+        if ticks and (alone or kind != "text" or opened or len(items) != depth):
+            return rows, span_at  # the paragraph ended with the span open: its opener is text
         if kind == "fence" and (opener := _FENCE_RE.match(text)):  # `_kind` matched it already
             fence, fence_depth = opener["fence"], len(items)
-        elif kind != "code":
+        elif kind != "code" and comments:
             was = commented
-            commented = comments and _comment_open(line, commented)
+            commented, ticks, span_at = _inline(line, number, commented, ticks, span_at, literal)
             comment_depth = len(items) if commented and not was else comment_depth
-        loose = kind in ("fence", "code", "setext") or not line.strip() or bool(_ATX.match(text) or _BREAK.match(text))
+        loose = alone
         depth = len(items)  # a heading or a break is one line, no paragraph; `depth` finds a lazy line
-        yield number, kind, opened, len(items), text, line
+        rows.append((number, kind, opened, len(items), text, line))
+    return rows, (span_at if ticks else None)
+
+
+def _inline(line: str, number: int, commented: bool, ticks: str, span_at: tuple[int, int],
+            literal: set[tuple[int, int]]) -> tuple[bool, str, tuple[int, int]]:
+    """`_comment_open` on line `number`, with the opener of the code span left open after it."""
+    before = ticks
+    commented, ticks, column = _comment_open(line, commented, ticks, {c for n, c in literal if n == number})
+    return commented, ticks, (number, column) if ticks and not before else span_at
+
+
+def _stands_alone(kind: str, text: str, line: str) -> bool:
+    """Whether the line is no paragraph text: a fence, code, an underline, a blank, a heading or a break."""
+    return kind in ("fence", "code", "setext") or not line.strip() or bool(_ATX.match(text) or _BREAK.match(text))
 
 
 def _kind(rest: str, items: list[int], loose: bool, commented: bool, lazy: bool = False) -> tuple[str, int, str]:
@@ -175,32 +206,38 @@ def _item_text(line: str, items: list[int], opens: bool) -> str:
     return line[items[-1]:] if items else line
 
 
-#: The next `<!--`, or a backtick run that may open a code span, which holds a `<!--` as text.
-_COMMENT_OR_TICKS = re.compile(r"<!--|`+")
+#: A backslash escape of a backslash, backtick or `<`; the next `<!--`; or a backtick run.
+_INLINE = re.compile(r"\\[\\`<]|<!--|`+")
 
 
-def _comment_open(line: str, commented: bool) -> bool:
-    """Whether an HTML comment is open after `line`, given whether one was open before it.
+def _comment_open(line: str, commented: bool, ticks: str = "", literal=frozenset()) -> tuple[bool, str, int]:
+    """After `line`: whether an HTML comment is open, the backtick run of a code span still open, and its column.
 
-    Outside a comment a code span outranks it: `<!--` between two backtick
-    runs of one length is text. A run with no closer on the line is text.
+    `commented` and `ticks` say what was open before `line`. Outside a
+    comment a code span outranks it: `<!--` in a span is text, and so is
+    an escaped `\\<` or `\\``. A span closes on a run of its length; a
+    backslash in it is text. A run whose column is in `literal` is text.
     """
-    # ponytail: a code span read on one line; one that wraps across lines is not seen.
+    position, column = 0, -1
     while True:
         if commented:
-            end = line.find("-->")
+            end = line.find("-->", position)
             if end < 0:
-                return True
-            commented, line = False, line[end + 3:]
-            continue
-        match = _COMMENT_OR_TICKS.search(line)
-        if match is None:
-            return False
-        if match[0] == "<!--":
-            commented, line = True, line[match.end():]
-            continue
-        close = re.compile(r"(?<!`)" + match[0] + r"(?!`)").search(line, match.end())
-        line = line[close.end():] if close else line[match.end():]
+                return True, "", -1
+            commented, position = False, end + 3
+        elif ticks:
+            close = re.compile(r"(?<!`)" + ticks + r"(?!`)").search(line, position)
+            if close is None:
+                return False, ticks, column
+            ticks, position = "", close.end()
+        elif (match := _INLINE.search(line, position)) is None:
+            return False, "", -1
+        else:
+            position = match.end()
+            if match[0] == "<!--":
+                commented = True
+            elif match[0][0] == "`" and match.start() not in literal:
+                ticks, column = match[0], match.start()
 
 
 def owned_lines(body: str) -> list[OwnedLine]:
