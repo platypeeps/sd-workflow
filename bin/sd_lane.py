@@ -3005,6 +3005,8 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
         if why is not None:
             return {"status": "failed", "reason": why[:600]}
         pull = train_pull(api, branch, base, f"chore(lane): land the train of {names}")
+        if "declared_gap" in api.gate(base, tip):  # no protection checks the tip, so every check must, as alone
+            api.every_check(tip)
         message = train_message(root, tip, base, len(items))
         if message is None:
             return {"status": "failed", "pull": pull,

@@ -6702,6 +6702,26 @@ roles:
         self.assertEqual(self.connection.execute("SELECT status FROM item WHERE id=?", (self.item,)).fetchone()[0],
                          "in_progress")
 
+    def test_land_train_under_a_declared_gap_needs_every_check_at_the_tip(self):
+        """Review of sd:9923: a lone merge under a declared gap needs every
+        check, the pull_request workflows too, at the exact head it lands;
+        the train merged its tip with its members' runs alone."""
+        tip = self.joined_tip()
+        member = _git(self.root, "rev-parse", "topic")
+        self.remote.protection = None
+        set_declaration(self.connection, str(self.operator), "status", DeclaredGapCase.DECLARATION)
+        self.double.workflow_runs = [{"path": ".github/workflows/tests.yml", "name": "tests.yml",
+                                      "event": "pull_request", "status": "completed",
+                                      "conclusion": "success", "head_sha": member}]
+        main = _git(self.remote.path, "rev-parse", "main")
+        with patch.object(ship.GitHub, "expected_workflows",
+                          lambda api, head: [(".github/workflows/tests.yml", "Tests")]):
+            landed, _ = self.landed_by_lane(tip)
+        self.assertEqual(landed["status"], "failed")
+        self.assertIn(tip, landed["reason"])
+        self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
+        self.assertEqual(_git(self.remote.path, "rev-parse", "main"), main)
+
     def test_land_train_that_github_refuses_lands_nothing(self):
         tip = self.joined_tip()
         saved = self.double._route
