@@ -357,6 +357,9 @@ HANDED_BACK = "handed_back"
 MEMBER_LEFT = "member_cancelled_alone"
 #: A `Closes:` trailer cites a blocked item that no `--item` names and no `Refs:` keeps (sd:9918).
 CITED_BLOCKED = "cited_blocked"
+#: Set on every `sd-ship` the runner starts: a lane prepare never renews a delivery claim, even once a forced
+#: runner stop leaves it running under another parent (sd:9335).
+LANE_CHILD = "SD_LANE_CHILD"
 #: The refusal code of a cancel whose `--expected-claim` no longer holds the item's running entry (sd:3330).
 STALE_CLAIM = "stale_claim"
 #: The refusals of a cancelled entry's retry (sd:3389): its item has a newer entry, or merged at its head.
@@ -1966,7 +1969,7 @@ def ship_process(argv: list[str], log: pathlib.Path, timeout: int) -> dict[str, 
     log.parent.mkdir(parents=True, exist_ok=True)
     try:
         done = sd_lib.run_group([sys.executable, str(BIN / "sd-ship"), *argv], cwd=pathlib.Path("."),
-                                env=dict(os.environ), timeout=timeout)
+                                env={**os.environ, LANE_CHILD: "1"}, timeout=timeout)
         out, err = done.stdout, done.stderr
     except sd_lib.GroupTimeout as error:
         out, err = error.stdout, f"timed out after {timeout} s\n{error.stderr}"
