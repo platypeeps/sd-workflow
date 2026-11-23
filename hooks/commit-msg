@@ -65,15 +65,20 @@ def main(argv: list[str]) -> int:
         return 1
     message = message_file.read_text(encoding="utf-8", errors="replace")
     # pack sd:10212: the lane refuses a line over the limit at enqueue, after a full review; refuse it here.
-    # A merge is git's own message (sd-ship's catch-up merge runs this hook too), so it is not measured.
-    merging = sd_lib.git_output(["rev-parse", "--git-path", "MERGE_HEAD"], root)
-    if not (merging and (root / merging.strip()).is_file()):
-        # Git drops a verbose commit's diff below the scissors after this hook runs. The refusal quotes
-        # the line, since git's later cleanup can renumber lines.
-        # ponytail: `#` lines are skipped; git keeps them under -m/-F, so such a long line still reaches
-        # the lane (filed with the --body-only advisory). Reading the cleanup mode would close it.
-        above = message.split("\n# " + "-" * 24 + " >8 " + "-" * 24 + "\n", 1)[0]
-        kept = [line for line in above.split("\n") if not line.startswith("#")]
+    # A merge, revert, cherry-pick or rebase replays git's own message (sd-ship's catch-up merge runs
+    # this hook too), so it is not measured; the lane still measures what lands.
+    replaying = any(
+        (path := sd_lib.git_output(["rev-parse", "--git-path", name], root)) and (root / path).exists()
+        for name in ("MERGE_HEAD", "REVERT_HEAD", "CHERRY_PICK_HEAD", "rebase-merge", "rebase-apply"))
+    if not replaying:
+        # Git drops comment lines, a verbose commit's diff below the scissors and trailing spaces
+        # after this hook runs. The refusal quotes the line, since that cleanup can renumber lines.
+        # ponytail: comment lines are skipped though git keeps them under -m/-F, and commentChar=auto
+        # reads as `#`; the lane still refuses such a line (filed with the --body-only advisory).
+        char = (sd_lib.git_output(["config", "core.commentChar"], root) or "").strip()
+        char = char if char and char != "auto" else "#"
+        above = message.split(f"\n{char} " + "-" * 24 + " >8 " + "-" * 24 + "\n", 1)[0]
+        kept = [line.rstrip() for line in above.split("\n") if not line.startswith(char)]
         long = sd_ship_body.long_lines("\n".join(kept))
         if long:
             for number, length in long:

@@ -244,6 +244,35 @@ class TheHook(HookFixture):
                                 check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_editor_trailing_spaces_do_not_count(self):
+        """Review round 3: on the editor path the hook sees the spaces git strips after it."""
+        editor = "sh -c 'printf \"fix: a subject\\n\\n%s   \\n\" " + "e" * 72 + " > \"$1\"' -"
+        result = subprocess.run(["git", "commit", "-q", "--allow-empty", "-e", "-m", "x"], cwd=self.root,
+                                env=clean_environment(GIT_EDITOR=editor), capture_output=True, text=True,
+                                check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_verbose_commit_with_another_comment_char_commits(self):
+        """Review round 3: core.commentChar moves both the comment lines and the scissors."""
+        (self.root / "wide.txt").write_text("w" * 90 + "\n", encoding="utf-8")
+        git("add", "wide.txt", cwd=self.root)
+        result = subprocess.run(["git", "-c", "core.commentChar=;", "commit", "-q", "-v", "-e", "-m", "fix: a"],
+                                cwd=self.root, env=clean_environment(GIT_EDITOR="true"), capture_output=True,
+                                text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_revert_of_a_long_subject_commits(self):
+        """Review round 3: `Revert "<subject>"` is git's own line; a 70-character subject makes 80."""
+        (self.root / "undo.txt").write_text("u\n", encoding="utf-8")
+        git("add", "undo.txt", cwd=self.root)
+        self.assertEqual(self.commit("fix: " + "r" * 65 + "\n").returncode, 0)
+        # `git revert` itself runs no commit-msg; a revert that stops (-n, or a conflict) and is then
+        # finished by `git commit` does, with REVERT_HEAD set.
+        git("revert", "-n", "HEAD", cwd=self.root)
+        result = subprocess.run(["git", "commit", "-q", "--no-edit"], cwd=self.root,
+                                env=clean_environment(), capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_a_long_bare_url_or_fenced_line_still_commits(self):
         url = "https://example.test/" + "a" * 80
         result = self.commit(f"fix: a subject\n\n{url}\n\n```\n{'y' * 90}\n```\n")
