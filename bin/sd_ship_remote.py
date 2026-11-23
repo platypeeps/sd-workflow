@@ -202,14 +202,14 @@ class GitHub:
         except (OSError, subprocess.SubprocessError) as error:
             raise Refusal(f"gh could not finish: {error}", code="command_unavailable", boundary="runtime",
                           state="retryable_failure", next_action="Restore command access, then retry this command.") from None
-        head, _, body = result.stdout.partition("\n\n")
+        head, _, answer = result.stdout.partition("\n\n")
         match = re.match(r"HTTP/[\d.]+ (\d{3})", head)
         if not match:
             raise Refusal((result.stderr or "gh api returned no HTTP status line").strip()[:2000],
                           code="command_failed", boundary="runtime", state="retryable_failure",
                           next_action="Inspect the command error, resolve its cause, then retry.")
         try:
-            return int(match[1]), json.loads(body)
+            return int(match[1]), json.loads(answer)
         except ValueError:
             raise Refusal("GitHub returned unreadable JSON") from None
 
