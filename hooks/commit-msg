@@ -65,18 +65,23 @@ def main(argv: list[str]) -> int:
         return 1
     message = message_file.read_text(encoding="utf-8", errors="replace")
     # pack sd:10212: the lane refuses a line over the limit at enqueue, after a full review; refuse it here.
-    # Git drops comment lines and a verbose commit's diff below the scissors after this hook runs,
-    # so both are left out and a line number counts the message git keeps.
-    above = message.split("\n# " + "-" * 24 + " >8 " + "-" * 24 + "\n", 1)[0]
-    kept = "\n".join(line for line in above.split("\n") if not line.startswith("#"))
-    long = sd_ship_body.long_lines(kept)
-    if long:
-        for number, length in long:
-            print(f"commit-msg: refused, line {number} is {length} characters "
-                  f"(limit {sd_ship_body.LINE_LIMIT})", file=sys.stderr)
-        print("Rewrap it; a fenced code line or a bare URL line is exempt. "
-              "The rejected message is kept in .git/COMMIT_EDITMSG.", file=sys.stderr)
-        return 1
+    # A merge is git's own message (sd-ship's catch-up merge runs this hook too), so it is not measured.
+    merging = sd_lib.git_output(["rev-parse", "--git-path", "MERGE_HEAD"], root)
+    if not (merging and (root / merging.strip()).is_file()):
+        # Git drops a verbose commit's diff below the scissors after this hook runs. The refusal quotes
+        # the line, since git's later cleanup can renumber lines.
+        # ponytail: `#` lines are skipped; git keeps them under -m/-F, so such a long line still reaches
+        # the lane (filed with the --body-only advisory). Reading the cleanup mode would close it.
+        above = message.split("\n# " + "-" * 24 + " >8 " + "-" * 24 + "\n", 1)[0]
+        kept = [line for line in above.split("\n") if not line.startswith("#")]
+        long = sd_ship_body.long_lines("\n".join(kept))
+        if long:
+            for number, length in long:
+                print(f"commit-msg: refused, a line is {length} characters (limit {sd_ship_body.LINE_LIMIT}): "
+                      f"{kept[number - 1][:40]}...", file=sys.stderr)
+            print("Rewrap it; a fenced code line or a bare URL line is exempt. "
+                  "The rejected message is kept in .git/COMMIT_EDITMSG.", file=sys.stderr)
+            return 1
     if not sd_lib.unread_trailers(message, ""):  # states none of the checked trailers
         return 0
     parsed = sd_lib.git_output(

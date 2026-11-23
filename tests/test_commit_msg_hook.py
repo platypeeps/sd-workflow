@@ -212,7 +212,7 @@ class TheHook(HookFixture):
         """pack sd:10212: 27 lane refusals in 7 days named a commit line the hook let through."""
         result = self.commit("fix: a subject\n\n" + "x" * 73 + "\n")
         self.assertNotEqual(result.returncode, 0, "the commit went through")
-        self.assertIn("commit-msg: refused, line 3 is 73 characters (limit 72)", result.stderr)
+        self.assertIn("commit-msg: refused, a line is 73 characters (limit 72): xxxx", result.stderr)
         self.assertEqual(0, self.commits(), "a commit landed")
 
     def test_a_verbose_commit_is_measured_above_the_scissors_only(self):
@@ -221,6 +221,26 @@ class TheHook(HookFixture):
         git("add", "wide.txt", cwd=self.root)
         result = subprocess.run(["git", "commit", "-q", "-v", "-e", "-m", "fix: a subject"], cwd=self.root,
                                 env=clean_environment(GIT_EDITOR="true"), capture_output=True, text=True,
+                                check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_trailing_spaces_git_strips_do_not_count(self):
+        """Review round 2: git keeps the line without its trailing spaces, so 72 + 3 spaces is 72."""
+        result = self.commit("fix: a subject\n\n" + "t" * 72 + "   \n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_refusal_quotes_the_line_it_measured(self):
+        result = self.commit("fix: a subject\n\n\n\n" + "q" * 73 + "\n")
+        self.assertIn("qqqqqqqqqq", result.stderr)
+
+    def test_a_merge_commit_is_not_measured(self):
+        """Review round 2: git runs commit-msg for `git merge`; sd-ship's catch-up merge must not abort."""
+        self.assertEqual(self.commit("fix: base\n").returncode, 0)
+        git("checkout", "-q", "-b", "side", cwd=self.root)
+        self.assertEqual(self.commit("fix: side\n").returncode, 0)
+        git("checkout", "-q", "-", cwd=self.root)
+        result = subprocess.run(["git", "merge", "-q", "--no-ff", "-m", "Merge " + "m" * 80, "side"],
+                                cwd=self.root, env=clean_environment(), capture_output=True, text=True,
                                 check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
 
