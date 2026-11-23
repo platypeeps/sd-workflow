@@ -93,7 +93,7 @@ def quoted_lines(body: str, comments: bool = True, code: bool = False) -> set[in
         fence = ""  # the list item that held the fence ended, and the fence with it
         if commented:
             quoted.add(number)
-        elif loose and rest.startswith("    ") and rest.strip():
+        elif _code_line(rest, items, loose):
             quoted |= {number} if code else set()
             continue  # an indented code block: a paragraph cannot run into it, so the next line is loose too
         else:
@@ -129,6 +129,19 @@ def _item_text(line: str, items: list[int], opens: bool) -> str:
         while items and len(line) - len(line.lstrip(" ")) < items[-1]:
             items.pop()  # a line indented less than an item's text ends the item
     return line[items[-1]:] if items else line
+
+
+def _code_line(rest: str, items: list[int], loose: bool) -> bool:
+    """Whether `rest`, a line past its list column, is indented code: four spaces in after a blank line,
+    or after the list markers it opens, which `items` then holds (pack sd:9666)."""
+    if rest.startswith("    "):
+        return loose and bool(rest.strip())
+    opened = len(items)
+    text = _item_text(rest, items, opens=True)
+    if text.startswith("    ") and text.strip():
+        return True
+    del items[opened:]  # not code: the caller opens these markers again
+    return False
 
 
 def _comment_open(line: str, commented: bool) -> bool:
@@ -366,6 +379,11 @@ _SHA_LED = re.compile(r"([0-9a-f]{7,40})\b")
 _REVERTED_INTRO = re.compile(r"(?:^|[.!?][ \t]+)(?:reverted(?:[ \t]+commits)?|reverts):[ \t]*$", re.IGNORECASE)
 
 
+def _heading(text: str) -> str:
+    """`text` without the markup a heading wears: `## ` and closing `#`s, and emphasis around it."""
+    return re.sub(r"^#{1,6}[ \t]+|[ \t]+#+$", "", text.strip()).strip("*_ \t")
+
+
 def _listed_undone(message: str) -> list[str]:
     """The shas a hand-written revert lists as undone (pack sd:9666).
 
@@ -394,10 +412,10 @@ def _listed_undone(message: str) -> list[str]:
             if sha := _SHA_LED.match(text):
                 found += [sha[1]] if holder else []
             else:
-                holder = text.endswith(":") and bool(_REVERTED_INTRO.search(text))
+                holder = bool(_REVERTED_INTRO.search(_heading(text)))
             undoes += [holder] * (len(items) + 1 - len(undoes))
-        elif line.rstrip().endswith(":") or not line[0].isspace():  # an indented line continues an item
-            undoes[-1] = bool(_REVERTED_INTRO.search(line.strip()))
+        elif _heading(line).endswith(":") or not line[0].isspace():  # an indented line continues an item
+            undoes[-1] = bool(_REVERTED_INTRO.search(_heading(line)))
     return found
 
 
@@ -410,7 +428,9 @@ def kept_commits(commits, parents=None) -> list:
     itself reverted undoes nothing, so its target stays. A hand-written
     revert (`REVERT_SUBJECT`) also undoes each commit its list of reverted
     commits names (`_listed_undone`): a split listed its commits by short
-    sha, and the squash closed the items they cited (pack sd:9666).
+    sha, and the squash closed the items they cited (pack sd:9666). A
+    listed merge names no mainline, so it undoes itself alone: the lane's
+    file check (`sd_lane.unreverted`) decides each commit it brought in.
     """
     parents = parents or {}
 
@@ -442,10 +462,9 @@ def kept_commits(commits, parents=None) -> list:
             undone |= ancestors(full(target)) - ancestors(full(mainline)) if mainline else {full(target)}
         if REVERT_SUBJECT.match(message):
             # git's trailer names a commit's mainline; listing that commit too adds nothing to it.
-            for target in set(filter(None, map(only, _listed_undone(message)))) - trailed:
-                # A listed merge undoes what it brought in over its first parent, as `git revert -m 1` would.
-                mainline = parents.get(target, ())[:1]
-                undone |= ancestors(target) - ancestors(mainline[0]) if mainline else {target}
+            # A listed merge names no mainline, so it undoes itself alone; `sd_lane.unreverted` reads
+            # each commit it brought in at the head. git's trailer names a mainline (pack sd:9666).
+            undone |= set(filter(None, map(only, _listed_undone(message)))) - trailed
         kept.append((sha, message))
     return kept
 

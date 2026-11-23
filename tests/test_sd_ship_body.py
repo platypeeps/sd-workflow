@@ -421,6 +421,24 @@ class CitedIdTests(unittest.TestCase):
         revert = self.revert_of(f"Kept commits:\n\n    Reverted commits:\n\n- {kept[:9]} kept\n")
         self.assertEqual(sd_ship_body.cited_ids("", [revert, (kept, "fix: y\n\nCloses: sd:4\n")]), (4,))
 
+    def test_code_after_a_list_marker_opens_no_comment(self) -> None:
+        """pack sd:9666 review, round 8, instance 1: `-     <!--` starts an item whose text is indented
+        code, yet it opened a comment that hid the real revert after it."""
+        undone = "a" * 40
+        self.assertEqual(sd_ship_body.quoted_lines("-     <!--\n\n- b\n"), set())
+        revert = self.revert_of(f"Reverted commits:\n\n-     <!--\n\n- {undone[:9]} actual revert\n")
+        self.assertEqual(sd_ship_body.cited_ids("", [revert, (undone, "feat: x\n\nCloses: sd:2\n")]), ())
+
+    def test_a_markdown_heading_says_reverted(self) -> None:
+        """pack sd:9666 review, round 8, instance 3: `## Reverted commits:` failed the heading match, so
+        the commit it listed still closed its item. Emphasis around a heading is markup too."""
+        undone = "a" * 40
+        for heading in ("## Reverted commits:", "### Reverted commits: ###", "**Reverted commits:**",
+                        "- **Reverted:**"):
+            with self.subTest(heading=heading):
+                revert = self.revert_of(f"{heading}\n\n  - {undone[:9]} actual revert\n")
+                self.assertEqual(sd_ship_body.cited_ids("", [revert, (undone, "feat: x\n\nCloses: sd:2\n")]), ())
+
     def test_a_fence_on_a_list_marker_line_is_an_example(self) -> None:
         """pack sd:9666 review, round 5, instance 2: `- ```text` opened no fence, so the sha bullet in the
         example undid a real commit and dropped its citations."""
@@ -452,16 +470,20 @@ class CitedIdTests(unittest.TestCase):
                 revert = self.revert_of(f"Reverted commits:\n\n{marker} {undone[:9]} renew\n")
                 self.assertEqual(sd_ship_body.cited_ids("", [revert, (undone, "feat: x\n\nCloses: sd:2\n")]), ())
 
-    def test_a_listed_merge_undoes_what_it_brought_in(self) -> None:
-        """pack sd:9666 review, round 3, instance 4: a listed merge sha undid the merge alone, so the side
-        commit it brought in kept its close; `This reverts commit <merge>` with `-m 1` drops it."""
+    def test_a_listed_merge_leaves_its_sides_to_the_file_check(self) -> None:
+        """pack sd:9666 review, round 8: a listed merge with no `This reverts commit` trailer names no
+        mainline, and the first-parent guess undid the wrong side of a `-m 2` revert. The merge alone is
+        undone here; `sd_lane.unreverted` reads each side's files at the head. With the trailer, `-m 1`
+        drops the side commit."""
         base, side, main, merge = (c * 40 for c in "abce")
-        commits = [self.revert_of(f"Reverted commits:\n\n- {merge[:9]} the side branch\n"),
-                   (merge, "Merge branch 'side'"), (main, "fix: mainline\n\nCloses: sd:4"),
-                   (side, "fix: implement\n\nLane review fix, pack sd:3: y.\n\nCloses: sd:2\n"),
-                   (base, "fix: base\n\nCloses: sd:5")]
+        work = [(merge, "Merge branch 'side'"), (main, "fix: mainline\n\nCloses: sd:4"),
+                (side, "fix: implement\n\nLane review fix, pack sd:3: y.\n\nCloses: sd:2\n"),
+                (base, "fix: base\n\nCloses: sd:5")]
         parents = {merge: (main, side), main: (base,), side: (base,), base: ()}
-        self.assertEqual(sd_ship_body.cited_ids("", commits, parents), (4, 5))
+        listed = self.revert_of(f"Reverted commits:\n\n- {merge[:9]} the side branch\n")
+        self.assertEqual(sd_ship_body.cited_ids("", [listed, *work], parents), (4, 2, 5, 3))
+        trailed = self.revert_of(f"This reverts commit {merge}, reversing\nchanges made to {main}.\n")
+        self.assertEqual(sd_ship_body.cited_ids("", [trailed, *work], parents), (4, 5))
 
     def test_a_listed_merge_the_trailer_names_keeps_the_trailers_mainline(self) -> None:
         """pack sd:9666 review, round 6, instance 2: a merge listed beside git's `This reverts commit

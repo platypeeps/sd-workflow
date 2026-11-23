@@ -3564,6 +3564,27 @@ class CitedCloses(SharedQueue):
         entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
         self.assertEqual(entry["closes"], [c])
 
+    def test_a_listed_merge_reverted_against_parent_two_keeps_the_second_parents_work(self) -> None:
+        """pack sd:9666 review, round 8: a hand-written revert that lists a merge, made with `-m 2`, undid
+        the second parent's work by a first-parent guess and closed the first parent's reverted work."""
+        a, c, *_ = self.open
+        tree, _ = self.committed("topic-merge-two")
+        git(tree, "switch", "-q", "-c", "side")
+        (tree / "side.txt").write_text("side\n", encoding="utf-8")
+        git(tree, "add", "side.txt")
+        git(tree, "commit", "-q", "-m", f"fix: implement\n\nCloses: sd:{a}")
+        git(tree, "switch", "-q", "topic-merge-two")
+        (tree / "main.txt").write_text("main\n", encoding="utf-8")
+        git(tree, "add", "main.txt")
+        git(tree, "commit", "-q", "-m", f"fix: mainline\n\nCloses: sd:{c}")
+        git(tree, "merge", "-q", "--no-ff", "--no-edit", "side")
+        merge = git(tree, "rev-parse", "--short=9", "HEAD").strip()
+        git(tree, "revert", "--no-commit", "-m", "2", "HEAD")
+        git(tree, "commit", "-q", "-m", f"revert: drop the mainline half\n\nReverted commits:\n\n- {merge} the merge\n")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [a])
+
     def test_a_range_the_branch_reverts_closes_nothing(self) -> None:
         """Lane review of sd:5999, round 3: `git revert A..B` writes one revert per commit, each naming it."""
         a, b, c, *_ = self.open
