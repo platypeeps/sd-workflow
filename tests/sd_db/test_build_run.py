@@ -1095,9 +1095,10 @@ class Supervise(Case):
                      if "escalated" in body]
         self.assertEqual(len(escalated), 1, "the escalation is not recorded once on the run's item")
 
-    def test_review_rounds_cap_is_three(self):
-        """Operator 2026-11-23 (sd:10111): three rounds with blockers, then the class pass, before a build parks."""
-        self.assertEqual(build_run.REVIEW_ROUNDS, 3)
+    def test_review_rounds_cap_is_two(self):
+        """Operator 2026-11-23 (sd:10128): two rounds with blockers, then the class pass: a park after 3 reviews."""
+        self.assertEqual(build_run.REVIEW_ROUNDS, 2)
+        self.assertEqual(build_run.ESCALATE_AFTER, 1)
 
     def test_review_rounds_rule_reaches_the_builder(self):
         """Pack sd:9584: the brief asks for a failure table on a parser or event matching; the class pass keeps scope."""
