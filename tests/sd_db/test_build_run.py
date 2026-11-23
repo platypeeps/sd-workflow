@@ -218,6 +218,13 @@ FAKE = textwrap.dedent('''
                               "subject": {"head": git("-C", work, "rev-parse", "HEAD")}}))
             sys.exit(4)
         raw = {"path": "work.txt", "line": 1, "severity": "high", "instances": ["src.py:1"], "summary": "a blocker", "family": "correctness"}
+        if mode == "blocking-long":  # two findings past a note's 4000 characters, the first over three lines
+            first = dict(raw, summary="a long blocker\\n- an example bullet\\n" + "x" * 4500)
+            second = dict(raw, path="later.txt", line=9, summary="a later blocker")
+            findings = review.dispose([review._finding(first), review._finding(second)], "high")
+            print(json.dumps({"status": "blocking", "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
+                              "findings": findings}))
+            sys.exit(0)
         findings = review.dispose([review._finding(raw)], "high")  # the record shape `--json` prints
         if mode == "gate_failed":
             print(json.dumps({"status": "gate_failed", "cleared_status": "clean", "findings": [],
@@ -998,12 +1005,11 @@ class Supervise(Case):
     def test_a_usage_limit_claim_resumes_the_step_session_and_round(self):
         """Advisory of PR #1960 (sd:9973): the claim after a usage limit opened at `claimed` with no session and
         round 0, so a bundle limited in its third fix round rebuilt from scratch with a fresh round budget. It
-        resumes as a loss retry does: the step (`RESUME`), the session and the round."""
+        resumes its session and round, and a fix its own step (review of build/sd-1557), not `RESUME`'s."""
         self.press()
         ident = self.bundle["id"]
         reset = int(datetime.now(UTC).timestamp()) + 60
-        self.assertTrue(build.write(self.db, ident, step="fixing", session_id="session-limited",
-                                    review_round=build_run.REVIEW_ROUNDS,
+        self.assertTrue(build.write(self.db, ident, step="fixing", session_id="session-limited", review_round=2,
                                     final=json.dumps({"rate_limit_info": {"resetsAt": reset}})))
         build.end(self.db, ident, build.RATE_LIMITED, "rate limited")
         later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
@@ -1012,11 +1018,53 @@ class Supervise(Case):
                                 root=self.root / "worktrees")
         assert again is not None
         row = build.run(self.db, again["id"])
-        # The fix round it was in was counted before the fix; the resumed review counts it again, so the claim
-        # opens one round back, or that review would count past `REVIEW_ROUNDS` and park the run with its final
-        # fix round unrun (review of build/sd-1654).
-        self.assertEqual((row["step"], row["session_id"], row["review_round"]),
-                         ("reviewing", "session-limited", build_run.REVIEW_ROUNDS - 1))
+        self.assertEqual((row["step"], row["session_id"], row["review_round"]), ("fixing", "session-limited", 2))
+
+    def test_a_usage_limit_claim_keeps_the_question_cutoff(self):
+        """Lane review of build/sd-1557: the reclaim's new run moved the time open questions are read from, so a
+        member skipped with a question asked before the limit returned to planning, its question unseen."""
+        self.press(2)
+        ident = self.bundle["id"]
+        member = self.items[1]
+        reset = int(datetime.now(UTC).timestamp()) + 60
+        self.assertTrue(build.write(self.db, ident, step="fixing", session_id="session-limited", review_round=1,
+                                    final=json.dumps({"rate_limit_info": {"resetsAt": reset}})))
+        add_note(self.db, member, "question", "skipped: which parser?\nOption: a (Recommended)\nOption: b")
+        self.db.execute("UPDATE note SET timestamp = ? WHERE item = ? AND kind = 'question'",
+                        (build.run(self.db, ident)["created_at"], member))
+        self.db.commit()
+        build.end(self.db, ident, build.RATE_LIMITED, "rate limited")
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.assertTrue(build.enqueued(self.db, again["id"], [self.items[0]]))
+        status = self.db.execute("SELECT status FROM assignment WHERE item = ? AND id <> ? ORDER BY id DESC",
+                                 (member, self.bundle["assignment"])).fetchone()["status"]
+        self.assertEqual(status, "blocked", "the question asked before the limit still holds the member")
+
+    def test_a_usage_limit_claim_refuses_a_bundle_whose_lane_moved_off_its_host(self):
+        """Review of build/sd-1557: the claim after a usage limit resumed the old session on whichever host now
+        runs the lane, though the worktree and session stay where the run ran: it refuses, naming that host."""
+        self.press(2)
+        ident = self.bundle["id"]
+        reset = int(datetime.now(UTC).timestamp()) + 60
+        self.assertTrue(build.write(self.db, ident, step="fixing", session_id="session-limited", review_round=1,
+                                    final=json.dumps({"rate_limit_info": {"resetsAt": reset}})))
+        build.end(self.db, ident, build.RATE_LIMITED, "rate limited")
+        # It ran on the satellite `work`; the lane moved to the hub during the hold.
+        self.db.execute("UPDATE runner_run SET owner = 'fixture@work' WHERE id = ?", (ident,))
+        self.db.commit()
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            self.assertIsNone(build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                          root=self.root / "worktrees"))
+        rows = self.db.execute("SELECT status, result FROM assignment WHERE id = ? OR parent = ? ORDER BY id",
+                               (self.bundle["assignment"], self.bundle["assignment"])).fetchall()
+        self.assertEqual([row["status"] for row in rows], ["blocked", "blocked"])
+        self.assertIn(f"build run {ident} hit the usage limit on work", rows[0]["result"])
+        self.assertIn("move its lane back to work", rows[0]["result"])
 
     def test_a_usage_limit_resume_checks_the_worktree_branch_first(self):
         """Review of build/sd-1654 (build.py:1934): the claim after a usage limit resumes at its step, past the
@@ -1121,8 +1169,8 @@ class Supervise(Case):
         self.assertEqual(self.statuses(), ["blocked"])
 
     def test_fix_rounds_past_the_third_escalate(self):
-        """Pack sd:9264: fix rounds 1-3 run on the bundle's model; round 4 on runs on the strongest model at high
-        effort, its brief naming the repeating blockers' class; the park still comes after REVIEW_ROUNDS."""
+        """Pack sd:9264: early fix rounds run on the bundle's model; the class-pass round runs on the strongest
+        model at medium effort (sd:10192), its brief naming the blockers' class; the park stays."""
         R = build_run.REVIEW_ROUNDS
         self.press()
         self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1))], sd_review=["blocking"] * (R + 1))
@@ -1135,7 +1183,7 @@ class Supervise(Case):
         self.assertLess(E, R, "no fix escalates before the park (sd:10111)")
         self.assertEqual(models[:E], [("opus", False)] * E, "an early round escalated")
         self.assertEqual(models[E:], [(build_run.STRONGEST, True)] * (R - E), "a late round did not escalate")
-        self.assertEqual(fixes[E][fixes[E].index("--effort") + 1], "high")
+        self.assertEqual(fixes[E][fixes[E].index("--effort") + 1], "medium", "sd:10192")
         prompts = [argv[argv.index("-p") + 1] for argv in fixes]
         self.assertNotIn("name the class", prompts[E - 1])
         self.assertIn("name the class", prompts[E])
@@ -1904,6 +1952,22 @@ class Supervise(Case):
         far = {"path": "lib/helper.py", "line": 3, "summary": "an old defect in parse()"}
         _, kept = self.deferred([far], {"src/caller.py": {12}})
         self.assertEqual(kept["blockers"], [], "a blocker naming no changed file was held")
+
+    def test_a_conversion_broken_by_a_dropped_check_holds_on_its_repro(self):
+        """Sd:9900 (ruling #68857): a fix drops validation in lib/check.py, and the unchanged conversion in
+        lib/convert.py, which no call ties to it, raises. The reviewer cites the conversion; its `evidence`
+        repro (pack sd:9867) routes the failing input through the dropped check, so the blocker holds."""
+        self.press()
+        row = {"path": "lib/convert.py", "line": 12, "severity": "high", "family": "correctness",
+               "summary": "int(row[1]) raises ValueError on a non-numeric count",
+               "evidence": "input count='abc' passes lib/check.py:4, where the fix dropped the digit check, "
+                           "then lib/convert.py:12 int(row[1]) raises ValueError",
+               "instances": ["lib/convert.py:12"]}
+        _, kept = self.deferred([row], {"lib/check.py": {4}})
+        self.assertEqual(kept["blockers"], [row], "a conversion the dropped check breaks was filed")
+        uncited = dict(row, evidence="input count='abc': lib/convert.py:12 int(row[1]) raises ValueError")
+        _, kept = self.deferred([uncited], {"lib/check.py": {4}})
+        self.assertEqual(kept["blockers"], [], "a repro whose route skips the change held")
 
     def test_a_changed_caller_named_by_function_holds(self):
         """Lead ruling on sd:9769 (deferral eligibility): a reviewer can name the changed caller by its function
@@ -2952,6 +3016,113 @@ class Supervise(Case):
         self.assertIn("body line 3 is 80 characters (limit 72)", fix[fix.index("-p") + 1])
         self.assertIn("Fence each failure table", build_run.BRIEF)
         self.assertIn("`example.test`", build_run.BRIEF)
+
+    def test_a_lane_blocker_with_no_disposition_is_left_to_prepare(self):
+        """Lane review of build/sd-1557: a preflight disposition read spent fix rounds on a finding main may
+        fix, as prepare's catch-up moves the head. Prepare alone, at the final head, checks dispositions."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        ended = self.supervisor().run()
+        self.assertEqual(ended.get("step"), "enqueued", ended.get("outcome"))
+        # The fake `sd-ship` answers only `lane`: a disposition read would fail the run.
+        self.assertEqual([call for call in self.calls("sd-ship") if "adjudicate" in call["argv"]], [])
+
+    def test_a_usage_limit_in_a_fix_resumes_that_fix_without_a_round(self):
+        """Review of build/sd-1557: a limit in the fix resumed at `reviewing`, which charged the same blockers
+        another round. The claim resumes the fix itself, with the round's blockers and session."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "rate_limited"], sd_review=["blocking"])
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.assertEqual(build.run(self.db, again["id"])["step"], "fixing")
+        self.plan(claude=["fix1"], sd_review=["clean"])
+        self.assertEqual(self.supervisor(again["id"]).run()["step"], "enqueued")
+        fix = [call["argv"] for call in self.calls("claude")][-1]
+        self.assertEqual(fix[fix.index("--resume") + 1], "session-fixture")
+        self.assertIn("- work.txt:1 a blocker", fix[fix.index("-p") + 1])
+        self.assertEqual(build.run(self.db, again["id"])["review_round"], 1, "the resumed fix charged no round")
+
+    def test_a_resumed_fix_keeps_every_blocker_whole(self):
+        """Review of build/sd-1557: the resumed fix read its blockers back from the 4000-character note, so a
+        multiline finding lost its tail, its bullet read as a blocker of its own and a later finding was cut.
+        The resumed prompt is the interrupted one."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "rate_limited"], sd_review=["blocking-long"])
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.plan(claude=["fix1"], sd_review=["clean"])
+        self.assertEqual(self.supervisor(again["id"]).run()["step"], "enqueued")
+        limited, resumed = ([call["argv"] for call in self.calls("claude")][n] for n in (1, 2))
+        said = resumed[resumed.index("-p") + 1]
+        self.assertIn("later.txt:9 a later blocker", said)
+        self.assertIn("x" * 4500, said)
+        self.assertEqual(said, limited[limited.index("-p") + 1], "the same brief as the interrupted fix")
+
+    def test_a_usage_limit_in_the_class_pass_resumes_the_class_pass(self):
+        """Review of build/sd-1557: a limit in the last round's class pass resumed with the plain FIX brief, so
+        the class pass never ran before the bound parked the run. It resumes with CLASS_PASS."""
+        R = build_run.REVIEW_ROUNDS
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R)), "rate_limited"], sd_review=["blocking"] * R)
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.plan(claude=["fixc"], sd_review=["clean"])
+        self.assertEqual(self.supervisor(again["id"]).run()["step"], "enqueued")
+        fix = [call["argv"] for call in self.calls("claude")][-1]
+        self.assertIn("do one class pass", fix[fix.index("-p") + 1])
+        self.assertEqual(build.run(self.db, again["id"])["review_round"], R)
+
+    def test_a_usage_limit_reclaim_refuses_a_worktree_on_another_branch(self):
+        """Review of build/sd-1557: the reclaim resumed at building or fixing, past the worktree step's branch
+        guard, so a checkout switched during the hold took the builder's commits. The guard runs first."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["rate_limited"])
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        support.git(Path(self.bundle["work_path"]), "checkout", "-q", "-b", "operator-side")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.assertEqual(build.run(self.db, again["id"])["step"], "building")
+        self.plan(claude=["pass"], sd_review=["clean"])
+        ended = self.supervisor(again["id"]).run()
+        self.assertEqual(ended["outcome"], "blocked")
+        self.assertIn("is on operator-side, not build/sd-", ended["blocked"])
+        self.assertEqual(len(self.calls("claude")), 1, "no builder ran on the switched checkout")
+
+    def test_a_sent_finding_briefs_how_to_record_a_rejection(self):
+        """sd:10010: a Send to builder note may reject a review finding; the brief says how to record it."""
+        self.press()
+        add_note(self.db, self.items[0], "comment", "Send to builder: reject a.py:2, the pin is checked in b.py:9")
+        # Noted before this run started, as a Send to builder's note is.
+        self.db.execute("UPDATE note SET timestamp = (SELECT created_at FROM runner_run WHERE id = ?) "
+                        "WHERE body LIKE 'Send to builder: reject%'", (self.bundle["id"],))
+        prompt = build_run.BRIEF.format(**self.supervisor().brief())
+        self.assertIn("reject a.py:2", prompt)
+        self.assertIn(f"adjudicate --item {self.items[0]} --expected-head <HEAD> --json", prompt)
+        self.assertIn("`--dispositions-file /dev/stdin`", prompt)
 
     def test_the_leak_guard_is_checked_before_the_review(self):
         """Pack sd:6926: the pre-push leak guard refused a test's real first name only at enqueue."""
@@ -4766,6 +4937,23 @@ class Archive(Case):
         self.db.commit()
         return path, build_run.log_dir(self.logs, str(self.repo)) / path.name
 
+    def test_a_rate_limited_bundles_files_wait_for_its_resume(self):
+        """Review of build/sd-1557: a usage limit releases the run and queues the bundle again; the archive
+        moved its blockers file, so the resumed fix found none and reviewed again, charging another round."""
+        path, target = self.ended("sd-{assignment}.blockers.json")
+        paths = [path, *(path.with_name(f"sd-{self.bundle['assignment']}.{name}") for name in ("body.md", "title"))]
+        for each in paths[1:]:
+            each.write_text("x")
+            os.utime(each, (0, 0))
+        self.db.execute("UPDATE runner_run SET outcome = ? WHERE id = ?", (build.RATE_LIMITED, self.bundle["id"]))
+        self.db.commit()
+        self.assertEqual(build_run.archive(self.db, self.root / "local", self.logs), [])
+        self.assertTrue(all(each.exists() for each in paths), "the resume reads the local files")
+        self.db.execute("UPDATE runner_run SET outcome = 'done' WHERE id = ?", (self.bundle["id"],))
+        self.db.commit()
+        self.assertEqual(sorted(build_run.archive(self.db, self.root / "local", self.logs)),
+                         sorted(str(target.with_name(each.name)) for each in paths))
+
     def test_notes_and_end_messages_name_the_archived_log(self):
         """sd:8275: the move rewrote only `log_path`; a note or end message still named the local file it removed."""
         path, target = self.ended("{run}.jsonl")
@@ -5632,6 +5820,29 @@ class HubFaults(Case):
         self.assertEqual((fired, ended["step"]), (["write"], "enqueued"))
         self.assertEqual(len(self.calls("claude")), 1, "the result was not paid for twice")
         self.assertIsNotNone(self.row()["final"])
+
+    def test_a_hub_fault_in_a_resumed_fix_resumes_the_fix(self):
+        """Review of build/sd-1557: a fault before a resumed fix's child started walked again with its blockers
+        already read, so the walk took the review for the fix: the fix never ran and a round was spent."""
+        self.plan(claude=["pass", "rate_limited"], sd_review=["blocking"])
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.plan(claude=["fix1", "fix2"], sd_review=["clean", "clean"])
+        before = len(self.calls("claude"))
+        patch, fired = self.faults_once("write", self.UNREACHABLE, fields=("step",),
+                                        where=lambda kwargs: kwargs.get("step") == "fixing")
+        with patch:
+            ended = self.supervisor(again["id"]).run()
+        self.assertEqual((fired, ended.get("step")), (["write"], "enqueued"))
+        fixes = [call["argv"] for call in self.calls("claude")][before:]
+        self.assertEqual(len(fixes), 1, "the resumed fix did not run once")
+        self.assertIn("- work.txt:1 a blocker", fixes[0][fixes[0].index("-p") + 1])
+        self.assertEqual(len(self.calls("sd-review")), 2, "a review ran in place of the fix")
 
     def test_a_mismatch_after_the_child_replays_its_result_in_the_new_image(self):
         self.plan(claude=["pass"], sd_review=["clean"])
