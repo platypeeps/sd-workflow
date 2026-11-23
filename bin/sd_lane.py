@@ -3005,6 +3005,10 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
         if why is not None:
             return {"status": "failed", "reason": why[:600]}
         pull = train_pull(api, branch, base, f"chore(lane): land the train of {names}")
+        message = train_message(root, tip, base, len(items))
+        if message is None:
+            return {"status": "failed", "pull": pull,
+                    "reason": "the members' closing trailers could not be read from git; no merge was sent"}
         why = ready()  # last: it ends in the lane host's fence
         if why is not None:
             return {"status": "failed", "pull": pull, "reason": why[:600]}
@@ -3012,7 +3016,7 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
         with contextlib.suppress(sd_ship_remote.Refusal):  # a lost answer is read back below, never sent twice
             api.api(f"{api.prefix}/pulls/{pull}/merge", method="PUT",
                     body={"sha": tip, "merge_method": "merge", "commit_title": f"chore(lane): train of {names} (#{pull})",
-                          "commit_message": train_message(root, tip, base)})
+                          "commit_message": message})
         return read_back(api.pull(pull), pull, base)
     except sd_ship_remote.Refusal as error:
         return {"status": "unknown" if sent else "failed", "reason": str(error)[:600]}
@@ -3040,18 +3044,25 @@ def read_back(merged: Any, pull: int, base: str) -> dict[str, Any]:
     return {"status": "merged", "pull": pull, "merge_commit": commit}
 
 
-def train_message(root: pathlib.Path, tip: str, base: str) -> str:
+def train_message(root: pathlib.Path, tip: str, base: str, members: int) -> str | None:
     """The train merge's message: each member's `Delivers:` and `Closes:`, and the base the train was checked on.
 
     The delivery ledger reads first parents only, where a member's own merge
     is not; the outer merge repeats its closing trailers. `Reviewed-base:`
     names `origin/<base>` as fetched last, so a merge GitHub lands onto a
-    newer base is held, as a lone squash is (sd:9923).
+    newer base is held, as a lone squash is (sd:9923). None when a read
+    fails or finds other than one merge per member: a train whose ledger
+    would lose a member's trailers is not sent.
     """
-    fetched = lane_git(root, "rev-parse", f"refs/remotes/origin/{base}") or ""
+    fetched = lane_git(root, "rev-parse", f"refs/remotes/origin/{base}")
+    listed = lane_git(root, "rev-list", "--first-parent", "--merges", f"{fetched}..{tip}") if fetched else None
+    commits = (listed or "").split()
+    messages = [lane_git(root, "show", "-s", "--format=%B", commit) for commit in commits]
+    if len(commits) != members or any(message is None for message in messages):
+        return None
     lines: list[str] = []
-    for commit in (lane_git(root, "rev-list", "--first-parent", "--merges", f"{fetched}..{tip}") or "").split():
-        for line in sd_lib.trailer_block(lane_git(root, "show", "-s", "--format=%B", commit) or "").splitlines():
+    for message in messages:
+        for line in sd_lib.trailer_block(message or "").splitlines():
             name = line.partition(" ")[0]
             if name in (sd_lib.DELIVERS_TRAILER, sd_lib.CLOSES_TRAILER) and line not in lines:
                 lines.append(line)

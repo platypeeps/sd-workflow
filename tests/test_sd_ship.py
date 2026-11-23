@@ -6607,6 +6607,25 @@ roles:
         self.assertEqual(landed["status"], "unknown")
         self.assertEqual(self.train_branches(), [])
 
+    def assert_unread_member_trailers_send_no_merge(self, failing):
+        """Review of sd:9923: a git read that failed dropped trailers from a train that still merged."""
+        tip = self.joined_tip()
+        real = ship.sd_lane.lane_git
+
+        def lane_git(tree, *args):
+            return None if args[:1] == (failing,) else real(tree, *args)
+        with patch.object(ship.sd_lane, "lane_git", lane_git):
+            landed, _ = self.landed_by_lane(tip)
+        self.assertEqual(landed["status"], "failed")
+        self.assertIn("trailers", landed["reason"])
+        self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
+
+    def test_land_train_whose_member_merges_cannot_be_listed_sends_no_merge(self):
+        self.assert_unread_member_trailers_send_no_merge("rev-list")
+
+    def test_land_train_whose_member_message_cannot_be_read_sends_no_merge(self):
+        self.assert_unread_member_trailers_send_no_merge("show")
+
     def test_land_train_whose_gate_fails_opens_no_pull_request(self):
         tip = self.joined_tip()
         landed, _ = self.landed_by_lane(tip, gate="failure")
