@@ -883,7 +883,7 @@ class Ship(SharedReview):
         pending, publishing, self.publishing = self.state.get("pending"), self.publishing, False
         return {**(pending if publishing and pending else {}), **({"pending": None} if pending else {})}
 
-    def renewal(self, claim: dict | None) -> tuple[dict | None, dict | None, str | None]:
+    def renewal(self, claim: dict | None, body: str) -> tuple[dict | None, dict | None, str | None]:
         """The claim to save, the one `assert_scope` reads in place of the stored one, and the line saying so.
 
         Only a prepare the lane did not start renews a claim the item
@@ -904,41 +904,57 @@ class Ship(SharedReview):
         if not (changed or stored.get("renewed")):
             return claim, None, None
         if self.lane_started():
-            self.refuse_held_by_lane_row(changed)
-            items = list(self.closing(tuple(dict.fromkeys(self.args.closes)), self.args.deliver))
-            other_items = set(items) != set((self.state.get("closing") or {}).get("items") or [])
-            if stored.get("renewed") and not changed and other_items:
-                raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this lane entry "
-                              f"names other items, as a retry of an entry enqueued before the renewal does; "
-                              f"the renewal stands as `{self.renew_command()}`: enqueue again with those "
-                              f"items and its acceptance file", code="delivery_claim_renewed", boundary="input",
-                              state="operator_decision",
-                              next_action="Enqueue the item again with the items and acceptance file the "
-                                          "renewal used.")
-            if stored.get("renewed") and not changed and claim.get("claim") != stored.get("claim"):
-                if notes := edited_waivers(claim.get("claim"), stored.get("claim")):
-                    named = ", ".join(f"#{note}" for note in notes)
-                    raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and since then only "
-                                  f"decision note {named} changed; its `Waive:` line still holds, so this entry's "
-                                  f"acceptance file stands: refresh the claim by hand with `{self.renew_command()} "
-                                  f"--acceptance-file FILE`, the same file, then "
-                                  f"`sd-ship lane retry {self.args.item}`", code="delivery_claim_renewed",
-                                  boundary="input",
-                                  state="operator_decision",
-                                  next_action="Rerun prepare --deliver by hand with the same acceptance file, "
-                                              "then retry the lane entry.")
-                raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this lane entry "
-                              f"carries other acceptance evidence, as a retry of an entry enqueued before "
-                              f"the renewal does; enqueue again with the renewal's acceptance file",
-                              code="delivery_claim_renewed", boundary="input", state="operator_decision",
-                              next_action="Enqueue the item again with the acceptance file the renewal used.")
-            return ({**claim, "renewed": True} if stored.get("renewed") else claim), None, None
+            return self.lane_renewal(claim, stored, changed, body), None, None
         claim = {**claim, "renewed": True}
         if not changed:
             return claim, None, None
         self.refuse_stale_evidence(claim, stored)
         return claim, claim, (f"--deliver renews the delivery claim of sd:{self.args.item}: item scope "
                               f"{str(stored.get('item_scope'))[:12]} is now {claim['item_scope'][:12]}")
+
+    def lane_renewal(self, claim: dict, stored: dict, changed: bool, body: str) -> dict:
+        """The claim a lane prepare saves, or a refusal when its entry is older than a renewal by hand.
+
+        A retry of an entry enqueued before the renewal carries the old
+        items, evidence and body; the scope now matches, so each must equal
+        the renewal's, or the retry would publish what it replaced (sd:9335).
+        The title is `assert_title_matches`'s.
+        """
+        self.refuse_held_by_lane_row(changed)
+        items = list(self.closing(tuple(dict.fromkeys(self.args.closes)), self.args.deliver))
+        other_items = set(items) != set((self.state.get("closing") or {}).get("items") or [])
+        if stored.get("renewed") and not changed and other_items:
+            raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this lane entry "
+                          f"names other items, as a retry of an entry enqueued before the renewal does; "
+                          f"the renewal stands as `{self.renew_command()}`: enqueue again with those "
+                          f"items and its acceptance file", code="delivery_claim_renewed", boundary="input",
+                          state="operator_decision",
+                          next_action="Enqueue the item again with the items and acceptance file the "
+                                      "renewal used.")
+        if stored.get("renewed") and not changed and claim.get("claim") != stored.get("claim"):
+            if notes := edited_waivers(claim.get("claim"), stored.get("claim")):
+                named = ", ".join(f"#{note}" for note in notes)
+                raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and since then only "
+                              f"decision note {named} changed; its `Waive:` line still holds, so this entry's "
+                              f"acceptance file stands: refresh the claim by hand with `{self.renew_command()} "
+                              f"--acceptance-file FILE`, the same file, then "
+                              f"`sd-ship lane retry {self.args.item}`", code="delivery_claim_renewed",
+                              boundary="input",
+                              state="operator_decision",
+                              next_action="Rerun prepare --deliver by hand with the same acceptance file, "
+                                          "then retry the lane entry.")
+            raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this lane entry "
+                          f"carries other acceptance evidence, as a retry of an entry enqueued before "
+                          f"the renewal does; enqueue again with the renewal's acceptance file",
+                          code="delivery_claim_renewed", boundary="input", state="operator_decision",
+                          next_action="Enqueue the item again with the acceptance file the renewal used.")
+        if stored.get("renewed") and not changed and body != self.state.get("body"):
+            raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this lane entry "
+                          f"carries another body, as a retry of an entry enqueued before the renewal does; "
+                          f"the renewal's body stands: enqueue again with it as the body file",
+                          code="delivery_claim_renewed", boundary="input", state="operator_decision",
+                          next_action="Enqueue the item again with the body the renewal published.")
+        return {**claim, "renewed": True} if stored.get("renewed") else claim
 
     def refuse_held_by_lane_row(self, changed: bool) -> None:
         """Refuse a scope change in a prepare `lane_started` counted by a running row, naming that row.
@@ -1784,7 +1800,7 @@ class Ship(SharedReview):
             self.assert_title_matches(title)
             if not self.args.no_item and self.state.get("deliver") != deliver:
                 raise Refusal("existing PR delivery claim differs; reconcile the prepared scope first")
-        claim, renewed, renewal_line = self.renewal(claim)
+        claim, renewed, renewal_line = self.renewal(claim, body)
         self.assert_scope(renewed)
         closing: dict | None = None
         closing_warnings: list[str] = []

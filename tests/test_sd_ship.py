@@ -4772,6 +4772,32 @@ roles:
                 self.prepare("--deliver", "--item", str(kept))  # an entry with the renewal's items proceeds
         self.assertEqual(self.operation().state["closing"]["items"], [kept])
 
+    def test_a_lane_retry_with_the_body_a_renewal_replaced_refuses(self):
+        """Review of build/sd-1636: a task's claim has no evidence rows, so a lane retry of an entry enqueued with
+        body A passed the evidence and item checks against a renewal by hand with body B, published body A
+        again, and merge squashed it. A lane prepare on a renewed claim also needs the published body."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        old, new = self.directory / "old.md", self.directory / "new.md"
+        old.write_text("Body A, the enqueue's.\n")
+        new.write_text("Body B, the renewal's.\n")
+        self.prepare("--deliver", "--body-file", str(old))
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--body-file", str(new))  # the renewal by hand
+        published = self.operation().state["body"]
+        self.assertIn("Body B", published)
+        with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}):
+            with contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body") as caught:
+                self.prepare("--deliver", "--body-file", str(old))
+            self.assertEqual(caught.exception.workflow["blocker"]["code"], "delivery_claim_renewed")
+            state = self.operation().state
+            self.assertEqual((state["body"], state.get("pending")), (published, None))
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.prepare("--deliver", "--body-file", str(new))  # an entry with the renewal's body proceeds
+        self.assertEqual(self.operation().state["body"], published)
+
     def test_a_lane_retry_with_the_renewals_items_in_another_order_proceeds(self):
         """Lead review of sd:9268: the lane compared the closing lists in order, so a retry naming the renewal's
         items in another order refused. A closing set is a set."""

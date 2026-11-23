@@ -66,7 +66,7 @@ the `renewed` mark in `bin/sd-ship`. Tests are in
 | renewal evidence text | none | old evidence with a trailing space, line break or renamed criterion | folded the same; refuses before any save | `test_a_renewal_whose_evidence_differs_only_in_spacing_or_its_criterion_name_refuses` |
 | reconcile of another head | `merged` recorded | a reprepare pushed a tip, then refused; GitHub merged that tip | refuses `closing_set_stale`; nothing delivered or closed; deliver by hand | `test_a_reconcile_of_a_head_the_published_closing_set_was_not_read_at_refuses` |
 | hand prepare under a lane row | none | a running row with no lane mark counts it as the lane's | refuses `lane_entry_running`, naming the row and `sd-ship lane cancel` | `test_a_hand_prepare_held_by_a_running_lane_row_names_that_row` |
-| lane retry after a renewal | none | old items or evidence | refuses `delivery_claim_renewed` | `test_a_lane_retry_of_an_entry_older_than_a_renewal_refuses`, `test_a_lane_retry_with_the_items_a_renewal_dropped_refuses` |
+| lane retry after a renewal | none | old items, evidence or body | refuses `delivery_claim_renewed` before any save | `test_a_lane_retry_of_an_entry_older_than_a_renewal_refuses`, `test_a_lane_retry_with_the_items_a_renewal_dropped_refuses`, `test_a_lane_retry_with_the_body_a_renewal_replaced_refuses` |
 | `renewed` mark | kept on every later claim | a new enqueue with new evidence refuses too | sd:9580, next PR; no fix here (ruling #64736) | `test_a_lane_retry_of_an_entry_older_than_a_renewal_refuses` |
 
 ## Acceptance criteria
