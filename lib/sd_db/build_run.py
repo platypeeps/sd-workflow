@@ -1627,10 +1627,13 @@ class Supervisor:
 
     def calls_into(self, path: str, line: int | None, head: str, sources: dict[str, list[str] | None],
                    defined: set[str]) -> bool:
-        """Whether the function around `path:line` calls one the change `defined`, or reaches one through
-        `CALL_DEPTH` unchanged functions it calls at `head`; an answer git cannot give, or a search past its
-        bounds, counts as calling (pack sd:9769).
-        ponytail: a call is any `name(`, so a keyword before a parenthesis (`return (x)`) holds more."""
+        """Whether the function around `path:line` names one the change `defined`, or reaches one through
+        `CALL_DEPTH` unchanged definitions of the names it uses at `head`; an answer git cannot give, or a
+        search past its bounds, counts as reaching (pack sd:9769).
+
+        Every name counts, not only `name(`: a function passed as a value (`apply(rows, handler)`), named in
+        a string (`getattr(mod, "handler")`) or held in a table is an edge too. A missed edge would defer.
+        ponytail: prose and keywords count as names, so this holds more, never fewer."""
         places: list[tuple[str, int | None]] = [(path, line)]
         seen: set[str] = set()
         for _depth in range(CALL_DEPTH):
@@ -1638,7 +1641,7 @@ class Supervisor:
             for place, number in places:
                 if (found := self.scope(place, number, head, sources)) is None:
                     return True
-                calls = set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", "\n".join(found[1])))
+                calls = set(re.findall(r"[A-Za-z_]\w*", "\n".join(found[1])))
                 # A call through an alias the file binds (`decode()` after `parse as decode`) calls the name too.
                 called |= calls | {name for text in sources.get(place) or [] for name, alias in aliases(text)
                                    if alias in calls}
@@ -1652,18 +1655,27 @@ class Supervisor:
                 return True
             places = []
             for name in sorted(called):
-                hits = self.naming(name, head)
+                hits = self.definitions(name, head)
                 if hits is None:
                     return True
                 places += [(place, number) for place, number, text in hits if name in defined_names(text)]
         return True
 
-    def naming(self, name: str, head: str) -> list[tuple[str, int, str]] | None:
-        """Each `(path, line, text)` at `head` that names `name` as a whole word; None when git cannot say
-        or past `CALL_HITS` lines (pack sd:9769)."""
+    def definitions(self, name: str, head: str) -> list[tuple[str, int, str]] | None:
+        """`naming`, for the lines that may define `name` only: a keyword form, a `name(...) {` method or an
+        assignment, so a common name (`self`) is not a search past its bounds (pack sd:9769)."""
+        return self.naming(name, head, [
+            rf"(def|function|func|fn|class|sub|proc|struct|interface|type|module|trait|enum)[[:space:]]+\*?[[:space:]]*{name}([^[:alnum:]_]|$)",
+            rf"(^|[^[:alnum:]_.]){name}[[:space:]]*\([^()]*\)[[:space:]]*\{{",
+            rf"(^|[^[:alnum:]_.]){name}[[:space:]]*:?=([^=]|$)"])
+
+    def naming(self, name: str, head: str, patterns: list[str] | None = None) -> list[tuple[str, int, str]] | None:
+        """Each `(path, line, text)` at `head` that names `name` as a whole word, or matches one of the
+        extended `patterns`; None when git cannot say or past `CALL_HITS` lines (pack sd:9769)."""
+        search = ["-E", *(part for pattern in patterns for part in ("-e", pattern))] if patterns else ["-w", "-e", name]
         try:  # `head:path\0line\0text` per line
-            hits = _grep([*self.tools.git, "-C", str(self.work), "grep", "-n", "-z", "-w", "-I", "-e", name,
-                          head, "--"], env=self.env).split("\n")
+            hits = _grep([*self.tools.git, "-C", str(self.work), "grep", "-n", "-z", "-I", *search, head, "--"],
+                         env=self.env).split("\n")
         except Unread:
             return None
         if len(hits) > CALL_HITS + 1:

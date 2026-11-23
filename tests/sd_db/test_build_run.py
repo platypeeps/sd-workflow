@@ -360,6 +360,18 @@ def group_gone(pgid):
     return False
 
 
+def fake_grep(files: dict[str, str], head: str, argv: list[str]) -> str:
+    """`git grep -n -z` over `files` at `head`: `-w -e NAME` as a whole word, or `-E` with each `-e` pattern
+    in POSIX classes; `head:path\0line\0text` per matching line."""
+    patterns = [argv[index + 1] for index, arg in enumerate(argv) if arg == "-e"]
+    if "-E" in argv:
+        tests = [re.compile(pattern.replace("[^[:alnum:]_]", r"\W").replace("[[:space:]]", r"\s").replace("[[:alnum:]_]", r"\w")) for pattern in patterns]
+    else:
+        tests = [re.compile(rf"\b{re.escape(pattern)}\b") for pattern in patterns]
+    return "".join(f"{head}:{path}\0{number}\0{text}\n" for path, body in files.items()
+                   for number, text in enumerate(body.splitlines(), 1) if any(test.search(text) for test in tests))
+
+
 def exclude(work: Path, patterns: str) -> None:
     """Ignore `patterns` in every worktree of `work`'s repository, through its common `info/exclude`."""
     common = Path(support.git(work, "rev-parse", "--path-format=absolute", "--git-common-dir"))
@@ -1604,10 +1616,7 @@ class Supervise(Case):
             raise build_run.Unread("no such file")
 
         def grep(argv, **_kwargs):  # `git grep -n -z -w`: `head:path\0line\0text`
-            name = argv[argv.index("-e") + 1]
-            return "".join(f"{head}:{path}\0{number}\0{text}\n" for path, body in files.items()
-                           for number, text in enumerate(body.splitlines(), 1)
-                           if re.search(rf"\b{re.escape(name)}\b", text))
+            return fake_grep(files, head, argv)
 
         deep = {"path": "lib/parse.py", "line": 2, "summary": "an empty value crashes the parser"}
         far = {"path": "lib/parse.py", "line": 6, "summary": "an old defect"}
@@ -1642,10 +1651,7 @@ class Supervise(Case):
             raise build_run.Unread("no such file")
 
         def grep(argv, **_kwargs):
-            name = argv[argv.index("-e") + 1]
-            return "".join(f"{head}:{path}\0{number}\0{text}\n" for path, body in files.items()
-                           for number, text in enumerate(body.splitlines(), 1)
-                           if re.search(rf"\b{re.escape(name)}\b", text))
+            return fake_grep(files, head, argv)
 
         rows = [{"path": "lib/consume.py", "line": 2, "summary": "a missing key crashes here"},
                 {"path": "lib/consume.py", "line": 6, "summary": "a missing key crashes here"}]
@@ -1697,10 +1703,7 @@ class Supervise(Case):
             raise build_run.Unread("no such file")
 
         def grep(argv, **_kwargs):
-            name = argv[argv.index("-e") + 1]
-            return "".join(f"{head}:{path}\0{number}\0{text}\n" for path, body in files.items()
-                           for number, text in enumerate(body.splitlines(), 1)
-                           if re.search(rf"\b{re.escape(name)}\b", text))
+            return fake_grep(files, head, argv)
 
         consumers = [{"path": "lib/consume.py", "line": 5, "summary": "a None result crashes here"},
                      {"path": "lib/rebind.py", "line": 2, "summary": "a None result crashes here"}]
@@ -1737,6 +1740,31 @@ class Supervise(Case):
                 mock.patch.object(build_run, "_grep", return_value=""):
             _, kept = self.deferred([row], {"lib/store.py": {3}}, {"lookup", "key"}, {"lookup"}, callees=True)
         self.assertEqual(kept["blockers"], [row], "a consumer with a multiline signature was deferred")
+
+    def edges(self, files, rows, changed, words, defined):
+        """`deferred` over `rows` with `git show` and `git grep` answered from `files` at one head."""
+        head = "a" * 40
+
+        def show(argv, **_kwargs):
+            path = argv[-1].removeprefix(f"{head}:")
+            if "show" in argv and path in files:
+                return files[path]
+            raise build_run.Unread("no such file")
+
+        with mock.patch.object(build_run, "_read", side_effect=show), \
+                mock.patch.object(build_run, "_grep", side_effect=lambda argv, **_: fake_grep(files, head, argv)):
+            return self.deferred(rows, changed, words, defined, callees=True)[1]["blockers"]
+
+    def test_a_changed_function_passed_as_a_value_is_an_edge(self):
+        """Class pass, review of sd:9769 (a missed edge read as independence): a consumer that passes the
+        changed handler as a value (`apply(rows, handler_a)`, `getattr(mod, "handler_a")`) depends on it."""
+        self.press()
+        files = {"lib/run.py": "def run(rows):\n    return apply(rows, handler_a).name\n\n\n"
+                               "def named(mod):\n    return getattr(mod, \"handler_a\")().name\n"}
+        rows = [{"path": "lib/run.py", "line": 2, "summary": "a missing result crashes here"},
+                {"path": "lib/run.py", "line": 6, "summary": "a missing result crashes here"}]
+        self.assertEqual(self.edges(files, rows, {"lib/handlers.py": {3}}, {"handler_a"}, {"handler_a"}), rows,
+                         "a consumer referencing the changed function as a value was deferred")
 
     def test_a_short_function_name_still_names_the_changed_caller(self):
         """Review of sd:9769: `go()` names a changed function; no length filter drops it."""
