@@ -577,6 +577,14 @@ def aliases(text: str) -> set[tuple[str, str]]:
             | {(name, alias) for alias, name in re.findall(r"\b([A-Za-z_]\w*)\s*:?=\s*([A-Za-z_]\w*)\s*;?\s*$", text)})
 
 
+def bound_names(line: str) -> set[str]:
+    """The names an assignment at the start of `line` binds: `x = ...`, `a, b = ...`, `x: T = ...`,
+    `const x = ...`, `x := ...` (pack sd:9769)."""
+    found = re.match(r"\s*(?:export\s+)?(?:(?:const|let|var)\s+)?([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)"
+                     r"\s*(?::[^=]*)?:?=(?!=)", line)
+    return set(re.findall(r"[A-Za-z_]\w*", found[1])) if found else set()
+
+
 def callable_words(text: str) -> set[str]:
     """The identifiers a finding names as code: `name(`, a snake or camel name, or a backticked dotted name."""
     words = set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", text))
@@ -1658,7 +1666,9 @@ class Supervisor:
                 hits = self.definitions(name, head)
                 if hits is None:
                     return True
-                places += [(place, number) for place, number, text in hits if name in defined_names(text)]
+                # A definition, or an assignment that binds the name (`HANDLERS = {"a": handler_a}`).
+                places += [(place, number) for place, number, text in hits
+                           if name in defined_names(text) | bound_names(text)]
         return True
 
     def definitions(self, name: str, head: str) -> list[tuple[str, int, str]] | None:
@@ -1667,7 +1677,7 @@ class Supervisor:
         return self.naming(name, head, [
             rf"(def|function|func|fn|class|sub|proc|struct|interface|type|module|trait|enum)[[:space:]]+\*?[[:space:]]*{name}([^[:alnum:]_]|$)",
             rf"(^|[^[:alnum:]_.]){name}[[:space:]]*\([^()]*\)[[:space:]]*\{{",
-            rf"(^|[^[:alnum:]_.]){name}[[:space:]]*:?=([^=]|$)"])
+            rf"(^|[^[:alnum:]_.]){name}[[:space:]]*([,:][^=]*)?=([^=]|$)"])
 
     def naming(self, name: str, head: str, patterns: list[str] | None = None) -> list[tuple[str, int, str]] | None:
         """Each `(path, line, text)` at `head` that names `name` as a whole word, or matches one of the

@@ -1766,6 +1766,16 @@ class Supervise(Case):
         self.assertEqual(self.edges(files, rows, {"lib/handlers.py": {3}}, {"handler_a"}, {"handler_a"}), rows,
                          "a consumer referencing the changed function as a value was deferred")
 
+    def test_a_table_bound_by_assignment_is_an_edge(self):
+        """Class pass, review of sd:9769: `HANDLERS[key]()` reaches the changed handler through a table an
+        assignment binds; the walk follows the assignment as it follows a definition."""
+        self.press()
+        files = {"lib/table.py": "HANDLERS = {\"a\": handler_a}\n",
+                 "lib/dispatch.py": "def dispatch(key):\n    return HANDLERS[key]().name\n"}
+        rows = [{"path": "lib/dispatch.py", "line": 2, "summary": "a missing result crashes here"}]
+        self.assertEqual(self.edges(files, rows, {"lib/handlers.py": {3}}, {"handler_a"}, {"handler_a"}), rows,
+                         "a dispatcher reaching the changed handler through a table was deferred")
+
     def test_a_short_function_name_still_names_the_changed_caller(self):
         """Review of sd:9769: `go()` names a changed function; no length filter drops it."""
         self.press()
