@@ -245,6 +245,17 @@ class TheHook(HookFixture):
                                 capture_output=True, text=True, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_a_comment_string_with_a_trailing_space_is_matched_before_stripping(self):
+        """Lane review: commentString `> ` matched the stripped `>` line only, which closed the list's fence."""
+        draft = self.root.parent / f"{self.root.name}-trailing"
+        draft.write_text("fix: a subject\n\n- item\n  ```\n> \n  " + "i" * 80 + "\n", encoding="utf-8")
+        self.addCleanup(draft.unlink)
+        result = subprocess.run(["git", "-c", "core.commentString=> ", "commit", "-q", "--allow-empty", "-e",
+                                 "-m", "x"], cwd=self.root,
+                                env=clean_environment(GIT_EDITOR=f"cp {shlex.quote(str(draft))}"),
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_a_fixup_of_a_long_subject_commits(self):
         """Review round 4: `fixup! <subject>` is git's line, and autosquash removes it."""
         self.assertEqual(self.commit("fix: " + "f" * 67 + "\n").returncode, 0)
