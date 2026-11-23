@@ -402,6 +402,25 @@ class CitedIdTests(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertEqual(sd_ship_body.cited_ids("", [self.revert_of(body), *work]), (3, 5))
 
+    def test_a_marker_before_the_items_text_column_is_a_sibling(self) -> None:
+        """pack sd:9666 review, round 7, instance 1: ` - <sha>` one space in sits before the text column of
+        `- Reverted commits:`, so it is a sibling, yet the heading held it and dropped its citations."""
+        kept = "b" * 40
+        cited = (kept, "fix: shared\n\nLane review fix, pack sd:5: y.\n\nCloses: sd:4\n")
+        revert = self.revert_of(f"- Reverted commits:\n - {kept[:9]} retained\n")
+        self.assertEqual(sd_ship_body.cited_ids("", [revert, cited]), (4, 5))
+
+    def test_indented_code_opens_no_comment_and_no_heading(self) -> None:
+        """pack sd:9666 review, round 7, instance 2: a literal `<!--` in an indented code block opened a
+        comment that hid the real list after it. Instance 3: a heading in indented code is code too."""
+        undone, kept = "a" * 40, "b" * 40
+        self.assertEqual(sd_ship_body.quoted_lines("- a\n\n      <!--\n\n  b\n"), set())
+        self.assertEqual(sd_ship_body.quoted_lines("- a\n\n      <!--\n\n  b\n", code=True), {3})
+        revert = self.revert_of(f"- Reverted commits:\n\n      <!--\n\n  - {undone[:9]} undone\n")
+        self.assertEqual(sd_ship_body.cited_ids("", [revert, (undone, "feat: x\n\nCloses: sd:2\n")]), ())
+        revert = self.revert_of(f"Kept commits:\n\n    Reverted commits:\n\n- {kept[:9]} kept\n")
+        self.assertEqual(sd_ship_body.cited_ids("", [revert, (kept, "fix: y\n\nCloses: sd:4\n")]), (4,))
+
     def test_a_fence_on_a_list_marker_line_is_an_example(self) -> None:
         """pack sd:9666 review, round 5, instance 2: `- ```text` opened no fence, so the sha bullet in the
         example undid a real commit and dropped its citations."""

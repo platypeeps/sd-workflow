@@ -67,7 +67,7 @@ _FENCE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
 _ITEM_MARKER = re.compile(r"^( {0,3}(?:[-*+]|[0-9]{1,9}[.)]))( +|$)")
 
 
-def quoted_lines(body: str, comments: bool = True) -> set[int]:
+def quoted_lines(body: str, comments: bool = True, code: bool = False) -> set[int]:
     """The 1-based numbers of the lines of `body` a fenced code block or an HTML comment holds.
 
     A fence closes on a line of the same character, at least as long, and
@@ -77,9 +77,11 @@ def quoted_lines(body: str, comments: bool = True) -> set[int]:
     spaces at the top level start an indented code block. A comment holds a line
     when it is open where the line starts. Inside a fence a comment is text.
     With `comments` false only fences count, and a comment is text too.
+    An indented code block, four spaces past its list column after a blank
+    line, opens no fence, comment or list item; `code` counts its lines too.
     """
     quoted: set[int] = set()
-    fence, depth, commented = "", 0, False
+    fence, depth, commented, loose = "", 0, False, True  # loose: no paragraph runs into this line
     items: list[int] = []  # the text column of each open list item, outermost first (pack sd:9666)
     for number, line in enumerate(body.split("\n"), start=1):
         line = line.rstrip("\r").expandtabs(4)
@@ -91,6 +93,9 @@ def quoted_lines(body: str, comments: bool = True) -> set[int]:
         fence = ""  # the list item that held the fence ended, and the fence with it
         if commented:
             quoted.add(number)
+        elif loose and rest.startswith("    ") and rest.strip():
+            quoted |= {number} if code else set()
+            continue  # an indented code block: a paragraph cannot run into it, so the next line is loose too
         else:
             match = _FENCE_RE.match(_item_text(rest, items, opens=True))
             if match and not (match["fence"][0] == "`" and "`" in match["info"]):
@@ -98,6 +103,7 @@ def quoted_lines(body: str, comments: bool = True) -> set[int]:
                 fence, depth = match["fence"], len(items)
                 continue
         commented = comments and _comment_open(line, commented)
+        loose = not line.strip()
     return quoted
 
 
@@ -366,38 +372,32 @@ def _listed_undone(message: str) -> list[str]:
     A list item that opens with a sha, under a heading such as `Reverted
     commits:`. A heading is a line that ends with a colon, bare, indented or
     itself a list item, or any line at column zero that is no list item.
-    Each heading and list item holds what nests under it: a list item the
-    items indented past it, any other heading those at or past its indent.
-    The innermost holder decides: a heading that says reverted undoes, a
-    sha item passes on what holds it, and anything else undoes nothing.
-    An item inside a fence, an indented code block or an HTML comment
-    names nothing.
+    The top level and each open list item, as `quoted_lines` reads them,
+    hold the last heading in them: a list item's own text is its first.
+    A sha item undoes when the heading of what holds it says reverted, and
+    passes that on to what nests in it; any other item, or a heading that
+    does not say reverted, undoes nothing. An item inside a fence, an
+    indented code block or an HTML comment names nothing.
     """
-    quoted, holders, found = quoted_lines(message), [], []  # holders: (indent, is an item, undoes)
+    quoted, found = quoted_lines(message, code=True), []
     items: list[int] = []  # open list items' text columns, as `quoted_lines` reads them
+    undoes = [False]  # per open list item, and the top level first: whether its last heading says reverted
     for number, line in enumerate(message.split("\n"), start=1):
         line = line.rstrip("\r").expandtabs(4)
         rest = _item_text(line, items, opens=False)
+        del undoes[len(items) + 1:]  # the items `_item_text` ended take their headings with them
         if number in quoted or not line.strip():
             continue
-        indent = len(line) - len(line.lstrip())
-        # A marker four spaces past its list column starts no item: that is an indented code block.
-        item = _ITEM_MARKER.match(rest)
-        text = (_item_text(rest, items, opens=True) if item else line).strip()
-        if item:
-            while holders and (holders[-1][0] > indent or (holders[-1][0] == indent and holders[-1][1])):
-                holders.pop()  # the item dedented out of it, or is its sibling
-            undoes = bool(holders) and holders[-1][2]
+        if _ITEM_MARKER.match(rest):  # four spaces past the list column start no item: that is code
+            text = _item_text(rest, items, opens=True).strip()
+            holder = undoes[-1]
             if sha := _SHA_LED.match(text):
-                if undoes:
-                    found.append(sha[1])
+                found += [sha[1]] if holder else []
             else:
-                undoes = text.endswith(":") and bool(_REVERTED_INTRO.search(text))
-            holders.append((indent, True, undoes))
-        elif text.endswith(":") or not indent:  # an indented line continues an item
-            while holders and holders[-1][0] >= indent:
-                holders.pop()
-            holders.append((indent, False, bool(_REVERTED_INTRO.search(text))))
+                holder = text.endswith(":") and bool(_REVERTED_INTRO.search(text))
+            undoes += [holder] * (len(items) + 1 - len(undoes))
+        elif line.rstrip().endswith(":") or not line[0].isspace():  # an indented line continues an item
+            undoes[-1] = bool(_REVERTED_INTRO.search(line.strip()))
     return found
 
 
