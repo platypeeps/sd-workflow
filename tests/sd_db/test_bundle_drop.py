@@ -225,7 +225,8 @@ class DropReview(Repo):
     def test_a_kept_item_with_a_newer_build_refuses(self):
         items, ids, run = self.bundle()
         newer = create_assignment(self.db, role="author", status="blocked", item=items[2])
-        self.db.execute("UPDATE assignment SET scope = ? WHERE id = ?", (build.SCOPE, newer))
+        # A newer build that ran: one that never ran owns nothing (`_current`, sd:9788).
+        self.db.execute("UPDATE assignment SET scope = ?, run_count = 1 WHERE id = ?", (build.SCOPE, newer))
         work = Path(run["work_path"])
         old = git(work, "rev-parse", "HEAD")
         with self.assertRaisesRegex(DROP.DropRefused, f"sd:{items[2]} has a newer build, assignment {newer}"):
