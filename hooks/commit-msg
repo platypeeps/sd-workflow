@@ -63,6 +63,18 @@ def main(argv: list[str]) -> int:
               file=sys.stderr)
         return 1
     message = message_file.read_text(encoding="utf-8", errors="replace")
+    # pack sd:10212: the lane refuses a line over the limit at enqueue, after a full review; refuse it here.
+    # Lines git strips as comments are left out, so a line number counts the message git keeps.
+    import sd_ship_body
+    kept = "\n".join(line for line in message.split("\n") if not line.startswith("#"))
+    long = sd_ship_body.long_lines(kept)
+    if long:
+        for number, length in long:
+            print(f"commit-msg: refused, line {number} is {length} characters "
+                  f"(limit {sd_ship_body.LINE_LIMIT})", file=sys.stderr)
+        print("Rewrap it; a fenced code line or a bare URL line is exempt. "
+              "The rejected message is kept in .git/COMMIT_EDITMSG.", file=sys.stderr)
+        return 1
     if not sd_lib.unread_trailers(message, ""):  # states none of the checked trailers
         return 0
     parsed = sd_lib.git_output(

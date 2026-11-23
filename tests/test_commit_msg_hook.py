@@ -149,14 +149,14 @@ class HookFixture(unittest.TestCase):
         self.root = scratch_repository("sd-1931-hook-")
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         (self.root / "hooks").mkdir()
-        (self.root / "bin").mkdir()
         shutil.copy2(HOOK, self.root / "hooks" / "commit-msg")
         # The pre-commit tier is not under test here; a stub stands in for it
         # so `make hooks` has both files to link.
         stub = self.root / "hooks" / "pre-commit"
         stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         stub.chmod(0o755)
-        shutil.copy2(REPO_ROOT / "bin" / "sd_lib.py", self.root / "bin" / "sd_lib.py")
+        # The hook imports from the pack's bin/ beside its real path, as an installed pack has it whole.
+        shutil.copytree(REPO_ROOT / "bin", self.root / "bin", ignore=shutil.ignore_patterns("__pycache__"))
         shutil.copy2(REPO_ROOT / "Makefile", self.root / "Makefile")
         made = subprocess.run(["make", "hooks"], cwd=self.root, env=clean_environment(),
                               capture_output=True, text=True, check=False)
@@ -207,6 +207,28 @@ class TheHook(HookFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual("sd:7", git(
             "log", "-1", "--format=%(trailers:key=Delivers,valueonly)", cwd=self.root).strip())
+
+    def test_a_line_over_72_characters_is_refused_at_commit_time(self):
+        """pack sd:10212: 27 lane refusals in 7 days named a commit line the hook let through."""
+        result = self.commit("fix: a subject\n\n" + "x" * 73 + "\n")
+        self.assertNotEqual(result.returncode, 0, "the commit went through")
+        self.assertIn("commit-msg: refused, line 3 is 73 characters (limit 72)", result.stderr)
+        self.assertEqual(0, self.commits(), "a commit landed")
+
+    def test_a_long_bare_url_or_fenced_line_still_commits(self):
+        url = "https://example.test/" + "a" * 80
+        result = self.commit(f"fix: a subject\n\n{url}\n\n```\n{'y' * 90}\n```\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_make_hooks_replaces_a_dangling_link(self):
+        """pack sd:10212: 19 clones linked a retired pack path, and git skipped the hook silently."""
+        link = self.root / ".git" / "hooks" / "commit-msg"
+        link.unlink()
+        link.symlink_to("/nonexistent/sd-ai-command-pack/hooks/commit-msg")
+        made = subprocess.run(["make", "hooks"], cwd=self.root, env=clean_environment(),
+                              capture_output=True, text=True, check=False)
+        self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
+        self.assertEqual(os.readlink(link), "../../hooks/commit-msg")
 
     def test_a_message_with_no_checked_trailer_commits_as_before(self):
         for message in (PLAIN, QUOTED):
