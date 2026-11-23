@@ -1806,27 +1806,31 @@ def row_tests(row: dict) -> list[str]:
         return []
     if not steps or not failing or not all(test_step(step, failing) for step in steps):
         return []
-    # Only a failing shard's headers name its failures: a passing one may print one as output (sd:9866).
-    blocks = "\n".join(block.group(0) for block in SHARD_BLOCK.finditer(text) if block.group(1) in failing)
+    # Only a failing shard's headers name its failures: a passing one may print one as output (sd:9866). The
+    # blocks are the ones validation counted, so an early end line a test printed hides no failure.
+    blocks = "\n".join(failing.values())
     return [paren if paren.endswith(f".{name}") else f"{paren}.{name}" for name, paren in named_failures(blocks) or []]
 
 
-def unittest_failed_shards(text: str) -> set[str]:
+def unittest_failed_shards(text: str) -> dict[str, str]:
     """The shards in `run-tests.sh` output `text` that finished with unittest's own failure exit and printed a FAIL
-    or ERROR header; empty when any shard did not write its complete end line (killed or hung), ended with any
-    other non-zero exit (137 for a kill), or failed with no header: then more than a test failed."""
+    or ERROR header, each with the block validation read (its last start line before its last end line); empty
+    when any shard did not write its complete end line (killed or hung), ended with any other non-zero exit (137
+    for a kill), or failed with no header: then more than a test failed."""
     started = SHARD_START.findall(text)
     ended = {match.group(1): match for match in SHARD_END.finditer(text)}
     planned = SHARDS_PLANNED.findall(text)
     # Every planned shard finished: one that never launched left no log to count (review of sd:9768).
     if any(name not in ended for name in started) or planned != [str(len(ended))]:
-        return set()
-    failing = {name for name, match in ended.items() if match.group(2) != "0"}
-    for name in failing:
-        match = ended[name]
+        return {}
+    failing: dict[str, str] = {}
+    for name, match in ended.items():
+        if match.group(2) == "0":
+            continue
         opened = text.rfind(f"shard {name}: start\n", 0, match.start())
         if match.group(2) != UNITTEST_FAILED or opened < 0 or not read_failures(text[opened:match.start()]):
-            return set()
+            return {}
+        failing[name] = text[opened:match.start()]
     return failing
 
 
@@ -1847,7 +1851,7 @@ def read_failures(block: str) -> bool:
     return sum(int(count) for count in re.findall(r"(?:^|, )(?:failures|errors)=(\d+)", summaries[0])) == len(named)
 
 
-def test_step(step: str, failing: set[str]) -> bool:
+def test_step(step: str, failing: dict[str, str]) -> bool:
     """`make target test`, or one complete `shard X: Ns exit=1` line of a shard in `failing`: a listed step that
     only starts like one (`exit=1` of `exit=137`) or names an unfinished shard is not a test failure."""
     if step == "make target test":

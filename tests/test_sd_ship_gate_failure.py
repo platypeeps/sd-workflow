@@ -794,6 +794,17 @@ class AFlakyGateTestIsRerunAlone(unittest.TestCase):
                                       "FAIL: test_b (tests.test_other.Case.test_b)\nOK\n"), encoding="utf-8")
         self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [FLAKY_TEST])
 
+    def test_an_early_end_line_inside_a_shard_keeps_every_failure(self):
+        """Lane review of sd:9866: a test that prints its own shard's end line mid-run must not hide a later
+        failure; the ids come from the block validation counted, so both failing tests rerun."""
+        log = pathlib.Path(self.row["output_path"])
+        other = "tests.test_example.Case.test_b"
+        log.write_text(OUTPUT.replace("Ran 3 tests\nFAILED (failures=1)\n",
+                                      "shard tests.test_example: 0s exit=0\n"
+                                      f"FAIL: test_b ({other})\nRan 3 tests\nFAILED (failures=2)\n"),
+                       encoding="utf-8")
+        self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [FLAKY_TEST, other])
+
     def test_only_a_failure_of_tests_alone_is_rerun(self):
         lint = {**self.row, "failed_steps": [SHARD, "make target lint"]}
         crashed = {**self.row, "failed_steps": ["shard tests.test_crash: 1s exit=1", "make target test"]}
