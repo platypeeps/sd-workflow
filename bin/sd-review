@@ -1837,29 +1837,44 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
 
 def carried(prior: Sequence[Mapping[str, Any]], outcomes: Sequence[Outcome],
             rebutted: Sequence[Rebuttal] = ()) -> list[dict[str, Any]]:
-    """Each prior blocker this pass did not clear, as a blocking row (sd:10087). It clears only when every reader
-    that answered returned `fixed` for its `id` with evidence; `open`, no verdict, a blank one or a conflicting
-    one carries it, with each `open` verdict's evidence, else its own; so does a failed reader's `open`. A rebutted blocker is answered: none.
+    """Each prior blocker this pass did not clear, as a blocking row (sd:10087). It clears only when each
+    completed answer's own verdicts for its `id` are all `fixed` with evidence, and no reader said `open`:
+    `open`, no verdict, a blank one or a conflicting one carries it, with each `open` verdict's evidence, else
+    its own. An answer that did not complete (a failed or retried attempt, a voided or partial one) clears
+    nothing and answers for no other, yet its `open` carries (build/sd-1675 review). A rebutted blocker is
+    answered unless a reader's `open` gives evidence, as a cited repeat of a rebutted finding blocks.
     With no reader answered nothing is carried: the review is incomplete and blocks on that."""
     answered = [outcome for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)]
-    open_rows = [old for old in prior if answered and old.get("disposition") == "blocking" and not is_rebutted(rebutted, old)]
-    return [row for old in open_rows if (row := _carry(old, answered, outcomes)) is not None]
+    return [row for old in prior if answered and old.get("disposition") == "blocking"
+            and (not is_rebutted(rebutted, old) or _opened(old.get("id"), outcomes))
+            and (row := _carry(old, answered, outcomes)) is not None]
+
+
+def _said(ident: Any, outcome: Outcome) -> list[dict[str, str]]:
+    """The verdicts one answer gave for the prior blocker `ident`: never another answer's, whatever its name."""
+    return [row for row in outcome.verdicts if row["id"] == ident]
+
+
+def _opened(ident: Any, outcomes: Sequence[Outcome]) -> list[str]:
+    """Each `open` verdict for `ident` that gives evidence, as `reader: evidence`, from any outcome."""
+    return [f"{outcome.backend}: {row['evidence'].strip()}" for outcome in outcomes for row in _said(ident, outcome)
+            if row["verdict"] == "open" and row["evidence"].strip()]
 
 
 def _carry(old: Mapping[str, Any], answered: Sequence[Outcome], outcomes: Sequence[Outcome]) -> dict[str, Any] | None:
-    """`old` as a carried blocking row, or None when every reader in `answered` said `fixed` with evidence and
-    no reader, a failed one included, said `open` (build/sd-1675 review: a fallback cleared a failed one's)."""
-    said = [(outcome.backend, row) for outcome in outcomes for row in outcome.verdicts if row["id"] == old.get("id")]
-    def _fixed(name: str) -> bool:
-        mine = [row for backend, row in said if backend == name]
+    """`old` as a carried blocking row, or None when each answer in `answered` said `fixed` with evidence in its
+    own verdicts and no outcome, a failed one included, said `open`."""
+    ident = old.get("id")
+    def _fixed(outcome: Outcome) -> bool:
+        mine = _said(ident, outcome)
         return bool(mine) and all(row["verdict"] == "fixed" and row["evidence"].strip() for row in mine)
-    if all(_fixed(outcome.backend) for outcome in answered) and not any(row["verdict"] == "open" for _name, row in said):
+    still = any(row["verdict"] == "open" for outcome in outcomes for row in _said(ident, outcome))
+    if not still and all(_fixed(outcome) for outcome in answered):
         return None
-    opened = [f"{name}: {row['evidence'].strip()}" for name, row in said if row["verdict"] == "open" and row["evidence"].strip()]
     stored = old.get("evidence") if isinstance(old.get("evidence"), str) else ""
-    verdict = "open" if any(row["verdict"] == "open" for _name, row in said) else "none"
     return dict({key: value for key, value in old.items() if key != "id"}, disposition="blocking",
-                evidence="\n".join(dict.fromkeys(opened)) or stored, carried={"id": old.get("id"), "verdict": verdict})
+                evidence="\n".join(dict.fromkeys(_opened(ident, outcomes))) or stored,
+                carried={"id": ident, "verdict": "open" if still else "none"})
 
 
 def instance_place(entry: Any) -> tuple[str, int | None] | None:

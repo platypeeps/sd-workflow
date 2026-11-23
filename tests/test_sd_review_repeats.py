@@ -473,6 +473,44 @@ class PriorVerdictTests(unittest.TestCase):
         self.assertEqual(self.carried(result),
                          [("blocking", "one: python3 t.py []: IndexError", {"id": "B1", "verdict": "open"})])
 
+    def test_only_a_completed_answers_own_fixed_verdict_clears(self) -> None:
+        """build/sd-1675 class pass: verdicts were pooled by reader name over every outcome, so a `fixed` from
+        an attempt that did not complete answered for the same reader's retry that gave none. Each producer of
+        such an outcome is here: a failed process, a voided blind answer, a partial read."""
+        fixed = self.answer(verdicts=[verdict("fixed")])
+        raw = json.dumps({"findings": [], "verdicts": [verdict("fixed")]})
+        blind = self.answer(finding(path="elsewhere.py", line=1), verdicts=[verdict("fixed")])
+        attempts = {"failed": sd_review._answer("one", sd_review.Completed(1, raw, "crash"), sd_review.parse_findings(raw)),
+                    "voided": sd_review.unlocated(blind, frozenset({"src.py"}), "high"),
+                    "partial": sd_review.partial(fixed, ["big.bin"])}
+        for label, attempt in attempts.items():
+            with self.subTest(label):
+                self.assertNotIn(attempt.status, (sd_review.CLEAN, sd_review.FINDINGS))
+                self.assertEqual(attempt.verdicts, (verdict("fixed"),))
+                result = self.settle(attempt, self.answer(), reviewed=["one"])  # the retry completes, with no verdict
+                self.assertEqual(result["status"], "blocking")
+                self.assertEqual([row[2] for row in self.carried(result)], [{"id": "B1", "verdict": "none"}])
+                # it does not answer for another reader either, and a completed `fixed` needs nothing from it
+                self.assertEqual(self.settle(attempt, self.answer(name="two"), reviewed=["two"])["status"], "blocking")
+                cleared = self.settle(attempt, self.answer(verdicts=[verdict("fixed")], name="two"), reviewed=["two"])
+                self.assertEqual([row for row in cleared["findings"] if "carried" in row], [])
+
+    def test_two_completed_answers_under_one_name_each_need_a_fixed_verdict(self) -> None:
+        result = self.settle(self.answer(verdicts=[verdict("fixed")]), self.answer())
+        self.assertEqual(result["status"], "blocking")
+        self.assertEqual(self.settle(self.answer(verdicts=[verdict("fixed")]),
+                                     self.answer(verdicts=[verdict("fixed")]))["status"], "clean")
+
+    def test_a_cited_open_verdict_outlives_a_rebuttal_as_a_cited_repeat_does(self) -> None:
+        """build/sd-1675 class pass: a rebuttal cleared a prior blocker over a reader's own `open` verdict with
+        evidence, while the same reader's cited repeat of a rebutted finding blocks. An uncited one is answered."""
+        rebutted = listed(adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10))
+        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking", id="B1")]
+        for label, evidence, count in (("cited", "python3 t.py []: IndexError", 1), ("uncited", " ", 0)):
+            with self.subTest(label):
+                rows = sd_review.carried(prior, [self.answer(verdicts=[verdict("open", evidence)])], rebutted)
+                self.assertEqual(len(rows), count)
+
     def test_no_completed_reader_carries_nothing(self) -> None:
         failed = sd_review.Outcome("one", sd_review.UNAVAILABLE, (), "", (), ())
         result = self.settle(failed, reviewed=[])
