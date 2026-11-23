@@ -453,6 +453,37 @@ class CitedIdTests(unittest.TestCase):
                 revert = self.revert_of(f"Reverted commits:\n\n- {entry} renew\n")
                 self.assertEqual(sd_ship_body.cited_ids("", [revert, cited]), (2,))
 
+    def test_an_indented_markdown_heading_ends_the_section(self) -> None:
+        """pack sd:9666 review, round 10, instance 1: `  ## Kept commits`, a heading up to three spaces in,
+        left `Reverted commits:` in force, and the retained commit lost its citations."""
+        kept = "b" * 40
+        cited = (kept, "fix: shared\n\nLane review fix, pack sd:5: y.\n\nCloses: sd:4\n")
+        for heading in ("  ## Kept commits", "   # Kept commits", "## Kept commits"):
+            with self.subTest(heading=heading):
+                revert = self.revert_of(f"Reverted commits:\n\n{heading}\n\n- {kept[:9]} retained\n")
+                self.assertEqual(sd_ship_body.cited_ids("", [revert, cited]), (4, 5))
+
+    def test_a_sha_runs_to_a_word_boundary(self) -> None:
+        """pack sd:9666 review, round 10, instance 2: `<sha>é` and `<sha>_` matched the sha as a prefix."""
+        undone = "a" * 40
+        cited = (undone, "feat: x\n\nCloses: sd:2\n")
+        for entry in (f"{undone[:9]}é", f"{undone[:9]}_", f"{undone[:9]}ß rest"):
+            with self.subTest(entry=entry):
+                revert = self.revert_of(f"Reverted commits:\n\n- {entry} renew\n")
+                self.assertEqual(sd_ship_body.cited_ids("", [revert, cited]), (2,))
+
+    def test_a_closed_fence_or_a_heading_ends_the_paragraph(self) -> None:
+        """pack sd:9666 review, round 10, instance 3: after a closed fence, four spaces and `<!--` start
+        indented code, yet they opened a comment that hid the real revert. Instance 4 (class pass): the
+        same after a Markdown heading."""
+        undone = "a" * 40
+        cited = (undone, "feat: x\n\nCloses: sd:2\n")
+        self.assertEqual(sd_ship_body.quoted_lines("a\n```\nx\n```\n    <!--\ny\n"), {2, 3, 4})
+        for opener in ("Reverted commits:\n```\nexample\n```", "Notes.\n## Reverted commits:"):
+            with self.subTest(opener=opener):
+                revert = self.revert_of(f"{opener}\n    <!--\n\n- {undone[:9]} renew\n")
+                self.assertEqual(sd_ship_body.cited_ids("", [revert, cited]), ())
+
     def test_a_fence_on_a_list_marker_line_is_an_example(self) -> None:
         """pack sd:9666 review, round 5, instance 2: `- ```text` opened no fence, so the sha bullet in the
         example undid a real commit and dropped its citations."""

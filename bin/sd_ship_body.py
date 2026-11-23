@@ -63,6 +63,8 @@ class OwnedLine:
 #: A fence that opens or closes a fenced code block: up to three spaces, then
 #: three or more backticks or tildes (CommonMark).
 _FENCE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
+#: A Markdown heading line: up to three spaces, one to six `#`, then a space or the line's end.
+_ATX = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
 #: A list item's marker and the spaces after it; their width is where the item's text starts.
 _ITEM_MARKER = re.compile(r"^( {0,3}(?:[-*+]|[0-9]{1,9}[.)]))( +|$)")
 
@@ -89,6 +91,7 @@ def quoted_lines(body: str, comments: bool = True, code: bool = False) -> set[in
         if fence and len(items) >= depth:
             quoted.add(number)
             fence = "" if _closes(_FENCE_RE.match(rest), fence) else fence
+            loose = True  # a fence is no paragraph: indented code may follow its closing line
             continue
         fence = ""  # the list item that held the fence ended, and the fence with it
         if commented:
@@ -103,7 +106,7 @@ def quoted_lines(body: str, comments: bool = True, code: bool = False) -> set[in
                 fence, depth = match["fence"], len(items)
                 continue
         commented = comments and _comment_open(line, commented)
-        loose = not line.strip()
+        loose = not line.strip() or bool(_ATX.match(rest))  # a heading is one line, no paragraph
     return quoted
 
 
@@ -373,8 +376,9 @@ _REVERTS = re.compile(r"^This reverts commit ([0-9a-f]{7,40})\b(?:, reversing\s+
 #: A revert's subject: `git revert`'s `Revert "..."`, or a Conventional `revert:` (sd:8373).
 REVERT_SUBJECT = re.compile(r"^(?:Revert\b|revert(?:\([^)]*\))?!?:)", re.IGNORECASE)
 #: An item a hand-written revert names an undone commit on: one that opens with a sha, bare or in a code
-#: span, emphasis or a link's text (pack sd:9666). No letter, digit or `_` may follow the sha.
-_SHA_LED = re.compile(r"[`*_\[]*([0-9a-f]{7,40})(?![0-9A-Za-z])(?!_[0-9A-Za-z])")
+#: span, emphasis or a link's text (pack sd:9666). No letter, digit or `_`, in any script, may follow it,
+#: but the `_` that closes `_<sha>_`.
+_SHA_LED = re.compile(r"_([0-9a-f]{7,40})_(?!\w)|[`*\[]*([0-9a-f]{7,40})(?!\w)")
 #: The line that opens a list of undone commits: its last sentence is exactly `Reverted commits:`,
 #: `Reverted:` or `Reverts:`. A substring match let `Commits not reverted:` undo its list (pack sd:9666).
 _REVERTED_INTRO = re.compile(r"(?:^|[.!?][ \t]+)(?:reverted(?:[ \t]+commits)?|reverts):[ \t]*$", re.IGNORECASE)
@@ -411,11 +415,12 @@ def _listed_undone(message: str) -> list[str]:
             text = _item_text(rest, items, opens=True).strip()
             holder = undoes[-1]
             if sha := _SHA_LED.match(text):
-                found += [sha[1]] if holder else []
+                found += [sha[1] or sha[2]] if holder else []
             else:
                 holder = bool(_REVERTED_INTRO.search(_heading(text)))
             undoes += [holder] * (len(items) + 1 - len(undoes))
-        elif _heading(line).endswith(":") or not line[0].isspace():  # an indented line continues an item
+        elif _heading(line).endswith(":") or not line[0].isspace() or _ATX.match(rest):
+            # Any other indented line continues an item.
             undoes[-1] = bool(_REVERTED_INTRO.search(_heading(line)))
     return found
 
