@@ -95,8 +95,9 @@ def drop_sides(work: str | Path, start: str, tip: str, item: int, aside: set[int
     for sha in shas:
         message = _out("log", "-1", "--format=%B", sha, cwd=work)
         # A cherry-picked revert still names the old sha, so the lane would not pair it with the replayed commit,
-        # whose `Closes:` would close an item the revert undid (round 9).
-        if sd_ship_body._REVERTS.search(message):
+        # whose `Closes:` would close an item the revert undid (round 9). A hand-written revert's list of shas
+        # goes stale the same way, in whatever form it writes them, so any revert subject refuses (pack sd:9666).
+        if sd_ship_body._REVERTS.search(message) or sd_ship_body.REVERT_SUBJECT.match(message):
             raise DropRefused(f"commit {sha[:12]} reverts another commit; split it by hand")
         cited = set(sd_ship_body.cited_ids("", [(sha, message)]))
         if not cited:
