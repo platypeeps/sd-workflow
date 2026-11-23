@@ -846,25 +846,20 @@ class SharedReview:
         report it was handed, and its `request_sha256` compared with the one
         the pass recorded. Equal, the receipt is rebound and the record says
         so; no pass is spent. Policy stays byte-exact, a legacy receipt has no
-        request to replay, a `FINDING_FILES` member whose finding code moved
-        (`finding_kept`, sd:10191) could judge the same request differently,
-        and any doubt re-reviews.
+        request to replay, a moved `FINDING_FILES` member could judge the same
+        request differently, and any doubt re-reviews.
         """
         passes = self.history.native(self.state)
         request = (passes[-1].get("review_request") if passes else None) or {}
-        manifest = getattr(self.runtime, "manifest", None)
-        if manifest is None:
-            return False
-        stored, current = self.state.get("binding_manifest"), manifest(self.root)
-        changed = sd_ship_bindings.binding_change(stored, current)
-        if (not request.get("sha256") or not changed
-                or any(kind not in ("verdict", "gate", "check")
-                       or not sd_ship_bindings.finding_kept(name, stored, current) for name, kind in changed)
+        changed, manifest = self.binding_changes(), getattr(self.runtime, "manifest", None)
+        if (manifest is None or not request.get("sha256") or not changed
+                or any(kind not in ("verdict", "gate", "check") or name in sd_ship_bindings.FINDING_FILES
+                       for name, kind in changed)
                 or self.replayed_request(passes, request) != request["sha256"]):
             return False
         kept = {"head": passes[-1].get("head"), "recorded_at": self.runtime.clock(), "superseded_binding": self.state.get("binding"),
                 "changed": [list(row) for row in changed], "request_sha256": request["sha256"]}
-        rebound = {"binding": self.runtime.binding(self.root), "binding_manifest": current,
+        rebound = {"binding": self.runtime.binding(self.root), "binding_manifest": manifest(self.root),
                    "review_binding_kept": [*(self.state.get("review_binding_kept") or []), kept]}
         if self.read_only():
             # pack sd:7576. A read verb, such as the template `sd-ship adjudicate`
