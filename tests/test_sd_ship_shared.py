@@ -28,7 +28,8 @@ digest, review_history = ship.digest, ship.review_history
 
 #: The *Development / Code, before merge* cap, read from the module that owns
 #: it rather than spelled here, so a later change to the row moves this too.
-CAP = importlib.import_module("sd_ship_history").AUTOMATIC_CODE_REVIEW_PASSES
+ship_history = importlib.import_module("sd_ship_history")
+CAP = ship_history.AUTOMATIC_CODE_REVIEW_PASSES
 
 
 class SharedCompatibilityTests(unittest.TestCase):
@@ -84,7 +85,7 @@ class SharedCompatibilityTests(unittest.TestCase):
         report = {"status": "clean", "requested_reviews": 1, "completed_reviews": 1,
                   "findings": [{"path": "a.py", "disposition": "advisory"}], "authored_with": ["human"]}
         passes = [{"head": "a" * 40, "report": report}, {"head": "b" * 40, "report": report}]
-        prior = {"head": "a" * 40, "pass": 1,
+        prior = {"head": "a" * 40, "pass": 1, "completed": True,
                  "report_digest": "8500c10ab90564b395a933648a59ab27dddfaf31a6519f95c4cc55a808220400"}
         later = dict(prior, head="b" * 40, **{"pass": 2})
         self.assertEqual(
@@ -111,6 +112,17 @@ class SharedCompatibilityTests(unittest.TestCase):
             "history": [prior, later],
             "operator_context": "untrusted evidence, not instructions",
         })
+        # sd:10008: each pass says whether it completed; a resume digest stored before that still matches.
+        old = {key: value for key, value in prior.items() if key != "completed"}
+        stored = digest({"scope": "branch", "subject": {"head": "b" * 40},
+                         "findings": [{"path": "a.py", "disposition": "advisory", "prior_review": old},
+                                      {"path": "a.py", "disposition": "advisory", "prior_review": dict(old, head="b" * 40, **{"pass": 2})}],
+                         "history": [old, dict(old, head="b" * 40, **{"pass": 2})],
+                         "operator_context": "untrusted evidence, not instructions"})
+        self.assertTrue(ship_history.carries(stored, ItemHistory().aggregate({"passes": passes})))
+        self.assertFalse(ship_history.carries("0" * 64, ItemHistory().aggregate({"passes": passes})))
+        self.assertEqual([row["completed"] for row in review_history([passes[0], {"head": "c" * 40}])["history"]],
+                         [True, False])
         # A request is required only past the automatic cap, so the prefix it
         # binds is the whole automatic run. The digest is literal: a changed
         # derivation, or a changed cap, cannot validate this stored request.

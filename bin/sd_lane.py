@@ -326,8 +326,17 @@ SLOT_WAIT = sd_ship_workflow.GATE_SLOT_WAIT
 BLOCKED = ("failed", "skipped", "prepared")
 #: The ends whose entry notes each item it carries (`note_ended`, sd:5963), as the retired runner noted its runs.
 NOTED = ("failed", "skipped")
-#: How each `note_ended` body starts: a passing entry resolves the open followups that start so (sd:7357).
+#: How each `note_ended` body starts: of the lane's own notes, only these are blockers a pass answers (sd:7357).
 LANE_ENDED = tuple(f"Lane {status} in " for status in NOTED)
+#: The `note.session` every `default_note` write records (build/sd-1423 review): the lane's own
+#: followups are told apart by who wrote them, since an operator can paste the lane's text.
+LANE_SESSION = "sd-lane"
+
+
+def lane_note(session: object, body: object) -> bool:
+    """Whether a note is a blocker `note_ended` wrote: the lane's session and its opening. The lane's
+    `Release:` and `Post-merge:` followups are its too, but a later merge answers neither."""
+    return session == LANE_SESSION and str(body).startswith(LANE_ENDED)
 
 
 class LaneError(RuntimeError):
@@ -2745,9 +2754,12 @@ def start_train(entry: dict[str, Any], queue: Queue, gate: Gate, environ: dict[s
 
 
 def default_note(item: int, body: str, main: pathlib.Path, kind: str = "comment") -> str:
-    """`sd task note`, run from the main checkout as a person would."""
+    """`sd task note`, run from the main checkout as a person would, recorded as `LANE_SESSION`'s.
+
+    `sd task note` records the harness session it finds, so the lane names itself there."""
+    environ = {key: value for key, value in os.environ.items() if key != "SD_AGENT_SESSION"}
     done = subprocess.run([sys.executable, str(BIN / "sd"), "task", "note", str(item), "--kind", kind, "--body", body],
-                          cwd=main,
+                          cwd=main, env={**environ, "CLAUDE_CODE_SESSION_ID": LANE_SESSION},
                           capture_output=True, text=True, timeout=120, check=False)
     return "written" if done.returncode == 0 else f"failed: {(done.stderr or done.stdout).strip()[-300:]}"
 
@@ -3403,7 +3415,7 @@ def resolve_ended(row: dict[str, Any], queue: Queue) -> dict[str, str]:
 
     A passing entry is `merged` or `prepared` (`GATE_PASSED`); a lane
     followup is an open `followup` whose body starts as `note_ended`'s does
-    (`LANE_ENDED`). Other followups stay open. The answer is
+    (`lane_note`: `LANE_SESSION` wrote it). Other followups stay open. The answer is
     `{"sd:N": "resolved #id, ..." or "failed: ..."}` for each item that had
     one or whose read failed; a failure leaves the followup open on every
     machine and changes no outcome.
@@ -3423,8 +3435,8 @@ def resolve_ended(row: dict[str, Any], queue: Queue) -> dict[str, str]:
         for item in items:
             try:
                 open_ids = [found["id"] for found in connection.execute(
-                    "SELECT id, body FROM note WHERE item = ? AND kind = 'followup' AND resolved_at IS NULL"
-                    " ORDER BY id", (item,)) if str(found["body"]).startswith(LANE_ENDED)]
+                    "SELECT id, session, body FROM note WHERE item = ? AND kind = 'followup' AND resolved_at IS NULL"
+                    " ORDER BY id", (item,)) if lane_note(found["session"], found["body"])]
                 for number in open_ids:
                     writes.resolve_note(connection, number)
                 if open_ids:

@@ -43,7 +43,8 @@ class FixReviewTests(ReviewFixture):
     def test_unchanged_blocker_and_source_reach_the_fix_reviewer(self):
         root, first = self.branch()
         blocking = json.dumps({"findings": [{"path": "src.py", "line": 1, "summary": "original unresolved defect",
-                                            "family": "correctness", "severity": "high", "instances": ["src.py:1"]}]})
+                                            "family": "correctness", "severity": "high", "instances": ["src.py:1"],
+                                            "evidence": "python3 src.py: Traceback"}]})
         prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": sd_review.Completed(0, blocking, "")}),
                                  self.environment(), self.chatgpt_home())
         report = self.tmp / "prior.json"
@@ -67,7 +68,8 @@ class FixReviewTests(ReviewFixture):
         first = self.commit(root, "second.py", "the_second_instance = True\n")
         blocking = json.dumps({"findings": [{"path": "src.py", "line": 1, "summary": "grouped unresolved defect",
                                             "family": "correctness", "severity": "high",
-                                            "instances": ["src.py:1", "second.py:1"]}]})
+                                            "instances": ["src.py:1", "second.py:1"],
+                                            "evidence": "python3 src.py: Traceback"}]})
         prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": sd_review.Completed(0, blocking, "")}),
                                  self.environment(), self.chatgpt_home())
         report = self.tmp / "prior.json"
@@ -82,13 +84,74 @@ class FixReviewTests(ReviewFixture):
         self.assertIn("every listed instance", handed, "the verifier was not told each instance must be fixed")
         self.assertEqual(result["status"], "blocking")
 
+    def test_an_uncited_repeat_at_a_remaining_instance_still_blocks(self):
+        """build/sd-1623 review (bin/sd-review:1833): a blocker at src.py:1 that also lists second.py:1. With
+        src.py fixed, its uncited repeat at second.py posted as advisory: the prior match read the reported
+        place alone. Each listed instance now holds the blocker, mapped through the diff as its place is."""
+        self.remaining_instance_repeat("")
+
+    def test_a_remaining_instance_moved_by_an_insertion_still_blocks(self):
+        """build/sd-1623 review (bin/sd-review:1928): the instance's line moves through the diff too."""
+        self.remaining_instance_repeat("# a comment\n" * (sd_review.ECHO_LINES + 2))  # past an echo
+
+    def remaining_instance_repeat(self, above):
+        sd_review.READER_GROUPS.reopen_groups()  # a failed reader in an earlier test closes them
+        root, _ = self.branch()
+        first = self.commit(root, "second.py", "the_second_instance = True\n")
+        prior = {"scope": "branch", "subject": {"head": first}, "status": "blocking", "findings": [
+            {"path": "src.py", "line": 1, "summary": "grouped unresolved defect", "family": "correctness",
+             "severity": "high", "instances": ["src.py:1", "second.py:1"],
+             "evidence": "python3 src.py: Traceback", "disposition": "blocking"}]}
+        report = self.tmp / "prior.json"
+        report.write_text(json.dumps(prior))
+        self.commit(root, "src.py", "the_original_defect = False\n")
+        if above:
+            self.commit(root, "second.py", above + "the_second_instance = True\n")
+        line = 1 + above.count("\n")
+        repeat = json.dumps({"findings": [{"path": "second.py", "line": line,
+                                           "summary": "grouped unresolved defect", "family": "correctness",
+                                           "severity": "high", "instances": [f"second.py:{line}"]}]})
+        result = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)),
+                                  FakeRunner({"codex": sd_review.Completed(0, repeat, "")}),
+                                  self.environment(), self.chatgpt_home())
+        self.assertEqual(result["status"], "blocking")
+        self.assertEqual([row.get("evidence") for row in result["findings"]], ["python3 src.py: Traceback"])
+
+    def test_a_respelled_repeat_of_a_prior_blocker_still_blocks(self):
+        """build/sd-1423 class pass: a finding is matched across reports and readers in any spelling the review
+        accepts. A prior blocker at an absolute path, repeated uncited as `src.py`, posted as advisory; so did
+        the reverse spellings. Each is now matched on one repository-relative spelling."""
+        sd_review.READER_GROUPS.reopen_groups()  # the failed reader above closes them
+        root, first = self.branch()
+        spellings = (f"{root}/src.py", f"{root.resolve()}/src.py", "./src.py", "src.py")
+        # An absolute prior path is refused before review ("outside this repository"); filed apart.
+        for before, after in [(a, b) for a in spellings[2:] for b in spellings if a != b]:
+            with self.subTest(before=before, after=after):
+                prior = {"scope": "branch", "subject": {"head": first}, "status": "blocking", "findings": [
+                    {"path": before, "line": 1, "summary": "original unresolved defect", "family": "correctness",
+                     "severity": "high", "evidence": "python3 src.py: Traceback", "disposition": "blocking"}]}
+                report = self.tmp / "prior.json"
+                report.write_text(json.dumps(prior))
+                if not (root / "other.py").exists():
+                    self.commit(root, "other.py", "unrelated_fix = True\n")
+                repeat = json.dumps({"findings": [{"path": after, "line": 1, "summary": "original unresolved defect",
+                                                   "family": "correctness", "severity": "high",
+                                                   "instances": [f"{after}:1"]}]})
+                result = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)),
+                                          FakeRunner({"codex": sd_review.Completed(0, repeat, "")}),
+                                          self.environment(), self.chatgpt_home())
+                self.assertEqual(result["status"], "blocking")
+                self.assertEqual([(row["path"], row["evidence"]) for row in result["findings"]],
+                                 [("src.py", "python3 src.py: Traceback")])
+
     def test_a_reader_that_raises_after_a_prior_report_ends_with_its_own_error(self):
         """sd:7569. The prior finding's source is read in the main thread
         through `subprocess_runner`, which registers that thread as a group
         holder; the cleanup after a failed reader must not join it."""
         root, first = self.branch()
         blocking = json.dumps({"findings": [{"path": "src.py", "line": 1, "summary": "original unresolved defect",
-                                            "family": "correctness", "severity": "high", "instances": ["src.py:1"]}]})
+                                            "family": "correctness", "severity": "high", "instances": ["src.py:1"],
+                                            "evidence": "python3 src.py: Traceback"}]})
         prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": sd_review.Completed(0, blocking, "")}),
                                  self.environment(), self.chatgpt_home())
         report = self.tmp / "prior.json"
@@ -110,7 +173,8 @@ class FixReviewTests(ReviewFixture):
         """Review of sd:9769: a delta the router would skip must not clear blockers nobody checked."""
         root, first = self.branch()
         blocking = json.dumps({"findings": [{"path": "src.py", "line": 1, "summary": "original unresolved defect",
-                                            "family": "correctness", "severity": "high", "instances": ["src.py:1"]}]})
+                                            "family": "correctness", "severity": "high", "instances": ["src.py:1"],
+                                            "evidence": "python3 src.py: Traceback"}]})
         prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": sd_review.Completed(0, blocking, "")}),
                                  self.environment(), self.chatgpt_home())
         self.assertEqual(prior["status"], "blocking")
@@ -269,7 +333,8 @@ class FixReviewTests(ReviewFixture):
     def test_resume_reviews_full_branch_and_repeats_prior_blockers(self):
         root, first = self.branch()
         blocking = json.dumps({"findings": [{"path": "src.py", "line": 1, "summary": "original unresolved defect",
-                                            "family": "correctness", "severity": "high", "instances": ["src.py:1"]}]})
+                                            "family": "correctness", "severity": "high", "instances": ["src.py:1"],
+                                            "evidence": "python3 src.py: Traceback"}]})
         prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": sd_review.Completed(0, blocking, "")}),
                                  self.environment(), self.chatgpt_home())
         prior["completed_reviews"] = 0

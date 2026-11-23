@@ -30,6 +30,7 @@ from sd_ship_history import (
     AUTOMATIC_CODE_REVIEW_PASSES,
     completed_depth,
     digest,
+    legacy,
     reservation,
     verified_index,
 )
@@ -892,7 +893,8 @@ class SharedReview:
                 earlier = dict(self.state, passes=passes[:-1])
                 candidates = [self.history.prior(earlier)]
                 try:
-                    candidates.append(self.history.aggregate(earlier))
+                    aggregate = self.history.aggregate(earlier)
+                    candidates += [aggregate, legacy(aggregate)]  # a request stored before sd:10008 binds the old shape
                 except Refusal:
                     pass
                 prior = next((row for row in candidates if digest(row) == wanted), None)
