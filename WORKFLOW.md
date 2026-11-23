@@ -534,13 +534,12 @@ sentence.
 The provider registry maps roles to providers.
 Reusable skill procedures name roles; operator policy owns preferred entries.
 
-Cheap, standard, and deep changes ask two independent local reviews (sd:7519).
-With one eligible reader, the review asks one and its result names the shortfall (`review_shortfall`).
-The first two readers on the reviewer order run at once: with the shipped order, codex and Claude.
+Cheap, standard, and deep changes ask one local review (sd:10193): codex raised 120 of 129 blockers in 7 days.
+The reader is the first eligible entry on the reviewer order: with the shipped order, codex, else Claude.
 A reader that fails gives its slot to the next entry; the receipt keeps the registry order.
 Claude's reader also gets the ranked addition: trace callers and config readers, rank by production impact.
-Skip requires none; planning, lensed and challenged reviews keep a floor of two, so a research brief gets both.
-Tier selection still follows repository policy; the tier never adds a third reader.
+Skip requires none; planning, lensed and challenged reviews ask the same one reader.
+Tier selection still follows repository policy; the tier never adds a second reader.
 Complete local review before any Copilot request; [Standing authorization](#standing-authorization) holds the policy.
 A completed Copilot review must cover the merge head, or an ancestor whose diff to it touches only skippable `docs/` paths.
 
