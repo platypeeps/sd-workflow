@@ -1994,6 +1994,8 @@
     d.addEventListener('toggle', () => { if (!d.open) return; menu.style.maxHeight = `${Math.max(160, Math.floor(innerHeight - menu.getBoundingClientRect().top - 16))}px`; read(); });
     if (location.hash === '#usage') d.open = true; // screenshot hook, as #menu and #chat are; opening reads
     else read();
+    // Advisory of PR #1950 (sd:9973): a page left open reads the strip again every 5 minutes, unless hidden.
+    setInterval(() => { if (document.visibilityState !== 'hidden') read(); }, 5 * 60 * 1000);
     return read;
   }
   // usage:end
