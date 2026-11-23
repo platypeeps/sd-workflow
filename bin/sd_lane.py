@@ -2843,6 +2843,8 @@ TRAIN_BRANCH = "sd-train/{}"
 TRAIN_LEFT = "train_member_left"
 #: A cancel or hold refused for a pending member the running lead's train is merging (review of sd:9923).
 TRAIN_MERGING = "train_merging"
+#: A member row's mark, the head the train prepares it from; dropped once the row follows (round 3 of sd:9923).
+TRAIN_PREPARING = "train_preparing"
 #: A joined train member: its row, worktree, prepared head, the landing it joined onto and the merge it wrote.
 Joined = tuple[dict[str, Any], pathlib.Path, str, str, str]
 
@@ -2886,8 +2888,7 @@ def land_as_train(entry: dict[str, Any], queue: Queue, ship: Ship, head: str, lo
             record[row["id"]] = {"status": "skipped", "reason": OUT_OF_BUDGET}
             break
         renewed()
-        placed, why = prepared_member(row, queue, ship, logs, renewed, deadline)
-        row = follow_prepare(queue, row, placed)  # now: a train that stops later still leaves the row there
+        row, placed, why = prepared_member(row, queue, ship, logs, renewed, deadline)
         if placed is not None:
             landing, why = join_member(row, pathlib.Path(row["worktree"]), placed, onto, ship, logs)
         if placed is None or landing is None:
@@ -3001,75 +3002,122 @@ def train_base(tree: pathlib.Path) -> tuple[str, str] | None:
     return (branch, commit) if commit else None
 
 
-def prepared_member(row: dict[str, Any], queue: Queue, ship: Ship, logs: pathlib.Path,
-                    renewed: Callable[[], None], deadline: float) -> tuple[str | None, str]:
-    """A pending member's prepared head, as its own claim would prepare it, or None with why not."""
+def prepared_member(row: dict[str, Any], queue: Queue, ship: Ship, logs: pathlib.Path, renewed: Callable[[], None],
+                    deadline: float) -> tuple[dict[str, Any], str | None, str]:
+    """A pending member's row and prepared head, as its own claim would prepare it, or None with why not.
+
+    The row is marked `TRAIN_PREPARING` before the prepare and follows the
+    head the prepare left after it (`follow_prepare`); a mark or a follow
+    that cannot be written drops the member, and a refusal before the
+    prepare writes nothing.
+    """
     tree = pathlib.Path(row["worktree"])
     try:
         if not at_head(tree, row["expected_head"]):
-            return None, "its worktree moved from the queued head"
+            return row, None, "its worktree moved from the queued head"
     except LaneError as error:
-        return None, str(error)
+        return row, None, str(error)
     try:
         left = left_stop(row, queue, "merge")
     except LaneError as error:
-        return None, str(error)
+        return row, None, str(error)
     if left is not None:
-        return None, str(left.get("reason"))
+        return row, None, str(left.get("reason"))
+    if not mark_row(queue, row, {TRAIN_PREPARING: row["expected_head"]}):
+        return row, None, "its row could not be marked before its prepare"
     prepared, _ = prepare_step(row, tree, logs.with_name(f"train-prepare-{row['item']}-{logs.name}"), ship,
                                renewed, deadline)
     stopped = prepare_stop(row, tree, prepared)
+    placed = None if stopped is not None else str(prepared.get("head"))
+    followed = follow_prepare(queue, row, placed)
+    if followed is None:
+        return row, None, "its row could not follow its prepare; its own claim settles it"
     if stopped is not None:
-        return None, f"its prepare stopped: {stopped.get('reason') or stopped.get('status')}"
-    return str(prepared.get("head")), ""
+        return followed, None, f"its prepare stopped: {stopped.get('reason') or stopped.get('status')}"
+    return followed, placed, ""
 
 
-def follow_prepare(queue: Queue, row: dict[str, Any], placed: str | None) -> dict[str, Any]:
-    """`row` queued at the head its train prepare left, so its own claim starts there (class pass of sd:9923).
+def mark_row(queue: Queue, row: dict[str, Any], fields: dict[str, Any], drop: tuple[str, ...] = ()) -> bool:
+    """Write `fields` on `row`, and drop `drop`, while it is pending at the head the train read; False when not."""
+    def on_row(entries: list[dict[str, Any]]) -> bool:
+        mine = next((each for each in entries if each["id"] == row["id"]), None)
+        if mine is None or mine.get("status") != "pending" or mine.get("expected_head") != row["expected_head"]:
+            return False
+        mine.update(fields)
+        for key in drop:
+            mine.pop(key, None)
+        return True
+    try:
+        return bool(update(queue, on_row))
+    except Stop:
+        raise
+    except (LaneError, OSError):
+        return False
+
+
+def follow_prepare(queue: Queue, row: dict[str, Any], placed: str | None) -> dict[str, Any] | None:
+    """`row` queued at the head its train prepare left, its mark dropped, or None when that write failed.
 
     The train prepares a member it has not claimed, and that prepare moves
     the branch: a catch-up merge, or under a rebase policy a rewrite that
     is force-pushed. A row left at the old head skips `HEAD_MOVED` on its
     next claim. The row moves only while it is pending at the head the
-    train read, so a re-enqueue in between wins; a write that fails moves
-    nothing, and the row the train carries stays the one the queue holds.
+    train read, so a re-enqueue in between wins. A write that fails leaves
+    the mark, and the member's own claim settles it (`settle_mark`).
     """
-    old = row["expected_head"]
-    new = prepared_head(pathlib.Path(row["worktree"]), str(row.get("branch") or ""), old, placed)
-    if new == old:
-        return row
-
-    def on_row(entries: list[dict[str, Any]]) -> bool:
-        mine = next((each for each in entries if each["id"] == row["id"]), None)
-        if mine is None or mine.get("status") != "pending" or mine.get("expected_head") != old:
-            return False
-        mine["expected_head"] = new
-        return True
-    try:
-        return {**row, "expected_head": new} if update(queue, on_row) else row
-    except Stop:
-        raise
-    except (LaneError, OSError):
-        return row
+    new = prepared_head(pathlib.Path(row["worktree"]), str(row.get("branch") or ""), row["expected_head"], placed)
+    if not mark_row(queue, row, {"expected_head": new}, drop=(TRAIN_PREPARING,)):
+        return None
+    return {**row, "expected_head": new}
 
 
 def prepared_head(tree: pathlib.Path, branch: str, expected: str, placed: str | None) -> str:
-    """The head a member's train prepare left for `expected`, or `expected` when it made none the lane can name.
+    """The published head a member's train prepare left for `expected`, or `expected` (round 3 of sd:9923).
 
-    In order: the catch-up merge prepare pushed (`pushed_catch_up`); the
-    worktree's HEAD when it is the head `sd-ship prepare` answered ready,
-    which it reviewed and pushed; that HEAD when it is prepare's rebase of
-    `expected` (`rebase_of`), pushed or not, for a prepare that refused
-    after its rewrite. A read that fails keeps `expected`.
+    In order: the catch-up merge prepare pushed (`pushed_catch_up`);
+    `origin/<branch>` when the worktree is at it and it is the head
+    `sd-ship prepare` answered ready or prepare's rebase of `expected`
+    (`rebase_of`). A rewrite only in the worktree stays out of the shared
+    queue: another lane host could not fetch it. A read that fails keeps
+    `expected`.
     """
     pushed = pushed_catch_up(tree, branch, expected)
     if pushed != expected:
         return pushed
+    listed = publish_git(tree, "ls-remote", "origin", f"refs/heads/{branch}") if branch else None
+    tip = (listed.stdout.split() or [""])[0] if listed is not None and listed.returncode == 0 else ""
     try:
         head = read_git(tree, "rev-parse", "HEAD").stdout.strip()
-        return head if head and head != expected and (head == placed or rebase_of(tree, head, expected)) else expected
+        return tip if tip and tip == head != expected and (tip == placed or rebase_of(tree, tip, expected)) \
+            else expected
     except LaneError:
         return expected
+
+
+def settle_mark(queue: Queue, entry: dict[str, Any], token: str, root: pathlib.Path) -> dict[str, Any]:
+    """The claimed `entry` at the head a train's prepare of it pushed, its `TRAIN_PREPARING` mark dropped.
+
+    A train that prepared the member and could not write the head after
+    leaves the mark (`follow_prepare`). `origin/<branch>` is that head when
+    it is the catch-up or rebase of the marked head; anything else keeps
+    the queued head, and `checkout_for` skips a move as before. A fetch
+    with no answer raises `PUBLISH_UNKNOWN`.
+    """
+    if TRAIN_PREPARING not in entry:
+        return entry
+    expected, new = entry["expected_head"], entry["expected_head"]
+    if entry[TRAIN_PREPARING] == expected:
+        main = sd_lib.main_worktree_root(root)
+        tip = fetched_tip(main, str(entry.get("branch") or ""))
+        if tip and tip != expected and (catch_up_of(main, tip, expected) or rebase_of(main, tip, expected)):
+            new = tip
+
+    def unmark(entries: list[dict[str, Any]]) -> None:
+        row = held(entries, entry, token)
+        row["expected_head"] = new
+        row.pop(TRAIN_PREPARING, None)
+    runner_write(queue, unmark)
+    return {key: value for key, value in {**entry, "expected_head": new}.items() if key != TRAIN_PREPARING}
 
 
 def rebase_of(tree: pathlib.Path, commit: str, expected: str) -> bool:
@@ -5041,7 +5089,10 @@ def run_entry(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token: st
     worktree the runner made goes once the entry ends, whatever its outcome.
     """
     try:
+        entry = settle_mark(queue, entry, token, root)
         found = checkout_for(root, queue, entry)
+    except Stop as stop:
+        return None, record_hub_stop(queue, token, stop, entry)
     except LaneError as error:
         if error.code == PUBLISH_UNKNOWN:
             return unknown_checkout(queue, entry, token, error)
