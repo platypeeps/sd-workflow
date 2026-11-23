@@ -6353,6 +6353,127 @@ roles:
         self.assertIsNone(state.get("reviewed_head"))
 
 
+    # -- a train lands as one train pull request (sd:9923) --------------------
+
+    def landing_before(self, name="earlier.py"):
+        """A commit on `origin/main` that is not on it: the landing an earlier train member left."""
+        _git(self.root, "fetch", "-q", "origin", "main")
+        main = _git(self.root, "rev-parse", "FETCH_HEAD")
+        earlier = self.remote.commit_on(f"earlier-{name}", "earlier member\n\nAuthored-with: human",
+                                        files={name: "earlier = 1\n"})
+        _git(self.root, "fetch", "-q", "origin", f"earlier-{name}")
+        return main, earlier
+
+    def join(self, onto, *extra):
+        head = _git(self.root, "rev-parse", "HEAD")
+        return self.operation("merge", "--manual", "--expected-head", head, "--train-onto", onto, *extra).merge()
+
+    def land_train(self, tip):
+        """The train pull request merged with a merge commit, as `land_train` lands it."""
+        _git(self.root, "push", "-q", "origin", f"{tip}:refs/heads/sd-train/fixture")
+        train = self.remote.open_pull_request("sd-train/fixture", title="train")
+        return self.remote.merge(train.number, sha=tip, method="merge")
+
+    def test_a_train_join_writes_the_merge_onto_the_landing_and_dispatches_nothing(self):
+        self.delivering()
+        head = _git(self.root, "rev-parse", "HEAD")
+        _main, earlier = self.landing_before()
+        joined = self.join(earlier)
+        self.assertEqual(joined["phase"], "train_joined")
+        commit = joined["train_commit"]
+        self.assertEqual(_git(self.root, "rev-parse", f"{commit}^1", f"{commit}^2").split(), [earlier, head])
+        message = _git(self.root, "show", "-s", "--format=%B", commit)
+        self.assertIn("(#1)", message.splitlines()[0])
+        self.assertIn(f"Item: sd:{self.item}", message)
+        self.assertIn(f"Reviewed-base: {earlier}", message)
+        self.assertIs(ship.sd_lib.held_at_merge(message, earlier), False)  # the joined-tree gate releases it
+        self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
+        self.assertEqual(self.remote.pull(1).state, "OPEN")
+        state = self.operation("merge", "--manual", "--expected-head", head).state
+        self.assertEqual((state["phase"], state["train_commit"], state["train_onto"]),
+                         ("train_joined", commit, earlier))
+        again = self.join(earlier)["train_commit"]
+        after = self.operation("merge", "--manual", "--expected-head", head).state
+        self.assertEqual((after["train_commit"], _git(self.root, "rev-parse", f"{again}^1", f"{again}^2").split()),
+                         (again, [earlier, head]))  # a second join records the commit it answers
+
+    def test_a_train_join_that_conflicts_refuses_and_records_no_join(self):
+        self.prepare()
+        conflicting = self.remote.commit_on("clash", "clash\n\nAuthored-with: human", files={"src.py": "value = 9\n"})
+        _git(self.root, "fetch", "-q", "origin", "clash")
+        with self.assertRaises(ship.Refusal) as caught:
+            self.join(conflicting)
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "train_conflict")
+        self.assertNotEqual(self.operation("merge", "--manual", "--expected-head", "HEAD").state.get("phase"),
+                            "train_joined")
+
+    def test_a_train_join_refuses_a_landing_that_lacks_the_default_branch(self):
+        self.prepare()
+        _git(self.root, "fetch", "-q", "origin", "main")
+        old = _git(self.root, "rev-parse", "FETCH_HEAD")
+        self.remote.commit_on("main", "moved\n\nAuthored-with: human", files={"moved.py": "m = 1\n"})
+        with self.assertRaises(ship.Refusal) as caught:
+            self.join(old)
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "train_stale_landing")
+
+    def test_a_train_join_refuses_a_repository_without_merge_commits(self):
+        self.prepare()
+        _main, earlier = self.landing_before()
+        saved = self.double._route
+
+        def route(method, path, body):
+            code, value = saved(method, path, body)
+            if method == "GET" and path == f"/repos/{self.remote.slug}":
+                value = {**value, "allow_merge_commit": False}
+            return code, value
+        self.double._route = route
+        with self.assertRaisesRegex(ship.Refusal, "merge merging is disabled"):
+            self.join(earlier)
+
+    def test_a_landed_train_reconciles_each_member_at_its_train_merge(self):
+        self.delivering()
+        _main, earlier = self.landing_before()
+        commit = self.join(earlier)["train_commit"]
+        self.land_train(commit)
+        self.assertEqual((self.remote.pull(1).state, self.remote.pull(1).merge_commit_sha), ("MERGED", commit))
+        merged = self.merge()
+        self.assertEqual((merged["phase"], merged["merge_commit"]), ("merged", commit))
+        self.assertFalse(merged["delivery_pending"])
+        self.assertEqual(self.connection.execute("SELECT status FROM item WHERE id=?", (self.item,)).fetchone()[0],
+                         "done")
+        self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
+
+    def test_a_prepare_after_a_landed_train_reconciles(self):
+        """A run stopped after the train PR merged: the member's next claim prepares, and that reconciles."""
+        self.prepare()
+        _main, earlier = self.landing_before()
+        commit = self.join(earlier)["train_commit"]
+        self.land_train(commit)
+        prepared = self.prepare()
+        self.assertEqual((prepared["phase"], prepared["merge_commit"]), ("merged", commit))
+
+    def test_a_train_member_merged_at_another_commit_refuses(self):
+        self.prepare()
+        _main, earlier = self.landing_before()
+        commit = self.join(earlier)["train_commit"]
+        self.land_train(commit)
+        self.remote.pull(1).merge_commit_sha = _git(self.remote.path, "rev-parse", "main")
+        with self.assertRaises(ship.Refusal) as caught:
+            self.merge()
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "train_merge_mismatch")
+        self.assertIn(commit, str(caught.exception))
+
+    def test_a_member_whose_train_did_not_land_merges_alone(self):
+        self.prepare()
+        _main, earlier = self.landing_before()
+        self.join(earlier)
+        merged = self.merge()
+        self.assertEqual(merged["phase"], "merged")
+        state = self.operation("merge", "--manual", "--expected-head", "HEAD").state
+        self.assertIsNone(state.get("train_commit"))
+        self.assertEqual(len([call for call in self.remote.calls if call.method == "PUT"]), 1)
+
+
 class ReviewWatchdogTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

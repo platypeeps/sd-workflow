@@ -40,7 +40,15 @@ from sd_ship_history import review_history as review_history
 from sd_ship_history import timeout_evidence as timeout_evidence
 from sd_ship_history import validate_additional_requests as validate_additional_requests
 from sd_ship_item import ItemIdentity
-from sd_ship_remote import GitHub, Refusal, git, refuse_behind, run, slug
+from sd_ship_remote import (
+    GitHub,
+    Refusal,
+    completed_process,
+    git,
+    refuse_behind,
+    run,
+    slug,
+)
 from sd_ship_review import (
     RAW_CAPTURE_ENV,
     ReviewRuntime,
@@ -1495,6 +1503,9 @@ class Ship(SharedReview):
                               state="operator_decision",
                               next_action="Run sd work deliver with --associated and --reason.")
             return self.reconcile()
+        if self.state.get("phase") == "train_joined" and self.state.get("pull_request") and \
+                self.api.pull(self.state["pull_request"]["number"]).get("merged") is True:
+            return self.reconcile()  # its train landed and the run stopped before this member reconciled (sd:9923)
         self.refuse_live_review()
         self.require_claim()
         self.check_held(tuple(dict.fromkeys(self.args.closes)))  # before it commits or catches up (pack sd:7221)
@@ -2369,13 +2380,12 @@ class Ship(SharedReview):
         self.merge_rules(base, observed["number"], head, protection)
         # `repo.ci = local` (sd:1843): no Actions run, so the checks run here,
         # at the reviewed head in a clean worktree, before readiness reads them.
-        if self.api.ci == "local":
-            self.merge_local_gate(observed, base, head)
-        observed = self.settled_ready(observed["number"], head, base, protection)
+        train = getattr(self.args, "train_onto", None)
+        observed = self.merge_ready(observed, head, base, protection, train)
         self.abandon_copilot_review(observed["number"], head)
         self.require_copilot_clearance(observed["number"], observed, head)
         self.save(phase="ci_passed", protection=protection)
-        body, closes = self.landing_message(method, observed, head, self.reviewed_base(head, base))
+        body, closes = self.landing_message(method, observed, head, train or self.reviewed_base(head, base))
         # The squash message is composed here and read by `git
         # interpret-trailers --parse` afterwards, and those two only agree
         # while the trailers sit in the message's *last* paragraph. One blank
@@ -2387,21 +2397,15 @@ class Ship(SharedReview):
         # A pull-request body ending in a line that reads as a trailer is the
         # ordinary way this happens, so the check is on the composed message
         # rather than on the part this method wrote.
-        demoted = sd_lib.demoted_trailers(body)
-        if demoted:
-            raise Refusal(
-                "this squash message states "
-                + ", ".join(repr(line) for line in demoted)
-                + " outside the trailer block git reads, so the merge would land "
-                "without it; move the line into the message's last paragraph, "
-                "contiguously with the other trailers, or take it out of the body"
-            )
+        refuse_demoted(body)
         self.check_review(head)
         if self.merge_head() != head:
             raise Refusal("HEAD moved immediately before merge")
         self.merge_authority()
         self.check_held(self.co_delivered())  # a teammate run may have started during the gate (pack sd:7221)
         self.still_allowed(base, observed["number"], head, protection)
+        if train:
+            return self.join_train(train, head, body, observed["number"], closes)
         # `row_authorized_merge` is written here, with the phase that says a
         # merge is going out, and it is written on every dispatch rather than
         # only when there is something to say: `still_gated` above took the
@@ -2410,7 +2414,8 @@ class Ship(SharedReview):
         # ownership-only merge therefore cannot inherit a claim from a merge
         # that never happened (sd:1347).
         self.save(phase="merge_dispatch", merge_message=body, row_authorized_merge=self.row_authority, **closes,
-                  warnings=self.dispatch_warnings(), merge_invoker=self.invoker(), merge_method=method)
+                  warnings=self.dispatch_warnings(), merge_invoker=self.invoker(), merge_method=method,
+                  train_commit=None, train_onto=None)  # a lone merge after a train that did not land
         # Again after the receipt, whose write can wait on the database lock; a
         # refusal here leaves `merge_dispatch` as a refused merge call does.
         self.still_hosted()
@@ -2425,6 +2430,56 @@ class Ship(SharedReview):
             # PR once; never call merge again to discover what happened.
             return self.reconcile()
         return self.reconcile()
+
+    def merge_ready(self, observed: dict, head: str, base: str, protection: dict, train: str | None) -> dict:
+        """The pull request once ready to land: alone, after its own gate; in a train, open at `head`.
+
+        A train member's gate is the train PR's, on the joined tree (sd:9923).
+        """
+        if train:
+            return self.train_ready(observed["number"], head, base, train)
+        if self.api.ci == "local":
+            self.merge_local_gate(observed, base, head)
+        return self.settled_ready(observed["number"], head, base, protection)
+
+    def train_ready(self, number: int, head: str, base: str, onto: str) -> dict:
+        """The member's pull request, open at `head`, and `onto` a landing that holds `origin/<base>` (sd:9923).
+
+        A landing without the fetched base would drop main's newer commits from the train tip.
+        """
+        observed = self.api.pull(number)
+        if observed.get("state") != "open" or observed.get("draft") or observed.get("head", {}).get("sha") != head:
+            raise Refusal(f"pull request #{number} is not open at {head}; no train joins it",
+                          code="train_not_open", boundary="ci", state="retryable_failure",
+                          next_action="Prepare the branch again, then queue it again.")
+        git(self.root, "fetch", "--no-tags", "origin", f"refs/heads/{base}")
+        tip = git(self.root, "rev-parse", "FETCH_HEAD")
+        if not is_ancestor(self.root, tip, onto):
+            raise Refusal(f"the train landing {onto} does not contain origin/{base} at {tip}",
+                          code="train_stale_landing", boundary="ci", state="retryable_failure",
+                          next_action="Start the train again from the fetched default branch.")
+        return observed
+
+    def join_train(self, onto: str, head: str, body: str, number: int, closes: dict) -> dict:
+        """`head` merged onto `onto` as the train lands it, with the merge's own message; no PUT (sd:9923).
+
+        `git merge-tree` and `git commit-tree` touch no worktree and push
+        nothing. A second join writes a new commit and records it; the one
+        that lands is the one the receipt names when the train PR merges.
+        """
+        message = f"{self.state['title']} (#{number})\n\n{body}"
+        done = completed_process(self.root, ["git", "merge-tree", "--write-tree", "--no-messages", onto, head],
+                                 answers=frozenset({0, 1}))
+        if done.returncode != 0:
+            raise Refusal(f"{head} conflicts with the train landing {onto}; it rides the next train",
+                          code="train_conflict", boundary="ci", state="retryable_failure",
+                          next_action="Let the next train take it, or merge it alone.")
+        tree = done.stdout.split()[0]
+        commit = git(self.root, "commit-tree", tree, "-p", onto, "-p", head, "-m", message)
+        self.save(phase="train_joined", train_commit=commit, train_onto=onto, merge_message=body,
+                  row_authorized_merge=self.row_authority, **closes, warnings=self.dispatch_warnings(),
+                  merge_invoker=self.invoker(), merge_method="merge")
+        return self.result("train_joined", train_commit=commit, train_onto=onto, head=head)
 
     def landing_message(self, method: str, observed: dict, head: str, reviewed: str) -> tuple[str, dict]:
         """The message the merge lands: the prepared rebase tip's, else the squash or merge commit's (sd:6790)."""
@@ -2453,6 +2508,8 @@ class Ship(SharedReview):
 
     def merge_method(self) -> str:
         """The policy's `merge_method`: squash unless the repository declares rebase or merge (sd:6790)."""
+        if getattr(self.args, "train_onto", None):
+            return "merge"  # a train lands merge commits, whatever the policy (operator ruling, sd:9923)
         return sd_lib.sibling("sd_repo_policy", "sd_repo_policy.py").effective(self.declared_policy())["merge_method"]
 
     def rebase_branch(self, base: str, head: str) -> str:
@@ -2769,6 +2826,7 @@ class Ship(SharedReview):
                 or pull.get("base", {}).get("ref") != reference["base"]
                 or pull.get("head", {}).get("sha") != self.state.get("reviewed_head")):
             raise Refusal("merged PR evidence does not match the prepared receipt")
+        refuse_train_mismatch(commit, self.state.get("train_commit"))
         metadata = self.api.api(self.api.prefix)
         if metadata.get("default_branch") != reference["base"]:
             raise Refusal("the current default branch differs from the prepared base")
@@ -2955,6 +3013,28 @@ def remove_merged(root: pathlib.Path, branch: str, merged: str) -> dict:
     return {"removed": removed, "kept": kept}
 
 
+def refuse_demoted(body: str) -> None:
+    """Refuse a merge message whose trailer git would not read: one outside its last paragraph (sd:5)."""
+    demoted = sd_lib.demoted_trailers(body)
+    if demoted:
+        raise Refusal(
+            "this squash message states "
+            + ", ".join(repr(line) for line in demoted)
+            + " outside the trailer block git reads, so the merge would land "
+            "without it; move the line into the message's last paragraph, "
+            "contiguously with the other trailers, or take it out of the body"
+        )
+
+
+def refuse_train_mismatch(commit: str, joined: str | None) -> None:
+    """Refuse a train member GitHub names merged at another commit than its recorded train merge (sd:9923)."""
+    if joined and commit != joined:
+        raise Refusal(f"GitHub names {commit} as this pull request's merge, not its train merge {joined}",
+                      code="train_merge_mismatch", boundary="ci", state="operator_decision",
+                      next_action=f"Read origin's history: if {joined} landed, its own merge holds the "
+                                  "delivery; otherwise merge the branch again.")
+
+
 def require_merge_on_base(root: pathlib.Path, commit: str, tip: str, base: str) -> None:
     """Refuse a merge commit the fetched default branch does not contain.
 
@@ -2973,6 +3053,13 @@ def require_merge_on_base(root: pathlib.Path, commit: str, tip: str, base: str) 
 def quote_branch(repository, branch):
     from urllib.parse import quote
     return quote(f"{repository.split('/')[0]}:{branch}", safe="")
+
+
+def full_sha(value: str) -> str:
+    """A full lowercase commit id, the one form a train landing is named by (sd:9923)."""
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value):
+        raise argparse.ArgumentTypeError("takes a full commit id")
+    return value
 
 
 def review_seconds(value: str) -> int:
@@ -3095,6 +3182,8 @@ def merge_flags(action) -> None:
     action.add_argument("--wait-seconds", type=int, default=900)
     action.add_argument("--abandon-copilot-review", metavar="REASON",
                         help="stop waiting for the locally requested Copilot review on this exact PR and head")
+    action.add_argument("--train-onto", metavar="SHA", type=full_sha,
+                        help="write the merge onto this train landing and dispatch nothing (sd:9923)")
 
 
 def hold_commands(commands) -> None:
