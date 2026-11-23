@@ -2754,6 +2754,8 @@ def start_train(entry: dict[str, Any], queue: Queue, gate: Gate, environ: dict[s
 
 #: The branch a train pull request lands from, named by its tip (sd:9923).
 TRAIN_BRANCH = "sd-train/{}"
+#: A joined train member: its row, worktree, prepared head, the landing it joined onto and the merge it wrote.
+Joined = tuple[dict[str, Any], pathlib.Path, str, str, str]
 
 
 def land_as_train(entry: dict[str, Any], queue: Queue, ship: Ship, head: str, logs: pathlib.Path,
@@ -2784,10 +2786,10 @@ def land_as_train(entry: dict[str, Any], queue: Queue, ship: Ship, head: str, lo
     base = train_base(tree)
     if base is None:
         return {"status": "skipped", "reason": "origin/HEAD could not be fetched"}
-    joined = [(entry, tree, head)]
     onto, why = join_member(entry, tree, head, base[1], ship, logs)
     if onto is None:
         return {"status": "skipped", "reason": f"sd:{entry['item']} did not join: {why}"}
+    joined: list[Joined] = [(entry, tree, head, base[1], onto)]
     record: dict[str, dict[str, Any]] = {}
     for row in members[1:]:
         if clock() >= deadline:
@@ -2800,29 +2802,30 @@ def land_as_train(entry: dict[str, Any], queue: Queue, ship: Ship, head: str, lo
         if placed is None or landing is None:
             record[row["id"]] = {"status": "dropped", "reason": f"{why}; it rides the next train"}
             continue
+        joined.append((row, pathlib.Path(row["worktree"]), placed, onto, landing))
         onto = landing
-        joined.append((row, pathlib.Path(row["worktree"]), placed))
     answer = land_joined(joined, queue, ship, onto, base[0], logs, record, renewed)
     mark_train(queue, record, items)
     return answer
 
 
-def land_joined(joined: list[tuple[dict[str, Any], pathlib.Path, str]], queue: Queue, ship: Ship, tip: str,
+def land_joined(joined: list[Joined], queue: Queue, ship: Ship, tip: str,
                 branch: str, logs: pathlib.Path, record: dict[str, dict[str, Any]],
                 renewed: Callable[[], None] = lambda: None) -> dict[str, Any]:
     """`land_as_train`'s landing of the joined members at `tip`, each member's outcome written into `record`."""
-    items = [row["item"] for row, _, _ in joined]
+    items = [row["item"] for row, *_ in joined]
     if len(joined) < 2:
         return {"status": "skipped", "items": items, "reason": "fewer than two members joined"}
     why = train_stop(joined, queue, renewed)
     if why is not None:
         return {"status": "skipped", "items": items, "reason": why}
-    landed = land_train(joined[0][1], tip, branch, items, lambda: train_stop(joined, queue, renewed))
+    landed = land_train(joined[0][1], tip, branch, items,
+                        lambda: train_stop(joined, queue, renewed) or rejoin_stop(joined, ship, logs))
     if landed.get("status") != "merged":
-        for row, _, _ in joined[1:]:
+        for row, *_ in joined[1:]:
             record[row["id"]] = {"status": "failed", "reason": str(landed.get("reason"))[:REASON_CHARS]}
         return {**landed, "items": items, "tip": tip}
-    for row, tree, head in joined[1:]:  # each reconciles now; a stop here leaves it to its next claim's prepare
+    for row, tree, head, *_ in joined[1:]:  # each reconciles now; a stop here leaves it to its next claim's prepare
         merged = ship(["-C", str(tree), "merge", "--item", str(row["item"]), "--expected-head", head, "--manual",
                        "--json"], logs.with_name(f"train-merge-{row['item']}-{logs.name}.log"))
         record[row["id"]] = {"status": "landed", "pull": landed.get("pull"), "merge_commit": merged.get("merge_commit"),
@@ -2830,7 +2833,7 @@ def land_joined(joined: list[tuple[dict[str, Any], pathlib.Path, str]], queue: Q
     return {**landed, "items": items, "tip": tip}
 
 
-def train_stop(joined: list[tuple[dict[str, Any], pathlib.Path, str]], queue: Queue,
+def train_stop(joined: list[Joined], queue: Queue,
                 renewed: Callable[[], None]) -> str | None:
     """Why the joined train may not land now, or None: read again before the gate and right before the merge.
 
@@ -2843,12 +2846,12 @@ def train_stop(joined: list[tuple[dict[str, Any], pathlib.Path, str]], queue: Qu
         if frozen is not None:
             return frozen
         rows = {row["id"]: row for row in read_queue(queue)}
-        gone = [row["item"] for row, _, _ in joined[1:]
+        gone = [row["item"] for row, *_ in joined[1:]
                 if not runnable(rows.get(row["id"]) or {}) or merge_refusal(rows[row["id"]]) is not None
                 or rows[row["id"]].get("expected_head") != row["expected_head"]]
         if gone:
             return f"{', '.join(f'sd:{item}' for item in gone)} left the queue, moved or is held during the train"
-        for row, _, _ in joined:
+        for row, *_ in joined:
             left = left_stop(row, queue, "merge")
             if left is not None:
                 return f"sd:{row['item']}: {left.get('reason')}"
@@ -2856,6 +2859,21 @@ def train_stop(joined: list[tuple[dict[str, Any], pathlib.Path, str]], queue: Qu
         raise
     except LaneError as error:
         return f"the train could not be read again: {error}"
+    return None
+
+
+def rejoin_stop(joined: list[Joined], ship: Ship, logs: pathlib.Path) -> str | None:
+    """Why a member does not join again onto the same landing as the same commit, or None (review of sd:9923).
+
+    Each join runs the member's merge checks: its pull request open at its
+    head, its approvals, its own checks, the freeze and the base. The gate
+    takes minutes, so they are read again right before the merge; a join is
+    dated by its parents, so an unchanged member writes the commit gated.
+    """
+    for row, tree, head, onto, commit in joined:
+        again, why = join_member(row, tree, head, onto, ship, logs)
+        if again != commit:
+            return f"sd:{row['item']} {'joined as ' + again if again else 'no longer joins: ' + why} after the train gate"
     return None
 
 

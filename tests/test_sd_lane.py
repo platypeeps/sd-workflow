@@ -2091,7 +2091,7 @@ class TrainLanding(Trees):
         self.during_gate = change
         self.queue_three()
         sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
-        self.assertEqual(len(self.landed), 1)
+        self.assertEqual(self.landed[0][3], [1, 2, 3])  # the first train; a later claim may start its own
         landing = self.entries()[0]["train_landing"]
         self.assertEqual(landing["status"], "failed")
         self.assertIn(said, landing["reason"])
@@ -2115,6 +2115,19 @@ class TrainLanding(Trees):
             finally:
                 connection.close()
         self.assert_gate_change_lands_nothing(freeze, "frozen")
+
+    def test_a_member_whose_pull_request_closed_during_the_train_gate_lands_nothing(self) -> None:
+        """Review of sd:9923: the joins' PR, approval and check reads were not taken again after the gate."""
+        def close_second() -> None:
+            self.answers[(2, "join")] = {"ok": False, "code": "train_not_open",
+                                         "error": "pull request #2 is not open at its head; no train joins it"}
+        self.assert_gate_change_lands_nothing(close_second, "sd:2")
+        self.assertEqual([item for item, _ in self.joins][:5], [1, 2, 3, 1, 2])  # each joins again, in order
+
+    def test_a_member_whose_join_answers_another_commit_after_the_gate_lands_nothing(self) -> None:
+        def move_second() -> None:
+            self.answers[(2, "join")] = {"ok": True, "phase": "train_joined", "train_commit": "9" * 40}
+        self.assert_gate_change_lands_nothing(move_second, "sd:2")
 
     def test_a_member_cancelled_during_the_train_lands_nothing(self) -> None:
         def cancel_second() -> None:

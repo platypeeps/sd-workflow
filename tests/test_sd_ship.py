@@ -6397,6 +6397,14 @@ roles:
         self.assertEqual((after["train_commit"], _git(self.root, "rev-parse", f"{again}^1", f"{again}^2").split()),
                          (again, [earlier, head]))  # a second join records the commit it answers
 
+    def test_a_second_train_join_writes_the_same_commit(self):
+        """Review of sd:9923: the lane joins each member again after the gate, and the tip it gated must not move."""
+        self.delivering()
+        _main, earlier = self.landing_before()
+        first = self.join(earlier)["train_commit"]
+        time.sleep(1.1)  # a commit dated now would differ
+        self.assertEqual(self.join(earlier)["train_commit"], first)
+
     def test_a_train_join_that_conflicts_refuses_and_records_no_join(self):
         self.prepare()
         conflicting = self.remote.commit_on("clash", "clash\n\nAuthored-with: human", files={"src.py": "value = 9\n"})

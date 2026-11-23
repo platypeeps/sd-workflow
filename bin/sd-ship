@@ -2465,8 +2465,8 @@ class Ship(SharedReview):
         """`head` merged onto `onto` as the train lands it, with the merge's own message; no PUT (sd:9923).
 
         `git merge-tree` and `git commit-tree` touch no worktree and push
-        nothing. A second join writes a new commit and records it; the one
-        that lands is the one the receipt names when the train PR merges.
+        nothing. A second join with the same inputs writes the same commit,
+        which is how the lane rechecks a member right before the merge.
         """
         message = f"{self.state['title']} (#{number})\n\n{body}"
         done = completed_process(self.root, ["git", "merge-tree", "--write-tree", "--no-messages", onto, head],
@@ -2476,7 +2476,11 @@ class Ship(SharedReview):
                           code="train_conflict", boundary="ci", state="retryable_failure",
                           next_action="Let the next train take it, or merge it alone.")
         tree = done.stdout.split()[0]
-        commit = git(self.root, "commit-tree", tree, "-p", onto, "-p", head, "-m", message)
+        # Dated by its parents, not now: the lane joins each member again after the gate, and the same
+        # inputs must write the same commit, or the gated tip would move under the merge.
+        when = f"{max(int(git(self.root, 'show', '-s', '--format=%ct', each)) for each in (onto, head))} +0000"
+        commit = completed_process(self.root, ["env", f"GIT_AUTHOR_DATE={when}", f"GIT_COMMITTER_DATE={when}", "git",
+                                               "commit-tree", tree, "-p", onto, "-p", head, "-m", message]).stdout.strip()
         self.save(phase="train_joined", train_commit=commit, train_onto=onto, merge_message=body,
                   row_authorized_merge=self.row_authority, **closes, warnings=self.dispatch_warnings(),
                   merge_invoker=self.invoker(), merge_method="merge")
