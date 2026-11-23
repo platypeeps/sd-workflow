@@ -75,10 +75,10 @@ BEAT_SECONDS = 30
 #: Reviews with blockers before the class pass and park: 2, so a park comes after 3
 #: reviews (operator 2026-11-23, sd:10128; sd:10111 had set 4).
 REVIEW_ROUNDS = 2
-#: Fix rounds past this many blocked reviews run on the strongest model at high effort, the brief asking for
-#: the blockers' class (operator ruling on pack sd:9264, 2026-11-20); the park after REVIEW_ROUNDS stays.
+#: Fix rounds past this many blocked reviews run on the strongest model at medium effort (operator
+#: 2026-11-23, sd:10192), the brief asking for the blockers' class (pack sd:9264); the park stays.
 ESCALATE_AFTER = 1  # with REVIEW_ROUNDS 2, the class-pass fix escalates (sd:10128)
-STRONGEST, ESCALATED_EFFORT = "fable", "high"
+STRONGEST, ESCALATED_EFFORT = "fable", "medium"
 #: A rate-limited review waits this long, beating, then asks again, up to `RATE_LIMIT_WAITS` times before it
 #: blocks: a quota window passes, and a block parked the item for a manual Retry (sd:9882).
 RATE_LIMIT_WAIT_SECONDS = 900
