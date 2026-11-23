@@ -2382,6 +2382,19 @@ class TrainLanding(Trees):
         self.assertNotEqual(second.get("code"), sd_lane.HEAD_MOVED, second.get("reason"))
         self.assertEqual(second["status"], "merged")
 
+    def test_a_members_train_catch_up_becomes_its_queued_head(self) -> None:
+        """Review of sd:9923: each train that did not land added a catch-up link to the queued head.
+
+        Past `CATCH_UPS` links the member's next claim skipped it as moved.
+        Its row now names the pushed catch-up, so each train adds one link
+        at most, as a put-back does.
+        """
+        self.caught_up_in_the_train("failed")
+        second = self.entries()[1]
+        self.assertNotEqual(second.get("code"), sd_lane.HEAD_MOVED, second.get("reason"))
+        self.assertEqual((second["status"], second["expected_head"]),
+                         ("merged", git(self.second, "rev-parse", "HEAD")))
+
     def test_a_member_caught_up_in_a_train_that_landed_reconciles(self) -> None:
         self.caught_up_in_the_train("merged")
         self.assertEqual([entry["status"] for entry in self.entries()], ["merged"] * 3)

@@ -2705,12 +2705,21 @@ def receipt_of(result: dict[str, Any]) -> Any:
             result.get("receipt_skipped") or result.get("receipt_error") or "none")
 
 
-def mark_train(queue: Queue, fields: dict[str, dict[str, Any]], items: list[int]) -> None:
-    """Write each member's `train` record from `fields`, by entry id; a write that fails stops nothing."""
+def mark_train(queue: Queue, fields: dict[str, dict[str, Any]], items: list[int],
+               heads: dict[str, tuple[str, str]] | None = None) -> None:
+    """Write each member's `train` record from `fields`, by entry id; a write that fails stops nothing.
+
+    `heads` moves a member's `expected_head` from the queued head to the
+    catch-up its train prepare pushed, as a put-back does, only while the
+    row still queues that head: a re-enqueue in between wins.
+    """
     def on_members(entries: list[dict[str, Any]]) -> None:
         for row in entries:
             if row["id"] in fields:
                 row["train"] = {"items": items, "at": stamp_now(), **fields[row["id"]]}
+            old, new = (heads or {}).get(row["id"], ("", ""))
+            if new and row.get("status") == "pending" and row.get("expected_head") == old:
+                row["expected_head"] = new
     with contextlib.suppress(LaneError, OSError):
         update(queue, on_members)
 
@@ -2881,12 +2890,16 @@ def land_as_train(entry: dict[str, Any], queue: Queue, ship: Ship, head: str, lo
         return {"status": "skipped", "reason": f"sd:{entry['item']} did not join: {why}"}
     joined: list[Joined] = [(entry, tree, head, base[1], onto)]
     record: dict[str, dict[str, Any]] = {}
+    heads: dict[str, tuple[str, str]] = {}
     for row in members[1:]:
         if clock() >= deadline:
             record[row["id"]] = {"status": "skipped", "reason": OUT_OF_BUDGET}
             break
         renewed()
         placed, why = prepared_member(row, queue, ship, logs, renewed, deadline)
+        moved = pushed_catch_up(pathlib.Path(row["worktree"]), str(row.get("branch") or ""), row["expected_head"])
+        if moved != row["expected_head"]:  # its next claim starts there, not one more link behind (sd:3283)
+            heads[row["id"]] = (row["expected_head"], moved)
         if placed is not None:
             landing, why = join_member(row, pathlib.Path(row["worktree"]), placed, onto, ship, logs)
         if placed is None or landing is None:
@@ -2895,7 +2908,7 @@ def land_as_train(entry: dict[str, Any], queue: Queue, ship: Ship, head: str, lo
         joined.append((row, pathlib.Path(row["worktree"]), placed, onto, landing))
         onto = landing
     answer = land_joined(joined, queue, ship, onto, base[0], logs, record, renewed, fence)
-    mark_train(queue, record, items)
+    mark_train(queue, record, items, heads)
     return answer
 
 
