@@ -84,6 +84,39 @@ class FixReviewTests(ReviewFixture):
         self.assertIn("every listed instance", handed, "the verifier was not told each instance must be fixed")
         self.assertEqual(result["status"], "blocking")
 
+    def test_an_uncited_repeat_at_a_remaining_instance_still_blocks(self):
+        """build/sd-1623 review (bin/sd-review:1833): a blocker at src.py:1 that also lists second.py:1. With
+        src.py fixed, its uncited repeat at second.py posted as advisory: the prior match read the reported
+        place alone. Each listed instance now holds the blocker, mapped through the diff as its place is."""
+        self.remaining_instance_repeat("")
+
+    def test_a_remaining_instance_moved_by_an_insertion_still_blocks(self):
+        """build/sd-1623 review (bin/sd-review:1928): the instance's line moves through the diff too."""
+        self.remaining_instance_repeat("# a comment\n" * (sd_review.ECHO_LINES + 2))  # past an echo
+
+    def remaining_instance_repeat(self, above):
+        sd_review.READER_GROUPS.reopen_groups()  # a failed reader in an earlier test closes them
+        root, _ = self.branch()
+        first = self.commit(root, "second.py", "the_second_instance = True\n")
+        prior = {"scope": "branch", "subject": {"head": first}, "status": "blocking", "findings": [
+            {"path": "src.py", "line": 1, "summary": "grouped unresolved defect", "family": "correctness",
+             "severity": "high", "instances": ["src.py:1", "second.py:1"],
+             "evidence": "python3 src.py: Traceback", "disposition": "blocking"}]}
+        report = self.tmp / "prior.json"
+        report.write_text(json.dumps(prior))
+        self.commit(root, "src.py", "the_original_defect = False\n")
+        if above:
+            self.commit(root, "second.py", above + "the_second_instance = True\n")
+        line = 1 + above.count("\n")
+        repeat = json.dumps({"findings": [{"path": "second.py", "line": line,
+                                           "summary": "grouped unresolved defect", "family": "correctness",
+                                           "severity": "high", "instances": [f"second.py:{line}"]}]})
+        result = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)),
+                                  FakeRunner({"codex": sd_review.Completed(0, repeat, "")}),
+                                  self.environment(), self.chatgpt_home())
+        self.assertEqual(result["status"], "blocking")
+        self.assertEqual([row.get("evidence") for row in result["findings"]], ["python3 src.py: Traceback"])
+
     def test_a_respelled_repeat_of_a_prior_blocker_still_blocks(self):
         """build/sd-1423 class pass: a finding is matched across reports and readers in any spelling the review
         accepts. A prior blocker at an absolute path, repeated uncited as `src.py`, posted as advisory; so did

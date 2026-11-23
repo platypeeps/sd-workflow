@@ -1109,11 +1109,16 @@ class LineBudgetTests(unittest.TestCase):
         # `prior_at._moved` follow code moved unfixed within or across
         # files, plus one line for a nearby repeat answering its blocker.
         # Measured: `sd-review` is 3057 here.
+        #
+        # 5075 -> 5088 is the build/sd-1623 review: `bin/sd-review` +13 for
+        # `instance_rows`, so each place a prior blocker's `instances` name
+        # holds it, and the rebuttal filter reads those instances.
+        # Measured: `sd-review` is 3118 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5075,
+            5088,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

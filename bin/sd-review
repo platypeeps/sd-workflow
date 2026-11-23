@@ -1776,7 +1776,8 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
     # Only a repeat that blocks at the floor answers a prior blocker (build/sd-1423 review: a medium copy cleared it).
     at_floor = [row for row in findings if 0 < BLOCKING_ORDER.get(str(row.get("severity", "unspecified")), 0) >= threshold]
     # A rebutted prior blocker is answered, so it holds no other finding (build/sd-1423 review, bin/sd-review:1814).
-    prior = [old for old in prior if not getattr(recorded_at(rebutted, old.get("path"), old.get("summary"), old.get("line")), "listed", False)]
+    prior = [old for old in prior if not getattr(recorded_at(rebutted, old.get("path"), old.get("summary"), old.get("line"),
+                                                             old.get("instances")), "listed", False)]
     disposed = []
     for finding in findings:
         severity = str(finding.get("severity", "unspecified"))
@@ -1835,6 +1836,18 @@ def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]
     if matched:
         return "\n".join(dict.fromkeys(text for text in matched if isinstance(text, str) and text.strip()))
     return "" if any(_file(old, record) and _near(old, record) and not _answered(old) for old in blockers) else None
+
+
+def instance_rows(row: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """A prior blocker once per distinct place its `instances` name, the reported one first: a fix to one instance
+    leaves the others holding it (build/sd-1623 review, bin/sd-review:1833); `prior_at` maps each place."""
+    places = {(row.get("path"), row.get("line")): dict(row)}
+    for entry in row.get("instances") if row.get("disposition") == "blocking" and isinstance(row.get("instances"), list) else ():
+        path, _, line = entry.strip().rpartition(":") if isinstance(entry, str) else ("", "", "")
+        place = (path, int(line)) if path and re.fullmatch(r"[0-9]+", line) else (entry.strip(), None) if isinstance(entry, str) and entry.strip() else None
+        if place:
+            places.setdefault(place, dict(row, path=place[0], line=place[1]))
+    return list(places.values())
 
 
 def unresolved(previous: Mapping[str, Any]) -> list[dict[str, Any]]:
@@ -2596,7 +2609,7 @@ def review(
         finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)],
                       [row._replace(path=spelled(row.path)) for row in rebutted], subject.scope != "planning",
                       prior_at(root, previous["subject"].get("head"), subject.head, [dict(row, path=spelled(row["path"]))
-                                                                                     for row in unresolved(previous)]) if previous else ())
+                                                                                     for found in unresolved(previous) for row in instance_rows(found)]) if previous else ())
         if any(not reads_checkout(provider) for provider in chosen if provider.name in result["reviewed_by"]):
             result["covers_from"] = None  # a reader handed patches saw no whole file: no chain (sd:9769)
     finally:

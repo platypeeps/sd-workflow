@@ -643,6 +643,28 @@ class ReproRuleTests(unittest.TestCase):
                                      repro=True, prior=prior)
         self.assertEqual(record["disposition"], "advisory")
 
+    def test_a_blocker_holds_each_place_its_instances_name_and_no_other(self) -> None:
+        """build/sd-1623 review (bin/sd-review:1833): odd entries name no place and never raise."""
+        blocker = dict(finding(REPRO, line=10, summary="s"), disposition="blocking", instances=[
+            "src.py:10", "b.py:40", "b.py:40", " c.py ", "d.py:\u0663", "e.py:4\n", "", "  ", None, 7, ["x"],
+            "f.py:" + "9" * 40, "g\u00e9.py:2", "h.py:0"])
+        self.assertEqual([(row["path"], row["line"]) for row in sd_review.instance_rows(blocker)],
+                         [("src.py", 10), ("b.py", 40), ("c.py", None), ("d.py:\u0663", None), ("e.py", 4),
+                          ("f.py", int("9" * 40)), ("g\u00e9.py", 2), ("h.py", 0)])
+        self.assertEqual(sd_review.instance_rows(dict(blocker, disposition="advisory")), [dict(blocker, disposition="advisory")])
+        self.assertEqual(sd_review.instance_rows(dict(blocker, instances="src.py:1")), [dict(blocker, instances="src.py:1")])
+
+    def test_a_rebuttal_that_misses_an_instance_leaves_the_prior_blocker(self) -> None:
+        """build/sd-1623 review (bin/sd-review:1779): a rebuttal at src.py:10, then a cited blocker with one more
+        instance at b.py:40. Its uncited repeat listing both posted as advisory: the prior filter matched the
+        old rebuttal without the instances, as the finding's own rebuttal check already reads them."""
+        rebutted = listed(adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10))
+        both = {"instances": ["src.py:10", "b.py:40"]}
+        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes", **both), disposition="blocking")]
+        [record] = sd_review.dispose([finding(line=10, summary="Empty input crashes", **both)], "high", rebutted,
+                                     repro=True, prior=prior)
+        self.assertEqual((record["disposition"], record.get("evidence")), ("blocking", REPRO))
+
     def test_the_same_line_alone_gives_no_prior_evidence(self) -> None:
         """Lead after round 8: the matcher gave the old repro to an unrelated cache finding at the same line."""
         prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking")]
