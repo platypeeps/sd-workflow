@@ -6416,6 +6416,25 @@ roles:
             self.join(old)
         self.assertEqual(caught.exception.workflow["blocker"]["code"], "train_stale_landing")
 
+    def test_a_train_join_refuses_a_member_whose_own_check_failed(self):
+        """Review of sd:9923: the train gated only its tip, so a member whose remote check failed joined."""
+        self.prepare()
+        _main, earlier = self.landing_before()
+        self.remote.pull(1).checks[0]["conclusion"] = "failure"
+        with self.assertRaises(ship.Refusal) as caught:
+            self.join(earlier)
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "ci_not_passing")
+
+    def test_a_train_join_refuses_a_member_whose_status_failed(self):
+        self.prepare()
+        _main, earlier = self.landing_before()
+        head = _git(self.root, "rev-parse", "HEAD")
+        self.double.statuses.insert(0, {"context": "lint", "state": "failure", "sha": head,
+                                        "creator": {"login": "fixture"}})
+        with self.assertRaises(ship.Refusal) as caught:
+            self.join(earlier)
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "ci_not_passing")
+
     def test_a_train_join_refuses_a_repository_without_merge_commits(self):
         self.prepare()
         _main, earlier = self.landing_before()
