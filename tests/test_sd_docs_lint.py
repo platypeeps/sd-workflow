@@ -634,6 +634,11 @@ class PullRequestPrivacyTests(LintFixture):
             report.failures,
             [f"pull request body: line 3 matches a privacy pattern in {self.patterns}"])
 
+    def test_red_a_body_line_over_72_characters_is_named(self) -> None:
+        """pack sd:10212: the builder's own lint run catches what the lane refused at enqueue."""
+        report = self.run_lint("## Summary\n\n" + "z" * 73 + "\n", body_only=True)
+        self.assertEqual(report.failures, ["pull request body: line 3 is 73 characters (limit 72)"])
+
     def test_green_owned_and_scope_lines_are_neither_required_nor_refused(self) -> None:
         body = "Work: sd:1\nWork: sd:2\nWork:\n\n## Summary\n\n- touches .github/workflows\n"
         self.assertEqual(self.run_lint(body, body_only=True).failures, [])
