@@ -9,6 +9,7 @@ as a process, and the pull-request template.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import pathlib
 import re
@@ -628,6 +629,33 @@ class CitedIdTests(unittest.TestCase):
         for message, found in listed.items():
             with self.subTest(message=message):
                 self.assertEqual(sd_ship_body._listed_undone(message), found)
+
+    def test_a_line_a_span_or_a_comment_hides_moves_no_list_item(self) -> None:
+        """pack sd:9666 review, round 17: a line inside a code span said nothing but still moved the
+        revert list's nesting: its colon ended the item above it, its marker opened a false parent,
+        and a comment's line ended an item by its indent. Each dropped the revert heading."""
+        a = "a" * 7
+        head = "Revert: split\n\n- Reverted commits:\n  See `example\n"
+        listed = {
+            f"{head}text:\n  end`\n  - {a}\n": [a],  # the blocker: a colon line in the span
+            f"{head}  2. more\n     end`\n     - {a}\n": [a],  # its sibling: a marker in the span
+            f"text\n2. Reverted commits:\n   see <!-- note\nhidden\n-->\n   - {a} renew\n": [a],  # a comment's line
+            f"{head}- more\n  end`\n  - {a}\n": [],  # a real item ends the span, and holds what nests in it
+        }
+        for message, found in listed.items():
+            with self.subTest(message=message):
+                self.assertEqual(sd_ship_body._listed_undone(message), found)
+        # The property: a revert reads the same with a hidden line as without it.
+        inner = ("text:", "  2. more", "Kept commits:", "     words", "  1.", "  3) x")
+        wraps = (("  See `example", "     end`"), ("  see <!-- note", "  -->"))
+        for (opener, closer), *lines in itertools.chain(itertools.product(wraps, inner), itertools.product(wraps, inner, inner)):
+            message = ["- Reverted commits:", opener, *lines, closer, f"     - {a}"]
+            for number, (_, hidden) in sd_ship_body._scope("\n".join(message)).items():
+                if hidden and 2 < number <= 2 + len(lines):
+                    with self.subTest(message=message, without=number):
+                        without = message[:number - 1] + message[number:]
+                        self.assertEqual(sd_ship_body._listed_undone("\n".join(message)),
+                                         sd_ship_body._listed_undone("\n".join(without)))
 
     def test_markers_on_one_line_open_an_empty_parent(self) -> None:
         """pack sd:9666 review, round 12, blocker 3: `- - <sha>` under `Reverted commits:` undid the
