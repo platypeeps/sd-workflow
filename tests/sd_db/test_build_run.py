@@ -74,9 +74,7 @@ FAKE = textwrap.dedent('''
     queue = json.loads(plan.read_text()) if plan.exists() else []
     # `gh repo view` (the visibility read) takes no plan: plans/visibility.txt answers it.
     viewing = role == "gh" and sys.argv[1:3] == ["repo", "view"]
-    # `sd-ship adjudicate` (the disposition read, sd:10010) takes no plan: plans/adjudicate.json answers it.
-    adjudicating = role == "sd-ship" and "adjudicate" in sys.argv
-    mode = queue.pop(0) if queue and not viewing and not adjudicating else "default"
+    mode = queue.pop(0) if queue and not viewing else "default"
     plan.write_text(json.dumps(queue))
     if viewing:  # `gh repo view R --json isPrivate`: public unless plans/visibility.txt says otherwise
         said = (plans / "visibility.txt").read_text().strip() if (plans / "visibility.txt").exists() else "public"
@@ -260,11 +258,6 @@ FAKE = textwrap.dedent('''
         lane = plans / "lane.json"
         entries = json.loads(lane.read_text()) if lane.exists() else []
         _, args = real("sd-ship")
-        if adjudicating:  # no receipt unless plans/adjudicate[-<item>].json holds the template's answer
-            said = plans / f"adjudicate-{args.item}.json"
-            said = said if said.exists() else plans / "adjudicate.json"
-            print(said.read_text() if said.exists() else json.dumps({"ok": False, "error": "no ship receipt"}))
-            sys.exit(0 if said.exists() else 3)
         assert args.command == "lane", args
         if "list" in sys.argv:
             print(json.dumps({"ok": mode != "unread", "entries": entries}))
@@ -2469,8 +2462,7 @@ class Supervise(Case):
         self.assertEqual(ended["outcome"], "cancelled")
         self.assertEqual(self.statuses(), ["ready"])
         self.assertEqual([m["status"] for m in build.run(self.db, self.bundle["id"])["members"]], ["cancelled"])
-        # The disposition read before the review (sd:10010) is the only call: nothing enqueued.
-        self.assertEqual([call for call in self.calls("sd-ship") if "adjudicate" not in call["argv"]], [])
+        self.assertEqual(self.calls("sd-ship"), [])
         self.assertEqual(self.remote_branches(), "main")
         self.assertTrue(Path(self.bundle["work_path"]).is_dir(), "the worktree is kept")
 
@@ -2960,42 +2952,16 @@ class Supervise(Case):
         self.assertIn("Fence each failure table", build_run.BRIEF)
         self.assertIn("`example.test`", build_run.BRIEF)
 
-    def adjudicate(self, recorded):
-        """The lane's blocking review of the lead at any head, as `sd-ship adjudicate` prints its template."""
-        row = {"index": 1, "finding_digest": "d", "response_disposition": "rebutted|parked", "reason": "",
-               "raw_finding": {"path": "a.py", "line": 2, "summary": "the pin check is missing"}}
-        (self.plans / "adjudicate.json").write_text(json.dumps(
-            {"ok": True, "phase": "disposition_template", "recorded": recorded,
-             "proposal": {"schema_version": 1, "bindings": {}, "findings": [row]}}))
-
-    def test_a_reject_ruling_with_no_disposition_is_refused_before_enqueue(self):
-        """sd:10010: builds 1471 and 1478 re-enqueued a rejected blocker with no disposition, and the lane's
-        prepare refused it again. The supervisor reads the template first and sends the branch back."""
+    def test_a_lane_blocker_with_no_disposition_is_left_to_prepare(self):
+        """Lane review of build/sd-1557: a preflight disposition read spent fix rounds on a finding main may
+        fix, as prepare's catch-up moves the head. Prepare alone, at the final head, checks dispositions."""
         self.press()
         self.write_pr()
-        self.adjudicate(False)
-        self.plan(claude=["pass", "fix1", "fix2", "fix3"], sd_review=["clean"])
+        self.plan(claude=["pass"], sd_review=["clean"])
         ended = self.supervisor().run()
-        self.assertEqual(ended["outcome"], "blocked")
-        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
-        self.assertEqual(self.calls("sd-review"), [], "no review is spent on a branch the lane would refuse")
-        fix = [call["argv"] for call in self.calls("claude")][1]
-        said = fix[fix.index("-p") + 1]
-        self.assertIn(f"the lane's review of sd:{self.items[0]} at ", said)
-        self.assertIn("a.py: the pin check is missing", said)
-        self.assertIn("--dispositions-file", said)
-
-    def test_only_the_item_prepare_reads_is_checked_for_dispositions(self):
-        """Review of build/sd-1557: a skipped member's blocking receipt held back the delivered one. Prepare reads
-        the first delivered item's receipt, so only that one is checked."""
-        self.press(2)
-        self.write_pr()
-        (self.plans / f"adjudicate-{self.items[0]}.json").write_text(json.dumps({"ok": False}))
-        self.adjudicate(False)  # every other item's receipt blocks
-        self.plan(claude=["skip"], sd_review=["clean"])
-        self.assertEqual(self.supervisor().run()["step"], "enqueued")
-        asked = [call["argv"] for call in self.calls("sd-ship") if "adjudicate" in call["argv"]]
-        self.assertEqual({argv[argv.index("--item") + 1] for argv in asked}, {str(self.items[0])})
+        self.assertEqual(ended.get("step"), "enqueued", ended.get("outcome"))
+        # The fake `sd-ship` answers only `lane`: a disposition read would fail the run.
+        self.assertEqual([call for call in self.calls("sd-ship") if "adjudicate" in call["argv"]], [])
 
     def test_a_usage_limit_in_a_fix_resumes_that_fix_without_a_round(self):
         """Review of build/sd-1557: a limit in the fix resumed at `reviewing`, which charged the same blockers
@@ -3080,15 +3046,6 @@ class Supervise(Case):
         self.assertEqual(ended["outcome"], "blocked")
         self.assertIn("is on operator-side, not build/sd-", ended["blocked"])
         self.assertEqual(len(self.calls("claude")), 1, "no builder ran on the switched checkout")
-
-    def test_a_recorded_disposition_enqueues(self):
-        """sd:10010: once the dispositions are on file, the lane's prepare clears them: enqueue goes ahead."""
-        self.press()
-        self.write_pr()
-        self.adjudicate(True)
-        self.plan(claude=["pass"], sd_review=["clean"])
-        self.assertEqual(self.supervisor().run()["step"], "enqueued")
-        self.assertTrue([call for call in self.calls("sd-ship") if "adjudicate" in call["argv"]])
 
     def test_a_sent_finding_briefs_how_to_record_a_rejection(self):
         """sd:10010: a Send to builder note may reject a review finding; the brief says how to record it."""

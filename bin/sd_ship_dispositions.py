@@ -183,14 +183,7 @@ def adjudicate(operation: Any) -> dict:
     if args.dispositions_file is None:
         proposal = {"schema_version": 1, "bindings": bindings,
                     "findings": [dict(row, response_disposition="|".join(DISPOSITIONS), reason="") for row in rows]}
-        # `recorded`: dispositions this head's prepare accepts are on file; a builder's supervisor reads it
-        # before enqueue, so a reject ruling with no disposition goes back to the builder (sd:10010).
-        try:
-            accepted(operation, args.expected_head)
-            recorded = True
-        except Refusal:
-            recorded = False
-        return operation.result("disposition_template", proposal=proposal, recorded=recorded)
+        return operation.result("disposition_template", proposal=proposal)
     try:
         proposal = json.loads(read_file(args.dispositions_file, MAX_PROPOSAL_BYTES), object_pairs_hook=unique_object)
     except (ValueError, RecursionError):

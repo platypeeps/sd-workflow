@@ -220,7 +220,8 @@ Your final message is your report: the commits, the tests run with their result 
 """
 
 #: A sent finding that rejects a review finding: the lane's prepare refuses its blocker until a disposition is
-#: recorded at the reviewed head, so the builder records it; enqueue waits for it (`undisposed`, sd:10010).
+#: recorded at the reviewed head, so the builder records it (sd:10010). Prepare alone checks it, at the final
+#: head its catch-up merge may move (lane review of build/sd-1557).
 ADJUDICATE = """A finding that rejects a review finding adds no commit; record its disposition instead, at the
 reviewed head: `sd-ship -C {worktree} adjudicate --item {item} --expected-head <HEAD> --json` prints the
 template; set each rejected row's `response_disposition` to `rebutted` and `reason` to the ruling's reason,
@@ -713,30 +714,6 @@ def lane_entry(ship: list[str], cwd: Path | str, items: Collection[int], *, env:
         raise Unread("sd-ship lane list gave no entries")
     mine = [row for row in entries if isinstance(row, dict) and row.get("item") in items]
     return max(mine, key=lambda row: row.get("enqueue_seq") or 0) if mine else None
-
-
-def undisposed(ship: list[str], cwd: Path | str, item: int, head: str, *, env: dict | None = None) -> list[str]:
-    """The refusal for `item`'s blocking lane review at `head` with no recorded dispositions, or none (sd:10010).
-
-    Read from the adjudicate template's `recorded`. Any other answer (no receipt, another head, a refusal, no
-    JSON) is none: the lane's prepare stays the authority and refuses what this read could not see.
-    """
-    argv = [*ship, "-C", str(cwd), "adjudicate", "--item", str(item), "--expected-head", head, "--json"]
-    try:
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=READ_SECONDS, check=False,
-                              stdin=subprocess.DEVNULL, env=env, cwd=cwd)
-        answer = json.loads(done.stdout) if done.returncode == 0 else None
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return []
-    if not isinstance(answer, dict) or answer.get("phase") != "disposition_template" or answer.get("recorded") is not False:
-        return []
-    rows = (answer.get("proposal") or {}).get("findings") if isinstance(answer.get("proposal"), dict) else None
-    named = "; ".join(f"{(row.get('raw_finding') or {}).get('path')}: {(row.get('raw_finding') or {}).get('summary')}"
-                      for row in rows or [] if isinstance(row, dict) and isinstance(row.get("raw_finding"), dict))
-    return [f"the lane's review of sd:{item} at {head[:12]} blocks and no disposition is recorded, so prepare "
-            f"refuses it again: fix each blocker as a new commit, or rebut the ones a ruling rejects with "
-            f"`sd-ship -C {cwd} adjudicate --item {item} --expected-head {head} --json` and its "
-            f"`--dispositions-file`: {named[:1500] or 'see the template'}"]
 
 
 def _lead_item(connection, ident: str) -> tuple[int, list[int]]:
@@ -2009,13 +1986,6 @@ class Supervisor:
         except ValueError:  # not UTF-8: the builder rewrites it, as for any other refusal
             return [f"the title at {self.title} or the body at {self.body} is not UTF-8 text"]
         refused = self.checked(self.work, self.base(), head, title.strip(), body) if self.checked else []
-        if not build.unmanaged(self.db, self.row["repo"]):
-            # Prepare reads the lane entry's item, the first one enqueue delivers (review of build/sd-1557).
-            cited = self.cited(self.work, self.base(), head, body)
-            delivered = [item for item in [self.lead, *self.others] if cited is not None and item in cited
-                         and not build.open_question(self.db, [item], self.row["created_at"])]
-            if delivered:
-                refused += undisposed(self.tools.ship, self.work, delivered[0], head, env=self.env)
         return refused + self.untabled(head, body)
 
     def untabled(self, head: str, body: str) -> list[str]:
