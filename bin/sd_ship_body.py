@@ -65,6 +65,10 @@ class OwnedLine:
 _FENCE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
 #: A Markdown heading line: up to three spaces, one to six `#`, then a space or the line's end.
 _ATX = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
+#: A thematic break: three or more `-`, `*` or `_`, spaces between allowed; it outranks a list item.
+_BREAK = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
+#: A setext underline, `=` or `-` alone, under a paragraph line: it makes that line a heading.
+_SETEXT = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
 #: A list item's marker and the spaces after it; their width is where the item's text starts.
 _ITEM_MARKER = re.compile(r"^( {0,3}(?:[-*+]|[0-9]{1,9}[.)]))( +|$)")
 
@@ -82,32 +86,61 @@ def quoted_lines(body: str, comments: bool = True, code: bool = False) -> set[in
     An indented code block, four spaces past its list column after a blank
     line, opens no fence, comment or list item; `code` counts its lines too.
     """
-    quoted: set[int] = set()
-    fence, depth, commented, loose = "", 0, False, True  # loose: no paragraph runs into this line
-    items: list[int] = []  # the text column of each open list item, outermost first (pack sd:9666)
+    return {number for number, kind, *_ in _blocks(body, comments) if kind in ("fence", "comment")
+            or (code and kind == "code")}
+
+
+def _blocks(body: str, comments: bool = True):
+    """Each line of `body` with the Markdown block it sits in, read once for every reader (pack sd:9666).
+
+    Yields `(number, kind, opened, depth, text, line)`: `kind` is `fence`,
+    `comment`, `code` or `text`; `opened` counts the list items the line's
+    markers open, even when a fence or code follows them; `depth` counts
+    the items open after them; `text` is the line past their text column.
+    """
+    fence, fence_depth, commented, loose = "", 0, False, True  # loose: no paragraph runs into this line
+    items: list[int] = []  # the text column of each open list item, outermost first
     for number, line in enumerate(body.split("\n"), start=1):
         line = line.rstrip("\r").expandtabs(4)
         rest = _item_text(line, items, opens=False)
-        if fence and len(items) >= depth:
-            quoted.add(number)
+        if fence and len(items) >= fence_depth:
             fence = "" if _closes(_FENCE_RE.match(rest), fence) else fence
             loose = True  # a fence is no paragraph: indented code may follow its closing line
+            yield number, "fence", 0, len(items), rest, line
             continue
         fence = ""  # the list item that held the fence ended, and the fence with it
-        if commented:
-            quoted.add(number)
-        elif _code_line(rest, items, loose):
-            quoted |= {number} if code else set()
-            continue  # an indented code block: a paragraph cannot run into it, so the next line is loose too
-        else:
-            match = _FENCE_RE.match(_item_text(rest, items, opens=True))
-            if match and not (match["fence"][0] == "`" and "`" in match["info"]):
-                quoted.add(number)
-                fence, depth = match["fence"], len(items)
-                continue
-        commented = comments and _comment_open(line, commented)
-        loose = not line.strip() or bool(_ATX.match(rest))  # a heading is one line, no paragraph
-    return quoted
+        kind, opened, text = _kind(rest, items, loose, commented)
+        if kind == "fence":
+            fence, fence_depth = _FENCE_RE.match(text)["fence"], len(items)
+        elif kind != "code":
+            commented = comments and _comment_open(line, commented)
+        loose = kind in ("fence", "code") or not line.strip() or bool(_ATX.match(text) or _BREAK.match(text)) \
+            or (not loose and bool(_SETEXT.match(text)))  # a heading or a break is one line, no paragraph
+        yield number, kind, opened, len(items), text, line
+
+
+def _kind(rest: str, items: list[int], loose: bool, commented: bool) -> tuple[str, int, str]:
+    """The block `rest`, a line past its list column, starts, the list items it opens onto `items`, and its text.
+
+    An HTML comment open at its start holds it. Four spaces in after no
+    paragraph, or after the markers it opens, start indented code. A
+    thematic break or a setext underline outranks a list marker.
+    """
+    if commented:
+        return "comment", 0, rest
+    if loose and rest.startswith("    ") and rest.strip():
+        return "code", 0, rest
+    if _BREAK.match(rest) or (not loose and _SETEXT.match(rest)):
+        return "text", 0, rest
+    before = len(items)
+    text = _item_text(rest, items, opens=True)
+    opened = len(items) - before
+    if opened and text.startswith("    ") and text.strip():
+        return "code", opened, text
+    match = _FENCE_RE.match(text)
+    if match and not (match["fence"][0] == "`" and "`" in match["info"]):
+        return "fence", opened, text
+    return "text", opened, text
 
 
 def _closes(match, fence: str) -> bool:
@@ -132,19 +165,6 @@ def _item_text(line: str, items: list[int], opens: bool) -> str:
         while items and len(line) - len(line.lstrip(" ")) < items[-1]:
             items.pop()  # a line indented less than an item's text ends the item
     return line[items[-1]:] if items else line
-
-
-def _code_line(rest: str, items: list[int], loose: bool) -> bool:
-    """Whether `rest`, a line past its list column, is indented code: four spaces in after a blank line,
-    or after the list markers it opens, which `items` then holds (pack sd:9666)."""
-    if rest.startswith("    "):
-        return loose and bool(rest.strip())
-    opened = len(items)
-    text = _item_text(rest, items, opens=True)
-    if text.startswith("    ") and text.strip():
-        return True
-    del items[opened:]  # not code: the caller opens these markers again
-    return False
 
 
 def _comment_open(line: str, commented: bool) -> bool:
@@ -395,33 +415,26 @@ def _listed_undone(message: str) -> list[str]:
     A list item that opens with a sha, under a heading such as `Reverted
     commits:`. A heading is a line that ends with a colon, bare, indented or
     itself a list item, or any line at column zero that is no list item.
-    The top level and each open list item, as `quoted_lines` reads them,
+    The top level and each open list item, as `_blocks` reads them,
     hold the last heading in them: a list item's own text is its first.
     A sha item undoes when the heading of what holds it says reverted, and
     passes that on to what nests in it; any other item, or a heading that
     does not say reverted, undoes nothing. An item inside a fence, an
     indented code block or an HTML comment names nothing.
     """
-    quoted, found = quoted_lines(message, code=True), []
-    items: list[int] = []  # open list items' text columns, as `quoted_lines` reads them
-    undoes = [False]  # per open list item, and the top level first: whether its last heading says reverted
-    for number, line in enumerate(message.split("\n"), start=1):
-        line = line.rstrip("\r").expandtabs(4)
-        rest = _item_text(line, items, opens=False)
-        del undoes[len(items) + 1:]  # the items `_item_text` ended take their headings with them
-        if number in quoted or not line.strip():
-            continue
-        if _ITEM_MARKER.match(rest):  # four spaces past the list column start no item: that is code
-            text = _item_text(rest, items, opens=True).strip()
-            holder = undoes[-1]
-            if sha := _SHA_LED.match(text):
+    found, undoes = [], [False]  # undoes: per open list item, the top level first, whether its heading says reverted
+    for _, kind, opened, depth, raw, line in _blocks(message):
+        del undoes[depth - opened + 1:]  # the items this line ended take their headings with them
+        holder, text = undoes[-1], raw.strip()
+        if opened:  # an item, even one that opens with a fence or code, holds what nests in it
+            if kind == "text" and (sha := _SHA_LED.match(text)):
                 found += [sha[1] or sha[2]] if holder else []
             else:
-                holder = bool(_REVERTED_INTRO.search(_heading(text)))
-            undoes += [holder] * (len(items) + 1 - len(undoes))
-        elif _heading(line).endswith(":") or not line[0].isspace() or _ATX.match(rest):
+                holder = kind == "text" and bool(_REVERTED_INTRO.search(_heading(text)))
+            undoes += [holder] * opened
+        elif kind == "text" and text and (_heading(text).endswith(":") or not line[0].isspace() or _ATX.match(raw)):
             # Any other indented line continues an item.
-            undoes[-1] = bool(_REVERTED_INTRO.search(_heading(line)))
+            undoes[-1] = bool(_REVERTED_INTRO.search(_heading(text)))
     return found
 
 

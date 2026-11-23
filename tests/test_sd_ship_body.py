@@ -484,6 +484,30 @@ class CitedIdTests(unittest.TestCase):
                 revert = self.revert_of(f"{opener}\n    <!--\n\n- {undone[:9]} renew\n")
                 self.assertEqual(sd_ship_body.cited_ids("", [revert, cited]), ())
 
+    def test_an_item_that_opens_with_an_example_holds_its_nest(self) -> None:
+        """pack sd:9666 review, round 11, instances 1 and 2: an item whose first line opens a fence or
+        indented code was skipped whole, so an item nested under it read the `Reverted commits:` heading
+        and the retained commit lost its citations."""
+        kept = "b" * 40
+        cited = (kept, "fix: shared\n\nLane review fix, pack sd:5: y.\n\nCloses: sd:4\n")
+        for parent in ("- ```\n  example\n  ```\n", "-     example\n"):
+            with self.subTest(parent=parent):
+                revert = self.revert_of(f"Reverted commits:\n\n{parent}\n  - {kept[:9]} retained\n")
+                self.assertEqual(sd_ship_body.cited_ids("", [revert, cited]), (4, 5))
+
+    def test_a_thematic_break_or_setext_underline_ends_the_paragraph(self) -> None:
+        """pack sd:9666 review, round 11, instance 3: after `---`, four spaces and `<!--` start indented
+        code, yet they opened a comment that hid the real revert. Instance 4: a setext underline the same.
+        Instance 5: `- - -` and `* * *` are breaks, not list items."""
+        undone = "a" * 40
+        cited = (undone, "feat: x\n\nCloses: sd:2\n")
+        for opener in ("Notes.\n\n---", "Notes.\n\n***", "Notes.\n\n- - -", "Notes.\n\n* * *",
+                       "Notes\n---", "Notes\n==="):
+            with self.subTest(opener=opener):
+                self.assertEqual(sd_ship_body.quoted_lines(f"{opener}\n    <!--\nx\n"), set())
+                revert = self.revert_of(f"{opener}\n    <!--\n## Reverted commits:\n- {undone[:9]} actual revert\n")
+                self.assertEqual(sd_ship_body.cited_ids("", [revert, cited]), ())
+
     def test_a_fence_on_a_list_marker_line_is_an_example(self) -> None:
         """pack sd:9666 review, round 5, instance 2: `- ```text` opened no fence, so the sha bullet in the
         example undid a real commit and dropped its citations."""
