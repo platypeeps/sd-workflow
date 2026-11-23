@@ -4926,6 +4926,28 @@ roles:
         read, kept, _ = self.reconciled_closing(passes=True)
         self.assertEqual(read, [[kept]])
 
+    def test_a_reconcile_of_a_head_the_published_closing_set_was_not_read_at_refuses(self):
+        """Round 8 of sd:9268: a reprepare that dropped an item pushed and reviewed a newer tip, then Copilot refused, so its
+        closing set stayed pending. The pull request merged on GitHub at that tip, and reconcile closed the
+        published set, read at the old head, with the item the new tip dropped. It refuses and closes none."""
+        self.task_item("task")
+        kept, dropped = self.closes_items()[:2]
+        self.prepare("--deliver", "--item", str(kept), "--item", str(dropped))
+        published = self.operation().state["closing"]["head"]
+        _git(self.root, "commit", "--allow-empty", "-qm", "a newer tip\n\nAuthored-with: human")
+        with patch.object(ship.GitHub, "request_copilot_review", side_effect=ship.Refusal("copilot failed")), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "copilot"):
+            self.prepare("--deliver", "--item", str(kept), "--copilot-review", "request")
+        state = self.operation().state
+        self.assertNotEqual(state["reviewed_head"], published)
+        self.remote.merge(state["pull_request"]["number"])
+        with patch.object(ship.time, "sleep"), \
+                self.assertRaisesRegex(ship.Refusal, "closing set .* read at .*nothing is delivered"):
+            self.operation("reconcile").reconcile()
+        status = "SELECT status FROM item WHERE id = ?"
+        self.assertEqual([self.connection.execute(status, (number,)).fetchone()[0] != "done"
+                          for number in (self.item, kept, dropped)], [True, True, True])
+
     def test_a_renewal_hint_from_another_checkout_names_the_branchs_checkout(self):
         """Review of sd:9268: `merge --branch X` from another checkout printed a bare prepare, which would run in
         that checkout. The hint names the branch's checkout with -C, and it parses."""

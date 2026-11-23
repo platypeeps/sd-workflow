@@ -2293,6 +2293,25 @@ class Ship(SharedReview):
                  else sd_ship_body.title_ids(self.state.get("title") or "") if deliver else ())
         self.check_closes(named, deliver)
 
+    def refuse_unbound_closing(self, head: str, commit: str) -> None:
+        """Refuse to deliver or close at `commit` when the published closing set was read at another head.
+
+        A reprepare that pushed and reviewed `head`, then refused, left its own
+        set pending; a merge on GitHub at `head` lands what the published set
+        and claim do not describe (sd:9268 round 8). The merge is recorded.
+        """
+        stored = self.state.get("closing")
+        if self.args.no_item or stored is None or stored.get("head") == head:
+            return
+        if not (self.state.get("deliver") or stored.get("items")):
+            return
+        raise Refusal(f"the pull request merged at {commit[:12]} from head {head[:12]}, and the published closing "
+                      f"set and delivery claim were read at {str(stored.get('head'))[:12]}; nothing is delivered "
+                      f"or closed: check the merged change against each item, then {self.by_hand(commit)}, and "
+                      f"close each item it delivers the same way", code="closing_set_stale", boundary="input",
+                      state="operator_decision",
+                      next_action="Deliver or close each item the merged change delivers by hand.")
+
     def item_status(self, number: int) -> str | None:
         row = self.connection.execute("SELECT status FROM item WHERE id = ?", (number,)).fetchone()
         return None if row is None else row["status"]
@@ -3015,6 +3034,7 @@ class Ship(SharedReview):
         self.save(phase="merged", merge_commit=commit, evidence=evidence)
         if not self.args.no_item:
             self.store.note_merge(self.connection, self.args.item, evidence)
+        self.refuse_unbound_closing(pull["head"]["sha"], commit)
         # GitHub squashes onto the base it holds at the `PUT`, and no request
         # field pins that base. `ready` and `still_gated` saw the reviewed head
         # contain the base; a squash parent outside it means the base advanced
