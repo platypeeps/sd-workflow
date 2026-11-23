@@ -1748,6 +1748,32 @@ class Supervise(Case):
                 self.assertEqual((chosen or {}).get("subject", {}).get("head"), expected,
                                  "a replay held at the checks lost the delta review's prior")
 
+    def test_a_fresh_claim_reads_no_earlier_attempt_s_review(self):
+        """Review of build/sd-1726 (pack sd:10236): the fallback to an earlier run's reports walked every run of
+        the assignment, so a fresh claim with no report of its own verified an earlier attempt's, leaving the
+        rest of the branch unreviewed. Only a run that resumed one reads back, and no further than a fresh one."""
+        self.press()
+        earlier = self.supervisor()
+        earlier.logs.mkdir(parents=True, exist_ok=True)
+        earlier.out("review").write_text(json.dumps(
+            {**self.PRIOR, "status": "blocking", "scope": "branch"}), encoding="utf-8")
+        ident = "f" * 32
+        self.db.execute("INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, "
+                        "start_step, step, model, created_at, updated_at) SELECT ?, assignment, run + 1, repo, branch, "
+                        "owner, work_path, retained_path, ?, step, model, created_at, updated_at FROM runner_run "
+                        "WHERE id = ?", (ident, "claimed", self.bundle["id"]))
+        self.db.commit()
+        fresh = self.supervisor(ident)
+        with mock.patch.object(fresh, "fresh", return_value={"review_round": 1}), \
+                mock.patch.object(build_run, "_read", return_value=""):
+            self.assertIsNone(fresh.prior_review("a" * 40), "a fresh claim verified an earlier attempt's review")
+        self.db.execute("UPDATE runner_run SET start_step = 'fixing' WHERE id = ?", (ident,))
+        self.db.commit()
+        resumed = self.supervisor(ident)
+        with mock.patch.object(resumed, "fresh", return_value={"review_round": 1}), \
+                mock.patch.object(build_run, "_read", return_value=""):
+            self.assertEqual((resumed.prior_review("a" * 40) or {}).get("subject"), self.PRIOR["subject"])
+
     def test_a_short_blocking_round_is_no_prior_to_verify(self):
         """Review of sd:9769: a blocking round short of a reader read part of the patch; the next round reviews
         the branch in full, not the delta since it."""
