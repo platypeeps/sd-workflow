@@ -992,6 +992,28 @@ class Supervise(Case):
         row = build.run(self.db, again["id"])
         self.assertEqual((row["step"], row["session_id"], row["review_round"]), ("fixing", "session-limited", 2))
 
+    def test_a_usage_limit_claim_refuses_a_bundle_whose_lane_moved_off_its_host(self):
+        """Review of build/sd-1557: the claim after a usage limit resumed the old session on whichever host now
+        runs the lane, though the worktree and session stay where the run ran: it refuses, naming that host."""
+        self.press(2)
+        ident = self.bundle["id"]
+        reset = int(datetime.now(UTC).timestamp()) + 60
+        self.assertTrue(build.write(self.db, ident, step="fixing", session_id="session-limited", review_round=1,
+                                    final=json.dumps({"rate_limit_info": {"resetsAt": reset}})))
+        build.end(self.db, ident, build.RATE_LIMITED, "rate limited")
+        # It ran on the satellite `work`; the lane moved to the hub during the hold.
+        self.db.execute("UPDATE runner_run SET owner = 'fixture@work' WHERE id = ?", (ident,))
+        self.db.commit()
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            self.assertIsNone(build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                          root=self.root / "worktrees"))
+        rows = self.db.execute("SELECT status, result FROM assignment WHERE id = ? OR parent = ? ORDER BY id",
+                               (self.bundle["assignment"], self.bundle["assignment"])).fetchall()
+        self.assertEqual([row["status"] for row in rows], ["blocked", "blocked"])
+        self.assertIn(f"build run {ident} hit the usage limit on work", rows[0]["result"])
+        self.assertIn("move its lane back to work", rows[0]["result"])
+
     def test_a_fault_inside_the_usage_limit_end_writes_nothing_and_the_next_end_finishes(self):
         """Pack sd:9907, failure table row 2: the outcome, the release, the requeue and the hold are one
         transaction. A fault at its last write leaves the run open and its bundle running, as the

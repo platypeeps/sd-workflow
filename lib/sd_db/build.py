@@ -1658,6 +1658,19 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             if kept is not None and lanes[row["id"]] in hosts and lanes[row["id"]] != lane_of(connection, kept[1]):
                 _refuse(connection, row, f"its kept work is in a worktree on {kept[1] or 'the hub'}, which ran build "
                                          f"run {kept[0]}, but its lane moved; drop or Build its items again there")
+        # A bundle a usage limit queued again resumes its worktree and session (below), which stay on the host
+        # that ran it: a lane moved since would claim it where neither is, so the whole bundle blocks, saying
+        # where its work is (review of build/sd-1557).
+        for row in queued:
+            lead = _lead(row)
+            last = connection.execute("SELECT id, owner, step, outcome FROM runner_run WHERE assignment = ? "
+                                      "ORDER BY run DESC LIMIT 1", (lead,)).fetchone() if lead else None
+            if (last is not None and last["outcome"] == RATE_LIMITED and last["step"] not in LANE_STEPS
+                    and lanes[row["id"]] in hosts and lanes[row["id"]] != lane_of(connection, run_host(last["owner"]))):
+                ran_on = run_host(last["owner"]) or "the hub"
+                _refuse(connection, row, f"build run {last['id']} hit the usage limit on {ran_on}, whose worktree "
+                                         f"and session it resumes, but its lane moved; move its lane back to "
+                                         f"{ran_on} and Retry it, or Build its items again here")
         queued = [row for row in queued if lanes[row["id"]] in hosts and not _refused_repo(connection, row)]
         # A bundle's work is on its lead's branch in the repository of the run that made it, not wherever its item
         # reads now: a lead moved since would build fresh there, and a member moved since would still be briefed and
