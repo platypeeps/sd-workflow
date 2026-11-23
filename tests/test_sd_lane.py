@@ -2058,13 +2058,30 @@ class TrainLanding(Trees):
         self.assertEqual(self.joins[:3], [(1, fork), (2, "1" * 40), (3, "2" * 40)])
         [(root, tip, base, items)] = self.landed
         self.assertEqual((root, tip, base, items), (self.first, "3" * 40, "main", [1, 2, 3]))
-        self.assertEqual(self.merges(), [2, 3, 1])  # the members reconcile, then the claimed entry
+        self.assertEqual(self.reconciles(), [2, 3, 1])  # the members reconcile, then the claimed entry
         entries = self.entries()
         self.assertEqual([entry["status"] for entry in entries], ["merged"] * 3)
         self.assertEqual({key: entries[0]["train_landing"][key] for key in ("status", "pull", "items")},
                          {"status": "merged", "pull": 9, "items": [1, 2, 3]})
         self.assertEqual([entries[index]["train"]["status"] for index in (1, 2)], ["landed", "landed"])
         self.assertEqual([entries[index]["merge_commit"] for index in (1, 2)], ["2" * 40, "3" * 40])
+
+    def reconciles(self) -> list[int]:
+        return [int(argv[argv.index("--item") + 1]) for argv in self.calls if argv[2] == "reconcile"]
+
+    def test_a_landed_train_sends_no_merge_and_only_reconciles(self) -> None:
+        # Review of sd:9923: after GitHub confirmed the train merged, the lane still ran the write-capable
+        # `sd-ship merge` per member and for the claimed entry; a member still read as open merged alone.
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertEqual((self.merges(), self.reconciles()), ([], [2, 3, 1]))
+
+    def test_a_landed_train_whose_claimed_reconcile_refuses_merges_nothing_alone(self) -> None:
+        self.answers[(1, "reconcile")] = {"ok": False, "error": "GitHub has not confirmed this pull request merged"}
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertNotIn(1, self.merges())
+        self.assertEqual(self.entries()[0]["retryable_fault"]["step"], "train")
 
     def test_a_member_that_does_not_join_drops_and_the_rest_land(self) -> None:
         self.answers[(2, "join")] = {"ok": False, "error": "conflicts with the train landing", "code": "train_conflict"}
@@ -2220,7 +2237,7 @@ class TrainLanding(Trees):
 
         def ship(argv: list[str], log: pathlib.Path) -> dict:
             item = int(argv[argv.index("--item") + 1])
-            if argv[2] == "merge" and "--train-onto" not in argv:
+            if argv[2] == "reconcile":
                 if item == 3:
                     raise OSError(28, "No space left on device")
                 if item == 1:

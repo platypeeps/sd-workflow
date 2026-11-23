@@ -2149,10 +2149,18 @@ def process(entry: dict[str, Any], queue: Queue, ship: Ship, advance: Callable[.
         fields["train_landing"] = landing
     if refused is not None:
         return {**fields, **refused}
-    merge_log = logs / f"merge-{item}-{stamp}.log"
-    merged = ship(["-C", str(worktree), "merge", "--item", str(item), "--expected-head", str(prepared.get("head")),
+    return {**fields, **merge_step(entry, worktree, ship, str(prepared.get("head")), landing,
+                                   logs / f"merge-{item}-{stamp}.log")}
+
+
+def merge_step(entry: dict[str, Any], worktree: pathlib.Path, ship: Ship, head: str,
+               landing: dict[str, Any] | None, merge_log: pathlib.Path) -> dict[str, Any]:
+    """The entry's merge fields: a landed train only reconciles, else it merges alone (sd:9923)."""
+    if (landing or {}).get("status") == "merged":
+        return reconciled_train(entry, worktree, ship, merge_log)
+    merged = ship(["-C", str(worktree), "merge", "--item", str(entry["item"]), "--expected-head", head,
                    "--manual", "--watch", "--wait-seconds", str(MERGE_WAIT_SECONDS), "--json"], merge_log)
-    fields["merge_log"] = str(merge_log)
+    fields: dict[str, Any] = {"merge_log": str(merge_log)}
     if blocker_code(merged) == LANE_ELSEWHERE:
         return {**fields, "moved": str(merged.get("error") or "the lane moved")[:600]}  # a move, not a failure
     if not (merged.get("ok") and merged.get("phase") == "merged"):
@@ -2161,6 +2169,21 @@ def process(entry: dict[str, Any], queue: Queue, ship: Ship, advance: Callable[.
                 "reason": str(merged.get("error") or merged.get("code") or "merge did not confirm")[:REASON_CHARS],
                 **({"hub_fault": True} if answered_hub_fault(merged) else {}), **coded(merged)}
     return {**fields, "status": "merged", "merge_commit": merged.get("merge_commit")}
+
+
+def reconciled_train(entry: dict[str, Any], worktree: pathlib.Path, ship: Ship,
+                     log: pathlib.Path) -> dict[str, Any]:
+    """The claimed entry's fields after its train landed: `sd-ship reconcile`, which sends no merge (sd:9923).
+
+    GitHub may still read the pull request open; a refused reconcile puts
+    the entry back for its next prepare, which reconciles, never merges alone.
+    """
+    merged = ship(["-C", str(worktree), "reconcile", "--item", str(entry["item"]), "--json"], log)
+    if merged.get("ok") and merged.get("phase") == "merged":
+        return {"merge_log": str(log), "status": "merged", "merge_commit": merged.get("merge_commit")}
+    why = f"the train landed; reconcile: {merged.get('error') or merged.get('code') or merged.get('phase')}"
+    return {"merge_log": str(log), "status": "failed", "step": "train", "retryable": True,
+            "reason": f"{why}; the next prepare reconciles it"[:REASON_CHARS], **coded(merged)}
 
 
 def train_landing(entry: dict[str, Any], queue: Queue, ship: Ship, head: str, logs: pathlib.Path,
@@ -2904,11 +2927,11 @@ def land_joined(joined: list[Joined], queue: Queue, ship: Ship, tip: str,
             record[row["id"]] = {"status": "unknown" if landed.get("status") == "unknown" else "failed",
                                  "reason": str(landed.get("reason"))[:REASON_CHARS]}
         return {**landed, "items": items, "tip": tip}
-    for row, tree, head, *_ in joined[1:]:  # each reconciles now; a stop here leaves it to its next claim's prepare
+    for row, tree, _head, *_ in joined[1:]:  # each reconciles now; a stop here leaves it to its next claim's prepare
         record[row["id"]] = {"status": "landed", "pull": landed.get("pull"), "reconciled": False}
         try:  # a member's failure is its own: the landed train stays the claimed entry's answer
-            merged = ship(["-C", str(tree), "merge", "--item", str(row["item"]), "--expected-head", head, "--manual",
-                           "--json"], logs.with_name(f"train-merge-{row['item']}-{logs.name}.log"))
+            merged = ship(["-C", str(tree), "reconcile", "--item", str(row["item"]), "--json"],  # never a merge
+                          logs.with_name(f"train-merge-{row['item']}-{logs.name}.log"))
         except Stop:
             raise
         except Exception as error:
