@@ -80,13 +80,14 @@ class TheStrip(ScreenCase):
         self.assertEqual(rows[0]["windows"], [{"label": "7d", "used": 40.0, "resets_at": "2026-09-08T12:00:00Z", "pace": -10}])
         self.assertEqual((rows[1]["windows"], rows[1]["why"]), ([], "read 2h ago; a reading over 30 min old is unknown"))
 
-    def test_a_claude_account_with_a_cswap_alias_shows_it_after_its_number(self):
-        """pack sd:9861: system sd:9860 keeps cswap's alias; the id stays usage:claude#N; no alias is unchanged."""
+    def test_a_claude_account_with_a_cswap_alias_is_labelled_by_the_alias_alone(self):
+        """pack sd:9861, sd:9873: system sd:9860 keeps cswap's alias, the label is the alias alone; the id stays
+        usage:claude#N; no alias is unchanged."""
         accounts = [dict(CLAUDE["accounts"][0], alias="grinch"), dict(CLAUDE["accounts"][1], alias=" "),
                     dict(CLAUDE["accounts"][0], number=3, alias=7)]
         reading(self.connection, "claude", windows=[], accounts=accounts)
         self.assertEqual([(row["id"], row["label"]) for row in self.strip()["rows"]],
-                         [("usage:claude#1", "claude#1 grinch"), ("usage:claude#2", "claude#2"),
+                         [("usage:claude#1", "grinch"), ("usage:claude#2", "claude#2"),
                           ("usage:claude#3", "claude#3")])
 
     def test_a_claude_account_with_no_expected_share_paces_at_its_fetch_time(self):

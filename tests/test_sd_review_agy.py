@@ -138,7 +138,7 @@ class TheEnvelopeIsReadBack(unittest.TestCase):
         return sd_review.agy_answer(sd_review.Completed(exit_code, stdout, ""), expected)
 
     def test_a_successful_envelope_yields_its_findings(self) -> None:
-        finding = {"path": "src.py", "line": 1, "severity": "high",
+        finding = {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"],
                    "summary": "defect", "family": "correctness"}
         result, parsed = self.answer(stream(
             {"conversation_id": "x", "status": "SUCCESS", "response": "{}",

@@ -78,6 +78,7 @@ not read, or a merged pull whose item is still open, is named in `unread`, which
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -85,6 +86,7 @@ import re
 import shutil
 import sqlite3
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
@@ -224,12 +226,23 @@ def in_process(connection, path: str, remote: str | None) -> dict | None:
     return {"ok": True, "queue": str(queue), "revision": lane.queue_revision(entries), "entries": listed}
 
 
+#: How long one `sd-ship` answer to `lane retry --help` serves (pack sd:10077): each probe is a subprocess, ~0.1 s.
+HELP_SECONDS = 300.0
+#: `sd-ship`'s path -> (monotonic time, the answer); only an answer the probe read is kept.
+_help: dict = {}
+
+
 def retry_help() -> dict:
     """What the installed pack's `lane retry` takes, from its `--help`: `retry` when it names `--expected-head` (sd:3254,
     sd:3268), `requeue` when it also names a cancelled entry (pack sd:3389). A failed probe offers neither; `requeue_off`
-    says why Re-queue is off, and names a failed probe as one, not as a pack without it."""
+    says why Re-queue is off, and names a failed probe as one, not as a pack without it. A read answer serves
+    `HELP_SECONDS` per `sd-ship` path; a failed probe is asked again at the next read."""
+    found = command("sd-ship")
+    kept = _help.get(found)
+    if kept is not None and 0 <= time.monotonic() - kept[0] < HELP_SECONDS:
+        return dict(kept[1])
     try:
-        done = subprocess.run([command("sd-ship"), "lane", "retry", "--help"], capture_output=True, text=True,
+        done = subprocess.run([found, "lane", "retry", "--help"], capture_output=True, text=True,
                               timeout=LIST_SECONDS, check=False)
     except (OSError, subprocess.SubprocessError) as error:
         return {"retry": False, "requeue": False, "requeue_off": f"sd-ship lane retry --help gave no answer ({error})."}
@@ -239,8 +252,10 @@ def retry_help() -> dict:
                 "requeue_off": f"sd-ship lane retry --help exited {done.returncode}{f': {said}' if said else ''}."}
     retry = "--expected-head" in done.stdout
     requeue = retry and "cancelled" in done.stdout
-    return {"retry": retry, "requeue": requeue, "requeue_off": None if requeue else
-            "the installed pack's lane retry takes no cancelled entry; it needs pack sd:3389. Enqueue it again from its worktree."}
+    answer = {"retry": retry, "requeue": requeue, "requeue_off": None if requeue else
+              "the installed pack's lane retry takes no cancelled entry; it needs pack sd:3389. Enqueue it again from its worktree."}
+    _help[found] = (time.monotonic(), dict(answer))
+    return answer
 
 
 def lane_revision(entries: list[dict]) -> str:
@@ -568,6 +583,38 @@ def pr_rows(connection, lanes: list[dict], clock: float) -> dict:
             "error": f"pull-request waits skipped {'; '.join(skipped)}" if skipped else ""}
 
 
+#: How long `/api/queue` and `/api/now` share one document (pack sd:10077): a page load reads both, ~1 s each.
+SHARE_SECONDS = 3.0
+#: The database file -> (monotonic time the build started, the document). The lock is held over a build, so a read
+#: that comes while one builds waits for it rather than building a second.
+_shared: dict = {}
+_share_lock = threading.Lock()
+
+
+def shared(connection, *, now: str = "") -> dict:
+    """`document`, built once for the reads on one database within `SHARE_SECONDS`; each caller gets its own copy.
+
+    A write through this page (`move`, `check_prs`) drops it, so the read after a write is fresh. A lane change the
+    runner makes shows within `SHARE_SECONDS`. A build that raises keeps nothing. A database with no file builds each time.
+    """
+    key = next((row[2] for row in connection.execute("PRAGMA database_list") if row[1] == "main"), "")
+    if not key:
+        return document(connection, now=now)
+    # ponytail: one lock for every database file; the dashboard serves one, so no read waits on another's build.
+    with _share_lock:
+        kept = _shared.get(key)
+        if kept is None or not 0 <= time.monotonic() - kept[0] < SHARE_SECONDS:
+            started = time.monotonic()
+            kept = _shared[key] = (started, document(connection, now=now))
+        return copy.deepcopy(kept[1])
+
+
+def forget() -> None:
+    """Drop the shared document: the next read builds it again. Waits out a build in flight, so it drops that one too."""
+    with _share_lock:
+        _shared.clear()
+
+
 def document(connection, *, now: str = "") -> dict:
     """The page's document: the header readings and one section per repository lane."""
     from sd_db import repos
@@ -662,7 +709,11 @@ def move(payload: dict):
         if action in ("up", "down", "top", "hold", "release", "cancel"):
             # The fresh list matched the page, so its lane revision is the page's; the verb checks it under its lock.
             verb += ["--expected-revision", lane_revision(entries)]
-        answer = _run([command("sd-ship"), "-C", path, "lane", *verb], WRITE_SECONDS)
+        try:
+            answer = _run([command("sd-ship"), "-C", path, "lane", *verb], WRITE_SECONDS)
+        finally:
+            # The verb may have written even when it gave no answer: the next read builds the document again.
+            forget()
         if not (answer.get("ok") and answer.get("exit") == 0) and not refused(answer):
             # A hub fault, a timeout or an exit without a refusal may follow a landed write: not known (sd:3339).
             return 502, {"error": answer.get("error") or "sd-ship lane gave no answer.", "outcome": "unknown"}
@@ -685,7 +736,12 @@ def check_prs(payload: dict):
     if (not isinstance(items, list) or not 1 <= len(items) <= PR_CHECK_ITEMS
             or any(type(item) is not int or not 1 <= item <= 9223372036854775807 for item in items)):
         raise ValueError(f"Name 1 to {PR_CHECK_ITEMS} items.")
-    return lambda connection: pr_check(connection, list(dict.fromkeys(items)))
+    def write(connection):
+        try:
+            return pr_check(connection, list(dict.fromkeys(items)))
+        finally:
+            forget()
+    return write
 
 
 def pr_check(connection, items: list[int], *, client=None) -> dict:

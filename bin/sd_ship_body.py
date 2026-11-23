@@ -63,47 +63,249 @@ class OwnedLine:
 #: A fence that opens or closes a fenced code block: up to three spaces, then
 #: three or more backticks or tildes (CommonMark).
 _FENCE_RE = re.compile(r"^ {0,3}(?P<fence>`{3,}|~{3,})(?P<info>.*)$")
+#: A Markdown heading line: up to three spaces, one to six `#`, then a space or the line's end.
+_ATX = re.compile(r"^ {0,3}#{1,6}(?:[ \t]|$)")
+#: A thematic break: three or more `-`, `*` or `_`, spaces between allowed; it outranks a list item.
+_BREAK = re.compile(r"^ {0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
+#: A setext underline, `=` or `-` alone, under a paragraph line: it makes that line a heading.
+_SETEXT = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
+#: A list item's marker and the spaces after it; their width is where the item's text starts.
+_ITEM_MARKER = re.compile(r"^( {0,3}(?:[-*+]|[0-9]{1,9}[.)]))( +|$)")
 
 
-def quoted_lines(body: str, comments: bool = True) -> set[int]:
+def quoted_lines(body: str, comments: bool = True, code: bool = False) -> set[int]:
     """The 1-based numbers of the lines of `body` a fenced code block or an HTML comment holds.
 
     A fence closes on a line of the same character, at least as long, and
-    nothing else; an unclosed fence runs to the end. A comment holds a line
+    nothing else; an unclosed fence runs to the end of the list item that
+    holds it, or of the body. A fence opens at most three spaces past the
+    text column of its list item, or on the item's marker line; four
+    spaces at the top level start an indented code block. A comment holds a line
     when it is open where the line starts. Inside a fence a comment is text.
     With `comments` false only fences count, and a comment is text too.
+    An indented code block, four spaces past its list column after a blank
+    line, opens no fence, comment or list item; `code` counts its lines too.
     """
-    quoted: set[int] = set()
-    fence = ""
-    commented = False
+    return {number for number, kind, *_ in _blocks(body, comments) if kind in ("fence", "comment")
+            or (code and kind == "code")}
+
+
+def _blocks(body: str, comments: bool = True, plain: bool = False):
+    """Each line of `body` with the Markdown block it sits in, read once for every reader (pack sd:9666).
+
+    Two grammars, and each read is whole in one of them: it finds its own
+    fences, comments, code spans and list items, and takes no verdict
+    about a line from the other read, where the same line can be another
+    thing. By default a paragraph is CommonMark's, the read citations
+    get: a line indented less than its list item continues the item's
+    paragraph, and a marker that cannot interrupt a paragraph is text.
+    With `plain`, the grammar `_listed_undone` reads a revert's list by: a
+    line that ends with a colon is a heading and ends the items it is
+    indented less than, and every list marker opens an item. Inside an
+    open code span neither `plain` rule applies, so a span's line ends
+    and opens no item.
+
+    Yields `(number, kind, opened, depth, text, line, spanned)`: `kind` is `fence`,
+    `comment`, `code`, `setext` (an underline that makes the line above
+    it a heading), `wrapped` (text indented less than the list item whose
+    paragraph it continues) or `text`; `opened` counts the list items the line's
+    markers open, even when a fence or code follows them; `depth` counts
+    the items open after them; `text` is the line past their text column;
+    `spanned` says the line starts inside a code span.
+
+    A code span may wrap onto the next lines of its paragraph. An opening
+    backtick run that no line of the paragraph closes is text, so the read
+    runs again with that run taken as text, until every span closes.
+    """
+    literal: set[tuple[int, int]] = set()
+    while True:
+        rows, unclosed = _blocks_once(body, comments, literal, plain)
+        if unclosed is None:
+            return rows
+        literal.add(unclosed)  # ponytail: a reread per unclosed run; a commit message has few
+
+
+def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]], plain: bool):
+    """`_blocks` once, each backtick run in `literal` taken as text; with the opener of a span left unclosed."""
+    fence, fence_depth, commented, comment_depth, loose = "", 0, False, 0, True  # loose: no paragraph runs on
+    depth, ticks, span_at, rows = 0, "", (0, 0), []
+    items: list[int] = []  # the text column of each open list item, outermost first
     for number, line in enumerate(body.split("\n"), start=1):
-        line = line.rstrip("\r")
-        if fence:
-            quoted.add(number)
-            match = _FENCE_RE.match(line)
-            if match and match["fence"][0] == fence[0] and len(match["fence"]) >= len(fence) and not match["info"].strip():
-                fence = ""
+        line = line.rstrip("\r").expandtabs(4)
+        spanned = bool(ticks)  # in an open code span the `plain` rules rest
+        rest, lazy = _continues(line, items, not loose and not commented, plain, spanned)
+        commented = commented and len(items) >= comment_depth  # a comment ends with the list item that holds it
+        if fence and len(items) >= fence_depth:
+            fence = "" if _closes(_FENCE_RE.match(rest), fence) else fence
+            loose = True  # a fence is no paragraph: indented code may follow its closing line
+            rows.append((number, "fence", 0, len(items), rest, line, False))
             continue
+        fence = ""  # the list item that held the fence ended, and the fence with it
+        kind, opened, text = ("text", 0, rest) if lazy else _kind(rest, items, loose, commented, len(items) != depth,
+                                                                    plain, spanned)
+        alone = _stands_alone(kind, text, line)
+        if ticks and _ends_paragraph(kind, opened, alone, len(items) != depth):
+            return rows, span_at  # the paragraph ended with the span open: its opener is text
+        if kind == "fence" and (opener := _FENCE_RE.match(text)):  # `_kind` matched it already
+            fence, fence_depth = opener["fence"], len(items)
+        elif kind != "code" and comments:
+            was = commented
+            commented, ticks, span_at = _inline(line, number, commented, ticks, span_at, literal)
+            comment_depth = len(items) if commented and not was else comment_depth
+            if ticks and alone:
+                return rows, span_at  # a heading is one line: a span it opens ends with it
+        loose = alone
+        depth = len(items)  # a heading or a break is one line, no paragraph; `depth` finds a lazy line
+        rows.append((number, "wrapped" if lazy else kind, opened, len(items), text, line, spanned))
+    return rows, (span_at if ticks else None)
+
+
+def _inline(line: str, number: int, commented: bool, ticks: str, span_at: tuple[int, int],
+            literal: set[tuple[int, int]]) -> tuple[bool, str, tuple[int, int]]:
+    """`_comment_open` on line `number`, with the opener of the code span left open after it."""
+    commented, ticks, column = _comment_open(line, commented, ticks, {c for n, c in literal if n == number})
+    return commented, ticks, (number, column) if ticks and column >= 0 else span_at
+
+
+def _continues(line: str, items: list[int], paragraph: bool, plain: bool, spanned: bool) -> tuple[str, bool]:
+    """`line` past its list column, popping each item it ends, and whether it is a lazy line.
+
+    A line indented less than its list item continues the item's open
+    `paragraph` (CommonMark's lazy continuation) unless a block starts on
+    it: any list marker, or a block that interrupts a paragraph. In the
+    `plain` grammar a line that ends with a colon is a heading, so it
+    ends the item too, unless it starts in an open code span.
+    """
+    ended = items.copy()
+    rest = _item_text(line, ended, opens=False)
+    if paragraph and len(ended) < len(items) and not (_ITEM_MARKER.match(rest) or _interrupts(rest)) \
+            and not (plain and not spanned and _heading(rest).endswith(":")):
+        return line.strip(), True
+    items[:] = ended
+    return rest, False
+
+
+#: A tag that starts an HTML block able to interrupt a paragraph (CommonMark kinds 1 to 6).
+_HTML_START = re.compile(
+    r"^ {0,3}<(?:!--|\?|![A-Za-z]|!\[CDATA\[|(?:script|pre|style|textarea)(?:[ \t>]|$)|/?(?:address|article|aside|"
+    r"base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|"
+    r"figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|"
+    r"menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|"
+    r"title|tr|track|ul)(?:[ \t>]|/>|$))", re.IGNORECASE)
+
+
+def _interrupts(text: str) -> bool:
+    """Whether `text` starts a block that ends an open paragraph: a heading, fence, break, quote, HTML
+    block, or a list item with text that is a bullet or numbered 1."""
+    fence = _FENCE_RE.match(text)
+    if _ATX.match(text) or _BREAK.match(text) or _HTML_START.match(text) or text.lstrip(" ")[:1] == ">" \
+            or (fence and not (fence["fence"][0] == "`" and "`" in fence["info"])):
+        return True
+    marker = _ITEM_MARKER.match(text)
+    if marker is None:
+        return False
+    number = marker[1].strip()[:-1]
+    return bool(text[marker.end():].strip()) and (not number or int(number) == 1)
+
+
+def _ends_paragraph(kind: str, opened: int, alone: bool, moved: bool) -> bool:
+    """Whether a line ends the paragraph above it: no paragraph text, a list item, or a list item's end."""
+    return alone or kind != "text" or bool(opened) or moved
+
+
+def _stands_alone(kind: str, text: str, line: str) -> bool:
+    """Whether the line is no paragraph text: a fence, code, an underline, a blank, a heading or a break."""
+    return kind in ("fence", "code", "setext") or not line.strip() or bool(_ATX.match(text) or _BREAK.match(text))
+
+
+def _kind(rest: str, items: list[int], loose: bool, commented: bool, lazy: bool = False,
+          plain: bool = False, spanned: bool = False) -> tuple[str, int, str]:
+    """The block `rest`, a line past its list column, starts, the list items it opens onto `items`, and its text.
+
+    An HTML comment open at its start holds it. Four spaces in after no
+    paragraph, or after the markers it opens, start indented code. A
+    thematic break or a setext underline outranks a list marker; a line
+    that ended a list item (`lazy`) underlines nothing. A marker that
+    cannot interrupt a paragraph is text; in the `plain` grammar only
+    one that starts in an open code span is.
+    """
+    if commented:
+        return "comment", 0, rest
+    if loose and rest.startswith("    ") and rest.strip():
+        return "code", 0, rest
+    runs = not loose and not lazy  # an open paragraph runs on to this line
+    if runs and _SETEXT.match(rest):
+        return "setext", 0, rest
+    if _BREAK.match(rest) or (runs and (spanned or not plain) and _ITEM_MARKER.match(rest)
+                              and not _interrupts(rest)):
+        return "text", 0, rest  # an empty item or one numbered past 1 cannot interrupt a paragraph
+    before = len(items)
+    text = _item_text(rest, items, opens=True)
+    opened = len(items) - before
+    if opened and text.startswith("    ") and text.strip():
+        return "code", opened, text
+    match = _FENCE_RE.match(text)
+    if match and not (match["fence"][0] == "`" and "`" in match["info"]):
+        return "fence", opened, text
+    return "text", opened, text
+
+
+def _closes(match, fence: str) -> bool:
+    """Whether `match` (of `_FENCE_RE`) closes `fence`: the same character, as long or longer, nothing after."""
+    return bool(match) and match["fence"][0] == fence[0] and len(match["fence"]) >= len(fence) \
+        and not match["info"].strip()
+
+
+def _item_text(line: str, items: list[int], opens: bool) -> str:
+    """`line` past the text column of the list items it sits in, popping from `items` each it ends.
+
+    With `opens`, `line` is already that text: each list marker it opens
+    with pushes its item's text column, and the text after them is returned.
+    """
+    if opens:
+        while marker := _ITEM_MARKER.match(line):
+            width = len(marker[1]) + (len(marker[2]) if 1 <= len(marker[2]) <= 4 else 1)
+            items.append((items[-1] if items else 0) + width)
+            line = line[width:]
+        return line
+    if line.strip():
+        while items and len(line) - len(line.lstrip(" ")) < items[-1]:
+            items.pop()  # a line indented less than an item's text ends the item
+    return line[items[-1]:] if items else line
+
+
+#: A backslash escape of a backslash, backtick or `<`; the next `<!--`; or a backtick run.
+_INLINE = re.compile(r"\\[\\`<]|<!--|`+")
+
+
+def _comment_open(line: str, commented: bool, ticks: str = "", literal=frozenset()) -> tuple[bool, str, int]:
+    """After `line`: whether an HTML comment is open, the backtick run of a code span still open, and its column.
+
+    `commented` and `ticks` say what was open before `line`. Outside a
+    comment a code span outranks it: `<!--` in a span is text, and so is
+    an escaped `\\<` or `\\``. A span closes on a run of its length; a
+    backslash in it is text. A run whose column is in `literal` is text.
+    """
+    position, column = 0, -1
+    while True:
         if commented:
-            quoted.add(number)
-        match = _FENCE_RE.match(line)
-        if not commented and match and not (match["fence"][0] == "`" and "`" in match["info"]):
-            quoted.add(number)
-            fence = match["fence"]
-            continue
-        rest = line
-        while comments:
-            if commented:
-                end = rest.find("-->")
-                if end < 0:
-                    break
-                commented, rest = False, rest[end + 3:]
-            else:
-                start = rest.find("<!--")
-                if start < 0:
-                    break
-                commented, rest = True, rest[start + 4:]
-    return quoted
+            end = line.find("-->", position)
+            if end < 0:
+                return True, "", -1
+            commented, position = False, end + 3
+        elif ticks:
+            close = re.compile(r"(?<!`)" + ticks + r"(?!`)").search(line, position)
+            if close is None:
+                return False, ticks, column
+            ticks, position, column = "", close.end(), -1
+        elif (match := _INLINE.search(line, position)) is None:
+            return False, "", -1
+        else:
+            position = match.end()
+            if match[0] == "<!--":
+                commented = True
+            elif match[0][0] == "`" and match.start() not in literal:
+                ticks, column = match[0], match.start()
 
 
 def owned_lines(body: str) -> list[OwnedLine]:
@@ -317,6 +519,77 @@ _CLOSES = re.compile(rf"^{re.escape(sd_lib.CLOSES_TRAILER)} sd:([0-9]+)[ \t]*$")
 _REVERTS = re.compile(r"^This reverts commit ([0-9a-f]{7,40})\b(?:, reversing\s+changes made to ([0-9a-f]{7,40}))?",
                       re.MULTILINE)
 
+#: A revert's subject: `git revert`'s `Revert "..."`, or a Conventional `revert:` (sd:8373).
+REVERT_SUBJECT = re.compile(r"^(?:Revert\b|revert(?:\([^)]*\))?!?:)", re.IGNORECASE)
+#: An item a hand-written revert names an undone commit on: one that opens with a sha, bare or in a code
+#: span, emphasis or a link's text (pack sd:9666). No letter, digit or `_`, in any script, may follow it,
+#: but the `_` that closes `_<sha>_`.
+_SHA_LED = re.compile(r"_([0-9a-f]{7,40})_(?!\w)|[`*\[]*([0-9a-f]{7,40})(?!\w)")
+#: The line that opens a list of undone commits: its last sentence is exactly `Reverted commits:`,
+#: `Reverted:` or `Reverts:`. A substring match let `Commits not reverted:` undo its list (pack sd:9666).
+_REVERTED_INTRO = re.compile(r"(?:^|[.!?][ \t]+)(?:reverted(?:[ \t]+commits)?|reverts):[ \t]*$", re.IGNORECASE)
+
+
+def _heading(text: str) -> str:
+    """`text` without the markup a heading wears: `## ` and closing `#`s, and emphasis around it."""
+    return re.sub(r"^#{1,6}[ \t]+|[ \t]+#+$", "", text.strip()).strip("*_ \t")
+
+
+def _listed_undone(message: str) -> list[str]:
+    """The shas a hand-written revert lists as undone (pack sd:9666).
+
+    A list item that opens with a sha, under a heading such as `Reverted
+    commits:`. A heading is a line that ends with a colon, bare, indented or
+    itself a list item, or any line at column zero that is no list item.
+    One exception: a line with no colon that runs on from a list item's
+    text with no blank line between is that item's wrapped text, and
+    heads nothing; the same words could be either, and a wrapped entry is
+    the likelier one, since the heading that undoes must carry its colon.
+    The top level and each open list item, as `_blocks` reads them,
+    hold the last heading in them: a list item's own text is its first.
+    A sha item undoes when the heading of what holds it says reverted, and
+    passes that on to what nests in it; any other item, or a heading that
+    does not say reverted, undoes nothing. An item inside a fence, an
+    indented code block or an HTML comment names nothing, and neither
+    does a line that starts inside a code span, in the read that finds
+    it there.
+
+    The `plain` grammar of `_blocks` and CommonMark, the read citations
+    get, can give one line two roles: the fence a `10.` item opens is a
+    code span to CommonMark, which reads no item there. Neither role is
+    chosen. The list is read twice in the `plain` grammar, and a commit
+    either read lists is undone, so a message the two read apart closes
+    nothing: once whole, with the fences, comments and code spans that
+    grammar finds, and once with only its fences, over the lines
+    CommonMark leaves outside a comment and a code span.
+    """
+    shown = "\n".join(line for _, kind, *_, line, spanned in _blocks(message) if not spanned and kind != "comment")
+    found = _listed(_blocks(message, plain=True))
+    return found + [sha for sha in _listed(_blocks(shown, comments=False, plain=True)) if sha not in found]
+
+
+def _listed(rows) -> list[str]:
+    """The shas `_listed_undone` finds in one read of a message, `rows` of `_blocks`."""
+    found, undoes, previous = [], [False], ""  # undoes: per open list item, the top level first, whether its heading says reverted
+    for _, kind, opened, depth, raw, line, spanned in rows:
+        kind = "span" if spanned else kind
+        del undoes[depth - opened + 1:]  # the items this line ended take their headings with them
+        holder, text = undoes[-1], raw.strip()
+        if opened:  # an item, even one that opens with a fence or code, holds what nests in it
+            holder = holder and opened == 1  # each outer item of `- - x` is empty: its heading says nothing
+            if kind == "text" and (sha := _SHA_LED.match(text)):
+                found += [sha[1] or sha[2]] if holder else []
+            else:
+                holder = kind == "text" and bool(_REVERTED_INTRO.search(_heading(text)))
+            undoes += [False] * (opened - 1) + [holder]
+        elif kind == "setext":  # the underline makes the line above it the heading
+            undoes[-1] = bool(_REVERTED_INTRO.search(_heading(previous)))
+        elif kind == "text" and text and (_heading(text).endswith(":") or not line[0].isspace() or _ATX.match(raw)):
+            # Any other indented line continues an item.
+            undoes[-1] = bool(_REVERTED_INTRO.search(_heading(text)))
+        previous = text
+    return found
+
 
 def kept_commits(commits, parents=None) -> list:
     """`commits`, newest first, less each one a later commit of them reverts (sd:5999 lane review, rounds 2 and 3).
@@ -324,12 +597,22 @@ def kept_commits(commits, parents=None) -> list:
     A revert of a merge also undoes each commit the merge brought in over
     the mainline parent its message names, read from `parents` (sha to
     parent shas, the range's `git rev-list --parents`). A revert that is
-    itself reverted undoes nothing, so its target stays.
+    itself reverted undoes nothing, so its target stays. A hand-written
+    revert (`REVERT_SUBJECT`) also undoes each commit its list of reverted
+    commits names (`_listed_undone`): a split listed its commits by short
+    sha, and the squash closed the items they cited (pack sd:9666). A
+    listed merge names no mainline, so it undoes itself alone: the lane's
+    file check (`sd_lane.unreverted`) decides each commit it brought in.
     """
     parents = parents or {}
 
     def full(prefix: str) -> str:
         return next((sha for sha, _ in commits if sha.startswith(prefix)), prefix)
+
+    def only(prefix: str) -> str | None:
+        """The one branch commit `prefix` names; None when it names none or several, as git refuses."""
+        named = [sha for sha, _ in commits if sha.startswith(prefix)]
+        return named[0] if len(named) == 1 else None
 
     def ancestors(start: str) -> set[str]:
         seen, todo = set(), [start]
@@ -345,8 +628,15 @@ def kept_commits(commits, parents=None) -> list:
     for sha, message in commits:
         if sha in undone:
             continue
+        trailed = set()
         for target, mainline in _REVERTS.findall(message):
+            trailed.add(full(target))
             undone |= ancestors(full(target)) - ancestors(full(mainline)) if mainline else {full(target)}
+        if REVERT_SUBJECT.match(message):
+            # git's trailer names a commit's mainline; listing that commit too adds nothing to it.
+            # A listed merge names no mainline, so it undoes itself alone; `sd_lane.unreverted` reads
+            # each commit it brought in at the head. git's trailer names a mainline (pack sd:9666).
+            undone |= set(filter(None, map(only, _listed_undone(message)))) - trailed
         kept.append((sha, message))
     return kept
 

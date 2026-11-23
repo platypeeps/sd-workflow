@@ -30,7 +30,7 @@ REPOSITORY = "fixture/repo"
 
 def finding(summary: str, *, path: str = "bin/tool.py", family: str = "correctness",
             disposition: str = "blocking") -> dict[str, Any]:
-    return {"path": path, "line": 3, "severity": "high", "summary": summary, "family": family,
+    return {"path": path, "line": 3, "severity": "high", "instances": ["src.py:1"], "summary": summary, "family": family,
             "disposition": disposition}
 
 

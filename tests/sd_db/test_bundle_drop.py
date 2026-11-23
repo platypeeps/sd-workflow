@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -225,7 +226,8 @@ class DropReview(Repo):
     def test_a_kept_item_with_a_newer_build_refuses(self):
         items, ids, run = self.bundle()
         newer = create_assignment(self.db, role="author", status="blocked", item=items[2])
-        self.db.execute("UPDATE assignment SET scope = ? WHERE id = ?", (build.SCOPE, newer))
+        # A newer build that ran: one that never ran owns nothing (`_current`, sd:9788).
+        self.db.execute("UPDATE assignment SET scope = ?, run_count = 1 WHERE id = ?", (build.SCOPE, newer))
         work = Path(run["work_path"])
         old = git(work, "rev-parse", "HEAD")
         with self.assertRaisesRegex(DROP.DropRefused, f"sd:{items[2]} has a newer build, assignment {newer}"):
@@ -459,6 +461,21 @@ class DropRound9(Repo):
         self.assertEqual(git(work, "rev-parse", "HEAD"), head)
         self.assertEqual(self.statuses(items), ["blocked"] * 3)
 
+
+    def test_a_kept_list_form_revert_refuses_the_drop(self):
+        """pack sd:9666 review, round 9: a hand-written revert that lists the sha it undid was replayed with
+        that sha stale, so the replayed commit's `Closes:` closed the item the revert undid."""
+        items, ids, run = self.bundle()
+        work = Path(run["work_path"])
+        lead = git(work, "log", "--format=%H", "-1", "--grep", f"Closes: sd:{items[0]}")
+        git(work, "rm", "-q", "a.txt")
+        git(work, "commit", "-q", "-m", f"revert: drop the lead\n\nReverted commits:\n\n- `{lead[:9]}` lead\n\n"
+            f"Lane review fix, repo sd:{items[2]}")
+        head = git(work, "rev-parse", "HEAD")
+        with self.assertRaisesRegex(DROP.DropRefused, "reverts"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), head)
+        self.assertEqual(self.statuses(items), ["blocked"] * 3)
 
 class DropRound10(Repo):
     """Review round 10 of pack sd:9709: a lead drop reparented the kept members, so the ended run lost them and the
@@ -1311,3 +1328,38 @@ class DropWait(Repo):
         self.assertIn(build.LEFT_OUT, runner.queue_state(self.db, member)["result"])
         self.assertEqual(self.claim()["assignment"], lead)
         self.assertEqual(build.split(self.db, lead), "unread", "A's first run reads its branch for B's work")
+
+
+class DropLaneMove(Repo):
+    """Pack sd:9964: a drop's kept lead has no run of its own, so beat recovery read it as ran nowhere. Its lane
+    moved to another satellite whose beat went quiet; once that beat came back, that satellite queued the lead,
+    its claim refused it for the kept host and replaced the beat result, and moving the lane back recovered
+    nothing. Recovery reads the kept host as the lead's worktree host."""
+
+    def test_recovery_leaves_a_drops_kept_lead_to_the_host_holding_its_work(self):
+        items, ids, run = self.bundle()
+        self.db.execute("UPDATE runner_run SET owner = 'fixture@sat-a' WHERE id = ?", (run["id"],))
+        self.db.execute("UPDATE repo SET lane_host = 'sat-a' WHERE path = ?", (str(self.repo),))
+        for host in ("sat-a", "sat-b"):
+            record_state(self.db, "heartbeat", key=f"build-dispatch@{host}", body={})
+        def on(host):
+            return mock.patch.multiple(build, lane_hosts=mock.Mock(return_value=frozenset({host})),
+                                       hub_host=mock.Mock(return_value="hub"))
+        with on("sat-a"):
+            lead = DROP.drop_item(self.db, build, items[1], who="operator")[0]["id"]
+        self.db.execute("UPDATE repo SET lane_host = 'sat-b' WHERE path = ?", (str(self.repo),))
+        stamp = (datetime.fromisoformat(build.clock()) - timedelta(seconds=build.STALE_SECONDS + 1)).isoformat()
+        record_state(self.db, "heartbeat", key="build-dispatch@sat-b", timestamp=stamp, body={})
+        self.assertIsNone(self.claim(hosts=frozenset({None, "hub"})))
+        result = "SELECT status || ': ' || result FROM assignment WHERE id = ?"
+        self.assertIn("blocked: item", self.count(result, lead))
+        record_state(self.db, "heartbeat", key="build-dispatch@sat-b", body={})
+        with on("sat-b"):
+            claimed = [self.claim(hosts=frozenset({"sat-b"})) for _ in range(3)]
+        self.assertNotIn(lead, [one["assignment"] for one in claimed if one])
+        self.assertIn("lane runs on sat-b", self.count(result, lead), "the beat block stands")
+        self.db.execute("UPDATE repo SET lane_host = 'sat-a' WHERE path = ?", (str(self.repo),))
+        with on("sat-a"):
+            build._requeue_beat_blocked(self.db, frozenset({"sat-a"}))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", lead), "queued",
+                         "the host holding the work recovers it")
