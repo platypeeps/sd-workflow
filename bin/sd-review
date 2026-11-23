@@ -2093,6 +2093,7 @@ def covers_from(subject: Subject, args: argparse.Namespace, previous: dict[str, 
     """The base a passing run stands for (pack sd:9769): a full branch pass its own; a verify pass its prior's, under one binding."""
     if binding is not None and subject.scope == "branch" and not any(getattr(args, name, None) for name in UNRECORDED_OPTIONS[2:]):  # an unread binding is none
         return subject.base if not getattr(args, "base", None) else (previous or {}).get("covers_from") if (previous or {}).get("binding") == binding else None
+    return None
 
 
 def whole_files(subject: Subject, args: argparse.Namespace) -> str:
