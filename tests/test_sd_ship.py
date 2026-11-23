@@ -6655,6 +6655,16 @@ roles:
         self.assertEqual(caught.exception.workflow["blocker"]["code"], "train_merge_mismatch")
         self.assertIn(commit, str(caught.exception))
 
+    def test_a_member_merged_by_hand_after_a_train_that_never_landed_reconciles(self):
+        """Review of sd:9923: a join's `train_commit` outlived a train that never landed, so a hand merge
+        of the member read as `train_merge_mismatch` in merge, reconcile and prepare alike."""
+        self.prepare()
+        _main, earlier = self.landing_before()
+        self.join(earlier)
+        squash = self.remote.merge(1, sha=_git(self.root, "rev-parse", "HEAD"))
+        merged = self.operation("reconcile").reconcile()
+        self.assertEqual((merged["phase"], merged["merge_commit"]), ("merged", squash))
+
     def test_a_member_whose_train_did_not_land_merges_alone(self):
         self.prepare()
         _main, earlier = self.landing_before()

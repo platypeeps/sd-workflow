@@ -2865,13 +2865,13 @@ class Ship(SharedReview):
                 or pull.get("base", {}).get("ref") != reference["base"]
                 or pull.get("head", {}).get("sha") != self.state.get("reviewed_head")):
             raise Refusal("merged PR evidence does not match the prepared receipt")
-        refuse_train_mismatch(commit, self.state.get("train_commit"))
         metadata = self.api.api(self.api.prefix)
         if metadata.get("default_branch") != reference["base"]:
             raise Refusal("the current default branch differs from the prepared base")
         git(self.root, "fetch", "--no-tags", "origin", f"refs/heads/{reference['base']}")
         tip = git(self.root, "rev-parse", "FETCH_HEAD")
         require_merge_on_base(self.root, commit, tip, reference["base"])
+        self.settle_train(commit, tip)
         advertised = git(self.root, "ls-remote", "origin", f"refs/heads/{reference['base']}").split()
         if not advertised or advertised[0] != tip:
             raise Refusal("default branch changed during merge verification; retry reconciliation")
@@ -2906,6 +2906,19 @@ class Ship(SharedReview):
         git(self.root, "fetch", "--prune", "origin")
         return {**evidence, "delivery_pending": False,
                 "cleanup": clean_up_merged(self.root, self.branch, self.state["reviewed_head"])}
+
+    def settle_train(self, commit: str, tip: str) -> None:
+        """Refuse a merge at another commit than a train merge in the base; drop a train that never landed.
+
+        A train that never landed leaves its join behind; a merge of the
+        pull request after it, say one by hand, is the member's own (sd:9923).
+        """
+        joined = self.state.get("train_commit")
+        if not joined or commit == joined:
+            return
+        if train_on_base(self.root, joined, tip):
+            refuse_train_mismatch(commit, joined)
+        self.save(train_commit=None, train_onto=None)
 
     def hold_at_merge(self, commit: str, parent: str, evidence: dict, tip: str) -> dict | None:
         """The held answer when the base advanced at the merge and a close is still owed, else None.
@@ -3093,6 +3106,13 @@ def train_landed_tested(root: pathlib.Path, commit: str, tip: str) -> bool:
     """
     landing = outer_landing(root, commit, tip)
     return len(landing) == 3 and is_ancestor(root, landing[1], landing[2])
+
+
+def train_on_base(root: pathlib.Path, joined: str, tip: str) -> bool:
+    """Whether the recorded train merge `joined` is in the fetched base at `tip`; a missing object is not (sd:9923)."""
+    if sd_lib.git_output(["cat-file", "-e", f"{joined}^{{commit}}"], root) is None:
+        return False
+    return is_ancestor(root, joined, tip)
 
 
 def refuse_train_mismatch(commit: str, joined: str | None) -> None:
