@@ -126,6 +126,8 @@ EVIDENCE_ASK = ("a failing input and its path:line route, showing a failure this
                 "it touched or a caller it breaks; a code finding without one blocks nothing.")
 NO_REPRO_NOTE = "[advisory: no failing input or command cited]"
 #: How far a patch may move an unmatched prior blocker and its uncited repeat still block (fail closed).
+#: How far from a prior blocker's mapped line its own summary still repeats it, at a caller (bin/sd-review:1809).
+ECHO_LINES = 10  # ponytail: a neighbouring caller; a same-summary finding farther off is its own finding
 SHIFT_LINES = 3  # ponytail: a reader's imprecision around `prior_at`'s mapped line; closer unrelated ones block
 CODEX_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -1795,7 +1797,7 @@ def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]
 
     A match is the same file, as `repo_spelling` spells it, the same line and the
     same `summary_key`: a line alone gave an unrelated finding the old repro (lead after round 8). Failing that,
-    the same file and `summary_key` at another line, when no finding repeats that blocker at its own line."""
+    the same file and `summary_key` within `ECHO_LINES`, when no finding repeats that blocker at its own line."""
     def _place(path: Any) -> str:
         return str(pathlib.PurePosixPath(path.strip())) if isinstance(path, str) and path.strip() else ""
 
@@ -1806,18 +1808,18 @@ def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]
     def _same(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:
         return _file(old, new) and (old.get("line"), summary_key(old.get("summary"))) == (
             new.get("line"), summary_key(new.get("summary"))) and type(new.get("line")) in (int, type(None))
-    def _echo(old: Mapping[str, Any]) -> bool:  # its summary at a caller, unrepeated at its own line (sd-review:1816)
-        return _file(old, record) and summary_key(old.get("summary")) == summary_key(record.get("summary")) and not any(
-            _same(old, row) for row in findings)
+    def _near(old: Mapping[str, Any], window: int = SHIFT_LINES) -> bool:  # a partial fix keeps its defect (sd-review:1814)
+        lines = [row.get("line") for row in (old, record)]
+        return not all(type(line) is int for line in lines) or abs(
+            lines[0] - lines[1]) <= window  # an unplaced line may be the blocker's: it holds (sd-review:1821)
+    def _echo(old: Mapping[str, Any]) -> bool:  # its summary at a nearby caller, unrepeated at its own line (sd-review:1809)
+        return _file(old, record) and summary_key(old.get("summary")) == summary_key(record.get("summary")) and _near(
+            old, ECHO_LINES) and not any(_same(old, row) for row in findings)
     blockers = [old for old in prior if old.get("disposition") == "blocking"]
     matched = [old.get("evidence") for old in blockers if _same(old, record)] or [
         old.get("evidence") for old in blockers if _echo(old)]
     if matched:
         return "\n".join(dict.fromkeys(text for text in matched if isinstance(text, str) and text.strip()))
-    def _near(old: Mapping[str, Any]) -> bool:  # edited or not: a partial fix keeps its defect (bin/sd-review:1814)
-        lines = [row.get("line") for row in (old, record)]
-        return not all(type(line) is int for line in lines) or abs(
-            lines[0] - lines[1]) <= SHIFT_LINES  # an unplaced line may be the blocker's: it holds (sd-review:1821)
     return "" if any(_file(old, record) and _near(old) and not any(_same(old, row) for row in findings)
                      for old in blockers) else None
 

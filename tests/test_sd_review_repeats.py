@@ -550,6 +550,17 @@ class ReproRuleTests(unittest.TestCase):
         self.assertEqual([(row["disposition"], row.get("evidence")) for row in disposed],
                          [("blocking", REPRO), ("advisory", None)])
 
+    def test_the_same_summary_far_from_the_blocker_gets_no_repro(self) -> None:
+        """build/sd-1423 review (bin/sd-review:1809): a blocker at line 20 lent its repro to a separate,
+        uncited finding with the same summary at line 200, which then blocked. A summary repeats the blocker
+        only within `ECHO_LINES` of its mapped line; farther, it is a finding of its own."""
+        prior = [dict(finding(REPRO, line=20, summary="Missing null check"), disposition="blocking")]
+        for line, expected in ((200, ("advisory", None)), (20 + sd_review.ECHO_LINES, ("blocking", REPRO))):
+            with self.subTest(line=line):
+                [record] = sd_review.dispose([finding(line=line, summary="missing null check")], "high",
+                                             repro=True, prior=prior)
+                self.assertEqual((record["disposition"], record.get("evidence")), expected)
+
     def test_a_line_that_cannot_be_placed_holds_its_file(self) -> None:
         """build/sd-1423 review (bin/sd-review:1821): a reader repeated the empty-input crash at line 10,
         paraphrased, with the permitted `line: null` and no evidence, and it posted as advisory. A line that
