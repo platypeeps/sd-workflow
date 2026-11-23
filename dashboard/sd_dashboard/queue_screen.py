@@ -400,6 +400,11 @@ def _review_fields(entry: dict, lane: Path) -> dict:
                     LIST_SECONDS)
     recorded = template.get("recorded_revision", False) if template.get("exit") == 0 else False
     held = None if recorded is False else recorded is not None
+    # origin's default branch moved past the reviewed head: a retry merges it and reviews other code, so Retry
+    # stays on (sd:9966 lead review). One local ref read; a branch not read here keeps the review's answer.
+    ahead = _git(tree, "rev-list", "--count", f"{review[0]}..refs/remotes/origin/HEAD") if review else None
+    if held is False and ahead not in (None, "0"):
+        held = None
     shown = shown_review(review, template) if review else None
     if shown:
         return {"review": shown[1], "review_findings": shown[0], "held": held}

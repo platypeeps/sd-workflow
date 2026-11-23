@@ -989,6 +989,18 @@ class TheMove(Lane, BrowserSession):
                 self.assertIsNotNone(row["review"])
         self.assertIsNone(self.failed(enqueued_on="satellite-1")["held"])
 
+    def test_a_default_branch_past_the_reviewed_head_keeps_retry(self):
+        """sd:9966 lead review: once origin's default branch moved past the reviewed head, a retry merges it and
+        reviews other code, so Retry stays on; a default branch at the reviewed head, or none read, keeps it off."""
+        self.assertIs(self.failed()["held"], False)
+        git(self.checkout, "update-ref", "refs/remotes/origin/main", self.merged)
+        git(self.checkout, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+        self.assertIs(self.failed()["held"], False)
+        git(self.checkout, "-c", "user.name=t", "-c", "user.email=t@example.test", "commit", "-q", "--allow-empty",
+            "-m", "fix: the blocker")
+        git(self.checkout, "update-ref", "refs/remotes/origin/main", "HEAD")
+        self.assertIsNone(self.failed()["held"])
+
     def test_a_review_run_again_at_the_same_head_offers_retry_not_reject(self):
         """sd:9966 lane review: the review at that head ran again with other findings; the prepare log still
         names the old ones, so Reject would rebut findings no longer there. Retry reads the live review."""
