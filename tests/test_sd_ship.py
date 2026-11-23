@@ -6494,13 +6494,38 @@ roles:
         self.assertEqual(self.connection.execute("SELECT status FROM item WHERE id=?", (self.item,)).fetchone()[0],
                          "done")
 
-    def test_a_prepare_after_a_landed_train_reconciles(self):
-        """A run stopped after the train PR merged: the member's next claim prepares, and that reconciles."""
+    def test_a_prepare_after_a_landed_train_refuses_to_reconcile_unlocked(self):
+        """A train that landed after `dispatch` read it: the unlocked prepare refuses, and the next one locks."""
         self.prepare()
         _main, earlier = self.landing_before()
         commit = self.join(earlier)["train_commit"]
         self.land_train(commit)
-        prepared = self.prepare()
+        with self.assertRaises(ship.Refusal) as caught:
+            self.prepare()
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "train_landed")
+        self.assertEqual(self.operation().state["phase"], "train_joined")
+
+    def test_a_prepare_after_a_landed_train_reconciles_under_the_ship_lock(self):
+        """Review of sd:9923: a train_joined prepare reconciled unlocked, off the lane host's check."""
+        self.prepare()
+        _main, earlier = self.landing_before()
+        commit = self.join(earlier)["train_commit"]
+        self.land_train(commit)
+        real, locked = receipts.repository_lock, []
+
+        @contextlib.contextmanager
+        def recording(*args, **options):
+            with real(*args, **options):
+                locked.append(True)
+                yield
+        reconcile = ship.Ship.reconcile
+
+        def checked(delivery):
+            self.assertTrue(locked, "reconciled without the ship lock")
+            return reconcile(delivery)
+        with patch.object(receipts, "repository_lock", recording), patch.object(ship.Ship, "reconcile", checked):
+            prepared = ship.dispatch(self.root, self.connection, self.database, self.args("prepare"), receipts,
+                                     False)
         self.assertEqual((prepared["phase"], prepared["merge_commit"]), ("merged", commit))
 
     def test_a_train_member_merged_at_another_commit_refuses(self):
@@ -6626,6 +6651,23 @@ roles:
             landed, _ = self.landed_by_lane(tip)
         self.assertEqual((landed["status"], landed["merge_commit"]), ("merged", "c" * 40))
 
+    def test_land_train_whose_member_is_cancelled_during_the_final_fetch_sends_no_merge(self):
+        """Review of sd:9923: the last queue read ran before the final base fetch under the lock."""
+        tip = self.joined_tip()
+        real, fetched = ship.sd_lane.base_moved, []
+
+        def base_moved(*args):
+            fetched.append(True)
+            return real(*args)
+
+        def ready():  # the operator cancels sd:2 while the second fetch runs
+            return "sd:2 was cancelled" if len(fetched) >= 2 else None
+        with patch.object(ship.sd_lane, "base_moved", base_moved):
+            landed, _ = self.landed_by_lane(tip, ready=ready)
+        self.assertEqual(landed["status"], "failed")
+        self.assertIn("sd:2 was cancelled", landed["reason"])
+        self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
+
     def assert_unread_member_trailers_send_no_merge(self, failing):
         """Review of sd:9923: a git read that failed dropped trailers from a train that still merged."""
         tip = self.joined_tip()
@@ -6727,9 +6769,10 @@ roles:
         tip = self.joined_tip()
         main = []
 
-        def taken():
-            take()
-            main.append(_git(self.remote.path, "rev-parse", "main"))  # as it stands once taken: the PUT moves it
+        def taken():  # on the read before the lock; the read under it, after the last fetch, takes nothing
+            if not main:
+                take()
+                main.append(_git(self.remote.path, "rev-parse", "main"))  # as it stands once taken: the PUT moves it
         landed, _ = self.landed_by_lane(tip, ready=taken)
         self.assertEqual(landed["status"], "failed")
         self.assertIn(reason, landed["reason"])

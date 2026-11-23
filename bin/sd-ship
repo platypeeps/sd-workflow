@@ -588,6 +588,8 @@ class Ship(SharedReview):
     copilot_carried: bool = False
     #: The sd hub a satellite prepare reached, unlocked (sd:2679); None on the hub.
     served_by: str | None = None
+    #: True once `dispatch` holds the ship lock for this command (review of sd:9923).
+    locked: bool = False
     #: The warning that ancestor clearance earns, held until dispatch. It says
     #: the gate cleared a merge, so the step that sends the merge writes it;
     #: written when the gate cleared, it outlived every later refusal and each
@@ -1491,6 +1493,12 @@ class Ship(SharedReview):
             error.details["passes_spent"] = self.history.spent(self.state) - before
             raise
 
+    def train_landed(self) -> bool:
+        """Whether this member joined a train whose pull request GitHub merged (sd:9923)."""
+        pull = self.state.get("pull_request")
+        return self.state.get("phase") == "train_joined" and isinstance(pull, dict) and \
+            self.api.pull(pull["number"]).get("merged") is True
+
     def prepare_head(self) -> dict:
         if self.state.get("phase") in ("merged", "merge_dispatch"):
             if self.args.deliver and not self.state.get("deliver"):
@@ -1503,9 +1511,12 @@ class Ship(SharedReview):
                               state="operator_decision",
                               next_action="Run sd work deliver with --associated and --reason.")
             return self.reconcile()
-        if self.state.get("phase") == "train_joined" and self.state.get("pull_request") and \
-                self.api.pull(self.state["pull_request"]["number"]).get("merged") is True:
-            return self.reconcile()  # its train landed and the run stopped before this member reconciled (sd:9923)
+        if self.train_landed():  # the run stopped before this member reconciled (sd:9923)
+            if not self.locked:  # the train landed after dispatch read it: reconcile only under the lock
+                raise Refusal("this member's train landed; prepare again to reconcile it under the ship lock",
+                              code="train_landed", boundary="runtime", state="retryable_failure",
+                              next_action="Run sd-ship prepare again on the lane host.")
+            return self.reconcile()
         self.refuse_live_review()
         self.require_claim()
         self.check_held(tuple(dict.fromkeys(self.args.closes)))  # before it commits or catches up (pack sd:7221)
@@ -3470,10 +3481,13 @@ def dispatch(root, connection, database, args, store, readonly):
     # host): each save is checked against the row's revision, and a reserved
     # pass names its process (`refuse_live_review`). A merged record's prepare
     # reconciles under the lock, so off the lane host it meets LaneElsewhere there.
-    if args.command == "prepare" and delivery.state.get("phase") not in ("merged", "merge_dispatch"):
+    # A landed train's member reconciles too, so its prepare takes the lock as well (review of sd:9923).
+    if args.command == "prepare" and delivery.state.get("phase") not in ("merged", "merge_dispatch") \
+            and not delivery.train_landed():
         delivery.served_by = hub_serving(database)
         return delivery.prepare()
     with store.repository_lock(database, delivery.repository, **lock_options(args, store)):
+        delivery.locked = True
         if held:
             sd_ship_hold.refuse_other(database, delivery.repository, args.item)
         delivery.revision, delivery.state = store.read(connection, delivery.key)
