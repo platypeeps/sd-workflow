@@ -2174,6 +2174,27 @@ class CancelParks(Case):
             self.press_unran(item, "blocked")
         self.assert_fresh(build.queue_again(self.db, items[1:], who="operator"), items[1:], old)
 
+    def test_a_subset_build_reads_the_held_split_of_the_bundle_it_narrowed_to(self):
+        """Class pass, review of build/sd-1654: bundle A, B, C is held after a subset Retry left D out, and a newer
+        build owns C. Build A B read the bundle narrowed to A and B, but the held split on each item's newest row,
+        a cancelled press, so the bundle's Retry ran and refused. The split guard reads the same narrowed row:
+        A and B build fresh on a new branch."""
+        with mock.patch.object(build, "BUNDLE_MAX", 4):
+            items, old = self.blocked_bundle(4)
+        build.retry(self.db, old[0], who="operator", only=items[:3])
+        held = self.claim()
+        self.db.execute("UPDATE runner_run SET outcome = 'blocked', detail = ?, released_at = ? WHERE id = ?",
+                        (build.SPLIT + "its branch holds earlier work", build.clock(), held["id"]))
+        self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (build.clock(), held["id"]))
+        marks = ", ".join("?" for _ in old[:3])
+        self.db.execute(f"UPDATE assignment SET status = 'blocked' WHERE id IN ({marks})", old[:3])
+        self.db.execute(f"UPDATE item SET status = 'blocked' WHERE id IN ({marks})", items[:3])
+        self.assertEqual(build.split(self.db, old[0]), "held")
+        self.newer_build(items[2])
+        for item in items[:2]:
+            self.press_unran(item)
+        self.assert_fresh(build.queue_again(self.db, items[:2], who="operator"), items[:2], old[:3])
+
     def test_a_subset_retry_must_name_the_lead(self):
         """Pack sd:9581: the lead's worktree holds the bundle's work, so a subset without it refuses, writing nothing."""
         items, ids = self.blocked_bundle()

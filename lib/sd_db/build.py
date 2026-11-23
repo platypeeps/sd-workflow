@@ -1064,11 +1064,12 @@ def _current(connection, member: dict) -> bool:
                               (member["item"], SCOPE, member["id"])).fetchone() is None
 
 
-def split_held(connection, item: int) -> bool:
+def split_held(connection, item: int, selected: Collection[int] = ()) -> bool:
     """Whether the build bundle Build reads for `item` (`_retry_row`) is held after a split (`split`): Build takes
     it fresh, blocked as it is, on a new branch; Retry refuses that bundle (pack sd:9581). The same row Retry
-    would take, not merely the newest, which may be a cancelled build (review of sd:9788)."""
-    row = _retry_row(connection, item)
+    would take, not merely the newest, which may be a cancelled build (review of sd:9788), read with the press's
+    `selected` items when it has some, so a bundle the press narrowed to is the one read (build/sd-1654)."""
+    row = _retry_row(connection, item, selected)
     return (row is not None and row["status"] in AGAIN and not _alone(connection, row["id"])
             and split(connection, row["parent"] or row["id"]) == "held")
 
@@ -1158,7 +1159,8 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             # (`enqueued` marks a delivered member done): `retry` takes only members in the lead's status, so the
             # item's own assignment must be in it, or Retry would requeue the lead's items and not this one.
             # A skipped lead of a run still in the lane is no ended bundle: the run holds it no longer (sd:8960).
-            if split_held(connection, item):  # its branch may hold a left item's work: a fresh press, new branch
+            # Its branch may hold a left item's work: a fresh press, new branch.
+            if split_held(connection, item, items):
                 fresh.append(item)
                 continue
             # A drop's kept lead never ran, and its Retry resumes the split branch (`retry`, review of build/sd-1306).
