@@ -2256,6 +2256,36 @@ class TrainLanding(Trees):
         lead = self.entries()[0]
         self.assertEqual(lead["retryable_fault"]["step"], "train")
 
+    def caught_up_in_the_train(self, landing: str) -> None:
+        """Main moves before the train prepares sd:2, and its prepare pushes a catch-up merge of it."""
+        self.landing = {"status": landing, "pull": 9, "merge_commit": "c" * 40, "reason": "the train gate failed"}
+        done: list[bool] = []
+
+        def ship(argv: list[str], log: pathlib.Path) -> dict:
+            if argv[2] == "prepare" and argv[argv.index("--item") + 1] == "2" and not done:
+                done.append(True)
+                self.commit_files(self.repo, {"later.txt": "l\n"}, "main moved again")
+                git(self.repo, "push", "-q", "origin", "main")
+                git(self.second, "fetch", "-q", "origin")
+                git(self.second, "merge", "-q", "--no-ff", "--no-edit", "-m", "catch up", "origin/main")
+                git(self.second, "push", "-q", "origin", "HEAD:refs/heads/second")
+                self.calls.append(argv)
+                return {"ok": True, "phase": "ready_to_send", "head": git(self.second, "rev-parse", "HEAD")}
+            return self.ship(argv, log)
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, ship, self.gate)
+
+    def test_a_member_caught_up_in_a_train_that_did_not_land_runs_on_its_next_claim(self) -> None:
+        """Review of sd:9923: a member's catch-up push in the train left its queued head behind."""
+        self.caught_up_in_the_train("failed")
+        second = self.entries()[1]
+        self.assertNotEqual(second.get("code"), sd_lane.HEAD_MOVED, second.get("reason"))
+        self.assertEqual(second["status"], "merged")
+
+    def test_a_member_caught_up_in_a_train_that_landed_reconciles(self) -> None:
+        self.caught_up_in_the_train("merged")
+        self.assertEqual([entry["status"] for entry in self.entries()], ["merged"] * 3)
+
     def test_a_member_cancelled_during_the_train_lands_nothing(self) -> None:
         def cancel_second() -> None:
             sd_lane.update(self.store(), lambda rows: rows[1].update(status="cancelled"))
