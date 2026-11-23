@@ -32,11 +32,17 @@ and when a stored claim, body or flag goes stale. Two rules answer it.
   inferred. A lane prepare appends a Screenshots section per run, so
   the entry's body is read from its queue row (`body_basis`), and the
   receipt maps each published text to its basis (`body_bases`).
+- Equal content is no record. A body file's words are its text, even
+  when an earlier prepare published that text. A text no prepare
+  recorded has no basis: the entry must then be the published body,
+  the lane's section apart. A row is a prepare's own when the row's
+  holder, the runner, is its parent.
 - The published closing set is bound to the head it was read at.
   Reconcile refuses to deliver or close a merge of another head.
-- A `pending` set that differs from the published one is stale for
-  merge. Merge refuses `prepare_required` while one waits, in every
-  mode (`merge_scope`). An equal set hides nothing and merges.
+- A `pending` set means the prepare did not finish. Merge refuses
+  `prepare_required` while one waits, in every mode (`merge_scope`).
+  The Copilot request is outside the set, so an equal set merges only
+  with `--abandon-copilot-review`, which needs a request receipt.
 
 Rejected: check the closing head for `--no-item` merges. It covers one
 mode; a pending body can wait in any mode.
@@ -73,7 +79,11 @@ the `renewed` mark in `bin/sd-ship`. Tests are in
 | hand prepare under a lane row | none | a running row with no lane mark counts it as the lane's | refuses `lane_entry_running`, naming the row and `sd-ship lane cancel` | `test_a_hand_prepare_held_by_a_running_lane_row_names_that_row` |
 | lane retry after a renewal | none | old items, evidence or body | refuses `delivery_claim_renewed` before any save | `test_a_lane_retry_of_an_entry_older_than_a_renewal_refuses`, `test_a_lane_retry_with_the_items_a_renewal_dropped_refuses`, `test_a_lane_retry_with_the_body_a_renewal_replaced_refuses` |
 | lane prepare on a renewed claim | none | the published body mixes the entry's words with the lane's Screenshots section, drawn per run, and the pull request keeps the body it was opened with | the entry's body is read from its running queue row and tied to this prepare's body; `body_bases` records the words each published text was made from; no text is read to guess | `test_a_stale_entry_cannot_restore_the_screenshots_a_renewal_removed`, `test_a_retry_of_the_renewals_body_proceeds_whatever_the_lane_draws`, `test_a_renewal_of_a_body_the_lane_published_keeps_the_entrys_basis`, `test_a_lane_body_differs_from_a_renewals_in_any_byte_but_the_lanes_own_section` |
-| lane prepare that outlived its runner | none | it reads a newer entry's row as its own | untied body refuses `lane_unknown` before any save | `test_a_lane_prepare_whose_body_is_not_its_running_entrys_refuses` |
+| lane prepare that outlived its runner | none | it reads a newer entry's row as its own | a row another runner holds, or an untied body, refuses `lane_unknown` before any save | `test_a_lane_prepare_whose_body_is_not_its_running_entrys_refuses`, `test_a_lane_prepare_its_runner_does_not_hold_the_entry_of_refuses` |
+| renewal with a body file of a published text | `body_bases` maps the text to itself | the text took the earlier publication's basis, so the entry that drew it retried and removed the section | a body file is its own words; the entry refuses `delivery_claim_renewed` | `test_an_explicit_renewal_of_a_published_text_holds_against_the_entry_that_drew_it` |
+| renewal that takes a body no prepare recorded | `body_bases` maps the text to no basis | a receipt older than `body_bases` refused its own unchanged entry | the entry is held to the published text, the lane's section apart | `test_an_unchanged_retry_proceeds_on_a_receipt_older_than_the_body_record` |
+| enqueue of the published body | none | the published text's basis is the first entry's words, so the copy compared unequal | an entry whose body is the published body proceeds | `test_an_entry_enqueued_with_the_published_body_proceeds` |
+| merge after a failed Copilot request | none | the pending set equals the published one, and no request was recorded | merge refuses `prepare_required`; `--abandon-copilot-review` needs a request receipt | `test_a_merge_after_a_failed_explicit_copilot_request_refuses`, `test_later_head_can_abandon_the_latest_request_after_dispatch_failure` |
 | `renewed` mark | kept on every later claim | a new enqueue with new evidence refuses too | sd:9580, next PR; no fix here (ruling #64736) | `test_a_lane_retry_of_an_entry_older_than_a_renewal_refuses` |
 
 ## Acceptance criteria

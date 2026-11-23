@@ -2171,9 +2171,10 @@ def with_shots(body: str, files: list[str]) -> str:
 def only_shots(text: str) -> bool:
     """Whether `text` is nothing, or the one Screenshots section `with_shots` adds and nothing else.
 
-    `sd-ship` asks it of what follows an entry's own body in the body the
-    lane gave it, never of a body whose author is unknown: text alone
-    cannot tell the lane's section from an entry's copy of one (sd:9335).
+    `sd-ship` asks it of what follows an entry's own body: in the body the
+    lane gave it, and in a published body no prepare recorded the words
+    of. It never strips a section from an entry's body: text alone cannot
+    tell the lane's section from an entry's copy of one (sd:9335).
     """
     return not text or re.fullmatch(r"\s*" + re.escape(SHOTS_HEAD) + r"(?:- [^\n]*\n)*- [^\n]*\n?", text) is not None
 

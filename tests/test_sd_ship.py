@@ -2345,7 +2345,8 @@ roles:
             self.prepare("--copilot-review", "request")
         state = self.operation().state
         self.assertTrue(state["copilot_review_suppressed"])
-        self.assertEqual(state["phase"], "ready_to_send")
+        # The prepare did not finish, so its phase says where it stopped and merge refuses (sd:9268).
+        self.assertEqual(state["phase"], "push_dispatch")
         self.assertEqual(state["pull_request"]["number"], 1)
         self.assertEqual(self.double.copilot_requests, [])
 
@@ -4773,12 +4774,13 @@ roles:
                 self.prepare("--deliver", "--item", str(kept))  # an entry with the renewal's items proceeds
         self.assertEqual(self.operation().state["closing"]["items"], [kept])
 
-    def lane_runs(self, body: str, status: str = "running") -> None:
-        """The entry the lane holds while it prepares this item, with the `body` it was enqueued with."""
+    def lane_runs(self, body: str, status: str = "running", pid: int | None = None) -> None:
+        """The entry the lane holds while it prepares this item, with the `body` it was enqueued with; its
+        runner is this prepare's parent, as the lane's is, or `pid`."""
         sd_lane = ship.sd_lane
         sd_lane.store(self.connection, ship.slug(REMOTE_URL), {
             "id": "e-running", "position": 1, "item": self.item, "status": status, "step": "prepare",
-            "body": body, "holder": {"host": sd_lane.this_host(), "pid": os.getppid(), "token": "t"}})
+            "body": body, "holder": {"host": sd_lane.this_host(), "pid": pid or os.getppid(), "token": "t"}})
         self.connection.commit()
 
     @contextlib.contextmanager
@@ -4800,14 +4802,15 @@ roles:
         with self.as_lane(entry), contextlib.redirect_stderr(io.StringIO()):
             return self.prepare("--deliver", "--body-file", str(body))
 
-    def renewed_by_hand(self, first: str, renewal: str | None) -> None:
+    def renewed_by_hand(self, first: str, renewal: str | None, lane: bool = False) -> None:
         """A task published with body `first`, retitled, then renewed by hand with body `renewal`; with None
-        the lane published it, and the renewal has no body file, so it takes the pull request's own body."""
+        the lane published it, as with `lane`, and the renewal has no body file, so it takes the pull
+        request's own body."""
         from sd_db import set_item_fields
         self.task_item("task")
         body = self.directory / "hand-body.md"
         body.write_text(first)
-        if renewal is None:  # the lane opens the pull request, its Screenshots section in the body
+        if lane or renewal is None:  # the lane opens the pull request, its Screenshots section in the body
             self.assertEqual(self.lane_prepare(first, ("queue-dark-1280.png",))["phase"], "ready_to_send")
         else:
             self.prepare("--deliver", "--body-file", str(body))
@@ -4865,6 +4868,85 @@ roles:
                     self.assertRaisesRegex(ship.Refusal, "not the body of the one running lane entry") as caught:
                 self.prepare("--deliver", "--body-file", str(stale))
             self.assertEqual(caught.exception.workflow["blocker"]["code"], "lane_unknown")
+
+    def test_an_explicit_renewal_of_a_published_text_holds_against_the_entry_that_drew_it(self):
+        """Review of build/sd-1636, the class (equal content read as a record): a renewal by hand whose body
+        file held the very text the lane had published took that publication's basis, the entry's words, so
+        the entry retried, drew nothing, and removed the section the operator had supplied. A body file is
+        its author's words, whatever text an earlier prepare published."""
+        decorated = ship.sd_lane.with_shots("Body B.\n", ["queue-dark-1280.png"])
+        self.renewed_by_hand("Body B.\n", decorated, lane=True)
+        published = self.operation().state["body"]
+        self.assertIn("## Screenshots", published)
+        with self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body") as caught:
+            self.lane_prepare("Body B.\n")
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "delivery_claim_renewed")
+        self.assertEqual(self.operation().state["body"], published)
+        self.assertEqual(self.lane_prepare(decorated)["phase"], "ready_to_send")
+
+    def test_an_unchanged_retry_proceeds_on_a_receipt_older_than_the_body_record(self):
+        """Review of build/sd-1636, the class: a text with no recorded basis was taken as its own words, so on
+        a receipt saved before `body_bases` a renewal that took the pull request's body, the lane's section in
+        it, refused the unchanged entry that had published it. No record is no words: the entry then has to
+        be the published body, the lane's section apart."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        self.assertEqual(self.lane_prepare("Body B.\n", ("queue-dark-1280.png",))["phase"], "ready_to_send")
+        self.operation().save(body_bases=None)  # as a prepare before this record left it
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver")
+        state = self.operation().state
+        self.assertTrue(state["acceptance"].get("renewed"))
+        self.assertIn("## Screenshots", state["body"])
+        with self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body"):
+            self.lane_prepare("Body A.\n")
+        self.assertEqual(self.lane_prepare("Body B.\n", ("queue-light-390.png",))["phase"], "ready_to_send")
+
+    def test_an_entry_enqueued_with_the_published_body_proceeds(self):
+        """Review of build/sd-1636, the class: the refusal says to enqueue the renewal's body again, and a
+        renewal that took the pull request's body published the lane's section with a basis of the entry's
+        words, so an entry enqueued with that very body compared unequal and refused. An entry whose words
+        are the published body is not older than it."""
+        self.renewed_by_hand("Body B.\n", None)
+        published = self.operation().state["body"]
+        self.assertIn("## Screenshots", published)
+        with self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body"):
+            self.lane_prepare("Body A.\n")
+        self.assertEqual(self.lane_prepare(published)["phase"], "ready_to_send")
+
+    def test_a_lane_prepare_its_runner_does_not_hold_the_entry_of_refuses(self):
+        """The class, from the code: a prepare was tied to the running entry by its body alone, so one that
+        outlived its runner, its body a newer entry's plus a copied Screenshots section, took that entry's
+        words as its own. The entry's holder is the runner; a prepare is its entry's when that runner is its
+        parent."""
+        self.renewed_by_hand("Body A.\n", "Body B.\n")
+        self.lane_runs("Body B.\n", pid=os.getppid() + 1)  # a newer runner's entry
+        stale = self.directory / "stale.md"
+        stale.write_text(ship.sd_lane.with_shots("Body B.\n", ["queue-dark-1280.png"]))
+        with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}), \
+                self.assertRaisesRegex(ship.Refusal, "not the body of the one running lane entry") as caught:
+            self.prepare("--deliver", "--body-file", str(stale))
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "lane_unknown")
+        self.assertNotIn("## Screenshots", self.operation().state["body"])
+
+    def test_a_merge_after_a_failed_explicit_copilot_request_refuses(self):
+        """Review of build/sd-1636, the class: merge read a pending set equal to the published one as a
+        prepare that owed nothing, and the one step outside the set is the Copilot request, so a prepare whose
+        explicit request GitHub refused still merged, with no request for the clearance to wait on. A pending
+        set says the prepare did not finish; only an abandoned Copilot wait merges past an equal one."""
+        self.prepare()
+        self.double.lose_copilot_request = True
+        with self.assertRaisesRegex(ship.Refusal, "review request transport failed"):
+            self.prepare("--copilot-review", "request")
+        with self.assertRaisesRegex(ship.Refusal, "nothing merged") as caught:
+            self.merge()
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "prepare_required")
+        with self.assertRaisesRegex(ship.Refusal, "no locally recorded Copilot review request"):
+            self.merge("--abandon-copilot-review", "the request failed")
+        self.assertFalse(any(call.method == "PUT" for call in self.remote.calls))
+        self.double.lose_copilot_request = False
+        self.assertEqual(self.prepare("--copilot-review", "request")["phase"], "ready_to_send")
 
     def test_a_lane_retry_with_the_body_a_renewal_replaced_refuses(self):
         """Review of build/sd-1636: a task's claim has no evidence rows, so a lane retry of an entry enqueued with

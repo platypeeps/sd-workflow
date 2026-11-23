@@ -864,19 +864,26 @@ class Ship(SharedReview):
         return pending.get(key) if pending else self.state.get(key)
 
     def merge_scope(self) -> None:
-        """`assert_scope` for a merge, then refuse one while a prepare's `pending` set differs from the published.
+        """`assert_scope` for a merge, then refuse one while a prepare's `pending` set waits.
 
-        That prepare saved a new title, body or claim, may have pushed a newer
-        head, and did not publish them, so the published ones may not describe
-        the head merge would land, in any mode, `--no-item` too (sd:9268
-        review). Reconcile reads the published ones.
+        That prepare did not finish. It saved a title, body or claim, may have
+        pushed a newer head, and did not publish them, so the published ones
+        may not describe the head merge would land, in any mode, `--no-item`
+        too (sd:9268 review). Reconcile reads the published ones.
+
+        A pending set equal to the published one is no proof the prepare owed
+        nothing: the Copilot request is outside the set, and one GitHub
+        refused leaves no request for the clearance to wait on. So an equal
+        set merges only with `--abandon-copilot-review`, the operator's
+        recorded word that this head waits for no Copilot review, which itself
+        refuses without a request receipt.
         """
         self.assert_scope(merging=True)
-        pending = self.state.get("pending") or {}
-        # A pending set equal to the published one hides nothing: a prepare that failed after saving the same
-        # title, body and claim again, as an abandoned Copilot request does, still merges.
-        if any(self.state.get(key) != value for key, value in pending.items()):
-            raise Refusal("the last prepare saved a new title, body or delivery claim and did not publish them; "
+        pending = self.state.get("pending")
+        if pending and (self.args.abandon_copilot_review is None
+                        or any(self.state.get(key) != value for key, value in pending.items())):
+            raise Refusal("the last prepare did not finish, as one whose Copilot request failed: it saved a "
+                          "title, body or delivery claim and did not publish them; "
                           "nothing merged: prepare again, then merge", code="prepare_required",
                           state="operator_decision",
                           next_action="Run sd-ship prepare again with the same identity, then merge.")
@@ -886,7 +893,7 @@ class Ship(SharedReview):
         pending, publishing, self.publishing = self.state.get("pending"), self.publishing, False
         return {**(pending if publishing and pending else {}), **({"pending": None} if pending else {})}
 
-    def renewal(self, claim: dict | None, basis: tuple[str | None, bool]) -> tuple[dict | None, dict | None, str | None]:
+    def renewal(self, claim: dict | None, basis: tuple[str | None, str | None]) -> tuple[dict | None, dict | None, str | None]:
         """The claim to save, the one `assert_scope` reads in place of the stored one, and the line saying so.
 
         Only a prepare the lane did not start renews a claim the item
@@ -915,7 +922,7 @@ class Ship(SharedReview):
         return claim, claim, (f"--deliver renews the delivery claim of sd:{self.args.item}: item scope "
                               f"{str(stored.get('item_scope'))[:12]} is now {claim['item_scope'][:12]}")
 
-    def lane_renewal(self, claim: dict, stored: dict, changed: bool, basis: tuple[str | None, bool]) -> dict:
+    def lane_renewal(self, claim: dict, stored: dict, changed: bool, basis: tuple[str | None, str | None]) -> dict:
         """The claim a lane prepare saves, or a refusal when its entry is older than a renewal by hand.
 
         A retry of an entry enqueued before the renewal carries the old
@@ -956,33 +963,42 @@ class Ship(SharedReview):
             self.refuse_other_body(*basis)
         return {**claim, "renewed": True} if stored.get("renewed") else claim
 
-    def refuse_other_body(self, basis: str | None, tied: bool) -> None:
-        """Refuse a lane prepare on a renewed claim whose entry was enqueued with another body than the renewal's."""
-        if not tied:
+    def refuse_other_body(self, basis: str | None, entry: str | None) -> None:
+        """Refuse a lane prepare on a renewed claim whose entry was enqueued with another body than the renewal's.
+
+        `entry` is the entry's own body (`body_basis`), None when no row
+        gave it. It is the renewal's when it is the published body itself, as
+        an entry enqueued with that body is, or when its words are the
+        recorded basis of the published body. A published body with no
+        recorded basis, one a prepare took from the pull request or from a
+        receipt older than the record, has no words to hold the entry to: the
+        entry then has to be that body, the lane's section apart.
+        """
+        if entry is None:
             raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this prepare's body is "
-                          f"not the body of the one running lane entry for the item on this host, the lane's "
-                          f"Screenshots section apart, so it cannot be checked against the renewal's; nothing "
-                          f"was saved: `sd-ship lane retry {self.args.item}` once no other prepare of the item "
-                          f"runs", code="lane_unknown", boundary="runtime", state="retryable_failure")
-        if basis != self.published_basis():
-            raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this lane entry was "
-                          f"enqueued with another body, as a retry of an entry enqueued before the renewal is; "
-                          f"the renewal's body stands: enqueue again with the body file the renewal used, or "
-                          f"make this entry's body the renewal's with `{self.renew_command()} --body-file FILE` "
-                          f"by hand, then `sd-ship lane retry {self.args.item}`",
-                          code="delivery_claim_renewed", boundary="input", state="operator_decision",
-                          next_action="Enqueue the item again with the body the renewal used, or prepare by "
-                                      "hand with this entry's body, then retry.")
+                          f"not the body of the one running lane entry its runner holds for the item on this "
+                          f"host, the lane's Screenshots section apart, so it cannot be checked against the "
+                          f"renewal's; nothing was saved: `sd-ship lane retry {self.args.item}` once no other "
+                          f"prepare of the item runs", code="lane_unknown", boundary="runtime",
+                          state="retryable_failure")
+        published = self.normal(self.state.get("body"))
+        recorded = (self.state.get("body_bases") or {}).get(digest(published))
+        if entry == published or (basis == recorded if recorded else
+                                  published.startswith(entry) and sd_lane.only_shots(published[len(entry):])):
+            return
+        raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this lane entry was "
+                      f"enqueued with another body, as a retry of an entry enqueued before the renewal is; "
+                      f"the renewal's body stands: enqueue again with the renewal's body file or the body it "
+                      f"published, or make this entry's body the renewal's with `{self.renew_command()} "
+                      f"--body-file FILE` by hand, then `sd-ship lane retry {self.args.item}`",
+                      code="delivery_claim_renewed", boundary="input", state="operator_decision",
+                      next_action="Enqueue the item again with the body the renewal published, or prepare by "
+                                  "hand with this entry's body, then retry.")
 
     def bases_with(self, body: str, basis: str | None) -> dict:
         """The receipt's `body_bases` with this prepare's body: the digest of each text a prepare published, to
-        the digest of the words it was made from (`body_basis`)."""
+        the digest of the words it was made from (`body_basis`), None when nothing recorded them."""
         return {**(self.state.get("body_bases") or {}), digest(self.normal(body)): basis}
-
-    def published_basis(self) -> str:
-        """The basis of the published body: the one recorded for its text, or that text's own digest."""
-        text = digest(self.normal(self.state.get("body")))
-        return (self.state.get("body_bases") or {}).get(text, text)
 
     def normal(self, body: object) -> str:
         """`body` as `sd_ship_body.normalize` leaves it: no owned line, no trailing space; "" when it refuses."""
@@ -991,34 +1007,42 @@ class Ship(SharedReview):
         except Refusal:
             return ""
 
-    def body_basis(self, body: str) -> tuple[str | None, bool]:
-        """The digest of the words this prepare's body was made from, and whether a lane entry's row gave them.
+    def body_basis(self, body: str) -> tuple[str | None, str | None]:
+        """The digest of the words this prepare's body was made from, and its lane entry's own body when the
+        entry's row gave them.
 
         A published body is no record of its author's words: a lane prepare
         appends a Screenshots section drawn at that run, and the pull request
         keeps the body it was opened with. Text alone cannot tell the lane's
-        section from an entry's copy of one, so nothing here reads a body to
-        guess (sd:9335 class pass).
+        section from an entry's copy of one, and an equal text is no proof of
+        an equal author, so each answer here is a record (sd:9335 class pass).
 
         A lane prepare's words are its running entry's body, read from the
-        queue row, when this prepare's body is that body with nothing but the
-        lane's section after it; that tie keeps a prepare that outlived its
-        runner from borrowing a newer entry's row. Any other prepare's words
-        are its body, or, when a prepare published this very text before, the
-        words that one was made from (`body_bases`).
+        queue row. The row is this prepare's when its holder, the runner, is
+        this prepare's parent, and this prepare's body is that body with
+        nothing but the lane's section after it; a prepare that outlived its
+        runner has neither, and borrows no newer entry's row.
+
+        A body file's words are its text, whatever an earlier prepare
+        published. A body this prepare took from the pull request or the
+        receipt has the words recorded for that text (`body_bases`), and None
+        when no prepare recorded any, as on a receipt older than the record.
         """
         if self.args.no_item:
-            return None, False
+            return None, None
         given = self.normal(body)
         try:
-            rows = self.running_entries() if self.lane_started() else None
+            rows = self.running_entries() if self.lane_started() else []
         except Refusal:  # a queue that does not read: `renewal` refuses where the answer matters
-            rows = [] if os.environ.get(sd_lane.LANE_CHILD) else None
-        if rows is not None and len(rows) == 1:
+            rows = []
+        rows = [row for row in rows if (row.get("holder") or {}).get("pid") == os.getppid()]
+        if len(rows) == 1:
             entry = self.normal(rows[0].get("body"))
             if given.startswith(entry) and sd_lane.only_shots(given[len(entry):]):
-                return digest(entry), True
-        return (self.state.get("body_bases") or {}).get(digest(given), digest(given)), False
+                return digest(entry), entry
+        if self.body_source == "file":
+            return digest(given), None
+        return (self.state.get("body_bases") or {}).get(digest(given)), None
 
     def refuse_held_by_lane_row(self, changed: bool) -> None:
         """Refuse a scope change in a prepare `lane_started` counted by a running row, naming that row.
