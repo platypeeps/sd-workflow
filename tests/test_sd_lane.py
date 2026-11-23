@@ -35,6 +35,7 @@ import sd_lane  # noqa: E402
 
 #: The real writer, before a fixture replaces it: the round trip below runs it.
 REAL_NOTE = sd_lane.default_note
+real_scratch_git = sd_lane.scratch_git
 import sd_ship_body  # noqa: E402
 
 from tests.clean_env import clean_environment  # noqa: E402
@@ -2021,6 +2022,40 @@ class TrainReadBack(unittest.TestCase):
         self.assertEqual(sd_lane.put_merge({"merged": True, "sha": "a" * 40}), "a" * 40)
 
 
+class TrainState(unittest.TestCase):
+    """Review of sd:9923: what GitHub shows of a sent train's pull request, read by its shape."""
+
+    def state(self, answer: Any) -> str:
+        import sd_ship_remote
+
+        class Api:
+            prefix, repository = "/repos/example/pack", "example/pack"
+
+            def __init__(self, *args: Any) -> None:
+                pass
+
+            def api(self, path: str) -> Any:
+                if isinstance(answer, Exception):
+                    raise answer
+                return answer
+        with mock.patch.object(sd_ship_remote, "GitHub", Api), \
+                mock.patch.object(sd_ship_remote, "slug", lambda url: "example/pack"), \
+                mock.patch.object(sd_lane, "lane_git", lambda *args: "git@example.test:example/pack.git"):
+            return sd_lane.train_state(pathlib.Path("."), "sd-train/abc")
+
+    def test_each_state_is_read_and_any_other_shape_is_unknown(self) -> None:
+        pull = {"head": {"ref": "sd-train/abc"}, "state": "closed", "merged_at": None}
+        self.assertEqual([self.state(answer) for answer in (
+            [], [pull], [{**pull, "state": "open"}], [pull, {**pull, "merged_at": "2026-11-23T00:00:00Z"}],
+            [{**pull, "head": {"ref": "sd-train/other"}, "state": "open"}])],
+            ["none", "closed", "open", "merged", "none"])
+        for answer in ({}, [{**pull, "state": None}], [{**pull, "head": "sd-train/abc"}, {**pull, "state": 1}],
+                       RuntimeError("no answer")):
+            with self.subTest(answer=answer), self.assertRaises(sd_lane.LaneError) as raised:
+                self.state(answer)
+            self.assertEqual(raised.exception.code, sd_lane.PUBLISH_UNKNOWN)
+
+
 class TrainLanding(Trees):
     """sd:9923: a ready train lands as one train pull request, gated once on the joined tree.
 
@@ -2041,6 +2076,20 @@ class TrainLanding(Trees):
         patcher = mock.patch.object(sd_lane, "land_train", self.land)
         patcher.start()
         self.addCleanup(patcher.stop)
+        self.train_states: list[str] = []  # what GitHub shows of a sent train's pull request, read by read
+        self.deleted: list[str] = []
+        for name, fake in (("train_state", self.train_state), ("scratch_git", self.scratch_git)):
+            patcher = mock.patch.object(sd_lane, name, fake, create=True)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def train_state(self, root: pathlib.Path, branch: str) -> str:
+        return self.train_states.pop(0) if self.train_states else "closed"
+
+    def scratch_git(self, tree: pathlib.Path, *args: str) -> str | None:
+        if args[:4] == ("push", "--quiet", "origin", "--delete") and args[4].startswith("sd-train/"):
+            self.deleted.append(args[4])
+        return real_scratch_git(tree, *args)
 
     def gate(self, root: pathlib.Path, head: str, base: str) -> dict:
         return {"status": "success", "summary": "sd-check", "receipt_revision": 1}
@@ -2345,9 +2394,10 @@ class TrainLanding(Trees):
         steps: list[str] = []
         real = sd_lane.advance
 
-        def advance(queue: Any, entry: dict, token: str, step: str = "merge", members: Any = None) -> None:
+        def advance(queue: Any, entry: dict, token: str, step: str = "merge", members: Any = None,
+                    train: Any = None) -> None:
             steps.append(step)
-            real(queue, entry, token, step, members)
+            real(queue, entry, token, step, members, train)
         with mock.patch.object(sd_lane, "advance", advance):
             self.queue_three()
             sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
@@ -2355,6 +2405,75 @@ class TrainLanding(Trees):
         self.assertNotIn("merge", steps[:1])
         lead = self.entries()[0]
         self.assertEqual(lead["retryable_fault"]["step"], "train")
+
+    def test_a_train_lead_put_back_after_its_rebase_is_queued_at_the_rewrite(self) -> None:
+        """Review of sd:9923: an unknown train put the rebased lead back at its old head, which skips moved."""
+        head = self.lead_rebased_requeued("unknown")
+        lead = self.entries()[0]
+        self.assertEqual((lead["status"], lead["expected_head"], lead.get(sd_lane.TRAIN_SENT, "")[:9]),
+                         ("pending", head, "sd-train/"))
+
+    def lead_rebased_requeued(self, landing: str) -> str:
+        """`lead_rebased`, with the real put-back, stopping the run after the lead's claim."""
+        self.landing = {"status": landing, "pull": 9, "merge_commit": "c" * 40, "reason": "not read back"}
+        done: list[str] = []
+
+        def ship(argv: list[str], log: pathlib.Path) -> dict:
+            if argv[2] == "prepare" and argv[argv.index("--item") + 1] == "1" and not done:
+                self.commit_files(self.repo, {"later.txt": "l\n"}, "main moved again")
+                git(self.repo, "push", "-q", "origin", "main")
+                git(self.first, "fetch", "-q", "origin")
+                git(self.first, "rebase", "-q", "origin/main")
+                git(self.first, "commit", "-q", "--amend", "-m", "first\n\nDelivers: sd:1")
+                git(self.first, "push", "-q", "--force", "origin", "HEAD:refs/heads/first")
+                done.append(git(self.first, "rev-parse", "HEAD"))
+                self.calls.append(argv)
+                return {"ok": True, "phase": "ready_to_send", "head": done[0]}
+            return self.ship(argv, log)
+        self.queue_three()
+        real = sd_lane.requeue
+
+        def requeue(queue: Any, entry: dict, token: str, outcome: dict) -> str | None:
+            real(queue, entry, token, outcome)
+            raise SystemExit("stop after the lead")
+        with mock.patch.object(sd_lane, "requeue", requeue), self.assertRaises(SystemExit):
+            sd_lane.run_lane(self.repo, self.environ, ship, self.gate)
+        return done[0]
+
+    def test_a_train_lead_reclaimed_after_its_rebase_is_pending_at_the_rewrite(self) -> None:
+        """Review of sd:9923: a runner dead after the train fence left the rebased lead at its old head."""
+        self.queue_three()
+        lead = self.entries()[0]
+        sd_lane.update(self.store(), lambda rows: rows[0].update(status="running", holder={"token": "dead"}))
+        self.commit_files(self.repo, {"later.txt": "l\n"}, "main moved again")
+        git(self.repo, "push", "-q", "origin", "main")
+        git(self.first, "fetch", "-q", "origin")
+        git(self.first, "rebase", "-q", "origin/main")
+        git(self.first, "commit", "-q", "--amend", "-m", "first\n\nDelivers: sd:1")
+        git(self.first, "push", "-q", "--force", "origin", "HEAD:refs/heads/first")
+        head = git(self.first, "rev-parse", "HEAD")
+        sd_lane.advance(self.store(), {**lead, "status": "running"}, "dead", "train", [],
+                        {"head": head, "branch": "sd-train/abc"})
+        sd_lane.update(self.store(), lambda rows: sd_lane.reclaim(rows[0]))
+        row = self.entries()[0]
+        self.assertEqual((row["status"], row["expected_head"], row[sd_lane.TRAIN_SENT]),
+                         ("pending", head, "sd-train/abc"))
+
+    def test_an_unsettled_train_sends_no_lone_merge_on_the_next_claim(self) -> None:
+        """Review of sd:9923: the next claim merged the lead alone while its train pull request was open."""
+        self.queue_three()
+        sd_lane.update(self.store(), lambda rows: rows[0].update({sd_lane.TRAIN_SENT: "sd-train/abc"}))
+        self.landing = {"status": "failed", "pull": 10, "reason": "the train gate failed"}
+        self.train_states = ["open", "open"]
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        lead = self.entries()[0]
+        self.assertNotIn(1, self.merges())
+        self.assertEqual((lead["status"], lead[sd_lane.TRAIN_SENT], self.deleted), ("pending", "sd-train/abc",
+                                                                                    ["sd-train/abc"]))
+        self.train_states = ["closed"]  # the deletion closed it at last: nothing can land from it now
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        lead = self.entries()[0]
+        self.assertEqual((lead["status"], sd_lane.TRAIN_SENT in lead), ("merged", False))
 
     def caught_up_in_the_train(self, landing: str) -> None:
         """Main moves before the train prepares sd:2, and its prepare pushes a catch-up merge of it."""

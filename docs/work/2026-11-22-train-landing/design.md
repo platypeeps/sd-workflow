@@ -123,6 +123,8 @@ from 2 to 6 fails, each member ships alone, as after sd:9899: a later
 | 6 train PR | PR merged, main at final merge | answer lost | read the PR back; merged counts | land_train: lost answer |
 | 6 train PR | PR merged | PUT says merged; the read after fails, breaks or lags | the PUT's merge is the landing | land_train: put merged, read-back fails / breaks / stale |
 | 6 train PR | PR may be merged | PUT answer lost; the read after fails or says unmerged | unknown; back at step train; no lone merge | land_train: put answer lost, read-back stale / lost |
+| 6 fence | lead row: step train, expected_head = the published head its prepare left, train_sent = train branch | runner dies after the PUT | reclaim puts it back pending at that head; its next prepare reconciles | lane: lead reclaimed after its rebase |
+| 6 train PR | lead row back pending at its prepared head, train_sent kept | answer unknown | the next claim reads the train PR first: merged, prepare reconciles; open, the lane deletes its branch and waits; closed or none, train_sent goes, then a lone merge may run | lane: lead put back after its rebase; unsettled train sends no lone merge |
 | 6 train PR | none | GitHub refuses the merge (4xx) | PR closed, branch deleted; ship alone | land_train: refused |
 | 7 reconcile | none | train merge in the base, GitHub reads the PR open | prepare, join, merge refuse train_landed; no push, no PUT | ship: landed member GitHub reads open |
 | 7 reconcile | none | git cannot say whether the train merge is in the base | retryable refusal; train record kept | ship: git that cannot answer |
@@ -137,5 +139,5 @@ from 2 to 6 fails, each member ships alone, as after sd:9899: a later
 - One combined review: each member keeps its own (sd:9899).
 - Landing across repositories: a train is one repository's queue.
 - A claimed entry put back in a rebase-policy repository keeps its
-  pre-prepare head: the lone lane's rule, which a train lead put back
-  at `step: train` meets too (sd:10223).
+  pre-prepare head: the lone lane's rule (sd:10223). A train lead put
+  back at `step: train` follows its published prepared head.
