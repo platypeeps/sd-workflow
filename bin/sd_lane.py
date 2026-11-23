@@ -3059,7 +3059,7 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
     branch, names = TRAIN_BRANCH.format(tip[:12]), ", ".join(f"sd:{item}" for item in items)
     if scratch_git(root, "push", "--quiet", "origin", f"{tip}:refs/heads/{branch}") is None:
         return {"status": "failed", "reason": f"the push of {branch} failed"}
-    sent = False
+    outcome: dict[str, Any] | None = None  # set once the PUT is sent: from there GitHub may have merged
     try:
         api = sd_ship_remote.GitHub(root, sd_ship_remote.slug(lane_git(root, "config", "--get", "remote.origin.url")
                                                               or ""))
@@ -3092,18 +3092,31 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
             if hold is not None and set(items) != {hold["item"]}:
                 return {"status": "failed", "pull": pull,
                         "reason": f"the merge lane is held for {sd_ship_hold.held_text(hold)}; no merge was sent"}
-            sent = True  # from here a failure is unknown: GitHub may have merged
-            answer: Any = None
-            with contextlib.suppress(sd_ship_remote.Refusal):  # a lost answer is read back below, never sent twice
-                answer = api.api(f"{api.prefix}/pulls/{pull}/merge", method="PUT",
-                                 body={"sha": tip, "merge_method": "merge",
-                                       "commit_title": f"chore(lane): train of {names} (#{pull})",
-                                       "commit_message": message})
-            return read_back(api.pull(pull), pull, base, put_merge(answer))
-    except (sd_ship_remote.Refusal, store.WorkflowError) as error:  # the lock refuses before it sends
-        return {"status": "unknown" if sent else "failed", "reason": str(error)[:600]}
+            outcome = sent_train(api, pull, base, {
+                "sha": tip, "merge_method": "merge",
+                "commit_title": f"chore(lane): train of {names} (#{pull})", "commit_message": message})
+    except Exception as error:  # the lock refuses before it sends; after the PUT its outcome stands
+        if outcome is None and not isinstance(error, (sd_ship_remote.Refusal, store.WorkflowError)):
+            raise
+        outcome = outcome or {"status": "failed", "reason": str(error)[:600]}
     finally:
         scratch_git(root, "push", "--quiet", "origin", "--delete", branch)
+    return outcome
+
+
+def sent_train(api: Any, pull: int, base: str, body: dict[str, Any]) -> dict[str, Any]:
+    """The train's merge PUT, sent once, and what GitHub answered and showed after it (sd:9923).
+
+    Nothing raises from here: GitHub may have merged, so a failure is an
+    answer, never a way to a lone merge. The PUT's own `merged: true` is
+    proof of the landing, whatever the read after it does.
+    """
+    put = seen = None
+    with contextlib.suppress(Exception):  # lost or refused: the read below and `read_back` decide
+        put = put_merge(api.api(f"{api.prefix}/pulls/{pull}/merge", method="PUT", body=body))
+    with contextlib.suppress(Exception):  # a read that fails is no answer, as one that is unreadable
+        seen = api.pull(pull)
+    return read_back(seen, pull, base, put)
 
 
 def put_merge(answer: Any) -> str | None:

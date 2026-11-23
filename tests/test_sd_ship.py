@@ -6733,20 +6733,55 @@ roles:
         _git(self.root, "fetch", "-q", "origin", "main")
         self.assertFalse(ship.sd_lib._closed_by(self.root, "FETCH_HEAD", f"sd:{self.item}"))
 
-    def test_land_train_whose_read_back_fails_after_the_put_answers_unknown(self):
-        """Review of sd:9923: a lost read-back after the PUT read as failed, so the lead merged alone."""
+    def landed_after_the_put(self, read, *, lose_put=False):
+        """`land_train`'s answer when `read` stands in for the pull request read after the PUT.
+
+        `lose_put` loses the PUT's answer after GitHub merged, as a dropped connection does.
+        """
         tip = self.joined_tip()
         remote = sys.modules["sd_ship_remote"]
-        real = remote.GitHub.pull
+        real, saved = remote.GitHub.pull, self.double._route
+
+        def route(method, path, body):
+            answer = saved(method, path, body)
+            if lose_put and method == "PUT" and path.endswith("/merge"):
+                raise RemoteRefusal(502, "the merge answer was lost")
+            return answer
 
         def pull(api, number):
+            answer = real(api, number)
             if any(call.method == "PUT" for call in self.remote.calls):
-                raise remote.Refusal("read-back lost")
-            return real(api, number)
+                return read(answer)
+            return answer
+        self.double._route = route
         with patch.object(remote.GitHub, "pull", pull):
-            landed, _ = self.landed_by_lane(tip)
-        self.assertEqual(landed["status"], "unknown")
+            return self.landed_by_lane(tip)[0]
+
+    def refused_read(self, answer):
+        raise sys.modules["sd_ship_remote"].Refusal("read-back lost")
+
+    def broken_read(self, answer):
+        raise ValueError("the read broke outside any refusal")
+
+    def test_land_train_whose_put_merged_and_read_back_fails_counts_as_landed(self):
+        """Class pass of sd:9923: a refused GET dropped the PUT's own proof, so the landed train read unknown."""
+        landed = self.landed_after_the_put(self.refused_read)
+        self.assertEqual((landed["status"], landed.get("merge_commit")),
+                         ("merged", _git(self.remote.path, "rev-parse", "main")))
+
+    def test_land_train_whose_put_merged_and_read_back_breaks_counts_as_landed(self):
+        """Class pass of sd:9923: an exception that is no refusal left `land_train`, and the lead merged alone."""
+        landed = self.landed_after_the_put(self.broken_read)
+        self.assertEqual((landed["status"], landed.get("merge_commit")),
+                         ("merged", _git(self.remote.path, "rev-parse", "main")))
+
+    def test_land_train_whose_put_answer_and_read_back_are_lost_answers_unknown(self):
+        """Review of sd:9923: a lost read-back after the PUT read as failed, so the lead merged alone."""
+        self.assertEqual(self.landed_after_the_put(self.refused_read, lose_put=True)["status"], "unknown")
         self.assertEqual(self.remote.pull(1).state, "MERGED")  # GitHub took the PUT
+
+    def test_land_train_whose_put_answer_is_lost_and_read_back_breaks_answers_unknown(self):
+        self.assertEqual(self.landed_after_the_put(self.broken_read, lose_put=True)["status"], "unknown")
 
     def test_land_train_whose_read_back_is_malformed_after_the_put_answers_unknown(self):
         """Review of sd:9923: `base: "main"` raised AttributeError past the unknown outcome.
