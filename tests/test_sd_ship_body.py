@@ -558,6 +558,29 @@ class CitedIdTests(unittest.TestCase):
             with self.subTest(body=body):
                 self.assertEqual(sd_ship_body.quoted_lines(body), quoted)
 
+    def test_a_span_ends_with_its_paragraph_as_commonmark_reads_it(self) -> None:
+        """pack sd:9666 review, round 14: a second, unmatched span on a wrapped span's closing line took
+        the first span's place, so a reread exposed the `<!--` it holds; a backtick in a heading ran into
+        the next paragraph; and a lazy line or a marker that cannot interrupt a paragraph ended the span.
+        Each expected value is what CommonMark (markdown-it) renders."""
+        a, c = "a" * 7, "c" * 7
+        tail = f"\n\nReverted commits:\n\n- {a} renew\n"
+        undone = {
+            "A `span <!-- hidden\nends` and `` unmatched": [a],
+            "- `a\nb <!-- c`": [a],  # a lazy line continues the item's paragraph
+            "x `a\n2. <!-- b`": [a],  # `2.` cannot interrupt a paragraph
+            "- `a\n  2. <!-- b`": [a],
+            "- `a\n<!-- b`": [],  # a column-0 `<!--` starts an HTML block: CommonMark hides the rest too
+            "- `a\n- <!-- b`": [a],  # a sibling item ends the paragraph; its comment ends with it
+        }
+        for head, found in undone.items():
+            with self.subTest(head=head):
+                self.assertEqual(sd_ship_body._listed_undone(head + tail), found)
+        self.assertEqual(sd_ship_body.quoted_lines("# Example `\nx <!-- ` end\nLane review fix, pack sd:5\n"),
+                         {3, 4})
+        lazy = f"Reverted commits:\n\n- {a} renew\nwrapped on\n- {c} renew\n"
+        self.assertEqual(sd_ship_body._listed_undone(lazy), [a, c])
+
     def test_markers_on_one_line_open_an_empty_parent(self) -> None:
         """pack sd:9666 review, round 12, blocker 3: `- - <sha>` under `Reverted commits:` undid the
         commit, though the empty parent item holds it, as it does across two lines."""

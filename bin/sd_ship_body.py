@@ -118,7 +118,7 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]]):
     items: list[int] = []  # the text column of each open list item, outermost first
     for number, line in enumerate(body.split("\n"), start=1):
         line = line.rstrip("\r").expandtabs(4)
-        rest = _item_text(line, items, opens=False)
+        rest, lazy = _continues(line, items, paragraph=not loose and not commented)
         commented = commented and len(items) >= comment_depth  # a comment ends with the list item that holds it
         if fence and len(items) >= fence_depth:
             fence = "" if _closes(_FENCE_RE.match(rest), fence) else fence
@@ -126,9 +126,9 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]]):
             rows.append((number, "fence", 0, len(items), rest, line))
             continue
         fence = ""  # the list item that held the fence ended, and the fence with it
-        kind, opened, text = _kind(rest, items, loose, commented, lazy=len(items) != depth)
+        kind, opened, text = ("text", 0, rest) if lazy else _kind(rest, items, loose, commented, len(items) != depth)
         alone = _stands_alone(kind, text, line)
-        if ticks and (alone or kind != "text" or opened or len(items) != depth):
+        if ticks and _ends_paragraph(kind, opened, alone, len(items) != depth):
             return rows, span_at  # the paragraph ended with the span open: its opener is text
         if kind == "fence" and (opener := _FENCE_RE.match(text)):  # `_kind` matched it already
             fence, fence_depth = opener["fence"], len(items)
@@ -136,6 +136,8 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]]):
             was = commented
             commented, ticks, span_at = _inline(line, number, commented, ticks, span_at, literal)
             comment_depth = len(items) if commented and not was else comment_depth
+            if ticks and alone:
+                return rows, span_at  # a heading is one line: a span it opens ends with it
         loose = alone
         depth = len(items)  # a heading or a break is one line, no paragraph; `depth` finds a lazy line
         rows.append((number, kind, opened, len(items), text, line))
@@ -145,9 +147,51 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]]):
 def _inline(line: str, number: int, commented: bool, ticks: str, span_at: tuple[int, int],
             literal: set[tuple[int, int]]) -> tuple[bool, str, tuple[int, int]]:
     """`_comment_open` on line `number`, with the opener of the code span left open after it."""
-    before = ticks
     commented, ticks, column = _comment_open(line, commented, ticks, {c for n, c in literal if n == number})
-    return commented, ticks, (number, column) if ticks and not before else span_at
+    return commented, ticks, (number, column) if ticks and column >= 0 else span_at
+
+
+def _continues(line: str, items: list[int], paragraph: bool) -> tuple[str, bool]:
+    """`line` past its list column, popping each item it ends, and whether it is a lazy line.
+
+    A line indented less than its list item continues the item's open
+    `paragraph` (CommonMark's lazy continuation) unless a block starts on
+    it: any list marker, or a block that interrupts a paragraph.
+    """
+    ended = items.copy()
+    rest = _item_text(line, ended, opens=False)
+    if paragraph and len(ended) < len(items) and not (_ITEM_MARKER.match(rest) or _interrupts(rest)):
+        return line.strip(), True
+    items[:] = ended
+    return rest, False
+
+
+#: A tag that starts an HTML block able to interrupt a paragraph (CommonMark kinds 1 to 6).
+_HTML_START = re.compile(
+    r"^ {0,3}<(?:!--|\?|![A-Za-z]|!\[CDATA\[|(?:script|pre|style|textarea)(?:[ \t>]|$)|/?(?:address|article|aside|"
+    r"base|basefont|blockquote|body|caption|center|col|colgroup|dd|details|dialog|dir|div|dl|dt|fieldset|"
+    r"figcaption|figure|footer|form|frame|frameset|h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|"
+    r"menuitem|nav|noframes|ol|optgroup|option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|"
+    r"title|tr|track|ul)(?:[ \t>]|/>|$))", re.IGNORECASE)
+
+
+def _interrupts(text: str) -> bool:
+    """Whether `text` starts a block that ends an open paragraph: a heading, fence, break, quote, HTML
+    block, or a list item with text that is a bullet or numbered 1."""
+    fence = _FENCE_RE.match(text)
+    if _ATX.match(text) or _BREAK.match(text) or _HTML_START.match(text) or text.lstrip(" ")[:1] == ">" \
+            or (fence and not (fence["fence"][0] == "`" and "`" in fence["info"])):
+        return True
+    marker = _ITEM_MARKER.match(text)
+    if marker is None:
+        return False
+    number = marker[1].strip()[:-1]
+    return bool(text[marker.end():].strip()) and (not number or int(number) == 1)
+
+
+def _ends_paragraph(kind: str, opened: int, alone: bool, moved: bool) -> bool:
+    """Whether a line ends the paragraph above it: no paragraph text, a list item, or a list item's end."""
+    return alone or kind != "text" or bool(opened) or moved
 
 
 def _stands_alone(kind: str, text: str, line: str) -> bool:
@@ -169,8 +213,8 @@ def _kind(rest: str, items: list[int], loose: bool, commented: bool, lazy: bool 
         return "code", 0, rest
     if not loose and not lazy and _SETEXT.match(rest):
         return "setext", 0, rest
-    if _BREAK.match(rest):
-        return "text", 0, rest
+    if _BREAK.match(rest) or (not loose and not lazy and _ITEM_MARKER.match(rest) and not _interrupts(rest)):
+        return "text", 0, rest  # an empty item or one numbered past 1 cannot interrupt a paragraph
     before = len(items)
     text = _item_text(rest, items, opens=True)
     opened = len(items) - before
@@ -229,7 +273,7 @@ def _comment_open(line: str, commented: bool, ticks: str = "", literal=frozenset
             close = re.compile(r"(?<!`)" + ticks + r"(?!`)").search(line, position)
             if close is None:
                 return False, ticks, column
-            ticks, position = "", close.end()
+            ticks, position, column = "", close.end(), -1
         elif (match := _INLINE.search(line, position)) is None:
             return False, "", -1
         else:
