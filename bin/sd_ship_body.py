@@ -531,8 +531,14 @@ _REVERTED_INTRO = re.compile(r"(?:^|[.!?][ \t]+)(?:reverted(?:[ \t]+commits)?|re
 
 
 #: An HTML comment's text on one line: one closed on it, or one that opens the line and runs past its end,
-#: an HTML block's (pack sd:10090). An inline `<!--` left open is text to CommonMark, so it stays.
-_COMMENT_TEXT = re.compile(r"^<!--(?!.*-->).*$|<!--.*?-->")
+#: an HTML block's (pack sd:10090). An inline `<!--` left open is text to CommonMark, so it stays, and so
+#: does a code span, matched first: comment syntax in one is text (review of build/sd-1653).
+_COMMENT_TEXT = re.compile(r"(`+).+?(?<!`)\1(?!`)|^<!--(?!.*-->).*$|<!--.*?-->")
+
+
+def _uncommented(text: str) -> str:
+    """`text` without the HTML comments `_COMMENT_TEXT` finds; its code spans as written."""
+    return _COMMENT_TEXT.sub(lambda match: match[0] if match[1] else "", text)
 
 
 def _heading(text: str) -> str:
@@ -580,7 +586,7 @@ def _listed(rows) -> list[str]:
         kind = "span" if spanned else kind
         del undoes[depth - opened + 1:]  # the items this line ended take their headings with them
         # A reader never sees a comment, so it heads nothing and leaves the heading it follows (pack sd:10090).
-        holder, text = undoes[-1], _COMMENT_TEXT.sub("", raw.strip()).strip()
+        holder, text = undoes[-1], _uncommented(raw.strip()).strip()
         if opened:  # an item, even one that opens with a fence or code, holds what nests in it
             holder = holder and opened == 1  # each outer item of `- - x` is empty: its heading says nothing
             if kind == "text" and (sha := _SHA_LED.match(text)):

@@ -773,7 +773,10 @@ class CitedIdTests(unittest.TestCase):
                 (f"- Reverted commits:\n  <!--\n  why\n  -->\n  - {undone[:9]} renew\n", (3,)),
                 (f"<!-- Reverted commits: -->\n- {undone[:9]} renew\n", (2, 3)),
                 (f"Reverted commits:\n<!-- - {undone[:9]} renew -->\n", (2, 3)),
-                (f"Reverted commits:\n<!-- why -->\nKept:\n- {undone[:9]} renew\n", (2, 3))):
+                (f"Reverted commits:\n<!-- why -->\nKept:\n- {undone[:9]} renew\n", (2, 3)),
+                # Review of build/sd-1653: comment syntax in a code span is text, so no sha leads the item.
+                (f"Reverted commits:\n- `<!-- -->`{undone[:9]} renew\n", (2, 3)),
+                (f"Reverted commits:\n- `<!--` {undone[:9]} -->\n", (2, 3))):
             with self.subTest(listing=listing):
                 self.assertEqual(sd_ship_body.cited_ids("", [self.revert_of(listing), *work]), kept)
 
