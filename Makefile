@@ -298,7 +298,8 @@ endif
 # carries `core.hooksPath` is refused first, since `git rev-parse --git-path
 # hooks` would honour it and place the link under the retired directory. A
 # file already at the path that is not this link is refused by name and left
-# alone. A clone whose common git directory is not `<main checkout>/.git`, such
+# alone; a dangling link is replaced, as 19 clones linked a retired pack path
+# and git skipped the hook silently (pack sd:10212). A clone whose common git directory is not `<main checkout>/.git`, such
 # as a `--separate-git-dir` clone, is refused too: the relative link would
 # dangle there (sd:3136). This is a
 # setting of the clone, not a render: the installer does not make it, and
@@ -321,7 +322,7 @@ hooks:
 			printf '%s\n' "error: the git directory $$common is not <checkout>/.git (a --separate-git-dir clone?), so $$link -> $$target would not reach the checkout's hooks/$$hook; link it by hand" >&2; \
 			exit 1; \
 		fi; \
-		if { [ -e "$$link" ] || [ -L "$$link" ]; } && [ "$$(readlink "$$link")" != "$$target" ]; then \
+		if [ -e "$$link" ] && [ "$$(readlink "$$link")" != "$$target" ]; then \
 			printf '%s\n' "error: $$link exists and is not the link to hooks/$$hook; move it aside first" >&2; \
 			exit 1; \
 		fi; \
