@@ -6702,6 +6702,18 @@ roles:
         self.assertEqual(self.connection.execute("SELECT status FROM item WHERE id=?", (self.item,)).fetchone()[0],
                          "in_progress")
 
+    def test_a_held_train_member_names_the_train_landing_to_verify(self):
+        """Review of sd:9923: the recovery said to verify the member's merge, which lacks the newer base;
+        the combined tree is the outer train landing, and the member's merge is what delivers."""
+        tip = self.joined_tip()
+        raced = self.remote.commit_on("main", "raced\n\nAuthored-with: human", files={"raced.py": "r = 1\n"})
+        self.land_train(tip)
+        landing = _git(self.remote.path, "rev-parse", "main")
+        merged = self.merge()
+        self.assertEqual(merged["workflow"]["blocker"]["code"], "base_advanced_at_merge")
+        self.assertIn(f"Verify the combined tree at {landing}", merged["workflow"]["next_action"])
+        self.assertEqual((merged["train_landing"], merged["merged_parent"]), (landing, raced))
+
     def test_land_train_under_a_declared_gap_needs_every_check_at_the_tip(self):
         """Review of sd:9923: a lone merge under a declared gap needs every
         check, the pull_request workflows too, at the exact head it lands;

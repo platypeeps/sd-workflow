@@ -2512,6 +2512,8 @@ class Ship(SharedReview):
             held = sd_lib.git_output(["merge-base", "--is-ancestor", parent, self.state["reviewed_head"]], self.root) is None
         if self.state.get("train_commit"):
             held = held or not train_landed_tested(self.root, commit, tip)
+            landing = outer_landing(self.root, commit, tip)
+            parent = landing[1] if len(landing) == 3 else parent  # the base the train landed on, not its member's
         return parent, held
 
     def merge_method(self) -> str:
@@ -2855,7 +2857,7 @@ class Ship(SharedReview):
         # checked. The merge is a fact to record; delivery is not (sd:1089).
         parent, held = self.landed_hold(commit, tip)
         if held and not self.args.no_item:
-            answer = self.hold_at_merge(commit, parent, evidence)
+            answer = self.hold_at_merge(commit, parent, evidence, tip)
             if answer is not None:
                 return answer
         self.settle_closes(held, commit, evidence)
@@ -2876,8 +2878,11 @@ class Ship(SharedReview):
         return {**evidence, "delivery_pending": False,
                 "cleanup": clean_up_merged(self.root, self.branch, self.state["reviewed_head"])}
 
-    def hold_at_merge(self, commit: str, parent: str, evidence: dict) -> dict | None:
+    def hold_at_merge(self, commit: str, parent: str, evidence: dict, tip: str) -> dict | None:
         """The held answer when the base advanced at the merge and a close is still owed, else None.
+
+        A train member's combined tree is the train landing, so that is the
+        commit to verify; the member's own merge is what delivers (sd:9923).
 
         A hand delivery after the combined tree passed is the resolution;
         reissuing the hold over it would never clear (#1179). A hand close of
@@ -2895,10 +2900,12 @@ class Ship(SharedReview):
 
             named = item_refs(self.connection, held)
             steps.append(f"close the co-delivered items {', '.join(named[number] for number in held)} the same way")
+        landing = outer_landing(self.root, commit, tip)[:1] if self.state.get("train_commit") else []
+        verify = landing[0] if landing else commit
         pending = blocked("base_advanced_at_merge", "ci",
-                          f"Verify the combined tree at {commit} (default-branch CI), then {'; '.join(steps)}.",
+                          f"Verify the combined tree at {verify} (default-branch CI), then {'; '.join(steps)}.",
                           state="operator_decision")
-        return {**evidence, "delivery_pending": True, "merged_parent": parent,
+        return {**evidence, "delivery_pending": True, "merged_parent": parent, **({"train_landing": verify} if landing else {}),
                 "workflow": {**evidence["workflow"], **pending}}
 
     def deliver_closes(self, commit: str, ref: str, evidence: dict) -> dict:
@@ -3034,24 +3041,29 @@ def refuse_demoted(body: str) -> None:
         )
 
 
-def train_landed_tested(root: pathlib.Path, commit: str, tip: str) -> bool:
-    """Whether the train landing that brought `commit` onto `tip`'s branch merged onto a base the train held.
+def outer_landing(root: pathlib.Path, commit: str, tip: str) -> list[str]:
+    """The train landing that brought `commit` onto `tip`'s branch and its parents, or `[]` (sd:9923).
 
     The landing is the oldest first-parent commit of the branch that holds
     `commit`. A member below the train's top sits under the landing's
     second parent, which a first-parent walk never enters, so the walk's
-    commits are matched against `commit`'s descendants instead. GitHub
-    merges the train pull request onto the base it holds at the `PUT`; a
-    first parent outside the train tip means the base moved after the
-    gate, and the landed tree is one no gate ran (sd:9923).
+    commits are matched against `commit`'s descendants instead.
     """
     chain = (sd_lib.git_output(["rev-list", "--first-parent", f"{commit}..{tip}"], root) or "").split()
     above = set((sd_lib.git_output(["rev-list", "--ancestry-path", f"{commit}..{tip}"], root) or "").split())
     landings = [each for each in chain if each in above]
-    if not landings:
-        return False
-    parents = git(root, "rev-list", "--parents", "-n", "1", landings[-1]).split()[1:]
-    return len(parents) == 2 and is_ancestor(root, parents[0], parents[1])
+    return git(root, "rev-list", "--parents", "-n", "1", landings[-1]).split() if landings else []
+
+
+def train_landed_tested(root: pathlib.Path, commit: str, tip: str) -> bool:
+    """Whether the train landing that brought `commit` onto `tip`'s branch merged onto a base the train held.
+
+    GitHub merges the train pull request onto the base it holds at the
+    `PUT`; a first parent outside the train tip means the base moved after
+    the gate, and the landed tree is one no gate ran (sd:9923).
+    """
+    landing = outer_landing(root, commit, tip)
+    return len(landing) == 3 and is_ancestor(root, landing[1], landing[2])
 
 
 def refuse_train_mismatch(commit: str, joined: str | None) -> None:
