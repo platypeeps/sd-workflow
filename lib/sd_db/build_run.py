@@ -72,12 +72,12 @@ from .writes import add_note, create_item, now, record_cost, record_state
 TIMEOUT_SECONDS = build.BUDGET_MINUTES * 60
 GRACE_SECONDS = 20
 BEAT_SECONDS = 30
-#: Reviews with blockers before the class pass and park: 3, so a park comes after 4
-#: reviews (operator 2026-11-23, sd:10111: 8-round loops cost too many tokens).
-REVIEW_ROUNDS = 3
+#: Reviews with blockers before the class pass and park: 2, so a park comes after 3
+#: reviews (operator 2026-11-23, sd:10128; sd:10111 had set 4).
+REVIEW_ROUNDS = 2
 #: Fix rounds past this many blocked reviews run on the strongest model at high effort, the brief asking for
 #: the blockers' class (operator ruling on pack sd:9264, 2026-11-20); the park after REVIEW_ROUNDS stays.
-ESCALATE_AFTER = 2  # with REVIEW_ROUNDS 3, the class-pass fix escalates (sd:10111)
+ESCALATE_AFTER = 1  # with REVIEW_ROUNDS 2, the class-pass fix escalates (sd:10128)
 STRONGEST, ESCALATED_EFFORT = "fable", "high"
 #: A rate-limited review waits this long, beating, then asks again, up to `RATE_LIMIT_WAITS` times before it
 #: blocks: a quota window passes, and a block parked the item for a manual Retry (sd:9882).
