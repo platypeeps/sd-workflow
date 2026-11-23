@@ -347,6 +347,32 @@ class DropRound3(Repo):
         self.assertNotIn(f"sd:{items[1]}", self.closes(Path(new["work_path"])))
 
 
+class DropStranded(Repo):
+    """Pack sd:10167: items sat in_progress on an old branch for days after a drop. Each member the drop leaves
+    off the kept branch ends ready, its old branch cleared, so the next build takes it on its own branch."""
+
+    def branch_and_status(self, item):
+        row = self.db.execute("SELECT branch, status FROM item WHERE id = ?", (item,)).fetchone()
+        return row["branch"], row["status"]
+
+    def test_the_dropped_item_reads_no_old_branch(self):
+        items, _ids, run = self.bundle()
+        self.assertEqual(self.branch_and_status(items[1])[0], run["branch"])
+        DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual(self.branch_and_status(items[1]), (None, "ready"))
+
+    def test_a_member_left_out_in_progress_ends_ready_off_the_old_branch(self):
+        items, (lead, second, third), run = self.bundle()
+        build.retry(self.db, lead, who="operator", only=[items[0], items[2]])
+        again = self.claim()
+        build.write(self.db, again["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START)
+        build.end(self.db, again["id"], "blocked", "blockers")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        self.db.execute("UPDATE item SET status = 'in_progress', branch = ? WHERE id = ?", (run["branch"], items[1]))
+        DROP.drop_item(self.db, build, items[0], who="operator")
+        self.assertEqual(self.branch_and_status(items[1]), (None, "ready"))
+
+
 class DropRound5(Repo):
     """Review round 5 of pack sd:9709, class pass: a git exit code read as an answer. Only `rev-parse -q --verify`
     exit 1 says a ref is unset; any other failure refuses unwritten."""

@@ -966,10 +966,18 @@ def drop_writes(connection, plan: dict, *, who: str, note: str, left: str) -> li
         how = DROP_HOW.format(item=plan["item"]) + plan["run"]
         queued = _queue_members(connection, members, items, lead=lead, who=who, finding=note, parked="",
                                 how=how, verb="Drop")
+        # Each item the drop leaves off the kept branch ends ready, its old branch cleared, so the next build takes
+        # it on its own: dropped members sat in_progress on the old branch for days (pack sd:10167). One whose
+        # branch names another build is that build's; a done one keeps its record.
+        for row in connection.execute(f"SELECT id, status FROM item WHERE id IN ({', '.join('?' for _ in plan['aside'])}) "
+                                      "AND branch = ? AND status != 'done'", (*plan["aside"], plan["branch"])).fetchall():
+            if row["status"] in ("in_progress", "blocked"):
+                transition(connection, row["id"], "ready", who=who, reason=how)
+            set_item_fields(connection, row["id"], branch=None)
         # A done lead leaves its bundle and nothing more: there is nothing left to build (pack sd:9863).
         if _done(items, plan["item"]):
             return queued
-        if items[plan["item"]]["status"] == "blocked":
+        if connection.execute("SELECT status FROM item WHERE id = ?", (plan["item"],)).fetchone()[0] == "blocked":
             transition(connection, plan["item"], "ready", who=who, reason=how)
         unpark(connection, plan["item"])
         add_note(connection, plan["item"], "comment", left)
