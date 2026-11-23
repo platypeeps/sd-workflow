@@ -200,7 +200,8 @@
 .queue .act { text-align: right; white-space: nowrap; }
 .queue .act .ctl { display: inline-flex; flex-wrap: wrap; justify-content: flex-end; gap: var(--space-3xs); vertical-align: middle; }
 .queue .act .ctl .btn .i { margin-right: 0; }
-.queue .act .ctl .said { align-self: center; font-size: var(--text-xs); color: var(--color-ink-2); }
+/* pack sd:9863: a long refusal wraps, paths included, rather than widen the queue past the viewport. */
+.queue .act .ctl .said { align-self: center; font-size: var(--text-xs); color: var(--color-ink-2); white-space: normal; overflow-wrap: anywhere; }
 .queue .act .ctl .said[role="alert"] { color: var(--color-warning-ink); }
 @media (pointer: coarse) { .queue .act .btn, .queue .what .pick, .pulls .what .pick, .cats .what .pick { min-height: var(--row-touch); min-width: var(--row-touch); } }
 @media (max-width: 899px) {

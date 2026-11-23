@@ -673,13 +673,21 @@ The reserved `sd` namespace declares these settings:
   this machine; `0` is no cap. Absence reads a quarter of the cores. `SD_GATE_SLOTS` overrides it
   for one run. It grants nothing;
   see [Parallel work](#parallel-work).
+- `sd.gate_workers`: how many test workers one local run of the pack's tests starts, 1 to 99.
+  Absence reads the cores over the gate cap, so the gates together hold the cores. `TEST_WORKERS` overrides it for one run.
+  It grants nothing.
 - `sd.review_slots`: how many reviews may run their reviewers at once on this machine; `0` is no cap.
   Absence reads 2. `SD_REVIEW_SLOTS` overrides it for one run. It grants nothing.
 - `sd.bundle_max`: how many items one build bundle takes when this machine claims it, a mechanical item half
   of one. Absence reads 3. The claim fixes a build child's budget at 120 minutes per 3 slots it took, never
   less (sd:9109). It grants nothing.
+- `sd.build_model`: the model every build bundle this machine claims runs its builder on, as the builder's
+  `--model` takes it (`opus`, `sonnet`, `fable` or a model id). Absence runs opus, and sonnet for an
+  all-mechanical bundle (sd:9942). It grants nothing.
 - `sd.lane_parallel`: how many lanes one hosted lane run runs at once on this machine, 1 to 8. Absence reads 5
   (sd:9323); the gate's slots and load limit still hold lanes back below it. It grants nothing.
+- `sd.lane_train`: how many queued entries of one repository one lane run gates at once as a stack, 1 to 9;
+  1 gates each entry alone. Absence reads 3 (sd:9899). It grants nothing.
 - `sd.machine_cap`: how many code-writing builders, drafts and interactive builders may run at once on this
   machine, 1 to 16. Absence reads 6 (sd:8158, sd:9891); the load guard still holds builds back. It grants nothing.
 - `sd.repo_cap`: how many build bundles may build at once in one repository when this machine claims them,

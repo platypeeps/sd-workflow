@@ -52,6 +52,7 @@ from .runner import (
 from .ship import this_host
 from .workflow import item_area, item_blocked_by
 from .writes import (
+    UNBUILT,
     add_note,
     cancel_unwanted_blocked,
     create_assignment,
@@ -680,8 +681,11 @@ def parked_finding(detail: str | None) -> str:
             + "\n" + REVIEW_CLASS_PASS)
 
 
-def retry_state(connection, run: dict) -> dict:
+def retry_state(connection, run: dict, *, held: bool = False) -> dict:
     """Retry on an ended run: only the lead's latest run, released, whose bundle ended blocked or cancelled.
+
+    `held` True admits a bundle held after a split (`split`): bundle drop checks each commit's citation itself and
+    leaves the earlier work aside, on a fresh branch, so it may salvage one (pack sd:9863).
 
     A bundle blocks on a `blocked` outcome and on a second loss at one step, whose run keeps the loss as its
     outcome (`LOSSES`); the lead assignment's `blocked` status covers both. A `lane_failed` run's bundle ended
@@ -696,7 +700,7 @@ def retry_state(connection, run: dict) -> dict:
         reason = "the run still holds its lease"
     elif current["status"] not in AGAIN:
         reason = f"the bundle ended {current['status']}; Retry takes a blocked or cancelled one"
-    elif split(connection, run["assignment"]) == "held":
+    elif not held and split(connection, run["assignment"]) == "held":
         reason = ("its branch holds work from before a subset Retry; Build its items to build them fresh on a "
                   "new branch")
     return {"assignment": run["assignment"], "revision": current["revision"], "allowed": not reason, "reason": reason,
@@ -836,14 +840,22 @@ def drop_plan(connection, item: int) -> dict:
     lead = row["parent"] or row["id"]
     current = queue_state(connection, lead)
     last = current["run"]
-    state = retry_state(connection, last) if last else {"allowed": False, "reason": "it never ran"}
+    state = retry_state(connection, last, held=True) if last else {"allowed": False, "reason": "it never ran"}
     if not state["allowed"]:
         raise BuildRefused(f"Drop refused: {state['reason']}")
     members = _members(connection, lead, current["status"])
+    # A done lead's own transition cancels its blocked row (`cancel_unwanted_blocked`) and leaves its members
+    # blocked: the bundle ended blocked, so its members are the lead and the blocked rows. A cancelled member row
+    # is not one: its item went to planning (and maybe back) after the run (lead review).
+    if current["status"] == "cancelled" and _done(reads.items_by_ids(connection, [current["item"]]), current["item"]):
+        # With no blocked row left, a cancelled member cannot say which way it went, so none is kept: the drop
+        # refuses below and writes nothing.
+        members = [member for member in members if member["id"] == lead] + _members(connection, lead, "blocked")
     if row["id"] not in {member["id"] for member in members}:
         raise BuildRefused(f"Drop refused: sd:{item} is not a {current['status']} member of build {lead}")
     items = reads.items_by_ids(connection, [member["item"] for member in members])
-    kept = [member for member in members if member["id"] != row["id"] and not _done(items, member["item"])]
+    kept = [member for member in members if member["id"] != row["id"]
+            and (member["item"] not in items or items[member["item"]]["status"] not in UNBUILT)]
     # As Retry: a done lead kept as the parent would not lead the claim, which would start a member's own branch
     # and skip the cherry-picked one (round 2). Dropping the lead itself is the way out.
     if row["id"] != lead and _done(items, current["item"]):
@@ -877,15 +889,14 @@ def drop_plan(connection, item: int) -> dict:
                            f"{last['id']} ran on {ran_on or 'the hub'}, which holds their work; Retry it whole")
     # Every item the bundle built that is not kept, as Retry reads who leaves from the run's membership: a member
     # cancelled out before (`ALONE`, round 3) or moved to planning (`UNBUILT`, round 8). Its commits stay on the old
-    # branch, and the split must not carry them. A done item's commits may stay: the merge closes nothing open.
-    built = [member["item"] for member in connection.execute(
+    # branch, and the split must not carry them. Nor a done member's: reopened before enqueue, its replayed
+    # `Closes:` would close it again (pack sd:9863 review).
+    built = [one["item"] for one in connection.execute(
         "SELECT item FROM assignment WHERE (id = ? OR parent = ?) AND scope = ?", (lead, lead, SCOPE))]
-    states = reads.items_by_ids(connection, built)
-    gone = {one for one in built if not _done(states, one)}
     # The stored repo is a key (`~/...`); git needs the disk path, as `Supervisor` expands it (round 3).
     repo, work = paths.expand(last["repo"]), Path(last["work_path"])
     return {"item": item, "assignment": row["id"], "lead": lead, "kept": kept, "run": last["id"],
-            "aside": sorted(gone - {member["item"] for member in kept} | {item}), "built": sorted(set(built)),
+            "aside": sorted(set(built) - {member["item"] for member in kept} | {item}), "built": sorted(set(built)),
             "revision": current["revision"], "repo": str(repo), "work": str(work), "branch": last["branch"]}
 
 
@@ -946,6 +957,9 @@ def drop_writes(connection, plan: dict, *, who: str, note: str, left: str) -> li
         how = DROP_HOW.format(item=plan["item"]) + plan["run"]
         queued = _queue_members(connection, members, items, lead=lead, who=who, finding=note, parked="",
                                 how=how, verb="Drop")
+        # A done lead leaves its bundle and nothing more: there is nothing left to build (pack sd:9863).
+        if _done(items, plan["item"]):
+            return queued
         if items[plan["item"]]["status"] == "blocked":
             transition(connection, plan["item"], "ready", who=who, reason=how)
         unpark(connection, plan["item"])
@@ -1484,16 +1498,26 @@ def _mechanical(connection, item: int) -> bool:
     return isinstance(fields, dict) and fields.get("work_kind") == "mechanical"
 
 
+#: What `sd.build_model` may hold: a model alias or id the builder's `--model` takes (sd:9942).
+BUILD_MODEL = r"[a-z][a-z0-9.-]{0,63}"
+
+
+def build_model(environ: dict[str, str] | None = None) -> str | None:
+    """This machine's `sd.build_model`, or None when unset or malformed (sd:9942)."""
+    return _machine_value("build_model", BUILD_MODEL, environ)
+
+
 def _model(connection, items: list[int]) -> str:
-    return SONNET if all(_mechanical(connection, item) for item in items) else OPUS
+    """The builder's model: `sd.build_model` when set; else sonnet for an all-mechanical bundle, opus otherwise."""
+    return build_model() or (SONNET if all(_mechanical(connection, item) for item in items) else OPUS)
 
 
-def _machine_setting(key: str, pattern: str, default: int, environ: dict[str, str] | None) -> int:
-    """This machine's `sd.<key>` from the pack's machine config as a number, `default` when unset.
+def _machine_value(key: str, pattern: str, environ: dict[str, str] | None) -> str | None:
+    """This machine's `sd.<key>` from the pack's machine config when it matches `pattern`, else None.
 
     The machine that claims a bundle reads its own, as `sd.gate_slots` is read
-    (`sd_lib.file_setting`); a value that does not match `pattern` is the
-    default, so a bad file never stops a dispatcher.
+    (`sd_lib.file_setting`); a value that does not match `pattern` reads as
+    unset, so a bad file never stops a dispatcher.
     """
     env = os.environ if environ is None else environ
     home = env.get("XDG_CONFIG_HOME") or str(Path(env.get("HOME") or Path.home()) / ".config")
@@ -1501,8 +1525,14 @@ def _machine_setting(key: str, pattern: str, default: int, environ: dict[str, st
         config = json.loads((Path(home) / "sd-ai-command-pack" / "config.json").read_text()).get("config", {})
         value = config.get("sd", {}).get(key)
     except (OSError, ValueError, AttributeError):
-        return default
-    return int(value) if isinstance(value, str) and re.fullmatch(pattern, value) else default
+        return None
+    return value if isinstance(value, str) and re.fullmatch(pattern, value) else None
+
+
+def _machine_setting(key: str, pattern: str, default: int, environ: dict[str, str] | None) -> int:
+    """This machine's `sd.<key>` as a number, `default` when unset or malformed."""
+    value = _machine_value(key, pattern, environ)
+    return int(value) if value is not None else default
 
 
 def bundle_max(environ: dict[str, str] | None = None) -> int:

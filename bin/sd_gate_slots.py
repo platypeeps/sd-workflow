@@ -337,10 +337,23 @@ def counted_load(load: float, busy: float | None, cores: int | None = None) -> f
         return load
     return min(load, busy * count)
 
+#: `sd.gate_workers` (sd:9925): the test workers one local gate runs, set by hand over `run-tests.sh`'s slot
+#: rule, which keeps the pool at the cores. Cores over a cap of 8 gave 2 and doubled the pack gate, 28 to 51
+#: minutes; a fixed 8 let eight gates start 64 workers on 16 cores (build review round 7).
+WORKERS_PATTERN = re.compile(r"[1-9][0-9]?")
+
+
+def parse_workers(text: str, source: str) -> int:
+    """A worker count of 1 to 99, or a `ValueError` naming where it came from."""
+    if not WORKERS_PATTERN.fullmatch(text):
+        raise ValueError(f"{source} must be a whole number from 1 to 99 (got '{text[:40]}')")
+    return int(text)
+
 
 #: The machine settings the stdlib entry points read, with the check each value passes.
 MACHINE_SETTINGS: tuple[tuple[str, Callable[[str, str], object]], ...] = (
-    ("gate_slots", parse_count), ("gate_load_max", parse_number), ("gate_settle_seconds", parse_number))
+    ("gate_slots", parse_count), ("gate_load_max", parse_number), ("gate_settle_seconds", parse_number),
+    ("gate_workers", parse_workers))
 
 
 def machine_settings(environ: Mapping[str, str], *, stream: TextIO | None = None) -> dict[str, str | None]:
@@ -362,7 +375,15 @@ def machine_settings(environ: Mapping[str, str], *, stream: TextIO | None = None
             value = mine.get(key) if isinstance(mine, dict) else None
             if value is not None:
                 text = value if isinstance(value, str) else repr(value)
-                check(text, f"sd.{key}")
+                try:
+                    check(text, f"sd.{key}")
+                except ValueError as error:
+                    # A worker typo keeps the slot rule; it must not drop the gate's own limits (sd:9925 review).
+                    if key != "gate_workers":
+                        raise
+                    if stream is not None:
+                        stream.write(f"warning: {error}; keeping the slot rule\n")
+                    continue
                 values[key] = text
     except FileNotFoundError:
         pass
@@ -1142,6 +1163,7 @@ def slot_command(argv: list[str] | None = None) -> int:
     commands = parser.add_subparsers(dest="command_name", required=True)
     commands.add_parser("directory", help="print the slot directory")
     commands.add_parser("count", help="print how many slots this machine has (0: no cap)")
+    commands.add_parser("workers", help="print sd.gate_workers, or nothing when unset")
     wait = commands.add_parser("wait", help="queue, then lock one of the inherited slot descriptors")
     wait.add_argument("--pid", type=int, required=True, help="the gate's pid")
     wait.add_argument("--ppid", type=int, required=True, help="the gate's parent when it started")
@@ -1151,6 +1173,9 @@ def slot_command(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.command_name == "directory":
         print(directory(os.environ))
+        return 0
+    if args.command_name == "workers":
+        print(machine_settings(os.environ, stream=sys.stderr)["gate_workers"] or "", end="")
         return 0
     try:
         settings = machine_settings(os.environ, stream=sys.stderr)
