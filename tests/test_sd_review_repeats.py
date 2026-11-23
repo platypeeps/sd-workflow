@@ -594,6 +594,26 @@ class ReproRuleTests(unittest.TestCase):
         self.assertEqual([(row["disposition"], row.get("evidence")) for row in (repeat, other)],
                          [("blocking", REPRO), ("advisory", None)])
 
+    def test_a_blocker_a_later_completed_pass_cleared_holds_no_finding(self) -> None:
+        """Lane round 2 at 1c528acb0 (pack sd:10008): pass 1 blocked on src.py:10 "Empty input crashes", pass 2
+        completed and cleared it, yet an uncited "the cache is never cleared" at line 10 still blocked. Only a
+        blocker still open at the last completed pass holds a nearby finding; one still open keeps the 3-line
+        fail-closed rule (ruling #72671), and a pass that did not complete clears nothing."""
+        first, second = ({"pass": index, "head": head * 40, "completed": True} for index, head in ((1, "a"), (2, "b")))
+        blocker = dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking")
+        new = finding(line=10, summary="the cache is never cleared")
+        for label, history, found, expected in (
+                ("cleared by pass 2", [first, second], first, "advisory"),
+                ("found at pass 2", [first, second], second, "blocking"),
+                ("pass 2 incomplete", [first, dict(second, completed=False)], first, "blocking"),
+                ("no completion recorded", [{"pass": 1}, {"pass": 2}], {"pass": 1}, "blocking"),
+                ("a single report", None, None, "blocking")):
+            with self.subTest(label):
+                previous = {"findings": [dict(blocker, **({"prior_review": found} if found else {}))],
+                            **({"history": history} if history else {})}
+                [record] = sd_review.dispose([new], "high", repro=True, prior=sd_review.still_open(previous))
+                self.assertEqual(record["disposition"], expected)
+
     def test_a_reproduced_break_in_an_unchanged_caller_blocks(self) -> None:
         [record] = sd_review.dispose([finding("python3 reader.py: KeyError 'state'", path="reader.py")], "high",
                                      repro=True)

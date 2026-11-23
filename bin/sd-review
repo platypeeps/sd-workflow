@@ -1790,8 +1790,8 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
 def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any], findings: Sequence[Any] = ()) -> str | None:
     """The evidence a prior report's blockers stored for `record`'s finding, one per line; "" when they stored
     none, as a report from before sd:9867 may, or when a prior blocker of any pass within `SHIFT_LINES` matches no
-    finding in `findings` (fail closed: a shifted or edited, paraphrased repeat must not clear it, and the aggregate
-    records no pass status that could say a later pass cleared it); None otherwise.
+    finding in `findings` (fail closed: a shifted or edited, paraphrased repeat must not clear it; `still_open`
+    drops a blocker a later completed pass cleared before it gets here, pack sd:10008); None otherwise.
 
     A match is the same file, as `repo_spelling` spells it, the same line and the
     same `summary_key`: a line alone gave an unrelated finding the old repro (lead after round 8). Failing that,
@@ -1820,6 +1820,19 @@ def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]
             lines[0] - lines[1]) <= SHIFT_LINES  # an unplaced line may be the blocker's: it holds (sd-review:1821)
     return "" if any(_file(old, record) and _near(old) and not any(_same(old, row) for row in findings)
                      for old in blockers) else None
+
+
+def still_open(previous: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The prior rows still open at the aggregate's last completed pass: one an earlier pass found that a later
+    completed pass did not repeat was cleared there and holds no finding (pack sd:10008, lane round 2). A report
+    with no completed pass in its `history`, as a single report or one from before sd:10008, keeps every row,
+    and so does a row with no pass number: fail closed."""
+    history = previous.get("history")
+    done = [row["pass"] for row in history if isinstance(row, dict) and row.get("completed") is True
+            and type(row.get("pass")) is int] if isinstance(history, list) else []
+    def _found(row: Mapping[str, Any]) -> Any:
+        return row["prior_review"].get("pass") if isinstance(row.get("prior_review"), dict) else None
+    return [row for row in previous["findings"] if not done or type(_found(row)) is not int or _found(row) >= max(done)]
 
 
 _HUNK = re.compile(r"(?m)^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
@@ -2503,7 +2516,7 @@ def review(
         finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)],
                       [row._replace(path=spelled(row.path)) for row in rebutted], subject.scope != "planning",
                       prior_at(root, previous["subject"].get("head"), subject.head, [dict(row, path=spelled(row["path"]))
-                                                                                     for row in previous["findings"]]) if previous else ())
+                                                                                     for row in still_open(previous)]) if previous else ())
     finally:
         slot.give_back()  # sd:2523: on every exit; the gate below queues in its own pool
     # Shadow only (sd:2092): Jev's kind for each finding goes to its ledger and
