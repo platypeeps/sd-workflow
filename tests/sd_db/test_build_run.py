@@ -3024,6 +3024,30 @@ class Supervise(Case):
         self.assertIn("- work.txt:1 a blocker", fix[fix.index("-p") + 1])
         self.assertEqual(build.run(self.db, again["id"])["review_round"], 1, "the resumed fix charged no round")
 
+    def test_a_usage_limit_in_a_fix_keeps_the_prior_review_to_verify(self):
+        """pack sd:10236: the resumed fix is a new run, whose own log names hold no review, so the next review
+        lost the blocking round's report and reviewed the branch afresh, clearing without verifying it. The
+        resumed run verifies the report the limited run's round left."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "rate_limited"], sd_review=["blocking"])
+        first = self.supervisor()
+        self.assertEqual(first.run()["outcome"], "rate_limited")
+        blocking = json.loads(first.out("review").read_text(encoding="utf-8"))
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.plan(claude=["fix1"], sd_review=["clean"])
+        resumed = self.supervisor(again["id"])
+        self.assertEqual(resumed.run()["step"], "enqueued")
+        review = [call["argv"] for call in self.calls("sd-review")][-1]
+        self.assertIn("--verify-report", review, "the resumed fix's review verified no prior report")
+        self.assertEqual(review[review.index("--base") + 1], blocking["subject"]["head"])
+        self.assertEqual(json.loads(resumed.out("prior").read_text(encoding="utf-8")), blocking)
+
     def test_a_resumed_fix_keeps_every_blocker_whole(self):
         """Review of build/sd-1557: the resumed fix read its blockers back from the 4000-character note, so a
         multiline finding lost its tail, its bullet read as a blocker of its own and a later finding was cut.

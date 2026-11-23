@@ -637,6 +637,14 @@ def defined_names(line: str) -> set[str]:
     return {name for pattern in (keyword, assigned, method) for name in re.findall(pattern, line)}
 
 
+def _has_text(path: Path) -> bool:
+    """Whether `path` reads with more than whitespace; an unreadable file has none."""
+    try:
+        return bool(path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return False
+
+
 def instance_files(instances: Any) -> list[str]:
     """The file of each `path:line` in a finding's `instances`, as `sd-review` reads it; a value not a list
     names none (pack sd:9769)."""
@@ -1597,8 +1605,9 @@ class Supervisor:
         """
         if not (self.fresh()["review_round"] or 0):
             return None
-        last, kept = self.out("review"), self.out("prior")
-        for path in (last, kept):
+        last, mine = self.review_files()
+        kept = self.out("prior")
+        for path in (last, mine):
             try:
                 text = path.read_text(encoding="utf-8")
             except OSError:
@@ -1650,6 +1659,19 @@ class Supervisor:
             kept.write_text(encoded, encoding="utf-8")
             return answer
         return None
+
+    def review_files(self) -> tuple[Path, Path]:
+        """The last and kept review reports: this run's, or, when it holds neither, the latest earlier run's of
+        its assignment that does. A usage-limit or loss resume is a new run that keeps the round, so its own
+        names hold no review, and the next round would review the branch afresh (pack sd:10236)."""
+        earlier = [row[0] for row in self.db.execute(
+            "SELECT id FROM runner_run WHERE assignment = ? AND run < ? ORDER BY run DESC",
+            (self.row["assignment"], self.row["run"]))]
+        for ident in (self.ident, *earlier):
+            pair = (self.logs / f"{ident}.review.out", self.logs / f"{ident}.prior.out")
+            if any(_has_text(path) for path in pair):
+                return pair
+        return self.out("review"), self.out("prior")
 
     def verifiable(self, path: Any, head: str) -> bool:
         """Whether `sd-review --verify-report` takes a prior blocker at `path`: inside the checkout and a

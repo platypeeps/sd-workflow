@@ -2285,11 +2285,12 @@ def open_question(connection, items: list[int], since: str, *, pending: bool = F
     if not items:
         return None
     marks = ", ".join("?" for _ in items)
-    # A review withdrawal reopens the question and keeps its ruling (`review.withdraw`): pending, a withdrawn
-    # ruling answers nothing (advisory of PR #1940, sd:9973).
+    # A review withdrawal reopens the question and keeps its ruling (`review.withdraw`): a withdrawn ruling answers
+    # nothing, pending or as the skip's evidence (advisory of PR #1940, sd:9973, sd:10236). Exact, or before
+    # `review.WITHDRAWN`'s `; sd:N stays filed`: a bare `%` read note #2's withdrawal as note #23's.
+    pulled = "'Withdrawn: ruling #' || ruling.id || ' on note #' || asked.id"
     withdrawn = ("AND NOT EXISTS (SELECT 1 FROM note pulled WHERE pulled.item = asked.item AND pulled.kind = "
-                 "'decision' AND pulled.body LIKE 'Withdrawn: ruling #' || ruling.id || ' on note #' || asked.id || "
-                 "'%') " if pending else "")
+                 f"'decision' AND (pulled.body = {pulled} OR pulled.body LIKE {pulled} || '; %')) ")
     row = connection.execute(
         f"SELECT asked.id, asked.item FROM note asked WHERE asked.kind = 'question' AND asked.item IN ({marks}) "
         f"AND asked.timestamp >= ? {'AND asked.resolved_at IS NULL' if pending else ''} AND NOT EXISTS (SELECT 1 FROM note ruling WHERE ruling.item = asked.item "

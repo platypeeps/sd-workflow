@@ -664,7 +664,24 @@ class OpenQuestion(Case):
         add_note(self.db, item, "decision", f"Withdrawn: ruling #{ruling} on note #{asked}")
         found = build.open_question(self.db, [item], since, pending=True)
         self.assertEqual(found and found["id"], asked)
-        self.assertIsNone(build.open_question(self.db, [item], since), "the skip evidence reads as before")
+        found = build.open_question(self.db, [item], since)
+        self.assertEqual(found and found["id"], asked, "a withdrawn ruling counted as an answer at delivery")
+
+    def test_a_withdrawn_ruling_leaves_the_skip_evidence_standing(self):
+        """pack sd:10236: delivery and the class pass read the question as the builder's skip; a withdrawn
+        ruling answered it there, so a skipped item went back to planning, not blocked. A resolved question
+        still counts, and a ruling on another note answers nothing."""
+        item = self.item()
+        since = "2000-01-01T00:00:00+00:00"
+        asked = add_note(self.db, item, "question", "Which?\nOption: A (Recommended)\nOption: B")
+        ruling = add_note(self.db, item, "decision", f"Ruling on note #{asked}: A")
+        self.assertIsNone(build.open_question(self.db, [item], since), "a standing ruling answers the skip")
+        for other in (f"#{ruling + 1000} on note #{asked}", f"#{ruling} on note #{asked}9"):
+            add_note(self.db, item, "decision", f"Withdrawn: ruling {other}")
+            self.assertIsNone(build.open_question(self.db, [item], since), f"{other}'s withdrawal counted")
+        add_note(self.db, item, "decision", f"Withdrawn: ruling #{ruling} on note #{asked}")
+        found = build.open_question(self.db, [item], since)
+        self.assertEqual(found and found["id"], asked, "a withdrawn ruling counted as an answer at delivery")
 
 
 class Writes(Case):
