@@ -34,8 +34,9 @@ and when a stored claim, body or flag goes stale. Two rules answer it.
   receipt maps each published text to its basis (`body_bases`).
 - The published closing set is bound to the head it was read at.
   Reconcile refuses to deliver or close a merge of another head.
-- A `pending` set is stale for merge. Merge refuses `prepare_required`
-  while one waits, in every mode (`merge_scope`).
+- A `pending` set that differs from the published one is stale for
+  merge. Merge refuses `prepare_required` while one waits, in every
+  mode (`merge_scope`). An equal set hides nothing and merges.
 
 Rejected: check the closing head for `--no-item` merges. It covers one
 mode; a pending body can wait in any mode.

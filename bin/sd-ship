@@ -864,7 +864,7 @@ class Ship(SharedReview):
         return pending.get(key) if pending else self.state.get(key)
 
     def merge_scope(self) -> None:
-        """`assert_scope` for a merge, then refuse one while a prepare's `pending` set waits.
+        """`assert_scope` for a merge, then refuse one while a prepare's `pending` set differs from the published.
 
         That prepare saved a new title, body or claim, may have pushed a newer
         head, and did not publish them, so the published ones may not describe
@@ -872,7 +872,10 @@ class Ship(SharedReview):
         review). Reconcile reads the published ones.
         """
         self.assert_scope(merging=True)
-        if self.state.get("pending"):
+        pending = self.state.get("pending") or {}
+        # A pending set equal to the published one hides nothing: a prepare that failed after saving the same
+        # title, body and claim again, as an abandoned Copilot request does, still merges.
+        if any(self.state.get(key) != value for key, value in pending.items()):
             raise Refusal("the last prepare saved a new title, body or delivery claim and did not publish them; "
                           "nothing merged: prepare again, then merge", code="prepare_required",
                           state="operator_decision",
