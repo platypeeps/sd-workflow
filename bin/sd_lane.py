@@ -984,14 +984,17 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
 
     A `revert:` commit that names no sha escapes `sd_ship_body.kept_commits`:
     system sd:8242 closed though the branch undid its commit and fixes. A
-    commit with a `Closes:` line counts as undone when a later commit's
-    subject is a revert and the files it changed read at `head` as before
-    it. A read that fails keeps the commit, as before this check.
+    commit that cites an item, by a `Closes:` trailer or a `Lane review
+    fix` line, counts as undone when a later commit's subject is a revert
+    and the files it changed read at `head` as before it: a listed merge
+    leaves its side commits here, and one cited only by a review fix line
+    closed its item (pack sd:10108). A read that fails keeps the commit,
+    as before this check.
     """
     import sd_ship_body  # noqa: PLC0415
     kept = []
     for index, (sha, message) in enumerate(commits):
-        if "Closes:" in message and any(sd_ship_body.REVERT_SUBJECT.match(later) for _, later in commits[:index]):
+        if sd_ship_body.cited_ids("", [(sha, message)]) and any(sd_ship_body.REVERT_SUBJECT.match(later) for _, later in commits[:index]):
             # NUL-separated and literal: git quotes a name with a tab or non-ASCII byte otherwise.
             files = publish_git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-z", "-r", sha)
             names = [name for name in files.stdout.split("\0") if name] if files and files.returncode == 0 else []

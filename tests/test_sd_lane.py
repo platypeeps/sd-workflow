@@ -3605,6 +3605,27 @@ class CitedCloses(SharedQueue):
         entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
         self.assertEqual(entry["closes"], [a])
 
+    def test_a_listed_merge_closes_nothing_its_reverted_side_cites_by_a_review_fix_line(self) -> None:
+        """pack sd:10108: a hand-written revert listing a merge undid its side commit, cited only by a
+        `Lane review fix` line; the file check read only commits with `Closes:`, so sd:N still closed."""
+        b, c, *_ = self.open
+        tree, _ = self.committed("topic-merge-fix")
+        git(tree, "switch", "-q", "-c", "side")
+        (tree / "side.txt").write_text("side\n", encoding="utf-8")
+        git(tree, "add", "side.txt")
+        git(tree, "commit", "-q", "-m", f"fix: implement\n\nLane review fix, pack sd:{b}: y.")
+        git(tree, "switch", "-q", "topic-merge-fix")
+        (tree / "main.txt").write_text("main\n", encoding="utf-8")
+        git(tree, "add", "main.txt")
+        git(tree, "commit", "-q", "-m", f"fix: mainline\n\nCloses: sd:{c}")
+        git(tree, "merge", "-q", "--no-ff", "--no-edit", "side")
+        merge = git(tree, "rev-parse", "--short=9", "HEAD").strip()
+        git(tree, "revert", "--no-commit", "-m", "1", "HEAD")
+        git(tree, "commit", "-q", "-m", f"revert: drop the side\n\nReverted commits:\n\n- {merge} the merge\n")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [c])
+
     def test_a_range_the_branch_reverts_closes_nothing(self) -> None:
         """Lane review of sd:5999, round 3: `git revert A..B` writes one revert per commit, each naming it."""
         a, b, c, *_ = self.open
