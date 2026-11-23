@@ -2239,6 +2239,23 @@ class TrainLanding(Trees):
         self.assertIn("sd:2", landing["reason"])
         self.assertNotIn(2, self.merges())
 
+    def test_a_train_whose_merge_answer_is_unknown_leaves_the_lead_to_reconcile(self) -> None:
+        """Review of sd:9923: an unconfirmed train merge fell back to a lone merge at `step: merge`."""
+        self.landing = {"status": "unknown", "pull": 9, "reason": "the train merge was sent and not read back"}
+        steps: list[str] = []
+        real = sd_lane.advance
+
+        def advance(queue: Any, entry: dict, token: str, step: str = "merge", members: Any = None) -> None:
+            steps.append(step)
+            real(queue, entry, token, step, members)
+        with mock.patch.object(sd_lane, "advance", advance):
+            self.queue_three()
+            sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertNotIn(1, self.merges())  # no lone merge of the lead
+        self.assertNotIn("merge", steps[:1])
+        lead = self.entries()[0]
+        self.assertEqual(lead["retryable_fault"]["step"], "train")
+
     def test_a_member_cancelled_during_the_train_lands_nothing(self) -> None:
         def cancel_second() -> None:
             sd_lane.update(self.store(), lambda rows: rows[1].update(status="cancelled"))

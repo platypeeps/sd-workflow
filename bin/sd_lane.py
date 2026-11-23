@@ -2118,7 +2118,7 @@ def process(entry: dict[str, Any], queue: Queue, ship: Ship, advance: Callable[.
     if landing is not None:  # landed, its merge below reconciles; else it merges alone (sd:9923)
         fields["train_landing"] = landing
     if refused is not None:
-        return {**fields, "status": "prepared", **refused}
+        return {**fields, **refused}
     merge_log = logs / f"merge-{item}-{stamp}.log"
     merged = ship(["-C", str(worktree), "merge", "--item", str(item), "--expected-head", str(prepared.get("head")),
                    "--manual", "--watch", "--wait-seconds", str(MERGE_WAIT_SECONDS), "--json"], merge_log)
@@ -2139,7 +2139,10 @@ def train_landing(entry: dict[str, Any], queue: Queue, ship: Ship, head: str, lo
     """`land_as_train`'s answer, then `step: merge` unless the train landed and the merge after it only reconciles.
 
     A train takes minutes, so the entry's merge authority is read again
-    before it merges alone; the second value is its refusal (sd:9923).
+    before it merges alone. A train merge sent and not read back may have
+    landed: the entry stays at `step: train` and goes back to pending, and
+    its next prepare reconciles what landed. The second value is the
+    fields that end the entry here, or None (sd:9923).
     """
     try:
         landing = land_as_train(entry, queue, ship, head, logs, renewed, deadline,
@@ -2148,10 +2151,14 @@ def train_landing(entry: dict[str, Any], queue: Queue, ship: Ship, head: str, lo
         raise
     except Exception as error:  # a train that breaks lands nothing it did not record; the merge after decides
         landing = {"status": "error", "reason": f"{type(error).__name__}: {error}"[:REASON_CHARS]}
-    if (landing or {}).get("status") != "merged":
+    status = (landing or {}).get("status")
+    if status == "unknown":
+        why = f"the train merge may have landed: {(landing or {}).get('reason')}; the next prepare reconciles it"
+        return landing, {"status": "failed", "step": "train", "retryable": True, "reason": why[:REASON_CHARS]}
+    if status != "merged":
         refused = merge_refusal(entry)
         if refused is not None:
-            return landing, refused
+            return landing, {"status": "prepared", **refused}
         advance()
     return landing, None
 
@@ -2862,7 +2869,8 @@ def land_joined(joined: list[Joined], queue: Queue, ship: Ship, tip: str,
                         checks=lambda: rejoin_stop(joined, ship, logs))
     if landed.get("status") != "merged":
         for row, *_ in joined[1:]:
-            record[row["id"]] = {"status": "failed", "reason": str(landed.get("reason"))[:REASON_CHARS]}
+            record[row["id"]] = {"status": "unknown" if landed.get("status") == "unknown" else "failed",
+                                 "reason": str(landed.get("reason"))[:REASON_CHARS]}
         return {**landed, "items": items, "tip": tip}
     for row, tree, head, *_ in joined[1:]:  # each reconciles now; a stop here leaves it to its next claim's prepare
         merged = ship(["-C", str(tree), "merge", "--item", str(row["item"]), "--expected-head", head, "--manual",
@@ -2986,6 +2994,7 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
     branch, names = TRAIN_BRANCH.format(tip[:12]), ", ".join(f"sd:{item}" for item in items)
     if scratch_git(root, "push", "--quiet", "origin", f"{tip}:refs/heads/{branch}") is None:
         return {"status": "failed", "reason": f"the push of {branch} failed"}
+    sent = False
     try:
         api = sd_ship_remote.GitHub(root, sd_ship_remote.slug(lane_git(root, "config", "--get", "remote.origin.url")
                                                               or ""))
@@ -2999,6 +3008,7 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
         why = ready()  # last: it ends in the lane host's fence
         if why is not None:
             return {"status": "failed", "pull": pull, "reason": why[:600]}
+        sent = True  # from here a failure is unknown: GitHub may have merged
         with contextlib.suppress(sd_ship_remote.Refusal):  # a lost answer is read back below, never sent twice
             api.api(f"{api.prefix}/pulls/{pull}/merge", method="PUT",
                     body={"sha": tip, "merge_method": "merge", "commit_title": f"chore(lane): train of {names} (#{pull})",
@@ -3008,7 +3018,7 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
             return {"status": "failed", "pull": pull, "reason": f"GitHub did not merge train pull request #{pull} onto {base}"}
         return {"status": "merged", "pull": pull, "merge_commit": merged.get("merge_commit_sha")}
     except sd_ship_remote.Refusal as error:
-        return {"status": "failed", "reason": str(error)[:600]}
+        return {"status": "unknown" if sent else "failed", "reason": str(error)[:600]}
     finally:
         scratch_git(root, "push", "--quiet", "origin", "--delete", branch)
 

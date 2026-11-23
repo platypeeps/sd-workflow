@@ -6577,6 +6577,21 @@ roles:
         _git(self.root, "fetch", "-q", "origin", "main")
         self.assertFalse(ship.sd_lib._closed_by(self.root, "FETCH_HEAD", f"sd:{self.item}"))
 
+    def test_land_train_whose_read_back_fails_after_the_put_answers_unknown(self):
+        """Review of sd:9923: a lost read-back after the PUT read as failed, so the lead merged alone."""
+        tip = self.joined_tip()
+        remote = sys.modules["sd_ship_remote"]
+        real = remote.GitHub.pull
+
+        def pull(api, number):
+            if any(call.method == "PUT" for call in self.remote.calls):
+                raise remote.Refusal("read-back lost")
+            return real(api, number)
+        with patch.object(remote.GitHub, "pull", pull):
+            landed, _ = self.landed_by_lane(tip)
+        self.assertEqual(landed["status"], "unknown")
+        self.assertEqual(self.remote.pull(1).state, "MERGED")  # GitHub took the PUT
+
     def test_land_train_whose_gate_fails_opens_no_pull_request(self):
         tip = self.joined_tip()
         landed, _ = self.landed_by_lane(tip, gate="failure")
