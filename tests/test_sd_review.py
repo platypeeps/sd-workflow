@@ -2035,7 +2035,7 @@ class ScopeProvidersOverASkipTier(unittest.TestCase):
 
     def test_planning_scope_asks_a_provider_even_at_tier_skip(self) -> None:
         self.assertEqual(
-            sd_review.review_depth(self.skip, challenge=False, scope="planning"), 2,
+            sd_review.review_depth(self.skip, challenge=False, scope="planning"), 1,
             "scope=planning earned no reviewer at tier skip. Either `review_depth`"
             " stopped honouring FLOOR_SCOPES, or `planning` left it -- and"
             " `sd-plan` gates `planning -> ready` on a lane that now asks nobody.")
@@ -2044,7 +2044,7 @@ class ScopeProvidersOverASkipTier(unittest.TestCase):
         """The same seam, reached by the other role that uses it."""
 
         self.assertEqual(
-            sd_review.review_depth(self.skip, challenge=True, scope="worktree"), 2)  # both readers (sd:7519)
+            sd_review.review_depth(self.skip, challenge=True, scope="worktree"), 1)  # one reader (operator 2026-11-23)
 
     def test_an_ordinary_scope_at_tier_skip_asks_nobody(self) -> None:
         """The control. Without it the two above pass on a floor that is never
@@ -2164,6 +2164,7 @@ class TimingPlanTests(ReviewFixture):
         return root, args, report
 
     def test_all_fallbacks_receive_an_allowance_without_changing_depth(self):
+        self.one_reader_per_tier(2)  # the allowance for a two-reader chain; the shipped depth is 1
         root, args, planned = self.planned()
         self.assertEqual(planned["requested_reviews"], 2)  # sd:7519
         self.assertEqual(planned["fallback_candidates"], ["p2", "p3"])
