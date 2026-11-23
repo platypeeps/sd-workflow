@@ -14,6 +14,7 @@ take the real split names, which is the only way into the split path.
 
 from __future__ import annotations
 
+import json
 import os
 import pathlib
 import re
@@ -231,6 +232,36 @@ class SplitModuleFixtures(unittest.TestCase):
                 result = self.run_harness(workers=None, environment=environment)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f"test runner: workers={workers} ", result.stdout)
+
+    def test_local_workers_read_sd_gate_workers(self) -> None:
+        """sd:9925: a set `sd.gate_workers` overrides the slot rule; a bad value warns and keeps it; CI and
+        TEST_WORKERS win. Build review round 7: unset keeps the slot rule, so eight gates on 16 cores stay at 16."""
+        (self.root / "bin").mkdir()
+        shutil.copy2(REPO_ROOT / "bin/sd_gate_slots.py", self.root / "bin/sd_gate_slots.py")
+        config = self.root / "config/sd-ai-command-pack/config.json"
+        config.parent.mkdir(parents=True)
+        capped = {"FIXTURE_CORES": "16", "SD_GATE_POOL_SIZE": "8", "SD_GATE_SLOTS": "0"}
+        for value, workers, environment in ((None, "2", capped), ("3", "3", {}), ("12", "12", capped),
+                                            ("0", "2", capped), ("many", "2", {}), ("3", "4", {"CI": "1"}),
+                                            ("3", "2", {"TEST_WORKERS": "2"})):
+            config.write_text(json.dumps({"config": {"sd": {} if value is None else {"gate_workers": value}}}))
+            with self.subTest(value=value, environment=environment):
+                environment = dict(environment)
+                result = self.run_harness(workers=environment.pop("TEST_WORKERS", None),
+                                          environment={"XDG_CONFIG_HOME": str(self.root / "config"), **environment})
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn(f"test runner: workers={workers} ", result.stdout)
+                if value in ("0", "many"):
+                    self.assertIn("sd.gate_workers", result.stderr)
+
+    def test_a_failing_worker_helper_keeps_the_slot_rule(self) -> None:
+        """Build review round 7: the helper failing reads the slot rule, not a fixed count."""
+        (self.root / "bin").mkdir()
+        (self.root / "bin/sd_gate_slots.py").write_text("raise SystemExit(1)\n")
+        result = self.run_harness(workers=None, environment={"FIXTURE_CORES": "16", "SD_GATE_POOL_SIZE": "8",
+                                                             "SD_GATE_SLOTS": "0"})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("test runner: workers=2 ", result.stdout)
 
     def test_shards_skip_the_xcrun_trampoline_for_the_git_it_would_start(self) -> None:
         """sd:3179. `/usr/bin/git` starts xcrun, then the git xcrun names; shards start that git directly.
