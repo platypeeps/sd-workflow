@@ -296,7 +296,7 @@ def busy_since(ticks: tuple[int, int], row: tuple[float, int, int]) -> float | N
     return 1.0 - idle / total
 
 
-def steady_busy(where: pathlib.Path, now: float) -> float | None:
+def steady_busy(where: pathlib.Path, now: float, *, record: bool = True) -> float | None:
     """The busy share a load limit counts, read from the CPU tick rows under `where` without waiting (sd:9946).
 
     The higher of two averages up to the ticks now: since the newest row at least `CPU_SMOOTH_SECONDS`
@@ -304,17 +304,19 @@ def steady_busy(where: pathlib.Path, now: float) -> float | None:
     `CPU_SAMPLE_SECONDS` old, so a burst in the last seconds counts. None, so the load counts in full,
     while the ticks are unread, no row is old enough, or the ticks fell (a reboot). Every process that
     reads the load adds a row, under a lock on their file; a bad row or the clock set back counts as none.
+    With `record` false (`sd today`, `sd-status`: read-only) it reads the rows that exist and writes nothing.
     """
     ticks = cpu_ticks()
     try:
-        where.mkdir(parents=True, exist_ok=True)
-        fd = os.open(where / CPU_HISTORY, os.O_RDWR | os.O_CREAT, 0o644)
+        if record:
+            where.mkdir(parents=True, exist_ok=True)
+        fd = os.open(where / CPU_HISTORY, os.O_RDWR | os.O_CREAT if record else os.O_RDONLY, 0o644)
     except OSError:
         return None
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        fcntl.flock(fd, fcntl.LOCK_EX if record else fcntl.LOCK_SH)
         rows = busy_rows(os.pread(fd, os.fstat(fd).st_size, 0), now)
-        if ticks is not None and (not rows or now - rows[-1][0] >= CPU_ROW_SECONDS):
+        if record and ticks is not None and (not rows or now - rows[-1][0] >= CPU_ROW_SECONDS):
             os.ftruncate(fd, 0)
             os.pwrite(fd, json.dumps([list(row) for row in [*rows, (now, *ticks)]]).encode("utf-8"), 0)
     except OSError:
@@ -1056,7 +1058,7 @@ def held_by(queue: Queue) -> str:
                    + (f" in {entry['cwd']}" if entry["cwd"] else "") for entry in holders)
 
 
-def snapshot(where: pathlib.Path, slots: int, rule: LoadRule, *,
+def snapshot(where: pathlib.Path, slots: int, rule: LoadRule, *, record: bool = True,
              loadavg: Callable[[], Sequence[float]] = os.getloadavg, wall: Callable[[], float] = time.time) -> dict:
     """Who holds a slot (`read_holders`), who waits and in which place, the lane gates among them (sd:5078),
     and the load rule; read under `queue.lock`."""
@@ -1077,7 +1079,8 @@ def snapshot(where: pathlib.Path, slots: int, rule: LoadRule, *,
         load = [round(float(value), 2) for value in tuple(loadavg())[:3]]
     except OSError:
         load = []
-    share = steady_busy(where, wall())  # creates `where`: status alone must build CPU rows
+    # `sd gate status` creates `where` and adds a CPU row; `sd today` and `sd-status` only read.
+    share = steady_busy(where, wall(), record=record)
     last = state.get("last_admitted")
     return {"directory": str(where), "slots": slots, "holders": holders, "waiters": waiters, "lane_gates": lanes,
             "load": load, "cpu_busy": None if share is None else round(share, 3),
@@ -1095,7 +1098,7 @@ def machine_snapshot(environ: Mapping[str, str]) -> dict | str:
         settings = machine_settings(environ)
         slots, _ = configured(environ, settings["gate_slots"])
         rule = load_rule(environ, settings["gate_load_max"], settings["gate_settle_seconds"])
-        return snapshot(directory(environ), slots, rule)
+        return snapshot(directory(environ), slots, rule, record=False)
     except (OSError, ValueError) as error:
         return str(error)
 
