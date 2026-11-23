@@ -1708,7 +1708,10 @@ class Supervisor:
         for start in range(min(line, len(lines)) - 1, -1, -1):
             if names := defined_names(lines[start]):
                 depth = len(lines[start]) - len(lines[start].lstrip())
+                # A line that opens with `)` or `]` closes a bracket (a signature split over lines), not the
+                # function. ponytail: a multiline string's column-0 text still ends it; a parser if that costs.
                 end = next((index for index in range(start + 1, len(lines)) if lines[index].strip()
+                            and not lines[index].lstrip().startswith((")", "]"))
                             and len(lines[index]) - len(lines[index].lstrip()) <= depth), len(lines))
                 if line <= end:
                     return names, lines[start:end]

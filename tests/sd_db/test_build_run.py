@@ -1715,6 +1715,29 @@ class Supervise(Case):
                                     callees=True)
         self.assertEqual(kept["blockers"], [callee], "a callee the changed code calls by alias was deferred")
 
+    def test_a_multiline_signature_does_not_end_the_function(self):
+        """Review of sd:9769: a Python signature split over lines closes with `):` at the definition's own
+        indent; the function runs on past it, so `value = lookup(item)` above `return value.name` counts."""
+        self.press()
+        head = "a" * 40
+        body = "def show(\n    item,\n):\n    value = lookup(item)\n    return value.name\n"
+
+        def show(argv, **_kwargs):
+            if "show" in argv and argv[-1] == f"{head}:lib/consume.py":
+                return body
+            raise build_run.Unread("no such file")
+
+        supervisor = self.supervisor()
+        with mock.patch.object(build_run, "_read", side_effect=show):
+            names, lines = supervisor.scope("lib/consume.py", 5, head, {})
+        self.assertEqual((names, lines[-1]), ({"show"}, "    return value.name"),
+                         "a multiline signature ended the function at its closing line")
+        row = {"path": "lib/consume.py", "line": 5, "summary": "a missing item crashes here"}
+        with mock.patch.object(build_run, "_read", side_effect=show), \
+                mock.patch.object(build_run, "_grep", return_value=""):
+            _, kept = self.deferred([row], {"lib/store.py": {3}}, {"lookup", "key"}, {"lookup"}, callees=True)
+        self.assertEqual(kept["blockers"], [row], "a consumer with a multiline signature was deferred")
+
     def test_a_short_function_name_still_names_the_changed_caller(self):
         """Review of sd:9769: `go()` names a changed function; no length filter drops it."""
         self.press()
