@@ -540,6 +540,8 @@ The first two readers on the reviewer order run at once: with the shipped order,
 A reader that fails gives its slot to the next entry; the receipt keeps the registry order.
 Claude's reader also gets the ranked addition: trace callers and config readers, rank by production impact.
 Skip requires none; planning, lensed and challenged reviews keep a floor of two, so a research brief gets both.
+A fix verification that holds a prior blocker (`--verify-report`) asks one: the order's first eligible reader (sd:10127).
+The next reader takes it only when the first is capped, metered out, unready or gives no answer.
 Tier selection still follows repository policy; the tier never adds a third reader.
 Complete local review before any Copilot request; [Standing authorization](#standing-authorization) holds the policy.
 A completed Copilot review must cover the merge head, or an ancestor whose diff to it touches only skippable `docs/` paths.

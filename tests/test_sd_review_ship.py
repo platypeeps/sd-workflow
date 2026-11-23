@@ -59,6 +59,73 @@ class FixReviewTests(ReviewFixture):
         self.assertIn("the_original_defect = True", handed)
         self.assertTrue(result["verification_report_digest"])
 
+    def held_blocker_report(self):
+        """A full pass with a blocker, saved, and a fix commit on top."""
+        root, first = self.branch()
+        blocking = json.dumps({"findings": [{"path": "src.py", "line": 1, "summary": "held defect",
+                                            "family": "correctness", "severity": "high", "instances": ["src.py:1"]}]})
+        prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": sd_review.Completed(0, blocking, "")}),
+                                 self.environment(), self.chatgpt_home())
+        self.assertEqual(prior["status"], "blocking")
+        self.assertEqual(prior["providers"], ["codex", "second"], "a full branch pass keeps both readers")
+        report = self.tmp / "prior.json"
+        report.write_text(json.dumps(prior))
+        self.commit(root, "src.py", "the_original_defect = False\n")
+        return root, first, report
+
+    @staticmethod
+    def programs(runner):
+        return {os.path.basename(call["argv"][0]) for call in runner.calls}
+
+    def test_a_verify_round_with_a_held_blocker_asks_codex_alone(self):
+        """sd:10127: rounds 2-4 verify with one reader, the chain's first."""
+        root, first, report = self.held_blocker_report()
+        runner = FakeRunner()
+        result = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)),
+                                  runner, self.environment(), self.chatgpt_home())
+        self.assertEqual(result["providers"], ["codex"])
+        self.assertEqual(result["reviewed_by"], ["codex"])
+        self.assertEqual((result["status"], result["requested_reviews"], result["review_shortfall"]), ("clean", 1, None))
+        self.assertEqual(result["fallback_candidates"], ["second"])
+        self.assertTrue(result["covers_from"], "a one-reader verify pass is a full one: it extends the chain")
+        self.assertNotIn("second", self.programs(runner), "the second reader ran beside the first")
+        self.assertIn("codex", self.programs(runner))
+
+    def test_a_full_pass_and_a_challenged_verify_round_keep_both_readers(self):
+        """sd:10127: only a plain verify round drops to one; a resumed full pass holds its blocker at two."""
+        root, first, report = self.held_blocker_report()  # asserts round 1's two readers
+        resumed = sd_review.review(root, namespace(scope="branch", resume_report=str(report)), FakeRunner(),
+                                   self.environment(), self.chatgpt_home())
+        self.assertEqual(resumed["providers"], ["codex", "second"])
+        challenged = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report), challenge=True),
+                                      FakeRunner(), self.environment(), self.chatgpt_home())
+        self.assertEqual(challenged["providers"], ["codex", "second"])
+
+    def test_a_verify_round_falls_back_when_codex_is_unready(self):
+        """sd:10127: an unready codex hands the one verify read to the next reader."""
+        root, first, report = self.held_blocker_report()
+        path = self.registry_home / ".local/share/sd/providers.yaml"  # second needs no codex auth
+        path.write_text(path.read_text().replace(
+            "roles: [author, reviewer], reader: codex-json", "roles: [author, reviewer], reader: claude-json"))
+        runner = FakeRunner({"second": sd_review.Completed(0, json.dumps({"type": "result", "subtype": "success",
+                                                                         "structured_output": {"findings": []}}), "")})
+        result = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)),
+                                  runner, self.environment(), self.tmp / "missing-auth")
+        self.assertEqual(result["reviewed_by"], ["second"])
+        self.assertEqual((result["status"], result["requested_reviews"]), ("clean", 1))
+        self.assertEqual(self.programs(runner) & {"codex", "second"}, {"second"}, "an unready codex started")
+
+    def test_a_verify_round_passes_over_a_capped_or_metered_codex(self):
+        """sd:10127: a capped or metered bill leaves the chain, so the one read goes to the next reader, in full."""
+        root, first, report = self.held_blocker_report()
+        runner = FakeRunner()
+        with patch.object(sd_review, "capped_bills", return_value={"first": "its window reads zero"}):
+            result = sd_review.review(root, namespace(scope="branch", base=first, verify_report=str(report)),
+                                      runner, self.environment(), self.chatgpt_home())
+        self.assertEqual((result["providers"], result["reviewed_by"]), (["second"], ["second"]))
+        self.assertIsNone(result["review_shortfall"], "one asked, one eligible: the round is not short")
+        self.assertTrue(result["covers_from"])
+
     def test_a_grouped_blocker_hands_the_reviewer_every_instance_file(self):
         """Lead ruling on sd:9769 (15:20 MST): a fix to the primary file alone must not clear a blocker whose
         second instance sits in another file; the verifier gets each listed file's current source and is told

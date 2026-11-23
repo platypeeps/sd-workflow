@@ -82,6 +82,8 @@ Reviewing tiers ask two independent local reviews: the first two entries on the 
 With one eligible reader, the review asks one, and `review_shortfall` and a `shortfall` line say so.
 The `claude-json` reader's prompt adds the ranked instruction: trace callers and config readers, findings in production-impact order.
 Skip requires none, subject to the planning, lens and challenge floor of two.
+A `--verify-report` run that holds a prior blocker asks one: the order's first eligible reader.
+The next reader takes it only when that one is capped, metered out, unready or gives no answer.
 Enabled reviewers outside the order `sd providers list` shows require explicit `--provider NAME` selection and the same eligibility checks.
 Copilot never fills the local slot.
 Shipping may request it afterward through the configured `deep` tier or explicit task direction.

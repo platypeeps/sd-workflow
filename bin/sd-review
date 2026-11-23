@@ -1986,12 +1986,12 @@ def run_check(root: pathlib.Path, runner: Runner, env: Mapping[str, str], timeou
 FLOOR_SCOPES = ("planning",)
 
 
-def review_depth(plan: sd_route.Plan, challenge: bool, scope: str, previous: dict[str, Any] | None = None) -> int:
-    """How many reviewers this run takes off the chain; a prior blocker is verified at any tier (pack sd:9769)."""
+def review_depth(plan: sd_route.Plan, challenge: bool, scope: str, previous: dict[str, Any] | None = None, verify: bool = False) -> int:
+    """How many reviewers this run takes off the chain; a prior blocker is verified at any tier (pack sd:9769), by one reader on a verify round (sd:10127)."""
     held = any(row.get("disposition") == "blocking" for row in (previous or {}).get("findings") or [])
-    if challenge or held or scope in FLOOR_SCOPES:
+    if challenge or (held and not verify) or scope in FLOOR_SCOPES:
         return max(plan.depth, sd_route.DEFAULT_DEPTH)
-    return plan.depth
+    return 1 if held else plan.depth
 
 
 #: The vendor's two windows, in the minutes `sd_db.meter.sample` keys a row
@@ -2261,7 +2261,7 @@ def review(
     # month's total; a fault names itself the same way on every capped bill.
     ledger = open_ledger(env, getattr(args, "database", None), registry)
     # A lens, like the challenge stance, is a request to be read: docs_skip does not answer it.
-    asked = 1 if args.provider else review_depth(plan, args.challenge or bool(getattr(args, "lens", None)), args.scope, previous)
+    asked = 1 if args.provider else review_depth(plan, args.challenge or bool(getattr(args, "lens", None)), args.scope, previous, bool(verify))
     meter_candidates, selection_refusal = ([], "") if not asked else sd_review_readiness.select_ready_candidates(
         registry, args.provider, explain=args.explain, consent=consent, readers=READERS,
     )
