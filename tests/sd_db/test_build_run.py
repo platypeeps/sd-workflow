@@ -1805,6 +1805,20 @@ class Supervise(Case):
         self.assertEqual(self.edges(files, rows, {"lib/dispatch.py": {2}}, {"dispatch", "key"}, {"export"}), rows,
                          "a handler the changed dispatcher reaches through a table was deferred")
 
+    def test_a_table_filled_by_mutation_is_an_edge(self):
+        """Class pass, review of sd:9769: `HANDLERS["a"] = handler_a` or `HANDLERS.update(...)` fills the table
+        `HANDLERS[key]()` reads; both walks follow the statement that mutates it, as one that binds it."""
+        self.press()
+        files = {"lib/table.py": "HANDLERS = {}\nHANDLERS[\"a\"] = handler_a\nHANDLERS.update({\"b\": handler_b})\n",
+                 "lib/handlers.py": "def handler_b():\n    return lookup()\n",
+                 "lib/dispatch.py": "def dispatch(key):\n    return HANDLERS[key]().name\n"}
+        down = [{"path": "lib/dispatch.py", "line": 2, "summary": "a missing result crashes here"}]
+        self.assertEqual(self.edges(files, down, {"lib/handlers.py": {3}}, {"handler_a"}, {"handler_a"}), down,
+                         "a dispatcher reaching the changed handler through a mutated table was deferred")
+        up = [{"path": "lib/handlers.py", "line": 2, "summary": "an empty value crashes here"}]
+        self.assertEqual(self.edges(files, up, {"lib/dispatch.py": {2}}, {"dispatch", "key"}, {"export"}), up,
+                         "a handler the changed dispatcher reaches through a mutated table was deferred")
+
     def test_a_short_function_name_still_names_the_changed_caller(self):
         """Review of sd:9769: `go()` names a changed function; no length filter drops it."""
         self.press()

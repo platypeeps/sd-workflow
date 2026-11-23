@@ -579,10 +579,15 @@ def aliases(text: str) -> set[tuple[str, str]]:
 
 def bound_names(line: str) -> set[str]:
     """The names an assignment at the start of `line` binds: `x = ...`, `a, b = ...`, `x: T = ...`,
-    `const x = ...`, `x := ...` (pack sd:9769)."""
+    `const x = ...`, `x := ...`, or the name a statement mutates: `x[k] = ...`, `x.update(...)` (pack
+    sd:9769). ponytail: any `x.` or `x[` start counts, so a read (`x.get(k)`) binds more, never fewer."""
     found = re.match(r"\s*(?:export\s+)?(?:(?:const|let|var)\s+)?([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)"
                      r"\s*(?::[^=]*)?:?=(?!=)", line)
-    return set(re.findall(r"[A-Za-z_]\w*", found[1])) if found else set()
+    if found:
+        return set(re.findall(r"[A-Za-z_]\w*", found[1]))
+    # A statement that mutates a name binds what it adds: `HANDLERS["a"] = h`, `HANDLERS.update(...)`.
+    mutated = re.match(r"\s*([A-Za-z_]\w*)\s*[.[]", line)
+    return {mutated[1]} if mutated else set()
 
 
 def statement(lines: list[str], index: int) -> list[str]:
@@ -1690,12 +1695,13 @@ class Supervisor:
         return True
 
     def definitions(self, name: str, head: str) -> list[tuple[str, int, str]] | None:
-        """`naming`, for the lines that may define `name` only: a keyword form, a `name(...) {` method or an
-        assignment, so a common name (`self`) is not a search past its bounds (pack sd:9769)."""
+        """`naming`, for the lines that may define `name` only: a keyword form, a `name(...) {` method, an
+        assignment or a statement that mutates it, so a common name (`self`) is not a search past its bounds (pack sd:9769)."""
         return self.naming(name, head, [
             rf"(def|function|func|fn|class|sub|proc|struct|interface|type|module|trait|enum)[[:space:]]+\*?[[:space:]]*{name}([^[:alnum:]_]|$)",
             rf"(^|[^[:alnum:]_.]){name}[[:space:]]*\([^()]*\)[[:space:]]*\{{",
-            rf"(^|[^[:alnum:]_.]){name}[[:space:]]*([,:][^=]*)?=([^=]|$)"])
+            rf"(^|[^[:alnum:]_.]){name}[[:space:]]*([,:][^=]*)?=([^=]|$)",
+            rf"^[[:space:]]*{name}[[:space:]]*[.[]"])
 
     def naming(self, name: str, head: str, patterns: list[str] | None = None) -> list[tuple[str, int, str]] | None:
         """Each `(path, line, text)` at `head` that names `name` as a whole word, or matches one of the
