@@ -215,6 +215,15 @@ class TheHook(HookFixture):
         self.assertIn("commit-msg: refused, line 3 is 73 characters (limit 72)", result.stderr)
         self.assertEqual(0, self.commits(), "a commit landed")
 
+    def test_a_verbose_commit_is_measured_above_the_scissors_only(self):
+        """`git commit -v` appends the diff below a scissors line, and git drops it after the hook runs."""
+        (self.root / "wide.txt").write_text("w" * 90 + "\n", encoding="utf-8")
+        git("add", "wide.txt", cwd=self.root)
+        result = subprocess.run(["git", "commit", "-q", "-v", "-e", "-m", "fix: a subject"], cwd=self.root,
+                                env=clean_environment(GIT_EDITOR="true"), capture_output=True, text=True,
+                                check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_a_long_bare_url_or_fenced_line_still_commits(self):
         url = "https://example.test/" + "a" * 80
         result = self.commit(f"fix: a subject\n\n{url}\n\n```\n{'y' * 90}\n```\n")

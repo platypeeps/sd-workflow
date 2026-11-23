@@ -58,15 +58,17 @@ def main(argv: list[str]) -> int:
     sys.path.insert(0, str(pack_bin))
     try:
         import sd_lib
+        import sd_ship_body
     except Exception as error:  # the hook must name why it could not read, not crash
-        print(f"commit-msg: unchecked, cannot import {pack_bin / 'sd_lib.py'}: {error}",
+        print(f"commit-msg: unchecked, cannot import from {pack_bin}: {error}",
               file=sys.stderr)
         return 1
     message = message_file.read_text(encoding="utf-8", errors="replace")
     # pack sd:10212: the lane refuses a line over the limit at enqueue, after a full review; refuse it here.
-    # Lines git strips as comments are left out, so a line number counts the message git keeps.
-    import sd_ship_body
-    kept = "\n".join(line for line in message.split("\n") if not line.startswith("#"))
+    # Git drops comment lines and a verbose commit's diff below the scissors after this hook runs,
+    # so both are left out and a line number counts the message git keeps.
+    above = message.split("\n# " + "-" * 24 + " >8 " + "-" * 24 + "\n", 1)[0]
+    kept = "\n".join(line for line in above.split("\n") if not line.startswith("#"))
     long = sd_ship_body.long_lines(kept)
     if long:
         for number, length in long:
