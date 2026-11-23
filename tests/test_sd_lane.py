@@ -2129,6 +2129,61 @@ class TrainLanding(Trees):
             self.answers[(2, "join")] = {"ok": True, "phase": "train_joined", "train_commit": "9" * 40}
         self.assert_gate_change_lands_nothing(move_second, "sd:2")
 
+    def test_a_lane_moved_during_the_train_gate_lands_nothing(self) -> None:
+        """Review of sd:9923: the last renewal before the train merge checked the token, not the lane host."""
+        def move() -> None:
+            import sd_db
+            connection = sd_db.connect(home=self.tmp)
+            try:
+                sd_db.upsert_repo(connection, self.store().repository, remote="https://github.com/example/pack.git",
+                                  managed=1)
+                connection.execute("UPDATE repo SET lane_host = ?", ("build-2",))
+            finally:
+                connection.close()
+        self.during_gate = move
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertEqual(self.landed[0][3], [1, 2, 3])
+        self.assertEqual(self.merges(), [])  # no lone merge and no reconcile from the old host
+        lead = self.entries()[0]
+        self.assertEqual((lead["status"], lead["moved_off"]["host"]), ("pending", sd_lane.this_host()))
+
+    def lead_step(self) -> tuple[str, str]:
+        """The claimed entry's step now, and what a reclaim after a kill here makes of it."""
+        lead = self.entries()[0]
+        return str(lead.get("step")), sd_lane.reclaim(json.loads(json.dumps(lead)))["status"]
+
+    def test_a_kill_during_a_later_members_prepare_puts_the_claimed_entry_back(self) -> None:
+        """Review of sd:9923: the claimed entry was at `step: merge` all through the train, so a kill failed it."""
+        seen: list[tuple[str, str]] = []
+
+        def ship(argv: list[str], log: pathlib.Path) -> dict:
+            if argv[2] == "prepare" and argv[argv.index("--item") + 1] == "2" and not seen:
+                seen.append(self.lead_step())
+            return self.ship(argv, log)
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, ship, self.gate)
+        self.assertEqual(seen, [("prepare", "pending")])
+
+    def test_a_kill_after_the_train_merge_puts_the_claimed_entry_back_to_reconcile(self) -> None:
+        """Review of sd:9923: a kill once the train PR merged failed the claimed entry, so it never reconciled."""
+        seen: list[tuple[str, str]] = []
+        self.during_gate = lambda: None
+        real = self.land
+
+        def land(root: pathlib.Path, tip: str, base: str, items: list[int],
+                 ready: Callable[[], str | None] = lambda: None) -> dict:
+            def then() -> str | None:
+                why = ready()
+                seen.append(self.lead_step())  # the PUT goes out after this
+                return why
+            return real(root, tip, base, items, then)
+        with mock.patch.object(sd_lane, "land_train", land):
+            self.queue_three()
+            sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertEqual(seen, [("train", "pending")])
+        self.assertEqual(self.entries()[0]["status"], "merged")
+
     def test_a_member_cancelled_during_the_train_lands_nothing(self) -> None:
         def cancel_second() -> None:
             sd_lane.update(self.store(), lambda rows: rows[1].update(status="cancelled"))
