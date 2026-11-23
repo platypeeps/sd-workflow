@@ -141,6 +141,10 @@ CORE_CONFIG = {
                    "description": "How many gates (sd-check runs, sd gate run, the pack's make test) may run at once on this "
                                   "machine; 0 is no cap. Unset reads a quarter of the cores; SD_GATE_SLOTS overrides it "
                                   "for one run."},
+    "gate_workers": {"pattern": "[1-9][0-9]?",
+                     "description": "How many test workers one local run of the pack's tests starts, 1 to 99, "
+                                    "over the slot rule. Unset reads the cores over the gate cap (sd:9925); "
+                                    "TEST_WORKERS overrides it for one run. It grants nothing."},
     "gate_load_max": {"pattern": r"[0-9]+(\.[0-9]+)?",
                       "description": "The gate queue starts a gate only while load1 is below this; 0 is no load "
                                      "condition. Unset is none; SD_GATE_LOAD_MAX overrides it for one run."},
@@ -148,6 +152,10 @@ CORE_CONFIG = {
                    "description": "How many items one build bundle takes when this machine claims it, a mechanical "
                                   "item half of one; the claim gives a child 120 minutes per 3 slots it took, never less. "
                                   "Unset reads 3. It grants nothing."},
+    "build_model": {"pattern": r"[a-z][a-z0-9.-]{0,63}",
+                    "description": "The model every build bundle this machine claims runs its builder on, as the "
+                                   "builder's --model takes it (opus, sonnet, fable or a model id). Unset runs opus, "
+                                   "and sonnet for an all-mechanical bundle (sd:9942). It grants nothing."},
     "machine_cap": {"pattern": "[1-9]|1[0-6]",
                     "description": "How many code-writing builders, drafts and interactive builders may run at once "
                                    "on this machine, 1 to 16. Unset reads 6 (sd:9891); the load guard still holds "

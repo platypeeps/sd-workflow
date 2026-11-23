@@ -270,6 +270,20 @@ class Claim(Case):
         build.queue(self.db, [self.item(fields={"work_kind": "mechanical"})], who="operator")
         self.assertEqual(self.claim()["model"], "sonnet")
 
+    def test_a_build_model_setting_picks_every_bundles_model(self):
+        """sd:9942: a machine's sd.build_model runs its builders on that model, mechanical bundles too."""
+        folder = self.root / "config" / "sd-ai-command-pack"
+        folder.mkdir(parents=True, exist_ok=True)
+        config = folder / "config.json"
+        config.write_text(json.dumps({"config": {"sd": {"build_model": "fable"}}}))
+        build.queue(self.db, [self.item()], who="operator")
+        self.assertEqual(self.claim()["model"], "fable")
+        build.queue(self.db, [self.item(repo=B, fields={"work_kind": "mechanical"})], who="operator")
+        self.assertEqual(self.claim()["model"], "fable")
+        for bad in ("", "Opus", "opus --dangerously", "x" * 65, 3):
+            config.write_text(json.dumps({"config": {"sd": {"build_model": bad}}}))
+            self.assertIsNone(build.build_model(), f"{bad!r} reads as unset")
+
     def test_a_bundle_takes_at_most_three_and_the_best_repository_first(self):
         build.queue(self.db, [self.item(repo=B, priority=3)], who="operator")
         build.queue(self.db, [self.item(priority=2) for _ in range(4)], who="operator")
@@ -996,6 +1010,235 @@ class Reap(Case):
         with self.assertRaisesRegex(build.BuildRefused, "Retry refused: run .* has no blocked member|"
                                                         "has queued assignment"):
             build.queue_again(self.db, [self.items[0]], who="operator")
+
+    def test_build_by_item_retries_its_blocked_bundle_over_a_newer_cancelled_build(self):
+        """sd:9788: a member blocked in its bundle got a newer fresh build, cancelled before it ran; `sd assignments
+        build` of the item revived the cancelled one, and the blocked bundle's Retry refused ('has a newer build').
+        The blocked bundle, whose branch holds the item's work, is the one queued again, under its lead."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        old = sorted(member["id"] for member in build.run(self.db, row["id"])["members"])
+        transition(self.db, self.items[1], "ready", who="operator")
+        newer = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (newer,))  # before its claim
+        queued = build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual(sorted(entry["id"] for entry in queued), old)
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", newer), "cancelled")
+        self.assertEqual(self.claim()["assignment"], self.bundle["assignment"])
+
+    def test_build_by_item_builds_fresh_an_item_moved_away_from_its_bundles_repository(self):
+        """Review round 14 of sd:9788: the item moved to another repository after its bundle blocked, and a fresh
+        press there was cancelled before it ran. Build read the old bundle, whose branch is in the old repository;
+        the claim refused it, and every later press read it again. Build presses fresh in the new repository."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        old = {member["id"] for member in build.run(self.db, row["id"])["members"]}
+        self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (B, self.items[1]))
+        transition(self.db, self.items[1], "ready", who="operator")
+        newer = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (newer,))  # before its claim
+        queued = build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual(len(queued), 1)
+        self.assertNotIn(queued[0]["id"], old, "a fresh press, not Retry of the old repository's bundle")
+
+    def test_build_by_item_builds_fresh_when_its_bundles_lead_moved_to_another_repository(self):
+        """Class pass, review round 15 of sd:9788: Build of member B read its older bundle past B's cancelled press,
+        checking B's repository alone; the lead's item had moved away, so the claim refused the lead for its repository
+        and B for its lead, and every later Build of B did the same. Every member must be in the work's repository."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        old = {member["id"] for member in build.run(self.db, row["id"])["members"]}
+        self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (B, self.items[0]))
+        transition(self.db, self.items[1], "ready", who="operator")
+        newer = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (newer,))  # before its claim
+        queued = build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual(len(queued), 1)
+        self.assertNotIn(queued[0]["id"], old, "a fresh press, not Retry of a bundle the claim refuses")
+
+    def test_build_by_item_resumes_a_newer_cancelled_bundle_that_ran(self):
+        """Review round 2 of sd:9788: bundle A ends blocked; its item X builds fresh as bundle B, which the operator
+        cancels mid-build. A cancelled bundle that ran keeps its worktree, so Build of X is Retry of B, not of A,
+        which would drop B's newer work on X."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        transition(self.db, self.items[1], "ready", who="operator")
+        newer = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        build.end(self.db, self.claim()["id"], "cancelled", "the operator cancelled it")
+        queued = build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual([entry["id"] for entry in queued], [newer])
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", self.bundle["assignment"]),
+                         "blocked")
+
+    def test_build_by_item_resumes_the_newest_bundle_that_ran_past_a_cancel_that_never_ran(self):
+        """Review round 3 of sd:9788: bundle A ends blocked; item X builds as bundle B, cancelled after it ran; a
+        third build C of X is cancelled before it ran. Build of X skips C and resumes B, whose worktree is the
+        newest; A's Retry refuses, as B's cancel left newer work."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        transition(self.db, self.items[1], "ready", who="operator")
+        newer = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        build.end(self.db, self.claim()["id"], "cancelled", "the operator cancelled it")
+        third = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (third,))
+        with self.assertRaisesRegex(build.BuildRefused, f"has a newer build, assignment {third}|assignment {newer}"):
+            build.retry(self.db, self.bundle["assignment"], who="operator")
+        queued = build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual([entry["id"] for entry in queued], [newer])
+
+    def test_build_by_item_builds_fresh_when_its_bundle_has_a_member_a_newer_build_owns(self):
+        """Class pass, review round 7 of sd:9788: bundle A ends blocked; its first item gets a newer build that
+        ran, its second a newer build cancelled before its claim. Build of the second read A, whose Retry refused
+        on the first ('has a newer build'). Build reads only a bundle Retry can take: here a fresh build."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        transition(self.db, self.items[0], "ready", who="operator")
+        build.queue(self.db, [self.items[0]], who="operator")
+        build.end(self.db, self.claim()["id"], "cancelled", "the operator cancelled it")
+        transition(self.db, self.items[1], "ready", who="operator")
+        cancelled = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (cancelled,))
+        queued = build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [self.items[1]])
+        self.assertGreater(queued[0]["id"], cancelled, "a fresh build")
+
+    def test_build_by_item_retries_its_bundle_past_a_member_a_newer_build_delivered(self):
+        """Review of sd:9788: bundle A ends blocked; its second item is delivered by a newer build, its first gets
+        a newer build cancelled before its claim. Build of the first read the delivered member's newer build as
+        an owner and built fresh from main; Retry skips a done member, so A's Retry resumes the first item."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        transition(self.db, self.items[1], "ready", who="operator")
+        delivered = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'done', run_count = 1 WHERE id = ?", (delivered,))
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (self.items[1],))
+        transition(self.db, self.items[0], "ready", who="operator")
+        cancelled = build.queue(self.db, [self.items[0]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (cancelled,))
+        with self.subTest("a done sibling moved to another repository"):
+            self.db.execute("SAVEPOINT moved")
+            try:
+                self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (B, self.items[1]))
+                self.assertLess(build._retry_row(self.db, self.items[0])["id"], cancelled)
+            finally:
+                self.db.execute("ROLLBACK TO moved")
+                self.db.execute("RELEASE moved")
+        queued = build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertTrue(all(entry["id"] < cancelled for entry in queued), "Retry of the bundle, not a fresh build")
+        self.assertEqual(self.claim()["assignment"], self.bundle["assignment"])
+
+    def test_build_by_item_presses_the_lead_fresh_when_a_member_waits_on_outside_work(self):
+        """Class pass, last round of sd:9788: bundle A ends blocked after a run, a fresh build of its lead is
+        cancelled before its claim, then its other member gains an unfinished dependency. Build of the lead read A,
+        whose Retry refused the waiting member and rolled back, on every press. Build reads only a bundle Retry
+        queues (`_retry_takes`), so it presses the lead fresh, as before this branch."""
+        from sd_db.workflow import edit_item
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        old = {member["id"] for member in build.run(self.db, row["id"])["members"]}
+        transition(self.db, self.items[0], "ready", who="operator")
+        cancelled = build.queue(self.db, [self.items[0]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (cancelled,))
+        outside = self.item(status="planning")
+        edit_item(self.db, self.items[1], {"blocked_by": [outside]}, who="operator")
+        queued = build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [self.items[0]])
+        self.assertNotIn(queued[0]["id"], old, "a fresh press, not Retry of the bundle")
+
+    def _lead_pressed_and_cancelled(self):
+        """Bundle A ends blocked after a run; a fresh press of its lead is cancelled before its claim."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        transition(self.db, self.items[0], "ready", who="operator")
+        cancelled = build.queue(self.db, [self.items[0]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (cancelled,))
+        return cancelled
+
+    def test_build_by_item_resumes_the_lead_when_a_member_waits_on_it(self):
+        """sd:10022: a member of bundle A waits on its lead. Retry parks that member and resumes A's branch;
+        Build by item press-checked the member, read it as refused and pressed the lead fresh from main."""
+        from sd_db.workflow import edit_item
+        cancelled = self._lead_pressed_and_cancelled()
+        edit_item(self.db, self.items[1], {"blocked_by": [self.items[0]]}, who="operator")
+        queued = build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertEqual([entry["id"] for entry in queued], [self.bundle["assignment"]])
+        self.assertLess(queued[0]["id"], cancelled, "Retry of the bundle, not a fresh press")
+
+    def test_build_by_item_frees_a_member_the_lead_waits_on(self):
+        """sd:10022: bundle A's lead waits on its member. Retry frees the member to build on its own and keeps
+        A's branch for the lead; Build by item refused the bundle and pressed the waiting lead fresh."""
+        from sd_db.workflow import edit_item
+        self._lead_pressed_and_cancelled()
+        edit_item(self.db, self.items[0], {"blocked_by": [self.items[1]]}, who="operator")
+        queued = build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [self.items[1]])
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", self.bundle["assignment"]),
+                         "blocked")
+
+    def test_build_by_item_reads_no_bundle_whose_lead_is_done(self):
+        """Class pass, last round of sd:9788: Retry refuses a bundle whose lead's item is done. Bundle A ends
+        blocked, its lead is delivered by a newer build, and a fresh build of the member is cancelled before its
+        claim: `_retry_row`, which `split_held` and the Tasks page read too, chose A. It reads the newest row."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        transition(self.db, self.items[0], "ready", who="operator")
+        delivered = build.queue(self.db, [self.items[0]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'done', run_count = 1 WHERE id = ?", (delivered,))
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (self.items[0],))
+        transition(self.db, self.items[1], "ready", who="operator")
+        cancelled = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (cancelled,))
+        self.assertEqual(build._retry_row(self.db, self.items[1])["id"], cancelled)
+
+    def test_build_by_item_skips_a_blocked_build_that_never_ran(self):
+        """Review of sd:9788: a fresh build the claim refused never ran, then a newer one was cancelled before its
+        claim. Build of the item read the refused one, a fresh press from main; the bundle that ran, whose
+        worktree holds the item's work, is the one queued again."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        old = sorted(member["id"] for member in build.run(self.db, row["id"])["members"])
+        transition(self.db, self.items[1], "ready", who="operator")
+        refused = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'blocked', result = 'refused; not built' WHERE id = ?",
+                        (refused,))
+        cancelled = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (cancelled,))
+        queued = build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual(sorted(entry["id"] for entry in queued), old)
+        self.assertEqual(self.claim()["assignment"], self.bundle["assignment"])
+
+    def test_build_by_item_reads_the_held_split_of_the_bundle_it_chose(self):
+        """Review of sd:9788: Build read the held split on the item's newest build, a cancelled one, while it chose
+        the older blocked bundle, held after a subset Retry; that bundle's Retry refused and no fresh build ran.
+        The held bundle it chose sends the item to a fresh build on a new branch."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        lead = self.bundle["assignment"]
+        build.retry(self.db, lead, who="operator", only=[self.items[0]])
+        held = self.claim()
+        self.db.execute("UPDATE runner_run SET outcome = 'blocked', detail = ?, released_at = ? WHERE id = ?",
+                        (build.SPLIT + "its branch holds earlier work", build.clock(), held["id"]))
+        self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (build.clock(), held["id"]))
+        self.db.execute("UPDATE assignment SET status = 'blocked' WHERE id = ?", (lead,))
+        self.db.execute("UPDATE item SET status = 'blocked' WHERE id = ?", (self.items[0],))
+        self.assertEqual(build.split(self.db, lead), "held")
+        cancelled = build.queue(self.db, [self.items[0]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (cancelled,))
+        queued = build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [self.items[0]])
+        self.assertNotIn(queued[0]["id"], (lead, cancelled), "a fresh build")
 
     def test_build_with_a_finding_on_a_blocked_bundle_sends_it_to_the_builder(self):
         """pack sd:8792: `sd assignments build N --finding TEXT` is Send to builder: the finding note the builder
@@ -2559,6 +2802,337 @@ class Hosts(Case):
         run = self.claim(hosts=WORK)
         assert run is not None
         self.assertEqual(run["assignment"], rows[0], "the satellite claims it")
+
+    def test_pickup_leaves_a_beat_blocked_item_to_its_own_assignment(self):
+        """sd:9774: after a hub outage the hub blocked a satellite's queued build on its quiet beat; once the beat
+        was back, the satellite's auto-pickup queued the item fresh from main, and Retry of the old bundle
+        refused ('has a newer build'). Pickup leaves such an item: its own build queues again."""
+        item = self.item(repo=SAT)
+        lead = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", lead), "blocked")
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        build.set_pickup(self.db, True, now=Pickup.NOW)
+        with mock.patch.object(build, "lane_hosts", return_value=WORK):
+            self.assertNotIn(item, [row["id"] for row in build.eligible(self.db, now=Pickup.NOW)])
+            build.pickup(self.db, build.room(self.db, **IDLE, hosts=WORK), now=Pickup.NOW)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE item = ?", item), 1,
+                         "no fresh build supersedes the blocked one")
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.claim(hosts=WORK)["assignment"], lead, "the same assignment builds")
+
+    def test_a_drop_lead_blocked_before_its_first_claim_requeues_on_its_satellite(self):
+        """Review of sd:9775: a bundle drop queues its rows with `run_count` 1 and no run row behind it. Blocked
+        on the quiet beat before its first claim, recovery read it as stranded, so pickup built the item fresh
+        and skipped the branch the drop made. It ran nowhere else: its satellite requeues it."""
+        item = self.item(repo=SAT)
+        lead = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET run_count = 1 WHERE id = ?", (lead,))
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", lead), "blocked")
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        build.set_pickup(self.db, True, now=Pickup.NOW)
+        with mock.patch.object(build, "lane_hosts", return_value=WORK):
+            build.pickup(self.db, build.room(self.db, **IDLE, hosts=WORK), now=Pickup.NOW)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE item = ?", item), 1,
+                         "no fresh build supersedes the dropped lead")
+        self.assertEqual(self.claim(hosts=WORK)["assignment"], lead, "the same assignment builds")
+
+    def test_beat_recovery_leaves_a_bundle_whose_item_moved_away_from_its_work(self):
+        """Class pass, review round 15 of sd:9775: recovery queued a beat-blocked bundle whose member's item had
+        moved to another repository; the claim then refused it for the move, so recovery chose a row the claim does
+        not build. It reads the work's repository as the claim does, and leaves the bundle blocked."""
+        items = [self.item(repo=SAT), self.item(repo=SAT)]
+        build.queue(self.db, items, who="operator")
+        first = self.claim(hosts=WORK)
+        self.retried(first)
+        self.db.execute("UPDATE assignment SET status = 'queued' WHERE parent = ?", (first["assignment"],))
+        self.db.execute("UPDATE item SET status = 'ready' WHERE id = ?", (items[1],))
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        upsert_repo(self.db, SAT + "-other", remote="/fixture/remote-sat-other", managed=1)
+        self.db.execute("UPDATE repo SET lane_host = 'work' WHERE path = ?", (SAT + "-other",))
+        self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (SAT + "-other", items[1]))
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        build._requeue_beat_blocked(self.db, WORK)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE status = 'queued'"), 0,
+                         "no row the claim would refuse is queued")
+
+    def test_a_satellite_back_after_a_hub_outage_requeues_its_blocked_bundle_as_it_was(self):
+        """sd:9775: the hub was down, so the satellite's beat went stale and the hub blocked its retried bundle.
+        On its first tick back, before any hub tick, the satellite queues that bundle again and claims it under
+        its lead, worktree and all; its pickup takes no other item of the repository meanwhile."""
+        items = [self.item(repo=SAT), self.item(repo=SAT)]
+        build.queue(self.db, items, who="operator")
+        first = self.claim(hosts=WORK)
+        self.retried(first)
+        # Retry queues each member and readies its item, as `retried` does the lead's.
+        self.db.execute("UPDATE assignment SET status = 'queued' WHERE parent = ?", (first["assignment"],))
+        self.db.execute("UPDATE item SET status = 'ready' WHERE id = ?", (items[1],))
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE status = 'blocked'"), 2)
+        other = self.item(repo=SAT)
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        build.set_pickup(self.db, True, now=Pickup.NOW)
+        with mock.patch.object(build, "lane_hosts", return_value=WORK):
+            self.assertEqual(build.pickup(self.db, build.room(self.db, **IDLE, hosts=WORK), now=Pickup.NOW), [],
+                             "the requeued bundle goes first")
+        run = self.claim(hosts=WORK)
+        assert run is not None
+        self.assertEqual((run["assignment"], run["work_path"]), (first["assignment"], first["work_path"]))
+        self.assertEqual(sorted(member["item"] for member in run["members"]), sorted(items))
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE item = ?", other), 0)
+        self.assertIn("beat is fresh", self.count("SELECT body FROM note WHERE item = ? AND body LIKE ? "
+                                                  "ORDER BY id DESC LIMIT 1", items[0], "%queued again%"))
+
+    def test_a_satellite_takes_no_beat_blocked_retry_another_satellite_ran(self):
+        """Review of sd:9775: a satellite requeued a blocked retry whose lane had moved to it from another
+        satellite, and built it without the first satellite's worktree. It takes only the rows its own quiet
+        beat blocked."""
+        build.queue(self.db, [self.item(repo=SAT)], who="operator")
+        first = self.claim(hosts=WORK)
+        self.retried(first)
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.db.execute("UPDATE repo SET lane_host = 'other' WHERE path = ?", (SAT,))
+        record_state(self.db, "heartbeat", key="build-dispatch@other", body={})
+        self.assertIsNone(self.claim(hosts=frozenset({"other"})))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", first["assignment"]), "blocked")
+
+    def test_a_satellite_takes_a_beat_blocked_build_that_never_ran_after_its_lane_moved(self):
+        """Review round 2 of sd:9775: a fresh build blocked on one satellite's quiet beat, then its repository moved
+        to another. No host requeued it, and pickup skipped the item for good. It never ran, so it has no worktree
+        to keep: the new lane host queues it again and builds it."""
+        item = self.item(repo=SAT)
+        lead = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", lead), "blocked")
+        self.db.execute("UPDATE repo SET lane_host = 'other' WHERE path = ?", (SAT,))
+        record_state(self.db, "heartbeat", key="build-dispatch@other", body={})
+        run = self.claim(hosts=frozenset({"other"}))
+        assert run is not None
+        self.assertEqual((run["assignment"], run["owner"]), (lead, "fixture@other"))
+
+    def test_a_satellite_takes_no_retry_another_satellite_ran_when_the_block_names_it(self):
+        """Review round 3 of sd:9775: a retry ran on one satellite, its lane moved to another before the hub
+        blocked it, so the block names the new host. The new host took it without the first host's worktree.
+        A retry requeues only on the host its last run ran on."""
+        build.queue(self.db, [self.item(repo=SAT)], who="operator")
+        first = self.claim(hosts=WORK)
+        self.retried(first)
+        self.db.execute("UPDATE repo SET lane_host = 'other' WHERE path = ?", (SAT,))
+        self.quiet("other")
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertIn("lane runs on other,", self.count("SELECT result FROM assignment WHERE id = ?",
+                                                        first["assignment"]))
+        record_state(self.db, "heartbeat", key="build-dispatch@other", body={})
+        self.assertIsNone(self.claim(hosts=frozenset({"other"})))
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", first["assignment"]), "blocked")
+
+    def test_build_by_item_presses_fresh_a_bundle_stranded_on_the_satellite_its_lane_left(self):
+        """Review of build/sd-1378: a build ran on one satellite and ended blocked, a newer press was cancelled
+        before its claim, then the lane moved to a healthy satellite. Build by item read the old assignment,
+        whose worktree is on the first satellite, and the new host claimed it without that work. It presses
+        fresh, as beat recovery leaves a `_stranded` row."""
+        item = self.item(repo=SAT)
+        build.queue(self.db, [item], who="operator")
+        first = self.claim(hosts=WORK)
+        self.retried(first)
+        self.db.execute("UPDATE assignment SET status = 'blocked' WHERE id = ?", (first["assignment"],))
+        cancelled = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (cancelled,))
+        self.db.execute("UPDATE repo SET lane_host = 'other' WHERE path = ?", (SAT,))
+        record_state(self.db, "heartbeat", key="build-dispatch@other", body={})
+        queued = build.queue_again(self.db, [item], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [item])
+        self.assertGreater(queued[0]["id"], cancelled, "a fresh press, not the stranded bundle's Retry")
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", first["assignment"]), "blocked")
+
+    def test_build_by_item_presses_fresh_a_satellite_bundle_whose_lane_moved_to_the_hub(self):
+        """Review of build/sd-1378: as the satellite-to-satellite case, but the lane moved to the hub. `_stranded`
+        read a hub route as no move, so Build by item retried the old assignment in a hub worktree, its work
+        left on the satellite. It presses fresh."""
+        item = self.item(repo=SAT)
+        build.queue(self.db, [item], who="operator")
+        first = self.claim(hosts=WORK)
+        self.retried(first)
+        self.db.execute("UPDATE assignment SET status = 'blocked' WHERE id = ?", (first["assignment"],))
+        cancelled = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (cancelled,))
+        self.db.execute("UPDATE repo SET lane_host = NULL WHERE path = ?", (SAT,))
+        queued = build.queue_again(self.db, [item], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [item])
+        self.assertGreater(queued[0]["id"], cancelled, "a fresh press, not the stranded bundle's Retry")
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", first["assignment"]), "blocked")
+
+    def test_pickup_builds_fresh_a_retry_stranded_on_the_satellite_its_lane_left(self):
+        """Review round 4 of sd:9774: a retry ran on one satellite, its lane moved to another, and the hub blocked
+        it there. No host may requeue it, its worktree being on the first, so pickup must not wait on it either:
+        the new lane host builds the item fresh, as before this branch."""
+        item = self.item(repo=SAT)
+        build.queue(self.db, [item], who="operator")
+        first = self.claim(hosts=WORK)
+        self.retried(first)
+        self.db.execute("UPDATE repo SET lane_host = 'other' WHERE path = ?", (SAT,))
+        self.quiet("other")
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", first["assignment"]), "blocked")
+        record_state(self.db, "heartbeat", key="build-dispatch@other", body={})
+        build.set_pickup(self.db, True, now=Pickup.NOW)
+        other = frozenset({"other"})
+        with mock.patch.object(build, "lane_hosts", return_value=other):
+            self.assertEqual(build.pickup(self.db, build.room(self.db, **IDLE, hosts=other), now=Pickup.NOW), [item])
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", first["assignment"]), "blocked")
+
+    def test_a_beat_blocked_bundle_requeues_whole_past_a_leads_cancel_that_never_ran(self):
+        """Review round 5 of sd:9775: a bundle's lead item had a newer build cancelled before it ran, then the
+        bundle was retried and the hub blocked it on a quiet beat. Recovery read only each item's highest
+        assignment, so it requeued the member alone, and the claim led with it on another branch. A newer build
+        that never ran owns nothing: the whole bundle queues again under its lead, and pickup leaves its items."""
+        items = [self.item(repo=SAT), self.item(repo=SAT)]
+        build.queue(self.db, items, who="operator")
+        first = self.claim(hosts=WORK)
+        lead = first["assignment"]
+        stamp = build.clock()
+        self.db.execute("UPDATE runner_run SET outcome = 'blocked', released_at = ? WHERE id = ?", (stamp, first["id"]))
+        self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (stamp, first["id"]))
+        self.db.execute("UPDATE assignment SET status = 'blocked' WHERE id = ? OR parent = ?", (lead, lead))
+        self.db.execute("UPDATE item SET status = 'ready'")
+        newer = build.queue(self.db, [items[0]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (newer,))
+        self.db.execute("UPDATE assignment SET status = 'queued' WHERE id = ? OR parent = ?", (lead, lead))
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE status = 'blocked'"), 2)
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        with mock.patch.object(build, "lane_hosts", return_value=WORK):
+            self.assertEqual(build.eligible(self.db, now=Pickup.NOW), [])
+        run = self.claim(hosts=WORK)
+        assert run is not None
+        self.assertEqual((run["assignment"], run["work_path"]), (lead, first["work_path"]))
+        self.assertEqual(sorted(member["item"] for member in run["members"]), sorted(items))
+
+    def test_a_retry_blocked_while_its_lane_was_away_requeues_once_the_lane_returns(self):
+        """Review round 5 of sd:9775: a retry ran on one satellite; the hub blocked it while its lane pointed to
+        another, so the block names that one. Once the lane is back on the satellite holding its worktree, that
+        satellite queues it again; before, both hosts refused and pickup waited for good."""
+        build.queue(self.db, [self.item(repo=SAT)], who="operator")
+        first = self.claim(hosts=WORK)
+        self.retried(first)
+        self.db.execute("UPDATE repo SET lane_host = 'other' WHERE path = ?", (SAT,))
+        self.quiet("other")
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", first["assignment"]), "blocked")
+        self.db.execute("UPDATE repo SET lane_host = 'work' WHERE path = ?", (SAT,))
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        run = self.claim(hosts=WORK)
+        assert run is not None
+        self.assertEqual((run["assignment"], run["work_path"]), (first["assignment"], first["work_path"]))
+
+    def test_beat_recovery_queues_one_assignment_per_item(self):
+        """Review round 6 of sd:9775: two fresh presses of one item both blocked on a quiet beat. Neither ran, so
+        neither disqualified the other, and one recovery queued both: two open builds of one item. Recovery
+        queues one."""
+        item = self.item(repo=SAT)
+        first = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        second = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.assertEqual([self.count("SELECT status FROM assignment WHERE id = ?", row) for row in (first, second)],
+                         ["blocked", "blocked"])
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        build.set_pickup(self.db, True, now=Pickup.NOW)
+        with mock.patch.object(build, "lane_hosts", return_value=WORK):
+            build.pickup(self.db, build.room(self.db, **IDLE, hosts=WORK), now=Pickup.NOW)
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE item = ? AND status = 'queued'", item), 1)
+        self.assertIsNotNone(self.claim(hosts=WORK))
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE item = ? AND status IN "
+                                    "('queued', 'running')", item), 1)
+
+    def test_beat_recovery_leaves_a_build_whose_item_a_cancel_parked(self):
+        """Class pass, review round 7 of sd:9775: a build blocked on a quiet beat; the operator pressed a
+        replacement and cancelled it before its claim, which parked the item. Recovery passed the cancelled build,
+        which never ran, and queued the old one over the operator's pause. A parked item's build stays blocked."""
+        item = self.item(repo=SAT)
+        old = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        newer = build.queue(self.db, [item], who="operator")[0]["id"]
+        state = operations.assignment_state(self.db, newer)
+        operations.cancel_assignment(self.db, newer, expected_revision=state["revision"], who="operator")
+        self.assertIsNotNone(item_state(self.db, item)["item"]["parked_at"])
+        self.assertIsNone(self.claim(hosts=WORK))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", old), "blocked")
+
+    def test_beat_recovery_requeues_no_member_of_a_bundle_whose_lead_it_leaves(self):
+        """Class pass, review round 7 of sd:9775: recovery left a retried bundle's lead (its item parked) and
+        queued the member, and the claim made the member a lead on a new branch. A member of a bundle that ran
+        queues again only with its lead; pickup builds its item fresh, as before this branch."""
+        items = [self.item(repo=SAT), self.item(repo=SAT)]
+        build.queue(self.db, items, who="operator")
+        first = self.claim(hosts=WORK)
+        self.retried(first)
+        self.db.execute("UPDATE assignment SET status = 'queued' WHERE parent = ?", (first["assignment"],))
+        self.db.execute("UPDATE item SET status = 'ready'")
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        self.db.execute("UPDATE item SET parked_at = ? WHERE id = ?", (build.clock(), items[0]))
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        with mock.patch.object(build, "lane_hosts", return_value=WORK):
+            self.assertEqual([row["id"] for row in build.eligible(self.db, now=Pickup.NOW)], [items[1]])
+        self.assertIsNone(self.claim(hosts=WORK))
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE status = 'blocked'"), 2)
+
+    def _blocked_retry(self):
+        """A two-item retry on a satellite the hub blocked on its quiet beat: (items, lead, member)."""
+        items = [self.item(repo=SAT), self.item(repo=SAT)]
+        build.queue(self.db, items, who="operator")
+        first = self.claim(hosts=WORK)
+        self.retried(first)
+        lead = first["assignment"]
+        self.db.execute("UPDATE assignment SET status = 'queued' WHERE parent = ?", (lead,))
+        self.db.execute("UPDATE item SET status = 'ready'")
+        self.quiet()
+        self.assertIsNone(self.claim(hosts=HUB))
+        member = self.count("SELECT id FROM assignment WHERE parent = ?", lead)
+        return items, lead, member
+
+    def test_beat_recovery_requeues_no_lead_of_a_bundle_whose_member_is_parked(self):
+        """Class pass, review round 23: a member's item parked, so recovery left the member but queued the lead,
+        and the claim refused the lead (its branch holds the member's work), replacing the beat result: unpark
+        could not recover the bundle. A bundle that ran queues again whole or not at all."""
+        items, lead, member = self._blocked_retry()
+        self.db.execute("UPDATE item SET parked_at = ? WHERE id = ?", (build.clock(), items[1]))
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        self.claim(hosts=WORK)
+        self.assertEqual([self.count("SELECT status FROM assignment WHERE id = ?", row) for row in (lead, member)],
+                         ["blocked", "blocked"])
+        self.assertIn("lane runs on work, and", self.count("SELECT result FROM assignment WHERE id = ?", lead))
+        self.db.execute("UPDATE item SET parked_at = NULL WHERE id = ?", (items[1],))
+        run = self.claim(hosts=WORK)
+        assert run is not None
+        self.assertEqual(run["assignment"], lead)
+        self.assertEqual(sorted(entry["item"] for entry in run["members"]), sorted(items))
+
+    def test_beat_recovery_requeues_no_lead_of_a_bundle_whose_members_item_another_build_owns(self):
+        """Class pass, review round 23: another build of a member's item queued after the block, so recovery left
+        the member (`OWNING`) but queued the lead, whose branch holds that member's work too."""
+        items, lead, member = self._blocked_retry()
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        build.queue(self.db, [items[1]], who="operator")
+        self.claim(hosts=WORK)
+        self.assertEqual([self.count("SELECT status FROM assignment WHERE id = ?", row) for row in (lead, member)],
+                         ["blocked", "blocked"])
+        self.assertIn("lane runs on work, and", self.count("SELECT result FROM assignment WHERE id = ?", lead))
 
     def test_the_hub_blocks_a_row_whose_satellite_beat_comes_from_a_clock_ahead(self):
         """Pack sd:7955: a beat stamped more than STALE_SECONDS after now has no age to trust, so the claim blocks

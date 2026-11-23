@@ -216,6 +216,7 @@ Merge permission is one setting, `repo.runner_merge` on the repository row; the 
 These values live in `~/.config/sd-ai-command-pack/config.json`; `XDG_CONFIG_HOME` overrides the configuration root.
 `sd config get`, `list`, and `unset` inspect or remove settings. No personal grant ships in this repository.
 `sd.gate_slots` is load control, not a grant: how many gates may run at once on the machine, across every repository (unset: a quarter of the cores).
+`sd.gate_workers` is load control too: how many test workers one local run of the pack's tests starts (unset: the cores over the gate cap).
 `sd.gate_load_max` and `sd.gate_settle_seconds` are load control too: the gate queue starts its head 45 s after the last start by default, and only below a load1 limit where one is set (unset: none, since macOS counts disk waits in the load average).
 `sd.fleet_owners` names the GitHub logins whose repositories `sd fleet stamp` treats as the operator's own, comma-separated; it grants nothing.
 `sd.hub_name` names the hub by its tailnet name; a machine with its own database serves it and runs lanes from it only while its tailnet name matches, and writes to it unless another node holds the name (unset: no fence; `bin/sd-db fence` answers). It grants nothing.
@@ -236,6 +237,7 @@ A waiting gate names who holds each slot and since when.
 `sd.lane_parallel` is load control too: how many lanes one hosted lane run runs at once (unset: 5, 1 to 8).
 `sd.lane_train` is load control too: how many queued entries of one repository one lane run gates at once as a stack (unset: 3, 1 to 9).
 `sd.machine_cap`, `sd.repo_cap` and `sd.bundle_max` are load control too: how many builders run at once on this machine (unset: 6), how many bundles build at once in one repository (unset: 1), and how many items one build bundle takes when this machine claims it (unset: 3); the claim gives a build child 120 minutes per 3 slots it took, never less.
+`sd.build_model` names the model every build bundle this machine claims runs its builder on (unset: opus, and sonnet for an all-mechanical bundle).
 `sd gate post --head SHA` runs the merge gate at SHA and posts `sd/local-gate`, for a merge path that is not `sd-ship merge`.
 `sd gate check` runs the same check at `HEAD` and records a pass that `sd-ship prepare` and the merge gate reuse at that head; it posts nothing.
 
@@ -314,6 +316,7 @@ followup takes `--ref`, and not with `--recur`.
 
 `sd store items --open` lists the backlog, and `--here` narrows it to this registered checkout; `sd store item 42 --json` includes
 history and a revision that edits can require with `--if-revision`.
+Each `sd store items --json` row carries `status_reason`, the reason its latest status change gave, or null.
 `sd task show 42` is an alias that prints the same thing.
 `sd task cancel 42 --reason TEXT` closes a task or followup nobody will do,
 with the `cancelled` receipt `sd work cancel` writes. Notes,

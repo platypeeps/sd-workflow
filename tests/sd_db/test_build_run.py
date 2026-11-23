@@ -607,9 +607,16 @@ class Supervise(Case):
         """pack sd:9709 round 26: the supervisor's git calls and the builder start from this env; a hook's
         `GIT_DIR` or `GIT_WORK_TREE` would point them at the hook's repository, not the run's worktree."""
         self.press(1)
-        self.env.update({"GIT_DIR": "/decoy/.git", "GIT_WORK_TREE": "/decoy", "GIT_INDEX_FILE": "/decoy/index"})
+        self.env.update({"GIT_DIR": "/decoy/.git", "GIT_WORK_TREE": "/decoy", "GIT_INDEX_FILE": "/decoy/index",
+                         "GIT_CONFIG_COUNT": "2", "GIT_CONFIG_KEY_0": "url.file:///decoy.git.insteadOf",
+                         "GIT_CONFIG_VALUE_0": "origin", "GIT_CONFIG_KEY_1": "maintenance.auto",
+                         "GIT_CONFIG_VALUE_1": "false"})
         env = self.supervisor().env
-        self.assertEqual({key for key in env if key in paths.GIT_LOCAL}, set())
+        # Only the suite's maintenance keys ride on, renumbered; a one-off `insteadOf` does not (pack sd:9863).
+        self.assertEqual({key for key in env if key in paths.GIT_LOCAL} - {"GIT_CONFIG_COUNT"}, set())
+        self.assertEqual((env["GIT_CONFIG_COUNT"], env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_VALUE_0"]),
+                         ("1", "maintenance.auto", "false"))
+        self.assertNotIn("GIT_CONFIG_KEY_1", env)
         self.assertEqual(env["GIT_CONFIG_NOSYSTEM"], self.env["GIT_CONFIG_NOSYSTEM"], "config isolation stays")
 
     def test_a_press_runs_to_the_lane(self):
@@ -1536,7 +1543,7 @@ class Supervise(Case):
         self.release_all()
         self.db.execute("UPDATE item SET status = 'ready' WHERE id = ?", (item,))
         newer = build.queue(self.db, [item], who="operator")[0]["id"]
-        self.db.execute("UPDATE assignment SET status = 'blocked' WHERE id = ?", (newer,))
+        self.db.execute("UPDATE assignment SET status = 'blocked', run_count = 1 WHERE id = ?", (newer,))
         self.db.execute("UPDATE item SET status = 'blocked' WHERE id = ?", (item,))
         return newer
 
@@ -3941,6 +3948,28 @@ class Drafts(Case):
         self.assertIsNone(row["released_at"], "held until the reap reads the supervisor gone")
         self.assertEqual(draft.reap(self.db, probe=GoneProbe(alive=False, group=False)), [])
         self.assertIsNotNone(build.run(self.db, run["id"])["released_at"])
+
+    def test_a_usage_limit_requeues_the_draft_and_holds_this_host(self):
+        """sd:9938: a draft's 429 ended it blocked (sd:9907 left `drafting` out). It queues again, with no
+        block or followup, and this host drafts nothing until the limit's `resetsAt`."""
+        run = self.claimed()
+        self.plan(claude=["rate_limited"])
+        ended = self.drafter(run["id"]).run()
+        self.assertEqual((ended["outcome"], ended["retry"]), ("rate_limited", None))
+        self.assertEqual((self.assignment_status(), self.statuses()), ("queued", ["planning"]))
+        self.assertNotIn("followup", [note["kind"] for note in self.notes()])
+        self.assertIsNotNone(build.run(self.db, run["id"])["released_at"])
+        reset = datetime.fromtimestamp(int((self.plans / "reset.txt").read_text()), UTC)
+        until = reset.isoformat(timespec="seconds")
+        self.assertEqual(writes.read_settings(self.db, ["build.rate_hold.hub"]), {"build.rate_hold.hub": until})
+        room = build.room(self.db, load=1.0, load_cap=40.0, interactive=[])
+        self.assertIsNone(draft.claim(self.db, owner="fixture", available=room), "no draft before the reset")
+        later = (reset + timedelta(seconds=1)).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            room = build.room(self.db, load=1.0, load_cap=40.0, interactive=[])
+        again = draft.claim(self.db, owner="fixture", available=room)
+        assert again is not None
+        self.assertEqual((again["assignment"], again["run"]), (self.assignment, 2), "the same draft, again")
 
     def test_a_hung_draft_is_killed_and_retried_once(self):
         """Failure table, Drafting: the bound kills the group; a fresh run retries once, then a followup blocks it."""

@@ -461,8 +461,10 @@ details:not(.fpick, .usage-drop)[open] > summary::before { content: '▾'; }
 .composer .meta { display: flex; justify-content: space-between; gap: var(--space-sm); margin-top: var(--space-2xs); font-size: var(--text-2xs); color: var(--color-muted); }
 
 /* ---------- Palette (⌘K) ---------- */
-dialog.palette { width: min(36rem, calc(100vw - 2rem)); padding: 0; margin: 12vh auto auto; border: var(--rule-hair) solid var(--color-rule); border-radius: var(--radius-md); background: var(--color-panel); color: var(--color-ink); }
+dialog.palette { width: min(36rem, calc(100vw - 2rem)); max-height: calc(100dvh - 12vh - 1rem); overflow-y: auto; padding: 0; margin: 12vh auto auto; border: var(--rule-hair) solid var(--color-rule); border-radius: var(--radius-md); background: var(--color-panel); color: var(--color-ink); }
 dialog.palette::backdrop { background: var(--color-scrim); }
+/* sd:10002: a dialog taller than the window scrolls; its buttons stay on its bottom edge. */
+dialog.palette form > .actions { position: sticky; bottom: 0; padding-block: var(--space-xs); background: var(--color-panel); }
 .palette ul { list-style: none; margin: 0; padding: var(--space-2xs); max-height: 50vh; overflow-y: auto; }
 .palette li { display: flex; align-items: center; gap: var(--space-sm); padding: 0 var(--space-sm); min-height: var(--row); border-radius: var(--radius-sm); cursor: pointer; }
 .palette li:hover, .palette li[aria-selected="true"] { background: var(--color-accent-bg); }

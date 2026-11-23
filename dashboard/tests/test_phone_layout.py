@@ -93,6 +93,18 @@ class TheBuildControls(unittest.TestCase):
         narrow = selectors(blocks(TASKS_CSS, "(max-width: 380px)"), "grid-auto-columns")
         self.assertEqual(sorted(wide - narrow), [])
 
+    def test_a_dialog_taller_than_the_window_scrolls_and_keeps_its_buttons(self):
+        """sd:10002: a long Build preview ran below the screen with its Build button. No test here computes
+        layout, so read the rules: every palette dialog stops at the window and scrolls, and its form's
+        actions row sticks to the dialog's bottom edge over the panel's own background."""
+        [base] = [body for sels, body in rules(SHELL_CSS) if "dialog.palette" in sels]
+        self.assertRegex(base, r"max-height:\s*calc\(100dvh - 12vh - 1rem\)")
+        self.assertRegex(base, r"overflow-y:\s*auto")
+        [sticky] = [body for sels, body in rules(SHELL_CSS) if "dialog.palette form > .actions" in sels]
+        self.assertRegex(sticky, r"position:\s*sticky")
+        self.assertRegex(sticky, r"bottom:\s*0")
+        self.assertRegex(sticky, r"background:\s*var\(--color-panel\)")
+
     def test_the_build_dialog_keeps_each_item_number_whole(self):
         # `.palette li code` ellipsizes; in a wrapping title row it left "#" and hid which item the Build is for.
         bodies = [body for sels, body in rules(TASK_DETAILS_CSS) if ".palette .start-list li code" in sels]
