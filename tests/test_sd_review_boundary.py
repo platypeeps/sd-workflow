@@ -1125,11 +1125,17 @@ class LineBudgetTests(unittest.TestCase):
         # one spelling, the newest overlapping record decides, and a repeat
         # at any place of a blocker answers it. Measured: `sd-review` is
         # 3150 here.
+        #
+        # 5120 -> 5178 is sd:10191: `bin/sd-review` +58 for `hunk_kept` and
+        # `rulings_placed`. A ruling holds while its own hunk is unchanged,
+        # not its whole file, so each ruling is placed at the reviewed head
+        # (one cached diff per receipt and path) and the newest at a place
+        # is read there. Measured: `sd-review` is 3208 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5120,
+            5178,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

@@ -1289,6 +1289,20 @@ class RebuttalIdentityTests(unittest.TestCase):
         seen = sd_review.rebuttals([(body,)], {ON_BRANCH}.__contains__, lambda _head, path, line: None if path == "src.py" else (line,))
         self.assertEqual([entry.listed for entry in seen], [False], "a changed instance file kept the rebuttal")
 
+    def test_a_newer_ruling_that_cannot_be_placed_decides_for_its_file(self) -> None:
+        """Review of sd:10191: a parked ruling whose hunk changed since its receipt has no line to compare, so an
+        older rebuttal of the same summary in a file both name is not listed; one in another file still is."""
+        newer = adjudicated(("src.py", "defect", "parked", 30), ("lib.py", "other defect", "parked", 30))
+        older = adjudicated(("src.py", "defect", "rebutted", 20), ("src.py", "other defect", "rebutted", 20))
+        seen = sd_review.rebuttals([(newer,), (older,)], {ON_BRANCH}.__contains__,
+                                   lambda _head, _path, line: None if line == 30 else (line,))
+        self.assertEqual([(entry.summary, entry.line, entry.listed) for entry in seen],
+                         [("defect", 30, False), ("other defect", 30, False), ("defect", 20, False),
+                          ("other defect", 20, True)])
+        self.assertEqual([entry.listed for entry in sd_review.rebuttals(
+            [(adjudicated(([], "defect", "rebutted", 20)),)], {ON_BRANCH}.__contains__,
+            lambda _head, _path, line: (line,))], [True], "a path that is no text broke the comparison")
+
     def test_a_finding_that_names_a_new_instance_file_is_not_the_rebutted_one(self) -> None:
         """Review of sd:9769: a fix that spreads the defect to `new.py` keeps the primary place and summary;
         the rebuttal named no `new.py`, so it is a new finding and blocks."""
@@ -1488,13 +1502,52 @@ class RebuttalScopeTests(RepeatFixture):
         self.assertEqual([entry.listed for entry in found], [False])
 
     def test_hunk_kept_holds_on_doubt(self) -> None:
-        """A ruling without a line, or a diff with no hunk (binary, mode), lapses; a hunk past the window moves it."""
-        self.assertIsNone(sd_review.hunk_kept("@@ -1 +1 @@\n-a\n+b", None))
-        self.assertIsNone(sd_review.hunk_kept("Binary files a/x and b/x differ", 20))
-        self.assertIsNone(sd_review.hunk_kept("@@ -17,0 +18,2 @@\n+a\n+b", 20))
-        self.assertEqual(sd_review.hunk_kept("@@ -16,0 +17,2 @@\n+a\n+b", 20), (22,))
-        self.assertEqual(sd_review.hunk_kept("@@ -24,2 +23,0 @@\n-a\n-b", 20), (20,))
-        self.assertIsNone(sd_review.hunk_kept("@@ -23,2 +22,0 @@\n-a\n-b", 20))
+        """A ruling without a line, a diff with no hunk (binary, mode) or with two files' hunks (a path that names
+        a directory) lapses; a hunk past the window moves it."""
+        def diff(*hunks: str, files: int = 1) -> str:
+            return "\n".join(["diff --git a/x b/x"] * files + list(hunks))
+        self.assertIsNone(sd_review.hunk_kept(diff("@@ -1 +1 @@\n-a\n+b"), None))
+        self.assertIsNone(sd_review.hunk_kept(diff("Binary files a/x and b/x differ"), 20))
+        self.assertIsNone(sd_review.hunk_kept(diff("@@ -17,0 +18,2 @@\n+a\n+b"), 20))
+        self.assertEqual(sd_review.hunk_kept(diff("@@ -16,0 +17,2 @@\n+a\n+b"), 20), (22,))
+        self.assertEqual(sd_review.hunk_kept(diff("@@ -24,2 +23,0 @@\n-a\n-b"), 20), (20,))
+        self.assertIsNone(sd_review.hunk_kept(diff("@@ -23,2 +22,0 @@\n-a\n-b"), 20))
+        self.assertIsNone(sd_review.hunk_kept(diff("@@ -1 +1 @@\n-a\n+b", files=2), 20), "two files' hunks moved a line")
+        self.assertIsNone(sd_review.hunk_kept("@@ -1 +1 @@\n-a\n+b", 20), "hunks of no named file moved a line")
+
+    def test_a_newer_ruling_decides_where_its_place_is_now(self) -> None:
+        """Review of sd:10191: `defect` was rebutted at line 20; two lines came in above and it was parked at 22;
+        three more came in. Both rulings sit at 25 now, and the newer one, parked, blocks. A newer ruling whose
+        hunk changed since cannot be placed, so it decides for every place in its file."""
+        tool = self.root / "bin/tool.py"
+        tool.parent.mkdir()
+        tool.write_text("".join(f"line_{n} = {n}\n" for n in range(1, 31)), encoding="utf-8")
+        self.commit("add", "bin/tool.py")
+        ruled = self.commit("the ruled code")
+
+        def above(count: int, message: str) -> str:
+            tool.write_text("".join(f"{message.split()[0]}_{n} = 0\n" for n in range(count))
+                            + tool.read_text(encoding="utf-8"), encoding="utf-8")
+            self.commit("add", "bin/tool.py")
+            return self.commit(message)
+
+        def seen() -> list[tuple[str, bool, int | None]]:
+            found = sd_review.rebutted_findings(self.root, sd_review.resolve_subject(self.root, "branch"), None,
+                                                self.environment())
+            return [(entry.reason, entry.listed, entry.line) for entry in found]
+
+        self.adjudication(("lane claim", "rebutted", "older"), head=ruled, line=20, key="older", days=0.5)
+        parked = above(2, "first catch-up merge")
+        self.assertEqual(seen(), [("older", True, 22)])
+        self.adjudication(("lane claim", "parked", "newer"), head=parked, line=22, key="newer", days=0.25)
+        above(3, "second catch-up merge")
+        self.assertEqual(seen(), [("newer", False, 25), ("older", False, 25)])
+        self.assertEqual(self.review_answering(row(path="bin/tool.py", line=25, summary="lane claim"))["lane claim"][0],
+                         "blocking")
+        tool.write_text(tool.read_text(encoding="utf-8").replace("line_20 = 20", "line_20 = 0"), encoding="utf-8")
+        self.commit("add", "bin/tool.py")
+        self.commit("the ruled line changes")
+        self.assertEqual([entry[1] for entry in seen()], [False, False])
 
     def test_a_diff_git_cannot_run_holds_the_rebuttal_back(self) -> None:
         self.adjudication(("lane claim", "rebutted", "x"))
