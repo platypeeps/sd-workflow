@@ -620,6 +620,8 @@ def acceptance_row_answered(row: object) -> bool:
 class Ship(SharedReview):
     #: True while a prepare publishes a pending claim (`claimed`, sd:9268).
     publishing = False
+    #: The running lane entry `lane_started` counted this prepare as, when no lane mark did (sd:9335).
+    lane_row: dict | None = None
     #: What the last `merge_ownership` read found: the authority record when
     #: the repository row overrode co-ownership, `None` when ownership alone
     #: answered. A per-process value on purpose. It reaches the receipt at
@@ -902,6 +904,7 @@ class Ship(SharedReview):
         if not (changed or stored.get("renewed")):
             return claim, None, None
         if self.lane_started():
+            self.refuse_held_by_lane_row(changed)
             items = list(self.closing(tuple(dict.fromkeys(self.args.closes)), self.args.deliver))
             other_items = set(items) != set((self.state.get("closing") or {}).get("items") or [])
             if stored.get("renewed") and not changed and other_items:
@@ -937,6 +940,22 @@ class Ship(SharedReview):
         return claim, claim, (f"--deliver renews the delivery claim of sd:{self.args.item}: item scope "
                               f"{str(stored.get('item_scope'))[:12]} is now {claim['item_scope'][:12]}")
 
+    def refuse_held_by_lane_row(self, changed: bool) -> None:
+        """Refuse a scope change in a prepare `lane_started` counted by a running row, naming that row.
+
+        No lane mark means this may be the operator's prepare, so the refusal
+        names the row and how to release it, not the lane (sd:9335).
+        """
+        if changed and self.lane_row is not None:
+            raise Refusal(f"item acceptance scope changed after the delivery claim; a running lane entry "
+                          f"for sd:{self.args.item} (step {self.lane_row.get('step')}, pid "
+                          f"{(self.lane_row.get('holder') or {}).get('pid')}) holds the item on this host, so "
+                          f"this prepare counts as the lane's and does not renew it: let that entry end, or "
+                          f"release it with `sd-ship lane cancel {self.args.item}`, then run "
+                          f"`{self.renew_command()}` by hand", code="lane_entry_running", boundary="input",
+                          state="operator_decision",
+                          next_action="Let the running lane entry end or cancel it, then prepare by hand.")
+
     def refuse_stale_evidence(self, claim: dict, stored: dict) -> None:
         """Refuse a renewal whose evidence is the old claim's (`stale_criteria`), before anything is saved."""
         if stale := stale_criteria(claim.get("claim"), stored.get("claim")):
@@ -971,8 +990,10 @@ class Ship(SharedReview):
                           f"prepare is unknown, and sd:{self.args.item}'s delivery claim is not renewed; prepare "
                           f"again once the queue reads", code="lane_unknown", boundary="database",
                           state="retryable_failure") from None
-        return any(row.get("item") == self.args.item and row.get("status") == "running"
-                   and (row.get("holder") or {}).get("host") == host for row in rows)
+        self.lane_row = next((row for row in rows if row.get("item") == self.args.item
+                              and row.get("status") == "running"
+                              and (row.get("holder") or {}).get("host") == host), None)
+        return self.lane_row is not None
 
     def body_input(self, default: str) -> tuple[str, str]:
         """The body to publish and where it came from (sd:1870).

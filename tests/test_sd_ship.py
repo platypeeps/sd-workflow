@@ -4634,6 +4634,28 @@ roles:
         self.assertIn(f"renews the delivery claim of sd:{self.item}: item scope {old[:12]} is now {renewed[:12]}",
                       stderr.getvalue())
 
+    def test_a_hand_prepare_held_by_a_running_lane_row_names_that_row(self):
+        """Round 8 of sd:9268 (advisory): with no lane mark, a running entry for the item on this host still
+        counts the prepare as the lane's, and the refusal told the operator, who had run it by hand, to run it
+        by hand. It names the running entry and how to release it."""
+        from sd_db import set_item_fields
+        sd_lane = ship.sd_lane
+        acceptance = self.directory / "acceptance.json"
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        entry = {"id": "e1", "position": 1, "item": self.item, "status": "running", "step": "merge",
+                 "holder": {"host": sd_lane.this_host(), "pid": 4242, "token": "t"}}
+        sd_lane.store(self.connection, ship.slug(REMOTE_URL), entry)
+        self.connection.commit()
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [
+            {"criterion": "actual scope", "passed": True, "evidence": "rechecked on the new scope"}]}))
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(
+                ship.Refusal, rf"running lane entry for sd:{self.item} \(step merge, pid 4242\).*"
+                              rf"`sd-ship lane cancel {self.item}`"):
+            self.prepare("--deliver", "--acceptance-file", str(acceptance))
+
     def test_an_orphaned_lane_prepare_never_renews(self):
         """Lead review of sd:9335: a lane prepare leads its own process group, so a forced runner stop leaves it
         running under pid 1. Its parent no longer matches the entry's holder, and the parent-pid check took it
