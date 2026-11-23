@@ -2125,6 +2125,22 @@ class CancelParks(Case):
         self.assertEqual(sorted(entry["id"] for entry in queued), [lead, kept])
         self.assertEqual(runner.queue_state(self.db, left)["status"], "cancelled")
 
+    def test_a_subset_build_reads_a_refused_press_as_one_that_never_ran(self):
+        """Review of build/sd-1654: as above, but B's newer press was refused before a claim (blocked, never ran), as
+        `_current` reads it. Build A B read A's row narrowed to A and B, B's row as its own press, and so retried
+        the whole bundle, which C's newer build refuses. B's row is the bundle's too: Build resumes A and B."""
+        items, (lead, kept, left) = self.blocked_bundle()
+        transition(self.db, items[2], "ready", who="operator")
+        build.queue(self.db, [items[2]], who="operator")
+        build.end(self.db, self.claim()["id"], "cancelled", "the operator cancelled it")
+        for item, status in zip(items[:2], ("cancelled", "blocked"), strict=True):
+            transition(self.db, item, "ready", who="operator")
+            press = build.queue(self.db, [item], who="operator")[0]["id"]
+            self.db.execute("UPDATE assignment SET status = ? WHERE id = ?", (status, press))  # before a claim
+        queued = build.queue_again(self.db, items[:2], who="operator")
+        self.assertEqual(sorted(entry["id"] for entry in queued), [lead, kept])
+        self.assertEqual(runner.queue_state(self.db, left)["status"], "cancelled")
+
     def test_a_subset_retry_must_name_the_lead(self):
         """Pack sd:9581: the lead's worktree holds the bundle's work, so a subset without it refuses, writing nothing."""
         items, ids = self.blocked_bundle()

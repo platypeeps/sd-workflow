@@ -1202,7 +1202,9 @@ def _retry_row(connection, item: int, selected: Collection[int] = ()):
     items a Build press names, narrows the bundle to the members that press would retry (`_retry_takes`)."""
     rows = connection.execute("SELECT id, item, parent, status, run_count FROM assignment WHERE item = ? "
                               "AND scope = ? ORDER BY id DESC", (item, SCOPE)).fetchall()
-    if rows and rows[0]["status"] == "cancelled" and not rows[0]["run_count"]:
+    # A newest press refused before a claim (blocked, never ran) owns nothing either, as `_current` reads it: read
+    # past it too, or `_retry_takes` narrows a subset this item's row then leaves (review of build/sd-1654).
+    if rows and rows[0]["status"] in AGAIN and not rows[0]["run_count"]:
         ran = next((row for row in rows[1:] if row["run_count"]), None)
         # Only a bundle Retry can take: every member it would queue owns its item (`_current`), or Retry refuses the
         # whole press and Build reads a fresh one instead (class pass, review round 7); and every member in the
