@@ -101,7 +101,8 @@ def review_history(passes: list[dict]) -> dict:
         rows = (report or {}).get("findings", [])
         if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
             raise Refusal("prior review evidence cannot be preserved")
-        source = {"pass": index + 1, "head": entry["head"],
+        # Whether the pass verified anything: sd-review carries forward only what the last one left open (sd:10008).
+        source = {"pass": index + 1, "head": entry["head"], "completed": not reservation(entry),
                   "report_digest": digest(entry["report"]) if entry.get("report") is not None else None}
         if captured is not None:
             source.update(timeout_capture_digest=digest(captured), operator_context="untrusted timeout evidence; review did not complete")
@@ -162,11 +163,28 @@ def verification_link(previous: dict, report: dict) -> bool:
             and report.get("verification_report_digest") == digest(previous.get("report") or {}))
 
 
+def legacy(aggregate: dict) -> dict:
+    """`aggregate` as `review_history` wrote it before each pass said whether it completed (sd:10008), so a
+    receipt stored then still matches; anything else is returned as it is."""
+    def _old(source):
+        return {key: value for key, value in source.items() if key != "completed"} if isinstance(source, dict) else source
+    if not isinstance(aggregate, dict) or not isinstance(aggregate.get("history"), list):
+        return aggregate
+    return dict(aggregate, history=[_old(row) for row in aggregate["history"]],
+                findings=[dict(row, prior_review=_old(row["prior_review"])) if isinstance(row, dict) and "prior_review" in row
+                          else row for row in aggregate.get("findings") or []])
+
+
+def carries(stored, prior: dict) -> bool:
+    """`stored` is the digest of `prior`, in today's shape or the one before sd:10008."""
+    return stored in (digest(prior), digest(legacy(prior)))
+
+
 def full_branch_coverage(report: dict, prior: dict) -> None:
     base = report.get("authorship_base")
     if (not isinstance(base, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", base)
             or report.get("subject", {}).get("base") != base
-            or report.get("resume_report_digest") != digest(prior)):
+            or not carries(report.get("resume_report_digest"), prior)):
         raise Refusal("additional review history or full-branch coverage does not match")
 
 
@@ -384,5 +402,6 @@ class ItemHistory(ReviewHistory):
         # was handed.
         prior = review_history(passes[:-1]) if reservation(preceding) else incomplete
         if (completed_depth(incomplete) or report.get("subject", {}).get("base") != report.get("authorship_base")
-                or report.get("resume_report_digest") != (digest(prior) if prior else None)):
+                or not (carries(report.get("resume_report_digest"), prior) if prior
+                        else report.get("resume_report_digest") is None)):
             raise Refusal("retry must complete the full branch and retain the incomplete review evidence")

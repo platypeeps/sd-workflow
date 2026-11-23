@@ -864,7 +864,8 @@ class PipelineTests(ReviewFixture):
         root = self.make_repo()
         self.prepare(root)
         payload = json.dumps(
-            {"findings": [{"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "summary": "bad", "family": "correctness"}]}
+            {"findings": [{"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "summary": "bad",
+                           "family": "correctness", "evidence": "python3 src.py: Traceback"}]}
         )
         runner = FakeRunner({"sd-check": sd_review.Completed(0, "{}", ""), "codex": sd_review.Completed(0, payload, "")})
         result = self.run_review(root, runner)
@@ -1165,7 +1166,8 @@ class PipelineTests(ReviewFixture):
         root = self.make_repo()
         self.prepare(root)
         payload = json.dumps(
-            {"findings": [{"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "summary": "bad", "family": "correctness"}]}
+            {"findings": [{"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "summary": "bad",
+                           "family": "correctness", "evidence": "python3 src.py: Traceback"}]}
         )
         runner = FakeRunner(
             {"sd-check": sd_review.Completed(0, "{}", ""), "codex": sd_review.Completed(0, payload, "")}
@@ -1891,7 +1893,8 @@ class TheUrlEntryRunsTests(ReviewFixture):
             {
                 "remote": chat_answer(
                     '<think>a</think>{"findings": [{"path": "src.py", "line": 1, '
-                    '"severity": "high", "instances": ["src.py:1"], "summary": "wrong", "family": "correctness"}]}'
+                    '"severity": "high", "instances": ["src.py:1"], "summary": "wrong", "family": "correctness", '
+                    '"evidence": "python3 src.py: Traceback"}]}'
                 )
             }
         )
