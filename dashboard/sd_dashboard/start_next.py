@@ -71,7 +71,7 @@ def _load(gate) -> tuple[float, float]:
     if not (isinstance(load, list) and len(load) >= 2 and all(isinstance(x, (int, float)) and math.isfinite(x) for x in load[:2])
             and isinstance(cap, (int, float)) and math.isfinite(cap)):
         raise Unread("sd gate status gave no load or load cap")
-    return float(load[1]), float(cap)
+    return build.counted(answer, float(load[1])), float(cap)
 
 
 def _holders(holders: list[dict]) -> str:
