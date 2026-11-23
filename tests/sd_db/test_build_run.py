@@ -1677,9 +1677,43 @@ class Supervise(Case):
         row = {"path": "lib/mod.py", "line": 5, "summary": "a None value crashes here"}
         with mock.patch.object(build_run, "_read", side_effect=show), \
                 mock.patch.object(build_run, "_grep", return_value=""):
-            _, kept = self.deferred([row], {"lib/api.py": {3}}, {"changed_api", "None"}, {"changed_api", "None"},
+            _, kept = self.deferred([row], {"lib/api.py": {3}}, {"changed_api", "value"}, {"changed_api"},
                                     callees=True)
         self.assertEqual(kept["blockers"], [row], "a module-level consumer of the changed API was deferred")
+
+    def test_an_import_alias_links_a_changed_function_both_ways(self):
+        """Review of sd:9769: `from parser import parse as decode` hides the link between `decode()` and the
+        changed `parse()`; the walk down from a consumer and the walk up from a callee both follow it."""
+        self.press()
+        head = "a" * 40
+        files = {"lib/consume.py": "from parser import parse as decode\n\n\ndef show(text):\n    return decode(text).name\n",
+                 "lib/rebind.py": "def show(text):\n    return load(text).name\n\n\nload = parse\n",
+                 "lib/parser.py": "def parse(text):\n    return text[0]\n"}
+
+        def show(argv, **_kwargs):
+            path = argv[-1].removeprefix(f"{head}:")
+            if "show" in argv and path in files:
+                return files[path]
+            raise build_run.Unread("no such file")
+
+        def grep(argv, **_kwargs):
+            name = argv[argv.index("-e") + 1]
+            return "".join(f"{head}:{path}\0{number}\0{text}\n" for path, body in files.items()
+                           for number, text in enumerate(body.splitlines(), 1)
+                           if re.search(rf"\b{re.escape(name)}\b", text))
+
+        consumers = [{"path": "lib/consume.py", "line": 5, "summary": "a None result crashes here"},
+                     {"path": "lib/rebind.py", "line": 2, "summary": "a None result crashes here"}]
+        with mock.patch.object(build_run, "_read", side_effect=show), \
+                mock.patch.object(build_run, "_grep", side_effect=grep):
+            _, kept = self.deferred(consumers, {"lib/store.py": {3}}, {"parse", "text"}, {"parse"}, callees=True)
+        self.assertEqual(kept["blockers"], consumers, "a consumer calling the changed function by alias was deferred")
+        callee = {"path": "lib/parser.py", "line": 2, "summary": "an empty value crashes here"}
+        with mock.patch.object(build_run, "_read", side_effect=show), \
+                mock.patch.object(build_run, "_grep", side_effect=grep):
+            _, kept = self.deferred([callee], {"src/caller.py": {12}}, {"decode", "value"}, {"export"},
+                                    callees=True)
+        self.assertEqual(kept["blockers"], [callee], "a callee the changed code calls by alias was deferred")
 
     def test_a_short_function_name_still_names_the_changed_caller(self):
         """Review of sd:9769: `go()` names a changed function; no length filter drops it."""

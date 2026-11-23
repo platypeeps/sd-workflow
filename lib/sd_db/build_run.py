@@ -570,6 +570,13 @@ def instance_files(instances: Any) -> list[str]:
             if isinstance(entry, str) and entry.strip()]
 
 
+def aliases(text: str) -> set[tuple[str, str]]:
+    """Each `(name, alias)` a line binds: `parse as decode` (an import, a `use`) or `decode = parse`.
+    ponytail: by line, so prose (`such as x`) binds more names, never fewer; no destructuring."""
+    return (set(re.findall(r"\b([A-Za-z_]\w*)\s+as\s+([A-Za-z_]\w*)", text))
+            | {(name, alias) for alias, name in re.findall(r"\b([A-Za-z_]\w*)\s*:?=\s*([A-Za-z_]\w*)\s*;?\s*$", text)})
+
+
 def callable_words(text: str) -> set[str]:
     """The identifiers a finding names as code: `name(`, a snake or camel name, or a backticked dotted name."""
     words = set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", text))
@@ -1609,11 +1616,12 @@ class Supervisor:
                 hits = self.naming(name, head)
                 if hits is None:
                     return True
-                for place, number, _text in hits:
+                for place, number, text in hits:
                     names = self.enclosing(place, number, head, sources)
                     if names is None:
                         return True
-                    callers |= names
+                    # A line that binds `name` to another (`parse as decode`): callers of the alias call it too.
+                    callers |= names | {alias for bound, alias in aliases(text) if bound == name}
             frontier = callers
         return True
 
@@ -1630,7 +1638,10 @@ class Supervisor:
             for place, number in places:
                 if (found := self.scope(place, number, head, sources)) is None:
                     return True
-                called |= set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", "\n".join(found[1])))
+                calls = set(re.findall(r"\b([A-Za-z_]\w*)\s*\(", "\n".join(found[1])))
+                # A call through an alias the file binds (`decode()` after `parse as decode`) calls the name too.
+                called |= calls | {name for text in sources.get(place) or [] for name, alias in aliases(text)
+                                   if alias in calls}
             if called & defined:
                 return True
             called -= seen
