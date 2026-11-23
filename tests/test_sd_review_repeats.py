@@ -1563,6 +1563,15 @@ class RebuttalScopeTests(RepeatFixture):
         placed = sd_review.rulings_placed([newer, older], lambda _head, _path, line: (line,))
         self.assertEqual([entry.listed for entry in placed], [False, False])
 
+    def test_a_newline_in_an_instance_path_still_places_its_line(self) -> None:
+        """Review of sd:10191 (bin/sd-review:942): an instance `a\nb.py:10` did not match `(.*):(\d+)`, as `.`
+        stops at a newline, so it was placed as a path with no line and kept after its line changed."""
+        older = sd_review.Rebuttal("head", "src.py", "s", 10, True, "src.py", "x", "y", ("src.py:10", "a\nb.py:10"))
+
+        def kept(_head: str, path: Any, line: int | None) -> tuple[int | None] | None:
+            return None if (path, line) == ("a\nb.py", 10) else (line,)
+        self.assertEqual([entry.listed for entry in sd_review.rulings_placed([older], kept)], [False])
+
     def test_an_instance_line_too_long_to_read_lapses_its_ruling(self) -> None:
         """Lead review of sd:10191 (bin/sd-review:943): a saved instance whose line number has 5000 digits
         raised ValueError from int() and aborted every later review of the branch. It lapses its ruling."""

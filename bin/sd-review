@@ -939,7 +939,7 @@ def rulings_placed(records: Sequence[Rebuttal], kept: Callable[[str, Any, int | 
         line = kept(record.head, record.path, record.line)
         instances = []
         for entry in record.instances if line is not None else ():
-            found = re.fullmatch(r"(.*):(\d+)", entry)
+            found = re.fullmatch(r"(?s)(.*):(\d+)", entry)
             at = (kept(record.head, found[1], int(found[2])) if len(found[2]) < 10 else None) if found else kept(record.head, entry, None)
             if at is None:
                 return None
