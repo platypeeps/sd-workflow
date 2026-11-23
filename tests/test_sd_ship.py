@@ -6644,6 +6644,52 @@ roles:
                                      False)
         self.assertEqual((prepared["phase"], prepared["merge_commit"]), ("merged", commit))
 
+    def landed_and_read_open(self):
+        """A member whose train landed, and a patch under which GitHub still reads its pull request open."""
+        self.prepare()
+        _main, earlier = self.landing_before()
+        commit = self.join(earlier)["train_commit"]
+        self.land_train(commit)
+        remote = sys.modules["sd_ship_remote"]
+        real = remote.GitHub.pull
+
+        def lagging(api, number):
+            return {**real(api, number), "merged": False, "state": "open", "merge_commit_sha": None}
+        return commit, patch.object(remote.GitHub, "pull", lagging)
+
+    def assert_train_landed_refusal(self, caught, commit):
+        blocker = caught.exception.workflow["blocker"]
+        self.assertEqual((blocker["code"], blocker["retryable"]), ("train_landed", True))
+        state = self.operation().state
+        self.assertEqual((state["phase"], state["train_commit"]), ("train_joined", commit))
+
+    def test_a_prepare_of_a_landed_member_github_reads_open_pushes_nothing(self):
+        """Class pass of sd:9923: `train_landed` read GitHub's `merged` flag alone, so a flag that lagged the
+        landing sent the next prepare on to catch up and push a member the train had delivered."""
+        commit, lagging = self.landed_and_read_open()
+        branch = _git(self.root, "rev-parse", "--abbrev-ref", "HEAD")
+        pushed = _git(self.remote.path, "rev-parse", branch)
+        with lagging, self.assertRaises(ship.Refusal) as caught:
+            ship.dispatch(self.root, self.connection, self.database, self.args("prepare", "--catch-up"), receipts,
+                          False)  # as the lane prepares
+        self.assertEqual(_git(self.remote.path, "rev-parse", branch), pushed)
+        self.assert_train_landed_refusal(caught, commit)
+
+    def test_a_merge_of_a_landed_member_github_reads_open_sends_no_merge(self):
+        """Class pass of sd:9923: the same lagging flag sent `sd-ship merge` down the lone merge, which
+        cleared the train record and sent its own PUT."""
+        commit, lagging = self.landed_and_read_open()
+        with lagging, self.assertRaises(ship.Refusal) as caught:
+            self.merge()
+        self.assert_train_landed_refusal(caught, commit)
+        self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
+
+    def test_a_rejoin_of_a_landed_member_github_reads_open_writes_no_join(self):
+        commit, lagging = self.landed_and_read_open()
+        with lagging, self.assertRaises(ship.Refusal) as caught:
+            self.join(_git(self.remote.path, "rev-parse", "main"))
+        self.assert_train_landed_refusal(caught, commit)
+
     def test_a_train_member_merged_at_another_commit_refuses(self):
         self.prepare()
         _main, earlier = self.landing_before()

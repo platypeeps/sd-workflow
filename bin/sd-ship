@@ -1515,6 +1515,24 @@ class Ship(SharedReview):
         return self.state.get("phase") == "train_joined" and isinstance(pull, dict) and \
             self.api.pull(pull["number"]).get("merged") is True
 
+    def refuse_landed_train(self) -> None:
+        """Refuse to prepare, join or merge a member whose train merge is in the fetched base (sd:9923).
+
+        GitHub's `merged` flag can lag a landing; the base cannot. Read
+        where that flag says "not merged", this stops the catch-up push and
+        the lone merge that would write again what the train delivered. The
+        next run reconciles once GitHub shows the pull request merged.
+        """
+        pull, joined = self.state.get("pull_request"), self.state.get("train_commit")
+        if not joined or not isinstance(pull, dict):
+            return
+        git(self.root, "fetch", "--no-tags", "origin", f"refs/heads/{pull['base']}")
+        if train_on_base(self.root, joined, git(self.root, "rev-parse", "FETCH_HEAD")):
+            raise Refusal(f"this member's train merge {joined} is in origin/{pull['base']}, and GitHub does not "
+                          "show its pull request merged yet; nothing prepares or merges it again",
+                          code="train_landed", boundary="runtime", state="retryable_failure",
+                          next_action="Run the command again; it reconciles once GitHub shows the merge.")
+
     def prepare_head(self) -> dict:
         if self.state.get("phase") in ("merged", "merge_dispatch"):
             if self.args.deliver and not self.state.get("deliver"):
@@ -1533,6 +1551,7 @@ class Ship(SharedReview):
                               code="train_landed", boundary="runtime", state="retryable_failure",
                               next_action="Run sd-ship prepare again on the lane host.")
             return self.reconcile()
+        self.refuse_landed_train()
         self.refuse_live_review()
         self.require_claim()
         self.check_held(tuple(dict.fromkeys(self.args.closes)))  # before it commits or catches up (pack sd:7221)
@@ -2379,6 +2398,7 @@ class Ship(SharedReview):
         observed = self.api.pull(self.state["pull_request"]["number"])
         if observed.get("merged") is True:
             return self.reconcile()
+        self.refuse_landed_train()
         head = self.args.expected_head
         if not head or self.merge_head() != head:
             raise Refusal("--expected-head must name the current exact reviewed commit")
