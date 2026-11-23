@@ -3032,15 +3032,20 @@ def refuse_demoted(body: str) -> None:
 def train_landed_tested(root: pathlib.Path, commit: str, tip: str) -> bool:
     """Whether the train landing that brought `commit` onto `tip`'s branch merged onto a base the train held.
 
-    The landing is the oldest first-parent commit of the branch above
-    `commit`. GitHub merges the train pull request onto the base it holds at
-    the `PUT`; a first parent outside the train tip means the base moved
-    after the gate, and the landed tree is one no gate ran (sd:9923).
+    The landing is the oldest first-parent commit of the branch that holds
+    `commit`. A member below the train's top sits under the landing's
+    second parent, which a first-parent walk never enters, so the walk's
+    commits are matched against `commit`'s descendants instead. GitHub
+    merges the train pull request onto the base it holds at the `PUT`; a
+    first parent outside the train tip means the base moved after the
+    gate, and the landed tree is one no gate ran (sd:9923).
     """
-    chain = sd_lib.git_output(["rev-list", "--first-parent", "--ancestry-path", f"{commit}..{tip}"], root)
-    if not chain:
+    chain = (sd_lib.git_output(["rev-list", "--first-parent", f"{commit}..{tip}"], root) or "").split()
+    above = set((sd_lib.git_output(["rev-list", "--ancestry-path", f"{commit}..{tip}"], root) or "").split())
+    landings = [each for each in chain if each in above]
+    if not landings:
         return False
-    parents = git(root, "rev-list", "--parents", "-n", "1", chain.split()[-1]).split()[1:]
+    parents = git(root, "rev-list", "--parents", "-n", "1", landings[-1]).split()[1:]
     return len(parents) == 2 and is_ancestor(root, parents[0], parents[1])
 
 

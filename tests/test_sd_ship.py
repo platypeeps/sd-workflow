@@ -6462,6 +6462,20 @@ roles:
                          "done")
         self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
 
+    def test_a_member_below_the_train_top_reconciles_delivered(self):
+        """Review of sd:9923: `--first-parent` never walked into the train, so every member but the top was held."""
+        self.delivering()
+        _main, earlier = self.landing_before()
+        commit = self.join(earlier)["train_commit"]
+        _old, later = self.landing_before("later.py")
+        top = _git(self.root, "commit-tree", f"{commit}^{{tree}}", "-p", commit, "-p", later, "-m", "later member")
+        self.land_train(top)
+        merged = self.merge()
+        self.assertEqual((merged["phase"], merged["merge_commit"]), ("merged", commit))
+        self.assertFalse(merged["delivery_pending"])
+        self.assertEqual(self.connection.execute("SELECT status FROM item WHERE id=?", (self.item,)).fetchone()[0],
+                         "done")
+
     def test_a_prepare_after_a_landed_train_reconciles(self):
         """A run stopped after the train PR merged: the member's next claim prepares, and that reconciles."""
         self.prepare()
