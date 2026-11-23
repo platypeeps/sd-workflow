@@ -766,6 +766,10 @@ def retry(connection, assignment: int, *, who: str, finding: str = "", only: Col
         if only is not None and current["item"] not in only and {member["item"] for member in members} - set(only):
             raise BuildRefused(f"Retry refused: a retry of part of the bundle names its lead sd:{current['item']}, "
                                f"whose worktree holds its work")
+        # A retry that names a planning item would drop it with no word: Build sets it ready (build/sd-1653).
+        for number in sorted(only or ()):
+            if number in items and items[number]["status"] == "planning":
+                raise BuildRefused(f"Retry refused: sd:{number} is planning; Build it to set it ready")
         # A member whose item wants no build (`UNBUILT`) leaves as one `only` omits: a cancelled bundle keeps a
         # member moved to planning in its view, and queueing it refused the whole Retry (pack sd:10113).
         members = [member for member in members if (only is None or member["item"] in only)
@@ -1165,7 +1169,8 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                     and (state["run"] is not None
                          or _resumable(connection, lead, state["item"], state["status"]) is not None)
                     and not (state["run"] and state["run"]["outcome"] is None and state["run"]["step"] in LANE_STEPS)
-                    and not _unbuilt(reads.items_by_ids(connection, [state["item"]]), state["item"])):
+                    and not (_unbuilt(lead_items := reads.items_by_ids(connection, [state["item"]]), state["item"])
+                             and not (state["item"] in items and lead_items[state["item"]]["status"] == "planning"))):
                 leads += [] if lead in leads else [lead]
                 named.setdefault(lead, set()).add(item)
             else:
@@ -1173,6 +1178,13 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
         if finding and fresh:
             raise BuildRefused(f"--finding goes to a Retry or a Fix; {', '.join(f'sd:{item}' for item in fresh)} "
                                "would be a fresh build, with no builder to send it to")
+        # A named planning item is set ready first, as a fresh press sets one: Retry leaves a planning member out,
+        # and the press then queued only the rest (review of build/sd-1653).
+        from .workflow import change_status, item_state
+        for item in sorted({item for lead in leads for item in named[lead]}):
+            state = item_state(connection, item)
+            if state["item"]["status"] == "planning":
+                change_status(connection, item, "ready", who=who, expected_revision=state["revision"])
         # One named item is the row's Retry of its whole bundle; two or more name the part to retry (pack sd:9581).
         queued = [entry for lead in leads for entry in retry(
             connection, lead, who=who, finding=finding,
@@ -1183,7 +1195,6 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             queued += [{"id": member["id"], "item": member["item"], "status": "queued"}
                        for member in _members(connection, run["assignment"], "queued") if member["item"] in fixed]
         if fresh:
-            from .workflow import change_status, item_state
             for item in fresh:
                 state = item_state(connection, item)
                 if state["item"]["status"] == "planning":

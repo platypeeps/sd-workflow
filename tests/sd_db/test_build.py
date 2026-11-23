@@ -1353,6 +1353,27 @@ class Reap(Case):
         self.assertNotIn(queued[0]["id"], (lead, member))
         self.assertEqual(self.statuses(self.items), ["planning", "ready"])
 
+    def build_the_planning_one(self, planning):
+        """Review of build/sd-1653: Build on a planning item of an ended bundle queued only the other item and
+        left the selected one in planning. The press sets it ready first, as a fresh press does, and retries."""
+        lead, member = self.cancelled_with_a_done_item(planning, "planning")
+        queued = build.queue_again(self.db, [self.items[planning]], who="operator")
+        self.assertEqual(sorted(entry["id"] for entry in queued), [lead, member])
+        self.assertEqual(self.statuses(self.items), ["ready", "ready"])
+
+    def test_building_a_member_back_in_planning_sets_it_ready_and_retries_it(self):
+        self.build_the_planning_one(1)
+
+    def test_building_a_lead_back_in_planning_sets_it_ready_and_retries_it(self):
+        self.build_the_planning_one(0)
+
+    def test_a_partial_retry_naming_a_planning_member_refuses(self):
+        """Review of build/sd-1653: `only` naming a planning member dropped it with no word."""
+        lead, _member = self.cancelled_with_a_done_item(1, "planning")
+        with self.assertRaisesRegex(build.BuildRefused, f"sd:{self.items[1]} is planning"):
+            build.retry(self.db, lead, who="operator", only={self.items[0], self.items[1]})
+        self.assertEqual(self.statuses(self.items), ["ready", "planning"])
+
     def test_build_again_on_a_cancelled_bundle_whose_lead_is_done_presses_fresh(self):
         """sd:9015 review: Retry without its lead would claim under a member, on a new branch and worktree, and
         drop a Send to builder finding: Retry refuses it, and `sd assignments build` presses the item fresh."""
