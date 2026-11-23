@@ -533,12 +533,20 @@ def on_hub(queue: Queue, work: Callable[[Any], Any], *, write: bool = True) -> A
                       code=HUB_UNAVAILABLE) from None
 
 
+def _key_range(prefix: str) -> tuple[str, str]:
+    """The bounds of the keys that start with `prefix`, which ends in `:`: `;` sorts right after `:`.
+
+    A range uses the `state_by_kind_key` index; `substr(key, ...)` scanned every checkpoint row (pack sd:10077).
+    """
+    return prefix, prefix[:-1] + ";"
+
+
 def stored(connection: Any, repository: str) -> list[dict[str, Any]]:
     """The latest row of each of `repository`'s entry keys, in queue order; older rows are each entry's history."""
     prefix = f"{KEY_PREFIX}{repository}:"
     rows = connection.execute(
         "SELECT body FROM state WHERE id IN (SELECT MAX(id) FROM state WHERE kind = 'checkpoint' "
-        "AND substr(key, 1, ?) = ? GROUP BY key)", (len(prefix), prefix)).fetchall()
+        "AND key >= ? AND key < ? GROUP BY key)", _key_range(prefix)).fetchall()
     return sorted((json.loads(row["body"]) for row in rows), key=lambda row: (row.get("position") or 0, row["id"]))
 
 
@@ -1338,8 +1346,8 @@ def enqueue_order(connection: Any, repository: str) -> dict[str, int]:
     """Each entry id's first row id: the order the hub took the entries in, which no clock and no `move` changes."""
     prefix = f"{KEY_PREFIX}{repository}:"
     return {row["key"][len(prefix):]: row["first"] for row in connection.execute(
-        "SELECT key, MIN(id) AS first FROM state WHERE kind = 'checkpoint' AND substr(key, 1, ?) = ? GROUP BY key",
-        (len(prefix), prefix)).fetchall()}
+        "SELECT key, MIN(id) AS first FROM state WHERE kind = 'checkpoint' AND key >= ? AND key < ? GROUP BY key",
+        _key_range(prefix)).fetchall()}
 
 
 #: The days the Queue page's wait and gate times read back (pack sd:6006).
@@ -1422,8 +1430,8 @@ def entry_times(connection: Any, repository: str, *, now: float, days: int = TIM
         "json_extract(body, '$.enqueued_at') AS enqueued, json_extract(body, '$.started_at') AS started, "
         "json_extract(body, '$.finished_at') AS finished, json_extract(body, '$.speculation.status') AS speculation "
         "FROM state WHERE kind = 'checkpoint' AND key IN (SELECT key FROM state WHERE kind = 'checkpoint' "
-        "AND substr(key, 1, ?) = ? AND timestamp >= ?) ORDER BY id",
-        (len(prefix), prefix, time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(start)))).fetchall()
+        "AND key >= ? AND key < ? AND timestamp >= ?) ORDER BY id",
+        (*_key_range(prefix), time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(start)))).fetchall()
     history: dict[str, list[Any]] = {}
     for row in rows:
         history.setdefault(row["key"], []).append(row)
