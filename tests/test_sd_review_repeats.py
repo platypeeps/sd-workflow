@@ -1570,6 +1570,19 @@ class RebuttalScopeTests(RepeatFixture):
         placed = sd_review.rulings_placed([older], lambda _head, _path, line: (line,))
         self.assertEqual([entry.listed for entry in placed], [False])
 
+    def test_an_untracked_ruled_file_at_worktree_scope_lapses_the_ruling(self) -> None:
+        """Failure table of sd:10191: `git diff HEAD` cannot see an untracked file, so a ruled path that is
+        untracked in the worktree counts as changed and the ruling lapses; once gone, it holds again."""
+        self.adjudication(("lane claim", "rebutted", "x"))
+
+        def seen() -> list[bool]:
+            return [entry.listed for entry in sd_review.rebutted_findings(
+                self.root, sd_review.resolve_subject(self.root, "worktree"), None, self.environment())]
+        self.assertEqual(seen(), [True])
+        (self.root / "bin").mkdir()
+        (self.root / "bin/tool.py").write_text("line_3 = 3\n", encoding="utf-8")
+        self.assertEqual(seen(), [False])
+
     def test_a_diff_git_cannot_run_holds_the_rebuttal_back(self) -> None:
         self.adjudication(("lane claim", "rebutted", "x"))
         real = sd_review.sd_lib.git_output
