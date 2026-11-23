@@ -3002,7 +3002,7 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
         with contextlib.suppress(sd_ship_remote.Refusal):  # a lost answer is read back below, never sent twice
             api.api(f"{api.prefix}/pulls/{pull}/merge", method="PUT",
                     body={"sha": tip, "merge_method": "merge", "commit_title": f"chore(lane): train of {names} (#{pull})",
-                          "commit_message": "Each member's own merge carries its trailers."})
+                          "commit_message": train_message(root, tip, base)})
         merged = api.pull(pull)
         if merged.get("merged") is not True or (merged.get("base") or {}).get("ref") != base:
             return {"status": "failed", "pull": pull, "reason": f"GitHub did not merge train pull request #{pull} onto {base}"}
@@ -3011,6 +3011,25 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
         return {"status": "failed", "reason": str(error)[:600]}
     finally:
         scratch_git(root, "push", "--quiet", "origin", "--delete", branch)
+
+
+def train_message(root: pathlib.Path, tip: str, base: str) -> str:
+    """The train merge's message: each member's `Delivers:` and `Closes:`, and the base the train was checked on.
+
+    The delivery ledger reads first parents only, where a member's own merge
+    is not; the outer merge repeats its closing trailers. `Reviewed-base:`
+    names `origin/<base>` as fetched last, so a merge GitHub lands onto a
+    newer base is held, as a lone squash is (sd:9923).
+    """
+    fetched = lane_git(root, "rev-parse", f"refs/remotes/origin/{base}") or ""
+    lines: list[str] = []
+    for commit in (lane_git(root, "rev-list", "--first-parent", "--merges", f"{fetched}..{tip}") or "").split():
+        for line in sd_lib.trailer_block(lane_git(root, "show", "-s", "--format=%B", commit) or "").splitlines():
+            name = line.partition(" ")[0]
+            if name in (sd_lib.DELIVERS_TRAILER, sd_lib.CLOSES_TRAILER) and line not in lines:
+                lines.append(line)
+    trailers = "\n".join([*lines, f"{sd_lib.REVIEWED_BASE_TRAILER} {fetched}"])
+    return f"Each member's own merge holds its review.\n\n{trailers}"
 
 
 def base_moved(root: pathlib.Path, tip: str, base: str) -> str | None:

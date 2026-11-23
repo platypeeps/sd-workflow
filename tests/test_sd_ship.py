@@ -6559,6 +6559,24 @@ roles:
         self.assertEqual(self.train_branches(), [])
         self.assertEqual(self.merge()["merge_commit"], tip)
 
+    def test_a_landed_train_shows_each_member_delivered_on_the_first_parent_history(self):
+        """Review of sd:9923: the outer train merge carried no trailer, and the ledger reads first parents only."""
+        tip = self.joined_tip()
+        landed, _ = self.landed_by_lane(tip)
+        self.assertEqual(landed["status"], "merged")
+        _git(self.root, "fetch", "-q", "origin", "main")
+        self.assertTrue(ship.sd_lib._closed_by(self.root, "FETCH_HEAD", f"sd:{self.item}"))
+
+    def test_a_train_merged_onto_a_base_that_moved_before_the_put_delivers_nothing_in_git(self):
+        tip = self.joined_tip()
+
+        def race():
+            self.remote.commit_on("main", "raced\n\nAuthored-with: human", files={"raced.py": "r = 1\n"})
+        landed, _ = self.landed_by_lane(tip, ready=race)
+        self.assertEqual(landed["status"], "merged")
+        _git(self.root, "fetch", "-q", "origin", "main")
+        self.assertFalse(ship.sd_lib._closed_by(self.root, "FETCH_HEAD", f"sd:{self.item}"))
+
     def test_land_train_whose_gate_fails_opens_no_pull_request(self):
         tip = self.joined_tip()
         landed, _ = self.landed_by_lane(tip, gate="failure")
