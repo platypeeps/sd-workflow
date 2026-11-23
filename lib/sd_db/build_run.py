@@ -1707,7 +1707,8 @@ class Supervisor:
             changed = None
         self.judged = tuple(sorted(changed or ()))
         # ponytail: location, not causation: a defect a new caller causes in unchanged code is filed, not held,
-        # unless the finding's own words name a changed file (pack sd:9900 tracks the rest).
+        # unless the finding's own words name a changed file. Its `evidence` is among them: a blocker's repro
+        # routes the failing input through the change (pack sd:9867), so a dropped check holds (sd:9900).
         # A changed path or its file name; a name shared with an unchanged file holds more, never less.
         names = {name for path in changed or () for name in (path, os.path.basename(path)) if name}
         # The identifiers of the functions the branch changes, read whole: a caller named by function (sd:9769).

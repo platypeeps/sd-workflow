@@ -1928,6 +1928,22 @@ class Supervise(Case):
         _, kept = self.deferred([far], {"src/caller.py": {12}})
         self.assertEqual(kept["blockers"], [], "a blocker naming no changed file was held")
 
+    def test_a_conversion_broken_by_a_dropped_check_holds_on_its_repro(self):
+        """Sd:9900 (ruling #68857): a fix drops validation in lib/check.py, and the unchanged conversion in
+        lib/convert.py, which no call ties to it, raises. The reviewer cites the conversion; its `evidence`
+        repro (pack sd:9867) routes the failing input through the dropped check, so the blocker holds."""
+        self.press()
+        row = {"path": "lib/convert.py", "line": 12, "severity": "high", "family": "correctness",
+               "summary": "int(row[1]) raises ValueError on a non-numeric count",
+               "evidence": "input count='abc' passes lib/check.py:4, where the fix dropped the digit check, "
+                           "then lib/convert.py:12 int(row[1]) raises ValueError",
+               "instances": ["lib/convert.py:12"]}
+        _, kept = self.deferred([row], {"lib/check.py": {4}})
+        self.assertEqual(kept["blockers"], [row], "a conversion the dropped check breaks was filed")
+        uncited = dict(row, evidence="input count='abc': lib/convert.py:12 int(row[1]) raises ValueError")
+        _, kept = self.deferred([uncited], {"lib/check.py": {4}})
+        self.assertEqual(kept["blockers"], [], "a repro whose route skips the change held")
+
     def test_a_changed_caller_named_by_function_holds(self):
         """Lead ruling on sd:9769 (deferral eligibility): a reviewer can name the changed caller by its function
         alone; a name the branch's changed functions hold ties the blocker to the branch, so it is not filed."""
