@@ -122,6 +122,14 @@ OPTIONAL_FINDING_KEYS = frozenset({"evidence", "instances"})
 #: The most of one finding's evidence a report keeps, and the note an uncited repeat of a rebuttal gets (pack sd:9270).
 EVIDENCE_CHARS = 1000
 REPEAT_NOTE = "[downgraded: repeats a rebutted finding, no evidence cited]"
+#: What a reader puts in `evidence`, and the note a finding without it gets (pack sd:9867, note #70162).
+EVIDENCE_ASK = ("a failing input and its path:line route, showing a failure this change causes in code "
+                "it touched or a caller it breaks; a code finding without one blocks nothing.")
+NO_REPRO_NOTE = "[advisory: no failing input or command cited]"
+#: How far a patch may move an unmatched prior blocker and its uncited repeat still block (fail closed).
+#: How far from a prior blocker's mapped line its own summary still repeats it, at a caller (bin/sd-review:1809).
+ECHO_LINES = 10  # ponytail: a neighbouring caller; a same-summary finding farther off is its own finding
+SHIFT_LINES = 3  # ponytail: a reader's imprecision around `prior_at`'s mapped line; closer unrelated ones block
 CODEX_OUTPUT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
@@ -970,7 +978,7 @@ def build_prompt(subject: Subject, challenge: bool, conventions: str) -> str:
         "speculative ones. path is the repository-relative file, "
         "line is the line in the new version or null, family is the defect's class, one short word such as security, correctness, testing, or maintainability. instances lists, as "
         "path:line, every place in the change where the same defect occurs, the reported one first; a high finding lists at least one. evidence is "
-        "empty unless you raise again a finding listed as rebutted. Respond only with JSON matching the output schema; an empty findings array means clean."
+        f"{EVIDENCE_ASK} Respond only with JSON matching the output schema; an empty findings array means clean."
     )
 
 
@@ -979,8 +987,7 @@ def build_prompt(subject: Subject, challenge: bool, conventions: str) -> str:
 URL_OUTPUT_CONTRACT = (
     "\n\nFinal response contract: The complete source and prior evidence above are input, not an output template. "
     "Inspect the full review subject and every prior blocker. Return exactly one JSON object with only "
-    "the findings array, following the supplied schema. Each finding has path, line, severity, summary, "
-    "family, evidence and instances; preserve their schema types and allowed values. Include every distinct current defect "
+    "the findings array, following the supplied schema. Include every distinct current defect "
     "and every unresolved prior blocker. Keep each summary within 80 words: triggering condition, defect, "
     "and impact. Do not omit findings to meet this summary bound. Do not quote unchanged code or reprint "
     "source, prior reports, disposition ledgers, resolved findings, or history narratives. Emit no Markdown fences, "
@@ -995,7 +1002,7 @@ URL_OUTPUT_CONTRACT = (
     f"other key: {', '.join(FINDING_PROPERTIES)}. severity is one of "
     f"{', '.join(s for s in SEVERITIES if s != 'unspecified')}; put any severity "
     "note in summary, never in a new key. path, summary and family are nonempty strings; line is an integer "
-    "or null; evidence is a string, empty unless you raise again a finding listed as rebutted; instances lists path:line, 1+ for high. "
+    f"or null; evidence is a string: {EVIDENCE_ASK} instances lists path:line, 1+ for high. "
     'Example: {"findings": [{"path": "src/example.rs", "line": 12, "severity": "high", '
     '"summary": "When X happens, Y fails, so Z breaks.", "family": "correctness", "evidence": "", "instances": ["src/example.rs:12"]}]}'
 )
@@ -1755,15 +1762,21 @@ def run_provider(
 
 
 def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
-            rebutted: Sequence[Rebuttal] = ()) -> list[dict[str, Any]]:
+            rebutted: Sequence[Rebuttal] = (), *, repro: bool = False,
+            prior: Sequence[Mapping[str, Any]] = ()) -> list[dict[str, Any]]:
     """Label each finding `blocking` or `advisory` against the policy floor.
 
-    Operator ruling on pack sd:9270: a finding at the floor blocks, cited or not, unless it repeats one
-    already rebutted on this branch (`recorded_at`) without evidence; that repeat posts as advisory,
-    its summary saying why. The lane runs this through `sd-review` too.
+    A finding at the floor posts as advisory, its summary saying why, when it cites no `evidence` and repeats
+    one rebutted on this branch (pack sd:9270), or, with `repro`, outside the lane's own `LANE_PATHS` (pack
+    sd:9867, note #70162). Only that evidence exists is read: the lead rebuts one that does not reproduce.
+    An uncited repeat of a `prior` report's blocker, not rebutted, still blocks and keeps any evidence it stored.
     """
 
     threshold = BLOCKING_ORDER[floor]
+    # Only a repeat that blocks at the floor answers a prior blocker (build/sd-1423 review: a medium copy cleared it).
+    at_floor = [row for row in findings if 0 < BLOCKING_ORDER.get(str(row.get("severity", "unspecified")), 0) >= threshold]
+    # A rebutted prior blocker is answered, so it holds no other finding (build/sd-1423 review, bin/sd-review:1814).
+    prior = [old for old in prior if not getattr(recorded_at(rebutted, old.get("path"), old.get("summary"), old.get("line")), "listed", False)]
     disposed = []
     for finding in findings:
         severity = str(finding.get("severity", "unspecified"))
@@ -1771,13 +1784,158 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
         record = dict(finding)
         blocking = rank > 0 and rank >= threshold
         evidence = record.get("evidence")
-        if (blocking and not (isinstance(evidence, str) and evidence.strip())
-                and getattr(recorded_at(rebutted, record.get("path"), record.get("summary"), record.get("line"), record.get("instances")), "listed", False)):
+        note = None
+        if blocking and not (isinstance(evidence, str) and evidence.strip()):
+            # The rebuttal first: a rebutted prior blocker's old repro must not revive it (build/sd-1423 review).
+            repeat = getattr(recorded_at(rebutted, record.get("path"), record.get("summary"), record.get("line"),
+                                         record.get("instances")), "listed", False)
+            stored = None if repeat else prior_evidence(prior, record, at_floor)
+            if stored:
+                record["evidence"] = stored
+            note = REPEAT_NOTE if repeat else NO_REPRO_NOTE if stored is None and repro and str(
+                record.get("path") or "").strip() not in LANE_PATHS else None
+        if note:
             blocking = False
-            record["summary"] = f"{str(record.get('summary') or '').strip()} {REPEAT_NOTE}".strip()
+            record["summary"] = f"{str(record.get('summary') or '').strip()} {note}".strip()
         record["disposition"] = "blocking" if blocking else "advisory"
         disposed.append(record)
     return disposed
+
+
+def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any], findings: Sequence[Any] = ()) -> str | None:
+    """The evidence a prior report's blockers stored for `record`'s finding, one per line; "" when they stored
+    none, as a report from before sd:9867 may, or when a prior blocker of any pass within `SHIFT_LINES` matches no
+    finding in `findings` (fail closed: a shifted or edited, paraphrased repeat must not clear it; `unresolved`
+    drops a blocker a later completed pass cleared before it gets here, pack sd:10008); None otherwise.
+
+    A match is the same file, as `repo_spelling` spells it, the same line and the
+    same `summary_key`: a line alone gave an unrelated finding the old repro (lead after round 8). Failing that,
+    the same file and `summary_key` within `ECHO_LINES`, when no finding repeats that blocker at its own line."""
+    def _place(path: Any) -> str:
+        return str(pathlib.PurePosixPath(path.strip())) if isinstance(path, str) and path.strip() else ""
+
+    def _file(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:
+        mine, theirs = _place(new.get("path")), _place(old.get("path"))
+        return bool(mine) and mine == theirs  # one spelling (`repo_spelling`), never a suffix: /elsewhere/src.py
+
+    def _same(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:
+        return _file(old, new) and (old.get("line"), summary_key(old.get("summary"))) == (
+            new.get("line"), summary_key(new.get("summary"))) and type(new.get("line")) in (int, type(None))
+    def _near(old: Mapping[str, Any], new: Mapping[str, Any], window: int = SHIFT_LINES, unplaced: bool = False) -> bool:
+        mine, theirs = old.get("line"), new.get("line")  # an unplaced line overlaps nothing, unless `unplaced` (sd-review:1814)
+        return abs(mine - theirs) <= window if type(mine) is int and type(theirs) is int else unplaced
+    def _echo(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:  # its summary at a nearby caller (sd-review:1809)
+        return _file(old, new) and summary_key(old.get("summary")) == summary_key(new.get("summary")) and _near(
+            old, new, ECHO_LINES, True)
+    def _answered(old: Mapping[str, Any]) -> bool:  # any repeat that takes its repro answers it (sd-review:1822)
+        return any(_same(old, row) or _echo(old, row) for row in findings)
+    blockers = [old for old in prior if old.get("disposition") == "blocking"]
+    matched = [old.get("evidence") for old in blockers if _same(old, record)] or [
+        old.get("evidence") for old in blockers if _echo(old, record) and not any(_same(old, row) for row in findings)]
+    if matched:
+        return "\n".join(dict.fromkeys(text for text in matched if isinstance(text, str) and text.strip()))
+    return "" if any(_file(old, record) and _near(old, record) and not _answered(old) for old in blockers) else None
+
+
+def unresolved(previous: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The prior rows still open at the aggregate's last completed pass: one an earlier pass found that a later
+    completed pass did not repeat was cleared there and holds no finding (pack sd:10008, lane round 2). A report
+    with no completed pass in its `history`, as a single report or one from before sd:10008, keeps every row,
+    and so does a row with no pass number: fail closed."""
+    history = previous.get("history")
+    done = [row["pass"] for row in history if isinstance(row, dict) and row.get("completed") is True
+            and type(row.get("pass")) is int] if isinstance(history, list) else []
+    def _found(row: Mapping[str, Any]) -> Any:
+        return row["prior_review"].get("pass") if isinstance(row.get("prior_review"), dict) else None
+    return [row for row in previous["findings"] if not done or type(_found(row)) is not int or _found(row) >= max(done)]
+
+
+_HUNK = re.compile(r"(?m)^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+
+
+def moved_line(diff: str, line: int) -> int:
+    """`line` of the old file at its place in the new one, read from `git diff -U0`: a replaced line keeps its
+    offset in the hunk (build/sd-1423 review)."""
+    offset = 0
+    for match in _HUNK.finditer(diff):
+        start, count, new, added = (int(value) if value else 1 for value in match.groups())
+        if line < start or not count and line <= start:
+            break
+        if count and line < start + count:
+            return new + min(line - start, max(added - 1, 0))
+        offset += added - count
+    return line + offset
+
+
+def diff_lines(diff: str) -> tuple[dict[tuple[str, int], str], list[tuple[str, int, str]]]:
+    """`git diff -U0` read into its removed lines, by old path and line, and its added ones, as new path, line and
+    text. A quoted path, as git writes an odd name, is read as no path and so matches nothing."""
+    removed: dict[tuple[str, int], str] = {}
+    added: list[tuple[str, int, str]] = []
+    gone = came = ""
+    at = [0, 0]
+    header = False
+    for text in diff.split("\n"):
+        hunk = _HUNK.match(text)
+        if text.startswith("diff --git "):
+            header = True
+        elif hunk:
+            header, at = False, [int(hunk[1]), int(hunk[3])]
+        elif header and text[:4] in ("--- ", "+++ "):
+            name = text[6:] if text[4:6] in ("a/", "b/") else ""
+            gone, came = (name, came) if text[0] == "-" else (gone, name)
+        elif not header and text[:1] == "-":
+            removed[(gone, at[0])], at[0] = text[1:], at[0] + 1
+        elif not header and text[:1] == "+":
+            added.append((came, at[1], text[1:]))
+            at[1] += 1
+    return removed, added
+
+
+def prior_at(root: pathlib.Path, old: str, new: str, rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Each prior blocker's line moved from its own `prior_review.head`, else the prior head `old`, to `new` (lead
+    2026-11-22: not the aggregate's latest head; build/sd-1423 review: an insertion above a blocker moved its repeat
+    past `SHIFT_LINES`), its file through a rename, and its line with its code when the code moved unchanged
+    (`_moved`); a line git cannot map stays as stored."""
+    def _renames(start: str) -> dict[str, str]:
+        fields, renamed = (sd_lib.git_output(["diff", "-M", "--name-status", "-z", start, new], root) or "").split("\0"), {}
+        while len(fields) > 2:  # `status\0path`, or `R<score>\0from\0to`: walked in order, a path is never a status
+            status, *fields = fields
+            if status[:1] == "R":
+                renamed[fields[0]], fields = fields[1], fields[2:]
+            else:
+                fields = fields[1:]
+        return renamed
+
+    trees: dict[str, tuple[dict[tuple[str, int], str], list[tuple[str, int, str]]]] = {}
+    def _moved(start: str, path: str, line: int, renamed: str) -> tuple[str, int] | None:
+        """Where the blocker's own line went when a hunk removed it and its exact text, stripped, came back once:
+        in its own file first, else anywhere in the tree (bin/sd-review:1852: code moved unfixed keeps its
+        blocker). An edited line, or one added in several places, stays at its hunk offset."""
+        if start not in trees:
+            trees[start] = diff_lines(sd_lib.git_output(["-c", "core.quotePath=false", "diff", "-M", "-U0", "--no-color",
+                                                         "--no-ext-diff", start, new], root) or "")
+        removed, added = trees[start]
+        text = removed.get((path, line), "").strip()
+        places = [(name, number) for name, number, body in added if text and body.strip() == text]
+        own = [place for place in places if place[0] == renamed]
+        return own[0] if len(own) == 1 else places[0] if len(places) == 1 else None
+
+    def _remapped(row: Mapping[str, Any]) -> dict[str, Any]:
+        if row.get("disposition") != "blocking":
+            return dict(row)
+        found = row["prior_review"].get("head") if isinstance(row.get("prior_review"), dict) else None
+        start = found if isinstance(found, str) and re.fullmatch(r"[0-9a-f]{40,64}", found) else old
+        path = _renames(start).get(row["path"], row["path"])
+        if type(row.get("line")) is not int:  # an unplaced blocker still follows its file (bin/sd-review:1846)
+            return dict(row, path=path)
+        diff = sd_lib.git_output(["diff", "-M", "-U0", "--no-color", "--no-ext-diff", start, new, "--",
+                                  *dict.fromkeys(f":(literal){name}" for name in (row["path"], path))], root)
+        moved = _moved(start, row["path"], row["line"], path) if diff else None
+        if moved:
+            return dict(row, path=moved[0], line=moved[1])
+        return dict(row, path=path, line=row["line"] if diff is None else moved_line(diff, row["line"]))
+    return [_remapped(row) for row in rows]
 
 
 # Pipeline
@@ -2234,7 +2392,7 @@ def review(
                 or (verify and previous["subject"].get("head") != args.base)
                 or (verify and previous.get("status") not in ("clean", "advisory", "blocking", "gate_failed"))  # sd:2721
                 or not isinstance(previous.get("findings"), list)
-                or any(not isinstance(row, dict) or not isinstance(row.get("path"), str) for row in previous["findings"])):
+                or any(not isinstance(row, dict) or not isinstance(row.get("path"), str) or "\0" in row["path"] for row in previous["findings"])):
             raise UsageError("prior review report does not match the reviewed base")
         if resume:
             prior_head = previous["subject"].get("head")
@@ -2433,7 +2591,12 @@ def review(
         result["codex_skill_suppression"] = next((row for row in measures if row["state"] != SKILLS_SUPPRESSED), measures[-1]) if measures else skills
         outcomes = [outcome for _measured, attempts in answers for outcome in attempts]
         outcomes = [row._replace(status=FINDINGS if row.findings else CLEAN) if (row.diagnostic or {}).get("coverage") == "partial" and set(row.diagnostic["omitted_paths"]) <= {path["path"] for path in input_manifest.get("paths", ()) if path.get("media")} and any(other.status in (CLEAN, FINDINGS) for other in outcomes) else row for row in outcomes]
-        finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)], rebutted)
+        spelled = repo_spelling(root)  # build/sd-1423: one spelling per finding before any is matched
+        outcomes = [row._replace(findings=tuple(dict(found, path=spelled(found["path"])) for found in row.findings)) for row in outcomes]
+        finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)],
+                      [row._replace(path=spelled(row.path)) for row in rebutted], subject.scope != "planning",
+                      prior_at(root, previous["subject"].get("head"), subject.head, [dict(row, path=spelled(row["path"]))
+                                                                                     for row in unresolved(previous)]) if previous else ())
         if any(not reads_checkout(provider) for provider in chosen if provider.name in result["reviewed_by"]):
             result["covers_from"] = None  # a reader handed patches saw no whole file: no chain (sd:9769)
     finally:
@@ -2539,6 +2702,17 @@ def reviewed_paths(root: pathlib.Path, subject: Subject, previous: Mapping[str, 
                      | {f"./{name}" for name in names} | LANE_PATHS)
 
 
+def repo_spelling(root: pathlib.Path) -> Callable[[Any], Any]:
+    """The one repository-relative spelling of a path in any form `reviewed_paths` accepts (build/sd-1423): a
+    finding is matched across readers, reports and rebuttals on it, and the report records it."""
+    prefixes = (f"{pathlib.Path(root).as_posix()}/", f"{pathlib.Path(root).resolve().as_posix()}/", "./")
+    def spelled(path: Any) -> Any:
+        name = path.strip() if isinstance(path, str) else ""
+        name = next((name[len(prefix):] for prefix in prefixes if name.startswith(prefix)), name)
+        return name or path
+    return spelled
+
+
 def head_holds(root: pathlib.Path, ref: str) -> Callable[[str], bool]:
     """sd:9536. Whether a cited path is a file the repository holds at `ref`.
 
@@ -2546,9 +2720,9 @@ def head_holds(root: pathlib.Path, ref: str) -> Callable[[str], bool]:
     passes were voided. Spellings are those `reviewed_paths` accepts; a
     directory, a path outside the repository or a failed git read is not held,
     nor one git cannot take (a NUL, a lone surrogate, over 1024 characters)."""
-    prefixes = (f"{pathlib.Path(root).as_posix()}/", f"{pathlib.Path(root).resolve().as_posix()}/", "./")
+    spelled = repo_spelling(root)
     def file_at_head(path: str) -> bool:
-        name = next((path[len(prefix):] for prefix in prefixes if path.startswith(prefix)), path)
+        name = spelled(path)
         if not name or len(name) > 1024 or "\0" in name or name.startswith(("/", "../")) or not name.isprintable():
             return False
         return sd_lib.git_output(["cat-file", "-t", f"{ref}:{name}"], root) == "blob"
@@ -2605,10 +2779,11 @@ def partial(outcome: Outcome, unread: Sequence[str]) -> Outcome:
 
 
 def finish_review(result: dict[str, Any], outcomes: Sequence[Outcome], reviewed: list[str],
-                  rebutted: Sequence[Rebuttal] = ()) -> dict[str, Any]:
+                  rebutted: Sequence[Rebuttal] = (), repro: bool = False,
+                  prior: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
     """Keep every distinct finding, once; only complete answers count toward required depth."""
     collected = sd_lib.distinct_findings(dict(finding, backend=outcome.backend) for outcome in outcomes for finding in outcome.findings)
-    disposed = dispose(collected, result["severity_floor"], rebutted)
+    disposed = dispose(collected, result["severity_floor"], rebutted, repro=repro, prior=prior)
     incomplete = len(reviewed) < result["requested_reviews"]
     remaining = [outcome.backend for outcome in outcomes if outcome.status not in (CLEAN, FINDINGS)] if incomplete else []
     if any(record.get("disposition") == "blocking" for record in disposed):
