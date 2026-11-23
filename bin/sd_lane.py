@@ -2154,6 +2154,10 @@ def draw_shots(worktree: pathlib.Path, out: pathlib.Path) -> dict[str, Any]:
     return {"shots": files} if files else {}
 
 
+#: The Screenshots section's head `with_shots` writes; `without_shots` finds it by this text alone.
+SHOTS_HEAD = "## Screenshots\n\nThe lane drew each changed dashboard page.\nThe Queue row links the PNGs.\n\n"
+
+
 def with_shots(body: str, files: list[str]) -> str:
     """`body` and a Screenshots section naming each page and its variants; the PNGs stay local (sd:6728)."""
     pages: dict[str, list[str]] = {}
@@ -2161,8 +2165,12 @@ def with_shots(body: str, files: list[str]) -> str:
         page, theme, width = pathlib.Path(file).stem.rsplit("-", 2)
         pages.setdefault(page, []).append(f"{theme} {width}")
     lines = [f"- {page}: {', '.join(variants)}" for page, variants in pages.items()]
-    return (f"{body.rstrip()}\n\n## Screenshots\n\nThe lane drew each changed dashboard page.\n"
-            "The Queue row links the PNGs.\n\n" + "\n".join(lines) + "\n")
+    return f"{body.rstrip()}\n\n{SHOTS_HEAD}" + "\n".join(lines) + "\n"
+
+
+def without_shots(body: str) -> str:
+    """`body` without each Screenshots section `with_shots` added: the lane's, not the entry's (sd:9335)."""
+    return re.sub(r"\n*" + re.escape(SHOTS_HEAD) + r"(?:- [^\n]*(?:\n|\Z))+", "\n", body)
 
 
 def prepare_step(entry: dict[str, Any], worktree: pathlib.Path, log: pathlib.Path, ship: Ship,

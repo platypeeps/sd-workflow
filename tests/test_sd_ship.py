@@ -4798,6 +4798,34 @@ roles:
                 self.prepare("--deliver", "--body-file", str(new))  # an entry with the renewal's body proceeds
         self.assertEqual(self.operation().state["body"], published)
 
+    def test_a_lane_entry_with_the_renewals_body_and_the_lanes_screenshots_proceeds(self):
+        """Review of build/sd-1636: the lane appends a Screenshots section to a dashboard change's body before
+        prepare, so an entry enqueued with the renewal's exact body refused as another body, and the advice to
+        enqueue again failed the same way. The lane's section is not the entry's body; the published body,
+        given back as the body file, is the renewal's too."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        old, new = self.directory / "old.md", self.directory / "new.md"
+        old.write_text("Body A, the enqueue's.\n")
+        new.write_text("Body B, the renewal's.\n")
+        self.prepare("--deliver", "--body-file", str(old))
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with contextlib.redirect_stderr(io.StringIO()):
+            self.prepare("--deliver", "--body-file", str(new))
+        shot = self.directory / "shot.md"
+        republished = self.directory / "republished.md"
+        republished.write_text(self.operation().state["body"])
+        stale = self.directory / "stale.md"
+        stale.write_text(ship.sd_lane.with_shots(old.read_text(), ["queue-dark-1280.png"]))
+        with patch.dict(os.environ, {"SD_LANE_CHILD": "1"}):
+            for body in (new, republished):
+                shot.write_text(ship.sd_lane.with_shots(body.read_text(), ["queue-dark-1280.png", "queue-light-390.png"]))
+                with self.subTest(body=body.name), contextlib.redirect_stderr(io.StringIO()):
+                    self.assertEqual(self.prepare("--deliver", "--body-file", str(shot))["phase"], "ready_to_send")
+            with contextlib.redirect_stderr(io.StringIO()), \
+                    self.assertRaisesRegex(ship.Refusal, "renewed by hand.*other body"):
+                self.prepare("--deliver", "--body-file", str(stale))
+
     def test_a_lane_retry_with_the_renewals_items_in_another_order_proceeds(self):
         """Lead review of sd:9268: the lane compared the closing lists in order, so a retry naming the renewal's
         items in another order refused. A closing set is a set."""

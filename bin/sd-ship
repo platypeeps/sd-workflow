@@ -586,6 +586,14 @@ def evidence_of(row: object) -> str:
                       sort_keys=True)
 
 
+def body_basis(body: object) -> str:
+    """What a lane entry's body says, to compare with a renewal's: without the lane's Screenshots section
+    (`sd_lane.without_shots`), the `Work:` line prepare adds and blank-line runs (sd:9335)."""
+    text = sd_lane.without_shots(str(body or ""))
+    text = re.sub(rf"(?m)^{re.escape(sd_lib.WORK_TRAILER)} sd:\d+\s*\Z", "", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
 def stale_criteria(claim: object, stored: object) -> list[str]:
     """The criteria of `claim` when not one of its rows proves anything `stored`'s did not, or [] (sd:9268 review).
 
@@ -948,7 +956,7 @@ class Ship(SharedReview):
                           f"the renewal does; enqueue again with the renewal's acceptance file",
                           code="delivery_claim_renewed", boundary="input", state="operator_decision",
                           next_action="Enqueue the item again with the acceptance file the renewal used.")
-        if stored.get("renewed") and not changed and body != self.state.get("body"):
+        if stored.get("renewed") and not changed and body_basis(body) != body_basis(self.state.get("body")):
             raise Refusal(f"sd:{self.args.item}'s delivery claim was renewed by hand, and this lane entry "
                           f"carries another body, as a retry of an entry enqueued before the renewal does; "
                           f"the renewal's body stands: enqueue again with it as the body file",
