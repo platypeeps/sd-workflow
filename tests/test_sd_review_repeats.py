@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import itertools
 import json
 import os
 import pathlib
@@ -330,10 +331,11 @@ class PriorLineTests(RepeatFixture):
         moved = sd_review.prior_at(self.root, old, new, prior)
         self.assertEqual([(row["path"], row["line"]) for row in moved], [("src.py", 9), ("helpers.py", 30)])
 
-    def test_a_repeat_at_a_moved_blocker_answers_its_old_place_too(self) -> None:
-        """build/sd-1623 review (bin/sd-review:1955): code moved from src.py:10 to helpers.py:30 and repeated
-        there. The old place, which the move also holds, still failed closed, so an unrelated uncited finding
-        within `SHIFT_LINES` of it blocked. A repeat at any place of a blocker answers the whole blocker."""
+    def test_a_repeat_at_a_moved_blocker_leaves_its_old_place_holding(self) -> None:
+        """build/sd-1623 review (bin/sd-review:1838, :1980): code moved from src.py:10 to helpers.py:30 and
+        repeated there. The move was inferred from line text, and the repeat at the new place cleared the hold
+        at the old hunk, where the defect may have stayed. A move adds a place and answers none: the old place
+        holds a finding beside it until a completed pass clears the blocker (`unresolved`, lead #72671)."""
         body = "".join(f"line{n}\n" for n in range(1, 10)) + "    broken_call()\n" + "tail\n"
         (self.root / "src.py").write_text(body, encoding="utf-8")
         (self.root / "helpers.py").write_text("".join(f"h{n}\n" for n in range(1, 30)), encoding="utf-8")
@@ -348,11 +350,26 @@ class PriorLineTests(RepeatFixture):
                                            finding(line=9, summary="the cache is never cleared")],
                                           "high", repro=True, prior=moved)
         self.assertEqual([(row["disposition"], row.get("evidence")) for row in (repeat, other)],
-                         [("blocking", REPRO), ("advisory", None)])
-        # Unanswered, the old place still fails closed.
-        [alone] = sd_review.dispose([finding(line=9, summary="the cache is never cleared")], "high", repro=True,
-                                    prior=moved)
-        self.assertEqual(alone["disposition"], "blocking")
+                         [("blocking", REPRO), ("blocking", None)])
+
+    def test_each_instance_maps_to_this_head_on_its_own(self) -> None:
+        """Class pass on bin/sd-review:1838: `prior_at` takes a blocker as stored and maps each place it names
+        through its own file's diff; no row keeps the list of places as the prior head spelled them."""
+        (self.root / "src.py").write_text("".join(f"line{n}\n" for n in range(1, 21)), encoding="utf-8")
+        (self.root / "b.py").write_text("".join(f"b{n}\n" for n in range(1, 61)), encoding="utf-8")
+        old = self.commit("add", "src.py", "b.py") and self.commit("old")
+        (self.root / "b.py").write_text("top\ntop\n" + "".join(f"b{n}\n" for n in range(1, 61)), encoding="utf-8")
+        new = self.commit("add", "b.py") and self.commit("new")
+        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes", instances=["src.py:10", "b.py:40"]),
+                      disposition="blocking")]
+        moved = sd_review.prior_at(self.root, old, new, prior)
+        self.assertEqual([(row["path"], row["line"], "instances" in row) for row in moved],
+                         [("src.py", 10, False), ("b.py", 42, False)])
+        # A rebuttal recorded at this head's place answers that place.
+        rebutted = listed(adjudicated(("b.py", "Empty input crashes", "rebutted"), line=42))
+        [record] = sd_review.dispose([finding(path="b.py", line=43, summary="the cache is never cleared")], "high",
+                                     rebutted, repro=True, prior=moved)
+        self.assertEqual(record["disposition"], "advisory")
 
     def test_a_blocker_whose_line_was_edited_keeps_its_place_when_its_text_appears_elsewhere(self) -> None:
         """build/sd-1623 review (bin/sd-review:2612, :1921): `return None` at src.py:10 replaced by another
@@ -372,6 +389,11 @@ class PriorLineTests(RepeatFixture):
         [record] = sd_review.dispose([finding(line=10, summary="returns None on empty input")], "high",
                                      repro=True, prior=moved)
         self.assertEqual((record["disposition"], record.get("evidence")), ("blocking", REPRO))
+        # build/sd-1623 review (bin/sd-review:1980): the same summary at the place the text went answers that
+        # place alone, so a paraphrase at the edited line is still held.
+        disposed = sd_review.dispose([finding(path="helpers.py", line=2, summary="returns None on empty input"),
+                                      finding(line=10, summary="x is never checked")], "high", repro=True, prior=moved)
+        self.assertEqual([row["disposition"] for row in disposed], ["blocking", "blocking"])
 
     def test_a_blocker_follows_its_file_through_a_rename(self) -> None:
         """build/sd-1423 review (bin/sd-review:1839): renaming src.py to renamed.py left the prior blocker on
@@ -686,19 +708,28 @@ class ReproRuleTests(unittest.TestCase):
                                      repro=True, prior=prior)
         self.assertEqual(record["disposition"], "advisory")
 
-    def test_a_blocker_holds_each_place_its_instances_name_and_no_other(self) -> None:
-        """build/sd-1623 review (bin/sd-review:1833): odd entries name no place and never raise."""
-        blocker = dict(finding(REPRO, line=10, summary="s"), disposition="blocking", instances=[
-            "src.py:10", "b.py:40", "b.py:40", " c.py ", "d.py:\u0663", "e.py:4\n", "", "  ", None, 7, ["x"],
-            "f.py:" + "9" * 4301, "g\u00e9.py:2", "h.py:0"])
-        self.assertEqual([(row["path"], row["line"]) for row in sd_review.instance_rows(blocker)],
+    def test_a_row_is_one_row_per_place_it_names(self) -> None:
+        """build/sd-1623 review (bin/sd-review:1833): odd entries name no place and never raise. Class pass on
+        bin/sd-review:1838: a place row carries no `instances`, so no decision at it reads another place, and an
+        instance's file is the one `sd_lib.instance_files` gives the reader."""
+        entries = ["src.py:10", "b.py:40", "b.py:040", " c.py ", "d.py:\u0663", "e.py:4\n", "", "  ", None, 7, ["x"],
+                   "f.py:" + "9" * 4301, "g\u00e9.py:2", "h.py:0", ":7"]
+        blocker = dict(finding(REPRO, line=10, summary="s"), disposition="blocking", instances=entries)
+        rows = sd_review.instance_rows(blocker)
+        self.assertEqual([(row["path"], row["line"]) for row in rows],
                          [("src.py", 10), ("b.py", 40), ("c.py", None), ("d.py:\u0663", None), ("e.py", 4),
-                          ("f.py:" + "9" * 4301, None), ("g\u00e9.py", 2), ("h.py", 0)])
-        self.assertEqual(sd_review.instance_rows(dict(blocker, disposition="advisory")), [dict(blocker, disposition="advisory")])
-        self.assertEqual(sd_review.instance_rows(dict(blocker, instances="src.py:1")), [dict(blocker, instances="src.py:1")])
+                          ("f.py", None), ("g\u00e9.py", 2), ("h.py", 0)])
+        self.assertEqual({row["path"] for row in rows}, set(sd_review.sd_lib.instance_files(entries)) - {""})
+        self.assertFalse(any("instances" in row for row in rows))
+        self.assertEqual(sd_review.instance_rows(rows[1]), [rows[1]])
+        self.assertEqual(sd_review.instance_rows(dict(finding(line=3), instances="src.py:1")), [finding(line=3)])
         # build/sd-1623 review (bin/sd-review:1844): a stored place that is not JSON-scalar is no key error.
         odd = dict(blocker, path=["src.py"], line=[], instances=["b.py:40"])
         self.assertEqual([row["path"] for row in sd_review.instance_rows(odd)], [["src.py"], "b.py"])
+        for line in (10, None, [], 10 ** 400, True, float("nan"), "10"):  # no stored or reported place raises
+            [record] = sd_review.dispose([dict(finding(line=10, summary="s"), instances=entries)], "high", repro=True,
+                                         prior=[dict(odd, line=line, instances=entries)])
+            self.assertEqual(record["disposition"], "blocking", line)
 
     def test_a_rebuttal_covering_an_instance_answers_its_repeat_there(self) -> None:
         """build/sd-1623 review (bin/sd-review:1779, :1791): a rebuttal at src.py:10 that answered both
@@ -738,6 +769,81 @@ class ReproRuleTests(unittest.TestCase):
         [record] = sd_review.dispose([finding(line=10, summary="Empty input crashes", **both)], "high", rebutted,
                                      repro=True, prior=prior)
         self.assertEqual((record["disposition"], record.get("evidence")), ("blocking", REPRO))
+
+    def test_a_repeat_at_one_place_leaves_every_other_place_holding(self) -> None:
+        """build/sd-1623 review (bin/sd-review:1838), class pass: "Empty input crashes" at a.py:10 and b.py:40,
+        repeated at a.py:10 and paraphrased at b.py:41. The repeat answered the whole blocker, so the paraphrase
+        posted as advisory. Each place holds alone, and one finding place repeats the nearest prior place only."""
+        def held(places: list[str], *rows: dict[str, Any]) -> list[str]:
+            path, _, line = places[0].partition(":")
+            blocker = dict(finding(REPRO, path=path, line=int(line), summary="Empty input crashes",
+                                   instances=places), disposition="blocking")
+            return [row["disposition"] for row in sd_review.dispose(list(rows), "high", repro=True, prior=[blocker])]
+        paraphrase = "An empty list raises IndexError"
+        for places, repeat, other in ((["a.py:10", "b.py:40"], ("a.py", 10), ("b.py", 41)),
+                                      (["src.py:10", "src.py:14"], ("src.py", 10), ("src.py", 15)),
+                                      (["src.py:10", "src.py:14"], ("src.py", 11), ("src.py", 15))):
+            with self.subTest(places=places, repeat=repeat):
+                self.assertEqual(held(places, finding(path=repeat[0], line=repeat[1], summary="Empty input crashes"),
+                                      finding(path=other[0], line=other[1], summary=paraphrase)),
+                                 ["blocking", "blocking"])
+        # Repeated at each place, the blocker is answered: an unrelated finding beside one is no longer held.
+        self.assertEqual(held(["src.py:10", "src.py:14"], finding(line=10, summary="Empty input crashes"),
+                              finding(line=14, summary="Empty input crashes"), finding(line=15, summary=paraphrase)),
+                         ["blocking", "blocking", "advisory"])
+
+    def test_every_place_is_held_until_a_repeat_at_that_place(self) -> None:
+        """Property for the class of bin/sd-review:1838, over every subset of repeated places, across files, far
+        apart in one file and inside one echo window: a paraphrase beside a place is held exactly when no
+        finding repeats that place, whether each repeat is a finding of its own or one finding lists them all."""
+        places = [("a.py", 10), ("a.py", 20), ("a.py", 90), ("b.py", 40)]
+        blocker = dict(finding(REPRO, path="a.py", line=10, summary="Empty input crashes",
+                               instances=[f"{path}:{line}" for path, line in places]), disposition="blocking")
+        beside = [finding(path=path, line=line + 1, summary="An empty list raises IndexError") for path, line in places]
+        for repeated in (chosen for count in range(len(places) + 1) for chosen in itertools.combinations(places, count)):
+            each = [finding(path=path, line=line, summary="Empty input crashes") for path, line in repeated]
+            listing = [dict(each[0], instances=[f"{path}:{line}" for path, line in repeated])] if each else []
+            for repeats in (each, listing):
+                with self.subTest(repeated=repeated, findings=len(repeats)):
+                    disposed = sd_review.dispose(repeats + beside, "high", repro=True, prior=[blocker])
+                    self.assertEqual([row["disposition"] for row in disposed], ["blocking"] * len(repeats) + [
+                        "advisory" if place in repeated else "blocking" for place in places])
+
+    def test_a_finding_repeats_a_prior_blocker_at_any_place_it_names(self) -> None:
+        """Class pass on bin/sd-review:1838: the matcher read a finding's reported place alone, so an uncited
+        repeat reported at a new place, c.py:5, that lists the prior blocker's b.py:40 as an instance posted as
+        advisory. A finding is matched at each place it names, as a prior blocker is."""
+        prior = [dict(finding(REPRO, path="b.py", line=40, summary="Empty input crashes"), disposition="blocking")]
+        for summary, instance, expected in (("Empty input crashes", "b.py:40", ("blocking", REPRO)),
+                                            ("An empty list raises IndexError", "b.py:41", ("blocking", None)),
+                                            ("An empty list raises IndexError", "b.py:90", ("advisory", None))):
+            with self.subTest(instance=instance):
+                [record] = sd_review.dispose([finding(path="c.py", line=5, summary=summary,
+                                                      instances=["c.py:5", instance])], "high", repro=True, prior=prior)
+                self.assertEqual((record["disposition"], record.get("evidence")), expected)
+        # A repeat that names the place, at the floor, answers it for a finding beside it.
+        repeat, other = sd_review.dispose([
+            finding(path="c.py", line=5, summary="Empty input crashes", instances=["c.py:5", "b.py:40"]),
+            finding(path="b.py", line=41, summary="the cache is never cleared")], "high", repro=True, prior=prior)
+        self.assertEqual([repeat["disposition"], other["disposition"]], ["blocking", "advisory"])
+
+    def test_a_rebuttal_answers_only_the_places_it_covers(self) -> None:
+        """Class pass on bin/sd-review:1838: a rebuttal at a.py:10 and a blocker at a.py:10 and b.py:40. The
+        rebutted place holds no finding beside it; the place the rebuttal does not cover still does, and still
+        lends its repro to a repeat that names it."""
+        rebutted = listed(adjudicated(("a.py", "Empty input crashes", "rebutted"), line=10))
+        both = ["a.py:10", "b.py:40"]
+        prior = [dict(finding(REPRO, path="a.py", line=10, summary="Empty input crashes", instances=both),
+                      disposition="blocking")]
+        disposed = sd_review.dispose([finding(path="a.py", line=12, summary="the cache is never cleared"),
+                                      finding(path="b.py", line=41, summary="the cache is never cleared"),
+                                      finding(path="b.py", line=40, summary="Empty input crashes")],
+                                     "high", rebutted, repro=True, prior=prior)
+        self.assertEqual([(row["disposition"], row.get("evidence")) for row in disposed],
+                         [("advisory", None), ("advisory", None), ("blocking", REPRO)])
+        [alone] = sd_review.dispose([finding(path="b.py", line=41, summary="the cache is never cleared")], "high",
+                                    rebutted, repro=True, prior=prior)
+        self.assertEqual(alone["disposition"], "blocking")
 
     def test_the_same_line_alone_gives_no_prior_evidence(self) -> None:
         """Lead after round 8: the matcher gave the old repro to an unrelated cache finding at the same line."""
