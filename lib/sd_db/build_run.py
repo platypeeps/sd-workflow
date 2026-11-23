@@ -79,6 +79,10 @@ REVIEW_ROUNDS = 7
 #: the blockers' class (operator ruling on pack sd:9264, 2026-11-20); the park after REVIEW_ROUNDS stays.
 ESCALATE_AFTER = 3
 STRONGEST, ESCALATED_EFFORT = "fable", "high"
+#: A rate-limited review waits this long, beating, then asks again, up to `RATE_LIMIT_WAITS` times before it
+#: blocks: a quota window passes, and a block parked the item for a manual Retry (sd:9882).
+RATE_LIMIT_WAIT_SECONDS = 900
+RATE_LIMIT_WAITS = 4
 MAX_TURNS = 300
 TITLE_MAX = 63
 #: A read (`git status`, `lane list`) that takes longer is unread.
@@ -92,6 +96,60 @@ HEARTBEAT = build.HEARTBEAT
 #: The lane entry states that end an `enqueued` run without a merge: the lane's `BLOCKED` ends, which
 #: `lane retry` queues again (`prepared` is a merge the lane refused), and a cancel.
 LANE_ENDED = ("failed", "skipped", "prepared", "cancelled")
+#: `bin/sd-review`'s markers of a rate-limited reply, one vocabulary: a test pins this copy to that one.
+RATE_LIMIT_MARKERS = (
+    "rate limit",
+    "rate-limit",
+    "rate_limit",
+    "usage limit",
+    "quota exceeded",
+    "too many requests",
+    "http 429",
+    "status 429",
+    " 429 ",
+)
+
+#: The blocker classes the brief checks a change against (sd:9770): a pattern over one recorded blocker, the
+#: checklist line. The brief shows the `CHECKLIST_TOP` that recorded rounds (`build.ROUND_BLOCKERS`) of the last
+#: `CHECKLIST_DAYS` days matched most, so the list follows the reviews; a blocker no pattern names counts nowhere.
+BLOCKER_CLASSES = (
+    (re.compile(r"\b(race|concurren\w*|lock\w*|atomic\w*|toctou|interleav\w*)\b", re.I),
+     "two writers or a read-then-write that another process can interleave"),
+    (re.compile(r"\b(crash\w*|interrupt\w*|replay\w*|resum\w*|idempoten\w*|partial\w*|half)\b", re.I),
+     "a step interrupted halfway: what state it leaves and what recovers it"),
+    (re.compile(r"\b(retr(y|ies|ied)|again|twice|duplicate\w*|repeat\w*)\b", re.I),
+     "a step run twice: a retry or replay that writes or charges again"),
+    (re.compile(r"\b(stale|moved|outdated|newer|older)\b", re.I),
+     "a value read once and used after it went stale (a head, a row, a revision)"),
+    (re.compile(r"\b(untracked|ignored|uncommitted|staged|dirty)\b", re.I),
+     "untracked, ignored or uncommitted files a git check does not see"),
+    (re.compile(r"\b(swallow\w*|silent\w*|ignores? (the )?(error|failure|exit)|masks?|hides?)\b", re.I),
+     "an error swallowed or reported as success, or as another stage's"),
+    (re.compile(r"\b(json|narrow\w*|isinstance|malformed|unvalidated|type)\b", re.I),
+     "external input used before its type and shape are checked"),
+    (re.compile(r"\b(substring|prefix|suffix|token boundar\w*|startswith|regex|pattern)\b", re.I),
+     "names matched by substring or loose pattern, not exactly"),
+    (re.compile(r"\b(empty|unicode|non-ascii|escap\w*|quot\w*|newline|markup|long)\b", re.I),
+     "input that is empty, long, non-ASCII or carries markup or newlines"),
+    (re.compile(r"\b(clock|timestamp\w*|timezone|utc|deadline|timeout\w*)\b", re.I),
+     "time: clock skew, time zones, deadlines and timeouts"),
+    (re.compile(r"\b(pid|process group|pgid|kill\w*|orphan\w*|child(ren)?|signal\w*)\b", re.I),
+     "processes: a kill that misses children or ends another's process"),
+    (re.compile(r"\b(no test|untested|test (does not|doesn't|never)|fail-first|not (covered|tested))\b", re.I),
+     "a fix or branch with no test that failed before it"),
+    (re.compile(r"\b(path|symlink|outside|traversal|home directory)\b", re.I),
+     "paths: symlinks, relative paths, and writes outside the intended root"),
+)
+CHECKLIST_TOP = 10
+CHECKLIST_DAYS = 30
+#: The columns a failure table's header names, in order (sd:9770).
+FAILURE_COLUMNS = ("step", "state", "failure", "recovery", "test")
+#: A table's header separator row, `| --- | :-: |`: no data.
+TABLE_SEPARATOR = re.compile(r"[\s|:-]+")
+#: The rule the precheck names when a state-moving change has no failure table (sd:9584, sd:9770).
+FAILURE_TABLE_RULE = ("WORKFLOW.md, Review rounds: a change that moves state in steps carries a failure table "
+                      "(step, state moved, failure, recovery, test) in its design.md or the PR body before review "
+                      "round 1 (sd:9584)")
 
 #: The builder's pre-approved calls: the brief's two commit forms (pack sd:6723). A prefix rule cannot pin
 #: the -F file inside the worktree; the brief does.
@@ -127,7 +185,7 @@ BRIEF = """You are a headless builder run by the build dispatcher (pack sd:6094)
 
 Build these items, one commit per item, in the worktree {worktree} on branch {branch}:
 {items}
-{findings}{denied}
+{findings}{checklist}{denied}
 Rules:
 - Work only in {worktree}. Read each item with `sd task show N` and the repository's CLAUDE.md first.
 - Write no file outside the worktree but the title and body below, not even in /tmp. Commit with
@@ -361,8 +419,8 @@ class Tools:
 def judge(lines: list[str], *, session: str | None = None) -> dict:
     """The builder's verdict from the stream-json lines one child wrote: the last line, never the exit code.
 
-    `state` is `pass`, `denied` (with `tools`), `max_turns`, `failed` or
-    `unknown`. A pass needs a `result` line of subtype `success`, `is_error`
+    `state` is `pass`, `denied` (with `tools`), `max_turns`,
+    `rate_limited`, `failed` or `unknown`. A pass needs a `result` line of subtype `success`, `is_error`
     false and an empty `permission_denials` list, in the session the run
     recorded (`session`), else the one its `init` line named: a line of
     another session is no evidence for this run.
@@ -402,6 +460,12 @@ def judge(lines: list[str], *, session: str | None = None) -> dict:
                 "calls": "; ".join(_denied_call(row) for row in denials)}
     if final.get("subtype") == "error_max_turns":
         return {**result, "state": "max_turns", "why": "the builder hit its turn limit"}
+    # `sd-review`'s rule for Claude's envelope (pack sd:9907): an error with status 429, or a marker in its text.
+    status, reply = final.get("api_error_status"), final.get("result")
+    said = reply if isinstance(reply, str) else ""
+    if final.get("is_error") is True and (type(status) is int and status == 429
+                                          or any(marker in said.lower() for marker in RATE_LIMIT_MARKERS)):
+        return {**result, "state": "rate_limited", "why": f"the builder's account is rate limited: {said[:300]}"}
     if final.get("subtype") != "success" or final.get("is_error") is not False:
         return {**result, "state": "failed", "why": f"the result is {final.get('subtype')}, is_error "
                                                     f"{final.get('is_error')}"}
@@ -466,7 +530,8 @@ def _read_bytes(argv: list[str], *, env: dict | None = None) -> bytes:
 def kept_files(git: Collection[str], work: str, *, env: dict | None = None) -> str:
     """The status lines of `work` that `git worktree remove` would lose: changes, untracked and ignored
     files, those config hides too, less the ignored ones under a `DISPOSABLE` folder; "" when it may go."""
-    lines = _read([*git, "-C", work, "status", "--porcelain", "--ignored", "--untracked-files=all"], env=env)
+    lines = _read([*git, "-C", work, "-c", "core.quotePath=false", "status", "--porcelain", "--ignored",
+                   "--untracked-files=all"], env=env)
     return "\n".join(line for line in lines.splitlines() if line.strip() and not (
         # Folder parts only: git ends an ignored folder with "/", so a file of that name is no cache.
         line.startswith("!! ") and DISPOSABLE.intersection(line[3:].strip('"').split("/")[:-1])))
@@ -790,7 +855,7 @@ def dispatch(connection, *, owner: str, load: float | None, load_cap: float | No
     # The beat carries why this tick claims nothing: the hub reads a satellite's beat as one that would claim a
     # press only when `why` is empty (`build.dispatcher_refusal`, review round 4).
     why = why or build.unread(load, load_cap, interactive) or (
-        build.RESTORING if build.restoration_pending(connection) else "")
+        build.RESTORING if build.restoration_pending(connection) else "") or build.rate_hold(connection)
     record_state(connection, "heartbeat", key=HEARTBEAT if hub else f"{HEARTBEAT}@{build.this_host()}",
                  body={"pid": os.getpid(), "owner": owner, "why": why,
                        "load": build.over_load(load, load_cap) if not build.unread(load, load_cap, []) else ""})
@@ -1028,8 +1093,12 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
     return moved
 
 
-def _environ(environ: dict | None) -> dict:
-    env = dict(os.environ if environ is None else environ)
+def _environ(environ: dict | None, ident: str) -> dict:
+    # The supervisor's `git -C` calls and the builder start here: a hook's `GIT_DIR` would point them at its own
+    # repository, not the run's worktree (pack sd:9709, round 26).
+    env = paths.git_env(os.environ if environ is None else environ)
+    # Machine hooks tell a headless builder from a session by this (pack sd:9715).
+    env["SD_BUILD_RUN"] = ident
     # The token reaches the child's environment only: no row or log holds it.
     if env.get("CUSTOM_CLAUDE_CODE_OAUTH_TOKEN"):
         env["CLAUDE_CODE_OAUTH_TOKEN"] = env["CUSTOM_CLAUDE_CODE_OAUTH_TOKEN"]
@@ -1083,7 +1152,7 @@ class Supervisor:
         self.reviewed: str | None = None
         self.blockers: list[dict] = []
         self.last_beat = 0.0
-        self.env = _environ(environ)
+        self.env = _environ(environ, ident)
         # Claude Code's own OTel, where the machine turns it on, names the run
         # by these (pack sd:6943); the switch and endpoint are system sd:6944's.
         self.env["OTEL_RESOURCE_ATTRIBUTES"] = ",".join(filter(None, (
@@ -1395,7 +1464,8 @@ class Supervisor:
             return self.blocked_round([{"path": "enqueue check", "line": "-", "summary": text} for text in refused])
         answer: dict | None = None
         argv, prior = self.review_plan(head)
-        for _attempt in range(2):
+        unknown = waits = 0
+        while unknown < 2:
             out = self.out("review")
             self.empty(out, "review")
             self.child(argv, cwd=self.work, name="review")
@@ -1406,6 +1476,17 @@ class Supervisor:
             if answer is not None and not (prior and (answer["status"] == "skipped" or answer["status"] in (
                     "clean", "advisory") and not answer["covers"])):
                 break
+            if answer is None and self.rate_limited(out):
+                if waits >= RATE_LIMIT_WAITS:
+                    return self.finish("blocked", f"the review stayed rate_limited after {waits} waits of "
+                                                  f"{RATE_LIMIT_WAIT_SECONDS:g} s at {head[:12]}; see {out}")
+                waits += 1
+                self.note(self.lead, f"Build run {self.ident}: the review is rate_limited at {head[:12]}; "
+                                     f"asking again in {RATE_LIMIT_WAIT_SECONDS:g} s ({waits} of {RATE_LIMIT_WAITS})")
+                self.pause(RATE_LIMIT_WAIT_SECONDS)
+                continue
+            unknown += 1
+            answer = None
             if prior:  # `sd-review` can refuse a verify plan (input past its bound): retry the branch in full
                 argv, prior = argv[:argv.index("--verify-report")], None  # verify args close the argv
         if answer is None:
@@ -1862,18 +1943,51 @@ class Supervisor:
         return bool(said) and said[-1] == GATE_NOT_STARTED
 
     def prechecked(self, head: str) -> list[str]:
-        if self.checked is None:
-            return []
         try:
             title, body = (path.read_text(encoding="utf-8") if path.exists() else "" for path in (self.title, self.body))
         except ValueError:  # not UTF-8: the builder rewrites it, as for any other refusal
             return [f"the title at {self.title} or the body at {self.body} is not UTF-8 text"]
-        return self.checked(self.work, self.base(), head, title.strip(), body)
+        refused = self.checked(self.work, self.base(), head, title.strip(), body) if self.checked else []
+        return refused + self.untabled(head, body)
+
+    def untabled(self, head: str, body: str) -> list[str]:
+        """The failure-table refusal for a change that moves state in steps, or none (sd:9770).
+
+        `docs/work/*/design.md` exists only for such a change (docs/work/README.md): the change is one when the
+        branch adds or changes a design.md there, or one there names a member (`item: sd:N`); deleting a finished
+        one moves no state (review of sd:9770). It passes when each such
+        design.md, or the body, holds a failure table (`failure_table`): a header and a data row.
+        """
+        git = [*self.tools.git, "-C", str(self.work)]
+        # NUL-split, so git quotes no path (a non-ASCII one under core.quotePath; lane review of 0e395efb).
+        changed = _read([*git, "diff", "--name-only", "-z", "--diff-filter=d", f"{self.base()}...{head}", "--",
+                         "docs/work"], env=self.env).split("\0")
+        named = re.compile(r"^item:\s*sd:(" + "|".join(str(item) for item in [self.lead, *self.others]) + r")\b", re.M)
+        # The committed head, as the clean review worktree holds it: no uncommitted or ignored file counts.
+        texts = {}
+        for path in _read([*git, "ls-tree", "-r", "-z", "--name-only", head, "--", "docs/work"],
+                          env=self.env).split("\0"):
+            if re.fullmatch(r"docs/work/[^/]+/design\.md", path):
+                text = _read_bytes([*git, "cat-file", "blob", f"{head}:{path}"], env=self.env).decode("utf-8", "replace")
+                if path in changed or named.search(text):
+                    texts[path] = text
+        # Each design needs its own table; the body's covers one it names, or the only one (review of sd:9770).
+        bare = [path for path, text in sorted(texts.items()) if not failure_table(text)
+                and not (failure_table(body) and (len(texts) == 1 or str(Path(path).parent) in body))]
+        if not bare:
+            return []
+        return [f"this change moves state in steps ({', '.join(bare)}), and neither that design.md nor "
+                f"the body holds its failure table: {FAILURE_TABLE_RULE}. Add the table, one row per step"]
 
     def blocked_round(self, blockers: list[dict]) -> str | dict:
         self.blockers = blockers
         # Once per child that blocked: a fault after this write re-walks the held review, which is the same review.
-        self.once(f"round:{(self.last or {}).get('pid')}", self.count_round)
+        child = (self.last or {}).get("pid")
+        self.once(f"round:{child}", self.count_round)
+        # The record the brief's checklist counts (sd:9770).
+        self.once(f"blockers:{child}", lambda: add_note(
+            self.db, self.lead, "comment",
+            (build.ROUND_BLOCKERS + self.summary(blockers, limit=None))[:build.FINDING_MAX]))
         rounds = self.fresh()["review_round"] or 0
         if rounds < REVIEW_ROUNDS:
             return self.fix()
@@ -2210,7 +2324,24 @@ class Supervisor:
             f"SELECT id, title FROM item WHERE id IN ({', '.join('?' for _ in items)})", items)}
         return {"worktree": self.work, "branch": self.row["branch"], "title": self.title, "body": self.body,
                 "title_max": TITLE_MAX, "items": "\n".join(f"- sd:{item} {titles.get(item, '')}" for item in items),
-                "findings": self.findings(items), "denied": self.denied()}
+                "findings": self.findings(items), "checklist": self.checklist(), "denied": self.denied()}
+
+    def checklist(self) -> str:
+        """The blocker classes recorded review rounds of the last `CHECKLIST_DAYS` found most, top first; "" for
+        none (sd:9770). Each recorded blocker counts once per class it matches."""
+        since = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - CHECKLIST_DAYS * 86400))
+        counts = [0] * len(BLOCKER_CLASSES)
+        for (body,) in self.db.execute("SELECT body FROM note WHERE body LIKE ? AND timestamp >= ?",
+                                       (build.ROUND_BLOCKERS + "%", since)):
+            for line in body[len(build.ROUND_BLOCKERS):].splitlines():
+                for at, (pattern, _) in enumerate(BLOCKER_CLASSES):
+                    counts[at] += bool(line.strip() and pattern.search(line))
+        top = sorted((-count, at) for at, count in enumerate(counts) if count)[:CHECKLIST_TOP]
+        if not top:
+            return ""
+        lines = "\n".join(f"- {BLOCKER_CLASSES[at][1]} ({-count})" for count, at in top)
+        return (f"\nBefore the first review, check the change against the blocker classes recorded review rounds\n"
+                f"found most in the last {CHECKLIST_DAYS} days, with their counts, and fix what applies:\n{lines}\n")
 
     def findings(self, items: list[int]) -> str:
         """The Send to builder notes on `items` since the lead's first run, up to this run (pack sd:6020), then the
@@ -2220,8 +2351,14 @@ class Supervisor:
         A bundle queued again keeps its lead, so this run resumes the branch an earlier run left. Only a Send to
         builder note is the operator's; a REVIEWED note is the reviewer's text, and the brief says so.
         """
-        first = self.db.execute("SELECT MIN(created_at) FROM runner_run WHERE assignment = ?",
-                                (self.row["assignment"],)).fetchone()[0]
+        # Or since the lead was first queued, if that is earlier: a bundle drop notes its finding on a new lead
+        # before the lead's first run (round 14). The queue's note keeps that time; `queued_at` moves at each
+        # Retry, which lost the finding from the second run on (pack sd:9709, round 16).
+        lead = self.row["assignment"]
+        first = self.db.execute(
+            f"SELECT MIN(at) FROM (SELECT created_at AS at FROM runner_run WHERE assignment = ? UNION ALL "
+            f"SELECT timestamp FROM note WHERE item IN ({', '.join('?' for _ in items)}) AND body LIKE ?)",
+            (lead, *items, f"Build assignment {lead} queued %")).fetchone()[0]
 
         def listed(prefix: str, *, latest: bool = False) -> str:
             notes = self.db.execute(
@@ -2297,6 +2434,8 @@ class Supervisor:
             return self.finish("blocked", verdict["why"], question=self.denial_question(verdict))
         if verdict["state"] == "max_turns":
             return self.finish("error_max_turns", verdict["why"])
+        if verdict["state"] == "rate_limited":
+            return self.finish(build.RATE_LIMITED, f"{verdict['why']}; log {self.log}")
         return self.finish("blocked", f"{verdict['why']}; log {self.log}")
 
     def denial_question(self, verdict: dict) -> str:
@@ -2369,6 +2508,23 @@ class Supervisor:
 
     def head(self) -> str:
         return _read([*self.tools.git, "-C", str(self.work), "rev-parse", "HEAD"], env=self.env).strip()
+
+    @staticmethod
+    def rate_limited(out: Path) -> bool:
+        """Whether the review's answer is the provider's quota, which a wait outlasts (sd:9882)."""
+        try:
+            answer = json.loads(out.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        return isinstance(answer, dict) and answer.get("status") == "rate_limited"
+
+    def pause(self, seconds: float) -> None:
+        """Wait `seconds`, beating, so the reap keeps the run and a cancel still ends it.
+        ponytail: the run holds its slot while it waits; a not-before column on the queue frees it if that matters."""
+        stop = time.monotonic() + seconds
+        while (left := stop - time.monotonic()) > 0:
+            time.sleep(min(self.beat_seconds, left))
+            self.enter("reviewing")
 
     def review_answer(self, out: Path, head: str) -> dict | None:
         """The review's `status` and blockers, for this head; None for an unknown answer."""
@@ -2626,7 +2782,7 @@ class DraftSupervisor(Supervisor):
         self.item = self.db.execute("SELECT item FROM assignment WHERE id = ?",
                                        (self.row["assignment"],)).fetchone()["item"]
         self.last_beat = 0.0
-        self.env = _environ(environ)
+        self.env = _environ(environ, ident)
         self.reviewed: str | None = None
         self.take_resume(settle_seconds)
 
@@ -2675,6 +2831,8 @@ class DraftSupervisor(Supervisor):
             if not build.write(self.db, self.ident, **fields):
                 raise Lost
             self.once("cost", lambda: self.cost(final))
+        if verdict["state"] == "rate_limited":  # queued again, and this host held (sd:9938)
+            return self.finish(build.RATE_LIMITED, f"{verdict['why']}; nothing was written; log {self.log}")
         if verdict["state"] != "pass":
             # A turn limit is no loss here: a fresh run has no session to resume, so it blocks as any other end.
             return self.finish("blocked", f"{verdict['why']}; nothing was written; log {self.log}")
@@ -2685,3 +2843,20 @@ class DraftSupervisor(Supervisor):
         if not draft.write(self.db, self.ident, *parsed):
             raise Lost
         return {"run": self.ident, "outcome": "done", "questions": len(parsed[1])}
+
+
+def failure_table(text: str) -> bool:
+    """Whether `text` holds a failure table (sd:9770): a header line whose `|`-separated cells begin with the five
+    `FAILURE_COLUMNS` in order, then at least one data row in the lines of `|` right below it. Prose naming the
+    words, or a header with only its separator, is no table."""
+    lines = text.splitlines()
+    for at, line in enumerate(lines):
+        cells = [cell.strip().lower() for cell in line.strip().strip("|").split("|")]
+        if len(cells) < len(FAILURE_COLUMNS) or not all(map(str.startswith, cells, FAILURE_COLUMNS)):
+            continue
+        for row in lines[at + 1:]:
+            if "|" not in row:
+                break
+            if not TABLE_SEPARATOR.fullmatch(row.strip()):
+                return True
+    return False

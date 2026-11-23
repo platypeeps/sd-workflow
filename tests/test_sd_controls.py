@@ -125,6 +125,30 @@ class Controls(unittest.TestCase):
         self.assertEqual(self.cli("reports", "list", "--open").stdout, "no open reports\n")
         self.assertEqual(json.loads(self.cli("reports", "list", "--open", "--json").stdout), [])
 
+    def test_reports_sweep_previews_then_closes_and_names_why(self):
+        """sd:9759: `sd reports sweep` runs the Needs you sweep; --dry-run lists what would close and writes nothing."""
+        from sd_db import connect
+        from sd_db.writes import add_note, create_item
+        db = connect(home=self.home)
+        try:
+            item = create_item(db, kind="task", title="a task", status="planning")
+            note = add_note(db, item, "question", "Which way?\nOption: a (Recommended)\nOption: b", session="operator")
+            ruled = add_note(db, item, "decision", f"Ruling on note #{note}: a", session="operator")
+            db.commit()
+        finally:
+            db.close()
+        preview = self.cli("reports", "sweep", "--dry-run")
+        self.assertEqual(preview.returncode, 0, preview.stderr)
+        self.assertEqual(preview.stdout, f"would close 1\n  sd:{item} question #{note}: answered by decision #{ruled}\n")
+        ran = json.loads(self.cli("reports", "sweep", "--json").stdout)
+        self.assertEqual((ran["applied"], [row["note"] for row in ran["closed"]]), (True, [note]))
+        db = connect(home=self.home)
+        try:
+            self.assertIsNotNone(db.execute("SELECT resolved_at FROM note WHERE id = ?", (note,)).fetchone()[0])
+        finally:
+            db.close()
+        self.assertEqual(self.cli("reports", "sweep").stdout, "closed 0\n")
+
     def test_report_ingestion_is_replayable_and_acknowledged(self):
         # A clean tick is not an event: the library records a heartbeat and
         # files no report (system sd:739), and replaying the same run records

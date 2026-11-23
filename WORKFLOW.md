@@ -374,9 +374,10 @@ Four roles share the work:
 
 Workers:
 
-- **Run at most 6 code-writing builders per machine, and one build bundle building per repository at a time.** A machine's `sd.repo_cap` raises the second only by the operator's ruling (sd:9172). More starve the gates and reviews they wait on,
+- **Run at most 6 code-writing builders per machine, and one build bundle building per repository at a time.** A machine's `sd.machine_cap` and `sd.repo_cap` raise them only by the operator's ruling (sd:9172, sd:9891). More starve the gates and reviews they wait on,
   and one serial lane lands about 3 at a time: the rest only queue and go stale against main (sd:5617).
   A repository's later items wait, and the next bundle takes them (sd:8158).
+  A P1 item does not wait: it builds beside that bundle, alone or with the queued items of its own area, under the machine cap only (operator ruling #64744, sd:9700).
   A bundle in the lane frees its repository's slot: the lane stays serial, so the next bundle builds while it lands (sd:8277).
 - **Split a parked bundle by Retry, then build fresh.** A Retry naming two or more of its items, the lead among them,
   retries those alone; each item left out leaves the bundle, parked (pack sd:9581). The next run blocks if its branch or
@@ -397,8 +398,8 @@ Workers:
   `sd assignments beat <items> --start --worktree <path> --branch <branch> --budget <minutes>`; on its final report, `--end` before the lane enqueue, which refuses a held item. Only `--end` ends a run: silence and a done item do not.
 - **Fan out only when the targets are independent, share no mutable state, and are cheap to verify.**
 - **Keep one open bundle branch per repository**, one commit per row; rows that change the same files always group.
-  Open a second pull request only for a change that moves state in steps or when the bundle is already in the lane (pack sd:7737).
-  `--start` refuses a second open branch of the repository, naming the open one; `--into <branch>` starts a side branch that merges into it, and `--reason state-move|in-lane` opens a second one and notes why.
+  Open a second pull request only for a change that moves state in steps, when the bundle is already in the lane (pack sd:7737), or for a P1 item, alone or with items of its own area (sd:9700).
+  `--start` refuses a second open branch of the repository, naming the open one; `--into <branch>` starts a side branch that merges into it, and `--reason state-move|in-lane|p1` opens a second one and notes why; `p1` takes a P1 item first and only items of its area after it.
   Name every grouped row in the pull request. Where goldens exist, bless them once per bundle.
   Add a bundle's shadow columns in one schema migration, not one per feature (pack sd:6358).
   Bundling comes before parallel lanes: revisit them only when Metrics' Lane times median wait (pack sd:6006) passes 30 min (pack sd:7412).
@@ -431,11 +432,15 @@ Gates and reviews:
 - **A change that moves state in steps carries a failure table before review round 1:**
   each step, the state it moved, the failure, the recovery and the test.
   A parser, a journal, or event and protocol matching needs one too: a parser without one took nine rounds (sd:9584).
+  A build refuses to start review on a branch whose `docs/work` design.md lacks one, in it or the body (sd:9770).
 - **A repeating finding starts a class pass.** The trigger is two findings of one class in different rounds, or three blocking rounds in a row.
   Name the class, list every instance from the code rather than the findings, add each to the failure table,
   and fix each row that lacks a recovery or a test, fail-first. Record the trigger in `sd task note`. Split the pull request if the table shows it does too much.
   A class pass fixes the class within the change's own scope; a new reader, audit or entry kind becomes its own item:
   a round that added an entry kind with three readers blocked on one of them the next round (sd:9584).
+- **A cleared review's gate that failed only in unittest tests reruns those tests once, alone** (sd:9768).
+  A pass notes a flake on the item and on its suite's `flake:` item, and prepare goes on; the merge still runs its own gate.
+  It runs once per head, never for a test that failed a rerun in the last 7 days.
 - **Gates share the machine through slots** (`sd.gate_slots`). Every `sd-check` run and every gate `sd-ship` runs queues in one machine-wide order.
   Wrap any other gate as `sd gate run -- make check`. Use no per-repository `lockf` and do not wait on the load average. `sd gate status` shows holders and waiters.
 - **Gates start in the order they queued** (sd:5409). Every `sd-check` run is a lane gate; a builder's `sd gate run` waits its turn beside it.
@@ -668,13 +673,23 @@ The reserved `sd` namespace declares these settings:
   this machine; `0` is no cap. Absence reads a quarter of the cores. `SD_GATE_SLOTS` overrides it
   for one run. It grants nothing;
   see [Parallel work](#parallel-work).
+- `sd.gate_workers`: how many test workers one local run of the pack's tests starts, 1 to 99.
+  Absence reads the cores over the gate cap, so the gates together hold the cores. `TEST_WORKERS` overrides it for one run.
+  It grants nothing.
 - `sd.review_slots`: how many reviews may run their reviewers at once on this machine; `0` is no cap.
   Absence reads 2. `SD_REVIEW_SLOTS` overrides it for one run. It grants nothing.
 - `sd.bundle_max`: how many items one build bundle takes when this machine claims it, a mechanical item half
   of one. Absence reads 3. The claim fixes a build child's budget at 120 minutes per 3 slots it took, never
   less (sd:9109). It grants nothing.
+- `sd.build_model`: the model every build bundle this machine claims runs its builder on, as the builder's
+  `--model` takes it (`opus`, `sonnet`, `fable` or a model id). Absence runs opus, and sonnet for an
+  all-mechanical bundle (sd:9942). It grants nothing.
 - `sd.lane_parallel`: how many lanes one hosted lane run runs at once on this machine, 1 to 8. Absence reads 5
   (sd:9323); the gate's slots and load limit still hold lanes back below it. It grants nothing.
+- `sd.lane_train`: how many queued entries of one repository one lane run gates at once as a stack, 1 to 9;
+  1 gates each entry alone. Absence reads 3 (sd:9899). It grants nothing.
+- `sd.machine_cap`: how many code-writing builders, drafts and interactive builders may run at once on this
+  machine, 1 to 16. Absence reads 6 (sd:8158, sd:9891); the load guard still holds builds back. It grants nothing.
 - `sd.repo_cap`: how many build bundles may build at once in one repository when this machine claims them,
   1 to 6. Absence reads 1, the one-bundle-per-repository rule (sd:8158, sd:9172). It grants nothing.
 - `sd.gate_load_max`: the gate queue starts a gate only while load1 is below this; `0` is no load condition.

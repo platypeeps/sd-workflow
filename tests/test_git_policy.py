@@ -70,6 +70,8 @@ VARIANTS = {
                       "git_output folds into one None, and a fetch or push outlasts 15 s (sd:3282)",
     "bin/sd_skill_intake.py": "reads untrusted blobs as bytes, raises git's stderr as the refusal, and a "
                               "fetch from GitHub outlasts 15 s (sd:3560)",
+    "bin/sd_bundle_drop.py": "tells a lookup's absent exit (1 or 2) from a failure, reads NUL-delimited "
+                             "unstripped paths, and a fetch or cherry-pick outlasts 15 s (pack sd:9709)",
 }
 
 

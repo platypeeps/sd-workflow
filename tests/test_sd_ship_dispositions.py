@@ -206,6 +206,22 @@ class DispositionTests(unittest.TestCase):
         ):
             self.prepare()
 
+    def test_the_template_and_the_refusal_name_the_allowed_values(self):
+        """sd:9881: a blank template and `rebut` left the values unnamed."""
+        self.blocked()
+        template = json.loads(self.command().stdout)["proposal"]
+        row = template["findings"][0]
+        self.assertEqual(row["response_disposition"], "rebutted|parked")
+        row["reason"] = "the operator ruled on this finding"
+        for value in ("rebut", "rebutted|parked"):
+            with self.subTest(value=value):
+                row["response_disposition"] = value
+                self.proposal_file.write_text(json.dumps(template))
+                result = self.command("--dispositions-file", str(self.proposal_file))
+                self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
+                self.assertIn("'rebutted' or 'parked'", result.stdout + result.stderr)
+                self.assertIn(repr(value), result.stdout + result.stderr)
+
     def test_duplicate_occurrences_need_distinct_indices_and_unchanged_raw_findings(
         self,
     ):

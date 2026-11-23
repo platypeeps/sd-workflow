@@ -1864,6 +1864,50 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
             self.assertNotIn('data-run="r1"', html)
             self.assertIn('data-pr="7"', html)
 
+    def test_a_retryable_ended_build_keeps_its_row_beside_its_items_pr_wait(self):
+        """sd:9761 review: a blocked review-fix build whose item waits on its PR lost its Retry and Send to builder,
+        which the PR row does not offer; an ended build with those controls keeps its row."""
+        pr = {"item": 50, "title": "Fifty", "repo": "/repos/gamma", "url": "https://github.com/example/gamma/pull/50",
+              "lane": "awaiting_them", "on": "reviewers", "since": NOW, "waited": 60}
+        doc = queue_screen.document(self.connection, now=NOW)
+        doc["prs"] = {"error": "", "rows": [pr]}
+        out = self.run_view("open('gamma'); R.html = ELS.queue.html;", search="?show=ended",
+                            answers={"/api/queue": [200, doc]})
+        self.assertIn('data-pr="50"', out["R"]["html"])
+        self.assertIn('data-build="retry" data-run="r0"', out["R"]["html"])
+        self.assertIn('data-build="send" data-run="r0"', out["R"]["html"])
+
+    def test_an_item_with_an_open_lane_entry_is_one_row_with_every_filter_on(self):
+        """sd:9761: a handed-back cancelled entry, a failed one, the ended run and the open task drew 9748 twice."""
+        from sd_dashboard import tasks_screen
+        from sd_db import workflow
+        n = self.item("Stamp the files", kind="task", priority=3, repo=str(self.checkout))
+        workflow.change_status(self.connection, n, "in_progress", who="test", reason="test")
+        base = {"item": n, "title": "Stamp the files", "head": "abc1234", "expected_head": "abc1234" * 4,
+                "finished": NOW}
+        failed = {**base, "state": "blocked", "status": "failed", "step": "prepare", "reason": "review blocking",
+                  "who": "builder", "unchanged": True, "failure": None, "log": None, "branch": "build/sd-1"}
+        back = {**base, "state": "cancelled", "reason": "handed back to its builder by Fix"}
+        doc = queue_screen.document(self.connection, now=NOW)
+        doc["lanes"] = [*doc["lanes"], {"path": str(self.checkout), "key": str(self.checkout), "repo": "system",
+                                        "lane": "serial", "host": "hub", "runner_merge": "auto",
+                                        "rows": [failed, back]}]
+        ended = {**self.BUILDS["recent"][0], "run": "r9", "repo": str(self.checkout), "outcome": "done",
+                 "items": [{"item": n, "assignment": 9, "status": "done", "title": "Stamp the files"}],
+                 "retry": {**self.BUILDS["recent"][0]["retry"], "bundle": None}}
+        entry = f"entry:{self.checkout}:{n}"
+        out = self.run_view("open('system'); R.html = ELS.queue.html;"
+                            " act('button[data-entry]', { entry: " + json.dumps(entry) + " }); R.details = ELS.details.html;",
+                            search="?show=suggested,open,ended",
+                            answers={"/api/queue": [200, doc],
+                                     "/api/queue/builds?show=all": [200, {**self.BUILDS, "recent": [ended]}],
+                                     "/api/tasks": [200, tasks_screen.document(self.connection, now=NOW)]})
+        rows = re.findall(rf'<tr class="child"[^>]*>(?:(?!</tr>).)*#{n} Stamp the files', out["R"]["html"], re.S)
+        self.assertEqual(len(rows), 1, rows)
+        self.assertIn('data-type="blocked"', rows[0])
+        # Review of sd:9761: the hidden cancelled entry shares the drawn one's id; its Details must not replace it.
+        self.assertIn("Lane entry · blocked", out["R"]["details"])
+
     def test_a_run_not_in_the_lane_keeps_its_row_beside_its_items_pr_wait(self):
         """sd:9022 review: a builder fixing an open PR's review is working, not waiting; its row and Cancel stay."""
         lanes = queue_screen.document(self.connection, now=NOW)
@@ -2991,6 +3035,56 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertEqual([p[:2] for p in out["posts"]], [["/api/queue/builds/retry", {"assignment": 832, "revision": "c" * 64,
                                                                                       "finding": finding, "run": "r9"}]])
         self.assertIn("system: sd:14 sent to its builder with the lane's finding", out["R"]["said"])
+
+    FIXED = {"allowed": True, "reason": "", "assignment": 832, "revision": "c" * 64, "run": "r9"}
+
+    def fix_press(self, fix, answer, item=14, ask=True):
+        """pack sd:9705: press Fix on item `item`; R.busy is the row while the post runs, R.row the row after."""
+        doc = self.fix_doc(fix)
+        yes = "{ yes: true, values: { finding: a.fields[0].value } }" if ask else "{ yes: false }"
+        row = (r'const ROW = () => { const m = ELS.queue.html.match(/<tr class="child"[^>]*data-id="entry:[^"]*:14"'
+               r'[^>]*>([\s\S]*?)<\/tr>/); return m ? m[1] : null; };')
+        return self.run_view(f"{row} window.shell.ask = a => Promise.resolve({yes});"
+                             " const P0 = window.shell.post; window.shell.post = (p, b) => { R.busy = ROW(); return P0(p, b); };"
+                             f"open('system'); act('button[data-act]', {{ repo: {json.dumps(str(self.checkout))}, item: '{item}', act: 'fix' }});"
+                             " await flush(); await flush(); await flush(); R.row = ROW(); R.said = ELS['queue-said'].textContent;",
+                             answers={"/api/queue": [200, doc], "/api/queue/builds/retry": answer})
+
+    def test_fix_shows_busy_then_sent_on_the_row_itself(self):
+        out = self.fix_press(self.FIXED, [200, {"run": "r9", "queued": [{"id": 832, "item": 14, "status": "queued"}]}])
+        self.assertIn("sending to its builder", out["R"]["busy"])
+        self.assertRegex(out["R"]["busy"], r'data-act="fix"[^>]* disabled')
+        self.assertIn("sent to builder; build #832 queued", out["R"]["row"])
+
+    def test_fix_feedback_leaves_a_later_failure_of_the_item(self):
+        """pack sd:9863: the word is the failed head's; the builder's new head that fails again shows none."""
+        doc = self.fix_doc(self.FIXED)
+        row = (r'const ROW = () => { const m = ELS.queue.html.match(/<tr class="child"[^>]*data-id="entry:[^"]*:14"'
+               r'[^>]*>([\s\S]*?)<\/tr>/); return m ? m[1] : null; };')
+        out = self.run_view(f"{row} window.shell.ask = a => Promise.resolve({{ yes: true, values: {{ finding: 'f' }} }});"
+                            "window.shell.view.current = () => 'queue';"
+                            f"open('system'); act('button[data-act]', {{ repo: {json.dumps(str(self.checkout))}, item: '14', act: 'fix' }});"
+                            " await flush(); await flush(); await flush(); R.sent = ROW();"
+                            " QDOCS['/api/queue'][1].lanes[0].rows.find(r => r.item === 14).head = 'f'.repeat(40);"
+                            " await window.PAGE_AGAIN.run(); await flush(); await flush(); R.again = ROW();",
+                            answers={"/api/queue": [200, doc],
+                                     "/api/queue/builds/retry": [200, {"run": "r9", "queued": []}]})
+        self.assertIn("sent to builder; build #832 queued", out["R"]["sent"])
+        self.assertNotIn("sent to builder", out["R"]["again"])
+
+    def test_fix_refused_says_why_on_the_row(self):
+        out = self.fix_press(self.FIXED, [409, {"error": "Fix refused: build run r9 is not the latest run"}])
+        self.assertIn("not sent: Fix refused: build run r9 is not the latest run", out["R"]["row"])
+
+    def test_fix_not_allowed_says_why_on_the_row(self):
+        out = self.fix_press({**self.FIXED, "allowed": False, "reason": "its build run still runs"}, None, ask=False)
+        self.assertEqual(out["posts"], [])
+        self.assertIn("not sent: its build run still runs", out["R"]["row"])
+
+    def test_fix_on_a_row_no_longer_blocked_says_why(self):
+        out = self.fix_press(self.FIXED, None, item=99, ask=False)
+        self.assertEqual(out["posts"], [])
+        self.assertIn("sd:99 is not blocked in this read; nothing sent. Read again.", out["R"]["said"])
 
     def test_fix_on_a_merge_failure_sends_the_merge_log(self):
         """pack sd:8601: the finding names the log of the step that failed, never a prepare log that passed."""

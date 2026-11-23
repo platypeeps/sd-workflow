@@ -50,7 +50,9 @@ Effort is `high` on purpose: multi-file code, tests and evidence. You hold no Ag
    Title each commit and the PR as a Conventional Commit (`fix:`, `feat(scope):`, `chore:`); enqueue refuses another title.
    Wrap commit and PR body lines at 72 characters, merge subjects too, and keep the title at 63 or less: enqueue refuses longer ones.
    Follow the repository's `CLAUDE.md` for any trailer it requires.
-   After each commit and before the report, run `sd assignments beat N`; exit 1 means no run is registered (pack sd:7221).
+   After each commit and before the report, run `sd assignments beat N` (pack sd:7221).
+   Exit 1 with `no open teammate run holds item N` means your lead registered no run:
+   it is no failure; skip every later beat and say so in the report (sd:9915).
 5. Run the focused tests for the files you touched in the machine gate queue, in turn with lane gates:
    `sd gate run --max-wait 240 --label '<branch> tests' -- <test command>`. It waits in arrival order while every gate slot is held.
    It exits 75, the tests not run, when no slot came free in 240 s: run it again later.

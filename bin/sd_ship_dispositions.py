@@ -16,6 +16,8 @@ from sd_ship_bindings import adjudicator_binding
 from sd_ship_remote import Refusal, git
 
 MAX_PROPOSAL_BYTES = 2_000_000
+#: The only values that clear a blocker; the template names them (sd:9881).
+DISPOSITIONS = ("rebutted", "parked")
 
 
 def digest(value: Any) -> str:
@@ -156,8 +158,9 @@ def validate(operation: Any, head: str, proposal: Any) -> str:
         if (not isinstance(row, dict) or set(row) != set(identity) | {"response_disposition", "reason"}
                 or type(row.get("index")) is not int or digest({name: row.get(name) for name in identity}) != digest(identity)):
             raise Refusal("disposition finding indices, raw findings or digests changed")
-        if row["response_disposition"] not in ("rebutted", "parked"):
-            raise Refusal("only a rebuttal or a parked risk can clear a blocker")
+        if row["response_disposition"] not in DISPOSITIONS:
+            raise Refusal("only a rebuttal or a parked risk can clear a blocker: response_disposition "
+                          f"is 'rebutted' or 'parked', not {row['response_disposition']!r}")
         text(row["reason"], "reason")
     return digest(proposal)
 
@@ -179,7 +182,7 @@ def adjudicate(operation: Any) -> dict:
     bindings, rows = context(operation, args.expected_head)
     if args.dispositions_file is None:
         proposal = {"schema_version": 1, "bindings": bindings,
-                    "findings": [dict(row, response_disposition="", reason="") for row in rows]}
+                    "findings": [dict(row, response_disposition="|".join(DISPOSITIONS), reason="") for row in rows]}
         return operation.result("disposition_template", proposal=proposal)
     try:
         proposal = json.loads(read_file(args.dispositions_file, MAX_PROPOSAL_BYTES), object_pairs_hook=unique_object)

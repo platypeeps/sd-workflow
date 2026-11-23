@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from . import hub
-from .build import HEALTH
+from .build import HEALTH, waiting_on
 from .reads import (
     IDEA_KINDS,
     REVIEW_BATCH,
@@ -34,6 +34,7 @@ from .reads import (
 from .reporting import _current_basis
 from .runner import OWNING
 from .ship import this_host
+from .workflow import is_item_id
 
 #: `sd_lane.KEY_PREFIX`: a lane entry is the newest `checkpoint` row of its key.
 LANE_KEY_PREFIX = "lane:v1:"
@@ -362,6 +363,8 @@ def landing(connection: sqlite3.Connection, *, repos: Iterable[str | None] | Non
     ).fetchall()
     keys, keep = repo_keys(connection), _keep(repos)
     newest: dict[tuple[str, Any], tuple[int, dict]] = {}
+    # A bundle entry's `closes` supersede each member's older entries too (pack sd:9694).
+    closed: dict[tuple[str, Any], int] = {}
     unread = 0
     for row in rows:
         # One bad checkpoint is counted, never the end of every other row (pack sd:8822).
@@ -369,7 +372,8 @@ def landing(connection: sqlite3.Connection, *, repos: Iterable[str | None] | Non
             entry = json.loads(row["body"])
         except (TypeError, ValueError):
             entry = None
-        if not isinstance(entry, dict):
+        # An item that is no item id, or a `closes` member that is none, names no row (pack sd:9694 class pass).
+        if not isinstance(entry, dict) or not is_item_id(entry.get("item")):
             unread += 1
             continue
         repository = row["key"][len(LANE_KEY_PREFIX):].rpartition(":")[0]
@@ -377,9 +381,18 @@ def landing(connection: sqlite3.Connection, *, repos: Iterable[str | None] | Non
         if keep is not None and (keys.get(repository.lower()) is None or keys[repository.lower()] not in keep):
             continue
         key = (repository, entry.get("item"))
-        if entry.get("status") != "cancelled" and row["first"] > newest.get(key, (0, {}))[0]:
+        if entry.get("status") == "cancelled":
+            continue
+        if row["first"] > newest.get(key, (0, {}))[0]:
             newest[key] = (row["first"], {**entry, "repository": repository, "queued_at": row["queued_at"]})
-    live = [entry for _, entry in newest.values() if entry.get("status") != "merged"]
+        closes = entry.get("closes")
+        for member in closes if isinstance(closes, list) else ():
+            if is_item_id(member):
+                closed[(repository, member)] = max(closed.get((repository, member), 0), row["first"])
+    # A newer bundle hides only a member's failed or skipped history: its own live entry still lands.
+    live = [entry for key, (first, entry) in newest.items()
+            if entry.get("status") != "merged"
+            and (entry.get("status") not in FAILED_LANE or closed.get(key, 0) < first)]
     items = {row["id"]: row for row in connection.execute(
         f"SELECT id, title, status FROM item WHERE id IN ({', '.join('?' for _ in live)})",
         [entry.get("item") for entry in live]).fetchall()}
@@ -422,7 +435,9 @@ def queues(connection: sqlite3.Connection, *, repos: Iterable[str | None] | None
     built = builds(connection, repos=keep)
     building = {row["item"] for row in built}
     found = [{"queue": "ready", "id": row["id"], "repo": row["repo"], "title": row["title"], "status": "ready",
-              "detail": f"P{row['priority']}" if row["priority"] is not None else "-", "since": row["status_since"]}
+              "detail": " · ".join(part for part in (f"P{row['priority']}" if row["priority"] is not None else "-",
+                                                     waiting_on(connection, row)) if part),
+              "since": row["status_since"]}
              for row in backlog_items(connection, status="ready", now=now)
              if (keep is None or row["repo"] in keep) and row["id"] not in building and not row["scheduled"]]
     found += [{"queue": "build", "id": row["item"], "repo": row["repo"], "title": row["title"], "status": row["status"],

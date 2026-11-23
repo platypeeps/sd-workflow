@@ -374,7 +374,13 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   }
   const again = (r, manual) => !QV.lanes.retry ? '' : html`<div class="ctl" role="group" aria-label="Unblock sd:${String(r.item)}">${sb('retry', r, r.unchanged === true ? 'Retry…' : 'Retry', `Retry sd:${r.item}: queue it again at the same head`, html` data-head="${r.expected_head}"`)}${manual ? sb('approve', r, 'Approve…', `Approve sd:${r.item}: queue it again with the merge granted`, html` data-head="${r.expected_head}"`) : ''}</div>`;
   // pack sd:8584: a failed entry's Fix sends the lane's finding to the build run that enqueued its branch; off says why.
-  const mendBtn = r => !r.fix ? '' : html`<div class="ctl" role="group" aria-label="Fix sd:${String(r.item)}">${sb('fix', r, 'Fix…', `Fix sd:${r.item}: send the lane's finding to its builder`, r.fix.allowed ? '' : html` disabled title="${r.fix.reason}"`)}</div>`;
+  // pack sd:9705: a Fix press's outcome shows on its own row: busy while it posts, then sent or why not.
+  // `${lane}:${item}:${head}` -> { busy, ok, text }: scoped to the failed head, so a later failure of the item
+  // shows no earlier Fix's word (pack sd:9863).
+  const QMEND = new Map();
+  const mendSaid = m => !m ? '' : html` <span class="said" role="${m.ok === false ? 'alert' : 'status'}">${m.text}</span>`;
+  const mendBtn = r => { const m = QMEND.get(`${r.lane}:${r.item}:${r.head}`); return !r.fix ? (m ? html`<div class="ctl">${mendSaid(m)}</div>` : '')
+    : html`<div class="ctl" role="group" aria-label="Fix sd:${String(r.item)}">${sb('fix', r, m && m.busy ? 'Sending…' : 'Fix…', `Fix sd:${r.item}: send the lane's finding to its builder`, r.fix.allowed ? '' : html` disabled title="${r.fix.reason}"`)}${mendSaid(m)}</div>`; };
   // pack sd:8584: what a failed entry's facts add: whether a commit moved its head since, and what prepare answered.
   const moved = r => r.unchanged === true ? ' · head unchanged since this failure: Retry repeats it unless the failure was transient'
     : r.unchanged === false ? ' · the worktree moved past this head: enqueue the new head; Retry is refused' : '';
@@ -539,6 +545,14 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // A task's read row (SROW) holds while it is still an item row at the revision its /api/tasks row has (pack sd:7251): a
   // row read at another revision is dropped, so taskOf acts on the fresh row, not the status it had when it was selected.
   const freshRows = () => [...SROW].filter(([k, t]) => !isItem(k) || (listedTask(k) && listedTask(k).revision !== t.revision)).forEach(([k]) => SROW.delete(k));
+  // sd:9078: the items with a lane entry not yet ended.
+  const lanedItems = () => new Set((QV.lanes ? QV.lanes.lanes : []).flatMap(l => l.rows)
+    .filter(r => r.item != null && !['cancelled', 'landed'].includes(r.state)).map(r => Number(r.item)));
+  // sd:9761: a lane's drawn rows, one per item: its first open entry (the lane lists them merging, next, blocked, then
+  // ended) wins, and an ended one of an item with an open entry anywhere is no row. The rows and the entry commands and
+  // Details (qAdopt) both read this, so a hidden entry, which shares the drawn one's id, never replaces it.
+  const drawnRows = (l, laned = lanedItems()) => { const seen = new Set();
+    return l.rows.filter(r => r.item == null || (!seen.has(r.item) && !(laned.has(Number(r.item)) && ['cancelled', 'landed'].includes(r.state)) && !!seen.add(r.item))); };
   // Each repo's children, from the four reads, each with the rows the filters show; queueView draws a repo that shows one.
   function qGroups() {
     const G = new Map(), add = (repo, [type, s, tr, pr]) => {
@@ -549,8 +563,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     const live = new Map(), prs = ((QV.lanes || {}).prs || {}).rows || [], waits = new Set(prs.filter(p => p.item != null).map(p => Number(p.item)));
     // sd:9078: an item with a lane entry not yet ended is that entry's row alone: no live-session, run or blocked
     // assignment row beside it.
-    const laned = new Set((QV.lanes ? QV.lanes.lanes : []).flatMap(l => l.rows)
-      .filter(r => r.item != null && !['cancelled', 'landed'].includes(r.state)).map(r => Number(r.item)));
+    const laned = lanedItems();
     // pack sd:7859: an item waiting on its PR is its PR row alone: no live-session, suggested or open row beside it.
     ((ACTIVE || {}).rows || []).filter(r => !waits.has(Number(r.item)) && !laned.has(Number(r.item))).forEach(r => { if (!live.has(r.item)) live.set(r.item, []); live.get(r.item).push(r); });
     live.forEach((rows, item) => add(rows[0].repo, liveRow(item, rows)));
@@ -574,19 +587,22 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       && !aside(a.item, `blocked build · assignment ${a.id} · ${a.why}`, asgCtl(a))).forEach(a => add(a.repo, blockedAsg(a)));
     // A prepared entry and its item's PR wait are one row (pack sd:7859): the lane's, leading with the wait.
     const waitOf = new Map(prs.map(p => [Number(p.item), p])), drawn = new Set();
-    (QV.lanes ? QV.lanes.lanes : []).forEach(l => { l.rows.forEach(r => {
+    (QV.lanes ? QV.lanes.lanes : []).forEach(l => { drawnRows(l, laned).forEach(r => {
       const p = r.state === 'blocked' && r.status === 'prepared' ? waitOf.get(Number(r.item)) : undefined;
       if (p) drawn.add(p);
       if (r.state === 'blocked' && !p && aside(r.item, `lane ${r.status}${r.step ? ` at ${r.step}` : ''} · ${r.reason}`, html`${unblock(l, r)}${entryBtn(l, r)}${shell.commands.rowActions(entryId(l, r))}`)) return;
       add(l.key, entryRow(l, r, p)); });
       if (G.has(repoKey(l.key))) G.get(repoKey(l.key)).host = l.host; });
     prs.filter(p => !drawn.has(p)).forEach(p => add(p.repo, prRow(p)));
-    SUGG.forEach(r => { if (!waits.has(Number(r.id))) add(r.repo, suggestRow(r)); });
-    OPENI.forEach(t => { if (!waits.has(Number(t.id))) add(t.repo_path, openRow(t)); });
+    // sd:9761: an item with an open lane entry is that row alone: no suggested, open or ended-run row beside it.
+    SUGG.forEach(r => { if (!waits.has(Number(r.id)) && !laned.has(Number(r.id))) add(r.repo, suggestRow(r)); });
+    OPENI.forEach(t => { if (!waits.has(Number(t.id)) && !laned.has(Number(t.id))) add(t.repo_path, openRow(t)); });
     // sd:9247: each repo's parked tasks (no idea kind), PR wait or lane entry or not; hidden until their box is pressed.
     // A task with no repo is no row (pack sd:7731), as in Suggested; the tally counts it, as Tasks' Parked chip lists it.
     parkedTasks().filter(t => t.repo_path).forEach(t => add(t.repo_path, openRow(t, 'parked', why.get(Number(t.id)))));
-    B.recent.forEach(r => add(r.repo, endedRun(r)));
+    // An ended build that offers Retry and Send to builder keeps its row: the entry or PR row offers neither.
+    B.recent.filter(r => ['blocked', 'cancelled'].includes(r.retry.bundle) || !(r.items.length && r.items.every(shown)))
+      .forEach(r => add(r.repo, endedRun(r)));
     const RANK = { warning: 0, caution: 1, unknown: 2, ok: 3, queued: 4 };
     // pack sd:7679: the busiest repo first, box by box in the boxes' order, each most first; then the name. Unassociated last.
     const busy = (a, b) => BOXES.reduce((d, t) => d || b.n[t] - a.n[t], 0);
@@ -646,8 +662,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     if (!groups.some(g => g.key === qOpen)) qOpen = null;
     if (qTile && qTile.repo !== qOpen) qTile = null;
     // pack sd:8127: All items counts its open items with the filter off as on, less those waiting on a PR; a failed read counts nothing.
-    const waits = new Set((((QV.lanes || {}).prs || {}).rows || []).map(p => Number(p.item)));
-    const opens = QV.tasks ? [...openItems(true).values()].filter(t => !waits.has(Number(t.id))).length : null;
+    const waits = new Set((((QV.lanes || {}).prs || {}).rows || []).map(p => Number(p.item))), laned = lanedItems();
+    const opens = QV.tasks ? [...openItems(true).values()].filter(t => !waits.has(Number(t.id)) && !laned.has(Number(t.id))).length : null;
     const n = v => v !== 'open' ? every.filter(c => c.type === v).length : opens;
     put($('queue-filters'), shell.list.fseg('qshow', 'Show', [['suggested', 'Suggested'], ['open', 'All items'], ['ended', 'Ended builds']].map(([v, label]) =>
       ({ v, pressed: qShow.has(v), label: n(v) === null ? html`${label}` : html`${label} <span class="n">${String(n(v))}</span>` }))));
@@ -706,7 +722,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     const now = new Set();
     [...OPENI.values(), ...PARKI.values()].forEach(x => { shell.commands.put(TD.objectOf(taskOf(x.key))); now.add(x.key); });
     QOTHER.clear();
-    (QV.lanes ? QV.lanes.lanes : []).forEach(lane => lane.rows.filter(x => x.state !== 'building').forEach(x => {
+    (QV.lanes ? QV.lanes.lanes : []).forEach(lane => drawnRows(lane).filter(x => x.state !== 'building').forEach(x => {
       const id = entryId(lane, x);
       shell.commands.put({ id, type: 'entry', label: `sd:${x.item}`, item: x.item, worktree: x.worktree, repo: lane.repo });
       QOTHER.set(id, { draw: () => entryDetails(lane, x) }); now.add(id);
@@ -781,27 +797,35 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   }
   // Fix (pack sd:8584): Send to builder on the build run that enqueued the entry, its finding the lane's, edited first.
   async function mend(l, item) {
-    const r = l.rows.find(x => x.state === 'blocked' && x.item === item);
-    if (!r || !r.fix || !r.fix.allowed) return;
+    const r = l.rows.find(x => x.state === 'blocked' && x.item === item), key = r && `${l.path}:${item}:${r.head}`;
+    if (!r) { qSaid = { ok: false, text: `${l.repo}: sd:${item} is not blocked in this read; nothing sent. Read again.` }; return queueView(); }
+    if (!r.fix || !r.fix.allowed) {
+      QMEND.set(key, { ok: false, text: `not sent: ${(r.fix && r.fix.reason) || 'no build run enqueued this entry'}` });
+      return queueView();
+    }
     const { yes, values } = await shell.ask({ title: `Fix sd:${item}${r.title ? ` · ${r.title}` : ''} in ${l.repo}?`, ok: 'Send to builder', keep: 'Cancel', danger: false,
       body: `The finding goes on the item as a note, and build run ${r.fix.run}'s bundle queues again. Its next builder resumes ${r.worktree || 'the same worktree'} on ${r.branch}, fixes the finding first and enqueues the new head.`,
       fields: [{ name: 'finding', label: 'Finding', required: true, multiline: true, value: finding(r) }] });
     const text = (values && values.finding || '').trim();
     if (!yes || !text) return;
-    QV.busy = true; queueView();
+    QV.busy = true; QMEND.set(key, { busy: true, text: 'sending to its builder…' }); queueView();
     try {
       await shell.post('/api/queue/builds/retry', { assignment: r.fix.assignment, revision: r.fix.revision, finding: text, run: r.fix.run });
       qSaid = { ok: true, text: `${l.repo}: sd:${item} sent to its builder with the lane's finding; its build queues again.` };
+      QMEND.set(key, { ok: true, text: `sent to builder; build #${r.fix.assignment} queued` });
     } catch (err) {
-      qSaid = { ok: false, text: err.status >= 400 && err.status < 500 ? `${l.repo}: sd:${item} not sent to its builder: ${err.message}`
+      const refused = err.status >= 400 && err.status < 500;
+      qSaid = { ok: false, text: refused ? `${l.repo}: sd:${item} not sent to its builder: ${err.message}`
         : `${l.repo}: not known whether sd:${item} was sent to its builder: ${err.message} Read the view before you act again.` };
+      QMEND.set(key, { ok: false, text: refused ? `not sent: ${err.message}` : `not known whether sent: ${err.message} Read again before you act again.` });
     }
     QV.busy = false;
     await loadQueue();
   }
   async function laneAct(b) {
     const l = QV.lanes && QV.lanes.lanes.find(x => x.path === b.dataset.repo);
-    if (!l || QV.busy) return;
+    if (QV.busy) return;
+    if (!l) { qSaid = { ok: false, text: `sd:${b.dataset.item}: its lane is not in this read; nothing done. Read again.` }; return queueView(); }
     const item = Number(b.dataset.item), action = b.dataset.act, head = b.dataset.head || '', claim = b.dataset.claim || '';
     if (action === 'fix') return mend(l, item);
     if (action === 'retry' && !(await anyway(l, item, head))) return;
@@ -1019,7 +1043,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     document.body.dataset.observed = doc.now;
     const items = [...[...SUGG].map(([id, r]) => SROW.has(id) ? TD.objectOf(SROW.get(id)) : { id, type: 'item', label: `#${r.id} ${r.title}`, item: r.id }),
       ...[...OPENI.keys(), ...PARKI.keys()].map(k => TD.objectOf(taskOf(k)))];
-    return { objects: [...[...ALL.values()].map(objectOf), ...[...OTHER].map(([id, o]) => ({ id, ...o.obj })), ...items, ...SNOOZED.map(window.snooze.object)],
+    return { objects: [...[...ALL.values()].map(objectOf), ...[...OTHER].map(([id, o]) => ({ id, ...o.obj })), ...items, ...SNOOZED.map(window.snooze.object),
+                       { id: 'needs', type: 'needs list', label: 'Needs you' }],
              state: doc.snooze_error ? window.snooze.unread(doc.snooze_error, '/api/now') : null };
   }
   function clear(err) { DOC = null; NEEDS = []; ALL = new Map(); OTHER = new Map(); SUGG = new Map(); OPENI = new Map(); PARKI = new Map(); TASKS = new Map(); SROW.clear(); SNOOZED = []; ACTIVE = null; failed = err.message; delete document.body.dataset.observed; }
@@ -1120,6 +1145,13 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     const found = o => taskOf(o.id) || (SUGG.has(o.id) ? { id: SUGG.get(o.id).id, status: SUGG.get(o.id).status, repo: SUGG.get(o.id).repo, repo_path: SUGG.get(o.id).repo, kind: SUGG.get(o.id).kind, assignment: null } : null);
     // sd:8565: a live assignment the queue read holds the row as a Tasks row's does, and the press is said on the queue's line.
     const ready = o => { const t = found(o), a = t && runFor(t.id); return t && a && !t.assignment ? { ...t, assignment: a.status } : t; };
+    // sd:9759: Clean up runs the sweep the nightly job runs: it closes each row that no longer needs you, with a note
+    // naming why, and keeps any it cannot prove; Details shows what it closed, and Today reads again.
+    C.register({ id: 'needs.sweep', on: 'needs list', label: 'Clean up', icon: 'sparkles', risk: 'confirm', executes: true,
+      does: 'Closes each row that no longer needs you, naming why.',
+      consequence: () => 'This closes each alert that cleared, pull alert no read sees, answered question and done item\'s followup, with a note naming why. A row it cannot prove stays open. Details lists what closed.',
+      cli: () => 'sd reports sweep', sends: () => 'POST /api/actions/run {action: needs.sweep}',
+      run: o => window.commands.runAction(o, 'needs.sweep').then(said => reading.reread().then(() => said)) });
     C.register(K.build({ row: ready, reread: () => reading.reread(), primary: () => true,
       said: (text, ok) => { qSaid = { ok, text }; queueView(); } }));
     TD = window.taskDetails.attach({ details: $('details'), rows: () => [...new Map([...OPENI, ...PARKI, ...SROW]).values()], byKey: taskOf, selected: sel,

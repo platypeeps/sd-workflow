@@ -70,6 +70,14 @@ class TheList(unittest.TestCase):
                           "line 5: groups is not lower-case group names", "line 6: options need kind statuspage",
                           "line 7: want <name> <kind> <url> [provider] [key=value ...]"])
 
+    def test_a_long_stale_or_a_mistyped_kind_is_its_own_problem(self):
+        """pack sd:9756: 5000 digits made int() raise and abort the parse; a mistyped kind blamed the options."""
+        check = settings_screen._list("dashboard.status_services")[1]
+        self.assertEqual(check("a statuspage https://a.example.test stale=" + "9" * 5000 + "\n"
+                               "b statuspag https://b.example.test stale=3\n"),
+                         ["line 1: stale is not a whole number of days above 0",
+                          "line 2: kind is not one of statuspage, slack, google-incidents, http"])
+
 
 class TheRows(ScreenCase):
     def area(self):

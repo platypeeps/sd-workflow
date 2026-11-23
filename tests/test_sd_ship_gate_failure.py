@@ -591,5 +591,498 @@ class ASlotWaitThatRanOut(unittest.TestCase):
         self.assertNotIn("slot_ran_out", check)
 
 
+#: A gate that failed in one test of one shard, as `sd-check` reports it (sd:9768).
+FLAKY_TEST = "tests.test_example.Case.test_a"
+SHARD = "shard tests.test_example: 4s exit=1"
+#: The notes a flake and a failed rerun write.
+FLAKE, RERUN_FAILED = "Gate flake: ", "Gate rerun failed: "
+OUTPUT = ("test runner: workers=2 shards=2\nshard tests.test_other: start\nOK\nshard tests.test_other: 2s exit=0\n"
+          f"shard tests.test_example: start\nFAIL: test_a ({FLAKY_TEST})\nAssertionError: git failed\n"
+          f"Ran 3 tests\nFAILED (failures=1)\n{SHARD}\nmake: *** [test] Error 1\n")
+
+
+class AFlakyGateTestIsRerunAlone(unittest.TestCase):
+    """sd:9768. A gate that failed in tests that pass alone on one rerun records a flake and goes on."""
+
+    context = provider_tests.ProviderSelection.context
+
+    def setUp(self):
+        import tempfile
+
+        from sd_db import connect, create_item, initialise
+        from sd_db.writes import upsert_repo
+
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        root = pathlib.Path(scratch.name)
+        initialise(root / "sd.db")
+        self.db = connect(root / "sd.db")
+        self.addCleanup(self.db.close)
+        upsert_repo(self.db, str(root / "repo"))
+        self.item = create_item(self.db, kind="task", title="Example entry", repo=str(root / "repo"))
+        (root / "check.log").write_text(OUTPUT, encoding="utf-8")
+        self.row = {"name": "check", "status": "fail", "exit_code": 2, "stdout": "", "stderr": "",
+                    "output_path": str(root / "check.log"), "failed_shards": [SHARD],
+                    "failed_steps": [SHARD, "make target test"], "failure": OUTPUT[-200:]}
+
+    def prepared(self, rerun=(0, "OK", ""), state=None, check=None):
+        """One prepare whose cleared review's gate failed in FLAKY_TEST, the rerun answering `rerun`."""
+        failed = {"status": "fail", "exit_code": 1, "detail": "", "checks": [check or self.row]}
+        review, _process = self.context(report_changes={**CLEARED, "check": failed}, state=state)
+        review.connection, review.identity = self.db, ship.ItemIdentity(self.item)
+        with unittest.mock.patch.object(sd_ship_review, "rerun_tests", return_value=rerun, create=True) as rerun_mock:
+            try:
+                review.review(HEAD)
+            except ship.Refusal as refusal:
+                return review, rerun_mock, refusal
+        return review, rerun_mock, None
+
+    def saved_with_the_review(self, review, run):
+        """Every save that records the flake also clears the review, in one write: a stop between two writes
+        must not leave the once-per-entry retry spent with no cleared review to reuse it."""
+        saves = []
+        real = review.save
+
+        def save(**updates):
+            saves.append(set(updates))
+            real(**updates)
+
+        with unittest.mock.patch.object(review, "save", side_effect=save):
+            run()
+        flaked = [keys for keys in saves if "gate_flake" in keys]
+        self.assertTrue(flaked, saves)
+        for keys in flaked:
+            self.assertLessEqual({"gate_flake", "passes", "reviewed_head"}, keys, saves)
+
+    def notes(self, prefix):
+        return [body for (body,) in self.db.execute("SELECT body FROM note WHERE substr(body, 1, ?) = ?",
+                                                    (len(prefix), prefix))]
+
+    def test_a_flaky_test_passes_on_rerun_and_the_entry_proceeds_with_a_flake_record(self):
+        review, rerun, refused = self.prepared()
+        self.assertIsNone(refused)
+        self.assertEqual(rerun.call_args.args[1:], (HEAD, [FLAKY_TEST]), "only the failing test, alone, at head")
+        [entry] = review.state["passes"]
+        self.assertEqual((entry["report"]["status"], entry["report"]["check"]["status"]), ("clean", "pass"))
+        self.assertEqual(entry["report"]["failed_check"]["status"], "fail")
+        self.assertEqual(review.state["reviewed_head"], HEAD)
+        self.assertEqual((review.state["gate_flake"]["head"], review.state["gate_flake"]["tests"]), (HEAD, [FLAKY_TEST]))
+        [note] = self.notes(FLAKE)
+        self.assertIn(f"{FLAKY_TEST} failed the gate at {HEAD[:12]} and passed alone", note)
+        listed = self.db.execute("SELECT id FROM item WHERE external_id = 'flake:tests.test_example'").fetchone()
+        self.assertIsNotNone(listed, "the flake list holds the suite")
+        self.assertEqual(len(self.notes(f"Gate flake in fixture/repo: {FLAKY_TEST}")), 1)
+
+    def test_the_flake_is_saved_with_the_cleared_review(self):
+        failed = {"status": "fail", "exit_code": 1, "detail": "", "checks": [self.row]}
+        review, _process = self.context(report_changes={**CLEARED, "check": failed})
+        review.connection, review.identity = self.db, ship.ItemIdentity(self.item)
+        with unittest.mock.patch.object(sd_ship_review, "rerun_tests", return_value=(0, "OK", "")):
+            self.saved_with_the_review(review, lambda: review.review(HEAD))
+        state = AClearedReviewOutlivesItsGate.kept(self)
+        review, _process = self.context(state=state)
+        review.connection, review.identity = self.db, ship.ItemIdentity(self.item)
+        with unittest.mock.patch.object(sd_ship_review, "adjudicated_check", return_value=failed), \
+                unittest.mock.patch.object(sd_ship_review, "rerun_tests", return_value=(0, "OK", "")):
+            self.saved_with_the_review(review, lambda: review.review(HEAD))
+
+    def test_only_the_whole_output_can_show_that_only_tests_failed(self):
+        """An excerpt can leave out a runner error or a skip summary: with no whole output, no flake."""
+        excerpt = {**self.row, "output_path": None, "failure": OUTPUT}
+        gone = {**self.row, "output_path": str(pathlib.Path(self.row["output_path"]).with_name("gone.log")),
+                "failure": OUTPUT}
+        for name, row in (("excerpt", excerpt), ("gone", gone)):
+            with self.subTest(name):
+                self.assertEqual(sd_ship_review.failed_tests({"checks": [row]}), [])
+        _review, rerun, refused = self.prepared(check=excerpt)
+        self.assertIsNotNone(refused)
+        self.assertEqual(rerun.call_count, 0)
+
+    def test_a_real_failure_still_fails_and_is_noted(self):
+        review, rerun, refused = self.prepared(rerun=(1, f"FAIL: test_a ({FLAKY_TEST})\nFAILED", ""))
+        self.assertIsNotNone(refused)
+        self.assertIn("after the review cleared; the review pass is kept", str(refused))
+        self.assertEqual(rerun.call_count, 1)
+        self.assertIsNone(review.state.get("reviewed_head"))
+        self.assertEqual(len(self.notes(f"{RERUN_FAILED}{FLAKY_TEST} at ")), 1)
+        self.assertEqual(self.notes(FLAKE), [])
+
+    def test_an_unfinished_rerun_names_its_reason_not_exit_none(self):
+        """Lead triage of sd:9768: a rerun that did not finish says why, not 'exit None'."""
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            _review, _rerun, refused = self.prepared(rerun=(None, "", "no worktree of 0123456789ab: boom"))
+        self.assertIsNotNone(refused)
+        self.assertNotIn("exit None", stderr.getvalue())
+        self.assertIn("no worktree of 0123456789ab: boom", stderr.getvalue())
+
+    def test_a_rerun_failure_it_cannot_name_bars_every_rerun_test(self):
+        """Review of sd:9768: a rerun that failed in a header the parser cannot read bars all it reran."""
+        odd = "FAIL: test_e\u0301 (tests.test_example.Case.test_e\u0301)"
+        _review, _rerun, refused = self.prepared(rerun=(1, f"{odd}\nFAILED (failures=1)", ""))
+        self.assertIsNotNone(refused)
+        self.assertEqual(len(self.notes(f"{RERUN_FAILED}{FLAKY_TEST} at ")), 1)
+
+    def test_a_skipped_rerun_says_so_without_a_skip_summary(self):
+        """Gate of sd:9768: the refusal echoed the rerun's `OK (skipped=1)`, and `make test`'s skip check read that
+        line in the gate's own log as a skipped test. It names the reason in words instead."""
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            _review, _rerun, refused = self.prepared(rerun=(0, "", "Ran 1 test\n\nOK (skipped=1)"))
+        self.assertIsNotNone(refused)
+        self.assertNotRegex(stderr.getvalue(), r"skipped=[1-9]")
+        self.assertIn("skipped a test or passed one unexpectedly", stderr.getvalue())
+
+    def test_a_second_flake_on_the_same_entry_fails(self):
+        _review, rerun, refused = self.prepared(state={"passes": [], "gate_flake": {"head": HEAD, "tests": []}})
+        self.assertIsNotNone(refused)
+        self.assertEqual(rerun.call_count, 0)
+
+    def test_a_test_that_failed_its_rerun_this_week_is_not_rerun(self):
+        from sd_db.writes import add_note
+
+        add_note(self.db, self.item, "comment", f"{RERUN_FAILED}{FLAKY_TEST} at 0123456789ab: x")
+        _review, rerun, refused = self.prepared()
+        self.assertIsNotNone(refused)
+        self.assertEqual(rerun.call_count, 0)
+
+    def test_a_rerun_failure_of_a_longer_named_test_does_not_bar_this_one(self):
+        """A name that extends FLAKY_TEST is another test: matched whole, never by prefix."""
+        from sd_db.writes import add_note
+
+        add_note(self.db, self.item, "comment", f"{RERUN_FAILED}{FLAKY_TEST}b at 0123456789ab")
+        _review, rerun, refused = self.prepared()
+        self.assertIsNone(refused)
+        self.assertEqual(rerun.call_count, 1)
+
+    def test_the_kept_reviews_gate_alone_takes_the_flake_retry_too(self):
+        """The next prepare at the head runs only the gate (`rerun_gate`): a flake there goes on as well."""
+        state = AClearedReviewOutlivesItsGate.kept(self)
+        review, _process = self.context(state=state)
+        review.connection, review.identity = self.db, ship.ItemIdentity(self.item)
+        failed = {"status": "fail", "exit_code": 1, "detail": "", "checks": [self.row]}
+        with unittest.mock.patch.object(sd_ship_review, "adjudicated_check", return_value=failed), \
+                unittest.mock.patch.object(sd_ship_review, "rerun_tests", return_value=(0, "OK", ""), create=True):
+            review.review(HEAD)
+        self.assertEqual(review.state["reviewed_head"], HEAD)
+        self.assertEqual(review.state["passes"][-1]["report"]["check"]["flake"]["tests"], [FLAKY_TEST])
+
+    def test_only_a_finished_shard_with_unittests_failure_exit_is_a_flake(self):
+        """Review of sd:9768: a shard killed after it printed a unittest failure (exit 137), one whose end line
+        only starts like the listed step, or one that never wrote its end line, is no flake: only a complete
+        `shard X: Ns exit=1` line counts, read from the whole output."""
+        log = pathlib.Path(self.row["output_path"])
+        killed = OUTPUT.replace(SHARD, "shard tests.test_example: 4s exit=137")
+        cases = (("killed, listed as killed", killed, ["shard tests.test_example: 4s exit=137", "make target test"]),
+                 ("killed, listed as exit=1", killed, [SHARD, "make target test"]),
+                 ("no end line", OUTPUT.replace(SHARD, ""), ["make target test"]),
+                 ("an unlisted failing shard", OUTPUT.replace("shard tests.test_other: 2s exit=0",
+                                                               "shard tests.test_other: 2s exit=2"),
+                  [SHARD, "make target test"]))
+        for name, text, steps in cases:
+            with self.subTest(name):
+                log.write_text(text, encoding="utf-8")
+                self.assertEqual(sd_ship_review.failed_tests({"checks": [{**self.row, "failed_steps": steps}]}), [])
+        log.write_text(OUTPUT, encoding="utf-8")
+        self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [FLAKY_TEST])
+
+    def test_only_a_failure_of_tests_alone_is_rerun(self):
+        lint = {**self.row, "failed_steps": [SHARD, "make target lint"]}
+        crashed = {**self.row, "failed_steps": ["shard tests.test_crash: 1s exit=1", "make target test"]}
+        hung = {**self.row, "failed_steps": ["shard tests.test_example: unfinished"]}
+        many = {**self.row, "output_path": None, "failed_steps": ["make target test"],
+                "failure": "".join(f"FAIL: test_{n} (tests.m.C.test_{n})\n" for n in range(6))}
+        self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [FLAKY_TEST])
+        for name, row in (("lint", lint), ("crashed", crashed), ("hung", hung), ("many", many)):
+            with self.subTest(name):
+                self.assertEqual(sd_ship_review.failed_tests({"checks": [row]}), [])
+        _review, rerun, refused = self.prepared(check=lint)
+        self.assertIsNotNone(refused)
+        self.assertEqual(rerun.call_count, 0)
+
+    def test_a_timed_out_gate_is_not_taken_for_a_flake(self):
+        """A row that timed out after a failing shard finished never ran its other shards: it is no flake."""
+        timed_out = {**self.row, "exit_code": None, "reason": "timed out after 900s"}
+        unstarted = {**self.row, "exit_code": None, "reason": "cannot run make: not found"}
+        for name, row in (("timed out", timed_out), ("unstarted", unstarted)):
+            with self.subTest(name):
+                self.assertEqual(sd_ship_review.failed_tests({"checks": [row]}), [])
+        _review, rerun, refused = self.prepared(check=timed_out)
+        self.assertIsNotNone(refused)
+        self.assertEqual(rerun.call_count, 0)
+
+    def test_a_gate_whose_runner_also_failed_is_no_flake(self):
+        """`run-tests.sh` failing to publish its results gives the same shard and step lines as a failed test:
+        the test passing alone must not clear that second fault."""
+        log = pathlib.Path(self.row["output_path"])
+        log.write_text(OUTPUT + "error: could not publish this run's results to example; the files there are "
+                       "not this run's.\n", encoding="utf-8")
+        self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [])
+        log.write_text(OUTPUT + "Tests skipped locally; install required tools or make the skip explicit.\n",
+                       encoding="utf-8")
+        self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [])
+        _review, rerun, refused = self.prepared()
+        self.assertIsNotNone(refused)
+        self.assertEqual(rerun.call_count, 0)
+
+    def test_a_gate_that_also_skipped_a_test_is_no_flake(self):
+        """A failing shard ends `make test` before its skip refusal prints: a skip in the original output would
+        fail the gate on its own, so the test that passes alone must not clear it."""
+        log = pathlib.Path(self.row["output_path"])
+        log.write_text(OUTPUT.replace("FAILED (failures=1)", "FAILED (failures=1, skipped=1)"), encoding="utf-8")
+        self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [])
+        log.write_text(OUTPUT.replace("OK\n", "OK (skipped=2)\n", 1), encoding="utf-8")
+        self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [], "a skip in another shard")
+        _review, rerun, refused = self.prepared()
+        self.assertIsNotNone(refused)
+        self.assertEqual(rerun.call_count, 0)
+
+    def test_a_gate_with_an_unexpected_success_is_no_flake(self):
+        """Every unittest outcome that fails a run besides FAIL and ERROR: an unexpected success fails the gate
+        by itself, so the test that passes alone must not clear it."""
+        log = pathlib.Path(self.row["output_path"])
+        for name, extra in (("header", "UNEXPECTED SUCCESS: test_b (tests.test_example.Case.test_b)\n"),
+                            ("summary", "FAILED (failures=1, unexpected successes=1)\n")):
+            with self.subTest(name):
+                log.write_text(OUTPUT.replace("Ran 3 tests\n", f"{extra}Ran 3 tests\n"), encoding="utf-8")
+                self.assertEqual(sd_ship_review.failed_tests({"checks": [self.row]}), [])
+        _review, rerun, refused = self.prepared()
+        self.assertIsNotNone(refused)
+        self.assertEqual(rerun.call_count, 0)
+
+    def test_a_rerun_with_an_unexpected_success_is_no_pass(self):
+        review, _rerun, refused = self.prepared(rerun=(0, "", "Ran 1 test\n\nOK (unexpected successes=1)\n"))
+        self.assertIsNotNone(refused)
+        self.assertEqual((self.notes(FLAKE), self.notes(RERUN_FAILED)), ([], []))
+
+    def test_a_rerun_that_skipped_is_no_pass(self):
+        """`make test` refuses a skip; a rerun that skipped the test (a missing tool) proves nothing and bars
+        nothing."""
+        review, _rerun, refused = self.prepared(rerun=(0, "", "Ran 1 test in 0.001s\n\nOK (skipped=1)\n"))
+        self.assertIsNotNone(refused)
+        self.assertEqual((self.notes(FLAKE), self.notes(RERUN_FAILED)), ([], []))
+        self.assertIsNone(review.state.get("gate_flake"))
+
+    def test_a_rerun_that_never_ran_the_test_bars_nothing(self):
+        """An import or environment fault in the rerun names no failed test: the gate failure stands, but no
+        test goes on the seven-day list for it."""
+        for name, rerun in (("import", (1, "", "ImportError: No module named 'example'\nFAILED (errors=1)")),
+                            ("timeout", (None, "", "timed out"))):
+            with self.subTest(name):
+                _review, _rerun, refused = self.prepared(rerun=rerun)
+                self.assertIsNotNone(refused)
+                self.assertEqual(self.notes(RERUN_FAILED), [])
+
+
+class TheRerunRunsAtTheReviewedHead(unittest.TestCase):
+    """sd:9768 review: the rerun runs in a clean worktree of the gate's head, never the caller's checkout."""
+
+    def test_the_rerun_runs_in_a_clean_worktree_of_head(self):
+        import subprocess
+        import tempfile
+
+        import sd_gate_run
+
+        from tests.clean_env import clean_environment
+
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        root = pathlib.Path(scratch.name) / "repo"
+        root.mkdir()
+
+        def git(*args):
+            return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True,
+                                  text=True, env=clean_environment()).stdout.strip()
+
+        git("init", "-q")
+        # The gate's Makefile builds its environment first (`$(GATE_ENV)`), then names it relative to the tree.
+        # In gate mode only, as the real one: the probe must see SD_LOCAL_GATE, the tests must not.
+        (root / "Makefile").write_text(f"ifeq ($(SD_LOCAL_GATE),1)\nGATE_ENV := made\nendif\n"
+                                       f"VENV_PYTHON = v/bin/python\nmade:\n"
+                                       f"\t@mkdir -p v/bin && ln -sf {sys.executable} v/bin/python\n", encoding="utf-8")
+        git("config", "user.email", "operator@example.test")
+        git("config", "user.name", "operator")
+        (root / "example.py").write_text("BROKEN = True\n", encoding="utf-8")
+        (root / ".github/scripts").mkdir(parents=True)
+        (root / ".github/scripts/run-tests.sh").write_text(
+            "export JEV_ENABLED=0\nexport JEV_METER=0\nexport JEV_CORPUS=0\n", encoding="utf-8")
+        git("add", "example.py", "Makefile", ".github/scripts/run-tests.sh")
+        git("commit", "-q", "-m", "head")
+        head = git("rev-parse", "HEAD")
+        (root / "example.py").write_text("BROKEN = False\n", encoding="utf-8")  # an uncommitted fix
+        seen = {}
+
+        def child(command, env, cwd, timeout):
+            seen.update(cwd=pathlib.Path(cwd), command=command, env=env,
+                        head=subprocess.run(["git", "-C", str(cwd), "rev-parse", "HEAD"], capture_output=True,
+                                            text=True, env=clean_environment()).stdout.strip(),
+                        text=(pathlib.Path(cwd) / "example.py").read_text(encoding="utf-8"))
+            return 0, "OK", ""
+
+        with unittest.mock.patch.object(sd_gate_run, "run_child", side_effect=child), \
+                unittest.mock.patch.dict("os.environ", {"JEV_ENABLED": "1", "JEV_METER": "1"}):
+            self.assertEqual(sd_ship_review.rerun_tests(root, head, [FLAKY_TEST]), (0, "OK", ""))
+        self.assertEqual({key: seen["env"].get(key) for key in ("JEV_ENABLED", "JEV_METER", "JEV_CORPUS")},
+                         {"JEV_ENABLED": "0", "JEV_METER": "0", "JEV_CORPUS": "0"},
+                         "the runner's Jev guards at head: no live, metered call")
+        # A boolean, never the mapping: a failure must not print the environment (it holds secrets).
+        self.assertFalse("SD_LOCAL_GATE" in seen["env"], "the Makefile unexports it from its recipes")
+        self.assertNotEqual(seen["cwd"].resolve(), root.resolve())
+        self.assertEqual((seen["head"], seen["text"]), (head, "BROKEN = True\n"))
+        self.assertEqual((seen["command"][0], seen["command"][-1]), (f"{seen['cwd']}/v/bin/python", FLAKY_TEST),
+                         "the gate's interpreter, built and named by the Makefile at head")
+        self.assertFalse(seen["cwd"].exists(), "the worktree is removed after the rerun")
+        self.assertNotIn(str(seen["cwd"]), git("worktree", "list"))
+        git("rm", "-q", "Makefile")
+        git("commit", "-q", "-m", "no makefile")
+        with unittest.mock.patch.object(sd_gate_run, "run_child", side_effect=child) as ran:
+            code, _out, err = sd_ship_review.rerun_tests(root, git("rev-parse", "HEAD"), [FLAKY_TEST])
+        self.assertEqual((code, ran.call_count), (None, 0), err)
+
+    def test_each_test_reruns_in_its_shards_environment(self):
+        """Review of sd:9768: a dashboard test imports `support` through `dashboard/tests`, as its gate shard
+        runs it; every rerun gets the runner's `SD_REVIEW_SLOTS=0` and `SD_GATE_SLOTS=0`, so no gate test waits
+        on a real slot. One child per test, so each gets its own shard's path."""
+        import subprocess
+        import tempfile
+
+        import sd_gate_run
+
+        from tests.clean_env import clean_environment
+
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        root = pathlib.Path(scratch.name) / "repo"
+        root.mkdir()
+
+        def git(*args):
+            return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True,
+                                  text=True, env=clean_environment()).stdout.strip()
+
+        git("init", "-q")
+        git("config", "user.email", "operator@example.test")
+        git("config", "user.name", "operator")
+        (root / "Makefile").write_text(f"VENV_PYTHON = {sys.executable}\n", encoding="utf-8")
+        git("add", "Makefile")
+        git("commit", "-q", "-m", "head")
+        runs = []
+
+        def child(command, env, cwd, timeout):
+            runs.append((command[3:], env.get("PYTHONPATH"), env.get("SD_REVIEW_SLOTS"), env.get("SD_GATE_SLOTS"),
+                         env.get("SD_AI_COMMAND_PACK_PYTHON"), str(cwd)))
+            return 0, "", "OK"
+
+        dashboard, sd_db = "dashboard.tests.test_example.Case.test_a", "tests.sd_db.test_example.Case.test_a"
+        with unittest.mock.patch.object(sd_gate_run, "run_child", side_effect=child), \
+                unittest.mock.patch.dict("os.environ", {"SD_REVIEW_SLOTS": "4", "PYTHONPATH": "/elsewhere"}):
+            code, _out, _err = sd_ship_review.rerun_tests(root, git("rev-parse", "HEAD"), [FLAKY_TEST, dashboard, sd_db])
+        self.assertEqual(code, 0)
+        self.assertEqual([run[0] for run in runs], [[FLAKY_TEST], [dashboard], [sd_db]])
+        tree = runs[0][5]
+        self.assertEqual([run[1] for run in runs],
+                         [None, f"{tree}/dashboard:{tree}/lib:{tree}/dashboard/tests", None])
+        self.assertEqual({run[2:5] for run in runs}, {("0", "0", sys.executable)})
+
+    def test_a_later_unfinished_rerun_keeps_an_earlier_failures_code(self):
+        """Lead triage of sd:9768: a test that failed alone stays failed when a later one times out; the
+        timeout's reason ends the error output."""
+        import subprocess
+        import tempfile
+
+        import sd_gate_run
+
+        from tests.clean_env import clean_environment
+
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        root = pathlib.Path(scratch.name) / "repo"
+        root.mkdir()
+
+        def git(*args):
+            return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True,
+                                  text=True, env=clean_environment()).stdout.strip()
+
+        git("init", "-q")
+        git("config", "user.email", "operator@example.test")
+        git("config", "user.name", "operator")
+        (root / "Makefile").write_text(f"VENV_PYTHON = {sys.executable}\n", encoding="utf-8")
+        git("add", "Makefile")
+        git("commit", "-q", "-m", "head")
+        answers = iter([(1, "", f"FAIL: test_a ({FLAKY_TEST})"), (None, "sd-check could not finish: timeout", "")])
+        with unittest.mock.patch.object(sd_gate_run, "run_child", side_effect=lambda *_a: next(answers)):
+            code, _out, err = sd_ship_review.rerun_tests(root, git("rev-parse", "HEAD"),
+                                                         [FLAKY_TEST, f"{FLAKY_TEST}_other"])
+        self.assertEqual(code, 1)
+        self.assertTrue(err.endswith("sd-check could not finish: timeout"), err)
+
+    def test_a_planned_shard_with_no_log_is_no_flake(self):
+        """Review of sd:9768: the runner prints the planned shard count and appends only the logs that exist, so a
+        shard `xargs` never launched leaves no start line; a gate with fewer finished shards than planned is no
+        flake. A gate output with no planned count says nothing either way, so it is none too."""
+        root = pathlib.Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        for name, text, expected in (
+                ("planned and finished", OUTPUT, [FLAKY_TEST]),
+                ("one never launched", OUTPUT.replace("shards=2", "shards=3"), []),
+                ("no planned count", OUTPUT.replace("test runner: workers=2 shards=2\n", ""), [])):
+            with self.subTest(name):
+                (root / "check.log").write_text(text, encoding="utf-8")
+                row = {"name": "check", "status": "fail", "exit_code": 2, "output_path": str(root / "check.log"),
+                       "failed_steps": [SHARD, "make target test"]}
+                self.assertEqual(sd_ship_review.failed_tests({"checks": [row]}), expected)
+
+    def test_a_failing_shard_with_a_header_it_cannot_parse_is_no_flake(self):
+        """Review of sd:9768: a valid test name with a combining mark escapes the header pattern; a shard whose
+        headers do not all parse, or do not add up to its FAILED count, is no flake."""
+        root = pathlib.Path(self.enterContext(__import__("tempfile").TemporaryDirectory()))
+        odd = "FAIL: test_e\u0301 (tests.test_example.Case.test_e\u0301)\nAssertionError\n"
+        for name, text in (
+                ("unparsed header", OUTPUT.replace("Ran 3 tests\nFAILED (failures=1)",
+                                                   f"{odd}Ran 3 tests\nFAILED (failures=2)")),
+                ("count above headers", OUTPUT.replace("FAILED (failures=1)", "FAILED (failures=1, errors=1)"))):
+            with self.subTest(name):
+                (root / "check.log").write_text(text, encoding="utf-8")
+                row = {"name": "check", "status": "fail", "exit_code": 2, "output_path": str(root / "check.log"),
+                       "failed_steps": [SHARD, "make target test"]}
+                self.assertEqual(sd_ship_review.failed_tests({"checks": [row]}), [])
+        (root / "check.log").write_text(OUTPUT.replace("FAILED (failures=1)", "FAILED (failures=1, expected failures=2)"),
+                                        encoding="utf-8")
+        row = {"name": "check", "status": "fail", "exit_code": 2, "output_path": str(root / "check.log"),
+               "failed_steps": [SHARD, "make target test"]}
+        self.assertEqual(sd_ship_review.failed_tests({"checks": [row]}), [FLAKY_TEST], "expected failures pass")
+
+    def test_the_interpreter_probe_ends_its_whole_group_at_its_deadline(self):
+        """Review of sd:9768: a provisioning child of the probe's `make` must not outlive the timeout and keep
+        writing while the rerun removes its worktree."""
+        import tempfile
+
+        scratch = tempfile.TemporaryDirectory()
+        self.addCleanup(scratch.cleanup)
+        tree = pathlib.Path(scratch.name)
+        (tree / "Makefile").write_text("GATE_ENV = slow\nVENV_PYTHON = /usr/bin/true\n"
+                                       "slow:\n\tsleep 30 & echo $$! > pid; wait\n", encoding="utf-8")
+        with unittest.mock.patch.object(sd_ship_review.sd_lib, "GATE_CHECK_SECONDS", 2):
+            self.assertIsNone(sd_ship_review.gate_python(tree, dict(os.environ)))
+        pid = int((tree / "pid").read_text(encoding="utf-8"))
+        alive = True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            alive = False
+        if alive:
+            os.kill(pid, 9)
+        self.assertFalse(alive, "the probe's provisioning child outlived its deadline")
+
+    def test_the_shard_rules_still_match_the_runner(self):
+        """The rerun copies the shard rules `run-tests.sh` and `make test` give: this fails when either moves."""
+        root = pathlib.Path(__file__).resolve().parents[1]
+        runner = (root / ".github/scripts/run-tests.sh").read_text(encoding="utf-8")
+        self.assertIn('export PYTHONPATH="$5/dashboard:$5/lib:$5/dashboard/tests${4:+:$4}"', runner)
+        self.assertIn("export SD_GATE_SLOTS=0", runner)
+        self.assertIn('export SD_AI_COMMAND_PACK_PYTHON="$toolchain_python"', runner)
+        self.assertIn("SD_REVIEW_SLOTS=0", (root / "Makefile").read_text(encoding="utf-8"))
+        self.assertEqual(sd_ship_review.SHARD_PATHS["dashboard.tests."],
+                         ("dashboard", "lib", "dashboard/tests"))
+
+
 if __name__ == "__main__":
     unittest.main()
