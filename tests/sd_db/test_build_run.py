@@ -1083,19 +1083,21 @@ class Supervise(Case):
         self.assertEqual(len(self.calls("sd-review")), R + 1, "the park moved")
         fixes = [call["argv"] for call in self.calls("claude")][1:]
         models = [(argv[argv.index("--model") + 1], "--effort" in argv) for argv in fixes]
-        self.assertEqual(models[:3], [("opus", False)] * 3, "rounds 1-3 escalated")
-        self.assertEqual(models[3:], [(build_run.STRONGEST, True)] * (R - 3), "round 4 on did not escalate")
-        self.assertEqual(fixes[3][fixes[3].index("--effort") + 1], "high")
+        E = build_run.ESCALATE_AFTER
+        self.assertLess(E, R, "no fix escalates before the park (sd:10111)")
+        self.assertEqual(models[:E], [("opus", False)] * E, "an early round escalated")
+        self.assertEqual(models[E:], [(build_run.STRONGEST, True)] * (R - E), "a late round did not escalate")
+        self.assertEqual(fixes[E][fixes[E].index("--effort") + 1], "high")
         prompts = [argv[argv.index("-p") + 1] for argv in fixes]
-        self.assertNotIn("name the class", prompts[2])
-        self.assertIn("name the class", prompts[3])
+        self.assertNotIn("name the class", prompts[E - 1])
+        self.assertIn("name the class", prompts[E])
         escalated = [body for (body,) in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))
                      if "escalated" in body]
         self.assertEqual(len(escalated), 1, "the escalation is not recorded once on the run's item")
 
-    def test_review_rounds_cap_is_seven(self):
-        """Operator 2026-11-20: seven rounds with blockers, then the class pass, before a build parks."""
-        self.assertEqual(build_run.REVIEW_ROUNDS, 7)
+    def test_review_rounds_cap_is_three(self):
+        """Operator 2026-11-23 (sd:10111): three rounds with blockers, then the class pass, before a build parks."""
+        self.assertEqual(build_run.REVIEW_ROUNDS, 3)
 
     def test_review_rounds_rule_reaches_the_builder(self):
         """Pack sd:9584: the brief asks for a failure table on a parser or event matching; the class pass keeps scope."""
