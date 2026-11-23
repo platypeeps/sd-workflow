@@ -561,6 +561,17 @@ class ReproRuleTests(unittest.TestCase):
                                              repro=True, prior=prior)
                 self.assertEqual((record["disposition"], record.get("evidence")), expected)
 
+    def test_a_nearby_same_summary_repeat_answers_the_blocker(self) -> None:
+        """build/sd-1423 review (bin/sd-review:1822): a blocker at line 10 was repeated by its own summary at
+        line 15, which took the repro, yet an unrelated uncited claim at line 11 still blocked, since the
+        fallback counted only an exact-line repeat as the answer. Any repeat that takes the repro answers it."""
+        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking")]
+        repeat, other = sd_review.dispose([finding(line=15, summary="empty input crashes"),
+                                           finding(line=11, summary="the cache is never cleared")],
+                                          "high", repro=True, prior=prior)
+        self.assertEqual([(row["disposition"], row.get("evidence")) for row in (repeat, other)],
+                         [("blocking", REPRO), ("advisory", None)])
+
     def test_a_line_that_cannot_be_placed_holds_no_nearby_finding(self) -> None:
         """build/sd-1423 review (bin/sd-review:1813): a prior blocker with `line: null` made an unrelated,
         uncited finding at line 200 of its file block after the defect was fixed. A proximity hold needs two
