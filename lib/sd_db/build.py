@@ -1200,7 +1200,11 @@ def _retry_row(connection, item: int):
         # work's repository (`_in_work_repo`), or the claim refuses it and every later press reads it again (round 14).
         if ran is not None and ran["status"] in AGAIN and not _alone(connection, ran["id"]):
             lead: int = ran["parent"] or ran["id"]
+            # Not `_stranded`: a bundle that ran on a satellite its lane left has its worktree there, as beat
+            # recovery reads it (review of build/sd-1378).
+            host = connection.execute(_REPO, (ran["item"],)).fetchone()["lane_host"]
             if (queue_state(connection, lead)["status"] == ran["status"] and _in_work_repo(connection, lead, ran["status"])
+                    and not _stranded(connection, {**dict(ran), "lane_host": host})
                     and _retry_takes(connection, lead, ran["status"])):
                 return ran
     return rows[0] if rows else None

@@ -2934,6 +2934,25 @@ class Hosts(Case):
         self.assertIsNone(self.claim(hosts=HUB))
         self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", first["assignment"]), "blocked")
 
+    def test_build_by_item_presses_fresh_a_bundle_stranded_on_the_satellite_its_lane_left(self):
+        """Review of build/sd-1378: a build ran on one satellite and ended blocked, a newer press was cancelled
+        before its claim, then the lane moved to a healthy satellite. Build by item read the old assignment,
+        whose worktree is on the first satellite, and the new host claimed it without that work. It presses
+        fresh, as beat recovery leaves a `_stranded` row."""
+        item = self.item(repo=SAT)
+        build.queue(self.db, [item], who="operator")
+        first = self.claim(hosts=WORK)
+        self.retried(first)
+        self.db.execute("UPDATE assignment SET status = 'blocked' WHERE id = ?", (first["assignment"],))
+        cancelled = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (cancelled,))
+        self.db.execute("UPDATE repo SET lane_host = 'other' WHERE path = ?", (SAT,))
+        record_state(self.db, "heartbeat", key="build-dispatch@other", body={})
+        queued = build.queue_again(self.db, [item], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [item])
+        self.assertGreater(queued[0]["id"], cancelled, "a fresh press, not the stranded bundle's Retry")
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", first["assignment"]), "blocked")
+
     def test_pickup_builds_fresh_a_retry_stranded_on_the_satellite_its_lane_left(self):
         """Review round 4 of sd:9774: a retry ran on one satellite, its lane moved to another, and the hub blocked
         it there. No host may requeue it, its worktree being on the first, so pickup must not wait on it either:
