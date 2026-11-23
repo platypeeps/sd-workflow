@@ -1988,6 +1988,39 @@ class Train(Trees):
 
 
 
+class TrainReadBack(unittest.TestCase):
+    """sd:9923, class pass: once the train's PUT is sent, only proof that nothing merged fails the train."""
+
+    def test_only_proof_of_no_merge_fails_a_sent_train(self) -> None:
+        put, seen = "a" * 40, "b" * 40
+        merged = {"merged": True, "base": {"ref": "main"}, "merge_commit_sha": seen}
+        stale = {"merged": False, "base": {"ref": "main"}, "merge_commit_sha": None}
+        elsewhere = {**merged, "base": {"ref": "other"}}
+        rows: list[tuple[Any, str | None, bool, str, str | None]] = [
+            # the read after the PUT, the PUT's merge, GitHub refused the PUT -> status, merge commit
+            (merged, put, False, "merged", seen), (merged, None, False, "merged", seen),
+            (merged, None, True, "merged", seen), ({**merged, "base": {}}, None, False, "merged", seen),
+            (stale, put, False, "merged", put), (None, put, False, "merged", put),
+            ({"merged": True, "base": "main"}, put, False, "merged", put),
+            (stale, None, False, "unknown", None), (None, None, False, "unknown", None),
+            ("", None, False, "unknown", None), ({"merged": True, "base": "main"}, None, False, "unknown", None),
+            ({**merged, "merge_commit_sha": "zz"}, None, False, "unknown", None),
+            (stale, None, True, "failed", None), (None, None, True, "failed", None),
+            (elsewhere, put, False, "failed", None), (elsewhere, None, True, "failed", None),
+        ]
+        for read, sent, refused, status, commit in rows:
+            with self.subTest(read=read, put=sent, refused=refused):
+                answer = sd_lane.read_back(read, 9, "main", sent, refused)
+                self.assertEqual((answer["status"], answer.get("merge_commit")), (status, commit))
+
+    def test_a_put_answer_names_a_merge_only_when_it_says_merged_at_a_commit(self) -> None:
+        for answer in (None, "", [], {"merged": True}, {"merged": True, "sha": "zz"}, {"merged": "true", "sha": "a" * 40},
+                       {"merged": False, "sha": "a" * 40}, {"merged": True, "sha": 7}):
+            with self.subTest(answer=answer):
+                self.assertIsNone(sd_lane.put_merge(answer))
+        self.assertEqual(sd_lane.put_merge({"merged": True, "sha": "a" * 40}), "a" * 40)
+
+
 class TrainLanding(Trees):
     """sd:9923: a ready train lands as one train pull request, gated once on the joined tree.
 

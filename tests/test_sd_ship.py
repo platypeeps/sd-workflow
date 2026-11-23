@@ -6780,6 +6780,14 @@ roles:
         self.assertEqual(self.landed_after_the_put(self.refused_read, lose_put=True)["status"], "unknown")
         self.assertEqual(self.remote.pull(1).state, "MERGED")  # GitHub took the PUT
 
+    def test_land_train_whose_put_answer_is_lost_and_read_back_is_stale_answers_unknown(self):
+        """Class pass of sd:9923: a lost PUT answer and a lagging `merged: false` read as failed, so the lead
+        merged alone over a train GitHub had landed."""
+        landed = self.landed_after_the_put(lambda answer: {**answer, "merged": False, "merge_commit_sha": None},
+                                           lose_put=True)
+        self.assertEqual(landed["status"], "unknown")
+        self.assertEqual(self.remote.pull(1).state, "MERGED")  # GitHub took the PUT
+
     def test_land_train_whose_put_answer_is_lost_and_read_back_breaks_answers_unknown(self):
         self.assertEqual(self.landed_after_the_put(self.broken_read, lose_put=True)["status"], "unknown")
 

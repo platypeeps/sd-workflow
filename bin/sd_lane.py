@@ -3109,14 +3109,16 @@ def sent_train(api: Any, pull: int, base: str, body: dict[str, Any]) -> dict[str
 
     Nothing raises from here: GitHub may have merged, so a failure is an
     answer, never a way to a lone merge. The PUT's own `merged: true` is
-    proof of the landing, whatever the read after it does.
+    proof of the landing, whatever the read after it does; its 4xx is
+    GitHub's word that it merged nothing; a 5xx or no answer is neither.
     """
-    put = seen = None
-    with contextlib.suppress(Exception):  # lost or refused: the read below and `read_back` decide
-        put = put_merge(api.api(f"{api.prefix}/pulls/{pull}/merge", method="PUT", body=body))
+    put, refused, seen = None, False, None
+    with contextlib.suppress(Exception):  # no answer: the read below and `read_back` decide
+        status, answer = api.api_status(f"{api.prefix}/pulls/{pull}/merge", method="PUT", body=body)
+        put, refused = (put_merge(answer) if 200 <= status < 300 else None), 400 <= status < 500
     with contextlib.suppress(Exception):  # a read that fails is no answer, as one that is unreadable
         seen = api.pull(pull)
-    return read_back(seen, pull, base, put)
+    return read_back(seen, pull, base, put, refused)
 
 
 def put_merge(answer: Any) -> str | None:
@@ -3125,31 +3127,32 @@ def put_merge(answer: Any) -> str | None:
     return commit if isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit) else None
 
 
-def read_back(merged: Any, pull: int, base: str, put: str | None = None) -> dict[str, Any]:
-    """The train pull request's state read after its PUT: merged onto `base`, not merged, or unknown (sd:9923).
+def read_back(merged: Any, pull: int, base: str, put: str | None = None, refused: bool = False) -> dict[str, Any]:
+    """What a sent train merge left: merged onto `base`, proven not merged, or unknown (sd:9923).
 
-    Only a well-formed answer decides. `merged: false` is GitHub's word that
-    nothing landed; any other shape may hide a merge, so it is unknown, and
-    the claimed entry reconciles on its next prepare instead of merging alone.
-    A PUT that answered merged at `put` landed: a read that lags it does not
-    undo that, and only a merge onto another base still fails.
+    `merged` is the pull request read after the PUT, `put` the merge the
+    PUT's own answer named, `refused` whether GitHub refused the PUT. Only
+    proof decides. A read of `merged: true` at a commit, or `put`, is the
+    landing; a lagging or failed read does not undo `put`. Only GitHub's
+    refusal of the PUT, or a merge onto another base, fails the train. A
+    lost PUT answer with any other read is unknown: the read may lag a
+    merge, so the claimed entry reconciles on its next prepare and never
+    merges alone.
     """
     shaped = isinstance(merged, dict) and isinstance(merged.get("base"), dict)
-    if put is not None and not (shaped and merged.get("merged") is True):
+    commit = merged.get("merge_commit_sha") if shaped and merged.get("merged") is True else None
+    if isinstance(commit, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit):
+        ref = merged["base"].get("ref")  # a ref left out of the answer is no other base: the train landed
+        if isinstance(ref, str) and ref and ref != base:
+            return {"status": "failed", "pull": pull, "reason": f"train pull request #{pull} merged onto "
+                                                                f"{ref}, not {base}"}
+        return {"status": "merged", "pull": pull, "merge_commit": commit}
+    if put is not None:
         return {"status": "merged", "pull": pull, "merge_commit": put}
-    if shaped and merged.get("merged") is False:
-        return {"status": "failed", "pull": pull, "reason": f"GitHub did not merge train pull request #{pull}"}
-    commit = merged.get("merge_commit_sha") if shaped else None
-    if not (shaped and merged.get("merged") is True and isinstance(commit, str)
-            and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)):
-        if put is not None:
-            return {"status": "merged", "pull": pull, "merge_commit": put}
-        return {"status": "unknown", "pull": pull, "reason": f"train pull request #{pull} read back unreadable"}
-    ref = merged["base"].get("ref")  # a ref left out of the answer is no other base: the train landed
-    if isinstance(ref, str) and ref and ref != base:
-        return {"status": "failed", "pull": pull, "reason": f"train pull request #{pull} merged onto "
-                                                            f"{ref}, not {base}"}
-    return {"status": "merged", "pull": pull, "merge_commit": commit}
+    if refused:
+        return {"status": "failed", "pull": pull, "reason": f"GitHub refused to merge train pull request #{pull}"}
+    return {"status": "unknown", "pull": pull,
+            "reason": f"train pull request #{pull} was sent to merge and not read back merged"}
 
 
 def train_message(root: pathlib.Path, tip: str, base: str, members: int) -> str | None:

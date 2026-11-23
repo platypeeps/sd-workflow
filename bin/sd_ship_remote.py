@@ -178,8 +178,11 @@ class GitHub:
         except ValueError:
             raise Refusal("GitHub returned unreadable JSON") from None
 
-    def api_status(self, path: str) -> tuple[int, Any]:
-        """`(HTTP status, body)` for a GET whose non-2xx answer is still an answer.
+    def api_status(self, path: str, *, method: str = "GET", body: dict | None = None) -> tuple[int, Any]:
+        """`(HTTP status, body)` for a call whose non-2xx answer is still an answer.
+
+        A train's merge PUT reads it too: a 4xx there is GitHub's word that
+        it merged nothing, where a 5xx or no answer may hide a merge (sd:9923).
 
         `api` folds every failure into one refusal, which is right everywhere
         but the protection endpoints: there a 404 means "no classic protection
@@ -192,9 +195,10 @@ class GitHub:
         the response line `gh api --include` prints, not from the wording of
         gh's stderr, so a reworded message cannot turn a refusal into a fact.
         """
-        argv = ["gh", "api", "--include", path, "--method", "GET"]
+        argv = ["gh", "api", "--include", path, "--method", method, *(["--input", "-"] if body is not None else [])]
         try:
-            result = subprocess.run(argv, cwd=self.root, text=True, capture_output=True, timeout=60, check=False)
+            result = subprocess.run(argv, cwd=self.root, text=True, capture_output=True, timeout=60, check=False,
+                                    input=json.dumps(body) if body is not None else None)
         except (OSError, subprocess.SubprocessError) as error:
             raise Refusal(f"gh could not finish: {error}", code="command_unavailable", boundary="runtime",
                           state="retryable_failure", next_action="Restore command access, then retry this command.") from None
