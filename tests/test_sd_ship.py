@@ -6539,7 +6539,8 @@ roles:
             during()
             return {"status": gate, "summary": f"sd-check {gate}"}
         with patch.object(ship.sd_local_gate, "local_gate", local_gate):
-            landed = ship.sd_lane.land_train(self.root, tip, "main", [self.item], ready)
+            landed = ship.sd_lane.land_train(self.root, tip, "main", [self.item], ready,
+                                             database=self.database)
         return landed, gates
 
     def train_branches(self):
@@ -6701,6 +6702,29 @@ roles:
         self.assertEqual(merged["workflow"]["blocker"]["code"], "base_advanced_at_merge")
         self.assertEqual(self.connection.execute("SELECT status FROM item WHERE id=?", (self.item,)).fetchone()[0],
                          "in_progress")
+
+    def assert_taken_before_the_put_sends_no_merge(self, take, reason):
+        """Review of sd:9923: the train PUT neither read the repository hold nor took the ship lock that
+        serializes holds with merges, so a hold taken after the last join did not stop it."""
+        tip = self.joined_tip()
+        main = _git(self.remote.path, "rev-parse", "main")
+        landed, _ = self.landed_by_lane(tip, ready=lambda: take() and None)
+        self.assertEqual(landed["status"], "failed")
+        self.assertIn(reason, landed["reason"])
+        self.assertEqual([call for call in self.remote.calls if call.method == "PUT"], [])
+        self.assertEqual(_git(self.remote.path, "rev-parse", "main"), main)
+
+    def test_land_train_under_a_repository_hold_sends_no_merge(self):
+        other = create_item(self.connection, kind="work", title="held work", status="in_progress",
+                            repo=str(self.operator), branch="other")
+        self.assert_taken_before_the_put_sends_no_merge(
+            lambda: ship.sd_ship_hold.take(self.database, self.operation().repository, other, window=600,
+                                           holder="operator", command=f"sd-ship hold --item {other}"),
+            f"held for sd:{other}")
+
+    def test_land_train_while_another_merge_holds_the_ship_lock_sends_no_merge(self):
+        self.assert_taken_before_the_put_sends_no_merge(
+            lambda: self.hold_ship_lock(self.operation().repository), "another ship operation")
 
     def test_a_held_train_member_names_the_train_landing_to_verify(self):
         """Review of sd:9923: the recovery said to verify the member's merge, which lacks the newer base;

@@ -2866,7 +2866,7 @@ def land_joined(joined: list[Joined], queue: Queue, ship: Ship, tip: str,
         return None
     # The rejoins take minutes, so the queue is read after them, and the fence reads it again in its own write.
     landed = land_train(joined[0][1], tip, branch, items, lambda: train_stop(joined, queue, renewed) or fenced(),
-                        checks=lambda: rejoin_stop(joined, ship, logs))
+                        checks=lambda: rejoin_stop(joined, ship, logs), database=hub_database(queue.environ))
     if landed.get("status") != "merged":
         for row, *_ in joined[1:]:
             record[row["id"]] = {"status": "unknown" if landed.get("status") == "unknown" else "failed",
@@ -2982,7 +2982,7 @@ def join_member(row: dict[str, Any], tree: pathlib.Path, head: str, onto: str, s
 
 def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
                ready: Callable[[], str | None] = lambda: None,
-               checks: Callable[[], str | None] = lambda: None) -> dict[str, Any]:
+               checks: Callable[[], str | None] = lambda: None, *, database: pathlib.Path) -> dict[str, Any]:
     """One train pull request at `tip`: pushed, gated once, merged with a merge commit (sd:9923).
 
     A direct push of the base is refused under protection; a pull request
@@ -2997,7 +2997,10 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
     GitHub would land a combination the gate never saw.
     """
     import sd_local_gate  # noqa: PLC0415 -- the GitHub client loads only for a train landing
+    import sd_ship_hold  # noqa: PLC0415
     import sd_ship_remote  # noqa: PLC0415
+    require_sd_db()
+    from sd_db import ship as store  # noqa: PLC0415
     branch, names = TRAIN_BRANCH.format(tip[:12]), ", ".join(f"sd:{item}" for item in items)
     if scratch_git(root, "push", "--quiet", "origin", f"{tip}:refs/heads/{branch}") is None:
         return {"status": "failed", "reason": f"the push of {branch} failed"}
@@ -3018,16 +3021,23 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
         if message is None:
             return {"status": "failed", "pull": pull,
                     "reason": "the members' closing trailers could not be read from git; no merge was sent"}
-        why = ready()  # last: it ends in the lane host's fence
+        why = ready()  # it ends in the lane host's fence
         if why is not None:
             return {"status": "failed", "pull": pull, "reason": why[:600]}
-        sent = True  # from here a failure is unknown: GitHub may have merged
-        with contextlib.suppress(sd_ship_remote.Refusal):  # a lost answer is read back below, never sent twice
-            api.api(f"{api.prefix}/pulls/{pull}/merge", method="PUT",
-                    body={"sha": tip, "merge_method": "merge", "commit_title": f"chore(lane): train of {names} (#{pull})",
-                          "commit_message": message})
-        return read_back(api.pull(pull), pull, base)
-    except sd_ship_remote.Refusal as error:
+        # As a lone merge does, the PUT goes out under the ship lock, after the hold it serializes with.
+        with store.repository_lock(database, api.repository, holder={"command": f"sd lane train {names}",
+                                                                     "item": items[0], "review": None}):
+            hold = sd_ship_hold.standing(database, api.repository)
+            if hold is not None and set(items) != {hold["item"]}:
+                return {"status": "failed", "pull": pull,
+                        "reason": f"the merge lane is held for {sd_ship_hold.held_text(hold)}; no merge was sent"}
+            sent = True  # from here a failure is unknown: GitHub may have merged
+            with contextlib.suppress(sd_ship_remote.Refusal):  # a lost answer is read back below, never sent twice
+                api.api(f"{api.prefix}/pulls/{pull}/merge", method="PUT",
+                        body={"sha": tip, "merge_method": "merge",
+                              "commit_title": f"chore(lane): train of {names} (#{pull})", "commit_message": message})
+            return read_back(api.pull(pull), pull, base)
+    except (sd_ship_remote.Refusal, store.WorkflowError) as error:  # the lock refuses before it sends
         return {"status": "unknown" if sent else "failed", "reason": str(error)[:600]}
     finally:
         scratch_git(root, "push", "--quiet", "origin", "--delete", branch)

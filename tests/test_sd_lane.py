@@ -1999,7 +1999,8 @@ class TrainLanding(Trees):
         return super().ship(argv, log)
 
     def land(self, root: pathlib.Path, tip: str, base: str, items: list[int],
-             ready: Callable[[], str | None] = lambda: None, checks: Callable[[], str | None] = lambda: None) -> dict:
+             ready: Callable[[], str | None] = lambda: None, checks: Callable[[], str | None] = lambda: None,
+                 *, database: pathlib.Path) -> dict:
         """The recorder's landing; once merged, a member's next prepare reconciles, as `sd-ship` does.
 
         `during_gate` runs where the train gate runs; `checks`, then `ready`, are read after it, as `land_train`
@@ -2173,12 +2174,13 @@ class TrainLanding(Trees):
         real = self.land
 
         def land(root: pathlib.Path, tip: str, base: str, items: list[int],
-                 ready: Callable[[], str | None] = lambda: None, checks: Callable[[], str | None] = lambda: None) -> dict:
+                 ready: Callable[[], str | None] = lambda: None, checks: Callable[[], str | None] = lambda: None,
+                 *, database: pathlib.Path) -> dict:
             def then() -> str | None:
                 why = ready()
                 seen.append(self.lead_step())  # the PUT goes out after this
                 return why
-            return real(root, tip, base, items, then, checks)
+            return real(root, tip, base, items, then, checks, database=database)
         with mock.patch.object(sd_lane, "land_train", land):
             self.queue_three()
             sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
