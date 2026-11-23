@@ -967,7 +967,8 @@ roles:
         """The fixture's reviewer answers one high finding from now on: (program, payload)."""
         program = self.programs / "review-fixture"
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "value is wrong"}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "value is wrong",
+             "evidence": "python3 src.py: Traceback"}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         return program, payload
 
@@ -2402,6 +2403,7 @@ roles:
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [{
             "path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"],
             "family": "correctness", "summary": "value is wrong",
+            "evidence": "python3 src.py: Traceback",
         }]}}
         provider.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         with self.assertRaisesRegex(ship.Refusal, "local review blocking"):
@@ -3181,6 +3183,36 @@ roles:
         self.unanswered("--deliver").prepare()
         with patch.object(ship.time, "sleep"):
             self.assert_closed_by_merge(self.merge())
+
+    def test_a_delivery_resolves_only_the_lanes_own_followups(self):
+        """sd:9869. A merge closed an item and resolved two followups that
+        still waited on an outside reply. A delivery resolves only the lane's
+        own blockers; no line of its message, a `Settles:` trailer included,
+        resolves another (class pass after round 7)."""
+        self.task_item("task")
+        waiting = sd_db.add_note(self.connection, self.item, "followup", "Waits on the reviewer's reply")
+        sd_db.add_note(self.connection, self.item, "followup", "Lane failed in prepare at aaaaaaaaaaaa: gate red",
+                       session=ship.sd_lane.LANE_SESSION)
+        named = sd_db.add_note(self.connection, self.item, "followup", "Rename the flag")
+        self.connection.commit()
+        body = self.directory / "body.md"
+        # An ordinary PR reference or URL fragment with the same number settles nothing.
+        unrelated = sd_db.add_note(self.connection, self.item, "followup", "Waits on PR 42's author")
+        self.connection.commit()
+        left = sd_db.add_note(self.connection, self.item, "followup", "Left open on purpose")
+        self.connection.commit()
+        body.write_text(f"Renames the flag.\nDepends on PR #{unrelated}; "
+                        f"see https://example.test/pull/1#{unrelated}.\n"
+                        f"Leave followup #{left} open until the reviewer replies.\n\n"
+                        f"```\nSettles: followup #{left}\n```\n\n"
+                        f"Settles: followup #{named}\n")
+        self.unanswered("--deliver", "--title", "Rename", "--body-file", str(body)).prepare()
+        with patch.object(ship.time, "sleep"):
+            self.merge()
+        self.assertEqual(self.status_of(self.item), "done")
+        still = {row[0] for row in self.connection.execute(
+            "SELECT id FROM note WHERE item = ? AND kind = 'followup' AND resolved_at IS NULL", (self.item,))}
+        self.assertEqual(still, {waiting, unrelated, left, named})
 
     def test_a_design_only_branch_cannot_deliver_its_build_item(self):
         """sd:3519. PR #260 changed docs/work/ and CLAUDE.md, merged with
@@ -4214,7 +4246,8 @@ roles:
         answered "there is no durable pull-request receipt to observe"."""
         program = self.programs / "review-fixture"
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "sd2021 finding"}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "sd2021 finding",
+             "evidence": "python3 src.py: Traceback"}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         with self.assertRaises(ship.Refusal):
             self.prepare()
@@ -4714,7 +4747,8 @@ roles:
         program = self.programs / "review-fixture"
         long = "the value is wrong " * 40
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": long}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": long,
+             "evidence": "python3 src.py: Traceback"}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         head = _git(self.root, "rev-parse", "HEAD")
         for attempt in ("review", "reuse"):
@@ -4734,7 +4768,8 @@ roles:
     def test_fix_verifications_keep_prior_findings_and_refuse_a_pass_past_the_cap(self):
         program = self.programs / "review-fixture"
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "value is wrong"}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "value is wrong",
+             "evidence": "python3 src.py: Traceback"}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         with self.assertRaisesRegex(ship.Refusal, "local review blocking"):
             self.prepare()
@@ -4773,7 +4808,8 @@ roles:
         """
         program = self.programs / "review-fixture"
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "value is wrong"}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "value is wrong",
+             "evidence": "python3 src.py: Traceback"}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         with self.assertRaisesRegex(ship.Refusal, "local review blocking"):
             self.prepare()
@@ -4814,7 +4850,8 @@ roles:
         _git(self.root, "commit", "-m", "change\n\nAuthored-with: human")
         program = self.programs / "review-fixture"
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "value is wrong"}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "value is wrong",
+             "evidence": "python3 src.py: Traceback"}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         with self.assertRaisesRegex(ship.Refusal, "local review blocking"):
             self.prepare()
@@ -4881,7 +4918,8 @@ roles:
         """sd:2600: a restart is for an orphaned review, not a way to drop live findings."""
         program = self.programs / "review-fixture"
         payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "value is wrong"}]}}
+            {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "value is wrong",
+             "evidence": "python3 src.py: Traceback"}]}}
         program.write_text("#!/usr/bin/env python3\nimport json\nprint(" + repr(json.dumps(payload)) + ")\n")
         with self.assertRaisesRegex(ship.Refusal, "local review blocking"):
             self.prepare()
@@ -5604,7 +5642,7 @@ roles:
             if blockers:
                 payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
                     {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness",
-                     "summary": f"unresolved from pass {index + 1}"}]}}
+                     "summary": f"unresolved from pass {index + 1}", "evidence": "python3 src.py: Traceback"}]}}
                 provider.write_text("#!/usr/bin/env python3\nprint(" + repr(json.dumps(payload)) + ")\n")
                 if index:
                     _git(self.root, "commit", "--allow-empty", "-m", "fix attempt\n\nAuthored-with: human")
@@ -6369,7 +6407,8 @@ roles:
                 if any(str(a).endswith("/sd-check") for a in command):
                     return sd_review.Completed(0, "{}", "")
                 payload = {"type": "result", "subtype": "success", "structured_output": {"findings": [
-                    {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "captured timeout blocker"}]}}
+                    {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "family": "correctness", "summary": "captured timeout blocker",
+                     "evidence": "python3 src.py: Traceback"}]}}
                 return sd_review.Completed(0, json.dumps(payload), "")
             report = sd_review.review(root, args, canned, self.environment)
             raise ship.ReviewTimeout({"kind": "watchdog_expired", "allowed_seconds": kwargs["timeout"], "captured_report": report})
@@ -6428,6 +6467,43 @@ roles:
         state = self.operation().state
         self.assertFalse(state.get("passes"))
         self.assertIsNone(state.get("reviewed_head"))
+
+
+class SettledFollowupTests(unittest.TestCase):
+    """sd:9869, class pass after round 7: every reading of the squash message's text to pick the followups a
+    delivery settles drew a new case (fences, comments, `<pre>`, `--><pre>`, `Context: <!--` above a trailer).
+    A delivery now settles only the lane's own blockers, by the prefix the lane writes; the end-to-end
+    `test_a_delivery_resolves_only_the_lanes_own_followups` shows a `Settles:` trailer settles none."""
+
+    def settled(self, body: str, session: str | None = "operator") -> set[int]:
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute("CREATE TABLE note (id INTEGER, item INTEGER, kind TEXT, body TEXT, resolved_at TEXT,"
+                           " session TEXT)")
+        connection.execute("INSERT INTO note VALUES (42, 1, 'followup', ?, NULL, ?)", (body, session))
+        connection.execute("INSERT INTO note VALUES (43, 1, 'followup', ?, NULL, ?)",
+                           ("Lane failed in prepare at aaaaaaaaaaaa: gate red", ship.sd_lane.LANE_SESSION))
+        connection.execute("INSERT INTO note VALUES (44, 1, 'followup', 'Lane failed in gate at bbbbbbbbbbbb: red',"
+                           " '2026-01-01', ?)", (ship.sd_lane.LANE_SESSION,))
+        return ship.settled_followups(connection, 1)
+
+    def test_only_the_lanes_own_open_blockers_settle(self) -> None:
+        self.assertEqual(self.settled("Waits on a reply"), {43})
+        self.assertEqual(self.settled("Lane skipped in the lane at an unrecorde: stale", ship.sd_lane.LANE_SESSION),
+                         {42, 43})
+        self.assertEqual(self.settled("Note: Lane failed in prepare"), {43})
+
+    def test_an_operator_note_that_starts_like_the_lane_settles_nothing(self) -> None:
+        # Review of build/sd-1423: a prefix match resolved an operator's own
+        # followup on delivery, which hid the repair it waits on from Today.
+        self.assertEqual(self.settled(
+            "Lane failed in prepare because the remote runner needs a separate repair"), {43})
+        self.assertEqual(self.settled("Lane failed in prepare at noon: the runner was down"), {43})
+        # build/sd-1423 review: the lane's release and post-merge followups are not what a merge answers.
+        for body in ("Post-merge: make deploy failed", "Release: the tag push was refused"):
+            self.assertEqual(self.settled(body, ship.sd_lane.LANE_SESSION), {43})
+        # build/sd-1423 review: the whole header pasted by hand is still the operator's.
+        self.assertEqual(self.settled("Lane failed in prepare at aaaaaaaaaaaa: gate red"), {43})
 
 
 class ReviewWatchdogTests(unittest.TestCase):

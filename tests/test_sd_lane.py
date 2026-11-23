@@ -32,6 +32,9 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "bin"))
 
 import sd_lane  # noqa: E402
+
+#: The real writer, before a fixture replaces it: the round trip below runs it.
+REAL_NOTE = sd_lane.default_note
 import sd_ship_body  # noqa: E402
 
 from tests.clean_env import clean_environment  # noqa: E402
@@ -7153,8 +7156,11 @@ class FailureNotes(SharedQueue):
         items = self.register_items(2)
         connection = sd_db.connect(home=self.tmp)
         try:
-            notes = [sd_db.add_note(connection, item, "followup", body) for item in items
-                     for body in ("Lane failed in prepare at aaaaaaaaaaaa: a blocking finding", "Chase the vendor")]
+            # The lane's note carries its session; the other repeats its text by hand (build/sd-1423 review).
+            notes = [sd_db.add_note(connection, item, "followup", body, session=session) for item in items
+                     for body, session in (("Lane failed in prepare at aaaaaaaaaaaa: a blocking finding",
+                                            sd_lane.LANE_SESSION),
+                                           ("Lane failed in prepare at aaaaaaaaaaaa: a separate repair", None))]
         finally:
             connection.close()
         return items, dict.fromkeys(notes)
@@ -7167,6 +7173,43 @@ class FailureNotes(SharedQueue):
                                                (number,)).fetchone()[0] is not None for number in notes}
         finally:
             connection.close()
+
+    def test_a_note_the_lane_writes_reads_back_as_the_lanes(self) -> None:
+        """Round trip (build/sd-1423 review): `note_ended` through the real `sd task note`, with no head
+        recorded, reads back as the lane's; the same text written by hand does not."""
+        import sd_db
+        [item] = self.register_items(1)
+        row = {"status": "failed", "step": "runner", "reason": "runner pid 7 is gone", "item": item}
+        with mock.patch.dict(os.environ, {"HOME": str(self.tmp)}), \
+                mock.patch.object(sd_lane, "ended_kind", lambda queue: "followup"):
+            self.assertEqual(sd_lane.note_ended(row, self.repo, REAL_NOTE, queue=None), {f"sd:{item}": "written"})
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            [(body, session)] = connection.execute("SELECT body, session FROM note WHERE item = ? AND kind = "
+                                                   "'followup'", (item,)).fetchall()
+            sd_db.add_note(connection, item, "followup", body)
+            written = connection.execute(
+                "SELECT session, body FROM note WHERE item = ? AND kind = 'followup' ORDER BY id", (item,)).fetchall()
+        finally:
+            connection.close()
+        self.assertIn("at an unrecorde", body)
+        self.assertEqual([sd_lane.lane_note(*found) for found in written], [True, False])
+
+    def test_a_passing_run_leaves_the_lanes_post_merge_and_release_followups_open(self) -> None:
+        """build/sd-1423 review: `default_note` also writes `Post-merge:` and `Release:` followups as the lane;
+        a later pass answers neither, so only `note_ended`'s blockers resolve."""
+        import sd_db
+        items = self.register_items(1)
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            kept = {sd_db.add_note(connection, items[0], "followup", body, session=sd_lane.LANE_SESSION): False
+                    for body in ("Post-merge: make deploy failed", "Release: the tag push was refused")}
+        finally:
+            connection.close()
+        sd_lane.enqueue_entry(self.feature, items[0], "fix: one", self.body, self.environ, claim="deliver")
+        sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertIn(self.entries()[0]["status"], sd_lane.GATE_PASSED)
+        self.assertEqual(self.resolved(dict.fromkeys(kept)), kept)
 
     def test_a_passing_run_resolves_only_the_lanes_open_followups(self) -> None:
         """Failure table S2 session resolves: a later pass closes the lane's followups on each item it carries."""
