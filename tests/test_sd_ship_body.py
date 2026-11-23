@@ -780,6 +780,46 @@ class CitedIdTests(unittest.TestCase):
             with self.subTest(listing=listing):
                 self.assertEqual(sd_ship_body.cited_ids("", [self.revert_of(listing), *work]), kept)
 
+    def test_the_revert_list_takes_comments_from_the_one_inline_scan(self) -> None:
+        """Class pass, review of build/sd-1653 (pack sd:10090): the revert list found comments with its own
+        per-line pattern, apart from the scan that tracks code spans, comments, escapes and unclosed runs
+        across lines (`_comment_open`). Each construct the two read apart is a row; a comment the scan
+        finds reads as a space, so it joins no two fragments into a sha."""
+        undone, other = "a" * 40, "b" * 40
+        work = [(undone, "feat: renew\n\nCloses: sd:2\n"), (other, "fix: prepare\n\nCloses: sd:3\n")]
+        sha = undone[:9]
+        for listing, kept in (
+                # 1. A code span that closes on a later line: comment syntax in it is text.
+                (f"Reverted commits:\n- `<!-- -->{sha} renew\n  end`\n", (2, 3)),
+                (f"Reverted commits:\n- ``<!-- -->{sha} renew\n  end``\n", (2, 3)),
+                # 2. A comment that opens after text and closes on a later line.
+                (f"Reverted commits: <!-- why\nmore -->\n- {sha} renew\n", (3,)),
+                (f"Reverted commits: <!-- a --> <!-- b\nc -->\n- {sha} renew\n", (3,)),
+                (f"Reverted commits:\n- {sha} renew <!-- why\n  more -->\n- {other[:9]} prepare\n", ()),
+                # 3. A comment between two fragments joins them into no sha.
+                (f"Reverted commits:\n- {sha[:4]}<!-- -->{sha[4:]} renew\n", (2, 3)),
+                # 4. A backtick run its paragraph never closes is text, and the comment after it a comment.
+                (f"Reverted commits:\n- `<!-- why --> {sha} renew\n", (2, 3)),
+                # 5. An escaped `<` opens no comment; an escaped backtick opens no span.
+                (f"Reverted commits:\n- \\<!-- --> {sha} renew\n", (2, 3)),
+                (f"Reverted commits:\n\\<!-- kept -->\n- {sha} renew\n", (2, 3)),
+                (f"Reverted commits:\n- \\`<!-- -->{sha}` renew\n", (2, 3)),
+                # 6. A comment before the sha: the item a reader sees opens with it.
+                (f"Reverted commits:\n- <!-- why --> {sha} renew\n", (3,)),
+                # 7. A comment open from an earlier line holds the whole line it closes on, as before.
+                (f"Reverted commits:\n<!-- why\n--> - {sha} renew\n", (2, 3))):
+            with self.subTest(listing=listing):
+                self.assertEqual(sd_ship_body.cited_ids("", [self.revert_of(listing), *work]), kept)
+        # The property: comment syntax inside a code span, however the span wraps, reads as any other text.
+        spans = (("`", "`"), ("``", "``"), ("`a\n  ", "`"), ("`", "\n  b`"), ("``a\n  ", "\n  b``"))
+        for (opener, closer), inner in itertools.product(spans, ("<!-- -->", "<!--", "-->", "<!-- x --> <!--")):
+            for line in (f"- {opener}{inner}{closer}{sha} renew", f"- {opener}{inner}{sha}{closer} renew",
+                         f"- {sha} {opener}{inner}{closer}", f"{opener}{inner}{closer}\n- {sha} renew"):
+                listing = f"Reverted commits:\n{line}\n- {other[:9]} prepare\n"
+                with self.subTest(listing=listing):
+                    self.assertEqual(sd_ship_body._listed_undone(listing),
+                                     sd_ship_body._listed_undone(listing.replace(inner, "zz zz")))
+
     def test_a_merge_the_branch_reverts_cites_nothing_it_brought_in(self) -> None:
         """Lane review of sd:5999, round 3: `git revert -m 1 <merge>` undoes each commit the merge brought in."""
         base, side, main, merge, undo, again = (c * 40 for c in "abcdef")

@@ -110,7 +110,8 @@ def _blocks(body: str, comments: bool = True, plain: bool = False):
     it a heading), `wrapped` (text indented less than the list item whose
     paragraph it continues) or `text`; `opened` counts the list items the line's
     markers open, even when a fence or code follows them; `depth` counts
-    the items open after them; `text` is the line past their text column;
+    the items open after them; `text` is the line past their text column,
+    each comment on it one space when comments are read;
     `spanned` says the line starts inside a code span.
 
     A code span may wrap onto the next lines of its paragraph. An opening
@@ -149,21 +150,33 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]], plain
         if kind == "fence" and (opener := _FENCE_RE.match(text)):  # `_kind` matched it already
             fence, fence_depth = opener["fence"], len(items)
         elif kind != "code" and comments:
-            was = commented
-            commented, ticks, span_at = _inline(line, number, commented, ticks, span_at, literal)
+            was, cut = commented, []
+            commented, ticks, span_at = _inline(line, number, commented, ticks, span_at, literal, cut)
             comment_depth = len(items) if commented and not was else comment_depth
             if ticks and alone:
                 return rows, span_at  # a heading is one line: a span it opens ends with it
+            text = _less(line, text, lazy, cut)
         loose = alone
         depth = len(items)  # a heading or a break is one line, no paragraph; `depth` finds a lazy line
         rows.append((number, "wrapped" if lazy else kind, opened, len(items), text, line, spanned))
     return rows, (span_at if ticks else None)
 
 
+def _less(line: str, text: str, lazy: bool, cut: list[tuple[int, int]]) -> str:
+    """`text`, the part of `line` a row holds, with each comment `cut` names read as one space: a reader
+    sees no comment, and what stood either side of it stays apart (pack sd:10090)."""
+    start = len(line) - len(line.lstrip()) if lazy else len(line) - len(text)  # a lazy line's text is stripped
+    for first, last in reversed(cut):
+        first, last = max(first - start, 0), last - start
+        if last > first:
+            text = text[:first] + " " + text[last:]
+    return text
+
+
 def _inline(line: str, number: int, commented: bool, ticks: str, span_at: tuple[int, int],
-            literal: set[tuple[int, int]]) -> tuple[bool, str, tuple[int, int]]:
+            literal: set[tuple[int, int]], cut: list[tuple[int, int]]) -> tuple[bool, str, tuple[int, int]]:
     """`_comment_open` on line `number`, with the opener of the code span left open after it."""
-    commented, ticks, column = _comment_open(line, commented, ticks, {c for n, c in literal if n == number})
+    commented, ticks, column = _comment_open(line, commented, ticks, {c for n, c in literal if n == number}, cut)
     return commented, ticks, (number, column) if ticks and column >= 0 else span_at
 
 
@@ -278,18 +291,24 @@ def _item_text(line: str, items: list[int], opens: bool) -> str:
 _INLINE = re.compile(r"\\[\\`<]|<!--|`+")
 
 
-def _comment_open(line: str, commented: bool, ticks: str = "", literal=frozenset()) -> tuple[bool, str, int]:
+def _comment_open(line: str, commented: bool, ticks: str = "", literal=frozenset(),
+                  cut: list[tuple[int, int]] | None = None) -> tuple[bool, str, int]:
     """After `line`: whether an HTML comment is open, the backtick run of a code span still open, and its column.
 
     `commented` and `ticks` say what was open before `line`. Outside a
     comment a code span outranks it: `<!--` in a span is text, and so is
     an escaped `\\<` or `\\``. A span closes on a run of its length; a
     backslash in it is text. A run whose column is in `literal` is text.
+    `cut` takes the columns of each comment on the line, from its `<!--`,
+    or the line's start, through its `-->`, or the line's end: the one
+    place that says what a comment holds (pack sd:10090).
     """
-    position, column = 0, -1
+    position, column, opened = 0, -1, 0  # opened: where the open comment starts on this line
     while True:
         if commented:
             end = line.find("-->", position)
+            if cut is not None:
+                cut.append((opened, len(line) if end < 0 else end + 3))
             if end < 0:
                 return True, "", -1
             commented, position = False, end + 3
@@ -303,7 +322,7 @@ def _comment_open(line: str, commented: bool, ticks: str = "", literal=frozenset
         else:
             position = match.end()
             if match[0] == "<!--":
-                commented = True
+                commented, opened = True, match.start()
             elif match[0][0] == "`" and match.start() not in literal:
                 ticks, column = match[0], match.start()
 
@@ -530,17 +549,6 @@ _SHA_LED = re.compile(r"_([0-9a-f]{7,40})_(?!\w)|[`*\[]*([0-9a-f]{7,40})(?!\w)")
 _REVERTED_INTRO = re.compile(r"(?:^|[.!?][ \t]+)(?:reverted(?:[ \t]+commits)?|reverts):[ \t]*$", re.IGNORECASE)
 
 
-#: An HTML comment's text on one line: one closed on it, or one that opens the line and runs past its end,
-#: an HTML block's (pack sd:10090). An inline `<!--` left open is text to CommonMark, so it stays, and so
-#: does a code span, matched first: comment syntax in one is text (review of build/sd-1653).
-_COMMENT_TEXT = re.compile(r"(`+).+?(?<!`)\1(?!`)|^<!--(?!.*-->).*$|<!--.*?-->")
-
-
-def _uncommented(text: str) -> str:
-    """`text` without the HTML comments `_COMMENT_TEXT` finds; its code spans as written."""
-    return _COMMENT_TEXT.sub(lambda match: match[0] if match[1] else "", text)
-
-
 def _heading(text: str) -> str:
     """`text` without the markup a heading wears: `## ` and closing `#`s, and emphasis around it."""
     return re.sub(r"^#{1,6}[ \t]+|[ \t]+#+$", "", text.strip()).strip("*_ \t")
@@ -563,7 +571,9 @@ def _listed_undone(message: str) -> list[str]:
     does not say reverted, undoes nothing. An item inside a fence, an
     indented code block or an HTML comment names nothing, and neither
     does a line that starts inside a code span, in the read that finds
-    it there.
+    it there. A comment on a line reads as one space, where the read
+    itself finds it (`_comment_open`): it heads nothing, hides what it
+    holds and joins no two fragments into a sha (pack sd:10090).
 
     The `plain` grammar of `_blocks` and CommonMark, the read citations
     get, can give one line two roles: the fence a `10.` item opens is a
@@ -585,8 +595,9 @@ def _listed(rows) -> list[str]:
     for _, kind, opened, depth, raw, line, spanned in rows:
         kind = "span" if spanned else kind
         del undoes[depth - opened + 1:]  # the items this line ended take their headings with them
-        # A reader never sees a comment, so it heads nothing and leaves the heading it follows (pack sd:10090).
-        holder, text = undoes[-1], _uncommented(raw.strip()).strip()
+        # `raw` holds no comment the read found (`_less`): a comment heads nothing and leaves the heading it
+        # follows, and the read itself says where one starts and ends, never a second pattern (pack sd:10090).
+        holder, text = undoes[-1], raw.strip()
         if opened:  # an item, even one that opens with a fence or code, holds what nests in it
             holder = holder and opened == 1  # each outer item of `- - x` is empty: its heading says nothing
             if kind == "text" and (sha := _SHA_LED.match(text)):
