@@ -6405,6 +6405,16 @@ roles:
         time.sleep(1.1)  # a commit dated now would differ
         self.assertEqual(self.join(earlier)["train_commit"], first)
 
+    def test_a_train_join_refuses_a_member_retargeted_off_the_base(self):
+        """Review of sd:9923: the join read the member PR's head and state, not its base, so a PR moved to a
+        release branch landed on main through the train."""
+        self.prepare()
+        _main, earlier = self.landing_before()
+        self.remote.pull(1).base = "release"
+        with self.assertRaises(ship.Refusal) as caught:
+            self.join(earlier)
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "train_not_open")
+
     def test_a_train_join_that_conflicts_refuses_and_records_no_join(self):
         self.prepare()
         conflicting = self.remote.commit_on("clash", "clash\n\nAuthored-with: human", files={"src.py": "value = 9\n"})

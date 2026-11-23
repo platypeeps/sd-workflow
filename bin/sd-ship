@@ -2448,8 +2448,9 @@ class Ship(SharedReview):
         A landing without the fetched base would drop main's newer commits from the train tip.
         """
         observed = self.api.pull(number)
-        if observed.get("state") != "open" or observed.get("draft") or observed.get("head", {}).get("sha") != head:
-            raise Refusal(f"pull request #{number} is not open at {head}; no train joins it",
+        if observed.get("state") != "open" or observed.get("draft") or observed.get("head", {}).get("sha") != head \
+                or observed.get("base", {}).get("ref") != base:  # retargeted: the train lands on `base` alone
+            raise Refusal(f"pull request #{number} is not open at {head} onto {base}; no train joins it",
                           code="train_not_open", boundary="ci", state="retryable_failure",
                           next_action="Prepare the branch again, then queue it again.")
         self.api.member_checks(head)  # the train PR's checks are its tip's, not this member's
