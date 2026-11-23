@@ -1794,6 +1794,17 @@ class Supervise(Case):
         self.assertEqual(self.edges(files, rows, {"lib/handlers.py": {3}}, {"handler_a"}, {"handler_a"}), rows,
                          "a dispatcher reaching the changed handler through a multiline table was deferred")
 
+    def test_a_reference_outside_any_function_passes_on_what_it_binds(self):
+        """Class pass, review of sd:9769: walking up from an unchanged handler, a table entry outside any
+        function names no caller; the name the table binds does, so the walk reaches the changed dispatcher."""
+        self.press()
+        files = {"lib/handlers.py": "def handler_a():\n    return lookup()\n",
+                 "lib/table.py": "HANDLERS = {\n    \"a\": handler_a,\n}\n",
+                 "lib/dispatch.py": "def dispatch(key):\n    return HANDLERS[key]().name\n"}
+        rows = [{"path": "lib/handlers.py", "line": 2, "summary": "an empty value crashes here"}]
+        self.assertEqual(self.edges(files, rows, {"lib/dispatch.py": {2}}, {"dispatch", "key"}, {"export"}), rows,
+                         "a handler the changed dispatcher reaches through a table was deferred")
+
     def test_a_short_function_name_still_names_the_changed_caller(self):
         """Review of sd:9769: `go()` names a changed function; no length filter drops it."""
         self.press()

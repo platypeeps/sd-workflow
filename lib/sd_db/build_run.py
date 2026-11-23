@@ -1641,9 +1641,11 @@ class Supervisor:
                 if hits is None:
                     return True
                 for place, number, text in hits:
-                    names = self.enclosing(place, number, head, sources)
-                    if names is None:
+                    if (found := self.scope(place, number, head, sources)) is None:
                         return True
+                    # Outside every function a reference passes on what its statement binds: users of
+                    # `HANDLERS = {"a": handler_a}` reach `handler_a` (a missed edge would defer).
+                    names = found[0] or {bound for row in found[1][:1] for bound in bound_names(row)}
                     # A line that binds `name` to another (`parse as decode`): callers of the alias call it too.
                     callers |= names | {alias for bound, alias in aliases(text) if bound == name}
             frontier = callers
