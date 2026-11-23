@@ -4798,6 +4798,24 @@ roles:
                 self.prepare("--deliver", "--body-file", str(new))  # an entry with the renewal's body proceeds
         self.assertEqual(self.operation().state["body"], published)
 
+    def test_a_lane_body_differs_from_a_renewals_in_any_byte_but_the_lanes_own_section(self):
+        """Review of build/sd-1636: the body check stripped every Screenshots-shaped block, fenced examples too,
+        and folded blank-line runs, so a stale entry that differed only there passed. Only the one section the
+        lane appends at the end, and the `Work:` line after it, are not the entry's body."""
+        with_shots = ship.sd_lane.with_shots
+        fence = "Before\n\n```\n" + with_shots("x", ["queue-dark-1280.png"]) + "```\n\nAfter"
+        other = fence.replace("queue: dark 1280", "queue: light 390")
+        work = f"\n\n{ship.sd_lib.WORK_TRAILER} sd:7\n"
+        renewal = fence + work
+        for stale in (other + work, "line\n\n\nkept" + work):
+            with self.subTest(stale=stale):
+                self.assertFalse(ship.lane_body_matches(with_shots(stale, ["queue-dark-1280.png"]), renewal))
+        self.assertFalse(ship.lane_body_matches("line\n\n\nkept" + work, "line\n\nkept" + work))
+        for body in (renewal, fence):
+            with self.subTest(body=body[-12:]):
+                self.assertTrue(ship.lane_body_matches(with_shots(fence, ["queue-dark-1280.png"]) + work, renewal))
+                self.assertTrue(ship.lane_body_matches(renewal, renewal))
+
     def test_a_lane_entry_with_the_renewals_body_and_the_lanes_screenshots_proceeds(self):
         """Review of build/sd-1636: the lane appends a Screenshots section to a dashboard change's body before
         prepare, so an entry enqueued with the renewal's exact body refused as another body, and the advice to

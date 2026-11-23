@@ -2169,8 +2169,15 @@ def with_shots(body: str, files: list[str]) -> str:
 
 
 def without_shots(body: str) -> str:
-    """`body` without each Screenshots section `with_shots` added: the lane's, not the entry's (sd:9335)."""
-    return re.sub(r"\n*" + re.escape(SHOTS_HEAD) + r"(?:- [^\n]*(?:\n|\Z))+", "\n", body)
+    """`body` without the one Screenshots section `with_shots` appended at its end, or `body` as it is.
+
+    Only a section that ends the body, every line after its head a page
+    bullet (`normalize` may drop the last newline), is the lane's; a
+    fenced example, or a section that text follows, is the entry's
+    (sd:9335).
+    """
+    found = re.fullmatch(r"(.*)\n\n" + re.escape(SHOTS_HEAD) + r"(?:- [^\n]*\n)*- [^\n]*\n?", body, flags=re.S)
+    return found[1] if found else body
 
 
 def prepare_step(entry: dict[str, Any], worktree: pathlib.Path, log: pathlib.Path, ship: Ship,
