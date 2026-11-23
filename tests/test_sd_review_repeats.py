@@ -1564,7 +1564,7 @@ class RebuttalScopeTests(RepeatFixture):
         self.assertEqual([entry.listed for entry in placed], [False, False])
 
     def test_a_newline_in_an_instance_path_still_places_its_line(self) -> None:
-        """Review of sd:10191 (bin/sd-review:942): an instance `a\nb.py:10` did not match `(.*):(\d+)`, as `.`
+        """Review of sd:10191 (bin/sd-review:942): an instance `a\nb.py:10` did not match the `path:line` pattern, as `.`
         stops at a newline, so it was placed as a path with no line and kept after its line changed."""
         older = sd_review.Rebuttal("head", "src.py", "s", 10, True, "src.py", "x", "y", ("src.py:10", "a\nb.py:10"))
 
