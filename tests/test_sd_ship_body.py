@@ -759,6 +759,24 @@ class CitedIdTests(unittest.TestCase):
                    (first, "fix: one\n\nCloses: sd:2\n"), (second, "fix: two\n\nCloses: sd:3\n")]
         self.assertEqual(sd_ship_body.cited_ids("", commits), (2, 3))
 
+    def test_an_html_comment_in_a_revert_list_heads_nothing(self) -> None:
+        """pack sd:10090: a comment line after `Reverted commits:` read as a heading that does not say
+        reverted, so the listed sha kept its `Closes:` and sd:2 closed. A comment a reader never sees
+        heads nothing; one that hides a heading or an item hides it."""
+        undone, other = "a" * 40, "b" * 40
+        work = [(undone, "feat: renew\n\nCloses: sd:2\n"), (other, "fix: prepare\n\nCloses: sd:3\n")]
+        for listing, kept in (
+                (f"Reverted commits:\n<!-- why -->\n- {undone[:9]} renew\n- {other[:9]} prepare\n", ()),
+                (f"Reverted commits:\n- {undone[:9]} renew\n<!-- why -->\n- {other[:9]} prepare\n", ()),
+                (f"Reverted commits: <!-- why -->\n- {undone[:9]} renew\n", (3,)),
+                (f"Reverted commits:\n<!--\nwhy\n-->\n- {undone[:9]} renew\n", (3,)),
+                (f"- Reverted commits:\n  <!--\n  why\n  -->\n  - {undone[:9]} renew\n", (3,)),
+                (f"<!-- Reverted commits: -->\n- {undone[:9]} renew\n", (2, 3)),
+                (f"Reverted commits:\n<!-- - {undone[:9]} renew -->\n", (2, 3)),
+                (f"Reverted commits:\n<!-- why -->\nKept:\n- {undone[:9]} renew\n", (2, 3))):
+            with self.subTest(listing=listing):
+                self.assertEqual(sd_ship_body.cited_ids("", [self.revert_of(listing), *work]), kept)
+
     def test_a_merge_the_branch_reverts_cites_nothing_it_brought_in(self) -> None:
         """Lane review of sd:5999, round 3: `git revert -m 1 <merge>` undoes each commit the merge brought in."""
         base, side, main, merge, undo, again = (c * 40 for c in "abcdef")

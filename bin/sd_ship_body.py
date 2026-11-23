@@ -530,6 +530,11 @@ _SHA_LED = re.compile(r"_([0-9a-f]{7,40})_(?!\w)|[`*\[]*([0-9a-f]{7,40})(?!\w)")
 _REVERTED_INTRO = re.compile(r"(?:^|[.!?][ \t]+)(?:reverted(?:[ \t]+commits)?|reverts):[ \t]*$", re.IGNORECASE)
 
 
+#: An HTML comment's text on one line: one closed on it, or one that opens the line and runs past its end,
+#: an HTML block's (pack sd:10090). An inline `<!--` left open is text to CommonMark, so it stays.
+_COMMENT_TEXT = re.compile(r"^<!--(?!.*-->).*$|<!--.*?-->")
+
+
 def _heading(text: str) -> str:
     """`text` without the markup a heading wears: `## ` and closing `#`s, and emphasis around it."""
     return re.sub(r"^#{1,6}[ \t]+|[ \t]+#+$", "", text.strip()).strip("*_ \t")
@@ -574,7 +579,8 @@ def _listed(rows) -> list[str]:
     for _, kind, opened, depth, raw, line, spanned in rows:
         kind = "span" if spanned else kind
         del undoes[depth - opened + 1:]  # the items this line ended take their headings with them
-        holder, text = undoes[-1], raw.strip()
+        # A reader never sees a comment, so it heads nothing and leaves the heading it follows (pack sd:10090).
+        holder, text = undoes[-1], _COMMENT_TEXT.sub("", raw.strip()).strip()
         if opened:  # an item, even one that opens with a fence or code, holds what nests in it
             holder = holder and opened == 1  # each outer item of `- - x` is empty: its heading says nothing
             if kind == "text" and (sha := _SHA_LED.match(text)):
