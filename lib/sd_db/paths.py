@@ -41,19 +41,37 @@ PREFIX = "~/"
 
 #: What points git at another repository than the one `-C` names: the variables `git rev-parse --local-env-vars`
 #: lists. A hook exports `GIT_DIR` and `GIT_WORK_TREE`, and a child that inherits them reads and writes the hook's
-#: repository and its origin (pack sd:9709, round 26).
+#: repository and its origin (pack sd:9709, round 26). The config carriers are here too: a one-off
+#: `url.*.insteadOf` would redirect the child's origin (pack sd:9863 review).
 GIT_LOCAL = frozenset({
     "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CONFIG", "GIT_CONFIG_PARAMETERS", "GIT_CONFIG_COUNT",
     "GIT_OBJECT_DIRECTORY", "GIT_DIR", "GIT_WORK_TREE", "GIT_IMPLICIT_WORK_TREE", "GIT_GRAFT_FILE",
     "GIT_INDEX_FILE", "GIT_NO_REPLACE_OBJECTS", "GIT_REPLACE_REF_BASE", "GIT_PREFIX", "GIT_SHALLOW_FILE",
     "GIT_COMMON_DIR"})
+#: The command-scope keys a child keeps, renumbered: the suite's guard against git's detached auto-maintenance
+#: racing a temporary directory's cleanup (`.github/scripts/run-tests.sh`). None names a location.
+GIT_KEPT_CONFIG = frozenset({"maintenance.auto", "gc.auto", "receive.autogc"})
+#: More config entries than any caller sets; a larger count is no real one.
+GIT_CONFIG_MAX = 64
 
 
 def git_env(environ=None) -> dict[str, str]:
-    """`environ`, this process's when None, less `GIT_LOCAL`: the environment a `git -C DIR` child, or a child
-    that starts one, runs in, so `DIR` alone names the repository."""
-    return {key: value for key, value in (os.environ if environ is None else environ).items()
-            if key not in GIT_LOCAL}
+    """`environ`, this process's when None, less `GIT_LOCAL` and every `GIT_CONFIG_KEY_n`/`VALUE_n`, with the
+    `GIT_KEPT_CONFIG` entries put back: the environment a `git -C DIR` child, or a child that starts one, runs in,
+    so `DIR` alone names the repository and its remotes."""
+    source = os.environ if environ is None else environ
+    result = {key: value for key, value in source.items()
+              if key not in GIT_LOCAL and not key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))}
+    count = source.get("GIT_CONFIG_COUNT", "")
+    total = int(count) if count.isascii() and count.isdigit() and len(count) <= 2 else 0
+    kept = [(source[f"GIT_CONFIG_KEY_{n}"], source.get(f"GIT_CONFIG_VALUE_{n}", ""))
+            for n in range(min(total, GIT_CONFIG_MAX))
+            if source.get(f"GIT_CONFIG_KEY_{n}", "").lower() in GIT_KEPT_CONFIG]
+    for index, (key, value) in enumerate(kept):
+        result[f"GIT_CONFIG_KEY_{index}"], result[f"GIT_CONFIG_VALUE_{index}"] = key, value
+    if kept:
+        result["GIT_CONFIG_COUNT"] = str(len(kept))
+    return result
 
 
 class PathRefused(SdDbError):
