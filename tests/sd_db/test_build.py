@@ -1153,6 +1153,37 @@ class Reap(Case):
         self.assertEqual([entry["item"] for entry in queued], [self.items[0]])
         self.assertNotIn(queued[0]["id"], old, "a fresh press, not Retry of the bundle")
 
+    def _lead_pressed_and_cancelled(self):
+        """Bundle A ends blocked after a run; a fresh press of its lead is cancelled before its claim."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        transition(self.db, self.items[0], "ready", who="operator")
+        cancelled = build.queue(self.db, [self.items[0]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (cancelled,))
+        return cancelled
+
+    def test_build_by_item_resumes_the_lead_when_a_member_waits_on_it(self):
+        """sd:10022: a member of bundle A waits on its lead. Retry parks that member and resumes A's branch;
+        Build by item press-checked the member, read it as refused and pressed the lead fresh from main."""
+        from sd_db.workflow import edit_item
+        cancelled = self._lead_pressed_and_cancelled()
+        edit_item(self.db, self.items[1], {"blocked_by": [self.items[0]]}, who="operator")
+        queued = build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertEqual([entry["id"] for entry in queued], [self.bundle["assignment"]])
+        self.assertLess(queued[0]["id"], cancelled, "Retry of the bundle, not a fresh press")
+
+    def test_build_by_item_frees_a_member_the_lead_waits_on(self):
+        """sd:10022: bundle A's lead waits on its member. Retry frees the member to build on its own and keeps
+        A's branch for the lead; Build by item refused the bundle and pressed the waiting lead fresh."""
+        from sd_db.workflow import edit_item
+        self._lead_pressed_and_cancelled()
+        edit_item(self.db, self.items[0], {"blocked_by": [self.items[1]]}, who="operator")
+        queued = build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [self.items[1]])
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", self.bundle["assignment"]),
+                         "blocked")
+
     def test_build_by_item_reads_no_bundle_whose_lead_is_done(self):
         """Class pass, last round of sd:9788: Retry refuses a bundle whose lead's item is done. Bundle A ends
         blocked, its lead is delivered by a newer build, and a fresh build of the member is cancelled before its

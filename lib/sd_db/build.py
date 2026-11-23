@@ -1210,15 +1210,19 @@ def _retry_takes(connection, lead: int, status: str) -> bool:
     """Whether Retry queues build `lead`'s bundle in `status`, read, not tried: its lead's item is not done, and
     each member it would queue (`_open_members`) owns its item (`_current`) and passes the press's check once
     ready (`_press_refusal`), as `retry` and its `_queue_members` refuse otherwise (class pass, review of sd:9788).
-    Build by item reads a fresh press instead of a bundle whose Retry refuses."""
+    Build by item reads a fresh press instead of a bundle whose Retry refuses.
+    Retry's dependency split (`_inside`) refuses neither case: members the lead waits on leave to build on their
+    own, and a member that waits on another bundle item leaves parked, so neither is press-checked (sd:10022)."""
     row = connection.execute("SELECT item FROM assignment WHERE id = ?", (lead,)).fetchone()
     if row is None or _done(reads.items_by_ids(connection, [row["item"]]), row["item"]):
         return False
     members = _open_members(connection, lead, status)
-    return bool(members) and all(
-        _current(connection, member)
-        and _press_refusal(connection, connection.execute(_REPO, (member["item"],)).fetchone(), lead=lead) is None
-        for member in members)
+    if not members or not all(_current(connection, member) for member in members):
+        return False
+    ahead, behind = _inside(connection, row["item"], members)
+    return bool(ahead) or all(
+        _press_refusal(connection, connection.execute(_REPO, (member["item"],)).fetchone(), lead=lead) is None
+        for member in members if member not in behind)
 
 
 def eligible(connection, *, now: str | None = None) -> list[dict]:
