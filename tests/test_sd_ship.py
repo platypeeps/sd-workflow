@@ -4807,6 +4807,24 @@ roles:
         self.assertEqual(caught.exception.workflow["blocker"]["code"], "delivery_evidence_stale")
         self.assertEqual(self.operation().state["acceptance"], old)
 
+    def test_a_renewal_whose_evidence_differs_only_in_spacing_or_its_criterion_name_refuses(self):
+        """Round 8 of sd:9268: a trailing space, a line break or a renamed criterion over the same evidence
+        counted as fresh. Evidence text is compared with its spacing folded, and the criterion's name is not
+        proof; changed evidence, a changed result or a changed waiver still is."""
+        old = {"criteria": [{"criterion": "actual scope", "passed": True, "evidence": "fixture check pass"}]}
+
+        def renewed(**row):
+            return {"criteria": [{**old["criteria"][0], **row}]}
+
+        for stale in (renewed(evidence="fixture check pass "), renewed(evidence="fixture\ncheck  pass"),
+                      renewed(evidence="\uff46ixture check pass"), renewed(criterion="the renamed scope")):
+            with self.subTest(stale=stale):
+                self.assertTrue(ship.stale_criteria(stale, old))
+        for fresh in (renewed(evidence="fixture check pass at 2b7e5560"), renewed(passed=False),
+                      renewed(waived={"reason": "out of scope", "decision": 7})):
+            with self.subTest(fresh=fresh):
+                self.assertEqual(ship.stale_criteria(fresh, old), [])
+
     def test_a_renewal_whose_claim_has_no_evidence_still_renews(self):
         """A task's claim is the verified merge alone, so its renewal has no evidence to go stale."""
         from sd_db import set_item_fields

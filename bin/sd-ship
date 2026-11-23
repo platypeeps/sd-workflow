@@ -23,6 +23,7 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from datetime import datetime, timezone
 
 import sd_lane
@@ -564,19 +565,25 @@ def edited_waivers(claim: object, stored: object) -> list[int]:
 
 
 def evidence_of(row: object) -> str:
-    """What an acceptance row proves, as one string: its criterion, evidence, result and waiver.
+    """What an acceptance row proves, as one string: its evidence, result and waiver.
 
     Any other field, such as a comment, and the waiving note's body, which
     the claim copies from the database, prove nothing (sd:9268 review).
+    Nor does the criterion's name, and text is compared with its Unicode
+    compatibility forms and spacing folded: a renamed criterion, a trailing
+    space or a line break over the old evidence is the old evidence
+    (sd:9268 round 8).
     """
+    def folded(value: object) -> object:
+        return " ".join(unicodedata.normalize("NFKC", value).split()) if isinstance(value, str) else value
+
     if not isinstance(row, dict):
         return json.dumps(row, sort_keys=True)
     waived = row.get("waived")
     if isinstance(waived, dict):
-        reason = waived.get("reason")
-        waived = {"reason": reason.strip() if isinstance(reason, str) else reason, "decision": waived.get("decision")}
-    return json.dumps({"criterion": row.get("criterion"), "evidence": row.get("evidence"),
-                       "passed": row.get("passed"), "waived": waived}, sort_keys=True)
+        waived = {"reason": folded(waived.get("reason")), "decision": waived.get("decision")}
+    return json.dumps({"evidence": folded(row.get("evidence")), "passed": row.get("passed"), "waived": waived},
+                      sort_keys=True)
 
 
 def stale_criteria(claim: object, stored: object) -> list[str]:
