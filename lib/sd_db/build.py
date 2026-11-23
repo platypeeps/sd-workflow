@@ -1193,6 +1193,24 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
         return queued + (queue(connection, fresh, who=who) if fresh else [])
 
 
+def _past_cancel(rows: list):
+    """Of an item's build rows, newest first: the newest that ran, when the newest was cancelled before it ran;
+    None otherwise. The one rule for the row `_retry_row` reads past a cancelled press, which `_retry_takes`
+    reads too for each member a press names (class pass, review of build/sd-1654). A press refused before a
+    claim (blocked, never ran) is not read past: its item builds fresh."""
+    if rows and rows[0]["status"] == "cancelled" and not rows[0]["run_count"]:
+        return next((row for row in rows[1:] if row["run_count"]), None)
+    return None
+
+
+def _reads(connection, member: dict) -> bool:
+    """Whether Build reads bundle `member`'s row for its item (`_retry_row`): it is the item's newest build, or
+    the newest that ran under one cancelled before it ran. `queue_again` hands `retry` only such items."""
+    rows = connection.execute("SELECT id, status, run_count FROM assignment WHERE item = ? AND scope = ? "
+                              "ORDER BY id DESC", (member["item"], SCOPE)).fetchall()
+    return member["id"] in (rows[0]["id"], (_past_cancel(rows) or rows[0])["id"])
+
+
 def _retry_row(connection, item: int, selected: Collection[int] = ()):
     """The build assignment `sd assignments build` reads for `item`: its newest that ran, past newer ones that
     never ran (cancelled or blocked before a claim), when the newest was cancelled before it ran: the bundle that
@@ -1202,23 +1220,20 @@ def _retry_row(connection, item: int, selected: Collection[int] = ()):
     items a Build press names, narrows the bundle to the members that press would retry (`_retry_takes`)."""
     rows = connection.execute("SELECT id, item, parent, status, run_count FROM assignment WHERE item = ? "
                               "AND scope = ? ORDER BY id DESC", (item, SCOPE)).fetchall()
-    # A newest press refused before a claim (blocked, never ran) owns nothing either, as `_current` reads it: read
-    # past it too, or `_retry_takes` narrows a subset this item's row then leaves (review of build/sd-1654).
-    if rows and rows[0]["status"] in AGAIN and not rows[0]["run_count"]:
-        ran = next((row for row in rows[1:] if row["run_count"]), None)
-        # Only a bundle Retry can take: every member it would queue owns its item (`_current`), or Retry refuses the
-        # whole press and Build reads a fresh one instead (class pass, review round 7); and every member in the
-        # work's repository (`_in_work_repo`), or the claim refuses it and every later press reads it again (round 14).
-        if ran is not None and ran["status"] in AGAIN and not _alone(connection, ran["id"]):
-            lead: int = ran["parent"] or ran["id"]
-            # Its claim routes where its last run ran, which holds its worktree: not a bundle a satellite ran whose
-            # lane moved to another satellite or to the hub (reviews of build/sd-1378), as `_stranded` reads for
-            # beat recovery (pack sd:9964).
-            host = connection.execute(_REPO, (ran["item"],)).fetchone()["lane_host"]
-            if (queue_state(connection, lead)["status"] == ran["status"] and _in_work_repo(connection, lead, ran["status"])
-                    and _ran_on(connection, lead) == _route(connection, host, lead)
-                    and _retry_takes(connection, lead, ran["status"], selected)):
-                return ran
+    ran = _past_cancel(rows)
+    # Only a bundle Retry can take: every member it would queue owns its item (`_current`), or Retry refuses the
+    # whole press and Build reads a fresh one instead (class pass, review round 7); and every member in the
+    # work's repository (`_in_work_repo`), or the claim refuses it and every later press reads it again (round 14).
+    if ran is not None and ran["status"] in AGAIN and not _alone(connection, ran["id"]):
+        lead: int = ran["parent"] or ran["id"]
+        # Its claim routes where its last run ran, which holds its worktree: not a bundle a satellite ran whose
+        # lane moved to another satellite or to the hub (reviews of build/sd-1378), as `_stranded` reads for
+        # beat recovery (pack sd:9964).
+        host = connection.execute(_REPO, (ran["item"],)).fetchone()["lane_host"]
+        if (queue_state(connection, lead)["status"] == ran["status"] and _in_work_repo(connection, lead, ran["status"])
+                and _ran_on(connection, lead) == _route(connection, host, lead)
+                and _retry_takes(connection, lead, ran["status"], selected)):
+            return ran
     return rows[0] if rows else None
 
 
@@ -1230,13 +1245,16 @@ def _retry_takes(connection, lead: int, status: str, selected: Collection[int] =
     Retry's dependency split (`_inside`) refuses neither case: members the lead waits on leave to build on their
     own, and a member that waits on another bundle item leaves parked, so neither is press-checked (sd:10022).
     A press naming two or more of the bundle's items retries those alone (`retry`'s `only`): a member it leaves
-    out leaves the bundle, so its newer build refuses nothing (pack sd:9936)."""
+    out leaves the bundle, so its newer build refuses nothing (pack sd:9936). The read names the set `queue_again`
+    hands `retry`, by `retry`'s own rules, or Build picks a Retry that refuses (class pass, review of
+    build/sd-1654): only a member whose row Build reads for its item counts (`_reads`), and a part that leaves
+    the lead out is no Retry, so it reads the whole bundle."""
     row = connection.execute("SELECT item FROM assignment WHERE id = ?", (lead,)).fetchone()
     if row is None or _done(reads.items_by_ids(connection, [row["item"]]), row["item"]):
         return False
     members = _open_members(connection, lead, status)
-    named = [member for member in members if member["item"] in set(selected)]
-    members = named if len(named) > 1 else members
+    named = [member for member in members if member["item"] in set(selected) and _reads(connection, member)]
+    members = named if len(named) > 1 and row["item"] in {member["item"] for member in named} else members
     if not members or not all(_current(connection, member) for member in members):
         return False
     ahead, behind = _inside(connection, row["item"], members)

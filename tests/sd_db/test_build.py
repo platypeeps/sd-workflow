@@ -2125,21 +2125,54 @@ class CancelParks(Case):
         self.assertEqual(sorted(entry["id"] for entry in queued), [lead, kept])
         self.assertEqual(runner.queue_state(self.db, left)["status"], "cancelled")
 
-    def test_a_subset_build_reads_a_refused_press_as_one_that_never_ran(self):
-        """Review of build/sd-1654: as above, but B's newer press was refused before a claim (blocked, never ran), as
-        `_current` reads it. Build A B read A's row narrowed to A and B, B's row as its own press, and so retried
-        the whole bundle, which C's newer build refuses. B's row is the bundle's too: Build resumes A and B."""
-        items, (lead, kept, left) = self.blocked_bundle()
-        transition(self.db, items[2], "ready", who="operator")
-        build.queue(self.db, [items[2]], who="operator")
+    def press_unran(self, item, status="cancelled"):
+        """A newer press of `item` that ended `status` before any claim: cancelled, or refused (blocked)."""
+        transition(self.db, item, "ready", who="operator")
+        press = build.queue(self.db, [item], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = ? WHERE id = ?", (status, press))
+        return press
+
+    def newer_build(self, item):
+        """A newer build of `item` that ran and was cancelled: it owns the item (`_current`)."""
+        transition(self.db, item, "ready", who="operator")
+        build.queue(self.db, [item], who="operator")
         build.end(self.db, self.claim()["id"], "cancelled", "the operator cancelled it")
-        for item, status in zip(items[:2], ("cancelled", "blocked"), strict=True):
-            transition(self.db, item, "ready", who="operator")
-            press = build.queue(self.db, [item], who="operator")[0]["id"]
-            self.db.execute("UPDATE assignment SET status = ? WHERE id = ?", (status, press))  # before a claim
-        queued = build.queue_again(self.db, items[:2], who="operator")
-        self.assertEqual(sorted(entry["id"] for entry in queued), [lead, kept])
-        self.assertEqual(runner.queue_state(self.db, left)["status"], "cancelled")
+
+    def assert_fresh(self, queued, items, old):
+        """`queued` is one fresh build per item of `items`, and the `old` bundle's rows are as they ended."""
+        self.assertEqual(sorted(entry["item"] for entry in queued), sorted(items))
+        self.assertFalse({entry["id"] for entry in queued} & set(old), "fresh builds, not the old bundle's rows")
+        self.assertEqual({runner.queue_state(self.db, ident)["status"] for ident in old}, {"blocked"})
+
+    def test_a_subset_build_counts_only_the_members_whose_row_reads_the_bundle(self):
+        """Class pass, review of build/sd-1654 (the read and the Retry it runs name one set): as above, but B's newer
+        press was refused before a claim (blocked, never ran). B's row is that press, not the bundle, so the press
+        names one bundle member, A: its Retry is the whole bundle's, which C's newer build refuses. The read
+        narrowed A's row to A and B and that Retry ran and refused. Both build fresh, as before pack sd:9936."""
+        items, old = self.blocked_bundle()
+        self.newer_build(items[2])
+        self.press_unran(items[0])
+        self.press_unran(items[1], "blocked")
+        self.assert_fresh(build.queue_again(self.db, items[:2], who="operator"), items[:2], old)
+
+    def test_a_subset_build_without_the_lead_reads_the_whole_bundle(self):
+        """Class pass, review of build/sd-1654: Build B C of bundle A, B, C whose lead A a newer build owns. A part
+        without the lead is no Retry (`retry` refuses it), so the read is the whole bundle's, which A's newer
+        build refuses: B and C build fresh, as before pack sd:9936. The read narrowed to B and C and refused."""
+        items, old = self.blocked_bundle()
+        self.newer_build(items[0])
+        for item in items[1:]:
+            self.press_unran(item)
+        self.assert_fresh(build.queue_again(self.db, items[1:], who="operator"), items[1:], old)
+
+    def test_two_items_whose_newest_press_was_refused_build_fresh(self):
+        """Class pass, review of build/sd-1654: B and C of a blocked bundle, each with a newer press refused before a
+        claim. `_retry_row` read past a refused press to the bundle, and the part without its lead refused; it
+        reads past a cancelled press only, so both build fresh, as before this change."""
+        items, old = self.blocked_bundle()
+        for item in items[1:]:
+            self.press_unran(item, "blocked")
+        self.assert_fresh(build.queue_again(self.db, items[1:], who="operator"), items[1:], old)
 
     def test_a_subset_retry_must_name_the_lead(self):
         """Pack sd:9581: the lead's worktree holds the bundle's work, so a subset without it refuses, writing nothing."""
