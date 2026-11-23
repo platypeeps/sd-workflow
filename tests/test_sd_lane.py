@@ -1999,14 +1999,15 @@ class TrainLanding(Trees):
         return super().ship(argv, log)
 
     def land(self, root: pathlib.Path, tip: str, base: str, items: list[int],
-             ready: Callable[[], str | None] = lambda: None) -> dict:
+             ready: Callable[[], str | None] = lambda: None, checks: Callable[[], str | None] = lambda: None) -> dict:
         """The recorder's landing; once merged, a member's next prepare reconciles, as `sd-ship` does.
 
-        `during_gate` runs where the train gate runs; `ready` is read after it, as `land_train` reads it.
+        `during_gate` runs where the train gate runs; `checks`, then `ready`, are read after it, as `land_train`
+        reads them.
         """
         self.landed.append((root, tip, base, items))
         self.during_gate()
-        why = ready()
+        why = checks() or ready()
         if why is not None:
             return {"status": "failed", "reason": why}
         trees = {1: self.first, 2: self.second, 3: self.third}
@@ -2172,12 +2173,12 @@ class TrainLanding(Trees):
         real = self.land
 
         def land(root: pathlib.Path, tip: str, base: str, items: list[int],
-                 ready: Callable[[], str | None] = lambda: None) -> dict:
+                 ready: Callable[[], str | None] = lambda: None, checks: Callable[[], str | None] = lambda: None) -> dict:
             def then() -> str | None:
                 why = ready()
                 seen.append(self.lead_step())  # the PUT goes out after this
                 return why
-            return real(root, tip, base, items, then)
+            return real(root, tip, base, items, then, checks)
         with mock.patch.object(sd_lane, "land_train", land):
             self.queue_three()
             sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
@@ -2204,6 +2205,39 @@ class TrainLanding(Trees):
 
     def test_a_lead_whose_train_stopped_on_authority_does_not_merge_alone(self) -> None:
         self.assert_authority_withdrawn_during_the_gate_lands_nothing((False, False, True))
+
+    def test_a_member_cancelled_while_a_later_member_joins_again_lands_nothing(self) -> None:
+        """Review of sd:9923: the last queue read came before the serial rejoins after the gate."""
+        joins = {"3": 0}
+
+        def cancel_on_rejoin() -> None:
+            joins["3"] += 1
+            if joins["3"] == 2:  # sd:3's rejoin, after the gate
+                sd_lane.update(self.store(), lambda rows: rows[1].update(status="cancelled"))
+        self.on_join[3] = cancel_on_rejoin
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        landing = self.entries()[0]["train_landing"]
+        self.assertEqual(landing["status"], "failed")
+        self.assertIn("sd:2", landing["reason"])
+        self.assertNotIn(2, self.merges())
+
+    def test_a_member_cancelled_after_the_last_read_is_refused_by_the_fence(self) -> None:
+        """Review of sd:9923: the fence checked the lead's claim only, so a cancel after the last read landed."""
+        real = sd_lane.left_stop
+
+        def left_stop(entry: dict, queue: Any, step: str) -> Any:
+            answer = real(entry, queue, step)
+            if entry["item"] == 3 and len(self.joins) >= 5:  # the final read, after every rejoin
+                sd_lane.update(self.store(), lambda rows: rows[1].update(held=True))
+            return answer
+        with mock.patch.object(sd_lane, "left_stop", left_stop):
+            self.queue_three()
+            sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        landing = self.entries()[0]["train_landing"]
+        self.assertEqual(landing["status"], "failed")
+        self.assertIn("sd:2", landing["reason"])
+        self.assertNotIn(2, self.merges())
 
     def test_a_member_cancelled_during_the_train_lands_nothing(self) -> None:
         def cancel_second() -> None:

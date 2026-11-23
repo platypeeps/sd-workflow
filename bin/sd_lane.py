@@ -2142,7 +2142,8 @@ def train_landing(entry: dict[str, Any], queue: Queue, ship: Ship, head: str, lo
     before it merges alone; the second value is its refusal (sd:9923).
     """
     try:
-        landing = land_as_train(entry, queue, ship, head, logs, renewed, deadline, lambda: advance("train"))
+        landing = land_as_train(entry, queue, ship, head, logs, renewed, deadline,
+                                lambda members: advance("train", members))
     except Stop:
         raise
     except Exception as error:  # a train that breaks lands nothing it did not record; the merge after decides
@@ -2778,13 +2779,15 @@ def start_train(entry: dict[str, Any], queue: Queue, gate: Gate, environ: dict[s
 
 #: The branch a train pull request lands from, named by its tip (sd:9923).
 TRAIN_BRANCH = "sd-train/{}"
+#: The fence's refusal of a train whose member left the queue after the last read (sd:9923).
+TRAIN_LEFT = "train_member_left"
 #: A joined train member: its row, worktree, prepared head, the landing it joined onto and the merge it wrote.
 Joined = tuple[dict[str, Any], pathlib.Path, str, str, str]
 
 
 def land_as_train(entry: dict[str, Any], queue: Queue, ship: Ship, head: str, logs: pathlib.Path,
                   renewed: Callable[[], None], deadline: float = math.inf,
-                  fence: Callable[[], None] = lambda: None) -> dict[str, Any] | None:
+                  fence: Callable[[list[dict[str, Any]]], None] = lambda members: None) -> dict[str, Any] | None:
     """Land `entry` and the pending entries after it as one train pull request, or None for no train (sd:9923).
 
     `entry` is prepared at `head`. It joins first, onto the fetched base,
@@ -2836,7 +2839,8 @@ def land_as_train(entry: dict[str, Any], queue: Queue, ship: Ship, head: str, lo
 
 def land_joined(joined: list[Joined], queue: Queue, ship: Ship, tip: str,
                 branch: str, logs: pathlib.Path, record: dict[str, dict[str, Any]],
-                renewed: Callable[[], None] = lambda: None, fence: Callable[[], None] = lambda: None) -> dict[str, Any]:
+                renewed: Callable[[], None] = lambda: None,
+                fence: Callable[[list[dict[str, Any]]], None] = lambda members: None) -> dict[str, Any]:
     """`land_as_train`'s landing of the joined members at `tip`, each member's outcome written into `record`."""
     items = [row["item"] for row, *_ in joined]
     if len(joined) < 2:
@@ -2844,8 +2848,18 @@ def land_joined(joined: list[Joined], queue: Queue, ship: Ship, tip: str,
     why = train_stop(joined, queue, renewed)
     if why is not None:
         return {"status": "skipped", "items": items, "reason": why}
-    landed = land_train(joined[0][1], tip, branch, items,
-                        lambda: train_stop(joined, queue, renewed) or rejoin_stop(joined, ship, logs) or fence())
+
+    def fenced() -> str | None:
+        try:
+            fence([row for row, *_ in joined[1:]])
+        except LaneError as error:
+            if error.code != TRAIN_LEFT:
+                raise
+            return str(error)
+        return None
+    # The rejoins take minutes, so the queue is read after them, and the fence reads it again in its own write.
+    landed = land_train(joined[0][1], tip, branch, items, lambda: train_stop(joined, queue, renewed) or fenced(),
+                        checks=lambda: rejoin_stop(joined, ship, logs))
     if landed.get("status") != "merged":
         for row, *_ in joined[1:]:
             record[row["id"]] = {"status": "failed", "reason": str(landed.get("reason"))[:REASON_CHARS]}
@@ -2952,7 +2966,8 @@ def join_member(row: dict[str, Any], tree: pathlib.Path, head: str, onto: str, s
 
 
 def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
-               ready: Callable[[], str | None] = lambda: None) -> dict[str, Any]:
+               ready: Callable[[], str | None] = lambda: None,
+               checks: Callable[[], str | None] = lambda: None) -> dict[str, Any]:
     """One train pull request at `tip`: pushed, gated once, merged with a merge commit (sd:9923).
 
     A direct push of the base is refused under protection; a pull request
@@ -2960,10 +2975,11 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
     member merged at its own merge. A refused or lost merge answer is read
     back once; any other failure lands nothing. The branch is deleted
     whatever happened, which also closes a train PR left open. After the
-    gate, `ready` and a fresh fetch of the base decide again: a member
-    held, a claim lost, or a base that moved during the gate sends no
-    merge, since GitHub would land a combination the gate never saw. The
-    pull request opens or is found only then, and only onto `base`.
+    gate, a fresh fetch of the base and the slow `checks` decide again,
+    then the pull request opens or is found, only onto `base`, and the
+    fast `ready` is the last read before the PUT: a member held, a claim
+    lost, or a base that moved during the gate sends no merge, since
+    GitHub would land a combination the gate never saw.
     """
     import sd_local_gate  # noqa: PLC0415 -- the GitHub client loads only for a train landing
     import sd_ship_remote  # noqa: PLC0415
@@ -2976,10 +2992,13 @@ def land_train(root: pathlib.Path, tip: str, base: str, items: list[int],
         gate = sd_local_gate.local_gate(api, root, tip, base=base)
         if gate.get("status") != "success":
             return {"status": "failed", "reason": f"the train gate at {tip} did not pass: {gate.get('summary')}"[:600]}
-        why = base_moved(root, tip, base) or ready()  # `ready` ends in the lane host's fence
+        why = base_moved(root, tip, base) or checks()
         if why is not None:
             return {"status": "failed", "reason": why[:600]}
         pull = train_pull(api, branch, base, f"chore(lane): land the train of {names}")
+        why = ready()  # last: it ends in the lane host's fence
+        if why is not None:
+            return {"status": "failed", "pull": pull, "reason": why[:600]}
         with contextlib.suppress(sd_ship_remote.Refusal):  # a lost answer is read back below, never sent twice
             api.api(f"{api.prefix}/pulls/{pull}/merge", method="PUT",
                     body={"sha": tip, "merge_method": "merge", "commit_title": f"chore(lane): train of {names} (#{pull})",
@@ -3989,11 +4008,14 @@ class Moved(Stop):
     """The lane moved to another host before the merge; the entry is pending again at its place (sd:3283)."""
 
 
-def advance(queue: Queue, entry: dict[str, Any], token: str, step: str = "merge") -> None:
+def advance(queue: Queue, entry: dict[str, Any], token: str, step: str = "merge",
+            members: list[dict[str, Any]] | None = None) -> None:
     """The before-merge write: `step` and the merge lease, while `token` holds the entry on the lane host.
 
     `step` is `merge` before a lone merge and `train` before a train's
-    merge, which reclaim puts back to pending (sd:9923).
+    merge, which reclaim puts back to pending (sd:9923). Each of the
+    train's `members` must still be runnable at its queued head in the
+    same transaction, or `TRAIN_LEFT` refuses and nothing is written.
 
     The host is read in the write's transaction. Off it the entry goes back
     to pending at its place with `moved_off`, and `Moved` stops the run; a
@@ -4015,6 +4037,13 @@ def advance(queue: Queue, entry: dict[str, Any], token: str, step: str = "merge"
 
     def to_merge(entries: list[dict[str, Any]]) -> None:
         row = held(entries, entry, token)
+        now = {each["id"]: each for each in entries}
+        gone = [member["item"] for member in members or ()
+                if not runnable(now.get(member["id"]) or {})
+                or now[member["id"]].get("expected_head") != member["expected_head"]]
+        if gone:
+            raise LaneError(f"{', '.join(f'sd:{item}' for item in gone)} left the queue, moved or is held "
+                            "before the train merge", code=TRAIN_LEFT)
         if elsewhere:
             back_to_pending(row, expected, moved_off={"host": this_host(), "at": stamp_now()})
         else:
@@ -4795,8 +4824,8 @@ def run_checkout(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token:
     """
     outcome, stage = found, {"step": entry.get("step") or "prepare"}
 
-    def advanced(step: str = "merge") -> None:
-        advance(queue, local, token, step)
+    def advanced(step: str = "merge", members: list[dict[str, Any]] | None = None) -> None:
+        advance(queue, local, token, step, members)
         stage["step"] = step
     try:
         if tree is not None:
