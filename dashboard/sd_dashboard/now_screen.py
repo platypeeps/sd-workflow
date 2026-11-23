@@ -708,7 +708,7 @@ def needs(rows: list[dict], *, work: list[dict], live: set[int], today: str, lan
 def _lanes(connection, now: str) -> dict:
     from . import queue_screen
 
-    return queue_screen.document(connection, now=now)
+    return queue_screen.shared(connection, now=now)
 
 
 def lane_summary(queue: dict) -> dict:
