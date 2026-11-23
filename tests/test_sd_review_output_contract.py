@@ -11,6 +11,7 @@ from tests.test_sd_review import (
     FakeClient,
     FakeRunner,
     ReviewFixture,
+    chat_answer,
     namespace,
     sd_review,
 )
@@ -59,7 +60,7 @@ class URLContractTests(ReviewFixture):
         material = sd_review.review_material(root, subject, prompt)
         prefix = f"{prompt}\nSchema: {json.dumps(sd_review.CODEX_OUTPUT_SCHEMA)}\n\nReview input:\n{material}"
         self.assertGreater(len(prefix.encode()), 150000)
-        self.assertIn(json.dumps(prior["findings"], sort_keys=True), prompt)
+        self.assertIn(json.dumps([dict(row, id="B1") for row in prior["findings"]], sort_keys=True), prompt)
         self.assertIn((root / "prior.py").read_text(), prompt)
         self.assertIn("keep-the-complete-local-provenance", prompt)
         self.assertIn("+# first input marker", material)
@@ -83,7 +84,8 @@ class URLContractTests(ReviewFixture):
     def test_selection_timing_and_checks_still_control_dispatch(self):
         root, args, _ = self.prepare()
         args.explain = True
-        client = FakeClient()
+        fixed = {"findings": [], "verdicts": [{"id": "B1", "verdict": "fixed", "evidence": "prior.py:2 fixed"}]}
+        client = FakeClient(default=chat_answer(json.dumps(fixed)))  # sd:10087: else the prior blocker carries
         planned = self.run_review(root, args, client)
         self.assertEqual(client.sent, [])
         args.explain = False

@@ -243,6 +243,8 @@ Read only the applicable reference in the sd-workflow checkout:
 
 Ship fix verification uses `--scope branch --base <full ancestor SHA> --verify-report <prior JSON>`.
 It reviews the committed fix range and current source for prior blockers.
+Each prior blocker gets an id; every reader that answers must return a `fixed` verdict with evidence
+for it, or the blocker carries forward as blocking.
 The report must name that exact base.
 Changed default-branch code remains within the reviewed tree diff.
 This evidence does not authorize replacing a ship receipt with a claimed reviewed head.
