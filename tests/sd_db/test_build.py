@@ -2094,6 +2094,22 @@ class CancelParks(Case):
         fresh = build.queue_again(self.db, [items[2]], who="operator")
         self.assertNotIn(fresh[0]["id"], (lead, kept, left))
 
+    def test_a_subset_build_resumes_its_bundle_past_an_unselected_member_a_newer_build_owns(self):
+        """Pack sd:9936: bundle A, B, C ended blocked; newer presses of A and B were cancelled before a claim, and C
+        has a newer build that ran. Build A B read every member's ownership, C's too, and built A and B fresh from
+        main; the press queues only A and B, so they resume the bundle's branch under its lead."""
+        items, (lead, kept, left) = self.blocked_bundle()
+        transition(self.db, items[2], "ready", who="operator")
+        build.queue(self.db, [items[2]], who="operator")
+        build.end(self.db, self.claim()["id"], "cancelled", "the operator cancelled it")
+        for item in items[:2]:
+            transition(self.db, item, "ready", who="operator")
+            press = build.queue(self.db, [item], who="operator")[0]["id"]
+            self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (press,))  # before a claim
+        queued = build.queue_again(self.db, items[:2], who="operator")
+        self.assertEqual(sorted(entry["id"] for entry in queued), [lead, kept])
+        self.assertEqual(runner.queue_state(self.db, left)["status"], "cancelled")
+
     def test_a_subset_retry_must_name_the_lead(self):
         """Pack sd:9581: the lead's worktree holds the bundle's work, so a subset without it refuses, writing nothing."""
         items, ids = self.blocked_bundle()

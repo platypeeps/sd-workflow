@@ -1104,7 +1104,7 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             # lane_failed for Fix. Read before `alone`, which the split itself sets (review of build/sd-1306).
             if any(item in done for done in freed.values()):
                 continue
-            row = _retry_row(connection, item)
+            row = _retry_row(connection, item, items)
             # A member cancelled on its own left its bundle: building it is a fresh press, not the bundle's Retry.
             alone = row is not None and row["parent"] is not None and _alone(connection, row["id"])
             lead = row and (row["parent"] or row["id"])
@@ -1185,12 +1185,13 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
         return queued + (queue(connection, fresh, who=who) if fresh else [])
 
 
-def _retry_row(connection, item: int):
+def _retry_row(connection, item: int, selected: Collection[int] = ()):
     """The build assignment `sd assignments build` reads for `item`: its newest that ran, past newer ones that
     never ran (cancelled or blocked before a claim), when the newest was cancelled before it ran: the bundle that
     ran last holds the item's newest work (sd:9788, review rounds 2 and 3). A cancelled bundle that ran keeps its
     worktree, so it stays the one read, as does a member a subset Retry left out. A newest row that ran, or no
-    older row that ran in a bundle ended as it did and not left on its own, reads the newest."""
+    older row that ran in a bundle ended as it did and not left on its own, reads the newest. `selected`, the
+    items a Build press names, narrows the bundle to the members that press would retry (`_retry_takes`)."""
     rows = connection.execute("SELECT id, item, parent, status, run_count FROM assignment WHERE item = ? "
                               "AND scope = ? ORDER BY id DESC", (item, SCOPE)).fetchall()
     if rows and rows[0]["status"] == "cancelled" and not rows[0]["run_count"]:
@@ -1206,22 +1207,26 @@ def _retry_row(connection, item: int):
             host = connection.execute(_REPO, (ran["item"],)).fetchone()["lane_host"]
             if (queue_state(connection, lead)["status"] == ran["status"] and _in_work_repo(connection, lead, ran["status"])
                     and _ran_on(connection, lead) == _route(connection, host, lead)
-                    and _retry_takes(connection, lead, ran["status"])):
+                    and _retry_takes(connection, lead, ran["status"], selected)):
                 return ran
     return rows[0] if rows else None
 
 
-def _retry_takes(connection, lead: int, status: str) -> bool:
+def _retry_takes(connection, lead: int, status: str, selected: Collection[int] = ()) -> bool:
     """Whether Retry queues build `lead`'s bundle in `status`, read, not tried: its lead's item is not done, and
     each member it would queue (`_open_members`) owns its item (`_current`) and passes the press's check once
     ready (`_press_refusal`), as `retry` and its `_queue_members` refuse otherwise (class pass, review of sd:9788).
     Build by item reads a fresh press instead of a bundle whose Retry refuses.
     Retry's dependency split (`_inside`) refuses neither case: members the lead waits on leave to build on their
-    own, and a member that waits on another bundle item leaves parked, so neither is press-checked (sd:10022)."""
+    own, and a member that waits on another bundle item leaves parked, so neither is press-checked (sd:10022).
+    A press naming two or more of the bundle's items retries those alone (`retry`'s `only`): a member it leaves
+    out leaves the bundle, so its newer build refuses nothing (pack sd:9936)."""
     row = connection.execute("SELECT item FROM assignment WHERE id = ?", (lead,)).fetchone()
     if row is None or _done(reads.items_by_ids(connection, [row["item"]]), row["item"]):
         return False
     members = _open_members(connection, lead, status)
+    named = [member for member in members if member["item"] in set(selected)]
+    members = named if len(named) > 1 else members
     if not members or not all(_current(connection, member) for member in members):
         return False
     ahead, behind = _inside(connection, row["item"], members)
