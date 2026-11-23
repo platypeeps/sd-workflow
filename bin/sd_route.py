@@ -39,12 +39,13 @@ from typing import Any, Mapping, NamedTuple, Sequence
 DEFAULT_TIER_ORDER: tuple[str, ...] = ("skip", "cheap", "standard", "deep")
 DEFAULT_LARGE_CHANGE_LINES = 800
 
-#: Risk classification does not create additional provider calls: every
-#: reviewing tier asks two readers, so codex and Claude both answer (sd:7519,
-#: operator ruling sd:7239). Unknown tiers still require an independent local
-#: review rather than silently skipping it.
-TIER_DEPTH: dict[str, int] = {"skip": 0, "cheap": 2, "standard": 2, "deep": 2}
-DEFAULT_DEPTH = 2
+#: Every reviewing tier asks one reader, the chain's first eligible one:
+#: codex, or claude when codex is capped, metered out or unready. Codex raised
+#: 120 of 129 blockers in the 7 days to 2026-11-23, claude 2 codex missed
+#: (operator 2026-11-23; replaces sd:7239's two readers). Unknown tiers still
+#: require a local review rather than silently skipping it.
+TIER_DEPTH: dict[str, int] = {"skip": 0, "cheap": 1, "standard": 1, "deep": 1}
+DEFAULT_DEPTH = 1
 
 
 def reader_depth(asked: int, eligible: int) -> int:

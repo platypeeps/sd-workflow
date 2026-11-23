@@ -2206,6 +2206,7 @@ class TheReadAgainButton(unittest.TestCase):
 const { html, put } = window.markup;
 const ICON = n => html`<svg class="i" aria-hidden="true"><use href="#i-${n}"/></svg>`;
 var OUT = { toasts: [], gets: [], error: null }, R = {}, WIN = [], ELS = {}, location = { hash: "" }, innerHeight = 900;
+var setInterval = () => 0;
 const toast = m => OUT.toasts.push(m), flush = async () => { for (let i = 0; i < 50; i++) await null; };
 var ANSWER = { error: '', rows: [], nosource: [] };
 const getJSON = async path => { OUT.gets.push(path); if (typeof ANSWER === 'string') throw new Error(ANSWER); return typeof ANSWER === 'function' ? ANSWER() : ANSWER; };
