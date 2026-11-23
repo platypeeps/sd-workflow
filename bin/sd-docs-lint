@@ -363,6 +363,10 @@ def check_pr_privacy(body: str | None, report: Report) -> None:
     if body is None:
         report.warn("PR privacy: no --pr-body supplied, not run")
         return
+    # pack sd:10212: the line limit the lane refuses at enqueue, caught by the builder's own lint run.
+    import sd_ship_body
+    for at, length in sd_ship_body.long_lines(body):
+        report.fail("pull request body", f"line {at} is {length} characters (limit {sd_ship_body.LINE_LIMIT})")
     remedy = "set sd.privacy_patterns, or write one ERE per line to that file"
     try:
         path = privacy_file()
