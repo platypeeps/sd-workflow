@@ -64,7 +64,8 @@ class FixReviewTests(ReviewFixture):
         """A full pass with a blocker, saved, and a fix commit on top."""
         root, first = self.branch()
         blocking = json.dumps({"findings": [{"path": "src.py", "line": 1, "summary": "held defect",
-                                            "family": "correctness", "severity": "high", "instances": ["src.py:1"]}]})
+                                            "family": "correctness", "severity": "high", "instances": ["src.py:1"],
+                                            "evidence": "python3 src.py: Traceback"}]})
         prior = sd_review.review(root, namespace(scope="branch"), FakeRunner({"codex": sd_review.Completed(0, blocking, "")}),
                                  self.environment(), self.chatgpt_home())
         self.assertEqual(prior["status"], "blocking")
