@@ -1002,7 +1002,8 @@ class Supervise(Case):
         self.press()
         ident = self.bundle["id"]
         reset = int(datetime.now(UTC).timestamp()) + 60
-        self.assertTrue(build.write(self.db, ident, step="fixing", session_id="session-limited", review_round=2,
+        self.assertTrue(build.write(self.db, ident, step="fixing", session_id="session-limited",
+                                    review_round=build_run.REVIEW_ROUNDS,
                                     final=json.dumps({"rate_limit_info": {"resetsAt": reset}})))
         build.end(self.db, ident, build.RATE_LIMITED, "rate limited")
         later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
@@ -1011,7 +1012,11 @@ class Supervise(Case):
                                 root=self.root / "worktrees")
         assert again is not None
         row = build.run(self.db, again["id"])
-        self.assertEqual((row["step"], row["session_id"], row["review_round"]), ("reviewing", "session-limited", 2))
+        # The fix round it was in was counted before the fix; the resumed review counts it again, so the claim
+        # opens one round back, or that review would count past `REVIEW_ROUNDS` and park the run with its final
+        # fix round unrun (review of build/sd-1654).
+        self.assertEqual((row["step"], row["session_id"], row["review_round"]),
+                         ("reviewing", "session-limited", build_run.REVIEW_ROUNDS - 1))
 
     def test_a_fault_inside_the_usage_limit_end_writes_nothing_and_the_next_end_finishes(self):
         """Pack sd:9907, failure table row 2: the outcome, the release, the requeue and the hold are one

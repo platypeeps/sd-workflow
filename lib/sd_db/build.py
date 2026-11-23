@@ -1894,12 +1894,17 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
                                           "WHERE assignment = ? ORDER BY run DESC LIMIT 1", (lead,)).fetchone()
                 limited = last is not None and last["outcome"] == RATE_LIMITED and last["step"] not in LANE_STEPS
                 step = RESUME.get(last["step"] or "claimed", last["step"] or "claimed") if limited else "claimed"
+                rounds = last["review_round"] if limited else None
+                # A fix round is counted before its fix runs, and the resumed review counts it again: one round
+                # back, or a limit inside the final fix round parks the run with that fix unrun (build/sd-1654).
+                if limited and last["step"] == "fixing" and rounds:
+                    rounds -= 1
                 ident = _open_run(connection, lead, repo=repo, owner=run_owner(owner, lanes[lead]),
                                   step=step,
                                   model=_model(connection, [row["item"] for row in bundle]),
                                   work=worktree(repo, lead, root=root), stamp=stamp,
                                   session_id=last["session_id"] if limited else None,
-                                  review_round=last["review_round"] if limited else None)
+                                  review_round=rounds)
                 for row in bundle:
                     transition(connection, row["item"], "in_progress", who="build",
                                reason=f"build run {ident} claimed assignment {row['id']}")
