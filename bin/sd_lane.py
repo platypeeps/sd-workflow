@@ -1168,6 +1168,20 @@ def check_item(connection: Any, worktree: pathlib.Path, item: int, body: str, cl
         raise LaneError(f"{error}; nothing was queued", code=error.workflow["blocker"]["code"]) from None
 
 
+def train_merging_stop(entries: list[dict[str, Any]], row: dict[str, Any]) -> None:
+    """Refuse a change to `row` while the lead that fenced it for its train runs at `step: train`.
+
+    The train's last queue read comes before its PUT, and a cancel or hold
+    takes no ship lock; the fence's mark, read in the change's own write,
+    keeps either from reporting success for a member the train then merges
+    (review of sd:9923). A lead that stopped or was reclaimed blocks nothing.
+    """
+    lead = next((entry for entry in entries if row.get("train_of") and entry["id"] == row["train_of"]), None)
+    if lead is not None and lead.get("status") == "running" and lead.get("step") == "train":
+        raise LaneError(f"sd:{row['item']} is in the train sd:{lead['item']} is merging; cancel or hold it "
+                        "once that train ends", code=TRAIN_MERGING)
+
+
 def pending_entry(entries: list[dict[str, Any]], item: int) -> dict[str, Any]:
     for row in entries:
         if row.get("item") == item and row.get("status") == "pending":
@@ -1301,6 +1315,7 @@ def cancel(root: pathlib.Path, item: int, environ: dict[str, str], *,
                            reason=f"cancelled by the operator on {this_host()}: {merge}")
             return prepared[-1]
         row = pending_entry(entries, item)
+        train_merging_stop(entries, row)
         row.update(status="cancelled", finished_at=stamp_now(), reason=f"cancelled by the operator on {this_host()}")
         return row
     row = update(queue, mark, read_first)
@@ -1818,6 +1833,7 @@ def set_hold(root: pathlib.Path, item: int, environ: dict[str, str], *, held: bo
     def toggle_hold(entries: list[dict[str, Any]]) -> dict[str, Any]:
         check_revision(entries, expected_revision)
         row = pending_entry(entries, item)
+        train_merging_stop(entries, row)
         if bool(row.get("held")) == held:
             raise LaneError(f"sd:{item} is {'already' if held else 'not'} held")
         row.update(held=held, held_at=stamp_now() if held else None)
@@ -2788,6 +2804,8 @@ def start_train(entry: dict[str, Any], queue: Queue, gate: Gate, environ: dict[s
 TRAIN_BRANCH = "sd-train/{}"
 #: The fence's refusal of a train whose member left the queue after the last read (sd:9923).
 TRAIN_LEFT = "train_member_left"
+#: A cancel or hold refused for a pending member the running lead's train is merging (review of sd:9923).
+TRAIN_MERGING = "train_merging"
 #: A joined train member: its row, worktree, prepared head, the landing it joined onto and the merge it wrote.
 Joined = tuple[dict[str, Any], pathlib.Path, str, str, str]
 
@@ -4131,6 +4149,12 @@ def advance(queue: Queue, entry: dict[str, Any], token: str, step: str = "merge"
             back_to_pending(row, expected, moved_off={"host": this_host(), "at": stamp_now()})
         else:
             row.update(step=step, lease_until=stamp_at(time.time() + MERGE_SECONDS + LANDING_SECONDS))
+            ours = {member["id"] for member in members or ()}
+            for each in entries:  # a cancel or hold reads it in its own write (`train_merging_stop`)
+                if each["id"] in ours:
+                    each["train_of"] = entry["id"]
+                elif each.get("train_of") == entry["id"]:  # an earlier train of this lead left it
+                    each.pop("train_of")
     runner_write(queue, to_merge, check=read_host)
     if elsewhere:
         raise Moved(f"{elsewhere[0]} sd:{entry['item']} is pending again at its place, for that host.",

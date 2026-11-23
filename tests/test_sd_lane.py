@@ -1981,6 +1981,7 @@ class TrainLanding(Trees):
         self.landing = {"status": "merged", "pull": 9, "merge_commit": "c" * 40}
         self.on_join: dict[int, Callable[[], None]] = {}
         self.during_gate: Callable[[], None] = lambda: None
+        self.after_ready: Callable[[], None] = lambda: None
         patcher = mock.patch.object(sd_lane, "land_train", self.land)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -2011,6 +2012,7 @@ class TrainLanding(Trees):
         why = checks() or ready()
         if why is not None:
             return {"status": "failed", "reason": why}
+        self.after_ready()  # after the last fence, as the PUT is sent
         trees = {1: self.first, 2: self.second, 3: self.third}
         for item in items[1:] if self.landing["status"] == "merged" else ():
             self.answers[(item, "prepare")] = {"ok": True, "phase": "merged", "merge_commit": f"{item}" * 40,
@@ -2310,6 +2312,43 @@ class TrainLanding(Trees):
     def test_a_member_caught_up_in_a_train_that_landed_reconciles(self) -> None:
         self.caught_up_in_the_train("merged")
         self.assertEqual([entry["status"] for entry in self.entries()], ["merged"] * 3)
+
+    def test_a_member_fenced_for_the_train_refuses_a_cancel_or_hold_until_it_ends(self) -> None:
+        """Review of sd:9923: a cancel after the last fence reported success, and the train merged it."""
+        refused: list[str | None] = []
+
+        def change_second() -> None:
+            for change in (lambda: sd_lane.cancel(self.repo, 2, self.environ),
+                           lambda: sd_lane.set_hold(self.repo, 2, self.environ, held=True)):
+                try:
+                    change()
+                    refused.append(None)
+                except sd_lane.LaneError as error:
+                    refused.append(error.code)
+        self.after_ready = change_second
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertEqual(refused, [sd_lane.TRAIN_MERGING] * 2)
+        self.assertEqual([entry["status"] for entry in self.entries()], ["merged"] * 3)
+
+    def test_a_train_mark_whose_lead_is_not_merging_blocks_no_cancel(self) -> None:
+        """A lead that stopped or was reclaimed leaves its mark; the member cancels as any pending entry."""
+        self.queue_three()
+        lead = self.entries()[0]["id"]
+        sd_lane.update(self.store(), lambda rows: rows[1].update(train_of=lead))
+        self.assertEqual(sd_lane.cancel(self.repo, 2, self.environ)["status"], "cancelled")
+
+    def test_a_later_train_of_the_lead_clears_the_mark_of_a_member_it_left_out(self) -> None:
+        self.queue_three()
+        lead = sd_lane.claim_entry(self.store(), "mine")
+        sd_lane.update(self.store(), lambda rows: rows[2].update(train_of=lead["id"]))
+        sd_lane.advance(self.store(), lead, "mine", "train", [self.entries()[1]])
+        entries = self.entries()
+        self.assertEqual((entries[1].get("train_of"), "train_of" in entries[2]), (lead["id"], False))
+        self.assertEqual(sd_lane.cancel(self.repo, 3, self.environ)["status"], "cancelled")
+        with self.assertRaises(sd_lane.LaneError) as merging:
+            sd_lane.cancel(self.repo, 2, self.environ)
+        self.assertEqual(merging.exception.code, sd_lane.TRAIN_MERGING)
 
     def test_a_member_cancelled_during_the_train_lands_nothing(self) -> None:
         def cancel_second() -> None:
