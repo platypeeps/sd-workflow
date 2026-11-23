@@ -877,10 +877,10 @@ def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: 
 def hunk_kept(diff: str, line: int | None) -> tuple[int | None] | None:
     """`line` moved past the hunks of one file's `git diff -U0`, or None when a hunk changed a line within
     `SHIFT_LINES` of it (sd:10191: a catch-up merge that edits the file elsewhere keeps the ruling). A ruling
-    with no line, or a diff with no hunk (a binary or mode change), holds on doubt: None."""
+    with no line, a diff with no hunk (binary) or a header that changes the file (mode, new, deleted): None."""
     hunks = [tuple(int(value) if value else 1 for value in match.groups()) for match in _HUNK.finditer(diff)]
     # One file's hunks only: a path that names a directory diffs several, and their lines are not this one's.
-    if line is None or not hunks or len(re.findall(r"(?m)^diff --git ", diff)) != 1:
+    if line is None or not hunks or len(re.findall(r"(?m)^diff --git ", diff)) != 1 or re.search(r"(?m)^(?!diff --git |index |--- |\+\+\+ |@@ |[-+\\])", diff):
         return None
     low, high = line - SHIFT_LINES, line + SHIFT_LINES
     if any(low <= start + count - 1 and start <= high if count else low <= start <= high
@@ -940,7 +940,7 @@ def rulings_placed(records: Sequence[Rebuttal], kept: Callable[[str, Any, int | 
         instances = []
         for entry in record.instances if line is not None else ():
             found = re.fullmatch(r"(.*):(\d+)", entry)
-            at = kept(record.head, found[1], int(found[2])) if found else kept(record.head, entry, None)
+            at = (kept(record.head, found[1], int(found[2])) if len(found[2]) < 10 else None) if found else kept(record.head, entry, None)
             if at is None:
                 return None
             instances.append(f"{found[1]}:{at[0]}" if found else entry)
@@ -965,7 +965,7 @@ def rulings_placed(records: Sequence[Rebuttal], kept: Callable[[str, Any, int | 
         if moved is not None and not any(_placed(n) is None and _named_files(records[n]) & _named_files(record)
                                          for n in newer) and recorded_at(
                 [*(at for n in newer for at in [_placed(n)] if at is not None), moved],
-                moved.path, moved.summary, moved.line) is moved:
+                moved.path, moved.summary, moved.line, list(moved.instances)) is moved:
             shown[index] = moved
     return [shown.get(index) or (placed.get(index) or record)._replace(listed=False)
             for index, record in enumerate(records)]

@@ -1514,6 +1514,9 @@ class RebuttalScopeTests(RepeatFixture):
         self.assertIsNone(sd_review.hunk_kept(diff("@@ -23,2 +22,0 @@\n-a\n-b"), 20))
         self.assertIsNone(sd_review.hunk_kept(diff("@@ -1 +1 @@\n-a\n+b", files=2), 20), "two files' hunks moved a line")
         self.assertIsNone(sd_review.hunk_kept("@@ -1 +1 @@\n-a\n+b", 20), "hunks of no named file moved a line")
+        # Lead review of sd:10191 (bin/sd-review:883): a mode change with a distant content edit kept the ruling.
+        for header in ("old mode 100644\nnew mode 100755", "deleted file mode 100644", "new file mode 100644"):
+            self.assertIsNone(sd_review.hunk_kept(diff(header, "@@ -1 +1 @@\n-a\n+b"), 20), header)
 
     def test_a_newer_ruling_decides_where_its_place_is_now(self) -> None:
         """Review of sd:10191: `defect` was rebutted at line 20; two lines came in above and it was parked at 22;
@@ -1548,6 +1551,24 @@ class RebuttalScopeTests(RepeatFixture):
         self.commit("add", "bin/tool.py")
         self.commit("the ruled line changes")
         self.assertEqual([entry[1] for entry in seen()], [False, False])
+
+    def test_a_newer_ruling_at_an_instance_decides_for_the_primary_place(self) -> None:
+        """Lead review of sd:10191 (bin/sd-review:968): a rebuttal at src.py:10 with an instance at b.py:40, then
+        a newer accepted ruling at b.py:40 only. Placement read the newest record at src.py:10 alone and listed
+        the older rebuttal; the gate reads every place it names and found the newer ruling. Both read all."""
+        def ruling(path: str, line: int, listed: bool, instances: tuple[str, ...]) -> Any:
+            return sd_review.Rebuttal("head", path, "empty input crashes", line, listed, path, "x", "y", instances)
+        newer = ruling("b.py", 40, False, ("b.py:40",))
+        older = ruling("src.py", 10, True, ("src.py:10", "b.py:40"))
+        placed = sd_review.rulings_placed([newer, older], lambda _head, _path, line: (line,))
+        self.assertEqual([entry.listed for entry in placed], [False, False])
+
+    def test_an_instance_line_too_long_to_read_lapses_its_ruling(self) -> None:
+        """Lead review of sd:10191 (bin/sd-review:943): a saved instance whose line number has 5000 digits
+        raised ValueError from int() and aborted every later review of the branch. It lapses its ruling."""
+        older = sd_review.Rebuttal("head", "src.py", "s", 10, True, "src.py", "x", "y", ("b.py:" + "9" * 5000,))
+        placed = sd_review.rulings_placed([older], lambda _head, _path, line: (line,))
+        self.assertEqual([entry.listed for entry in placed], [False])
 
     def test_a_diff_git_cannot_run_holds_the_rebuttal_back(self) -> None:
         self.adjudication(("lane claim", "rebutted", "x"))
