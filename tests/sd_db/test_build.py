@@ -3153,6 +3153,19 @@ class Hosts(Case):
                          ["blocked", "blocked"])
         self.assertIn("lane runs on work, and", self.count("SELECT result FROM assignment WHERE id = ?", lead))
 
+    def test_beat_recovery_requeues_no_lead_of_a_bundle_whose_member_moved_to_planning(self):
+        """Pack sd:9865 (review of build/sd-1378 at 9b5457ce4): a member moved to planning after the hub blocked
+        the bundle, which cancels its assignment. The whole-bundle check read blocked members only, so recovery
+        queued the lead, and the claim refused it (its branch holds the member's work), replacing the beat result.
+        The lead stays blocked on the beat, for a Retry of the bundle once the member is ready."""
+        items, lead, member = self._blocked_retry()
+        transition(self.db, items[1], "planning", who="operator")
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", member), "cancelled")
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        self.assertIsNone(self.claim(hosts=WORK))
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", lead), "blocked")
+        self.assertIn("lane runs on work, and", self.count("SELECT result FROM assignment WHERE id = ?", lead))
+
     def test_the_hub_blocks_a_row_whose_satellite_beat_comes_from_a_clock_ahead(self):
         """Pack sd:7955: a beat stamped more than STALE_SECONDS after now has no age to trust, so the claim blocks
         the row as for a stale beat, and its note names the skew, not a dead dispatcher."""

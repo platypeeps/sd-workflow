@@ -2078,11 +2078,15 @@ def _recoverable(connection) -> list:
     # lead first. A member left out by any filter above (parked, its item owned by another build, not ready) keeps
     # its commits on the lead's branch, so the claim would refuse the lead and replace the beat result, and no
     # later tick could recover it (class pass, review round 23). A member whose item is done leaves, as in `retry`.
+    # A member that left after the block (cancelled when its item went to planning) is a stray the claim refuses
+    # the lead for, as it reads `_strays` (pack sd:9865).
     ids = {row["id"] for row in rows}
     leads: set[int] = {lead for row in rows if (lead := _lead(row)) is not None}
     whole = {lead for lead in leads
              if lead in ids and all(member["id"] in ids for member in _members(connection, lead, "blocked")
-                                    if not _done(reads.items_by_ids(connection, [member["item"]]), member["item"]))}
+                                    if not _done(reads.items_by_ids(connection, [member["item"]]), member["item"]))
+             and ((home := _work_repo(connection, {"id": lead, "parent": None})) is None
+                  or not _strays(connection, lead, home, ("blocked",)))}
     return [row for row in rows if (lead := _lead(row)) is None or lead in whole]
 
 
