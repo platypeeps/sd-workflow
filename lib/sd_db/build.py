@@ -1201,8 +1201,8 @@ def _retry_row(connection, item: int):
         if ran is not None and ran["status"] in AGAIN and not _alone(connection, ran["id"]):
             lead: int = ran["parent"] or ran["id"]
             # Its claim routes where its last run ran, which holds its worktree: not a bundle a satellite ran whose
-            # lane moved to another satellite or to the hub (reviews of build/sd-1378). `_stranded` lets the hub
-            # take a lane moved to it, as beat recovery does on origin/main (sd:8991); pack sd:9964 owns that.
+            # lane moved to another satellite or to the hub (reviews of build/sd-1378), as `_stranded` reads for
+            # beat recovery (pack sd:9964).
             host = connection.execute(_REPO, (ran["item"],)).fetchone()["lane_host"]
             if (queue_state(connection, lead)["status"] == ran["status"] and _in_work_repo(connection, lead, ran["status"])
                     and _ran_on(connection, lead) == _route(connection, host, lead)
@@ -2023,16 +2023,23 @@ def _ran_on(connection, lead: int) -> str | None:
 
 
 def _stranded(connection, row) -> bool:
-    """Whether the blocked build `row` ran on a satellite other than the one its lane runs on now: its worktree is
-    there, whatever host the block names, so no host requeues it (review round 3 of sd:9775), and pickup builds
-    its item fresh rather than wait on it (round 4 of sd:9774). A lead with no run row, as a bundle drop queues
-    its rows, ran nowhere: not stranded; the claim's `_kept_host` check guards a lane moved since the drop."""
+    """Whether the blocked build `row` keeps a worktree on a host other than the one its lane routes to now: its
+    lead's last run's, or a bundle drop's kept lead's ended run's (`_kept_host`), whatever host the block names, so
+    no host requeues it (review round 3 of sd:9775), and pickup builds its item fresh rather than wait on it
+    (round 4 of sd:9774). A lane moved to the hub counts too: the hub holds no satellite's worktree (pack sd:9964).
+    A fresh row, or a lead with no run row and no kept work, ran nowhere: not stranded."""
     lead = _lead(row)
-    away = _route(connection, row["lane_host"], lead)
-    if away is None or lead is None or connection.execute(
-            "SELECT 1 FROM runner_run WHERE assignment = ?", (lead,)).fetchone() is None:
+    if lead is None:
         return False
-    return _ran_on(connection, lead) != away
+    if connection.execute("SELECT 1 FROM runner_run WHERE assignment = ?", (lead,)).fetchone() is not None:
+        held = _ran_on(connection, lead)
+    else:
+        lead_row = connection.execute("SELECT id, item, parent FROM assignment WHERE id = ?", (lead,)).fetchone()
+        kept = _kept_host(connection, lead_row) if lead_row is not None else None
+        if kept is None:
+            return False
+        held = lane_of(connection, kept[1])
+    return held != _route(connection, row["lane_host"], lead)
 
 
 def _in_work_repo(connection, lead: int, status: str) -> bool:
@@ -2079,8 +2086,8 @@ def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
     beat is fresh and not stuck again (pack sd:8745): a slow-DB stretch blocked them for good before.
 
     Only the item's newest build, its item still `ready`, no other assignment
-    owning it, and its lane (`_route`) still on the host the block names, or
-    moved to this hub's own lanes (sd:8991): an item moved on, or a build
+    owning it, and its lane (`_route`) on the host holding its worktree, or
+    any host for one that never ran (`_stranded`, pack sd:9964): an item moved on, or a build
     requeued by hand since, stays as it is. A satellite takes its own on its
     first tick back, before its pickup reads, so a hub outage that left its
     beat stale requeues its bundles as they were (sd:9775).
@@ -2092,8 +2099,8 @@ def _requeue_beat_blocked(connection, hosts: Collection[str | None]) -> None:
         names = away is not None and (_lead(row) is not None
                                       or row["result"].startswith(f"item {row['item']}'s lane runs on {away}, "))
         # This host ticks, so its beat is back: a satellite takes the rows its own quiet beat blocked (sd:9775), not
-        # one another satellite ran, whose worktree is there (review of sd:9775); the hub takes a lane moved to it,
-        # and any host one that never ran, with no worktree to keep (review round 2).
+        # one another satellite ran, whose worktree is there (review of sd:9775); a lane moved to this host takes
+        # one that never ran, with no worktree to keep (review round 2).
         if away in hosts and (names or None in hosts or _lead(row) is None):
             why = f"the {HEARTBEAT}@{away} beat is fresh" if names else "its lane runs on this host now"
         elif (away is None or None not in hosts or not names
