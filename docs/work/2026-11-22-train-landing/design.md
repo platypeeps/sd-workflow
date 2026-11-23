@@ -55,13 +55,19 @@ these steps. Each step reuses a reader or writer that exists today.
 6. Train PR: one pull request, head the train branch, base `<base>`,
    opened and merged through `sd-ship`'s GitHub client (`land_train`),
    at `sha=M_N` with `merge_method=merge`. GitHub marks
-   each member merged at its `M_i` (fact 3).
-7. Reconcile: each member runs `sd-ship merge` again. It reads
-   `merged: true` and runs the existing `reconcile`, which also checks
-   that `merge_commit_sha` is the receipt's `train_commit`. `Delivers:`
-   on `M_i` closes the item; cleanup runs as today. A pending member's
-   next claim reconciles it as well: `prepare` on a `train_joined`
-   receipt whose pull request merged reconciles instead.
+   each member merged at its `M_i` (fact 3). Once the PUT is sent,
+   only proof decides: the PUT's own `merged: true`, or a read of the
+   pull request merged, is the landing; a 4xx answer to the PUT, or a
+   merge onto another base, is no landing. Anything else is unknown:
+   the entry goes back at `step: train` and never merges alone.
+7. Reconcile: each member runs `sd-ship reconcile`, which sends no
+   merge. It reads `merged: true` and checks that `merge_commit_sha`
+   is the receipt's `train_commit`. `Delivers:` on `M_i` closes the
+   item; cleanup runs as today. A pending member's next claim
+   reconciles it as well: `prepare` on a `train_joined` receipt whose
+   pull request merged reconciles instead. While the train merge is
+   in the fetched base and GitHub still reads the pull request open,
+   prepare, join and merge refuse `train_landed` and write nothing.
 8. Cleanup: the train branch is deleted; a missed delete leaves a ref
    the next train with the same tip pushes up to date.
 
@@ -108,7 +114,11 @@ from 2 to 6 fails, each member ships alone, as after sd:9899: a later
 | 4 branch | sd-train ref | push fails | no gate, no PR; each ships alone | lane: train land fails |
 | 5 gate | sd/local-gate on M_N | the gate fails | no PR; branch deleted; each ships alone | land_train: gate fails |
 | 6 train PR | PR merged, main at final merge | answer lost | read the PR back; merged counts | land_train: lost answer |
-| 6 train PR | none | GitHub refuses the merge | PR closed, branch deleted; ship alone | land_train: refused |
+| 6 train PR | PR merged | PUT says merged; the read after fails, breaks or lags | the PUT's merge is the landing | land_train: put merged, read-back fails / breaks / stale |
+| 6 train PR | PR may be merged | PUT answer lost; the read after fails or says unmerged | unknown; back at step train; no lone merge | land_train: put answer lost, read-back stale / lost |
+| 6 train PR | none | GitHub refuses the merge (4xx) | PR closed, branch deleted; ship alone | land_train: refused |
+| 7 reconcile | none | train merge in the base, GitHub reads the PR open | prepare, join, merge refuse train_landed; no push, no PUT | ship: landed member GitHub reads open |
+| 7 reconcile | none | git cannot say whether the train merge is in the base | retryable refusal; train record kept | ship: git that cannot answer |
 | 7 reconcile | items done, PRs merged | stopped midway | next claim's prepare reconciles | ship: prepare reconciles |
 | 7 reconcile | none | merge_commit_sha is not M_i | refused train_merge_mismatch | ship: mismatch |
 | 7 reconcile | none | stale train_joined, lone merge | merge_dispatch clears train_commit | ship: lone merge after join |
