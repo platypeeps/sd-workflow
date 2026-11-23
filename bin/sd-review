@@ -877,12 +877,15 @@ def summary_key(summary: Any) -> str:
 
 
 def recorded_at(records: Sequence[Rebuttal], path: Any, summary: Any, line: Any, instances: Any = ()) -> Rebuttal | None:
-    """The newest recorded disposition for a finding: the same `summary_key`, its place and every `path:line` instance it names among
-    the places the record answered, its own or one of its instances (sd:9769; build/sd-1623 review: a repeat at a rebutted instance)."""
+    """The newest recorded disposition for a finding: the newest with the same `summary_key` at any place the finding names, its own
+    or a `path:line` instance, when that record answered every one of them (sd:9769; build/sd-1623 review: a newer record at one
+    instance decides over an older rebuttal of both)."""
     def _at(where: Any, number: Any) -> str:
         return f"{where}:{number}" if type(number) is int else str(where)
     key, named = summary_key(summary), {_at(path, line), *(entry.strip() for entry in (instances if isinstance(instances, list) else []) if isinstance(entry, str) and entry.strip())}
-    return next((record for record in records if record.summary == key and named <= {_at(record.path, record.line), *record.instances}), None)
+    newest = next(((record, places) for record in records if record.summary == key
+                   for places in [{_at(record.path, record.line), *record.instances}] if named & places), None)
+    return newest[0] if newest and named <= newest[1] else None
 
 
 def rebuttals(rows: Sequence[Sequence[Any]], on_branch: Callable[[str], bool],
@@ -1831,8 +1834,8 @@ def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]
     def _echo(old: Mapping[str, Any], new: Mapping[str, Any]) -> bool:  # its summary at a nearby caller (sd-review:1809)
         return _file(old, new) and summary_key(old.get("summary")) == summary_key(new.get("summary")) and _near(
             old, new, ECHO_LINES, True)
-    def _answered(old: Mapping[str, Any]) -> bool:  # any repeat that takes its repro answers it (sd-review:1822)
-        return any(_same(old, row) or _echo(old, row) for row in findings)
+    def _answered(old: Mapping[str, Any]) -> bool:  # a repeat at any of its blocker's places answers it (sd-review:1822, :1955)
+        return any(_same(place, row) or _echo(place, row) for place in blockers if origin(place) == origin(old) for row in findings)
     blockers = [old for old in prior if old.get("disposition") == "blocking"]
     matched = [old.get("evidence") for old in blockers if _same(old, record)] or [
         old.get("evidence") for old in blockers if _echo(old, record) and not any(_same(old, row) for row in findings)]
@@ -1841,15 +1844,38 @@ def prior_evidence(prior: Sequence[Mapping[str, Any]], record: Mapping[str, Any]
     return "" if any(_file(old, record) and _near(old, record) and not _answered(old) for old in blockers) else None
 
 
+def instance_place(entry: Any) -> tuple[str, int | None] | None:
+    """A `path:line` instance as its path and line, a bare path with no line; None for no place. A line past 9
+    digits is no line: int() refuses 4301 (build/sd-1623 review)."""
+    path, _, line = entry.strip().rpartition(":") if isinstance(entry, str) else ("", "", "")
+    return (path, int(line)) if path and re.fullmatch(r"[0-9]{1,9}", line) else (entry.strip(), None) if isinstance(entry, str) and entry.strip() else None
+
+
+def respelled(spelled: Callable[[Any], Any], row: Mapping[str, Any]) -> dict[str, Any]:
+    """`row` with its path and each `path:line` instance in `repo_spelling`'s one spelling (build/sd-1623 review)."""
+    def _at(entry: Any) -> Any:
+        place = instance_place(entry)
+        return entry if place is None else spelled(place[0]) if place[1] is None else f"{spelled(place[0])}:{place[1]}"
+    found = row.get("instances")
+    return dict(row, path=spelled(row.get("path")), **({"instances": [_at(entry) for entry in found]} if isinstance(found, list) else {}))
+
+
+def origin(row: Mapping[str, Any]) -> str:
+    """The prior blocker a row places: each of its places, instance or move, is one blocker (sd-review:1955)."""
+    return row["origin"] if isinstance(row.get("origin"), str) else json.dumps(
+        [row.get("path"), row.get("line"), row.get("summary")], sort_keys=True, default=str)
+
+
 def instance_rows(row: Mapping[str, Any]) -> list[dict[str, Any]]:
     """A prior blocker once per distinct place its `instances` name, the reported one first: a fix to one instance
     leaves the others holding it (build/sd-1623 review, bin/sd-review:1833); `prior_at` maps each place."""
-    places = {json.dumps([row.get("path"), row.get("line")], sort_keys=True, default=str): dict(row)}  # any JSON is a key (sd-review:1844)
-    for entry in row.get("instances") if row.get("disposition") == "blocking" and isinstance(row.get("instances"), list) else ():
-        path, _, line = entry.strip().rpartition(":") if isinstance(entry, str) else ("", "", "")
-        place = (path, int(line)) if path and re.fullmatch(r"[0-9]{1,9}", line) else (entry.strip(), None) if isinstance(entry, str) and entry.strip() else None
-        if place:  # ponytail: a line past 9 digits is no line; int() refuses 4301 digits
-            places.setdefault(json.dumps(place), dict(row, path=place[0], line=place[1]))
+    expands = row.get("disposition") == "blocking" and isinstance(row.get("instances"), list)
+    first = dict(row, origin=origin(row)) if expands else dict(row)
+    places = {json.dumps([row.get("path"), row.get("line")], sort_keys=True, default=str): first}  # any JSON is a key (sd-review:1844)
+    for entry in row["instances"] if expands else ():
+        place = instance_place(entry)
+        if place:
+            places.setdefault(json.dumps(place), dict(first, path=place[0], line=place[1]))
     return list(places.values())
 
 
@@ -1950,8 +1976,8 @@ def prior_at(root: pathlib.Path, old: str, new: str, rows: Sequence[Mapping[str,
         moved = _moved(start, row["path"], row["line"], path) if diff else None
         # A move also holds the hunk's place: an edited line whose old text appears elsewhere may still be the
         # defect (build/sd-1623 review, bin/sd-review:2612): fail closed.
-        kept = dict(row, path=path, line=row["line"] if diff is None else moved_line(diff, row["line"]))
-        return [kept, dict(row, path=moved[0], line=moved[1])] if moved else [kept]
+        kept = dict(row, path=path, line=row["line"] if diff is None else moved_line(diff, row["line"]), origin=origin(row))
+        return [kept, dict(kept, path=moved[0], line=moved[1])] if moved else [kept]
     return [place for row in rows for place in _remapped(row)]
 
 
@@ -2609,11 +2635,13 @@ def review(
         outcomes = [outcome for _measured, attempts in answers for outcome in attempts]
         outcomes = [row._replace(status=FINDINGS if row.findings else CLEAN) if (row.diagnostic or {}).get("coverage") == "partial" and set(row.diagnostic["omitted_paths"]) <= {path["path"] for path in input_manifest.get("paths", ()) if path.get("media")} and any(other.status in (CLEAN, FINDINGS) for other in outcomes) else row for row in outcomes]
         spelled = repo_spelling(root)  # build/sd-1423: one spelling per finding before any is matched
-        outcomes = [row._replace(findings=tuple(dict(found, path=spelled(found["path"])) for found in row.findings)) for row in outcomes]
+        outcomes = [row._replace(findings=tuple(respelled(spelled, found) for found in row.findings)) for row in outcomes]
         finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)],
-                      [row._replace(path=spelled(row.path)) for row in rebutted], subject.scope != "planning",
-                      prior_at(root, previous["subject"].get("head"), subject.head, [dict(row, path=spelled(row["path"]))
-                                                                                     for found in unresolved(previous) for row in instance_rows(found)]) if previous else ())
+                      [row._replace(path=spelled(row.path), instances=tuple(respelled(spelled, {"instances": list(row.instances)})["instances"]))
+                       for row in rebutted], subject.scope != "planning",
+                      prior_at(root, previous["subject"].get("head"), subject.head, [
+                          dict(row, path=spelled(row["path"])) for found in unresolved(previous)
+                          for row in instance_rows(respelled(spelled, found))]) if previous else ())
         if any(not reads_checkout(provider) for provider in chosen if provider.name in result["reviewed_by"]):
             result["covers_from"] = None  # a reader handed patches saw no whole file: no chain (sd:9769)
     finally:

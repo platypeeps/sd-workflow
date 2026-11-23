@@ -1119,11 +1119,17 @@ class LineBudgetTests(unittest.TestCase):
         # so `recorded_at` matches a rebuttal at any place it answered and a
         # moved blocker also holds its hunk's place. Measured: `sd-review`
         # is 3122 here.
+        #
+        # 5092 -> 5120 is the third build/sd-1623 review: `bin/sd-review`
+        # +28 for `instance_place`, `respelled` and `origin`: instances in
+        # one spelling, the newest overlapping record decides, and a repeat
+        # at any place of a blocker answers it. Measured: `sd-review` is
+        # 3150 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5092,
+            5120,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
