@@ -2,7 +2,7 @@
 title: A hand prepare renews a delivery claim the item outgrew
 created: 2026-11-19
 item: sd:9268
-branch: build/sd-9268-renewal
+branch: build/sd-1636
 ---
 
 # Design — delivery-claim-renewal
@@ -24,9 +24,12 @@ request exists, prepare saves its title, body, claim and closing set as
 The review class: what counts as the evidence a delivery stands on,
 and when a stored claim, body or flag goes stale. Two rules answer it.
 
-- Evidence is a row's criterion, evidence, result and waiver
-  (`evidence_of`). A comment or a waiving note's body proves nothing.
-  A renewal whose rows prove nothing new refuses.
+- Evidence is a row's evidence, result and waiver (`evidence_of`),
+  with text folded (NFKC, spacing). A comment, a waiving note's body
+  or a criterion's name proves nothing. A renewal whose rows prove
+  nothing new refuses.
+- The published closing set is bound to the head it was read at.
+  Reconcile refuses to deliver or close a merge of another head.
 - A `pending` set is stale for merge. Merge refuses `prepare_required`
   while one waits, in every mode (`merge_scope`).
 
@@ -36,8 +39,8 @@ mode; a pending body can wait in any mode.
 ## Non-goals
 
 - The sticky `renewed` mark (pack sd:9580). The operator ruled it
-  ships after this item merges (note #64736). A patch waits at
-  `/Volumes/local/repo-storage/sd-workflow/patches/`.
+  ships after this item merges (note #64736). Its old patch no longer
+  applies; sd:9580 rebuilds on this.
 - Renewal from phase `merge_dispatch`: prepare routes it to reconcile.
 
 ## Failure table
@@ -60,6 +63,9 @@ the `renewed` mark in `bin/sd-ship`. Tests are in
 | merge dispatch | `merge_message` from the published body | the answer is lost | reconcile reads the PR; no second merge | `test_lost_merge_response_reconciles_without_a_second_merge` |
 | merge read of scope | none | the item changed after the claim | refuses; nothing merged; renew by hand | `test_a_scope_change_before_the_merge_says_nothing_merged` |
 | reconcile read of scope | `merged`, the closing set | the item changed after the merge | refuses; the advice delivers by hand | `test_a_scope_change_after_the_merge_gives_the_merged_advice` |
+| renewal evidence text | none | old evidence with a trailing space, line break or renamed criterion | folded the same; refuses before any save | `test_a_renewal_whose_evidence_differs_only_in_spacing_or_its_criterion_name_refuses` |
+| reconcile of another head | `merged` recorded | a reprepare pushed a tip, then refused; GitHub merged that tip | refuses `closing_set_stale`; nothing delivered or closed; deliver by hand | `test_a_reconcile_of_a_head_the_published_closing_set_was_not_read_at_refuses` |
+| hand prepare under a lane row | none | a running row with no lane mark counts it as the lane's | refuses `lane_entry_running`, naming the row and `sd-ship lane cancel` | `test_a_hand_prepare_held_by_a_running_lane_row_names_that_row` |
 | lane retry after a renewal | none | old items or evidence | refuses `delivery_claim_renewed` | `test_a_lane_retry_of_an_entry_older_than_a_renewal_refuses`, `test_a_lane_retry_with_the_items_a_renewal_dropped_refuses` |
 | `renewed` mark | kept on every later claim | a new enqueue with new evidence refuses too | sd:9580, next PR; no fix here (ruling #64736) | `test_a_lane_retry_of_an_entry_older_than_a_renewal_refuses` |
 
