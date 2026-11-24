@@ -3122,7 +3122,8 @@ def settle_mark(queue: Queue, entry: dict[str, Any], token: str, root: pathlib.P
     """The claimed `entry` at the head a train's prepare of it pushed, its `TRAIN_PREPARING` mark dropped.
 
     A train that prepared the member and could not write the head after
-    leaves the mark (`follow_prepare`). `origin/<branch>` is that head when
+    leaves the mark (`follow_prepare`), as does a train fence that could
+    not read its lead's (`advance`). `origin/<branch>` is that head when
     it is the catch-up or rebase of the marked head; anything else keeps
     the queued head, and `checkout_for` skips a move as before. A fetch
     with no answer raises `PUBLISH_UNKNOWN`.
@@ -3140,6 +3141,7 @@ def settle_mark(queue: Queue, entry: dict[str, Any], token: str, root: pathlib.P
         row = held(entries, entry, token)
         row["expected_head"] = new
         row.pop(TRAIN_PREPARING, None)
+        row.pop("head_unknown", None)
     runner_write(queue, drop_mark)
     return {key: value for key, value in {**entry, "expected_head": new}.items() if key != TRAIN_PREPARING}
 
@@ -4402,7 +4404,8 @@ def advance(queue: Queue, entry: dict[str, Any], token: str, step: str = "merge"
     `train` names the lead's prepared `head` and the train's `branch`. The
     row moves to the published head that prepare left (`prepared_head`),
     so a put-back or reclaim finds the lead where it can reconcile; a head
-    no read could see holds the row (`head_unknown`) until a release. The
+    no read could see holds the row (`head_unknown`) until a release, and
+    marks it `TRAIN_PREPARING` so the claim after reads that head. The
     lead and each member keep `TRAIN_SENT`, which each one's next claim
     settles before any lone merge (`sent_train_settled`); a lone merge's
     write drops the lead's (review of sd:9923). Answers the head the row
@@ -4442,6 +4445,7 @@ def advance(queue: Queue, entry: dict[str, Any], token: str, step: str = "merge"
                 row.update(expected_head=expected, **{TRAIN_SENT: train["branch"]})
                 row.pop("head_unknown", None)
                 if found is None:  # the train may land the rewrite: a put-back here must not run the old head
+                    row[TRAIN_PREPARING] = expected  # its next claim moves it to the rewrite (`settle_mark`)
                     row.update(held=True, held_at=stamp_now(), head_unknown={"at": stamp_now(), "reason": (
                         f"the fence could not read origin/{branch} after prepare, so the head is unknown; "
                         f"`sd-ship lane release {entry['item']}` runs it again once that branch reads")})

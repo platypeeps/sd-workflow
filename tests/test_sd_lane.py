@@ -2534,6 +2534,55 @@ class TrainLanding(Trees):
         row = self.entries()[0]
         self.assertEqual((sd_lane.runnable(row), row[sd_lane.TRAIN_SENT]), (True, "sd-train/abc"))
 
+    def unread_fence(self) -> tuple[dict, str, str]:
+        """sd:1 fenced for a train while no read of `origin` answers; its claimed row, old and rebased head."""
+        self.queue_three()
+        lead = self.entries()[0]
+        sd_lane.update(self.store(), lambda rows: rows[0].update(status="running", holder={"token": "dead"}))
+        self.commit_files(self.repo, {"later.txt": "l\n"}, "main moved again")
+        git(self.repo, "push", "-q", "origin", "main")
+        git(self.first, "fetch", "-q", "origin")
+        git(self.first, "rebase", "-q", "origin/main")
+        git(self.first, "commit", "-q", "--amend", "-m", "first\n\nDelivers: sd:1")
+        git(self.first, "push", "-q", "--force", "origin", "HEAD:refs/heads/first")
+        head = git(self.first, "rev-parse", "HEAD")
+        with mock.patch.object(sd_lane, "publish_git", lambda *args: None):
+            sd_lane.advance(self.store(), {**lead, "status": "running"}, "dead", "train", self.entries()[1:],
+                            {"head": head, "branch": "sd-train/abc"})
+        return lead, lead["expected_head"], head
+
+    def claimed_again(self) -> dict:
+        """sd:1 as its next claim reads it, running under `next`."""
+        sd_lane.update(self.store(), lambda rows: rows[0].update(status="running", holder={"token": "next"}))
+        return self.entries()[0]
+
+    def test_a_released_lead_of_an_unread_fence_moves_to_its_rebase_on_its_claim(self) -> None:
+        """Class pass of sd:9923: the unread fence left no mark, so the released lead skipped as moved."""
+        lead, old, head = self.unread_fence()
+        sd_lane.put_back(self.store(), lead, "dead", old, retryable_retries=1)
+        sd_lane.set_hold(self.repo, 1, self.environ, held=False)
+        settled = sd_lane.settle_mark(self.store(), self.claimed_again(), "next", self.repo)
+        row = self.entries()[0]
+        self.assertEqual((settled["expected_head"], row["expected_head"], row[sd_lane.TRAIN_SENT]),
+                         (head, head, "sd-train/abc"))
+        self.assertFalse({sd_lane.TRAIN_PREPARING, "head_unknown"} & set(row))
+
+    def test_a_reclaimed_or_stopped_lead_of_an_unread_fence_keeps_its_mark(self) -> None:
+        """Class pass of sd:9923: each put-back of the fenced row keeps the mark its next claim settles."""
+        for name, back in (("reclaim", lambda row, old: sd_lane.reclaim(row)),
+                           ("hub stop", lambda row, old: sd_lane.resume_stopped(row, {"expected_head": old,
+                                                                                    "at": "now"}))):
+            with self.subTest(name):
+                self.setUp()
+                _lead, old, head = self.unread_fence()
+                sd_lane.update(self.store(), lambda rows, back=back, old=old: back(rows[0], old))
+                row = self.entries()[0]
+                self.assertEqual((row["status"], sd_lane.runnable(row), row.get(sd_lane.TRAIN_PREPARING)),
+                                 ("pending", False, old))
+                sd_lane.set_hold(self.repo, 1, self.environ, held=False)
+                self.assertEqual(sd_lane.settle_mark(self.store(), self.claimed_again(), "next",
+                                                     self.repo)["expected_head"], head)
+
     def test_the_fence_marks_each_member_with_the_sent_train(self) -> None:
         """Class pass of sd:9923: a member claimed before its lead had no guard against a lone merge."""
         self.fenced_lead()
