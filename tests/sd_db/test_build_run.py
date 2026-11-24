@@ -5622,10 +5622,7 @@ class Drafts(Case):
         self.write_pr()
         (self.plans / "rule.json").write_text(json.dumps({"item": design, "body": f"Ruling on note #{asked['id']}: B"}))
         self.plan(claude=["rule"], sd_review=["clean"])
-        self.assertEqual(self.supervisor().run()["step"], "enqueued")
-        enqueue = next(call["argv"] for call in self.calls("sd-ship") if "enqueue" in call["argv"])
-        self.assertEqual([enqueue[n + 1] for n, arg in enumerate(enqueue) if arg == "--item"], [str(self.items[0])])
-        self.assertEqual(self.statuses(), ["in_progress", "blocked"])
+        self.assert_stale_design_held(design)
 
     def test_two_designs_in_one_file_do_not_reach_review(self):
         """Review of sd:10096: two designs with one title closed from one design.md that kept only one.
@@ -5711,10 +5708,15 @@ class Drafts(Case):
         add_note(self.db, design, "decision", f"Reversed ruling #{ruling}: question #{asked['id']} asks again.")
         writes.reopen_note(self.db, asked["id"])
         self.assertNotIn("Ruling on note", self.supervisor().brief()["findings"])
-        self.assertEqual(self.supervisor().run()["step"], "enqueued")
-        enqueue = next(call["argv"] for call in self.calls("sd-ship") if "enqueue" in call["argv"])
-        self.assertEqual([enqueue[n + 1] for n, arg in enumerate(enqueue) if arg == "--item"], [str(self.items[0])])
-        self.assertEqual(self.statuses(), ["in_progress", "blocked"])
+        self.assert_stale_design_held(design)
+
+    def assert_stale_design_held(self, design: int):
+        """Review of sd:10096: the branch holds the design.md written under the old ruling. Left out of the
+        delivery, it landed all the same with the code: the run blocks and enqueues nothing."""
+        ended = self.supervisor().run()
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+        self.assertIn(f"design sd:{design}", build.run(self.db, self.bundle["id"])["detail"])
 
     def test_every_hub_read_before_the_draft_run_loop_is_retried_with_the_child_kept(self):
         """Round 2: `DraftSupervisor` has its own constructor and its own reads."""

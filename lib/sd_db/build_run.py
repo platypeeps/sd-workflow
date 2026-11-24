@@ -2194,6 +2194,13 @@ class Supervisor:
         left = build.design_left(self.db, delivered, [self.lead, *self.others])
         if left:
             return self.finish("blocked", f"{left}; rule on the design or commit its design.md, then Retry")
+        # A design left out so still has its design.md on the branch, written under the old ruling: it would
+        # land with the code while its item stays open (review of sd:10096).
+        stale = sorted(build.aboard(self.db, asked))
+        if stale:
+            return self.finish("blocked", f"design {', '.join(f'sd:{item}' for item in stale)} waits on the "
+                                          f"operator again, and the branch holds its design.md written under the "
+                                          f"old ruling; rule on it, then Retry")
         # Nor does a design ship without code: the lane refuses a branch of design records
         # (`design_only_delivery`), and no reader of a delivery expects one with no code item (class pass).
         if delivered and build.aboard(self.db, delivered) == set(delivered):
