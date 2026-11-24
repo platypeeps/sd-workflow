@@ -5175,6 +5175,61 @@ roles:
         state = self.operation().state
         self.assertEqual((state.get("opened_pull_request"), state["pull_request"]["number"]), (None, 1))
 
+    def stopped_at_save(self, count: int, *extra) -> None:
+        """A prepare with `extra` that stops at its `count`th save of the receipt, which is not written."""
+        real, seen = ship.Ship.save, []
+
+        def save(operation, **fields):
+            seen.append(fields)
+            if len(seen) == count:
+                raise KeyboardInterrupt
+            return real(operation, **fields)
+
+        with patch.object(ship.Ship, "save", save), contextlib.redirect_stderr(io.StringIO()), \
+                self.assertRaises(KeyboardInterrupt):
+            self.prepare(*extra)
+
+    def test_a_prepare_stopped_after_it_recorded_an_owed_copilot_request_holds_the_merge(self):
+        """The class, last round of sd:9268: a prepare records what it owes in more than one save, and merge
+        read one of them. Stopped between `copilot_review_owed` and `pending`, the receipt read as owing
+        nothing, and merge went without the review the operator asked for."""
+        self.prepare()
+        self.stopped_at_save(2, "--copilot-review", "request")
+        state = self.operation().state
+        self.assertEqual((state.get("copilot_review_owed"), state.get("pending")), (True, None))
+        with self.assertRaisesRegex(ship.Refusal, "nothing merged.*`--copilot-review skip` withdraws it") as caught:
+            self.merge()
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "prepare_required")
+        self.assertEqual(self.prepare()["copilot_review"]["decision"], "recorded")  # the retry pays it
+        self.assertEqual(len(self.double.copilot_requests), 1)
+        self.assertFalse(self.operation().state.get("copilot_review_owed"))
+
+    def test_a_skip_stopped_halfway_never_leaves_the_request_it_withdraws_owed(self):
+        """The same class: `skip` saved its suppression, then withdrew the owed request in a second save. A
+        stop between left both, and the plain retry asked for the paid review the operator had skipped."""
+        self.prepare()
+        self.stopped_at_save(2, "--copilot-review", "request")
+        self.stopped_at_save(2, "--copilot-review", "skip")
+        state = self.operation().state
+        self.assertEqual((state.get("copilot_review_suppressed"), bool(state.get("copilot_review_owed"))),
+                         (True, False))
+        self.assertEqual(self.prepare()["copilot_review"]["decision"], "skipped")
+        self.assertEqual(self.double.copilot_requests, [])
+        self.assertEqual(self.merge()["phase"], "merged")
+
+    def test_a_prepare_stopped_after_its_copilot_request_was_recorded_asks_no_second_one(self):
+        """The same class, a guard that held: the request is recorded in one save and no longer owed in the
+        next. A stop between holds the merge, and the retry reads the recorded request, charging none."""
+        self.prepare()
+        with patch.object(ship.Ship, "clear_copilot_suppression", side_effect=KeyboardInterrupt), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaises(KeyboardInterrupt):
+            self.prepare("--copilot-review", "request")
+        with self.assertRaisesRegex(ship.Refusal, "nothing merged"):
+            self.merge()
+        self.assertEqual(self.prepare()["copilot_review"]["decision"], "already_recorded")
+        self.assertEqual(len(self.double.copilot_requests), 1)
+        self.assertFalse(self.operation().state.get("copilot_review_owed"))
+
     def test_an_explicit_skip_withdraws_an_owed_copilot_request(self):
         """The way out when Copilot stays down: the operator's `skip` withdraws the request, and merge goes."""
         self.prepare()

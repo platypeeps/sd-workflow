@@ -925,11 +925,13 @@ class Ship(SharedReview):
         refuses without a request receipt.
         """
         self.assert_scope(merging=True)
-        pending = self.state.get("pending")
-        if pending and (self.args.abandon_copilot_review is None
-                        or any(self.state.get(key) != value for key, value in pending.items())):
+        # An owed Copilot request holds the merge by itself: it is saved before `pending`, and a prepare
+        # stopped between the two left a receipt that read as owing nothing (sd:10207).
+        pending, owes = self.state.get("pending"), bool(self.state.get("copilot_review_owed"))
+        if (pending or owes) and (self.args.abandon_copilot_review is None
+                                  or any(self.state.get(key) != value for key, value in (pending or {}).items())):
             owed = ("; that prepare asks again for the Copilot review an earlier one could not request, and "
-                    "`--copilot-review skip` withdraws it" if self.state.get("copilot_review_owed") else "")
+                    "`--copilot-review skip` withdraws it" if owes else "")
             raise Refusal("the last prepare did not finish, as one whose Copilot request failed: it saved a "
                           "title, body or delivery claim and did not publish them; "
                           f"nothing merged: prepare again, then merge{owed}", code="prepare_required",
@@ -1499,11 +1501,14 @@ class Ship(SharedReview):
         suppressed = self.state.get("copilot_review_suppressed", False)
         if type(suppressed) is not bool:
             raise Refusal("Copilot review suppression receipt is malformed")
-        if self.args.copilot_review == "skip" and not suppressed:
-            self.save(copilot_review_suppressed=True)
         owed = self.args.copilot_review == "request"
-        if self.args.copilot_review != "auto" and bool(self.state.get("copilot_review_owed")) != owed:
-            self.save(copilot_review_owed=owed)
+        # One save: a stop between two left a skip's suppression beside the request it withdraws (sd:10207).
+        direction = {**({"copilot_review_suppressed": True}
+                        if self.args.copilot_review == "skip" and not suppressed else {}),
+                     **({"copilot_review_owed": owed} if self.args.copilot_review != "auto"
+                        and bool(self.state.get("copilot_review_owed")) != owed else {})}
+        if direction:
+            self.save(**direction)
 
     def clear_copilot_suppression(self) -> None:
         suppressed = self.state.get("copilot_review_suppressed", False)
