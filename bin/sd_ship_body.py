@@ -199,7 +199,8 @@ def _cut(line: str, text: str, lazy: bool, cut: list[tuple[int, int]], was: bool
     if runs and runs[-1][2]:  # only the last run on a line can be open past its end
         first = runs[-1][0]
         pending.append((len(rows), first > 0 and bool(re.match(r"\w", line[first - 1])), line[first:]))
-    return _less(line, text, lazy, runs), _less(line, line, False, runs, True)
+    lead = len(line) - len(line.lstrip() if lazy else text.lstrip())  # where the line's own text starts
+    return _less(line, text, lazy, runs), _less(line, line, False, runs, lead)
 
 
 def _settle(rows: list, pending: list[tuple[int, bool, str]], right: str | None, ended: bool = True) -> None:
@@ -214,17 +215,32 @@ def _settle(rows: list, pending: list[tuple[int, bool, str]], right: str | None,
     del pending[:len(pending) if ended else 0]
 
 
-def _less(line: str, text: str, lazy: bool, runs: list[tuple[int, int, bool]], held: bool = False) -> str:
+def _less(line: str, text: str, lazy: bool, runs: list[tuple[int, int, bool]], lead: int | None = None) -> str:
     """`text`, the part of `line` a row holds, with each comment run read as one space: a reader sees
     no comment, and what stood either side of it stays apart (pack sd:10090). A run with a word
-    character either side reads as `_SEAM`: a reader sees one token there, which a space would split.
-    A run open past the line end after a word character, or any such run when `held`, reads as
-    `_OPEN`, which its close decides."""
+    character either side reads as `_SEAM`: a reader sees one token there, which a space would split;
+    one between a word character and punctuation reads as nothing, so `Kept<!-- -->:` keeps its colon.
+    A run open past the line end after a word character reads as `_OPEN`, which its close decides.
+
+    With `lead`, the column the line's own text starts at, `text` is the whole line for a second read
+    (`_listed_undone`), which takes each line's role from what stands here. So no stand-in may give
+    the text beside it a role: a run that leads the line's text reads as `_SEAM` at the line's
+    indent, so what follows is prose there and no item, indent or deeper line; every run open past
+    the line end reads as `_OPEN`; and a run before punctuation stays a space, so `1<!-- -->.` makes
+    no marker."""
     start = len(line) - len(line.lstrip()) if lazy else len(line) - len(text)  # a lazy line's text is stripped
+    indent = len(line) - len(line.lstrip())
     for first, last, open_on in reversed(runs):
+        after = line[last:last + 1]
         word = first > 0 and re.match(r"\w", line[first - 1])
-        seam = _OPEN if open_on and (word or held) else \
-            _SEAM if word and re.match(r"\w", line[last:last + 1]) else " "
+        if open_on and (word or lead is not None):
+            seam = _OPEN
+        elif lead is not None and first <= lead and line[last:].strip():
+            seam = line[first:indent] + _SEAM
+        elif word and re.match(r"\w", after):
+            seam = _SEAM
+        else:
+            seam = "" if word and lead is None and after.strip() else " "
         first, last = max(first - start, 0), last - start
         if last > first:
             text = text[:first] + seam + text[last:]
@@ -644,9 +660,13 @@ def _listed_undone(message: str) -> list[str]:
     nothing: once whole, with the fences, comments and code spans that
     grammar finds, and once with only its fences, over the lines
     CommonMark leaves outside a comment and a code span, each comment
-    on them read as in the first.
+    on them read as in the first. A comment's stand-in gives the text
+    beside it no role in either read: text after a comment that leads
+    a line, or after the `-->` a comment closes with, is prose at the
+    line's indent, which heads as any line does and opens no item.
     """
-    shown = "\n".join(line for _, kind, *_, spanned, line in _blocks(message) if not spanned and kind != "comment")
+    shown = "\n".join(line for _, kind, *_, spanned, line in _blocks(message)
+                      if not spanned and (kind != "comment" or line.lstrip().startswith(_SEAM)))
     found = _listed(_blocks(message, plain=True))
     return found + [sha for sha in _listed(_blocks(shown, comments=False, plain=True)) if sha not in found]
 
@@ -669,8 +689,10 @@ def _listed(rows) -> list[str]:
             undoes += [False] * (opened - 1) + [holder]
         elif kind == "setext":  # the underline makes the line above it the heading
             undoes[-1] = bool(_REVERTED_INTRO.search(_heading(previous)))
-        elif kind == "text" and text and (_heading(text).endswith(":") or not line[0].isspace() or _ATX.match(raw)):
-            # Any other indented line continues an item.
+        elif kind in ("text", "comment") and text and (_heading(text).endswith(":") or not line[0].isspace()
+                                                       or _ATX.match(raw)):
+            # Any other indented line continues an item. On the line a comment closes on, `text` is what
+            # follows its `-->`: a reader sees it, so it heads as any line does, and opens no item.
             undoes[-1] = bool(_REVERTED_INTRO.search(_heading(text)))
         previous = text
     return found

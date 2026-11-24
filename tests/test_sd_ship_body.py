@@ -876,6 +876,52 @@ class CitedIdTests(unittest.TestCase):
             with self.subTest(message=message):
                 self.assertEqual(sd_ship_body._listed_undone(message), found)
 
+    def test_a_comment_gives_the_text_after_it_no_new_role(self) -> None:
+        """Class pass, round 5 of build/sd-1653 (pack sd:10090). The class: a comment's stand-in, or its
+        dropped line, changed the role of the text beside it: prose became a list item, a heading moved
+        into an item, or a heading a reader sees was lost. The scan decides a line's role from the line
+        as written; text after a comment that leads a line is prose at the line's own indent, which may
+        head and opens no item, in both reads. Each instance is a row."""
+        a, k = "a" * 7, "b" * 7
+        top = f"Reverted commits:\n- {a} renew\n"
+        listed = {
+            # 1. The second read took the stand-in's blank for an indent, and the marker after it for an item.
+            f"Reverted commits:\n<!-- x --> - {k} renew\n": [],
+            f"Reverted commits:\n<!-- x -->- {k} renew\n": [],
+            f"Reverted commits:\n<!-- x --><!-- y --> - {k} renew\n": [],
+            # 2. The blank moved a heading into the item above it, so the kept list stayed under `Reverted`.
+            f"{top}<!-- why --> Kept:\n- {k} retained\n": [a],
+            f"{top}<!-- why -->Kept:\n- {k} retained\n": [a],
+            # 3. The same after a list marker: the second read nested an item that says reverted.
+            f"Notes:\n- <!-- x -->- Reverted commits:\n    - {k}\n": [],
+            f"Notes:\n- <!-- x -->  - Reverted commits:\n      - {k}\n": [],
+            # 4. The line a comment closes on was dropped whole, with the heading after its `-->`.
+            f"{top}<!-- why\n--> Kept:\n- {k} retained\n": [a],
+            f"{top}<!-- why\nmore -->Kept commits:\n- {k} retained\n": [a],
+            f"{top}<!--\nwhy\n--><!-- x --> Kept:\n- {k} retained\n": [a],
+            f"Kept:\n<!-- why\n--> Reverted commits:\n- {a} renew\n": [a],
+            # What follows the close opens no item, as before; a close with nothing after it heads nothing.
+            f"Reverted commits:\n<!-- why\n--> - {k} renew\n": [],
+            f"Reverted commits:\n<!-- why\n-->\n- {a} renew\n": [a],
+            # 5. A comment before a heading's colon took the heading's word from it.
+            f"Reverted commits<!-- x -->:\n- {a} renew\n": [a],
+            f"{top}Kept<!-- x -->:\n- {k} retained\n": [a],
+            # A stand-in before punctuation makes no marker for the second read: `1<!-- -->.` is no item.
+            f"Reverted commits:\ntext\n\n1<!-- x -->. {k} renew\n": [],
+        }
+        for message, found in listed.items():
+            with self.subTest(message=message):
+                self.assertEqual(sd_ship_body._listed_undone(message), found)
+        # The property: a heading reads the same behind a comment that leads its line as on its own.
+        leads = ("<!-- c -->", "<!-- c --> ", "<!-- c --><!-- d -->", "<!-- c\n-->", "<!--\nc\nd --> ")
+        heads = ("Kept:", "Kept commits:", "Reverted commits:", "Reverts:", "## Kept:")
+        for lead, head, indent, first in itertools.product(leads, heads, ("", "  "), ("Reverted commits:", "Kept:")):
+            plain = f"{first}\n- {a} renew\n{indent}{head}\n- {k} retained\n"
+            lead = lead.replace("\n", "\n" + indent)  # each line of the comment at the heading's indent
+            message = f"{first}\n- {a} renew\n{indent}{lead}{head}\n- {k} retained\n"
+            with self.subTest(message=message):
+                self.assertEqual(sd_ship_body._listed_undone(message), sd_ship_body._listed_undone(plain))
+
     def test_a_merge_the_branch_reverts_cites_nothing_it_brought_in(self) -> None:
         """Lane review of sd:5999, round 3: `git revert -m 1 <merge>` undoes each commit the merge brought in."""
         base, side, main, merge, undo, again = (c * 40 for c in "abcdef")
