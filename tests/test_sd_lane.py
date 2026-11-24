@@ -3754,6 +3754,34 @@ class CitedCloses(SharedQueue):
         entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
         self.assertEqual(entry["closes"], [a])
 
+    def test_an_unrelated_revert_keeps_the_close_of_work_a_later_change_moved(self) -> None:
+        """sd:10214 review round 4: a revert that touches none of a cited commit's files undid none of its work.
+
+        A later refactor moves the cited work out of its file, so the file
+        reads as before it; a revert of other work on the same branch made
+        that read count as an undo, and the shipped item stayed open.
+        """
+        a, *_ = self.open
+        tree, _ = self.committed("topic-unrelated-revert")
+        (tree / "work.txt").write_text("work\n", encoding="utf-8")
+        git(tree, "add", "work.txt")
+        git(tree, "commit", "-q", "-m", f"feat: implement\n\nCloses: sd:{a}")
+        git(tree, "rm", "-q", "work.txt")
+        (tree / "caller.txt").write_text("work\n", encoding="utf-8")
+        git(tree, "add", "caller.txt")
+        git(tree, "commit", "-q", "-m", "refactor: fold the work into the caller")
+        (tree / "other.txt").write_text("other\n", encoding="utf-8")
+        git(tree, "add", "other.txt")
+        git(tree, "commit", "-q", "-m", "fix: other")
+        git(tree, "rm", "-q", "other.txt")
+        git(tree, "commit", "-q", "-m", "revert: hold the other fix")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [a])
+        import sd_operations
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a})
+
     def test_an_associate_only_claim_closes_nothing_it_cites(self) -> None:
         entry = self.enqueue("Words.\n", f"fix: the slice\n\nCloses: sd:{self.open[0]}", claim="associate-only")
         self.assertEqual(entry["closes"], [])

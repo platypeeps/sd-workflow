@@ -999,7 +999,10 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     it, or as at `head`'s merge base with `origin/<base>`: the branch
     leaves them as it found them. The second read catches a cited commit
     stacked on an earlier one, or one main moved since (sd:10214, system
-    PR #727 closed three items so). A read that fails keeps the commit.
+    PR #727 closed three items so). The later reverts must change every
+    one of those files: a revert of other work undid none of it, though a
+    later refactor moved it out (sd:10214 review). A read that fails
+    keeps the commit.
 
     `kept_commits` reads this list after it, so this check hides none of
     its evidence (sd:10214 review). An undone commit stays in place with
@@ -1015,14 +1018,20 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         same = publish_git(worktree, "--literal-pathspecs", "diff", "--quiet", before, head, "--", *names)
         return bool(same) and same.returncode == 0
 
+    def commit_files(sha: str) -> list[str]:
+        # NUL-separated and literal: git quotes a name with a tab or non-ASCII byte otherwise.
+        files = publish_git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-z", "-r", sha)
+        return [name for name in files.stdout.split("\0") if name] if files and files.returncode == 0 else []
+
     kept = []
     for index, (sha, message) in enumerate(commits):
-        if "Closes:" in message and any(sd_ship_body.REVERT_SUBJECT.match(later) for _, later in commits[:index]):
-            # NUL-separated and literal: git quotes a name with a tab or non-ASCII byte otherwise.
-            files = publish_git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-z", "-r", sha)
-            names = [name for name in files.stdout.split("\0") if name] if files and files.returncode == 0 else []
+        reverts = [later for later, text in commits[:index] if sd_ship_body.REVERT_SUBJECT.match(text)]
+        if "Closes:" in message and reverts:
+            names = commit_files(sha)
+            touched = {name for later in reverts for name in commit_files(later)}
             at_base = None if sd_ship_body.reverts_another(message) else fork
-            if names and any(reads_as_at(before, names) for before in (f"{sha}^", at_base) if before):
+            if (names and touched.issuperset(names)
+                    and any(reads_as_at(before, names) for before in (f"{sha}^", at_base) if before)):
                 message = ""
         kept.append((sha, message))
     return kept
