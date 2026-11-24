@@ -2530,6 +2530,9 @@ class TrainLanding(Trees):
         self.assertEqual((row["status"], sd_lane.runnable(row), row[sd_lane.TRAIN_SENT]),
                          ("pending", False, "sd-train/abc"))
         self.assertIn("release", row["head_unknown"]["reason"])
+        sd_lane.set_hold(self.repo, 1, self.environ, held=False)  # round 4: the release it names must work
+        row = self.entries()[0]
+        self.assertEqual((sd_lane.runnable(row), row[sd_lane.TRAIN_SENT]), (True, "sd-train/abc"))
 
     def test_the_fence_marks_each_member_with_the_sent_train(self) -> None:
         """Class pass of sd:9923: a member claimed before its lead had no guard against a lone merge."""

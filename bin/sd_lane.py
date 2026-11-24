@@ -1850,11 +1850,17 @@ def move(root: pathlib.Path, item: int, where: str, environ: dict[str, str], *,
 
 def set_hold(root: pathlib.Path, item: int, environ: dict[str, str], *, held: bool,
              expected_revision: str | None = None) -> dict[str, Any]:
-    """Hold a pending entry in place, so the runner and its speculation skip it, or release it."""
+    """Hold a pending entry in place, so the runner and its speculation skip it, or release it.
+
+    A release is never a train stop: the claim it allows settles the
+    entry's train before any merge, and a fence that could not read the
+    lead's head holds it for just that release (round 4 of sd:9923).
+    """
     def toggle_hold(entries: list[dict[str, Any]]) -> dict[str, Any]:
         check_revision(entries, expected_revision)
         row = pending_entry(entries, item)
-        train_merging_stop(entries, row)
+        if held:
+            train_merging_stop(entries, row)
         if bool(row.get("held")) == held:
             raise LaneError(f"sd:{item} is {'already' if held else 'not'} held")
         row.update(held=held, held_at=stamp_now() if held else None)
