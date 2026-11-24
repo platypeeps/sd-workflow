@@ -1801,7 +1801,7 @@ class TheView(Lane, ReaderCase):
 
     BUILDS = {"error": "", "read": NOW, "show": "all", "quiet_seconds": 900, "stale_seconds": 180,
               "runs": [{"run": "r1", "attempt": 1, "repo": "/repos/alpha", "name": "alpha", "model": "opus", "step": "building",
-                        "state": "stalled", "why": "", "outcome": None, "started": NOW, "elapsed": 1200, "beat": 20,
+                        "state": "stalled", "builder": True, "why": "", "outcome": None, "started": NOW, "elapsed": 1200, "beat": 20,
                         "quiet": 960, "usd": 0.42, "log": "/logs/r1.jsonl", "branch": "build/sd-7", "worktree": "/w/r1",
                         "pull": "https://github.com/example/alpha/pull/7",
                         "items": [{"item": 7, "assignment": 7, "status": "running", "title": "Seven"}],
@@ -2315,7 +2315,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         # builds than ran. Building counts the working and stalled runs alone; each member shows its blocking rounds.
         builds, runner = json.loads(json.dumps(self.BUILDS)), json.loads(json.dumps(self.RUNNER))
         builds["runs"][0]["items"][0]["reviews"] = 4
-        builds["runs"].append({**builds["runs"][0], "run": "r2", "state": "waiting", "why": "an open question asks",
+        builds["runs"].append({**builds["runs"][0], "run": "r2", "state": "waiting", "builder": False, "why": "an open question asks",
                                "items": [{"item": 8, "assignment": 8, "status": "running", "title": "Eight", "reviews": 1}],
                                "cancel": {**builds["runs"][0]["cancel"], "assignment": 8}})
         runner["live"].append({**runner["live"][1], "id": 42, "item": 42, "repo": "/repos/alpha", "title": "Waits a slot"})

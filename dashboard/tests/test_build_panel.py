@@ -245,6 +245,29 @@ class BuildsPanel(Fixture):
         # The lane notes each member itself: the lead's lane round is the lead's alone, so none counts twice.
         self.assertEqual({m["item"]: m["reviews"] for m in row["items"]}, {lead: 3, other: 3})
 
+    def test_a_member_skips_the_rounds_its_lead_ran_before_this_run(self):
+        """pack sd:10306 review 4: a lead's earlier solo build is not a round the new member ran."""
+        from sd_db.writes import add_note
+        items = [self.ready(), self.ready()]
+        run = self.claimed(items)
+        lead = build.run(self.connection, run["id"])["members"][0]["item"]
+        other = next(item for item in items if item != lead)
+        add_note(self.connection, lead, "comment", "Review round blockers: - old.py:1 x")
+        self.connection.execute("UPDATE note SET timestamp = '2000-01-01T00:00:00Z' WHERE item = ? AND body LIKE "
+                                "'Review round blockers: - old.py%'", (lead,))
+        add_note(self.connection, lead, "comment", "Review round blockers: - a.py:1 x")
+        row = builds.panel(self.connection, now=run["created_at"])["runs"][0]
+        self.assertEqual({m["item"]: m["reviews"] for m in row["items"]}, {lead: 2, other: 1})
+
+    def test_only_a_run_at_a_builder_step_holds_a_builder(self):
+        """pack sd:10306 review 4: a run at a lane step (checking, cleaning) released its builder slot."""
+        run = self.claimed([self.ready()])
+        held = {}
+        for step in ("building", "checking", "cleaning"):
+            build.write(self.connection, run["id"], step=step)
+            held[step] = builds.panel(self.connection, now=run["created_at"])["runs"][0]["builder"]
+        self.assertEqual(held, {"building": True, "checking": False, "cleaning": False})
+
     def test_an_enqueued_run_reads_merging_and_its_untrailed_member_is_no_blocked_row(self):
         """sd:8960: a run in the lane waits on review; the member no `Closes:` trailer named is no blocked build."""
         from sd_dashboard import queue_screen

@@ -291,17 +291,18 @@ def _log_quiet(path: str | None, now: str) -> int | None:
     return max(0, int(clock.timestamp() - changed)) if clock else None
 
 
-def review_rounds(connection, items: list[int], lead: int | None = None) -> dict[int, int]:
+def review_rounds(connection, items: list[int], lead: int | None = None, since: str | None = None) -> dict[int, int]:
     """Each item's review rounds that left blockers, builder and lane (pack sd:10306): its `Review round blockers:`
     notes (a review, gate or enqueue check that blocked), plus its lane prepares a local review blocked. Clean rounds
     leave no note, so they are not counted. A bundle notes its builder rounds on its `lead` item alone, so every
-    other member adds the lead's builder rounds; the lane notes each member itself, so no lane round counts twice.
-    The lead's builder rounds are its whole history, earlier solo builds included: a ceiling, not an exact count."""
+    other member adds the lead's builder rounds from `since` (the run's start) on: the lead's earlier builds are not
+    the member's. The lane notes each member itself, so no lane round counts twice."""
     if not items:
         return {}
     rows = reads.review_round_counts(connection, items)
     own = {item: sum(n for i, _, n in rows if i == item) for item in items}
-    built = sum(n for i, builder, n in rows if i == lead and builder)
+    shared = reads.review_round_counts(connection, [lead], since=since) if lead is not None else []
+    built = sum(n for _, builder, n in shared if builder)
     return {item: own[item] + (built if lead is not None and item != lead else 0) for item in items if own[item] or built}
 
 
@@ -309,7 +310,7 @@ def _members(connection, run: dict) -> list[dict]:
     rows = build.run(connection, run["id"])["members"]
     titles = reads.items_by_ids(connection, [row["item"] for row in rows])
     lead = next((row["item"] for row in rows if row["id"] == run["assignment"]), None)
-    rounds = review_rounds(connection, [row["item"] for row in rows], lead)
+    rounds = review_rounds(connection, [row["item"] for row in rows], lead, run["created_at"])
     return [{"item": row["item"], "assignment": row["id"], "status": row["status"], "reviews": rounds.get(row["item"], 0),
              "title": titles[row["item"]]["title"] if row["item"] in titles else ""} for row in rows]
 
@@ -343,6 +344,8 @@ def _open_row(connection, run: dict, now: str) -> dict:
             connection, run["id"], members[0]["item"] if members else "<item>"))
     return {"run": run["id"], "attempt": run["run"], "repo": run["repo"], "name": Path(run["repo"]).name, "host": host,
             "items": members, "model": run["model"] or "", "step": step, "state": state, "why": waiting,
+            # pack sd:10306: a run at a lane step released its builder slot (`build.LANE_STEPS`).
+            "builder": state in ("working", "stalled") and step not in build.LANE_STEPS,
             "outcome": run["outcome"], "started": run["created_at"], "elapsed": _seconds(run["created_at"], now),
             "beat": beat, "quiet": quiet, "usd": round(build.run_spent(connection, run["id"]), 2),
             "log": run["log_path"] or "", "branch": run["branch"] or "", "worktree": run["work_path"] or "",

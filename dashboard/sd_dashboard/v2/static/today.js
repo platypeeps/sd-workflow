@@ -455,12 +455,12 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   const teamFacts = r => html`<b>${r.state}</b> · teammate · worktree <code>${r.worktree}</code> · branch ${r.branch || 'not recorded'} · due ${at(r.due)} · ${r.beat == null ? 'no beat yet' : `beat ${dur(r.beat)} ago`}`;
   function runRow(r) {
     const s = RUNSTATE[r.state] || 'unknown', id = `run:${r.run}`;
-    // pack sd:10306: a run that is working or stalled holds a builder now; it counts in the building box too.
+    // pack sd:10306: a run that holds a builder now (`builder`: working or stalled, not at a lane step) counts in building.
     return ['working', s, html`<tr class="child" data-type="working" data-run="${r.run}" data-id="${id}" aria-selected="${String(row() === id)}">${marker(s, 'working')}
       <td class="what">${names(r)}</td>
       <td class="detail">${r.teammate ? teamFacts(r) : html`<b>${r.state}</b> · build ${r.run} · ${r.model || 'model not recorded'} · step <b>${r.step}</b> · ${r.quiet == null ? 'no output yet' : `output ${dur(r.quiet)} ago`} · ${usd(r.usd || 0)} so far`}${hostFacts(r)}${r.why ? ` · ${r.why}` : ''}${r.cancel_requested ? ` · cancel requested: ${r.cancel_requested}` : ''}</td>
       <td class="num">${dur(r.elapsed)}</td>
-      <td class="act"><div class="ctl" role="group" aria-label="Run ${r.run}">${bb('cancel', r, 'Cancel…', `Cancel build run ${r.run}`, r.cancel.allowed ? '' : r.cancel.reason || 'cancel is off')}${prLink(r)}${logBtn(r)}</div></td></tr>`, undefined, !r.teammate && ['working', 'stalled'].includes(r.state)];
+      <td class="act"><div class="ctl" role="group" aria-label="Run ${r.run}">${bb('cancel', r, 'Cancel…', `Cancel build run ${r.run}`, r.cancel.allowed ? '' : r.cancel.reason || 'cancel is off')}${prLink(r)}${logBtn(r)}</div></td></tr>`, undefined, !r.teammate && !!r.builder];
   }
   // A blocked or cancelled bundle keeps its worktree: Retry queues it again at once; Send to builder asks for a finding,
   // notes it on each item and queues it again, so the next builder resumes that worktree with it.
