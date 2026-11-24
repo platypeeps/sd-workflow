@@ -4355,6 +4355,60 @@ class Tick(Case):
         notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", self.items)]
         self.assertIn(build.FINDING + "pin the fixture clock", notes)
 
+    def rebuilt_after_lane_failure(self, count, *, lost=False):
+        """sd:10379: a bundle of two fails in the lane; the operator moves its first `count` items back to ready and
+        builds them again, a fresh press. Answers the failed branch's head and the new run's started worktree."""
+        run = self.enqueued(2)
+        support.git(self.repo, "checkout", "-q", "-b", run["branch"])
+        (self.repo / "work.txt").write_text("the bundle's work\n", encoding="utf-8")
+        support.git(self.repo, "add", "work.txt")
+        support.git(self.repo, "commit", "-qm", "feat: the bundle's work")
+        head = support.git(self.repo, "rev-parse", "HEAD")
+        support.git(self.repo, "checkout", "-q", "main")
+        if lost:  # the failed branch is gone and its entry names a commit this checkout lacks
+            support.git(self.repo, "branch", "-D", run["branch"])
+            head = "0" * 40
+        self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red", "expected_head": head}
+        self.tick()
+        self.assertEqual(build.run(self.db, run["id"])["outcome"], "lane_failed")
+        rebuild = self.items[:count]
+        self.db.execute(f"UPDATE item SET status = 'ready' WHERE id IN ({', '.join('?' for _ in rebuild)})",
+                        rebuild)
+        queued = build.queue_again(self.db, rebuild, who="operator")
+        self.assertNotIn(run["assignment"], [entry["id"] for entry in queued], "a fresh press, not Fix")
+        again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                            root=self.root / "worktrees")
+        assert again is not None
+        self.bundle = again
+        self.assertNotEqual(self.bundle["branch"], run["branch"])
+        supervisor = self.supervisor()
+        supervisor.logs.mkdir(parents=True, exist_ok=True)
+        self.assertEqual(supervisor.worktree(), "building")
+        return head, supervisor
+
+    def test_a_fresh_build_after_a_lane_failure_starts_from_the_failed_head(self):
+        """sd:10379: it started from origin/main and dropped the bundle's commits; it starts from the entry head."""
+        head, supervisor = self.rebuilt_after_lane_failure(2)
+        work = Path(self.bundle["work_path"])
+        self.assertEqual(support.git(work, "rev-parse", "HEAD"), head)
+        self.assertIn("whose lane entry failed", supervisor.brief()["findings"])
+        self.assertIn("gate red", supervisor.brief()["findings"])
+
+    def test_a_fresh_build_of_part_of_a_lane_failed_bundle_starts_from_main(self):
+        """sd:10379: the failed branch's commits cite an item this bundle leaves out, so it starts from main."""
+        head, supervisor = self.rebuilt_after_lane_failure(1)
+        work = Path(self.bundle["work_path"])
+        self.assertNotEqual(support.git(work, "rev-parse", "HEAD"), head)
+        self.assertEqual(supervisor.brief()["findings"].count("whose lane entry failed"), 0)
+
+    def test_a_failed_branch_that_does_not_read_starts_from_main_and_says_so(self):
+        """sd:10379: a fallback to main is no silent loss of the bundle's commits: a note on the lead says why."""
+        self.rebuilt_after_lane_failure(2, lost=True)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"),
+                         support.git(self.repo, "rev-parse", "main"))
+        notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
+        self.assertTrue(any("did not read here" in body for body in notes), notes)
+
     def reopened_dependency(self):
         """The bundle's lead waits on an item reopened since its build: the dependency is open again."""
         first = create_item(self.db, kind="task", title="Prerequisite", repo=str(self.repo), status="ready")

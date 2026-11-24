@@ -1498,10 +1498,32 @@ class Supervisor:
             _read([*self.tools.git, "-C", str(self.repo), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], env=self.env)
             argv = ["worktree", "add", str(self.work), branch]
         except Unread:
-            argv = ["worktree", "add", "-b", branch, str(self.work), self.base()]
+            start = self.start_point()
+            if start is None and (failed := build.lane_failed_start(self.db, self.row["assignment"])):
+                self.once("start", lambda: add_note(
+                    self.db, self.lead, "comment", f"Build run {self.ident}: {failed['branch']}, whose lane entry "
+                    f"failed, did not read here, so {branch} starts from {self.base()} without its commits"))
+            argv = ["worktree", "add", "-b", branch, str(self.work), start or self.base()]
         if self.child([*self.tools.git, "-C", str(self.repo), *argv], cwd=self.repo, name="worktree") != 0:
             return self.finish("blocked", f"git worktree add {self.work} failed; see {self.out('worktree')}")
         return self.split_first() or "building"
+
+    def start_point(self) -> str | None:
+        """The commit a new branch starts from when its items' last bundle failed in the lane: that entry's head, or
+        the failed branch's tip, local then pushed (sd:10379); None, so the base, when there is none or none reads."""
+        failed = build.lane_failed_start(self.db, self.row["assignment"])
+        if failed is None:
+            return None
+        head = failed["head"] if re.fullmatch(r"[0-9a-f]{7,64}", failed["head"] or "") else None
+        for ref in (head, f"refs/heads/{failed['branch']}", f"refs/remotes/origin/{failed['branch']}"):
+            if ref is None:
+                continue
+            try:
+                return _read([*self.tools.git, "-C", str(self.repo), "rev-parse", "--verify", "--quiet",
+                              "--end-of-options", f"{ref}^{{commit}}"], env=self.env).strip() or None
+            except Unread:
+                continue
+        return None
 
     def guarded(self) -> dict | None:
         """The kept worktree's guard: the blocked end when a subset Retry's split holds it, or it is gone or on
@@ -2465,7 +2487,16 @@ class Supervisor:
             f"SELECT id, title FROM item WHERE id IN ({', '.join('?' for _ in items)})", items)}
         return {"worktree": self.work, "branch": self.row["branch"], "title": self.title, "body": self.body,
                 "title_max": TITLE_MAX, "items": "\n".join(f"- sd:{item} {titles.get(item, '')}" for item in items),
-                "findings": self.findings(items), "checklist": self.checklist(), "denied": self.denied()}
+                "findings": self.started() + self.findings(items), "checklist": self.checklist(),
+                "denied": self.denied()}
+
+    def started(self) -> str:
+        """The brief's line for a branch started from a failed lane entry (`start_point`, sd:10379); "" otherwise."""
+        failed = build.lane_failed_start(self.db, self.row["assignment"])
+        if failed is None or self.start_point() is None:
+            return ""
+        return (f"\nThe branch starts from {failed['branch']}, whose lane entry failed: its commits are these items'\n"
+                f"earlier work, so build on them and fix what the lane said: {failed['detail'][:1500]}\n")
 
     def checklist(self) -> str:
         """The blocker classes recorded review rounds of the last `CHECKLIST_DAYS` found most, top first; "" for
