@@ -15,6 +15,8 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
+import unittest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -266,3 +268,54 @@ class TheRequest(ScreenCase):
         from sd_dashboard import health_cleanup
 
         self.assertTrue(callable(health_cleanup.request({"row": "wt:merged", "revision": "0" * 64})))
+
+
+class Disposable(unittest.TestCase):
+    """Class pass, review of build/sd-1782: build output is what its generator stamped, not what a suffix or a
+    folder suggests. Each case is one ignored entry in a Unity project folder named `Game`."""
+
+    STAMP = ("<Project>\n  <!-- Generated file, do not modify, your changes will be overwritten "
+             "(use AssetPostprocessor.OnGeneratedCSProject) -->\n</Project>\n")
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name).resolve()
+        self.game = self.root / "Game"
+        (self.game / "ProjectSettings").mkdir(parents=True)
+        (self.game / "ProjectSettings" / "ProjectVersion.txt").write_text("m_EditorVersion: 6000.0\n")
+        (self.game / "Assembly-CSharp.csproj").write_text(self.STAMP)
+
+    def goes(self, name: str) -> bool:
+        return health_collectors._disposable(name, self.root)
+
+    def test_a_stamped_project_goes_and_a_hand_kept_one_beside_it_stays(self):
+        (self.game / "Tool.csproj").write_text("<Project/>\n")
+        self.assertTrue(self.goes("Game/Assembly-CSharp.csproj"))
+        self.assertFalse(self.goes("Game/Tool.csproj"), "no Unity stamp: hand-kept")
+
+    def test_a_stamp_outside_a_unity_project_or_behind_a_link_or_a_folder_stays(self):
+        (self.root / "Loose.csproj").write_text(self.STAMP)
+        (self.game / "Link.csproj").symlink_to("Assembly-CSharp.csproj")
+        (self.game / "Dir.csproj").mkdir()
+        (self.game / "Late.csproj").write_text("<Project/>\n" + " " * 5000 + self.STAMP)
+        for name in ("Loose.csproj", "Game/Link.csproj", "Game/Dir.csproj/", "Game/Late.csproj", "Game/Gone.csproj"):
+            with self.subTest(name=name):
+                self.assertFalse(self.goes(name))
+        self.assertFalse(health_collectors._disposable("Game/Assembly-CSharp.csproj"), "no root, no proof")
+
+    def test_a_solution_goes_only_under_the_folder_s_name_with_stamped_projects_alone(self):
+        (self.game / "Tool.csproj").write_text("<Project/>\n")
+        for ext, line in ((".sln", 'Project("{{FAE04EC0}}") = "A", "{0}", "{{1}}"\n'),
+                          (".slnx", '<Solution>\n  <Project Path="{0}" />\n</Solution>\n')):
+            with self.subTest(ext=ext):
+                (self.game / f"Game{ext}").write_text(line.format("Assembly-CSharp.csproj"))
+                self.assertTrue(self.goes(f"Game/Game{ext}"))
+                (self.game / f"Mine{ext}").write_text(line.format("Assembly-CSharp.csproj"))
+                self.assertFalse(self.goes(f"Game/Mine{ext}"), "Unity writes only <folder>" + ext)
+                for project in ("Tool.csproj", "../Loose.csproj", "Native.vcxproj", "Gone.csproj"):
+                    (self.game / f"Game{ext}").write_text(
+                        line.format("Assembly-CSharp.csproj") + line.format(project))
+                    self.assertFalse(self.goes(f"Game/Game{ext}"), project)
+                (self.game / f"Game{ext}").write_text("")
+                self.assertFalse(self.goes(f"Game/Game{ext}"), "names no project")

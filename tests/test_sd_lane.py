@@ -16,7 +16,6 @@ import json
 import math
 import os
 import pathlib
-import shutil
 import signal
 import sqlite3
 import subprocess
@@ -2381,9 +2380,11 @@ class Landing(Lane):
         self.assertFalse(tree.exists())
 
     def test_generated_unity_project_files_do_not_keep_a_merged_worktree(self) -> None:
-        """sd:10325: Unity regenerates its ignored *.csproj and *.sln on every open; the lane kept a merged
-        clean worktree for `Assembly-CSharp-Editor.csproj`. Review of build/sd-1782: only a file beside a Unity
-        project's ProjectSettings/ProjectVersion.txt is Unity's; any other ignored project file or folder stays."""
+        """sd:10325: Unity regenerates its ignored *.csproj and solution on every open; the lane kept a merged
+        clean worktree for `Assembly-CSharp-Editor.csproj`. Class pass, review of build/sd-1782: a file is Unity's
+        by Unity's own stamp in it, not by its suffix or its folder; a hand-kept project beside it keeps the tree."""
+        stamp = ("<Project>\n  <!-- Generated file, do not modify, your changes will be overwritten "
+                 "(use AssetPostprocessor.OnGeneratedCSProject) -->\n</Project>\n")
         tree, _ = self.topic()
         (tree / "Game/ProjectSettings").mkdir(parents=True)
         (tree / "Game/ProjectSettings/ProjectVersion.txt").write_text("m_EditorVersion: 6000.0\n", encoding="utf-8")
@@ -2394,17 +2395,13 @@ class Landing(Lane):
         self.merge_lands(tree, 1, head)
         self.drain()
         (self.repo / ".git/info/exclude").write_text("*.csproj\n*.sln\n", encoding="utf-8")
-        for name in ("Game/Assembly-CSharp-Editor.csproj", "Game/Game.sln"):
-            (tree / name).write_text("<Project/>\n", encoding="utf-8")
-        (tree / "Tool.csproj").write_text("<Project/>\n", encoding="utf-8")
+        (tree / "Game/Assembly-CSharp-Editor.csproj").write_text(stamp, encoding="utf-8")
+        (tree / "Game/Game.sln").write_text(
+            'Project("{FAE04EC0}") = "Editor", "Assembly-CSharp-Editor.csproj", "{1}"\n', encoding="utf-8")
+        (tree / "Game/Tool.csproj").write_text("<Project/>\n", encoding="utf-8")
         self.assertEqual(self.watched(1)[1:], [f"pack sd:1 kept {tree}: it holds ignored files that are not "
-                                               "build output: Tool.csproj"])
-        (tree / "Tool.csproj").unlink()
-        (tree / "Game/Data.sln").mkdir()
-        (tree / "Game/Data.sln/notes.txt").write_text("mine\n", encoding="utf-8")
-        self.assertEqual(self.watched(1)[1:], [f"pack sd:1 kept {tree}: it holds ignored files that are not "
-                                               "build output: Game/Data.sln/notes.txt"])
-        shutil.rmtree(tree / "Game/Data.sln")
+                                               "build output: Game/Tool.csproj"])
+        (tree / "Game/Tool.csproj").unlink()
         self.assertEqual(self.watched(1)[1][:24], "pack sd:1 Removed: workt")
         self.assertFalse(tree.exists())
 

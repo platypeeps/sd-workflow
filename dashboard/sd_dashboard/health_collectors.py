@@ -94,8 +94,14 @@ _DU_OVERRAN: dict[str, float] = {}
 BUILD_DIRS = ("target", "node_modules", ".venv")
 #: Ignored folders and files a merged worktree may hold and still be removed: build output and tool caches.
 DISPOSABLE = (*BUILD_DIRS, "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".DS_Store")
-#: Project files Unity writes on every open beside its ProjectSettings/ProjectVersion.txt (sd:10325).
-UNITY_GENERATED = (".csproj", ".sln")
+#: The line Unity writes at the top of each project file it generates: the file's own proof of who wrote it. A
+#: suffix or a folder is no proof: a hand-kept project sits beside Unity's (sd:10325, review of build/sd-1782).
+UNITY_STAMP = (b"Generated file, do not modify, your changes will be overwritten "
+               b"(use AssetPostprocessor.OnGeneratedCSProject)")
+#: The solution files Unity writes, named after its project folder; each lists the projects it generated.
+UNITY_SOLUTIONS = (".sln", ".slnx")
+#: Every project a solution names, in either format: a quoted path that ends in `proj`.
+SOLUTION_PROJECT = re.compile(rb'"([^"]*proj)"')
 #: A full object name, SHA-1 or SHA-256.
 OBJECT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
@@ -260,21 +266,54 @@ def _cwds(walk: Walk) -> list[str] | None:
     return [line[1:] for line in done.stdout.splitlines() if line.startswith("n")]
 
 
+def _unity_project(path: str) -> bool:
+    """Whether `path` is a regular file that opens with Unity's stamp; unread, linked or unstamped is not."""
+    try:
+        if os.path.islink(path) or not os.path.isfile(path):
+            return False
+        with open(path, "rb") as handle:
+            return UNITY_STAMP in handle.read(512)
+    except OSError:
+        return False
+
+
+def _unity_generated(root: str | os.PathLike, parts: list[str]) -> bool:
+    """Whether the ignored file at `parts` under `root` is one Unity wrote and writes again on its next open.
+
+    In a Unity project's folder (it holds ProjectSettings/ProjectVersion.txt): a *.csproj with Unity's stamp, or
+    the solution named after that folder that lists one or more projects, each a stamped *.csproj beside it. A
+    solution carries no stamp, so its name and what it lists stand for it; anything else may be hand-kept."""
+    folder = os.path.join(root, *parts[:-1])
+    path, name = os.path.join(folder, parts[-1]), parts[-1]
+    if not os.path.isfile(os.path.join(folder, "ProjectSettings", "ProjectVersion.txt")):
+        return False
+    if name.endswith(".csproj"):
+        return _unity_project(path)
+    stem, extension = os.path.splitext(name)
+    if extension not in UNITY_SOLUTIONS or stem != os.path.basename(os.path.realpath(folder)):
+        return False
+    try:
+        if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) > 1 << 20:
+            return False
+        with open(path, "rb") as handle:
+            listed = SOLUTION_PROJECT.findall(handle.read())
+        projects = [project.decode("utf-8") for project in listed]
+    except (OSError, UnicodeDecodeError):
+        return False
+    return bool(projects) and all(
+        project.endswith(".csproj") and os.path.basename(project) == project and "\\" not in project
+        and _unity_project(os.path.join(folder, project)) for project in projects)
+
+
 def _disposable(name: str, root: str | os.PathLike | None = None) -> bool:
     """Whether the ignored entry `name`, relative to the worktree `root`, is build output or a tool cache.
 
-    A *.csproj or *.sln counts only as a regular file in a Unity project's folder, the one that holds
-    ProjectSettings/ProjectVersion.txt: elsewhere it may be hand-kept, and a folder so named holds anything
-    (review of build/sd-1782)."""
+    A project or solution file counts only when Unity generated it (`_unity_generated`); with no `root` to read
+    it from, it does not."""
     parts = name.rstrip("/").split("/")
     if any(part in DISPOSABLE or part.endswith(".egg-info") for part in parts):
         return True
-    if root is None or name.endswith("/") or not parts[-1].endswith(UNITY_GENERATED):
-        return False
-    path = os.path.join(root, *parts)
-    folder = os.path.join(root, *parts[:-1])
-    return (os.path.isfile(path) and not os.path.islink(path)
-            and os.path.isfile(os.path.join(folder, "ProjectSettings", "ProjectVersion.txt")))
+    return root is not None and not name.endswith("/") and _unity_generated(root, parts)
 
 
 def busy(path: str, cwds: list[str] | None) -> str:
