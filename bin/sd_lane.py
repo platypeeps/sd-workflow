@@ -4891,6 +4891,9 @@ def requeue(queue: Queue, entry: dict[str, Any], token: str, outcome: dict[str, 
     review pass `RETRYABLE_RETRIES` times (sd:3478); a gate slot wait that
     ran out every time, counted in `slot_waits`: no gate ran, and the kept
     review serves the next prepare (pack sd:7412). Each has its own count.
+    A refusal after a train that may have landed (`step: train`, or
+    prepare's `train_landed`) is held past its retries, never failed:
+    main may hold its train, and its delivery is still owed (sd:9923).
     It keeps its place, and `hub_fault` or `retryable_fault` says what failed
     where; a later outcome writes its own fields beside it. Its
     `expected_head` moves only to a catch-up merge prepare pushed
@@ -4899,7 +4902,8 @@ def requeue(queue: Queue, entry: dict[str, Any], token: str, outcome: dict[str, 
     hub, retryable = outcome.pop("hub_fault", False), outcome.pop("retryable", False)
     waited = outcome.pop("slot_wait", False)
     retries = int(entry.get("hub_retries" if hub else "retryable_retries") or 0)
-    if not (hub or retryable or waited) or (retryable and retries >= RETRYABLE_RETRIES):
+    landed = train_may_have_landed(outcome)
+    if not (hub or retryable or waited) or (retryable and retries >= (math.inf if landed else RETRYABLE_RETRIES)):
         return None
     tree, branch = pathlib.Path(entry["worktree"]), str(entry.get("branch") or "")
     expected = pushed_catch_up(tree, branch, entry["expected_head"])  # a fenced lead's copy is at its fenced head
@@ -4907,14 +4911,33 @@ def requeue(queue: Queue, entry: dict[str, Any], token: str, outcome: dict[str, 
                              if key in outcome}
     fields = (hub_fields(retries, fault) if hub else
               {"slot_waits": int(entry.get("slot_waits") or 0) + 1, "slot_wait": {**fault, "at": stamp_now()}}
-              if waited else
-              {"retryable_retries": retries + 1, "retryable_fault": {**fault, "at": stamp_now()}})
+              if waited else retryable_fields(retries, fault, landed))
     put_back(queue, entry, token, expected, **fields)
     if fields.get("held"):
-        return (f"a hub fault after {retries} retries; it is held at its place, and "
+        met = "a hub fault" if hub else "a train that may have landed"
+        return (f"{met} after {retries} retries; it is held at its place, and "
                 f"`sd-ship lane release {entry['item']}` runs it again")
     met = "a hub fault" if hub else "a gate slot wait that ran out at the run's budget" if waited else "a retryable refusal"
     return f"{met}; it is pending again, and the next run retries it"
+
+
+def train_may_have_landed(outcome: dict[str, Any]) -> bool:
+    """Whether `outcome` met a train that may have landed: `step: train`, or prepare's `train_landed` (sd:9923)."""
+    return outcome.get("step") == "train" or outcome.get("code") == "train_landed"
+
+
+def retryable_fields(retries: int, fault: dict[str, Any], landed: bool) -> dict[str, Any]:
+    """The fields of an entry put back after its `retries + 1`th retryable refusal.
+
+    One after a train that may have landed is held past `RETRYABLE_RETRIES`,
+    never failed: main may hold its train, and its delivery is owed (sd:9923).
+    """
+    fields: dict[str, Any] = {"retryable_retries": retries + 1, "retryable_fault": {**fault, "at": stamp_now()}}
+    if landed and retries >= RETRYABLE_RETRIES:
+        fields.update(held=True, held_at=stamp_now())
+        fields["retryable_fault"]["held"] = (f"held after {retries + 1} refusals of a train that may have landed; "
+                                             "`sd-ship lane release` runs it again once GitHub shows it merged")
+    return fields
 
 
 def settle_checkout(root: pathlib.Path, queue: Queue) -> dict[str, Any]:

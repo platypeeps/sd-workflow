@@ -141,6 +141,7 @@ from 2 to 6 fails, each member ships alone, as after sd:9899: a later
 | 7 reconcile | items done, PRs merged | stopped midway | next claim's prepare reconciles | ship: prepare reconciles |
 | 7 reconcile | none | merge_commit_sha is not M_i | refused train_merge_mismatch | ship: mismatch |
 | 7 reconcile | none | stale train_joined, lone merge | merge_dispatch clears train_commit | ship: lone merge after join |
+| 7 reconcile | entry pending | GitHub stays stale past the retry | entry held, never failed; release runs it | lane: past its retries is held |
 | 8 cleanup | ref deleted | delete fails | stale ref; noted, nothing else | land_train |
 ```
 
