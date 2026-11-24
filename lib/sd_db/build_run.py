@@ -271,9 +271,13 @@ your report: each blocker, its ruling and reason, and the test of each fix.
 
 {blockers}
 """
+#: The checkpoint key prefix of a blocker a REJECT or FILE ruling cleared, by run, head and number.
+RULED = "build-run-ruled:"
 #: The rulings `RULING` asks for, and the longest reason kept.
 RULINGS = ("fix", "reject", "file", "ask")
 REASON_MAX = 500
+#: The longest evidence the ruling brief quotes per blocker.
+EVIDENCE_MAX = 1500
 
 DRAFT = """You are the headless lead, run by the build dispatcher (pack sd:6361). Draft the spec for one
 captured item. You hold the read tools only: read the repository in the current directory, its CLAUDE.md
@@ -1973,7 +1977,10 @@ class Supervisor:
 
     def numbered(self, blockers: list[dict]) -> str:
         """The blockers as the ruling round names them: `N. path:line summary`, N from 1 (sd:10286)."""
-        return "\n".join(f"{at}. {self.summary([row], None)[2:]}" for at, row in enumerate(blockers, 1))
+        def evidence(row: dict) -> str:  # the failing input the builder rules on, one line (review of sd:10286)
+            text = " ".join(row["evidence"].split())[:EVIDENCE_MAX] if isinstance(row.get("evidence"), str) else ""
+            return f" (evidence: {text})" if text else ""
+        return "\n".join(f"{at}. {self.summary([row], None)[2:]}{evidence(row)}" for at, row in enumerate(blockers, 1))
 
     def read_rulings(self, count: int) -> tuple[dict[int, tuple[str, str]], str]:
         """The rulings file as {blocker number: (ruling, reason)} and what did not read, "" for nothing.
@@ -2027,9 +2034,11 @@ class Supervisor:
             self.note(self.lead, f"Build run {self.ident}: the ruling round's rulings at {head[:12]}: {unread}; "
                                  f"each such blocker stays a blocker")
         repository = self.github()
+        delta = self.branch_delta(head, head) if found else {}
+        changed = None if delta is None else delta.keys()
         for number, (ruling, reason) in sorted(found.items()):
             self.once(f"ruling:{head}:{number}", functools.partial(
-                self.rule, number, blockers[number - 1], ruling, reason, head, repository))
+                self.rule, number, blockers[number - 1], ruling, reason, head, repository, changed))
         asked = [(blockers[number - 1], reason) for number, (ruling, reason) in sorted(found.items()) if ruling == "ask"]
         if asked:
             # Kept beside the body until the run ends: a replay of this end reads the same rulings.
@@ -2048,23 +2057,29 @@ class Supervisor:
         """A blocker as the ruling round's repeat check matches it: its summary, whitespace folded."""
         return " ".join(str(row.get("summary") or "").split()).casefold()
 
+    def place(self, row: dict) -> tuple[str, Any, str]:
+        """A blocker as a ruling clears its repeat: file, line and summary, whitespace folded (sd:10286)."""
+        return self.locations(row)[0][0], row.get("line"), self.said(row)
+
     def settled(self, answer: dict, head: str) -> dict:
         """The review after the ruling round, less each blocker that repeats one ruled REJECT or FILE at `head`
         (lead ruling on sd:10286): a repeat that cites evidence blocks past its rebuttal in `sd-review`, so the
         ruling clears it here. A repeat is the same file and summary at any line: the round's fixes move lines.
-        The rulings come from the decision notes `rule` wrote, so a replay after the rulings file went reads
-        them too. A FIX ruling, an unruled blocker or a new one still blocks."""
-        mark = f"Build run {self.ident} ruling "
-        pattern = re.compile(rf"ruling (\d+) at {re.escape(head[:12])}: (?:REJECT|FILE)\b")
-        blockers, ruled = self.round_blockers(), set()
-        for (body,) in self.db.execute("SELECT body FROM note WHERE item = ? AND kind = 'decision' "
-                                       "AND substr(body, 1, ?) = ?", (self.lead, len(mark), mark)):
-            found = pattern.match(body, len(mark) - len("ruling "))
-            number = int(found.group(1)) if found else 0
-            if 0 < number <= len(blockers) and blockers[number - 1].get("line") != "-":
-                row = blockers[number - 1]
-                ruled.add((self.locations(row)[0][0], self.said(row)))
-        left = [row for row in answer["blockers"] if (self.locations(row)[0][0], self.said(row)) not in ruled]
+        The ruled blockers come from the checkpoints `rule` wrote with each decision note, never the round's
+        file: a replay after the review rewrote it would shift a number onto another blocker. A repeat is the
+        same file, line and words: the same words at another line are another defect, and a fix that moved the
+        line parks the run, fail closed. A FIX ruling, an unruled blocker or a new one still blocks."""
+        key = f"{RULED}{self.ident}:{head}:"
+        ruled = set()
+        for (body,) in self.db.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND substr(key, 1, ?) = ?",
+                                       (len(key), key)):
+            try:
+                row = json.loads(body)
+            except (TypeError, ValueError):
+                continue
+            if isinstance(row, dict) and row.get("line") != "-":
+                ruled.add(self.place(row))
+        left = [row for row in answer["blockers"] if self.place(row) not in ruled]
         if len(left) == len(answer["blockers"]):
             return answer
         cleared = [row for row in answer["blockers"] if row not in left]
@@ -2073,7 +2088,8 @@ class Supervisor:
                        f"the ruling round rejected or filed, cleared by its ruling: {self.summary(cleared)}"))
         return dict(answer, blockers=left) if left else dict(answer, status="advisory", blockers=[])
 
-    def rule(self, number: int, row: dict, ruling: str, reason: str, head: str, repository: str) -> None:
+    def rule(self, number: int, row: dict, ruling: str, reason: str, head: str, repository: str,
+             changed: Collection[str] | None = ()) -> None:
         """One ruling's writes in one transaction: the decision note, a filed item, the rebuttal (sd:10286).
 
         The note's opening names the run, the blocker's number and the head: a supervisor that walks this step
@@ -2096,9 +2112,13 @@ class Supervisor:
             add_note(self.db, self.lead, "decision",
                      (f"{mark}{ruling.upper()}{f' as sd:{filed}' if filed else ''}, {reason}. Blocker: {said}"
                       )[:build.FINDING_MAX])
-            if ruling in ("reject", "file") and finding and repository:
+            if ruling in ("reject", "file") and finding:  # the blocker itself, for `settled`
+                record_state(self.db, "checkpoint", key=f"{RULED}{self.ident}:{head}:{number}", body=row)
+            # Each file the branch changes is an instance too, as for a follow-up: a later change to a caller
+            # there lapses the rebuttal in the lane. A branch that does not read takes none (fail closed).
+            if ruling in ("reject", "file") and finding and repository and changed is not None:
                 raw = {"path": self.locations(row)[0][0], "summary": row.get("summary"), "line": row.get("line"),
-                       "instances": [str(entry) for entry in row.get("instances") or []]}
+                       "instances": [str(entry) for entry in row.get("instances") or []] + sorted(changed)}
                 record_state(self.db, "checkpoint", key=f"ship-adjudication:build-run:{self.ident}:ruling:{head}:{number}",
                              body={"decision": "accepted", "proposal": {
                                  "bindings": {"repository": repository, "branch": self.row["branch"], "head": head},

@@ -251,10 +251,12 @@ FAKE = textwrap.dedent('''
                               "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                               "findings": review.dispose([review._finding(far), *held], "high")}))
             sys.exit(0)
-        if mode in ("blocking2", "repeat2"):  # sd:10286: two blockers in the changed file, the second with a newline
+        if mode in ("blocking2", "repeat2", "moved2"):  # sd:10286: two blockers in the changed file, the second with a newline
             second = {**raw, "line": 2, "instances": [], "summary": "a later\\nOption: blocker"}
-            # repeat2: the second alone, its original evidence cited, so a rebuttal holds it back nowhere
-            rows = [{**second, "evidence": "the original evidence"}] if mode == "repeat2" else [raw, second]
+            # repeat2: the second alone, its original evidence cited, so a rebuttal holds it back nowhere;
+            # moved2: the same file and words at another line, another defect
+            rows = ([{**second, "evidence": "the original evidence", **({"line": 5} if mode == "moved2" else {})}]
+                    if mode in ("repeat2", "moved2") else [raw, second])
             findings, mode = review.dispose([review._finding(row) for row in rows], "high"), "blocking"
         if mode == "absolute":  # pack sd:9769: a blocker spelled as an absolute path inside the checkout
             findings = review.dispose([review._finding({**raw, "path": os.path.join(work, "work.txt")})], "high")
@@ -1221,6 +1223,44 @@ class Supervise(Case):
                                           after=after)
                 self.assertEqual(ended["outcome"], "blocked", ended)
                 self.assertIn("work.txt:1 a blocker", self.latest()["detail"])
+
+    def test_a_ruling_clears_only_its_own_place(self):
+        """Review of sd:10286: a finding with the ruled blocker's file and words at another line is another
+        defect, and it still parks the run."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("moved2",))
+        self.assertEqual(ended["outcome"], "blocked", ended)
+        self.assertIn("work.txt:5 a later", self.latest()["detail"])
+
+    def test_a_round_file_rewritten_after_the_rulings_clears_nothing(self):
+        """Review of sd:10286, a hub fault: the review after the ruling round rewrote the round's blockers, and
+        a replay maps ruling 2 onto the new blocker 2. The ruling is read as the blocker it ruled."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("repeat2",))
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        again = self.supervisor()
+        head = support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD").strip()
+        other = {"path": "work.txt", "line": 7, "summary": "an unresolved defect"}
+        again.round_file.write_text(json.dumps([{"path": "work.txt", "line": 1, "summary": "a blocker"}, other]))
+        answer = again.settled({"status": "blocking", "blockers": [other]}, head)
+        self.assertEqual((answer["status"], answer["blockers"]), ("blocking", [other]))
+
+    def test_a_ruling_rebuttal_names_the_files_the_branch_changes(self):
+        """Review of sd:10286: as a follow-up's rebuttal does, a ruling's rebuttal lists each file the branch
+        changes, so a later change to a caller there lapses it in the lane."""
+        self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                           {"blocker": 2, "ruling": "reject", "reason": "no failing input"}])
+        (proposal,) = self.rebuttals()
+        self.assertIn("work.txt", proposal["findings"][0]["raw_finding"]["instances"])
+
+    def test_the_ruling_brief_carries_each_blockers_evidence(self):
+        """Review of sd:10286: the builder rules on the failing input, so the brief names it, on one line."""
+        self.press()
+        said = self.supervisor().numbered([{"path": "a.py", "line": 3, "summary": "s",
+                                            "evidence": "run x\nit fails"}])
+        self.assertIn("1. a.py:3 s (evidence: run x it fails)", said)
 
     def rulings_file(self):
         return self.supervisor().rulings
