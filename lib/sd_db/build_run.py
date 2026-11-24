@@ -72,8 +72,8 @@ from .writes import add_note, create_item, now, record_cost, record_state
 TIMEOUT_SECONDS = build.BUDGET_MINUTES * 60
 GRACE_SECONDS = 20
 BEAT_SECONDS = 30
-#: Reviews with blockers before the class pass and park: 2, so a park comes after 3
-#: reviews (operator 2026-11-23, sd:10128; sd:10111 had set 4).
+#: Reviews with blockers before the class pass: 2, then one ruling round (`RULING`, sd:10286), so a park
+#: comes after 4 reviews (operator 2026-11-23, sd:10128; sd:10111 had set 4).
 REVIEW_ROUNDS = 2
 #: Fix rounds past this many blocked reviews run on the strongest model at medium effort (operator
 #: 2026-11-23, sd:10192), the brief asking for the blockers' class (pack sd:9264); the park stays.
@@ -247,6 +247,26 @@ share, enumerate every instance of it from the code, not from the findings, and 
 new commit in {worktree}. Fix the class within this change's own scope: a new reader, audit or entry kind
 becomes its own item, not a commit here (sd:9584). Add each instance to the failure table in the body at
 {body}. Never push. Your final message is your report: the class, each instance and its test.
+
+{blockers}
+"""
+
+# sd:10286: the round after the class pass, once, on the strongest model: the merge lane's rule, applied by the
+# run, in place of the park the lead ruled by hand. A FIX that survives, or a question, still parks.
+RULING = """The review of branch {branch} still found blockers after {rounds} rounds and the class pass. Do
+not park and do not fix everything: rule each blocker below by the merge-lane rule, then act on the ruling.
+- FIX when it names a concrete failing input, command or interruption that this change causes, in code
+  it touched or an unchanged caller it breaks. Fix it fail-first as a new commit in {worktree}.
+- REJECT when it names no such input, or its claim does not hold: give a reason a reader can check.
+- FILE anything else, a real defect this change does not cause: `sd task add "<title>" --belongs-to
+  {worktree}`, then treat it as rejected with the reason "filed as sd:N".
+Record each ruling on sd:{item} with `sd task note {item} "<blocker>: FIX|REJECT|FILE, <reason>" --kind
+decision`. A ruling that touches money, security or privacy risk, or a standing operator ruling, is the
+operator's: record it as a `--kind question` with options instead, and leave that blocker as it is.
+After your last commit, record every REJECT and FILE ruling as a rebuttal at the new HEAD:
+{adjudicate}
+Then update the body at {body}. Never push. Your final message is your report: each blocker, its ruling
+and reason, and the test of each fix.
 
 {blockers}
 """
@@ -2035,13 +2055,19 @@ class Supervisor:
         rounds = self.fresh()["review_round"] or 0
         if rounds < REVIEW_ROUNDS:
             return self.fix()
-        # One class-pass round past the bound (sd:9263). None when every member waits on a question no fix answers;
-        # a question on one member leaves the others to fix, as enqueue delivers them without it.
+        # One class-pass round past the bound (sd:9263), then one ruling round (sd:10286). None when every member
+        # waits on a question no fix answers; a question on one member leaves the others to fix, as enqueue
+        # delivers them without it.
         unasked = [item for item in [self.lead, *self.others]
                    if not build.open_question(self.db, [item], self.row["asked_since"])]
-        if rounds == REVIEW_ROUNDS and unasked:
-            return self.fix(CLASS_PASS, rounds=rounds)
+        if rounds <= REVIEW_ROUNDS + 1 and unasked:
+            return self.fix(self.late_brief(rounds), rounds=rounds)
         return self.finish("blocked", f"{rounds} review rounds left blockers: {self.summary(self.blockers)}")
+
+    @staticmethod
+    def late_brief(rounds: int) -> str:
+        """The fix brief for a round at or past the bound: the class pass, then the ruling round (sd:10286)."""
+        return CLASS_PASS if rounds == REVIEW_ROUNDS else RULING
 
     def round_blockers(self) -> list[dict]:
         """The last blocking round's findings as `blocked_round` kept them; [] for none or an unreadable file."""
@@ -2052,9 +2078,9 @@ class Supervisor:
         return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
     def resume_fix(self) -> str | dict:
-        """The interrupted fix again, with its own brief: the last round's is the class pass (`blocked_round`)."""
+        """The interrupted fix again, with its own brief: the class pass or the ruling round (`blocked_round`)."""
         rounds = self.fresh()["review_round"] or 0
-        return self.fix(CLASS_PASS, rounds=rounds) if rounds == REVIEW_ROUNDS else self.fix()
+        return self.fix(self.late_brief(rounds), rounds=rounds) if rounds >= REVIEW_ROUNDS else self.fix()
 
     def count_round(self) -> None:
         if not build.write(self.db, self.ident, review_round=(self.fresh()["review_round"] or 0) + 1):
@@ -2069,12 +2095,15 @@ class Supervisor:
         session = self.fresh()["session_id"]
         if not session:
             return self.finish("blocked", "no builder session recorded to resume for the fix")
-        prompt = brief.format(blockers=self.summary(self.blockers, limit=None), **self.brief(), **extra)
+        prompt = brief.format(blockers=self.summary(self.blockers, limit=None), **self.brief(), **extra,
+                              item=self.lead, adjudicate=ADJUDICATE.format(worktree=self.work, item=self.lead))
         rounds = self.fresh()["review_round"] or 0
         if rounds <= ESCALATE_AFTER:
             return self.claude(prompt, session=session, then="reviewing", role=self.fix_role())
         self.once("escalated", lambda: self.escalate(rounds))
-        return self.claude(prompt + ESCALATED.format(rounds=rounds), session=session, then="reviewing",
+        # The ruling round rules, then fixes only its FIX rulings: no class enumeration (sd:10286).
+        suffix = "" if brief is RULING else ESCALATED.format(rounds=rounds)
+        return self.claude(prompt + suffix, session=session, then="reviewing",
                            role=self.fix_role(), model=STRONGEST, effort=ESCALATED_EFFORT)
 
     def escalate(self, rounds: int) -> None:

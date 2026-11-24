@@ -1126,38 +1126,60 @@ class Supervise(Case):
         self.assertEqual(build.run(self.db, ended["retry"])["step"], "building")
 
     def test_review_rounds_bound(self):
-        """Failure table, Reviewing: blockers after REVIEW_ROUNDS rounds and one class pass block the items; each fix resumes."""
+        """Failure table, Reviewing: blockers after REVIEW_ROUNDS rounds, one class pass and one ruling round
+        block the items; each fix resumes."""
         R = build_run.REVIEW_ROUNDS
         self.press()
-        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1))], sd_review=["blocking"] * (R + 1))
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 2))], sd_review=["blocking"] * (R + 2))
         ended = self.supervisor().run()
         self.assertEqual(ended["outcome"], "blocked")
-        self.assertIn(f"{R + 1} review rounds left blockers: work.txt:1 a blocker", self.latest()["detail"])
-        self.assertEqual(len(self.calls("sd-review")), R + 1)
+        self.assertIn(f"{R + 2} review rounds left blockers: work.txt:1 a blocker", self.latest()["detail"])
+        self.assertEqual(len(self.calls("sd-review")), R + 2)
         fixes = [call["argv"] for call in self.calls("claude")][1:]
-        self.assertEqual([argv[argv.index("--resume") + 1] for argv in fixes], ["session-fixture"] * R)
+        self.assertEqual([argv[argv.index("--resume") + 1] for argv in fixes], ["session-fixture"] * (R + 1))
         prompts = [argv[argv.index("-p") + 1] for argv in fixes]
         self.assertIn("- work.txt:1 a blocker", prompts[0], "the fix names each blocker")
-        self.assertFalse(any("class pass" in prompt for prompt in prompts[1:-1]))
-        self.assertIn("class pass", prompts[-1], "sd:9263: the last round is a class pass")
+        self.assertFalse(any("class pass" in prompt for prompt in prompts[1:-2]))
+        self.assertIn("do one class pass", prompts[-2], "sd:9263: the round past the bound is a class pass")
+        self.assertIn("rule each blocker", prompts[-1], "sd:10286: the last round rules")
         self.assertIn("- work.txt:1 a blocker", prompts[-1])
         self.assertEqual(self.statuses(), ["blocked"])
+
+    def test_a_run_at_the_cap_rules_its_blockers_and_delivers(self):
+        """sd:10286: blockers after the class pass no longer park; the run rules each one on the strongest
+        model (FIX, REJECT through adjudicate, FILE, a question for the operator's), and a clean review after
+        the ruling delivers."""
+        R = build_run.REVIEW_ROUNDS
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 2))],
+                  sd_review=[*["blocking"] * (R + 1), "clean"])
+        ended = self.supervisor().run()
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        ruling = [call["argv"] for call in self.calls("claude")][-1]
+        prompt = ruling[ruling.index("-p") + 1]
+        self.assertEqual(ruling[ruling.index("--model") + 1], build_run.STRONGEST)
+        item = self.items[0]
+        for said in ("FIX when", "REJECT when", "FILE anything else", f"sd task note {item}", "--kind\ndecision",
+                     "--kind question", f"adjudicate --item {item}", "- work.txt:1 a blocker"):
+            self.assertIn(said, prompt)
+        self.assertNotIn("name the class", prompt, "the ruling round fixes only its FIX rulings")
 
     def test_fix_rounds_past_the_third_escalate(self):
         """Pack sd:9264: early fix rounds run on the bundle's model; the class-pass round runs on the strongest
         model at medium effort (sd:10192), its brief naming the blockers' class; the park stays."""
         R = build_run.REVIEW_ROUNDS
         self.press()
-        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1))], sd_review=["blocking"] * (R + 1))
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 2))], sd_review=["blocking"] * (R + 2))
         ended = self.supervisor().run()
         self.assertEqual(ended["outcome"], "blocked")
-        self.assertEqual(len(self.calls("sd-review")), R + 1, "the park moved")
+        self.assertEqual(len(self.calls("sd-review")), R + 2, "the park moved")
         fixes = [call["argv"] for call in self.calls("claude")][1:]
         models = [(argv[argv.index("--model") + 1], "--effort" in argv) for argv in fixes]
         E = build_run.ESCALATE_AFTER
         self.assertLess(E, R, "no fix escalates before the park (sd:10111)")
         self.assertEqual(models[:E], [("opus", False)] * E, "an early round escalated")
-        self.assertEqual(models[E:], [(build_run.STRONGEST, True)] * (R - E), "a late round did not escalate")
+        self.assertEqual(models[E:], [(build_run.STRONGEST, True)] * (R + 1 - E), "a late round did not escalate")
         self.assertEqual(fixes[E][fixes[E].index("--effort") + 1], "medium", "sd:10192")
         prompts = [argv[argv.index("-p") + 1] for argv in fixes]
         self.assertNotIn("name the class", prompts[E - 1])
@@ -1167,7 +1189,8 @@ class Supervise(Case):
         self.assertEqual(len(escalated), 1, "the escalation is not recorded once on the run's item")
 
     def test_review_rounds_cap_is_two(self):
-        """Operator 2026-11-23 (sd:10128): two rounds with blockers, then the class pass: a park after 3 reviews."""
+        """Operator 2026-11-23 (sd:10128, sd:10286): two rounds with blockers, the class pass, then the ruling
+        round: a park after 4 reviews."""
         self.assertEqual(build_run.REVIEW_ROUNDS, 2)
         self.assertEqual(build_run.ESCALATE_AFTER, 1)
 
@@ -1334,12 +1357,12 @@ class Supervise(Case):
         """Review of sd:9263: a question on a skipped member B must not park A, which the class pass can still fix."""
         R = build_run.REVIEW_ROUNDS
         self.press(2)
-        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1))], sd_review=["blocking"] * (R + 1))
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 2))], sd_review=["blocking"] * (R + 2))
         add_note(self.db, self.items[1], "question", "Which option?\nOption: Yes (Recommended)\nOption: No")
         ended = self.supervisor().run()
         self.assertEqual(ended["outcome"], "blocked")
-        self.assertIn(f"{R + 1} review rounds left blockers", self.latest()["detail"])
-        self.assertEqual(len(self.calls("sd-review")), R + 1)
+        self.assertIn(f"{R + 2} review rounds left blockers", self.latest()["detail"])
+        self.assertEqual(len(self.calls("sd-review")), R + 2)
 
     def test_an_open_question_skips_the_class_pass(self):
         """sd:9263: no fix round answers a question, so a build that asked one parks at REVIEW_ROUNDS."""
@@ -3065,6 +3088,26 @@ class Supervise(Case):
         fix = [call["argv"] for call in self.calls("claude")][-1]
         self.assertIn("do one class pass", fix[fix.index("-p") + 1])
         self.assertEqual(build.run(self.db, again["id"])["review_round"], R)
+
+    def test_a_usage_limit_in_the_ruling_round_resumes_the_ruling_round(self):
+        """sd:10286: a limit in the ruling round resumes with RULING, not the class pass or a plain fix."""
+        R = build_run.REVIEW_ROUNDS
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), "rate_limited"],
+                  sd_review=["blocking"] * (R + 1))
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.plan(claude=["fixr"], sd_review=["clean"])
+        self.assertEqual(self.supervisor(again["id"]).run()["step"], "enqueued")
+        fix = [call["argv"] for call in self.calls("claude")][-1]
+        self.assertIn("rule each blocker", fix[fix.index("-p") + 1])
+        self.assertEqual(build.run(self.db, again["id"])["review_round"], R + 1)
 
     def test_a_usage_limit_reclaim_refuses_a_worktree_on_another_branch(self):
         """Review of build/sd-1557: the reclaim resumed at building or fixing, past the worktree step's branch
