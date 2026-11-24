@@ -1970,6 +1970,8 @@ class Supervise(Case):
         def show(argv, **_kwargs):
             if "show" in argv and argv[-1] == f"{'a' * 40}:lib/parse.py":
                 return source
+            if "show" in argv and argv[-1] == f"{'a' * 40}:src/caller.py":
+                return "def export():\n    return 1\n"
             raise build_run.Unread("no such file")
 
         rows = [{"path": "lib/parse.py", "line": 5, "summary": "an empty value crashes here"},
@@ -1996,7 +1998,8 @@ class Supervise(Case):
         self.press()
         head = "a" * 40
         files = {"lib/parse.py": "def parse_row(value):\n    return value[0]\n\n\ndef old_reader():\n    return 1\n",
-                 "lib/wrap.py": "from lib.parse import parse_row\n\n\ndef wrap(value):\n    return parse_row(value)\n"}
+                 "lib/wrap.py": "from lib.parse import parse_row\n\n\ndef wrap(value):\n    return parse_row(value)\n",
+                 "src/caller.py": "def export():\n    return 1\n"}
 
         def show(argv, **_kwargs):
             path = argv[-1].removeprefix(f"{head}:")
@@ -2031,7 +2034,8 @@ class Supervise(Case):
         head = "a" * 40
         files = {"lib/consume.py": "def show_name(key):\n    return lookup(key).name\n\n\n"
                                    "def label(key):\n    return middle(key).name\n\n\ndef plain():\n    return 1\n",
-                 "lib/mid.py": "def middle(key):\n    return lookup(key)\n"}
+                 "lib/mid.py": "def middle(key):\n    return lookup(key)\n",
+                 "lib/store.py": "def lookup(key):\n    return None\n"}
 
         def show(argv, **_kwargs):
             path = argv[-1].removeprefix(f"{head}:")
@@ -2207,6 +2211,84 @@ class Supervise(Case):
         up = [{"path": "lib/handlers.py", "line": 2, "summary": "an empty value crashes here"}]
         self.assertEqual(self.edges(files, up, {"lib/dispatch.py": {2}}, {"dispatch", "key"}, {"export"}), up,
                          "a handler the changed dispatcher reaches through a mutated table was deferred")
+
+    REGISTRY = {"lib/registry.py": "REGISTRY = {}\n\n\ndef register(name):\n    def wrap(fn):\n"
+                                   "        REGISTRY[name] = fn\n        return fn\n    return wrap\n",
+                "lib/handlers.py": "import functools\n\n\n@register(\n    \"a\",\n)\ndef handler_a():\n"
+                                   "    return lookup()\n\n\n@functools.cache\ndef cached():\n    return lookup()\n",
+                "lib/dispatch.py": "def dispatch(key):\n    return REGISTRY[key]().name\n"}
+
+    def test_a_decorator_registry_is_an_edge(self):
+        """sd:10027: `@register("a")` files `handler_a` in a table `dispatch` reads, an edge no name walk
+        sees; both directions hold. A pure wrapper (`@functools.cache`) adds no edge."""
+        self.press()
+        up = [{"path": "lib/handlers.py", "line": 8, "summary": "an empty value crashes here"}]
+        self.assertEqual(self.edges(self.REGISTRY, up, {"lib/dispatch.py": {2}}, {"dispatch", "key"}, {"dispatch"}),
+                         up, "a handler the changed dispatcher reaches through a decorator registry was deferred")
+        down = [{"path": "lib/dispatch.py", "line": 2, "summary": "a missing result crashes here"}]
+        self.assertEqual(self.edges(self.REGISTRY, down, {"lib/handlers.py": {8}}, {"handler_a", "lookup"},
+                                    {"handler_a"}),
+                         down, "a dispatcher reaching a changed registered handler was deferred")
+        wrapped = [{"path": "lib/handlers.py", "line": 13, "summary": "an empty value crashes here"}]
+        self.assertEqual(self.edges(self.REGISTRY, wrapped, {"lib/dispatch.py": {2}}, {"dispatch", "key"},
+                                    {"dispatch"}),
+                         [], "a function behind a pure wrapper the change never reaches still held")
+
+    def test_an_implicit_call_is_an_edge(self):
+        """Lead scope on sd:10027: `table[key]` or `a == b` calls `__getitem__` or `__eq__` by no name; a
+        finding in an unchanged one, or past a changed one, holds. A changed `__init__` is reached by name."""
+        self.press()
+        files = {"lib/table.py": "class Table:\n    def __getitem__(self, key):\n        return self.rows[key]\n\n"
+                                 "    def __init__(self):\n        self.rows = {}\n\n    def size(self):\n"
+                                 "        return len(self.rows)\n",
+                 "lib/use.py": "def same(a, b):\n    return a == b\n"}
+        up = [{"path": "lib/table.py", "line": 3, "summary": "a missing key crashes here"}]
+        self.assertEqual(self.edges(files, up, {"lib/load.py": {4}}, {"load", "table"}, {"load"}), up,
+                         "a finding in an unchanged __getitem__ was deferred")
+        down = [{"path": "lib/use.py", "line": 2, "summary": "a None row now compares equal"}]
+        self.assertEqual(self.edges(files, down, {"lib/table.py": {3}}, {"__getitem__", "rows"}, {"__getitem__"}),
+                         down, "a finding past a changed __getitem__ was deferred")
+        plain = [{"path": "lib/use.py", "line": 2, "summary": "a None row now compares equal"}]
+        self.assertEqual(self.edges(files, plain, {"lib/table.py": {6}}, {"__init__", "rows"}, {"__init__"}), [],
+                         "a changed __init__ held a finding that never names its class")
+
+    def test_a_shared_artifact_key_is_an_edge(self):
+        """Lead scope on sd:10027: an exporter that writes `"covers_from"` and an unchanged importer that reads
+        it share a file format, not a name; the quoted key is the edge. Another key is none."""
+        self.press()
+        files = {"lib/importer.py": "def load(prior):\n    return prior.get(\"covers_from\").strip()\n",
+                 "lib/other.py": "def load(prior):\n    return prior.get(\"unrelated\").strip()\n",
+                 "lib/exporter.py": "def export(head):\n    row = {}\n    row[\"covers_from\"] = head\n"
+                                    "    return row\n"}
+        rows = [{"path": "lib/importer.py", "line": 2, "summary": "a missing key crashes here"}]
+        self.assertEqual(self.edges(files, rows, {"lib/exporter.py": {4}}, {"export", "covers_from", '"covers_from"'},
+                                    {"export"}), rows, "an importer of the key the changed exporter writes was deferred")
+        other = [{"path": "lib/other.py", "line": 2, "summary": "a missing key crashes here"}]
+        self.assertEqual(self.edges(files, other, {"lib/exporter.py": {4}}, {"export", "covers_from", '"covers_from"'},
+                                    {"export"}), [], "an importer of another key held")
+
+    def test_function_words_mark_each_quoted_literal(self):
+        """sd:10027: the changed functions' quoted literals read as `"text"` among the words, so an unchanged
+        reader of the same key is tied to the branch; an identifier never carries quotes."""
+        repo = Path(tempfile.mkdtemp(dir=self.root))
+
+        def run(*args):
+            return subprocess.run(["git", "-C", str(repo), "-c", "user.name=operator",
+                                   "-c", "user.email=operator@example.test", *args],
+                                  check=True, capture_output=True, text=True).stdout.strip()
+
+        run("init", "-q")
+        body = "def export(head):\n    return {'covers_from': head, \"x\": 1}\n"
+        (repo / "exporter.py").write_text(body)
+        run("add", "-A")
+        run("commit", "-q", "-m", "base")
+        base = run("rev-parse", "HEAD")
+        (repo / "exporter.py").write_text(body.replace("1}", "2}"))
+        run("add", "-A")
+        run("commit", "-q", "-m", "change")
+        read = build_run.function_words(["git"], str(repo), base, run("rev-parse", "HEAD"))
+        assert read is not None, "git's function context did not read"
+        self.assertIn('"covers_from"', read[0], read[0])
 
     def test_a_short_function_name_still_names_the_changed_caller(self):
         """Review of sd:9769: `go()` names a changed function; no length filter drops it."""

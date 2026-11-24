@@ -1220,9 +1220,20 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
             raise BuildRefused(f"--finding goes to a Retry or a Fix; {', '.join(f'sd:{item}' for item in fresh)} "
                                "would be a fresh build, with no builder to send it to")
         # One named item is the row's Retry of its whole bundle; two or more name the part to retry (pack sd:9581).
-        queued = [entry for lead in leads for entry in retry(
-            connection, lead, who=who, finding=finding,
-            only=named[lead] if len(named[lead]) > 1 else None)["queued"]]
+        queued = []
+        for lead in leads:
+            built = retry(connection, lead, who=who, finding=finding,
+                          only=named[lead] if len(named[lead]) > 1 else None)["queued"]
+            # Every selected item is built or the press refuses, read from what Retry queued, not predicted: its
+            # split (`_inside`) frees only the members the lead waits on, each that waits on nothing, or parks a
+            # member that waits on bundle work (class pass, review of build/sd-1742). The lead alone is excused:
+            # a Build of it frees what it waits on, as Retry of its row does. The refusal undoes Retry's writes.
+            lead_item = queue_state(connection, lead)["item"]
+            for item in sorted(named[lead] - {entry["item"] for entry in built} - {lead_item}):
+                names = ", ".join(f"sd:{entry['item']}" for entry in built) or "no item now"
+                raise BuildRefused(f"sd:{item} would stay unbuilt: a Retry of its bundle builds only {names}; "
+                                   f"Build its lead sd:{lead_item} alone first, then Build sd:{item}")
+            queued += built
         for run in fixes:
             fixed = lane_fix(connection, run["id"],
                              finding or f"the lane entry failed; fix what it names: {run['detail']}"[:2000], who=who)
@@ -1257,7 +1268,8 @@ def _retry_row(connection, item: int):
             # lane moved to another satellite or to the hub (reviews of build/sd-1378), as `_stranded` reads for
             # beat recovery (pack sd:9964).
             host = connection.execute(_REPO, (ran["item"],)).fetchone()["lane_host"]
-            if (queue_state(connection, lead)["status"] == ran["status"] and _in_work_repo(connection, lead, ran["status"])
+            if (queue_state(connection, lead)["status"] == ran["status"]
+                    and _in_work_repo(connection, lead, ran["status"], retry=item)
                     and _resumes(connection, host, lead)
                     and _retry_takes(connection, lead, ran["status"])):
                 return ran
@@ -2119,16 +2131,30 @@ def _stranded(connection, row) -> bool:
             and not _home(connection, lane_of(connection, row["lane_host"]), lead))
 
 
-def _in_work_repo(connection, lead: int, status: str) -> bool:
+def _in_work_repo(connection, lead: int, status: str, *, retry: int | None = None) -> bool:
     """Whether the claim resumes build `lead`'s bundle in `status` where its work is: every member's item reads the
     repository of that work (`_work_repo`), as the claim checks, which refuses the lead or drops the member
-    otherwise. The rule each resume selector shares, Build by item's and recovery's (class pass, review round 15)."""
+    otherwise. The rule each resume selector shares, Build by item's and recovery's (class pass, review round 15).
+    With `retry`, only the members Retry keeps (`_inside`): one that waits on a bundle item leaves parked, and
+    with a member the lead waits on, those leave to build fresh and none resumes (sd:10086). `retry` is the item
+    Build presses, checked too when Retry would park it: that Retry queues the lead and leaves the pressed item
+    unbuilt (review of sd:10086). The check reads what Retry resumes on the branch, nothing else (class pass)."""
     row = connection.execute("SELECT id, item, parent FROM assignment WHERE id = ?", (lead,)).fetchone()
     home = _work_repo(connection, row)
     if home is None:
         return True
+    members = _open_members(connection, lead, status)
+    if retry is not None:
+        ahead, behind = _inside(connection, row["item"], [member for member in members if _current(connection, member)])
+        # What Retry resumes on the branch: nothing while the lead waits on a member (it frees those to build
+        # fresh where they read now, the pressed one too); else the kept members, and the pressed item.
+        # The pressed item is checked whenever Retry does not build it: a member Retry neither frees nor leads
+        # stays ended, so a moved one presses fresh where it reads now, not skipped (lead round 3 of sd:10086).
+        members = [member for member in members if member["item"] == retry and member["id"] != lead
+                   and member not in ahead] if ahead else [
+                       member for member in members if member["item"] == retry or member not in behind]
     repos = [connection.execute("SELECT repo FROM item WHERE id = ?", (member["item"],)).fetchone()["repo"]
-             for member in _open_members(connection, lead, status)]
+             for member in members]
     return all(repo is not None and paths.same(home, repo) for repo in repos)
 
 
