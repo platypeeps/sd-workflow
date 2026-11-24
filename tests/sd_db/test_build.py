@@ -1851,10 +1851,49 @@ class ReapThree(Case):
         lead, ahead, member = self.items
         edit_item(self.db, lead, {"blocked_by": [ahead]}, who="operator")
         members = [one["id"] for one in build.run(self.db, row["id"])["members"]]
-        with self.assertRaisesRegex(build.BuildRefused, f"waits on sd:{ahead}"):
+        with self.assertRaisesRegex(build.BuildRefused, f"sd:{member} would stay unbuilt.*only sd:{ahead}"):
             build.queue_again(self.db, [member], who="operator")
         self.assertEqual([self.count("SELECT status FROM assignment WHERE id = ?", one) for one in members],
                          ["blocked"] * 3, "the refused press wrote")
+
+    def _blocked(self, row):
+        return [self.count("SELECT status FROM assignment WHERE id = ?", one["id"])
+                for one in build.run(self.db, row["id"])["members"]]
+
+    def test_build_of_the_lead_and_a_member_its_retry_skips_is_refused(self):
+        """Class pass, review of build/sd-1742 (build.py:1228): every selected item is built or the press
+        refuses. The lead waits on one member; the selection names the whole bundle. Retry builds only the
+        member the lead waits on, and naming the lead excused the third, which stayed ended."""
+        from sd_db.workflow import edit_item
+        row = self._ended()
+        lead, ahead, member = self.items
+        edit_item(self.db, lead, {"blocked_by": [ahead]}, who="operator")
+        with self.assertRaisesRegex(build.BuildRefused, f"sd:{member} would stay unbuilt"):
+            build.queue_again(self.db, [lead, ahead, member], who="operator")
+        self.assertEqual(self._blocked(row), ["blocked"] * 3, "the refused press wrote")
+
+    def test_build_of_the_lead_and_a_member_that_waits_on_it_is_refused(self):
+        """Class pass (build.py:1231): the selection names the lead and a member that waits on it. Retry parks
+        that member and queues the lead, and naming the lead excused the parked one."""
+        from sd_db.workflow import edit_item
+        row = self._ended()
+        lead, behind, _ = self.items
+        edit_item(self.db, behind, {"blocked_by": [lead]}, who="operator")
+        with self.assertRaisesRegex(build.BuildRefused, f"sd:{behind} would stay unbuilt"):
+            build.queue_again(self.db, [lead, behind], who="operator")
+        self.assertEqual(self._blocked(row), ["blocked"] * 3, "the refused press wrote")
+
+    def test_build_of_a_member_the_lead_waits_on_that_waits_itself_is_refused(self):
+        """Class pass: the pressed member is one the lead waits on, and it waits on an open item outside the
+        bundle. Retry frees it but queues nothing, so Build reported success with nothing built."""
+        from sd_db.workflow import edit_item
+        row = self._ended()
+        lead, ahead, _ = self.items
+        edit_item(self.db, lead, {"blocked_by": [ahead]}, who="operator")
+        edit_item(self.db, ahead, {"blocked_by": [self.item()]}, who="operator")
+        with self.assertRaisesRegex(build.BuildRefused, f"sd:{ahead} would stay unbuilt"):
+            build.queue_again(self.db, [ahead], who="operator")
+        self.assertEqual(self._blocked(row), ["blocked"] * 3, "the refused press wrote")
 
 class Park(Case):
     """pack sd:6132 (operator ruling #32107): a build run that ends blocked parks its items once its lease is
