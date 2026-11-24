@@ -105,7 +105,7 @@ def _blocks(body: str, comments: bool = True, plain: bool = False):
     open code span neither `plain` rule applies, so a span's line ends
     and opens no item.
 
-    Yields `(number, kind, opened, depth, text, line, spanned)`: `kind` is `fence`,
+    Yields `(number, kind, opened, depth, text, line, spanned, shown)`: `kind` is `fence`,
     `comment`, `code`, `setext` (an underline that makes the line above
     it a heading), `wrapped` (text indented less than the list item whose
     paragraph it continues) or `text`; `opened` counts the list items the line's
@@ -113,7 +113,8 @@ def _blocks(body: str, comments: bool = True, plain: bool = False):
     the items open after them; `text` is the line past their text column,
     each comment on it one space, or `_SEAM` inside a word (`_less`),
     when comments are read;
-    `spanned` says the line starts inside a code span.
+    `spanned` says the line starts inside a code span; `shown` is `line`
+    with its comments read as `text` reads them.
 
     A code span may wrap onto the next lines of its paragraph. An opening
     backtick run that no line of the paragraph closes is text, so the read
@@ -132,15 +133,17 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]], plain
     fence, fence_depth, commented, comment_depth, loose = "", 0, False, 0, True  # loose: no paragraph runs on
     depth, ticks, span_at, rows = 0, "", (0, 0), []
     items: list[int] = []  # the text column of each open list item, outermost first
+    pending: list[tuple[int, bool, str]] = []  # (row, word before, raw comment): an `_OPEN` waits on its close
     for number, line in enumerate(body.split("\n"), start=1):
         line = line.rstrip("\r").expandtabs(4)
         spanned = bool(ticks)  # in an open code span the `plain` rules rest
         rest, lazy = _continues(line, items, not loose and not commented, plain, spanned)
         commented = commented and len(items) >= comment_depth  # a comment ends with the list item that holds it
+        _settle(rows, pending, None, ended=not commented)  # it ended with its list item, and no `-->`
         if fence and len(items) >= fence_depth:
             fence = "" if _closes(_FENCE_RE.match(rest), fence) else fence
             loose = True  # a fence is no paragraph: indented code may follow its closing line
-            rows.append((number, "fence", 0, len(items), rest, line, False))
+            rows.append((number, "fence", 0, len(items), rest, line, False, line))
             continue
         fence = ""  # the list item that held the fence ended, and the fence with it
         kind, opened, text = ("text", 0, rest) if lazy else _kind(rest, items, loose, commented, len(items) != depth,
@@ -148,6 +151,7 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]], plain
         alone = _stands_alone(kind, text, line)
         if ticks and _ends_paragraph(kind, opened, alone, len(items) != depth):
             return rows, span_at  # the paragraph ended with the span open: its opener is text
+        shown = line
         if kind == "fence" and (opener := _FENCE_RE.match(text)):  # `_kind` matched it already
             fence, fence_depth = opener["fence"], len(items)
         elif kind != "code" and comments:
@@ -156,36 +160,74 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]], plain
             comment_depth = len(items) if commented and not was else comment_depth
             if ticks and alone:
                 return rows, span_at  # a heading is one line: a span it opens ends with it
-            text = _less(line, text, lazy, cut)
+            text, shown = _cut(line, text, lazy, cut, was, rows, pending)
         loose = alone
         depth = len(items)  # a heading or a break is one line, no paragraph; `depth` finds a lazy line
-        rows.append((number, "wrapped" if lazy else kind, opened, len(items), text, line, spanned))
+        rows.append((number, "wrapped" if lazy else kind, opened, len(items), text, line, spanned, shown))
+    _settle(rows, pending, None)
     return rows, (span_at if ticks else None)
 
 
 #: What a comment between two word characters reads as: a word character no sha holds, so the two
 #: fragments neither join into a sha nor does the one before it end as one (pack sd:10090, round 3).
 _SEAM = "\u02bc"
+#: What a comment open past the line end after a word character reads as until it closes: `_SEAM`
+#: when a word character follows its `-->`, else a space (pack sd:10090, round 4).
+_OPEN = "\ue000"
 
 
-def _less(line: str, text: str, lazy: bool, cut: list[tuple[int, int]]) -> str:
-    """`text`, the part of `line` a row holds, with each comment `cut` names read as one space: a reader
-    sees no comment, and what stood either side of it stays apart (pack sd:10090). A run of comments
-    with a word character on its left and one on its right, or a comment that runs past the line end,
-    reads as `_SEAM`: a reader sees one token there, which a space would split into two."""
-    start = len(line) - len(line.lstrip()) if lazy else len(line) - len(text)  # a lazy line's text is stripped
+def _runs(line: str, cut: list[tuple[int, int]]) -> list[tuple[int, int, bool]]:
+    """The comments `cut` names on `line`, adjacent ones as one run: `(first, last, open)`, `open` when
+    no `-->` on the line closes the run."""
     runs: list[list[int]] = []
-    for first, last in cut:  # adjacent comments are one run: what stands either side of it decides
+    for first, last in cut:
         if runs and runs[-1][1] == first:
             runs[-1][1] = last
         else:
             runs.append([first, last])
-    for first, last in reversed(runs):
-        open_on = last >= len(line) and not line.endswith("-->", first + 4)  # no `-->` closes it on the line
-        word = first > 0 and re.match(r"\w", line[first - 1]) and (open_on or re.match(r"\w", line[last:last + 1]))
+    return [(first, last, last >= len(line) and not line.endswith("-->", first + 4)) for first, last in runs]
+
+
+def _cut(line: str, text: str, lazy: bool, cut: list[tuple[int, int]], was: bool, rows: list,
+         pending: list[tuple[int, bool, str]]) -> tuple[str, str]:
+    """`text` and the whole `line` with the comments `cut` names read (`_less`). A comment open from an
+    earlier line (`was`) that closes here settles the `_OPEN` waiting on it; one open past this line's
+    end leaves its own, for the row `_blocks_once` appends next."""
+    runs = _runs(line, cut)
+    if was and runs and runs[0][0] == 0 and not runs[0][2]:
+        _settle(rows, pending, line[runs[0][1]:runs[0][1] + 1])
+    if runs and runs[-1][2]:  # only the last run on a line can be open past its end
+        first = runs[-1][0]
+        pending.append((len(rows), first > 0 and bool(re.match(r"\w", line[first - 1])), line[first:]))
+    return _less(line, text, lazy, runs), _less(line, line, False, runs, True)
+
+
+def _settle(rows: list, pending: list[tuple[int, bool, str]], right: str | None, ended: bool = True) -> None:
+    """Settle each `_OPEN` that `pending` holds, once its comment `ended`: `right` follows the comment's
+    `-->`, or None when it ended with no `-->`. In `text` the read's comment is a space, or `_SEAM` when word characters
+    stand either side; `shown` reads an unclosed comment as CommonMark does, as text."""
+    for at, word, raw in pending if ended else ():
+        seam = _SEAM if word and right and re.match(r"\w", right) else " "
+        number, kind, opened, depth, text, line, spanned, shown = rows[at]
+        rows[at] = (number, kind, opened, depth, text.replace(_OPEN, seam), line, spanned,
+                    shown.replace(_OPEN, seam if right is not None else raw))
+    del pending[:len(pending) if ended else 0]
+
+
+def _less(line: str, text: str, lazy: bool, runs: list[tuple[int, int, bool]], held: bool = False) -> str:
+    """`text`, the part of `line` a row holds, with each comment run read as one space: a reader sees
+    no comment, and what stood either side of it stays apart (pack sd:10090). A run with a word
+    character either side reads as `_SEAM`: a reader sees one token there, which a space would split.
+    A run open past the line end after a word character, or any such run when `held`, reads as
+    `_OPEN`, which its close decides."""
+    start = len(line) - len(line.lstrip()) if lazy else len(line) - len(text)  # a lazy line's text is stripped
+    for first, last, open_on in reversed(runs):
+        word = first > 0 and re.match(r"\w", line[first - 1])
+        seam = _OPEN if open_on and (word or held) else \
+            _SEAM if word and re.match(r"\w", line[last:last + 1]) else " "
         first, last = max(first - start, 0), last - start
         if last > first:
-            text = text[:first] + (_SEAM if word else " ") + text[last:]
+            text = text[:first] + seam + text[last:]
     return text
 
 
@@ -559,7 +601,7 @@ REVERT_SUBJECT = re.compile(r"^(?:Revert\b|revert(?:\([^)]*\))?!?:)", re.IGNOREC
 #: An item a hand-written revert names an undone commit on: one that opens with a sha, bare or in a code
 #: span, emphasis or a link's text (pack sd:9666). No letter, digit or `_`, in any script, may follow it,
 #: but the `_` that closes `_<sha>_`.
-_SHA_LED = re.compile(r"_([0-9a-f]{7,40})_(?!\w)|[`*\[]*([0-9a-f]{7,40})(?!\w|<!--)")
+_SHA_LED = re.compile(r"_([0-9a-f]{7,40})_(?!\w)|[`*\[]*([0-9a-f]{7,40})(?!\w)")
 #: The line that opens a list of undone commits: its last sentence is exactly `Reverted commits:`,
 #: `Reverted:` or `Reverts:`. A substring match let `Commits not reverted:` undo its list (pack sd:9666).
 _REVERTED_INTRO = re.compile(r"(?:^|[.!?][ \t]+)(?:reverted(?:[ \t]+commits)?|reverts):[ \t]*$", re.IGNORECASE)
@@ -590,8 +632,9 @@ def _listed_undone(message: str) -> list[str]:
     it there. A comment on a line reads as one space, where the read
     itself finds it (`_comment_open`): it heads nothing, hides what it
     holds and joins no two fragments into a sha; inside a word it reads
-    as `_SEAM`, so no sha ends at it either, and in the read that takes
-    comment syntax as text no sha ends at a `<!--` (pack sd:10090).
+    as `_SEAM`, so no sha ends at it either. A comment that runs onto
+    later lines is inside a word when a word character follows its
+    `-->` (pack sd:10090).
 
     The `plain` grammar of `_blocks` and CommonMark, the read citations
     get, can give one line two roles: the fence a `10.` item opens is a
@@ -600,9 +643,10 @@ def _listed_undone(message: str) -> list[str]:
     either read lists is undone, so a message the two read apart closes
     nothing: once whole, with the fences, comments and code spans that
     grammar finds, and once with only its fences, over the lines
-    CommonMark leaves outside a comment and a code span.
+    CommonMark leaves outside a comment and a code span, each comment
+    on them read as in the first.
     """
-    shown = "\n".join(line for _, kind, *_, line, spanned in _blocks(message) if not spanned and kind != "comment")
+    shown = "\n".join(line for _, kind, *_, spanned, line in _blocks(message) if not spanned and kind != "comment")
     found = _listed(_blocks(message, plain=True))
     return found + [sha for sha in _listed(_blocks(shown, comments=False, plain=True)) if sha not in found]
 
@@ -610,7 +654,7 @@ def _listed_undone(message: str) -> list[str]:
 def _listed(rows) -> list[str]:
     """The shas `_listed_undone` finds in one read of a message, `rows` of `_blocks`."""
     found, undoes, previous = [], [False], ""  # undoes: per open list item, the top level first, whether its heading says reverted
-    for _, kind, opened, depth, raw, line, spanned in rows:
+    for _, kind, opened, depth, raw, line, spanned, _ in rows:
         kind = "span" if spanned else kind
         del undoes[depth - opened + 1:]  # the items this line ended take their headings with them
         # `raw` holds no comment the read found (`_less`): a comment heads nothing and leaves the heading it

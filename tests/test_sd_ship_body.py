@@ -654,7 +654,7 @@ class CitedIdTests(unittest.TestCase):
         cases = itertools.chain(itertools.product(wraps, inner), itertools.product(wraps, inner, inner))
         for ((opener, closer), *lines), plain in itertools.product(cases, (False, True)):
             message = ["- Reverted commits:", opener, *lines, closer, f"     - {a}"]
-            for number, kind, *_, spanned in sd_ship_body._blocks("\n".join(message), plain=plain):
+            for number, kind, *_, spanned, _ in sd_ship_body._blocks("\n".join(message), plain=plain):
                 if (spanned or kind == "comment") and 2 < number <= 2 + len(lines):
                     with self.subTest(message=message, without=number, plain=plain):
                         without = message[:number - 1] + message[number:]
@@ -831,7 +831,8 @@ class CitedIdTests(unittest.TestCase):
         for listing, kept in (
                 (f"Reverted commits:\n- {sha}<!-- -->ccc renew\n", (2, 3)),
                 (f"Reverted commits:\n- {sha}<!-- x --><!-- y -->ccc renew\n", (2, 3)),
-                (f"Reverted commits:\n- `{sha}<!-- -->ccc` renew\n", (2, 3)),
+                # In a code span comment syntax is text, which a sha may end at, as at any `<`.
+                (f"Reverted commits:\n- `{sha}<!-- -->ccc` renew\n", (3,)),
                 (f"Reverted commits:\n- {sha}<!--\n  -->ccc renew\n", (2, 3)),
                 (f"Reverted commits:\n- {sha[:4]}<!-- -->{sha[4:]} renew\n", (2, 3)),
                 # A comment beside a space or punctuation ends nothing a reader does not see end.
@@ -846,6 +847,34 @@ class CitedIdTests(unittest.TestCase):
             listing = f"Reverted commits:\n- {sha}{comment}{right} renew\n"
             with self.subTest(listing=listing):
                 self.assertEqual(sd_ship_body.cited_ids("", [self.revert_of(listing), *work]), (2, 3))
+
+    def test_a_comment_after_a_whole_sha_ends_it_where_it_closes(self) -> None:
+        """Round 4, review of build/sd-1653 (pack sd:10090): a comment open past the line end after a
+        sha read as a seam whatever followed its `-->`, so `- aaaaaaaaa<!-- why` then `more -->` kept
+        the reverted commit's `Closes:`. What follows the close decides, as on one line; and the read
+        over CommonMark's lines ended no sha at a `<!--`, so a sha only that read finds was lost."""
+        undone, other = "a" * 40, "b" * 40
+        work = [(undone, "feat: renew\n\nCloses: sd:2\n"), (other, "fix: prepare\n\nCloses: sd:3\n")]
+        sha, more = undone[:9], f"- {other[:9]} prepare\n"
+        for listing, kept in (
+                (f"Reverted commits:\n- {sha}<!-- why\n  more -->\n{more}", ()),
+                (f"Reverted commits:\n- {sha}<!-- why\n  more --> renew\n{more}", ()),
+                (f"Reverted commits:\n- {sha}<!--\n  why\n  -->: renew\n{more}", ()),
+                (f"Reverted commits:\n- {sha} renew<!-- why\n  more -->ccc\n{more}", ()),
+                # It closes against a word character: one token, so no sha.
+                (f"Reverted commits:\n- {sha}<!-- why\n  more -->ccc renew\n{more}", (2,)),
+                (f"Reverted commits:\n- {sha}<!-- why\n  -->ccc<!-- x --> renew\n{more}", (2,)),
+                # The list item ends before any `-->`: the comment ends with it.
+                (f"Reverted commits:\n- {sha}<!-- why\nKept:\n", (3,))):
+            with self.subTest(listing=listing):
+                self.assertEqual(sd_ship_body.cited_ids("", [self.revert_of(listing), *work]), kept)
+        # A sha only the read over CommonMark's lines finds (`test_a_line_with_two_roles_is_read_both_ways`).
+        a = "a" * 7
+        for line, found in ((f"2. {a}<!-- why -->", [a]), (f"2. {a}<!-- why --> b", [a]),
+                            (f"2. {a}<!-- why -->c", [])):
+            message = f"  1. one\n  Reverts:\n    end`\n{line}\n      + `y\n"
+            with self.subTest(message=message):
+                self.assertEqual(sd_ship_body._listed_undone(message), found)
 
     def test_a_merge_the_branch_reverts_cites_nothing_it_brought_in(self) -> None:
         """Lane review of sd:5999, round 3: `git revert -m 1 <merge>` undoes each commit the merge brought in."""
