@@ -1927,7 +1927,9 @@ class Supervisor:
                 # Every instance too: the lane drops the rebuttal once any file the finding names changes.
                 # And each file the branch changes: a lane gate fix to its own caller lapses it (sd:9769).
                 raw = {"path": self.locations(row)[0][0], "summary": row.get("summary"), "line": row.get("line"),
-                       "instances": [str(entry) for entry in row.get("instances") or []] + list(self.judged)}
+                       "instances": [str(entry) for entry in row.get("instances") or []] + list(self.judged),
+                       # What it answered: on this head only that evidence is old to it (sd:10191, sd-review:2030).
+                       "evidence": row.get("evidence") if isinstance(row.get("evidence"), str) else ""}
                 record_state(self.db, "checkpoint", key=f"ship-adjudication:build-run:{self.ident}:{filed}", body={
                     "decision": "accepted", "proposal": {
                         "bindings": {"repository": repository, "branch": self.row["branch"], "head": head},

@@ -2229,6 +2229,17 @@ class Supervise(Case):
         raw = json.loads(body[0])["proposal"]["findings"][0]["raw_finding"]
         self.assertEqual(raw.get("instances"), ["far.py:2", "other.py:7"], "the rebuttal dropped the instances")
 
+    def test_a_rebuttal_records_the_evidence_it_answered(self):
+        """Review of sd:10191 (bin/sd-review:2030): `sd-review` holds a filed finding back on its head only
+        against the evidence the rebuttal answered; a rebuttal without it revived the filed blocker there."""
+        self.press()
+        supervisor = self.supervisor()
+        self.db.execute("UPDATE repo SET remote = 'https://github.com/example/repo.git'")
+        supervisor.file_follow_up({"path": "far.py", "line": 2, "summary": "a", "evidence": "original repro"}, "a" * 40)
+        body = self.db.execute("SELECT body FROM state WHERE key LIKE 'ship-adjudication:build-run:%'").fetchone()
+        raw = json.loads(body[0])["proposal"]["findings"][0]["raw_finding"]
+        self.assertEqual(raw.get("evidence"), "original repro", "the rebuttal dropped the evidence it answered")
+
     def test_a_deferred_rebuttal_names_every_file_the_branch_changes(self):
         """Review of sd:9769: a managed build files a rebuttal before the lane gate runs; a gate fix that
         changes only the branch's own caller must lapse it, so the rebuttal names each file it was judged on."""
