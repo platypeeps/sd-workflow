@@ -1199,6 +1199,30 @@ class Reap(Case):
         self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", self.bundle["assignment"]),
                          "blocked")
 
+    def test_build_by_item_resumes_the_lead_past_a_waiting_member_moved_away(self):
+        """sd:10086: a member of bundle A waits on its lead and moved to another repository. Retry parks it and
+        resumes A's branch, but Build by item read its repository, refused the bundle and pressed the lead fresh
+        from main. The repository check reads only the members Retry keeps."""
+        from sd_db.workflow import edit_item
+        cancelled = self._lead_pressed_and_cancelled()
+        edit_item(self.db, self.items[1], {"blocked_by": [self.items[0]]}, who="operator")
+        self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (B, self.items[1]))
+        queued = build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertEqual([entry["id"] for entry in queued], [self.bundle["assignment"]])
+        self.assertLess(queued[0]["id"], cancelled, "Retry of the bundle, not a fresh press")
+
+    def test_build_by_item_frees_a_member_the_lead_waits_on_moved_away(self):
+        """sd:10086: bundle A's lead waits on its member, which moved to another repository. Retry frees the
+        member to build fresh where it reads now, so its repository is no reason to press the lead fresh."""
+        from sd_db.workflow import edit_item
+        self._lead_pressed_and_cancelled()
+        edit_item(self.db, self.items[0], {"blocked_by": [self.items[1]]}, who="operator")
+        self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (B, self.items[1]))
+        queued = build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [self.items[1]])
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", self.bundle["assignment"]),
+                         "blocked")
+
     def test_build_by_item_reads_no_bundle_whose_lead_is_done(self):
         """Class pass, last round of sd:9788: Retry refuses a bundle whose lead's item is done. Bundle A ends
         blocked, its lead is delivered by a newer build, and a fresh build of the member is cancelled before its

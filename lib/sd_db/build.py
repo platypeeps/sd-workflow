@@ -1204,7 +1204,8 @@ def _retry_row(connection, item: int):
             # lane moved to another satellite or to the hub (reviews of build/sd-1378), as `_stranded` reads for
             # beat recovery (pack sd:9964).
             host = connection.execute(_REPO, (ran["item"],)).fetchone()["lane_host"]
-            if (queue_state(connection, lead)["status"] == ran["status"] and _in_work_repo(connection, lead, ran["status"])
+            if (queue_state(connection, lead)["status"] == ran["status"]
+                    and _in_work_repo(connection, lead, ran["status"], retry=True)
                     and _ran_on(connection, lead) == _route(connection, host, lead)
                     and _retry_takes(connection, lead, ran["status"])):
                 return ran
@@ -2066,16 +2067,22 @@ def _stranded(connection, row) -> bool:
     return held != _route(connection, row["lane_host"], lead)
 
 
-def _in_work_repo(connection, lead: int, status: str) -> bool:
+def _in_work_repo(connection, lead: int, status: str, *, retry: bool = False) -> bool:
     """Whether the claim resumes build `lead`'s bundle in `status` where its work is: every member's item reads the
     repository of that work (`_work_repo`), as the claim checks, which refuses the lead or drops the member
-    otherwise. The rule each resume selector shares, Build by item's and recovery's (class pass, review round 15)."""
+    otherwise. The rule each resume selector shares, Build by item's and recovery's (class pass, review round 15).
+    With `retry`, only the members Retry keeps (`_inside`): one that waits on a bundle item leaves parked, and
+    with a member the lead waits on, those leave to build fresh and none resumes (sd:10086)."""
     row = connection.execute("SELECT id, item, parent FROM assignment WHERE id = ?", (lead,)).fetchone()
     home = _work_repo(connection, row)
     if home is None:
         return True
+    members = _open_members(connection, lead, status)
+    if retry:
+        ahead, behind = _inside(connection, row["item"], [member for member in members if _current(connection, member)])
+        members = [] if ahead else [member for member in members if member not in behind]
     repos = [connection.execute("SELECT repo FROM item WHERE id = ?", (member["item"],)).fetchone()["repo"]
-             for member in _open_members(connection, lead, status)]
+             for member in members]
     return all(repo is not None and paths.same(home, repo) for repo in repos)
 
 
