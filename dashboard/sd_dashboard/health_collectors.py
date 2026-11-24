@@ -70,6 +70,7 @@ import sqlite3
 import subprocess
 import time
 from pathlib import Path
+from xml.etree import ElementTree
 
 from sd_db import paths, reads, repos
 from sd_db.config import system_checkout
@@ -98,10 +99,27 @@ DISPOSABLE = (*BUILD_DIRS, "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff
 #: suffix or a folder is no proof: a hand-kept project sits beside Unity's (sd:10325, review of build/sd-1782).
 UNITY_STAMP = (b"Generated file, do not modify, your changes will be overwritten "
                b"(use AssetPostprocessor.OnGeneratedCSProject)")
-#: The solution files Unity writes, named after its project folder; each lists the projects it generated.
-UNITY_SOLUTIONS = (".sln", ".slnx")
-#: Every project a solution names, in either format: a quoted path that ends in `proj`.
-SOLUTION_PROJECT = re.compile(rb'"([^"]*proj)"')
+#: The whole of the solution Unity 6 writes, named after its project folder: one line per project it generated.
+#: Anything more, such as a build configuration, is the operator's (review of build/sd-1782, round 3). A *.sln's
+#: shape is not checked here, so it keeps the tree.
+UNITY_SOLUTION = re.compile(rb'(?:\xef\xbb\xbf)?<Solution>\r?\n((?:  <Project Path="[^"\r\n]*" />\r?\n)+)'
+                            rb'</Solution>(?:\r?\n)?')
+SOLUTION_PROJECT = re.compile(rb'Path="([^"]*)"')
+#: The elements and attributes Unity 6's project generator writes. A stamped project with any other, such as a
+#: Target or a Condition, holds an edit and keeps the tree (review of build/sd-1782, round 3).
+# ponytail: shape, not values: an edited value inside a known element passes. Unity offers no checksum.
+UNITY_PROJECT_TAGS = frozenset((
+    "Project", "PropertyGroup", "ItemGroup", "Import", "Reference", "HintPath", "Private", "Compile", "None",
+    "Analyzer", "ProjectReference", "ProjectCapability", "UseCommonOutputDirectory", "UnityVersion",
+    "UnityProjectType", "UnityProjectGeneratorVersion", "UnityProjectGeneratorStyle", "UnityProjectGenerator",
+    "UnityBuildTarget", "TargetFramework", "RootNamespace", "OutputType", "OutputPath", "NoWarn", "NoStdLib",
+    "NoStandardLibraries", "NoConfig", "MSBuildWarningsAsMessages", "LangVersion", "IntermediateOutputPath",
+    "GenerateAssemblyInfo", "EnableDefaultItems", "DisableImplicitFrameworkReferences", "DefineConstants",
+    "BaseIntermediateOutputPath", "BaseDirectory", "AssemblyName", "AppendTargetFrameworkToOutputPath",
+    "AllowUnsafeBlocks"))
+UNITY_PROJECT_ATTRIBUTES = frozenset(("Include", "Remove", "Project", "Sdk"))
+#: A generated project or solution larger than this is not read and keeps the tree; Unity's run to about 100 KB.
+UNITY_FILE_MAX = 4 << 20
 #: A full object name, SHA-1 or SHA-256.
 OBJECT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
@@ -266,39 +284,53 @@ def _cwds(walk: Walk) -> list[str] | None:
     return [line[1:] for line in done.stdout.splitlines() if line.startswith("n")]
 
 
-def _unity_project(path: str) -> bool:
-    """Whether `path` is a regular file that opens with Unity's stamp; unread, linked or unstamped is not."""
+def _read_regular(path: str) -> bytes | None:
+    """The bytes of the regular file at `path`, or None for a link, a folder, an unread or an oversized file."""
     try:
-        if os.path.islink(path) or not os.path.isfile(path):
-            return False
+        if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) > UNITY_FILE_MAX:
+            return None
         with open(path, "rb") as handle:
-            return UNITY_STAMP in handle.read(512)
+            return handle.read(UNITY_FILE_MAX + 1)
     except OSError:
+        return None
+
+
+def _unity_project(path: str) -> bool:
+    """Whether `path` is a regular file that opens with Unity's stamp and holds only what Unity's generator writes;
+    unread, linked, unstamped, malformed or carrying another element or attribute is not."""
+    data = _read_regular(path)
+    if data is None or UNITY_STAMP not in data[:512] or b"<!" in data.replace(b"<!--", b""):
+        return False  # a DOCTYPE or an entity is never Unity's, and is not parsed
+    try:
+        root = ElementTree.fromstring(data)
+    except ElementTree.ParseError:
         return False
+    return all(node.tag in UNITY_PROJECT_TAGS and UNITY_PROJECT_ATTRIBUTES.issuperset(node.attrib)
+               for node in root.iter())
 
 
 def _unity_generated(root: str | os.PathLike, parts: list[str]) -> bool:
     """Whether the ignored file at `parts` under `root` is one Unity wrote and writes again on its next open.
 
-    In a Unity project's folder (it holds ProjectSettings/ProjectVersion.txt): a *.csproj with Unity's stamp, or
-    the solution named after that folder that lists one or more projects, each a stamped *.csproj beside it. A
-    solution carries no stamp, so its name and what it lists stand for it; anything else may be hand-kept."""
+    In a Unity project's folder (it holds ProjectSettings/ProjectVersion.txt): a *.csproj that `_unity_project`
+    accepts, or the *.slnx named after that folder in exactly Unity's shape, listing one or more projects, each
+    such a *.csproj beside it. A solution carries no stamp, so its name, shape and list stand for it; anything
+    else may be hand-kept."""
     folder = os.path.join(root, *parts[:-1])
     path, name = os.path.join(folder, parts[-1]), parts[-1]
     if not os.path.isfile(os.path.join(folder, "ProjectSettings", "ProjectVersion.txt")):
         return False
     if name.endswith(".csproj"):
         return _unity_project(path)
-    stem, extension = os.path.splitext(name)
-    if extension not in UNITY_SOLUTIONS or stem != os.path.basename(os.path.realpath(folder)):
+    if name != os.path.basename(os.path.realpath(folder)) + ".slnx":
+        return False
+    data = _read_regular(path)
+    shape = UNITY_SOLUTION.fullmatch(data) if data is not None else None
+    if shape is None:
         return False
     try:
-        if os.path.islink(path) or not os.path.isfile(path) or os.path.getsize(path) > 1 << 20:
-            return False
-        with open(path, "rb") as handle:
-            listed = SOLUTION_PROJECT.findall(handle.read())
-        projects = [project.decode("utf-8") for project in listed]
-    except (OSError, UnicodeDecodeError):
+        projects = [project.decode("utf-8") for project in SOLUTION_PROJECT.findall(shape.group(1))]
+    except UnicodeDecodeError:
         return False
     return bool(projects) and all(
         project.endswith(".csproj") and os.path.basename(project) == project and "\\" not in project

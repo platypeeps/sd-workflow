@@ -306,16 +306,37 @@ class Disposable(unittest.TestCase):
 
     def test_a_solution_goes_only_under_the_folder_s_name_with_stamped_projects_alone(self):
         (self.game / "Tool.csproj").write_text("<Project/>\n")
-        for ext, line in ((".sln", 'Project("{{FAE04EC0}}") = "A", "{0}", "{{1}}"\n'),
-                          (".slnx", '<Solution>\n  <Project Path="{0}" />\n</Solution>\n')):
-            with self.subTest(ext=ext):
-                (self.game / f"Game{ext}").write_text(line.format("Assembly-CSharp.csproj"))
-                self.assertTrue(self.goes(f"Game/Game{ext}"))
-                (self.game / f"Mine{ext}").write_text(line.format("Assembly-CSharp.csproj"))
-                self.assertFalse(self.goes(f"Game/Mine{ext}"), "Unity writes only <folder>" + ext)
-                for project in ("Tool.csproj", "../Loose.csproj", "Native.vcxproj", "Gone.csproj"):
-                    (self.game / f"Game{ext}").write_text(
-                        line.format("Assembly-CSharp.csproj") + line.format(project))
-                    self.assertFalse(self.goes(f"Game/Game{ext}"), project)
-                (self.game / f"Game{ext}").write_text("")
-                self.assertFalse(self.goes(f"Game/Game{ext}"), "names no project")
+        line = '  <Project Path="{0}" />\r\n'
+
+        def solution(*projects):
+            return "\ufeff<Solution>\r\n" + "".join(line.format(p) for p in projects) + "</Solution>\r\n"
+
+        (self.game / "Game.slnx").write_text(solution("Assembly-CSharp.csproj"), newline="")
+        self.assertTrue(self.goes("Game/Game.slnx"))
+        (self.game / "Mine.slnx").write_text(solution("Assembly-CSharp.csproj"), newline="")
+        self.assertFalse(self.goes("Game/Mine.slnx"), "Unity writes only <folder>.slnx")
+        for project in ("Tool.csproj", "../Loose.csproj", "Native.vcxproj", "Gone.csproj"):
+            (self.game / "Game.slnx").write_text(solution("Assembly-CSharp.csproj", project), newline="")
+            self.assertFalse(self.goes("Game/Game.slnx"), project)
+        (self.game / "Game.slnx").write_text("")
+        self.assertFalse(self.goes("Game/Game.slnx"), "names no project")
+
+    def test_a_hand_edited_solution_or_stamped_project_stays(self):
+        """Review of build/sd-1782 round 3: a solution that lists only stamped projects, or a project that keeps
+        Unity's stamp, may still carry the operator's edits; only Unity's exact shape goes."""
+        edited = ('<Solution>\n  <Configurations><BuildType Name="Custom" /></Configurations>\n'
+                  '  <Project Path="Assembly-CSharp.csproj" />\n</Solution>\n')
+        (self.game / "Game.slnx").write_text(edited)
+        self.assertFalse(self.goes("Game/Game.slnx"), "a custom build configuration")
+        (self.game / "Game.sln").write_text(
+            'Project("{FAE04EC0}") = "A", "Assembly-CSharp.csproj", "{1}"\nGlobal\n\tCustom|Any CPU\nEndGlobal\n')
+        self.assertFalse(self.goes("Game/Game.sln"), "a *.sln's shape is not checked, so it stays")
+        stamped = self.STAMP.replace("</Project>", '  <Target Name="Mine"><Exec Command="make" /></Target>\n'
+                                                   "</Project>")
+        (self.game / "Edited.csproj").write_text(stamped)
+        self.assertFalse(self.goes("Game/Edited.csproj"), "a target Unity never writes")
+        (self.game / "Cond.csproj").write_text(self.STAMP.replace(
+            "</Project>", '  <PropertyGroup Condition="x"><Mine>1</Mine></PropertyGroup>\n</Project>'))
+        self.assertFalse(self.goes("Game/Cond.csproj"), "an attribute or property Unity never writes")
+        (self.game / "Broken.csproj").write_text(self.STAMP + "<")
+        self.assertFalse(self.goes("Game/Broken.csproj"), "not well-formed")

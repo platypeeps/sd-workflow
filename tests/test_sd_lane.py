@@ -2394,10 +2394,10 @@ class Landing(Lane):
         head = git(tree, "rev-parse", "HEAD")
         self.merge_lands(tree, 1, head)
         self.drain()
-        (self.repo / ".git/info/exclude").write_text("*.csproj\n*.sln\n", encoding="utf-8")
+        (self.repo / ".git/info/exclude").write_text("*.csproj\n*.slnx\n", encoding="utf-8")
         (tree / "Game/Assembly-CSharp-Editor.csproj").write_text(stamp, encoding="utf-8")
-        (tree / "Game/Game.sln").write_text(
-            'Project("{FAE04EC0}") = "Editor", "Assembly-CSharp-Editor.csproj", "{1}"\n', encoding="utf-8")
+        (tree / "Game/Game.slnx").write_text(
+            '<Solution>\n  <Project Path="Assembly-CSharp-Editor.csproj" />\n</Solution>\n', encoding="utf-8")
         (tree / "Game/Tool.csproj").write_text("<Project/>\n", encoding="utf-8")
         self.assertEqual(self.watched(1)[1:], [f"pack sd:1 kept {tree}: it holds ignored files that are not "
                                                "build output: Game/Tool.csproj"])
