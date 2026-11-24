@@ -1040,6 +1040,8 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     (sd:10214 review, round 5). The verdict is the head's own: who took
     the work out is carried commit by commit, so a removal a later commit
     put back, or a revert one reapplied, decides nothing (class pass 3).
+    When the files as a set never read so, each file is judged alone:
+    reverts on two sides of a merge that took out all of it undid it.
 
     `kept_commits` reads this list after it, so this check hides none of
     its evidence (sd:10214 review). An undone commit stays in place with
@@ -1122,7 +1124,11 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         if "Closes:" in message and any(sd_ship_body.REVERT_SUBJECT.match(later) for _, later in commits[:index]):
             names = [name for name in fields("diff-tree", "--no-commit-id", "--name-only", "-z", "-r", sha) or [] if name]
             at_base = None if sd_ship_body.reverts_another(message) else fork
-            if names and any(undone(index, names, before) for before in (f"{sha}^", at_base) if before):
+            # Each file on its own too: two partial reverts a merge joins took all the work out, though no
+            # commit read as before for the whole set (sd:10214 review).
+            # ponytail: one walk per file; cache reads per commit if a wide commit makes this slow.
+            if names and any(undone(index, names, before) or (len(names) > 1 and all(
+                    undone(index, [name], before) for name in names)) for before in (f"{sha}^", at_base) if before):
                 message = ""
         kept.append((sha, message))
     return kept

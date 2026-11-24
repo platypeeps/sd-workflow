@@ -3884,6 +3884,28 @@ class CitedCloses(SharedQueue):
                 kept = sd_lane.unreverted(tree, head, commits, "main")
                 self.assertEqual([sha for sha, message in kept if f"sd:{a}" in message], [])
 
+    def test_a_merge_of_two_partial_reverts_closes_nothing_it_undid(self) -> None:
+        """sd:10214 review: each side of a merge reverts one of the cited commit's two files; the merge carries
+        both removals, so reverts alone took all the work out, though neither side read as before on its own."""
+        import sd_operations
+        a, b, *_ = self.open
+        tree, _ = self.committed("topic-two-partial-reverts")
+        for name in ("one.txt", "two.txt"):
+            (tree / name).write_text(f"{name}\n", encoding="utf-8")
+        git(tree, "add", "one.txt", "two.txt")
+        git(tree, "commit", "-q", "-m", f"feat: implement\n\nCloses: sd:{a}")
+        base = git(tree, "rev-parse", "HEAD")
+        git(tree, "rm", "-q", "one.txt")
+        git(tree, "commit", "-q", "-m", "revert: hold the first reader")
+        first = git(tree, "rev-parse", "HEAD")
+        git(tree, "checkout", "-q", "--detach", base)
+        git(tree, "rm", "-q", "two.txt")
+        git(tree, "commit", "-q", "-m", "revert: hold the second reader")
+        git(tree, "merge", "-q", "--no-ff", "-m", "Merge the two lines", first)
+        git(tree, "commit", "-q", "--allow-empty", "-m", f"fix: the gate\n\nCloses: sd:{b}")
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {b})
+
     def test_a_revert_of_a_file_named_like_pathspec_magic_closes_nothing(self) -> None:
         """sd:10214 review: git reads `:(unknown)x` as pathspec magic and fails; the lookup reads names
         literally, so a revert that removes such a file undid the work."""
