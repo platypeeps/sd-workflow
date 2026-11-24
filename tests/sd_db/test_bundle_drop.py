@@ -1434,3 +1434,12 @@ class DropDesign(Repo):
         with self.assertRaisesRegex(DROP.DropRefused, "keeps only design"):
             DROP.drop_item(self.db, build, items[0], who="operator")
         self.unmade(run)
+
+    def test_a_done_design_lead_drops_and_the_kept_code_queues(self):
+        """Class pass of sd:10096: a done design has shipped, so nothing builds it alone. The drop of a done
+        lead is the one way to salvage the kept commits, and the design guard refused it."""
+        items, ids, run = self.bundle()
+        self.designs(items[0])
+        writes.transition(self.db, items[0], "done", who="operator", reason="landed by hand")
+        queued = DROP.drop_item(self.db, build, items[0], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], items[1:])

@@ -978,8 +978,9 @@ def drop_plan(connection, item: int) -> dict:
     if not kept:
         raise BuildRefused(f"Drop refused: sd:{item} is the only open item of build {lead}; Retry or cancel it")
     # A design ships with code (`design_only_delivery`): one dropped builds alone, and a kept bundle of designs
-    # alone leads one; either run blocks at delivery (review of sd:10096).
-    if aboard(connection, [item]):
+    # alone leads one; either run blocks at delivery (review of sd:10096). A done design has shipped: nothing
+    # builds it, and dropping a done lead is the way to the kept commits (class pass).
+    if aboard(connection, [item]) and not _done(items, item):
         raise BuildRefused(f"Drop refused: sd:{item} is a design, which ships with its bundle's code; "
                            f"move it to planning to take it out")
     if aboard(connection, [member["item"] for member in kept]) == {member["item"] for member in kept}:
