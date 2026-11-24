@@ -1007,6 +1007,9 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     carry a revert subject. A refactor that moved the work out keeps the
     close, whatever a later revert of other work touched; a revert that
     removes a moved file undoes it. A read that fails keeps the commit.
+    A commit whose own files read as before undid nothing later; a merge
+    that carries the before state from a parent took nothing out itself
+    (sd:10214 review, round 5).
 
     `kept_commits` reads this list after it, so this check hides none of
     its evidence (sd:10214 review). An undone commit stays in place with
@@ -1046,21 +1049,27 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     def undone(index: int, names: list[str], before: str) -> bool:
         sha = commits[index][0]
         want = blobs(before, names)
-        if want is None or not reads_before(sha, head, names, want):
+        # The cited commit itself left them so (a fix that restores the base): no later commit undid it.
+        if want is None or not reads_before(sha, head, names, want) or reads_before(sha, sha, names, want) is not False:
             return False
         # Its descendants alone: a sibling a merge brought in never held the work, so it took none out.
-        after = lane_git(worktree, "rev-list", "--ancestry-path", f"{sha}..{head}")
+        after = lane_git(worktree, "rev-list", "--parents", "--ancestry-path", f"{sha}..{head}")
         if after is None:
             return False
-        descendants, was = set(after.split()), False
-        for later, text in reversed(commits[:index]):
-            if later not in descendants:
+        parents = {line.split()[0]: line.split()[1:] for line in after.splitlines() if line.strip()}
+        state, reverted = {sha: False}, False
+        for later, text in reversed(commits[:index]):  # --topo-order: each parent before its child
+            if later not in parents:
                 continue
-            now = reads_before(sha, later, names, want)
-            if now is None or (now and not was and not sd_ship_body.REVERT_SUBJECT.match(text)):
-                return False  # no answer, or a change that is no revert took the work out
-            was = now
-        return was
+            now = state[later] = reads_before(sha, later, names, want)
+            if now is None:
+                return False
+            # A commit took the work out only where no parent had: a merge carries a revert from one side.
+            if now and not any(state.get(parent) for parent in parents[later]):
+                if not sd_ship_body.REVERT_SUBJECT.match(text):
+                    return False  # a change that is no revert took the work out
+                reverted = True
+        return reverted
 
     kept = []
     for index, (sha, message) in enumerate(commits):
