@@ -1977,9 +1977,14 @@ class Supervisor:
 
     def numbered(self, blockers: list[dict]) -> str:
         """The blockers as the ruling round names them: `N. path:line summary`, N from 1 (sd:10286)."""
-        def evidence(row: dict) -> str:  # the failing input the builder rules on, one line (review of sd:10286)
-            text = " ".join(row["evidence"].split())[:EVIDENCE_MAX] if isinstance(row.get("evidence"), str) else ""
-            return f" (evidence: {text})" if text else ""
+        def evidence(row: dict) -> str:
+            # The failing input the builder rules on, as a JSON string: one line, its own whitespace kept
+            # (class pass on sd:10286); a cut one says so, never a shorter input passed off as the whole.
+            text = row["evidence"] if isinstance(row.get("evidence"), str) else ""
+            if not text.strip():
+                return ""
+            cut = f", its first {EVIDENCE_MAX} of {len(text)} characters" if len(text) > EVIDENCE_MAX else ""
+            return f" (evidence, a JSON string{cut}: {json.dumps(text[:EVIDENCE_MAX], ensure_ascii=False)})"
         return "\n".join(f"{at}. {self.summary([row], None)[2:]}{evidence(row)}" for at, row in enumerate(blockers, 1))
 
     def read_rulings(self, count: int) -> tuple[dict[int, tuple[str, str]], str]:
@@ -2052,14 +2057,12 @@ class Supervisor:
         self.rulings.unlink(missing_ok=True)
         return None
 
-    @staticmethod
-    def said(row: dict) -> str:
-        """A blocker as the ruling round's repeat check matches it: its summary, whitespace folded."""
-        return " ".join(str(row.get("summary") or "").split()).casefold()
-
-    def place(self, row: dict) -> tuple[str, Any, str]:
-        """A blocker as a ruling clears its repeat: file, line and summary, whitespace folded (sd:10286)."""
-        return self.locations(row)[0][0], row.get("line"), self.said(row)
+    def place(self, row: dict) -> str:
+        """A blocker as a ruling clears its repeat: the claim itself, no folded copy (class pass on sd:10286).
+        Its file, as the worktree spells it, and its line, words, class, instances and evidence as recorded,
+        types included: a finding that differs in any is another claim and blocks, fail closed."""
+        return json.dumps([self.locations(row)[0][0], *(row.get(key) for key in (
+            "line", "summary", "family", "instances", "evidence"))], sort_keys=True, default=str)
 
     def settled(self, answer: dict, head: str) -> dict:
         """The review after the ruling round, less each blocker that repeats one ruled REJECT or FILE at `head`
@@ -2067,8 +2070,9 @@ class Supervisor:
         ruling clears it here. A repeat is the same file and summary at any line: the round's fixes move lines.
         The ruled blockers come from the checkpoints `rule` wrote with each decision note, never the round's
         file: a replay after the review rewrote it would shift a number onto another blocker. A repeat is the
-        same file, line and words: the same words at another line are another defect, and a fix that moved the
-        line parks the run, fail closed. A FIX ruling, an unruled blocker or a new one still blocks."""
+        same record (`place`): the same words at another line, or other words, instances or evidence at the
+        same line, are another claim, and a fix that moved the line parks the run, fail closed. A FIX ruling,
+        an unruled blocker or a new one still blocks."""
         key = f"{RULED}{self.ident}:{head}:"
         ruled = set()
         for (body,) in self.db.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND substr(key, 1, ?) = ?",

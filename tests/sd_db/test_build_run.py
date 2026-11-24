@@ -252,10 +252,11 @@ FAKE = textwrap.dedent('''
                               "findings": review.dispose([review._finding(far), *held], "high")}))
             sys.exit(0)
         if mode in ("blocking2", "repeat2", "moved2"):  # sd:10286: two blockers in the changed file, the second with a newline
-            second = {**raw, "line": 2, "instances": [], "summary": "a later\\nOption: blocker"}
+            second = {**raw, "line": 2, "instances": [], "summary": "a later\\nOption: blocker",
+                      "evidence": "the original evidence"}
             # repeat2: the second alone, its original evidence cited, so a rebuttal holds it back nowhere;
             # moved2: the same file and words at another line, another defect
-            rows = ([{**second, "evidence": "the original evidence", **({"line": 5} if mode == "moved2" else {})}]
+            rows = ([{**second, **({"line": 5} if mode == "moved2" else {})}]
                     if mode in ("repeat2", "moved2") else [raw, second])
             findings, mode = review.dispose([review._finding(row) for row in rows], "high"), "blocking"
         if mode == "absolute":  # pack sd:9769: a blocker spelled as an absolute path inside the checkout
@@ -1258,9 +1259,39 @@ class Supervise(Case):
     def test_the_ruling_brief_carries_each_blockers_evidence(self):
         """Review of sd:10286: the builder rules on the failing input, so the brief names it, on one line."""
         self.press()
-        said = self.supervisor().numbered([{"path": "a.py", "line": 3, "summary": "s",
-                                            "evidence": "run x\nit fails"}])
-        self.assertIn("1. a.py:3 s (evidence: run x it fails)", said)
+        """Class pass: quoted as JSON, so a failing input's own whitespace reaches the builder unchanged, and
+        a cut one says so."""
+        supervisor = self.supervisor()
+        said = supervisor.numbered([{"path": "a.py", "line": 3, "summary": "s", "evidence": "run  x\n\tit fails "}])
+        self.assertEqual(said, '1. a.py:3 s (evidence, a JSON string: "run  x\\n\\tit fails ")')
+        long = supervisor.numbered([{"path": "a.py", "line": 3, "summary": "s",
+                                     "evidence": "é" * (build_run.EVIDENCE_MAX + 5)}])
+        self.assertIn(f"its first {build_run.EVIDENCE_MAX} of {build_run.EVIDENCE_MAX + 5} characters", long)
+        self.assertEqual(supervisor.numbered([{"path": "a.py", "line": 3, "summary": "s", "evidence": " \n"}]),
+                         "1. a.py:3 s")
+
+    def test_a_ruling_clears_only_the_blocker_it_ruled_word_for_word(self):
+        """Class pass on sd:10286: a ruling acts on the blocker itself, no folded copy. A finding at the ruled
+        file and line that differs in its words' case or whitespace, its class, its instances or its evidence
+        is another claim and still blocks; the same record clears."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                  after=("repeat2",))
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        again = self.supervisor()
+        head = support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD").strip()
+        (ruled,) = [json.loads(body) for (body,) in self.db.execute(
+            "SELECT body FROM state WHERE kind = 'checkpoint' AND key LIKE 'build-run-ruled:%'")]
+        self.assertEqual(again.settled({"status": "blocking", "blockers": [dict(ruled)]}, head)["status"], "advisory")
+        for name, other in {"case": {"summary": ruled["summary"].upper()},
+                            "whitespace": {"summary": " ".join(ruled["summary"].split())},
+                            "class": {"family": "security"}, "instances": {"instances": ["other.py:9"]},
+                            "evidence": {"evidence": "a new failing input"},
+                            "no evidence": {"evidence": None}, "line type": {"line": "2"}}.items():
+            with self.subTest(name):
+                row = {**ruled, **other}
+                answer = again.settled({"status": "blocking", "blockers": [row]}, head)
+                self.assertEqual((answer["status"], answer["blockers"]), ("blocking", [row]))
 
     def rulings_file(self):
         return self.supervisor().rulings
