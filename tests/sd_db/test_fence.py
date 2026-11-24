@@ -5,7 +5,8 @@ setting `sd.hub_name`. A returning old hub still has its database and no
 `hub.json`, so without the fence it serves, runs lanes and pushes as the hub.
 Each caller reads four answers: `holder` and `off` (no setting: a fleet that
 never named its hub) go on; `elsewhere` (another node holds the name) and
-`unknown` (the setting or Tailscale does not answer) refuse.
+`unknown` (the setting or Tailscale does not answer) refuse, except that a
+running listener serves on a Tailscale `unknown` (sd:10221).
 
 `tailscale` is the harness stub on PATH; no test reaches the real daemon.
 """
@@ -391,7 +392,7 @@ class TheLiveServer(StubCase):
     def test_the_fence_state_crosses_the_wire(self):
         """pack sd:9543: a satellite tells a fence that could not answer from a demotion by `state`."""
         self.enterContext(mock.patch.object(serve, "FENCE_SECONDS", 0.0))
-        for dnsname, state, cause in (("", "unknown", "tailscale"), ("old-hub.example.test.", "elsewhere", None)):
+        for dnsname, state, cause in (("old-hub.example.test.", "elsewhere", None),):
             with self.subTest(state=state):
                 self.rename(dnsname)
                 hub._name_failed = None
@@ -404,17 +405,30 @@ class TheLiveServer(StubCase):
                 self.assertEqual(rebuilt.cause, cause, answers[0]["error"])
                 self.assertIn("this machine is not the hub", str(rebuilt))
 
-    def test_a_partition_after_start_refuses_the_next_frame(self):
-        """Third review: the old hub keeps its cached name while cut from the control plane."""
+    def test_a_partition_after_start_keeps_serving(self):
+        """sd:10221, ruling on note #78838: a Tailscale `unknown` closed every satellite
+        session for the length of a control-plane drop; the listener refuses on
+        `elsewhere` alone, like `hub.write_role`."""
         self.enterContext(mock.patch.object(serve, "FENCE_SECONDS", 0.0))
         self.assertTrue(self.session(remote.request("close"))[0]["ok"])
         self.rename(HUB_NAME + ".", online=False)
-        answers = self.session(remote.request("execute", sql="INSERT INTO probe (name) VALUES ('stale')", params=None,
-                                              rid=remote.new_request_id()))
+        rid = remote.new_request_id()
+        answers = self.session(
+            remote.request("execute", sql="BEGIN IMMEDIATE", params=None, rid=rid),
+            remote.request("execute", sql="INSERT INTO probe (name) VALUES ('kept')", params=None),
+            remote.request("execute", sql="COMMIT", params=None, rid=rid),
+            remote.request("close"))
+        self.assertTrue(all(a and a["ok"] for a in answers), answers)
+        self.assertEqual(self.rows(), 1)
+
+    def test_an_unknown_not_from_tailscale_still_refuses(self):
+        """sd:10221: only the Tailscale cause serves; a setting that does not read refuses."""
+        self.enterContext(mock.patch.object(serve, "FENCE_SECONDS", 0.0))
+        unreadable = hub.Role("unknown", None, "sd.hub_name does not read: example")
+        self.enterContext(mock.patch.object(hub, "role_at", lambda *a, **k: unreadable))
+        answers = self.session(remote.request("close"))
         self.assertFalse(answers[0]["ok"], answers)
-        self.assertIn("not connected to the Tailscale control plane", answers[0]["error"]["text"])
-        self.assertEqual(answers[1:], [None])
-        self.assertEqual(self.rows(), 0)
+        self.assertIn("sd.hub_name does not read", answers[0]["error"]["text"])
 
     def test_a_rename_mid_session_refuses_the_write_and_rolls_back(self):
         self.enterContext(mock.patch.object(serve, "FENCE_SECONDS", 0.0))

@@ -859,8 +859,12 @@ class Server(socketserver.ThreadingTCPServer):
     def fence(self, *, within: float | None = None) -> hub.Role | None:
         """The refusing role when this machine no longer holds the hub role, or `None`: asked
         again past `within` seconds, `FENCE_SECONDS` by default, or once the wall clock jumped
-        (a sleep). Unknown refuses. A frame with a held answer waits on no ask (sd:7042)."""
+        (a sleep). A frame with a held answer waits on no ask (sd:7042). An `unknown` that
+        Tailscale gave serves, like `hub.write_role`: refusing it closed every satellite
+        session for a whole control-plane drop (sd:10221). Any other `unknown` refuses."""
         found = self.fenced.get(lambda: hub.role_at(self.database), FENCE_SECONDS if within is None else within)
+        if found.state == "unknown" and found.cause == "tailscale":
+            return None
         return found if found.refuses else None
 
     def admit(self, peer, frame: dict, session: int = 0) -> None:
