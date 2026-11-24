@@ -1277,6 +1277,26 @@ class Supervise(Case):
         self.assertEqual([key.rsplit(":", 1)[1] for (key,) in self.db.execute(
             "SELECT key FROM state WHERE kind = 'checkpoint' AND key LIKE 'build-run-ruled:%'")], ["3"])
 
+    def test_a_ruling_clears_no_gate_blocker(self):
+        """Review of sd:10286: the review gate's own blocker (a response past its byte limit, a finding it could
+        not place) names no code a ruling judged. A reject of it records nothing, and its repeat still blocks:
+        the omitted evidence may hold a real blocker."""
+        self.press()
+        supervisor = self.supervisor()
+        head = "a" * 40
+        rows = [{"path": "<review-response>", "line": None, "severity": "high", "family": "correctness",
+                 "summary": "response exceeds the declared byte limit; omitted evidence may contain blocking findings"},
+                {"path": "<unknown>", "line": None, "summary": "a finding with no place"}]
+        for number, row in enumerate(rows, 1):
+            supervisor.rule(number, row, "reject", "no failing input", head, "example/repo", ["work.txt"], ["far.py"])
+        self.assertEqual(self.rebuttals(), [])
+        self.assertEqual(self.db.execute("SELECT count(*) FROM state WHERE kind = 'checkpoint' AND "
+                                         "key LIKE 'build-run-ruled:%'").fetchone()[0], 0)
+        for body in self.decisions():
+            self.assertIn("not applied: the review gate's own blocker", body)
+        answer = {"status": "blocking", "blockers": rows}
+        self.assertEqual(supervisor.settled(answer, head), answer)
+
     def test_a_ruling_clears_only_its_own_place(self):
         """Review of sd:10286: a finding with the ruled blocker's file and words at another line is another
         defect, and it still parks the run."""

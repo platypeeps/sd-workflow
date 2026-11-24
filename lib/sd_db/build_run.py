@@ -574,6 +574,13 @@ def kept_files(git: Collection[str], work: str, *, env: dict | None = None) -> s
         line.startswith("!! ") and DISPOSABLE.intersection(line[3:].strip('"').split("/")[:-1])))
 
 
+def ruleable(row: dict) -> bool:
+    """A blocker a ruling may clear: a review finding at a repository path. A gate line ("-") or the review
+    gate's own blocker (`<review-response>`: omitted evidence; `<unknown>`) names no code a ruling judged."""
+    path = row.get("path")
+    return row.get("line") != "-" and isinstance(path, str) and bool(path) and not path.startswith("<")
+
+
 def changed_lines(git: Collection[str], work: str, base: str, head: str, *,
                   env: dict | None = None) -> dict[str, set[int]] | None:
     """Each path `base..head` changes, with the new-side lines its hunks touch, or no lines for a change git
@@ -2097,7 +2104,7 @@ class Supervisor:
                 row = json.loads(body)
             except (TypeError, ValueError):
                 continue
-            if isinstance(row, dict) and row.get("line") != "-":
+            if isinstance(row, dict) and ruleable(row):
                 ruled.add(self.place(row))
         left = [row for row in answer["blockers"] if self.place(row) not in ruled]
         if len(left) == len(answer["blockers"]):
@@ -2122,7 +2129,9 @@ class Supervisor:
         said = " ".join(self.summary([row]).split())
         finding = row.get("line") != "-"
         touched = sorted({path for path, _ in self.locations(row)} & set(moved)) if moved is not None else None
-        lapsed = ("" if ruling not in ("reject", "file") or not finding or touched == [] else
+        lapsed = ("" if ruling not in ("reject", "file") or not finding else
+                  "; not applied: the review gate's own blocker, no code it judged" if not ruleable(row) else
+                  "" if touched == [] else
                   "; not applied: the round changed " + ", ".join(touched) if touched else
                   "; not applied: the round's own changes did not read")
         finding = finding and not lapsed
