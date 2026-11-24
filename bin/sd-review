@@ -1827,13 +1827,14 @@ def run_provider(
 
 def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
             rebutted: Sequence[Rebuttal] = (), *, repro: bool = False,
-            prior: Sequence[Mapping[str, Any]] = ()) -> list[dict[str, Any]]:
+            prior: Sequence[Mapping[str, Any]] = (), later: Callable[[str, Mapping[str, Any]], bool] = lambda *_: False) -> list[dict[str, Any]]:
     """Label each finding `blocking` or `advisory` against the policy floor.
 
     A finding at the floor posts as advisory, its summary saying why, when it cites no `evidence` and repeats
     one rebutted on this branch (pack sd:9270), or, with `repro`, outside the lane's own `LANE_PATHS` (pack
     sd:9867, note #70162). Only that evidence exists is read: the lead rebuts one that does not reproduce.
-    An uncited repeat of a `prior` report's blocker, not rebutted, still blocks and keeps any evidence it stored.
+    An uncited repeat of a `prior` report's blocker, not rebutted, still blocks and keeps any evidence it stored;
+    so does one whose rebutted blocker stored evidence at a head `later` finds after the ruling's (`found_after`).
     """
 
     threshold = BLOCKING_ORDER[floor]
@@ -1841,13 +1842,20 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
         return 0 < BLOCKING_ORDER.get(str(row.get("severity", "unspecified")), 0) >= threshold
     def _rebutted(row: Mapping[str, Any]) -> bool:  # the newest record at every place it names is a listed rebuttal
         return getattr(recorded_at(rebutted, row.get("path"), row.get("summary"), row.get("line"), row.get("instances")), "listed", False)
-    def _repeat(row: Mapping[str, Any]) -> bool:  # an uncited repeat of a rebutted finding: the rebuttal is read first (build/sd-1423 review)
-        return _floor(row) and not (isinstance(row.get("evidence"), str) and row["evidence"].strip()) and _rebutted(row)
     def _prior(old: dict[str, Any]) -> dict[str, Any]:  # a rebutted place holds and lends nothing (sd-review:1814); it stays: a repeat on it is its own
-        return dict(old, disposition="rebutted") if old.get("disposition") == "blocking" and _rebutted(old) else old
+        ruling = recorded_at(rebutted, old.get("path"), old.get("summary"), old.get("line"))
+        if old.get("disposition") != "blocking" or not getattr(ruling, "listed", False):
+            return old  # evidence found after the ruling is new: a distant edit may make it real (sd:10191, sd-review:886)
+        return old if later(ruling.head, old) else dict(old, disposition="rebutted")
+    prior = [*map(_prior, instance_rows(*prior))]
+    def _lends(old: Mapping[str, Any]) -> bool:  # a rebutted place still blocking: its evidence came after the ruling
+        return old.get("disposition") == "blocking" and _rebutted(old)
+    revived = [*filter(_lends, prior)]
+    def _repeat(row: Mapping[str, Any]) -> bool:  # an uncited repeat of a rebutted finding: the rebuttal is read first (build/sd-1423 review)
+        return _floor(row) and not (isinstance(row.get("evidence"), str) and row["evidence"].strip()) and _rebutted(row) and not prior_evidence(revived, row)
     # Only a finding that blocks releases a hold: not a medium copy (build/sd-1423 review), not a rebutted repeat (sd-review:1783).
     at_floor = instance_rows(*(row for row in findings if _floor(row) and not _repeat(row)))
-    prior, disposed = [*map(_prior, instance_rows(*prior))], []
+    disposed = []
     for finding in findings:
         record, blocking = dict(finding), _floor(finding)
         evidence, note = record.get("evidence"), REPEAT_NOTE if _repeat(finding) else None
@@ -1993,6 +2001,17 @@ def diff_lines(diff: str) -> tuple[dict[tuple[str, int], str], list[tuple[str, i
     return removed, added
 
 
+def found_after(root: pathlib.Path) -> Callable[[str, Mapping[str, Any]], bool]:
+    """Whether a prior blocker stored evidence at a head after a ruling recorded at head `ruling`: its `found_at`
+    descends from `ruling` and is not it. A head git cannot place counts as after: hold on doubt."""
+    heads = re.compile(r"[0-9a-f]{40,64}").fullmatch
+    def _after(ruling: str, row: Mapping[str, Any]) -> bool:
+        found, evidence = row.get("found_at"), row.get("evidence")
+        return isinstance(evidence, str) and bool(evidence.strip()) and isinstance(found, str) and found != ruling and (
+            not (heads(found) and heads(ruling)) or sd_lib.git_output(["merge-base", ruling, found], root) in (ruling, None))
+    return _after
+
+
 def prior_at(root: pathlib.Path, old: str, new: str, rows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Each prior blocker's line moved from its own `prior_review.head`, else the prior head `old`, to `new` (lead
     2026-11-22: not the aggregate's latest head; build/sd-1423 review: an insertion above a blocker moved its repeat
@@ -2028,6 +2047,7 @@ def prior_at(root: pathlib.Path, old: str, new: str, rows: Sequence[Mapping[str,
         found = row["prior_review"].get("head") if isinstance(row.get("prior_review"), dict) else None
         start = found if isinstance(found, str) and re.fullmatch(r"[0-9a-f]{40,64}", found) else old
         path = _renames(start).get(row["path"], row["path"])
+        row = dict(row, found_at=start)  # the head the blocker was found at, for a ruling's age (`found_after`)
         if type(row.get("line")) is not int:  # an unplaced blocker still follows its file (bin/sd-review:1846)
             return [dict(row, path=path)]
         diff = sd_lib.git_output(["diff", "-M", "-U0", "--no-color", "--no-ext-diff", start, new, "--",
@@ -2699,7 +2719,8 @@ def review(
                       [row._replace(path=spelled(row.path), instances=tuple(respelled(spelled, {"instances": list(row.instances)})["instances"]))
                        for row in rebutted], subject.scope != "planning",
                       prior_at(root, previous["subject"].get("head"), subject.head,
-                               [respelled(spelled, found) for found in unresolved(previous)]) if previous else ())
+                               [respelled(spelled, found) for found in unresolved(previous)]) if previous else (),
+                      found_after(root))
         if any(not reads_checkout(provider) for provider in chosen if provider.name in result["reviewed_by"]):
             result["covers_from"] = None  # a reader handed patches saw no whole file: no chain (sd:9769)
     finally:
@@ -2883,10 +2904,10 @@ def partial(outcome: Outcome, unread: Sequence[str]) -> Outcome:
 
 def finish_review(result: dict[str, Any], outcomes: Sequence[Outcome], reviewed: list[str],
                   rebutted: Sequence[Rebuttal] = (), repro: bool = False,
-                  prior: Sequence[Mapping[str, Any]] = ()) -> dict[str, Any]:
+                  prior: Sequence[Mapping[str, Any]] = (), later: Callable[[str, Mapping[str, Any]], bool] = lambda *_: False) -> dict[str, Any]:
     """Keep every distinct finding, once; only complete answers count toward required depth."""
     collected = sd_lib.distinct_findings(dict(finding, backend=outcome.backend) for outcome in outcomes for finding in outcome.findings)
-    disposed = dispose(collected, result["severity_floor"], rebutted, repro=repro, prior=prior)
+    disposed = dispose(collected, result["severity_floor"], rebutted, repro=repro, prior=prior, later=later)
     incomplete = len(reviewed) < result["requested_reviews"]
     remaining = [outcome.backend for outcome in outcomes if outcome.status not in (CLEAN, FINDINGS)] if incomplete else []
     if any(record.get("disposition") == "blocking" for record in disposed):

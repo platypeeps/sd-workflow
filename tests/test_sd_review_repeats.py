@@ -273,6 +273,32 @@ class PriorLineTests(RepeatFixture):
                                      repro=True, prior=moved)
         self.assertEqual(record["disposition"], "blocking")
 
+    def test_evidence_found_after_a_rebuttal_still_blocks_its_uncited_repeat(self) -> None:
+        """Review of sd:10191 (bin/sd-review:886): a rebuttal at line 20 rests on line 2; a distant edit of
+        line 2 keeps the ruling's hunk, so it stays listed. A pass after the ruling found the crash with
+        evidence; the next pass repeats it uncited, and the rebuttal held it back as advisory. Evidence found
+        after the ruling's head is new evidence: the repeat takes it and blocks. Evidence of the pass the
+        ruling answered is not: that repeat stays advisory."""
+        (self.root / "src.py").write_text("".join(f"line{n}\n" for n in range(1, 41)), encoding="utf-8")
+        ruled = self.commit("add", "src.py") and self.commit("ruled")
+        (self.root / "src.py").write_text((self.root / "src.py").read_text(encoding="utf-8").replace(
+            "line2\n", "divisor = 0\n"), encoding="utf-8")
+        found = self.commit("add", "src.py") and self.commit("a distant edit")
+        (self.root / "other.py").write_text("x = 1\n", encoding="utf-8")
+        new = self.commit("add", "other.py") and self.commit("new")
+        rebutted = [sd_review.Rebuttal(ruled, "src.py", sd_review.summary_key("Division by zero"), 20, True,
+                                       "src.py", "Division by zero", "line 2 sets the divisor to 1", ("src.py:20",))]
+        repeat = finding(line=20, summary="Division by zero")
+        for head, expected in ((found, "blocking"), (ruled, "advisory")):
+            with self.subTest(found_at=head):
+                prior = [dict(finding(REPRO, line=20, summary="Division by zero"), disposition="blocking",
+                              prior_review={"pass": 1, "head": head})]
+                moved = sd_review.prior_at(self.root, head, new, prior)
+                [record] = sd_review.dispose([repeat], "high", rebutted, repro=True, prior=moved,
+                                             later=sd_review.found_after(self.root))
+                self.assertEqual(record["disposition"], expected)
+                self.assertEqual(record.get("evidence"), REPRO if expected == "blocking" else None)
+
     def test_each_blocker_maps_from_the_head_it_was_found_at(self) -> None:
         """Lead ruling 2026-11-22 (bin/sd-review:2496): a full-branch retry mapped every prior finding from the
         aggregate's latest head, so a blocker found at line 10 on an older head, with 30 lines inserted above it

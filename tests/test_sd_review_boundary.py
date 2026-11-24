@@ -1131,11 +1131,16 @@ class LineBudgetTests(unittest.TestCase):
         # not its whole file, so each ruling is placed at the reviewed head
         # (one cached diff per receipt and path) and the newest at a place
         # is read there. Measured: `sd-review` is 3208 here.
+        #
+        # 5178 -> 5199 is the sd:10191 review at bin/sd-review:886:
+        # `bin/sd-review` +21 for `found_after`: evidence a prior pass found
+        # after a ruling's head lends itself to an uncited repeat, which then
+        # blocks. Measured: `sd-review` is 3229 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5178,
+            5199,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 
