@@ -24,7 +24,7 @@ request exists, prepare saves its title, body, claim and closing set as
 The review class: what counts as the evidence a delivery stands on,
 and when a stored claim, body or flag goes stale. Two rules answer it.
 
-- Evidence is a row's evidence, result and waiver (`evidence_of`),
+- Evidence is a row's evidence, result and waiver (`same_evidence`),
   with text folded (NFKC, spacing). A comment, a waiving note's body
   or a criterion's name proves nothing. A renewal whose rows prove
   nothing new refuses.

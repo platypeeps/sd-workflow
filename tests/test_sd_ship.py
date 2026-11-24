@@ -5212,6 +5212,22 @@ roles:
             with self.subTest(fresh=fresh):
                 self.assertEqual(ship.stale_criteria(renewed(fresh), old), [])
 
+    def test_results_moved_between_named_checks_are_fresh_evidence(self):
+        """Round 11 of sd:9268: the leaves dropped an object's keys, so the same results under other checks
+        read as the old evidence. A key both claims name must hold the same text; a renamed key does not."""
+        old = {"criteria": [{"criterion": "actual scope", "passed": True,
+                             "evidence": {"lint": "pass", "tests": "fail"}}]}
+
+        def renewed(evidence):
+            return {"criteria": [{**old["criteria"][0], "evidence": evidence}]}
+
+        for fresh in ({"lint": "fail", "tests": "pass"}, [{"tests": "pass"}, {"lint": "fail"}]):
+            with self.subTest(fresh=fresh):
+                self.assertEqual(ship.stale_criteria(renewed(fresh), old), [])
+        for stale in ({"tests": "fail ", "lint": "pass"}, {"linter": "pass", "suite": "fail"}, ["pass", "fail"]):
+            with self.subTest(stale=stale):
+                self.assertTrue(ship.stale_criteria(renewed(stale), old))
+
     def test_a_waiver_reason_respaced_inside_a_structure_is_the_old_waiver(self):
         """The waiver's reason folds the same way as evidence, whatever shape the row gives it."""
         def waived(reason):
