@@ -73,6 +73,10 @@ def review_session(argv: Any) -> bool:
 
 
 class ParallelFixture(ReviewFixture):
+    #: Operator 2026-11-23 cut every tier to one reader; these classes pin two to
+    #: keep the parallel path (both readers, dedup, fallback beside a running one) tested.
+    reviewing_depth = 2
+
     def prepare(self, registry: str | None = None, consent: str | None = None) -> pathlib.Path:
         if registry is not None:
             (self.registry_home / ".local/share/sd/providers.yaml").write_text(registry, encoding="utf-8")
@@ -90,12 +94,17 @@ class ParallelFixture(ReviewFixture):
         return sd_review.review(root, namespace(**options), runner, self.environment(), self.chatgpt_home())
 
 
-class TwoReadersAtOnce(ParallelFixture):
-    def test_every_reviewing_tier_asks_two_readers(self) -> None:
+class ShippedDepth(unittest.TestCase):
+    def test_every_reviewing_tier_asks_one_reader(self) -> None:
+        """Operator 2026-11-23: codex alone; claude only when codex is not eligible."""
         for tier in ("cheap", "standard", "deep"):
             with self.subTest(tier=tier):
-                self.assertEqual(sd_review.sd_route.TIER_DEPTH[tier], 2)
+                self.assertEqual(sd_review.sd_route.TIER_DEPTH[tier], 1)
+        self.assertEqual(sd_review.sd_route.DEFAULT_DEPTH, 1)
         self.assertEqual(sd_review.sd_route.TIER_DEPTH["skip"], 0)
+
+
+class TwoReadersAtOnce(ParallelFixture):
 
     def test_a_lensed_brief_that_routes_to_skip_still_asks_two_readers(self) -> None:
         root = self.prepare()
@@ -477,3 +486,25 @@ def _quietly_kill(pid: int) -> None:
         os.killpg(pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
+
+
+class AnUnreadyFirstReaderIsNotThePlan(ParallelFixture):
+    """sd:10231: at one reader, an unready first entry was the plan's sole provider.
+
+    Readiness counted the ready second entry toward the depth and passed, yet
+    `providers` named the first, and the run spent an attempt on it before the
+    slot fell to the second. The ready reader now leads the plan."""
+
+    reviewing_depth = 1
+
+    def test_the_ready_reader_leads_and_the_unready_one_is_the_fallback(self) -> None:
+        root = self.prepare(THREE_READERS, "codex@codex, second@second")
+        (self.tool_bin / "codex").unlink()  # codex is not installed: executable_missing
+        explained = self.review(root, FakeRunner(), explain=True)
+        self.assertEqual(explained["readiness"]["status"], "ready", explained["readiness"])
+        self.assertEqual(explained["providers"], ["second"])
+        self.assertEqual(explained["fallback_candidates"], ["codex"])
+        runner = FakeRunner()
+        result = self.review(root, runner)
+        self.assertEqual(result["reviewed_by"], ["second"])
+        self.assertNotIn("codex", [call["argv"][0] for call in runner.calls if review_session(call["argv"])])

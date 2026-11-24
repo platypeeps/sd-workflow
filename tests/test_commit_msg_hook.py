@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import os
 import pathlib
+import shlex
 import shutil
 import subprocess
 import sys
@@ -149,14 +150,14 @@ class HookFixture(unittest.TestCase):
         self.root = scratch_repository("sd-1931-hook-")
         self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
         (self.root / "hooks").mkdir()
-        (self.root / "bin").mkdir()
         shutil.copy2(HOOK, self.root / "hooks" / "commit-msg")
         # The pre-commit tier is not under test here; a stub stands in for it
         # so `make hooks` has both files to link.
         stub = self.root / "hooks" / "pre-commit"
         stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         stub.chmod(0o755)
-        shutil.copy2(REPO_ROOT / "bin" / "sd_lib.py", self.root / "bin" / "sd_lib.py")
+        # The hook imports from the pack's bin/ beside its real path, as an installed pack has it whole.
+        shutil.copytree(REPO_ROOT / "bin", self.root / "bin", ignore=shutil.ignore_patterns("__pycache__"))
         shutil.copy2(REPO_ROOT / "Makefile", self.root / "Makefile")
         made = subprocess.run(["make", "hooks"], cwd=self.root, env=clean_environment(),
                               capture_output=True, text=True, check=False)
@@ -207,6 +208,161 @@ class TheHook(HookFixture):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual("sd:7", git(
             "log", "-1", "--format=%(trailers:key=Delivers,valueonly)", cwd=self.root).strip())
+
+    def test_a_line_over_72_characters_is_refused_at_commit_time(self):
+        """pack sd:10212: 27 lane refusals in 7 days named a commit line the hook let through (operator: hard limit)."""
+        result = self.commit("fix: a subject\n\n" + "x" * 73 + "\n")
+        self.assertNotEqual(result.returncode, 0, "the commit went through")
+        self.assertIn("commit-msg: refused, a line is 73 characters (limit 72): xxxx", result.stderr)
+        self.assertEqual(0, self.commits(), "a commit landed")
+
+    def verbose(self, *config: str) -> subprocess.CompletedProcess[str]:
+        (self.root / "wide.txt").write_text("w" * 90 + "\n", encoding="utf-8")
+        git("add", "wide.txt", cwd=self.root)
+        flags = [arg for pair in config for arg in ("-c", pair)]
+        return subprocess.run(["git", *flags, "commit", "-q", "-v", "-e", "-m", "fix: a", "-m", "#hash body"],
+                              cwd=self.root, env=clean_environment(GIT_EDITOR="true"), capture_output=True,
+                              text=True, check=False)
+
+    def test_a_verbose_commit_with_an_auto_comment_char_commits(self):
+        """Review round 4: `auto` picks another char when a line starts with `#`; the scissors move with it."""
+        result = self.verbose("core.commentChar=auto")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_verbose_commit_with_a_comment_string_commits(self):
+        """Review round 4: core.commentString (git 2.45+) is not core.commentChar."""
+        result = self.verbose("core.commentString=//")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_comment_string_with_leading_spaces_is_read_whole(self):
+        """Review round 6: git_output strips stdout, so `  //` read as `//` and missed the editor's comments."""
+        draft = self.root.parent / f"{self.root.name}-spaced"
+        draft.write_text("fix: a subject\n\n  // " + "c" * 80 + "\n", encoding="utf-8")
+        self.addCleanup(draft.unlink)
+        result = subprocess.run(["git", "-c", "core.commentString=  //", "commit", "-q", "--allow-empty", "-e",
+                                 "-m", "x"], cwd=self.root,
+                                env=clean_environment(GIT_EDITOR=f"cp {shlex.quote(str(draft))}"),
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_comment_string_with_a_trailing_space_is_matched_before_stripping(self):
+        """Lane review: commentString `> ` matched the stripped `>` line only, which closed the list's fence."""
+        draft = self.root.parent / f"{self.root.name}-trailing"
+        draft.write_text("fix: a subject\n\n- item\n  ```\n> \n  " + "i" * 80 + "\n", encoding="utf-8")
+        self.addCleanup(draft.unlink)
+        result = subprocess.run(["git", "-c", "core.commentString=> ", "commit", "-q", "--allow-empty", "-e",
+                                 "-m", "x"], cwd=self.root,
+                                env=clean_environment(GIT_EDITOR=f"cp {shlex.quote(str(draft))}"),
+                                capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_fixup_of_a_long_subject_commits(self):
+        """Review round 4: `fixup! <subject>` is git's line, and autosquash removes it."""
+        self.assertEqual(self.commit("fix: " + "f" * 67 + "\n").returncode, 0)
+        result = subprocess.run(["git", "commit", "-q", "--allow-empty", "--fixup", "HEAD"], cwd=self.root,
+                                env=clean_environment(), capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_squash_merge_commit_commits(self):
+        """Review round 4: `git merge --squash` then `git commit` keeps git's SQUASH_MSG."""
+        self.assertEqual(self.commit("fix: base\n").returncode, 0)
+        git("checkout", "-q", "-b", "side", cwd=self.root)
+        (self.root / "s.txt").write_text("s\n", encoding="utf-8")
+        git("add", "s.txt", cwd=self.root)
+        self.assertEqual(self.commit("fix: " + "s" * 67 + "\n").returncode, 0)
+        git("checkout", "-q", "-", cwd=self.root)
+        git("merge", "-q", "--squash", "side", cwd=self.root)
+        result = subprocess.run(["git", "commit", "-q", "--no-edit"], cwd=self.root,
+                                env=clean_environment(), capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_verbose_commit_is_measured_above_the_scissors_only(self):
+        """`git commit -v` appends the diff below a scissors line, and git drops it after the hook runs."""
+        (self.root / "wide.txt").write_text("w" * 90 + "\n", encoding="utf-8")
+        git("add", "wide.txt", cwd=self.root)
+        result = subprocess.run(["git", "commit", "-q", "-v", "-e", "-m", "fix: a subject"], cwd=self.root,
+                                env=clean_environment(GIT_EDITOR="true"), capture_output=True, text=True,
+                                check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_trailing_spaces_git_strips_do_not_count(self):
+        """Review round 2: git keeps the line without its trailing spaces, so 72 + 3 spaces is 72."""
+        result = self.commit("fix: a subject\n\n" + "t" * 72 + "   \n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_refusal_quotes_the_line_it_measured(self):
+        result = self.commit("fix: a subject\n\n\n\n" + "q" * 73 + "\n")
+        self.assertIn("qqqqqqqqqq", result.stderr)
+
+    def test_a_merge_commit_is_not_measured(self):
+        """Review round 2: git runs commit-msg for `git merge`; sd-ship's catch-up merge must not abort."""
+        self.assertEqual(self.commit("fix: base\n").returncode, 0)
+        git("checkout", "-q", "-b", "side", cwd=self.root)
+        self.assertEqual(self.commit("fix: side\n").returncode, 0)
+        git("checkout", "-q", "-", cwd=self.root)
+        result = subprocess.run(["git", "merge", "-q", "--no-ff", "-m", "Merge " + "m" * 80, "side"],
+                                cwd=self.root, env=clean_environment(), capture_output=True, text=True,
+                                check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_editor_trailing_spaces_do_not_count(self):
+        """Review round 3: on the editor path the hook sees the spaces git strips after it."""
+        editor = "sh -c 'printf \"fix: a subject\\n\\n%s   \\n\" " + "e" * 72 + " > \"$1\"' -"
+        result = subprocess.run(["git", "commit", "-q", "--allow-empty", "-e", "-m", "x"], cwd=self.root,
+                                env=clean_environment(GIT_EDITOR=editor), capture_output=True, text=True,
+                                check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_verbose_commit_with_another_comment_char_commits(self):
+        """Review round 3: core.commentChar moves both the comment lines and the scissors."""
+        (self.root / "wide.txt").write_text("w" * 90 + "\n", encoding="utf-8")
+        git("add", "wide.txt", cwd=self.root)
+        result = subprocess.run(["git", "-c", "core.commentChar=;", "commit", "-q", "-v", "-e", "-m", "fix: a"],
+                                cwd=self.root, env=clean_environment(GIT_EDITOR="true"), capture_output=True,
+                                text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_revert_of_a_long_subject_commits(self):
+        """Review round 3: `Revert "<subject>"` is git's own line; a 70-character subject makes 80."""
+        (self.root / "undo.txt").write_text("u\n", encoding="utf-8")
+        git("add", "undo.txt", cwd=self.root)
+        self.assertEqual(self.commit("fix: " + "r" * 65 + "\n").returncode, 0)
+        # `git revert` itself runs no commit-msg; a revert that stops (-n, or a conflict) and is then
+        # finished by `git commit` does, with REVERT_HEAD set.
+        git("revert", "-n", "HEAD", cwd=self.root)
+        result = subprocess.run(["git", "commit", "-q", "--no-edit"], cwd=self.root,
+                                env=clean_environment(), capture_output=True, text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_a_kept_heading_does_not_unfence_a_code_line(self):
+        """Review round 5: under -F git keeps `# H`, which keeps the line fenced; dropping it unfenced it."""
+        result = self.commit("fix: a subject\n\n- item\n# H\n  ```\n" + "i" * 80 + "\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_an_edited_heading_git_drops_does_not_close_a_fence(self):
+        """The editor path drops `# H`, which keeps the list's fence open; keeping it closed the fence."""
+        draft = self.root.parent / f"{self.root.name}-draft"
+        draft.write_text("fix: a subject\n\n- item\n  ```\n# H\n  " + "i" * 80 + "\n", encoding="utf-8")
+        self.addCleanup(draft.unlink)
+        result = subprocess.run(["git", "commit", "-q", "--allow-empty", "-e", "-m", "x"], cwd=self.root,
+                                env=clean_environment(GIT_EDITOR=f"cp {shlex.quote(str(draft))}"), capture_output=True,
+                                text=True, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_long_bare_url_or_fenced_line_still_commits(self):
+        url = "https://example.test/" + "a" * 80
+        result = self.commit(f"fix: a subject\n\n{url}\n\n```\n{'y' * 90}\n```\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_make_hooks_replaces_a_dangling_link(self):
+        """pack sd:10212: 19 clones linked a retired pack path, and git skipped the hook silently."""
+        link = self.root / ".git" / "hooks" / "commit-msg"
+        link.unlink()
+        link.symlink_to(self.root / "gone" / "sd-ai-command-pack" / "hooks" / "commit-msg")
+        made = subprocess.run(["make", "hooks"], cwd=self.root, env=clean_environment(),
+                              capture_output=True, text=True, check=False)
+        self.assertEqual(made.returncode, 0, made.stdout + made.stderr)
+        self.assertEqual(os.readlink(link), "../../hooks/commit-msg")
 
     def test_a_message_with_no_checked_trailer_commits_as_before(self):
         for message in (PLAIN, QUOTED):

@@ -88,6 +88,31 @@ class DispositionTests(unittest.TestCase):
         self.assertEqual(result.returncode, 3, result.stdout + result.stderr)
         self.assertEqual(list(self.connection.execute("SELECT * FROM state")), before)
 
+    def test_a_blocking_refusal_names_the_head_its_review_saw(self):
+        """sd:9966 review: prepare's catch-up moves the head past the queued one, and adjudicate takes only the
+        reviewed head, so the answer names it for Reject and enqueue."""
+        self.blocked()
+        with self.assertRaises(ship.Refusal) as caught:
+            self.prepare()
+        self.assertEqual(caught.exception.details["reviewed_head"], self.head)
+
+    def test_a_blocking_refusal_names_the_digest_of_each_finding_adjudicate_binds(self):
+        """sd:9966 review round 2: Reject binds the review the page showed; adjudicate's rows carry the same digests."""
+        self.blocked()
+        with self.assertRaises(ship.Refusal) as caught:
+            self.prepare()
+        template = json.loads(self.command().stdout)["proposal"]["findings"]
+        self.assertEqual(caught.exception.details["finding_digests"], [row["finding_digest"] for row in template])
+        self.assertTrue(template)
+
+    def test_the_template_names_the_dispositions_this_review_already_holds(self):
+        """sd:9966 class pass: a filled template replaces every recorded disposition, so the template says
+        whether this review holds some; Reject and enqueue refuses rather than replace them."""
+        self.blocked()
+        self.assertIsNone(json.loads(self.command().stdout)["recorded_revision"])
+        self.accepted()
+        self.assertIsNotNone(json.loads(self.command().stdout)["recorded_revision"])
+
     def test_the_command_a_blocking_refusal_names_prints_each_finding_whole(self):
         """sd:2102. `next_action` is only useful if the command it names runs and shows the findings."""
         self.blocked()
