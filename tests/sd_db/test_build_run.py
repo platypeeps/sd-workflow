@@ -3289,6 +3289,18 @@ class Supervise(Case):
         first = build_run.BRIEF.format(**self.supervisor(self.bundle["id"]).brief())
         self.assertNotIn("Send to builder", first)
 
+    def test_a_fresh_build_with_a_finding_briefs_it(self):
+        """sd:10320: `sd assignments build N --finding TEXT` on a ready item with no build refused: "would be a
+        fresh build, with no builder to send it to". It queues the build and its builder reads TEXT."""
+        item = create_item(self.db, kind="task", title="Build me", repo=str(self.repo), status="ready")
+        queued = build.queue_again(self.db, [item], who="operator", finding="pin the clock\n<b>naïve</b>")
+        self.assertEqual([(entry["item"], entry["status"]) for entry in queued], [(item, "queued")])
+        claimed = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                              root=self.root / "worktrees")
+        assert claimed is not None
+        prompt = build_run.BRIEF.format(**self.supervisor(claimed["id"]).brief())
+        self.assertIn(f"- sd:{item}: pin the clock\n<b>naïve</b>", prompt)
+
     def test_a_plain_retry_briefs_review_blockers_as_the_reviewer_s_not_the_operator_s(self):
         """Lead review of pack sd:9498: a plain Retry noted the parked run's blockers as Send to builder, which the
         brief presents as the operator's findings. They are the reviewer's text; only Send to builder is the

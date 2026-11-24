@@ -757,7 +757,7 @@ def register(groups: Any) -> None:
             parser.set_defaults(handler=queue_builds)
             parser.add_argument("items", nargs="+", type=item_id, help=ITEM_HELP)
             parser.add_argument("--finding", default="", metavar="TEXT",
-                                help="Send to builder: the note the retried or fixed bundle's builder reads")
+                                help="Send to builder: the note the build's builder reads")
             parser.add_argument("--drop", action="store_true",
                                 help="take the one item out of its ended bundle: the kept items' commits go on a "
                                      "fresh branch under a kept lead, and the item builds alone (pack sd:9709)")

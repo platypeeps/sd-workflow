@@ -1095,7 +1095,8 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
     every other item is the Build press (`queue`), a `planning` one set ready first: the one verb that starts a
     build, so a task just filed builds with no status step (sd:9063). One transaction, so one refusal writes
     nothing, the ready step included (pack sd:8785).
-    A `finding` is Send to builder on a Retry or a Fix; a fresh build has no builder to send it to (pack sd:8792)."""
+    A `finding` is Send to builder (pack sd:8792): a Retry's or Fix's builder reads it, and a fresh build's builder
+    reads it from the note written after its queue note (sd:10320)."""
     if not items or len(set(items)) != len(items) or any(type(item) is not int for item in items):
         raise BuildRefused("select one or more distinct items")
     finding = finding.strip()
@@ -1169,9 +1170,6 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                 named.setdefault(lead, set()).add(item)
             else:
                 fresh.append(item)
-        if finding and fresh:
-            raise BuildRefused(f"--finding goes to a Retry or a Fix; {', '.join(f'sd:{item}' for item in fresh)} "
-                               "would be a fresh build, with no builder to send it to")
         # One named item is the row's Retry of its whole bundle; two or more name the part to retry (pack sd:9581).
         queued = []
         for lead in leads:
@@ -1199,7 +1197,11 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                 if state["item"]["status"] == "planning":
                     change_status(connection, item, "ready", who=who, expected_revision=state["revision"])
         fresh = list(dict.fromkeys(fresh))
-        return queued + (queue(connection, fresh, who=who) if fresh else [])
+        built = queue(connection, fresh, who=who) if fresh else []
+        # After the queue's note, where a fresh build's brief starts its findings (sd:10320).
+        for item in fresh if finding else []:
+            add_note(connection, item, "comment", FINDING + finding)
+        return queued + built
 
 
 def _retry_row(connection, item: int):
