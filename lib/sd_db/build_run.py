@@ -1529,6 +1529,11 @@ class Supervisor:
     def building(self) -> str | dict:
         self.enter("building", log_path=str(self.log))
         session = self.fresh()["session_id"]
+        if not session:
+            # Before the brief reads them: a ruling between the two is one the brief may not carry (sd:10096).
+            for item in [self.lead, *self.others]:
+                if draft.is_design(self.db, item) and draft.design(self.db, item) is not None:
+                    build.note_brief(self.db, item, self.ident)
         prompt = (RESUME if session else BRIEF).format(**self.brief())
         return self.claude(prompt, session=session, then="reviewing", role="building")
 

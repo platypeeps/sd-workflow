@@ -149,6 +149,14 @@ FAKE = textwrap.dedent('''
                   "result": "denied", "permission_denials": [{"tool_name": "Bash",
                                                               "tool_input": {"command": "git push"}}]})
             sys.exit(3)
+        if mode == "rule":  # the operator rules while the builder works: plans/rule.json names the note
+            import sqlite3
+            from datetime import UTC, datetime
+            rule = json.loads((plans / "rule.json").read_text())
+            db = sqlite3.connect(os.environ["FAKE_DB"])
+            db.execute("INSERT INTO note (item, timestamp, kind, body) VALUES (?, ?, 'decision', ?)",
+                       (rule["item"], datetime.now(UTC).isoformat(timespec="seconds"), rule["body"]))
+            db.commit()
         # A function per round: a change outside any function holds every later blocker (sd:9769).
         added = f"def {mode}(): pass\\n"
         Path("work.txt").write_text(Path("work.txt").read_text() + added if Path("work.txt").exists() else added)
@@ -5450,8 +5458,8 @@ class Drafts(Case):
 
     def test_a_design_whose_ruling_is_replaced_after_the_claim_is_not_delivered(self):
         """Review of sd:10096: the operator replaces the ruling while the bundle builds. A ruling still
-        stands, so the question waits on nothing, but a brief sent since the claim may carry the old one: the
-        enqueue leaves the design out, and the brief of a later run carries the new ruling."""
+        stands, so the question waits on nothing, but the brief carried the old one: the enqueue leaves the
+        design out, and the brief of a later run carries the new ruling."""
         design = self.designed("draft")
         [asked] = [note for note in self.notes() if note["kind"] == "question"]
         add_note(self.db, design, "decision", f"Ruling on note #{asked['id']}: A")
@@ -5460,8 +5468,8 @@ class Drafts(Case):
         self.press()
         self.items = [self.items[0], design]
         self.write_pr()
-        self.plan(claude=["pass"], sd_review=["clean"])
-        add_note(self.db, design, "decision", f"Ruling on note #{asked['id']}: B")
+        (self.plans / "rule.json").write_text(json.dumps({"item": design, "body": f"Ruling on note #{asked['id']}: B"}))
+        self.plan(claude=["rule"], sd_review=["clean"])
         self.assertEqual(self.supervisor().run()["step"], "enqueued")
         enqueue = next(call["argv"] for call in self.calls("sd-ship") if "enqueue" in call["argv"])
         self.assertEqual([enqueue[n + 1] for n, arg in enumerate(enqueue) if arg == "--item"], [str(self.items[0])])
@@ -5483,6 +5491,25 @@ class Drafts(Case):
         self.assertEqual(ended.get("outcome"), "blocked", ended)
         self.assertEqual(self.calls("sd-review"), [], "no review ran")
         self.assertIn(f"design.md of its own: sd:{second} has none", build.run(self.db, self.bundle["id"])["detail"])
+
+    def test_a_ruling_in_the_claims_second_is_no_replacement(self):
+        """Review of sd:10096: delivery read a ruling written at or after the claim's second as one the brief
+        did not carry. The brief records the rulings it carries, so the design delivers."""
+        design = self.designed("draft")
+        [asked] = [note for note in self.notes() if note["kind"] == "question"]
+        ruling = add_note(self.db, design, "decision", f"Ruling on note #{asked['id']}: A")
+        resolve_note(self.db, asked["id"])
+        build.queue(self.db, [design], who="operator")
+        self.press()
+        claimed = self.db.execute("SELECT created_at FROM runner_run WHERE id = ?", (self.bundle["id"],)).fetchone()[0]
+        self.db.execute("UPDATE note SET timestamp = ? WHERE id = ?", (claimed, ruling))
+        self.items = [self.items[0], design]
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        enqueue = next(call["argv"] for call in self.calls("sd-ship") if "enqueue" in call["argv"])
+        self.assertEqual([enqueue[n + 1] for n, arg in enumerate(enqueue) if arg == "--item"],
+                         [str(item) for item in self.items])
 
     def test_a_design_whose_ruling_is_reversed_after_the_claim_is_not_delivered(self):
         """Class pass of sd:10096: Decide reverses the ruling while the bundle builds. The design's commit

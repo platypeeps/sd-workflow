@@ -704,21 +704,42 @@ def queue_row(connection, item: int, *, who: str) -> int:
     return ident
 
 
-def design_waits(connection, item: int, since: str | None = None) -> str | None:
+def design_waits(connection, item: int, *, delivered: bool = False) -> str | None:
     """Why the design item `item` may not ride, be claimed or be delivered, or None: a question on it that no
     standing ruling answers. The one reader of a design's rulings beside `design_rulings`: the press, auto-pickup,
-    Retry, the claim and delivery all ask it, so a ruling Decide reversed or a review withdrew holds each of them
-    (class pass of sd:10096). With `since`, a run's claim, a standing ruling written at or after it holds the
-    design too: a brief sent since may carry the ruling it replaced (review of sd:10096)."""
+    Retry, the claim, delivery and the merge all ask it, so a ruling Decide reversed or a review withdrew holds
+    each of them (class pass of sd:10096). `delivered`, at a run's delivery: a standing ruling the newest brief
+    did not carry holds it too, as the committed design applies the one it replaced (review of sd:10096)."""
     if work_kind(connection, item) != DESIGN_KIND:
         return None
     asked = open_question(connection, [item], "", pending=True)
     if asked:
         return f"waits on design question note #{asked['id']}"
-    if since is None:
+    carried = briefed(connection, item) if delivered else None
+    if carried is None:
         return None
-    newer = next((ruling for ruling in _standing_rulings(connection, item) if ruling["timestamp"] >= since), None)
-    return f"has ruling #{newer['id']}, written since its build started" if newer else None
+    newer = next((ruling["id"] for ruling in _standing_rulings(connection, item) if ruling["id"] not in carried), None)
+    return f"has ruling #{newer}, which its build's brief did not carry" if newer else None
+
+
+#: The comment a build run writes on a design item as it sends the brief: the rulings the brief carries.
+BRIEFED = "Design brief carries rulings:"
+
+
+def note_brief(connection, item: int, ident: str) -> None:
+    """Record the standing rulings a brief sent now carries for the design item `item` (`briefed`)."""
+    carried = " ".join(f"#{ruling['id']}" for ruling in _standing_rulings(connection, item)) or "none"
+    add_note(connection, item, "comment", f"{BRIEFED} {carried} (build run {ident})")
+
+
+def briefed(connection, item: int) -> set[int] | None:
+    """The rulings the newest brief carried for `item` (`note_brief`), or None when no brief recorded them.
+    Note ids, never timestamps: a ruling in the claim's second is no replacement (review of sd:10096)."""
+    row = connection.execute("SELECT body FROM note WHERE item = ? AND kind = 'comment' AND body LIKE ? "
+                             "ORDER BY id DESC LIMIT 1", (item, f"{BRIEFED} %")).fetchone()
+    if row is None:
+        return None
+    return {int(number) for number in re.findall(r"#([0-9]+)", row["body"].removeprefix(BRIEFED).partition("(")[0])}
 
 
 def design_rulings(connection, item: int) -> list[str]:
@@ -740,8 +761,9 @@ def _standing_rulings(connection, item: int) -> list:
 
 def waits_on_operator(connection, item: int, since: str) -> bool:
     """Whether `item` waits on the operator at delivery: a question since `since` (`open_question`), or a design
-    whose ruling was taken back, whenever its question was asked, or replaced since `since` (`design_waits`)."""
-    return open_question(connection, [item], since) is not None or design_waits(connection, item, since) is not None
+    whose ruling was taken back, whenever its question was asked, or replaced since its brief (`design_waits`)."""
+    return (open_question(connection, [item], since) is not None
+            or design_waits(connection, item, delivered=True) is not None)
 
 
 def draft_design(connection, item: int) -> str | None:
