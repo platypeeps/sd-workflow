@@ -3076,33 +3076,38 @@ def follow_prepare(queue: Queue, row: dict[str, Any], placed: str | None) -> dic
     train read, so a re-enqueue in between wins. A write that fails leaves
     the mark, and the member's own claim settles it (`settle_mark`).
     """
-    new = prepared_head(pathlib.Path(row["worktree"]), str(row.get("branch") or ""), row["expected_head"], placed)
+    new = prepared_head(pathlib.Path(row["worktree"]), str(row.get("branch") or ""), row["expected_head"],
+                        placed) or row["expected_head"]
     if not mark_row(queue, row, {"expected_head": new}, drop=(TRAIN_PREPARING,)):
         return None
     return {**row, "expected_head": new}
 
 
-def prepared_head(tree: pathlib.Path, branch: str, expected: str, placed: str | None) -> str:
-    """The published head a member's train prepare left for `expected`, or `expected` (round 3 of sd:9923).
+def prepared_head(tree: pathlib.Path, branch: str, expected: str, placed: str | None) -> str | None:
+    """The published head a member's train prepare left for `expected`, `expected`, or None (round 3 of sd:9923).
 
     In order: the catch-up merge prepare pushed (`pushed_catch_up`);
     `origin/<branch>` when the worktree is at it and it is the head
     `sd-ship prepare` answered ready or prepare's rebase of `expected`
     (`rebase_of`). A rewrite only in the worktree stays out of the shared
-    queue: another lane host could not fetch it. A read that fails keeps
-    `expected`.
+    queue: another lane host could not fetch it. None when a read fails
+    and the worktree is not at `expected`: prepare may have pushed a
+    rewrite no read could see.
     """
     pushed = pushed_catch_up(tree, branch, expected)
     if pushed != expected:
         return pushed
     listed = publish_git(tree, "ls-remote", "origin", f"refs/heads/{branch}") if branch else None
-    tip = (listed.stdout.split() or [""])[0] if listed is not None and listed.returncode == 0 else ""
+    known = listed is not None and listed.returncode == 0
+    tip = (listed.stdout.split() or [""])[0] if listed is not None and known else ""
     try:
         head = read_git(tree, "rev-parse", "HEAD").stdout.strip()
+        if not known:
+            return expected if head == expected else None
         return tip if tip and tip == head != expected and (tip == placed or rebase_of(tree, tip, expected)) \
             else expected
     except LaneError:
-        return expected
+        return None
 
 
 def settle_mark(queue: Queue, entry: dict[str, Any], token: str, root: pathlib.Path) -> dict[str, Any]:
@@ -4388,15 +4393,17 @@ def advance(queue: Queue, entry: dict[str, Any], token: str, step: str = "merge"
 
     `train` names the lead's prepared `head` and the train's `branch`. The
     row moves to the published head that prepare left (`prepared_head`),
-    so a put-back or reclaim finds the lead where it can reconcile. The
+    so a put-back or reclaim finds the lead where it can reconcile; a head
+    no read could see holds the row (`head_unknown`) until a release. The
     lead and each member keep `TRAIN_SENT`, which each one's next claim
     settles before any lone merge (`sent_train_settled`); a lone merge's
     write drops the lead's (review of sd:9923). Answers the head the row
     holds now, for the claim's own copy.
     """
     tree, branch = pathlib.Path(entry["worktree"]), str(entry.get("branch") or "")
-    expected = prepared_head(tree, branch, entry["expected_head"], train["head"]) if train else \
+    found = prepared_head(tree, branch, entry["expected_head"], train["head"]) if train else \
         pushed_catch_up(tree, branch, entry["expected_head"])
+    expected = found or str(entry["expected_head"])
     elsewhere: list[str] = []
 
     def read_host(connection: Any) -> None:
@@ -4425,6 +4432,11 @@ def advance(queue: Queue, entry: dict[str, Any], token: str, step: str = "merge"
             row.update(step=step, lease_until=stamp_at(time.time() + MERGE_SECONDS + LANDING_SECONDS))
             if train:
                 row.update(expected_head=expected, **{TRAIN_SENT: train["branch"]})
+                row.pop("head_unknown", None)
+                if found is None:  # the train may land the rewrite: a put-back here must not run the old head
+                    row.update(held=True, held_at=stamp_now(), head_unknown={"at": stamp_now(), "reason": (
+                        f"the fence could not read origin/{branch} after prepare, so the head is unknown; "
+                        f"`sd-ship lane release {entry['item']}` runs it again once that branch reads")})
             elif step == "merge":
                 row.pop(TRAIN_SENT, None)
             ours = {member["id"] for member in members or ()}

@@ -2510,6 +2510,27 @@ class TrainLanding(Trees):
         sd_lane.put_back(self.store(), lead, "dead", old, retryable_retries=1)
         self.assertEqual(self.entries()[0]["expected_head"], head)
 
+    def test_a_fence_that_cannot_read_the_rebased_head_holds_the_lead(self) -> None:
+        """Round 3 of sd:9923: both lookups failed, so a landed rebased lead went back runnable at its old head."""
+        self.queue_three()
+        lead = self.entries()[0]
+        sd_lane.update(self.store(), lambda rows: rows[0].update(status="running", holder={"token": "dead"}))
+        self.commit_files(self.repo, {"later.txt": "l\n"}, "main moved again")
+        git(self.repo, "push", "-q", "origin", "main")
+        git(self.first, "fetch", "-q", "origin")
+        git(self.first, "rebase", "-q", "origin/main")
+        git(self.first, "commit", "-q", "--amend", "-m", "first\n\nDelivers: sd:1")
+        git(self.first, "push", "-q", "--force", "origin", "HEAD:refs/heads/first")
+        head = git(self.first, "rev-parse", "HEAD")
+        with mock.patch.object(sd_lane, "publish_git", lambda *args: None):  # both ls-remote reads fail
+            sd_lane.advance(self.store(), {**lead, "status": "running"}, "dead", "train", self.entries()[1:],
+                            {"head": head, "branch": "sd-train/abc"})
+        sd_lane.put_back(self.store(), lead, "dead", lead["expected_head"], retryable_retries=1)
+        row = self.entries()[0]
+        self.assertEqual((row["status"], sd_lane.runnable(row), row[sd_lane.TRAIN_SENT]),
+                         ("pending", False, "sd-train/abc"))
+        self.assertIn("release", row["head_unknown"]["reason"])
+
     def test_the_fence_marks_each_member_with_the_sent_train(self) -> None:
         """Class pass of sd:9923: a member claimed before its lead had no guard against a lone merge."""
         self.fenced_lead()
