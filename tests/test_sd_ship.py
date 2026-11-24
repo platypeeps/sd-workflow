@@ -6675,6 +6675,25 @@ roles:
         self.assertEqual(_git(self.remote.path, "rev-parse", branch), pushed)
         self.assert_train_landed_refusal(caught, commit)
 
+    def test_a_prepare_whose_train_read_fails_refuses_retryably_having_spent_nothing(self):
+        """Review of sd:9923: a transient GitHub failure in `train_landed` before prepare's lock refused
+        with no `passes_spent`, so the lane failed a member whose train had landed."""
+        self.prepare()
+        _main, earlier = self.landing_before()
+        self.land_train(self.join(earlier)["train_commit"])
+        remote = sys.modules["sd_ship_remote"]
+
+        def down(api, number):
+            raise remote.Refusal("gh api returned no HTTP status line", code="command_failed",
+                                 state="retryable_failure")
+        with patch.object(remote.GitHub, "pull", down), self.assertRaises(ship.Refusal) as caught:
+            ship.dispatch(self.root, self.connection, self.database, self.args("prepare", "--catch-up"), receipts,
+                          False)
+        answer = ship.failure("prepare", caught.exception)
+        self.assertEqual((answer["workflow"]["blocker"]["code"], answer["workflow"]["blocker"]["retryable"],
+                          answer.get("passes_spent")), ("train_unread", True, 0))
+        self.assertEqual(self.operation().state["phase"], "train_joined")
+
     def test_a_merge_of_a_landed_member_github_reads_open_sends_no_merge(self):
         """Class pass of sd:9923: the same lagging flag sent `sd-ship merge` down the lone merge, which
         cleared the train record and sent its own PUT."""

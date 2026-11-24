@@ -792,17 +792,21 @@ class Runner(Lane):
     def test_a_landed_train_refusal_past_its_retries_is_held_not_failed(self) -> None:
         """Lane review of sd:9923: prepare's `train_landed` refusal spent the one retry and failed a member
         whose train main already holds; it waits held until GitHub confirms or an operator releases it."""
-        sd_lane.enqueue_entry(self.feature, 1, "fix: one", self.body, self.environ, manual=True, claim="deliver")
-        self.answers[(1, "prepare")] = {"ok": False, "phase": "prepare", "passes_spent": 0,
-                                        "error": "this member's train merge is in origin/main",
-                                        "workflow": {"blocker": {"code": "train_landed", "retryable": True}}}
-        sd_lane.run_lane(self.repo, self.environ, self.ship)
-        sd_lane.run_lane(self.repo, self.environ, self.ship)
-        entry = self.entries()[0]
-        self.assertEqual((entry["status"], entry.get("held"), entry["retryable_fault"]["step"]),
-                         ("pending", True, "prepare"))
-        sd_lane.run_lane(self.repo, self.environ, self.ship)
-        self.assertEqual(len(self.calls), sd_lane.RETRYABLE_RETRIES + 1)  # held: no run claims it again
+        for item, code in enumerate(("train_landed", "train_unread"), start=1):  # unread: review of sd:9923
+            with self.subTest(code=code):
+                sd_lane.enqueue_entry(self.feature, item, "fix: one", self.body, self.environ, manual=True,
+                                      claim="deliver")
+                self.answers[(item, "prepare")] = {"ok": False, "phase": "prepare", "passes_spent": 0,
+                                                   "error": "this member's train may be in origin/main",
+                                                   "workflow": {"blocker": {"code": code, "retryable": True}}}
+                self.calls.clear()
+                sd_lane.run_lane(self.repo, self.environ, self.ship)
+                sd_lane.run_lane(self.repo, self.environ, self.ship)
+                entry = self.entries()[-1]
+                self.assertEqual((entry["status"], entry.get("held"), entry["retryable_fault"]["step"]),
+                                 ("pending", True, "prepare"))
+                sd_lane.run_lane(self.repo, self.environ, self.ship)
+                self.assertEqual(len(self.calls), sd_lane.RETRYABLE_RETRIES + 1)  # held: no run claims it again
 
     def test_a_refusal_that_spent_a_pass_or_does_not_say_or_is_not_retryable_fails_at_once(self) -> None:
         """sd:3478. An unknown spend is not "none"; a failed gate is not run again unasked."""

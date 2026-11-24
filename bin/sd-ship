@@ -1511,10 +1511,21 @@ class Ship(SharedReview):
             raise
 
     def train_landed(self) -> bool:
-        """Whether this member joined a train whose pull request GitHub merged (sd:9923)."""
+        """Whether this member joined a train whose pull request GitHub merged (sd:9923).
+
+        A read that fails is no answer: it refuses `train_unread`, retryable
+        and spending no review pass, so the lane puts the member back, never
+        fails it while its train may be in main (review of sd:9923).
+        """
         pull = self.state.get("pull_request")
-        return self.state.get("phase") == "train_joined" and isinstance(pull, dict) and \
-            self.api.pull(pull["number"]).get("merged") is True
+        if self.state.get("phase") != "train_joined" or not isinstance(pull, dict):
+            return False
+        try:
+            return self.api.pull(pull["number"]).get("merged") is True
+        except Refusal as error:
+            raise Refusal(f"cannot read whether this member's train landed: {error}", code="train_unread",
+                          boundary="runtime", state="retryable_failure", details={"passes_spent": 0},
+                          next_action="Run the command again once GitHub answers.") from None
 
     def refuse_landed_train(self) -> None:
         """Refuse to prepare, join or merge a member whose train merge is in the fetched base (sd:9923).

@@ -4922,8 +4922,9 @@ def requeue(queue: Queue, entry: dict[str, Any], token: str, outcome: dict[str, 
 
 
 def train_may_have_landed(outcome: dict[str, Any]) -> bool:
-    """Whether `outcome` met a train that may have landed: `step: train`, or prepare's `train_landed` (sd:9923)."""
-    return outcome.get("step") == "train" or outcome.get("code") == "train_landed"
+    """Whether `outcome` met a train that may have landed: `step: train`, or prepare's `train_landed`
+    or `train_unread` (sd:9923)."""
+    return outcome.get("step") == "train" or outcome.get("code") in ("train_landed", "train_unread")
 
 
 def retryable_fields(retries: int, fault: dict[str, Any], landed: bool) -> dict[str, Any]:
