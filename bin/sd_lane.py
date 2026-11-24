@@ -3081,7 +3081,29 @@ def post_merge(root: pathlib.Path, queue: Queue, environ: dict[str, str], answer
         return answer
     # Its first try noted a target that did not start; a retry notes only a run.
     noted = [row for row in taken if not retry or row["item"] in {merged.get("item") for merged in landed}]
-    return {**answer, "post_merge": note_post_merge(noted, ran, main)}
+    ran = note_post_merge(noted, ran, main)
+    if ran.startswith(POST_MERGE_PASSED):
+        ran = settle_post_merge(queue, [row["item"] for row in taken], ran)
+    return {**answer, "post_merge": ran}
+
+
+def settle_post_merge(queue: Queue, items: list[Any], ran: str) -> str:
+    """`ran`, after a passing target resolved the open `Post-merge:` followups of its repository (sd:10407).
+
+    A later pass covers every earlier commit, so each earlier failure is answered. A failed write leaves
+    them open and is said in the answer; the merge stands either way.
+    """
+    def resolve_earlier(connection: Any) -> list[int]:
+        from sd_db import workflow  # noqa: PLC0415 -- `on_hub` made sd_db importable
+        return workflow.resolve_post_merge(connection, items)
+
+    try:
+        resolved = on_hub(queue, resolve_earlier)
+    except LaneError as error:
+        return f"{ran}; earlier post-merge followups stay open: {error}"[:1200]
+    if not resolved:
+        return ran
+    return f"{ran}; resolved earlier post-merge followups {', '.join(f'#{note}' for note in resolved)}"[:1200]
 
 
 def release_chain(root: pathlib.Path, queue: Queue, environ: dict[str, str], answer: dict[str, Any]) -> dict[str, Any]:
@@ -3210,9 +3232,13 @@ def release_ruling(queue: Queue, item: int, main: pathlib.Path) -> Callable[[str
     return ruling
 
 
+#: How `make_post_merge` answers a target that passed.
+POST_MERGE_PASSED = "make post-merge passed"
+
+
 def note_post_merge(rows: list[dict[str, Any]], ran: str, main: pathlib.Path) -> str:
     """Note each row's item with `ran`, a comment when the target passed, else a followup; `ran` with any failure."""
-    kind = "comment" if ran.startswith("make post-merge passed") else "followup"
+    kind = "comment" if ran.startswith(POST_MERGE_PASSED) else "followup"
     for row in rows:
         try:
             written = default_note(row["item"], f"Post-merge: {ran}", main, kind)
@@ -3325,7 +3351,7 @@ def make_post_merge(main: pathlib.Path, environ: dict[str, str], moved: str) -> 
         except OSError as error:
             return f"make post-merge did not start in {main}: {error}"
     if done.returncode == 0:
-        return f"make post-merge passed in {main}"
+        return f"{POST_MERGE_PASSED} in {main}"
     # Both tails, labelled: a `[step]` line always fills stderr, so a refusal on stdout was dropped (sd:4047).
     streams = (("stderr", done.stderr or ""), ("stdout", done.stdout or ""))
     tails = "; ".join(f"{name}: {text.strip()[-300:]}" for name, text in streams if text.strip())

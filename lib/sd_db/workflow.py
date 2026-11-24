@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 import sqlite3
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from datetime import date
 from typing import Any
 
@@ -879,19 +879,54 @@ def _refuse_unlanded_branch(state: dict, item: int) -> None:
         f"commit that landed it as its delivery")
 
 
+#: How each followup the machine writes starts (sd:10407): a build's block (`build._block`), a lane
+#: entry's end (`sd_lane.note_ended`) and a post-merge target's answer (`sd_lane.note_post_merge`).
+#: A done item owes none of them, so its close resolves them without being asked.
+MACHINE_FOLLOWUPS = ("Build blocked: ", "Lane failed in ", "Lane skipped in ", "Post-merge: ")
+
+
+def machine_followup(note: Mapping[str, Any]) -> bool:
+    """Whether `note` is an open-able followup the machine wrote, by its exact opening (sd:10407)."""
+    return note["kind"] == "followup" and str(note["body"] or "").startswith(MACHINE_FOLLOWUPS)
+
+
+def resolve_post_merge(connection: sqlite3.Connection, items: Collection[int]) -> list[int]:
+    """Resolve every open `Post-merge: ` followup on the items of the repositories `items` belong to.
+
+    A passing post-merge target covers every commit before it: main is linear, so a later pass
+    answers each earlier failure in the same repository (sd:10406, sd:10407). The ids resolved."""
+    numbers = sorted({int(item) for item in items})
+    if not numbers:
+        return []
+    marks = ", ".join("?" for _ in numbers)
+    with transaction(connection):
+        found = [row["id"] for row in connection.execute(
+            "SELECT note.id FROM note JOIN item ON item.id = note.item "
+            "WHERE note.kind = 'followup' AND note.resolved_at IS NULL "
+            "AND substr(note.body, 1, 12) = 'Post-merge: ' AND item.repo IN "
+            f"(SELECT repo FROM item WHERE id IN ({marks}) AND repo IS NOT NULL) ORDER BY note.id", numbers)]
+        for note in found:
+            resolve_note(connection, note)
+    return found
+
+
 def change_status(
     connection: sqlite3.Connection, item: int, target: str, *, who: str,
     reason: str | None = None, expected_revision: str | None = None, session: str | None = None,
-    followups: Collection[int] | None = None,
+    followups: Collection[int] | None = None, resolve_followups: bool = False,
 ) -> dict:
     """Move a task, followup, hand idea or active work item without bypassing delivery authority.
 
     `session` is the status note's session, `who` when not given (pack sd:6046).
-    `followups` limits which open followups a move to done resolves: a
-    delivery passes the ones it settles; None, a hand close, resolves all
-    (sd:9869).
+    A move to done always resolves the machine's followups (`machine_followup`,
+    sd:10407). `followups` names the others a delivery settles; the rest stay
+    open and owed (sd:9869). A hand close (`followups` None) refuses while any
+    other followup is open, naming each as `resolve followup N`, unless
+    `resolve_followups` is True, as `reporting.acknowledge` does.
     """
     who = _text(who, "who")
+    if type(resolve_followups) is not bool:
+        raise WorkflowError("resolve_followups must be exactly True or False")
     if reason is not None:
         reason = _text(reason, "reason")
     if not isinstance(target, str) or target not in STATUSES:
@@ -968,12 +1003,19 @@ def change_status(
                 set_item_fields(connection, item, fields=held)
         if target == "done":
             # sd:3505: what a done item still owed is no longer owed; the brief
-            # and Today read only open notes, so close them with the move. A
+            # and Today read only open notes, so close them with the move, the
+            # machine's always and a person's only when asked (sd:10407). A
             # question is not owed work: it waits on the operator's answer,
             # which a close does not give (pack sd:6329).
-            owed = [note["id"] for note in state["notes"]
-                    if note["kind"] == "followup" and not note["resolved_at"]
-                    and (followups is None or note["id"] in followups)]
+            open_followups = [note for note in state["notes"]
+                              if note["kind"] == "followup" and not note["resolved_at"]]
+            if followups is None and not resolve_followups:
+                blocking = [note["id"] for note in open_followups if not machine_followup(note)]
+                if blocking:
+                    raise TransitionRefused(
+                        f"item {item} has open followups; resolve each first: " + "; ".join(f"resolve followup {note}" for note in blocking))
+            owed = [note["id"] for note in open_followups
+                    if machine_followup(note) or followups is None or note["id"] in followups]
             for note in owed:
                 resolve_note(connection, note)
             if owed:

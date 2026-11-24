@@ -2587,6 +2587,34 @@ class Landing(Lane):
                           (2, f"Post-merge: make post-merge passed in {self.repo}")])
         self.assertEqual(self.note_kinds[-2:], ["comment", "comment"])
 
+    def test_a_passing_post_merge_resolves_the_repositorys_earlier_post_merge_followups(self) -> None:
+        """sd:10406, sd:10407: a refresh refused while a lane held its lock filed a followup on every merge,
+        217 of them, each answered by the next refresh that passed. A pass resolves them; a person's stays."""
+        import sd_db
+        earlier, landed = self.register_items(2)
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            failed = sd_db.add_note(connection, earlier, "followup", "Post-merge: make post-merge failed (exit 2)")
+            person = sd_db.add_note(connection, earlier, "followup", "Check the refresh by hand")
+            connection.commit()
+        finally:
+            connection.close()
+        tree, head = self.topic()
+        self.advance_origin_main()
+        git(self.repo, "switch", "-q", "--detach")  # a deploying checkout is pinned (sd:3647)
+        self.post_merge("touch ran")
+        self.merge_lands(tree, landed, head)
+        answer = self.drain()
+        self.assertEqual(answer["post_merge"],
+                         f"make post-merge passed in {self.repo}; resolved earlier post-merge followups #{failed}")
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            still = [row[0] for row in connection.execute(
+                "SELECT id FROM note WHERE item = ? AND kind = 'followup' AND resolved_at IS NULL", (earlier,))]
+        finally:
+            connection.close()
+        self.assertEqual(still, [person])
+
     def test_a_makefile_without_the_target_runs_nothing_and_notes_nothing(self) -> None:
         tree, head = self.topic()
         (self.repo / "Makefile").write_text("post-merge-later:\n\ttouch ran\npost-merge := 1\n", encoding="utf-8")

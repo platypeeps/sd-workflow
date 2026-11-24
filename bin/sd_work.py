@@ -806,14 +806,23 @@ def _change_status(workflow: Any, connection: Any, args: argparse.Namespace,
     (sd:5065), after `--delivered-by` is refused with its own reason; the
     library's refusal names the action, never a verb (sd:3503).
     """
+    if getattr(args, "resolve_followups", False) and args.status != "done":
+        raise WorkRefusal("--resolve-followups closes followups with done; give it only with done")
     reason = _status_reason(workflow, connection, args)
     if args.status == "done" and workflow.item_state(connection, args.item)["item"]["kind"] == "report":
         raise WorkRefusal(
             f"item {args.item} is a report, and a report closes by acknowledgement: "
             f"`sd reports acknowledge {args.item} --resolve-followups` also resolves its open followups")
-    result = workflow.change_status(
-        connection, args.item, args.status, who=who, session=_session(who),
-        expected_revision=getattr(args, "if_revision", None), reason=reason)
+    try:
+        result = workflow.change_status(
+            connection, args.item, args.status, who=who, session=_session(who),
+            expected_revision=getattr(args, "if_revision", None), reason=reason,
+            resolve_followups=bool(getattr(args, "resolve_followups", False)))
+    except workflow.TransitionRefused as refused:
+        if not str(refused).startswith(f"item {args.item} has open followups; "):
+            raise
+        raise WorkRefusal(f"{refused}; or close with `sd task status {args.item} done "
+                          f"--resolve-followups`, which resolves them too") from None
     spawned = result.get("next_occurrence")
     following = None if spawned is None else workflow.item_state(connection, spawned)["item"]
     return result, following
@@ -914,7 +923,7 @@ def _deliver(progress: Any, workflow: Any, connection: Any, args: argparse.Names
             return _delivered_again(state, args.commit)
         sentence = _delivery_reason(row, args.commit, trailer="Item")
         return workflow.change_status(
-            connection, args.item, "done", who=who, expected_revision=args.if_revision,
+            connection, args.item, "done", who=who, expected_revision=args.if_revision, resolve_followups=True,
             reason=f"{sentence} (after the fact: {args.reason.strip()})")
     deliver = getattr(progress, "deliver_associated_work", None)
     if deliver is None:
@@ -1802,6 +1811,9 @@ def register(groups: Any, store: Any) -> None:
     status.add_argument("--delivered-in", metavar="PATH",
                         help="registered checkout the --delivered-by commit landed in, "
                              "when it is not the item's own; the item keeps its checkout")
+    status.add_argument("--resolve-followups", action="store_true",
+                        help="with done: resolve every open followup too; without it, done refuses "
+                             "while a followup the machine did not write is open (sd:10407)")
     _output(status, "status", revision=True)
 
     cancel = verbs.add_parser(
