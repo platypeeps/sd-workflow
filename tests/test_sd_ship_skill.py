@@ -667,6 +667,22 @@ class TheReviewedHead(unittest.TestCase):
         self.assertNotIn(cap, SKILL_TEXT)
         self.assertIn(".claude/rules/sd-planning-adversarial-review.md", steps()[2])
 
+    def test_each_code_row_states_the_limit_its_runtime_enforces(self) -> None:
+        """sd:10215: one row stated 15 rounds, while a build run parks after
+        3 reviews; a reader took one limit for the other. Each code row's
+        cap is the number the code that enforces it holds."""
+
+        import sd_ship_history
+
+        runner = (REPO_ROOT / "lib/sd_db/build_run.py").read_text(encoding="utf-8")
+        rounds = int(re.search(r"^REVIEW_ROUNDS = (\d+)$", runner, re.MULTILINE).group(1))
+        caps = {line.split("|")[2].strip(): line.rsplit("|", 2)[1].strip()
+                for line in RULE.read_text(encoding="utf-8").splitlines() if line.startswith("| Development | Code")}
+        self.assertEqual(caps, {
+            "Code, in a build run": f"{rounds + 1} reviews, then it parks",
+            "Code, before merge": f"{sd_ship_history.AUTOMATIC_CODE_REVIEW_PASSES} `sd-ship` passes",
+        })
+
     def test_the_push_refuses_a_head_the_local_review_has_not_cleared(self) -> None:
         """One sentence carries all three, rather than the step between them.
 

@@ -19,7 +19,12 @@ Non-blocking findings hold nothing.
 | Research | After the brief and decisions | Claims against sources, gaps, wrong calls | 2 |
 | Research | Final product, before the send box | The piece, page or ticket as a reader sees it | 1 |
 | Development | prd and design | Scope, missing requirements, wrong assumptions | 5 |
-| Development | Code, before merge | Defects a second reader finds | 15 rounds |
+| Development | Code, in a build run | Defects a second reader finds in the builder's branch | 3 reviews, then it parks |
+| Development | Code, before merge | Automatic local reviews `sd-ship` runs on one item's branch | 15 `sd-ship` passes |
+
+The two code rows count different things: a build run's own reviews, and every automatic `sd-ship` pass on the
+item's branch, the lane's prepares included. Neither is the lead's limit: after round 3, counting builder and
+lane rounds together, the lead records fix, file or reject for each blocker (system sd:10204).
 
 This file holds the only copy of that table. A skill that runs a review names its point here and reads its cap from
 that row; no skill carries a cap of its own.
