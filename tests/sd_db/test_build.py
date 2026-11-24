@@ -1211,6 +1211,26 @@ class Reap(Case):
         self.assertEqual([entry["id"] for entry in queued], [self.bundle["assignment"]])
         self.assertLess(queued[0]["id"], cancelled, "Retry of the bundle, not a fresh press")
 
+    def test_build_of_a_waiting_member_moved_away_never_queues_its_old_lead(self):
+        """Review of sd:10086: a member that waits on its lead moved to another repository; Build of that member
+        read the old bundle, whose Retry parks the member and queues the lead alone. The pressed item's own
+        repository is always checked, so Build presses it fresh where it reads now."""
+        from sd_db.workflow import edit_item
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        transition(self.db, self.items[1], "ready", who="operator")
+        newer = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (newer,))  # before its claim
+        edit_item(self.db, self.items[1], {"blocked_by": [self.items[0]]}, who="operator")
+        self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (B, self.items[1]))
+        self.assertGreaterEqual(build._retry_row(self.db, self.items[1])["id"], newer,
+                                "Build of the moved member read its old bundle")
+        with self.assertRaisesRegex(build.BuildRefused, "waits on"):  # a fresh press, refused for its wait
+            build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", self.bundle["assignment"]),
+                         "blocked", "the old lead queued")
+
     def test_build_by_item_frees_a_member_the_lead_waits_on_moved_away(self):
         """sd:10086: bundle A's lead waits on its member, which moved to another repository. Retry frees the
         member to build fresh where it reads now, so its repository is no reason to press the lead fresh."""
