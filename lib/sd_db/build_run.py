@@ -2194,6 +2194,12 @@ class Supervisor:
         left = build.design_left(self.db, delivered, [self.lead, *self.others])
         if left:
             return self.finish("blocked", f"{left}; rule on the design or commit its design.md, then Retry")
+        # Nor does a design ship without code: the lane refuses a branch of design records
+        # (`design_only_delivery`), and no reader of a delivery expects one with no code item (class pass).
+        if delivered and build.aboard(self.db, delivered) == set(delivered):
+            return self.finish("blocked", f"the branch delivers only design "
+                                          f"{', '.join(f'sd:{item}' for item in delivered)}, and a design ships "
+                                          f"with code; settle what held the code items, then Retry")
         # A member the operator cancelled on its own needs no line: the lane reads it from data (`build.left`).
         if asked:
             # The lane closes every open item a branch trailer cites; a `Refs:` line keeps these open.

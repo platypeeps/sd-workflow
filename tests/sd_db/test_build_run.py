@@ -195,6 +195,8 @@ FAKE = textwrap.dedent('''
         items = [] if mode == "none" else items[:-1] if mode == "skip" else items
         if mode == "skip-design":  # cites every item but the designs
             items = [item for item in items if item not in designs]
+        if mode == "only-design":  # cites the designs alone, as a builder whose code lead asked a question
+            items = [item for item in items if item in designs]
         trailers = "".join(f"\\nCloses: sd:{item}" for item in items)
         message = f"fix: {mode}" + "".join("\\n\\n" + text for text in extra.get("message", []))
         git("-c", "commit.gpgsign=false", "commit", "-qm", message + (f"\\n{trailers}" if items else ""))
@@ -5527,6 +5529,21 @@ class Drafts(Case):
         self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
         self.assertIn(f"sd:{code} waits on design sd:{design}, which this delivery leaves out",
                       build.run(self.db, self.bundle["id"])["detail"])
+
+    def test_a_design_is_not_delivered_without_code(self):
+        """Class pass of sd:10096: the builder commits the design alone, its code lead skipped. The lane
+        refuses a branch of design records (`design_only_delivery`), and no reader of a delivery expects one
+        with no code item: the run holds it, and Retry builds the code on the same branch."""
+        code, design = self.bound()
+        self.write_pr()
+        self.plan(claude=["only-design"], sd_review=["clean"])
+        ended = self.supervisor().run()
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+        self.assertIn(f"the branch delivers only design sd:{design}", build.run(self.db, self.bundle["id"])["detail"])
+        self.park_bundle()
+        queued = build.retry(self.db, self.bundle["assignment"], who="operator")["queued"]
+        self.assertEqual([row["item"] for row in queued], [code, design])
 
     def test_a_code_item_still_waits_on_a_design_with_no_ride(self):
         """The ride exemption reads a queued ride only: a design not yet written still holds its code item."""
