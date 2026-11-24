@@ -3664,6 +3664,27 @@ class CitedCloses(SharedQueue):
         head = git(tree, "rev-parse", "HEAD")
         self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {c})
 
+    def test_a_revert_that_reads_as_the_base_still_undoes_its_commit(self) -> None:
+        """sd:10214 review: a `git revert` that carries its own `Closes:` reads as the base, and a later revert
+        subject made the base check drop it; `kept_commits` then no longer saw the commit it undid."""
+        a, b, *_ = self.open
+        tree, _ = self.committed("topic-revert-at-base")
+        (tree / "work.txt").write_text("work\n", encoding="utf-8")
+        git(tree, "add", "work.txt")
+        git(tree, "commit", "-q", "-m", f"feat: implement\n\nCloses: sd:{a}")
+        work = git(tree, "rev-parse", "HEAD").strip()
+        (tree / "other.txt").write_text("other\n", encoding="utf-8")
+        git(tree, "add", "other.txt")
+        git(tree, "commit", "-q", "-m", "fix: other")
+        git(tree, "revert", "--no-commit", work)
+        git(tree, "commit", "-q", "-m",
+            f'Revert "feat: implement"\n\nThis reverts commit {work}.\n\nCloses: sd:{b}')
+        git(tree, "rm", "-q", "other.txt")
+        git(tree, "commit", "-q", "-m", "revert: hold the other fix")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [b])
+
     def test_a_revert_of_other_work_keeps_a_close_on_a_quoted_filename(self) -> None:
         """sd:8373 review: git quotes a name with a tab or non-ASCII byte; a quoted pathspec matched nothing."""
         a, b, *_ = self.open

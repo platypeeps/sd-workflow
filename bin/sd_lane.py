@@ -1014,7 +1014,10 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
             # NUL-separated and literal: git quotes a name with a tab or non-ASCII byte otherwise.
             files = publish_git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-z", "-r", sha)
             names = [name for name in files.stdout.split("\0") if name] if files and files.returncode == 0 else []
-            if names and any(reads_as_at(before, names) for before in (f"{sha}^", fork) if before):
+            # A revert is read by `kept_commits` for what it undid, so the base check never drops one (sd:10214
+            # review): it reads as the base exactly when it undid the work.
+            base_check = fork if not sd_ship_body.REVERT_SUBJECT.match(message) else None
+            if names and any(reads_as_at(before, names) for before in (f"{sha}^", base_check) if before):
                 continue
         kept.append((sha, message))
     return kept
