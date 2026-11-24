@@ -622,7 +622,64 @@ def function_words(git: Collection[str], work: str, base: str, head: str, *,
     # Every name on a changed line, and each name a context line defines (`defined_names`).
     defined = {name for line in lines for name in (re.findall(r"[A-Za-z_]\w*", line[1:]) if line[0] in "+-"
                                                    else defined_names(line[1:]))}
-    return set(re.findall(r"[A-Za-z_]\w*", diff)), defined
+    # A quoted literal reads as `"text"`, which no identifier spells: a key an exporter writes ties it to the
+    # unchanged importer that reads the same key, a format and no name (sd:10027).
+    return set(re.findall(r"[A-Za-z_]\w*", diff)) | literals("\n".join(line[1:] for line in lines)), defined
+
+
+def literals(text: str) -> set[str]:
+    """Each quoted literal of two or more characters in `text`, as `"text"` whatever its quotes (sd:10027).
+    ponytail: an apostrophe in prose pairs with the next, so it reads more literals, never fewer."""
+    return {f'"{body}"' for _quote, body in re.findall(r"""(["'])((?:(?!\1)[^\\\n]){2,})\1""", text)}
+
+
+# Decorators that wrap a function and leave it reached by its own name; any other may file it in a table
+# (`@register("a")`, `@app.route`) its readers reach by no name, an edge the name walk misses (sd:10027).
+WRAPPERS = frozenset({"property", "setter", "getter", "deleter", "staticmethod", "classmethod", "abstractmethod",
+                      "cached_property", "cache", "lru_cache", "wraps", "override", "final", "dataclass",
+                      "contextmanager", "asynccontextmanager", "total_ordering"})
+# What a test decorator files, only a test runner reads, and the gate runs those.
+TEST_DECORATORS = frozenset({"mock", "unittest", "pytest"})
+# Dunders reached by name through their class (`Table()` reads the class body); any other is called by syntax:
+# `table[key]`, `a == b`, `obj.missing` (sd:10027).
+NAMED_DUNDERS = frozenset({"__init__", "__new__", "__post_init__"})
+
+
+def definition(lines: list[str], line: int) -> tuple[int, int] | None:
+    """The `(start, end)` indexes of the nearest definition whose lines hold the 1-based `line`: a line below
+    a function's end is not its own; None outside every function."""
+    for start in range(min(line, len(lines)) - 1, -1, -1):
+        if defined_names(lines[start]):
+            depth = len(lines[start]) - len(lines[start].lstrip())
+            # A line that opens with `)` or `]` closes a bracket (a signature split over lines), not the
+            # function. ponytail: a multiline string's column-0 text still ends it; a parser if that costs.
+            end = next((index for index in range(start + 1, len(lines)) if lines[index].strip()
+                        and not lines[index].lstrip().startswith((")", "]"))
+                        and len(lines[index]) - len(lines[index].lstrip()) <= depth), len(lines))
+            if line <= end:
+                return start, end
+    return None
+
+
+def implicit(lines: list[str], start: int, *, named: Collection[str] = ()) -> bool:
+    """Whether the definition at `lines[start]` is reached by no name: a dunder outside `named`, or one under
+    a decorator not in `WRAPPERS` (sd:10027). Decorator lines sit above it at its indent; a decorator's
+    arguments split over lines sit deeper or close with `)`."""
+    if any(name.startswith("__") and name.endswith("__") and name not in named for name in defined_names(lines[start])):
+        return True
+    depth = len(lines[start]) - len(lines[start].lstrip())
+    for text in reversed(lines[:start]):
+        indent = len(text) - len(text.lstrip())
+        if not text.strip() or indent < depth:
+            return False
+        if indent > depth or text.lstrip().startswith((")", "]")):
+            continue
+        if not text.lstrip().startswith("@"):
+            return False
+        parts = re.findall(r"[A-Za-z_]\w*", re.split(r"[^\w.]", text.lstrip()[1:].lstrip(), maxsplit=1)[0])
+        if parts and parts[-1] not in WRAPPERS and parts[0] not in TEST_DECORATORS:
+            return True
+    return False
 
 
 def defined_names(line: str) -> set[str]:
@@ -1716,6 +1773,10 @@ class Supervisor:
         functions = self.branch_words(head) if changed is not None else None
 
         sources: dict[str, list[str] | None] = {}
+        # A change to a function reached by no name (a registered handler, a `__getitem__`) reaches readers no
+        # walk finds: every blocker holds (sd:10027).
+        if functions is not None and changed and self.implicit_change(changed, head, sources):
+            functions = None
 
         def held(row: dict) -> bool:
             # `<...>` names no file; an absolute or `..` path is outside the checkout no delta of it can clear.
@@ -1739,7 +1800,10 @@ class Supervisor:
             # name, so its path defers nothing.
             # Or a place whose function calls a changed one, directly or through unchanged ones: a fix that makes
             # `lookup()` return None breaks the unchanged consumer at `lookup().name`.
-            if any(self.called_from(path, line, head, sources, functions[0])
+            # Or a place reached by no name: under a registering decorator, a dunder, or a reader of a quoted key
+            # the changed code also spells (sd:10027).
+            if any(self.implicit_place(path, line, head, sources, functions[0])
+                   or self.called_from(path, line, head, sources, functions[0])
                    or self.calls_into(path, line, head, sources, functions[1]) for path, line in self.locations(row)):
                 return True
             # A name with a space or other character no word holds (`bin/my tool`), found literally and whole.
@@ -1747,6 +1811,31 @@ class Supervisor:
                        for name in names if re.search(r"[^\w./-]", name))
         new = [row for row in answer["blockers"] if not held(row)]
         return new, [row for row in answer["blockers"] if row not in new]
+
+    def implicit_place(self, path: str, line: int | None, head: str, sources: dict[str, list[str] | None],
+                       words: set[str]) -> bool:
+        """Whether the code at `path:line` is reached by no name (`implicit`, any dunder), or its scope quotes a
+        literal the changed code quotes too; an answer git cannot give counts as reached (sd:10027)."""
+        if (found := self.scope(path, line, head, sources)) is None:
+            return True
+        lines = sources.get(path) or []
+        at = definition(lines, line) if line is not None else None
+        return bool(at and implicit(lines, at[0])) or bool(literals("\n".join(found[1])) & words)
+
+    def implicit_change(self, changed: dict[str, set[int]], head: str,
+                        sources: dict[str, list[str] | None]) -> bool:
+        """Whether a line the branch changes sits in a definition reached by no name, a dunder outside
+        `NAMED_DUNDERS` or a registered function; a path with no lines reads whole, one git cannot read
+        counts (sd:10027)."""
+        for path, numbers in changed.items():
+            if (found := self.scope(path, None, head, sources)) is None:
+                return True
+            lines = found[1]
+            starts = ({at[0] for number in numbers if (at := definition(lines, number))} if numbers
+                      else {index for index, text in enumerate(lines) if defined_names(text)})
+            if any(implicit(lines, start, named=NAMED_DUNDERS) for start in starts):
+                return True
+        return False
 
     def called_from(self, path: str, line: int | None, head: str, sources: dict[str, list[str] | None],
                     words: set[str]) -> bool:
@@ -1871,17 +1960,8 @@ class Supervisor:
             return None
         if line is None:
             return {name for text in lines for name in defined_names(text)}, lines
-        # The nearest definition whose lines hold the cited one: a line below a function's end is not its own.
-        for start in range(min(line, len(lines)) - 1, -1, -1):
-            if names := defined_names(lines[start]):
-                depth = len(lines[start]) - len(lines[start].lstrip())
-                # A line that opens with `)` or `]` closes a bracket (a signature split over lines), not the
-                # function. ponytail: a multiline string's column-0 text still ends it; a parser if that costs.
-                end = next((index for index in range(start + 1, len(lines)) if lines[index].strip()
-                            and not lines[index].lstrip().startswith((")", "]"))
-                            and len(lines[index]) - len(lines[index].lstrip()) <= depth), len(lines))
-                if line <= end:
-                    return names, lines[start:end]
+        if (found := definition(lines, line)) is not None:
+            return defined_names(lines[found[0]]), lines[found[0]:found[1]]
         return set(), statement(lines, max(line - 1, 0))
 
     def branch_words(self, head: str) -> tuple[set[str], set[str]] | None:
