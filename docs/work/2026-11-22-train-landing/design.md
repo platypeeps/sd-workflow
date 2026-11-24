@@ -68,6 +68,10 @@ these steps. Each step reuses a reader or writer that exists today.
    pull request merged reconciles instead. While the train merge is
    in the fetched base and GitHub still reads the pull request open,
    prepare, join and merge refuse `train_landed` and write nothing.
+   An entry whose train may have landed never ends failed: its row
+   carries `train_sent`, then `train_landed` once the train pull
+   request reads merged, and one decision (`kept_landed`) puts it back
+   at every exit of a claim, then holds it for `sd-ship lane release`.
 8. Cleanup: the train branch is deleted; a missed delete leaves a ref
    the next train with the same tip pushes up to date.
 
@@ -144,6 +148,13 @@ from 2 to 6 fails, each member ships alone, as after sd:9899: a later
 | 7 reconcile | entry pending | GitHub stays stale past the retry | entry held, never failed; release runs it | lane: past its retries is held |
 | 7 reconcile | none | GitHub read fails before prepare's lock | train_unread, retryable, no pass spent | ship: train read fails |
 | 7 reconcile | none | the lead's reconcile raises (log write) | entry back at step train, never failed | lane: claimed reconcile raises |
+| 7 settle | train_sent becomes train_landed | train PR reads merged | every later claim knows; only a reconcile ends it | lane: recovery claim, prepare refuses |
+| 7 recover | none | prepare refuses, any code or spend | put back; held past its retries | lane: recovery claim, prepare refuses |
+| 7 recover | none | prepare raises (full log volume) | put back | lane: recovery claim, prepare raises |
+| 7 recover | none | no checkout: a skip or a refusal | put back | lane: recovery claim, no checkout; checkout refuses |
+| 7 recover | none | train mark of another shape | mark kept; put back, then held | lane: mark names no train branch |
+| 6-7 | none | any raise at step train | put back at step train | lane: a raise after the train landed |
+| 6-7 | holder gone | runner dies RECLAIMS times | held, never failed; release runs it | lane: last reclaim holds |
 | 8 cleanup | ref deleted | delete fails | stale ref; noted, nothing else | land_train |
 ```
 

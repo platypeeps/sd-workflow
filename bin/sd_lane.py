@@ -1237,7 +1237,9 @@ def reclaim(row: dict[str, Any], *, released: bool = False) -> dict[str, Any]:
     `RECLAIMS`th reclaim fails it instead. `step: train` is reclaimed the
     same way: the next prepare reconciles a train that landed, and runs the
     entry again when none did (sd:9923). At `step: merge` it fails: a merge
-    may have landed. The holder goes, so its token holds nothing any more.
+    may have landed. An entry whose train may have landed (`step: train`
+    or `train_marked`) is held where it would fail: only a reconcile ends
+    it. The holder goes, so its token holds nothing any more.
     """
     holder = row.pop("holder", None) or {}
     pid, step = holder.get("pid"), row.pop("step", None)
@@ -1248,6 +1250,11 @@ def reclaim(row: dict[str, Any], *, released: bool = False) -> dict[str, Any]:
     row.update(last_holder=holder, reclaims=reclaims, **({"released": True} if released else {}))
     if step in ("prepare", "train") and reclaims < RECLAIMS:
         row.update(status="pending")
+    elif step == "train" or train_marked(row):  # main may hold its train: held, never failed (class pass of sd:9923)
+        why = f"{who} in {step}, reclaim {reclaims}; its train may have landed, so it is held, not failed"
+        row.update(status="pending", held=True, held_at=stamp_now(), retryable_fault={
+            "step": step, "reason": why, "at": stamp_now(),
+            "held": "`sd-ship lane release` runs it again once GitHub shows its pull request merged"})
     elif step in ("prepare", "train"):
         row.update(status="failed", step="runner", finished_at=stamp_now(), reclaimed_by=os.getpid(),
                    reason=f"{who} in {step}, reclaim {reclaims} of {RECLAIMS}; the lane stops retrying it, so "
@@ -2870,6 +2877,9 @@ TRAIN_SENT = "train_sent"
 TRAIN_PREPARING = "train_preparing"
 #: The head that prepare answered for a marked row no read could follow; the claim takes it from origin (round 5).
 TRAIN_PLACED = "train_placed"
+#: The row of an entry whose sent train GitHub read merged: only a reconcile ends it, so no failure fails it
+#: (class pass of sd:9923). It names the train branch, and replaces `TRAIN_SENT` at that read.
+TRAIN_LANDED = "train_landed"
 #: A joined train member: its row, worktree, prepared head, the landing it joined onto and the merge it wrote.
 Joined = tuple[dict[str, Any], pathlib.Path, str, str, str]
 
@@ -3189,8 +3199,10 @@ def sent_train_settled(queue: Queue, entry: dict[str, Any], token: str, root: pa
     closes it, and reads again. Closed: nothing more can land from it.
     Only then is the mark dropped and a lone merge possible; a read with
     no answer, or a pull request still open, raises `PUBLISH_UNKNOWN`, and
-    the entry waits at its place. A mark of another shape fails the entry
-    and stays: it proves nothing.
+    the entry waits at its place. A merged train leaves `TRAIN_LANDED` in
+    the mark's place, so every later claim knows that only a reconcile
+    ends the entry (`kept_landed`). A mark of another shape proves
+    nothing: it stays, and the entry is put back, then held.
     """
     branch = entry.get(TRAIN_SENT)
     if TRAIN_SENT not in entry:
@@ -3207,10 +3219,14 @@ def sent_train_settled(queue: Queue, entry: dict[str, Any], token: str, root: pa
         raise LaneError(f"train pull request from {branch} is still open; close it, and the next run "
                         "settles the entry", code=PUBLISH_UNKNOWN)
 
+    landed = {TRAIN_LANDED: branch} if state == "merged" else {}
+
     def drop_sent(entries: list[dict[str, Any]]) -> None:
-        held(entries, entry, token).pop(TRAIN_SENT, None)
+        row = held(entries, entry, token)
+        row.pop(TRAIN_SENT, None)
+        row.update(landed)
     runner_write(queue, drop_sent)
-    return {key: value for key, value in entry.items() if key != TRAIN_SENT}
+    return {**{key: value for key, value in entry.items() if key != TRAIN_SENT}, **landed}
 
 
 def train_state(root: pathlib.Path, branch: str) -> str:
@@ -4897,9 +4913,9 @@ def requeue(queue: Queue, entry: dict[str, Any], token: str, outcome: dict[str, 
     review pass `RETRYABLE_RETRIES` times (sd:3478); a gate slot wait that
     ran out every time, counted in `slot_waits`: no gate ran, and the kept
     review serves the next prepare (pack sd:7412). Each has its own count.
-    A refusal after a train that may have landed (`step: train`, or
-    prepare's `train_landed`) is held past its retries, never failed:
-    main may hold its train, and its delivery is still owed (sd:9923).
+    A refusal after a train that may have landed (`kept_landed`'s mark,
+    `step: train`, or prepare's `train_landed`) is held past its retries,
+    never failed: main may hold its train, and its delivery is owed (sd:9923).
     It keeps its place, and `hub_fault` or `retryable_fault` says what failed
     where; a later outcome writes its own fields beside it. Its
     `expected_head` moves only to a catch-up merge prepare pushed
@@ -4908,7 +4924,7 @@ def requeue(queue: Queue, entry: dict[str, Any], token: str, outcome: dict[str, 
     hub, retryable = outcome.pop("hub_fault", False), outcome.pop("retryable", False)
     waited = outcome.pop("slot_wait", False)
     retries = int(entry.get("hub_retries" if hub else "retryable_retries") or 0)
-    landed = train_may_have_landed(outcome)
+    landed = outcome.pop("landed", False) or train_may_have_landed(outcome)
     if not (hub or retryable or waited) or (retryable and retries >= (math.inf if landed else RETRYABLE_RETRIES)):
         return None
     tree, branch = pathlib.Path(entry["worktree"]), str(entry.get("branch") or "")
@@ -4931,6 +4947,26 @@ def train_may_have_landed(outcome: dict[str, Any]) -> bool:
     """Whether `outcome` met a train that may have landed: `step: train`, or prepare's `train_landed`
     or `train_unread` (sd:9923)."""
     return outcome.get("step") == "train" or outcome.get("code") in ("train_landed", "train_unread")
+
+
+def train_marked(row: dict[str, Any]) -> bool:
+    """Whether `row` is in a train that landed, or one whose sent merge is not settled (class pass of sd:9923)."""
+    return TRAIN_LANDED in row or TRAIN_SENT in row
+
+
+def kept_landed(entry: dict[str, Any], step: str, outcome: dict[str, Any]) -> dict[str, Any]:
+    """`outcome`, put back instead when it ends an entry whose train may have landed (class pass of sd:9923).
+
+    The one place that decides it, for every exit of a claim: a refusal of
+    any code, a raise, a skip, a checkout that could not be made. Main may
+    hold the entry's work, so only a reconcile ends it: `requeue` puts it
+    back, and holds it once its retries are spent. A hub fault keeps its
+    own count.
+    """
+    if outcome.get("status") not in NOTED or not (train_marked(entry) or step == "train"
+                                                  or train_may_have_landed(outcome)):
+        return outcome
+    return {"step": "worktree", **outcome, "retryable": True, "landed": True}
 
 
 def retryable_fields(retries: int, fault: dict[str, Any], landed: bool) -> dict[str, Any]:
@@ -5283,29 +5319,42 @@ def run_checkout(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token:
     `stage` follows `advance`, so a raise after the before-merge write names
     merge in the note and the finish record, not the claim's prepare (sd:5968).
     """
-    outcome, stage = found, {"step": entry.get("step") or "prepare"}
+    outcome, stage, local = found, {"step": entry.get("step") or "prepare"}, entry
 
     def advanced(step: str = "merge", members: list[dict[str, Any]] | None = None,
                  train: dict[str, str] | None = None) -> None:
         head = advance(queue, local, token, step, members, train)
         entry["expected_head"] = local["expected_head"] = head  # every later write starts from the fenced head
         stage["step"] = step
+    def processed() -> dict[str, Any]:
+        """`process`'s outcome; a raise in an entry whose train may have landed is a failure `kept_landed` reads."""
+        try:
+            return process(local, queue, ship, advanced, functools.partial(renew, queue, local, token), deadline)
+        except Stop:
+            raise
+        except Exception as error:
+            unknown = isinstance(error, LaneError) and error.code == PUBLISH_UNKNOWN
+            if unknown or not (train_marked(entry) or stage["step"] == "train"):
+                raise
+            return {"status": "failed", **stage, "reason": f"{type(error).__name__}: {error}"[:600]}
     try:
         if tree is not None:
             built = {"lane_worktree": True, "builder_worktree": entry.get("worktree"),
                      "builder_host": entry.get("enqueued_on")}
             local = {**entry, "worktree": str(tree), **(built if found.get("made") else {})}
-            outcome = process(local, queue, ship, advanced, functools.partial(renew, queue, local, token), deadline)
+            outcome = processed()
             if outcome.get("moved"):
                 put_back(queue, entry, token, pushed_catch_up(tree, str(entry.get("branch") or ""),
                                                               entry["expected_head"]),
                          moved_off={"host": this_host(), "at": stamp_now(), "step": "merge"})
                 return ({"item": entry["item"], **outcome, "status": "pending"},
                         f"{outcome['moved']} sd:{entry['item']} is pending again at its place, for that host.")
-            met = requeue(queue, local, token, outcome)
-            if met is not None:
-                return ({"item": entry["item"], **outcome, "status": "pending"},
-                        f"sd:{entry['item']} met {met} in {outcome.get('step')}")
+        outcome = kept_landed(entry, stage["step"], outcome)
+        met = requeue(queue, local, token, outcome)
+        if met is not None:
+            return ({"item": entry["item"], **outcome, "status": "pending"},
+                    f"sd:{entry['item']} met {met} in {outcome.get('step')}")
+        if tree is not None:
             if outcome.get("status") == "merged":  # before the landing, so a kill in it still owes the target
                 outcome["post_merge"] = POST_MERGE_OWED
                 outcome["release"] = RELEASE_OWED

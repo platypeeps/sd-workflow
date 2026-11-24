@@ -2203,6 +2203,78 @@ class TrainLanding(Trees):
         self.assertIn("No space left on device", lead["retryable_fault"]["reason"])
         self.assertNotIn(1, self.merges())
 
+    def recovering(self, retries: int = 0) -> None:
+        """sd:1 queued with the mark of a sent train that GitHub reads merged: its recovery claim."""
+        self.queue_three()
+        sd_lane.update(self.store(), lambda rows: rows[0].update({sd_lane.TRAIN_SENT: "sd-train/abc",
+                                                                  "retryable_retries": retries}))
+        self.landing = {"status": "failed", "pull": 10, "reason": "no second train"}
+        self.train_states = ["merged"]
+
+    def assert_lead_kept(self, held: bool = False) -> dict:
+        lead = self.entries()[0]
+        self.assertEqual((lead["status"], bool(lead.get("held")), lead.get(sd_lane.TRAIN_LANDED),
+                          sd_lane.TRAIN_SENT in lead), ("pending", held, "sd-train/abc", False))
+        self.assertNotIn(1, self.merges())
+        return lead
+
+    def test_a_landed_trains_recovery_claim_whose_prepare_refuses_is_kept_then_held(self) -> None:
+        """Class pass of sd:9923: a landed train's entry failed at every exit no train code named. A GitHub
+        timeout in prepare's reconcile, which says no spend, failed the member and left delivery open."""
+        self.answers[(1, "prepare")] = {"ok": False, "phase": "prepare", "error": "gh could not finish: timeout",
+                                        "workflow": {"blocker": {"code": "command_unavailable", "retryable": True}}}
+        self.recovering()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        lead = self.assert_lead_kept()
+        self.assertEqual((lead["retryable_retries"], lead["retryable_fault"]["step"]), (1, "prepare"))
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)  # the mark is gone; the row remembers
+        self.assertIn("sd-ship lane release", self.assert_lead_kept(held=True)["retryable_fault"]["held"])
+
+    def test_a_landed_trains_recovery_claim_whose_prepare_raises_is_kept(self) -> None:
+        """Class pass of sd:9923: a full log volume raised out of the recovery claim's prepare and failed it."""
+        def ship(argv: list[str], log: pathlib.Path) -> dict:
+            if argv[2] == "prepare" and argv[argv.index("--item") + 1] == "1":
+                raise OSError(28, "No space left on device")
+            return self.ship(argv, log)
+        self.recovering()
+        sd_lane.run_lane(self.repo, self.environ, ship, self.gate)
+        self.assertIn("No space left on device", self.assert_lead_kept()["retryable_fault"]["reason"])
+
+    def test_a_landed_trains_recovery_claim_that_finds_no_checkout_is_kept(self) -> None:
+        """Class pass of sd:9923: a skip (the worktree moved on) ended a landed train's entry as skipped."""
+        self.recovering()
+        self.commit_files(self.first, {"more.txt": "m\n"}, "moved on")
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertEqual(self.assert_lead_kept()["retryable_fault"]["step"], "worktree")
+
+    def test_a_landed_trains_recovery_claim_whose_checkout_refuses_is_kept(self) -> None:
+        self.recovering()
+        with mock.patch.object(sd_lane, "checkout_for", side_effect=sd_lane.LaneError("cannot make the worktree")):
+            sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        self.assertIn("cannot make the worktree", self.assert_lead_kept()["retryable_fault"]["reason"])
+
+    def test_a_raise_after_the_train_landed_puts_the_lead_back(self) -> None:
+        """Class pass of sd:9923: any raise at `step: train` skipped the put-back and failed the lead."""
+        self.queue_three()
+        with mock.patch.object(sd_lane, "merge_step", side_effect=RuntimeError("broke after the landing")):
+            sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        lead = self.entries()[0]
+        self.assertEqual((lead["status"], lead["retryable_fault"]["step"]), ("pending", "train"))
+
+    def test_the_last_reclaim_of_a_train_that_may_have_landed_holds_the_entry(self) -> None:
+        """Class pass of sd:9923: the `RECLAIMS`th dead runner at `step: train` failed the entry."""
+        for case, marks in (("step", {"step": "train"}), ("sent", {"step": "prepare", sd_lane.TRAIN_SENT: "sd-train/abc"}),
+                            ("landed", {"step": "merge", sd_lane.TRAIN_LANDED: "sd-train/abc"})):
+            with self.subTest(case=case):
+                row = {"item": 1, "status": "running", "holder": {"pid": 1, "host": "example.test"},
+                       "reclaims": sd_lane.RECLAIMS - 1, "expected_head": "a" * 40, **marks}
+                sd_lane.reclaim(row)
+                self.assertEqual((row["status"], row.get("held")), ("pending", True))
+        plain = {"item": 1, "status": "running", "holder": {"pid": 1}, "reclaims": sd_lane.RECLAIMS - 1,
+                 "step": "prepare", "expected_head": "a" * 40}
+        sd_lane.reclaim(plain)
+        self.assertEqual(plain["status"], "failed")  # no train: the old end stands
+
     def test_a_landed_train_whose_reconcile_refuses_past_its_retries_is_held_not_failed(self) -> None:
         """Lane review of sd:9923: a stale GitHub read after the train landed spent the one retry and
         failed the entry, so main held the train and its delivery stayed open."""
@@ -2684,14 +2756,17 @@ class TrainLanding(Trees):
             self.assertEqual(refused.exception.code, sd_lane.TRAIN_MERGING)
         self.assertEqual((self.entries()[1]["status"], bool(self.entries()[1].get("held"))), ("pending", False))
 
-    def test_a_train_mark_that_names_no_train_branch_is_kept_and_fails_the_entry(self) -> None:
-        """A mark of another shape proves nothing, so it clears nothing."""
+    def test_a_train_mark_that_names_no_train_branch_is_kept_and_holds_the_entry(self) -> None:
+        """A mark of another shape proves nothing, so it clears nothing; its train may have landed, so the
+        entry is put back, then held, never failed (class pass of sd:9923)."""
         self.queue_three()
         sd_lane.update(self.store(), lambda rows: rows[0].update({sd_lane.TRAIN_SENT: 7}))
         sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
         lead = self.entries()[0]
         self.assertNotIn(1, self.merges())
-        self.assertEqual((lead["status"], lead[sd_lane.TRAIN_SENT]), ("failed", 7))
+        self.assertEqual((lead["status"], lead.get("held"), lead[sd_lane.TRAIN_SENT]), ("pending", True, 7))
+        self.assertIn("names no train branch", lead["retryable_fault"]["reason"])
 
     def caught_up_in_the_train(self, landing: str) -> None:
         """Main moves before the train prepares sd:2, and its prepare pushes a catch-up merge of it."""
