@@ -1076,8 +1076,11 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     def reads_before(sha: str, rev: str, names: list[str], want: dict[str, str]) -> bool | None:
         """Whether `sha`'s files, where `rev` holds them, read as `want`; None when git gave no answer."""
         where = renames_since(sha, rev)
-        now = None if where is None else blobs(rev, [where.get(name, name) for name in names])
-        return None if now is None else all(now.get(where.get(name, name)) == want.get(name) for name in names)
+        if where is None:
+            return None
+        held = [where.get(name, name) for name in names]
+        now = blobs(rev, held)
+        return None if now is None else all(now.get(at) == want.get(name) for at, name in zip(held, names, strict=True))
 
     def undone(index: int, names: list[str], before: str) -> bool:
         sha = commits[index][0]
@@ -1092,15 +1095,16 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         parents = {line.split()[0]: line.split()[1:] for line in after.splitlines() if line.strip()}
         # Who took the work out, read per commit and carried to the head (`work_left`, class pass 3). The
         # head's own entry decides: a removal a later commit put back, or a revert one reapplied, decides nothing.
-        own, unread = blobs(sha, names), []
+        own = blobs(sha, names)
         if own is None:
             return False
+        unread: list[None] = []
 
         def git_answered(answer: bool | None) -> bool:
             unread.extend([answer] if answer is None else [])
             return bool(answer)
 
-        before: dict[str, bool] = {sha: False}
+        was: dict[str, bool] = {sha: False}
         left: dict[str, bool | None] = {sha: None}
         for later, text in reversed(commits[:index]):  # --topo-order: each parent before its child
             if later not in parents:
@@ -1111,10 +1115,12 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
                 forked = (lane_git(worktree, "merge-base", *held) or "").strip()
                 return forked in left and left[forked] is None
 
-            before[later] = git_answered(reads_before(sha, later, names, want))
-            left[later] = work_left(before[later], bool(sd_ship_body.REVERT_SUBJECT.match(text)),
-                                    [(before[parent], left[parent]) for parent in held],
-                                    lambda later=later: git_answered(reads_before(sha, later, names, own)), forked_in)
+            def back(later: str = later, own: dict[str, str] = own) -> bool:
+                return git_answered(reads_before(sha, later, names, own))
+
+            was[later] = git_answered(reads_before(sha, later, names, want))
+            left[later] = work_left(was[later], bool(sd_ship_body.REVERT_SUBJECT.match(text)),
+                                    [(was[parent], left[parent]) for parent in held], back, forked_in)
             if unread:
                 return False
         return left.get(next(iter(parents), "")) is True  # rev-list names the head first
