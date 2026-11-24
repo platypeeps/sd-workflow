@@ -2567,6 +2567,16 @@ class TrainLanding(Trees):
                          (head, head, "sd-train/abc"))
         self.assertFalse({sd_lane.TRAIN_PREPARING, "head_unknown"} & set(row))
 
+    def test_a_released_lead_of_an_unread_fence_moves_to_the_head_its_prepare_named(self) -> None:
+        """Round 5 of sd:9923: a rebase whose tree is not the three-way merge kept the old head."""
+        lead, old, head = self.unread_fence()
+        sd_lane.put_back(self.store(), lead, "dead", old, retryable_retries=1)
+        sd_lane.set_hold(self.repo, 1, self.environ, held=False)
+        with mock.patch.object(sd_lane, "rebase_of", lambda *args: False):
+            settled = sd_lane.settle_mark(self.store(), self.claimed_again(), "next", self.repo)
+        self.assertEqual((settled["expected_head"], self.entries()[0]["expected_head"]), (head, head))
+        self.assertNotIn(sd_lane.TRAIN_PLACED, self.entries()[0])
+
     def test_a_reclaimed_or_stopped_lead_of_an_unread_fence_keeps_its_mark(self) -> None:
         """Class pass of sd:9923: each put-back of the fenced row keeps the mark its next claim settles."""
         for name, back in (("reclaim", lambda row, old: sd_lane.reclaim(row)),
@@ -2765,6 +2775,25 @@ class TrainLanding(Trees):
             followed = sd_lane.follow_prepare(self.store(), self.entries()[1], None)
         second = self.entries()[1]
         self.assertEqual((followed, second["expected_head"], second.get(sd_lane.TRAIN_PREPARING)), (None, old, old))
+
+    def test_an_unread_follow_moves_the_member_to_its_prepared_head_on_its_claim(self) -> None:
+        """Round 5 of sd:9923: the follow kept no prepared head, so the claim read the tree."""
+        self.queue_three()
+        old = self.entries()[1]["expected_head"]
+        sd_lane.update(self.store(), lambda rows: rows[1].update({sd_lane.TRAIN_PREPARING: old}))
+        self.commit_files(self.repo, {"later.txt": "l\n"}, "main moved again")
+        git(self.repo, "push", "-q", "origin", "main")
+        git(self.second, "fetch", "-q", "origin")
+        git(self.second, "rebase", "-q", "origin/main")
+        git(self.second, "commit", "-q", "--amend", "-m", "second\n\nDelivers: sd:2")
+        git(self.second, "push", "-q", "--force", "origin", "HEAD:refs/heads/second")
+        head = git(self.second, "rev-parse", "HEAD")
+        with mock.patch.object(sd_lane, "publish_git", lambda *args: None):
+            self.assertIsNone(sd_lane.follow_prepare(self.store(), self.entries()[1], head))
+        sd_lane.update(self.store(), lambda rows: rows[1].update(status="running", holder={"token": "next"}))
+        with mock.patch.object(sd_lane, "rebase_of", lambda *args: False):
+            settled = sd_lane.settle_mark(self.store(), self.entries()[1], "next", self.repo)
+        self.assertEqual(settled["expected_head"], head)
 
     def test_a_member_whose_mark_cannot_be_written_is_not_prepared_by_the_train(self) -> None:
         """No mark, no prepare: a write that fails before it leaves the branch where the row says."""

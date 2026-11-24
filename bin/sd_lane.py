@@ -2862,6 +2862,8 @@ TRAIN_MERGING = "train_merging"
 TRAIN_SENT = "train_sent"
 #: A member row's mark, the head the train prepares it from; dropped once the row follows (round 3 of sd:9923).
 TRAIN_PREPARING = "train_preparing"
+#: The head that prepare answered for a marked row no read could follow; the claim takes it from origin (round 5).
+TRAIN_PLACED = "train_placed"
 #: A joined train member: its row, worktree, prepared head, the landing it joined onto and the merge it wrote.
 Joined = tuple[dict[str, Any], pathlib.Path, str, str, str]
 
@@ -3040,7 +3042,7 @@ def prepared_member(row: dict[str, Any], queue: Queue, ship: Ship, logs: pathlib
         return row, None, str(error)
     if left is not None:
         return row, None, str(left.get("reason"))
-    if not mark_row(queue, row, {TRAIN_PREPARING: row["expected_head"]}):
+    if not mark_row(queue, row, {TRAIN_PREPARING: row["expected_head"]}, drop=(TRAIN_PLACED,)):
         return row, None, "its row could not be marked before its prepare"
     prepared, _ = prepare_step(row, tree, logs.with_name(f"train-prepare-{row['item']}-{logs.name}"), ship,
                                renewed, deadline)
@@ -3085,8 +3087,10 @@ def follow_prepare(queue: Queue, row: dict[str, Any], placed: str | None) -> dic
     """
     new = prepared_head(pathlib.Path(row["worktree"]), str(row.get("branch") or ""), row["expected_head"], placed)
     if new is None:  # unknown: the mark stays for the member's claim (round 4 of sd:9923)
+        if placed:  # and names the head prepare answered, which no tree comparison has to guess (round 5)
+            mark_row(queue, row, {TRAIN_PLACED: placed})
         return None
-    if not mark_row(queue, row, {"expected_head": new}, drop=(TRAIN_PREPARING,)):
+    if not mark_row(queue, row, {"expected_head": new}, drop=(TRAIN_PREPARING, TRAIN_PLACED)):
         return None
     return {**row, "expected_head": new}
 
@@ -3123,7 +3127,8 @@ def settle_mark(queue: Queue, entry: dict[str, Any], token: str, root: pathlib.P
     A train that prepared the member and could not write the head after
     leaves the mark (`follow_prepare`), as does a train fence that could
     not read its lead's (`advance`). `origin/<branch>` is that head when
-    it is the catch-up or rebase of the marked head; anything else keeps
+    it is the head prepare answered (`TRAIN_PLACED`), or the catch-up or
+    rebase of the marked head; anything else keeps
     the queued head, and `checkout_for` skips a move as before. A fetch
     with no answer raises `PUBLISH_UNKNOWN`.
     """
@@ -3133,16 +3138,18 @@ def settle_mark(queue: Queue, entry: dict[str, Any], token: str, root: pathlib.P
     if entry[TRAIN_PREPARING] == expected:
         main = sd_lib.main_worktree_root(root)
         tip = fetched_tip(main, str(entry.get("branch") or ""))
-        if tip and tip != expected and (catch_up_of(main, tip, expected) or rebase_of(main, tip, expected)):
+        if tip and tip != expected and (tip == entry.get(TRAIN_PLACED) or catch_up_of(main, tip, expected)
+                                        or rebase_of(main, tip, expected)):
             new = tip
 
     def drop_mark(entries: list[dict[str, Any]]) -> None:
         row = held(entries, entry, token)
         row["expected_head"] = new
-        row.pop(TRAIN_PREPARING, None)
-        row.pop("head_unknown", None)
+        for key in (TRAIN_PREPARING, TRAIN_PLACED, "head_unknown"):
+            row.pop(key, None)
     runner_write(queue, drop_mark)
-    return {key: value for key, value in {**entry, "expected_head": new}.items() if key != TRAIN_PREPARING}
+    return {key: value for key, value in {**entry, "expected_head": new}.items()
+            if key not in (TRAIN_PREPARING, TRAIN_PLACED)}
 
 
 def rebase_of(tree: pathlib.Path, commit: str, expected: str) -> bool:
@@ -4445,6 +4452,7 @@ def advance(queue: Queue, entry: dict[str, Any], token: str, step: str = "merge"
                 row.pop("head_unknown", None)
                 if found is None:  # the train may land the rewrite: a put-back here must not run the old head
                     row[TRAIN_PREPARING] = expected  # its next claim moves it to the rewrite (`settle_mark`)
+                    row[TRAIN_PLACED] = train["head"]  # the rewrite prepare answered, not one a tree guesses
                     row.update(held=True, held_at=stamp_now(), head_unknown={"at": stamp_now(), "reason": (
                         f"the fence could not read origin/{branch} after prepare, so the head is unknown; "
                         f"`sd-ship lane release {entry['item']}` runs it again once that branch reads")})
