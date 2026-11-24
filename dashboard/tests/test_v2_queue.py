@@ -1037,6 +1037,19 @@ class TheMove(Lane, BrowserSession):
                 self.assertNotEqual(fold(line), fold(queue_screen._line(base)))
                 self.assertEqual(json.loads(line), {**base, "summary": other})
 
+    def test_findings_that_read_alike_print_apart_as_their_own_json(self):
+        """sd:10246: a character past U+FFFF printed as five hex digits, `\\ue0001`, which reads back as U+E000 and
+        a "1": the dialog showed another finding than the one Reject rebuts. A homoglyph or a combining mark printed
+        raw, so two findings read alike. Every line is ASCII and reads back as its own finding."""
+        base = {"summary": "cafe", "path": "x.py"}
+        others = ("caf\u00e9", "cafe\u0301", "c\u0430fe", "cafe\U000e0001", "cafe\ue000" + "1", "cafe\U0001f600")
+        lines = [queue_screen._line({**base, "summary": text}) for text in others]
+        for text, line in zip(others, lines, strict=True):
+            with self.subTest(text=text):
+                self.assertTrue(line.isascii(), line)
+                self.assertEqual(json.loads(line), {**base, "summary": text})
+        self.assertEqual(len(set(lines)), len(others))
+
     def test_a_finding_that_is_no_object_offers_no_reject_and_refuses_one(self):
         """sd:9966 class pass: a finding that is no object names nothing the page can print; its row binds no
         review. Any object prints whole (`_line`), whatever its fields hold."""
@@ -1066,7 +1079,7 @@ class TheMove(Lane, BrowserSession):
         with mock.patch.dict(os.environ, {"QUEUE_RAW": json.dumps(raw)}):
             row = self.failed()
         self.assertEqual([json.loads(line) for line in row["review_findings"]], [raw])
-        self.assertIn("é" * 5000, row["review_findings"][0])
+        self.assertIn("\\u00e9" * 5000, row["review_findings"][0])  # every character past ASCII escaped (sd:10246)
         self.assertIsNotNone(row["review"])
 
     def test_reject_refuses_a_review_that_already_holds_dispositions(self):
@@ -1103,6 +1116,9 @@ class TheMove(Lane, BrowserSession):
         with mock.patch.dict(os.environ, {"QUEUE_REFUSE": "disposition proposal does not bind the current review"}):
             status, _, answer = self.reject()
         self.assertEqual(status, 400, answer)
+        # sd:10246: the refusal is adjudicate's write's, not an earlier step's that ran no adjudication.
+        self.assertIn("refused the rebuttal: disposition proposal does not bind", answer["error"])
+        self.assertEqual(len([call for call in self.calls() if "--dispositions-file" in call]), 1)
         self.assertNotIn("retry", [word for call in self.calls() for word in call])
 
     def test_retry_or_approve_without_a_full_head_runs_nothing(self):
@@ -3436,6 +3452,10 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         reason = "a.py:1 reads the value the finding says is missing"
         out = self.reject_press({"yes": True, "values": {"reason": f"  {reason}\n"}})
         self.assertEqual(out["asked"]["ok"], "Reject and enqueue")
+        # sd:10246: the CLI line records the rebuttal first; `lane retry` alone meets the same review again.
+        self.assertIn(f"-C '{self.checkout}' adjudicate --item 14 --expected-head {self.merged} --json --dispositions-file ",
+                      out["asked"]["cli"])
+        self.assertLess(out["asked"]["cli"].index("adjudicate"), out["asked"]["cli"].index("lane retry"))
         self.assertIn(f"lane retry 14 --expected-head {self.merged}", out["asked"]["cli"])
         posted = [p[1] for p in out["posts"] if p[0] == "/api/queue/move"]
         self.assertEqual([(p["action"], p["item"], p["head"], p["reason"], p["review"]) for p in posted],
