@@ -922,6 +922,36 @@ class CitedIdTests(unittest.TestCase):
             with self.subTest(message=message):
                 self.assertEqual(sd_ship_body._listed_undone(message), sd_ship_body._listed_undone(plain))
 
+    def test_a_comment_closed_on_a_later_line_joins_the_line_it_opened_on(self) -> None:
+        """Review of build/sd-1653 (pack sd:10090). A comment that opens after a line's text and closes
+        on a later line keeps one paragraph line: a reader sees what follows its `-->` on the line the
+        comment opened on. The read kept the two apart, so `Reverted commits:<!-- note` headed alone and
+        a qualifier after the close, `pending verification`, was dropped or indented away."""
+        a = "a" * 7
+        listed = {
+            f"Reverted commits:<!-- note\n  --> pending verification\n- {a} renew\n": [],
+            f"Reverted commits:<!-- note\n--> pending verification\n- {a} renew\n": [],
+            f"Reverted commits:<!--\nnote\n  --> pending verification\n- {a} renew\n": [],
+            f"Kept<!-- note\n  --> Reverted commits:\n- {a} renew\n": [],
+            f"Kept.<!-- note\n  --> Reverted commits:\n- {a} renew\n": [a],
+            f"Reverted<!-- note\n  -->commits:\n- {a} renew\n": [],
+            f"Reverted commits:<!-- note\n  -->\n- {a} renew\n": [a],
+        }
+        for message, found in listed.items():
+            with self.subTest(message=message):
+                self.assertEqual(sd_ship_body._listed_undone(message), found)
+        # The property: the comment reads as the one line a reader sees, the comment gone.
+        heads = ("Reverted commits:", "Kept:", "Notes.", "Reverts:")
+        for first, then, indent in itertools.product(heads, heads + ("pending",), ("", "  ")):
+            plain = f"{first} {then}\n- {a} renew\n"
+            message = f"{first}<!-- c\n{indent}--> {then}\n- {a} renew\n"
+            with self.subTest(message=message):
+                self.assertEqual(sd_ship_body._listed_undone(message), sd_ship_body._listed_undone(plain))
+        # The review's case: the kept commit's closure survives the revert.
+        revert = f"revert: undo\n\nReverted commits:<!-- note\n  --> pending verification\n- {a}\n"
+        commits = [("c" * 40, revert), (a + "0" * 33, "fix: work\n\nCloses: sd:2\n")]
+        self.assertEqual(sd_ship_body.cited_ids("", commits), (2,))
+
     def test_a_merge_the_branch_reverts_cites_nothing_it_brought_in(self) -> None:
         """Lane review of sd:5999, round 3: `git revert -m 1 <merge>` undoes each commit the merge brought in."""
         base, side, main, merge, undo, again = (c * 40 for c in "abcdef")

@@ -151,7 +151,7 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]], plain
         alone = _stands_alone(kind, text, line)
         if ticks and _ends_paragraph(kind, opened, alone, len(items) != depth):
             return rows, span_at  # the paragraph ended with the span open: its opener is text
-        shown = line
+        shown, joins = line, None
         if kind == "fence" and (opener := _FENCE_RE.match(text)):  # `_kind` matched it already
             fence, fence_depth = opener["fence"], len(items)
         elif kind != "code" and comments:
@@ -160,10 +160,11 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]], plain
             comment_depth = len(items) if commented and not was else comment_depth
             if ticks and alone:
                 return rows, span_at  # a heading is one line: a span it opens ends with it
-            text, shown = _cut(line, text, lazy, cut, was, rows, pending)
+            text, shown, joins = _cut(line, text, lazy, cut, was, rows, pending)
         loose = alone
         depth = len(items)  # a heading or a break is one line, no paragraph; `depth` finds a lazy line
         rows.append((number, "wrapped" if lazy else kind, opened, len(items), text, line, spanned, shown))
+        _join(rows, joins, pending)
     _settle(rows, pending, None)
     return rows, (span_at if ticks else None)
 
@@ -193,14 +194,32 @@ def _cut(line: str, text: str, lazy: bool, cut: list[tuple[int, int]], was: bool
     """`text` and the whole `line` with the comments `cut` names read (`_less`). A comment open from an
     earlier line (`was`) that closes here settles the `_OPEN` waiting on it; one open past this line's
     end leaves its own, for the row `_blocks_once` appends next."""
-    runs = _runs(line, cut)
+    runs, joins = _runs(line, cut), None
     if was and runs and runs[0][0] == 0 and not runs[0][2]:
+        # A comment that opened after a row's text keeps one paragraph line: what follows its `-->` is
+        # read on that row (`_join`), so a qualifier after the close stays on the heading it qualifies.
+        opener = pending[0][0] if pending else None
+        if opener is not None and rows[opener][4].replace(_OPEN, "").strip() and line[runs[0][1]:].strip():
+            joins = opener
         _settle(rows, pending, line[runs[0][1]:runs[0][1] + 1])
     if runs and runs[-1][2]:  # only the last run on a line can be open past its end
         first = runs[-1][0]
         pending.append((len(rows), first > 0 and bool(re.match(r"\w", line[first - 1])), line[first:]))
     lead = len(line) - len(line.lstrip() if lazy else text.lstrip())  # where the line's own text starts
-    return _less(line, text, lazy, runs), _less(line, line, False, runs, lead)
+    return _less(line, text, lazy, runs), _less(line, line, False, runs, lead), joins
+
+
+def _join(rows: list, at: int | None, pending: list[tuple[int, bool, str]]) -> None:
+    """Move what the last row holds past the comment it closes onto row `at`, where the comment
+    opened after text: one paragraph line to a reader (pack sd:10090). The last row then holds
+    nothing, in either read, and a comment it leaves open waits on row `at`. None joins nothing."""
+    if at is None:
+        return
+    number, kind, opened, depth, text, line, spanned, shown = rows[-1]
+    head = rows[at]
+    rows[at] = (*head[:4], head[4] + text.lstrip(), *head[5:7], head[7] + shown.lstrip().removeprefix(_SEAM).lstrip())
+    rows[-1] = (number, kind, opened, depth, "", line, spanned, "")
+    pending[:] = [(at if row == len(rows) - 1 else row, word, raw) for row, word, raw in pending]
 
 
 def _settle(rows: list, pending: list[tuple[int, bool, str]], right: str | None, ended: bool = True) -> None:
@@ -665,8 +684,9 @@ def _listed_undone(message: str) -> list[str]:
     a line, or after the `-->` a comment closes with, is prose at the
     line's indent, which heads as any line does and opens no item.
     """
-    shown = "\n".join(line for _, kind, *_, spanned, line in _blocks(message)
-                      if not spanned and (kind != "comment" or line.lstrip().startswith(_SEAM)))
+    shown = "\n".join(line for _, kind, *_, raw, spanned, line in _blocks(message)
+                      if not spanned and (kind != "comment" or line.lstrip().startswith(_SEAM))
+                      and (line or not raw.strip()))  # a row `_join` emptied is no blank line
     found = _listed(_blocks(message, plain=True))
     return found + [sha for sha in _listed(_blocks(shown, comments=False, plain=True)) if sha not in found]
 
