@@ -2495,11 +2495,16 @@ class Supervisor:
         # Or since the lead was first queued, if that is earlier: a bundle drop notes its finding on a new lead
         # before the lead's first run (round 14). The queue's note keeps that time; `queued_at` moves at each
         # Retry, which lost the finding from the second run on (pack sd:9709, round 16).
+        # Each member's own queue note counts too: a fresh member queued with its finding before a later item that
+        # leads the bundle (review of build/sd-1782).
         lead = self.row["assignment"]
+        queues = [f"Build assignment {row[0]} queued %" for row in self.db.execute(
+            "SELECT id FROM assignment WHERE id = ? OR parent = ?", (lead, lead))]
         first = self.db.execute(
             f"SELECT MIN(at) FROM (SELECT created_at AS at FROM runner_run WHERE assignment = ? UNION ALL "
-            f"SELECT timestamp FROM note WHERE item IN ({', '.join('?' for _ in items)}) AND body LIKE ?)",
-            (lead, *items, f"Build assignment {lead} queued %")).fetchone()[0]
+            f"SELECT timestamp FROM note WHERE item IN ({', '.join('?' for _ in items)}) AND "
+            f"({' OR '.join('body LIKE ?' for _ in queues)}))",
+            (lead, *items, *queues)).fetchone()[0]
 
         def listed(prefix: str, *, latest: bool = False) -> str:
             notes = self.db.execute(

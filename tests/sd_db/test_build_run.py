@@ -3301,6 +3301,21 @@ class Supervise(Case):
         prompt = build_run.BRIEF.format(**self.supervisor(claimed["id"]).brief())
         self.assertIn(f"- sd:{item}: pin the clock\n<b>naïve</b>", prompt)
 
+    def test_a_fresh_finding_reaches_a_bundle_a_later_item_leads(self):
+        """Review of build/sd-1782: the brief read findings from its lead's queue note on; a later-queued item of a
+        higher priority led the bundle, so the earlier member's finding note was dropped."""
+        member = create_item(self.db, kind="task", title="Member", repo=str(self.repo), status="ready", priority=3)
+        build.queue_again(self.db, [member], who="operator", finding="pin the clock")
+        self.db.execute("UPDATE note SET timestamp = '2026-01-01T00:00:00+00:00' WHERE item = ?", (member,))
+        lead = create_item(self.db, kind="task", title="Lead", repo=str(self.repo), status="ready", priority=2)
+        build.queue(self.db, [lead], who="operator")
+        claimed = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                              root=self.root / "worktrees")
+        assert claimed is not None
+        self.assertEqual([entry["item"] for entry in claimed["members"]], [lead, member])
+        prompt = build_run.BRIEF.format(**self.supervisor(claimed["id"]).brief())
+        self.assertIn(f"- sd:{member}: pin the clock", prompt)
+
     def test_a_plain_retry_briefs_review_blockers_as_the_reviewer_s_not_the_operator_s(self):
         """Lead review of pack sd:9498: a plain Retry noted the parked run's blockers as Send to builder, which the
         brief presents as the operator's findings. They are the reviewer's text; only Send to builder is the
