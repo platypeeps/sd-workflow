@@ -1385,23 +1385,27 @@ class DropHubFallback(Repo):
         self.assertIsNone(build._route(self.db, "sat-a", lead), "routed to the hub, which holds the kept work")
         self.assertEqual(self.claim()["assignment"], lead, "the hub builds the kept bundle")
 
-    def test_a_fix_up_citing_its_item_in_refs_goes_with_that_item(self):
-        """sd:10319: a builder's review fix-ups carried no `Closes:` trailer, and the drop refused 'commit ... cites
-        no item'. A `Refs:` line naming a bundle item says whose it is; one naming an item outside the bundle
-        says nothing, and the commit still refuses."""
+    def test_a_fix_up_carrying_its_items_closes_trailer_goes_with_that_item(self):
+        """sd:10319: a builder's review fix-ups carried no trailer, and the drop refused 'commit ... cites no item'.
+        The brief now asks each fix-up to carry its item's `Closes:` trailer again, which says whose it is."""
         items, ids, run = self.bundle()
         work = Path(run["work_path"])
-        self.commit(work, "b.txt", "second fixed\n", f"fix: second follow-up\n\nRefs: sd:{items[1]}")
-        self.commit(work, "c.txt", "third fixed\n", f"fix: third follow-up\n\nRefs: sd:{items[2]}")
+        self.commit(work, "b.txt", "second fixed\n", f"fix: second follow-up\n\nCloses: sd:{items[1]}")
+        self.commit(work, "c.txt", "third fixed\n", f"fix: third follow-up\n\nCloses: sd:{items[2]}")
         new = self.drop(run, items[1])
         self.assertEqual(self.files(new), ["README", "a.txt", "c.txt"])
         self.assertEqual((Path(new) / "c.txt").read_text(), "third fixed\n")
         self.assertNotIn(f"sd:{items[1]}", self.closes(new))
 
-    def test_a_refs_line_naming_only_an_item_outside_the_bundle_still_refuses(self):
+    def test_a_refs_line_says_nothing_about_whose_a_commit_is(self):
+        """Review of sd:10319: `Refs:` names a related item, not the owner. The dropped item's follow-up that
+        refers to a kept item read as the kept item's and was replayed onto the kept branch; it refuses."""
         items, ids, run = self.bundle()
-        stranger = self.item(repo=str(self.repo))
-        self.commit(Path(run["work_path"]), "d.txt", "other\n", f"fix: other\n\nRefs: sd:{stranger}")
+        work = Path(run["work_path"])
+        self.commit(work, "d.txt", "second's follow-up\n", f"fix: second follow-up\n\nRefs: sd:{items[2]}")
+        old = git(work, "rev-parse", "HEAD")
         with self.assertRaisesRegex(DROP.DropRefused, "cites no item"):
             DROP.drop_item(self.db, build, items[1], who="operator")
+        self.assertEqual(git(work, "rev-parse", "HEAD"), old)
+        self.unmade(run)
         self.assertEqual(self.statuses(items), ["blocked"] * 3)

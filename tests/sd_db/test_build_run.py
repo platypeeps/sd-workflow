@@ -3251,10 +3251,13 @@ class Supervise(Case):
 
     def test_the_brief_cites_an_item_on_every_commit(self):
         """sd:10319: builders committed review fix-ups with no trailer, so a bundle drop refused: 'commit ... cites
-        no item'. Every commit cites one; a fix brief says so again."""
-        self.assertIn("`Refs: sd:N` trailer on every other commit", build_run.BRIEF)
-        self.assertIn("`Refs: sd:N`", build_run.FIX)
-        self.assertIn("`Refs: sd:N`", build_run.CLASS_PASS)
+        no item'. Each fix-up carries its item's `Closes:` trailer again, not a `Refs:` line, which names a related
+        item, not the owner (review); a fix brief says so again."""
+        self.assertIn("that item's `Closes: sd:N` trailer again", build_run.BRIEF)
+        for brief in (build_run.BRIEF, build_run.FIX, build_run.CLASS_PASS):
+            self.assertNotIn("Refs: sd:N", brief)
+        self.assertIn("its item's `Closes: sd:N` trailer on it", build_run.FIX)
+        self.assertIn("its item's `Closes: sd:N` trailer on it", build_run.CLASS_PASS)
 
     def test_the_brief_forbids_a_kill_by_pattern(self):
         """Pack sd:6815: build 268's `pkill -f "sd-check --json"` ended the vault job's queued gate."""
