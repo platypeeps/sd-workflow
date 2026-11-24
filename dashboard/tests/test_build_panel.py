@@ -229,6 +229,32 @@ class BuildsPanel(Fixture):
         self.assertEqual(again["cancel_requested"], "cancelled by dashboard")
         self.assertIn("cancelled by dashboard; build run", again["cancel"]["reason"])
 
+    def test_a_bundle_lead_carries_its_builder_rounds_and_members_their_own(self):
+        """pack sd:10306: a bundle notes its builder rounds on its lead alone; the lead row carries them as the bundle's."""
+        from sd_db.writes import add_note
+        items = [self.ready(), self.ready()]
+        run = self.claimed(items)
+        lead = build.run(self.connection, run["id"])["members"][0]["item"]
+        other = next(item for item in items if item != lead)
+        for body in ("Review round blockers: - a.py:1 x", "Review round blockers: - b.py:2 y",
+                     "Lane failed in prepare at abc: local review blocking: 1/1 completed"):
+            add_note(self.connection, lead, "comment", body)
+        add_note(self.connection, other, "comment", "Lane failed in prepare at abc: local review blocking: 1/1 completed")
+        add_note(self.connection, other, "comment", "Lane failed in prepare at abc: gate output quoted local review blocking")
+        row = builds.panel(self.connection, now=run["created_at"])["runs"][0]
+        # Review 5: notes carry no run, so a member inherits none; the lead's row says its count is the bundle's.
+        self.assertEqual({m["item"]: (m["reviews"], m["bundle"]) for m in row["items"]},
+                         {lead: (3, True), other: (1, False)})
+
+    def test_only_a_run_at_a_builder_step_holds_a_builder(self):
+        """pack sd:10306 review 4: a run at a lane step (checking, cleaning) released its builder slot."""
+        run = self.claimed([self.ready()])
+        held = {}
+        for step in ("building", "checking", "cleaning"):
+            build.write(self.connection, run["id"], step=step)
+            held[step] = builds.panel(self.connection, now=run["created_at"])["runs"][0]["builder"]
+        self.assertEqual(held, {"building": True, "checking": False, "cleaning": False})
+
     def test_an_enqueued_run_reads_merging_and_its_untrailed_member_is_no_blocked_row(self):
         """sd:8960: a run in the lane waits on review; the member no `Closes:` trailer named is no blocked build."""
         from sd_dashboard import queue_screen
@@ -801,3 +827,16 @@ class AutoPickup(Fixture):
         self.assertEqual((status, body["on"]), (200, False), body)
         for payload in ({"on": "yes", "value": None}, {"on": True}, {"on": True, "until": None}):
             self.assertEqual(self.post("/api/queue/builds/pickup", payload)[0], 400, payload)
+
+
+class ReviewRounds(Fixture):
+    def test_review_rounds_count_each_blocking_builder_and_lane_round_only(self):
+        """pack sd:10306: a builder round's blockers and a lane prepare a local review blocked count; other notes do not."""
+        from sd_db.writes import add_note
+        busy, quiet = self.ready(), self.ready()
+        for body in ("Review round blockers: - a.py:1 x", "Review round blockers: - gate:- the repository gate failed",
+                     "Lane failed in prepare at abc: local review blocking: 1/1 completed", "Lane failed in prepare at abc: merging origin/main failed",
+                     "Build run r report: done", "Parked: build run r ended blocked"):
+            add_note(self.connection, busy, "comment", body)
+        self.assertEqual(builds.review_rounds(self.connection, [busy, quiet]), {busy: 3})
+        self.assertEqual(builds.review_rounds(self.connection, []), {})

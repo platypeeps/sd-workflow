@@ -99,6 +99,8 @@ def drop_sides(work: str | Path, start: str, tip: str, item: int, aside: set[int
         # goes stale the same way, in whatever form it writes them, so any revert subject refuses (pack sd:9666).
         if sd_ship_body._REVERTS.search(message) or sd_ship_body.REVERT_SUBJECT.match(message):
             raise DropRefused(f"commit {sha[:12]} reverts another commit; split it by hand")
+        # `Refs:` names a related item, not the owner, so it says nothing here: a fix-up carries its item's
+        # `Closes:` trailer again, as the brief asks (sd:10319 review).
         cited = set(sd_ship_body.cited_ids("", [(sha, message)]))
         if not cited:
             raise DropRefused(f"commit {sha[:12]} cites no item, so nothing says whose it is; split it by hand")

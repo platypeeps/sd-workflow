@@ -197,6 +197,8 @@ Rules:
   the background, and no exit wakes you (sd:9183). The lane runs the full gate.
 - End the commit that delivers a whole item with a `Closes: sd:N` trailer: an item no trailer names
   stays open and is not delivered. Add no attribution lines.
+- Give each later fix-up of a delivered item that item's `Closes: sd:N` trailer again: a bundle drop
+  reads whose a commit is from that trailer alone, and refuses a commit that cites no item (sd:10319).
 - Keep every commit line, and every body line, at 72 characters or less outside a code fence:
   `sd-ship lane enqueue` refuses a longer one.
 - Write the pull-request title, a Conventional Commit of {title_max} characters or less, alone to {title}.
@@ -229,7 +231,8 @@ then record it with the same command plus `--dispositions-file /dev/stdin`, the 
 """
 
 FIX = """The review of branch {branch} found these blockers. Fix each one fail-first as a new commit in
-{worktree}, then update the body at {body}. Never push. Your final message is your report.
+{worktree}, its item's `Closes: sd:N` trailer on it, then update the body at {body}. Never push. Your final
+message is your report.
 
 {blockers}
 """
@@ -244,8 +247,9 @@ enumerate every instance of it in this change, from the code, not from the findi
 CLASS_PASS = """The review of branch {branch} still found blockers after {rounds} rounds. This is the last round
 before the build parks, so do one class pass, not another single-finding fix: name the class these blockers
 share, enumerate every instance of it from the code, not from the findings, and fix each one fail-first as a
-new commit in {worktree}. Fix the class within this change's own scope: a new reader, audit or entry kind
-becomes its own item, not a commit here (sd:9584). Add each instance to the failure table in the body at
+new commit in {worktree}, its item's `Closes: sd:N` trailer on it. Fix the class
+within this change's own scope: a new reader, audit or entry kind becomes its own item, not a commit here
+(sd:9584). Add each instance to the failure table in the body at
 {body}. Never push. Your final message is your report: the class, each instance and its test.
 
 {blockers}
