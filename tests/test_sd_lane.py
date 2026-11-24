@@ -6391,6 +6391,26 @@ class AnyHost(SharedQueue):
         self.assertEqual((self.entries()[0]["status"], self.entries()[0].get("delivery_pending")), ("merged", True))
         self.assertTrue(self.made().exists())
 
+    def test_a_lane_worktree_is_kept_when_the_run_stops_after_a_held_merge(self) -> None:
+        """Class pass of sd:9923: a hub stop after the merge returned no row, and the worktree went."""
+        self.enqueued_elsewhere(1, "topic", "work")
+        self.answers[(1, "merge")] = DELIVERY_HELD
+        with mock.patch.object(sd_lane, "owe_post_merge", side_effect=sd_lane.Stop("the hub went away")):
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertTrue(self.made().exists())
+
+    def test_a_lane_worktree_is_kept_when_the_merge_call_is_interrupted(self) -> None:
+        """Class pass of sd:9923: the merge may have landed with its delivery pending; unknown keeps it."""
+        self.enqueued_elsewhere(1, "topic", "work")
+
+        def ship(argv: list[str], log: pathlib.Path) -> dict:
+            if argv[2] == "merge":
+                raise KeyboardInterrupt
+            return self.ship(argv, log)
+        with self.assertRaises(KeyboardInterrupt):
+            sd_lane.run_lane(self.repo, self.environ, ship)
+        self.assertTrue(self.made().exists())
+
     def test_a_remote_branch_that_moved_skips_head_moved(self) -> None:
         """Failure table, worktree: the fetched head is neither `expected_head` nor its catch-up merge."""
         self.enqueued_elsewhere(1, "topic", "work")
