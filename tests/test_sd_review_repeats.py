@@ -1034,10 +1034,21 @@ class ReproRuleTests(unittest.TestCase):
                 self.assertEqual((record["disposition"], record["summary"]), ("blocking", "defect"))
 
     def test_a_synthetic_repro_releases_no_prior_hold(self) -> None:
-        """sd:10288: only a finding that blocks answers a prior blocker's hold; a synthetic repeat does not."""
+        """sd:10288: a synthetic finding beside a prior blocker neither answers its hold nor posts as advisory."""
         prior = [dict(finding(REPRO), disposition="blocking")]
-        records = sd_review.dispose([finding(REPRO, trigger="synthetic"), finding()], "high", repro=True, prior=prior)
-        self.assertEqual([record["disposition"] for record in records], ["advisory", "blocking"])
+        [record] = sd_review.dispose([finding(REPRO, trigger="synthetic", line=2, summary="other")],
+                                     "high", repro=True, prior=prior)
+        self.assertEqual(record["disposition"], "blocking")
+
+    def test_a_synthetic_repeat_of_a_held_prior_blocker_still_blocks(self) -> None:
+        """sd:10288 review (bin/sd-review:1798): a reader cleared an unresolved blocker by repeating it with
+        `trigger: synthetic`; the downgrade skipped the prior evidence check."""
+        prior = [dict(finding(REPRO), disposition="blocking")]
+        for evidence in (None, "python3 t.py: still 2"):
+            with self.subTest(evidence=evidence):
+                [record] = sd_review.dispose([finding(evidence, trigger="synthetic")], "high", repro=True, prior=prior)
+                self.assertEqual((record["disposition"], record["summary"], record["evidence"]),
+                                 ("blocking", "defect", evidence or REPRO))
 
     def test_a_planning_review_keeps_the_floor_alone(self) -> None:
         [record] = sd_review.dispose([finding(REPRO, trigger="synthetic")], "high")
