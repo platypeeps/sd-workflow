@@ -1489,9 +1489,23 @@ class Supervisor:
         Only a top-level `Cargo.toml` beside a real `target/` folder, never a link, and `--target-dir` names it, so
         a `CARGO_TARGET_DIR` or cargo config elsewhere is untouched. Idempotent: a replay of the end runs it again
         on an empty or gone folder. A failure is noted on the lead and the run still ends: the commits are kept.
+
+        Kept as it is (review of build/sd-1798): a `target/` git does not ignore, or one holding a tracked file,
+        is work, not build output; and a worktree a live session other than this run's builder holds may be
+        building in it. A git that does not answer keeps it too.
         """
         manifest, target = self.work / "Cargo.toml", self.work / "target"
         if not manifest.is_file() or target.is_symlink() or not target.is_dir():
+            return
+        git = [*self.tools.git, "-C", str(self.work)]
+        try:
+            _read([*git, "check-ignore", "-q", "--", "target/"], env=self.env)  # exit 1, not ignored: Unread
+            if _read([*git, "ls-files", "-z", "--", "target"], env=self.env):
+                return
+        except Unread:
+            return
+        own = self.fresh()["session_id"]
+        if sessions.holders(self.db, str(self.work), machine=this_host(), exclude=(own,) if own else ()):
             return
         argv = [*self.tools.cargo, "clean", "--offline", "--manifest-path", str(manifest), "--target-dir", str(target)]
         try:

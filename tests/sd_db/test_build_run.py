@@ -4216,12 +4216,14 @@ class CargoClean(Case):
                           "sys.exit(int(__import__('os').environ.get('FAKE_CARGO_EXIT', '0')))\n")
         self.tools.cargo = [sys.executable, str(script)]
 
-    def rust(self, work=None):
-        work = work or self.work
-        work.mkdir(parents=True, exist_ok=True)
-        (work / "Cargo.toml").write_text('[package]\nname = "fixture"\n')
-        (work / "target" / "debug").mkdir(parents=True)
-        (work / "target" / "debug" / "big.rlib").write_bytes(b"x" * 64)
+    def rust(self, ignored=True):
+        """The run's worktree, a real one, holding a `Cargo.toml` and a `target/` git ignores unless told not to."""
+        support.git(self.repo, "worktree", "add", "-q", "-b", self.bundle["branch"], str(self.work), "origin/main")
+        if ignored:
+            exclude(self.work, "target/\n")
+        (self.work / "Cargo.toml").write_text('[package]\nname = "fixture"\n')
+        (self.work / "target" / "debug").mkdir(parents=True)
+        (self.work / "target" / "debug" / "big.rlib").write_bytes(b"x" * 64)
 
     def cargo_calls(self):
         return [json.loads(line) for line in self.cargo_log.read_text().splitlines()] if self.cargo_log.exists() else []
@@ -4245,7 +4247,8 @@ class CargoClean(Case):
         self.assertEqual(self.cargo_calls(), [])
 
     def test_no_rust_no_target_or_a_linked_target_runs_nothing(self):
-        self.work.mkdir(parents=True)
+        support.git(self.repo, "worktree", "add", "-q", "-b", self.bundle["branch"], str(self.work), "origin/main")
+        exclude(self.work, "target\n")
         (self.work / "Cargo.toml").write_text("")  # no target/ yet
         elsewhere = self.root / "elsewhere"
         elsewhere.mkdir()
@@ -4265,6 +4268,31 @@ class CargoClean(Case):
         self.assertEqual(self.supervisor().finish("blocked", "fixture block")["outcome"], "blocked")
         notes = [row["body"] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
         self.assertTrue(any("cargo clean" in body and "exit 3" in body for body in notes), notes)
+
+    def test_an_untracked_target_git_does_not_ignore_is_kept(self):
+        """Review of build/sd-1798: a `target/` git does not ignore is uncommitted work the run keeps."""
+        self.rust(ignored=False)
+        self.supervisor().finish("done", "worktree kept: not clean")
+        self.assertEqual(self.cargo_calls(), [])
+        self.assertTrue((self.work / "target" / "debug" / "big.rlib").is_file())
+
+    def test_a_tracked_file_under_target_is_kept(self):
+        """Review of build/sd-1798: a committed file under `target/` would read deleted after a clean."""
+        self.rust()
+        support.git(self.work, "add", "-f", "target/debug/big.rlib")
+        support.git(self.work, "-c", "commit.gpgsign=false", "commit", "-qm", "fix: tracked")
+        self.supervisor().finish("blocked", "fixture block")
+        self.assertEqual(self.cargo_calls(), [])
+        self.assertTrue((self.work / "target" / "debug" / "big.rlib").is_file())
+
+    def test_a_worktree_a_live_session_holds_is_kept(self):
+        """Review of build/sd-1798: another session may be building in it; its output stays."""
+        self.rust()
+        sessions.beat(self.db, "session-other", machine=this_host(), cwd=None,
+                      found=sessions.worktrees([str(self.work)]))
+        self.supervisor().finish("blocked", "fixture block")
+        self.assertEqual(self.cargo_calls(), [])
+        self.assertTrue((self.work / "target" / "debug" / "big.rlib").is_file())
 
     def test_a_missing_cargo_notes_and_still_ends(self):
         self.rust()
