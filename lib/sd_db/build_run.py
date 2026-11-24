@@ -2495,22 +2495,27 @@ class Supervisor:
         # Or since the lead was first queued, if that is earlier: a bundle drop notes its finding on a new lead
         # before the lead's first run (round 14). The queue's note keeps that time; `queued_at` moves at each
         # Retry, which lost the finding from the second run on (pack sd:9709, round 16).
-        # Each member's own queue note counts too: a fresh member queued with its finding before a later item that
-        # leads the bundle (review of build/sd-1782).
         lead = self.row["assignment"]
-        queues = [f"Build assignment {row[0]} queued %" for row in self.db.execute(
-            "SELECT id FROM assignment WHERE id = ? OR parent = ?", (lead, lead))]
         first = self.db.execute(
             f"SELECT MIN(at) FROM (SELECT created_at AS at FROM runner_run WHERE assignment = ? UNION ALL "
-            f"SELECT timestamp FROM note WHERE item IN ({', '.join('?' for _ in items)}) AND "
-            f"({' OR '.join('body LIKE ?' for _ in queues)}))",
-            (lead, *items, *queues)).fetchone()[0]
+            f"SELECT timestamp FROM note WHERE item IN ({', '.join('?' for _ in items)}) AND body LIKE ?)",
+            (lead, *items, f"Build assignment {lead} queued %")).fetchone()[0]
+        # Each item's window opens at its own assignment's queue note in this bundle, if that is earlier: a fresh
+        # member queued with its finding before a later item that leads. Its own, not the bundle's earliest: that
+        # took in the finding of another member's cancelled build (class pass, review of build/sd-1782).
+        opens = dict.fromkeys(items, first)
+        for row in self.db.execute("SELECT id, item FROM assignment WHERE id = ? OR parent = ?", (lead, lead)):
+            own = self.db.execute("SELECT MIN(timestamp) FROM note WHERE item = ? AND body LIKE ?",
+                                  (row["item"], f"Build assignment {row['id']} queued %")).fetchone()[0]
+            if row["item"] in opens and own is not None:
+                opens[row["item"]] = min(filter(None, (opens[row["item"]], own)))
 
         def listed(prefix: str, *, latest: bool = False) -> str:
-            notes = self.db.execute(
-                f"SELECT item, body FROM note WHERE item IN ({', '.join('?' for _ in items)}) AND body LIKE ? "
-                f"AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp, id",
-                (*items, prefix + "%", first, self.row["created_at"])).fetchall()
+            notes = [note for note in self.db.execute(
+                f"SELECT item, body, timestamp FROM note WHERE item IN ({', '.join('?' for _ in items)}) "
+                f"AND body LIKE ? AND timestamp <= ? ORDER BY timestamp, id",
+                (*items, prefix + "%", self.row["created_at"])).fetchall()
+                if opens[note["item"]] is not None and note["timestamp"] >= opens[note["item"]]]
             # Only the latest park's blockers (pack sd:9593): one Retry notes the same text on each member, so the
             # newest note's text names them, whatever runs a recovery started since.
             if latest and notes:
