@@ -239,6 +239,12 @@ class Lane(unittest.TestCase):
         return sd_lane.read_queue(self.store())
 
 
+#: An `sd-ship` merge answer whose delivery is pending (review of sd:9923).
+DELIVERY_HELD = {"ok": True, "phase": "merged", "merge_commit": "c" * 40, "delivery_pending": True,
+                "workflow": {"blocker": {"code": "base_advanced_at_merge"},
+                             "next_action": "Verify the combined tree at main (default-branch CI)."}}
+
+
 class QueueOutlivesTheProcess(Lane):
     checks_item = True  # the verbs run in a child process, which no patch here reaches
     lints_docs = True
@@ -685,6 +691,31 @@ class Runner(Lane):
                          ("merged", "landed-1", True), entry.get("reason"))
         self.assertEqual([c[2] for c in self.calls], ["prepare"])  # no second merge
         self.assertIn("Landed: merged at landed-1", self.notes[0][1])
+
+    def test_a_reconciled_merge_whose_delivery_is_pending_says_so(self) -> None:
+        """Review of sd:9923: prepare answered `merged` with `delivery_pending`, and the lane recorded a
+        completed merge with no word of the delivery blocker."""
+        head = sd_lane.enqueue_entry(self.feature, 1, "fix: one", self.body, self.environ, claim="deliver")["expected_head"]
+        self.answers[(1, "prepare")] = {**DELIVERY_HELD, "head": head}
+        sd_lane.run_lane(self.repo, self.environ, self.ship)
+        entry = self.entries()[0]
+        self.assertEqual((entry["status"], entry.get("delivery_pending"), entry.get("code")),
+                         ("merged", True, "base_advanced_at_merge"))
+        self.assertTrue(any("delivery pending" in body for _, body, _ in self.notes), self.notes)
+
+    def test_a_lone_merge_whose_delivery_is_pending_says_so(self) -> None:
+        sd_lane.enqueue_entry(self.feature, 1, "fix: one", self.body, self.environ, manual=True, claim="deliver")
+        self.answers[(1, "merge")] = DELIVERY_HELD
+        sd_lane.run_lane(self.repo, self.environ, self.ship)
+        entry = self.entries()[0]
+        self.assertEqual((entry["status"], entry.get("delivery_pending")), ("merged", True), entry.get("reason"))
+        self.assertIn("Verify the combined tree", entry["reason"])
+
+    def test_a_merged_entry_whose_delivery_is_pending_resolves_no_followup(self) -> None:
+        store = self.store()
+        with mock.patch.object(sd_lane.sd_lib, "import_sd_db", side_effect=AssertionError("read")):
+            self.assertEqual(sd_lane.resolve_ended({"item": 1, "status": "merged", "delivery_pending": True},
+                                                   store), {})
 
     def caught_up_topic(self) -> tuple[pathlib.Path, str, str]:
         """A worktree whose branch has a commit, then prepare's catch-up merge of a moved `origin/main` on it."""
@@ -2202,6 +2233,18 @@ class TrainLanding(Trees):
         self.assertEqual((lead["status"], lead["retryable_fault"]["step"]), ("pending", "train"))
         self.assertIn("No space left on device", lead["retryable_fault"]["reason"])
         self.assertNotIn(1, self.merges())
+
+    def test_a_landed_train_whose_delivery_is_pending_marks_no_member_complete(self) -> None:
+        """Review of sd:9923: reconcile answered `merged` with `delivery_pending`; the lead read it as a
+        completed merge and the member as reconciled."""
+        self.answers[(1, "reconcile")] = DELIVERY_HELD
+        self.answers[(2, "reconcile")] = DELIVERY_HELD
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        lead, member = self.entries()[:2]
+        self.assertEqual((lead["status"], lead.get("delivery_pending"), lead.get("code")),
+                         ("merged", True, "base_advanced_at_merge"))
+        self.assertEqual((member["train"]["reconciled"], member["train"].get("delivery_pending")), (False, True))
 
     def recovering(self, retries: int = 0) -> None:
         """sd:1 queued with the mark of a sent train that GitHub reads merged: its recovery claim."""

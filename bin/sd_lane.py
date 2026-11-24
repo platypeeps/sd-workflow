@@ -2111,6 +2111,19 @@ def coded(answer: dict[str, Any]) -> dict[str, str]:
     return {"code": code} if isinstance(code, str) and code else {}
 
 
+def delivery_held(answer: dict[str, Any]) -> dict[str, Any]:
+    """The fields that keep a merge `sd-ship` answered with its delivery pending from reading complete.
+
+    The merge landed, so the entry is merged; its item is not delivered
+    until the operator acts on the blocker (review of sd:9923). `{}` for
+    any other answer.
+    """
+    if answer.get("delivery_pending") is not True:
+        return {}
+    why = (answer.get("workflow") or {}).get("next_action") or answer.get("delivery_error") or "no step named"
+    return {"delivery_pending": True, "reason": f"merged; delivery pending: {why}"[:REASON_CHARS], **coded(answer)}
+
+
 def answered_hub_fault(answer: dict[str, Any]) -> bool:
     """Whether `sd-ship` answered with a hub fault, which the next run retries (sd:3239)."""
     return blocker_code(answer) == sd_ship_workflow.HUB_UNAVAILABLE
@@ -2188,7 +2201,7 @@ def merge_step(entry: dict[str, Any], worktree: pathlib.Path, ship: Ship, head: 
         return {**fields, "status": "failed", "step": "merge", "phase": merged.get("phase"),
                 "reason": str(merged.get("error") or merged.get("code") or "merge did not confirm")[:REASON_CHARS],
                 **({"hub_fault": True} if answered_hub_fault(merged) else {}), **coded(merged)}
-    return {**fields, "status": "merged", "merge_commit": merged.get("merge_commit")}
+    return {**fields, "status": "merged", "merge_commit": merged.get("merge_commit"), **delivery_held(merged)}
 
 
 def reconciled_train(entry: dict[str, Any], worktree: pathlib.Path, ship: Ship,
@@ -2206,7 +2219,8 @@ def reconciled_train(entry: dict[str, Any], worktree: pathlib.Path, ship: Ship,
     except Exception as error:  # noqa: BLE001 -- the train landed; nothing here may fail the entry
         merged = {"error": f"{type(error).__name__}: {error}"}
     if merged.get("ok") and merged.get("phase") == "merged":
-        return {"merge_log": str(log), "status": "merged", "merge_commit": merged.get("merge_commit")}
+        return {"merge_log": str(log), "status": "merged", "merge_commit": merged.get("merge_commit"),
+                **delivery_held(merged)}
     why = f"the train landed; reconcile: {merged.get('error') or merged.get('code') or merged.get('phase')}"
     return {"merge_log": str(log), "status": "failed", "step": "train", "retryable": True,
             "reason": f"{why}; the next prepare reconciles it"[:REASON_CHARS], **coded(merged)}
@@ -2333,7 +2347,8 @@ def prepare_stop(entry: dict[str, Any], worktree: pathlib.Path, prepared: dict[s
                     "reason": f"prepare answered sd-ship's merge of {merged_head}; whether it is of {expected} "
                               f"is unknown: {error}"[:REASON_CHARS]}
         if ours:
-            return {"status": "merged", "merge_commit": prepared.get("merge_commit"), "reconciled": True}
+            return {"status": "merged", "merge_commit": prepared.get("merge_commit"), "reconciled": True,
+                    **delivery_held(prepared)}
         return {"status": "failed", "step": "prepare", "phase": "merged",
                 "reason": f"prepare answered sd-ship's merge of {merged_head or 'an unrecorded head'}, not this "
                           f"entry's head {expected} or its catch-up; read the ship receipt before enqueueing it again"}
@@ -2974,8 +2989,9 @@ def land_joined(joined: list[Joined], queue: Queue, ship: Ship, tip: str,
         except Exception as error:
             record[row["id"]]["reason"] = f"{type(error).__name__}: {error}"[:REASON_CHARS]
             continue
-        record[row["id"]].update(merge_commit=merged.get("merge_commit"),
-                                 reconciled=bool(merged.get("ok") and merged.get("phase") == "merged"))
+        held = delivery_held(merged)
+        record[row["id"]].update(merge_commit=merged.get("merge_commit"), **held,
+                                 reconciled=bool(merged.get("ok") and merged.get("phase") == "merged" and not held))
     return {**landed, "items": items, "tip": tip}
 
 
@@ -4062,9 +4078,9 @@ def note_ended(row: dict[str, Any], root: pathlib.Path, note: Note | None = None
     and changes no outcome. `note` defaults to `default_note`, read at the
     call, so a suite can replace it.
     """
-    if row.get("status") not in NOTED:
+    if row.get("status") not in NOTED and not row.get("delivery_pending"):
         return {}
-    kind = ended_kind(queue)
+    kind = "followup" if row.get("delivery_pending") else ended_kind(queue)  # the operator owes a step
     reason = next((line.strip() for line in str(row.get("reason") or "").splitlines() if line.strip()),
                   str(row.get("code") or "no reason recorded"))
     head = str(row.get("head") or row.get("expected_head") or "an unrecorded head")[:12]
@@ -4121,7 +4137,7 @@ def resolve_ended(row: dict[str, Any], queue: Queue) -> dict[str, str]:
     one or whose read failed; a failure leaves the followup open on every
     machine and changes no outcome.
     """
-    if row.get("status") not in GATE_PASSED or sd_lib.import_sd_db().module is None:
+    if row.get("status") not in GATE_PASSED or row.get("delivery_pending") or sd_lib.import_sd_db().module is None:
         return {}
     from sd_db import writes  # noqa: PLC0415
     from sd_db.database import connect  # noqa: PLC0415
