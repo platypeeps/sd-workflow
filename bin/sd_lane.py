@@ -770,6 +770,9 @@ def add_entry(queue: Queue, entry: dict[str, Any],
         if any(row.get("item") == entry["item"] and row.get("status") in ("pending", "running") for row in entries):
             raise LaneError(f"sd:{entry['item']} is already queued in this lane")
         entry["position"] = max((int(row.get("position") or 0) for row in entries), default=0) + 1
+        for row in entries:  # an unsettled train of the item's earlier entry guards this one now (sd:9923)
+            if row.get("item") == entry["item"] and TRAIN_SENT in row:
+                entry[TRAIN_SENT] = row.pop(TRAIN_SENT)
         entries.append(entry)
         return entry
     return update(queue, append_last, check)
@@ -1188,12 +1191,16 @@ def train_merging_stop(entries: list[dict[str, Any]], row: dict[str, Any]) -> No
     The train's last queue read comes before its PUT, and a cancel or hold
     takes no ship lock; the fence's mark, read in the change's own write,
     keeps either from reporting success for a member the train then merges
-    (review of sd:9923). A lead that stopped or was reclaimed blocks nothing.
+    (review of sd:9923). A lead that stopped or was reclaimed leaves
+    `TRAIN_SENT` on each row, which refuses the same until its claim settles it.
     """
     lead = next((entry for entry in entries if row.get("train_of") and entry["id"] == row["train_of"]), None)
     if lead is not None and lead.get("status") == "running" and lead.get("step") == "train":
         raise LaneError(f"sd:{row['item']} is in the train sd:{lead['item']} is merging; cancel or hold it "
                         "once that train ends", code=TRAIN_MERGING)
+    if TRAIN_SENT in row:  # that train's merge was sent and is not settled: it may still land this entry
+        raise LaneError(f"sd:{row['item']} is in a train whose merge is not settled; cancel or hold it once "
+                        "the next run settles it", code=TRAIN_MERGING)
 
 
 def pending_entry(entries: list[dict[str, Any]], item: int) -> dict[str, Any]:
@@ -2663,7 +2670,8 @@ def train_members(entry: dict[str, Any], queue: Queue, size: int) -> list[dict[s
         return []
     members = [entry]
     for row in (row for row in rows if runnable(row) and row["id"] != entry["id"]):
-        if len(members) >= size or merge_refusal(members[-1]) is not None or not tree_here(row, host):
+        if len(members) >= size or merge_refusal(members[-1]) is not None or not tree_here(row, host) \
+                or TRAIN_SENT in row:  # its own claim settles that train first (`sent_train_settled`)
             break
         members.append(row)
     return members if len(members) > 1 else []
@@ -3151,23 +3159,26 @@ def sent_train_settled(queue: Queue, entry: dict[str, Any], token: str, root: pa
     A train merge sent and not read back, or a runner that died at `step:
     train`, leaves that pull request unsettled. Merged: the prepare
     reconciles it. Open: the lane deletes its own train branch, which
-    closes it, and reads again. Closed, or never opened: nothing more can
-    land from it. Only then is the mark dropped and a lone merge possible;
-    a read with no answer, or a pull request still open, raises
-    `PUBLISH_UNKNOWN`, and the entry waits at its place.
+    closes it, and reads again. Closed: nothing more can land from it.
+    Only then is the mark dropped and a lone merge possible; a read with
+    no answer, or a pull request still open, raises `PUBLISH_UNKNOWN`, and
+    the entry waits at its place. A mark of another shape fails the entry
+    and stays: it proves nothing.
     """
     branch = entry.get(TRAIN_SENT)
     if TRAIN_SENT not in entry:
         return entry
-    if isinstance(branch, str) and branch.startswith(TRAIN_BRANCH.format("")):
-        main = sd_lib.main_worktree_root(root)
+    if not isinstance(branch, str) or not re.fullmatch(TRAIN_BRANCH.format("[0-9a-f]+"), branch):
+        raise LaneError(f"sd:{entry['item']}'s train mark names no train branch ({str(branch)[:80]!r}), so nothing "
+                        "proves its train did not land; read its pull requests before enqueueing it again")
+    main = sd_lib.main_worktree_root(root)
+    state = train_state(main, branch)
+    if state == "open":
+        scratch_git(main, "push", "--quiet", "origin", "--delete", branch)
         state = train_state(main, branch)
-        if state == "open":
-            scratch_git(main, "push", "--quiet", "origin", "--delete", branch)
-            state = train_state(main, branch)
-        if state == "open":
-            raise LaneError(f"train pull request from {branch} is still open; close it, and the next run "
-                            "settles the entry", code=PUBLISH_UNKNOWN)
+    if state == "open":
+        raise LaneError(f"train pull request from {branch} is still open; close it, and the next run "
+                        "settles the entry", code=PUBLISH_UNKNOWN)
 
     def drop_sent(entries: list[dict[str, Any]]) -> None:
         held(entries, entry, token).pop(TRAIN_SENT, None)
@@ -3176,10 +3187,12 @@ def sent_train_settled(queue: Queue, entry: dict[str, Any], token: str, root: pa
 
 
 def train_state(root: pathlib.Path, branch: str) -> str:
-    """`merged`, `open`, `closed` or `none`: the pull requests from `branch`, read from GitHub now.
+    """`merged`, `open` or `closed`: the pull requests from `branch`, read from GitHub now.
 
-    Any of them merged is `merged`, else any open is `open`. A read that
-    fails, or an answer of another shape, raises `PUBLISH_UNKNOWN`.
+    Any of them merged is `merged`, else any open is `open`. Only proof
+    answers: a read that fails, an element of another shape (it may be
+    the open one), or no pull request from `branch` at all, which the
+    fence saw opened, raises `PUBLISH_UNKNOWN` (class pass of sd:9923).
     """
     import sd_ship_remote  # noqa: PLC0415 -- the GitHub client loads only for a train
     try:
@@ -3188,13 +3201,20 @@ def train_state(root: pathlib.Path, branch: str) -> str:
         found = api.api(f"{api.prefix}/pulls?head={api.repository.split('/')[0]}:{branch}&state=all")
     except Exception as error:  # noqa: BLE001 -- any failure is no answer
         raise LaneError(f"cannot read the train pull request from {branch}: {error}", code=PUBLISH_UNKNOWN) from None
-    pulls = [pull for pull in found if isinstance(pull, dict) and isinstance(pull.get("head"), dict)
-             and pull["head"].get("ref") == branch] if isinstance(found, list) else None
-    if pulls is None or any(pull.get("state") not in ("open", "closed") for pull in pulls):
-        raise LaneError(f"the train pull request from {branch} read back in an unknown shape", code=PUBLISH_UNKNOWN)
-    if any(isinstance(pull.get("merged_at"), str) and pull["merged_at"] for pull in pulls):
+
+    def shaped(pull: Any) -> bool:
+        return isinstance(pull, dict) and isinstance(pull.get("head"), dict) \
+            and isinstance(pull["head"].get("ref"), str) and pull.get("state") in ("open", "closed") \
+            and "merged_at" in pull and (pull["merged_at"] is None or
+                                         (isinstance(pull["merged_at"], str) and bool(pull["merged_at"])))
+    pulls = [pull for pull in found if shaped(pull) and pull["head"]["ref"] == branch] \
+        if isinstance(found, list) and all(shaped(pull) for pull in found) else []
+    if not pulls:
+        raise LaneError(f"the train pull request from {branch} read back absent or in an unknown shape",
+                        code=PUBLISH_UNKNOWN)
+    if any(pull["merged_at"] for pull in pulls):
         return "merged"
-    return "open" if any(pull["state"] == "open" for pull in pulls) else "closed" if pulls else "none"
+    return "open" if any(pull["state"] == "open" for pull in pulls) else "closed"
 
 
 def join_member(row: dict[str, Any], tree: pathlib.Path, head: str, onto: str, ship: Ship,
@@ -4354,7 +4374,7 @@ class Moved(Stop):
 
 
 def advance(queue: Queue, entry: dict[str, Any], token: str, step: str = "merge",
-            members: list[dict[str, Any]] | None = None, train: dict[str, str] | None = None) -> None:
+            members: list[dict[str, Any]] | None = None, train: dict[str, str] | None = None) -> str:
     """The before-merge write: `step` and the merge lease, while `token` holds the entry on the lane host.
 
     `step` is `merge` before a lone merge and `train` before a train's
@@ -4368,9 +4388,11 @@ def advance(queue: Queue, entry: dict[str, Any], token: str, step: str = "merge"
 
     `train` names the lead's prepared `head` and the train's `branch`. The
     row moves to the published head that prepare left (`prepared_head`),
-    so a put-back or reclaim finds the lead where it can reconcile, and
-    keeps `TRAIN_SENT`, which the next claim settles before any lone merge
-    (`sent_train_settled`); a lone merge's write drops it (review of sd:9923).
+    so a put-back or reclaim finds the lead where it can reconcile. The
+    lead and each member keep `TRAIN_SENT`, which each one's next claim
+    settles before any lone merge (`sent_train_settled`); a lone merge's
+    write drops the lead's (review of sd:9923). Answers the head the row
+    holds now, for the claim's own copy.
     """
     tree, branch = pathlib.Path(entry["worktree"]), str(entry.get("branch") or "")
     expected = prepared_head(tree, branch, entry["expected_head"], train["head"]) if train else \
@@ -4409,12 +4431,15 @@ def advance(queue: Queue, entry: dict[str, Any], token: str, step: str = "merge"
             for each in entries:  # a cancel or hold reads it in its own write (`train_merging_stop`)
                 if each["id"] in ours:
                     each["train_of"] = entry["id"]
+                    if train:
+                        each[TRAIN_SENT] = train["branch"]
                 elif each.get("train_of") == entry["id"]:  # an earlier train of this lead left it
                     each.pop("train_of")
     runner_write(queue, to_merge, check=read_host)
     if elsewhere:
         raise Moved(f"{elsewhere[0]} sd:{entry['item']} is pending again at its place, for that host.",
                     code=LANE_ELSEWHERE)
+    return expected if train else str(entry["expected_head"])
 
 
 def owe_post_merge(queue: Queue, entry: dict[str, Any], token: str, outcome: dict[str, Any]) -> None:
@@ -4550,10 +4575,15 @@ def pushed_catch_up(tree: pathlib.Path, branch: str, expected: str) -> str:
 
 
 def back_to_pending(row: dict[str, Any], expected: str, **fields: Any) -> None:
-    """A running row back to pending at its place, its holder gone; `fields` say why."""
+    """A running row back to pending at its place, its holder gone; `fields` say why.
+
+    A row a train fenced (`TRAIN_SENT`) keeps the head the fence wrote:
+    every caller's `expected` comes from a copy read before it, or from a
+    hub-stop record of that copy (class pass of sd:9923).
+    """
     for key in ("started_at", "holder", "step", "lease_until"):
         row.pop(key, None)
-    row.update(status="pending", expected_head=expected, **fields)
+    row.update(status="pending", expected_head=row["expected_head"] if TRAIN_SENT in row else expected, **fields)
 
 
 def put_back(queue: Queue, entry: dict[str, Any], token: str, expected: str, **fields: Any) -> None:
@@ -4841,8 +4871,7 @@ def requeue(queue: Queue, entry: dict[str, Any], token: str, outcome: dict[str, 
     if not (hub or retryable or waited) or (retryable and retries >= RETRYABLE_RETRIES):
         return None
     tree, branch = pathlib.Path(entry["worktree"]), str(entry.get("branch") or "")
-    expected = prepared_head(tree, branch, entry["expected_head"], outcome.get("head")) \
-        if outcome.get("step") == "train" else pushed_catch_up(tree, branch, entry["expected_head"])
+    expected = pushed_catch_up(tree, branch, entry["expected_head"])  # a fenced lead's copy is at its fenced head
     fault: dict[str, Any] = {key: outcome[key] for key in ("step", "reason", "prepare_log", "merge_log", "log_host")
                              if key in outcome}
     fields = (hub_fields(retries, fault) if hub else
@@ -5197,7 +5226,8 @@ def run_checkout(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token:
 
     def advanced(step: str = "merge", members: list[dict[str, Any]] | None = None,
                  train: dict[str, str] | None = None) -> None:
-        advance(queue, local, token, step, members, train)
+        head = advance(queue, local, token, step, members, train)
+        entry["expected_head"] = local["expected_head"] = head  # every later write starts from the fenced head
         stage["step"] = step
     try:
         if tree is not None:

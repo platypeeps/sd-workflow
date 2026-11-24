@@ -2045,11 +2045,16 @@ class TrainState(unittest.TestCase):
 
     def test_each_state_is_read_and_any_other_shape_is_unknown(self) -> None:
         pull = {"head": {"ref": "sd-train/abc"}, "state": "closed", "merged_at": None}
+        other = {**pull, "head": {"ref": "sd-train/other"}, "state": "open"}
         self.assertEqual([self.state(answer) for answer in (
-            [], [pull], [{**pull, "state": "open"}], [pull, {**pull, "merged_at": "2026-11-23T00:00:00Z"}],
-            [{**pull, "head": {"ref": "sd-train/other"}, "state": "open"}])],
-            ["none", "closed", "open", "merged", "none"])
-        for answer in ({}, [{**pull, "state": None}], [{**pull, "head": "sd-train/abc"}, {**pull, "state": 1}],
+            [pull], [{**pull, "state": "open"}], [pull, {**pull, "merged_at": "2026-11-23T00:00:00Z"}],
+            [other, pull])], ["closed", "open", "merged", "closed"])
+        # Class pass of sd:9923: only proof clears the mark. A pull request the fence saw cannot be
+        # absent, and one element of another shape may be the open one.
+        for answer in ({}, [], [other], [{**pull, "state": None}], [{**pull, "head": "sd-train/abc"}],
+                       [pull, {"number": 9, "head": None, "state": "open"}], [{**pull, "head": {"ref": 7}}],
+                       [{**pull, "merged_at": 5}], [{**pull, "merged_at": ""}],
+                       [{key: value for key, value in pull.items() if key != "merged_at"}], [pull, "text"],
                        RuntimeError("no answer")):
             with self.subTest(answer=answer), self.assertRaises(sd_lane.LaneError) as raised:
                 self.state(answer)
@@ -2474,6 +2479,89 @@ class TrainLanding(Trees):
         sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
         lead = self.entries()[0]
         self.assertEqual((lead["status"], sd_lane.TRAIN_SENT in lead), ("merged", False))
+
+    def fenced_lead(self) -> tuple[dict, str, str]:
+        """sd:1 running under `dead`, rebased and pushed, then fenced for a train: its row, old and new head."""
+        self.queue_three()
+        lead = self.entries()[0]
+        sd_lane.update(self.store(), lambda rows: rows[0].update(status="running", holder={"token": "dead"}))
+        self.commit_files(self.repo, {"later.txt": "l\n"}, "main moved again")
+        git(self.repo, "push", "-q", "origin", "main")
+        git(self.first, "fetch", "-q", "origin")
+        git(self.first, "rebase", "-q", "origin/main")
+        git(self.first, "commit", "-q", "--amend", "-m", "first\n\nDelivers: sd:1")
+        git(self.first, "push", "-q", "--force", "origin", "HEAD:refs/heads/first")
+        head = git(self.first, "rev-parse", "HEAD")
+        sd_lane.advance(self.store(), {**lead, "status": "running"}, "dead", "train", self.entries()[1:],
+                        {"head": head, "branch": "sd-train/abc"})
+        return lead, lead["expected_head"], head
+
+    def test_a_hub_stop_record_of_the_old_head_leaves_a_fenced_lead_at_its_fenced_head(self) -> None:
+        """Class pass of sd:9923: a stop record written from the claim's copy restored the pre-rebase head."""
+        _lead, old, head = self.fenced_lead()
+        sd_lane.update(self.store(), lambda rows: sd_lane.resume_stopped(rows[0], {"expected_head": old, "at": "now"}))
+        row = self.entries()[0]
+        self.assertEqual((row["status"], row["expected_head"], row[sd_lane.TRAIN_SENT]),
+                         ("pending", head, "sd-train/abc"))
+
+    def test_a_put_back_from_the_claims_copy_leaves_a_fenced_lead_at_its_fenced_head(self) -> None:
+        """The live put-back, a move and an unanswered checkout all write the head through one place."""
+        lead, old, head = self.fenced_lead()
+        sd_lane.put_back(self.store(), lead, "dead", old, retryable_retries=1)
+        self.assertEqual(self.entries()[0]["expected_head"], head)
+
+    def test_the_fence_marks_each_member_with_the_sent_train(self) -> None:
+        """Class pass of sd:9923: a member claimed before its lead had no guard against a lone merge."""
+        self.fenced_lead()
+        self.assertEqual([row.get(sd_lane.TRAIN_SENT) for row in self.entries()], ["sd-train/abc"] * 3)
+
+    def test_a_member_of_an_unsettled_train_joins_no_train_and_merges_alone_only_once_settled(self) -> None:
+        self.queue_three()
+        sd_lane.update(self.store(), lambda rows: rows[1].update({sd_lane.TRAIN_SENT: "sd-train/abc"}))
+        self.train_states = ["open", "open"]
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        second = self.entries()[1]
+        self.assertNotIn(2, [item for item, _onto in self.joins])
+        self.assertNotIn(2, self.merges())
+        self.assertEqual((second["status"], second[sd_lane.TRAIN_SENT]), ("pending", "sd-train/abc"))
+
+    def test_a_lone_merge_put_back_after_a_failed_train_keeps_the_fenced_head(self) -> None:
+        """Class pass of sd:9923: the claim's copy kept the pre-rebase head after the fence moved the row."""
+        with mock.patch.object(sd_lane, "merge_step", lambda *args: {
+                "status": "failed", "step": "merge", "retryable": True, "reason": "a transient refusal"}):
+            head = self.lead_rebased_requeued("failed")
+        lead = self.entries()[0]
+        self.assertEqual((lead["status"], lead["expected_head"]), ("pending", head))
+
+    def test_a_new_entry_for_an_item_takes_over_its_unsettled_train(self) -> None:
+        """Class pass of sd:9923: `lane retry` and a new enqueue copied the row without its train mark."""
+        self.queue_three()
+        sd_lane.update(self.store(), lambda rows: rows[0].update({"status": "failed", sd_lane.TRAIN_SENT: "sd-train/abc"}))
+        last = self.entries()[0]
+        copied = {key: value for key, value in last.items() if key != sd_lane.TRAIN_SENT}  # as `retry` keeps keys
+        sd_lane.add_entry(self.store(), {**copied, "id": sd_lane.entry_id(), "status": "pending"})
+        rows = [row for row in self.entries() if row["item"] == 1]
+        self.assertEqual([(row["status"], row.get(sd_lane.TRAIN_SENT)) for row in rows],
+                         [("failed", None), ("pending", "sd-train/abc")])
+
+    def test_a_cancel_or_hold_of_a_row_in_an_unsettled_train_is_refused(self) -> None:
+        self.queue_three()
+        sd_lane.update(self.store(), lambda rows: rows[1].update({sd_lane.TRAIN_SENT: "sd-train/abc"}))
+        for change in (lambda: sd_lane.cancel(self.repo, 2, self.environ),
+                       lambda: sd_lane.set_hold(self.repo, 2, self.environ, held=True)):
+            with self.assertRaises(sd_lane.LaneError) as refused:
+                change()
+            self.assertEqual(refused.exception.code, sd_lane.TRAIN_MERGING)
+        self.assertEqual((self.entries()[1]["status"], bool(self.entries()[1].get("held"))), ("pending", False))
+
+    def test_a_train_mark_that_names_no_train_branch_is_kept_and_fails_the_entry(self) -> None:
+        """A mark of another shape proves nothing, so it clears nothing."""
+        self.queue_three()
+        sd_lane.update(self.store(), lambda rows: rows[0].update({sd_lane.TRAIN_SENT: 7}))
+        sd_lane.run_lane(self.repo, self.environ, self.ship, self.gate)
+        lead = self.entries()[0]
+        self.assertNotIn(1, self.merges())
+        self.assertEqual((lead["status"], lead[sd_lane.TRAIN_SENT]), ("failed", 7))
 
     def caught_up_in_the_train(self, landing: str) -> None:
         """Main moves before the train prepares sd:2, and its prepare pushes a catch-up merge of it."""
