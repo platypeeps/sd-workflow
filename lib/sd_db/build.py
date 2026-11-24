@@ -2073,8 +2073,8 @@ def _in_work_repo(connection, lead: int, status: str, *, retry: int | None = Non
     otherwise. The rule each resume selector shares, Build by item's and recovery's (class pass, review round 15).
     With `retry`, only the members Retry keeps (`_inside`): one that waits on a bundle item leaves parked, and
     with a member the lead waits on, those leave to build fresh and none resumes (sd:10086). `retry` is the item
-    Build presses, checked whatever Retry does with it: Retry of a bundle that drops it would queue the lead and
-    leave the pressed item unbuilt (review of sd:10086)."""
+    Build presses, checked too when Retry would park it: that Retry queues the lead and leaves the pressed item
+    unbuilt (review of sd:10086). The check reads what Retry resumes on the branch, nothing else (class pass)."""
     row = connection.execute("SELECT id, item, parent FROM assignment WHERE id = ?", (lead,)).fetchone()
     home = _work_repo(connection, row)
     if home is None:
@@ -2082,7 +2082,9 @@ def _in_work_repo(connection, lead: int, status: str, *, retry: int | None = Non
     members = _open_members(connection, lead, status)
     if retry is not None:
         ahead, behind = _inside(connection, row["item"], [member for member in members if _current(connection, member)])
-        members = [member for member in members if member["item"] == retry or not ahead and member not in behind]
+        # What Retry resumes on the branch: nothing while the lead waits on a member (it frees those to build
+        # fresh where they read now, the pressed one too); else the kept members, and the pressed item.
+        members = [] if ahead else [member for member in members if member["item"] == retry or member not in behind]
     repos = [connection.execute("SELECT repo FROM item WHERE id = ?", (member["item"],)).fetchone()["repo"]
              for member in members]
     return all(repo is not None and paths.same(home, repo) for repo in repos)
