@@ -131,7 +131,8 @@ def _blocks(body: str, comments: bool = True, plain: bool = False):
 def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]], plain: bool):
     """`_blocks` once, each backtick run in `literal` taken as text; with the opener of a span left unclosed."""
     fence, fence_depth, commented, comment_depth, loose = "", 0, False, 0, True  # loose: no paragraph runs on
-    depth, ticks, span_at, rows = 0, "", (0, 0), []
+    depth, ticks, span_at = 0, "", (0, 0)
+    rows: list[tuple] = []
     items: list[int] = []  # the text column of each open list item, outermost first
     pending: list[tuple[int, bool, str]] = []  # (row, word before, raw comment): an `_OPEN` waits on its close
     for number, line in enumerate(body.split("\n"), start=1):
@@ -155,7 +156,8 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]], plain
         if kind == "fence" and (opener := _FENCE_RE.match(text)):  # `_kind` matched it already
             fence, fence_depth = opener["fence"], len(items)
         elif kind != "code" and comments:
-            was, cut = commented, []
+            was = commented
+            cut: list[tuple[int, int]] = []
             commented, ticks, span_at = _inline(line, number, commented, ticks, span_at, literal, cut)
             comment_depth = len(items) if commented and not was else comment_depth
             if ticks and alone:
@@ -190,7 +192,7 @@ def _runs(line: str, cut: list[tuple[int, int]]) -> list[tuple[int, int, bool]]:
 
 
 def _cut(line: str, text: str, lazy: bool, cut: list[tuple[int, int]], was: bool, rows: list,
-         pending: list[tuple[int, bool, str]]) -> tuple[str, str]:
+         pending: list[tuple[int, bool, str]]) -> tuple[str, str, int | None]:
     """`text` and the whole `line` with the comments `cut` names read (`_less`). A comment open from an
     earlier line (`was`) that closes here settles the `_OPEN` waiting on it; one open past this line's
     end leaves its own, for the row `_blocks_once` appends next."""
