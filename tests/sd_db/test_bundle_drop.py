@@ -96,6 +96,14 @@ class Repo(Case):
         ids = [member["id"] for member in build.run(self.db, run["id"])["members"]]
         return items, ids, run
 
+    def delivers(self, item, name="1.txt", text="1\n"):
+        """origin/main lands `item`'s work in a squash whose trailer delivers it, as `sd-ship` writes one."""
+        self.main_moves(name, text)
+        other = self.root / "other"
+        git(other, "commit", "-q", "--amend", "-m", f"feat: landed (#1)\n\nDelivers: sd:{item}")
+        git(other, "push", "-q", "-f", "origin", "HEAD:main")
+        git(self.repo, "fetch", "-q", "origin")
+
     def main_moves(self, name, text):
         """origin/main gains a commit on `name`, made in a second clone."""
         other = self.root / "other"
@@ -1117,14 +1125,6 @@ class Advisories(Repo):
         self.assertEqual(self.files(new), ["0.txt", "1.txt", "2.txt", "README"])
         self.assertNotIn(f"sd:{items[1]}", self.closes(new))
 
-    def delivers(self, item, name="1.txt", text="1\n"):
-        """origin/main lands `item`'s work in a squash whose trailer delivers it, as `sd-ship` writes one."""
-        self.main_moves(name, text)
-        other = self.root / "other"
-        git(other, "commit", "-q", "--amend", "-m", f"feat: landed (#1)\n\nDelivers: sd:{item}")
-        git(other, "push", "-q", "-f", "origin", "HEAD:main")
-        git(self.repo, "fetch", "-q", "origin")
-
     def test_a_done_member_main_never_delivered_refuses_the_drop(self):
         """sd:10021: B marked done by hand, its work only on the bundle branch, then drop D. B's commits stayed
         aside, so a kept commit that needs B's file replayed cleanly onto a branch without it. The drop refuses."""
@@ -1165,6 +1165,7 @@ class Advisories(Repo):
         items, (lead, second, third), run = self.bundle()
         self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[0],))
         lead_id = self.next_lead()
+        self.delivers(items[0], "a.txt", "lead fixed\n")
         queued = DROP.drop_item(self.db, build, items[0], who="operator")
         self.assertEqual([entry["item"] for entry in queued], items[1:])
         self.assertEqual(queued[0]["id"], lead_id)
@@ -1180,6 +1181,7 @@ class Advisories(Repo):
         writes.transition(self.db, items[0], "done", who="operator", reason="landed by hand")
         self.assertEqual(self.db.execute("SELECT status FROM assignment WHERE id = ?", (lead,)).fetchone()[0],
                          "cancelled")
+        self.delivers(items[0], "a.txt", "lead fixed\n")
         queued = DROP.drop_item(self.db, build, items[0], who="operator")
         self.assertEqual([entry["item"] for entry in queued], items[1:])
         self.assertEqual(self.db.execute("SELECT status FROM item WHERE id = ?", (items[0],)).fetchone()[0], "done")
@@ -1189,6 +1191,7 @@ class Advisories(Repo):
         items, ids, run = self.bundle()
         writes.transition(self.db, items[2], "planning", who="operator", reason="not now")
         writes.transition(self.db, items[0], "done", who="operator", reason="landed by hand")
+        self.delivers(items[0], "a.txt", "lead fixed\n")
         queued = DROP.drop_item(self.db, build, items[0], who="operator")
         self.assertEqual([entry["item"] for entry in queued], [items[1]])
 
@@ -1200,10 +1203,11 @@ class Advisories(Repo):
         writes.transition(self.db, items[2], "ready", who="operator", reason="back")
         writes.transition(self.db, items[0], "done", who="operator", reason="landed by hand")
         lead = self.next_lead()
+        self.delivers(items[0], "a.txt", "lead fixed\n")
         queued = DROP.drop_item(self.db, build, items[0], who="operator")
         self.assertEqual([entry["item"] for entry in queued], [items[1]])
         new = Path(run["work_path"]).parent / f"repo-build-{lead}"
-        self.assertEqual(self.files(new), ["README", "b.txt"])
+        self.assertEqual(self.files(new), ["README", "a.txt", "b.txt"])
 
     def test_a_done_lead_with_only_a_member_back_from_planning_refuses(self):
         """No blocked member is left to keep: the old cancelled row is not one, so nothing replays."""
@@ -1441,5 +1445,16 @@ class DropDesign(Repo):
         items, ids, run = self.bundle()
         self.designs(items[0])
         writes.transition(self.db, items[0], "done", who="operator", reason="landed by hand")
+        self.delivers(items[0], "a.txt", "lead fixed\n")
         queued = DROP.drop_item(self.db, build, items[0], who="operator")
         self.assertEqual([entry["item"] for entry in queued], items[1:])
+
+    def test_a_done_design_lead_main_never_delivered_refuses_the_drop(self):
+        """Review of sd:10096: the design lead marked done before its commit reached main. Its commit went
+        aside unchecked, and the kept code queued without the design it needs. The drop refuses."""
+        items, ids, run = self.bundle()
+        self.designs(items[0])
+        writes.transition(self.db, items[0], "done", who="operator", reason="landed by hand")
+        with self.assertRaisesRegex(DROP.DropRefused, f"work of sd:{items[0]}, which is done but which"):
+            DROP.drop_item(self.db, build, items[0], who="operator")
+        self.unmade(run)

@@ -978,8 +978,8 @@ def drop_plan(connection, item: int) -> dict:
     if not kept:
         raise BuildRefused(f"Drop refused: sd:{item} is the only open item of build {lead}; Retry or cancel it")
     # A design ships with code (`design_only_delivery`): one dropped builds alone, and a kept bundle of designs
-    # alone leads one; either run blocks at delivery (review of sd:10096). A done design has shipped: nothing
-    # builds it, and dropping a done lead is the way to the kept commits (class pass).
+    # alone leads one; either run blocks at delivery (review of sd:10096). A done design builds no more,
+    # and dropping a done lead is the way to the kept commits once main delivers it (`done` below).
     if aboard(connection, [item]) and not _done(items, item):
         raise BuildRefused(f"Drop refused: sd:{item} is a design, which ships with its bundle's code; "
                            f"move it to planning to take it out")
@@ -1022,8 +1022,9 @@ def drop_plan(connection, item: int) -> dict:
     states = reads.items_by_ids(connection, built)
     return {"item": item, "assignment": row["id"], "lead": lead, "kept": kept, "run": last["id"],
             "aside": sorted(set(built) - {member["item"] for member in kept} | {item}), "built": sorted(set(built)),
-            # A done member's commits stay aside only once the base delivers it (`sd_bundle_drop`, sd:10021).
-            "done": sorted(one for one in set(built) - {member["item"] for member in kept} - {item}
+            # A done member's commits stay aside only once the base delivers it (`sd_bundle_drop`, sd:10021);
+            # so do a dropped done item's: a kept commit may need them (review of sd:10096).
+            "done": sorted(one for one in set(built) - {member["item"] for member in kept}
                            if one in states and states[one]["status"] == "done"),
             "revision": current["revision"], "repo": str(repo), "work": str(work), "branch": last["branch"]}
 
