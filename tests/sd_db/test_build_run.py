@@ -3104,6 +3104,26 @@ class Supervise(Case):
         self.assertEqual(ended["outcome"], "blocked")
         self.assertIn(f"{again['branch']} holds the work of a run on the hub", ended["blocked"])
 
+    def test_a_second_retry_after_that_block_does_not_start_from_the_base_either(self):
+        """Class pass, review of build/sd-1688: the guard read only the run before, so once one attempt on the
+        lane host had blocked, the next read that attempt, on its own host, and started from the base."""
+        self.test_a_retry_whose_work_is_on_another_host_and_not_pushed_blocks()
+        first = self.latest()
+        self.assertEqual(first["step"], "worktree")
+        stamp = build.clock()  # released and queued again, as Retry does
+        self.db.execute("UPDATE runner_run SET released_at = ? WHERE id = ?", (stamp, first["id"]))
+        self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (stamp, first["id"]))
+        self.db.execute("UPDATE assignment SET status = 'queued' WHERE id = ?", (self.bundle["assignment"],))
+        self.db.execute("UPDATE item SET status = 'ready', parked_at = NULL WHERE id = ?", (self.items[0],))
+        again = next(filter(None, (build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                               root=self.root / "worktrees", hosts=hosts)
+                                   for hosts in (frozenset({"work"}), None))), None)
+        assert again is not None
+        self.db.execute("UPDATE runner_run SET owner = 'fixture@work' WHERE id = ?", (again["id"],))
+        ended = self.supervisor(again["id"]).worktree()
+        self.assertIsInstance(ended, dict, "the worktree was started from the base")
+        self.assertIn("holds the work of a run on the hub", ended["blocked"])
+
     def test_a_usage_limit_reclaim_refuses_a_worktree_on_another_branch(self):
         """Review of build/sd-1557: the reclaim resumed at building or fixing, past the worktree step's branch
         guard, so a checkout switched during the hold took the builder's commits. The guard runs first."""

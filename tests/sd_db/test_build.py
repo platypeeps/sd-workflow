@@ -2602,6 +2602,51 @@ class Hosts(Case):
         self.assertIsNone(self.claim(hosts=HUB), "the pushed retry waits for its lane host")
         self.assertEqual(self.claim(hosts=WORK)["owner"], "fixture@work")
 
+    def pushed_fallback(self):
+        """A bundle the hub built for the busy satellite, its branch pushed by the lane, queued again, the
+        satellite's beat fresh and under its cap; its run."""
+        build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
+        fallback = self.claim(hosts=HUB)
+        self.retried(fallback)
+        self.db.execute("UPDATE runner_run SET step = 'enqueued', outcome = 'lane_failed' WHERE id = ?",
+                        (fallback["id"],))
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        return fallback
+
+    def lane_row(self, assignment):
+        return self.db.execute(
+            "SELECT assignment.id, assignment.item, assignment.parent, assignment.run_count, repo.lane_host "
+            "FROM assignment JOIN item ON item.id = assignment.item LEFT JOIN repo ON repo.path = item.repo "
+            "WHERE assignment.id = ?", (assignment,)).fetchone()
+
+    def test_a_pushed_fallback_bundle_going_home_is_not_stranded(self):
+        """Class pass, review of build/sd-1688: `_stranded` and Build's retry pick compared the host of the last
+        run with the route, so a pushed bundle routed home read as stranded, and Build took its item fresh."""
+        fallback = self.pushed_fallback()
+        self.assertFalse(build._stranded(self.db, self.lane_row(fallback["assignment"])))
+        self.assertTrue(build._resumes(self.db, "work", fallback["assignment"]))
+
+    def test_a_home_attempt_that_held_no_work_sends_the_retry_back_to_the_hub(self):
+        """Class pass, review of build/sd-1688: each reader took where the work is from the bundle's last run. A
+        lane-host attempt that blocked before it had a worktree holds none, yet the next Retry routed there
+        again, read no other host's work (`work_elsewhere`), and started from the base. The hub, which holds
+        the work, takes the Retry, and every reader still names the hub."""
+        fallback = self.pushed_fallback()
+        home = self.claim(hosts=WORK)
+        self.assertEqual(home["owner"], "fixture@work")
+        self.assertEqual(build.work_elsewhere(self.db, home["id"]), "the hub")
+        self.retried(home)
+        self.db.execute("UPDATE runner_run SET step = 'worktree' WHERE id = ?", (home["id"],))
+        self.assertIsNone(build._ran_on(self.db, fallback["assignment"]), "the hub still holds the work")
+        self.assertFalse(build._stranded(self.db, self.lane_row(fallback["assignment"])))
+        self.assertIsNone(self.claim(hosts=WORK), "no second attempt where the branch is missing")
+        back = self.claim(hosts=HUB)
+        self.assertEqual(back["owner"], "fixture")
+        # Were a later run on the lane host all the same, it still reads the hub's work, past the empty attempt.
+        self.db.execute("UPDATE runner_run SET owner = 'fixture@work' WHERE id = ?", (back["id"],))
+        self.assertEqual(build.work_elsewhere(self.db, back["id"]), "the hub")
+
     def test_a_retry_follows_its_lane_moved_from_a_quiet_satellite_to_the_hub(self):
         """sd:8991 review round 3: `_ran_on` kept every retry on the host of its last run, so a Retry whose lane
         the operator moved from a down satellite to the hub was blocked on that satellite's quiet beat."""

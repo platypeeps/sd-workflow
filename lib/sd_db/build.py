@@ -434,35 +434,69 @@ def _lead(row) -> int | None:
     return row["parent"] or (row["id"] if row["run_count"] else None)
 
 
+#: The steps a run ends at before it has a worktree: such a run holds none of its bundle's work.
+_NO_WORK = ("claimed", "worktree")
+
+
+def _holder(connection, lead: int, before: int | None = None):
+    """The run (`id`, `owner`, `step`) that holds the work of the bundle `lead` leads: its latest run that got past
+    the worktree step, among those before run number `before` when given; else its latest run, which holds an
+    empty claim's nothing; None when it never ran. The one reader of where a bundle's work is: a later attempt
+    that blocked before it had a worktree moves no work (class pass, review of build/sd-1688)."""
+    marks = ", ".join("?" for _ in _NO_WORK)
+    rows = connection.execute(
+        f"SELECT id, owner, step FROM runner_run WHERE assignment = ? AND (? IS NULL OR run < ?) "
+        f"ORDER BY COALESCE(step, 'claimed') IN ({marks}), run DESC LIMIT 1", (lead, before, before, *_NO_WORK))
+    return rows.fetchone()
+
+
+def _home(connection, lane: str | None, lead: int | None) -> bool:
+    """Whether the bundle `lead` leads, built by the hub under the overload fallback for the satellite lane `lane`,
+    goes back to that lane host now (sd:10143): its work's last run reached the lane, which pushed its head
+    (`LANE_STEPS`); no attempt since ended with no worktree, as one on the lane host that found no pushed branch
+    does; and the lane host's beat is fresh and under its cap."""
+    if lane is None or lead is None:
+        return False
+    held = _holder(connection, lead)
+    if held is None or lane_of(connection, run_host(held["owner"])) is not None or held["step"] not in LANE_STEPS:
+        return False
+    last = connection.execute("SELECT id FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
+                              (lead,)).fetchone()
+    return last["id"] == held["id"] and not dispatcher_gone(connection, lane) and not overloaded(connection, lane)
+
+
 def _route(connection, lane_host: str | None, lead: int | None) -> str | None:
     """`lane_of` the host whose dispatcher claims a build of the repository whose lane is `lane_host`, for the
     bundle `lead` leads (None when it never ran): its lane now, as a retry follows `repo.lane_host`, except a bundle
-    the hub built under the overload fallback for a satellite's lane, whose commits sit in the hub's worktree: that
-    one builds on the hub again (sd:8991) while it may hold unpushed commits, or while its lane host is busy or
-    quiet. Once its last run reached the lane, which pushed its head (`LANE_STEPS`), and the lane host's beat is
-    fresh and under its cap, it goes home, its worktree started from the pushed branch (sd:10143). The one rule for
-    a claim, Retry, pickup and the Builds panel."""
+    the hub built under the overload fallback for a satellite's lane, whose commits sit in the hub's worktree
+    (`_holder`): that one builds on the hub again (sd:8991) until it goes home (`_home`, sd:10143), its worktree
+    there started from the pushed branch. The one rule for a claim, Retry, pickup and the Builds panel."""
     lane = lane_of(connection, lane_host)
     if lane is None or lead is None:
         return lane
-    ran = connection.execute("SELECT owner, step FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
-                             (lead,)).fetchone()
-    if not ran or lane_of(connection, run_host(ran["owner"])) is not None:
+    held = _holder(connection, lead)
+    if held is None or lane_of(connection, run_host(held["owner"])) is not None:
         return lane
-    home = ran["step"] in LANE_STEPS and not dispatcher_gone(connection, lane) and not overloaded(connection, lane)
-    return lane if home else None
+    return lane if _home(connection, lane, lead) else None
+
+
+def _resumes(connection, lane_host: str | None, lead: int) -> bool:
+    """Whether the host a claim of the bundle `lead` leads routes to can resume its work: the host that holds it
+    (`_ran_on`), or the lane host a pushed fallback bundle goes home to (`_home`)."""
+    return (_ran_on(connection, lead) == _route(connection, lane_host, lead)
+            or _home(connection, lane_of(connection, lane_host), lead))
 
 
 def work_elsewhere(connection, ident: str) -> str | None:
-    """The host that ran the bundle of run `ident` last before it, when that is not `ident`'s own host ("the hub"
-    for the hub's), or None: that host's worktree holds the bundle's commits, which only a push brings here
-    (review of build/sd-1688)."""
+    """The host that holds the work of run `ident`'s bundle from before it (`_holder`), when that is not `ident`'s
+    own host ("the hub" for the hub's), or None: that host's worktree holds the bundle's commits, which only a
+    push brings here (review of build/sd-1688). An earlier attempt that never had a worktree held none."""
     now = connection.execute("SELECT assignment, run, owner FROM runner_run WHERE id = ?", (ident,)).fetchone()
     if now is None:
         return None
-    before = connection.execute("SELECT owner FROM runner_run WHERE assignment = ? AND run < ? ORDER BY run DESC "
-                                "LIMIT 1", (now["assignment"], now["run"])).fetchone()
-    if before is None or run_host(before["owner"]) == run_host(now["owner"]):
+    before = _holder(connection, now["assignment"], now["run"])
+    if (before is None or (before["step"] or "claimed") in _NO_WORK
+            or run_host(before["owner"]) == run_host(now["owner"])):
         return None
     return run_host(before["owner"]) or "the hub"
 
@@ -1225,7 +1259,7 @@ def _retry_row(connection, item: int):
             # beat recovery (pack sd:9964).
             host = connection.execute(_REPO, (ran["item"],)).fetchone()["lane_host"]
             if (queue_state(connection, lead)["status"] == ran["status"] and _in_work_repo(connection, lead, ran["status"])
-                    and _ran_on(connection, lead) == _route(connection, host, lead)
+                    and _resumes(connection, host, lead)
                     and _retry_takes(connection, lead, ran["status"])):
                 return ran
     return rows[0] if rows else None
@@ -2059,10 +2093,9 @@ _BEAT_BLOCKED = (f"assignment.scope = ? AND assignment.status = 'blocked' AND as
 
 
 def _ran_on(connection, lead: int) -> str | None:
-    """`lane_of` the host whose dispatcher ran build `lead`'s latest run, which holds its worktree; None for the
-    hub's, or when it never ran."""
-    ran = connection.execute("SELECT owner FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
-                             (lead,)).fetchone()
+    """`lane_of` the host whose dispatcher ran the run that holds build `lead`'s work and worktree (`_holder`);
+    None for the hub's, or when it never ran."""
+    ran = _holder(connection, lead)
     return lane_of(connection, run_host(ran["owner"])) if ran else None
 
 
@@ -2083,7 +2116,8 @@ def _stranded(connection, row) -> bool:
         if kept is None:
             return False
         held = lane_of(connection, kept[1])
-    return held != _route(connection, row["lane_host"], lead)
+    return (held != _route(connection, row["lane_host"], lead)
+            and not _home(connection, lane_of(connection, row["lane_host"]), lead))
 
 
 def _in_work_repo(connection, lead: int, status: str) -> bool:

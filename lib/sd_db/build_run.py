@@ -1447,8 +1447,8 @@ class Supervisor:
                 away = build.work_elsewhere(self.db, self.ident)
                 if away is not None:
                     return self.finish("blocked", f"branch {branch} holds the work of a run on {away}, but neither "
-                                                  f"{self.repo} nor origin has it; push it from {away}, or move "
-                                                  f"the lane there and Retry")
+                                                  f"{self.repo} nor origin has it; push it from {away}, then "
+                                                  f"Retry")
                 start = self.base()
             argv = ["worktree", "add", "-b", branch, str(self.work), start]
         if self.child([*self.tools.git, "-C", str(self.repo), *argv], cwd=self.repo, name="worktree") != 0:
