@@ -868,7 +868,7 @@ def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: 
             untracked = subject.scope == "worktree" and sd_lib.git_output(
                 ["--literal-pathspecs", "ls-files", "--others", "--exclude-standard", "--", path], root) != ""
             diffs[receipt, path] = None if untracked else sd_lib.git_output(
-                ["--literal-pathspecs", "diff", "-U0", "--no-color", "--no-ext-diff", *ends, "--", path], root)
+                ["--literal-pathspecs", "diff", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", *ends, "--", path], root)
         diff = diffs[receipt, path]
         return None if diff is None else (line,) if diff == "" else hunk_kept(diff, line)
     return rebuttals(rows, span[2].__contains__, ruled_place, repo_spelling(root))
@@ -2063,7 +2063,7 @@ def prior_at(root: pathlib.Path, old: str, new: str, rows: Sequence[Mapping[str,
         blocker). An edited line, or one added in several places, stays at its hunk offset."""
         if start not in trees:
             trees[start] = diff_lines(sd_lib.git_output(["-c", "core.quotePath=false", "diff", "-M", "-U0", "--no-color",
-                                                         "--no-ext-diff", start, new], root) or "")
+                                                         "--no-ext-diff", "--no-textconv", start, new], root) or "")
         removed, added = trees[start]
         text = removed.get((path, line), "").strip()
         places = [(name, number) for name, number, body in added if text and body.strip() == text]
@@ -2079,7 +2079,7 @@ def prior_at(root: pathlib.Path, old: str, new: str, rows: Sequence[Mapping[str,
         row = dict(row, found_at=start)  # the head the blocker was found at, for a ruling's age (`found_after`)
         if type(row.get("line")) is not int:  # an unplaced blocker still follows its file (bin/sd-review:1846)
             return [dict(row, path=path)]
-        diff = sd_lib.git_output(["diff", "-M", "-U0", "--no-color", "--no-ext-diff", start, new, "--",
+        diff = sd_lib.git_output(["diff", "-M", "-U0", "--no-color", "--no-ext-diff", "--no-textconv", start, new, "--",
                                   *dict.fromkeys(f":(literal){name}" for name in (row["path"], path))], root)
         moved = _moved(start, row["path"], row["line"], path) if diff else None
         # A move adds a place and answers none: the hunk's place still holds, since an edited line whose old text

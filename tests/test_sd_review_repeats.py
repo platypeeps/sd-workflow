@@ -274,6 +274,19 @@ class PriorLineTests(RepeatFixture):
                                      repro=True, prior=moved)
         self.assertEqual(record["disposition"], "blocking")
 
+    def test_a_textconv_filter_cannot_hide_an_insertion_above_a_blocker(self) -> None:
+        """Class pass of bin/sd-review:871: `prior_at` maps a blocker's line through the raw diff; a `diff=`
+        textconv that drops the inserted lines would leave it at its old line."""
+        source = "".join(f"line{number}\n" for number in range(1, 41))
+        (self.root / "src.py").write_text(source, encoding="utf-8")
+        (self.root / ".gitattributes").write_text("*.py diff=hide\n", encoding="utf-8")
+        self.commit("config", "diff.hide.textconv", "sed /new/d")
+        old = self.commit("add", "src.py", ".gitattributes") and self.commit("old")
+        (self.root / "src.py").write_text("".join(f"new{n}\n" for n in range(21)) + source, encoding="utf-8")
+        new = self.commit("add", "src.py") and self.commit("new")
+        prior = [dict(finding(REPRO, line=10, summary="Empty input crashes"), disposition="blocking")]
+        self.assertEqual([row["line"] for row in sd_review.prior_at(self.root, old, new, prior)], [31])
+
     def test_evidence_found_after_a_rebuttal_still_blocks_its_uncited_repeat(self) -> None:
         """Review of sd:10191 (bin/sd-review:886): a rebuttal at line 20 rests on line 2; a distant edit of
         line 2 keeps the ruling's hunk, so it stays listed. A pass after the ruling found the crash with
@@ -1733,6 +1746,27 @@ class RebuttalScopeTests(RepeatFixture):
         found = sd_review.rebutted_findings(self.root, sd_review.resolve_subject(self.root, "branch"), None,
                                             self.environment())
         self.assertEqual([entry.listed for entry in found], [False])
+
+    def test_a_textconv_filter_cannot_hide_an_edit_at_the_ruled_line(self) -> None:
+        """Review of sd:10191 (bin/sd-review:871): a `diff=` attribute's textconv may drop the ruled line from
+        both sides, so the diff shows no hunk there; the ruling must read the raw source and lapse."""
+        tool = self.root / "bin/tool.py"
+        tool.parent.mkdir()
+        tool.write_text("".join(f"line_{n} = {n}\n" for n in range(1, 31)), encoding="utf-8")
+        (self.root / ".gitattributes").write_text("*.py diff=hide\n", encoding="utf-8")
+        self.commit("config", "diff.hide.textconv", "sed /line_20/d")
+        self.commit("add", "bin/tool.py", ".gitattributes")
+        ruled = self.commit("the ruled code")
+        self.adjudication(("lane claim", "rebutted", "x"), head=ruled, line=20)
+        tool.write_text(tool.read_text(encoding="utf-8").replace("line_20 = 20", "line_20 = crash()"),
+                        encoding="utf-8")
+        self.commit("add", "bin/tool.py")
+        self.commit("an edit at the ruled line")
+        for scope in ("worktree", "branch"):
+            with self.subTest(scope=scope):
+                found = sd_review.rebutted_findings(self.root, sd_review.resolve_subject(self.root, scope), None,
+                                                    self.environment())
+                self.assertEqual([entry.listed for entry in found], [False])
 
     def test_hunk_kept_holds_on_doubt(self) -> None:
         """A ruling without a line, a diff with no hunk (binary, mode) or with two files' hunks (a path that names
