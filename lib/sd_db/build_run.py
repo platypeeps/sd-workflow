@@ -1567,9 +1567,14 @@ class Supervisor:
 
         if contains(pushed, head):
             return None
-        if contains(head, pushed) and self.child([*git, "merge", "-q", "--ff-only", pushed], cwd=self.work,
-                                                 name="worktree") == 0:
-            return None
+        if contains(head, pushed):
+            # git overwrites an ignored file the push tracks by default; a local one may be the operator's.
+            if self.child([*git, "merge", "-q", "--ff-only", "--no-overwrite-ignore", pushed], cwd=self.work,
+                          name="worktree") == 0:
+                return None
+            return self.finish("blocked", f"worktree {self.work} could not fast-forward to origin/{branch} at "
+                                          f"{pushed[:12]}: a local file, ignored or uncommitted, is in its way; "
+                                          f"see {self.out('worktree')}, move it, then Retry")
         return self.finish("blocked", f"worktree {self.work} at {head[:12]} and origin/{branch} at {pushed[:12]} "
                                       f"diverged, and origin holds the work of a run on {away}; settle the "
                                       f"branch, then Retry")

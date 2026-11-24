@@ -3281,6 +3281,22 @@ class Supervise(Case):
         self.assertIsInstance(ended, dict, "the run resumed without the newer push")
         self.assertIn("diverged", ended["blocked"])
 
+    def test_a_retry_back_on_the_hub_keeps_an_ignored_file_the_push_would_overwrite(self):
+        """Review of build/sd-1688: the fast-forward to the newer push overwrote an ignored local file the
+        push tracks, as git does by default; the run blocks and the file keeps its content."""
+        back, _ = self.moved_back()
+        work = Path(back["work_path"])
+        exclude = Path(support.git(work, "rev-parse", "--git-common-dir"))
+        exclude = (exclude if exclude.is_absolute() else work / exclude) / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        with exclude.open("a", encoding="utf-8") as handle:
+            handle.write("b.txt\n")
+        (work / "b.txt").write_text("local only\n", encoding="utf-8")
+        ended = self.supervisor(back["id"]).worktree()
+        self.assertIsInstance(ended, dict, "the run overwrote the ignored file")
+        self.assertIn("ignored", ended["blocked"])
+        self.assertEqual((work / "b.txt").read_text(encoding="utf-8"), "local only\n")
+
     def test_a_moved_retry_reads_the_branch_from_origin_not_its_tracking_ref(self):
         """Class pass, review of build/sd-1688: the worktree step took origin's head of the branch from the
         tracking ref, which a fetch that does not name the branch leaves where it was. A kept worktree, a
