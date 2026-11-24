@@ -879,19 +879,27 @@ def _refuse_unlanded_branch(state: dict, item: int) -> None:
         f"commit that landed it as its delivery")
 
 
-#: How each followup the machine writes starts (sd:10407): a build's block (`build._block`), a lane
-#: entry's end (`sd_lane.note_ended`) and a post-merge target's answer (`sd_lane.note_post_merge`).
-#: A done item owes none of them, so its close resolves them without being asked.
-MACHINE_FOLLOWUPS = ("Build blocked: ", "Lane failed in ", "Lane skipped in ", "Post-merge: ")
+#: How each followup the machine writes starts, by who wrote it (sd:10407). The lane's session writes
+#: an entry's end (`sd_lane.note_ended`) and a post-merge target's answer (`sd_lane.note_post_merge`);
+#: a build's block (`build._block`) records no session, which no person's note does: the CLI and the
+#: dashboard always record one. The text alone names no author: an operator can type or paste it.
+#: A done item owes none of the machine's, so its close resolves them without being asked.
+LANE_SESSION = "sd-lane"  # `sd_lane.LANE_SESSION` is the same name
+POST_MERGE_FOLLOWUP = "Post-merge: "
+LANE_FOLLOWUPS = ("Lane failed in ", "Lane skipped in ", POST_MERGE_FOLLOWUP)
+BUILD_FOLLOWUP = "Build blocked: "
 
 
 def machine_followup(note: Mapping[str, Any]) -> bool:
-    """Whether `note` is an open-able followup the machine wrote, by its exact opening (sd:10407)."""
-    return note["kind"] == "followup" and str(note["body"] or "").startswith(MACHINE_FOLLOWUPS)
+    """Whether `note` is a followup the machine wrote: its writer's session and its exact opening (sd:10407)."""
+    body, session = str(note["body"] or ""), note["session"]
+    return note["kind"] == "followup" and (
+        (session == LANE_SESSION and body.startswith(LANE_FOLLOWUPS))
+        or (session is None and body.startswith(BUILD_FOLLOWUP)))
 
 
 def resolve_post_merge(connection: sqlite3.Connection, items: Collection[int]) -> list[int]:
-    """Resolve every open `Post-merge: ` followup on the items of the repositories `items` belong to.
+    """Resolve every open `Post-merge: ` followup the lane wrote on the items of the repositories `items` belong to.
 
     A passing post-merge target covers every commit before it: main is linear, so a later pass
     answers each earlier failure in the same repository (sd:10406, sd:10407). The ids resolved."""
@@ -903,8 +911,9 @@ def resolve_post_merge(connection: sqlite3.Connection, items: Collection[int]) -
         found = [row["id"] for row in connection.execute(
             "SELECT note.id FROM note JOIN item ON item.id = note.item "
             "WHERE note.kind = 'followup' AND note.resolved_at IS NULL "
-            "AND substr(note.body, 1, 12) = 'Post-merge: ' AND item.repo IN "
-            f"(SELECT repo FROM item WHERE id IN ({marks}) AND repo IS NOT NULL) ORDER BY note.id", numbers)]
+            "AND note.session = ? AND substr(note.body, 1, ?) = ? AND item.repo IN "
+            f"(SELECT repo FROM item WHERE id IN ({marks}) AND repo IS NOT NULL) ORDER BY note.id",
+            [LANE_SESSION, len(POST_MERGE_FOLLOWUP), POST_MERGE_FOLLOWUP, *numbers])]
         for note in found:
             resolve_note(connection, note)
     return found

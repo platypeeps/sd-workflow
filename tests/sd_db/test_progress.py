@@ -178,12 +178,13 @@ class WorkCompletion(ProgressCase):
         from sd_db.writes import add_note
         waiting = add_note(self.db, self.item, "followup", "Waits on an outside reply")
         blocked = add_note(self.db, self.item, "followup", "Build blocked: gate red. Look at the log")
+        pasted = add_note(self.db, self.item, "followup", "Build blocked: the vendor must answer", session="operator")
         self.remote()
         commit = self.commit(f"Delivers: sd:{self.item}")
         self.git("push", "origin", "main")
         result = deliver_work(self.db, self.item, commit, who="sd-ship")
-        self.assertEqual([row["id"] for row in reads.open_followups(self.db)], [waiting])
-        self.assertEqual(json.loads(result["item"]["fields"])["kept_followups"], [waiting])
+        self.assertEqual([row["id"] for row in reads.open_followups(self.db)], [waiting, pasted])
+        self.assertEqual(json.loads(result["item"]["fields"])["kept_followups"], [waiting, pasted])
         self.assertIsNotNone(self.db.execute("SELECT resolved_at FROM note WHERE id = ?", (blocked,)).fetchone()[0])
 
     def notes(self, kind="status_change"):

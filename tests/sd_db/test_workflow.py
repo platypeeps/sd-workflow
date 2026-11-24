@@ -15,6 +15,7 @@ from sd_db.migrate import initialise
 from sd_db.reads import item_by_id
 from sd_db.workflow import (
     HAND_KINDS,
+    LANE_SESSION,
     REPO_LESS_KINDS,
     TASK_STATUSES,
     MissingItem,
@@ -596,9 +597,32 @@ class DoneResolvesOpenNotes(WorkflowCase):
                   "Lane failed in prepare at aaaaaaaaaaaa: gate red",
                   "Lane skipped in merge at aaaaaaaaaaaa: stale head",
                   "Post-merge: make post-merge failed (exit 2)")
-        machine = [add_note(self.db, item, "followup", body) for body in bodies]
+        machine = [add_note(self.db, item, "followup", body,
+                            session=None if body.startswith("Build") else LANE_SESSION) for body in bodies]
         change_status(self.db, item, "done", who="operator")
         self.assertEqual(self.notes(item), {note: ("followup", False) for note in machine})
+
+    def test_a_persons_followup_that_opens_like_the_machines_is_still_owed(self):
+        """sd:10407 class pass: the author was read from the text alone, so an operator's
+        followup that opens `Post-merge: ` or `Build blocked: ` was resolved unasked and left
+        Today. The machine's are told by who wrote them: the lane's session, a build's none."""
+        cases = (("Post-merge: check the refresh by hand", "operator"),
+                 ("Lane failed in prepare at aaaaaaaaaaaa: pasted by a person", "dashboard"),
+                 ("Lane skipped in merge at aaaaaaaaaaaa: pasted", "a-harness-session"),
+                 ("Build blocked: I looked, the vendor must answer", "operator"),
+                 ("Build blocked: written under the lane's name", LANE_SESSION),
+                 ("Post-merge: a library write with no session", None),
+                 ("Post-merge: the lane's name with a suffix", LANE_SESSION + "-2"),
+                 ("Post-merge: an empty session", ""))
+        for body, session in cases:
+            with self.subTest(body=body):
+                item = self.capture()["item"]["id"]
+                note = add_note(self.db, item, "followup", body, session=session)
+                with self.assertRaisesRegex(TransitionRefused, f"resolve followup {note}$"):
+                    change_status(self.db, item, "done", who="operator")
+                change_status(self.db, item, "done", who="sd-ship", reason="delivered", followups=())
+                self.assertEqual(self.notes(item), {note: ("followup", True)})
+                self.assertEqual(json.loads(item_state(self.db, item)["item"]["fields"])["kept_followups"], [note])
 
     def test_a_prefix_inside_the_body_is_not_the_machines(self):
         for body in (" Build blocked: indented", "post-merge: lower case", "Post-merge:no space", ""):
@@ -619,11 +643,15 @@ class DoneResolvesOpenNotes(WorkflowCase):
         earlier = create_item(self.db, kind="task", title="Earlier", repo="/repos/example", status="done")
         landed = create_item(self.db, kind="task", title="Landed", repo="/repos/example", status="done")
         elsewhere = create_item(self.db, kind="task", title="Other", repo="/repos/other", status="done")
-        failed = add_note(self.db, earlier, "followup", "Post-merge: make post-merge failed (exit 2)")
+        failed = add_note(self.db, earlier, "followup", "Post-merge: make post-merge failed (exit 2)",
+                          session=LANE_SESSION)
         person = add_note(self.db, earlier, "followup", "Check the refresh by hand")
-        foreign = add_note(self.db, elsewhere, "followup", "Post-merge: make post-merge failed (exit 2)")
+        pasted = add_note(self.db, earlier, "followup", "Post-merge: check it by hand", session="operator")
+        foreign = add_note(self.db, elsewhere, "followup", "Post-merge: make post-merge failed (exit 2)",
+                           session=LANE_SESSION)
         self.assertEqual(resolve_post_merge(self.db, [landed]), [failed])
-        self.assertEqual(self.notes(earlier), {failed: ("followup", False), person: ("followup", True)})
+        self.assertEqual(self.notes(earlier), {failed: ("followup", False), person: ("followup", True),
+                                               pasted: ("followup", True)})
         self.assertEqual(self.notes(elsewhere), {foreign: ("followup", True)})
         self.assertEqual(resolve_post_merge(self.db, [landed]), [])
         self.assertEqual(resolve_post_merge(self.db, []), [])
@@ -639,6 +667,7 @@ class DoneResolvesOpenNotes(WorkflowCase):
         item = self.capture()["item"]["id"]
         kept = add_note(self.db, item, "followup", "Waits on a reply")
         machine = add_note(self.db, item, "followup", "Build blocked: gate red")
+        self.assertIsNone(self.db.execute("SELECT session FROM note WHERE id = ?", (machine,)).fetchone()[0])
         change_status(self.db, item, "done", who="sd-ship", reason="delivered", followups=())
         self.assertEqual(self.notes(item), {kept: ("followup", True), machine: ("followup", False)})
 

@@ -2594,8 +2594,10 @@ class Landing(Lane):
         earlier, landed = self.register_items(2)
         connection = sd_db.connect(home=self.tmp)
         try:
-            failed = sd_db.add_note(connection, earlier, "followup", "Post-merge: make post-merge failed (exit 2)")
-            person = sd_db.add_note(connection, earlier, "followup", "Check the refresh by hand")
+            failed = sd_db.add_note(connection, earlier, "followup", "Post-merge: make post-merge failed (exit 2)",
+                                    session=sd_lane.LANE_SESSION)
+            person = sd_db.add_note(connection, earlier, "followup", "Post-merge: I check the refresh by hand",
+                                    session="operator")
             connection.commit()
         finally:
             connection.close()
@@ -2614,6 +2616,10 @@ class Landing(Lane):
         finally:
             connection.close()
         self.assertEqual(still, [person])
+
+    def test_the_library_knows_the_lanes_session_by_the_lanes_own_name(self) -> None:
+        from sd_db import workflow
+        self.assertEqual(workflow.LANE_SESSION, sd_lane.LANE_SESSION)
 
     def test_a_makefile_without_the_target_runs_nothing_and_notes_nothing(self) -> None:
         tree, head = self.topic()

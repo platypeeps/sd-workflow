@@ -160,9 +160,14 @@ class TaskCLI(unittest.TestCase):
         self.assertIn(f"`sd task status {item} done --resolve-followups`", refused.stderr)
         self.assertIn("--resolve-followups closes followups with done",
                       self.call("task", "status", item, "blocked", "--resolve-followups", code=1).stderr)
+        # sd:10407 class pass: a person's followup that opens like the lane's is still a person's.
+        pasted = json.loads(self.call("task", "note", item, "Post-merge: check by hand", "--kind", "followup",
+                                      "--json").stdout)["note"]["id"]
+        self.call("note", "resolve", note)
+        self.assertIn(f"resolve followup {pasted}", self.call("task", "status", item, "done", code=1).stderr)
         closed = json.loads(self.call("task", "status", item, "done", "--resolve-followups", "--json").stdout)
         self.assertEqual(closed["item"]["status"], "done")
-        self.assertTrue(next(row for row in closed["notes"] if row["id"] == note)["resolved_at"])
+        self.assertTrue(next(row for row in closed["notes"] if row["id"] == pasted)["resolved_at"])
 
     def test_an_edit_with_no_field_names_the_edit_command(self):
         """sd:5065: the refusal names the command that fixes it."""
