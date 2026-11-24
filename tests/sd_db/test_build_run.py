@@ -150,8 +150,10 @@ FAKE = textwrap.dedent('''
             sys.exit(3)
         # A function per round: a change outside any function holds every later blocker (sd:9769).
         added = f"def {mode}(): pass\\n"
-        Path("work.txt").write_text(Path("work.txt").read_text() + added if Path("work.txt").exists() else added)
-        git("add", "work.txt")
+        # `rule_apart`: a ruling round whose fix commits to a file no blocker names (sd:10286)
+        target = Path("apart.txt" if mode == "rule_apart" else "work.txt")
+        target.write_text(target.read_text() + added if target.exists() else added)
+        git("add", str(target))
         # `extra`: plans/extra.json adds files (name to hex bytes) and message lines, as a builder may write.
         extra = json.loads((plans / "extra.json").read_text()) if mode == "extra" else {}
         for name, data in extra.get("files", {}).items():
@@ -170,7 +172,7 @@ FAKE = textwrap.dedent('''
         prompt = sys.argv[sys.argv.index("-p") + 1]
         # `rule`: the ruling round's builder writes plans/rulings.txt to the file its brief names (sd:10286).
         named = re.search(r"JSON list to `([^`]+)`", prompt)
-        if mode == "rule" and named and (plans / "rulings.txt").exists():
+        if mode in ("rule", "rule_apart") and named and (plans / "rulings.txt").exists():
             Path(named.group(1)).write_bytes((plans / "rulings.txt").read_bytes())
         items = re.findall(r"^- sd:(\\d+)", prompt, re.M)
         items = [] if mode == "none" else items[:-1] if mode == "skip" else items
@@ -1161,14 +1163,15 @@ class Supervise(Case):
         self.assertIn("1. work.txt:1 a blocker", prompts[-1])
         self.assertEqual(self.statuses(), ["blocked"])
 
-    def ruling_round(self, rulings, *, after=("clean",), members=1, last="blocking2"):
-        """A run whose class pass left `last`'s blockers, its ruling round writing `rulings` (text, or rows)."""
+    def ruling_round(self, rulings, *, after=("clean",), members=1, last="blocking2", rule="rule_apart"):
+        """A run whose class pass left `last`'s blockers, its ruling round writing `rulings` (text, or rows).
+        `rule`: the round's fix commits apart from the blockers' file, or (`rule`) to that file."""
         R = build_run.REVIEW_ROUNDS
         self.press(members)
         self.write_pr()
         if rulings is not None:
             (self.plans / "rulings.txt").write_text(rulings if isinstance(rulings, str) else json.dumps(rulings))
-        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), "rule"],
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), rule],
                   sd_review=[*["blocking"] * R, last, *after])
         return self.supervisor().run()
 
@@ -1240,6 +1243,39 @@ class Supervise(Case):
                                           after=(after,))
                 self.assertEqual(ended.get("outcome"), "blocked", ended)
                 self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+
+    def test_a_ruling_lapses_when_its_round_changes_the_ruled_file(self):
+        """Class pass 3 on sd:10286: a ruling judged the code at the reviewed head. A fix in the same round
+        that changes a file the blocker names can make it reachable, so the reject clears nothing and takes
+        no rebuttal: the repeat parks the run, and the decision note says the ruling was not applied."""
+        for ruling in ("reject", "file"):
+            with self.subTest(ruling):
+                self.setUp()
+                ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                           {"blocker": 2, "ruling": ruling, "reason": "no failing input"}],
+                                          after=("repeat2",), rule="rule")
+                self.assertEqual(ended.get("outcome"), "blocked", ended)
+                self.assertIn("work.txt:2 a later", self.latest()["detail"])
+                self.assertEqual(self.rebuttals(), [])
+                self.assertEqual(self.db.execute("SELECT count(*) FROM state WHERE kind = 'checkpoint' AND "
+                                                 "key LIKE 'build-run-ruled:%'").fetchone()[0], 0)
+                self.assertIn("not applied: the round changed work.txt", self.decisions()[1])
+
+    def test_a_ruling_lapses_when_its_rounds_changes_do_not_read(self):
+        """Class pass 3, fail closed: with no reviewed head or no delta to read, a reject is noted, not applied."""
+        self.press()
+        supervisor = self.supervisor()
+        row = {"path": "work.txt", "line": 2, "summary": "a later", "instances": ["other.py:9"]}
+        supervisor.rule(1, row, "reject", "no failing input", "a" * 40, "example/repo", ["work.txt"], None)
+        supervisor.rule(2, row, "reject", "no failing input", "a" * 40, "example/repo", ["work.txt"], ["other.py"])
+        supervisor.rule(3, row, "reject", "no failing input", "a" * 40, "example/repo", ["work.txt"], ["far.py"])
+        first, second, third = self.decisions()
+        self.assertIn("not applied: the round's own changes did not read", first)
+        self.assertIn("not applied: the round changed other.py", second)
+        self.assertNotIn("not applied", third)
+        self.assertEqual(len(self.rebuttals()), 1)
+        self.assertEqual([key.rsplit(":", 1)[1] for (key,) in self.db.execute(
+            "SELECT key FROM state WHERE kind = 'checkpoint' AND key LIKE 'build-run-ruled:%'")], ["3"])
 
     def test_a_ruling_clears_only_its_own_place(self):
         """Review of sd:10286: a finding with the ruled blocker's file and words at another line is another

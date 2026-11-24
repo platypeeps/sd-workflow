@@ -2044,9 +2044,13 @@ class Supervisor:
         repository = self.github()
         delta = self.branch_delta(head, head) if found else {}
         changed = None if delta is None else delta.keys()
+        # What the round's own commits changed since the head its rulings judged; None when it does not read.
+        reviewed = self.round_head() if found else None
+        moved = changed_lines(self.tools.git, str(self.work), reviewed, head, env=self.env) if reviewed else None
         for number, (ruling, reason) in sorted(found.items()):
             self.once(f"ruling:{head}:{number}", functools.partial(
-                self.rule, number, blockers[number - 1], ruling, reason, head, repository, changed))
+                self.rule, number, blockers[number - 1], ruling, reason, head, repository, changed,
+                None if moved is None else moved.keys()))
         asked = [(blockers[number - 1], reason) for number, (ruling, reason) in sorted(found.items()) if ruling == "ask"]
         if asked:
             # Kept beside the body until the run ends: a replay of this end reads the same rulings.
@@ -2059,6 +2063,15 @@ class Supervisor:
         # Applied: a later walk of this run, or a retry that keeps the count, must not apply them to another head.
         self.rulings.unlink(missing_ok=True)
         return None
+
+    def round_head(self) -> str | None:
+        """The head the last review, whose blockers the ruling round ruled, read; None when it does not read."""
+        try:
+            answer = json.loads(self.out("review").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        head = (answer.get("subject") or {}).get("head") if isinstance(answer, dict) else None
+        return head if isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40,64}", head) else None
 
     def place(self, row: dict) -> str:
         """A blocker as a ruling clears its repeat: the claim itself, no folded copy (class pass on sd:10286).
@@ -2096,13 +2109,23 @@ class Supervisor:
         return dict(answer, blockers=left) if left else dict(answer, status="advisory", blockers=[])
 
     def rule(self, number: int, row: dict, ruling: str, reason: str, head: str, repository: str,
-             changed: Collection[str] | None = ()) -> None:
+             changed: Collection[str] | None = (), moved: Collection[str] | None = ()) -> None:
         """One ruling's writes in one transaction: the decision note, a filed item, the rebuttal (sd:10286).
+
+        A reject or file judged the code at the reviewed head. `moved` is what the round's own commits changed
+        since: one that changed a file the blocker names can make it reachable, so that ruling is noted and
+        not applied (no item, no clearing, no rebuttal), as when `moved` does not read (None): the review
+        finds the blocker again and the run parks, fail closed (class pass 3).
 
         The note's opening names the run, the blocker's number and the head: a supervisor that walks this step
         again without its marks (a crash before the rulings file went) finds it and writes nothing twice."""
         said = " ".join(self.summary([row]).split())
         finding = row.get("line") != "-"
+        touched = sorted({path for path, _ in self.locations(row)} & set(moved)) if moved is not None else None
+        lapsed = ("" if ruling not in ("reject", "file") or not finding or touched == [] else
+                  "; not applied: the round changed " + ", ".join(touched) if touched else
+                  "; not applied: the round's own changes did not read")
+        finding = finding and not lapsed
         mark = f"Build run {self.ident} ruling {number} at {head[:12]}: "
         with transaction(self.db):
             if self.db.execute("SELECT 1 FROM note WHERE item = ? AND kind = 'decision' AND substr(body, 1, ?) = ?",
@@ -2117,7 +2140,7 @@ class Supervisor:
                                                     f"blocker, not caused by its change ({reason}): "
                                                     f"{self.summary([row], None)}")
             add_note(self.db, self.lead, "decision",
-                     (f"{mark}{ruling.upper()}{f' as sd:{filed}' if filed else ''}, {reason}. Blocker: {said}"
+                     (f"{mark}{ruling.upper()}{f' as sd:{filed}' if filed else ''}, {reason}{lapsed}. Blocker: {said}"
                       )[:build.FINDING_MAX])
             if ruling in ("reject", "file") and finding:  # the blocker itself, for `settled`
                 record_state(self.db, "checkpoint", key=f"{RULED}{self.ident}:{head}:{number}", body=row)
