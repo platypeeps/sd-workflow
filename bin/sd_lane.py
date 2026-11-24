@@ -3598,6 +3598,8 @@ def reap(queue: Queue, entry: dict[str, Any], note: Note | None = None) -> str:
     tree, head = pathlib.Path(str(entry["worktree"])), str(entry.get("head") or "")
     if not tree.is_dir():
         return ""
+    if entry.get("delivery_pending"):  # sd:9923: `sd-ship reconcile` runs in it
+        return f"kept {tree}: delivery pending; `sd-ship reconcile` runs there"
     main = sd_lib.main_worktree_root(tree).resolve()
     branch = lane_git(tree, "branch", "--show-current") or ""
     if kept := reap_refusal(queue, entry, tree, main, branch):
@@ -3697,13 +3699,16 @@ def land(entry: dict[str, Any], outcome: dict[str, Any], environ: dict[str, str]
     gone = not worktree.is_dir()
     main = sd_lib.main_worktree_root(root if gone else worktree).resolve()
     head, merged = outcome.get("head"), str(outcome.get("merge_commit") or "")
-    note_cited(entry, merged, main, note)
+    held = outcome.get("delivery_pending")  # sd:9923: merged, and nothing closed yet
+    if not held:
+        note_cited(entry, merged, main, note)
+    merged_at = f"Landed: merged at {merged[:12]}{', delivery pending' if held else ''}"
     pruned = prune_after_merge(main, [str(head or entry.get("expected_head") or "")])  # the head that merged
     if gone:  # the merge removed the worktree with its branches; nothing is left to clean
         branch, tip = "", None
         cleanup, remove = f"Cleanup: worktree {worktree} was already removed by the merge{pruned}", None
         fields: dict[str, Any] = {"cleanup": cleanup, "remove": remove}
-        body = f"Landed: merged at {merged[:12]} (head {str(head)[:12]}). {cleanup}."
+        body = f"{merged_at} (head {str(head)[:12]}). {cleanup}."
         return land_note(fields, body, entry, environ, note, own_lock, main)
     branch, tip = lane_git(worktree, "branch", "--show-current") or "", lane_git(worktree, "rev-parse", "HEAD")
     cleanup, remove = clean_up(entry, head, main, branch, tip)
@@ -3712,7 +3717,7 @@ def land(entry: dict[str, Any], outcome: dict[str, Any], environ: dict[str, str]
         cleanup, remove = f"{cleanup}; the builder worktree {kept} stays{where}", f"git -C {kept} worktree remove {kept}"
     cleanup += pruned
     fields = {"cleanup": cleanup, "remove": remove}
-    body = f"Landed: merged at {merged[:12]} (head {str(head)[:12]}). {cleanup}."
+    body = f"{merged_at} (head {str(head)[:12]}). {cleanup}."
     if branch and tip:
         body += f" Recover: git branch {branch} {tip}."
     if remove:
@@ -5784,8 +5789,21 @@ def watch_pause() -> None:
     time.sleep(WATCH_PAUSE)
 
 
+def merge_delivered(entry: dict[str, Any] | None) -> bool:
+    """Whether `entry` merged with no delivery pending: the one end `watch --item` counts a success (sd:9923)."""
+    return entry is not None and entry.get("status") == "merged" and not entry.get("delivery_pending")
+
+
+def watched_merge(entry: dict[str, Any]) -> str:
+    """What `watch --item` says of a merged entry: its commit, and a delivery that is pending (sd:9923)."""
+    held = "" if merge_delivered(entry) else f"; {entry.get('reason') or 'delivery pending'}"
+    return f"merged at {str(entry.get('merge_commit') or '')[:12]}{held}"
+
+
 def watch_items(queue: Queue, items: list[int], write: Callable[[str], Any] = print) -> int:
     """Wait until each item's newest entry that is not cancelled ends; 0 when every one merged (sd:3565).
+
+    A merge whose delivery is pending is no success: its line says so, and the exit is 1 (sd:9923).
 
     It reads the hub alone, through `queue`, resolved once: the merge may
     remove the worktree it started in. One line per item as it ends; an item
@@ -5815,14 +5833,14 @@ def watch_items(queue: Queue, items: list[int], write: Callable[[str], Any] = pr
             if entry is None:
                 write(f"{item_ref(item, queue.repository)} none: no lane entry that is not cancelled")
             elif status == "merged":
-                write(f"{item_ref(item, queue.repository)} merged at {str(entry.get('merge_commit') or '')[:12]}")
+                write(f"{item_ref(item, queue.repository)} {watched_merge(entry)}")
                 if said := reap(queue, entry):  # sd:6727
                     write(f"{item_ref(item, queue.repository)} {said}")
             else:
                 write(f"{item_ref(item, queue.repository)} {status}: "
                       f"{entry.get('reason') or entry.get('code') or 'no reason recorded'}")
             left.remove(item)
-            merged = merged and status == "merged"
+            merged = merged and merge_delivered(entry)
         if not left:
             return 0 if merged else 1
         watch_pause()

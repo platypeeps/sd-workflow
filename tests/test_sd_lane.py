@@ -3403,6 +3403,18 @@ class Landing(Lane):
         self.assertEqual(self.notes[-1][1], f"{removed}; the builder had stopped.")
         self.assertEqual(self.watched(1), ["pack sd:1 merged at c0ffeec0ffee"])  # gone: nothing left to do
 
+    def test_a_merged_worktree_whose_delivery_is_pending_is_kept_for_its_reconcile(self) -> None:
+        """Review of sd:9923: `sd-ship reconcile` runs in the worktree the watch and the prune removed."""
+        tree, head = self.topic()
+        self.merge_lands(tree, 1, head)
+        self.answers[(1, "merge")] = {**DELIVERY_HELD, "merge_commit": "c0ffee" * 6 + "c0ff"}
+        self.drain()
+        entry = self.entries()[0]
+        self.assertIn("delivery pending", sd_lane.reap(self.store(), entry))
+        self.assertTrue(tree.exists())
+        landed = [body for _, body, _ in self.notes if body.startswith("Landed")]
+        self.assertIn("delivery pending", landed[0])
+
     def test_a_held_dirty_or_moved_merged_worktree_is_kept_and_tried_again(self) -> None:
         import sd_db
         from sd_db import sessions
@@ -4619,6 +4631,16 @@ class CitedCloses(SharedQueue):
         self.assertEqual(refused.exception.code, "teammate_held")
         self.assertIn(f"sd:{a} is held by teammate run {run['id']}", str(refused.exception))
         self.assertEqual((len(self.entries()), "push" in self.git_verbs), (before, False))
+
+    def test_a_merge_whose_delivery_is_pending_notes_no_close_by_citation(self) -> None:
+        """Review of sd:9923: the merge closed nothing yet, and each cited item was noted as closed."""
+        a, *_ = self.open
+        self.enqueue("## Summary\n\nWords.\n", f"fix(lane): the slice\n\nCloses: sd:{a}")
+        self.answers[(self.own, "merge")] = DELIVERY_HELD
+        with mock.patch.object(sd_lane, "default_runner_merge", lambda root: "auto"):
+            sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual(self.entries()[-1].get("delivery_pending"), True)
+        self.assertEqual([body for _, body, _ in self.notes if body.startswith("Closed by citation")], [])
 
     def test_each_cited_close_is_listed_in_the_body_and_noted_on_its_item(self) -> None:
         """Lane review of sd:5999, operator ruling: a reader sees every close by citation, so a wrong one is one reopen.
@@ -7369,6 +7391,15 @@ class Watch(Lane):
         self.assertEqual((code, pauses), (1, [0]))
         self.assertEqual(lines, ["pack sd:1 merged at merged-1", "pack sd:2 failed: a blocking finding"])
         self.assertEqual(self.watch_items(self.repo, 1), (0, ["pack sd:1 merged at merged-1"]))
+
+    def test_watch_item_of_a_merge_whose_delivery_is_pending_says_so_and_exits_1(self) -> None:
+        """Review of sd:9923: the watch printed `merged` and exited 0 while the item's delivery was pending."""
+        sd_lane.enqueue_entry(self.feature, 1, "fix: one", self.body, self.environ, manual=True, claim="deliver")
+        self.answers[(1, "merge")] = DELIVERY_HELD
+        sd_lane.run_lane(self.repo, self.environ, self.ship)
+        code, lines = self.watch_items(self.repo, 1)
+        self.assertEqual(code, 1, lines)
+        self.assertIn("delivery pending: Verify the combined tree", lines[0])
 
     def test_watch_item_skips_cancelled_entries_and_ends_an_item_with_none_at_once(self) -> None:
         sd_lane.enqueue_entry(self.feature, 3, "fix: three", self.body, self.environ, manual=True, claim="deliver")

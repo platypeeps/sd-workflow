@@ -2988,11 +2988,13 @@ class LaneTests(InventoryFixture):
                                                               "branch": f"task/{name}", "status": lane_status})
                 sd_lane.store(connection, "acme/widget",
                               {"id": "g1", "item": 9999, "branch": "task/ghost", "status": "failed"})
+                sd_lane.store(connection, "acme/widget", {"id": "p1", "item": 9998, "branch": "task/held",
+                                                          "status": "merged", "delivery_pending": True})
         finally:
             connection.close()
         section = status.lane_section(self.repo, {"HOME": str(self.home)})
         self.assertEqual({entry["item"]: entry["item_status"] for entry in section["entries"]},
-                         {made["open"]: "in_progress", made["queued"]: "done", 9999: None})
+                         {made["open"]: "in_progress", made["queued"]: "done", 9999: None, 9998: None})
         stream = io.StringIO()
         status._render_lane(section, stream.write)
         self.assertNotIn("task/done", stream.getvalue())

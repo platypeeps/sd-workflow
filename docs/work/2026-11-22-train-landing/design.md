@@ -143,6 +143,11 @@ from 2 to 6 fails, each member ships alone, as after sd:9899: a later
 | 7 reconcile | none | train merge in the base, GitHub reads the PR open | prepare, join, merge refuse train_landed; no push, no PUT | ship: landed member GitHub reads open |
 | 7 reconcile | none | git cannot say whether the train merge is in the base | retryable refusal; train record kept | ship: git that cannot answer |
 | 7 reconcile | entry merged, delivery_pending, code; member reconciled false | sd-ship answers merged with delivery_pending (base moved at the PUT) | entry stays merged with the blocker and a followup; its lane followups stay open | lane: delivery is pending (lead, member, recovery prepare, lone merge) |
+| 7 read | none (row merged, delivery_pending) | `lane watch --item` reads the row | line says delivery pending; exit 1 | lane: watch item of a merge whose delivery is pending |
+| 7 read | none | `sd assignments get --wait --until merged` reads the row | lane key carries delivery_pending; exit 1 | operations: until merged exits 1; sd_db: lane_state |
+| 7 read | none | watch or `lane prune` reaps the merged worktree | worktree kept: `sd-ship reconcile` runs there | lane: merged worktree is kept for its reconcile |
+| 7 read | none | `sd-status` lane section hides merged rows as history | row stays listed until its item is finished | status: failed entry of a finished item (held row) |
+| 7 note | landing notes | the landing notes `Landed` and `Closed by citation` | `Landed` says delivery pending; no close is noted | lane: notes no close by citation; kept for its reconcile |
 | 7 reconcile | items done, PRs merged | stopped midway | next claim's prepare reconciles | ship: prepare reconciles |
 | 7 reconcile | none | merge_commit_sha is not M_i | refused train_merge_mismatch | ship: mismatch |
 | 7 reconcile | none | stale train_joined, lone merge | merge_dispatch clears train_commit | ship: lone merge after join |
