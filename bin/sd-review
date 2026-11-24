@@ -2018,16 +2018,16 @@ def diff_lines(diff: str) -> tuple[dict[tuple[str, int], str], list[tuple[str, i
 def found_after(root: pathlib.Path) -> Callable[[Rebuttal, Mapping[str, Any]], bool]:
     """Whether a prior blocker's evidence is new to `ruling`, a listed rebuttal at its place. What a ruling answered
     is the evidence in its own adjudication, not a commit (sd:10191 class pass): at the ruling's head any other
-    line of evidence is new, as a later pass at that head cites. A head before the ruling's is old; any other
-    head, one git cannot place included, is after it: hold on doubt. No evidence, or no `found_at`, is none."""
-    def _lines(text: Any) -> set[str]:  # each line's ends stripped, nothing folded: `Foo`, `a  b` are other inputs
-        return {line.strip() for line in text.splitlines() if line.strip()} if isinstance(text, str) else set()
+    text is new, as a later pass at that head cites. The text itself is compared, never a normal form of it
+    (case, spacing, line breaks, order, a part): each read another repro as the answered one. A head before the
+    ruling's is old; any other head, one git cannot place included, is after it: hold on doubt. No evidence, or
+    no `found_at`, is none."""
     def _new(ruling: Rebuttal, row: Mapping[str, Any]) -> bool:
-        found, cited = row.get("found_at"), _lines(row.get("evidence"))
-        if not cited or not isinstance(found, str):
+        found, cited = row.get("found_at"), row.get("evidence")
+        if not isinstance(cited, str) or not cited.strip() or not isinstance(found, str):
             return False
         if found == ruling.head:
-            return not cited <= _lines(ruling.answered)
+            return cited != ruling.answered
         return not re.fullmatch(r"[0-9a-f]{40,64}", found) or sd_lib.git_output(["merge-base", ruling.head, found], root) != found
     return _new
 

@@ -301,10 +301,12 @@ class PriorLineTests(RepeatFixture):
                 self.assertEqual(record.get("evidence"), REPRO if expected == "blocking" else None)
 
     def test_only_the_evidence_a_ruling_answered_is_old_to_it(self) -> None:
-        """Class pass of sd:10191 (bin/sd-review:2011): what a ruling answered is the evidence in its own
-        adjudication, not a commit. At the ruling's head, evidence it did not answer is new, whole or one
-        line of a joined repro; the evidence it answered is not. A head before the ruling is old; a head on
-        another line of history, or one git cannot place, counts as after: hold on doubt."""
+        """Class pass of sd:10191 (bin/sd-review:2011, :2024): what a ruling answered is the evidence in its
+        own adjudication, not a commit and not a normal form of it. At the ruling's head only that text,
+        whole and unchanged, is old. Every other text is new, as each form the comparison once read as the
+        same shows: another case, other spacing, another line break, a blank line, another order, a repeat,
+        a part. A head before the ruling is old; a head on another line of history, or one git cannot
+        place, counts as after: hold on doubt."""
         (self.root / "src.py").write_text("".join(f"line{n}\n" for n in range(1, 41)), encoding="utf-8")
         before = self.commit("add", "src.py") and self.commit("before")
         ruled = self.commit("ruled")
@@ -312,18 +314,18 @@ class PriorLineTests(RepeatFixture):
         aside = self.commit("aside")
         self.commit("checkout", "--quiet", "-")
         new = self.commit("new")
+        answered, fresh = f"{REPRO}\nsecond line", "python3 src.py: ZeroDivisionError"
         rebutted = [sd_review.Rebuttal(ruled, "src.py", sd_review.summary_key("Division by zero"), 20, True,
-                                       "src.py", "Division by zero", "a reason", ("src.py:20",), f" {REPRO}\n\nsecond line")]
-        fresh = "python3 src.py: ZeroDivisionError"
-        cased = f"{REPRO.swapcase()}\nsecond line"  # names other identifiers: case is not folded (bin/sd-review:2012)
-        spaced = f"  {REPRO}  \n\nsecond line"  # the same lines, padded: only each line's ends are stripped
-        inner = f"{REPRO.replace(' ', '  ', 1)}\nsecond line"  # another repro input (bin/sd-review:2012)
-        for head, evidence, expected in ((ruled, fresh, "blocking"), (ruled, REPRO, "advisory"),
-                                         (ruled, cased, "blocking"), (ruled, spaced, "advisory"),
-                                         (ruled, inner, "blocking"),
-                                         (ruled, f"second line\n{REPRO}", "advisory"),
-                                         (ruled, f"{REPRO}\n{fresh}", "blocking"), (before, fresh, "advisory"),
-                                         (aside, REPRO, "blocking"), ("f" * 40, REPRO, "blocking")):
+                                       "src.py", "Division by zero", "a reason", ("src.py:20",), answered)]
+        other = {"case": answered.swapcase(), "inner spacing": answered.replace(" ", "  ", 1),
+                 "a line's end": f"{REPRO} \nsecond line", "a line's start": f"{REPRO}\n second line",
+                 "a form feed for the break": f"{REPRO}\fsecond line", "a blank line": f"{REPRO}\n\nsecond line",
+                 "order": f"second line\n{REPRO}", "a repeat": f"{REPRO}\n{answered}", "a part": REPRO,
+                 "one more line": f"{answered}\n{fresh}"}
+        for head, evidence, expected in ((ruled, answered, "advisory"), (ruled, fresh, "blocking"),
+                                         *((ruled, text, "blocking") for text in other.values()),
+                                         (before, fresh, "advisory"), (aside, answered, "blocking"),
+                                         ("f" * 40, answered, "blocking")):
             with self.subTest(found_at=head, evidence=evidence):
                 prior = [dict(finding(evidence, line=20, summary="Division by zero"), disposition="blocking",
                               prior_review={"pass": 1, "head": head})]
