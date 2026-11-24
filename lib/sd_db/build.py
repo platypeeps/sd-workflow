@@ -1159,6 +1159,8 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                          or _resumable(connection, lead, state["item"], state["status"]) is not None)
                     and not (state["run"] and state["run"]["outcome"] is None and state["run"]["step"] in LANE_STEPS)
                     and not _done(reads.items_by_ids(connection, [state["item"]]), state["item"])):
+                if (skipped := _retry_skips(connection, lead, state["status"], item, items)) is not None:
+                    raise BuildRefused(skipped)
                 leads += [] if lead in leads else [lead]
                 named.setdefault(lead, set()).add(item)
             else:
@@ -1210,6 +1212,25 @@ def _retry_row(connection, item: int):
                     and _retry_takes(connection, lead, ran["status"])):
                 return ran
     return rows[0] if rows else None
+
+
+def _retry_skips(connection, lead: int, status: str, item: int, selection: list[int]) -> str | None:
+    """Why Retry of build `lead`'s bundle in `status` would leave the pressed `item` unbuilt, or None: Build
+    refuses rather than report success over it (review of build/sd-1742). As `retry` splits (`_inside`): with
+    members the lead waits on, it builds only those, so the selection must name the lead or one of them, as the
+    lane-failed path asks; else a pressed member that waits on a bundle item leaves parked, unless the selection
+    names the lead it waits behind."""
+    lead_item = connection.execute("SELECT item FROM assignment WHERE id = ?", (lead,)).fetchone()["item"]
+    members = [member for member in _open_members(connection, lead, status) if _current(connection, member)]
+    ahead, behind = _inside(connection, lead_item, members)
+    if ahead:
+        names = ", ".join("sd:" + str(member["item"]) for member in ahead)
+        if not set(selection) & {lead_item, *(member["item"] for member in ahead)}:
+            return (f"its lead sd:{lead_item} waits on {names}; Build sd:{lead_item} or {names} to build those "
+                    f"first, then Build sd:{item}")
+    elif item in {member["item"] for member in behind} and lead_item not in selection:
+        return f"sd:{item} waits on its bundle's work; Build its lead sd:{lead_item} first, then Build sd:{item}"
+    return None
 
 
 def _retry_takes(connection, lead: int, status: str) -> bool:
