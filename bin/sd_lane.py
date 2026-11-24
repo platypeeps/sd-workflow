@@ -833,7 +833,7 @@ def enqueue_entry(worktree: pathlib.Path, item: int, title: str, body_file: path
         check_convention(worktree, title, base, head, queue.environ)
         check_docs(worktree, body, base)
         if claim == "deliver":  # an associate-only claim closes nothing (sd:3365)
-            commits = unreverted(worktree, head, branch_commits(worktree, base, head))
+            commits = unreverted(worktree, head, branch_commits(worktree, base, head), base)
             parents = branch_parents(worktree, base, head)
             cited, left = on_hub(queue, lambda connection: (
                 cited_closes(connection, item, body, commits, closes, parents, branch),
@@ -988,25 +988,33 @@ def branch_commits(worktree: pathlib.Path, base: str, head: str) -> list[tuple[s
             (chunk.strip("\n").partition("\x1f") for chunk in raw.split("\x1e")) if sha.strip()]
 
 
-def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]) -> list[tuple[str, str]]:
+def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]],
+               base: str = "") -> list[tuple[str, str]]:
     """`commits` (newest first) less each cited one a later hand-written revert undid (sd:8373).
 
     A `revert:` commit that names no sha escapes `sd_ship_body.kept_commits`:
     system sd:8242 closed though the branch undid its commit and fixes. A
     commit with a `Closes:` line counts as undone when a later commit's
     subject is a revert and the files it changed read at `head` as before
-    it. A read that fails keeps the commit, as before this check.
+    it, or as at `head`'s merge base with `origin/<base>`: the branch
+    leaves them as it found them. The second read catches a cited commit
+    stacked on an earlier one, or one main moved since (sd:10214, system
+    PR #727 closed three items so). A read that fails keeps the commit.
     """
     import sd_ship_body  # noqa: PLC0415
+    fork = lane_git(worktree, "merge-base", f"refs/remotes/origin/{base}", head) if base else None
+
+    def reads_as_at(before: str, names: list[str]) -> bool:
+        same = publish_git(worktree, "--literal-pathspecs", "diff", "--quiet", before, head, "--", *names)
+        return bool(same) and same.returncode == 0
+
     kept = []
     for index, (sha, message) in enumerate(commits):
         if "Closes:" in message and any(sd_ship_body.REVERT_SUBJECT.match(later) for _, later in commits[:index]):
             # NUL-separated and literal: git quotes a name with a tab or non-ASCII byte otherwise.
             files = publish_git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-z", "-r", sha)
             names = [name for name in files.stdout.split("\0") if name] if files and files.returncode == 0 else []
-            same = names and publish_git(worktree, "--literal-pathspecs", "diff", "--quiet", f"{sha}^", head,
-                                         "--", *names)
-            if same and same.returncode == 0:
+            if names and any(reads_as_at(before, names) for before in (f"{sha}^", fork) if before):
                 continue
         kept.append((sha, message))
     return kept

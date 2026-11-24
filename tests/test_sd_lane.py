@@ -3639,6 +3639,31 @@ class CitedCloses(SharedQueue):
         entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
         self.assertEqual(entry["closes"], [b])
 
+    def test_a_hand_written_revert_to_the_base_closes_nothing_a_stacked_commit_cited(self) -> None:
+        """sd:10214: system PR #727 closed three items whose work a path-restore revert had undone.
+
+        Two cited commits edit one file, so the second's parent is not the
+        base; the revert puts the file back as the base has it. Reading
+        only `sha^` kept both, and enqueue closed them.
+        """
+        a, b, c, *_ = self.open
+        tree, _ = self.committed("topic-stacked-revert")
+        (tree / "meter.txt").write_text("one reader\n", encoding="utf-8")
+        git(tree, "add", "meter.txt")
+        git(tree, "commit", "-q", "-m", f"feat: the first reader\n\nCloses: sd:{a}")
+        (tree / "meter.txt").write_text("one reader\ntwo readers\n", encoding="utf-8")
+        git(tree, "commit", "-q", "-am", f"feat: the second reader\n\nCloses: sd:{b}")
+        git(tree, "rm", "-q", "meter.txt")
+        git(tree, "commit", "-q", "-m", "revert: drop the readers from this bundle\n\nThe operator split it.")
+        git(tree, "commit", "-q", "--allow-empty", "-m", f"fix: the gate\n\nCloses: sd:{c}")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [c])
+        # The build run reads delivery the same way and names each as an --item (system sd:9928's path).
+        import sd_operations
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {c})
+
     def test_a_revert_of_other_work_keeps_a_close_on_a_quoted_filename(self) -> None:
         """sd:8373 review: git quotes a name with a tab or non-ASCII byte; a quoted pathspec matched nothing."""
         a, b, *_ = self.open
