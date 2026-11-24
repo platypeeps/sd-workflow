@@ -3094,26 +3094,25 @@ def follow_prepare(queue: Queue, row: dict[str, Any], placed: str | None) -> dic
 def prepared_head(tree: pathlib.Path, branch: str, expected: str, placed: str | None) -> str | None:
     """The published head a member's train prepare left for `expected`, `expected`, or None (round 3 of sd:9923).
 
-    In order: the catch-up merge prepare pushed (`pushed_catch_up`);
-    `origin/<branch>` when the worktree is at it and it is the head
+    `origin/<branch>` when it is the catch-up merge prepare pushed
+    (`catch_up_of`), or when the worktree is at it and it is the head
     `sd-ship prepare` answered ready or prepare's rebase of `expected`
     (`rebase_of`). A rewrite only in the worktree stays out of the shared
-    queue: another lane host could not fetch it. None when a read fails
-    and the worktree is not at `expected`: prepare may have pushed a
-    rewrite no read could see.
+    queue: another lane host could not fetch it. None is unknown, never
+    "did not move": `origin` did not answer while the worktree is off
+    `expected`, or a read of the commits failed (class pass of sd:9923).
     """
-    pushed = pushed_catch_up(tree, branch, expected)
-    if pushed != expected:
-        return pushed
     listed = publish_git(tree, "ls-remote", "origin", f"refs/heads/{branch}") if branch else None
-    known = listed is not None and listed.returncode == 0
-    tip = (listed.stdout.split() or [""])[0] if listed is not None and known else ""
     try:
-        head = read_git(tree, "rev-parse", "HEAD").stdout.strip()
-        if not known:
-            return expected if head == expected else None
-        return tip if tip and tip == head != expected and (tip == placed or rebase_of(tree, tip, expected)) \
-            else expected
+        if listed is None or listed.returncode != 0:
+            return expected if read_git(tree, "rev-parse", "HEAD").stdout.strip() == expected else None
+        tip = (listed.stdout.split() or [""])[0]
+        if not tip or tip == expected:
+            return expected
+        if catch_up_of(tree, tip, expected):
+            return tip
+        at_tip = read_git(tree, "rev-parse", "HEAD").stdout.strip() == tip
+        return tip if at_tip and (tip == placed or rebase_of(tree, tip, expected)) else expected
     except LaneError:
         return None
 

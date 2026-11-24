@@ -5852,6 +5852,9 @@ class AnyHost(SharedQueue):
         self.assertEqual(sd_lane.prepared_head(tree, "unit", queued, extra), queued)  # answered, not pushed
         git(tree, "push", "-q", "--force", "origin", "HEAD:refs/heads/unit")
         self.assertEqual(sd_lane.prepared_head(tree, "unit", queued, extra), extra)  # the head prepare answered
+        with mock.patch.object(sd_lane, "catch_up_of", mock.Mock(side_effect=sd_lane.LaneError("no read"))), \
+                mock.patch.object(sd_lane, "rebase_of", lambda *args: False):
+            self.assertIsNone(sd_lane.prepared_head(tree, "unit", queued, None))  # unread is not "did not move"
         git(tree, "reset", "-q", "--hard", head)
         self.assertFalse(sd_lane.rebase_of(tree, self.foreign_merge(tree), queued))  # a merge in the chain
         git(tree, "reset", "-q", "--hard", queued)
