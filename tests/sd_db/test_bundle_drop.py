@@ -1410,3 +1410,27 @@ class DropLaneMove(Repo):
             build._requeue_beat_blocked(self.db, frozenset({"sat-a"}))
         self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", lead), "queued",
                          "the host holding the work recovers it")
+
+
+class DropDesign(Repo):
+    """Review of sd:10096: a design ships with code, never alone. A dropped design built alone, and a kept
+    bundle of designs only, each reached a delivery that refuses a design-only branch."""
+
+    def designs(self, *items):
+        for item in items:
+            self.db.execute("UPDATE item SET fields = json_set(COALESCE(fields, '{}'), '$.work_kind', "
+                            "'design') WHERE id = ?", (item,))
+
+    def test_dropping_a_design_refuses_and_writes_nothing(self):
+        items, ids, run = self.bundle()
+        self.designs(items[1])
+        with self.assertRaisesRegex(DROP.DropRefused, f"sd:{items[1]} is a design"):
+            DROP.drop_item(self.db, build, items[1], who="operator")
+        self.unmade(run)
+
+    def test_a_drop_that_keeps_only_designs_refuses_and_writes_nothing(self):
+        items, ids, run = self.bundle()
+        self.designs(items[1], items[2])
+        with self.assertRaisesRegex(DROP.DropRefused, "keeps only design"):
+            DROP.drop_item(self.db, build, items[0], who="operator")
+        self.unmade(run)

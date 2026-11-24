@@ -977,6 +977,14 @@ def drop_plan(connection, item: int) -> dict:
         raise BuildRefused(f"Drop refused: its lead sd:{current['item']} is done")
     if not kept:
         raise BuildRefused(f"Drop refused: sd:{item} is the only open item of build {lead}; Retry or cancel it")
+    # A design ships with code (`design_only_delivery`): one dropped builds alone, and a kept bundle of designs
+    # alone leads one; either run blocks at delivery (review of sd:10096).
+    if aboard(connection, [item]):
+        raise BuildRefused(f"Drop refused: sd:{item} is a design, which ships with its bundle's code; "
+                           f"move it to planning to take it out")
+    if aboard(connection, [member["item"] for member in kept]) == {member["item"] for member in kept}:
+        raise BuildRefused(f"Drop refused: build {lead} keeps only design items without sd:{item}, and a design "
+                           f"ships with code; Retry or cancel it")
     # As Retry: a kept member whose item a newer build owns would resume this older branch over that work.
     for member in kept:
         if not _current(connection, member):
