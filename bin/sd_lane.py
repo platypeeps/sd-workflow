@@ -3079,11 +3079,13 @@ def follow_prepare(queue: Queue, row: dict[str, Any], placed: str | None) -> dic
     the branch: a catch-up merge, or under a rebase policy a rewrite that
     is force-pushed. A row left at the old head skips `HEAD_MOVED` on its
     next claim. The row moves only while it is pending at the head the
-    train read, so a re-enqueue in between wins. A write that fails leaves
-    the mark, and the member's own claim settles it (`settle_mark`).
+    train read, so a re-enqueue in between wins. A write that fails, or a
+    head no read could see, leaves the mark, and the member's own claim
+    settles it (`settle_mark`).
     """
-    new = prepared_head(pathlib.Path(row["worktree"]), str(row.get("branch") or ""), row["expected_head"],
-                        placed) or row["expected_head"]
+    new = prepared_head(pathlib.Path(row["worktree"]), str(row.get("branch") or ""), row["expected_head"], placed)
+    if new is None:  # unknown: the mark stays for the member's claim (round 4 of sd:9923)
+        return None
     if not mark_row(queue, row, {"expected_head": new}, drop=(TRAIN_PREPARING,)):
         return None
     return {**row, "expected_head": new}

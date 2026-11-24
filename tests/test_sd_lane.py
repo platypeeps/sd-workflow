@@ -2701,6 +2701,22 @@ class TrainLanding(Trees):
         self.assertEqual((second["status"], second["expected_head"]), ("merged", head))
         self.assertNotIn(sd_lane.TRAIN_PREPARING, second)
 
+    def test_a_follow_that_cannot_read_the_rebased_head_keeps_the_mark(self) -> None:
+        """Round 4 of sd:9923: both reads failed, so the follow dropped the mark and kept the old head."""
+        self.queue_three()
+        old = self.entries()[1]["expected_head"]
+        sd_lane.update(self.store(), lambda rows: rows[1].update({sd_lane.TRAIN_PREPARING: old}))
+        self.commit_files(self.repo, {"later.txt": "l\n"}, "main moved again")
+        git(self.repo, "push", "-q", "origin", "main")
+        git(self.second, "fetch", "-q", "origin")
+        git(self.second, "rebase", "-q", "origin/main")
+        git(self.second, "commit", "-q", "--amend", "-m", "second\n\nDelivers: sd:2")
+        git(self.second, "push", "-q", "--force", "origin", "HEAD:refs/heads/second")
+        with mock.patch.object(sd_lane, "publish_git", lambda *args: None):  # both ls-remote reads fail
+            followed = sd_lane.follow_prepare(self.store(), self.entries()[1], None)
+        second = self.entries()[1]
+        self.assertEqual((followed, second["expected_head"], second.get(sd_lane.TRAIN_PREPARING)), (None, old, old))
+
     def test_a_member_whose_mark_cannot_be_written_is_not_prepared_by_the_train(self) -> None:
         """No mark, no prepare: a write that fails before it leaves the branch where the row says."""
         armed: list[bool] = []
