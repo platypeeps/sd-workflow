@@ -294,20 +294,25 @@ def _log_quiet(path: str | None, now: str) -> int | None:
 def review_rounds(connection, items: list[int]) -> dict[int, int]:
     """Each item's review rounds that left blockers, builder and lane (pack sd:10306): its `Review round blockers:`
     notes (a review, gate or enqueue check that blocked), plus its lane prepares a local review blocked. Clean rounds
-    leave no note, so they are not counted."""
+    leave no note, so they are not counted. A bundle notes its rounds on its lead item only: `_members` adds them."""
     if not items:
         return {}
     marks = ",".join("?" * len(items))
     return {row[0]: row[1] for row in connection.execute(
         f"SELECT item, COUNT(*) FROM note WHERE item IN ({marks}) AND (body LIKE 'Review round blockers:%' "
-        "OR (body LIKE 'Lane failed in prepare%' AND body LIKE '%local review blocking%')) GROUP BY item", items)}
+        "OR body LIKE 'Lane failed in prepare at %: local review blocking%') GROUP BY item", items)}
 
 
 def _members(connection, run: dict) -> list[dict]:
     rows = build.run(connection, run["id"])["members"]
     titles = reads.items_by_ids(connection, [row["item"] for row in rows])
+    # A bundle's builder rounds are noted on its lead's item alone (lead review): every member ran them.
+    lead = next((row["item"] for row in rows if row["id"] == run["assignment"]), None)
     rounds = review_rounds(connection, [row["item"] for row in rows])
-    return [{"item": row["item"], "assignment": row["id"], "status": row["status"], "reviews": rounds.get(row["item"], 0),
+
+    def shared(item: int) -> int:
+        return rounds.get(item, 0) + (rounds.get(lead, 0) if lead is not None and item != lead else 0)
+    return [{"item": row["item"], "assignment": row["id"], "status": row["status"], "reviews": shared(row["item"]),
              "title": titles[row["item"]]["title"] if row["item"] in titles else ""} for row in rows]
 
 
