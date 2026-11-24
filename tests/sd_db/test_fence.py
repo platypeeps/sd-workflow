@@ -6,7 +6,7 @@ setting `sd.hub_name`. A returning old hub still has its database and no
 Each caller reads four answers: `holder` and `off` (no setting: a fleet that
 never named its hub) go on; `elsewhere` (another node holds the name) and
 `unknown` (the setting or Tailscale does not answer) refuse, except that a
-running listener serves on a Tailscale `unknown` (sd:10221).
+running listener serves reads on a Tailscale `unknown` (sd:10221).
 
 `tailscale` is the harness stub on PATH; no test reaches the real daemon.
 """
@@ -405,21 +405,51 @@ class TheLiveServer(StubCase):
                 self.assertEqual(rebuilt.cause, cause, answers[0]["error"])
                 self.assertIn("this machine is not the hub", str(rebuilt))
 
-    def test_a_partition_after_start_keeps_serving(self):
+    def test_a_partition_after_start_keeps_serving_reads(self):
         """sd:10221, ruling on note #78838: a Tailscale `unknown` closed every satellite
-        session for the length of a control-plane drop; the listener refuses on
-        `elsewhere` alone, like `hub.write_role`."""
+        session for the length of a control-plane drop; the listener now serves reads."""
         self.enterContext(mock.patch.object(serve, "FENCE_SECONDS", 0.0))
         self.assertTrue(self.session(remote.request("close"))[0]["ok"])
         self.rename(HUB_NAME + ".", online=False)
-        rid = remote.new_request_id()
         answers = self.session(
-            remote.request("execute", sql="BEGIN IMMEDIATE", params=None, rid=rid),
-            remote.request("execute", sql="INSERT INTO probe (name) VALUES ('kept')", params=None),
-            remote.request("execute", sql="COMMIT", params=None, rid=rid),
+            remote.request("execute", sql="SELECT count(*) FROM probe", params=None),
             remote.request("close"))
         self.assertTrue(all(a and a["ok"] for a in answers), answers)
-        self.assertEqual(self.rows(), 1)
+
+    def test_a_partition_after_start_refuses_a_write(self):
+        """sd:10221 review: an old hub the console renamed while it was cut off
+        reads `unknown` too, so a write, lone or batched, refuses and rolls back."""
+        self.enterContext(mock.patch.object(serve, "FENCE_SECONDS", 0.0))
+        self.rename(HUB_NAME + ".", online=False)
+        lone = self.session(remote.request("execute", sql="INSERT INTO probe (name) VALUES ('lone')",
+                                           params=None, rid=remote.new_request_id()),
+                            remote.request("close"))
+        rid = remote.new_request_id()
+        batch = self.session(remote.request("execute", sql="BEGIN IMMEDIATE", params=None, rid=rid),
+                             remote.request("close"))
+        for answers in (lone, batch):
+            self.assertTrue(answers[0]["ok"], "the open, a read, is served")
+            self.assertFalse(answers[1]["ok"], answers)
+            self.assertIn("not connected to the Tailscale control plane", answers[1]["error"]["text"])
+            self.assertEqual(answers[2:], [None])
+        self.assertEqual(self.rows(), 0)
+
+    def test_a_partition_mid_transaction_refuses_the_commit(self):
+        """sd:10221 review: BEGIN passed while Tailscale answered; the commit asks again."""
+        self.enterContext(mock.patch.object(serve, "FENCE_SECONDS", 0.0))
+        rid = remote.new_request_id()
+
+        def partition():
+            self.rename(HUB_NAME + ".", online=False)
+        answers = self.session(
+            remote.request("execute", sql="BEGIN IMMEDIATE", params=None, rid=rid),
+            remote.request("execute", sql="INSERT INTO probe (name) VALUES ('stale')", params=None),
+            remote.request("execute", sql="COMMIT", params=None, rid=rid),
+            between=partition, after=2)
+        self.assertTrue(all(a["ok"] for a in answers[:3]), answers)
+        self.assertFalse(answers[3]["ok"], answers)
+        self.assertIn("not connected to the Tailscale control plane", answers[3]["error"]["text"])
+        self.assertEqual(self.rows(), 0, "a partitioned hub committed a row")
 
     def test_an_unknown_not_from_tailscale_still_refuses(self):
         """sd:10221: only the Tailscale cause serves; a setting that does not read refuses."""

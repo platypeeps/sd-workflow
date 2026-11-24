@@ -452,7 +452,7 @@ class Session(socketserver.BaseRequestHandler):
         if self.server.node is not None:  # type: ignore[attr-defined]
             # Before BEGIN takes the write lock, so a short transaction's commit
             # trusts this answer and asks Tailscale nothing under it (sd:7042).
-            fenced = self.server.fence(within=FENCE_SECONDS / 2)  # type: ignore[attr-defined]
+            fenced = self.server.fence(within=FENCE_SECONDS / 2, write=True)  # type: ignore[attr-defined]
             if fenced is not None:
                 raise fenced_by(fenced)
         owners = self.server.owners  # type: ignore[attr-defined]
@@ -529,7 +529,7 @@ class Session(socketserver.BaseRequestHandler):
                 if self.server.node is not None:  # type: ignore[attr-defined]
                     # At most `FENCE_SECONDS` old and never across a sleep (sd:4044), as
                     # the frame's own check; asked afresh it held the write lock (sd:7042).
-                    fenced = self.server.fence()  # type: ignore[attr-defined]
+                    fenced = self.server.fence(write=True)  # type: ignore[attr-defined]
                     if fenced is not None:
                         raise fenced_by(fenced)
                 # A transaction that changed nothing gets no row: committed
@@ -654,7 +654,8 @@ class Session(socketserver.BaseRequestHandler):
                             f"{remote.PROTOCOL_VERSION}"
                         )
                     if server.node is not None:
-                        # Every frame, open or not: a demoted hub writes nothing and serves no stale read.
+                        # Every frame, open or not: a demoted hub serves no stale read. A
+                        # Tailscale `unknown` serves reads; its writes refuse at BEGIN and COMMIT.
                         fenced = server.fence()
                         if fenced is not None:
                             raise fenced_by(fenced)
@@ -856,14 +857,16 @@ class Server(socketserver.ThreadingTCPServer):
         self.fenced = hub.Held()
         super().__init__((LOOPBACK if node is None else str(node.address), port), Session)
 
-    def fence(self, *, within: float | None = None) -> hub.Role | None:
+    def fence(self, *, within: float | None = None, write: bool = False) -> hub.Role | None:
         """The refusing role when this machine no longer holds the hub role, or `None`: asked
         again past `within` seconds, `FENCE_SECONDS` by default, or once the wall clock jumped
         (a sleep). A frame with a held answer waits on no ask (sd:7042). An `unknown` that
-        Tailscale gave serves, like `hub.write_role`: refusing it closed every satellite
-        session for a whole control-plane drop (sd:10221). Any other `unknown` refuses."""
+        Tailscale gave serves a read: refusing it closed every satellite session for a whole
+        control-plane drop (sd:10221). A `write` refuses it: an old hub the console renamed
+        while cut off reads `unknown` too, and must not commit to its stale database. Every
+        tailnet write passes `_begin_write` and `_commit`, which ask with `write`."""
         found = self.fenced.get(lambda: hub.role_at(self.database), FENCE_SECONDS if within is None else within)
-        if found.state == "unknown" and found.cause == "tailscale":
+        if not write and found.state == "unknown" and found.cause == "tailscale":
             return None
         return found if found.refuses else None
 
