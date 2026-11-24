@@ -988,6 +988,34 @@ def branch_commits(worktree: pathlib.Path, base: str, head: str) -> list[tuple[s
             (chunk.strip("\n").partition("\x1f") for chunk in raw.split("\x1e")) if sha.strip()]
 
 
+def work_left(now: bool, revert: bool, held: list[tuple[bool, bool | None]], back: Callable[[], bool],
+              forked_in: Callable[[], bool]) -> bool | None:
+    """Who took a cited commit's work out, as one descendant leaves it: None while it holds the work, True where
+    reverts alone took it out, False where another change did (sd:10214 class pass 3).
+
+    `now` says its files read as before the cited commit, `revert` that its
+    subject is a revert's, and `held` gives each parent's own reading and
+    verdict. `back` answers whether the files read as the cited commit left
+    them; `forked_in` whether its two parents forked with the work in.
+
+    Files that do not read as before hold the work when no parent had it
+    out, when a merged parent holds it, or when they are `back`. Any other
+    content at the path is not the work: the parents' verdict stands.
+    Files that read as before are carried from the parents when all had the
+    work out, or when a merge's two lines forked with it in: one side
+    reverted it. Forked without it, the other side put it back, and the
+    merge took it out itself, as any commit no parent explains: its own
+    subject decides. A carry from a parent with other content at the path
+    needs this commit to be a revert too, or the close is kept.
+    """
+    out = [(was, verdict) for was, verdict in held if verdict is not None]
+    if not now:
+        return None if not out or len(out) < len(held) or back() else all(verdict for _, verdict in out)
+    if out and (len(out) == len(held) or (len(held) == 2 and forked_in())):
+        return all(verdict and (was or revert) for was, verdict in out)
+    return revert
+
+
 def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]],
                base: str = "") -> list[tuple[str, str]]:
     """`commits` (newest first), each cited one a later hand-written revert undid with its message emptied (sd:8373).
@@ -1009,7 +1037,9 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     removes a moved file undoes it. A read that fails keeps the commit.
     A commit whose own files read as before undid nothing later; a merge
     that carries the before state from a parent took nothing out itself
-    (sd:10214 review, round 5).
+    (sd:10214 review, round 5). The verdict is the head's own: who took
+    the work out is carried commit by commit, so a removal a later commit
+    put back, or a revert one reapplied, decides nothing (class pass 3).
 
     `kept_commits` reads this list after it, so this check hides none of
     its evidence (sd:10214 review). An undone commit stays in place with
@@ -1057,19 +1087,34 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         if after is None:
             return False
         parents = {line.split()[0]: line.split()[1:] for line in after.splitlines() if line.strip()}
-        state, reverted = {sha: False}, False
+        # Who took the work out, read per commit and carried to the head (`work_left`, class pass 3). The
+        # head's own entry decides: a removal a later commit put back, or a revert one reapplied, decides nothing.
+        own, unread = blobs(sha, names), []
+        if own is None:
+            return False
+
+        def git_answered(answer: bool | None) -> bool:
+            unread.extend([answer] if answer is None else [])
+            return bool(answer)
+
+        before: dict[str, bool] = {sha: False}
+        left: dict[str, bool | None] = {sha: None}
         for later, text in reversed(commits[:index]):  # --topo-order: each parent before its child
             if later not in parents:
                 continue
-            now = state[later] = reads_before(sha, later, names, want)
-            if now is None:
+            held = [parent for parent in parents[later] if parent in left]
+
+            def forked_in(held: list[str] = held) -> bool:
+                forked = (lane_git(worktree, "merge-base", *held) or "").strip()
+                return forked in left and left[forked] is None
+
+            before[later] = git_answered(reads_before(sha, later, names, want))
+            left[later] = work_left(before[later], bool(sd_ship_body.REVERT_SUBJECT.match(text)),
+                                    [(before[parent], left[parent]) for parent in held],
+                                    lambda later=later: git_answered(reads_before(sha, later, names, own)), forked_in)
+            if unread:
                 return False
-            # A commit took the work out only where no parent had: a merge carries a revert from one side.
-            if now and not any(state.get(parent) for parent in parents[later]):
-                if not sd_ship_body.REVERT_SUBJECT.match(text):
-                    return False  # a change that is no revert took the work out
-                reverted = True
-        return reverted
+        return left.get(next(iter(parents), "")) is True  # rev-list names the head first
 
     kept = []
     for index, (sha, message) in enumerate(commits):

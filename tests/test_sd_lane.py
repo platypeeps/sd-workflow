@@ -3884,6 +3884,62 @@ class CitedCloses(SharedQueue):
                 kept = sd_lane.unreverted(tree, head, commits, "main")
                 self.assertEqual([sha for sha, message in kept if f"sd:{a}" in message], [])
 
+    def test_a_merge_that_drops_a_reapplied_fix_keeps_its_close(self) -> None:
+        """sd:10214 class pass 3: after a revert and a reapply, a merge whose other parent never took the work back
+        takes it out itself. It is no revert, so the close stays, as for any later change that is none (sd:8373)."""
+        import sd_operations
+        a, b, *_ = self.open
+        tree, _ = self.committed("topic-merge-drops-reapply")
+        (tree / "notes.txt").write_text("notes\n", encoding="utf-8")
+        git(tree, "add", "notes.txt")
+        git(tree, "commit", "-q", "-m", "docs: notes")
+        (tree / "work.txt").write_text("the reader\n", encoding="utf-8")
+        git(tree, "add", "work.txt")
+        git(tree, "commit", "-q", "-m", f"feat: implement\n\nCloses: sd:{a}")
+        git(tree, "rm", "-q", "work.txt")
+        git(tree, "commit", "-q", "-m", "revert: hold the reader")
+        held = git(tree, "rev-parse", "HEAD")
+        (tree / "work.txt").write_text("the reader\n", encoding="utf-8")
+        git(tree, "add", "work.txt")
+        git(tree, "commit", "-q", "-m", "feat: the reader again")
+        again = git(tree, "rev-parse", "HEAD")
+        git(tree, "checkout", "-q", "--detach", held)
+        (tree / "other.txt").write_text("other\n", encoding="utf-8")
+        git(tree, "add", "other.txt")
+        git(tree, "commit", "-q", "-m", "docs: other")
+        git(tree, "merge", "-q", "--no-ff", "--no-commit", again)
+        (tree / "notes.txt").write_text("notes\nthe reader\n", encoding="utf-8")
+        git(tree, "rm", "-q", "-f", "work.txt")
+        git(tree, "add", "notes.txt")
+        git(tree, "commit", "-q", "-m", "Merge the two lines")
+        git(tree, "commit", "-q", "--allow-empty", "-m", f"fix: the gate\n\nCloses: sd:{b}")
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a, b})
+        kept = sd_lane.unreverted(tree, head, sd_lane.branch_commits(tree, "main", head), "main")
+        self.assertEqual(len([sha for sha, message in kept if f"sd:{a}" in message]), 1)
+
+    def test_a_revert_of_work_put_back_after_a_plain_removal_closes_nothing_it_undid(self) -> None:
+        """sd:10214 class pass 3: who undid the work is the commit the head's reading comes from. A plain removal
+        a later commit put back decides nothing; the revert after it took the work out."""
+        import sd_operations
+        a, b, *_ = self.open
+        tree, _ = self.committed("topic-restored-then-reverted")
+        for subject in (f"feat: implement\n\nCloses: sd:{a}", "chore: take the reader out", "feat: the reader again",
+                        "revert: hold the reader"):
+            if (tree / "work.txt").exists():
+                git(tree, "rm", "-q", "work.txt")
+            else:
+                (tree / "work.txt").write_text("the reader\n", encoding="utf-8")
+                git(tree, "add", "work.txt")
+            git(tree, "commit", "-q", "-m", subject)
+        git(tree, "commit", "-q", "--allow-empty", "-m", f"fix: the gate\n\nCloses: sd:{b}")
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertFalse((tree / "work.txt").exists())
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {b})
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [b])
+
     def test_an_associate_only_claim_closes_nothing_it_cites(self) -> None:
         entry = self.enqueue("Words.\n", f"fix: the slice\n\nCloses: sd:{self.open[0]}", claim="associate-only")
         self.assertEqual(entry["closes"], [])
