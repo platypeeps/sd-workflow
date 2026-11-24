@@ -1148,6 +1148,19 @@ class Advisories(Repo):
         with self.assertRaisesRegex(DROP.DropRefused, f"work of sd:{items[1]}"):
             DROP.drop_item(self.db, build, items[3], who="operator")
 
+    def test_a_done_member_whose_main_delivery_is_held_at_merge_still_refuses(self):
+        """Review of sd:10021: a squash whose `Reviewed-base:` is not its parent is held at merge, so the merge
+        guard (`sd_lib._closed_by`) reads it as delivering nothing; the drop read it as delivered."""
+        items, run = self.four()
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[1],))
+        self.main_moves("x.txt", "x\n")
+        other = self.root / "other"
+        git(other, "commit", "-q", "--amend", "-m",
+            f"feat: x\n\nDelivers: sd:{items[1]}\nReviewed-base: {'0' * 40}")
+        git(other, "push", "-q", "-f", "origin", "HEAD:main")
+        with self.assertRaisesRegex(DROP.DropRefused, f"work of sd:{items[1]}"):
+            DROP.drop_item(self.db, build, items[3], who="operator")
+
     def test_dropping_a_done_lead_queues_the_kept_items_and_leaves_it_done(self):
         items, (lead, second, third), run = self.bundle()
         self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (items[0],))
