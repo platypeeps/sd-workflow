@@ -2008,8 +2008,8 @@ def found_after(root: pathlib.Path) -> Callable[[Rebuttal, Mapping[str, Any]], b
     is the evidence in its own adjudication, not a commit (sd:10191 class pass): at the ruling's head any other
     line of evidence is new, as a later pass at that head cites. A head before the ruling's is old; any other
     head, one git cannot place included, is after it: hold on doubt. No evidence, or no `found_at`, is none."""
-    def _lines(text: Any) -> set[str]:
-        return {_folded(line) for line in text.splitlines() if line.strip()} if isinstance(text, str) else set()
+    def _lines(text: Any) -> set[str]:  # whitespace folded, not case: `Foo` and `foo` are other identifiers
+        return {" ".join(line.split()) for line in text.splitlines() if line.strip()} if isinstance(text, str) else set()
     def _new(ruling: Rebuttal, row: Mapping[str, Any]) -> bool:
         found, cited = row.get("found_at"), _lines(row.get("evidence"))
         if not cited or not isinstance(found, str):
