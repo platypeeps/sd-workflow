@@ -814,7 +814,8 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
       ok: 'Reject and enqueue', keep: 'Leave it blocked', danger: false,
       // Every finding the review key covers, whole: the refusal's own text names only the first few (sd:9966).
       body: `${(r.review_findings || []).length} blocking finding${(r.review_findings || []).length === 1 ? '' : 's'} of the lane's review, each whole: ${(r.review_findings || []).map((f, n) => `(${n + 1}) ${f}`).join(' ')} Each is recorded as rebutted with this reason through sd-ship adjudicate; then the entry is queued again at head ${head.slice(0, 12)}: prepare reuses that review and the rebuttal clears it.`,
-      cli: `sd-ship -C ${shell.shq(l.path)} lane retry ${item} --expected-head ${head}`,
+      // sd:10246: both steps; `lane retry` alone skips the rebuttal and the same review blocks again.
+      cli: `sd-ship -C ${shell.shq(r.worktree || '')} adjudicate --item ${item} --expected-head ${r.reviewed_head || head} --json --dispositions-file <the template, each finding rebutted with the reason> && sd-ship -C ${shell.shq(l.path)} lane retry ${item} --expected-head ${head}`,
       fields: [{ name: 'reason', label: 'Reason a reader can check', required: true, multiline: true, value: '' }] });
     return yes ? String(values && values.reason || '').trim() : '';
   }
