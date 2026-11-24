@@ -316,9 +316,11 @@ class PriorLineTests(RepeatFixture):
                                        "src.py", "Division by zero", "a reason", ("src.py:20",), f" {REPRO}\n\nsecond line")]
         fresh = "python3 src.py: ZeroDivisionError"
         cased = f"{REPRO.swapcase()}\nsecond line"  # names other identifiers: case is not folded (bin/sd-review:2012)
-        spaced = f"  {REPRO}  \n\nsecond   line"  # the same evidence, spaced otherwise: whitespace is folded
+        spaced = f"  {REPRO}  \n\nsecond line"  # the same lines, padded: only each line's ends are stripped
+        inner = f"{REPRO.replace(' ', '  ', 1)}\nsecond line"  # another repro input (bin/sd-review:2012)
         for head, evidence, expected in ((ruled, fresh, "blocking"), (ruled, REPRO, "advisory"),
                                          (ruled, cased, "blocking"), (ruled, spaced, "advisory"),
+                                         (ruled, inner, "blocking"),
                                          (ruled, f"second line\n{REPRO}", "advisory"),
                                          (ruled, f"{REPRO}\n{fresh}", "blocking"), (before, fresh, "advisory"),
                                          (aside, REPRO, "blocking"), ("f" * 40, REPRO, "blocking")):
