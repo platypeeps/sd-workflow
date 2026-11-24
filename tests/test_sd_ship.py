@@ -4068,6 +4068,23 @@ roles:
         self.assertEqual(self.connection.execute("SELECT status FROM item WHERE id=?", (self.item,)).fetchone()[0], "done")
         self.assertEqual(len([call for call in self.remote.calls if call.method == "PUT"]), 1)
 
+    def test_a_reconcile_that_delivers_clears_the_lanes_pending_delivery(self):
+        """Review of sd:9923: a reconcile that delivered left the lane row reading delivery pending;
+        a lane write that fails is reported, not swallowed."""
+        acceptance = self.directory / "acceptance.json"
+        acceptance.write_text(json.dumps({"item": self.item, "complete": True, "criteria": [{"criterion": "actual scope", "passed": True, "evidence": "fixture-check-pass"}]}))
+        self.prepare("--deliver", "--acceptance-file", str(acceptance))
+        with patch("sd_db.progress.deliver_work", side_effect=sqlite3.OperationalError("DB write unavailable")):
+            self.assertTrue(self.merge()["delivery_pending"])
+        refused = ship.sd_lane.LaneError("hub down", code=ship.sd_lane.HUB_UNAVAILABLE)
+        with patch.object(ship.sd_lane, "delivery_settled", side_effect=refused) as settled:
+            fixed = self.operation("reconcile").reconcile()
+        self.assertEqual((fixed["delivery_pending"], fixed.get("lane_unsettled")), (False, "hub down"))
+        self.assertEqual(settled.call_args.args[1], self.item)
+        with patch.object(ship.sd_lane, "delivery_settled", return_value=1) as settled:
+            again = self.operation("reconcile").reconcile()
+        self.assertEqual((again["delivery_pending"], "lane_unsettled" in again, settled.call_count), (False, False, 1))
+
     def waiver_file(self, *rows: dict) -> pathlib.Path:
         """An acceptance file for the claimed item: a passing row, then `rows`."""
         acceptance = self.directory / "acceptance.json"

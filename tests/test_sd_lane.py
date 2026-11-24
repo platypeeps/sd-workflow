@@ -3415,6 +3415,20 @@ class Landing(Lane):
         landed = [body for _, body, _ in self.notes if body.startswith("Landed")]
         self.assertIn("delivery pending", landed[0])
 
+    def test_a_reconcile_that_delivers_clears_the_pending_delivery(self) -> None:
+        """Review of sd:9923: a successful `sd-ship reconcile` left the row reading delivery pending."""
+        tree, head = self.topic()
+        self.merge_lands(tree, 1, head)
+        self.answers[(1, "merge")] = {**DELIVERY_HELD, "merge_commit": "c0ffee" * 6 + "c0ff"}
+        self.drain()
+        self.assertFalse(sd_lane.merge_delivered(self.entries()[0]))
+        sd_lane.delivery_settled(tree, 1, self.environ)
+        entry = self.entries()[0]
+        self.assertTrue(sd_lane.merge_delivered(entry), entry)
+        self.assertNotIn("delivery pending", entry.get("reason") or "")
+        sd_lane.delivery_settled(tree, 1, self.environ)  # twice: nothing left to change
+        self.assertEqual(self.entries(), [entry])
+
     def test_a_held_dirty_or_moved_merged_worktree_is_kept_and_tried_again(self) -> None:
         import sd_db
         from sd_db import sessions

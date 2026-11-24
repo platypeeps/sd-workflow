@@ -5789,6 +5789,26 @@ def watch_pause() -> None:
     time.sleep(WATCH_PAUSE)
 
 
+def delivery_settled(root: pathlib.Path, item: int, environ: dict[str, str]) -> int:
+    """Clear `delivery_pending` on `item`'s merged rows once `sd-ship reconcile` delivered it; how many changed.
+
+    A checkout whose origin names no GitHub repository has no lane, so
+    nothing to clear. A second call finds nothing pending and writes nothing.
+    """
+    if repository_of(root) is None:
+        return 0
+
+    def clear(entries: list[dict[str, Any]]) -> int:
+        held = [row for row in entries
+                if row.get("item") == item and row.get("status") == "merged" and row.get("delivery_pending")]
+        for row in held:
+            row.pop("delivery_pending")
+            row.pop("code", None)
+            row["reason"] = "merged; delivered by sd-ship reconcile"
+        return len(held)
+    return update(queue_for(root, environ), clear)
+
+
 def merge_delivered(entry: dict[str, Any] | None) -> bool:
     """Whether `entry` merged with no delivery pending: the one end `watch --item` counts a success (sd:9923)."""
     return entry is not None and entry.get("status") == "merged" and not entry.get("delivery_pending")
