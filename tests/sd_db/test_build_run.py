@@ -5710,9 +5710,9 @@ class Drafts(Case):
         self.assertNotIn("Ruling on note", self.supervisor().brief()["findings"])
         self.assert_stale_design_held(design)
 
-    def test_a_done_design_whose_ruling_turned_does_not_hold_the_code(self):
-        """Class pass of sd:10096: a done design has shipped, so a ruling taken back since holds no
-        bundle. The code enqueues without it."""
+    def test_a_done_design_whose_ruling_turned_still_holds_the_code(self):
+        """Review of sd:10096: done says nothing of this branch's design.md, written under the old ruling.
+        Left out of the delivery, it still landed with the code: the run blocks and enqueues nothing."""
         design = self.designed("draft")
         [asked] = [note for note in self.notes() if note["kind"] == "question"]
         ruling = add_note(self.db, design, "decision", f"Ruling on note #{asked['id']}: A")
@@ -5725,10 +5725,7 @@ class Drafts(Case):
         add_note(self.db, design, "decision", f"Reversed ruling #{ruling}: question #{asked['id']} asks again.")
         writes.reopen_note(self.db, asked["id"])
         self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (design,))
-        ended = self.supervisor().run()
-        self.assertEqual(ended.get("step"), "enqueued", build.run(self.db, self.bundle["id"])["detail"])
-        enqueue = next(call["argv"] for call in self.calls("sd-ship") if "enqueue" in call["argv"])
-        self.assertEqual([enqueue[n + 1] for n, arg in enumerate(enqueue) if arg == "--item"], [str(self.items[0])])
+        self.assert_stale_design_held(design)
 
     def assert_stale_design_held(self, design: int):
         """Review of sd:10096: the branch holds the design.md written under the old ruling. Left out of the

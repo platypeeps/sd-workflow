@@ -2196,9 +2196,8 @@ class Supervisor:
             return self.finish("blocked", f"{left}; rule on the design or commit its design.md, then Retry")
         # A design left out so still has its design.md on the branch, written under the old ruling: it would
         # land with the code while its item stays open (review of sd:10096).
-        # A done design has shipped and holds nothing (class pass).
-        stale = sorted(item for item in build.aboard(self.db, asked) if self.db.execute(
-            "SELECT status FROM item WHERE id = ?", (item,)).fetchone()["status"] != "done")
+        # Done or not: done says nothing of this branch's design.md, which would still land (review of sd:10096).
+        stale = sorted(build.aboard(self.db, asked))
         if stale:
             return self.finish("blocked", f"design {', '.join(f'sd:{item}' for item in stale)} waits on the "
                                           f"operator again, and the branch holds its design.md written under the "
