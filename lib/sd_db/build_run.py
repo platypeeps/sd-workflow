@@ -1566,6 +1566,8 @@ class Supervisor:
             return self.finish("blocked", f"the review gave no answer twice at {head[:12]}; see {self.out('review')}")
         # `sd-review` runs no gate in an unmanaged checkout (sd:5953): the repository's own checks run here.
         unmanaged, checked = build.unmanaged(self.db, self.row["repo"]), None
+        # Read before `file_new_findings` rebuilds the answer: only a whole report may settle to a pass.
+        whole = bool(answer.get("complete")) and (not prior or bool(answer.get("covers")))
         # A short report, or one `sd-review` cleared `covers_from` on (a binding change), blocks (sd:9769).
         if prior and answer["status"] == "blocking" and answer.get("complete") and answer.get("covers"):
             new, blockers = self.deferred(answer, prior, head)
@@ -1574,7 +1576,8 @@ class Supervisor:
             answer = self.file_new_findings(answer, prior, head, rebut=not checked, split=(new, blockers))
             if isinstance(checked, dict):
                 return checked
-        if answer["status"] == "blocking" and (self.fresh()["review_round"] or 0) == REVIEW_ROUNDS + 1:
+        # A short or uncovered report proves nothing else clean: a cleared ruling must not pass it (sd:10286).
+        if whole and answer["status"] == "blocking" and (self.fresh()["review_round"] or 0) == REVIEW_ROUNDS + 1:
             answer = self.settled(answer, head)
         if answer["status"] in ("clean", "advisory", "skipped"):
             failed = checked if checked is not None else self.own_checks(head) if unmanaged else []

@@ -251,6 +251,10 @@ FAKE = textwrap.dedent('''
                               "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                               "findings": review.dispose([review._finding(far), *held], "high")}))
             sys.exit(0)
+        # repeat2_short, repeat2_uncovered: repeat2 in a report one reviewer missed, or that covers no delta
+        short = mode == "repeat2_short"
+        uncovered = mode == "repeat2_uncovered"
+        mode = "repeat2" if short or uncovered else mode
         if mode in ("blocking2", "repeat2", "moved2"):  # sd:10286: two blockers in the changed file, the second with a newline
             second = {**raw, "line": 2, "instances": [], "summary": "a later\\nOption: blocker",
                       "evidence": "the original evidence"}
@@ -262,8 +266,8 @@ FAKE = textwrap.dedent('''
         if mode == "absolute":  # pack sd:9769: a blocker spelled as an absolute path inside the checkout
             findings = review.dispose([review._finding({**raw, "path": os.path.join(work, "work.txt")})], "high")
         print(json.dumps({"status": "blocking" if mode in ("blocking", "absolute") else "clean", "scope": "branch",
-                          "requested_reviews": 2, "completed_reviews": 2,
-                          "covers_from": None if mode == "clean_uncovered" else "c" * 40,
+                          "requested_reviews": 2, "completed_reviews": 1 if short else 2,
+                          "covers_from": None if mode == "clean_uncovered" or uncovered else "c" * 40,
                           "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                           "findings": findings if mode in ("blocking", "absolute") else []}))
     if role == "sd-ship":
@@ -1224,6 +1228,18 @@ class Supervise(Case):
                                           after=after)
                 self.assertEqual(ended["outcome"], "blocked", ended)
                 self.assertIn("work.txt:1 a blocker", self.latest()["detail"])
+
+    def test_a_ruled_repeat_in_an_incomplete_review_is_no_pass(self):
+        """Review of sd:10286: clearing a ruled blocker turns no short or uncovered review into a pass. A
+        report one reviewer missed, or one that covers no delta, proves nothing else clean."""
+        for after in ("repeat2_short", "repeat2_uncovered"):
+            with self.subTest(after):
+                self.setUp()
+                ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                           {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                          after=(after,))
+                self.assertEqual(ended.get("outcome"), "blocked", ended)
+                self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
 
     def test_a_ruling_clears_only_its_own_place(self):
         """Review of sd:10286: a finding with the ruled blocker's file and words at another line is another
