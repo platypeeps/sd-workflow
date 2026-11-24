@@ -3884,6 +3884,21 @@ class CitedCloses(SharedQueue):
                 kept = sd_lane.unreverted(tree, head, commits, "main")
                 self.assertEqual([sha for sha, message in kept if f"sd:{a}" in message], [])
 
+    def test_a_revert_of_a_file_named_like_pathspec_magic_closes_nothing(self) -> None:
+        """sd:10214 review: git reads `:(unknown)x` as pathspec magic and fails; the lookup reads names
+        literally, so a revert that removes such a file undid the work."""
+        import sd_operations
+        a, b, *_ = self.open
+        tree, _ = self.committed("topic-magic-name")
+        (tree / ":(unknown)x").write_text("the reader\n", encoding="utf-8")
+        git(tree, "--literal-pathspecs", "add", ":(unknown)x")
+        git(tree, "commit", "-q", "-m", f"feat: implement\n\nCloses: sd:{a}")
+        git(tree, "--literal-pathspecs", "rm", "-q", ":(unknown)x")
+        git(tree, "commit", "-q", "-m", "revert: hold the reader")
+        git(tree, "commit", "-q", "--allow-empty", "-m", f"fix: the gate\n\nCloses: sd:{b}")
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {b})
+
     def test_a_merge_that_drops_a_reapplied_fix_keeps_its_close(self) -> None:
         """sd:10214 class pass 3: after a revert and a reapply, a merge whose other parent never took the work back
         takes it out itself. It is no revert, so the close stays, as for any later change that is none (sd:8373)."""

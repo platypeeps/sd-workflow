@@ -1052,8 +1052,9 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     fork = lane_git(worktree, "merge-base", f"refs/remotes/origin/{base}", head) if base else None
 
     def fields(*args: str) -> list[str] | None:
-        # NUL-separated: git quotes a name with a tab or non-ASCII byte otherwise.
-        done = publish_git(worktree, *args)
+        # NUL-separated: git quotes a name with a tab or non-ASCII byte otherwise. Literal: a name such as
+        # `:(unknown)x` is pathspec magic to git, and a failed read keeps the commit (sd:10214 review).
+        done = publish_git(worktree, "--literal-pathspecs", *args)
         return done.stdout.split("\0") if done and done.returncode == 0 else None
 
     def blobs(rev: str, paths: list[str]) -> dict[str, str] | None:
