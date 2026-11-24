@@ -5719,6 +5719,24 @@ class Drafts(Case):
         self.assertEqual(self.rides(item), [])
         self.assertFalse([note for note in self.notes() if note["body"].startswith(draft.DESIGN)])
 
+    def test_a_design_written_for_another_repo_rides_nothing_after_a_move(self):
+        """Review of sd:10096: a design written in its old repository read as the item's design after the
+        item moved, so it rode the new repository's bundle and closed with the old one's design. A design
+        fits the repository its run read: after a move the item has none and runs again."""
+        design = self.designed("draft-plain")
+        self.assertIsNotNone(draft.design(self.db, design))
+        moved = str(self.repo) + "-moved"
+        upsert_repo(self.db, moved, remote="https://github.com/fixture/moved.git", managed=1)
+        self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (moved, design))
+        self.assertIsNone(draft.design(self.db, design))
+        self.assertEqual(build_run.Supervisor.designs(mock.Mock(db=self.db), [design]), "")
+        [ride] = self.rides(design)
+        build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                    root=self.root / "worktrees")
+        row = self.db.execute("SELECT status, result FROM assignment WHERE id = ?", (ride["id"],)).fetchone()
+        self.assertEqual(row["status"], "blocked", "the ride of a design written elsewhere joins no bundle")
+        self.assertIn("no design written for", row["result"])
+
     def test_a_design_whose_ruling_is_replaced_after_the_claim_is_not_delivered(self):
         """Review of sd:10096: the operator replaces the ruling while the bundle builds. A ruling still
         stands, so the question waits on nothing, but the brief carried the old one: the enqueue leaves the

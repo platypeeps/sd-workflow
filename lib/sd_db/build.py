@@ -1980,6 +1980,14 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
                                          f"{row['repo']}, and its branch {branch(row['parent'])} holds the "
                                          f"bundle's work")
         queued = [row for row in queued if row["parent"] is None or leads.get(row["parent"]) == row["repo"]]
+        # A ride whose design was written for another repository, its item moved since, joins no bundle: it
+        # would close with that repository's design (review of sd:10096). Build runs its design again here.
+        for row in queued:
+            if _rides(connection, row) and draft_design(connection, row["item"]) is None:
+                _refuse(connection, row, f"item {row['item']} has no design written for {row['repo']}; "
+                                         f"Build it again to run its design there")
+        queued = [row for row in queued if connection.execute(
+            "SELECT status FROM assignment WHERE id = ?", (row["id"],)).fetchone()[0] == "queued"]
         # A fresh design row rides a code bundle and never leads one (sd:10096); one that ran leads its Retry.
         best = next((row for row in queued if room_for(available, row["repo"], p1=_leads_beside(row)) > 0
                      and not _rides(connection, row)), None)

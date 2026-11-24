@@ -100,10 +100,16 @@ def is_design(connection, item: int) -> bool:
 
 
 def design(connection, item: int) -> str | None:
-    """The design the newest design run of `item` wrote, or None: no run, or a newer one not done."""
-    ran = connection.execute("SELECT status FROM assignment WHERE item = ? AND scope = ? ORDER BY id DESC LIMIT 1",
-                             (item, SCOPE)).fetchone()
+    """The design the newest design run of `item` wrote, or None: no run, a newer one not done, or one that read
+    another repository than the item's now: a design fits the repository it read (review of sd:10096)."""
+    ran = connection.execute(
+        "SELECT assignment.status, item.repo, (SELECT runner_run.repo FROM runner_run WHERE runner_run.assignment = "
+        "assignment.id ORDER BY runner_run.run DESC LIMIT 1) AS ran FROM assignment JOIN item ON item.id = "
+        "assignment.item WHERE assignment.item = ? AND assignment.scope = ? ORDER BY assignment.id DESC LIMIT 1",
+        (item, SCOPE)).fetchone()
     if ran is None or ran["status"] != "done":
+        return None
+    if ran["ran"] is not None and not paths.same(ran["repo"], ran["ran"]):
         return None
     note = connection.execute(
         "SELECT body FROM note WHERE item = ? AND kind = 'comment' AND session LIKE ? AND body LIKE ? "
