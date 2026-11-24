@@ -32,7 +32,7 @@
       if (r.ok) throw Object.assign(new Error(`the answer (HTTP ${r.status}) could not be read, so whether it changed is not known`), { unknown: true });
       return {};
     });
-    if (!r.ok) { const e = new Error(out.error || `HTTP ${r.status}`); e.stale = r.status === 409; e.status = r.status; throw e; }
+    if (!r.ok) { const e = new Error(out.error || `HTTP ${r.status}`); e.stale = r.status === 409; e.status = r.status; e.answer = out; throw e; }
     return out;
   }
   async function getJSON(path) {
