@@ -1395,6 +1395,12 @@ def eligible(connection, *, now: str | None = None) -> list[dict]:
             continue
         if lane_of(connection, taken["lane_host"]) not in hosts:
             continue
+        if work_kind(connection, row["id"]) == DESIGN_KIND and connection.execute(
+                "SELECT 1 FROM assignment WHERE id = (SELECT MAX(id) FROM assignment WHERE item = ? AND scope = ?) "
+                "AND status = 'blocked'", (row["id"], DRAFT)).fetchone():
+            # A blocked design run waits on the operator's Build, as a blocked build does; picked again, it
+            # ran again every tick (review of sd:10096).
+            continue
         found.append({"id": row["id"], "title": row["title"], "repo": row["repo"], "priority": row["priority"],
                       "fields": row["fields"]})
     return found
@@ -1418,10 +1424,12 @@ def set_pickup(connection, on: bool, *, now: str | None = None) -> dict:
 
 
 def picked(connection, lead: int) -> bool:
-    """Whether auto-pickup queued the bundle whose lead assignment is `lead`."""
+    """Whether auto-pickup queued the bundle whose lead assignment is `lead`, or the design run `lead`."""
     return connection.execute(
-        "SELECT 1 FROM note JOIN assignment ON assignment.item = note.item WHERE assignment.id = ? AND note.body = ?",
-        (lead, f"Build assignment {lead} queued by {PICKUP}")).fetchone() is not None
+        "SELECT 1 FROM note JOIN assignment ON assignment.item = note.item WHERE assignment.id = ? "
+        "AND note.body IN (?, ?)",
+        (lead, f"Build assignment {lead} queued by {PICKUP}",
+         f"Design assignment {lead} queued by {PICKUP}")).fetchone() is not None
 
 
 def pickup(connection, available: dict, *, now: str | None = None) -> list[int]:
@@ -1498,8 +1506,9 @@ def stop_on_blocks(connection, *, now: str | None = None) -> str | None:
     if not state["on"]:
         return None
     rows = connection.execute(
-        "SELECT id, item, status FROM assignment WHERE scope = ? AND parent IS NULL AND status IN ('done', 'blocked') "
-        "AND started IS NOT NULL AND ended >= ? ORDER BY ended DESC, id DESC", (SCOPE, state["since"])).fetchall()
+        "SELECT id, item, status FROM assignment WHERE scope IN (?, ?) AND parent IS NULL "
+        "AND status IN ('done', 'blocked') AND started IS NOT NULL AND ended >= ? ORDER BY ended DESC, id DESC",
+        (SCOPE, DRAFT, state["since"])).fetchall()
     ended = [row for row in rows if picked(connection, row["id"])][:2]
     if len(ended) < 2 or any(row["status"] != "blocked" for row in ended):
         return None

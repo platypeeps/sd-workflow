@@ -2727,6 +2727,31 @@ class Pickup(Case):
                         (later(build.clock(), 3600),))
         self.assertIsNone(build.stop_on_blocks(self.db, now=self.NOW), "On again counts only what ends after it")
 
+    def blocked_design(self):
+        """A design item auto-pickup queued, whose design run then ended blocked (draft `_block`)."""
+        item = self.item(fields={"work_kind": "design"})
+        self.assertIn(item, build.pickup(self.db, self.room(), now=self.NOW))
+        lead = self.count("SELECT id FROM assignment WHERE item = ? AND scope = ?", item, build.DRAFT)
+        stamp = later(build.clock(), self.count("SELECT COUNT(*) FROM assignment"))
+        self.db.execute("UPDATE assignment SET status = 'blocked', started = ?, ended = ? WHERE id = ?",
+                        (stamp, stamp, lead))
+        return item
+
+    def test_a_blocked_design_run_is_not_picked_again(self):
+        """Review of sd:10096: a failed design run left its item ready with no design, so every tick picked
+        it again and ran it again. Like a blocked build, it waits on the operator's Build."""
+        self.on()
+        item = self.blocked_design()
+        self.assertNotIn(item, build.pickup(self.db, self.room(), now=self.NOW))
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE item = ?", item), 1)
+
+    def test_two_blocked_design_runs_turn_off(self):
+        """Review of sd:10096: the stop counted build rows only, so blocked design runs never turned it off."""
+        self.on()
+        self.blocked_design()
+        self.blocked_design()
+        self.assertIn("ended blocked in a row", build.stop_on_blocks(self.db, now=self.NOW) or "")
+
     def picked_run(self):
         item = self.item()
         build.set_pickup(self.db, True, now=self.NOW)
