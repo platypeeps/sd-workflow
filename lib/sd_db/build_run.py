@@ -1570,6 +1570,8 @@ class Supervisor:
             answer = self.file_new_findings(answer, prior, head, rebut=not checked, split=(new, blockers))
             if isinstance(checked, dict):
                 return checked
+        if answer["status"] == "blocking" and (self.fresh()["review_round"] or 0) == REVIEW_ROUNDS + 1:
+            answer = self.settled(answer, head)
         if answer["status"] in ("clean", "advisory", "skipped"):
             failed = checked if checked is not None else self.own_checks(head) if unmanaged else []
             if isinstance(failed, dict):
@@ -2040,6 +2042,36 @@ class Supervisor:
         # Applied: a later walk of this run, or a retry that keeps the count, must not apply them to another head.
         self.rulings.unlink(missing_ok=True)
         return None
+
+    @staticmethod
+    def said(row: dict) -> str:
+        """A blocker as the ruling round's repeat check matches it: its summary, whitespace folded."""
+        return " ".join(str(row.get("summary") or "").split()).casefold()
+
+    def settled(self, answer: dict, head: str) -> dict:
+        """The review after the ruling round, less each blocker that repeats one ruled REJECT or FILE at `head`
+        (lead ruling on sd:10286): a repeat that cites evidence blocks past its rebuttal in `sd-review`, so the
+        ruling clears it here. A repeat is the same file and summary at any line: the round's fixes move lines.
+        The rulings come from the decision notes `rule` wrote, so a replay after the rulings file went reads
+        them too. A FIX ruling, an unruled blocker or a new one still blocks."""
+        mark = f"Build run {self.ident} ruling "
+        pattern = re.compile(rf"ruling (\d+) at {re.escape(head[:12])}: (?:REJECT|FILE)\b")
+        blockers, ruled = self.round_blockers(), set()
+        for (body,) in self.db.execute("SELECT body FROM note WHERE item = ? AND kind = 'decision' "
+                                       "AND substr(body, 1, ?) = ?", (self.lead, len(mark), mark)):
+            found = pattern.match(body, len(mark) - len("ruling "))
+            number = int(found.group(1)) if found else 0
+            if 0 < number <= len(blockers) and blockers[number - 1].get("line") != "-":
+                row = blockers[number - 1]
+                ruled.add((self.locations(row)[0][0], self.said(row)))
+        left = [row for row in answer["blockers"] if (self.locations(row)[0][0], self.said(row)) not in ruled]
+        if len(left) == len(answer["blockers"]):
+            return answer
+        cleared = [row for row in answer["blockers"] if row not in left]
+        self.once(f"settled:{head}", lambda: self.note(
+            self.lead, f"Build run {self.ident}: the review at {head[:12]} repeated {len(cleared)} blocker(s) "
+                       f"the ruling round rejected or filed, cleared by its ruling: {self.summary(cleared)}"))
+        return dict(answer, blockers=left) if left else dict(answer, status="advisory", blockers=[])
 
     def rule(self, number: int, row: dict, ruling: str, reason: str, head: str, repository: str) -> None:
         """One ruling's writes in one transaction: the decision note, a filed item, the rebuttal (sd:10286).

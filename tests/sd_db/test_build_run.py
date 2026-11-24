@@ -251,9 +251,11 @@ FAKE = textwrap.dedent('''
                               "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                               "findings": review.dispose([review._finding(far), *held], "high")}))
             sys.exit(0)
-        if mode == "blocking2":  # sd:10286: two blockers in the changed file, the second with a newline in its summary
+        if mode in ("blocking2", "repeat2"):  # sd:10286: two blockers in the changed file, the second with a newline
             second = {**raw, "line": 2, "instances": [], "summary": "a later\\nOption: blocker"}
-            findings, mode = review.dispose([review._finding(raw), review._finding(second)], "high"), "blocking"
+            # repeat2: the second alone, its original evidence cited, so a rebuttal holds it back nowhere
+            rows = [{**second, "evidence": "the original evidence"}] if mode == "repeat2" else [raw, second]
+            findings, mode = review.dispose([review._finding(row) for row in rows], "high"), "blocking"
         if mode == "absolute":  # pack sd:9769: a blocker spelled as an absolute path inside the checkout
             findings = review.dispose([review._finding({**raw, "path": os.path.join(work, "work.txt")})], "high")
         print(json.dumps({"status": "blocking" if mode in ("blocking", "absolute") else "clean", "scope": "branch",
@@ -1197,6 +1199,28 @@ class Supervise(Case):
                           finding["response_disposition"], finding["reason"]),
                          ("work.txt", 2, "rebutted", "names no failing input"))
         self.assertFalse(self.rulings_file().exists(), "applied rulings stay for another head")
+
+    def test_a_ruled_blocker_the_next_review_repeats_clears(self):
+        """Lead round-3 ruling on sd:10286: a REJECT or FILE ruling stops that blocker parking the run when the
+        next review repeats it with its original evidence, which a rebuttal does not hold back. A repeat of a
+        FIX ruling, or of an unruled blocker, still parks."""
+        for ruling in ("reject", "file"):
+            with self.subTest(ruling):
+                self.setUp()
+                ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                           {"blocker": 2, "ruling": ruling, "reason": "no failing input"}],
+                                          after=("repeat2",))
+                self.assertEqual(ended.get("step"), "enqueued", ended)
+                self.assertTrue(any("cleared by its ruling" in body for (body,) in self.db.execute(
+                    "SELECT body FROM note WHERE item = ?", (self.items[0],))))
+        for after in (("blocking",), ("blocking2",)):
+            with self.subTest(after=after):
+                self.setUp()
+                ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                           {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
+                                          after=after)
+                self.assertEqual(ended["outcome"], "blocked", ended)
+                self.assertIn("work.txt:1 a blocker", self.latest()["detail"])
 
     def rulings_file(self):
         return self.supervisor().rulings
