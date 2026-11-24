@@ -2318,11 +2318,10 @@ def prepared_prompt(root: pathlib.Path, subject: Subject, args: argparse.Namespa
                    "every unresolved blocker; an unrelated clean diff does not resolve it. A blocker that lists instances is "
                    "resolved only when every listed instance is fixed; repeat it with each one still unfixed. Prior findings:\n" + evidence)
         required = len(prompt.encode())
-        for name in sd_lib.blocking_places(previous["findings"]):  # each instance's file too (sd:9769)
+        for name in dict.fromkeys(map(repo_spelling(root), sd_lib.blocking_places(previous["findings"]))):  # sd:9769; sd:9962 an old absolute path
             path = pathlib.Path(name)
             if path.is_absolute() or ".." in path.parts or not (root / path).resolve().is_relative_to(root.resolve()):
                 raise UsageError("prior blocking finding path is outside this repository")
-            target = root / path
             entry = sd_lib.git_output(["ls-tree", "-z", "-l", subject.head, "--", f":(literal){name}"], root)
             if entry is None:
                 raise UsageError("cannot inspect prior finding source at current HEAD")
@@ -2340,7 +2339,7 @@ def prepared_prompt(root: pathlib.Path, subject: Subject, args: argparse.Namespa
                         raise UsageError("cannot read prior finding source at current HEAD")
                     current = blob.stdout
                     size = len(current.encode())
-            elif target.exists() or target.is_symlink():
+            elif (root / path).exists() or (root / path).is_symlink():
                 raise UsageError("prior finding source must be a tracked regular file")
             size += len(prefix.encode()) + 1
             required += size
@@ -2501,7 +2500,8 @@ def review(
     chosen, selection_refusal = ([], selection_refusal) if not asked else sd_review_readiness.select_ready_candidates(
         registry, args.provider, explain=args.explain, consent=consent, capped_bills=capped, readers=READERS,
     )
-    depth = sd_route.reader_depth(asked, len(chosen))  # min(2, eligible) (#43332)
+    chosen = sorted(chosen, key=lambda provider: bool(sd_review_readiness.provider_issues(provider, auth, env, str(root))))  # an unready reader falls back (sd:10231)
+    depth = sd_route.reader_depth(asked, len(chosen))  # the tier's depth cut to the eligible readers (#43332)
     providers = [provider.name for provider in chosen[:depth]]
     phase, check_seconds = phase_seconds(args), gate_seconds(args)
     timing: dict[str, Any] = {"setup_seconds": SETUP_TIMEOUT_SECONDS, "phase_seconds": phase,
