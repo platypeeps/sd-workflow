@@ -820,6 +820,33 @@ class CitedIdTests(unittest.TestCase):
                     self.assertEqual(sd_ship_body._listed_undone(listing),
                                      sd_ship_body._listed_undone(listing.replace(inner, "zz zz")))
 
+    def test_a_comment_inside_a_sha_neither_joins_nor_ends_it(self) -> None:
+        """Round 3, review of build/sd-1653 (pack sd:10090): a comment read as a space ended the sha
+        before it, so `- aaaaaaaaa<!-- -->ccc` undid commit aaaaaaaaa while a reader sees the one
+        token aaaaaaaaaccc. A comment between two word characters, or one that runs past the line end
+        after a word character, is a seam: no sha ends or starts at it, in either read."""
+        undone, other = "a" * 40, "b" * 40
+        work = [(undone, "feat: renew\n\nCloses: sd:2\n"), (other, "fix: prepare\n\nCloses: sd:3\n")]
+        sha = undone[:9]
+        for listing, kept in (
+                (f"Reverted commits:\n- {sha}<!-- -->ccc renew\n", (2, 3)),
+                (f"Reverted commits:\n- {sha}<!-- x --><!-- y -->ccc renew\n", (2, 3)),
+                (f"Reverted commits:\n- `{sha}<!-- -->ccc` renew\n", (2, 3)),
+                (f"Reverted commits:\n- {sha}<!--\n  -->ccc renew\n", (2, 3)),
+                (f"Reverted commits:\n- {sha[:4]}<!-- -->{sha[4:]} renew\n", (2, 3)),
+                # A comment beside a space or punctuation ends nothing a reader does not see end.
+                (f"Reverted commits:\n- {sha}<!-- --> renew\n", (3,)),
+                (f"Reverted commits:\n- {sha}<!-- -->: renew\n", (3,)),
+                (f"Reverted commits:\n- {sha}<!-- -->\n", (3,))):
+            with self.subTest(listing=listing):
+                self.assertEqual(sd_ship_body.cited_ids("", [self.revert_of(listing), *work]), kept)
+        # The property: no word character a comment touches, in any script, lets the sha before it end.
+        for comment, right in itertools.product(("<!-- -->", "<!---->", "<!-- a --><!-- b -->", "<!--\n  -->"),
+                                                ("c", "0", "g", "_", "\u00e9", "\u0434", "\u0661")):
+            listing = f"Reverted commits:\n- {sha}{comment}{right} renew\n"
+            with self.subTest(listing=listing):
+                self.assertEqual(sd_ship_body.cited_ids("", [self.revert_of(listing), *work]), (2, 3))
+
     def test_a_merge_the_branch_reverts_cites_nothing_it_brought_in(self) -> None:
         """Lane review of sd:5999, round 3: `git revert -m 1 <merge>` undoes each commit the merge brought in."""
         base, side, main, merge, undo, again = (c * 40 for c in "abcdef")

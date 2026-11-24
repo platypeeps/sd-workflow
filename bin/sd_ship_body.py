@@ -111,7 +111,8 @@ def _blocks(body: str, comments: bool = True, plain: bool = False):
     paragraph it continues) or `text`; `opened` counts the list items the line's
     markers open, even when a fence or code follows them; `depth` counts
     the items open after them; `text` is the line past their text column,
-    each comment on it one space when comments are read;
+    each comment on it one space, or `_SEAM` inside a word (`_less`),
+    when comments are read;
     `spanned` says the line starts inside a code span.
 
     A code span may wrap onto the next lines of its paragraph. An opening
@@ -162,14 +163,29 @@ def _blocks_once(body: str, comments: bool, literal: set[tuple[int, int]], plain
     return rows, (span_at if ticks else None)
 
 
+#: What a comment between two word characters reads as: a word character no sha holds, so the two
+#: fragments neither join into a sha nor does the one before it end as one (pack sd:10090, round 3).
+_SEAM = "\u02bc"
+
+
 def _less(line: str, text: str, lazy: bool, cut: list[tuple[int, int]]) -> str:
     """`text`, the part of `line` a row holds, with each comment `cut` names read as one space: a reader
-    sees no comment, and what stood either side of it stays apart (pack sd:10090)."""
+    sees no comment, and what stood either side of it stays apart (pack sd:10090). A run of comments
+    with a word character on its left and one on its right, or a comment that runs past the line end,
+    reads as `_SEAM`: a reader sees one token there, which a space would split into two."""
     start = len(line) - len(line.lstrip()) if lazy else len(line) - len(text)  # a lazy line's text is stripped
-    for first, last in reversed(cut):
+    runs: list[list[int]] = []
+    for first, last in cut:  # adjacent comments are one run: what stands either side of it decides
+        if runs and runs[-1][1] == first:
+            runs[-1][1] = last
+        else:
+            runs.append([first, last])
+    for first, last in reversed(runs):
+        open_on = last >= len(line) and not line.endswith("-->", first + 4)  # no `-->` closes it on the line
+        word = first > 0 and re.match(r"\w", line[first - 1]) and (open_on or re.match(r"\w", line[last:last + 1]))
         first, last = max(first - start, 0), last - start
         if last > first:
-            text = text[:first] + " " + text[last:]
+            text = text[:first] + (_SEAM if word else " ") + text[last:]
     return text
 
 
@@ -543,7 +559,7 @@ REVERT_SUBJECT = re.compile(r"^(?:Revert\b|revert(?:\([^)]*\))?!?:)", re.IGNOREC
 #: An item a hand-written revert names an undone commit on: one that opens with a sha, bare or in a code
 #: span, emphasis or a link's text (pack sd:9666). No letter, digit or `_`, in any script, may follow it,
 #: but the `_` that closes `_<sha>_`.
-_SHA_LED = re.compile(r"_([0-9a-f]{7,40})_(?!\w)|[`*\[]*([0-9a-f]{7,40})(?!\w)")
+_SHA_LED = re.compile(r"_([0-9a-f]{7,40})_(?!\w)|[`*\[]*([0-9a-f]{7,40})(?!\w|<!--)")
 #: The line that opens a list of undone commits: its last sentence is exactly `Reverted commits:`,
 #: `Reverted:` or `Reverts:`. A substring match let `Commits not reverted:` undo its list (pack sd:9666).
 _REVERTED_INTRO = re.compile(r"(?:^|[.!?][ \t]+)(?:reverted(?:[ \t]+commits)?|reverts):[ \t]*$", re.IGNORECASE)
@@ -573,7 +589,9 @@ def _listed_undone(message: str) -> list[str]:
     does a line that starts inside a code span, in the read that finds
     it there. A comment on a line reads as one space, where the read
     itself finds it (`_comment_open`): it heads nothing, hides what it
-    holds and joins no two fragments into a sha (pack sd:10090).
+    holds and joins no two fragments into a sha; inside a word it reads
+    as `_SEAM`, so no sha ends at it either, and in the read that takes
+    comment syntax as text no sha ends at a `<!--` (pack sd:10090).
 
     The `plain` grammar of `_blocks` and CommonMark, the read citations
     get, can give one line two roles: the fence a `10.` item opens is a
