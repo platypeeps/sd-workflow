@@ -1431,10 +1431,16 @@ class Supervisor:
         # Work another host holds since this host last built the bundle reaches here only by a push, so a
         # kept worktree or local branch here may predate it (review of build/sd-1688).
         away = build.work_elsewhere(self.db, self.ident)
-        if self.work.is_dir():
-            return self.guarded() or (away and (self.fetched() or self.caught_up(away))) or "building"
-        if refused := self.fetched():
-            return refused
+        kept = self.work.is_dir()
+        if kept and away is None:
+            return self.guarded() or "building"
+        # Every read below is of the head the builder will start at: origin's own answer for the branch,
+        # read once, before any guard (class pass, review of build/sd-1688).
+        pushed = (None if kept else self.fetched()) or self.pushed()
+        if isinstance(pushed, dict):
+            return pushed
+        if kept and away is not None:
+            return self.guarded(pushed) or self.caught_up(away, pushed) or "building"
         local = True
         try:
             _read([*self.tools.git, "-C", str(self.repo), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], env=self.env)
@@ -1442,10 +1448,8 @@ class Supervisor:
         except Unread:
             local = False
             # A retry the hub built and the lane pushed starts from that push on its lane host (sd:10143).
-            try:
-                start = _read([*self.tools.git, "-C", str(self.repo), "rev-parse", "--verify", "--quiet",
-                               f"refs/remotes/origin/{branch}"], env=self.env).strip()
-            except Unread:
+            start = pushed
+            if not start:
                 # Work another host holds and origin lacks must not be rebuilt from the base without it
                 # (review of build/sd-1688).
                 if away is not None:
@@ -1456,7 +1460,9 @@ class Supervisor:
             argv = ["worktree", "add", "-b", branch, str(self.work), start]
         if self.child([*self.tools.git, "-C", str(self.repo), *argv], cwd=self.repo, name="worktree") != 0:
             return self.finish("blocked", f"git worktree add {self.work} failed; see {self.out('worktree')}")
-        return self.split_first() or (local and away and self.caught_up(away)) or "building"
+        if local and away:
+            return self.split_first(pushed) or self.caught_up(away, pushed) or "building"
+        return self.split_first() or "building"
 
     def fetched(self) -> dict | None:
         """The blocked end when `git fetch` in the repository fails; None once it fetched."""
@@ -1465,18 +1471,35 @@ class Supervisor:
             return self.finish("blocked", f"git fetch in {self.repo} failed; see {self.out('worktree')}")
         return None
 
-    def caught_up(self, away: str) -> dict | None:
-        """None once the worktree holds `origin/<branch>`, fast-forwarded to it when behind; the blocked end
-        when origin lacks the branch or the two diverged. `away` holds the bundle's newer work, which only
-        its push brings here (review of build/sd-1688)."""
-        branch, git = self.row["branch"], [*self.tools.git, "-C", str(self.work)]
+    def pushed(self) -> str | dict:
+        """Origin's head of the run's branch, fetched here; "" when origin has no such branch; the blocked end
+        when origin does not answer. Origin itself answers, by the branch's exact name, and the fetch names
+        the branch, not the head, which a server may refuse to serve by id: the tracking ref
+        stays where it was under a fetch that does not name the branch, and after origin deleted it
+        (class pass, review of build/sd-1688)."""
+        ref = f"refs/heads/{self.row['branch']}"
         try:
-            pushed = _read([*git, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
-                           env=self.env).strip()
-            head = _read([*git, "rev-parse", "HEAD"], env=self.env).strip()
-        except Unread:
+            listed = _read([*self.tools.git, "-C", str(self.repo), "ls-remote", "origin", ref], env=self.env)
+        except Unread as error:
+            return self.finish("blocked", f"origin did not say where {self.row['branch']} is: {error}")
+        heads = [line.split()[0] for line in listed.splitlines() if line.split()[1:] == [ref]]
+        if not heads:
+            return ""
+        if self.child([*self.tools.git, "-C", str(self.repo), "fetch", "-q", "origin", ref], cwd=self.repo,
+                      name="worktree") != 0:
+            return self.finish("blocked", f"git fetch of {self.row['branch']} in {self.repo} failed; see "
+                                          f"{self.out('worktree')}")
+        return heads[0]
+
+    def caught_up(self, away: str, pushed: str) -> dict | None:
+        """None once the worktree holds `pushed`, origin's head of the branch, fast-forwarded to it when
+        behind; the blocked end when origin lacks the branch or the two diverged. `away` holds the
+        bundle's newer work, which only its push brings here (review of build/sd-1688)."""
+        branch, git = self.row["branch"], [*self.tools.git, "-C", str(self.work)]
+        if not pushed:
             return self.finish("blocked", f"branch {branch} holds the work of a run on {away}, but origin lacks "
                                           f"it; push it from {away}, then Retry")
+        head = self.head()
 
         def contains(older: str, newer: str) -> bool:
             try:
@@ -1494,14 +1517,15 @@ class Supervisor:
                                       f"diverged, and origin holds the work of a run on {away}; settle the "
                                       f"branch, then Retry")
 
-    def guarded(self) -> dict | None:
+    def guarded(self, pushed: str = "") -> dict | None:
         """The kept worktree's guard: the blocked end when a subset Retry's split holds it, or it is gone or on
-        another branch; None when the builder may work in it."""
+        another branch; None when the builder may work in it. `pushed` is the head the step will then move it
+        to (`caught_up`), which the split reads too."""
         branch = self.row["branch"]
         if not self.work.is_dir():
             return self.finish("blocked", f"worktree {self.work} is gone; the resumed run has no checkout")
         # The guard reads first: a stopped rebase detaches HEAD, and a block here would record no hold.
-        held = self.split_first()
+        held = self.split_first(pushed)
         if held:
             return held
         current = _read([*self.tools.git, "-C", str(self.work), "branch", "--show-current"], env=self.env).strip()
@@ -1509,13 +1533,15 @@ class Supervisor:
             return self.finish("blocked", f"worktree {self.work} is on {current or 'no branch'}, not {branch}")
         return None
 
-    def split_first(self) -> dict | None:
+    def split_first(self, pushed: str = "") -> dict | None:
         """The blocked end of a run whose bundle a subset Retry left a member out of while its branch or worktree
         held earlier work; None when it held none (pack sd:9581). No message, trailer, revert or merge says which
         change is whose, and a rebase gives a change new ids, so only the first run after the Retry reads the
         branch: no builder ran since, so its start is the Retry's state. Commits past the base or a worktree not
         clean hold the bundle for good (`build.split`); Build then takes its items fresh on a new branch, which
         also never pushes over a tip an unmanaged bundle published. A clean start records its head (`base_head`).
+        `pushed`, the head the step moves the worktree to after this guard, is read as the start too: its commits
+        are earlier work the builder would inherit (class pass, review of build/sd-1688).
         ponytail: a left item's change in `git stash`, shared across worktrees, goes unread; no builder stashes."""
         state = build.split(self.db, self.row["assignment"])
         if state in ("", "clear"):
@@ -1523,8 +1549,8 @@ class Supervisor:
         named = ", ".join(f"sd:{item}" for item, _ in build.left_out(self.db, self.row["assignment"]))
         if state == "unread":
             base, head = self.base(), self.head()
-            commits = _read([*self.tools.git, "-C", str(self.work), "rev-list", f"{base}..{head}"],
-                            env=self.env).split()
+            commits = _read([*self.tools.git, "-C", str(self.work), "rev-list", head, *([pushed] if pushed else []),
+                             f"^{base}"], env=self.env).split()
             # Ignored files count too: a left item's local config is work a builder would inherit.
             dirty = kept_files(self.tools.git, str(self.work), env=self.env)
             # A pending merge leaves HEAD and status as they were; the next commit would take its parent.

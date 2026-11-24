@@ -3140,10 +3140,11 @@ class Supervise(Case):
         assert again is not None, "the Retry was not claimed"
         return again
 
-    def moved_back(self):
+    def moved_back(self, *, narrow=False):
         """The hub built A in its worktree and the lane pushed it; a satellite's retry pushed B on top; the
         lane moved back to the hub, whose Retry run claims the bundle with its old worktree still at A.
-        The Retry run and B."""
+        With `narrow`, the hub's checkout fetches only main from then on, so its tracking ref of the branch
+        stays at A. The Retry run and B."""
         self.press()
         self.write_pr()
         self.assertEqual(self.supervisor().worktree(), "building")
@@ -3152,6 +3153,8 @@ class Supervise(Case):
         support.git(work, "add", "a.txt")
         support.git(work, "commit", "-qm", "feat: hub work")
         support.git(work, "push", "-q", "origin", self.bundle["branch"])
+        if narrow:
+            support.git(self.repo, "config", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main")
         away = self.requeue(self.bundle["id"], lane_host="work")
         self.assertEqual(away["owner"], "fixture@work")
         other = support.repository(self.root / "elsewhere")
@@ -3195,6 +3198,69 @@ class Supervise(Case):
         ended = self.supervisor(back["id"]).worktree()
         self.assertIsInstance(ended, dict, "the run resumed without the newer push")
         self.assertIn("diverged", ended["blocked"])
+
+    def test_a_moved_retry_reads_the_branch_from_origin_not_its_tracking_ref(self):
+        """Class pass, review of build/sd-1688: the worktree step took origin's head of the branch from the
+        tracking ref, which a fetch that does not name the branch leaves where it was. A kept worktree, a
+        local branch and a start with neither all resumed at the older head."""
+        for shape in ("kept worktree", "local branch", "neither"):
+            with self.subTest(shape=shape):
+                back, newer = self.moved_back(narrow=True)
+                if shape != "kept worktree":
+                    support.git(self.repo, "worktree", "remove", "--force", back["work_path"])
+                if shape == "neither":
+                    support.git(self.repo, "branch", "-qD", back["branch"])
+                self.assertEqual(self.supervisor(back["id"]).worktree(), "building")
+                self.assertEqual(support.git(Path(back["work_path"]), "rev-parse", "HEAD"), newer)
+            self.tearDown()
+            self.setUp()
+
+    def test_a_moved_retry_blocks_on_a_branch_origin_no_longer_has(self):
+        """Class pass, review of build/sd-1688: a branch deleted on origin stays in the tracking ref, so the
+        step read the stale ref as the push and built on it. Origin itself answers: the run blocks."""
+        for shape in ("kept worktree", "neither"):
+            with self.subTest(shape=shape):
+                back, _ = self.moved_back()
+                support.git(self.root / "origin.git", "update-ref", "-d", f"refs/heads/{back['branch']}")
+                if shape == "neither":
+                    support.git(self.repo, "worktree", "remove", "--force", back["work_path"])
+                    support.git(self.repo, "branch", "-qD", back["branch"])
+                ended = self.supervisor(back["id"]).worktree()
+                self.assertIsInstance(ended, dict, "the run built on a branch origin lacks")
+                self.assertIn("push it from work", ended["blocked"])
+            self.tearDown()
+            self.setUp()
+
+    def subset_retry_of_work_pushed_elsewhere(self, kept):
+        """A three-item bundle whose first run, on a satellite, pushed work for all three; a subset Retry on
+        the hub leaves the third out. The hub's branch (and worktree, with `kept`) sits at the base, clean."""
+        supervisor = self.left_out_of_a_retry(run=False)
+        self.db.execute("UPDATE runner_run SET owner = 'fixture@work', step = 'enqueued' WHERE assignment = ? "
+                        "AND id != ?", (self.bundle["assignment"], self.bundle["id"]))
+        self.assertEqual(build.work_elsewhere(self.db, self.bundle["id"]), "work")
+        branch = self.bundle["branch"]
+        other = support.repository(self.root / "elsewhere")
+        support.git(other, "remote", "add", "origin", str(self.root / "origin.git"))
+        support.git(other, "fetch", "-q", "origin")
+        support.git(other, "checkout", "-q", "-b", branch, "origin/main")
+        (other / "b.txt").write_text("work for all three\n", encoding="utf-8")
+        support.git(other, "add", "b.txt")
+        support.git(other, "commit", "-qm", "feat: satellite work")
+        support.git(other, "push", "-q", "origin", branch)
+        support.git(self.repo, "fetch", "-q", "origin", "main")
+        support.git(self.repo, "branch", "-q", branch, "origin/main")
+        if kept:
+            support.git(self.repo, "worktree", "add", "-q", self.bundle["work_path"], branch)
+        return supervisor
+
+    def test_a_subset_retry_counts_the_push_it_would_take_as_earlier_work(self):
+        """Class pass, review of build/sd-1688: the split guard read the checkout before the fast-forward to
+        the other host's push, recorded a clean start, and the builder inherited the left item's work."""
+        for kept in (True, False):
+            with self.subTest(kept=kept):
+                self.assert_split_first(self.subset_retry_of_work_pushed_elsewhere(kept))
+            self.tearDown()
+            self.setUp()
 
     def test_a_usage_limit_reclaim_refuses_a_worktree_on_another_branch(self):
         """Review of build/sd-1557: the reclaim resumed at building or fixing, past the worktree step's branch
