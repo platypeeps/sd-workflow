@@ -94,8 +94,8 @@ _DU_OVERRAN: dict[str, float] = {}
 BUILD_DIRS = ("target", "node_modules", ".venv")
 #: Ignored folders and files a merged worktree may hold and still be removed: build output and tool caches.
 DISPOSABLE = (*BUILD_DIRS, "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".DS_Store")
-#: Ignored names by suffix that are generated output: Unity writes its *.csproj and *.sln on every open (sd:10325).
-DISPOSABLE_SUFFIXES = (".egg-info", ".csproj", ".sln")
+#: Project files Unity writes on every open beside its ProjectSettings/ProjectVersion.txt (sd:10325).
+UNITY_GENERATED = (".csproj", ".sln")
 #: A full object name, SHA-1 or SHA-256.
 OBJECT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
@@ -260,8 +260,21 @@ def _cwds(walk: Walk) -> list[str] | None:
     return [line[1:] for line in done.stdout.splitlines() if line.startswith("n")]
 
 
-def _disposable(name: str) -> bool:
-    return any(part in DISPOSABLE or part.endswith(DISPOSABLE_SUFFIXES) for part in name.rstrip("/").split("/"))
+def _disposable(name: str, root: str | os.PathLike | None = None) -> bool:
+    """Whether the ignored entry `name`, relative to the worktree `root`, is build output or a tool cache.
+
+    A *.csproj or *.sln counts only as a regular file in a Unity project's folder, the one that holds
+    ProjectSettings/ProjectVersion.txt: elsewhere it may be hand-kept, and a folder so named holds anything
+    (review of build/sd-1782)."""
+    parts = name.rstrip("/").split("/")
+    if any(part in DISPOSABLE or part.endswith(".egg-info") for part in parts):
+        return True
+    if root is None or name.endswith("/") or not parts[-1].endswith(UNITY_GENERATED):
+        return False
+    path = os.path.join(root, *parts)
+    folder = os.path.join(root, *parts[:-1])
+    return (os.path.isfile(path) and not os.path.islink(path)
+            and os.path.isfile(os.path.join(folder, "ProjectSettings", "ProjectVersion.txt")))
 
 
 def busy(path: str, cwds: list[str] | None) -> str:
@@ -286,7 +299,7 @@ def merged_tree_kept(walk: Walk, tree: dict, cwds: list[str] | None) -> str:
         # The first entry that is not ignored answers, before a rename's second path could be read as an entry.
         if not entry.startswith("!! "):
             return "it has uncommitted or untracked files"
-        if not _disposable(entry[3:]):
+        if not _disposable(entry[3:], tree["path"]):
             return f"it holds ignored files that are not build output: {entry[3:]}"
     return ""
 
