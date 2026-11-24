@@ -1665,12 +1665,15 @@ class Supervisor:
         its assignment that does. A usage-limit or loss resume is a new run that keeps the round, so its own
         names hold no review, and the next round would review the branch afresh (pack sd:10236). Only the runs
         it resumed: the walk stops at a fresh claim (`claimed`), whose earlier attempt's review covers another
-        start (review of build/sd-1726)."""
-        rows = [(self.ident, self.row["start_step"]), *((row[0], row[1]) for row in self.db.execute(
-            "SELECT id, start_step FROM runner_run WHERE assignment = ? AND run < ? ORDER BY run DESC",
+        start (review of build/sd-1726). An earlier run's file the archive moved is read from its bulk copy,
+        named beside its `log_path`: the copy lands before the local file goes, so it is read first."""
+        rows = [(self.ident, self.row["start_step"], None), *((row[0], row[1], row[2]) for row in self.db.execute(
+            "SELECT id, start_step, log_path FROM runner_run WHERE assignment = ? AND run < ? ORDER BY run DESC",
             (self.row["assignment"], self.row["run"])))]
-        for ident, start in rows:
-            pair = (self.logs / f"{ident}.review.out", self.logs / f"{ident}.prior.out")
+        for ident, start, log_path in rows:
+            review, prior = (archived if log_path and _has_text(archived := Path(log_path).parent / local.name)
+                             else local for local in (self.logs / f"{ident}.review.out", self.logs / f"{ident}.prior.out"))
+            pair = (review, prior)
             if any(_has_text(path) for path in pair):
                 return pair
             if start in ("claimed", None):  # a row with no start step reads as fresh: fail closed

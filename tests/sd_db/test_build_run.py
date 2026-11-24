@@ -3074,6 +3074,32 @@ class Supervise(Case):
         self.assertEqual(review[review.index("--base") + 1], blocking["subject"]["head"])
         self.assertEqual(json.loads(resumed.out("prior").read_text(encoding="utf-8")), blocking)
 
+    def test_a_resumed_fix_verifies_a_review_the_archive_moved(self):
+        """Review of build/sd-1726 (pack sd:10236): the archive moves a released run's own files to the bulk
+        root, so a usage-limited run's review left before the resume and the resumed fix reviewed afresh."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "rate_limited"], sd_review=["blocking"])
+        first = self.supervisor()
+        self.assertEqual(first.run()["outcome"], "rate_limited")
+        blocking = json.loads(first.out("review").read_text(encoding="utf-8"))
+        bulk = self.root / "archive"  # the fixture's live root is named `bulk`
+        moved = build_run.archive(self.db, self.logs, bulk, settle=-60)
+        self.assertIn(str(bulk / first.out("review").relative_to(self.logs)), moved)
+        self.assertFalse(first.out("review").exists())
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        self.plan(claude=["fix1"], sd_review=["clean"])
+        resumed = self.supervisor(again["id"])
+        self.assertEqual(resumed.run()["step"], "enqueued")
+        review = [call["argv"] for call in self.calls("sd-review")][-1]
+        self.assertIn("--verify-report", review, "the resumed fix lost the review the archive moved")
+        self.assertEqual(review[review.index("--base") + 1], blocking["subject"]["head"])
+
     def test_a_resumed_fix_keeps_every_blocker_whole(self):
         """Review of build/sd-1557: the resumed fix read its blockers back from the 4000-character note, so a
         multiline finding lost its tail, its bullet read as a blocker of its own and a later finding was cut.
