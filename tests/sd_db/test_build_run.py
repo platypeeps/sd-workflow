@@ -5435,6 +5435,21 @@ class Drafts(Case):
         assert bundle is not None
         self.assertEqual([one["item"] for one in build.run(self.db, bundle["id"])["members"]], [code, design])
 
+    def test_a_full_bundle_still_takes_the_design_its_code_waits_on(self):
+        """Review of sd:10096: the bundle cap cut the queue at the first item past it, so a design queued
+        after that cut left the bundle, though it takes no slot, and its code item built without it."""
+        design = self.designed("draft-plain")
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE item = ? AND status = 'queued'", (design,))
+        code = create_item(self.db, kind="task", title="Build me", repo=str(self.repo), status="ready",
+                           fields={"blocked_by": [design]})
+        other = create_item(self.db, kind="task", title="Build me too", repo=str(self.repo), status="ready")
+        build.queue(self.db, [code, other, design], who="operator")
+        with mock.patch.object(build, "bundle_max", return_value=1):
+            bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                 root=self.root / "worktrees")
+        assert bundle is not None
+        self.assertEqual([one["item"] for one in build.run(self.db, bundle["id"])["members"]], [code, design])
+
     def bound(self):
         """A claimed bundle of a code item and the written design it waits on: (code, design)."""
         design = self.designed("draft-plain")

@@ -2079,7 +2079,11 @@ def _bundle(connection, rows: list) -> list:
         # A design whose question reopened since its press waits for the ruling (sd:10096).
         fresh = [row for row in rows if row["parent"] is None and not row["run_count"] and not (
             _rides(connection, row) and design_waits(connection, row["item"]))]
-        return fresh[:bundled(connection, [row["item"] for row in fresh])]
+        # A ride takes no slot, so the cap counts code rows only and every ride joins: one cut past the
+        # cap lost a later ride its code item waits on (review of sd:10096).
+        code = [row for row in fresh if not _rides(connection, row)]
+        taken = {row["id"] for row in code[:bundled(connection, [row["item"] for row in code])]}
+        return [row for row in fresh if row["id"] in taken or _rides(connection, row)]
     return sorted((row for row in rows if group in (row["id"], row["parent"])), key=lambda row: row["id"] != group)
 
 
