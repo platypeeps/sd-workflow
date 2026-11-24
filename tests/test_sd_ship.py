@@ -4080,7 +4080,7 @@ roles:
         with patch.object(ship.sd_lane, "delivery_settled", side_effect=refused) as settled:
             fixed = self.operation("reconcile").reconcile()
         self.assertEqual((fixed["delivery_pending"], fixed.get("lane_unsettled")), (False, "hub down"))
-        self.assertEqual(settled.call_args.args[1], self.item)
+        self.assertEqual(settled.call_args.args[1:3], (self.item, fixed["merge_commit"]))
         with patch.object(ship.sd_lane, "delivery_settled", return_value=1) as settled:
             again = self.operation("reconcile").reconcile()
         self.assertEqual((again["delivery_pending"], "lane_unsettled" in again, settled.call_count), (False, False, 1))

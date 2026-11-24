@@ -2936,18 +2936,18 @@ class Ship(SharedReview):
         if "closes_failed" in evidence:
             return evidence
         git(self.root, "fetch", "--prune", "origin")
-        return {**evidence, "delivery_pending": False, **self.lane_settled(),
+        return {**evidence, "delivery_pending": False, **self.lane_settled(commit),
                 "cleanup": clean_up_merged(self.root, self.branch, self.state["reviewed_head"])}
 
-    def lane_settled(self) -> dict:
-        """Clear the lane's pending delivery of this item; `{}`, or the lane write's error (sd:9923).
+    def lane_settled(self, commit: str) -> dict:
+        """Clear the lane's pending delivery of this item's merge at `commit`; `{}`, or the write's error (sd:9923).
 
         The item is delivered either way; a reconcile run again clears it.
         """
         if self.args.no_item:
             return {}
         try:
-            sd_lane.delivery_settled(self.root, self.args.item, dict(os.environ))
+            sd_lane.delivery_settled(self.root, self.args.item, commit, dict(os.environ))
         except sd_lane.LaneError as error:
             return {"lane_unsettled": str(error)}
         return {}

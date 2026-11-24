@@ -3426,7 +3426,7 @@ class Landing(Lane):
         self.assertNotIn("Remove:", landed)
         self.assertIn("topic", self.remote_branches())
         self.assertIn("delivery pending", sd_lane.reap(self.store(), self.entries()[0]))
-        sd_lane.delivery_settled(tree, 1, self.environ)
+        sd_lane.delivery_settled(tree, 1, "c0ffee" * 6 + "c0ff", self.environ)
         self.assertTrue(sd_lane.reap(self.store(), self.entries()[0]).startswith("Removed: worktree"))
         self.assertFalse(tree.exists())
 
@@ -3437,12 +3437,66 @@ class Landing(Lane):
         self.answers[(1, "merge")] = {**DELIVERY_HELD, "merge_commit": "c0ffee" * 6 + "c0ff"}
         self.drain()
         self.assertFalse(sd_lane.merge_delivered(self.entries()[0]))
-        sd_lane.delivery_settled(tree, 1, self.environ)
+        sd_lane.delivery_settled(tree, 1, "c0ffee" * 6 + "c0ff", self.environ)
         entry = self.entries()[0]
         self.assertTrue(sd_lane.merge_delivered(entry), entry)
         self.assertNotIn("delivery pending", entry.get("reason") or "")
-        sd_lane.delivery_settled(tree, 1, self.environ)  # twice: nothing left to change
+        sd_lane.delivery_settled(tree, 1, "c0ffee" * 6 + "c0ff", self.environ)  # twice: nothing left to change
         self.assertEqual(self.entries(), [entry])
+
+    def test_a_reconcile_clears_only_the_merge_it_delivered(self) -> None:
+        """Class pass of sd:9923: the clear matched the item alone, so another merge of it read delivered."""
+        tree, head = self.topic()
+        self.merge_lands(tree, 1, head)
+        self.answers[(1, "merge")] = {**DELIVERY_HELD, "merge_commit": "c0ffee" * 6 + "c0ff"}
+        self.drain()
+        other = {**self.entries()[0], "id": "another-merge", "merge_commit": "d" * 40}
+        sd_lane.update(self.store(), lambda rows: rows.append(other))
+        self.assertEqual(sd_lane.delivery_settled(tree, 1, "c0ffee" * 6 + "c0ff", self.environ), 1)
+        pending = {row["merge_commit"]: bool(row.get("delivery_pending")) for row in self.entries()}
+        self.assertEqual(pending, {"c0ffee" * 6 + "c0ff": False, "d" * 40: True})
+        self.assertEqual(sd_lane.delivery_settled(tree, 1, "", self.environ), 0)  # no commit matches nothing
+        self.assertEqual(sd_lane.delivery_settled(tree, 1, "e" * 40, self.environ), 0)
+
+    def test_a_reconcile_before_the_runners_record_keeps_it_from_reading_pending(self) -> None:
+        """Class pass of sd:9923: `sd-ship` answered delivery pending, a reconcile delivered, and the
+        runner then recorded the stale answer; nothing cleared it again."""
+        tree, head = self.topic()
+        self.merge_lands(tree, 1, head)
+
+        def ship(argv: list[str], log: pathlib.Path) -> dict:
+            answer = self.ship(argv, log)
+            if argv[2] == "merge":
+                sd_lane.delivery_settled(tree, 1, "c0ffee" * 6 + "c0ff", self.environ)  # the row is still running
+            return answer
+        self.answers[(1, "merge")] = {**DELIVERY_HELD, "merge_commit": "c0ffee" * 6 + "c0ff"}
+        self.drain(ship)
+        entry = self.entries()[0]
+        self.assertTrue(sd_lane.merge_delivered(entry), entry)
+
+    def test_a_reconcile_of_another_merge_leaves_the_runners_record_pending(self) -> None:
+        tree, head = self.topic()
+        self.merge_lands(tree, 1, head)
+
+        def ship(argv: list[str], log: pathlib.Path) -> dict:
+            if argv[2] == "merge":
+                sd_lane.delivery_settled(tree, 1, "d" * 40, self.environ)
+            return self.ship(argv, log)
+        self.answers[(1, "merge")] = {**DELIVERY_HELD, "merge_commit": "c0ffee" * 6 + "c0ff"}
+        self.drain(ship)
+        self.assertEqual(self.entries()[0].get("delivery_pending"), True)
+
+    def test_a_hub_stop_record_written_after_a_reconcile_does_not_read_pending(self) -> None:
+        """Class pass of sd:9923: the outcome a stopped runner left is the same stale answer."""
+        outcome = {"status": "merged", "merge_commit": "c" * 40, "delivery_pending": True, "code": "held",
+                   "reason": "merged; delivery pending: verify"}
+        row = {"item": 1, "status": "running", "holder": {}, "expected_head": "h", "delivery_settled": "c" * 40}
+        sd_lane.resume_stopped(row, {"outcome": dict(outcome), "at": "now"})
+        self.assertTrue(sd_lane.merge_delivered(row), row)
+        other = {**row, "status": "running", "delivery_settled": "d" * 40}
+        other.pop("merge_commit")
+        sd_lane.resume_stopped(other, {"outcome": dict(outcome), "at": "now"})
+        self.assertEqual((other["status"], other.get("delivery_pending")), ("merged", True))
 
     def test_a_held_dirty_or_moved_merged_worktree_is_kept_and_tried_again(self) -> None:
         import sd_db

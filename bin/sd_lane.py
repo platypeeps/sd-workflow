@@ -4283,6 +4283,19 @@ def reclaim_dead(entries: list[dict[str, Any]], stops: dict[str, Any] | None = N
             and (row.get("holder") or {}).get("host") == host and not runner_alive(row["holder"].get("pid"))]
 
 
+def settled_outcome(row: dict[str, Any], outcome: dict[str, Any]) -> dict[str, Any]:
+    """`outcome` without its pending delivery when `sd-ship reconcile` already delivered that merge (sd:9923).
+
+    `delivery_settled` marked the running row with the delivered commit
+    before this outcome, an answer from before the reconcile, was written.
+    """
+    commit = row.get("delivery_settled")
+    if not (outcome.get("delivery_pending") and commit and outcome.get("merge_commit") == commit):
+        return outcome
+    kept = {key: value for key, value in outcome.items() if key not in ("delivery_pending", "code")}
+    return {**kept, "reason": "merged; delivered by sd-ship reconcile"}
+
+
 def resume_stopped(row: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
     """Settle a running entry whose runner stopped on a hub fault, by its `record`; never as a death (sd:4184).
 
@@ -4295,7 +4308,7 @@ def resume_stopped(row: dict[str, Any], record: dict[str, Any]) -> dict[str, Any
     """
     holder, step, outcome = row.get("holder") or {}, row.get("step"), record.get("outcome")
     if isinstance(outcome, dict) and outcome.get("status") in ("merged", *BLOCKED):
-        row.update(outcome, finished_at=str(record.get("at") or stamp_now()))
+        row.update(settled_outcome(row, outcome), finished_at=str(record.get("at") or stamp_now()))
         row.pop("lease_until", None)
         if row["status"] == "merged":  # an older version's record has no mark; the target is owed all the same
             row.setdefault("post_merge", POST_MERGE_OWED)
@@ -4540,7 +4553,8 @@ def finish_entry(queue: Queue, entry: dict[str, Any], token: str, outcome: dict[
         if (row.get("holder") or {}).get("token") == token and row.get("status") != "running":
             if row.get("status") == outcome.get("status"):
                 return  # an earlier try landed unseen
-        held(entries, entry, token).update(outcome, finished_at=stamp_now())
+        claimed = held(entries, entry, token)
+        claimed.update(settled_outcome(claimed, outcome), finished_at=stamp_now())
         row.pop("lease_until", None)
     runner_write(queue, mark_finished)
 
@@ -5798,23 +5812,32 @@ def watch_pause() -> None:
     time.sleep(WATCH_PAUSE)
 
 
-def delivery_settled(root: pathlib.Path, item: int, environ: dict[str, str]) -> int:
-    """Clear `delivery_pending` on `item`'s merged rows once `sd-ship reconcile` delivered it; how many changed.
+def delivery_settled(root: pathlib.Path, item: int, commit: str, environ: dict[str, str]) -> int:
+    """Clear `delivery_pending` on `item`'s rows merged at `commit`, which `sd-ship reconcile` delivered.
 
-    A checkout whose origin names no GitHub repository has no lane, so
-    nothing to clear. A second call finds nothing pending and writes nothing.
+    How many rows it cleared. Another merge of the item keeps its own
+    pending delivery. A running row has no outcome yet: it takes the mark
+    `delivery_settled`, and the outcome write drops a pending delivery of
+    that same commit (`settled_outcome`), so a reconcile that ran before
+    the runner's record is not undone by it. A checkout whose origin names
+    no GitHub repository has no lane. A second call writes nothing.
     """
-    if repository_of(root) is None:
+    if not commit or repository_of(root) is None:
         return 0
 
     def clear(entries: list[dict[str, Any]]) -> int:
-        held = [row for row in entries
-                if row.get("item") == item and row.get("status") == "merged" and row.get("delivery_pending")]
-        for row in held:
-            row.pop("delivery_pending")
-            row.pop("code", None)
-            row["reason"] = "merged; delivered by sd-ship reconcile"
-        return len(held)
+        cleared = 0
+        for row in entries:
+            if row.get("item") != item:
+                continue
+            if row.get("status") == "running":
+                row["delivery_settled"] = commit
+            elif row.get("status") == "merged" and row.get("merge_commit") == commit and row.get("delivery_pending"):
+                row.pop("delivery_pending")
+                row.pop("code", None)
+                row["reason"] = "merged; delivered by sd-ship reconcile"
+                cleared += 1
+        return cleared
     return update(queue_for(root, environ), clear)
 
 
