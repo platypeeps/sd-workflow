@@ -12,8 +12,9 @@ combining them are not.
 
 **It does not say who reviews.** The registry names the ordered provider chain;
 the tier records the change's risk classification. Every reviewing tier asks
-two independent local reviews, the first two readers in the chain run at once
-(sd:7519), cut to the eligible readers by `reader_depth`; skip requires none.
+one local review, from the chain's first ready reader (`TIER_DEPTH`); a policy
+that asks more runs the first readers at once (sd:7519), cut to the eligible
+ones by `reader_depth`; skip requires none.
 
 Policy shape (every key optional unless noted)::
 
@@ -58,7 +59,10 @@ def reader_depth(asked: int, eligible: int) -> int:
 
 
 def review_shortfall(asked: int, eligible: int) -> dict[str, int] | None:
-    """The result's record of a chain shorter than the asked depth (#43332)."""
+    """The result's record of a chain shorter than the asked depth (#43332).
+
+    At the shipped depth of 1 it fires only on an empty chain, which readiness
+    refuses; it stays for a depth over 1, the path the parallel tests pin."""
     return {"requested": asked, "eligible": eligible} if eligible < asked else None
 
 

@@ -1325,6 +1325,14 @@ class OuterTemporaryUntouched(unittest.TestCase):
         self.assertEqual((sorted(p.name for p in outer.iterdir() if p.name == leftover), done.stderr), ([leftover], ""))
 
 
+def roomy(disk: pathlib.Path) -> contextlib.AbstractContextManager[object]:
+    """`disk` reads `FREE` bytes free, others their real usage: the fake disk sits on the real temp dir, the
+    shared 4 GiB RAM disk in a gate, which concurrent gates filled under 1 GiB and failed six tests (sd-1715)."""
+    real = shutil.disk_usage
+    return mock.patch.object(shutil, "disk_usage",
+                             lambda path: mock.Mock(free=sd_tmpdisk.FREE) if pathlib.Path(path) == disk else real(path))
+
+
 class TmpDiskProbe(unittest.TestCase):
     """sd:7557: the RAM disk is ready only when every probe passes; any failed probe reads "not ready", never an error."""
 
@@ -1335,7 +1343,7 @@ class TmpDiskProbe(unittest.TestCase):
         self.disk.mkdir()
         (self.disk / sd_tmpdisk.READY).write_text("", encoding="utf-8")
         self.mounted = True
-        for patch in (mock.patch.object(sd_tmpdisk, "ROOT", self.disk),
+        for patch in (mock.patch.object(sd_tmpdisk, "ROOT", self.disk), roomy(self.disk),
                       mock.patch.object(sd_tmpdisk, "ismount", lambda path: self.mounted and path == self.disk)):
             patch.start()
             self.addCleanup(patch.stop)
@@ -1382,7 +1390,7 @@ class RamDiskGate(Repository):
         self.outer.mkdir()
         self.seen = self.root.parent / "seen"
         # The run's own `sd-tests-<pid>-` folder holds both fakes; that nesting keeps the real disk away (sd:3032).
-        for patch in (mock.patch.object(sd_tmpdisk, "ROOT", self.disk),
+        for patch in (mock.patch.object(sd_tmpdisk, "ROOT", self.disk), roomy(self.disk),
                       mock.patch.object(sd_tmpdisk, "ismount", lambda path: path == self.disk),
                       mock.patch.object(sd_tmpdisk, "owned_inside", lambda path: False),
                       mock.patch.dict(os.environ, {"TMPDIR": str(self.outer)}),
@@ -1531,7 +1539,9 @@ class RamDiskGate(Repository):
     def test_a_test_run_puts_its_temp_dir_on_a_ready_disk(self) -> None:
         code = ("import os, pathlib, sys; sys.path.insert(0, 'bin'); import sd_tmpdisk; "
                 f"sd_tmpdisk.ROOT = pathlib.Path({str(self.disk)!r}); sd_tmpdisk.ismount = lambda path: True; "
-                "sd_tmpdisk.owned_inside = lambda path: False; import tests; print(os.environ['TMPDIR'])")
+                "sd_tmpdisk.owned_inside = lambda path: False; import shutil, types; real = shutil.disk_usage; "
+                "shutil.disk_usage = lambda path: types.SimpleNamespace(free=sd_tmpdisk.FREE) "
+                "if pathlib.Path(path) == sd_tmpdisk.ROOT else real(path); import tests; print(os.environ['TMPDIR'])")
         done = subprocess.run([sys.executable, "-c", code], cwd=REPO_ROOT, capture_output=True, text=True,
                               env={**os.environ, "TMPDIR": str(self.outer)}, timeout=60)
         self.assertEqual(done.returncode, 0, done.stderr)
