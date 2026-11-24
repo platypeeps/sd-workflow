@@ -453,16 +453,15 @@ def _holder(connection, lead: int, before: int | None = None):
 def _home(connection, lane: str | None, lead: int | None) -> bool:
     """Whether the bundle `lead` leads, built by the hub under the overload fallback for the satellite lane `lane`,
     goes back to that lane host now (sd:10143): its work's last run reached the lane, which pushed its head
-    (`LANE_STEPS`); no attempt since ended with no worktree, as one on the lane host that found no pushed branch
-    does; and the lane host's beat is fresh and under its cap."""
+    (`LANE_STEPS`), and the lane host's beat is fresh and under its cap. A lane-host attempt since that ended
+    with no worktree (a failed fetch, a missing branch) keeps it home: the hub's kept checkout lacks any push
+    the lane made after, and the worktree guard blocks a branch origin lacks (review of build/sd-1688)."""
     if lane is None or lead is None:
         return False
     held = _holder(connection, lead)
     if held is None or lane_of(connection, run_host(held["owner"])) is not None or held["step"] not in LANE_STEPS:
         return False
-    last = connection.execute("SELECT id FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
-                              (lead,)).fetchone()
-    return last["id"] == held["id"] and not dispatcher_gone(connection, lane) and not overloaded(connection, lane)
+    return not dispatcher_gone(connection, lane) and not overloaded(connection, lane)
 
 
 def _route(connection, lane_host: str | None, lead: int | None) -> str | None:
