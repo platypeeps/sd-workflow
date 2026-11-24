@@ -1144,11 +1144,15 @@ class LineBudgetTests(unittest.TestCase):
         # 5207 -> 5211 is the sd:10191 review at bin/sd-review:1865: +4, as
         # only a revived blocker of a repeat's own ruling lends evidence to
         # it. Measured: `sd-review` is 3241.
+        #
+        # 5211 -> 5219 is the sd:10191 review at bin/sd-review:967: +8, as
+        # every ruling is read in `repo_spelling`'s one spelling before
+        # placement. Measured: `sd-review` is 3249.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5211,
+            5219,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

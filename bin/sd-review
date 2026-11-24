@@ -873,7 +873,7 @@ def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: 
                 ["--literal-pathspecs", "diff", "-U0", "--no-color", "--no-ext-diff", *ends, "--", path], root)
         diff = diffs[receipt, path]
         return None if diff is None else (line,) if diff == "" else hunk_kept(diff, line)
-    return rebuttals(rows, span[2].__contains__, ruled_place)
+    return rebuttals(rows, span[2].__contains__, ruled_place, repo_spelling(root))
 
 
 def hunk_kept(diff: str, line: int | None) -> tuple[int | None] | None:
@@ -915,7 +915,8 @@ def recorded_at(records: Sequence[Rebuttal], path: Any, summary: Any, line: Any,
 
 
 def rebuttals(rows: Sequence[Sequence[Any]], on_branch: Callable[[str], bool],
-              kept: Callable[[str, Any, int | None], tuple[int | None] | None]) -> list[Rebuttal]:
+              kept: Callable[[str, Any, int | None], tuple[int | None] | None],
+              spelled: Callable[[Any], Any] = lambda path: path) -> list[Rebuttal]:
     """Every disposition in adjudication bodies newest first, from receipts `on_branch`. A rebuttal is listed when
     it is the newest record at its place and `kept` finds each place it names unchanged since its receipt, up to
     `REBUTTED_LINES`, and is listed at the lines `kept` moved them to; the prompt shows exactly those, and the gate
@@ -930,12 +931,19 @@ def rebuttals(rows: Sequence[Sequence[Any]], on_branch: Callable[[str], bool],
                if isinstance(head, str) and on_branch(head)
                for path, summary, line, disposition, reason, instances, answered in found
                if summary_key(summary) and str(path).strip() not in LANE_PATHS]
-    return rulings_placed(records, kept)
+    return rulings_placed(records, kept, spelled)
 
 
-def rulings_placed(records: Sequence[Rebuttal], kept: Callable[[str, Any, int | None], tuple[int | None] | None]) -> list[Rebuttal]:
+def rulings_placed(records: Sequence[Rebuttal], kept: Callable[[str, Any, int | None], tuple[int | None] | None],
+                   spelled: Callable[[Any], Any] = lambda path: path) -> list[Rebuttal]:
     """`records`, newest first, with each listed rebuttal and each newer ruling of its summary at the lines `kept`
-    moved them to; `listed` only for a rebuttal that is still the newest at its place there (`rebuttals`)."""
+    moved them to; `listed` only for a rebuttal that is still the newest at its place there (`rebuttals`). Each
+    path is read in `spelled`'s one spelling first: `./a.py` and `a.py` are one place (bin/sd-review:967)."""
+    def _spelled(entry: str) -> str:  # the pattern `_moved` reads, so a line it lapses still lapses
+        found = re.fullmatch(r"(?s)(.*):(\d+)", entry)
+        return f"{spelled(found[1])}:{found[2]}" if found else spelled(entry)
+    records = [record._replace(path=spelled(record.path), instances=tuple(map(_spelled, record.instances)))
+               for record in records]
     def _moved(record: Rebuttal) -> Rebuttal | None:
         """The record at its places at the reviewed head; None when any place lapsed."""
         line = kept(record.head, record.path, record.line)

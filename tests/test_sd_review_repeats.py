@@ -1671,6 +1671,19 @@ class RebuttalScopeTests(RepeatFixture):
         placed = sd_review.rulings_placed([newer, older], lambda _head, _path, line: (line,))
         self.assertEqual([entry.listed for entry in placed], [False, False])
 
+    def test_a_newer_ruling_in_another_spelling_decides_for_an_older_rebuttal(self) -> None:
+        """Review of sd:10191 (bin/sd-review:967): a newer parked ruling at `./src.py:20` and an older
+        rebuttal at `src.py:20` name one place, but placement compared the raw spellings and listed the
+        older rebuttal. Each ruling is read in `repo_spelling`'s one spelling first."""
+        def ruling(path: str, listed: bool) -> Any:
+            return sd_review.Rebuttal("head", path, "s", 20, listed, path, "x", "y", (f"{path}:20",))
+        spelled = sd_review.repo_spelling(pathlib.Path("/example.test/repo"))
+        for newer in ("./src.py", "/example.test/repo/src.py"):
+            with self.subTest(newer=newer):
+                placed = sd_review.rulings_placed([ruling(newer, False), ruling("src.py", True)],
+                                                  lambda _head, _path, line: (line,), spelled)
+                self.assertEqual([entry.listed for entry in placed], [False, False])
+
     def test_a_newline_in_an_instance_path_still_places_its_line(self) -> None:
         """Review of sd:10191 (bin/sd-review:942): an instance `a\nb.py:10` did not match the `path:line` pattern, as `.`
         stops at a newline, so it was placed as a path with no line and kept after its line changed."""
