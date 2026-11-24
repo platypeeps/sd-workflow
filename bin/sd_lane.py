@@ -3711,6 +3711,12 @@ def land(entry: dict[str, Any], outcome: dict[str, Any], environ: dict[str, str]
         body = f"{merged_at} (head {str(head)[:12]}). {cleanup}."
         return land_note(fields, body, entry, environ, note, own_lock, main)
     branch, tip = lane_git(worktree, "branch", "--show-current") or "", lane_git(worktree, "rev-parse", "HEAD")
+    if held:  # sd:9923: `sd-ship reconcile` runs here; the reap removes it once the delivery is settled
+        cleanup = f"Cleanup held: delivery pending; `sd-ship reconcile` runs in {worktree}{pruned}"
+        remove = None if entry.get("lane_worktree") or not branch else (
+            f"git -C {main} worktree remove {worktree} && git -C {main} update-ref -d refs/heads/{branch} {tip}")
+        return land_note({"cleanup": cleanup, "remove": remove}, f"{merged_at} (head {str(head)[:12]}). {cleanup}.",
+                         entry, environ, note, own_lock, main)
     cleanup, remove = clean_up(entry, head, main, branch, tip)
     kept, where = entry.get("builder_worktree"), f" on {entry.get('builder_host')}"
     if entry.get("lane_worktree") and kept:  # the builder's own worktree, on the host that enqueued it (sd:3283)
@@ -5314,10 +5320,13 @@ def run_entry(root: pathlib.Path, queue: Queue, entry: dict[str, Any], token: st
             return unknown_checkout(queue, entry, token, error)
         found = {"status": "failed", "step": "worktree", "reason": str(error)[:600]}
     tree = found.pop("tree", None)
+    ran: tuple[dict[str, Any] | None, str | None] = (None, None)
     try:
-        return run_checkout(root, queue, entry, token, environ, ship, note, tree, found, deadline)
+        ran = run_checkout(root, queue, entry, token, environ, ship, note, tree, found, deadline)
+        return ran
     finally:
-        if tree is not None and found.get("made"):
+        held = bool(ran[0] and ran[0].get("delivery_pending"))  # sd:9923: `sd-ship reconcile` runs in it
+        if tree is not None and found.get("made") and not held:
             drop_lane_worktree(sd_lib.main_worktree_root(root), tree, found.get("branch_made"), made=True)
 
 

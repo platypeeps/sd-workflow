@@ -3415,6 +3415,21 @@ class Landing(Lane):
         landed = [body for _, body, _ in self.notes if body.startswith("Landed")]
         self.assertIn("delivery pending", landed[0])
 
+    def test_a_landing_whose_delivery_is_pending_cleans_nothing_up(self) -> None:
+        """Review of sd:9923: the landing deleted origin's branch and named the removal of the
+        checkout `sd-ship reconcile` still runs in."""
+        tree, head = self.topic()
+        self.merge_lands(tree, 1, head)
+        self.answers[(1, "merge")] = {**DELIVERY_HELD, "merge_commit": "c0ffee" * 6 + "c0ff"}
+        self.drain()
+        [landed] = [body for _, body, _ in self.notes if body.startswith("Landed")]
+        self.assertNotIn("Remove:", landed)
+        self.assertIn("topic", self.remote_branches())
+        self.assertIn("delivery pending", sd_lane.reap(self.store(), self.entries()[0]))
+        sd_lane.delivery_settled(tree, 1, self.environ)
+        self.assertTrue(sd_lane.reap(self.store(), self.entries()[0]).startswith("Removed: worktree"))
+        self.assertFalse(tree.exists())
+
     def test_a_reconcile_that_delivers_clears_the_pending_delivery(self) -> None:
         """Review of sd:9923: a successful `sd-ship reconcile` left the row reading delivery pending."""
         tree, head = self.topic()
@@ -6313,6 +6328,14 @@ class AnyHost(SharedQueue):
         sd_lane.run_lane(self.repo, self.environ, self.ship)
         self.assertEqual(self.entries()[0]["status"], "failed")
         self.assertEqual((self.made().exists(), git(self.repo, "branch", "--list", "topic")), (False, ""))
+
+    def test_a_lane_worktree_whose_delivery_is_pending_is_kept(self) -> None:
+        """Review of sd:9923: the runner removed the lane worktree `sd-ship reconcile` runs in."""
+        self.enqueued_elsewhere(1, "topic", "work")
+        self.answers[(1, "merge")] = DELIVERY_HELD
+        sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual((self.entries()[0]["status"], self.entries()[0].get("delivery_pending")), ("merged", True))
+        self.assertTrue(self.made().exists())
 
     def test_a_remote_branch_that_moved_skips_head_moved(self) -> None:
         """Failure table, worktree: the fetched head is neither `expected_head` nor its catch-up merge."""
