@@ -187,6 +187,24 @@ cmd_serve() {
 cmd_runtime() {
   runtime_python="${SD_DASHBOARD_PYTHON:-$RUNTIME_PYTHON_DEFAULT}"
   if [ ! -x "$runtime_python" ]; then
+    # A satellite has neither the server's runtime nor its config: health
+    # has nothing to check there, exit 3 as runtime.py does (sd:9916). The
+    # last --config wins, as argparse takes it.
+    if [ "${1:-}" = health ]; then
+      config="$HOME/.config/sd/dashboard.json"
+      previous=""
+      for argument in "$@"; do
+        case "$argument" in
+          --config=*) config="${argument#--config=}" ;;
+          *) [ "$previous" = --config ] && config="$argument" ;;
+        esac
+        previous="$argument"
+      done
+      if [ ! -e "$config" ]; then
+        echo "dashboard: no dashboard on this machine: $config does not exist" >&2
+        exit 3
+      fi
+    fi
     echo "dashboard: missing installed runtime $runtime_python" >&2
     exit 1
   fi

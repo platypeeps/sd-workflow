@@ -57,13 +57,29 @@ case "$*" in
   "lane retry --help") if [ -n "$QUEUE_NO_RETRY" ]; then echo "invalid choice: 'retry'" >&2; exit 2; fi
      if [ -n "$QUEUE_OLD_RETRY" ]; then echo "usage: sd-ship lane retry [--manual] item"; else echo "usage: sd-ship lane retry [--manual] [--expected-head EXPECTED_HEAD] item"; fi
      if [ -z "$QUEUE_OLD_REQUEUE$QUEUE_OLD_RETRY" ]; then echo "  --expected-head  ...; a cancelled entry needs it (sd:3389)"; fi ;;
+  *" adjudicate "*) case "$*" in
+       *--dispositions-file*) if [ -n "$QUEUE_REFUSE" ]; then printf '{"ok": false, "error": "%s"}\\n' "$QUEUE_REFUSE"; exit 3; fi
+         eval "f=\\${$#}"; cp "$f" "$QUEUE_LOG.dispositions"; printf '{"ok": true, "phase": "disposition_recorded"}\\n' ;;
+       *) raw="$QUEUE_RAW"; [ -n "$raw" ] || raw='{"severity": "high", "path": "a.py", "line": 1, "summary": "wrong"}'
+         fs=""; for d in ${QUEUE_DIGEST:-f1}; do fs="$fs${fs:+, }{\\"index\\": 1, \\"finding_digest\\": \\"$d\\", \\"raw_finding\\": $(printf '%s' "$raw" | sed "s/@D/$d/g"), \\"response_disposition\\": \\"rebutted|parked\\", \\"reason\\": \\"\\"}"; done
+         printf '{"ok": true, "phase": "disposition_template", "proposal": {"schema_version": 1, "bindings": {"head": "h"}, "findings": [%s]}%s}\\n' "$fs" "${QUEUE_OLD_TEMPLATE-, \\"recorded_revision\\": ${QUEUE_RECORDED:-null}}" ;;
+     esac ;;
   "gate status --json") printf '{"slots": 4, "holders": [{"slot": 1}], "waiters": [], "load": [1, 2, 3]}\\n' ;;
   *) if [ -n "$QUEUE_SLEEP" ]; then exec sleep "$QUEUE_SLEEP"; fi
      if [ -n "$QUEUE_CRASH" ]; then echo "Traceback: $QUEUE_CRASH" >&2; exit 1; fi
+     if [ -n "$QUEUE_RETRY_REFUSE" ]; then printf '{"ok": false, "error": "%s", "code": "%s"}\\n' "$QUEUE_RETRY_REFUSE" "$QUEUE_CODE"; exit 3; fi
      if [ -n "$QUEUE_REFUSE" ]; then printf '{"ok": false, "error": "%s", "code": "%s"}\\n' "$QUEUE_REFUSE" "$QUEUE_CODE"; exit "${QUEUE_EXIT:-3}"; fi
      printf '{"ok": true}\\n' ;;
 esac
 """
+
+
+#: sd:9966: the blocking finding a review-blocked prepare's answer names, whole, beside its digest.
+FOUND = [{"severity": "high", "path": "a.py", "line": 1, "summary": "wrong", "text": "wrong"}]
+#: Six blocking findings as the prepare log binds them and as adjudicate's template carries each (`@D`: its digest).
+SIX_DIGESTS = [str(n) for n in range(1, 7)]
+SIX_LIVE = {"QUEUE_DIGEST": " ".join(SIX_DIGESTS),
+            "QUEUE_RAW": '{"severity": "high", "path": "b@D.py", "line": @D, "summary": "finding @D whole"}'}
 
 
 def git(path, *args):
@@ -147,7 +163,7 @@ class Lane:
         """pack sd:8584: item 14 failed prepare at the checkout's head, enqueued here, its log in the lane's logs;
         `answer` is the log's stdout in place of prepare's JSON answer."""
         log = self.lane / "logs" / "prepare-14-20260906T100000.log"
-        prepared = json.dumps({"ok": False, "error": "local review blocking: 1/1 completed", "workflow": {
+        prepared = json.dumps({"ok": False, "error": "local review blocking: 1/1 completed", "reviewed_head": self.merged, "finding_digests": ["f1"], "findings": FOUND, "workflow": {
             "blocker": {"code": "review_blocking", "retryable": False},
             "next_action": "Run `sd-ship adjudicate --item 14` to print each blocking finding in full; fix them."}},
             indent=2)
@@ -827,6 +843,267 @@ class TheMove(Lane, BrowserSession):
         self.assertEqual((status, answer["ok"], answer["action"]), (200, True, "approve"))
         self.assertEqual(self.calls()[-1],
                          ["-C", str(self.checkout), "lane", "retry", "5", "--expected-head", "5" * 40, "--manual"])
+
+    REASON = "a.py:1 reads the value the finding says is missing"
+
+    def shown(self):
+        """The review key item 14's row showed, as the page read it."""
+        return next(row for row in queue_screen.document(self.connection, now=NOW)["lanes"][0]["rows"]
+                    if row.get("item") == 14).get("review")
+
+    def reject(self, item=14, reason=REASON, head=None, review=None):
+        review = review or self.shown() or "0" * 16
+        self.log.write_text("")
+        return self.post("/api/queue/move", {"repo": str(self.checkout), "item": item, "action": "reject",
+                                             "revision": self.revision(), "head": head or self.merged, "reason": reason,
+                                             "review": review})
+
+    def test_reject_rebuts_each_blocking_finding_then_queues_the_entry_again(self):
+        """sd:9966: Reject and enqueue records a rebuttal of every lane review blocker, then lane retry."""
+        self.failed()
+        self.log.write_text("")
+        status, _, answer = self.reject()
+        self.assertEqual((status, answer["ok"], answer["action"]), (200, True, "reject"), answer)
+        calls = self.calls()
+        adjudicate = ["-C", str(self.checkout), "adjudicate", "--item", "14", "--expected-head", self.merged, "--json"]
+        self.assertEqual(calls[:2], [["-C", str(self.checkout), "lane", "list"], adjudicate])
+        self.assertEqual(calls[2][:len(adjudicate) + 1], [*adjudicate, "--dispositions-file"])
+        self.assertEqual(calls[3:], [["-C", str(self.checkout), "lane", "retry", "14", "--expected-head", self.merged]])
+        filled = json.loads(Path(f"{self.log}.dispositions").read_text())
+        self.assertEqual([(row["response_disposition"], row["reason"]) for row in filled["findings"]],
+                         [("rebutted", self.REASON)])
+        self.assertEqual(filled["bindings"], {"head": "h"})
+
+    def caught_up(self, answer):
+        """Item 14's prepare merged main onto the queued head, then its review blocked at that merge."""
+        self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "review_blocking"}}, **answer}))
+        self.log.write_text("")
+
+    def test_reject_adjudicates_at_the_reviewed_head_and_retries_at_the_queued_one(self):
+        """sd:9966 review: a catch-up moved the head before the review blocked; adjudicate refused the queued one."""
+        reviewed = "e" * 40
+        self.caught_up({"reviewed_head": reviewed, "finding_digests": ["f1"], "findings": FOUND})
+        status, _, answer = self.reject()
+        self.assertEqual(status, 200, answer)
+        calls = self.calls()
+        self.assertEqual(calls[1], ["-C", str(self.checkout), "adjudicate", "--item", "14", "--expected-head", reviewed,
+                                    "--json"])
+        self.assertEqual(calls[-1], ["-C", str(self.checkout), "lane", "retry", "14", "--expected-head", self.merged])
+
+    def test_an_older_answer_naming_no_review_offers_no_reject_and_refuses_one(self):
+        """An answer from before `reviewed_head` and `finding_digests` binds no review: nothing to reject."""
+        for answer in ({"workflow": {"blocker": {"code": "review_blocking"}, "next_action":
+                                     f"Run `sd-ship adjudicate --item 14 --expected-head {'d' * 40} --json`."}},
+                       {"reviewed_head": "d" * 40}, {"finding_digests": ["f1"]},
+                       {"reviewed_head": "d" * 40, "finding_digests": ["f1", "f2"], "findings": FOUND}):
+            with self.subTest(answer=answer):
+                self.caught_up(answer)
+                self.assertIsNone(self.shown())
+                status, _, said = self.reject()
+                self.assertEqual(status, 400, said)
+                self.assertEqual(self.calls(), [["-C", str(self.checkout), "lane", "list"]])
+
+    SIX = [{"severity": "high", "path": f"b{n}.py", "line": n, "summary": f"cut {n}...", "text": f"finding {n} whole"}
+           for n in range(1, 7)]
+
+    def test_a_review_blocked_row_names_every_finding_its_review_key_covers_in_full(self):
+        """sd:9966 review round 6: six blockers; the refusal's text names five, and Reject rebuts all six."""
+        answer = json.dumps({"ok": False, "workflow": {"blocker": {"code": "review_blocking"}},
+                             "reviewed_head": self.merged, "finding_digests": SIX_DIGESTS, "findings": self.SIX})
+        with mock.patch.dict(os.environ, SIX_LIVE):
+            row = self.failed(answer=answer)
+        self.assertEqual(row["review_findings"], [json.dumps({"line": n, "path": f"b{n}.py", "severity": "high",
+                                                              "summary": f"finding {n} whole"}) for n in range(1, 7)])
+        self.assertIsNotNone(row["review"])
+        with mock.patch.dict(os.environ, {**SIX_LIVE, "QUEUE_RAW": SIX_LIVE["QUEUE_RAW"].replace("whole", "other")}):
+            other = self.failed(answer=answer)
+        self.assertNotEqual(other["review"], row["review"])  # the key binds the text the page shows
+
+    def test_reject_refuses_a_review_other_than_the_one_the_page_showed(self):
+        """sd:9966 review round 2: a newer prepare log names other findings than the page showed."""
+        self.failed()
+        seen = self.shown()
+        self.caught_up({"reviewed_head": self.merged, "finding_digests": ["f2"], "findings": FOUND})
+        status, _, answer = self.reject(review=seen)
+        self.assertEqual(status, 409, answer)
+        # The template is read, which writes nothing; no rebuttal is recorded and nothing is queued.
+        self.assertEqual([call for call in self.calls() if "--dispositions-file" in call or "retry" in call], [])
+
+    def test_reject_refuses_a_review_refreshed_at_the_same_head_since_the_lanes_run(self):
+        """sd:9966 review round 2: the review at that head was run again; its findings are not the ones shown."""
+        self.failed()
+        with mock.patch.dict(os.environ, {"QUEUE_DIGEST": "f9"}):
+            status, _, answer = self.reject()
+        self.assertEqual(status, 409, answer)
+        self.assertFalse(Path(f"{self.log}.dispositions").exists())
+        self.assertNotIn("--dispositions-file", [word for call in self.calls() for word in call])
+
+    def test_reject_refuses_an_entry_no_review_blocked_before_any_verb(self):
+        self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "merge_conflict"}}}))
+        self.log.write_text("")
+        status, _, answer = self.reject()
+        self.assertEqual(status, 400, answer)
+        self.assertIn("review", answer["error"])
+        self.assertEqual(self.calls(), [["-C", str(self.checkout), "lane", "list"]])
+
+    def test_reject_refuses_another_head_or_no_reason_before_any_verb(self):
+        self.failed()
+        for reason, head in (("", None), ("  \n ", None), ("x" * 4097, None), (self.REASON, "f" * 40)):
+            self.log.write_text("")
+            status, _, _ = self.reject(reason=reason, head=head)
+            self.assertEqual(status, 400)
+            self.assertEqual([c for c in self.calls() if "adjudicate" in c], [])
+
+    def test_reject_is_off_and_refused_for_a_checkout_another_host_enqueued(self):
+        """sd:9966 review round 3: the hub prepared a satellite's entry in a lane worktree it removed; the entry's
+        worktree is the satellite's, which adjudicate cannot open here."""
+        for extra in ({"enqueued_on": "satellite-1"}, {"worktree": str(self.checkout / "gone")}):
+            with self.subTest(extra=extra):
+                self.assertIsNone(self.failed(**extra)["review"])
+                status, _, answer = self.reject(review="0" * 16)
+                self.assertEqual(status, 400, answer)
+                self.assertIn("another host", answer["error"])
+                self.assertEqual(self.calls(), [["-C", str(self.checkout), "lane", "list"]])
+
+    def test_a_retry_that_fails_after_the_rebuttal_says_the_rebuttal_is_recorded(self):
+        """sd:9966 review round 3: adjudicate recorded the rebuttal, then lane retry refused, met a stale head or
+        gave no answer; each answer says the rebuttal stays and a later retry clears the review with it."""
+        for env, code in (({"QUEUE_RETRY_REFUSE": "cannot publish the branch"}, 400),
+                          ({"QUEUE_RETRY_REFUSE": "moved", "QUEUE_CODE": "stale_head"}, 409),
+                          ({"QUEUE_CRASH": "hub gone"}, 502)):
+            with self.subTest(env=env):
+                self.failed()
+                with mock.patch.dict(os.environ, env):
+                    status, _, answer = self.reject()
+                self.assertTrue(Path(f"{self.log}.dispositions").exists())
+                self.assertEqual((status, answer.get("rebutted")), (code, True), answer)
+                self.assertIn("rebuttal is recorded", answer["error"])
+                Path(f"{self.log}.dispositions").unlink()
+
+    def test_a_row_says_whether_its_review_holds_dispositions(self):
+        """sd:9966 round 8: adjudicate's template, read only, says; a template that cannot say reads as not known."""
+        for env, held in (({}, False), ({"QUEUE_RECORDED": "7"}, True), ({"QUEUE_OLD_TEMPLATE": ""}, None)):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                row = self.failed()
+                self.assertIs(row["held"], held)
+                self.assertIsNotNone(row["review"])
+        self.assertIsNone(self.failed(enqueued_on="satellite-1")["held"])
+
+    def test_a_review_run_again_at_the_same_head_offers_retry_not_reject(self):
+        """sd:9966 lane review: the review at that head ran again with other findings; the prepare log still
+        names the old ones, so Reject would rebut findings no longer there. Retry reads the live review."""
+        with mock.patch.dict(os.environ, {"QUEUE_DIGEST": "f9"}):
+            row = self.failed()
+        self.assertEqual((row["review"], row["review_findings"], row["held"]), (None, [], None))
+
+    #: A blocking finding whole, as adjudicate's template carries it: its evidence and each site of its class.
+    CITED = json.dumps({"severity": "high", "path": "a.py", "line": 1, "summary": "wrong",
+                        "evidence": "a.py:1 reads <b>x</b> unset", "instances": ["a.py:1", "b.py:9"]})
+
+    def test_a_review_blocked_row_shows_each_findings_evidence_and_sites(self):
+        """sd:9966 review: Reject rebuts a blocker; the operator sees what it cites, not only its summary."""
+        with mock.patch.dict(os.environ, {"QUEUE_RAW": self.CITED}):
+            row = self.failed()
+        self.assertEqual(row["review_findings"], [json.dumps(json.loads(self.CITED), sort_keys=True)])
+
+    def test_reject_refuses_findings_other_than_the_ones_the_dialog_showed(self):
+        """sd:9966 class pass: the dialog's lines and the rebuttal come from one read of adjudicate's template.
+        A template that names another failing input, site, path or summary under the digests the log binds
+        is not the review the page showed: nothing is rebutted."""
+        cited = json.loads(self.CITED)
+        for name, other in (("evidence", {"evidence": "b.py:9 reads y unset"}), ("sites", {"instances": ["c.py:3"]}),
+                            ("no sites", {"instances": None}), ("path", {"path": "c.py"}), ("line", {"line": 2}),
+                            ("severity", {"severity": "medium"}), ("summary", {"summary": "another defect"})):
+            with self.subTest(name):
+                with mock.patch.dict(os.environ, {"QUEUE_RAW": self.CITED}):
+                    self.failed()
+                    seen = self.shown()
+                raw = {key: value for key, value in {**cited, **other}.items() if value is not None}
+                with mock.patch.dict(os.environ, {"QUEUE_RAW": json.dumps(raw)}):
+                    status, _, answer = self.reject(review=seen)
+                self.assertEqual(status, 409, answer)
+                self.assertFalse(Path(f"{self.log}.dispositions").exists())
+                self.assertNotIn("retry", [word for call in self.calls() for word in call])
+
+    def test_findings_that_differ_only_in_whitespace_print_apart(self):
+        """sd:9966 lead review: the dialog is HTML, which folds a run of spaces and shows a no-break or zero-width
+        space as nothing or a space, so two findings could read alike. Each prints apart and still as its JSON."""
+        def fold(text):
+            return re.sub(r"\s+", " ", re.sub("[\u200b-\u200d\u2060\ufeff]", "", text))  # what HTML shows
+        base = {"summary": "a b", "path": "x.py"}
+        for other in ("a  b", "a\u00a0b", "a\u200bb", " a b", "a b ", "a\u2028b"):
+            with self.subTest(other=other):
+                line = queue_screen._line({**base, "summary": other})
+                self.assertNotEqual(fold(line), fold(queue_screen._line(base)))
+                self.assertEqual(json.loads(line), {**base, "summary": other})
+
+    def test_a_finding_that_is_no_object_offers_no_reject_and_refuses_one(self):
+        """sd:9966 class pass: a finding that is no object names nothing the page can print; its row binds no
+        review. Any object prints whole (`_line`), whatever its fields hold."""
+        for other in ("a finding", ["a.py"], {}, 7, None):
+            with self.subTest(other=other), mock.patch.dict(os.environ, {"QUEUE_RAW": json.dumps(other)}):
+                self.assertEqual((self.failed()["review"], self.failed()["review_findings"]), (None, []))
+                status, _, answer = self.reject(review="0" * 16)
+                self.assertIn(status, (400, 409), answer)
+                self.assertFalse(Path(f"{self.log}.dispositions").exists())
+
+    def test_two_findings_never_print_as_one_line(self):
+        """sd:9966 review round 3 class (queue_screen.py:376, :383, :384): the dialog printed a finding lossily, so
+        another failing input or affected path read the same, and Reject rebutted what the operator never saw."""
+        base = {"severity": "high", "path": "a.py", "line": 1, "summary": "wrong"}
+        for one, other in (({**base, "path": "a.py:1", "line": None}, base),
+                           ({**base, "summary": "wrong Evidence: x"}, {**base, "evidence": "x"}),
+                           ({**base, "evidence": "a\nb"}, {**base, "evidence": "a b"}),
+                           ({**base, "instances": ["a.py:1, b.py:2"]}, {**base, "instances": ["a.py:1", "b.py:2"]}),
+                           ({**base, "failing_input": "x"}, base)):
+            with self.subTest(one=one):
+                self.assertNotEqual(queue_screen._line(one), queue_screen._line(other))
+
+    def test_a_row_shows_a_long_non_ascii_finding_whole_with_its_markup_and_newlines(self):
+        """sd:9966 class pass: what Reject rebuts is shown whole, whatever it holds, newlines escaped, not folded."""
+        raw = {"severity": "high", "path": "dir/ü b.py", "line": None, "summary": "wrong\n  <script>x</script> " + "é" * 5000,
+               "evidence": "line one\n\tline two", "instances": [" dir/ü b.py:3 "]}
+        with mock.patch.dict(os.environ, {"QUEUE_RAW": json.dumps(raw)}):
+            row = self.failed()
+        self.assertEqual([json.loads(line) for line in row["review_findings"]], [raw])
+        self.assertIn("é" * 5000, row["review_findings"][0])
+        self.assertIsNotNone(row["review"])
+
+    def test_reject_refuses_a_review_that_already_holds_dispositions(self):
+        """sd:9966 class pass: the operator adjudicated through the CLI with reasons of their own or a parked risk
+        after the lane's run; the log still shows the review, and a filled template would replace each one."""
+        self.failed()
+        with mock.patch.dict(os.environ, {"QUEUE_RECORDED": "7"}):
+            status, _, answer = self.reject()
+        self.assertEqual(status, 409, answer)
+        self.assertIn("lane retry", answer["error"])
+        self.assertFalse(Path(f"{self.log}.dispositions").exists())
+        self.assertNotIn("--dispositions-file", [word for call in self.calls() for word in call])
+        self.assertNotIn("retry", [word for call in self.calls() for word in call])
+
+    def test_reject_refuses_a_template_that_cannot_say_what_it_would_replace(self):
+        """sd:9966 class pass: an sd-ship whose template names no `recorded_revision` cannot rule out a loss."""
+        self.failed()
+        with mock.patch.dict(os.environ, {"QUEUE_OLD_TEMPLATE": ""}):
+            status, _, answer = self.reject()
+        self.assertEqual(status, 400, answer)
+        self.assertNotIn("--dispositions-file", [word for call in self.calls() for word in call])
+
+    def test_a_kept_rebuttal_points_at_lane_retry_not_another_reject(self):
+        """sd:9966 class pass: a second Reject now refuses the review the first one adjudicated."""
+        self.failed()
+        with mock.patch.dict(os.environ, {"QUEUE_RETRY_REFUSE": "cannot publish the branch"}):
+            _, _, answer = self.reject()
+        self.assertIn("lane retry", answer["error"])
+        self.assertNotIn("pressed again", answer["error"])
+
+    def test_a_refused_adjudication_queues_nothing(self):
+        self.failed()
+        self.log.write_text("")
+        with mock.patch.dict(os.environ, {"QUEUE_REFUSE": "disposition proposal does not bind the current review"}):
+            status, _, answer = self.reject()
+        self.assertEqual(status, 400, answer)
+        self.assertNotIn("retry", [word for call in self.calls() for word in call])
 
     def test_retry_or_approve_without_a_full_head_runs_nothing(self):
         for action, head in (("retry", None), ("approve", None), ("approve", "5" * 12), ("retry", "HEAD")):
@@ -1524,7 +1801,7 @@ class TheView(Lane, ReaderCase):
 
     BUILDS = {"error": "", "read": NOW, "show": "all", "quiet_seconds": 900, "stale_seconds": 180,
               "runs": [{"run": "r1", "attempt": 1, "repo": "/repos/alpha", "name": "alpha", "model": "opus", "step": "building",
-                        "state": "stalled", "why": "", "outcome": None, "started": NOW, "elapsed": 1200, "beat": 20,
+                        "state": "stalled", "builder": True, "why": "", "outcome": None, "started": NOW, "elapsed": 1200, "beat": 20,
                         "quiet": 960, "usd": 0.42, "log": "/logs/r1.jsonl", "branch": "build/sd-7", "worktree": "/w/r1",
                         "pull": "https://github.com/example/alpha/pull/7",
                         "items": [{"item": 7, "assignment": 7, "status": "running", "title": "Seven"}],
@@ -1671,6 +1948,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
     BOX = {"merging": "merging: claimed by the lane runner, being merged",
            "review": "review: pull requests waiting on a review, 0 on you, 0 on reviewers",
            "working": "working: live sessions, build runs and lane gates now running",
+           "building": "building: build runs that hold a builder now, not queued or waiting",
            "next": "next: queued in the lane, not started",
            "blocked": "blocked: stopped in the lane or a build until someone acts",
            "suggested": "suggested: up to 9 items to do next: ready, due today or overdue, planned or unscheduled",
@@ -1680,7 +1958,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         # Pack sd:7383: the native title names the count and the meaning; the aria-label stays.
         out = self.run_view("open('system'); R.html = ELS.queue.html;")
         titles = re.findall(r'<span class="pip[^"]*" title="([^"]*)">', self.repo_detail(out["R"]["html"], "system")[2])
-        self.assertEqual(titles, [f"{n} {self.BOX[k]}" for n, k in zip((1, 0, 3, 2, 2, 4, 0), self.BOX, strict=True)])
+        self.assertEqual(titles, [f"{n} {self.BOX[k]}" for n, k in zip((1, 0, 3, 0, 2, 2, 4, 0), self.BOX, strict=True)])
 
     def test_each_repo_row_counts_working_merging_next_blocked_review_and_suggested_in_six_boxes(self):
         # pack sd:7470: merging is the leftmost box (operator 2026-11-04).
@@ -1693,21 +1971,22 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         out = self.run_view("R.closed = ELS.queue.html; press('ended'); press('suggested'); open('system');"
                             " R.open = ELS.queue.html; R.tally = ELS['queue-tally'].html;")
         # Pack sd:7383: each box also carries its count and meaning in its title.
-        system = ' aria-label="1 merging, 0 review, 3 working, 2 next, 2 blocked, 4 suggested, 0 parked"', \
+        system = ' aria-label="1 merging, 0 review, 3 working, 0 building, 2 next, 2 blocked, 4 suggested, 0 parked"', \
             (f'<span class="pip on" title="1 {self.BOX["merging"]}">1</span><span class="pip" title="0 {self.BOX["review"]}">0</span>'
-             f'<span class="pip on" title="3 {self.BOX["working"]}">3</span>'
+             f'<span class="pip on" title="3 {self.BOX["working"]}">3</span><span class="pip" title="0 {self.BOX["building"]}">0</span>'
              f'<span class="pip on" title="2 {self.BOX["next"]}">2</span><span class="pip warn" title="2 {self.BOX["blocked"]}">2</span>'
              f'<span class="pip on" title="4 {self.BOX["suggested"]}">4</span><span class="pip" title="0 {self.BOX["parked"]}">0</span>')
-        alpha = ' aria-label="0 merging, 0 review, 1 working, 0 next, 0 blocked, 0 suggested, 0 parked"', \
+        alpha = ' aria-label="0 merging, 0 review, 1 working, 1 building, 0 next, 0 blocked, 0 suggested, 0 parked"', \
             (f'<span class="pip" title="0 {self.BOX["merging"]}">0</span><span class="pip" title="0 {self.BOX["review"]}">0</span>'
-             f'<span class="pip on" title="1 {self.BOX["working"]}">1</span>') + "".join(
+             f'<span class="pip on" title="1 {self.BOX["working"]}">1</span>'
+             f'<span class="pip on" title="1 {self.BOX["building"]}">1</span>') + "".join(
                 f'<span class="pip" title="0 {self.BOX[k]}">0</span>' for k in ("next", "blocked", "suggested", "parked"))
         for html in (out["R"]["closed"], out["R"]["open"]):
             # pack sd:8138: each box sits in its toggle button; the boxes themselves are unchanged.
             for key, want in (("system", system), ("alpha", alpha)):
                 extra, attrs, body = self.repo_detail(html, key)
                 self.assertEqual((extra, attrs, re.sub(r"</?button[^>]*>", "", body)), (" pipe", *want))
-        self.assertEqual(re.sub(r"<[^>]*>", "", self.repo_detail(out["R"]["closed"], "system")[2]), "1032240", "the text tally is gone")
+        self.assertEqual(re.sub(r"<[^>]*>", "", self.repo_detail(out["R"]["closed"], "system")[2]), "10302240", "the text tally is gone")
         self.assertRegex(out["R"]["tally"], r"<span>\d+ working</span>", "the page's tally stays")
 
     def test_the_boxes_recount_on_the_30_s_read_and_on_a_read_after_a_build_starts(self):
@@ -1727,7 +2006,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
             " refresh(); await flush(); await flush(); await flush(); await flush(); R.reread = label();",
             before="var TICKS = []; setInterval = f => TICKS.push(f);\n")
         self.assertEqual((out["R"]["first"], out["R"]["tick"], out["R"]["reread"]),
-                         tuple(f"0 merging, 0 review, {n} working, 0 next, 0 blocked, 0 suggested, 0 parked" for n in (1, 2, 3)))
+                         tuple(f"0 merging, 0 review, {n} working, {n} building, 0 next, 0 blocked, 0 suggested, 0 parked" for n in (1, 2, 3)))
 
     def test_a_lane_that_was_not_read_counts_nothing_and_says_so(self):
         # A failed read is not zero (sd:7272): a repo whose lane was not read says so in place of its boxes.
@@ -1802,7 +2081,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                            out["R"]["html"], re.S)
         self.assertEqual(found, [("60", "ready · P1"), ("80", "planned for 2026-09-20 · P2 · planning"),
                                  ("81", "unscheduled P0 · planning"), ("82", "unscheduled · ready")])
-        self.assertIn('aria-label="1 merging, 0 review, 3 working, 2 next, 2 blocked, 4 suggested, 0 parked"', out["R"]["html"])
+        self.assertIn('aria-label="1 merging, 0 review, 3 working, 0 building, 2 next, 2 blocked, 4 suggested, 0 parked"', out["R"]["html"])
         self.assertEqual(out["R"]["build"], "a build takes a ready task; this one is planning")
 
     def test_suggested_leaves_out_an_item_with_no_repo_so_no_unassociated_group_shows(self):
@@ -1888,7 +2167,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertNotIn('data-type="working"', out["R"]["alpha"], "its assignment draws no runner row either")
         self.assertIn("<span>1 PR review: 0 on you, 1 on reviewers</span>", out["R"]["tally"])
         self.assertEqual(self.repo_detail(out["R"]["alpha"], "alpha")[1],
-                         ' aria-label="0 merging, 1 review, 0 working, 0 next, 0 blocked, 0 suggested, 0 parked"')
+                         ' aria-label="0 merging, 1 review, 0 working, 0 building, 0 next, 0 blocked, 0 suggested, 0 parked"')
         # A run with a member that does not wait on a PR keeps its row, unless its pull is that PR row's (sd:9114).
         both = {**run, "pull": "", "items": [*run["items"], {"item": 8, "assignment": 8, "status": "running",
                                                          "title": "Eight"}]}
@@ -2031,6 +2310,25 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertIn("<b>queued</b> · assignment 41", out["R"]["sd"])
         self.assertEqual(out["R"]["count"], 10)
 
+    def test_the_building_box_counts_only_runs_that_hold_a_builder_and_rows_show_review_rounds(self):
+        # pack sd:10306 (operator 2026-11-24): working counts queued assignments and waiting runs too, so it read more
+        # builds than ran. Building counts the working and stalled runs alone; each member shows its blocking rounds.
+        builds, runner = json.loads(json.dumps(self.BUILDS)), json.loads(json.dumps(self.RUNNER))
+        builds["runs"][0]["items"][0].update(reviews=4, bundle=True)
+        builds["runs"].append({**builds["runs"][0], "run": "r2", "state": "waiting", "builder": False, "why": "an open question asks",
+                               "items": [{"item": 8, "assignment": 8, "status": "running", "title": "Eight", "reviews": 1}],
+                               "cancel": {**builds["runs"][0]["cancel"], "assignment": 8}})
+        runner["live"].append({**runner["live"][1], "id": 42, "item": 42, "repo": "/repos/alpha", "title": "Waits a slot"})
+        out = self.run_view("open('alpha'); R.html = ELS.queue.html;",
+                            answers={"/api/queue/builds?show=all": [200, builds], "/api/queue/runner": [200, runner]})
+        self.assertEqual(self.repo_detail(out["R"]["html"], "alpha")[1],
+                         ' aria-label="0 merging, 0 review, 3 working, 1 building, 0 next, 0 blocked, 0 suggested, 0 parked"')
+        self.assertIn('#7 Seven</a> <span class="via" title="4 rounds ended on blockers: builder reviews, gates and lane reviews; '
+                      'the bundle&#39;s builder rounds are noted on this lead item">'
+                      '· 4 reviews</span>', out["R"]["html"])
+        self.assertIn("#8 Eight</a> <span", out["R"]["html"])
+        self.assertIn("· 1 review</span>", out["R"]["html"])
+
     def test_an_item_waiting_on_its_pull_request_is_blocked_by_it_not_working(self):
         # pack sd:7859 (operator 2026-11-06): live item 40's PR waits on the operator, item 44's on reviewers. Each is a
         # blocked row naming who it waits on and for how long; item 40 is no working row, and no suggested row either.
@@ -2055,7 +2353,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertIn('<span class="sr">waiting · </span>blocked', rows["44"])
         self.assertIn("<b>blocked: PR</b> · on reviewers · waited 2h 1m", rows["44"])
         self.assertEqual(out["R"]["kids"].count("working"), 2, "the lane builders stay; the live item is gone")
-        self.assertIn('aria-label="1 merging, 2 review, 2 working, 2 next, 2 blocked, 0 suggested, 0 parked"', html)
+        self.assertIn('aria-label="1 merging, 2 review, 2 working, 0 building, 2 next, 2 blocked, 0 suggested, 0 parked"', html)
 
     def test_an_unlinked_pull_request_row_says_approx_and_draft(self):
         """sd:8116: a draft and an approximate wait say so on the row."""
@@ -2090,7 +2388,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         out = self.run_view("R.closed = ELS.queue.html; open('solo'); R.open = ELS.queue.html; R.tally = ELS['queue-tally'].html;",
                             answers={"/api/queue": [200, lanes]})
         self.assertEqual(self.repo_detail(out["R"]["closed"], "solo")[1],
-                         ' aria-label="0 merging, 0 review, 0 working, 0 next, 0 blocked, 0 suggested, 0 parked"')
+                         ' aria-label="0 merging, 0 review, 0 working, 0 building, 0 next, 0 blocked, 0 suggested, 0 parked"')
         self.assertIn("<b>PR not read for a day</b>", out["R"]["open"])
         self.assertNotIn("PR review", out["R"]["tally"])
         self.assertIn("<span>2 blocked</span>", out["R"]["tally"], "only the fixture's two lane rows count")
@@ -2156,7 +2454,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         out = self.run_view("R.html = ELS.queue.html;")
         _, _, body = self.repo_detail(out["R"]["html"], "system")
         boxes = re.findall(r'data-tile="(\w+)"', body)
-        self.assertEqual(len(boxes), 7, boxes)
+        self.assertEqual(len(boxes), 8, boxes)
         names = re.findall(r'data-tile="(\w+)"[^>]*aria-label="Only the \d+ (\w+) rows"', body)
         self.assertEqual([b for b, _ in names], boxes, "a box has no accessible name")
         self.assertTrue(all(b == n for b, n in names), names)
@@ -2171,7 +2469,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         head = (v2.HERE / "today.html").read_text(encoding="utf-8")
         keys = re.search(r'<span class="keys"[^>]*>(.*?)</span></th>', head, re.S).group(1)
         shown = re.findall(r'<abbr title="\w+">([^<]*)</abbr>', keys)
-        self.assertEqual(len(shown), 7, keys)
+        self.assertEqual(len(shown), 8, keys)
         self.assertTrue(all(len(label) <= 3 for label in shown), shown)
         self.assertNotRegex(keys, r">\s+<", "a space between two labels moves every later label off its box")
         css = (v2.HERE / "static" / "today.css").read_text(encoding="utf-8")
@@ -2427,9 +2725,9 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
              "lane": "awaiting_you", "on": "you", "since": "2026-09-06T11:00:00+00:00", "waited": 3600}]}
         out = self.run_view("R.html = ELS.queue.html;", answers={"/api/queue": [200, lanes]})
         extra, attrs, body = self.repo_detail(out["R"]["html"], "solo")
-        self.assertEqual(attrs, ' aria-label="0 merging, 1 review, 0 working, 0 next, 0 blocked, 0 suggested, 0 parked"')
+        self.assertEqual(attrs, ' aria-label="0 merging, 1 review, 0 working, 0 building, 0 next, 0 blocked, 0 suggested, 0 parked"')
         boxes = re.findall(r'<span class="pip([^"]*)" title="([^"]*)">(\d+)</span>', body)
-        self.assertEqual([(c, n) for c, _, n in boxes], [("", "0"), (" caution", "1"), ("", "0"), ("", "0"), ("", "0"), ("", "0"), ("", "0")])
+        self.assertEqual([(c, n) for c, _, n in boxes], [("", "0"), (" caution", "1"), ("", "0"), ("", "0"), ("", "0"), ("", "0"), ("", "0"), ("", "0")])
         self.assertEqual(boxes[1][1], "1 review: pull requests waiting on a review, 1 on you, 0 on reviewers")
         solo = re.search(r'<tr class="repo" data-repo="~/repos/example/solo".*?</tr>', out["R"]["html"], re.S).group(0)
         self.assertIn('<td class="num"></td>', solo, "the box says it; the num cell repeats nothing")
@@ -2446,9 +2744,9 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                 lanes["prs"] = {"error": "", "rows": [wait(on)]}
                 html = self.run_view("R.html = ELS.queue.html;", answers={"/api/queue": [200, lanes]})["R"]["html"]
                 extra, attrs, body = self.repo_detail(html, "solo")
-                self.assertEqual(attrs, ' aria-label="0 merging, 1 review, 0 working, 0 next, 0 blocked, 0 suggested, 0 parked"')
+                self.assertEqual(attrs, ' aria-label="0 merging, 1 review, 0 working, 0 building, 0 next, 0 blocked, 0 suggested, 0 parked"')
                 boxes = re.findall(r'<span class="pip([^"]*)" title="\d+ (\w+):', body)
-                self.assertEqual(boxes, [("", "merging"), (lamp, "review"), ("", "working"), ("", "next"), ("", "blocked"),
+                self.assertEqual(boxes, [("", "merging"), (lamp, "review"), ("", "working"), ("", "building"), ("", "next"), ("", "blocked"),
                                          ("", "suggested"), ("", "parked")])
 
     # pack sd:8138 (operator 2026-11-08): a repo row's count tiles filter its sub-rows.
@@ -2468,7 +2766,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
 
     def test_each_tiles_line_counts_its_own_rows_beside_the_repos(self):
         """sd:8565 fault 5 (#53336): 'Showing blocked: 0 of 180' read as 180 blocked; every tile says '<n> <box> (<N> rows)'."""
-        boxes = ["merging", "review", "working", "next", "blocked", "suggested", "parked"]
+        boxes = ["merging", "review", "working", "building", "next", "blocked", "suggested", "parked"]
         out = self.run_view(self.TILE + " R.lines = {}; for (const b of " + json.dumps(boxes) + ") { tile('system', b);"
                             " const m = ELS.queue.html.match(/data-tile-clear=\"[^\"]*\\/system\">([^<]*)</); R.lines[b] = m ? m[1] : null;"
                             " tile('system', b); }", search="?show=suggested")
@@ -2493,7 +2791,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         out = self.run_view(self.TILE + " R.before = pressed('system'); tile('system', 'working'); R.working = pressed('system');"
                             " tile('system', 'next'); R.next = pressed('system'); open('system'); R.closed = pressed('system');"
                             " open('system'); R.reopened = kids();")
-        boxes = ["merging", "review", "working", "next", "blocked", "suggested", "parked"]
+        boxes = ["merging", "review", "working", "building", "next", "blocked", "suggested", "parked"]
         self.assertEqual(out["R"]["before"], [f"{b}:false" for b in boxes])
         self.assertEqual(out["R"]["working"], [f"{b}:{str(b == 'working').lower()}" for b in boxes])
         self.assertEqual(out["R"]["next"], [f"{b}:{str(b == 'next').lower()}" for b in boxes], "another tile switches")
@@ -2591,7 +2889,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                                  named: (None, "example/anvil", "you")})
         out = self.run_view("open('anvil'); R.html = ELS.queue.html; R.tally = ELS['queue-tally'].html;")
         extra, attrs, body = self.repo_detail(out["R"]["html"], "anvil")
-        self.assertEqual(attrs, ' aria-label="0 merging, 3 review, 0 working, 0 next, 0 blocked, 0 suggested, 0 parked"')
+        self.assertEqual(attrs, ' aria-label="0 merging, 3 review, 0 working, 0 building, 0 next, 0 blocked, 0 suggested, 0 parked"')
         row = re.search(r'<tr class="child" data-type="blocked" data-pr="' + re.escape(named) + r'">(.*?)</tr>',
                         out["R"]["html"], re.S).group(1)
         self.assertIn(f'<a href="{named}" target="_blank" rel="noopener noreferrer">example/anvil#3 Pull 3</a>', row)
@@ -3075,20 +3373,131 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
 
     NEXT = "Run `sd-ship adjudicate --item 14` to print each blocking finding in full; fix them."
 
+    def conflicted(self):
+        """Item 14 failed prepare on a merge conflict, not a review: Retry stays, as main may have fixed it."""
+        return self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "merge_conflict", "retryable": False},
+                                                                          "next_action": self.NEXT}}))
+
     def test_a_failed_entry_at_an_unchanged_head_says_retry_repeats_it_and_retry_asks_first(self):
-        """pack sd:8584: Retry on a head no commit moved repeated a review block silently; the row and the press say so."""
-        self.failed()
+        """pack sd:8584: Retry on a head no commit moved repeated a failure silently; the row and the press say so."""
+        self.conflicted()
         out = self.run_view("open('system'); R.html = ELS.queue.html;")
         self.assertIn("head unchanged since this failure: Retry repeats it unless the failure was transient", out["R"]["html"])
-        self.assertIn(f"review_blocking, not retryable · next: {self.NEXT}", out["R"]["html"])
+        self.assertIn(f"merge_conflict, not retryable · next: {self.NEXT}", out["R"]["html"])
         kept = self.confirmed("retry", 14, False, head=self.merged)
         self.assertEqual(kept["posts"], [])
         self.assertEqual(kept["asked"]["ok"], "Retry anyway")
         self.assertIn("No commit moved the head since this failure", kept["asked"]["body"])
-        self.assertIn("The lane marks review_blocking as not retryable", kept["asked"]["body"])
+        self.assertIn("The lane marks merge_conflict as not retryable", kept["asked"]["body"])
         self.assertIn(self.NEXT, kept["asked"]["body"])
         done = self.confirmed("retry", 14, True, head=self.merged)
         self.assertEqual((done["posts"][0][1]["action"], done["posts"][0][1]["head"]), ("retry", self.merged))
+
+    SAME = "same code, same review: send it to the builder"
+
+    def test_a_review_blocked_entry_offers_send_to_builder_and_reject_beside_a_warned_retry(self):
+        """sd:9966: Retry on mws sd:9214 re-ran prepare at an unchanged head and failed the same way. The page
+        cannot tell whether the default branch moved (lane review), so Retry stays on, asks first and warns."""
+        self.failed()
+        html = self.run_view("open('system'); R.html = ELS.queue.html;")["R"]["html"]
+        row = re.search(r'<tr class="child"[^>]*data-id="entry:[^"]*:14"[^>]*>([\s\S]*?)</tr>', html)[1]
+        self.assertRegex(row, r'data-act="retry" data-item="14"[^>]*data-head="' + self.merged + '"[^>]*>Retry…<')
+        self.assertNotRegex(row, r'<button[^>]*disabled[^>]*>Retry</button>')
+        self.assertRegex(row, r'data-act="reject" data-item="14"[^>]*data-head="' + self.merged + '"[^>]*>Reject and enqueue…<')
+        self.assertRegex(row, r'data-act="fix" data-item="14"[^>]*>Send to builder…<')
+
+    def test_a_review_that_holds_dispositions_keeps_retry_and_offers_no_reject(self):
+        """sd:9966 round 8: Reject recorded the rebuttal and queueing failed, or the operator adjudicated through
+        the CLI; the entry still reads review_blocking, and `lane retry` reuses the dispositions, so Retry stays."""
+        for env in ({"QUEUE_RECORDED": "7"}, {"QUEUE_OLD_TEMPLATE": ""}):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env):
+                self.failed()
+                html = self.run_view("open('system'); R.html = ELS.queue.html;")["R"]["html"]
+                row = re.search(r'<tr class="child"[^>]*data-id="entry:[^"]*:14"[^>]*>([\s\S]*?)</tr>', html)[1]
+                self.assertRegex(row, r'data-act="retry" data-item="14"[^>]*data-head="' + self.merged + '"')
+                self.assertNotIn(self.SAME, row)
+                self.assertNotIn('data-act="reject"', row)
+
+    def test_a_retryable_failure_keeps_retry_and_offers_no_reject(self):
+        self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "hub_unavailable", "retryable": True}}}))
+        html = self.run_view("open('system'); R.html = ELS.queue.html;")["R"]["html"]
+        self.assertRegex(html, r'data-act="retry" data-item="14"')
+        self.assertNotIn('data-act="reject"', html)
+        self.assertRegex(html, r'data-act="fix" data-item="14"[^>]*>Fix…<')
+
+    def reject_press(self, answer):
+        fields = json.dumps({"repo": str(self.checkout), "item": "14", "act": "reject", "head": self.merged})
+        return self.run_view(f"window.shell.ask = a => {{ OUT.asked = a; return Promise.resolve({json.dumps(answer)}); }};"
+                             f"open('system'); act('button[data-act]', {fields}); await flush(); await flush();"
+                             " R.said = ELS['queue-said'].textContent;")
+
+    def test_reject_asks_for_a_reason_then_posts_it_with_the_head(self):
+        self.failed()
+        reason = "a.py:1 reads the value the finding says is missing"
+        out = self.reject_press({"yes": True, "values": {"reason": f"  {reason}\n"}})
+        self.assertEqual(out["asked"]["ok"], "Reject and enqueue")
+        self.assertIn(f"lane retry 14 --expected-head {self.merged}", out["asked"]["cli"])
+        posted = [p[1] for p in out["posts"] if p[0] == "/api/queue/move"]
+        self.assertEqual([(p["action"], p["item"], p["head"], p["reason"], p["review"]) for p in posted],
+                         [("reject", 14, self.merged, reason, self.failed()["review"])])
+        self.assertIn("sd:14 rebutted and queued again", out["R"]["said"])
+
+    def test_a_retry_that_fails_after_the_rebuttal_reads_as_rebutted_not_queued(self):
+        """sd:9966 review round 3: the server recorded the rebuttal, then lane retry failed; the page says the
+        rebuttal stands, not that nothing was done."""
+        self.failed()
+        kept = f"moved. {queue_screen.KEPT}"
+        for status, said in ((409, "sd:14 rebutted, not queued again"),
+                             (502, "sd:14 rebutted; not known whether it was queued again")):
+            with self.subTest(status=status):
+                fields = json.dumps({"repo": str(self.checkout), "item": "14", "act": "reject", "head": self.merged})
+                out = self.run_view(
+                    "window.shell.ask = a => Promise.resolve({ yes: true, values: { reason: 'a.py:1 holds' } });"
+                    f"open('system'); act('button[data-act]', {fields}); await flush(); await flush();"
+                    " R.said = ELS['queue-said'].textContent;",
+                    answers={"/api/queue/move": [status, {"error": kept, "rebutted": True}]})
+                self.assertIn(said, out["R"]["said"])
+                self.assertIn("rebuttal is recorded", out["R"]["said"])
+                self.assertNotIn("not rebutted", out["R"]["said"])
+
+    def test_reject_shows_every_finding_it_rebuts_before_the_reason(self):
+        """sd:9966 review round 6: the dialog names each finding the reason rebuts, whole, not the first five."""
+        self.enterContext(mock.patch.dict(os.environ, SIX_LIVE))
+        six = [{"severity": "high", "path": f"b{n}.py", "line": n, "summary": "cut", "text": f"finding {n} whole"}
+               for n in range(1, 7)]
+        self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "review_blocking"}},
+                                       "reviewed_head": self.merged, "finding_digests": SIX_DIGESTS, "findings": six}))
+        body = self.reject_press({"yes": False})["asked"]["body"]
+        for n in range(1, 7):
+            self.assertIn(f'"summary": "finding {n} whole"', body)
+        self.assertIn("6 blocking findings", body)
+
+    def test_reject_shows_each_findings_evidence_and_sites_before_the_reason(self):
+        """sd:9966 review: the dialog names what each blocker cites, so the reason answers it."""
+        self.enterContext(mock.patch.dict(os.environ, {"QUEUE_RAW": TheMove.CITED}))
+        self.failed()
+        body = self.reject_press({"yes": False})["asked"]["body"]
+        self.assertIn('"evidence": "a.py:1 reads <b>x</b> unset"', body)
+        self.assertIn('"instances": ["a.py:1", "b.py:9"]', body)
+
+    def test_reject_is_off_on_a_row_whose_log_names_no_review(self):
+        self.failed(answer=json.dumps({"ok": False, "workflow": {"blocker": {"code": "review_blocking"}}}))
+        html = self.run_view("open('system'); R.html = ELS.queue.html;")["R"]["html"]
+        self.assertRegex(html, r'data-act="reject" data-item="14"[^>]*disabled title="no review to rebut here')
+
+    def test_a_kept_or_empty_reject_posts_nothing(self):
+        self.failed()
+        for answer in ({"yes": False}, {"yes": True, "values": {"reason": "  "}}):
+            with self.subTest(answer=answer):
+                self.assertEqual(self.reject_press(answer)["posts"], [])
+
+    def test_the_palette_retry_on_a_review_blocked_entry_asks_first_and_warns(self):
+        self.failed()
+        out = self.run_view("open('system'); const c = REG.find(x => x.id === 'today.lane.retry');"
+                            f" const o = {{ head: {json.dumps(self.merged)}, failure: {{ code: 'review_blocking' }}, held: false }};"
+                            " R.on = c.when(o); R.ask = c.askFirst(o); R.said = c.consequence(o);")
+        self.assertEqual((out["R"]["on"], out["R"]["ask"]), (True, True))
+        self.assertIn(self.SAME, out["R"]["said"])
 
     def test_a_failed_entry_whose_worktree_moved_says_retry_is_refused(self):
         self.failed()

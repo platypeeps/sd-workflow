@@ -1211,6 +1211,27 @@ class ServedCommit(unittest.TestCase):
             self.assertNotIn("Errno", err.getvalue())
             probe.assert_not_called()
 
+    def test_no_config_and_no_runtime_exits_3_from_the_shell(self):
+        """sd:9916: a satellite has neither the server's runtime nor a config: exit 3, not 1."""
+        temporary = tempfile.TemporaryDirectory(prefix="dashboard-satellite-")
+        self.addCleanup(temporary.cleanup)
+        home = Path(temporary.name)
+        script = str(REAL_HERE / "dashboard.sh")
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(home),
+               "SD_DASHBOARD_PYTHON": str(home / "no-runtime")}
+        for extra in ([], ["--config", str(home / "other.json")], [f"--config={home / 'other.json'}"]):
+            result = subprocess.run(["/bin/bash", script, "health", *extra], env=env,
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 3, (extra, result.stderr))
+            self.assertIn("no dashboard on this machine", result.stderr)
+        # A config that exists with no runtime is still broken: exit 1.
+        present = home / "dashboard.json"
+        present.write_text("{}", encoding="utf-8")
+        result = subprocess.run(["/bin/bash", script, "health", "--config", str(present)], env=env,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("missing installed runtime", result.stderr)
+
     def test_the_checkout_commit_passes_and_is_shown(self):
         code, out, err = self.health("a" * 40, "a" * 40)
         self.assertEqual((code, err), (0, ""))

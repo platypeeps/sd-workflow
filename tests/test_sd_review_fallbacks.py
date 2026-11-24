@@ -142,7 +142,9 @@ class FallbackTests(ReviewRunFixture):
                                   "structured_output": {"findings": []}}), "")})
         result = sd_review.review(root, namespace(), runner, self.environment(), self.tmp / "missing-auth")
         self.assertEqual(result["status"], "clean")
-        self.assertEqual(result["outcomes"][0]["status"], sd_review.REFUSED)
+        # sd:10231: the unready codex entry is the fallback, not the first attempt.
+        self.assertEqual([row["backend"] for row in result["outcomes"]], ["second"])
+        self.assertEqual(result["fallback_candidates"], ["codex"])
         self.assertEqual(result["reviewed_by"], ["second"])
         self.assertNotIn("codex", [call["argv"][0] for call in runner.calls])
 
