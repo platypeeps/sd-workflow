@@ -669,6 +669,19 @@ class OpenQuestion(Case):
         self.assertIsNone(build.open_question(self.db, [item], since), "the skip evidence reads as before")
 
 
+class DesignChain(Case):
+    """Review of sd:10096: a design aboard the bundle is no dependency, but what it waits on still is."""
+
+    def test_a_prerequisite_behind_a_riding_design_is_ahead_of_the_lead(self):
+        later = self.item()
+        design = self.item(fields={"work_kind": "design", "blocked_by": [later]})
+        lead = self.item(fields={"blocked_by": [design]})
+        members = [{"item": design}, {"item": later}]
+        ahead, behind = build._inside(self.db, lead, members)
+        self.assertEqual([member["item"] for member in ahead], [later])
+        self.assertEqual([member["item"] for member in behind], [design])
+
+
 class DesignRulings(Case):
     """Class pass of sd:10096: every reader of a design's rulings reads the standing one, so a ruling Decide
     reversed (`Reversed ruling #N`) holds the design as a review withdrawal does."""

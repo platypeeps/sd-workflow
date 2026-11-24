@@ -2135,8 +2135,10 @@ def design_left(connection, delivered: list[int], bundle: list[int]) -> str | No
 
 def _needed(connection, items: list[int], *, riding: Collection[int] = ()) -> set[int]:
     """The open items `items` wait on, directly or through other open items (pack sd:9570), but for a design
-    aboard their bundle (`riding`, `aboard`)."""
+    aboard their bundle (`riding`, `aboard`): it is no dependency, though what it waits on is (review of
+    sd:10096)."""
     needed: set[int] = set()
+    seen: set[int] = set()
     pending = list(items)
     while pending:
         row = connection.execute("SELECT fields FROM item WHERE id = ?", (pending.pop(),)).fetchone()
@@ -2146,9 +2148,11 @@ def _needed(connection, items: list[int], *, riding: Collection[int] = ()) -> se
             continue
         for other in named:
             status = connection.execute("SELECT status FROM item WHERE id = ?", (other,)).fetchone()
-            if other not in needed and other not in riding and status is not None and status["status"] != "done":
-                needed.add(other)
+            if other not in seen and status is not None and status["status"] != "done":
+                seen.add(other)
                 pending.append(other)
+                if other not in riding:
+                    needed.add(other)
     return needed
 
 
