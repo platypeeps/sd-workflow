@@ -78,6 +78,19 @@ class TheVerb(UsageCase):
         self.assertEqual((assignments[0]["usd"], assignments[0]["estimated"]), (2.0, 1))
 
     @hub_only
+    def test_it_reports_token_use_by_area(self):
+        """Builder runs (role author) are coding, reviewer calls review (sd:10307)."""
+        self.month()
+        found = reads.usage_month(self.db, month="2026-09")
+        self.assertEqual([(row["role"], row["area"]) for row in found.roles],
+                         [("author", "coding"), ("reviewer", "review")])
+        self.assertEqual([(area["area"], area["calls"], area["tokens_out"]) for area in found.areas],
+                         [("coding", 2, 0), ("review", 1, 20)])
+        completed = self.sd_db("usage", "--month", "2026-09")
+        self.assertIn("areas:\n  coding: 2 call(s), spent $5.00, tokens 0 in / 0 out\n"
+                      "  review: 1 call(s), spent $0.50, tokens 10 in / 20 out\n", completed.stdout)
+
+    @hub_only
     def test_json_is_the_read_byte_for_byte(self):
         self.month()
         completed = self.sd_db("usage", "--month", "2026-09", "--json")

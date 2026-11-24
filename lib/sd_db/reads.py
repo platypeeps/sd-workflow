@@ -1320,6 +1320,7 @@ class Usage:
     spent: float
     held: float
     unbilled: float | None = None
+    areas: tuple[dict, ...] = ()
 
     def document(self) -> dict:
         """The plain shape both faces serialise; the JSON is the same bytes."""
@@ -1328,8 +1329,26 @@ class Usage:
             "bills": [asdict(bill) for bill in self.bills],
             "roles": list(self.roles), "bound": list(self.bound),
             "meter": list(self.meter), "spent": self.spent, "held": self.held,
-            "unbilled": self.unbilled,
+            "unbilled": self.unbilled, "areas": list(self.areas),
         }
+
+
+# The area a cost row's role is spent in (sd:10307). Only builder runs
+# (`author`) and reviewer calls write rows; a role not named is `other`.
+AREAS = {"author": "coding", "reviewer": "review"}
+
+
+def _areas(roles: list[dict]) -> tuple[dict, ...]:
+    """The role rows summed per area, in first-seen order of `roles`."""
+    totals: dict[str, dict] = {}
+    for row in roles:
+        total = totals.setdefault(row["area"], {"area": row["area"], "calls": 0, "spent": 0.0, "held": 0.0,
+                                                "tokens_in": 0, "tokens_out": 0})
+        for key in ("calls", "spent", "held", "tokens_in", "tokens_out"):
+            total[key] += row[key]
+    for total in totals.values():
+        total["spent"], total["held"] = round(total["spent"], 6), round(total["held"], 6)
+    return tuple(totals.values())
 
 
 def month_of(month: str | None = None, *, now: str | None = None) -> str:
@@ -1453,9 +1472,10 @@ def _usage_reads(
         "AND window_minutes IS latest.window_minutes AND substr(timestamp, 1, 7) = ? "
         "ORDER BY timestamp DESC, id DESC LIMIT 1) ORDER BY provider, window_minutes",
         (month, month)).fetchall()
+    roles = [{**dict(row), "area": AREAS.get(row["role"], "other")} for row in roles]
     return Usage(
         month=month, days=days, today=today, bills=tuple(bills),
-        roles=tuple(dict(row) for row in roles), bound=tuple(dict(row) for row in bound),
+        roles=tuple(roles), areas=_areas(roles), bound=tuple(dict(row) for row in bound),
         meter=tuple(dict(row) for row in meter),
         spent=round(sum(bill.spent for bill in bills) + (unbilled or 0.0), 6),
         held=round(sum(bill.held for bill in bills), 6), unbilled=unbilled,
