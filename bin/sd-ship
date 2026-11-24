@@ -3287,7 +3287,10 @@ class Ship(SharedReview):
                 or pull.get("head", {}).get("sha") not in [head for head in heads if head]):
             raise Refusal("merged PR evidence does not match the prepared receipt")
         if not published:
-            self.save(pull_request=reference, reviewed_head=pull["head"]["sha"], **self.opened_at(None))
+            # `head` too: a failed reprepare left it at a head GitHub never merged, and the lane settles its
+            # entry by the reported head (sd:9268 round 14).
+            merged = pull["head"]["sha"]
+            self.save(pull_request=reference, reviewed_head=merged, head=merged, **self.opened_at(None))
         return reference, pull, commit
 
     def reconcile(self) -> dict:

@@ -5121,6 +5121,26 @@ roles:
         self.assertEqual(self.reconciled()["phase"], "merged")
         self.assertEqual(self.operation().state["reviewed_head"], pushed)
 
+    def test_reconcile_of_an_opened_pull_request_reports_the_head_github_merged(self):
+        """Round 14 of sd:9268: the receipt's `head` stayed at the newer head a failed reprepare saved, and the
+        lane settles the entry by that field, so it marked an unmerged head merged."""
+        opened = self.opened_then_copilot_failed()
+        _git(self.root, "commit", "--allow-empty", "-qm", "a newer tip\n\nAuthored-with: human")
+        real = ship.git
+
+        def lost_push(root, *args, **kwargs):
+            if args[:1] == ("push",):
+                raise ship.Refusal("push lost")
+            return real(root, *args, **kwargs)
+
+        with patch.object(ship, "git", lost_push), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "push lost"):
+            self.prepare()
+        self.assertNotEqual(self.operation().state["head"], opened)
+        self.remote.merge(1)
+        reconciled = self.reconciled()
+        self.assertEqual((reconciled["head"], reconciled["reviewed_head"]), (opened, opened))
+
     def test_a_head_no_prepare_pushed_to_an_opened_pull_request_never_reconciles(self):
         """The guard the class fix keeps: a head pushed by hand was reviewed by no prepare."""
         self.opened_then_copilot_failed()
