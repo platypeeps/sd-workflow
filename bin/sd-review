@@ -1856,7 +1856,7 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
         return getattr(_ruling(row), "listed", False)
     def _prior(old: dict[str, Any]) -> dict[str, Any]:  # a rebutted place holds and lends nothing (sd-review:1814); it stays: a repeat on it is its own
         ruling = recorded_at(rebutted, old.get("path"), old.get("summary"), old.get("line"))
-        if old.get("disposition") != "blocking" or not getattr(ruling, "listed", False):
+        if old.get("disposition") != "blocking" or ruling is None or not ruling.listed:
             return old  # evidence found after the ruling is new: a distant edit may make it real (sd:10191, sd-review:886)
         return old if later(ruling, old) else dict(old, disposition="rebutted")
     prior = [*map(_prior, instance_rows(*prior))]
