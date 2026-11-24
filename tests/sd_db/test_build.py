@@ -28,6 +28,8 @@ from sd_db.writes import (
     create_item,
     read_settings,
     record_state,
+    reopen_note,
+    resolve_note,
     set_setting,
     transition,
     upsert_repo,
@@ -665,6 +667,102 @@ class OpenQuestion(Case):
         found = build.open_question(self.db, [item], since, pending=True)
         self.assertEqual(found and found["id"], asked)
         self.assertIsNone(build.open_question(self.db, [item], since), "the skip evidence reads as before")
+
+
+class DesignRulings(Case):
+    """Class pass of sd:10096: every reader of a design's rulings reads the standing one, so a ruling Decide
+    reversed (`Reversed ruling #N`) holds the design as a review withdrawal does."""
+
+    def designed(self):
+        """A design item whose design run wrote its design and one question: (item, question)."""
+        item = self.item(fields={"work_kind": "design"})
+        [run] = build.queue(self.db, [item], who="operator")
+        self.assertEqual(run["scope"], build.DRAFT)
+        self.db.execute("UPDATE assignment SET status = 'done' WHERE id = ?", (run["id"],))
+        add_note(self.db, item, "comment", "Design:\n\nProblem: x", session="draft:fixture")
+        asked = add_note(self.db, item, "question", "Which?\nOption: A (Recommended)\nOption: B",
+                         session="draft:fixture")
+        return item, asked
+
+    def rule(self, item, asked, answer):
+        ruling = add_note(self.db, item, "decision", f"Ruling on note #{asked}: {answer}")
+        resolve_note(self.db, asked)
+        return ruling
+
+    def reverse(self, item, asked, ruling):
+        """As Decide's reverse writes it (`sd_dashboard.decisions.reverse`)."""
+        add_note(self.db, item, "decision", f"Reversed ruling #{ruling}: question #{asked} asks again.")
+        reopen_note(self.db, asked)
+
+    def test_a_reversed_ruling_leaves_its_question_pending(self):
+        item, asked = self.designed()
+        ruling = self.rule(item, asked, "A")
+        self.assertIsNone(build.open_question(self.db, [item], "", pending=True))
+        self.reverse(item, asked, ruling)
+        found = build.open_question(self.db, [item], "", pending=True)
+        self.assertEqual(found and found["id"], asked)
+
+    def test_the_press_refuses_a_design_whose_ruling_decide_reversed(self):
+        item, asked = self.designed()
+        self.reverse(item, asked, self.rule(item, asked, "A"))
+        with self.assertRaisesRegex(build.BuildRefused, f"waits on design question note #{asked}"):
+            build.queue(self.db, [item], who="operator")
+        self.assertNotIn(item, [row["id"] for row in build.eligible(self.db)])
+
+    def test_the_claim_leaves_out_a_ride_whose_ruling_decide_reversed(self):
+        item, asked = self.designed()
+        ruling = self.rule(item, asked, "A")
+        [ride] = build.queue(self.db, [item], who="operator")
+        code = self.item()
+        build.queue(self.db, [code], who="operator")
+        self.reverse(item, asked, ruling)
+        bundle = self.claim()
+        self.assertEqual([member["item"] for member in build.run(self.db, bundle["id"])["members"]], [code])
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", ride["id"]), "queued")
+
+    def test_a_retried_bundle_holds_while_its_design_ruling_is_reversed(self):
+        """A bundle that ran before claims whole, past the fresh rows' check: a ruling reversed between its
+        Retry and the claim holds it, as a reopened dependency does."""
+        item, asked = self.designed()
+        ruling = self.rule(item, asked, "A")
+        code = self.item()
+        build.queue(self.db, [code, item], who="operator")
+        bundle = self.claim()
+        self.assertEqual([member["item"] for member in build.run(self.db, bundle["id"])["members"]], [code, item])
+        build.write(self.db, bundle["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START)
+        build.end(self.db, bundle["id"], "blocked", "3 review rounds left blockers: a.py:2 one item")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        build.retry(self.db, bundle["assignment"], who="operator")
+        self.reverse(item, asked, ruling)
+        self.assertIsNone(self.claim())
+        results = [row["result"] for row in self.db.execute(
+            "SELECT result FROM assignment WHERE scope = ? AND item IN (?, ?) ORDER BY id", (build.SCOPE, code, item))]
+        self.assertTrue(all(f"waits on design question note #{asked}" in (result or "") for result in results),
+                        results)
+        with self.assertRaisesRegex(build.BuildRefused, "waits on design question"):
+            build.retry(self.db, bundle["assignment"], who="operator")
+
+    def test_a_p1_design_rides_an_ordinary_code_bundle(self):
+        """Review of sd:10096: a P1 row joined only a P1 lead of its area, and a ride never leads, so a P1
+        design waited while ordinary code bundles shipped. A ride takes no slot: it joins any fresh bundle."""
+        item = self.item(priority=1, fields={"work_kind": "design"})
+        [run] = build.queue(self.db, [item], who="operator")
+        self.db.execute("UPDATE assignment SET status = 'done' WHERE id = ?", (run["id"],))
+        add_note(self.db, item, "comment", "Design:\n\nProblem: x", session="draft:fixture")
+        build.queue(self.db, [item], who="operator")
+        code = self.item(priority=2)
+        build.queue(self.db, [code], who="operator")
+        bundle = self.claim()
+        self.assertEqual([member["item"] for member in build.run(self.db, bundle["id"])["members"]], [code, item])
+
+    def test_the_brief_rulings_are_the_standing_ones(self):
+        """A reversed ruling, and one a later ruling replaced, are no instruction."""
+        item, asked = self.designed()
+        self.reverse(item, asked, self.rule(item, asked, "A"))
+        self.assertEqual(build.design_rulings(self.db, item), [])
+        self.rule(item, asked, "B")
+        self.rule(item, asked, "C")
+        self.assertEqual(build.design_rulings(self.db, item), [f"Ruling on note #{asked}: C"])
 
 
 class Writes(Case):

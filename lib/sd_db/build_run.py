@@ -281,6 +281,43 @@ that start "Option:", the recommended one first, ending " (Recommended)". Leave 
 is none.>
 """
 
+DESIGN = """You are the headless lead, run by the build dispatcher (sd:10096). Write the design page for one
+design-only item. You hold the read tools only: read the repository in the current directory, its CLAUDE.md
+and AGENTS.md, its `templates/design.md` when it has one, and the code the item touches. You write nothing;
+the dispatcher writes your reply on the item, and the repository's next code bundle commits it as
+`docs/work/<date>-<slug>/design.md`.
+
+The item is sd:{item}, in {repo}:
+Title: {title}
+{body}
+
+Ask only what would change the design and the repository cannot answer. Keep requirements apart from
+assumptions; each acceptance criterion names a check and its result. A design that moves state in steps
+carries a failure table: step, state moved, failure, recovery, test.
+
+Your final message is the reply, in exactly this form and nothing else:
+
+## Spec
+
+<the design page's text, its sections as `###` headings>
+
+## Questions
+
+<At most {questions}, only those whose answer changes the design. Each is its text, then two or more lines
+that start "Option:", the recommended one first, ending " (Recommended)". Leave the section out when there
+is none.>
+"""
+
+#: Added to a bundle's brief for each design item it carries (sd:10096).
+DESIGNS = """
+Each design below is a design item's whole work, written by its design run. Commit it, with the rulings
+under it applied, as `docs/work/<date>-<slug>/design.md` in your first commit, `<date>` today's and
+`<slug>` from the item's title, with a `Closes: sd:N` trailer for its item. Each design gets a directory
+of its own, even when two titles match, and its front matter names its item alone: `item: sd:N`. Change
+no word of it but its headings and what a ruling changes.
+{designs}
+"""
+
 RESUME = """Your run was interrupted. Continue the brief in {worktree}: finish the items, commit, write the
 title to {title} and the body to {body}, and leave the worktree clean. Your final message is your report.
 {denied}"""
@@ -890,8 +927,9 @@ def dispatch(connection, *, owner: str, load: float | None, load_cap: float | No
             why, taken = str(refusal), None
         claimed += [taken["id"]] if taken else []
     drafted: list[str] = []
-    if not why and hub and not claimed:
-        # A tick that claimed no build: a draft takes what machine room the builds leave, and no repository slot.
+    if not why and hub:
+        # A draft or design run takes what machine room the builds leave, and no repository slot, so it claims
+        # beside a bundle in the same tick (sd:10096); one runs at a time, so a tick starts at most two.
         available = build.room(connection, load=load, load_cap=load_cap, interactive=interactive, hosts=hosts)
         taken = draft.claim(connection, owner=owner, available=available)
         drafted += [taken["id"]] if taken else []
@@ -1988,7 +2026,30 @@ class Supervisor:
         except ValueError:  # not UTF-8: the builder rewrites it, as for any other refusal
             return [f"the title at {self.title} or the body at {self.body} is not UTF-8 text"]
         refused = self.checked(self.work, self.base(), head, title.strip(), body) if self.checked else []
-        return refused + self.untabled(head, body)
+        return refused + self.untabled(head, body) + self.undesigned(head, body)
+
+    def undesigned(self, head: str, body: str) -> list[str]:
+        """The refusal for a design item the branch closes with no design.md of its own, or none (review of
+        sd:10096): two designs with one title closed from one file that kept only one. A design.md the branch
+        adds or changes under `docs/work` is the file of the item its first `item: sd:N` line names."""
+        designs = [item for item in [self.lead, *self.others] if draft.is_design(self.db, item)]
+        cited = self.cited(self.work, self.base(), head, body) if designs else None
+        designs = [item for item in designs if item in (cited or ())]
+        if not designs:
+            return []
+        git = [*self.tools.git, "-C", str(self.work)]
+        owned = set()
+        for path in _read([*git, "diff", "--name-only", "-z", "--diff-filter=d", f"{self.base()}...{head}", "--",
+                           "docs/work"], env=self.env).split("\0"):
+            if re.fullmatch(r"docs/work/[^/]+/design\.md", path):
+                text = _read_bytes([*git, "cat-file", "blob", f"{head}:{path}"], env=self.env).decode("utf-8", "replace")
+                named = re.search(r"^item:\s*sd:([0-9]+)\s*$", text, re.M)
+                owned |= {int(named.group(1))} if named else set()
+        missing = [item for item in designs if item not in owned]
+        if not missing:
+            return []
+        return [f"each design item the branch closes needs a docs/work/<date>-<slug>/design.md of its own: "
+                f"{', '.join(f'sd:{item}' for item in missing)} has none whose first `item:` line names it"]
 
     def untabled(self, head: str, body: str) -> list[str]:
         """The failure-table refusal for a change that moves state in steps, or none (sd:9770).
@@ -2038,7 +2099,7 @@ class Supervisor:
         # One class-pass round past the bound (sd:9263). None when every member waits on a question no fix answers;
         # a question on one member leaves the others to fix, as enqueue delivers them without it.
         unasked = [item for item in [self.lead, *self.others]
-                   if not build.open_question(self.db, [item], self.row["asked_since"])]
+                   if not build.waits_on_operator(self.db, item, self.row["asked_since"])]
         if rounds == REVIEW_ROUNDS and unasked:
             return self.fix(CLASS_PASS, rounds=rounds)
         return self.finish("blocked", f"{rounds} review rounds left blockers: {self.summary(self.blockers)}")
@@ -2112,7 +2173,8 @@ class Supervisor:
         delivered = [item for item in [self.lead, *self.others] if item in cited]
         # A retry's branch keeps the lost run's trailers: a member this run's builder skipped with a question
         # waits on it (pack sd:6571).
-        asked = [item for item in delivered if build.open_question(self.db, [item], self.row["asked_since"])]
+        # Nor does a design whose ruling was taken back since the claim deliver (class pass of sd:10096).
+        asked = [item for item in delivered if build.waits_on_operator(self.db, item, self.row["asked_since"])]
         delivered = [item for item in delivered if item not in asked]
         if not delivered and asked:
             return self.finish("blocked", f"every cited item has an open question since the run started: "
@@ -2381,7 +2443,18 @@ class Supervisor:
             f"SELECT id, title FROM item WHERE id IN ({', '.join('?' for _ in items)})", items)}
         return {"worktree": self.work, "branch": self.row["branch"], "title": self.title, "body": self.body,
                 "title_max": TITLE_MAX, "items": "\n".join(f"- sd:{item} {titles.get(item, '')}" for item in items),
-                "findings": self.findings(items), "checklist": self.checklist(), "denied": self.denied()}
+                "findings": self.findings(items) + self.designs(items), "checklist": self.checklist(), "denied": self.denied()}
+
+    def designs(self, items: list[int]) -> str:
+        """The design and rulings of each design item in `items` (sd:10096); "" for none."""
+        found = []
+        for item in items:
+            text = draft.design(self.db, item) if draft.is_design(self.db, item) else None
+            if text is None:
+                continue
+            rulings = build.design_rulings(self.db, item)
+            found.append("\n".join([f"\n- sd:{item}:\n\n{text}", *(f"\n  {ruling}" for ruling in rulings)]))
+        return DESIGNS.format(designs="\n".join(found)) if found else ""
 
     def checklist(self) -> str:
         """The blocker classes recorded review rounds of the last `CHECKLIST_DAYS` found most, top first; "" for
@@ -2864,7 +2937,7 @@ class DraftSupervisor(Supervisor):
 
     def argv(self) -> list[str]:
         title, body = draft.item_text(self.db, self.item)
-        prompt = DRAFT.format(item=self.item, repo=self.row["repo"], title=title, body=body.strip() or "(no body)",
+        prompt = (DESIGN if draft.is_design(self.db, self.item) else DRAFT).format(item=self.item, repo=self.row["repo"], title=title, body=body.strip() or "(no body)",
                               questions=draft.QUESTIONS_MAX)
         return [*self.tools.claude, "-p", prompt, "--output-format", "stream-json", "--verbose",
                 "--tools", *draft.TOOLS, "--permission-mode", "dontAsk", "--strict-mcp-config",

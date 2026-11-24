@@ -45,6 +45,8 @@ TOOLS = ("Read", "Grep", "Glob")
 QUESTIONS_MAX = 3
 #: The comment a draft's spec starts with, and the session prefix of its notes: the status guard reads it.
 SPEC = "Draft spec:"
+#: The comment a design run's design starts with (sd:10096): the brief of the code bundle it rides reads it.
+DESIGN = "Design:"
 SESSION = "draft:"
 BLOCKED = "Draft blocked:"
 
@@ -76,12 +78,37 @@ def queue_if_eligible(connection, item: int, *, who: str) -> int | None:
         if (row is None or row["kind"] not in RUNNABLE_KINDS or row["status"] != "planning"
                 or repo_refusal(row, connection) is not None or restoration_pending(connection)):
             return None
-        ident = create_assignment(connection, item=item, role="author", status="queued", lane="parallel",
-                                  budget_minutes=BUDGET_MINUTES)
-        connection.execute("UPDATE assignment SET scope = ?, queued_at = ?, started = NULL WHERE id = ?",
-                           (SCOPE, clock(), ident))
-        add_note(connection, item, "comment", f"Draft assignment {ident} queued by {who}")
-        return ident
+        return _queue(connection, item, who=who, what="Draft")
+
+
+def queue_design(connection, item: int, *, who: str) -> int:
+    """Queue the design run of a design item (`build.DESIGN_KIND`, sd:10096); `build.queue` checked it."""
+    return _queue(connection, item, who=who, what="Design")
+
+
+def _queue(connection, item: int, *, who: str, what: str) -> int:
+    ident = create_assignment(connection, item=item, role="author", status="queued", lane="parallel",
+                              budget_minutes=BUDGET_MINUTES)
+    connection.execute("UPDATE assignment SET scope = ?, queued_at = ?, started = NULL WHERE id = ?",
+                       (SCOPE, clock(), ident))
+    add_note(connection, item, "comment", f"{what} assignment {ident} queued by {who}")
+    return ident
+
+
+def is_design(connection, item: int) -> bool:
+    return build.work_kind(connection, item) == build.DESIGN_KIND
+
+
+def design(connection, item: int) -> str | None:
+    """The design the newest design run of `item` wrote, or None: no run, or a newer one not done."""
+    ran = connection.execute("SELECT status FROM assignment WHERE item = ? AND scope = ? ORDER BY id DESC LIMIT 1",
+                             (item, SCOPE)).fetchone()
+    if ran is None or ran["status"] != "done":
+        return None
+    note = connection.execute(
+        "SELECT body FROM note WHERE item = ? AND kind = 'comment' AND session LIKE ? AND body LIKE ? "
+        "ORDER BY timestamp DESC, id DESC LIMIT 1", (item, f"{SESSION}%", f"{DESIGN}%")).fetchone()
+    return note["body"].removeprefix(DESIGN).strip() if note else None
 
 
 def open_runs(connection, hosts=None) -> list[dict]:
@@ -139,7 +166,7 @@ def repo_refusal(row, connection) -> str | None:
 
 
 def _refusal(connection, row) -> str | None:
-    if row["status"] != "planning":
+    if row["status"] not in (("planning", "ready") if is_design(connection, row["item"]) else ("planning",)):
         return f"item {row['item']} moved to {row['status']} before its draft ran"
     refused = repo_refusal(connection.execute(build._REPO, (row["item"],)).fetchone(), connection)
     return f"{refused} before its draft ran" if refused else None
@@ -245,9 +272,19 @@ def write(connection, ident: str, spec: str, questions: list[str]) -> bool:
                                   "WHERE id = ? AND status = 'running'",
                                   (stamp, f"draft run {ident} wrote its spec", row["id"])).rowcount != 1:
                 raise _Moved
-            add_note(connection, row["item"], "comment", f"{SPEC}\n\n{spec}", session=session(ident))
+            designed = is_design(connection, row["item"])
+            add_note(connection, row["item"], "comment", f"{DESIGN if designed else SPEC}\n\n{spec}",
+                     session=session(ident))
             for question in questions:
                 add_note(connection, row["item"], "question", question, session=session(ident))
+            if designed and not questions:
+                # It rides the repository's next code bundle, which commits it (sd:10096); with a question, the
+                # operator's ruling, then Build, queues it. So does Build when the press refuses it now (an item
+                # moved off ready, a dependency reopened): the refusal precedes every write of the row.
+                try:
+                    build.queue_row(connection, row["item"], who=f"design run {ident}")
+                except build.BuildRefused as refusal:
+                    add_note(connection, row["item"], "comment", f"Design written; no build queued: {refusal}")
             return True
     except _Moved:
         return False

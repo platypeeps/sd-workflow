@@ -40,6 +40,7 @@ from pathlib import Path
 from . import hub, paths, reads
 from .database import served_by, transaction
 from .errors import SdDbError
+from .needs_sweep import standing_ruling
 from .runner import (
     ALONE,
     IN_SESSION,
@@ -534,6 +535,16 @@ def _press_refusal(connection, row, *, lead: int | None = None) -> str | None:
         f"SELECT id, status FROM assignment WHERE item = ? AND status IN {OWNING} LIMIT 1", (item,)).fetchone()
     if active:
         return f"item {item} has {active['status']} assignment {active['id']}"
+    if work_kind(connection, item) == DESIGN_KIND:
+        if draft_design(connection, item) is None:
+            # Its design run comes first, and design runs start on the hub only (review of sd:10096).
+            from . import draft  # noqa: PLC0415 -- draft imports this module
+            refused = draft.repo_refusal(row, connection)
+            if refused:
+                return refused
+    waits = design_waits(connection, item)
+    if waits:
+        return f"item {item} {waits}; rule on it, then Build it"
     return _held(connection, item)
 
 
@@ -669,15 +680,73 @@ def queue(connection, items: list[int], *, who: str, expected_revisions: dict | 
         for item in items:
             if reads.items_by_ids(connection, [item])[item]["status"] == "blocked":  # a split-held bundle's item
                 transition(connection, item, "ready", who=who, reason="its bundle's branch is held after a split")
-            ident = create_assignment(connection, item=item, role="author", status="queued", lane="parallel",
-                                      budget_minutes=BUDGET_MINUTES)
-            connection.execute("UPDATE assignment SET scope = ?, queued_at = ?, started = NULL WHERE id = ?",
-                               (SCOPE, clock(), ident))
-            add_note(connection, item, "comment", f"Build assignment {ident} queued by {who}")
+            if work_kind(connection, item) == DESIGN_KIND and draft_design(connection, item) is None:
+                # A design item with no design yet runs a design run first, beside the code (sd:10096).
+                from . import draft  # noqa: PLC0415 -- draft imports this module
+                ident = draft.queue_design(connection, item, who=who)
+            else:
+                ident = queue_row(connection, item, who=who)
             # A press of an item a cancel parked builds it unparked, as Retry does (sd:9222); pickup refused one above.
             unpark(connection, item)
             created.append(ident)
         return [queue_state(connection, ident) for ident in created]
+
+
+def queue_row(connection, item: int, *, who: str) -> int:
+    """One queued build assignment of `item`, with its note, or the press's refusal (`_item`): the one writer of
+    a queued build, so the ride a design run queues passes every check a press does (class pass of sd:10096)."""
+    _item(connection, item)
+    ident = create_assignment(connection, item=item, role="author", status="queued", lane="parallel",
+                              budget_minutes=BUDGET_MINUTES)
+    connection.execute("UPDATE assignment SET scope = ?, queued_at = ?, started = NULL WHERE id = ?",
+                       (SCOPE, clock(), ident))
+    add_note(connection, item, "comment", f"Build assignment {ident} queued by {who}")
+    return ident
+
+
+def design_waits(connection, item: int, since: str | None = None) -> str | None:
+    """Why the design item `item` may not ride, be claimed or be delivered, or None: a question on it that no
+    standing ruling answers. The one reader of a design's rulings beside `design_rulings`: the press, auto-pickup,
+    Retry, the claim and delivery all ask it, so a ruling Decide reversed or a review withdrew holds each of them
+    (class pass of sd:10096). With `since`, a run's claim, a standing ruling written at or after it holds the
+    design too: a brief sent since may carry the ruling it replaced (review of sd:10096)."""
+    if work_kind(connection, item) != DESIGN_KIND:
+        return None
+    asked = open_question(connection, [item], "", pending=True)
+    if asked:
+        return f"waits on design question note #{asked['id']}"
+    if since is None:
+        return None
+    newer = next((ruling for ruling in _standing_rulings(connection, item) if ruling["timestamp"] >= since), None)
+    return f"has ruling #{newer['id']}, written since its build started" if newer else None
+
+
+def design_rulings(connection, item: int) -> list[str]:
+    """The standing ruling of each question on the design item `item`, oldest question first: the newest ruling
+    that no reversal or withdrawal took back (`needs_sweep.standing_ruling`), never one before it."""
+    return [ruling["body"] for ruling in _standing_rulings(connection, item)]
+
+
+def _standing_rulings(connection, item: int) -> list:
+    """The standing ruling note of each question on `item`, oldest question first."""
+    found = []
+    for asked in connection.execute("SELECT id, item FROM note WHERE item = ? AND kind = 'question' ORDER BY id",
+                                    (item,)).fetchall():
+        ruling = standing_ruling(connection, asked)
+        if ruling is not None:
+            found.append(connection.execute("SELECT id, body, timestamp FROM note WHERE id = ?", (ruling,)).fetchone())
+    return found
+
+
+def waits_on_operator(connection, item: int, since: str) -> bool:
+    """Whether `item` waits on the operator at delivery: a question since `since` (`open_question`), or a design
+    whose ruling was taken back, whenever its question was asked, or replaced since `since` (`design_waits`)."""
+    return open_question(connection, [item], since) is not None or design_waits(connection, item, since) is not None
+
+
+def draft_design(connection, item: int) -> str | None:
+    from . import draft  # noqa: PLC0415 -- draft imports this module
+    return draft.design(connection, item)
 
 
 def parked_finding(detail: str | None) -> str:
@@ -1305,10 +1374,12 @@ def pickup(connection, available: dict, *, now: str | None = None) -> list[int]:
     hosts = lane_hosts(connection)
     with transaction(connection):  # a build blocked on a quiet beat is this host's press again (sd:9775)
         _requeue_beat_blocked(connection, hosts)
+    # A ride row waits for a code bundle, not the claim, so it holds no pickup (review of sd:10096).
     if any(_route(connection, row["lane_host"], _lead(row)) in hosts
-           and room_for(available, row["repo"], p1=_leads_beside(row)) > 0
+           and room_for(available, row["repo"], p1=_leads_beside(row)) > 0 and not _rides(connection, row)
            for row in connection.execute(
-            f"SELECT assignment.id, assignment.parent, assignment.run_count, item.repo, {LEAD_PRIORITY}, "
+            f"SELECT assignment.id, assignment.item, assignment.parent, assignment.run_count, item.repo, "
+            f"{LEAD_PRIORITY}, "
             "repo.lane_host "
             "FROM assignment JOIN item ON item.id = assignment.item "
             "LEFT JOIN repo ON repo.path = item.repo WHERE assignment.status = 'queued' AND assignment.scope = ?",
@@ -1555,14 +1626,25 @@ def room_for(available: dict, repo: str, *, p1: bool = False) -> int:
     return max(0, min(available["machine"], repo_cap() - available["used"].get(repo, 0)))
 
 
-def _mechanical(connection, item: int) -> bool:
-    """Whether `item`'s `fields.work_kind` is `mechanical`: the one size signal an item carries."""
+#: The `fields.work_kind` of a design-only item (sd:10096): a design run writes its design, and the item then
+#: rides the repository's next code bundle, which commits it; it never leads a bundle and takes no slot.
+DESIGN_KIND = "design"
+
+
+def work_kind(connection, item: int) -> str | None:
+    """`item`'s `fields.work_kind`, or None: `mechanical` is half a slot, `design` none."""
     row = connection.execute("SELECT fields FROM item WHERE id = ?", (item,)).fetchone()
     try:
         fields = json.loads(row["fields"] or "{}") if row else {}
     except ValueError:
         fields = {}
-    return isinstance(fields, dict) and fields.get("work_kind") == "mechanical"
+    kind = fields.get("work_kind") if isinstance(fields, dict) else None
+    return kind if isinstance(kind, str) else None
+
+
+def _mechanical(connection, item: int) -> bool:
+    """Whether `item`'s `fields.work_kind` is `mechanical`: the one size signal an item carries."""
+    return work_kind(connection, item) == "mechanical"
 
 
 #: What `sd.build_model` may hold: a model alias or id the builder's `--model` takes (sd:9942).
@@ -1618,7 +1700,8 @@ def repo_cap(environ: dict[str, str] | None = None) -> int:
 
 
 def _slots(connection, item: int) -> float:
-    return 0.5 if _mechanical(connection, item) else 1
+    kind = work_kind(connection, item)
+    return 0 if kind == DESIGN_KIND else 0.5 if kind == "mechanical" else 1
 
 
 def budget_minutes(connection, items: list[int]) -> int:
@@ -1821,19 +1904,26 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
                                          f"{row['repo']}, and its branch {branch(row['parent'])} holds the "
                                          f"bundle's work")
         queued = [row for row in queued if row["parent"] is None or leads.get(row["parent"]) == row["repo"]]
-        best = next((row for row in queued if room_for(available, row["repo"], p1=_leads_beside(row)) > 0), None)
+        # A fresh design row rides a code bundle and never leads one (sd:10096); one that ran leads its Retry.
+        best = next((row for row in queued if room_for(available, row["repo"], p1=_leads_beside(row)) > 0
+                     and not _rides(connection, row)), None)
         if best is None:
             return None
         repo = best["repo"]
         others = [row for row in queued if row["repo"] == repo and row["id"] != best["id"]]
         if best["parent"] is None and not best["run_count"]:
             # A fresh P1 lead takes its own area's items; an ordinary one leaves P1 items to their own (sd:9700).
-            others = [row for row in others if kin(best, row)] if beside(best) else [
-                row for row in others if not beside(row)]
+            # A ride never leads and takes no slot, so it joins either, or a P1 one waited on a P1 lead forever
+            # (review of sd:10096).
+            others = [row for row in others if _rides(connection, row) or (
+                kin(best, row) if beside(best) else not beside(row))]
         bundle = _bundle(connection, [best, *others])
         # A dependency reopened since the press holds the build: dispatch's start reads it too (pack sd:9570).
+        # So does a design member whose ruling was taken back since its Retry: a bundle that ran before claims
+        # whole (`_bundle`), so it holds as one a dependency holds (class pass of sd:10096).
         waiting = [(row, why) for row in bundle if (why := waiting_on(connection, connection.execute(
-            "SELECT id, fields FROM item WHERE id = ?", (row["item"],)).fetchone()))]
+            "SELECT id, fields FROM item WHERE id = ?", (row["item"],)).fetchone())
+            or design_waits(connection, row["item"]))]
         # Ran before means work to resume: a run, a drop's kept work, or members on the lead's branch. A drop's
         # solo row counts a run with no run row (`drop_writes`); held as a retry it would park with nothing for
         # Retry to resume, so it holds as a fresh build does (review of build/sd-1306).
@@ -1944,9 +2034,16 @@ def _bundle(connection, rows: list) -> list:
     best = rows[0]
     group = best["parent"] or (best["id"] if best["run_count"] else None)
     if group is None:
-        fresh = [row for row in rows if row["parent"] is None and not row["run_count"]]
+        # A design whose question reopened since its press waits for the ruling (sd:10096).
+        fresh = [row for row in rows if row["parent"] is None and not row["run_count"] and not (
+            _rides(connection, row) and design_waits(connection, row["item"]))]
         return fresh[:bundled(connection, [row["item"] for row in fresh])]
     return sorted((row for row in rows if group in (row["id"], row["parent"])), key=lambda row: row["id"] != group)
+
+
+def _rides(connection, row) -> bool:
+    """Whether `row` is a fresh design row: it joins a code bundle, never leads one (sd:10096)."""
+    return row["parent"] is None and not row["run_count"] and work_kind(connection, row["item"]) == DESIGN_KIND
 
 
 def _needed(connection, items: list[int]) -> set[int]:
@@ -2289,15 +2386,17 @@ def open_question(connection, items: list[int], since: str, *, pending: bool = F
     if not items:
         return None
     marks = ", ".join("?" for _ in items)
-    # A review withdrawal reopens the question and keeps its ruling (`review.withdraw`): pending, a withdrawn
-    # ruling answers nothing (advisory of PR #1940, sd:9973).
-    withdrawn = ("AND NOT EXISTS (SELECT 1 FROM note pulled WHERE pulled.item = asked.item AND pulled.kind = "
-                 "'decision' AND pulled.body LIKE 'Withdrawn: ruling #' || ruling.id || ' on note #' || asked.id || "
-                 "'%') " if pending else "")
+    if pending:
+        # A reopened question keeps its ruling note: Decide's reversal and a review withdrawal each take one back
+        # (`needs_sweep.standing_ruling` reads both; advisory of PR #1940, sd:9973; class pass of sd:10096).
+        return next((dict(row) for row in connection.execute(
+            f"SELECT id, item FROM note WHERE kind = 'question' AND item IN ({marks}) AND timestamp >= ? "
+            f"AND resolved_at IS NULL ORDER BY id", (*items, since)).fetchall()
+            if standing_ruling(connection, row) is None), None)
     row = connection.execute(
         f"SELECT asked.id, asked.item FROM note asked WHERE asked.kind = 'question' AND asked.item IN ({marks}) "
-        f"AND asked.timestamp >= ? {'AND asked.resolved_at IS NULL' if pending else ''} AND NOT EXISTS (SELECT 1 FROM note ruling WHERE ruling.item = asked.item "
-        f"AND ruling.kind = 'decision' AND ruling.body LIKE 'Ruling on note #' || asked.id || ':%' {withdrawn}) "
+        f"AND asked.timestamp >= ? AND NOT EXISTS (SELECT 1 FROM note ruling WHERE ruling.item = asked.item "
+        f"AND ruling.kind = 'decision' AND ruling.body LIKE 'Ruling on note #' || asked.id || ':%') "
         f"ORDER BY asked.id LIMIT 1", (*items, since)).fetchone()
     return dict(row) if row else None
 
@@ -2388,7 +2487,7 @@ def enqueued(connection, ident: str, delivered: Collection[int] | None = None, *
                                    (stamp, f"build run {ident} enqueued in {held_by}", member["id"]))
         for member in skipped:
             missing = f"build run {ident} enqueued no commit with a `Closes: sd:{member['item']}` trailer"
-            if open_question(connection, [member["item"]], since):
+            if waits_on_operator(connection, member["item"], since):
                 _block(connection, [member], f"{missing}, so the merge leaves this item open", stamp)
             else:
                 connection.execute("UPDATE assignment SET status = 'cancelled', ended = ?, result = ? WHERE id = ?",

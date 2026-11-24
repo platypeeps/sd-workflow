@@ -118,6 +118,7 @@ FAKE = textwrap.dedent('''
             # A draft run's reply (pack sd:6361): no file, no commit; `draft-bad` has no `## Spec`.
             reply = ("## Spec\\n\\nProblem: x\\n\\n## Questions\\n\\nWhich?\\nOption: A (Recommended)\\nOption: B\\n"
                      if mode != "draft-bad" else "Here is the spec you asked for.")
+            reply = "## Spec\\n\\nProblem: x\\n" if mode == "draft-plain" else reply
             final = {"type": "result", "subtype": "success", "is_error": False, "permission_denials": [],
                      "session_id": session, "result": reply, "total_cost_usd": 0.31,
                      "usage": {"input_tokens": 5, "output_tokens": 7}}
@@ -165,6 +166,15 @@ FAKE = textwrap.dedent('''
             git("mv", old, new)
         for name in extra.get("remove", []):
             git("rm", "-q", "--", name)
+        # The design file of each design the brief carries, its own, as the brief asks (sd:10096); `one-design`
+        # puts every design in one file, so a single file closes them all.
+        designs = re.findall(r"^- sd:(\\d+):$", sys.argv[sys.argv.index("-p") + 1], re.M)
+        table = "| Step | State moved | Failure | Recovery | Test |\\n| --- | --- | --- | --- | --- |\\n| a | b | c | d | e |\\n"
+        for name, owners in ([("all", designs)] if mode == "one-design" else [(n, [n]) for n in designs]):
+            path = Path(f"docs/work/2026-01-01-design-{name}/design.md")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("".join(f"---\\nitem: sd:{n}\\n---\\n" for n in owners) + table)
+            git("add", "--", str(path))
         # One `Closes: sd:N` trailer per item the brief lists, as the brief asks; `skip` leaves out the last
         # one, as a builder that skips an item for the operator does, and `none` delivers nothing.
         prompt = sys.argv[sys.argv.index("-p") + 1]
@@ -5326,6 +5336,178 @@ class Drafts(Case):
         self.assertEqual(build_run.dispatch(self.db, **tick)["drafted"], [], "one draft at a time")
         self.assertEqual(build_run.dispatch(self.db, **{**tick, "load": None})["drafted"], [])
 
+    def design(self):
+        """A ready design item (`fields.work_kind = design`), pressed as Build is (sd:10096)."""
+        item = create_item(self.db, kind="task", title="Design me", body={"text": "The design's one line."},
+                           repo=str(self.repo), status="ready", fields={"work_kind": "design"})
+        [queued] = build.queue(self.db, [item], who="operator")
+        return item, queued
+
+    def designed(self, mode):
+        """The design item after its design run, the fake `claude` replying in `mode`."""
+        item, _ = self.design()
+        run = draft.claim(self.db, owner="fixture", available=build.room(self.db, load=1.0, load_cap=40.0,
+                                                                         interactive=[]))
+        assert run is not None
+        self.items = [item]
+        self.plan(claude=[mode])
+        self.assertEqual(self.drafter(run["id"]).run()["outcome"], "done")
+        self.assertIn("design page", self.calls("claude")[0]["argv"][1])
+        return item
+
+    def rides(self, item):
+        return self.db.execute("SELECT id FROM assignment WHERE item = ? AND scope = ? AND status = 'queued'",
+                               (item, build.SCOPE)).fetchall()
+
+    def test_a_design_item_and_a_code_bundle_in_one_repo_both_claim_in_one_tick(self):
+        """sd:10096: a design build took the repository's one bundle slot (`REPO_CAP`), so a code bundle
+        waited behind it. A design item now runs a design run, no branch and the machine cap only, which
+        claims in the same tick as the code bundle of its repository."""
+        design, queued = self.design()
+        self.assertEqual(queued["scope"], build.DRAFT)
+        code = create_item(self.db, kind="task", title="Build me", repo=str(self.repo), status="ready")
+        build.queue(self.db, [code], who="operator")
+        spawned: list[str] = []
+        tick: dict[str, Any] = {"owner": "fixture", "spawn": spawned.append, "lane": lambda *_: None,
+                                "root": self.root / "worktrees", "load": 1.0, "load_cap": 40.0, "interactive": []}
+        result = build_run.dispatch(self.db, **tick)
+        self.assertEqual((len(result["claimed"]), len(result["drafted"])), (1, 1))
+        self.assertEqual([one["item"] for one in build.run(self.db, result["claimed"][0])["members"]], [code])
+        self.assertEqual(build.run(self.db, result["drafted"][0])["branch"], f"draft/sd-{design}")
+        self.assertEqual(item_state(self.db, design)["item"]["status"], "ready")
+
+    def test_a_written_design_rides_the_next_code_bundle_and_never_leads_one(self):
+        """sd:10096: a design with no question queues as a bundle row that takes no slot and joins the
+        repository's next code bundle, whose brief commits it; alone it claims nothing."""
+        design = self.designed("draft-plain")
+        [note] = [note for note in self.notes() if note["kind"] == "comment" and (note["session"] or "").startswith("draft:")]
+        self.assertTrue(note["body"].startswith("Design:\n\nProblem: x"), note["body"])
+        self.assertEqual(len(self.rides(design)), 1)
+        self.assertIsNone(build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                      root=self.root / "worktrees"))
+        with mock.patch.object(build, "bundle_max", return_value=1):
+            bundle = self.press()
+        members = [one["item"] for one in build.run(self.db, bundle["id"])["members"]]
+        self.assertEqual(members, [self.items[0], design])
+        brief = build_run.BRIEF.format(**self.supervisor(bundle["id"]).brief())
+        self.assertIn("docs/work/<date>-<slug>/design.md", brief)
+        self.assertIn(f"- sd:{design}:\n\nProblem: x", brief)
+
+    def test_a_design_question_holds_its_ride_until_ruled_and_again_once_withdrawn(self):
+        """sd:10096 failure table: a design with an open question queues no ride; a ruling lets Build
+        queue it; a withdrawn ruling reopens the question, and the claim leaves the ride out."""
+        design = self.designed("draft")
+        self.assertEqual(self.rides(design), [])
+        [asked] = [note for note in self.notes() if note["kind"] == "question"]
+        with self.assertRaisesRegex(build.BuildRefused, f"waits on design question note #{asked['id']}"):
+            build.queue(self.db, [design], who="operator")
+        ruling = add_note(self.db, design, "decision", f"Ruling on note #{asked['id']}: A")
+        [ride] = build.queue(self.db, [design], who="operator")
+        self.assertEqual(ride["scope"], build.SCOPE)
+        add_note(self.db, design, "decision", f"Withdrawn: ruling #{ruling} on note #{asked['id']}")
+        bundle = self.press()
+        self.assertEqual([one["item"] for one in build.run(self.db, bundle["id"])["members"]], self.items)
+        self.assertEqual(len(self.rides(design)), 1)
+
+    def test_a_queued_ride_holds_no_auto_pickup(self):
+        """Review of sd:10096: auto-pickup queues nothing while a build waits for the claim; a ride row
+        waits for a code bundle, so it held every pickup of the host."""
+        design = self.designed("draft-plain")
+        self.assertEqual(len(self.rides(design)), 1)
+        build.set_pickup(self.db, True)
+        code = create_item(self.db, kind="task", title="Pick me", repo=str(self.repo), status="ready")
+        self.assertEqual(build.pickup(self.db, build.room(self.db, load=1.0, load_cap=40.0, interactive=[])),
+                         [code])
+
+    def test_the_brief_leaves_out_a_withdrawn_ruling(self):
+        """Review of sd:10096: a withdrawn ruling is no instruction for the committed design."""
+        design = self.designed("draft")
+        [asked] = [note for note in self.notes() if note["kind"] == "question"]
+        first = add_note(self.db, design, "decision", f"Ruling on note #{asked['id']}: A")
+        add_note(self.db, design, "decision", f"Withdrawn: ruling #{first} on note #{asked['id']}")
+        add_note(self.db, design, "decision", f"Ruling on note #{asked['id']}: B")
+        build.queue(self.db, [design], who="operator")
+        bundle = self.press()
+        brief = build_run.BRIEF.format(**self.supervisor(bundle["id"]).brief())
+        self.assertIn(f"Ruling on note #{asked['id']}: B", brief)
+        self.assertNotIn(f"Ruling on note #{asked['id']}: A", brief)
+
+    def test_a_design_run_queues_no_ride_the_press_would_refuse(self):
+        """Class pass of sd:10096: the ride a design run queues is a press, so it passes the press's checks:
+        a dependency named while the run wrote holds it, with a note, and Build queues it later."""
+        item, _ = self.design()
+        other = create_item(self.db, kind="task", title="First", repo=str(self.repo), status="ready")
+        self.db.execute("UPDATE item SET fields = json_set(fields, '$.blocked_by', json_array(?)) WHERE id = ?",
+                        (other, item))
+        run = draft.claim(self.db, owner="fixture", available=build.room(self.db, load=1.0, load_cap=40.0,
+                                                                         interactive=[]))
+        assert run is not None
+        self.items = [item]
+        self.plan(claude=["draft-plain"])
+        self.assertEqual(self.drafter(run["id"]).run()["outcome"], "done")
+        self.assertEqual(self.rides(item), [])
+        self.assertIn(f"Design written; no build queued: item {item} ", self.notes()[-1]["body"])
+
+    def test_a_design_whose_ruling_is_replaced_after_the_claim_is_not_delivered(self):
+        """Review of sd:10096: the operator replaces the ruling while the bundle builds. A ruling still
+        stands, so the question waits on nothing, but a brief sent since the claim may carry the old one: the
+        enqueue leaves the design out, and the brief of a later run carries the new ruling."""
+        design = self.designed("draft")
+        [asked] = [note for note in self.notes() if note["kind"] == "question"]
+        add_note(self.db, design, "decision", f"Ruling on note #{asked['id']}: A")
+        resolve_note(self.db, asked["id"])
+        build.queue(self.db, [design], who="operator")
+        self.press()
+        self.items = [self.items[0], design]
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        add_note(self.db, design, "decision", f"Ruling on note #{asked['id']}: B")
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        enqueue = next(call["argv"] for call in self.calls("sd-ship") if "enqueue" in call["argv"])
+        self.assertEqual([enqueue[n + 1] for n, arg in enumerate(enqueue) if arg == "--item"], [str(self.items[0])])
+        self.assertEqual(self.statuses(), ["in_progress", "blocked"])
+
+    def test_two_designs_in_one_file_do_not_reach_review(self):
+        """Review of sd:10096: two designs with one title closed from one design.md that kept only one.
+        Each design item the branch closes needs a design.md of its own, whose front matter names it."""
+        first = self.designed("draft-plain")
+        second = self.designed("draft-plain")
+        self.press()
+        self.assertEqual([one["item"] for one in build.run(self.db, self.bundle["id"])["members"]],
+                         [self.items[0], first, second])
+        self.items = [self.items[0], first, second]
+        self.write_pr()
+        self.plan(claude=["one-design"], sd_review=["clean"])
+        with mock.patch.object(build_run, "REVIEW_ROUNDS", 1):
+            ended = self.supervisor().run()
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual(self.calls("sd-review"), [], "no review ran")
+        self.assertIn(f"design.md of its own: sd:{second} has none", build.run(self.db, self.bundle["id"])["detail"])
+
+    def test_a_design_whose_ruling_is_reversed_after_the_claim_is_not_delivered(self):
+        """Class pass of sd:10096: Decide reverses the ruling while the bundle builds. The design's commit
+        cites its item, but the item waits on its question again: the enqueue leaves it out, as it leaves
+        out a member its builder skipped with a question, and the brief of a later run drops the ruling."""
+        design = self.designed("draft")
+        [asked] = [note for note in self.notes() if note["kind"] == "question"]
+        ruling = add_note(self.db, design, "decision", f"Ruling on note #{asked['id']}: A")
+        resolve_note(self.db, asked["id"])
+        build.queue(self.db, [design], who="operator")
+        bundle = self.press()
+        self.assertEqual([one["item"] for one in build.run(self.db, bundle["id"])["members"]],
+                         [self.items[0], design])
+        self.assertIn(f"Ruling on note #{asked['id']}: A", self.supervisor().brief()["findings"])
+        self.items = [self.items[0], design]
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        add_note(self.db, design, "decision", f"Reversed ruling #{ruling}: question #{asked['id']} asks again.")
+        writes.reopen_note(self.db, asked["id"])
+        self.assertNotIn("Ruling on note", self.supervisor().brief()["findings"])
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        enqueue = next(call["argv"] for call in self.calls("sd-ship") if "enqueue" in call["argv"])
+        self.assertEqual([enqueue[n + 1] for n, arg in enumerate(enqueue) if arg == "--item"], [str(self.items[0])])
+        self.assertEqual(self.statuses(), ["in_progress", "blocked"])
+
     def test_every_hub_read_before_the_draft_run_loop_is_retried_with_the_child_kept(self):
         """Round 2: `DraftSupervisor` has its own constructor and its own reads."""
         self.assert_start_recovers(self.claimed()["id"])
@@ -5394,6 +5576,15 @@ class Hosts(Case):
         record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
         self.db.commit()
         self.asked: list[int] = []
+
+    def test_build_refuses_a_design_on_a_satellite_lane(self):
+        """Review of sd:10096: design runs start on the hub only, so a satellite design queued a run
+        that never starts; Build and auto-pickup now refuse it."""
+        item = create_item(self.db, kind="task", title="Design", repo=str(self.satellite), status="ready",
+                           fields={"work_kind": "design"})
+        with self.assertRaisesRegex(build.BuildRefused, "lane runs on work"):
+            build.queue(self.db, [item], who="operator")
+        self.assertNotIn(item, [row["id"] for row in build.eligible(self.db)])
 
     def lane(self, row, items):
         self.asked += items
