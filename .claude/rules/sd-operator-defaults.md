@@ -18,7 +18,7 @@ Explicit task instructions and stricter execution permissions take precedence.
 Before expensive checks or external transmission, inspect `sd-review --explain --json` for the intended scope.
 Check the complete fallback chain, required review count, authorship exclusions, and effective authorization.
 Stop if the plan includes an unrequested provider from outside the order.
-Two completed independent local reviews satisfy each reviewing tier, run at once (sd:7519); risk classification adds no third.
+One completed local review, the first eligible reader on the order, satisfies each reviewing tier (sd:10193); risk classification adds no second.
 Complete local review and fix verification before any Copilot request.
 `sd.copilot_review` decides automatic requests; otherwise request one only when the operator names the pull request.
 An unavailable local reviewer needs an operator decision, not an automatic remote escalation.

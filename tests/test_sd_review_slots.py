@@ -135,7 +135,7 @@ class TheReviewHoldsASlot(ReviewFixture):
     def test_a_review_records_the_slot_it_held(self) -> None:
         report = sd_review.review(self.change(), namespace(), FakeRunner(), self.environment(), self.chatgpt_home())
         self.assertEqual(report["review_slot"]["slots"], slots.DEFAULT_SLOTS, json.dumps(report)[:2000])
-        self.assertEqual(report["reviewed_by"], ["codex", "second"])  # one slot holds both readers (sd:7519)
+        self.assertEqual(report["reviewed_by"], ["codex"])  # every tier asks one reader (sd:10193)
 
     def test_the_slot_is_free_once_the_review_returns(self) -> None:
         """`sd-review` holds the slot in a local of `review`, so returning frees it, as a `finally` did."""

@@ -1012,11 +1012,128 @@ class LineBudgetTests(unittest.TestCase):
         # 4885 -> 4900, the ceiling: +15 so a verify pass is recorded only
         # from the fork its chain covers (`covers_from`) and a held blocker
         # keeps a docs-only delta at depth. Measured: `sd-review` is 2930.
+        #
+        # The lines below grew on build/sd-1423 from 4852 in parallel with
+        # pack sd:9769 above; with both merged the lane is 5075, measured
+        # with `sd-review` at 3105, after one duplicate key list left the URL
+        # contract (1696 -> 1568 bytes, under its 1600).
+        #
+        # 4852 -> 4860 is sd:9867: `bin/sd-review` +8 for `EVIDENCE_ASK`,
+        # `NO_REPRO_NOTE` and the `repro` flag through `finish_review` to
+        # `dispose`, after trimming the docstrings. Measured: `sd-review`
+        # is 2890 here.
+        #
+        # 4860 -> 4871 is the build/sd-1423 review: `bin/sd-review` +11 so
+        # an uncited repeat of a prior blocker keeps the prior report's
+        # evidence through `finish_review` to `dispose` (`prior_evidence`
+        # keeps `dispose` under the branch ceiling). Measured:
+        # `sd-review` is 2901 here.
+        #
+        # 4871 -> 4882 is the next build/sd-1423 review: `bin/sd-review`
+        # +11 so `prior_evidence` matches the finding (line or summary)
+        # and its file in any accepted spelling. Measured: `sd-review` is
+        # 2912 here.
+        #
+        # 4882 -> 4886 is the build/sd-1423 review after: `bin/sd-review`
+        # +4 so the rebuttal check runs before `prior_evidence`, and a
+        # prior blocker that stored no evidence still blocks. Measured:
+        # `sd-review` is 2916 here.
+        #
+        # 4886 -> 4901 is the build/sd-1423 class pass: `bin/sd-review`
+        # +15 for `repo_spelling`, the one spelling `head_holds` now
+        # shares, applied to findings, prior report rows and rebuttals
+        # before any is matched. Measured: `sd-review` is 2931 here.
+        #
+        # 4901 -> 4907 is the lead's ruling after round 8: `bin/sd-review`
+        # +6 so `prior_evidence` matches file, line and summary together,
+        # and a prior blocker no finding repeats keeps uncited findings on
+        # its file blocking. Measured: `sd-review` is 2937 here.
+        #
+        # 4907 -> 4913 is the next build/sd-1423 review: `bin/sd-review`
+        # +6 for `SHIFT_LINES`, so only a finding near an unmatched prior
+        # blocker fails closed, not any finding on its file. Measured:
+        # `sd-review` is 2943 here.
+        #
+        # 4913 -> 4942 is the next build/sd-1423 review: `bin/sd-review`
+        # +29 for `moved_line` and `prior_at`, which map each prior
+        # blocker's line through `git diff -U0` from the prior head, so a
+        # blocker an insertion moved still holds its repeat. Measured:
+        # `sd-review` is 2972 here.
+        #
+        # 4942 -> 4944 is the next build/sd-1423 review: `bin/sd-review`
+        # +2 so only a repeat that blocks at the floor answers a prior
+        # blocker. Measured: `sd-review` is 2974 here.
+        #
+        # 4944 -> 4954 is the next build/sd-1423 review: `bin/sd-review`
+        # +10 so `prior_at` follows a prior blocker's file through a
+        # rename. Measured: `sd-review` is 2984 here.
+        #
+        # 4954 -> 4956 is the next build/sd-1423 review: `bin/sd-review`
+        # +2 so a prior blocker with no line follows a rename too.
+        # Measured: `sd-review` is 2986 here.
+        #
+        # 4956 -> 4958 is the next build/sd-1423 review: `bin/sd-review`
+        # +2 so `moved_line` keeps a replaced line's offset and `prior_at`
+        # records the replacing hunk's span for the fail-closed check.
+        # Measured: `sd-review` is 2988 here.
+        #
+        # 4958 -> 4960 is the next build/sd-1423 review: `bin/sd-review`
+        # +2 so a rebutted prior blocker holds no other finding.
+        # Measured: `sd-review` is 2990 here.
+        #
+        # 4960 -> 4965 is the lead ruling of 2026-11-22: `bin/sd-review`
+        # +5 so `prior_at` maps each prior blocker from its own
+        # `prior_review.head`, not the aggregate's latest head.
+        # Measured: `sd-review` is 2995 here.
+        #
+        # 4965 -> 4974 is the next build/sd-1423 review: `bin/sd-review`
+        # +9 for `live_findings`, so a prior blocker a later pass cleared
+        # holds nothing. Measured: `sd-review` is 3004 here.
+        #
+        # 4974 -> 4964 is the next build/sd-1423 review: `bin/sd-review`
+        # -10, `live_findings` and `line_kept` deleted: the aggregate has
+        # no pass status, so every pass's blocker holds (fail closed).
+        # Measured: `sd-review` is 2994 here.
+        #
+        # 4964 -> 4969 is the next build/sd-1423 review: `bin/sd-review`
+        # +5 so a blocker's own summary cited at another line of its
+        # file repeats it. Measured: `sd-review` is 2999 here.
+        #
+        # 4969 -> 4984 is lane round 2 and the next build/sd-1423 review:
+        # `bin/sd-review` +15, `unresolved` keeps only blockers still open
+        # at the last completed pass (pack sd:10008), and ECHO_LINES bounds
+        # a summary's repeat. Measured: `sd-review` is 3014 here.
+        #
+        # 4984 -> 5027 is the build/sd-1423 class pass on a prior
+        # blocker's place: `bin/sd-review` +43, `diff_lines` and
+        # `prior_at._moved` follow code moved unfixed within or across
+        # files, plus one line for a nearby repeat answering its blocker.
+        # Measured: `sd-review` is 3057 here.
+        #
+        # 5075 -> 5088 is the build/sd-1623 review: `bin/sd-review` +13 for
+        # `instance_rows`, so each place a prior blocker's `instances` name
+        # holds it, and the rebuttal filter reads those instances.
+        # Measured: `sd-review` is 3118 here.
+        #
+        # 5088 -> 5092 is the next build/sd-1623 review: `bin/sd-review` +4
+        # so `recorded_at` matches a rebuttal at any place it answered and a
+        # moved blocker also holds its hunk's place. Measured: `sd-review`
+        # is 3122 here.
+        #
+        # 5092 -> 5120 is the third build/sd-1623 review: `bin/sd-review`
+        # +28 for `instance_place`, `respelled` and `origin`: instances in
+        # one spelling, the newest overlapping record decides, and a repeat
+        # at any place of a blocker answers it. Measured: `sd-review` is
+        # 3150 here.
+        #
+        # 5120 -> 5123 is sd:10205: `bin/sd-review` +3 so `reader_cost`
+        # reads codex's closing `tokens used` total; 0 of 214 codex
+        # outcomes carried usage. Measured: `sd-review` is 3153 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            4900,
+            5123,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

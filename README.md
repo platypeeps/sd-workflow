@@ -472,7 +472,7 @@ and prints its own wall time against the budget its header states.
 clone: the link sits in the clone's common `.git/hooks`, its target is the
 relative `../../hooks/pre-commit`, so it reads the main checkout's tracked
 file and every linked worktree shares it, whichever worktree ran `make
-hooks`; the target refuses to replace anything else already at that path; it never
+hooks`; the target replaces a dangling link and refuses anything else already at that path; it never
 sets `core.hooksPath` and refuses to run while one is set, since git would
 then place the link under that directory, and the directory is not
 `.githooks/`, because `sd-status` reports both of those as the retired gate

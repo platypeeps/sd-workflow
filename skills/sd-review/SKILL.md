@@ -68,6 +68,8 @@ Do not substitute another diff or copy a cap into this procedure.
    An exhausted chain with insufficient completed coverage fails.
 3. Disposition findings locally against the repository's severity floor; unset, it is `high`.
    A finding at the floor blocks, cited or not; only a repeat of a finding rebutted on this branch needs `evidence` (a check run, or `path:line` and a quote of the current code), and one without posts as advisory, marked `[downgraded: repeats a rebutted finding, no evidence cited]`.
+   A finding whose `trigger` is `synthetic`, input no caller or recorded data produces, posts as advisory, marked `[advisory: no caller or recorded data carries the failing input]`, outside planning reviews and the lane's own blockers.
+   Input from outside the operator's control (a network reply, another person's file or text, user-typed text) and a data-loss or secret-leak path still block on a synthetic repro (sd:10288).
    A finding takes the newest recorded disposition at its exact path, whole summary (case and spacing folded) and exact line; it posts as advisory only when that one is a listed rebuttal whose file is unchanged since its receipt's head (a failed diff counts as a change), so a finding that moved or whose file changed blocks again, and the lane's own blockers are never rebutted. The prompt lists the rebuttals recorded from 14 days before the base's commit on, at a receipt head that is the base or in base..head, at most 10, each with its line; a reused branch name inherits none, and a retry at the same head reads the receipt recorded after it.
    Preserve each provider's findings and attempt outcome.
    A completed adverse review counts; it does not trigger replacement.
@@ -78,10 +80,9 @@ Do not substitute another diff or copy a cap into this procedure.
    Explicit `--reuse-check` can reuse eligible full-check evidence; a reused receipt runs no gate.
    A failing gate fails the review.
 
-Reviewing tiers ask two independent local reviews: the first two entries on the reviewer order, run at once.
-With one eligible reader, the review asks one, and `review_shortfall` and a `shortfall` line say so.
+Reviewing tiers ask one local review: the first eligible entry on the reviewer order (sd:10193).
 The `claude-json` reader's prompt adds the ranked instruction: trace callers and config readers, findings in production-impact order.
-Skip requires none, subject to the planning, lens and challenge floor of two.
+Skip requires none; planning, lens and challenge reviews ask the same one reader.
 Enabled reviewers outside the order `sd providers list` shows require explicit `--provider NAME` selection and the same eligibility checks.
 Copilot never fills the local slot.
 Shipping may request it afterward through the configured `deep` tier or explicit task direction.

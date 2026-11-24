@@ -80,13 +80,14 @@ class TheStrip(ScreenCase):
         self.assertEqual(rows[0]["windows"], [{"label": "7d", "used": 40.0, "resets_at": "2026-09-08T12:00:00Z", "pace": -10}])
         self.assertEqual((rows[1]["windows"], rows[1]["why"]), ([], "read 2h ago; a reading over 30 min old is unknown"))
 
-    def test_a_claude_account_with_a_cswap_alias_shows_it_after_its_number(self):
-        """pack sd:9861: system sd:9860 keeps cswap's alias; the id stays usage:claude#N; no alias is unchanged."""
+    def test_a_claude_account_with_a_cswap_alias_is_labelled_by_the_alias_alone(self):
+        """pack sd:9861, sd:9873: system sd:9860 keeps cswap's alias, the label is the alias alone; the id stays
+        usage:claude#N; no alias is unchanged."""
         accounts = [dict(CLAUDE["accounts"][0], alias="grinch"), dict(CLAUDE["accounts"][1], alias=" "),
                     dict(CLAUDE["accounts"][0], number=3, alias=7)]
         reading(self.connection, "claude", windows=[], accounts=accounts)
         self.assertEqual([(row["id"], row["label"]) for row in self.strip()["rows"]],
-                         [("usage:claude#1", "claude#1 grinch"), ("usage:claude#2", "claude#2"),
+                         [("usage:claude#1", "grinch"), ("usage:claude#2", "claude#2"),
                           ("usage:claude#3", "claude#3")])
 
     def test_a_claude_account_with_no_expected_share_paces_at_its_fetch_time(self):
@@ -235,6 +236,7 @@ const ICON = n => html`<svg class="i" aria-hidden="true"><use href="#i-${n}"/></
 const toLocal = Date.prototype.toLocaleString;
 Date.prototype.toLocaleString = function (_, options) { return toLocal.call(this, 'en-US', options); };
 var OUT = { gets: [], error: null }, R = {}, ANSWER = """ + json.dumps(answer) + r""";
+var setInterval = () => 0;
 const getJSON = async path => { OUT.gets.push(path); if (typeof ANSWER === 'string') throw new Error(ANSWER); return ANSWER; };
 const flush = async () => { for (let i = 0; i < 50; i++) await null; };
 (async () => { try {
@@ -274,7 +276,7 @@ class TheStripInTheUsageDropdown(ScreenCase):
         body = out["R"]["body"]
         self.assertIn("5h window 62% used", body)
         self.assertIn('<rect class="fill caution" width="85.5"', body)
-        self.assertIn('<time datetime="2026-09-06T15:00:00Z">Sun, 09:00 AM MDT</time>', body)
+        self.assertIn('<time datetime="2026-09-06T15:00:00Z" title="Sun, 09:00 AM MDT">', body)
         self.assertIn("25 pts over pace", body)
         self.assertIn('href="https://status.example.test/incidents/9"', body)
         self.assertIn("No reader for gemini.", body)
@@ -283,6 +285,18 @@ class TheStripInTheUsageDropdown(ScreenCase):
         self.assertIn('read <time class="rel" datetime="2026-09-06T11:50:00Z">', body)
         # The outage on codex's service is the worst state the summary shows.
         self.assertEqual(out["R"]["state"], "warning")
+
+    def test_a_window_shows_the_days_and_hours_to_its_reset(self):
+        """Operator 2026-11-23: a window's reset reads as the time left to it, not its day and time."""
+        reading(self.connection, "codex", **CODEX)
+        for now, left in (("2026-09-06T11:50:00Z", "resets in 3h 10m"), ("2026-09-06T14:59:30Z", "resets in 1m"),
+                          ("2026-09-03T10:00:00Z", "resets in 3d 5h"), ("2026-09-06T15:00:00Z", "has reset"),
+                          ("2026-09-06T16:00:00Z", "has reset")):
+            with self.subTest(now=now):
+                stub = f"Date.now = () => Date.parse('{now}');"
+                body = run_usage(stub + "R.body = usageBody(ANSWER).text;", answer=self.strip(),
+                                 tz="America/Denver")["R"]["body"]
+                self.assertIn(f'title="Sun, 09:00 AM MDT">{left}</time>', body)
 
     def test_a_spend_shows_its_cap_and_the_days_left_in_the_local_zone(self):
         """pack sd:9702: 'spent $X of $CAP · N days left', caution at 80 % of the cap and warning at 100 %."""
@@ -417,6 +431,29 @@ for (const [view, key] of [[1000, 'tall'], [400, 'short']]) {
         self.assertEqual(out["R"]["short"], "324px")
         css = re.sub(r"/\*.*?\*/", "", (V2 / "static" / "shell.css").read_text(encoding="utf-8"), flags=re.S)
         self.assertRegex(re.search(r"\.fpick-menu \{([^}]*)\}", css).group(1), r"overflow-y:\s*auto")
+
+    def test_an_open_page_reads_the_strip_again_on_a_timer_while_visible(self):
+        """Advisory of PR #1950 (sd:9973): the summary was read only at load, an open and Read again, so a page
+        left open kept a state the strip had long left. A timer reads it again, but not on a hidden page."""
+        body = r"""
+const EL = {}, TIMERS = [];
+['usage-drop', 'usage-menu', 'usage-sum'].forEach(id => { EL[id] = { id, style: {}, dataset: {}, listeners: {},
+  addEventListener(t, f) { this.listeners[t] = f; }, getBoundingClientRect: () => ({ top: 60 }) }; });
+globalThis.document = { getElementById: id => EL[id] || null, visibilityState: 'visible' };
+globalThis.location = { hash: '' };
+globalThis.setInterval = (f, ms) => { TIMERS.push([f, ms]); return TIMERS.length; };
+usageWire(); await flush();
+R.timers = TIMERS.map(([, ms]) => ms);
+R.loaded = OUT.gets.length;
+TIMERS.forEach(([f]) => f()); await flush();
+R.visible = OUT.gets.length;
+document.visibilityState = 'hidden';
+TIMERS.forEach(([f]) => f()); await flush();
+R.hidden = OUT.gets.length;
+"""
+        out = run_usage(body, answer={"rows": [], "nosource": []})
+        self.assertEqual(out["R"]["timers"], [5 * 60 * 1000])
+        self.assertEqual((out["R"]["loaded"], out["R"]["visible"], out["R"]["hidden"]), (1, 2, 2))
 
     def test_the_kiosk_gives_the_usage_summary_read_again_s_touch_size(self):
         """Lead review of 8f483c6: Home's kiosk enlarged #read-again to 4rem but left the Usage summary beside it small."""
