@@ -43,6 +43,7 @@ import contextlib
 import functools
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -192,6 +193,8 @@ Rules:
   `git commit -m` or `git commit -F <file inside the worktree>`; add new commits and never amend.
 - The dispatcher owns every item's status: never run `sd task status`, never push, never open a pull request.
 - Write a test that fails before each fix, then make it pass; skip no test.
+- Start no test run on more threads than `$CARGO_BUILD_JOBS`, which the dispatcher sets from the machine's
+  load: `cargo -j`, `pytest -n`, Unity's `-job-worker-count`. Builders' own runs drove the load to 104.
 - Run tests in the foreground, focused on the modules you touch, 10 minutes or less: give each Bash call
   `timeout: 600000` and never `run_in_background`. Past its timeout (120 s by default) a call moves to
   the background, and no exit wakes you (sd:9183). The lane runs the full gate.
@@ -1182,6 +1185,38 @@ def _environ(environ: dict | None, ident: str) -> dict:
     return env
 
 
+#: The test thread counts a builder's child gets at its cap (sd:10393): the gate's own (`CPU_VARIABLES`), pytest-xdist's
+#: `-n auto`, and the pack's `run-tests.sh` workers. Unity reads none, so the brief names its flag.
+THREAD_VARIABLES = ("PYTEST_XDIST_AUTO_NUM_WORKERS", "TEST_WORKERS")
+
+
+@functools.cache
+def _gate_slots():
+    """`bin/sd_gate_slots.py`, stdlib only, as the gate itself reads its thread caps."""
+    import importlib.util  # noqa: PLC0415 - only a builder's spawn needs it
+    spec = importlib.util.spec_from_file_location("sd_gate_slots", PACK / "bin" / "sd_gate_slots.py")
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def thread_cap(env: dict, *, load: float | None, cores: int | None = None) -> int:
+    """How many test threads one builder's child may start (sd:10393): no more than a gate holder's share of the
+    cores, nor than the cores the five-minute `load` leaves idle, and at least one. On 2026-11-24 builders' own
+    `cargo`, Unity and pytest runs, each on every core, drove the load to 104 on 16 cores while the gates kept to
+    their caps. An unread `load` caps at the share alone."""
+    gate = _gate_slots()
+    cores = cores or os.cpu_count() or 1
+    try:
+        slots = gate.configured(env, gate.machine_settings(env)["gate_slots"])[0]
+    except ValueError:  # a bad count caps no gate either
+        slots = 0
+    share = gate.cpu_share(slots, cores) if slots > 0 else cores
+    idle = cores if load is None or not math.isfinite(load) else int(cores - load)
+    return max(1, min(share, idle))
+
+
 def _checks_environ(env: dict) -> dict:
     """A repo's own checks may fetch private release assets with GITHUB_TOKEN (sd:8506). Only they get it
     from the PAT: elsewhere gh and its credential helper would act as the PAT, not the gh login (sd:8515)."""
@@ -1232,6 +1267,7 @@ class Supervisor:
         self.blockers: list[dict] = []
         self.last_beat = 0.0
         self.env = _environ(environ, ident)
+        self.own_env = dict(self.env)  # before `threads` caps it: each spawn caps from this again
         # Claude Code's own OTel, where the machine turns it on, names the run
         # by these (pack sd:6943); the switch and endpoint are system sd:6944's.
         self.env["OTEL_RESOURCE_ATTRIBUTES"] = ",".join(filter(None, (
@@ -2564,6 +2600,7 @@ class Supervisor:
                 "--model", model or self.row["model"] or build.OPUS, *(["--effort", effort] if effort else [])]
         if session:
             argv += ["--resume", session]
+        self.env.update(self.threads())  # read again at each spawn: the load moves over a run
         offset = self.start_offset(role)
         before = self.read_head()
         self.child(argv, cwd=self.work, name="claude", out=self.log, session=session is None, offset=offset, role=role)
@@ -2664,6 +2701,16 @@ class Supervisor:
         except Unread as unread:
             return f"the worktree was not read: {unread}"
         return "" if ahead.strip().isdigit() and int(ahead) > 0 else f"the builder left no commit on {self.row['branch']}"
+
+    def threads(self) -> dict[str, str]:
+        """The thread counts a builder's child starts with, each at most `thread_cap` now; a lower one the
+        dispatcher's own environment set wins, as the gate's does (sd:10393)."""
+        try:
+            load: float | None = os.getloadavg()[1]
+        except OSError:
+            load = None
+        cap, gate = thread_cap(self.own_env, load=load), _gate_slots()
+        return {name: gate.thread_cap(self.own_env.get(name), cap) for name in (*gate.CPU_VARIABLES, *THREAD_VARIABLES)}
 
     def base(self) -> str:
         try:
@@ -2956,6 +3003,7 @@ class DraftSupervisor(Supervisor):
                                        (self.row["assignment"],)).fetchone()["item"]
         self.last_beat = 0.0
         self.env = _environ(environ, ident)
+        self.own_env = dict(self.env)  # before `threads` caps it: each spawn caps from this again
         self.reviewed: str | None = None
         self.take_resume(settle_seconds)
 

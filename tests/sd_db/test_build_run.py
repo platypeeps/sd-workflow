@@ -14,6 +14,7 @@ import hashlib
 import importlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -69,7 +70,9 @@ FAKE = textwrap.dedent('''
     role, plans = Path(sys.argv[0]).stem, Path(os.environ["FAKE_PLANS"])
     with open(plans / "calls.jsonl", "a") as log:
         log.write(json.dumps({"role": role, "argv": sys.argv[1:], "cwd": os.getcwd(),
-                             "run": os.environ.get("SD_BUILD_RUN")}) + "\\n")
+                             "run": os.environ.get("SD_BUILD_RUN"),
+                             "jobs": os.environ.get("CARGO_BUILD_JOBS"),
+                             "xdist": os.environ.get("PYTEST_XDIST_AUTO_NUM_WORKERS")}) + "\\n")
     plan = plans / f"{role}.json"
     queue = json.loads(plan.read_text()) if plan.exists() else []
     # `gh repo view` (the visibility read) takes no plan: plans/visibility.txt answers it.
@@ -924,6 +927,35 @@ class Supervise(Case):
         self.assertIn("Write no file outside the worktree", prompt)
         self.assertIn("never amend", prompt)
         self.assertIn("Bash(git commit -F:*)", argv[argv.index("--allowedTools"):argv.index("--permission-mode")])
+
+    def test_a_builders_child_runs_its_tests_on_capped_threads(self):
+        """sd:10393: a builder's cargo, pytest and Unity runs took every core; its child now starts with the cap,
+        and a lower count the dispatcher's own environment set wins, as it does for a gate holder."""
+        self.env.update(SD_GATE_SLOTS="1", TEST_WORKERS="1")
+        self.env.pop("CARGO_BUILD_JOBS", None)
+        self.env.pop("PYTEST_XDIST_AUTO_NUM_WORKERS", None)
+        self.press()
+        self.plan(claude=["pass"])
+        supervisor = self.supervisor()
+        with mock.patch("os.getloadavg", return_value=(0.0, 0.0, 0.0)), mock.patch("os.cpu_count", return_value=16):
+            supervisor.run()
+        call = self.calls("claude")[0]
+        self.assertEqual((call["jobs"], call["xdist"]), ("16", "16"), "one slot: a gate's share is every core")
+        self.assertEqual(supervisor.env["TEST_WORKERS"], "1", "the lower count set wins")
+        prompt = call["argv"][call["argv"].index("-p") + 1]
+        self.assertIn("$CARGO_BUILD_JOBS", prompt)
+        with mock.patch("os.getloadavg", return_value=(30.0, 13.0, 9.0)), mock.patch("os.cpu_count", return_value=16):
+            self.assertEqual(supervisor.threads()["CARGO_BUILD_JOBS"], "3", "the load leaves 3 cores idle")
+        with mock.patch("os.getloadavg", side_effect=OSError), mock.patch("os.cpu_count", return_value=16):
+            self.assertEqual(supervisor.threads()["NEXTEST_TEST_THREADS"], "16", "an unread load caps at the share")
+
+    def test_the_thread_cap_takes_the_lower_of_the_gate_share_and_the_idle_cores(self):
+        """sd:10393: at most a gate holder's share of the cores, at most the cores the load leaves idle, at least 1."""
+        for slots, load, cap in (("4", 2.0, 4), ("4", 14.0, 2), ("4", 104.0, 1), ("4", None, 4),
+                                 ("4", math.nan, 4), ("4", math.inf, 4), ("0", 2.0, 14), ("bad", 0.0, 16),
+                                 ("20", 0.0, 1)):
+            with self.subTest(slots=slots, load=load):
+                self.assertEqual(build_run.thread_cap({"SD_GATE_SLOTS": slots}, load=load, cores=16), cap)
 
     def test_a_success_line_passes_whatever_the_exit_code(self):
         self.press()
