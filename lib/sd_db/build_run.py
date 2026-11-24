@@ -1442,6 +1442,13 @@ class Supervisor:
                 start = _read([*self.tools.git, "-C", str(self.repo), "rev-parse", "--verify", "--quiet",
                                f"refs/remotes/origin/{branch}"], env=self.env).strip()
             except Unread:
+                # Work another host holds and origin lacks must not be rebuilt from the base without it
+                # (review of build/sd-1688).
+                away = build.work_elsewhere(self.db, self.ident)
+                if away is not None:
+                    return self.finish("blocked", f"branch {branch} holds the work of a run on {away}, but neither "
+                                                  f"{self.repo} nor origin has it; push it from {away}, or move "
+                                                  f"the lane there and Retry")
                 start = self.base()
             argv = ["worktree", "add", "-b", branch, str(self.work), start]
         if self.child([*self.tools.git, "-C", str(self.repo), *argv], cwd=self.repo, name="worktree") != 0:

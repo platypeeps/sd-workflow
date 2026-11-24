@@ -453,6 +453,20 @@ def _route(connection, lane_host: str | None, lead: int | None) -> str | None:
     return lane if home else None
 
 
+def work_elsewhere(connection, ident: str) -> str | None:
+    """The host that ran the bundle of run `ident` last before it, when that is not `ident`'s own host ("the hub"
+    for the hub's), or None: that host's worktree holds the bundle's commits, which only a push brings here
+    (review of build/sd-1688)."""
+    now = connection.execute("SELECT assignment, run, owner FROM runner_run WHERE id = ?", (ident,)).fetchone()
+    if now is None:
+        return None
+    before = connection.execute("SELECT owner FROM runner_run WHERE assignment = ? AND run < ? ORDER BY run DESC "
+                                "LIMIT 1", (now["assignment"], now["run"])).fetchone()
+    if before is None or run_host(before["owner"]) == run_host(now["owner"]):
+        return None
+    return run_host(before["owner"]) or "the hub"
+
+
 def run_owner(owner: str, lane_host: str | None) -> str:
     """The `runner_run.owner` a claim writes: the role on a hub lane, `<role>@<lane host>` on a satellite's."""
     return owner if lane_host is None else f"{owner}@{lane_host}"

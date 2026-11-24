@@ -3083,6 +3083,27 @@ class Supervise(Case):
         self.assertEqual(self.supervisor().worktree(), "building")
         self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), pushed)
 
+    def test_a_retry_whose_work_is_on_another_host_and_not_pushed_blocks(self):
+        """Review of build/sd-1688: a retry routed to its lane host after the hub built it started from the
+        base when origin lacked the branch, and the builder rebuilt without the hub's commits. It blocks."""
+        self.press()
+        stamp = build.clock()
+        self.db.execute("UPDATE runner_run SET outcome = 'lane_failed', step = 'enqueued', released_at = ? "
+                        "WHERE id = ?", (stamp, self.bundle["id"]))
+        self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (stamp, self.bundle["id"]))
+        self.db.execute("UPDATE assignment SET status = 'queued' WHERE id = ?", (self.bundle["assignment"],))
+        self.db.execute("UPDATE item SET status = 'ready' WHERE id = ?", (self.items[0],))
+        self.db.execute("UPDATE repo SET lane_host = 'work' WHERE path = ?", (str(self.repo),))
+        record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
+        again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                            root=self.root / "worktrees", hosts=frozenset({"work"}))
+        assert again is not None and again["owner"] == "fixture@work", again
+        self.write_pr()  # the run's log folder
+        ended = self.supervisor(again["id"]).worktree()
+        self.assertIsInstance(ended, dict, "the worktree was started from the base")
+        self.assertEqual(ended["outcome"], "blocked")
+        self.assertIn(f"{again['branch']} holds the work of a run on the hub", ended["blocked"])
+
     def test_a_usage_limit_reclaim_refuses_a_worktree_on_another_branch(self):
         """Review of build/sd-1557: the reclaim resumed at building or fixing, past the worktree step's branch
         guard, so a checkout switched during the hold took the builder's commits. The guard runs first."""
