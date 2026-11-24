@@ -5052,6 +5052,22 @@ roles:
         self.assertEqual(self.prepare()["copilot_review"]["selection"], "explicit")
         self.assertEqual(len(self.double.copilot_requests), 1)
 
+    def test_a_merge_of_a_first_prepares_pull_request_whose_copilot_request_failed_reconciles(self):
+        """Round 12 of sd:9268: a first prepare's Copilot request failed after GitHub opened the pull request,
+        so the receipt named none, and once it merged reconcile refused for good. The opened one is recorded
+        before the Copilot step; merge still refuses it, reconcile reads it."""
+        self.double.lose_copilot_request = True
+        with self.assertRaisesRegex(ship.Refusal, "review request transport failed"):
+            self.prepare("--copilot-review", "request")
+        self.assertNotIn("pull_request", self.operation().state)
+        with self.assertRaisesRegex(ship.Refusal, "prepare this branch before merging"):
+            self.merge()
+        self.remote.merge(1)
+        with patch.object(ship.time, "sleep"):
+            result = self.operation("reconcile").reconcile()
+        self.assertEqual(result["phase"], "merged")
+        self.assertEqual(self.operation().state["merge_commit"], self.remote.pull(1).merge_commit_sha)
+
     def test_an_explicit_skip_withdraws_an_owed_copilot_request(self):
         """The way out when Copilot stays down: the operator's `skip` withdraws the request, and merge goes."""
         self.prepare()

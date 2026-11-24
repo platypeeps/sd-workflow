@@ -2105,6 +2105,10 @@ class Ship(SharedReview):
             raise Refusal("GitHub pull-request URL does not match the prepared repository")
         # Every step that can still refuse runs before the publishing save: a failed Copilot request leaves
         # a renewal's scope pending, and a first prepare's pull request unrecorded, so merge refuses (sd:9268).
+        if not self.state.get("pull_request"):
+            # Recorded apart: merge reads only `pull_request`, so it still refuses this one, while reconcile
+            # finds it once it merges after a failed Copilot step (sd:9268 round 12).
+            self.save(opened_pull_request=reference)
         copilot = self.prepare_copilot_review(number, pull, head, mode)
         warned = {"warnings": list(self.state.get("warnings") or []) + [copilot["warning"]]} if copilot.get(
             "warning") else {}
@@ -3247,8 +3251,14 @@ class Ship(SharedReview):
                 "review_preflight_error": self.state.get("review_preflight_error"),
                 "local_gate": self.state.get("local_gate")}
 
-    def reconcile(self) -> dict:
-        reference = self.state.get("pull_request")
+    def merged_pull(self) -> tuple[dict, dict, str]:
+        """The receipt's pull request, GitHub's view of it and its merge commit, once GitHub says it merged.
+
+        A first prepare whose Copilot step failed recorded the pull request
+        it opened apart, so merge refuses it; once merged, it is this
+        receipt's (sd:9268 round 12).
+        """
+        reference = self.state.get("pull_request") or self.state.get("opened_pull_request")
         if not reference:
             raise Refusal("there is no durable pull-request receipt to reconcile")
         pull = self.api.pull(reference["number"])
@@ -3260,6 +3270,12 @@ class Ship(SharedReview):
                 or pull.get("base", {}).get("ref") != reference["base"]
                 or pull.get("head", {}).get("sha") != self.state.get("reviewed_head")):
             raise Refusal("merged PR evidence does not match the prepared receipt")
+        if not self.state.get("pull_request"):
+            self.save(pull_request=reference)
+        return reference, pull, commit
+
+    def reconcile(self) -> dict:
+        reference, pull, commit = self.merged_pull()
         metadata = self.api.api(self.api.prefix)
         if metadata.get("default_branch") != reference["base"]:
             raise Refusal("the current default branch differs from the prepared base")
