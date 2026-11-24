@@ -718,8 +718,14 @@ def design_waits(connection, item: int, *, delivered: bool = False) -> str | Non
     carried = briefed(connection, item) if delivered else None
     if carried is None:
         return None
-    newer = next((ruling["id"] for ruling in _standing_rulings(connection, item) if ruling["id"] not in carried), None)
-    return f"has ruling #{newer}, which its build's brief did not carry" if newer else None
+    # Either way round: a ruling the brief lacked, or one it carried that stands no more, its question
+    # reopened or not (class pass of sd:10096).
+    standing = {ruling["id"] for ruling in _standing_rulings(connection, item)}
+    if standing - carried:
+        return f"has ruling #{min(standing - carried)}, which its build's brief did not carry"
+    if carried - standing:
+        return f"has ruling #{min(carried - standing)}, which its build's brief carried, standing no more"
+    return None
 
 
 #: The comment a build run writes on a design item as it sends the brief: the rulings the brief carries.

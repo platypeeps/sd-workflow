@@ -3598,6 +3598,30 @@ roles:
         self.assertIn(f"sd:{other} waits on design question note #{asked}", str(caught.exception))
         self.assertIsNone(getattr(self.remote.pull(number), "merged_head", None))
 
+    def test_the_merge_refuses_a_design_whose_ruling_was_replaced_after_prepare(self):
+        """Class pass of sd:10096: the merge read only whether a question waits. A ruling that replaced the
+        one the brief carried leaves none waiting, so the merge closed the design under the old ruling."""
+        from sd_db import build
+        from sd_db.writes import add_note, resolve_note
+
+        self.task_item("task")
+        other = self.closes_items()[0]
+        self.connection.execute("UPDATE item SET fields = json_set(COALESCE(fields, '{}'), '$.work_kind', 'design') "
+                                "WHERE id = ?", (other,))
+        asked = add_note(self.connection, other, "question", "Which?\nOption: A (Recommended)\nOption: B")
+        add_note(self.connection, other, "decision", f"Ruling on note #{asked}: A")
+        resolve_note(self.connection, asked)
+        build.note_brief(self.connection, other, "run-1")
+        self.connection.commit()
+        number = self.unanswered("--deliver", "--title", "A change", *self.also(other)).prepare()["pull_request"]["number"]
+        replaced = add_note(self.connection, other, "decision", f"Ruling on note #{asked}: B")
+        self.connection.commit()
+        with patch.object(ship.time, "sleep"), self.assertRaises(ship.Refusal) as caught:
+            self.merge()
+        self.assertEqual(caught.exception.workflow["blocker"]["code"], "design_waits")
+        self.assertIn(f"sd:{other} has ruling #{replaced}", str(caught.exception))
+        self.assertIsNone(getattr(self.remote.pull(number), "merged_head", None))
+
     def test_a_held_item_refuses_prepare_before_it_commits_or_catches_up(self):
         """pack sd:7221 round 4: the builder may still write its worktree, so prepare writes none of it first."""
         from sd_db import teammate

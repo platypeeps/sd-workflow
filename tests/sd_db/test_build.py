@@ -755,6 +755,23 @@ class DesignRulings(Case):
         bundle = self.claim()
         self.assertEqual([member["item"] for member in build.run(self.db, bundle["id"])["members"]], [code, item])
 
+    def test_delivery_holds_unless_the_standing_rulings_are_the_briefs(self):
+        """Class pass of sd:10096: delivery held only a ruling the brief lacked. One the brief carried and
+        that stands no more holds too, also when its question was not reopened."""
+        item, asked = self.designed()
+        ruling = self.rule(item, asked, "A")
+        self.assertIsNone(build.design_waits(self.db, item, delivered=True))  # no brief sent: nothing to compare
+        build.note_brief(self.db, item, "run-1")
+        self.assertIsNone(build.design_waits(self.db, item, delivered=True))
+        self.assertEqual(build.briefed(self.db, item), {ruling})
+        add_note(self.db, item, "decision", f"Withdrawn: ruling #{ruling} on note #{asked}")
+        self.assertIsNone(build.open_question(self.db, [item], "", pending=True))
+        self.assertIn(f"ruling #{ruling}", build.design_waits(self.db, item, delivered=True) or "")
+        replaced = self.rule(item, asked, "B")
+        self.assertIn(f"ruling #{replaced}", build.design_waits(self.db, item, delivered=True) or "")
+        build.note_brief(self.db, item, "run-2")
+        self.assertIsNone(build.design_waits(self.db, item, delivered=True))
+
     def test_the_brief_rulings_are_the_standing_ones(self):
         """A reversed ruling, and one a later ruling replaced, are no instruction."""
         item, asked = self.designed()
