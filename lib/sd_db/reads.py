@@ -419,6 +419,19 @@ def brief_items(
     return list(connection.execute(f"SELECT item.* FROM item WHERE {live} {order}", probe).fetchall())
 
 
+def review_round_counts(connection: sqlite3.Connection, items: list[int]) -> list[tuple[int, bool, int]]:
+    """`(item, builder, count)` of `items`' review rounds that left blockers (pack sd:10306): `builder` true for a
+    `Review round blockers:` note (builder review, gate or enqueue check), false for a lane prepare a local review
+    blocked. The dashboard's Queue sums them."""
+    if not items:
+        return []
+    marks = ",".join("?" * len(items))
+    return [(row[0], bool(row[1]), row[2]) for row in connection.execute(
+        f"SELECT item, body LIKE 'Review round blockers:%', COUNT(*) FROM note WHERE item IN ({marks}) "
+        "AND (body LIKE 'Review round blockers:%' OR body LIKE 'Lane failed in prepare at %: local review blocking%') "
+        "GROUP BY 1, 2", items)]
+
+
 def brief_notes(connection: sqlite3.Connection, items: list[int]) -> list[sqlite3.Row]:
     """The open `followup` and `question` notes on `items`, newest first.
 
