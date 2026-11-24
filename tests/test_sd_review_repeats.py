@@ -347,6 +347,43 @@ class PriorLineTests(RepeatFixture):
         for shape in UNCITED:
             self.assertEqual(answered(shape).strip(), "", repr(shape))
 
+    def test_a_receipt_that_kept_no_evidence_does_not_say_what_its_ruling_answered(self) -> None:
+        """Class pass of sd:10191 (bin/sd-review:2030): a receipt without evidence is unknown, not empty. A
+        build's follow-up receipt once kept none, whatever the finding cited; only such a receipt, by its
+        key, leaves the answer unknown (None). Any other receipt without evidence answered an uncited finding."""
+        def answered(key: str, raw: dict[str, Any]) -> Any:
+            body = json.dumps({"decision": "accepted", "proposal": {"bindings": {"head": ON_BRANCH}, "findings": [
+                {"response_disposition": "rebutted", "reason": "a reason",
+                 "raw_finding": {"path": "src.py", "line": 1, "summary": "defect", "instances": ["src.py:1"], **raw}}]}})
+            [ruling] = sd_review.rebuttals([(body, key)], {ON_BRANCH}.__contains__, lambda _head, _path, line: (line,))
+            return ruling.answered
+        filed, shipped = "ship-adjudication:build-run:0a1b:7", "ship-adjudication:7:k"
+        self.assertIsNone(answered(filed, {}), "a build receipt from before it kept evidence")
+        for key, raw, expected in ((filed, {"evidence": REPRO}, REPRO), (filed, {"evidence": ""}, ""),
+                                   (filed, {"evidence": None}, ""), (shipped, {}, ""), (shipped, {"evidence": REPRO}, REPRO),
+                                   ("ship-adjudication:7:build-run:", {}, ""), ("ship-adjudication-no-item:build-run:k", {}, "")):
+            with self.subTest(key=key, raw=raw):
+                self.assertEqual(answered(key, raw), expected)
+
+    def test_a_ruling_that_cannot_say_what_it_answered_holds_at_its_own_head(self) -> None:
+        """Class pass of sd:10191 (bin/sd-review:2030): a build filed a blocker before its receipt kept
+        evidence. A retry at that head read the filed finding's own repro as new and blocked on it. An
+        unknown answer holds at the ruling's head, as before the ruling; evidence at a later head still
+        blocks, and a ruling that answered an uncited finding still reads any repro as new."""
+        (self.root / "src.py").write_text("".join(f"line{n}\n" for n in range(1, 41)), encoding="utf-8")
+        ruled = self.commit("add", "src.py") and self.commit("ruled")
+        new = self.commit("new")
+        for answered, head, expected in ((None, ruled, "advisory"), (None, new, "blocking"), ("", ruled, "blocking")):
+            with self.subTest(answered=answered, found_at=head):
+                rebutted = [sd_review.Rebuttal(ruled, "src.py", sd_review.summary_key("Division by zero"), 20, True,
+                                               "src.py", "Division by zero", "filed", ("src.py:20",), answered)]
+                prior = [dict(finding(REPRO, line=20, summary="Division by zero"), disposition="blocking",
+                              prior_review={"pass": 1, "head": head})]
+                moved = sd_review.prior_at(self.root, head, new, prior)
+                [record] = sd_review.dispose([finding(line=20, summary="Division by zero")], "high", rebutted,
+                                             repro=True, prior=moved, later=sd_review.found_after(self.root))
+                self.assertEqual(record["disposition"], expected)
+
     def test_fresh_evidence_at_one_rebuttal_leaves_a_nearby_rebuttal_holding(self) -> None:
         """Review of sd:10191 (bin/sd-review:1857, :1865): two separate rebuttals of one summary sit at lines
         20 and 25. Evidence found after the ruling at line 20 revives its blocker; it lent that evidence, as

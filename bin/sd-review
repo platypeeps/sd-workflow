@@ -775,7 +775,7 @@ REBUTTED_HEADER = "Findings already rebutted on this branch"
 REBUTTED_ROWS = 200
 #: The rows only: a body is ASCII JSON, while a field `json_extract` decodes may not be UTF-8 and failed the whole read.
 REBUTTED_QUERY = (
-    "SELECT a.body FROM state AS a WHERE a.kind = 'checkpoint' AND (a.key LIKE 'ship-adjudication:%' OR a.key LIKE"
+    "SELECT a.body, a.key FROM state AS a WHERE a.kind = 'checkpoint' AND (a.key LIKE 'ship-adjudication:%' OR a.key LIKE"
     " 'ship-adjudication-no-item:%') AND a.timestamp >= ?1 AND lower(json_extract(CASE WHEN"
     " json_valid(a.body) THEN a.body END, '$.proposal.bindings.repository')) = ?2 AND json_extract(CASE WHEN"
     " json_valid(a.body) THEN a.body END, '$.proposal.bindings.branch') = ?3 ORDER BY a.id DESC LIMIT ?4")
@@ -789,8 +789,8 @@ def _bounded(value: Any, limit: int) -> str:
     return text if len(text) <= limit else text[:limit - 3].rstrip() + "..."
 
 
-def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tuple[str, ...], str]]]:
-    """The receipt head and (path, summary, line, disposition, reason, `path:line` instances, evidence) per accepted finding; malformed: none."""
+def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tuple[str, ...], str | None]]]:
+    """The receipt head and (path, summary, line, disposition, reason, `path:line` instances, evidence; None: no such key) per accepted finding; malformed: none."""
     try:
         value = json.loads(body) if isinstance(body, (str, bytes)) else None
     except (ValueError, RecursionError):
@@ -801,7 +801,7 @@ def _adjudicated(body: Any) -> tuple[Any, list[tuple[Any, Any, Any, Any, Any, tu
     return (bindings.get("head") if isinstance(bindings, dict) else None), [
         (raw.get("path"), raw.get("summary"), raw.get("line"), row.get("response_disposition"), row.get("reason"),
          tuple(entry.strip() for entry in (raw["instances"] if isinstance(raw.get("instances"), list) else []) if isinstance(entry, str) and entry.strip()),
-         raw["evidence"] if isinstance(raw.get("evidence"), str) else "")
+         raw["evidence"] if isinstance(raw.get("evidence"), str) else "" if "evidence" in raw else None)
         for row in rows if isinstance(row, dict) and isinstance(raw := row.get("raw_finding"), dict)
     ] if isinstance(rows, list) else []
 
@@ -827,7 +827,7 @@ class Rebuttal(NamedTuple):
     text: str
     reason: str
     instances: tuple[str, ...] = ()  # each `path:line` it answered; a change to any one's file lapses it (sd:9769)
-    answered: str = ""  # the evidence its adjudicated finding cited: only that is old to the ruling (`found_after`)
+    answered: str | None = ""  # the evidence its adjudicated finding cited: only that is old to the ruling (`found_after`); None: unknown
 
 
 def rebutted_findings(root: pathlib.Path, subject: Subject, database: Any, env: Mapping[str, str]) -> list[Rebuttal]:
@@ -926,8 +926,8 @@ def rebuttals(rows: Sequence[Sequence[Any]], on_branch: Callable[[str], bool],
     The lane's own blockers (`LANE_PATHS`) are never recorded: a later truncated review must still block."""
     records = [Rebuttal(head, path, summary_key(summary), line if type(line) is int else None, disposition == "rebutted",
                         _bounded(path or "?", 120), _bounded(summary, REBUTTED_SUMMARY_CHARS),
-                        _bounded(reason, REBUTTED_REASON_CHARS), instances, answered)
-               for body, *_rest in rows for head, found in [_adjudicated(body)]
+                        _bounded(reason, REBUTTED_REASON_CHARS), instances, answered if str(key[0] if key else "").startswith("ship-adjudication:build-run:") else answered or "")  # unknown only on a build's follow-up receipt: it once kept none (sd-review:2030)
+               for body, *key in rows for head, found in [_adjudicated(body)]
                if isinstance(head, str) and on_branch(head)
                for path, summary, line, disposition, reason, instances, answered in found
                if summary_key(summary) and str(path).strip() not in LANE_PATHS]
@@ -2021,13 +2021,13 @@ def found_after(root: pathlib.Path) -> Callable[[Rebuttal, Mapping[str, Any]], b
     text is new, as a later pass at that head cites. The text itself is compared, never a normal form of it
     (case, spacing, line breaks, order, a part): each read another repro as the answered one. A head before the
     ruling's is old; any other head, one git cannot place included, is after it: hold on doubt. No evidence, or
-    no `found_at`, is none."""
+    no `found_at`, is none; a ruling whose receipt kept no evidence (`answered` None) holds at its own head."""
     def _new(ruling: Rebuttal, row: Mapping[str, Any]) -> bool:
         found, cited = row.get("found_at"), row.get("evidence")
         if not isinstance(cited, str) or not cited.strip() or not isinstance(found, str):
             return False
         if found == ruling.head:
-            return cited != ruling.answered
+            return ruling.answered is not None and cited != ruling.answered
         return not re.fullmatch(r"[0-9a-f]{40,64}", found) or sd_lib.git_output(["merge-base", ruling.head, found], root) != found
     return _new
 
