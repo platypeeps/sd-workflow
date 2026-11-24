@@ -764,8 +764,9 @@ The half no script can do — work it before publishing, per document:
 
   The second reader
     9. Run the independent pass through `sd-review`, from the repo. It takes
-       two readers at once from the provider registry's reviewer order, with this
-       repo's consent (`reviewers:` in CLAUDE.local.md), vendor independence
+       one reader, the first ready one in the provider registry's reviewer
+       order, with this repo's consent (`reviewers:` in CLAUDE.local.md),
+       vendor independence
        and fallback: a reviewer that fails or is disabled hands the pass to
        the next enabled one instead of blocking it. `--lens research-brief`
        keeps the research framing -- the prompt says this is a markdown
