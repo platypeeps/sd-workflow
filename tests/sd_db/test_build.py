@@ -1789,6 +1789,36 @@ class Reap(Case):
             workflow.change_status(self.db, self.items[0], "blocked", who="operator")
 
 
+class ReapThree(Case):
+    """A three-item bundle that ended blocked after a run (sd:10086, lead round 3)."""
+
+    def setUp(self):
+        super().setUp()
+        self.items = [self.item(), self.item(), self.item()]
+        build.queue(self.db, self.items, who="operator")
+        self.bundle = self.claim()
+
+    def test_build_of_a_moved_member_is_no_silent_skip_when_the_lead_waits_on_another(self):
+        """Lead round 3 of sd:10086 (build.py:2087, :1208): the lead waits on one member, and Build presses
+        another that moved to another repository. Retry frees only the member the lead waits on; the check read
+        no member at all, so Build took that Retry and the pressed item was neither queued nor refused."""
+        from sd_db.workflow import edit_item
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=later(self.bundle["created_at"],
+                                                               build.STALE_SECONDS + 1))[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        lead, ahead, moved = self.items
+        transition(self.db, moved, "ready", who="operator")
+        newer = build.queue(self.db, [moved], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (newer,))  # before its claim
+        edit_item(self.db, lead, {"blocked_by": [ahead]}, who="operator")
+        self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (B, moved))
+        queued = build.queue_again(self.db, [moved], who="operator")
+        self.assertIn(moved, [entry["item"] for entry in queued], "the pressed item was skipped")
+        self.assertGreater(next(entry["id"] for entry in queued if entry["item"] == moved), newer,
+                           "a fresh press where it reads now")
+
+
 class Park(Case):
     """pack sd:6132 (operator ruling #32107): a build run that ends blocked parks its items once its lease is
     released, as the nightly prune parks an idle item (sd:6008); a run that ends done or retried parks nothing."""

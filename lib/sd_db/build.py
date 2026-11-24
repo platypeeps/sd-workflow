@@ -2084,7 +2084,11 @@ def _in_work_repo(connection, lead: int, status: str, *, retry: int | None = Non
         ahead, behind = _inside(connection, row["item"], [member for member in members if _current(connection, member)])
         # What Retry resumes on the branch: nothing while the lead waits on a member (it frees those to build
         # fresh where they read now, the pressed one too); else the kept members, and the pressed item.
-        members = [] if ahead else [member for member in members if member["item"] == retry or member not in behind]
+        # The pressed item is checked whenever Retry does not build it: a member Retry neither frees nor leads
+        # stays ended, so a moved one presses fresh where it reads now, not skipped (lead round 3 of sd:10086).
+        members = [member for member in members if member["item"] == retry and member["id"] != lead
+                   and member not in ahead] if ahead else [
+                       member for member in members if member["item"] == retry or member not in behind]
     repos = [connection.execute("SELECT repo FROM item WHERE id = ?", (member["item"],)).fetchone()["repo"]
              for member in members]
     return all(repo is not None and paths.same(home, repo) for repo in repos)
