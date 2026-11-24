@@ -994,15 +994,19 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
 
     A `revert:` commit that names no sha escapes `sd_ship_body.kept_commits`:
     system sd:8242 closed though the branch undid its commit and fixes. A
-    commit with a `Closes:` line counts as undone when a later commit's
-    subject is a revert and the files it changed read at `head` as before
-    it, or as at `head`'s merge base with `origin/<base>`: the branch
-    leaves them as it found them. The second read catches a cited commit
-    stacked on an earlier one, or one main moved since (sd:10214, system
-    PR #727 closed three items so). The later reverts must change every
-    one of those files: a revert of other work undid none of it, though a
-    later refactor moved it out (sd:10214 review). A read that fails
-    keeps the commit.
+    commit with a `Closes:` line counts as undone when the files it
+    changed read at `head` as before it, or as at `head`'s merge base
+    with `origin/<base>`, and a revert put them there. The second read
+    catches a cited commit stacked on an earlier one, or one main moved
+    since (sd:10214, system PR #727 closed three items so).
+
+    Who undid the work is read where the work left, never from a file
+    name at the head (sd:10214 review, class pass 2). Each file is
+    followed through a later move (`git diff -M` from the cited commit),
+    and every later commit at which the files come to read as before must
+    carry a revert subject. A refactor that moved the work out keeps the
+    close, whatever a later revert of other work touched; a revert that
+    removes a moved file undoes it. A read that fails keeps the commit.
 
     `kept_commits` reads this list after it, so this check hides none of
     its evidence (sd:10214 review). An undone commit stays in place with
@@ -1014,24 +1018,56 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     import sd_ship_body  # noqa: PLC0415
     fork = lane_git(worktree, "merge-base", f"refs/remotes/origin/{base}", head) if base else None
 
-    def reads_as_at(before: str, names: list[str]) -> bool:
-        same = publish_git(worktree, "--literal-pathspecs", "diff", "--quiet", before, head, "--", *names)
-        return bool(same) and same.returncode == 0
+    def fields(*args: str) -> list[str] | None:
+        # NUL-separated: git quotes a name with a tab or non-ASCII byte otherwise.
+        done = publish_git(worktree, *args)
+        return done.stdout.split("\0") if done and done.returncode == 0 else None
 
-    def commit_files(sha: str) -> list[str]:
-        # NUL-separated and literal: git quotes a name with a tab or non-ASCII byte otherwise.
-        files = publish_git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-z", "-r", sha)
-        return [name for name in files.stdout.split("\0") if name] if files and files.returncode == 0 else []
+    def blobs(rev: str, paths: list[str]) -> dict[str, str] | None:
+        """Each of `paths` that `rev` holds, with its mode and blob."""
+        listed = fields("ls-tree", "-z", rev, "--", *paths)
+        return None if listed is None else {path: entry for entry, _, path in
+                                            (line.partition("\t") for line in listed if line)}
+
+    def renames_since(sha: str, rev: str) -> dict[str, str] | None:
+        """Where `rev` holds each file of `sha` that a commit between them renamed."""
+        status = fields("diff", "-M", "--name-status", "-z", sha, rev)
+        if status is None:
+            return None
+        return {status[at + 1]: status[at + 2] for at, field in enumerate(status[:-2])
+                if field[:1] == "R" and field[1:].isdigit()}
+
+    def reads_before(sha: str, rev: str, names: list[str], want: dict[str, str]) -> bool | None:
+        """Whether `sha`'s files, where `rev` holds them, read as `want`; None when git gave no answer."""
+        where = renames_since(sha, rev)
+        now = None if where is None else blobs(rev, [where.get(name, name) for name in names])
+        return None if now is None else all(now.get(where.get(name, name)) == want.get(name) for name in names)
+
+    def undone(index: int, names: list[str], before: str) -> bool:
+        sha = commits[index][0]
+        want = blobs(before, names)
+        if want is None or not reads_before(sha, head, names, want):
+            return False
+        # Its descendants alone: a sibling a merge brought in never held the work, so it took none out.
+        after = lane_git(worktree, "rev-list", "--ancestry-path", f"{sha}..{head}")
+        if after is None:
+            return False
+        descendants, was = set(after.split()), False
+        for later, text in reversed(commits[:index]):
+            if later not in descendants:
+                continue
+            now = reads_before(sha, later, names, want)
+            if now is None or (now and not was and not sd_ship_body.REVERT_SUBJECT.match(text)):
+                return False  # no answer, or a change that is no revert took the work out
+            was = now
+        return was
 
     kept = []
     for index, (sha, message) in enumerate(commits):
-        reverts = [later for later, text in commits[:index] if sd_ship_body.REVERT_SUBJECT.match(text)]
-        if "Closes:" in message and reverts:
-            names = commit_files(sha)
-            touched = {name for later in reverts for name in commit_files(later)}
+        if "Closes:" in message and any(sd_ship_body.REVERT_SUBJECT.match(later) for _, later in commits[:index]):
+            names = [name for name in fields("diff-tree", "--no-commit-id", "--name-only", "-z", "-r", sha) or [] if name]
             at_base = None if sd_ship_body.reverts_another(message) else fork
-            if (names and touched.issuperset(names)
-                    and any(reads_as_at(before, names) for before in (f"{sha}^", at_base) if before)):
+            if names and any(undone(index, names, before) for before in (f"{sha}^", at_base) if before):
                 message = ""
         kept.append((sha, message))
     return kept

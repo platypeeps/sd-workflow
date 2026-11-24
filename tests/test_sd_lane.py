@@ -3782,6 +3782,55 @@ class CitedCloses(SharedQueue):
         head = git(tree, "rev-parse", "HEAD")
         self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a})
 
+    def test_a_revert_of_other_work_in_the_same_file_keeps_the_close(self) -> None:
+        """sd:10214 class pass 2: who undid a cited commit is read where its work left, not from a file name.
+
+        A refactor moves the work out of its file; another fix then reuses
+        the path and a revert drops that fix. The revert touched the cited
+        file, and the file reads as before the cited commit, but the
+        refactor took the work out, and it still ships.
+        """
+        a, *_ = self.open
+        tree, _ = self.committed("topic-same-file-revert")
+        (tree / "work.txt").write_text("work\n", encoding="utf-8")
+        git(tree, "add", "work.txt")
+        git(tree, "commit", "-q", "-m", f"feat: implement\n\nCloses: sd:{a}")
+        git(tree, "rm", "-q", "work.txt")
+        (tree / "caller.txt").write_text("the caller\nholds the reader itself\nand a good deal more\n", encoding="utf-8")
+        git(tree, "add", "caller.txt")
+        git(tree, "commit", "-q", "-m", "refactor: fold the work into the caller")
+        (tree / "work.txt").write_text("another use of the path\n", encoding="utf-8")
+        git(tree, "add", "work.txt")
+        git(tree, "commit", "-q", "-m", "fix: other")
+        git(tree, "rm", "-q", "work.txt")
+        git(tree, "commit", "-q", "-m", "revert: hold the other fix")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [a])
+        import sd_operations
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a})
+
+    def test_a_revert_after_a_file_move_closes_nothing_it_undid(self) -> None:
+        """sd:10214 class pass 2: a cited commit's file is followed through a later move; a hand-written revert
+        that removes it under its new name undid the work, though it never touched the old name."""
+        a, b, *_ = self.open
+        tree, _ = self.committed("topic-moved-revert")
+        (tree / "work.txt").write_text("one reader\ntwo readers\nthree readers\n", encoding="utf-8")
+        git(tree, "add", "work.txt")
+        git(tree, "commit", "-q", "-m", f"feat: implement\n\nCloses: sd:{a}")
+        git(tree, "mv", "work.txt", "reader.txt")
+        git(tree, "commit", "-q", "-m", "refactor: name the file for what it holds")
+        git(tree, "rm", "-q", "reader.txt")
+        git(tree, "commit", "-q", "-m", "revert: hold the reader for a redesign")
+        git(tree, "commit", "-q", "--allow-empty", "-m", f"fix: the gate\n\nCloses: sd:{b}")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [b])
+        import sd_operations
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {b})
+
     def test_an_associate_only_claim_closes_nothing_it_cites(self) -> None:
         entry = self.enqueue("Words.\n", f"fix: the slice\n\nCloses: sd:{self.open[0]}", claim="associate-only")
         self.assertEqual(entry["closes"], [])
