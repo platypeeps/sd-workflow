@@ -990,7 +990,7 @@ def branch_commits(worktree: pathlib.Path, base: str, head: str) -> list[tuple[s
 
 def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]],
                base: str = "") -> list[tuple[str, str]]:
-    """`commits` (newest first) less each cited one a later hand-written revert undid (sd:8373).
+    """`commits` (newest first), each cited one a later hand-written revert undid with its message emptied (sd:8373).
 
     A `revert:` commit that names no sha escapes `sd_ship_body.kept_commits`:
     system sd:8242 closed though the branch undid its commit and fixes. A
@@ -1000,6 +1000,13 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     leaves them as it found them. The second read catches a cited commit
     stacked on an earlier one, or one main moved since (sd:10214, system
     PR #727 closed three items so). A read that fails keeps the commit.
+
+    `kept_commits` reads this list after it, so this check hides none of
+    its evidence (sd:10214 review). An undone commit stays in place with
+    an empty message, which cites nothing: a listed short sha still
+    resolves against every commit. The base read skips each commit that
+    reader may take as a revert (`sd_ship_body.reverts_another`): such
+    a commit reads as the base exactly when it undid the work.
     """
     import sd_ship_body  # noqa: PLC0415
     fork = lane_git(worktree, "merge-base", f"refs/remotes/origin/{base}", head) if base else None
@@ -1014,11 +1021,9 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
             # NUL-separated and literal: git quotes a name with a tab or non-ASCII byte otherwise.
             files = publish_git(worktree, "diff-tree", "--no-commit-id", "--name-only", "-z", "-r", sha)
             names = [name for name in files.stdout.split("\0") if name] if files and files.returncode == 0 else []
-            # A revert is read by `kept_commits` for what it undid, so the base check never drops one (sd:10214
-            # review): it reads as the base exactly when it undid the work.
-            base_check = fork if not sd_ship_body.REVERT_SUBJECT.match(message) else None
-            if names and any(reads_as_at(before, names) for before in (f"{sha}^", base_check) if before):
-                continue
+            at_base = None if sd_ship_body.reverts_another(message) else fork
+            if names and any(reads_as_at(before, names) for before in (f"{sha}^", at_base) if before):
+                message = ""
         kept.append((sha, message))
     return kept
 

@@ -3685,6 +3685,45 @@ class CitedCloses(SharedQueue):
         entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
         self.assertEqual(entry["closes"], [b])
 
+    def test_a_revert_under_its_own_subject_still_undoes_its_commit(self) -> None:
+        """sd:10214 class pass: `kept_commits` reads `This reverts commit` under any subject. A partial revert
+        with a custom subject read as the base and was dropped, so the commit it names closed its item."""
+        a, b, *_ = self.open
+        tree, _ = self.committed("topic-custom-revert")
+        (tree / "work.txt").write_text("work\n", encoding="utf-8")
+        (tree / "shared.txt").write_text("one\n", encoding="utf-8")
+        git(tree, "add", "work.txt", "shared.txt")
+        git(tree, "commit", "-q", "-m", f"feat: implement\n\nCloses: sd:{a}")
+        work = git(tree, "rev-parse", "HEAD").strip()
+        (tree / "shared.txt").write_text("two\n", encoding="utf-8")
+        (tree / "other.txt").write_text("other\n", encoding="utf-8")
+        git(tree, "add", "shared.txt", "other.txt")
+        git(tree, "commit", "-q", "-m", "fix: other")
+        git(tree, "rm", "-q", "work.txt")  # the conflict on shared.txt was resolved to keep the later text
+        git(tree, "commit", "-q", "-m", f"fix: back out the reader\n\nThis reverts commit {work}.\n\nCloses: sd:{b}")
+        git(tree, "rm", "-q", "other.txt")
+        git(tree, "commit", "-q", "-m", "revert: hold the other fix")
+        self.body.write_text("Words.\n", encoding="utf-8")
+        entry = sd_lane.enqueue_entry(tree, self.own, "fix: a slice", self.body, self.environ, claim="deliver")
+        self.assertEqual(entry["closes"], [b])
+
+    def test_an_undone_commit_keeps_its_place_and_cites_nothing(self) -> None:
+        """sd:10214 class pass: `kept_commits` resolves a listed short sha against the whole list, so the
+        file check removes no commit; it empties the message of the one it finds undone."""
+        a, *_ = self.open
+        tree, _ = self.committed("topic-undone-stays")
+        (tree / "work.txt").write_text("work\n", encoding="utf-8")
+        git(tree, "add", "work.txt")
+        git(tree, "commit", "-q", "-m", f"feat: implement\n\nCloses: sd:{a}")
+        work = git(tree, "rev-parse", "HEAD").strip()
+        git(tree, "rm", "-q", "work.txt")
+        git(tree, "commit", "-q", "-m", "revert: hold the work")
+        head = git(tree, "rev-parse", "HEAD").strip()
+        commits = sd_lane.branch_commits(tree, "main", head)
+        kept = sd_lane.unreverted(tree, head, commits, "main")
+        self.assertEqual([sha for sha, _ in kept], [sha for sha, _ in commits])
+        self.assertEqual(dict(kept)[work], "")
+
     def test_a_revert_of_other_work_keeps_a_close_on_a_quoted_filename(self) -> None:
         """sd:8373 review: git quotes a name with a tab or non-ASCII byte; a quoted pathspec matched nothing."""
         a, b, *_ = self.open

@@ -530,6 +530,12 @@ _SHA_LED = re.compile(r"_([0-9a-f]{7,40})_(?!\w)|[`*\[]*([0-9a-f]{7,40})(?!\w)")
 _REVERTED_INTRO = re.compile(r"(?:^|[.!?][ \t]+)(?:reverted(?:[ \t]+commits)?|reverts):[ \t]*$", re.IGNORECASE)
 
 
+def reverts_another(message: str) -> bool:
+    """Whether `kept_commits` may read `message` as undoing a commit: git's `This reverts commit` line under any
+    subject, or a revert subject, which may list shas. A filter ahead of it leaves such a commit alone (sd:10214)."""
+    return bool(_REVERTS.search(message) or REVERT_SUBJECT.match(message))
+
+
 def _heading(text: str) -> str:
     """`text` without the markup a heading wears: `## ` and closing `#`s, and emphasis around it."""
     return re.sub(r"^#{1,6}[ \t]+|[ \t]+#+$", "", text.strip()).strip("*_ \t")
