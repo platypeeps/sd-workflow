@@ -290,7 +290,8 @@ class TheStripInTheUsageDropdown(ScreenCase):
         """Operator 2026-11-23: a window's reset reads as the time left to it, not its day and time."""
         reading(self.connection, "codex", **CODEX)
         for now, left in (("2026-09-06T11:50:00Z", "resets in 3h 10m"), ("2026-09-06T14:59:30Z", "resets in 1m"),
-                          ("2026-09-03T10:00:00Z", "resets in 3d 5h")):
+                          ("2026-09-03T10:00:00Z", "resets in 3d 5h"), ("2026-09-06T15:00:00Z", "has reset"),
+                          ("2026-09-06T16:00:00Z", "has reset")):
             with self.subTest(now=now):
                 stub = f"Date.now = () => Date.parse('{now}');"
                 body = run_usage(stub + "R.body = usageBody(ANSWER).text;", answer=self.strip(),
