@@ -4212,6 +4212,8 @@ class CargoClean(Case):
         script = self.root / "tools" / "cargo.py"
         script.write_text("import json, shutil, sys\n"
                           f"open({str(self.cargo_log)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                          f"open({str(self.root / 'cargo.env')!r}, 'w').write("
+                          "__import__('os').environ.get('CARGO_BUILD_BUILD_DIR', ''))\n"
                           "shutil.rmtree(sys.argv[sys.argv.index('--target-dir') + 1])\n"
                           "sys.exit(int(__import__('os').environ.get('FAKE_CARGO_EXIT', '0')))\n")
         self.tools.cargo = [sys.executable, str(script)]
@@ -4224,6 +4226,73 @@ class CargoClean(Case):
         (self.work / "Cargo.toml").write_text('[package]\nname = "fixture"\n')
         (self.work / "target" / "debug").mkdir(parents=True)
         (self.work / "target" / "debug" / "big.rlib").write_bytes(b"x" * 64)
+        (self.work / "target" / "CACHEDIR.TAG").write_text(build_run.CACHE_TAG + "\n# cargo's\n")
+        (self.work / "target" / ".rustc_info.json").write_text("{}")
+
+    def assert_kept(self, outcome="blocked"):
+        self.supervisor().finish(outcome, "fixture end")
+        self.assertEqual(self.cargo_calls(), [])
+        self.assertTrue((self.work / "target" / "debug" / "big.rlib").is_file())
+
+    def notes(self):
+        return [row["body"] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
+
+    def test_a_target_without_cargos_cache_tag_is_kept(self):
+        """Class pass, build/sd-1798: an ignored `target/` cargo did not tag as its cache is not proven output."""
+        self.rust()
+        (self.work / "target" / "CACHEDIR.TAG").unlink()
+        self.assert_kept()
+
+    def test_a_tag_that_is_a_link_or_not_the_signature_is_kept(self):
+        self.rust()
+        tag = self.work / "target" / "CACHEDIR.TAG"
+        tag.write_text("Signature: not-the-one\n")
+        self.assert_kept()
+        tag.unlink()
+        (self.root / "tag").write_text(build_run.CACHE_TAG + "\n")
+        tag.symlink_to(self.root / "tag")
+        self.assert_kept()
+
+    def test_a_file_cargo_did_not_write_beside_the_tag_is_kept_with_a_note(self):
+        """Class pass: an uncommitted file in an ignored `target/` stays, and the note says why nothing was freed."""
+        self.rust()
+        (self.work / "target" / "notes.txt").write_text("mine")
+        self.assert_kept("done")
+        self.assertTrue(any("target/notes.txt" in body and "cargo clean" in body for body in self.notes()), self.notes())
+
+    def test_a_worktree_on_another_branch_is_kept(self):
+        """Class pass: `guarded` blocks a worktree off its branch; what it holds is not this run's."""
+        self.rust()
+        support.git(self.work, "checkout", "-q", "-b", "other-work")
+        self.assert_kept()
+
+    def test_a_folder_inside_another_checkout_is_kept(self):
+        """Class pass: `git worktree add` failed onto a plain folder; an outer checkout's ignore rule proves nothing."""
+        outer = self.work.parent
+        outer.mkdir(parents=True)
+        support.git(outer, "init", "-q", "-b", self.bundle["branch"])
+        (outer / ".git" / "info").mkdir(exist_ok=True)
+        (outer / ".git" / "info" / "exclude").write_text("target/\n")
+        self.work.mkdir()
+        (self.work / "Cargo.toml").write_text("")
+        (self.work / "target" / "debug").mkdir(parents=True)
+        (self.work / "target" / "debug" / "big.rlib").write_bytes(b"x")
+        (self.work / "target" / "CACHEDIR.TAG").write_text(build_run.CACHE_TAG + "\n")
+        self.assert_kept()
+
+    def test_a_branch_a_split_holds_or_has_not_read_is_kept(self):
+        """Class pass: `split_first` blocks a branch that may carry a left item's work, ignored files included."""
+        self.rust()
+        for state in ("unread", "held"):
+            with mock.patch.object(build, "split", return_value=state):
+                self.assert_kept()
+
+    def test_the_clean_pins_cargos_build_dir_to_the_target(self):
+        """Class pass: `cargo clean` also empties `build.build-dir`, which config may put outside the worktree."""
+        self.rust()
+        self.env["CARGO_BUILD_BUILD_DIR"] = str(self.root / "shared-build")
+        self.supervisor().finish("blocked", "fixture block")
+        self.assertEqual((self.root / "cargo.env").read_text(), str(self.work / "target"))
 
     def cargo_calls(self):
         return [json.loads(line) for line in self.cargo_log.read_text().splitlines()] if self.cargo_log.exists() else []

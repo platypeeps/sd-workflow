@@ -74,6 +74,11 @@ GRACE_SECONDS = 20
 BEAT_SECONDS = 30
 #: `cargo clean`'s bound: under `build.STALE_SECONDS`, as the supervisor beats no heartbeat while it runs.
 CLEAN_SECONDS = 300
+#: The first line of the `CACHEDIR.TAG` cargo writes in a target folder: the folder is a cache, rebuilt at will.
+CACHE_TAG = "Signature: 8a477f597d28d172789f06886806bc55"
+#: The files cargo itself writes at the top of a target folder; any other file there is someone's, and stays.
+CARGO_FILES = frozenset({"CACHEDIR.TAG", ".rustc_info.json", ".rustdoc_fingerprint.json",
+                         ".future-incompat-report.json"})
 #: Reviews with blockers before the class pass and park: 2, so a park comes after 3
 #: reviews (operator 2026-11-23, sd:10128; sd:10111 had set 4).
 REVIEW_ROUNDS = 2
@@ -1486,39 +1491,71 @@ class Supervisor:
     def clean_target(self) -> None:
         """`cargo clean` of the worktree's own `target/` (sd:10384): a kept Rust worktree held up to 106 GiB.
 
-        Only a top-level `Cargo.toml` beside a real `target/` folder, never a link, and `--target-dir` names it, so
-        a `CARGO_TARGET_DIR` or cargo config elsewhere is untouched. Idempotent: a replay of the end runs it again
+        It deletes only what `disposable` proves is cargo's rebuildable output in this run's own worktree.
+        `--target-dir` names the folder and `CARGO_BUILD_BUILD_DIR` pins cargo's build folder to it, so a
+        `CARGO_TARGET_DIR` or cargo config elsewhere is untouched. Idempotent: a replay of the end runs it again
         on an empty or gone folder. A failure is noted on the lead and the run still ends: the commits are kept.
-
-        Kept as it is (review of build/sd-1798): a `target/` git does not ignore, or one holding a tracked file,
-        is work, not build output; and a worktree a live session other than this run's builder holds may be
-        building in it. A git that does not answer keeps it too.
         """
         manifest, target = self.work / "Cargo.toml", self.work / "target"
-        if not manifest.is_file() or target.is_symlink() or not target.is_dir():
-            return
-        git = [*self.tools.git, "-C", str(self.work)]
-        try:
-            _read([*git, "check-ignore", "-q", "--", "target/"], env=self.env)  # exit 1, not ignored: Unread
-            if _read([*git, "ls-files", "-z", "--", "target"], env=self.env):
-                return
-        except Unread:
-            return
-        own = self.fresh()["session_id"]
-        if sessions.holders(self.db, str(self.work), machine=this_host(), exclude=(own,) if own else ()):
+        kept = self.disposable(manifest, target)
+        if kept is not None:
+            if kept:
+                self.note(self.lead, f"Build run {self.ident}: no cargo clean in {self.work}, its target/ is kept: {kept}")
             return
         argv = [*self.tools.cargo, "clean", "--offline", "--manifest-path", str(manifest), "--target-dir", str(target)]
         try:
             self.logs.mkdir(parents=True, exist_ok=True)
             with open(self.out("cargo-clean"), "ab") as sink:
                 code = subprocess.run(argv, cwd=self.work, stdin=subprocess.DEVNULL, stdout=sink,
-                                      stderr=subprocess.STDOUT, env=self.env, timeout=CLEAN_SECONDS).returncode
+                                      stderr=subprocess.STDOUT, timeout=CLEAN_SECONDS,
+                                      env={**self.env, "CARGO_BUILD_BUILD_DIR": str(target)}).returncode
             why = None if code == 0 else f"exit {code}"
         except (OSError, subprocess.TimeoutExpired) as fault:
             why = f"{type(fault).__name__}: {fault}"
         if why:
             self.note(self.lead, f"Build run {self.ident}: cargo clean in {self.work} failed ({why}); "
                                  f"see {self.out('cargo-clean')}")
+
+    def disposable(self, manifest: Path, target: Path) -> str | None:
+        """None when `target` is proven cargo's cache in this run's own worktree; else why it stays, "" for a
+        folder that is no cargo target of ours at all (class pass, review of build/sd-1798).
+
+        The folder: a real one, never a link, beside a top-level `Cargo.toml`, carrying cargo's own `CACHEDIR.TAG`
+        (by that tag's rule all below it is rebuilt at will), ignored by git with no tracked file below, and with
+        no top-level file but the ones cargo writes there (`CARGO_FILES`). The worktree: its own checkout root, on
+        the run's branch (`guarded`), no split holding or unread on it (`split_first` counts ignored files as a
+        left item's work), and no live session but this run's builder in it. An unread git keeps it.
+        """
+        if not manifest.is_file() or target.is_symlink() or not target.is_dir():
+            return ""
+        tag = target / "CACHEDIR.TAG"
+        try:
+            if tag.is_symlink() or not tag.is_file() or tag.read_text("utf-8", "replace").split("\n")[0] != CACHE_TAG:
+                return ""
+            stray = sorted(entry.name for entry in target.iterdir()
+                           if (entry.is_symlink() or not entry.is_dir()) and entry.name not in CARGO_FILES)
+        except OSError:
+            return ""
+        git = [*self.tools.git, "-C", str(self.work)]
+        try:
+            top = _read([*git, "rev-parse", "--show-toplevel"], env=self.env).rstrip("\n")
+            if not top or Path(top).resolve() != self.work.resolve():
+                return ""
+            if _read([*git, "branch", "--show-current"], env=self.env).strip() != self.row["branch"]:
+                return ""
+            _read([*git, "check-ignore", "-q", "--", "target/"], env=self.env)  # exit 1, not ignored: Unread
+            if _read([*git, "ls-files", "-z", "--", "target"], env=self.env):
+                return ""
+        except Unread:
+            return ""
+        if build.split(self.db, self.row["assignment"]) not in ("", "clear"):
+            return ""
+        own = self.fresh()["session_id"]
+        if sessions.holders(self.db, str(self.work), machine=this_host(), exclude=(own,) if own else ()):
+            return ""
+        if stray:
+            return f"cargo did not write target/{stray[0]}" + (f" and {len(stray) - 1} more" if stray[1:] else "")
+        return None
 
     def enter(self, step: str, **fields) -> None:
         if self.fresh()["cancel_requested"] and step in build.CANCELLABLE:
