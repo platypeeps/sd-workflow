@@ -5404,6 +5404,41 @@ class Drafts(Case):
         self.assertIn("docs/work/<date>-<slug>/design.md", brief)
         self.assertIn(f"- sd:{design}:\n\nProblem: x", brief)
 
+    def test_a_code_item_that_waits_on_its_design_builds_with_its_ride(self):
+        """Review of sd:10096: a code item whose `blocked_by` names its design waited on the open design,
+        and the written design's ride waited on a code bundle to join: neither ever built. A design whose
+        ride is queued rides in the code item's bundle, so the press, pickup and the claim let it build."""
+        design = self.designed("draft-plain")
+        self.assertEqual(len(self.rides(design)), 1)
+        code = create_item(self.db, kind="task", title="Build me", repo=str(self.repo), status="ready",
+                           fields={"blocked_by": [design]})
+        build.queue(self.db, [code], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        self.assertEqual([one["item"] for one in build.run(self.db, bundle["id"])["members"]], [code, design])
+
+    def test_a_code_item_pressed_with_its_written_design_builds_with_it(self):
+        """Review of sd:10096: one press of a code item and the written design it waits on refused the code
+        item, as the design's ride was not queued yet. Both queue, and one bundle takes both."""
+        design = self.designed("draft-plain")
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE item = ? AND status = 'queued'", (design,))
+        code = create_item(self.db, kind="task", title="Build me", repo=str(self.repo), status="ready",
+                           fields={"blocked_by": [design]})
+        build.queue(self.db, [code, design], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        self.assertEqual([one["item"] for one in build.run(self.db, bundle["id"])["members"]], [code, design])
+
+    def test_a_code_item_still_waits_on_a_design_with_no_ride(self):
+        """The ride exemption reads a queued ride only: a design not yet written still holds its code item."""
+        design, _ = self.design()
+        code = create_item(self.db, kind="task", title="Build me", repo=str(self.repo), status="ready",
+                           fields={"blocked_by": [design]})
+        with self.assertRaisesRegex(build.BuildRefused, f"waits on sd:{design}"):
+            build.queue(self.db, [code], who="operator")
+
     def test_a_design_question_holds_its_ride_until_ruled_and_again_once_withdrawn(self):
         """sd:10096 failure table: a design with an open question queues no ride; a ruling lets Build
         queue it; a withdrawn ruling reopens the question, and the claim leaves the ride out."""

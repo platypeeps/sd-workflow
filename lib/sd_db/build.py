@@ -495,9 +495,9 @@ _REPO = ("SELECT item.*, repo.path AS repo_path, repo.remote, repo.managed, repo
          "FROM item LEFT JOIN repo ON repo.path = item.repo WHERE item.id = ?")
 
 
-def _item(connection, item: int, *, lead: int | None = None) -> dict:
+def _item(connection, item: int, *, lead: int | None = None, riding: Collection[int] = ()) -> dict:
     """The item a build may take, or the refusal that names why not; `lead` is the bundle a Retry queues again,
-    whose lane `_route` reads (sd:8991)."""
+    whose lane `_route` reads (sd:8991); `riding`, designs of the same press that ride its bundle (`_riding`)."""
     row = connection.execute(_REPO, (item,)).fetchone()
     if row is None:
         raise BuildRefused(f"no item {item}")
@@ -505,20 +505,24 @@ def _item(connection, item: int, *, lead: int | None = None) -> dict:
         raise BuildRefused(_press_refusal(connection, row))
     if row["status"] != "ready" and not (row["status"] == "blocked" and split_held(connection, item)):
         raise BuildRefused(f"item {item} is {row['status']}; a build takes a ready item")
-    refused = _press_refusal(connection, row, lead=lead)
+    refused = _press_refusal(connection, row, lead=lead, riding=riding)
     if refused:
         raise BuildRefused(refused)
     return dict(row)
 
 
-def _press_refusal(connection, row, *, lead: int | None = None) -> str | None:
+def _press_refusal(connection, row, *, lead: int | None = None, riding: Collection[int] = ()) -> str | None:
     """Why the press refuses the item `row` once it is ready, or None: `_item`'s checks past its status, a read
     only, so Build by item asks it of each member Retry would queue (`_retry_row`, class pass, review of sd:9788)."""
     item = row["id"]
     if row["kind"] not in RUNNABLE_KINDS:
         return (f"item {item} is a {row['kind']} item; a build takes only "
                 f"{', '.join(RUNNABLE_KINDS[:-1])} and {RUNNABLE_KINDS[-1]} items")
-    waiting = waiting_on(connection, row)
+    # A design its ride brings into this item's bundle holds it no more: else each waited on the other
+    # forever (review of sd:10096).
+    aboard = {other for other in riding if connection.execute(
+        "SELECT repo FROM item WHERE id = ?", (other,)).fetchone()["repo"] == row["repo"]}
+    waiting = waiting_on(connection, row, riding=aboard | _riding(connection, row["repo"]))
     if waiting:
         return f"item {item} {waiting}"
     refused = _repo_refusal(row, connection)
@@ -548,10 +552,11 @@ def _press_refusal(connection, row, *, lead: int | None = None) -> str | None:
     return _held(connection, item)
 
 
-def waiting_on(connection, row) -> str:
+def waiting_on(connection, row, *, riding: Collection[int] = ()) -> str:
     """What the item `row` waits on, as "waits on sd:M", or "" (pack sd:9570): each item its `fields.blocked_by`
     names that is not done. Read where a build is chosen, so nothing runs on a done. Fails closed: fields that cannot
-    be read, or a named item gone, hold it too."""
+    be read, or a named item gone, hold it too. `riding`: design items that ride `row`'s own bundle, whose design
+    its first commit carries, so they hold no build of it (review of sd:10096)."""
     try:
         named = item_blocked_by(row)
     except ValueError as error:
@@ -564,7 +569,7 @@ def waiting_on(connection, row) -> str:
     gone = [other for other in named if other not in found]
     if gone:
         return f"waits on sd:{gone[0]}, which no longer exists; clear it with sd task edit --blocked-by"
-    held = [other for other in named if found[other] != "done"]
+    held = [other for other in named if found[other] != "done" and other not in riding]
     return f"waits on {', '.join(f'sd:{other}' for other in held)}" if held else ""
 
 
@@ -669,8 +674,11 @@ def queue(connection, items: list[int], *, who: str, expected_revisions: dict | 
                 expected = expected_revisions.get(item, expected_revisions.get(str(item)))
                 if item_state(connection, item)["revision"] != expected:
                     raise BuildRefused(f"item {item} changed; refresh the selection")
+        # A written design pressed with a code item that waits on it rides that item's bundle (review of sd:10096).
+        riding = {item for item in items if work_kind(connection, item) == DESIGN_KIND
+                  and draft_design(connection, item) is not None and design_waits(connection, item) is None}
         for item in items:
-            _item(connection, item)
+            _item(connection, item, riding=riding)
             # Pickup read `eligible` before this transaction: an item a cancel parked since is the operator's pause,
             # so a stale pickup refuses it and the next tick reads again (review of sd:9222).
             if who == PICKUP and connection.execute("SELECT parked_at FROM item WHERE id = ?",
@@ -685,17 +693,17 @@ def queue(connection, items: list[int], *, who: str, expected_revisions: dict | 
                 from . import draft  # noqa: PLC0415 -- draft imports this module
                 ident = draft.queue_design(connection, item, who=who)
             else:
-                ident = queue_row(connection, item, who=who)
+                ident = queue_row(connection, item, who=who, riding=riding)
             # A press of an item a cancel parked builds it unparked, as Retry does (sd:9222); pickup refused one above.
             unpark(connection, item)
             created.append(ident)
         return [queue_state(connection, ident) for ident in created]
 
 
-def queue_row(connection, item: int, *, who: str) -> int:
+def queue_row(connection, item: int, *, who: str, riding: Collection[int] = ()) -> int:
     """One queued build assignment of `item`, with its note, or the press's refusal (`_item`): the one writer of
     a queued build, so the ride a design run queues passes every check a press does (class pass of sd:10096)."""
-    _item(connection, item)
+    _item(connection, item, riding=riding)
     ident = create_assignment(connection, item=item, role="author", status="queued", lane="parallel",
                               budget_minutes=BUDGET_MINUTES)
     connection.execute("UPDATE assignment SET scope = ?, queued_at = ?, started = NULL WHERE id = ?",
@@ -1949,8 +1957,10 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
         # A dependency reopened since the press holds the build: dispatch's start reads it too (pack sd:9570).
         # So does a design member whose ruling was taken back since its Retry: a bundle that ran before claims
         # whole (`_bundle`), so it holds as one a dependency holds (class pass of sd:10096).
+        # A design that rides this bundle holds none of its members (review of sd:10096).
+        aboard = {row["item"] for row in bundle if _rides(connection, row)}
         waiting = [(row, why) for row in bundle if (why := waiting_on(connection, connection.execute(
-            "SELECT id, fields FROM item WHERE id = ?", (row["item"],)).fetchone())
+            "SELECT id, fields FROM item WHERE id = ?", (row["item"],)).fetchone(), riding=aboard)
             or design_waits(connection, row["item"]))]
         # Ran before means work to resume: a run, a drop's kept work, or members on the lead's branch. A drop's
         # solo row counts a run with no run row (`drop_writes`); held as a retry it would park with nothing for
@@ -2067,6 +2077,18 @@ def _bundle(connection, rows: list) -> list:
             _rides(connection, row) and design_waits(connection, row["item"]))]
         return fresh[:bundled(connection, [row["item"] for row in fresh])]
     return sorted((row for row in rows if group in (row["id"], row["parent"])), key=lambda row: row["id"] != group)
+
+
+def _riding(connection, repo: str | None) -> set[int]:
+    """The design items of `repo` whose ride is queued and may ride (`design_waits`): the next code bundle there
+    takes each, so a code item that waits on one builds with it (review of sd:10096)."""
+    if repo is None:
+        return set()
+    return {row["item"] for row in connection.execute(
+        "SELECT assignment.item, assignment.parent, assignment.run_count FROM assignment "
+        "JOIN item ON item.id = assignment.item WHERE assignment.status = 'queued' AND assignment.scope = ? "
+        "AND item.repo = ?", (SCOPE, repo)).fetchall()
+        if _rides(connection, row) and design_waits(connection, row["item"]) is None}
 
 
 def _rides(connection, row) -> bool:
