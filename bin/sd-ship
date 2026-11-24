@@ -2024,8 +2024,9 @@ class Ship(SharedReview):
         # `ready_to_send` promotes, so merge, reconcile and every other reader see the published ones after
         # a prepare whose lint, review or push fails (sd:9268 lane review). This prepare reads the pending
         # ones (`claimed`). The base stays active: this prepare's review reads it, and merge refuses one
-        # the repository's default branch no longer is.
-        if self.state.get("pull_request"):
+        # the repository's default branch no longer is. An opened pull request a Copilot failure left
+        # unpublished binds the same way: reconcile reads its claim once it merges (sd:9268 round 14).
+        if self.state.get("pull_request") or self.state.get("opened_pull_request"):
             fields, self.publishing = {"pending": fields}, True
         self.save(base=base, invoker=self.invoker(), **fields)
         pushed_from = head

@@ -5141,6 +5141,23 @@ roles:
         reconciled = self.reconciled()
         self.assertEqual((reconciled["head"], reconciled["reviewed_head"]), (opened, opened))
 
+    def test_a_failed_renewal_leaves_an_opened_pull_requests_claim_in_force(self):
+        """Round 14 of sd:9268: a reprepare of an opened, unpublished pull request saved its claim as the active
+        one before lint, so a lint refusal left reconcile reading a claim no prepare finished."""
+        from sd_db import set_item_fields
+        self.task_item("task")
+        self.double.lose_copilot_request = True
+        with self.assertRaisesRegex(ship.Refusal, "review request transport failed"):
+            self.prepare("--deliver", "--copilot-review", "request")
+        before = {key: self.operation().state.get(key) for key in ("title", "body", "acceptance", "closing")}
+        set_item_fields(self.connection, self.item, title="retitled scope")
+        with patch.object(ship.sd_ship_body, "docs_lint", side_effect=ship.Refusal("docs lint failed")), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "docs lint"):
+            self.prepare("--deliver", "--title", "a renewed title")
+        state = self.operation().state
+        self.assertEqual({key: state.get(key) for key in before}, before)
+        self.assertIsNotNone(state.get("pending"))
+
     def test_a_head_no_prepare_pushed_to_an_opened_pull_request_never_reconciles(self):
         """The guard the class fix keeps: a head pushed by hand was reviewed by no prepare."""
         self.opened_then_copilot_failed()
