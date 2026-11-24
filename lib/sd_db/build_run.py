@@ -3000,8 +3000,11 @@ class DraftSupervisor(Supervisor):
         if parsed is None:
             return self.finish("blocked", f"the reply has no `## Spec`, or a question short of two Option: "
                                           f"lines or of a recommended one; nothing was written; log {self.log}")
-        if not draft.write(self.db, self.ident, *parsed):
-            raise Lost
+        try:
+            if not draft.write(self.db, self.ident, *parsed):
+                raise Lost
+        except draft.Moved as moved:
+            return self.finish("blocked", f"{moved}; log {self.log}")
         return {"run": self.ident, "outcome": "done", "questions": len(parsed[1])}
 
 

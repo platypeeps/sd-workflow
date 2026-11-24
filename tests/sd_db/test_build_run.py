@@ -5608,6 +5608,25 @@ class Drafts(Case):
         self.assertEqual(self.rides(item), [])
         self.assertIn(f"Design written; no build queued: item {item} ", self.notes()[-1]["body"])
 
+    def test_a_design_moved_to_another_repo_during_its_run_writes_nothing(self):
+        """Review of sd:10096: the run read the old repository, so its design fits that one. Written and
+        queued under the item's new repository, that repository's next bundle committed it. The run
+        blocks and writes no design and no ride."""
+        item, _ = self.design()
+        run = draft.claim(self.db, owner="fixture", available=build.room(self.db, load=1.0, load_cap=40.0,
+                                                                         interactive=[]))
+        assert run is not None
+        self.items = [item]
+        self.plan(claude=["draft-plain"])
+        moved = str(self.repo) + "-moved"
+        upsert_repo(self.db, moved, remote="https://github.com/fixture/moved.git", managed=1)
+        self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (moved, item))
+        ended = self.drafter(run["id"]).run()
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertIn("moved to", build.run(self.db, run["id"])["detail"])
+        self.assertEqual(self.rides(item), [])
+        self.assertFalse([note for note in self.notes() if note["body"].startswith(draft.DESIGN)])
+
     def test_a_design_whose_ruling_is_replaced_after_the_claim_is_not_delivered(self):
         """Review of sd:10096: the operator replaces the ruling while the bundle builds. A ruling still
         stands, so the question waits on nothing, but the brief carried the old one: the enqueue leaves the

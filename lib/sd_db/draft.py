@@ -248,6 +248,10 @@ class _Moved(Exception):
     """The run's assignment is no longer running; the write rolls back."""
 
 
+class Moved(Exception):
+    """The item moved to another repository during its run, whose reply read the old one; the write rolls back."""
+
+
 def write(connection, ident: str, spec: str, questions: list[str]) -> bool:
     """Land a parsed draft: the `Draft spec:` comment, one question note each, the assignment `done`, the run released.
 
@@ -265,9 +269,14 @@ def write(connection, ident: str, spec: str, questions: list[str]) -> bool:
                     (f"drafted with {len(questions)} question{'s' if len(questions) != 1 else ''}", stamp, stamp,
                      ident)).rowcount != 1:
                 return False
-            row = connection.execute("SELECT assignment.id, assignment.item FROM runner_run JOIN assignment "
-                                     "ON assignment.id = runner_run.assignment WHERE runner_run.id = ?",
+            row = connection.execute("SELECT assignment.id, assignment.item, runner_run.repo AS ran, item.repo "
+                                     "FROM runner_run JOIN assignment ON assignment.id = runner_run.assignment "
+                                     "JOIN item ON item.id = assignment.item WHERE runner_run.id = ?",
                                      (ident,)).fetchone()
+            # Its draft fits the repository it read, not the one it now belongs to (review of sd:10096).
+            if not paths.same(row["repo"], row["ran"]):
+                raise Moved(f"sd:{row['item']} moved to {row['repo'] or 'no repository'} during its run, which "
+                            f"read {row['ran']}; nothing was written; Build it again")
             if connection.execute("UPDATE assignment SET status = 'done', ended = ?, result = ? "
                                   "WHERE id = ? AND status = 'running'",
                                   (stamp, f"draft run {ident} wrote its spec", row["id"])).rowcount != 1:
