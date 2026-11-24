@@ -1648,6 +1648,26 @@ class RebuttalScopeTests(RepeatFixture):
         answers = self.review_answering(row(path="bin/tool.py", line=50, summary="lane claim"))
         self.assertEqual(answers["lane claim"][0], "blocking")
 
+    def test_a_distant_edit_that_makes_a_rebutted_crash_real_blocks_once_cited(self) -> None:
+        """Class pass of sd:10191 (bin/sd-review:888): a distant edit keeps the rebuttal at its own line, and may
+        make the rebutted crash real. The ruling holds back only a repeat that cites nothing: one that cites the
+        check it ran blocks at the ruled line, and the uncited one beside it stays advisory."""
+        tool = self.root / "bin/tool.py"
+        tool.parent.mkdir()
+        tool.write_text("".join(f"line_{n} = {n}\n" for n in range(1, 61)), encoding="utf-8")
+        self.commit("add", "bin/tool.py")
+        ruled = self.commit("the ruled code")
+        self.adjudication(("lane claim", "rebutted", "x"), head=ruled, line=20)
+        self.adjudication(("other claim", "rebutted", "x"), head=ruled, line=30)
+        tool.write_text(tool.read_text(encoding="utf-8").replace("line_50 = 50", "line_50 = crash()"),
+                        encoding="utf-8")
+        self.commit("add", "bin/tool.py")
+        self.commit("a distant edit")
+        answers = self.review_answering(
+            row(path="bin/tool.py", line=20, summary="lane claim", evidence=REPRO),
+            row(path="bin/tool.py", line=30, summary="other claim"))
+        self.assertEqual((answers["lane claim"][0], answers["other claim"][0]), ("blocking", "advisory"))
+
     def test_a_ruling_lapses_when_its_own_hunk_changes(self) -> None:
         tool = self.root / "bin/tool.py"
         tool.parent.mkdir()
