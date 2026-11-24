@@ -3124,6 +3124,78 @@ class Supervise(Case):
         self.assertIsInstance(ended, dict, "the worktree was started from the base")
         self.assertIn("holds the work of a run on the hub", ended["blocked"])
 
+    def requeue(self, run, *, lane_host):
+        """`run` ended at the lane with a failed gate and queued again, as Retry does, the lane on `lane_host`."""
+        stamp = build.clock()
+        self.db.execute("UPDATE runner_run SET outcome = 'lane_failed', step = 'enqueued', released_at = ? "
+                        "WHERE id = ?", (stamp, run))
+        self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (stamp, run))
+        self.db.execute("UPDATE assignment SET status = 'queued' WHERE id = ?", (self.bundle["assignment"],))
+        self.db.execute("UPDATE item SET status = 'ready', parked_at = NULL WHERE id = ?", (self.items[0],))
+        self.db.execute("UPDATE repo SET lane_host = ? WHERE path = ?", (lane_host, str(self.repo)))
+        if lane_host:
+            record_state(self.db, "heartbeat", key=f"build-dispatch@{lane_host}", body={})
+        again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                            root=self.root / "worktrees", hosts=frozenset({lane_host}) if lane_host else None)
+        assert again is not None, "the Retry was not claimed"
+        return again
+
+    def moved_back(self):
+        """The hub built A in its worktree and the lane pushed it; a satellite's retry pushed B on top; the
+        lane moved back to the hub, whose Retry run claims the bundle with its old worktree still at A.
+        The Retry run and B."""
+        self.press()
+        self.write_pr()
+        self.assertEqual(self.supervisor().worktree(), "building")
+        work = Path(self.bundle["work_path"])
+        (work / "a.txt").write_text("hub work\n", encoding="utf-8")
+        support.git(work, "add", "a.txt")
+        support.git(work, "commit", "-qm", "feat: hub work")
+        support.git(work, "push", "-q", "origin", self.bundle["branch"])
+        away = self.requeue(self.bundle["id"], lane_host="work")
+        self.assertEqual(away["owner"], "fixture@work")
+        other = support.repository(self.root / "elsewhere")
+        support.git(other, "remote", "add", "origin", str(self.root / "origin.git"))
+        support.git(other, "fetch", "-q", "origin")
+        support.git(other, "checkout", "-q", "-b", self.bundle["branch"], f"origin/{self.bundle['branch']}")
+        (other / "b.txt").write_text("satellite work\n", encoding="utf-8")
+        support.git(other, "add", "b.txt")
+        support.git(other, "commit", "-qm", "feat: satellite work")
+        support.git(other, "push", "-q", "origin", self.bundle["branch"])
+        newer = support.git(other, "rev-parse", "HEAD")
+        back = self.requeue(away["id"], lane_host=None)
+        self.assertEqual(back["owner"], "fixture")
+        self.assertEqual(back["work_path"], self.bundle["work_path"])
+        self.assertEqual(build.work_elsewhere(self.db, back["id"]), "work")
+        return back, newer
+
+    def test_a_retry_back_on_the_hub_resumes_its_kept_worktree_at_the_newer_push(self):
+        """Review of build/sd-1688: a Retry routed back to a host whose kept worktree predates another
+        host's push resumed it as it was, and the builder worked without that push."""
+        back, newer = self.moved_back()
+        self.assertEqual(self.supervisor(back["id"]).worktree(), "building")
+        self.assertEqual(support.git(Path(back["work_path"]), "rev-parse", "HEAD"), newer)
+
+    def test_a_retry_back_on_the_hub_starts_its_local_branch_at_the_newer_push(self):
+        """Review of build/sd-1688: with the worktree gone, the local branch still at the older head won over
+        the fetched one."""
+        back, newer = self.moved_back()
+        support.git(self.repo, "worktree", "remove", "--force", back["work_path"])
+        self.assertEqual(self.supervisor(back["id"]).worktree(), "building")
+        self.assertEqual(support.git(Path(back["work_path"]), "rev-parse", "HEAD"), newer)
+
+    def test_a_retry_back_on_the_hub_whose_kept_worktree_diverged_blocks(self):
+        """Review of build/sd-1688: a kept worktree with commits the newer push lacks cannot take it by a
+        fast-forward; the run blocks and names both heads instead of building without the push."""
+        back, _ = self.moved_back()
+        work = Path(back["work_path"])
+        (work / "c.txt").write_text("unpushed\n", encoding="utf-8")
+        support.git(work, "add", "c.txt")
+        support.git(work, "commit", "-qm", "feat: unpushed")
+        ended = self.supervisor(back["id"]).worktree()
+        self.assertIsInstance(ended, dict, "the run resumed without the newer push")
+        self.assertIn("diverged", ended["blocked"])
+
     def test_a_usage_limit_reclaim_refuses_a_worktree_on_another_branch(self):
         """Review of build/sd-1557: the reclaim resumed at building or fixing, past the worktree step's branch
         guard, so a checkout switched during the hold took the builder's commits. The guard runs first."""

@@ -1428,15 +1428,19 @@ class Supervisor:
     def worktree(self) -> str | dict:
         self.enter("worktree")
         branch = self.row["branch"]
+        # Work another host holds since this host last built the bundle reaches here only by a push, so a
+        # kept worktree or local branch here may predate it (review of build/sd-1688).
+        away = build.work_elsewhere(self.db, self.ident)
         if self.work.is_dir():
-            return self.guarded() or "building"
-        if self.child([*self.tools.git, "-C", str(self.repo), "fetch", "-q", "origin"], cwd=self.repo,
-                      name="worktree") != 0:
-            return self.finish("blocked", f"git fetch in {self.repo} failed; see {self.out('worktree')}")
+            return self.guarded() or (away and (self.fetched() or self.caught_up(away))) or "building"
+        if refused := self.fetched():
+            return refused
+        local = True
         try:
             _read([*self.tools.git, "-C", str(self.repo), "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"], env=self.env)
             argv = ["worktree", "add", str(self.work), branch]
         except Unread:
+            local = False
             # A retry the hub built and the lane pushed starts from that push on its lane host (sd:10143).
             try:
                 start = _read([*self.tools.git, "-C", str(self.repo), "rev-parse", "--verify", "--quiet",
@@ -1444,7 +1448,6 @@ class Supervisor:
             except Unread:
                 # Work another host holds and origin lacks must not be rebuilt from the base without it
                 # (review of build/sd-1688).
-                away = build.work_elsewhere(self.db, self.ident)
                 if away is not None:
                     return self.finish("blocked", f"branch {branch} holds the work of a run on {away}, but neither "
                                                   f"{self.repo} nor origin has it; push it from {away}, then "
@@ -1453,7 +1456,43 @@ class Supervisor:
             argv = ["worktree", "add", "-b", branch, str(self.work), start]
         if self.child([*self.tools.git, "-C", str(self.repo), *argv], cwd=self.repo, name="worktree") != 0:
             return self.finish("blocked", f"git worktree add {self.work} failed; see {self.out('worktree')}")
-        return self.split_first() or "building"
+        return self.split_first() or (local and away and self.caught_up(away)) or "building"
+
+    def fetched(self) -> dict | None:
+        """The blocked end when `git fetch` in the repository fails; None once it fetched."""
+        if self.child([*self.tools.git, "-C", str(self.repo), "fetch", "-q", "origin"], cwd=self.repo,
+                      name="worktree") != 0:
+            return self.finish("blocked", f"git fetch in {self.repo} failed; see {self.out('worktree')}")
+        return None
+
+    def caught_up(self, away: str) -> dict | None:
+        """None once the worktree holds `origin/<branch>`, fast-forwarded to it when behind; the blocked end
+        when origin lacks the branch or the two diverged. `away` holds the bundle's newer work, which only
+        its push brings here (review of build/sd-1688)."""
+        branch, git = self.row["branch"], [*self.tools.git, "-C", str(self.work)]
+        try:
+            pushed = _read([*git, "rev-parse", "--verify", "--quiet", f"refs/remotes/origin/{branch}"],
+                           env=self.env).strip()
+            head = _read([*git, "rev-parse", "HEAD"], env=self.env).strip()
+        except Unread:
+            return self.finish("blocked", f"branch {branch} holds the work of a run on {away}, but origin lacks "
+                                          f"it; push it from {away}, then Retry")
+
+        def contains(older: str, newer: str) -> bool:
+            try:
+                _read([*git, "merge-base", "--is-ancestor", older, newer], env=self.env)
+            except Unread:
+                return False
+            return True
+
+        if contains(pushed, head):
+            return None
+        if contains(head, pushed) and self.child([*git, "merge", "-q", "--ff-only", pushed], cwd=self.work,
+                                                 name="worktree") == 0:
+            return None
+        return self.finish("blocked", f"worktree {self.work} at {head[:12]} and origin/{branch} at {pushed[:12]} "
+                                      f"diverged, and origin holds the work of a run on {away}; settle the "
+                                      f"branch, then Retry")
 
     def guarded(self) -> dict | None:
         """The kept worktree's guard: the blocked end when a subset Retry's split holds it, or it is gone or on
