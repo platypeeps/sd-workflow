@@ -352,7 +352,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // blocked or cancelled bundle's Retry and Send to builder post /api/queue/builds/retry (pack sd:6020). The view reads its
   // three documents when it first shows and on each Today read after; a source that was not read is said under the table.
   const QTYPES = ['working', 'merging', 'next', 'blocked', 'suggested', 'open', 'ended', 'parked'], QSHOW = ['suggested', 'open', 'ended', 'parked'], NEXT = 9;
-  const BOXES = ['merging', 'review', 'working', 'building', 'next', 'blocked', 'suggested', 'parked']; // a repo row's boxes, left to right (pack sd:7470, sd:8083, sd:8137, sd:9247); today.html's Detail head names them in this order (sd:9315)
+  const BOXES = ['merging', 'review', 'building', 'working', 'next', 'blocked', 'suggested', 'parked']; // a repo row's boxes, left to right (pack sd:7470, sd:8083, sd:8137, sd:9247); today.html's Detail head names them in this order (sd:9315)
   const QV = { lanes: null, lanesErr: '', built: null, builtErr: '', runner: null, runnerErr: '', tasks: null, tasksErr: '', seen: false, busy: false };
   const QOTHER = new Map(); // the lane entries, selectable as Today's other rows are
   const qShow = new Set();
@@ -630,7 +630,9 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   const stalePr = c => c.type === 'blocked' && c.s === 'unknown';
   // sd:8565: the filter text keeps the rows whose words carry it, an item's #number among them.
   const qMatch = c => !query || low(c.tr.text.replace(/<[^>]*>/g, ' ')).includes(query);
-  const inBox = t => t === 'review' ? c => c.pr : t === 'building' ? c => !!c.build && !c.pr : c => c.type === t && !c.pr && !stalePr(c);
+  const inBox = t => t === 'review' ? c => c.pr : t === 'building' ? c => !!c.build && !c.pr
+    // Operator 2026-11-24: a building row counts in building alone, so one box mentions it.
+    : t === 'working' ? c => c.type === t && !c.build && !c.pr : c => c.type === t && !c.pr && !stalePr(c);
   const tally = rows => QTYPES.map(t => [t, rows.filter(c => c.type === t && !stalePr(c)).length]).filter(([, n]) => n);
   // pack sd:8005: the page's PR waits, split by who they wait on; '' when there is none. Each repo's are its review box.
   const prTally = rows => { const you = rows.filter(c => c.pr === 'you').length, them = rows.filter(c => c.pr && c.pr !== 'you').length;
@@ -651,7 +653,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
     // pack sd:7470: merging is the leftmost box; pack sd:8137: review follows it.
     const { working: w, building: bd, merging: m, next: n, blocked: b, review: v, suggested: s, parked: pk } = g.n, you = g.rows.filter(c => c.pr === 'you').length;
     // Each box says its count and what it counts, in its title (pack sd:7383); the label above says all six at once.
-    return html`<td class="detail pipe" aria-label="${m} merging, ${v} review, ${w} working, ${bd} building, ${n} next, ${b} blocked, ${s} suggested, ${unread ? 'parked not read' : `${pk} parked`}">${pip('merging', m, ' on', 'merging: claimed by the lane runner, being merged')}${pip('review', v, you ? ' caution' : ' on', `review: pull requests waiting on a review, ${you} on you, ${v - you} on reviewers`)}${pip('working', w, ' on', 'working: live sessions, build runs and lane gates now running')}${pip('building', bd, ' on', 'building: build runs that hold a builder now, not queued or waiting')}${pip('next', n, ' on', 'next: queued in the lane, not started')}${pip('blocked', b, ' warn', 'blocked: stopped in the lane or a build until someone acts')}${pip('suggested', s, ' on', `suggested: up to ${NEXT} items to do next: ready, due today or overdue, planned or unscheduled`)}${parkedPip()}</td>`;
+    return html`<td class="detail pipe" aria-label="${m} merging, ${v} review, ${bd} building, ${w} working, ${n} next, ${b} blocked, ${s} suggested, ${unread ? 'parked not read' : `${pk} parked`}">${pip('merging', m, ' on', 'merging: claimed by the lane runner, being merged')}${pip('review', v, you ? ' caution' : ' on', `review: pull requests waiting on a review, ${you} on you, ${v - you} on reviewers`)}${pip('building', bd, ' on', 'building: build runs that hold a builder now, not queued or waiting')}${pip('working', w, ' on', 'working: live sessions, queued builds and lane gates; a building run counts in building only')}${pip('next', n, ' on', 'next: queued in the lane, not started')}${pip('blocked', b, ' warn', 'blocked: stopped in the lane or a build until someone acts')}${pip('suggested', s, ' on', `suggested: up to ${NEXT} items to do next: ready, due today or overdue, planned or unscheduled`)}${parkedPip()}</td>`;
   }
   function queueView() {
     const unread = [];

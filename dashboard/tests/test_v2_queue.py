@@ -1922,14 +1922,15 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
 
     def test_repos_order_by_merging_then_the_other_counts_then_name(self):
         # pack sd:7679 (operator 2026-11-05): the busiest repo first, compared box by box in the boxes' order (merging,
-        # review, working, next, blocked, suggested; pack sd:8137), each most first; a tie goes by repo name. A row's state does not order it.
+        # review, building, working, next, blocked, suggested; pack sd:8137), each most first; a tie goes by repo name. A row's state does not order it.
         def asg(n, repo):
             return {**self.RUNNER["live"][0], "id": n, "item": n, "repo": repo}
         runner = {"live": self.RUNNER["live"] + [asg(n, "/repos/many") for n in (81, 82, 83, 84)]
                   + [asg(n, "/repos/aaa") for n in (91, 92)]}
         out = self.run_view("R.repos = repos();", answers={"/api/queue/runner": [200, runner]})
-        # system merges one and works three; many works four, aaa two; alpha (a stalled build) and sd work one each.
-        self.assertEqual(out["R"]["repos"], ["system:false", "many:false", "aaa:false", "alpha:false", "sd:false"])
+        # system merges one and works three; alpha builds one (a stalled build), which the boxes' order puts before
+        # working; many works four, aaa two, sd one.
+        self.assertEqual(out["R"]["repos"], ["system:false", "alpha:false", "many:false", "aaa:false", "sd:false"])
 
     def test_opening_a_repo_closes_the_one_that_was_open(self):
         out = self.run_view("open('system'); open('alpha'); R.repos = repos(); R.kids = kids(); R.html = ELS.queue.html;")
@@ -1963,8 +1964,8 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
 
     BOX = {"merging": "merging: claimed by the lane runner, being merged",
            "review": "review: pull requests waiting on a review, 0 on you, 0 on reviewers",
-           "working": "working: live sessions, build runs and lane gates now running",
            "building": "building: build runs that hold a builder now, not queued or waiting",
+           "working": "working: live sessions, queued builds and lane gates; a building run counts in building only",
            "next": "next: queued in the lane, not started",
            "blocked": "blocked: stopped in the lane or a build until someone acts",
            "suggested": "suggested: up to 9 items to do next: ready, due today or overdue, planned or unscheduled",
@@ -1974,7 +1975,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         # Pack sd:7383: the native title names the count and the meaning; the aria-label stays.
         out = self.run_view("open('system'); R.html = ELS.queue.html;")
         titles = re.findall(r'<span class="pip[^"]*" title="([^"]*)">', self.repo_detail(out["R"]["html"], "system")[2])
-        self.assertEqual(titles, [f"{n} {self.BOX[k]}" for n, k in zip((1, 0, 3, 0, 2, 2, 4, 0), self.BOX, strict=True)])
+        self.assertEqual(titles, [f"{n} {self.BOX[k]}" for n, k in zip((1, 0, 0, 3, 2, 2, 4, 0), self.BOX, strict=True)])
 
     def test_each_repo_row_counts_working_merging_next_blocked_review_and_suggested_in_six_boxes(self):
         # pack sd:7470: merging is the leftmost box (operator 2026-11-04).
@@ -1987,22 +1988,22 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         out = self.run_view("R.closed = ELS.queue.html; press('ended'); press('suggested'); open('system');"
                             " R.open = ELS.queue.html; R.tally = ELS['queue-tally'].html;")
         # Pack sd:7383: each box also carries its count and meaning in its title.
-        system = ' aria-label="1 merging, 0 review, 3 working, 0 building, 2 next, 2 blocked, 4 suggested, 0 parked"', \
+        system = ' aria-label="1 merging, 0 review, 0 building, 3 working, 2 next, 2 blocked, 4 suggested, 0 parked"', \
             (f'<span class="pip on" title="1 {self.BOX["merging"]}">1</span><span class="pip" title="0 {self.BOX["review"]}">0</span>'
-             f'<span class="pip on" title="3 {self.BOX["working"]}">3</span><span class="pip" title="0 {self.BOX["building"]}">0</span>'
+             f'<span class="pip" title="0 {self.BOX["building"]}">0</span><span class="pip on" title="3 {self.BOX["working"]}">3</span>'
              f'<span class="pip on" title="2 {self.BOX["next"]}">2</span><span class="pip warn" title="2 {self.BOX["blocked"]}">2</span>'
              f'<span class="pip on" title="4 {self.BOX["suggested"]}">4</span><span class="pip" title="0 {self.BOX["parked"]}">0</span>')
-        alpha = ' aria-label="0 merging, 0 review, 1 working, 1 building, 0 next, 0 blocked, 0 suggested, 0 parked"', \
+        alpha = ' aria-label="0 merging, 0 review, 1 building, 0 working, 0 next, 0 blocked, 0 suggested, 0 parked"', \
             (f'<span class="pip" title="0 {self.BOX["merging"]}">0</span><span class="pip" title="0 {self.BOX["review"]}">0</span>'
-             f'<span class="pip on" title="1 {self.BOX["working"]}">1</span>'
-             f'<span class="pip on" title="1 {self.BOX["building"]}">1</span>') + "".join(
+             f'<span class="pip on" title="1 {self.BOX["building"]}">1</span>'
+             f'<span class="pip" title="0 {self.BOX["working"]}">0</span>') + "".join(
                 f'<span class="pip" title="0 {self.BOX[k]}">0</span>' for k in ("next", "blocked", "suggested", "parked"))
         for html in (out["R"]["closed"], out["R"]["open"]):
             # pack sd:8138: each box sits in its toggle button; the boxes themselves are unchanged.
             for key, want in (("system", system), ("alpha", alpha)):
                 extra, attrs, body = self.repo_detail(html, key)
                 self.assertEqual((extra, attrs, re.sub(r"</?button[^>]*>", "", body)), (" pipe", *want))
-        self.assertEqual(re.sub(r"<[^>]*>", "", self.repo_detail(out["R"]["closed"], "system")[2]), "10302240", "the text tally is gone")
+        self.assertEqual(re.sub(r"<[^>]*>", "", self.repo_detail(out["R"]["closed"], "system")[2]), "10032240", "the text tally is gone")
         self.assertRegex(out["R"]["tally"], r"<span>\d+ working</span>", "the page's tally stays")
 
     def test_the_boxes_recount_on_the_30_s_read_and_on_a_read_after_a_build_starts(self):
@@ -2022,7 +2023,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
             " refresh(); await flush(); await flush(); await flush(); await flush(); R.reread = label();",
             before="var TICKS = []; setInterval = f => TICKS.push(f);\n")
         self.assertEqual((out["R"]["first"], out["R"]["tick"], out["R"]["reread"]),
-                         tuple(f"0 merging, 0 review, {n} working, {n} building, 0 next, 0 blocked, 0 suggested, 0 parked" for n in (1, 2, 3)))
+                         tuple(f"0 merging, 0 review, {n} building, 0 working, 0 next, 0 blocked, 0 suggested, 0 parked" for n in (1, 2, 3)))
 
     def test_a_lane_that_was_not_read_counts_nothing_and_says_so(self):
         # A failed read is not zero (sd:7272): a repo whose lane was not read says so in place of its boxes.
@@ -2097,7 +2098,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                            out["R"]["html"], re.S)
         self.assertEqual(found, [("60", "ready · P1"), ("80", "planned for 2026-09-20 · P2 · planning"),
                                  ("81", "unscheduled P0 · planning"), ("82", "unscheduled · ready")])
-        self.assertIn('aria-label="1 merging, 0 review, 3 working, 0 building, 2 next, 2 blocked, 4 suggested, 0 parked"', out["R"]["html"])
+        self.assertIn('aria-label="1 merging, 0 review, 0 building, 3 working, 2 next, 2 blocked, 4 suggested, 0 parked"', out["R"]["html"])
         self.assertEqual(out["R"]["build"], "a build takes a ready task; this one is planning")
 
     def test_suggested_leaves_out_an_item_with_no_repo_so_no_unassociated_group_shows(self):
@@ -2183,7 +2184,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertNotIn('data-type="working"', out["R"]["alpha"], "its assignment draws no runner row either")
         self.assertIn("<span>1 PR review: 0 on you, 1 on reviewers</span>", out["R"]["tally"])
         self.assertEqual(self.repo_detail(out["R"]["alpha"], "alpha")[1],
-                         ' aria-label="0 merging, 1 review, 0 working, 0 building, 0 next, 0 blocked, 0 suggested, 0 parked"')
+                         ' aria-label="0 merging, 1 review, 0 building, 0 working, 0 next, 0 blocked, 0 suggested, 0 parked"')
         # A run with a member that does not wait on a PR keeps its row, unless its pull is that PR row's (sd:9114).
         both = {**run, "pull": "", "items": [*run["items"], {"item": 8, "assignment": 8, "status": "running",
                                                          "title": "Eight"}]}
@@ -2338,7 +2339,8 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         out = self.run_view("open('alpha'); R.html = ELS.queue.html;",
                             answers={"/api/queue/builds?show=all": [200, builds], "/api/queue/runner": [200, runner]})
         self.assertEqual(self.repo_detail(out["R"]["html"], "alpha")[1],
-                         ' aria-label="0 merging, 0 review, 3 working, 1 building, 0 next, 0 blocked, 0 suggested, 0 parked"')
+                         ' aria-label="0 merging, 0 review, 1 building, 2 working, 0 next, 0 blocked, 0 suggested, 0 parked"')
+        # Operator 2026-11-24: a row in building is not also in working; one box mentions it.
         self.assertIn('#7 Seven</a> <span class="via" title="4 rounds ended on blockers: builder reviews, gates and lane reviews; '
                       'the bundle&#39;s builder rounds are noted on this lead item">'
                       '· 4 reviews</span>', out["R"]["html"])
@@ -2369,7 +2371,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertIn('<span class="sr">waiting · </span>blocked', rows["44"])
         self.assertIn("<b>blocked: PR</b> · on reviewers · waited 2h 1m", rows["44"])
         self.assertEqual(out["R"]["kids"].count("working"), 2, "the lane builders stay; the live item is gone")
-        self.assertIn('aria-label="1 merging, 2 review, 2 working, 0 building, 2 next, 2 blocked, 0 suggested, 0 parked"', html)
+        self.assertIn('aria-label="1 merging, 2 review, 0 building, 2 working, 2 next, 2 blocked, 0 suggested, 0 parked"', html)
 
     def test_an_unlinked_pull_request_row_says_approx_and_draft(self):
         """sd:8116: a draft and an approximate wait say so on the row."""
@@ -2404,7 +2406,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         out = self.run_view("R.closed = ELS.queue.html; open('solo'); R.open = ELS.queue.html; R.tally = ELS['queue-tally'].html;",
                             answers={"/api/queue": [200, lanes]})
         self.assertEqual(self.repo_detail(out["R"]["closed"], "solo")[1],
-                         ' aria-label="0 merging, 0 review, 0 working, 0 building, 0 next, 0 blocked, 0 suggested, 0 parked"')
+                         ' aria-label="0 merging, 0 review, 0 building, 0 working, 0 next, 0 blocked, 0 suggested, 0 parked"')
         self.assertIn("<b>PR not read for a day</b>", out["R"]["open"])
         self.assertNotIn("PR review", out["R"]["tally"])
         self.assertIn("<span>2 blocked</span>", out["R"]["tally"], "only the fixture's two lane rows count")
@@ -2741,7 +2743,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
              "lane": "awaiting_you", "on": "you", "since": "2026-09-06T11:00:00+00:00", "waited": 3600}]}
         out = self.run_view("R.html = ELS.queue.html;", answers={"/api/queue": [200, lanes]})
         extra, attrs, body = self.repo_detail(out["R"]["html"], "solo")
-        self.assertEqual(attrs, ' aria-label="0 merging, 1 review, 0 working, 0 building, 0 next, 0 blocked, 0 suggested, 0 parked"')
+        self.assertEqual(attrs, ' aria-label="0 merging, 1 review, 0 building, 0 working, 0 next, 0 blocked, 0 suggested, 0 parked"')
         boxes = re.findall(r'<span class="pip([^"]*)" title="([^"]*)">(\d+)</span>', body)
         self.assertEqual([(c, n) for c, _, n in boxes], [("", "0"), (" caution", "1"), ("", "0"), ("", "0"), ("", "0"), ("", "0"), ("", "0"), ("", "0")])
         self.assertEqual(boxes[1][1], "1 review: pull requests waiting on a review, 1 on you, 0 on reviewers")
@@ -2760,9 +2762,9 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                 lanes["prs"] = {"error": "", "rows": [wait(on)]}
                 html = self.run_view("R.html = ELS.queue.html;", answers={"/api/queue": [200, lanes]})["R"]["html"]
                 extra, attrs, body = self.repo_detail(html, "solo")
-                self.assertEqual(attrs, ' aria-label="0 merging, 1 review, 0 working, 0 building, 0 next, 0 blocked, 0 suggested, 0 parked"')
+                self.assertEqual(attrs, ' aria-label="0 merging, 1 review, 0 building, 0 working, 0 next, 0 blocked, 0 suggested, 0 parked"')
                 boxes = re.findall(r'<span class="pip([^"]*)" title="\d+ (\w+):', body)
-                self.assertEqual(boxes, [("", "merging"), (lamp, "review"), ("", "working"), ("", "building"), ("", "next"), ("", "blocked"),
+                self.assertEqual(boxes, [("", "merging"), (lamp, "review"), ("", "building"), ("", "working"), ("", "next"), ("", "blocked"),
                                          ("", "suggested"), ("", "parked")])
 
     # pack sd:8138 (operator 2026-11-08): a repo row's count tiles filter its sub-rows.
@@ -2782,7 +2784,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
 
     def test_each_tiles_line_counts_its_own_rows_beside_the_repos(self):
         """sd:8565 fault 5 (#53336): 'Showing blocked: 0 of 180' read as 180 blocked; every tile says '<n> <box> (<N> rows)'."""
-        boxes = ["merging", "review", "working", "building", "next", "blocked", "suggested", "parked"]
+        boxes = ["merging", "review", "building", "working", "next", "blocked", "suggested", "parked"]
         out = self.run_view(self.TILE + " R.lines = {}; for (const b of " + json.dumps(boxes) + ") { tile('system', b);"
                             " const m = ELS.queue.html.match(/data-tile-clear=\"[^\"]*\\/system\">([^<]*)</); R.lines[b] = m ? m[1] : null;"
                             " tile('system', b); }", search="?show=suggested")
@@ -2807,7 +2809,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         out = self.run_view(self.TILE + " R.before = pressed('system'); tile('system', 'working'); R.working = pressed('system');"
                             " tile('system', 'next'); R.next = pressed('system'); open('system'); R.closed = pressed('system');"
                             " open('system'); R.reopened = kids();")
-        boxes = ["merging", "review", "working", "building", "next", "blocked", "suggested", "parked"]
+        boxes = ["merging", "review", "building", "working", "next", "blocked", "suggested", "parked"]
         self.assertEqual(out["R"]["before"], [f"{b}:false" for b in boxes])
         self.assertEqual(out["R"]["working"], [f"{b}:{str(b == 'working').lower()}" for b in boxes])
         self.assertEqual(out["R"]["next"], [f"{b}:{str(b == 'next').lower()}" for b in boxes], "another tile switches")
@@ -2820,7 +2822,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         self.assertEqual(out["R"]["after"], out["R"]["before"])
         self.assertIn("alpha:false", out["R"]["repos"])
         self.assertRegex(out["R"]["before"], r'data-repo="/repos/alpha" data-tile="next" aria-pressed="false"[^>]* disabled>')
-        self.assertNotRegex(out["R"]["before"], r'data-repo="/repos/alpha" data-tile="working" aria-pressed="false"[^>]* disabled>')
+        self.assertNotRegex(out["R"]["before"], r'data-repo="/repos/alpha" data-tile="building" aria-pressed="false"[^>]* disabled>')
 
     def test_the_suggested_tile_shows_suggested_rows_with_the_suggested_filter_off(self):
         out = self.run_view(self.TILE + " tile('system', 'suggested'); R.kids = kids(); R.filters = ELS['queue-filters'].html;")
@@ -2905,7 +2907,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                                  named: (None, "example/anvil", "you")})
         out = self.run_view("open('anvil'); R.html = ELS.queue.html; R.tally = ELS['queue-tally'].html;")
         extra, attrs, body = self.repo_detail(out["R"]["html"], "anvil")
-        self.assertEqual(attrs, ' aria-label="0 merging, 3 review, 0 working, 0 building, 0 next, 0 blocked, 0 suggested, 0 parked"')
+        self.assertEqual(attrs, ' aria-label="0 merging, 3 review, 0 building, 0 working, 0 next, 0 blocked, 0 suggested, 0 parked"')
         row = re.search(r'<tr class="child" data-type="blocked" data-pr="' + re.escape(named) + r'">(.*?)</tr>',
                         out["R"]["html"], re.S).group(1)
         self.assertIn(f'<a href="{named}" target="_blank" rel="noopener noreferrer">example/anvil#3 Pull 3</a>', row)
