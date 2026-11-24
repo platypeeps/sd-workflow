@@ -1333,22 +1333,13 @@ class Usage:
         }
 
 
-# The area a cost row's role is spent in (sd:10307). Only builder runs
-# (`author`) and reviewer calls write rows; a role not named is `other`.
-AREAS = {"author": "coding", "reviewer": "review"}
-
-
-def _areas(roles: list[dict]) -> tuple[dict, ...]:
-    """The role rows summed per area, in first-seen order of `roles`."""
-    totals: dict[str, dict] = {}
-    for row in roles:
-        total = totals.setdefault(row["area"], {"area": row["area"], "calls": 0, "spent": 0.0, "held": 0.0,
-                                                "tokens_in": 0, "tokens_out": 0})
-        for key in ("calls", "spent", "held", "tokens_in", "tokens_out"):
-            total[key] += row[key]
-    for total in totals.values():
-        total["spent"], total["held"] = round(total["spent"], 6), round(total["held"], 6)
-    return tuple(totals.values())
+# The area a cost row is spent in (sd:10307), from its role and its
+# assignment's scope: a specification draft is an author run on a `draft`
+# assignment and is design, not coding. A row on no assignment keeps its
+# role's area.
+_AREA = ("CASE WHEN cost.role = 'reviewer' THEN 'review' "
+         "WHEN cost.role = 'author' AND assignment.scope = 'draft' THEN 'design' "
+         "WHEN cost.role = 'author' THEN 'coding' ELSE 'other' END")
 
 
 def month_of(month: str | None = None, *, now: str | None = None) -> str:
@@ -1472,10 +1463,17 @@ def _usage_reads(
         "AND window_minutes IS latest.window_minutes AND substr(timestamp, 1, 7) = ? "
         "ORDER BY timestamp DESC, id DESC LIMIT 1) ORDER BY provider, window_minutes",
         (month, month)).fetchall()
-    roles = [{**dict(row), "area": AREAS.get(row["role"], "other")} for row in roles]
+    areas = connection.execute(
+        f"SELECT {_AREA} AS area, COUNT(*) AS calls, "
+        "COALESCE(SUM(CASE WHEN source IN ('run', 'bound') THEN usd END), 0.0) AS spent, "
+        "COALESCE(SUM(CASE WHEN source IN ('reserved', 'sending') THEN usd END), 0.0) AS held, "
+        "COALESCE(SUM(tokens_in), 0) AS tokens_in, COALESCE(SUM(tokens_out), 0) AS tokens_out "
+        "FROM cost LEFT JOIN assignment ON assignment.id = cost.assignment "
+        "WHERE source != 'meter' AND (source IN ('reserved', 'sending') "
+        "OR substr(cost.timestamp, 1, 7) = ?) GROUP BY area ORDER BY area", (month,)).fetchall()
     return Usage(
         month=month, days=days, today=today, bills=tuple(bills),
-        roles=tuple(roles), areas=_areas(roles), bound=tuple(dict(row) for row in bound),
+        roles=tuple(dict(row) for row in roles), areas=tuple(dict(row) for row in areas), bound=tuple(dict(row) for row in bound),
         meter=tuple(dict(row) for row in meter),
         spent=round(sum(bill.spent for bill in bills) + (unbilled or 0.0), 6),
         held=round(sum(bill.held for bill in bills), 6), unbilled=unbilled,
