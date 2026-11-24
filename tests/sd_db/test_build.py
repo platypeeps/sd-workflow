@@ -1327,6 +1327,96 @@ class Reap(Case):
         self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", self.bundle["assignment"]),
                          "blocked")
 
+    def test_build_of_a_member_that_waits_on_its_lead_is_refused_not_skipped(self):
+        """Review of build/sd-1742 (build.py:2091): Build presses a member that waits on its lead. Retry parks
+        it and queues the lead, so Build reported success with the selected item unbuilt. It refuses, naming
+        the lead to build first, and writes nothing."""
+        from sd_db.workflow import edit_item
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        edit_item(self.db, self.items[1], {"blocked_by": [self.items[0]]}, who="operator")
+        with self.assertRaisesRegex(build.BuildRefused, f"Build its lead sd:{self.items[0]}"):
+            build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", self.bundle["assignment"]),
+                         "blocked", "the refused press queued the lead")
+
+    def test_build_by_item_resumes_the_lead_past_a_waiting_member_moved_away(self):
+        """sd:10086: a member of bundle A waits on its lead and moved to another repository. Retry parks it and
+        resumes A's branch, but Build by item read its repository, refused the bundle and pressed the lead fresh
+        from main. The repository check reads only the members Retry keeps."""
+        from sd_db.workflow import edit_item
+        cancelled = self._lead_pressed_and_cancelled()
+        edit_item(self.db, self.items[1], {"blocked_by": [self.items[0]]}, who="operator")
+        self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (B, self.items[1]))
+        queued = build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertEqual([entry["id"] for entry in queued], [self.bundle["assignment"]])
+        self.assertLess(queued[0]["id"], cancelled, "Retry of the bundle, not a fresh press")
+
+    def test_build_of_a_waiting_member_moved_away_never_queues_its_old_lead(self):
+        """Review of sd:10086: a member that waits on its lead moved to another repository; Build of that member
+        read the old bundle, whose Retry parks the member and queues the lead alone. The pressed item's own
+        repository is always checked, so Build presses it fresh where it reads now."""
+        from sd_db.workflow import edit_item
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        transition(self.db, self.items[1], "ready", who="operator")
+        newer = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (newer,))  # before its claim
+        edit_item(self.db, self.items[1], {"blocked_by": [self.items[0]]}, who="operator")
+        self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (B, self.items[1]))
+        self.assertGreaterEqual(build._retry_row(self.db, self.items[1])["id"], newer,
+                                "Build of the moved member read its old bundle")
+        with self.assertRaisesRegex(build.BuildRefused, "waits on"):  # a fresh press, refused for its wait
+            build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", self.bundle["assignment"]),
+                         "blocked", "the old lead queued")
+
+    def test_build_of_a_moved_lead_still_frees_the_member_it_waits_on(self):
+        """Class pass, review of sd:10086: the check reads what Retry resumes. With a member the lead waits on,
+        Retry resumes nothing: it frees that member, so the pressed lead's own repository is no reason to press
+        it fresh, which only refuses it for its wait."""
+        from sd_db.workflow import edit_item
+        self._lead_pressed_and_cancelled()
+        edit_item(self.db, self.items[0], {"blocked_by": [self.items[1]]}, who="operator")
+        self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (B, self.items[0]))
+        queued = build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [self.items[1]])
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", self.bundle["assignment"]),
+                         "blocked")
+
+    def test_build_of_a_moved_member_the_lead_waits_on_leaves_its_bundle(self):
+        """Class pass, review of sd:10086: the pressed member is one the lead waits on, and it moved. Retry frees
+        it to build fresh where it reads now and marks it left, so the split guard reads the lead's branch; a
+        fresh press past the bundle left its old assignment blocked in it."""
+        from sd_db.workflow import edit_item
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=self.stale())[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        member = next(one["id"] for one in build.run(self.db, row["id"])["members"] if one["item"] == self.items[1])
+        transition(self.db, self.items[1], "ready", who="operator")
+        newer = build.queue(self.db, [self.items[1]], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (newer,))  # before its claim
+        edit_item(self.db, self.items[0], {"blocked_by": [self.items[1]]}, who="operator")
+        self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (B, self.items[1]))
+        queued = build.queue_again(self.db, [self.items[1]], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [self.items[1]])
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", member), "cancelled",
+                         "the freed member stayed in its old bundle")
+
+    def test_build_by_item_frees_a_member_the_lead_waits_on_moved_away(self):
+        """sd:10086: bundle A's lead waits on its member, which moved to another repository. Retry frees the
+        member to build fresh where it reads now, so its repository is no reason to press the lead fresh."""
+        from sd_db.workflow import edit_item
+        self._lead_pressed_and_cancelled()
+        edit_item(self.db, self.items[0], {"blocked_by": [self.items[1]]}, who="operator")
+        self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (B, self.items[1]))
+        queued = build.queue_again(self.db, [self.items[0]], who="operator")
+        self.assertEqual([entry["item"] for entry in queued], [self.items[1]])
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", self.bundle["assignment"]),
+                         "blocked")
+
     def test_build_by_item_reads_no_bundle_whose_lead_is_done(self):
         """Class pass, last round of sd:9788: Retry refuses a bundle whose lead's item is done. Bundle A ends
         blocked, its lead is delivered by a newer build, and a fresh build of the member is cancelled before its
@@ -1840,6 +1930,98 @@ class Reap(Case):
                                     f"cancel running build assignment {self.bundle['assignment']} first"):
             workflow.change_status(self.db, self.items[0], "blocked", who="operator")
 
+
+class ReapThree(Case):
+    """A three-item bundle that ended blocked after a run (sd:10086, lead round 3)."""
+
+    def setUp(self):
+        super().setUp()
+        self.items = [self.item(), self.item(), self.item()]
+        build.queue(self.db, self.items, who="operator")
+        self.bundle = self.claim()
+
+    def test_build_of_a_moved_member_is_no_silent_skip_when_the_lead_waits_on_another(self):
+        """Lead round 3 of sd:10086 (build.py:2087, :1208): the lead waits on one member, and Build presses
+        another that moved to another repository. Retry frees only the member the lead waits on; the check read
+        no member at all, so Build took that Retry and the pressed item was neither queued nor refused."""
+        from sd_db.workflow import edit_item
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=later(self.bundle["created_at"],
+                                                               build.STALE_SECONDS + 1))[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        lead, ahead, moved = self.items
+        transition(self.db, moved, "ready", who="operator")
+        newer = build.queue(self.db, [moved], who="operator")[0]["id"]
+        self.db.execute("UPDATE assignment SET status = 'cancelled' WHERE id = ?", (newer,))  # before its claim
+        edit_item(self.db, lead, {"blocked_by": [ahead]}, who="operator")
+        self.db.execute("UPDATE item SET repo = ? WHERE id = ?", (B, moved))
+        queued = build.queue_again(self.db, [moved], who="operator")
+        self.assertIn(moved, [entry["item"] for entry in queued], "the pressed item was skipped")
+        self.assertGreater(next(entry["id"] for entry in queued if entry["item"] == moved), newer,
+                           "a fresh press where it reads now")
+
+
+    def _ended(self):
+        """The bundle ends blocked after a run."""
+        build.write(self.db, self.bundle["id"], step="building")
+        row = build.run(self.db, build.reap(self.db, now=later(self.bundle["created_at"],
+                                                               build.STALE_SECONDS + 1))[0]["retry"])
+        build.reap(self.db, now=later(row["created_at"], build.STALE_SECONDS + 1))
+        return row
+
+    def test_build_of_a_member_the_retry_skips_is_refused_while_the_lead_waits_on_another(self):
+        """Review of build/sd-1742 (build.py:2089): the lead waits on one member, and Build presses another that
+        did not move. Retry frees only the member the lead waits on and leaves the pressed one ended, so Build
+        reported success with the selected item unbuilt. It refuses, naming what to build first, and writes
+        nothing."""
+        from sd_db.workflow import edit_item
+        row = self._ended()
+        lead, ahead, member = self.items
+        edit_item(self.db, lead, {"blocked_by": [ahead]}, who="operator")
+        members = [one["id"] for one in build.run(self.db, row["id"])["members"]]
+        with self.assertRaisesRegex(build.BuildRefused, f"sd:{member} would stay unbuilt.*only sd:{ahead}"):
+            build.queue_again(self.db, [member], who="operator")
+        self.assertEqual([self.count("SELECT status FROM assignment WHERE id = ?", one) for one in members],
+                         ["blocked"] * 3, "the refused press wrote")
+
+    def _blocked(self, row):
+        return [self.count("SELECT status FROM assignment WHERE id = ?", one["id"])
+                for one in build.run(self.db, row["id"])["members"]]
+
+    def test_build_of_the_lead_and_a_member_its_retry_skips_is_refused(self):
+        """Class pass, review of build/sd-1742 (build.py:1228): every selected item is built or the press
+        refuses. The lead waits on one member; the selection names the whole bundle. Retry builds only the
+        member the lead waits on, and naming the lead excused the third, which stayed ended."""
+        from sd_db.workflow import edit_item
+        row = self._ended()
+        lead, ahead, member = self.items
+        edit_item(self.db, lead, {"blocked_by": [ahead]}, who="operator")
+        with self.assertRaisesRegex(build.BuildRefused, f"sd:{member} would stay unbuilt"):
+            build.queue_again(self.db, [lead, ahead, member], who="operator")
+        self.assertEqual(self._blocked(row), ["blocked"] * 3, "the refused press wrote")
+
+    def test_build_of_the_lead_and_a_member_that_waits_on_it_is_refused(self):
+        """Class pass (build.py:1231): the selection names the lead and a member that waits on it. Retry parks
+        that member and queues the lead, and naming the lead excused the parked one."""
+        from sd_db.workflow import edit_item
+        row = self._ended()
+        lead, behind, _ = self.items
+        edit_item(self.db, behind, {"blocked_by": [lead]}, who="operator")
+        with self.assertRaisesRegex(build.BuildRefused, f"sd:{behind} would stay unbuilt"):
+            build.queue_again(self.db, [lead, behind], who="operator")
+        self.assertEqual(self._blocked(row), ["blocked"] * 3, "the refused press wrote")
+
+    def test_build_of_a_member_the_lead_waits_on_that_waits_itself_is_refused(self):
+        """Class pass: the pressed member is one the lead waits on, and it waits on an open item outside the
+        bundle. Retry frees it but queues nothing, so Build reported success with nothing built."""
+        from sd_db.workflow import edit_item
+        row = self._ended()
+        lead, ahead, _ = self.items
+        edit_item(self.db, lead, {"blocked_by": [ahead]}, who="operator")
+        edit_item(self.db, ahead, {"blocked_by": [self.item()]}, who="operator")
+        with self.assertRaisesRegex(build.BuildRefused, f"sd:{ahead} would stay unbuilt"):
+            build.queue_again(self.db, [ahead], who="operator")
+        self.assertEqual(self._blocked(row), ["blocked"] * 3, "the refused press wrote")
 
 class Park(Case):
     """pack sd:6132 (operator ruling #32107): a build run that ends blocked parks its items once its lease is

@@ -279,8 +279,37 @@ class EachReaderReportsItsTimeAndCost(ParallelFixture):
                 self.assertLessEqual(started, finished)
                 self.assertGreaterEqual(row["wall_seconds"], 0)
         self.assertGreaterEqual(rows["claude"]["wall_seconds"], 0.2)
-        self.assertEqual(rows["claude"]["cost"], {"usd": 1.25, "input_tokens": 3210, "output_tokens": 40})
+        self.assertEqual(rows["claude"]["cost"], {"usd": 1.25, "input_tokens": 3210, "output_tokens": 40,
+                                                  "uncached_input_tokens": 10, "cache_write_input_tokens": 200,
+                                                  "cache_read_input_tokens": 3000})
         self.assertIsNone(rows["codex"]["cost"])
+
+    def test_the_codex_outcome_carries_its_stderr_total(self) -> None:
+        root = self.prepare(CLAUDE_AND_CODEX, "codex@codex, claude@claude")
+        base = FakeRunner()
+
+        def codex(argv: Any, env: Any, cwd: Any, timeout: int) -> Any:
+            answer = base(argv, env, cwd, timeout)
+            return answer._replace(stderr=answer.stderr + "tokens used\n4,321\n")
+
+        result = self.review(root, FakeRunner({"codex": codex}))
+        rows = {row["backend"]: row for row in result["outcomes"]}
+        self.assertEqual(rows["codex"]["cost"], {"usd": None, "input_tokens": None, "output_tokens": None,
+                                                 "total_tokens": 4321}, result["outcomes"])
+
+    def test_codex_reports_the_total_its_stderr_names(self) -> None:
+        """sd:10205: 0 of 186 Codex outcomes in seven days carried usage; codex prints only a total."""
+        tail = "hook: Stop Completed\ntokens used\n37,640\n"
+        self.assertEqual(sd_review.reader_cost("codex-json", "", tail),
+                         {"usd": None, "input_tokens": None, "output_tokens": None, "total_tokens": 37640})
+        self.assertEqual(sd_review.reader_cost("codex-json", "", "tokens used\n12\ntokens used\n1,234,567"),
+                         {"usd": None, "input_tokens": None, "output_tokens": None, "total_tokens": 1234567})
+        for stderr in ("", "tokens used\n", "tokens used\n12,34", "tokens used\n-5", "tokens used: 40",
+                       "tokens used\n40 then more\n", "tokens used\n٣٤", "tokens used\n" + "9" * 14,
+                       "<b>tokens used</b>\n40", "xtokens used\n40"):
+            with self.subTest(stderr=stderr):
+                self.assertIsNone(sd_review.reader_cost("codex-json", "", stderr))
+        self.assertIsNone(sd_review.reader_cost("claude-json", "", "tokens used\n40"))
 
     def test_a_claude_envelope_without_cost_reports_none(self) -> None:
         odd = ('{"total_cost_usd": NaN}', '{"total_cost_usd": Infinity}', '{"total_cost_usd": -1}',
@@ -290,7 +319,9 @@ class EachReaderReportsItsTimeAndCost(ParallelFixture):
                 self.assertIsNone(sd_review.reader_cost("claude-json", stdout))
         self.assertIsNone(sd_review.reader_cost("codex-json", json.dumps({"total_cost_usd": 1.0})))
         self.assertEqual(sd_review.reader_cost("claude-json", json.dumps({"total_cost_usd": 0, "usage": {
-            "input_tokens": 10**13, "output_tokens": -1}})), {"usd": 0, "input_tokens": None, "output_tokens": None})
+            "input_tokens": 10**13, "output_tokens": -1}})), {"usd": 0, "input_tokens": None, "output_tokens": None,
+                                                                "uncached_input_tokens": None, "cache_write_input_tokens": None,
+                                                                "cache_read_input_tokens": None})
 
 
 DRIVER = textwrap.dedent("""
@@ -486,3 +517,25 @@ def _quietly_kill(pid: int) -> None:
         os.killpg(pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError):
         pass
+
+
+class AnUnreadyFirstReaderIsNotThePlan(ParallelFixture):
+    """sd:10231: at one reader, an unready first entry was the plan's sole provider.
+
+    Readiness counted the ready second entry toward the depth and passed, yet
+    `providers` named the first, and the run spent an attempt on it before the
+    slot fell to the second. The ready reader now leads the plan."""
+
+    reviewing_depth = 1
+
+    def test_the_ready_reader_leads_and_the_unready_one_is_the_fallback(self) -> None:
+        root = self.prepare(THREE_READERS, "codex@codex, second@second")
+        (self.tool_bin / "codex").unlink()  # codex is not installed: executable_missing
+        explained = self.review(root, FakeRunner(), explain=True)
+        self.assertEqual(explained["readiness"]["status"], "ready", explained["readiness"])
+        self.assertEqual(explained["providers"], ["second"])
+        self.assertEqual(explained["fallback_candidates"], ["codex"])
+        runner = FakeRunner()
+        result = self.review(root, runner)
+        self.assertEqual(result["reviewed_by"], ["second"])
+        self.assertNotIn("codex", [call["argv"][0] for call in runner.calls if review_session(call["argv"])])

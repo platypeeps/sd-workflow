@@ -51,7 +51,10 @@ class ScreenCase(unittest.TestCase):
         self.now = NOW
         # The Tasks read carries the sweeps' records (sd:5096): a run on this machine must not reach a fixture's page.
         # Management reads <config>/shared-upload/.env (sd:5405): this machine's config must not reach one either.
+        # The build caps read <XDG_CONFIG_HOME>/sd-ai-command-pack (sd:10311): a module run outside the package
+        # (`python -m unittest test_build_panel`) read the hub's `repo_cap` 2 and `machine_cap` 8.
         state = mock.patch.dict(os.environ, {"XDG_STATE_HOME": str(Path(self.tmp.name) / "state"),
+                                             "XDG_CONFIG_HOME": str(Path(self.tmp.name) / "xdg-config"),
                                              "SYSTEM_TOOLS_CONFIG": str(Path(self.tmp.name) / "config")})
         state.start()
         self.addCleanup(state.stop)

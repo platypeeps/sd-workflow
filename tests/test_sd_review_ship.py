@@ -124,8 +124,8 @@ class FixReviewTests(ReviewFixture):
         sd_review.READER_GROUPS.reopen_groups()  # the failed reader above closes them
         root, first = self.branch()
         spellings = (f"{root}/src.py", f"{root.resolve()}/src.py", "./src.py", "src.py")
-        # An absolute prior path is refused before review ("outside this repository"); filed apart.
-        for before, after in [(a, b) for a in spellings[2:] for b in spellings if a != b]:
+        # sd:9962: an absolute prior path, as older reports recorded, is read by its repository spelling.
+        for before, after in [(a, b) for a in spellings for b in spellings if a != b]:
             with self.subTest(before=before, after=after):
                 prior = {"scope": "branch", "subject": {"head": first}, "status": "blocking", "findings": [
                     {"path": before, "line": 1, "summary": "original unresolved defect", "family": "correctness",
@@ -143,6 +143,28 @@ class FixReviewTests(ReviewFixture):
                 self.assertEqual(result["status"], "blocking")
                 self.assertEqual([(row["path"], row["evidence"]) for row in result["findings"]],
                                  [("src.py", "python3 src.py: Traceback")])
+
+    def test_an_absolute_prior_path_is_read_by_its_repository_spelling(self):
+        """sd:9962: a report written before build/sd-1423 recorded the absolute path the review accepted.
+        Verify and resume refused it as outside the repository; each now reads the file it names."""
+        root, first = self.branch()
+        self.commit(root, "other.py", "unrelated_fix = True\n")
+        for spelling in (f"{root}/src.py", f"{root.resolve()}/src.py", "./src.py"):
+            prior = {"scope": "branch", "subject": {"head": first}, "status": "blocking", "findings": [
+                {"path": spelling, "line": 1, "summary": "original unresolved defect", "family": "correctness",
+                 "severity": "high", "instances": [f"{spelling}:1"], "evidence": "python3 src.py: Traceback",
+                 "disposition": "blocking"}]}
+            report = self.tmp / "prior.json"
+            report.write_text(json.dumps(prior))
+            for mode in ({"verify_report": str(report), "base": first}, {"resume_report": str(report)}):
+                sd_review.READER_GROUPS.reopen_groups()
+                with self.subTest(spelling=spelling, mode=sorted(mode)):
+                    runner = FakeRunner({"codex": sd_review.Completed(0, json.dumps({"findings": []}), "")})
+                    sd_review.review(root, namespace(scope="branch", **mode), runner,
+                                     self.environment(), self.chatgpt_home())
+                    handed = json.dumps(runner.calls, default=str)
+                    self.assertIn("Current source for prior finding src.py:", handed)
+                    self.assertIn("the_original_defect = True", handed)
 
     def test_a_reader_that_raises_after_a_prior_report_ends_with_its_own_error(self):
         """sd:7569. The prior finding's source is read in the main thread
