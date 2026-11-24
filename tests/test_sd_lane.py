@@ -2379,6 +2379,22 @@ class Landing(Lane):
         self.assertEqual(self.watched(1)[1][:24], "pack sd:1 Removed: workt")  # build output alone goes
         self.assertFalse(tree.exists())
 
+    def test_generated_unity_project_files_do_not_keep_a_merged_worktree(self) -> None:
+        """sd:10325: Unity regenerates its ignored *.csproj and *.sln on every open; the lane kept a merged
+        clean worktree for `Assembly-CSharp-Editor.csproj`. A name that only holds the suffix still keeps it."""
+        tree, head = self.topic()
+        self.merge_lands(tree, 1, head)
+        self.drain()
+        (self.repo / ".git/info/exclude").write_text("*.csproj\n*.sln\n*.csproj.bak\n", encoding="utf-8")
+        (tree / "notes.csproj.bak").write_text("mine\n", encoding="utf-8")
+        for name in ("Assembly-CSharp-Editor.csproj", "Game.sln"):
+            (tree / name).write_text("<Project/>\n", encoding="utf-8")
+        self.assertEqual(self.watched(1)[1:], [f"pack sd:1 kept {tree}: it holds ignored files that are not "
+                                               "build output: notes.csproj.bak"])
+        (tree / "notes.csproj.bak").unlink()
+        self.assertEqual(self.watched(1)[1][:24], "pack sd:1 Removed: workt")
+        self.assertFalse(tree.exists())
+
     def test_ignored_data_keeps_the_worktree_whatever_status_shows_by_default(self) -> None:
         """Review of sd:6727: `status.showUntrackedFiles=no` hides ignored files from a bare status too."""
         tree, head = self.topic()

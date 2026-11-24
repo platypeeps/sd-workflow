@@ -94,6 +94,8 @@ _DU_OVERRAN: dict[str, float] = {}
 BUILD_DIRS = ("target", "node_modules", ".venv")
 #: Ignored folders and files a merged worktree may hold and still be removed: build output and tool caches.
 DISPOSABLE = (*BUILD_DIRS, "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".DS_Store")
+#: Ignored names by suffix that are generated output: Unity writes its *.csproj and *.sln on every open (sd:10325).
+DISPOSABLE_SUFFIXES = (".egg-info", ".csproj", ".sln")
 #: A full object name, SHA-1 or SHA-256.
 OBJECT = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
@@ -259,7 +261,7 @@ def _cwds(walk: Walk) -> list[str] | None:
 
 
 def _disposable(name: str) -> bool:
-    return any(part in DISPOSABLE or part.endswith(".egg-info") for part in name.rstrip("/").split("/"))
+    return any(part in DISPOSABLE or part.endswith(DISPOSABLE_SUFFIXES) for part in name.rstrip("/").split("/"))
 
 
 def busy(path: str, cwds: list[str] | None) -> str:
