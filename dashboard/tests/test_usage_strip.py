@@ -276,7 +276,7 @@ class TheStripInTheUsageDropdown(ScreenCase):
         body = out["R"]["body"]
         self.assertIn("5h window 62% used", body)
         self.assertIn('<rect class="fill caution" width="85.5"', body)
-        self.assertIn('<time datetime="2026-09-06T15:00:00Z">Sun, 09:00 AM MDT</time>', body)
+        self.assertIn('<time datetime="2026-09-06T15:00:00Z" title="Sun, 09:00 AM MDT">', body)
         self.assertIn("25 pts over pace", body)
         self.assertIn('href="https://status.example.test/incidents/9"', body)
         self.assertIn("No reader for gemini.", body)
@@ -285,6 +285,17 @@ class TheStripInTheUsageDropdown(ScreenCase):
         self.assertIn('read <time class="rel" datetime="2026-09-06T11:50:00Z">', body)
         # The outage on codex's service is the worst state the summary shows.
         self.assertEqual(out["R"]["state"], "warning")
+
+    def test_a_window_shows_the_days_and_hours_to_its_reset(self):
+        """Operator 2026-11-23: a window's reset reads as the time left to it, not its day and time."""
+        reading(self.connection, "codex", **CODEX)
+        for now, left in (("2026-09-06T11:50:00Z", "resets in 3h 10m"), ("2026-09-06T14:59:30Z", "resets in 1m"),
+                          ("2026-09-03T10:00:00Z", "resets in 3d 5h")):
+            with self.subTest(now=now):
+                stub = f"Date.now = () => Date.parse('{now}');"
+                body = run_usage(stub + "R.body = usageBody(ANSWER).text;", answer=self.strip(),
+                                 tz="America/Denver")["R"]["body"]
+                self.assertIn(f'title="Sun, 09:00 AM MDT">{left}</time>', body)
 
     def test_a_spend_shows_its_cap_and_the_days_left_in_the_local_zone(self):
         """pack sd:9702: 'spent $X of $CAP · N days left', caution at 80 % of the cap and warning at 100 %."""

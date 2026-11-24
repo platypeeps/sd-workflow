@@ -1924,6 +1924,9 @@
   const URANK = ['ok', 'queued', 'unknown', 'caution', 'warning'];
   const usd = n => `$${Number(n).toFixed(2)}`;
   const zoned = iso => new Date(iso).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit', timeZoneName: 'short' });
+  // Operator 2026-11-23: a window's reset reads as the time left to it, days and hours, its clock time on hover.
+  const until = iso => { const m = Math.max(1, Math.ceil((Date.parse(iso) - Date.now()) / 6e4)), d = Math.floor(m / 1440), h = Math.floor(m % 1440 / 60);
+    return d ? `${d}d ${h}h` : h ? `${h}h ${m % 60}m` : `${m}m`; };
   const pace = p => p === null || p === undefined ? '' : Math.abs(p) < 3 ? ' · on pace' : ` · ${Math.abs(p)} pts ${p > 0 ? 'over' : 'under'} pace`;
   // Pack sd:9702: a spend with a cap draws a window's bar, caution at 80 % and warning at 100 %, and its cycle end as
   // the days left to it, counted in this zone's calendar days.
@@ -1943,7 +1946,7 @@
     const f = r.service;
     const flag = f && f.state !== 'ok' ? html`<a class="flag" href="${f.url && f.state !== 'unknown' ? f.url : '/fleet-health#view=status'}"${f.url && f.state !== 'unknown' ? html` target="_blank" rel="noopener noreferrer"` : ''}><span class="g-${f.state}" aria-hidden="true">${UGLYPH[f.state]}</span> ${f.name} ${f.status}${f.title ? `: ${f.title}` : ''}</a>` : '';
     const body = r.state === 'unknown' ? html`<span class="why">Unknown: ${r.why}</span>`
-      : html`${r.windows.map(w => html`<span class="w"><span class="wl">${w.label}</span><svg class="track" viewBox="0 0 100 1" preserveAspectRatio="none" role="img" aria-label="${`${w.label} window ${w.used}% used`}"><rect class="fill${w.used >= 100 ? ' warning' : w.used >= 80 ? ' caution' : ''}" width="${ubar(w.used)}" height="1"/></svg><b>${Math.round(w.used)}%</b>${w.resets_at ? html` · resets <time datetime="${w.resets_at}">${zoned(w.resets_at)}</time>` : ''}${pace(w.pace)}</span>`)}${money(r.balance, 'balance')}${money(r.spend, 'spent')}`;
+      : html`${r.windows.map(w => html`<span class="w"><span class="wl">${w.label}</span><svg class="track" viewBox="0 0 100 1" preserveAspectRatio="none" role="img" aria-label="${`${w.label} window ${w.used}% used`}"><rect class="fill${w.used >= 100 ? ' warning' : w.used >= 80 ? ' caution' : ''}" width="${ubar(w.used)}" height="1"/></svg><b>${Math.round(w.used)}%</b>${w.resets_at ? html` · <time datetime="${w.resets_at}" title="${zoned(w.resets_at)}">resets in ${until(w.resets_at)}</time>` : ''}${pace(w.pace)}</span>`)}${money(r.balance, 'balance')}${money(r.spend, 'spent')}`;
     return html`<li data-state="${r.state}"><span class="nm"><span class="g-${r.state}" aria-hidden="true">${UGLYPH[r.state]}</span><span class="sr">${r.state} · </span>${r.label}${r.active ? html`<span class="act" title="active account" aria-hidden="true">◆</span><span class="sr"> · active account</span>` : ''}</span>
       <span class="ws">${body}</span>${flag}<span class="age">${r.read_at ? html`read <time class="rel" datetime="${r.read_at}"></time>` : 'not read'}</span></li>`;
   }
