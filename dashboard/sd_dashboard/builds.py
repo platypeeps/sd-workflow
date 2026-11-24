@@ -291,10 +291,23 @@ def _log_quiet(path: str | None, now: str) -> int | None:
     return max(0, int(clock.timestamp() - changed)) if clock else None
 
 
+def review_rounds(connection, items: list[int]) -> dict[int, int]:
+    """Each item's review rounds that left blockers, builder and lane (pack sd:10306): its `Review round blockers:`
+    notes (a review, gate or enqueue check that blocked), plus its lane prepares a local review blocked. Clean rounds
+    leave no note, so they are not counted."""
+    if not items:
+        return {}
+    marks = ",".join("?" * len(items))
+    return {row[0]: row[1] for row in connection.execute(
+        f"SELECT item, COUNT(*) FROM note WHERE item IN ({marks}) AND (body LIKE 'Review round blockers:%' "
+        "OR (body LIKE 'Lane failed in prepare%' AND body LIKE '%local review blocking%')) GROUP BY item", items)}
+
+
 def _members(connection, run: dict) -> list[dict]:
     rows = build.run(connection, run["id"])["members"]
     titles = reads.items_by_ids(connection, [row["item"] for row in rows])
-    return [{"item": row["item"], "assignment": row["id"], "status": row["status"],
+    rounds = review_rounds(connection, [row["item"] for row in rows])
+    return [{"item": row["item"], "assignment": row["id"], "status": row["status"], "reviews": rounds.get(row["item"], 0),
              "title": titles[row["item"]]["title"] if row["item"] in titles else ""} for row in rows]
 
 

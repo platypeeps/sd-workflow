@@ -801,3 +801,16 @@ class AutoPickup(Fixture):
         self.assertEqual((status, body["on"]), (200, False), body)
         for payload in ({"on": "yes", "value": None}, {"on": True}, {"on": True, "until": None}):
             self.assertEqual(self.post("/api/queue/builds/pickup", payload)[0], 400, payload)
+
+
+class ReviewRounds(Fixture):
+    def test_review_rounds_count_each_blocking_builder_and_lane_round_only(self):
+        """pack sd:10306: a builder round's blockers and a lane prepare a local review blocked count; other notes do not."""
+        from sd_db.writes import add_note
+        busy, quiet = self.ready(), self.ready()
+        for body in ("Review round blockers: - a.py:1 x", "Review round blockers: - gate:- the repository gate failed",
+                     "Lane failed in prepare at abc: local review blocking: 1/1 completed", "Lane failed in prepare at abc: merging origin/main failed",
+                     "Build run r report: done", "Parked: build run r ended blocked"):
+            add_note(self.connection, busy, "comment", body)
+        self.assertEqual(builds.review_rounds(self.connection, [busy, quiet]), {busy: 3})
+        self.assertEqual(builds.review_rounds(self.connection, []), {})
