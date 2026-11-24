@@ -148,6 +148,9 @@ from 2 to 6 fails, each member ships alone, as after sd:9899: a later
 | 7 read | none | watch or `lane prune` reaps the merged worktree | worktree kept: `sd-ship reconcile` runs there | lane: merged worktree is kept for its reconcile |
 | 7 read | none | `sd-status` lane section hides merged rows as history | row stays listed until its item is finished | status: failed entry of a finished item (held row) |
 | 7 note | landing notes | the landing notes `Landed` and `Closed by citation` | `Landed` says delivery pending; no close is noted | lane: notes no close by citation; kept for its reconcile |
+| 7 land | none: origin's branch and the worktree kept, remove kept in the row | the landing of a merge whose delivery is pending | note says cleanup held; reap removes the worktree once reconcile settles it | lane: landing whose delivery is pending cleans nothing up |
+| 7 land | lane worktree kept | the runner ends an entry whose delivery is pending | its lane worktree stays for `sd-ship reconcile` | lane: lane worktree whose delivery is pending is kept |
+| 7 reconcile | lane rows of the item: delivery_pending cleared | reconcile delivers; the lane write fails | answer carries lane_unsettled; a second reconcile clears it | ship: reconcile that delivers clears the lane's pending delivery; lane: reconcile clears the pending delivery |
 | 7 reconcile | items done, PRs merged | stopped midway | next claim's prepare reconciles | ship: prepare reconciles |
 | 7 reconcile | none | merge_commit_sha is not M_i | refused train_merge_mismatch | ship: mismatch |
 | 7 reconcile | none | stale train_joined, lone merge | merge_dispatch clears train_commit | ship: lone merge after join |
