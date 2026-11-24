@@ -1140,11 +1140,15 @@ class LineBudgetTests(unittest.TestCase):
         # 5199 -> 5207 is the sd:10191 class pass: `bin/sd-review` +8, as
         # `found_after` compares a prior blocker's evidence with the evidence
         # the ruling's adjudication answered. Measured: `sd-review` is 3237.
+        #
+        # 5207 -> 5211 is the sd:10191 review at bin/sd-review:1865: +4, as
+        # only a revived blocker of a repeat's own ruling lends evidence to
+        # it. Measured: `sd-review` is 3241.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5207,
+            5211,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

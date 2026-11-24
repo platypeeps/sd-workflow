@@ -1842,8 +1842,10 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
     threshold = BLOCKING_ORDER[floor]
     def _floor(row: Mapping[str, Any]) -> bool:
         return 0 < BLOCKING_ORDER.get(str(row.get("severity", "unspecified")), 0) >= threshold
-    def _rebutted(row: Mapping[str, Any]) -> bool:  # the newest record at every place it names is a listed rebuttal
-        return getattr(recorded_at(rebutted, row.get("path"), row.get("summary"), row.get("line"), row.get("instances")), "listed", False)
+    def _ruling(row: Mapping[str, Any]) -> Rebuttal | None:  # the newest record at every place it names
+        return recorded_at(rebutted, row.get("path"), row.get("summary"), row.get("line"), row.get("instances"))
+    def _rebutted(row: Mapping[str, Any]) -> bool:  # ... is a listed rebuttal
+        return getattr(_ruling(row), "listed", False)
     def _prior(old: dict[str, Any]) -> dict[str, Any]:  # a rebutted place holds and lends nothing (sd-review:1814); it stays: a repeat on it is its own
         ruling = recorded_at(rebutted, old.get("path"), old.get("summary"), old.get("line"))
         if old.get("disposition") != "blocking" or not getattr(ruling, "listed", False):
@@ -1854,7 +1856,9 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
         return old.get("disposition") == "blocking" and _rebutted(old)
     revived = [*filter(_lends, prior)]
     def _repeat(row: Mapping[str, Any]) -> bool:  # an uncited repeat of a rebutted finding: the rebuttal is read first (build/sd-1423 review)
-        return _floor(row) and not (isinstance(row.get("evidence"), str) and row["evidence"].strip()) and _rebutted(row) and not prior_evidence(revived, row)
+        # Only a revived blocker of its own ruling lends: another rebuttal nearby still holds (sd:10191, sd-review:1865).
+        return _floor(row) and not (isinstance(row.get("evidence"), str) and row["evidence"].strip()) and _rebutted(row) and not prior_evidence(
+            [old for old in revived if _ruling(old) is _ruling(row)], row)
     # Only a finding that blocks releases a hold: not a medium copy (build/sd-1423 review), not a rebutted repeat (sd-review:1783).
     at_floor = instance_rows(*(row for row in findings if _floor(row) and not _repeat(row)))
     disposed = []
