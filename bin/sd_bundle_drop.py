@@ -5,8 +5,9 @@ queues the kept items under a kept lead and the dropped item alone. It replaces 
 must name the lead (ruling #64210), and a reverted commit keeps its `Closes: sd:N`, so the merge closed the item
 it dropped (sd:9651).
 
-A commit is the dropped item's when its message cites it (`sd_ship_body.cited_ids`), the kept items' when it
-cites only others. One that cites nothing refuses the drop: no message says whose it is.
+A commit is the dropped item's when its message cites it (`sd_ship_body.cited_ids`, else a `Refs:` line naming
+a bundle item), the kept items' when it cites only others. One that cites nothing refuses the drop: no message
+says whose it is.
 """
 
 from __future__ import annotations
@@ -100,6 +101,9 @@ def drop_sides(work: str | Path, start: str, tip: str, item: int, aside: set[int
         if sd_ship_body._REVERTS.search(message) or sd_ship_body.REVERT_SUBJECT.match(message):
             raise DropRefused(f"commit {sha[:12]} reverts another commit; split it by hand")
         cited = set(sd_ship_body.cited_ids("", [(sha, message)]))
+        # A fix-up closes nothing: its `Refs:` names whose it is, as the brief asks (sd:10319). Only the bundle's
+        # items count there, as a `Refs:` line may name a related item elsewhere.
+        cited = cited or sd_ship_body.referenced_ids(message) & built
         if not cited:
             raise DropRefused(f"commit {sha[:12]} cites no item, so nothing says whose it is; split it by hand")
         if cited - built:

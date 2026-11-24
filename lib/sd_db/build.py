@@ -438,13 +438,18 @@ def _route(connection, lane_host: str | None, lead: int | None) -> str | None:
     """`lane_of` the host whose dispatcher claims a build of the repository whose lane is `lane_host`, for the
     bundle `lead` leads (None when it never ran): its lane now, as a retry follows `repo.lane_host`, except a bundle
     the hub built under the overload fallback for a satellite's lane, whose commits sit in the hub's worktree: that
-    one builds on the hub again (sd:8991). The one rule for a claim, Retry, pickup and the Builds panel."""
+    one builds on the hub again (sd:8991). So does a bundle drop's kept lead that has not run, whose kept work is
+    in that hub worktree (`_kept_host`, sd:10319). The one rule for a claim, Retry, pickup and the Builds panel."""
     lane = lane_of(connection, lane_host)
     if lane is None or lead is None:
         return lane
     ran = connection.execute("SELECT owner FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
                              (lead,)).fetchone()
-    return None if ran and lane_of(connection, run_host(ran["owner"])) is None else lane
+    if ran is None:
+        row = connection.execute("SELECT id, item, parent FROM assignment WHERE id = ?", (lead,)).fetchone()
+        kept = _kept_host(connection, row) if row is not None else None
+        return None if kept is not None and lane_of(connection, kept[1]) is None else lane
+    return None if lane_of(connection, run_host(ran["owner"])) is None else lane
 
 
 def run_owner(owner: str, lane_host: str | None) -> str:
@@ -892,7 +897,8 @@ def drop_plan(connection, item: int) -> dict:
         raise BuildRefused(f"Drop refused: build run {last['id']} ran on {ran_on or 'the hub'}; "
                            f"drop it on {ran_on or 'the hub'}")
     lane = connection.execute("SELECT repo.lane_host FROM repo WHERE repo.path = ?", (last["repo"],)).fetchone()
-    claims = _route(connection, lane["lane_host"] if lane else None, None)
+    # Routed as the ended bundle: one the hub built for a satellite's lane builds on the hub again (sd:10319).
+    claims = _route(connection, lane["lane_host"] if lane else None, lead)
     if claims != lane_of(connection, ran_on):
         raise BuildRefused(f"Drop refused: its kept items would build on {claims or 'the hub'}, but build run "
                            f"{last['id']} ran on {ran_on or 'the hub'}, which holds their work; Retry it whole")

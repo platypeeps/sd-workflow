@@ -3249,6 +3249,13 @@ class Supervise(Case):
         """Pack sd:6626: run 137 copied its commit's Closes: trailer into the body; enqueue refuses it."""
         self.assertIn("The body carries no `Closes:` line", build_run.BRIEF)
 
+    def test_the_brief_cites_an_item_on_every_commit(self):
+        """sd:10319: builders committed review fix-ups with no trailer, so a bundle drop refused: 'commit ... cites
+        no item'. Every commit cites one; a fix brief says so again."""
+        self.assertIn("`Refs: sd:N` trailer on every other commit", build_run.BRIEF)
+        self.assertIn("`Refs: sd:N`", build_run.FIX)
+        self.assertIn("`Refs: sd:N`", build_run.CLASS_PASS)
+
     def test_the_brief_forbids_a_kill_by_pattern(self):
         """Pack sd:6815: build 268's `pkill -f "sd-check --json"` ended the vault job's queued gate."""
         self.assertIn("never `pkill` or `killall`", build_run.BRIEF)
