@@ -299,11 +299,7 @@ def review_rounds(connection, items: list[int], lead: int | None = None) -> dict
     The lead's builder rounds are its whole history, earlier solo builds included: a ceiling, not an exact count."""
     if not items:
         return {}
-    marks = ",".join("?" * len(items))
-    rows = connection.execute(
-        f"SELECT item, body LIKE 'Review round blockers:%', COUNT(*) FROM note WHERE item IN ({marks}) "
-        "AND (body LIKE 'Review round blockers:%' OR body LIKE 'Lane failed in prepare at %: local review blocking%') "
-        "GROUP BY 1, 2", items).fetchall()
+    rows = reads.review_round_counts(connection, items)
     own = {item: sum(n for i, _, n in rows if i == item) for item in items}
     built = sum(n for i, builder, n in rows if i == lead and builder)
     return {item: own[item] + (built if lead is not None and item != lead else 0) for item in items if own[item] or built}
