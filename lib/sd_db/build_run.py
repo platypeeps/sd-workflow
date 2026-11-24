@@ -1545,21 +1545,18 @@ class Supervisor:
         return self.split_first() or "building"
 
     def start_point(self) -> str | None:
-        """The commit a new branch starts from when its items' last bundle failed in the lane: that entry's head, or
-        the failed branch's tip, local then pushed (sd:10379); None, so the base, when there is none or none reads."""
+        """The commit a new branch starts from when its items' last bundle failed in the lane: the failed branch's
+        local tip as the operator left it, not the entry's head or a pushed copy, which can hold commits the
+        operator removed (sd:10379); None, so the base, when there is none or it does not read."""
         failed = build.lane_failed_start(self.db, self.row["assignment"])
         if failed is None:
             return None
-        head = failed["head"] if re.fullmatch(r"[0-9a-f]{7,64}", failed["head"] or "") else None
-        for ref in (head, f"refs/heads/{failed['branch']}", f"refs/remotes/origin/{failed['branch']}"):
-            if ref is None:
-                continue
-            try:
-                return _read([*self.tools.git, "-C", str(self.repo), "rev-parse", "--verify", "--quiet",
-                              "--end-of-options", f"{ref}^{{commit}}"], env=self.env).strip() or None
-            except Unread:
-                continue
-        return None
+        try:
+            tip = _read([*self.tools.git, "-C", str(self.repo), "rev-parse", "--verify", "--quiet",
+                         "--end-of-options", f"refs/heads/{failed['branch']}^{{commit}}"], env=self.env)
+            return tip.strip() or None
+        except Unread:
+            return None
 
     def guarded(self) -> dict | None:
         """The kept worktree's guard: the blocked end when a subset Retry's split holds it, or it is gone or on

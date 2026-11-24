@@ -2675,7 +2675,7 @@ def branch_run(connection, branch: str) -> dict | None:
 
 def lane_failed_start(connection, lead: int) -> dict | None:
     """Where a new bundle under assignment `lead` starts when its items were last built in a bundle whose lane entry
-    failed: that run's `branch`, the entry's `head` (None when no entry reads) and its `detail` (sd:10379). An item
+    failed: that run's `branch` and its `detail` (sd:10379). An item
     moved back to ready and built again is a fresh press with a new branch, which from origin/main dropped the
     failed bundle's commits. None, so main, unless each item's newest earlier build is one such run, the same
     for all, and every item it built is in this bundle: its commits cite them, and a missing one would not
@@ -2699,13 +2699,7 @@ def lane_failed_start(connection, lead: int) -> dict | None:
     failed = run(connection, runs.pop())
     if not {member["item"] for member in failed["members"]} <= items:
         return None
-    try:
-        entry = _lane_entry(connection, failed["branch"], actor="the new build")[1]
-    except BuildRefused:
-        entry = {}
-    head = entry.get("expected_head")
-    return {"run": failed["id"], "branch": failed["branch"], "head": head if isinstance(head, str) else None,
-            "detail": failed["detail"] or ""}
+    return {"run": failed["id"], "branch": failed["branch"], "detail": failed["detail"] or ""}
 
 
 def lane_fix_check(connection, run: str) -> tuple[list[dict], str, dict]:

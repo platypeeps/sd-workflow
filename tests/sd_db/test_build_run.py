@@ -4387,7 +4387,7 @@ class Tick(Case):
         notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", self.items)]
         self.assertIn(build.FINDING + "pin the fixture clock", notes)
 
-    def rebuilt_after_lane_failure(self, count, *, lost=False):
+    def rebuilt_after_lane_failure(self, count, *, lost=False, trimmed=False):
         """sd:10379: a bundle of two fails in the lane; the operator moves its first `count` items back to ready and
         builds them again, a fresh press. Answers the failed branch's head and the new run's started worktree."""
         run = self.enqueued(2)
@@ -4403,6 +4403,9 @@ class Tick(Case):
         self.entries[self.items[0]] = {"id": "e1", "status": "failed", "reason": "gate red", "expected_head": head}
         self.tick()
         self.assertEqual(build.run(self.db, run["id"])["outcome"], "lane_failed")
+        if trimmed:  # the operator drops the failed branch's commit after the failure; the entry still names it
+            support.git(self.repo, "branch", "-f", run["branch"], f"{head}~1")
+            head = support.git(self.repo, "rev-parse", run["branch"])
         rebuild = self.items[:count]
         self.db.execute(f"UPDATE item SET status = 'ready' WHERE id IN ({', '.join('?' for _ in rebuild)})",
                         rebuild)
@@ -4419,12 +4422,18 @@ class Tick(Case):
         return head, supervisor
 
     def test_a_fresh_build_after_a_lane_failure_starts_from_the_failed_head(self):
-        """sd:10379: it started from origin/main and dropped the bundle's commits; it starts from the entry head."""
+        """sd:10379: it started from origin/main and dropped the bundle's commits; it starts from the branch tip."""
         head, supervisor = self.rebuilt_after_lane_failure(2)
         work = Path(self.bundle["work_path"])
         self.assertEqual(support.git(work, "rev-parse", "HEAD"), head)
         self.assertIn("whose lane entry failed", supervisor.brief()["findings"])
         self.assertIn("gate red", supervisor.brief()["findings"])
+
+    def test_a_fresh_build_starts_from_the_failed_branch_as_the_operator_left_it(self):
+        """Review of build/sd-1808: it preferred the entry's head, so a commit the operator removed from the failed
+        branch came back. It starts from the branch's tip now."""
+        head, _ = self.rebuilt_after_lane_failure(2, trimmed=True)
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
 
     def test_a_fresh_build_of_part_of_a_lane_failed_bundle_starts_from_main(self):
         """sd:10379: the failed branch's commits cite an item this bundle leaves out, so it starts from main."""
