@@ -1487,6 +1487,26 @@ class RebuttalScopeTests(RepeatFixture):
         self.commit("an edit two lines from the instance")
         self.assertEqual(seen(), [], "an edit at an instance's hunk kept the ruling")
 
+    def test_a_finding_at_a_new_place_is_not_covered_by_an_old_rebuttal(self) -> None:
+        """Lane ruling on sd:10191 (bin/sd-review:885): a distant edit keeps a rebuttal at its own line, but the
+        distant edit is its own hunk; the same summary found there is a new place no rebuttal covers, so it
+        blocks, while the repeat at the ruled line stays held back."""
+        tool = self.root / "bin/tool.py"
+        tool.parent.mkdir()
+        tool.write_text("".join(f"line_{n} = {n}\n" for n in range(1, 61)), encoding="utf-8")
+        self.commit("add", "bin/tool.py")
+        ruled = self.commit("the ruled code")
+        self.adjudication(("lane claim", "rebutted", "x"), head=ruled, line=20)
+        tool.write_text(tool.read_text(encoding="utf-8").replace("line_50 = 50", "line_50 = crash()"),
+                        encoding="utf-8")
+        self.commit("add", "bin/tool.py")
+        self.commit("a distant edit")
+        found = sd_review.rebutted_findings(self.root, sd_review.resolve_subject(self.root, "branch"), None,
+                                            self.environment())
+        self.assertEqual([(entry.listed, entry.line) for entry in found], [(True, 20)])
+        answers = self.review_answering(row(path="bin/tool.py", line=50, summary="lane claim"))
+        self.assertEqual(answers["lane claim"][0], "blocking")
+
     def test_a_ruling_lapses_when_its_own_hunk_changes(self) -> None:
         tool = self.root / "bin/tool.py"
         tool.parent.mkdir()
