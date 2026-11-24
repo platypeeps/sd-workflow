@@ -254,22 +254,26 @@ becomes its own item, not a commit here (sd:9584). Add each instance to the fail
 # sd:10286: the round after the class pass, once, on the strongest model: the merge lane's rule, applied by the
 # run, in place of the park the lead ruled by hand. A FIX that survives, or a question, still parks.
 RULING = """The review of branch {branch} still found blockers after {rounds} rounds and the class pass. Do
-not park and do not fix everything: rule each blocker below by the merge-lane rule, then act on the ruling.
-- FIX when it names a concrete failing input, command or interruption that this change causes, in code
-  it touched or an unchanged caller it breaks. Fix it fail-first as a new commit in {worktree}.
-- REJECT when it names no such input, or its claim does not hold: give a reason a reader can check.
-- FILE anything else, a real defect this change does not cause: `sd task add "<title>" --belongs-to
-  {worktree}`, then treat it as rejected with the reason "filed as sd:N".
-Record each ruling on sd:{item} with `sd task note {item} "<blocker>: FIX|REJECT|FILE, <reason>" --kind
-decision`. A ruling that touches money, security or privacy risk, or a standing operator ruling, is the
-operator's: record it as a `--kind question` with options instead, and leave that blocker as it is.
-After your last commit, record every REJECT and FILE ruling as a rebuttal at the new HEAD:
-{adjudicate}
-Then update the body at {body}. Never push. Your final message is your report: each blocker, its ruling
-and reason, and the test of each fix.
+not fix everything: rule each numbered blocker below by the merge-lane rule, then act on your rulings.
+- fix: it names a concrete failing input, command or interruption that this change causes, in code it
+  touched or an unchanged caller it breaks. Fix it fail-first as a new commit in {worktree}.
+- reject: it names no such input, or its claim does not hold. Give a reason a reader can check.
+- file: a real defect this change does not cause. The supervisor files it as an item.
+- ask: the ruling touches money, security or privacy risk, or a standing operator ruling. It is the
+  operator's: the supervisor asks, and the build waits. Leave that blocker as it is.
+Record nothing yourself: run no `sd` command for a ruling. Write them as a JSON list to `{rulings}`, the
+one more file outside the worktree you may write, one object per blocker, every blocker ruled:
+{{"blocker": <its number>, "ruling": "fix" | "reject" | "file" | "ask", "reason": "<one line>"}}
+The supervisor reads that file after your last commit: it notes each ruling as a decision, records each
+reject and file as a rebuttal at the final head, files the items and asks the questions. A blocker with no
+ruling it can read stays a blocker. Then update the body at {body}. Never push. Your final message is
+your report: each blocker, its ruling and reason, and the test of each fix.
 
 {blockers}
 """
+#: The rulings `RULING` asks for, and the longest reason kept.
+RULINGS = ("fix", "reject", "file", "ask")
+REASON_MAX = 500
 
 DRAFT = """You are the headless lead, run by the build dispatcher (pack sd:6361). Draft the spec for one
 captured item. You hold the read tools only: read the repository in the current directory, its CLAUDE.md
@@ -1186,6 +1190,8 @@ class Supervisor:
         self.body = self.logs / f"sd-{lead_id}.body.md"
         # The last blocking round's findings whole, for a fix a usage limit interrupted (`walk`).
         self.round_file = self.logs / f"sd-{lead_id}.blockers.json"
+        # The ruling round's rulings, one per blocker of `round_file` (sd:10286).
+        self.rulings = self.logs / f"sd-{lead_id}.rulings.json"
         self.log = self.logs / f"{ident}.jsonl"
         self.reviewed: str | None = None
         self.blockers: list[dict] = []
@@ -1517,6 +1523,10 @@ class Supervisor:
     def reviewing(self) -> str | dict:
         self.enter("reviewing")
         head = self.head()
+        if (self.fresh()["review_round"] or 0) == REVIEW_ROUNDS + 1:
+            asked = self.ruled(head)  # the ruling round ran: its rulings, before the review that reads them
+            if asked is not None:
+                return asked
         # What enqueue would refuse goes back to the builder before a review is spent (pack sd:6926).
         refused = self.prechecked(head)
         if refused:
@@ -1934,9 +1944,7 @@ class Supervisor:
         The lane reviews the branch again; the rebuttal, in the record `sd-review` reads for this branch
         (pack sd:9270), holds back the same finding there and tells its readers where it went."""
         title = f"Review follow-up from build {self.row['branch']}: {row.get('path')}:{row.get('line')}"
-        remote = self.db.execute(f"SELECT remote FROM repo WHERE path IN ({paths.placeholders(paths.keys(self.row['repo']))})",
-                                 paths.keys(self.row["repo"])).fetchone()
-        repository = build.github_repository(remote["remote"] if remote else None).lower()
+        repository = self.github()
         with transaction(self.db):
             filed = create_item(self.db, kind="task", title=f"{title} {row.get('summary') or ''}"[:200],
                                 repo=self.row["repo"])
@@ -1954,6 +1962,116 @@ class Supervisor:
                         "findings": [{"raw_finding": raw, "response_disposition": "rebutted",
                                       "reason": f"filed as follow-up sd:{filed}: it is on code the build's fix did "
                                                 f"not change (pack sd:9769)"}]}})
+
+    def github(self) -> str:
+        """The repository's GitHub `owner/name`, lowercased, as a rebuttal binds it; "" with no GitHub origin."""
+        remote = self.db.execute(f"SELECT remote FROM repo WHERE path IN ({paths.placeholders(paths.keys(self.row['repo']))})",
+                                 paths.keys(self.row["repo"])).fetchone()
+        return build.github_repository(remote["remote"] if remote else None).lower()
+
+    def numbered(self, blockers: list[dict]) -> str:
+        """The blockers as the ruling round names them: `N. path:line summary`, N from 1 (sd:10286)."""
+        return "\n".join(f"{at}. {self.summary([row], None)[2:]}" for at, row in enumerate(blockers, 1))
+
+    def read_rulings(self, count: int) -> tuple[dict[int, tuple[str, str]], str]:
+        """The rulings file as {blocker number: (ruling, reason)} and what did not read, "" for nothing.
+
+        External input: a row counts only as an object with an int `blocker` in 1..count, a known `ruling` and a
+        `reason` that is text; the reason is folded to one line and cut. Two rulings for one blocker rule
+        neither: no order says which the builder meant."""
+        try:
+            rows = json.loads(self.rulings.read_text(encoding="utf-8"))
+        except OSError:
+            return {}, "no rulings file"
+        except (ValueError, RecursionError):
+            return {}, "the rulings file is not JSON"
+        if not isinstance(rows, list):
+            return {}, "the rulings file is not a JSON list"
+        found: dict[int, tuple[str, str]] = {}
+        twice, bad = set[int](), 0
+        for row in rows:
+            number, ruling, reason = (row.get(key) for key in ("blocker", "ruling", "reason")) if isinstance(
+                row, dict) else (None, None, None)
+            reason = " ".join(reason.split())[:REASON_MAX] if isinstance(reason, str) else ""
+            if type(number) is not int or not 1 <= number <= count or ruling not in RULINGS or not reason:
+                bad += 1
+            elif number in found or number in twice:
+                twice.add(number)
+                found.pop(number, None)
+            else:
+                found[number] = (ruling, reason)
+        unruled = [str(at) for at in range(1, count + 1) if at not in found]
+        return found, "; ".join(filter(None, (
+            f"{bad} row(s) did not read" if bad else "",
+            f"no single ruling for blocker(s) {', '.join(unruled)}" if unruled else "")))
+
+    def ruled(self, head: str) -> dict | None:
+        """Apply the ruling round's rulings at `head`, once, before the review after it (sd:10286); the blocked
+        end when one is the operator's, else None.
+
+        The supervisor writes what the builder cannot: the builder's review is no ship review `sd-ship
+        adjudicate` reads, and no blocker names a bundle member. So each ruling is a decision note on the lead;
+        a reject or file is a rebuttal in the record `sd-review` reads for this branch, bound to `head`, the
+        head after the round's last commit; a file is an item too. An `ask` ends the run with the question on
+        every member, so none is delivered around it. No file, or a blocker with no ruling that reads, changes
+        nothing for that blocker: the review finds it again and the run parks.
+        A blocker that is no review finding (an enqueue check, a failed gate: line "-") takes no rebuttal: no
+        review reads one for it."""
+        if not self.rulings.exists():
+            return None  # no ruling round wrote one for this head (a retry that kept the count): review as usual
+        blockers = self.round_blockers()
+        found, unread = self.read_rulings(len(blockers))
+        if unread:
+            self.note(self.lead, f"Build run {self.ident}: the ruling round's rulings at {head[:12]}: {unread}; "
+                                 f"each such blocker stays a blocker")
+        repository = self.github()
+        for number, (ruling, reason) in sorted(found.items()):
+            self.once(f"ruling:{head}:{number}", functools.partial(
+                self.rule, number, blockers[number - 1], ruling, reason, head, repository))
+        asked = [(blockers[number - 1], reason) for number, (ruling, reason) in sorted(found.items()) if ruling == "ask"]
+        if asked:
+            # Kept beside the body until the run ends: a replay of this end reads the same rulings.
+            # One line: a summary's own newline or `Option:` line must not reshape the question.
+            text = " ".join("; ".join(f"{self.summary([row])} ({reason})" for row, reason in asked).split())
+            return self.finish(
+                "blocked", f"the ruling round left {len(asked)} blocker(s) to the operator: {text}",
+                question=(f"Build run {self.ident} cannot rule on: {text}"[:build.FINDING_MAX - 80]
+                          + "\nOption: Fix it in this build (Recommended)\nOption: Reject it and deliver"))
+        # Applied: a later walk of this run, or a retry that keeps the count, must not apply them to another head.
+        self.rulings.unlink(missing_ok=True)
+        return None
+
+    def rule(self, number: int, row: dict, ruling: str, reason: str, head: str, repository: str) -> None:
+        """One ruling's writes in one transaction: the decision note, a filed item, the rebuttal (sd:10286).
+
+        The note's opening names the run, the blocker's number and the head: a supervisor that walks this step
+        again without its marks (a crash before the rulings file went) finds it and writes nothing twice."""
+        said = " ".join(self.summary([row]).split())
+        finding = row.get("line") != "-"
+        mark = f"Build run {self.ident} ruling {number} at {head[:12]}: "
+        with transaction(self.db):
+            if self.db.execute("SELECT 1 FROM note WHERE item = ? AND kind = 'decision' AND substr(body, 1, ?) = ?",
+                               (self.lead, len(mark), mark)).fetchone():
+                return
+            filed = None
+            if ruling == "file" and finding:
+                filed = create_item(self.db, kind="task", repo=self.row["repo"], title=(
+                    f"Review follow-up from build {self.row['branch']}: {row.get('path')}:{row.get('line')} "
+                    f"{row.get('summary') or ''}")[:200])
+                add_note(self.db, filed, "comment", f"Build run {self.ident}'s ruling round filed this review "
+                                                    f"blocker, not caused by its change ({reason}): "
+                                                    f"{self.summary([row], None)}")
+            add_note(self.db, self.lead, "decision",
+                     (f"{mark}{ruling.upper()}{f' as sd:{filed}' if filed else ''}, {reason}. Blocker: {said}"
+                      )[:build.FINDING_MAX])
+            if ruling in ("reject", "file") and finding and repository:
+                raw = {"path": self.locations(row)[0][0], "summary": row.get("summary"), "line": row.get("line"),
+                       "instances": [str(entry) for entry in row.get("instances") or []]}
+                record_state(self.db, "checkpoint", key=f"ship-adjudication:build-run:{self.ident}:ruling:{head}:{number}",
+                             body={"decision": "accepted", "proposal": {
+                                 "bindings": {"repository": repository, "branch": self.row["branch"], "head": head},
+                                 "findings": [{"raw_finding": raw, "response_disposition": "rebutted",
+                                               "reason": f"filed as follow-up sd:{filed}: {reason}" if filed else reason}]}})
 
     def own_checks(self, head: str) -> list[dict] | dict:
         """Run an unmanaged repository's own checks at `head`, each in a gate slot; a blocker per failure.
@@ -2095,8 +2213,14 @@ class Supervisor:
         session = self.fresh()["session_id"]
         if not session:
             return self.finish("blocked", "no builder session recorded to resume for the fix")
-        prompt = brief.format(blockers=self.summary(self.blockers, limit=None), **self.brief(), **extra,
-                              item=self.lead, adjudicate=ADJUDICATE.format(worktree=self.work, item=self.lead))
+        blockers = self.summary(self.blockers, limit=None)
+        if brief is RULING:
+            # Numbered, as the rulings name them. A rulings file from an earlier child is not this round's
+            # (a usage-limit resume, a retry that kept the count); a replayed child keeps what it wrote.
+            blockers = self.numbered(self.blockers)
+            if not self.will_replay("claude", self.fix_role()):
+                self.rulings.unlink(missing_ok=True)
+        prompt = brief.format(blockers=blockers, **self.brief(), **extra, rulings=self.rulings)
         rounds = self.fresh()["review_round"] or 0
         if rounds <= ESCALATE_AFTER:
             return self.claude(prompt, session=session, then="reviewing", role=self.fix_role())

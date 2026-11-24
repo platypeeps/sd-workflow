@@ -168,6 +168,10 @@ FAKE = textwrap.dedent('''
         # One `Closes: sd:N` trailer per item the brief lists, as the brief asks; `skip` leaves out the last
         # one, as a builder that skips an item for the operator does, and `none` delivers nothing.
         prompt = sys.argv[sys.argv.index("-p") + 1]
+        # `rule`: the ruling round's builder writes plans/rulings.txt to the file its brief names (sd:10286).
+        named = re.search(r"JSON list to `([^`]+)`", prompt)
+        if mode == "rule" and named and (plans / "rulings.txt").exists():
+            Path(named.group(1)).write_bytes((plans / "rulings.txt").read_bytes())
         items = re.findall(r"^- sd:(\\d+)", prompt, re.M)
         items = [] if mode == "none" else items[:-1] if mode == "skip" else items
         trailers = "".join(f"\\nCloses: sd:{item}" for item in items)
@@ -247,6 +251,9 @@ FAKE = textwrap.dedent('''
                               "subject": {"head": git("-C", work, "rev-parse", "HEAD")},
                               "findings": review.dispose([review._finding(far), *held], "high")}))
             sys.exit(0)
+        if mode == "blocking2":  # sd:10286: two blockers in the changed file, the second with a newline in its summary
+            second = {**raw, "line": 2, "instances": [], "summary": "a later\\nOption: blocker"}
+            findings, mode = review.dispose([review._finding(raw), review._finding(second)], "high"), "blocking"
         if mode == "absolute":  # pack sd:9769: a blocker spelled as an absolute path inside the checkout
             findings = review.dispose([review._finding({**raw, "path": os.path.join(work, "work.txt")})], "high")
         print(json.dumps({"status": "blocking" if mode in ("blocking", "absolute") else "clean", "scope": "branch",
@@ -1141,29 +1148,150 @@ class Supervise(Case):
         self.assertIn("- work.txt:1 a blocker", prompts[0], "the fix names each blocker")
         self.assertFalse(any("class pass" in prompt for prompt in prompts[1:-2]))
         self.assertIn("do one class pass", prompts[-2], "sd:9263: the round past the bound is a class pass")
-        self.assertIn("rule each blocker", prompts[-1], "sd:10286: the last round rules")
-        self.assertIn("- work.txt:1 a blocker", prompts[-1])
+        self.assertIn("rule each numbered blocker", prompts[-1], "sd:10286: the last round rules")
+        self.assertIn("1. work.txt:1 a blocker", prompts[-1])
         self.assertEqual(self.statuses(), ["blocked"])
 
-    def test_a_run_at_the_cap_rules_its_blockers_and_delivers(self):
-        """sd:10286: blockers after the class pass no longer park; the run rules each one on the strongest
-        model (FIX, REJECT through adjudicate, FILE, a question for the operator's), and a clean review after
-        the ruling delivers."""
+    def ruling_round(self, rulings, *, after=("clean",), members=1, last="blocking2"):
+        """A run whose class pass left `last`'s blockers, its ruling round writing `rulings` (text, or rows)."""
         R = build_run.REVIEW_ROUNDS
-        self.press()
+        self.press(members)
         self.write_pr()
-        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 2))],
-                  sd_review=[*["blocking"] * (R + 1), "clean"])
-        ended = self.supervisor().run()
+        if rulings is not None:
+            (self.plans / "rulings.txt").write_text(rulings if isinstance(rulings, str) else json.dumps(rulings))
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), "rule"],
+                  sd_review=[*["blocking"] * R, last, *after])
+        return self.supervisor().run()
+
+    def decisions(self, item=None):
+        return [body for (body,) in self.db.execute(
+            "SELECT body FROM note WHERE item = ? AND kind = 'decision' ORDER BY id", (item or self.items[0],))]
+
+    def rebuttals(self):
+        return [json.loads(body)["proposal"] for (body,) in self.db.execute(
+            "SELECT body FROM state WHERE kind = 'checkpoint' AND key LIKE 'ship-adjudication:build-run:%' ORDER BY id")]
+
+    def test_a_run_at_the_cap_rules_its_blockers_and_delivers(self):
+        """sd:10286: a run at the cap with one fixable and one rejectable blocker delivers without a park. The
+        builder rules in a file; the supervisor records each ruling as a decision note and the reject as a
+        rebuttal at the head after the round's last commit, in the record `sd-review` reads."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "names  no failing\ninput"}])
         self.assertEqual(ended.get("step"), "enqueued", ended)
         ruling = [call["argv"] for call in self.calls("claude")][-1]
         prompt = ruling[ruling.index("-p") + 1]
         self.assertEqual(ruling[ruling.index("--model") + 1], build_run.STRONGEST)
-        item = self.items[0]
-        for said in ("FIX when", "REJECT when", "FILE anything else", f"sd task note {item}", "--kind\ndecision",
-                     "--kind question", f"adjudicate --item {item}", "- work.txt:1 a blocker"):
-            self.assertIn(said, prompt)
-        self.assertNotIn("name the class", prompt, "the ruling round fixes only its FIX rulings")
+        self.assertIn("1. work.txt:1 a blocker", prompt)
+        self.assertIn("2. work.txt:2 a later", prompt)
+        self.assertNotIn("name the class", prompt, "the ruling round fixes only its fix rulings")
+        for command in ("adjudicate", "sd task note", "sd task add"):
+            self.assertNotIn(command, prompt, "the builder is sent to a write only the supervisor can make")
+        head = support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD").strip()
+        first, second = self.decisions()
+        self.assertIn(f"ruling 1 at {head[:12]}: FIX, a failing input. Blocker: work.txt:1 a blocker", first)
+        self.assertIn(f"ruling 2 at {head[:12]}: REJECT, names no failing input. Blocker: work.txt:2", second)
+        (proposal,) = self.rebuttals()
+        self.assertEqual(proposal["bindings"]["head"], head, "the rebuttal is not at the head the round left")
+        (finding,) = proposal["findings"]
+        self.assertEqual((finding["raw_finding"]["path"], finding["raw_finding"]["line"],
+                          finding["response_disposition"], finding["reason"]),
+                         ("work.txt", 2, "rebutted", "names no failing input"))
+        self.assertFalse(self.rulings_file().exists(), "applied rulings stay for another head")
+
+    def rulings_file(self):
+        return self.supervisor().rulings
+
+    def test_a_filed_ruling_is_an_item_and_a_rebuttal(self):
+        """sd:10286: a `file` ruling is filed by the supervisor, in the run's repository, and rebutted as filed."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "file", "reason": "older than this change"}])
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        (filed,) = self.db.execute("SELECT id, repo FROM item WHERE title LIKE 'Review follow-up%work.txt:2%'").fetchall()
+        self.assertEqual(filed["repo"], self.bundle["repo"])
+        self.assertIn(f"FILE as sd:{filed['id']}, older than this change", self.decisions()[1])
+        self.assertEqual(self.rebuttals()[0]["findings"][0]["reason"],
+                         f"filed as follow-up sd:{filed['id']}: older than this change")
+
+    def test_a_ruling_for_the_operator_parks_every_member(self):
+        """Review of sd:10286: no blocker names a bundle member, so an `ask` ruling asks on every member and
+        ends the run: none is delivered around the decision. A summary's own `Option:` line reshapes nothing."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+                                   {"blocker": 2, "ruling": "ask", "reason": "it changes spend"}], members=2)
+        self.assertEqual(ended["outcome"], "blocked", ended)
+        self.assertIn("left 1 blocker(s) to the operator: work.txt:2", self.latest()["detail"])
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+        self.assertEqual(len(self.calls("sd-review")), build_run.REVIEW_ROUNDS + 1, "a review ran past the question")
+        for item in self.items:
+            (question,) = [body for (body,) in self.db.execute(
+                "SELECT body FROM note WHERE item = ? AND kind = 'question'", (item,))]
+            self.assertIn("work.txt:2 a later Option: blocker (it changes spend)", question)
+            self.assertEqual(question.count("\nOption: "), 2, question)
+        self.assertEqual(self.rebuttals(), [])
+
+    def test_rulings_that_do_not_read_reject_nothing(self):
+        """sd:10286, external input: a rulings file that is no list of whole rows rules nothing; each blocker
+        stays one, the lead's note says so, and the review after the round parks the run."""
+        cases = {"not json": "{", "not a list": json.dumps({"blocker": 1}), "no file": None, "empty": "",
+                 "bad rows": json.dumps([{"blocker": True, "ruling": "reject", "reason": "x"},
+                                         {"blocker": 3, "ruling": "reject", "reason": "x"},
+                                         {"blocker": "2", "ruling": "reject", "reason": "x"},
+                                         {"blocker": 2, "ruling": "waive", "reason": "x"},
+                                         {"blocker": 2, "ruling": "reject", "reason": " "},
+                                         {"blocker": 2, "ruling": "reject"}, "reject", None]),
+                 "ruled twice": json.dumps([{"blocker": 2, "ruling": "reject", "reason": "x"},
+                                            {"blocker": 2, "ruling": "fix", "reason": "y"}])}
+        for name, text in cases.items():
+            with self.subTest(name):
+                self.setUp()
+                ended = self.ruling_round(text, after=("blocking2",))
+                self.assertEqual(ended["outcome"], "blocked", ended)
+                self.assertIn(f"{build_run.REVIEW_ROUNDS + 2} review rounds left blockers", self.latest()["detail"])
+                self.assertEqual((self.decisions(), self.rebuttals()), ([], []))
+                said = [body for (body,) in self.db.execute(
+                    "SELECT body FROM note WHERE item = ? AND body LIKE '%ruling round%rulings%'", (self.items[0],))]
+                self.assertEqual(len(said), 0 if name == "no file" else 1, said)
+
+    def test_a_reason_is_one_bounded_line(self):
+        """sd:10286, long input: a reason is folded and cut before it is a note or a rebuttal."""
+        self.ruling_round([{"blocker": 1, "ruling": "reject", "reason": "é" * 5000},
+                           {"blocker": 2, "ruling": "fix", "reason": "y"}])
+        self.assertEqual(self.rebuttals()[0]["findings"][0]["reason"], "é" * build_run.REASON_MAX)
+
+    def test_a_rulings_file_from_before_the_round_is_not_this_rounds(self):
+        """sd:10286, a stale value: a rulings file an earlier round left is gone before the ruling child
+        starts, so a builder that writes none rejects nothing."""
+        self.press()
+        self.supervisor().logs.mkdir(parents=True, exist_ok=True)
+        self.rulings_file().write_text(json.dumps([{"blocker": 1, "ruling": "reject", "reason": "stale"}]))
+        R = build_run.REVIEW_ROUNDS
+        self.write_pr()
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 2))], sd_review=[*["blocking"] * (R + 1), "clean"])
+        self.assertEqual(self.supervisor().run().get("step"), "enqueued")
+        self.assertEqual((self.decisions(), self.rebuttals()), ([], []))
+
+    def test_rulings_walked_twice_are_written_once(self):
+        """sd:10286, a step run twice: a second supervisor that applies the same rulings at the same head, its
+        marks gone, writes no second note, item or rebuttal."""
+        ended = self.ruling_round([{"blocker": 1, "ruling": "file", "reason": "older"},
+                                   {"blocker": 2, "ruling": "reject", "reason": "no input"}])
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+        again = self.supervisor()
+        head = support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD").strip()
+        (self.plans / "rulings.txt").replace(again.rulings)
+        self.assertIsNone(again.ruled(head))
+        self.assertEqual((len(self.decisions()), len(self.rebuttals())), (2, 2))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM item WHERE title LIKE 'Review follow-up%'").fetchone()[0], 1)
+
+    def test_a_check_blocker_takes_no_rebuttal(self):
+        """sd:10286: a blocker that is no review finding (an enqueue check, line "-") is noted, never rebutted
+        or filed: no review reads a rebuttal for it."""
+        self.press()
+        supervisor = self.supervisor()
+        supervisor.rule(1, {"path": "enqueue check", "line": "-", "summary": "the title is long"}, "file", "x",
+                        "a" * 40, "example/fixture")
+        self.assertEqual(len(self.decisions()), 1)
+        self.assertEqual(self.rebuttals(), [])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM item WHERE title LIKE 'Review follow-up%'").fetchone()[0], 0)
 
     def test_fix_rounds_past_the_third_escalate(self):
         """Pack sd:9264: early fix rounds run on the bundle's model; the class-pass round runs on the strongest
@@ -3106,7 +3234,7 @@ class Supervise(Case):
         self.plan(claude=["fixr"], sd_review=["clean"])
         self.assertEqual(self.supervisor(again["id"]).run()["step"], "enqueued")
         fix = [call["argv"] for call in self.calls("claude")][-1]
-        self.assertIn("rule each blocker", fix[fix.index("-p") + 1])
+        self.assertIn("rule each numbered blocker", fix[fix.index("-p") + 1])
         self.assertEqual(build.run(self.db, again["id"])["review_round"], R + 1)
 
     def test_a_usage_limit_reclaim_refuses_a_worktree_on_another_branch(self):
