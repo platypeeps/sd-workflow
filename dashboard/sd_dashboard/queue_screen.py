@@ -89,7 +89,6 @@ import subprocess
 import tempfile
 import threading
 import time
-import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -367,13 +366,12 @@ def _line(raw: object) -> str | None:
     as exact JSON. A folded or partial print let two findings read alike, another failing input or affected path
     among them, so Reject rebutted one the operator never saw (sd:9966 review round 3). None for a finding that is
     no object: no review the page can name. HTML folds a run of spaces and hides a no-break or zero-width space, so
-    every such character, and every space beside another, prints escaped, still valid JSON (sd:9966 lead review)."""
+    every space beside another prints escaped, still valid JSON (sd:9966 lead review). Every other character past
+    ASCII prints escaped too: a homoglyph or combining mark printed raw read like another finding, and a hand-made
+    escape of a character past U+FFFF read back as another one (sd:10246)."""
     if not (isinstance(raw, dict) and raw):
         return None
-    def hidden(c):
-        return c != " " and (c.isspace() or unicodedata.category(c) in ("Cf", "Zs", "Zl", "Zp"))
-    text = "".join(f"\\u{ord(c):04x}" if hidden(c) else c for c in json.dumps(raw, ensure_ascii=False, sort_keys=True))
-    return re.sub(r" (?= )|(?<= ) ", r"\\u0020", text)
+    return re.sub(r" (?= )|(?<= ) ", r"\\u0020", json.dumps(raw, sort_keys=True))
 
 
 def shown_review(review: tuple[str, list[str]], template: dict) -> tuple[list[str], str] | None:
@@ -399,7 +397,7 @@ def _review_fields(entry: dict, lane: Path) -> dict:
     False only when adjudicate's template says none, so Retry asks first only then; None when not read here."""
     tree = _here(entry)
     if not (tree and _logged(entry, lane).get("code") == REVIEW_BLOCKING):
-        return {"review": None, "review_findings": [], "held": None}
+        return {"review": None, "review_findings": [], "held": None, "reviewed_head": None}
     review = review_of(_answer(entry, lane))
     # One read-only template call, only on a review-blocked row: rebut's step 1, which writes nothing.
     template = _run([command("sd-ship"), "-C", str(tree), "adjudicate", "--item", str(entry.get("item")),
@@ -408,8 +406,8 @@ def _review_fields(entry: dict, lane: Path) -> dict:
     recorded = template.get("recorded_revision", False) if template.get("exit") == 0 else False
     held = None if recorded is False else recorded is not None
     shown = shown_review(review, template) if review else None
-    if shown:
-        return {"review": shown[1], "review_findings": shown[0], "held": held}
+    if shown:  # `reviewed_head`: the head Reject's CLI line adjudicates at (sd:10246)
+        return {"review": shown[1], "review_findings": shown[0], "held": held, "reviewed_head": review[0]}
     proposal = template.get("proposal") if template.get("exit") == 0 else None
     live = proposal.get("findings") if isinstance(proposal, dict) else None
     if review and isinstance(live, list) and [row.get("finding_digest") if isinstance(row, dict) else None
@@ -417,7 +415,7 @@ def _review_fields(entry: dict, lane: Path) -> dict:
         # The review at that head ran again since the log: its findings are not the logged ones, so no Reject,
         # and Retry, which runs prepare against the live review, stays on (sd:9966 lane review).
         held = None
-    return {"review": None, "review_findings": [], "held": held}
+    return {"review": None, "review_findings": [], "held": held, "reviewed_head": None}
 
 
 def _logged(entry: dict, lane: Path) -> dict:
