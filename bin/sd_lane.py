@@ -2188,10 +2188,16 @@ def reconciled_train(entry: dict[str, Any], worktree: pathlib.Path, ship: Ship,
                      log: pathlib.Path) -> dict[str, Any]:
     """The claimed entry's fields after its train landed: `sd-ship reconcile`, which sends no merge (sd:9923).
 
-    GitHub may still read the pull request open; a refused reconcile puts
-    the entry back for its next prepare, which reconciles, never merges alone.
+    GitHub may still read the pull request open; a refused reconcile, or
+    one that raised (a log it could not write), puts the entry back for its
+    next prepare, which reconciles, never merges alone.
     """
-    merged = ship(["-C", str(worktree), "reconcile", "--item", str(entry["item"]), "--json"], log)
+    try:
+        merged = ship(["-C", str(worktree), "reconcile", "--item", str(entry["item"]), "--json"], log)
+    except Stop:
+        raise
+    except Exception as error:  # noqa: BLE001 -- the train landed; nothing here may fail the entry
+        merged = {"error": f"{type(error).__name__}: {error}"}
     if merged.get("ok") and merged.get("phase") == "merged":
         return {"merge_log": str(log), "status": "merged", "merge_commit": merged.get("merge_commit")}
     why = f"the train landed; reconcile: {merged.get('error') or merged.get('code') or merged.get('phase')}"

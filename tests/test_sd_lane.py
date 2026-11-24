@@ -2189,6 +2189,20 @@ class TrainLanding(Trees):
         self.assertNotIn(1, self.merges())
         self.assertEqual(self.entries()[0]["retryable_fault"]["step"], "train")
 
+    def test_a_landed_train_whose_claimed_reconcile_raises_is_put_back_not_failed(self) -> None:
+        """Review of sd:9923: a reconcile log that could not be written raised out of the lead's reconcile,
+        so the lane finished a lead whose train had landed as failed."""
+        def ship(argv: list[str], log: pathlib.Path) -> dict:
+            if argv[2] == "reconcile" and argv[argv.index("--item") + 1] == "1":
+                raise OSError(28, "No space left on device")
+            return self.ship(argv, log)
+        self.queue_three()
+        sd_lane.run_lane(self.repo, self.environ, ship, self.gate)
+        lead = self.entries()[0]
+        self.assertEqual((lead["status"], lead["retryable_fault"]["step"]), ("pending", "train"))
+        self.assertIn("No space left on device", lead["retryable_fault"]["reason"])
+        self.assertNotIn(1, self.merges())
+
     def test_a_landed_train_whose_reconcile_refuses_past_its_retries_is_held_not_failed(self) -> None:
         """Lane review of sd:9923: a stale GitHub read after the train landed spent the one retry and
         failed the entry, so main held the train and its delivery stayed open."""
