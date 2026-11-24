@@ -520,9 +520,9 @@ def _press_refusal(connection, row, *, lead: int | None = None, riding: Collecti
                 f"{', '.join(RUNNABLE_KINDS[:-1])} and {RUNNABLE_KINDS[-1]} items")
     # A design its ride brings into this item's bundle holds it no more: else each waited on the other
     # forever (review of sd:10096).
-    aboard = {other for other in riding if connection.execute(
+    here = {other for other in riding if connection.execute(
         "SELECT repo FROM item WHERE id = ?", (other,)).fetchone()["repo"] == row["repo"]}
-    waiting = waiting_on(connection, row, riding=aboard | _riding(connection, row["repo"]))
+    waiting = waiting_on(connection, row, riding=here | _riding(connection, row["repo"]))
     if waiting:
         return f"item {item} {waiting}"
     refused = _repo_refusal(row, connection)
@@ -918,13 +918,14 @@ def _queue_members(connection, members: list[dict], items: dict, *, lead: int, w
     """Queue each ended bundle member again under `lead`, its item ready and unparked, with the finding or the
     parked run's blockers as a note: Retry's and bundle drop's one path (pack sd:9709)."""
     queued = []
+    riding = aboard(connection, [member["item"] for member in members])  # queued again together (class pass)
     for member in members:
         item = items.get(member["item"])
         if item is not None and item["status"] == "blocked":
             transition(connection, member["item"], "ready", who=who, reason=how)
         unpark(connection, member["item"])
         try:
-            _item(connection, member["item"], lead=lead)
+            _item(connection, member["item"], lead=lead, riding=riding)
         except BuildRefused as refusal:
             raise BuildRefused(f"{verb} refused: {refusal}") from None
         fresh = queue_state(connection, member["id"])["revision"]
@@ -1334,8 +1335,10 @@ def _retry_takes(connection, lead: int, status: str) -> bool:
     if not members or not all(_current(connection, member) for member in members):
         return False
     ahead, behind = _inside(connection, row["item"], members)
+    riding = aboard(connection, [member["item"] for member in members if member not in behind])
     return bool(ahead) or all(
-        _press_refusal(connection, connection.execute(_REPO, (member["item"],)).fetchone(), lead=lead) is None
+        _press_refusal(connection, connection.execute(_REPO, (member["item"],)).fetchone(), lead=lead,
+                       riding=riding) is None
         for member in members if member not in behind)
 
 
@@ -1958,9 +1961,10 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
         # So does a design member whose ruling was taken back since its Retry: a bundle that ran before claims
         # whole (`_bundle`), so it holds as one a dependency holds (class pass of sd:10096).
         # A design that rides this bundle holds none of its members (review of sd:10096).
-        aboard = {row["item"] for row in bundle if _rides(connection, row)}
+        # Fresh or retried: a retried design row is no ride, and it is aboard all the same (class pass).
+        riding = aboard(connection, [row["item"] for row in bundle])
         waiting = [(row, why) for row in bundle if (why := waiting_on(connection, connection.execute(
-            "SELECT id, fields FROM item WHERE id = ?", (row["item"],)).fetchone(), riding=aboard)
+            "SELECT id, fields FROM item WHERE id = ?", (row["item"],)).fetchone(), riding=riding)
             or design_waits(connection, row["item"]))]
         # Ran before means work to resume: a run, a drop's kept work, or members on the lead's branch. A drop's
         # solo row counts a run with no run row (`drop_writes`); held as a retry it would park with nothing for
@@ -1976,7 +1980,7 @@ def claim(connection, *, owner: str, load: float | None, load_cap: float | None,
             # It leaves before any row is refused, so one that waits itself leaves too (review of build/sd-1306).
             # A drop's kept lead that never ran leaves its member too: its Retry resumes the split branch once the
             # member is done (review of build/sd-1306).
-            needed = _needed(connection, [row["item"] for row, _ in waiting])
+            needed = _needed(connection, [row["item"] for row, _ in waiting], riding=riding)
             # A kept lead's marker names the kept run, which `left_out` reads as run 0. Unlike a member that leaves
             # before the claim (round 21), this one may be marked done by hand, and the lead then resumes the
             # split branch: only the marker makes its first run check that branch (review of build/sd-1306).
@@ -2096,8 +2100,28 @@ def _rides(connection, row) -> bool:
     return row["parent"] is None and not row["run_count"] and work_kind(connection, row["item"]) == DESIGN_KIND
 
 
-def _needed(connection, items: list[int]) -> set[int]:
-    """The open items `items` wait on, directly or through other open items (pack sd:9570)."""
+def aboard(connection, items) -> set[int]:
+    """The design items among `items`, the items of one bundle. The one rule every reader of a bundle's
+    dependencies asks (class pass of sd:10096): a design aboard is committed with the bundle's work, so it is
+    no dependency of a member there, fresh or retried; delivery holds a member whose design it leaves out
+    (`design_left`)."""
+    return {item for item in items if work_kind(connection, item) == DESIGN_KIND}
+
+
+def design_left(connection, delivered: list[int], bundle: list[int]) -> str | None:
+    """Why a delivery of `delivered` out of `bundle` may not ship, or None: a delivered item waits, directly or
+    through open items, on a design of the bundle that the delivery leaves out and that is not done."""
+    left = aboard(connection, bundle) - set(delivered)
+    for item in delivered:
+        held = sorted(_needed(connection, [item]) & left)
+        if held:
+            return f"sd:{item} waits on design sd:{held[0]}, which this delivery leaves out"
+    return None
+
+
+def _needed(connection, items: list[int], *, riding: Collection[int] = ()) -> set[int]:
+    """The open items `items` wait on, directly or through other open items (pack sd:9570), but for a design
+    aboard their bundle (`riding`, `aboard`)."""
     needed: set[int] = set()
     pending = list(items)
     while pending:
@@ -2108,7 +2132,7 @@ def _needed(connection, items: list[int]) -> set[int]:
             continue
         for other in named:
             status = connection.execute("SELECT status FROM item WHERE id = ?", (other,)).fetchone()
-            if other not in needed and status is not None and status["status"] != "done":
+            if other not in needed and other not in riding and status is not None and status["status"] != "done":
                 needed.add(other)
                 pending.append(other)
     return needed
@@ -2712,10 +2736,12 @@ def _inside(connection, lead: int, members: list[dict]) -> tuple[list[dict], lis
     waits on an item of the bundle. Neither can build in it: `ahead` leaves to build on its own (`_free`), and
     `behind` leaves the send-back, parked, as a subset Retry leaves one out."""
     bundle = {member["item"] for member in members}
-    needed = _needed(connection, [lead])
+    # A design aboard builds in the bundle with the members that wait on it: it is neither (class pass of sd:10096).
+    riding = aboard(connection, {lead, *bundle})
+    needed = _needed(connection, [lead], riding=riding)
     ahead = [member for member in members if member["item"] != lead and member["item"] in needed]
     behind = [member for member in members if member["item"] != lead and member not in ahead
-              and _needed(connection, [member["item"]]) & bundle]
+              and _needed(connection, [member["item"]], riding=riding) & bundle]
     return ahead, behind
 
 
@@ -2756,8 +2782,10 @@ def _sendable(connection, read: dict) -> tuple[list[dict], list[dict]]:
 def _waiting(connection, members: list[dict]) -> str:
     """What a send-back's members wait on, as Retry's `_item` reads it, or "": dispatch would block and park a
     bundle sent back while a dependency is open (review of pack sd:9570)."""
+    riding = aboard(connection, [member["item"] for member in members])
     return "; ".join(f"item {member['item']} {why}" for member in members if (why := waiting_on(
-        connection, connection.execute("SELECT id, fields FROM item WHERE id = ?", (member["item"],)).fetchone())))
+        connection, connection.execute("SELECT id, fields FROM item WHERE id = ?", (member["item"],)).fetchone(),
+        riding=riding)))
 
 
 def _sent_back(connection, read: dict) -> list[dict]:

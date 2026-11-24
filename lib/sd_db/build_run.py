@@ -2049,8 +2049,11 @@ class Supervisor:
             if re.fullmatch(r"docs/work/[^/]+/design\.md", path):
                 text = _read_bytes([*git, "cat-file", "blob", f"{head}:{path}"], env=self.env).decode("utf-8", "replace")
                 # The front matter's `item:` line alone: one in a Markdown example names no owner (review).
-                front = re.match(r"---\n(.*?)\n---(?:\n|$)", text, re.S)
-                named = re.search(r"^item:\s*sd:([0-9]+)\s*$", front.group(1), re.M) if front else None
+                # It ends at the first closing `---` line, an empty one too (class pass).
+                lines = text.split("\n")
+                front = lines[1:lines.index("---", 1)] if lines[0] == "---" and "---" in lines[1:] else []
+                named = next((found for line in front if (found := re.fullmatch(r"item:\s*sd:([0-9]+)\s*", line))),
+                             None)
                 owned |= {int(named.group(1))} if named else set()
         missing = [item for item in designs if item not in owned]
         if not missing:
@@ -2186,6 +2189,11 @@ class Supervisor:
         if not delivered and asked:
             return self.finish("blocked", f"every cited item has an open question since the run started: "
                                           f"{', '.join(f'sd:{item}' for item in asked)}")
+        # A member ships with the design it waits on or not at all: one left out above, or with no commit,
+        # holds the delivery (class pass of sd:10096).
+        left = build.design_left(self.db, delivered, [self.lead, *self.others])
+        if left:
+            return self.finish("blocked", f"{left}; rule on the design or commit its design.md, then Retry")
         # A member the operator cancelled on its own needs no line: the lane reads it from data (`build.left`).
         if asked:
             # The lane closes every open item a branch trailer cites; a `Refs:` line keeps these open.

@@ -182,8 +182,10 @@ FAKE = textwrap.dedent('''
         for name, owners in ([("all", designs)] if mode == "one-design" else [(n, [n]) for n in designs]):
             path = Path(f"docs/work/2026-01-01-design-{name}/design.md")
             path.parent.mkdir(parents=True, exist_ok=True)
-            head = ("".join(f"Example:\\n\\n```\\nitem: sd:{n}\\n```\\n\\n" for n in owners)
-                    if mode == "fenced-design" else "".join(f"---\\nitem: sd:{n}\\n---\\n" for n in owners))
+            fenced = "".join(f"Example:\\n\\n```\\nitem: sd:{n}\\n```\\n\\n" for n in owners)
+            # `empty-front-design`: empty front matter, the example, then a horizontal rule.
+            head = (fenced if mode == "fenced-design" else "---\\n---\\n" + fenced + "---\\n\\n"
+                    if mode == "empty-front-design" else "".join(f"---\\nitem: sd:{n}\\n---\\n" for n in owners))
             path.write_text(head + table)
             git("add", "--", str(path))
         # One `Closes: sd:N` trailer per item the brief lists, as the brief asks; `skip` leaves out the last
@@ -191,6 +193,8 @@ FAKE = textwrap.dedent('''
         prompt = sys.argv[sys.argv.index("-p") + 1]
         items = re.findall(r"^- sd:(\\d+)", prompt, re.M)
         items = [] if mode == "none" else items[:-1] if mode == "skip" else items
+        if mode == "skip-design":  # cites every item but the designs
+            items = [item for item in items if item not in designs]
         trailers = "".join(f"\\nCloses: sd:{item}" for item in items)
         message = f"fix: {mode}" + "".join("\\n\\n" + text for text in extra.get("message", []))
         git("-c", "commit.gpgsign=false", "commit", "-qm", message + (f"\\n{trailers}" if items else ""))
@@ -5431,6 +5435,84 @@ class Drafts(Case):
         assert bundle is not None
         self.assertEqual([one["item"] for one in build.run(self.db, bundle["id"])["members"]], [code, design])
 
+    def bound(self):
+        """A claimed bundle of a code item and the written design it waits on: (code, design)."""
+        design = self.designed("draft-plain")
+        code = create_item(self.db, kind="task", title="Build me", repo=str(self.repo), status="ready",
+                           fields={"blocked_by": [design]})
+        build.queue(self.db, [code], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        self.bundle, self.items = bundle, [code, design]
+        return code, design
+
+    def park_bundle(self):
+        build.end(self.db, self.bundle["id"], "blocked", "3 review rounds left blockers: a.py:2 pin check")
+        # The block holds the run until a reap reads its supervisor gone: release it as that reap does.
+        self.db.execute("UPDATE runner_run SET released_at = created_at WHERE id = ?", (self.bundle["id"],))
+        self.db.execute("UPDATE runner_lease SET released_at = (SELECT created_at FROM runner_run WHERE id = ?) "
+                        "WHERE run = ?", (self.bundle["id"], self.bundle["id"]))
+
+    def reclaimed(self):
+        again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                            root=self.root / "worktrees")
+        assert again is not None
+        return [one["item"] for one in build.run(self.db, again["id"])["members"]]
+
+    def test_a_retry_keeps_a_code_item_with_the_design_it_waits_on(self):
+        """Class pass of sd:10096: Retry read the design as a member its lead waits on, so the design left
+        to build alone, which a design never does, and the lead stayed ended. A design aboard the bundle
+        is no dependency of it: Retry queues both, and the claim takes the bundle whole."""
+        code, design = self.bound()
+        self.park_bundle()
+        queued = build.retry(self.db, self.bundle["assignment"], who="operator")["queued"]
+        self.assertEqual([row["item"] for row in queued], [code, design])
+        self.assertEqual(self.reclaimed(), [code, design])
+
+    def test_build_by_item_retries_a_code_item_with_the_design_it_waits_on(self):
+        """Class pass of sd:10096: `sd assignments build` of the code item reads the same bundle Retry."""
+        code, design = self.bound()
+        self.park_bundle()
+        queued = build.queue_again(self.db, [code], who="operator")
+        self.assertEqual([row["item"] for row in queued], [code, design])
+        self.assertEqual(self.reclaimed(), [code, design])
+
+    def test_a_code_item_is_not_delivered_without_the_design_it_waits_on(self):
+        """Class pass of sd:10096: the operator replaces the design's ruling while the bundle builds, so
+        delivery leaves the design out. The code item that waits on it shipped alone. The run now blocks."""
+        design = self.designed("draft")
+        [asked] = [note for note in self.notes() if note["kind"] == "question"]
+        add_note(self.db, design, "decision", f"Ruling on note #{asked['id']}: A")
+        resolve_note(self.db, asked["id"])
+        build.queue(self.db, [design], who="operator")
+        code = create_item(self.db, kind="task", title="Build me", repo=str(self.repo), status="ready",
+                           fields={"blocked_by": [design]})
+        build.queue(self.db, [code], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        self.bundle, self.items = bundle, [code, design]
+        self.write_pr()
+        (self.plans / "rule.json").write_text(json.dumps({"item": design, "body": f"Ruling on note #{asked['id']}: B"}))
+        self.plan(claude=["rule"], sd_review=["clean"])
+        ended = self.supervisor().run()
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+        self.assertIn(f"sd:{code} waits on design sd:{design}, which this delivery leaves out",
+                      build.run(self.db, bundle["id"])["detail"])
+
+    def test_a_code_item_is_not_delivered_when_its_design_has_no_commit(self):
+        """Class pass of sd:10096: the builder cites the code item and skips the design it waits on."""
+        code, design = self.bound()
+        self.write_pr()
+        self.plan(claude=["skip-design"], sd_review=["clean"])
+        ended = self.supervisor().run()
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
+        self.assertIn(f"sd:{code} waits on design sd:{design}, which this delivery leaves out",
+                      build.run(self.db, self.bundle["id"])["detail"])
+
     def test_a_code_item_still_waits_on_a_design_with_no_ride(self):
         """The ride exemption reads a queued ride only: a design not yet written still holds its code item."""
         design, _ = self.design()
@@ -5538,6 +5620,21 @@ class Drafts(Case):
         self.items = [self.items[0], design]
         self.write_pr()
         self.plan(claude=["fenced-design"], sd_review=["clean"])
+        with mock.patch.object(build_run, "REVIEW_ROUNDS", 1):
+            ended = self.supervisor().run()
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual(self.calls("sd-review"), [], "no review ran")
+        self.assertIn(f"design.md of its own: sd:{design} has none", build.run(self.db, self.bundle["id"])["detail"])
+
+    def test_an_example_after_empty_front_matter_owns_no_design(self):
+        """Class pass of sd:10096: empty front matter, then a fenced `item:` example, then a horizontal
+        rule: the owner read ran on to the rule and took the example. The front matter ends at its first
+        closing `---` line."""
+        design = self.designed("draft-plain")
+        self.press()
+        self.items = [self.items[0], design]
+        self.write_pr()
+        self.plan(claude=["empty-front-design"], sd_review=["clean"])
         with mock.patch.object(build_run, "REVIEW_ROUNDS", 1):
             ended = self.supervisor().run()
         self.assertEqual(ended.get("outcome"), "blocked", ended)
