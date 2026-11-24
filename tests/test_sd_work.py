@@ -82,6 +82,26 @@ class TaskCLI(unittest.TestCase):
         self.call("task", "add", "An idea", "--kind", "work-idea")
         self.call("task", "add", "Ranked", "--priority", 3)
 
+    def test_task_show_prints_the_items_review_rounds_and_cost(self):
+        """sd:10401: `sd task show` gives the item's review rounds, clean ones too, and their cost; JSON is unchanged."""
+        item = json.loads(self.call("task", "add", "--priority", "3", "Built", "--json").stdout)["item"]["id"]
+        self.assertNotIn("reviews:", self.call("task", "show", item).stdout, "no run, no line")
+        with database(home=self.home) as connection:
+            lead = sd_db.create_assignment(connection, item=item, role="author", status="done", lane="parallel")
+            connection.execute("UPDATE assignment SET scope = 'build' WHERE id = ?", (lead,))
+            sd_db.upsert_repo(connection, "/example/repo", remote="https://github.com/example/repo.git", managed=1)
+            connection.execute(
+                "INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, step, "
+                "review_round, created_at, updated_at) VALUES ('r1', ?, 1, '/example/repo', 'build/sd-1', 'fixture', "
+                "'/w', '/w', 'enqueued', 2, '2026-11-24T00:00:00Z', '2026-11-24T00:00:00Z')", (lead,))
+            connection.execute("INSERT INTO cost (timestamp, role, assignment, pass, tokens_in, tokens_out, usd, "
+                               "source) VALUES ('2026-11-24T00:00:00Z', 'author', ?, 'r1', 1200, 30, 3.5, 'run')",
+                               (lead,))
+        shown = self.call("task", "show", item).stdout
+        self.assertIn("reviews: 3 rounds (2 blocking, 1 clean build, 0 lane) over 1 build runs", shown)
+        self.assertIn("tokens 1,200 in, 30 out · $3.50", shown)
+        self.assertNotIn("reviews", json.loads(self.call("task", "show", item, "--json").stdout))
+
     def test_experiment_designates_and_refuses_a_bad_parent(self):
         """sd:3982: `--experiment` writes the designation; a task of itself or of an undesignated item refuses."""
         first = json.loads(self.call("task", "add", "--priority", "3", "An experiment", "--json").stdout)["item"]["id"]
