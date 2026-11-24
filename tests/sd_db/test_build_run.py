@@ -178,10 +178,13 @@ FAKE = textwrap.dedent('''
         # puts every design in one file, so a single file closes them all.
         designs = re.findall(r"^- sd:(\\d+):$", sys.argv[sys.argv.index("-p") + 1], re.M)
         table = "| Step | State moved | Failure | Recovery | Test |\\n| --- | --- | --- | --- | --- |\\n| a | b | c | d | e |\\n"
+        # `fenced-design` names each design only in a fenced Markdown example, with no front matter.
         for name, owners in ([("all", designs)] if mode == "one-design" else [(n, [n]) for n in designs]):
             path = Path(f"docs/work/2026-01-01-design-{name}/design.md")
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("".join(f"---\\nitem: sd:{n}\\n---\\n" for n in owners) + table)
+            head = ("".join(f"Example:\\n\\n```\\nitem: sd:{n}\\n```\\n\\n" for n in owners)
+                    if mode == "fenced-design" else "".join(f"---\\nitem: sd:{n}\\n---\\n" for n in owners))
+            path.write_text(head + table)
             git("add", "--", str(path))
         # One `Closes: sd:N` trailer per item the brief lists, as the brief asks; `skip` leaves out the last
         # one, as a builder that skips an item for the operator does, and `none` delivers nothing.
@@ -5491,6 +5494,20 @@ class Drafts(Case):
         self.assertEqual(ended.get("outcome"), "blocked", ended)
         self.assertEqual(self.calls("sd-review"), [], "no review ran")
         self.assertIn(f"design.md of its own: sd:{second} has none", build.run(self.db, self.bundle["id"])["detail"])
+
+    def test_a_fenced_example_owns_no_design(self):
+        """Review of sd:10096: a design.md that names its item only in a fenced Markdown example, with no
+        front matter, passed the ownership check, so the item closed with no design of its own."""
+        design = self.designed("draft-plain")
+        self.press()
+        self.items = [self.items[0], design]
+        self.write_pr()
+        self.plan(claude=["fenced-design"], sd_review=["clean"])
+        with mock.patch.object(build_run, "REVIEW_ROUNDS", 1):
+            ended = self.supervisor().run()
+        self.assertEqual(ended.get("outcome"), "blocked", ended)
+        self.assertEqual(self.calls("sd-review"), [], "no review ran")
+        self.assertIn(f"design.md of its own: sd:{design} has none", build.run(self.db, self.bundle["id"])["detail"])
 
     def test_a_ruling_in_the_claims_second_is_no_replacement(self):
         """Review of sd:10096: delivery read a ruling written at or after the claim's second as one the brief

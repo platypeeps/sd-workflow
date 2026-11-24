@@ -2036,7 +2036,7 @@ class Supervisor:
     def undesigned(self, head: str, body: str) -> list[str]:
         """The refusal for a design item the branch closes with no design.md of its own, or none (review of
         sd:10096): two designs with one title closed from one file that kept only one. A design.md the branch
-        adds or changes under `docs/work` is the file of the item its first `item: sd:N` line names."""
+        adds or changes under `docs/work` is the file of the item its front matter's `item: sd:N` line names."""
         designs = [item for item in [self.lead, *self.others] if draft.is_design(self.db, item)]
         cited = self.cited(self.work, self.base(), head, body) if designs else None
         designs = [item for item in designs if item in (cited or ())]
@@ -2048,7 +2048,9 @@ class Supervisor:
                            "docs/work"], env=self.env).split("\0"):
             if re.fullmatch(r"docs/work/[^/]+/design\.md", path):
                 text = _read_bytes([*git, "cat-file", "blob", f"{head}:{path}"], env=self.env).decode("utf-8", "replace")
-                named = re.search(r"^item:\s*sd:([0-9]+)\s*$", text, re.M)
+                # The front matter's `item:` line alone: one in a Markdown example names no owner (review).
+                front = re.match(r"---\n(.*?)\n---(?:\n|$)", text, re.S)
+                named = re.search(r"^item:\s*sd:([0-9]+)\s*$", front.group(1), re.M) if front else None
                 owned |= {int(named.group(1))} if named else set()
         missing = [item for item in designs if item not in owned]
         if not missing:
