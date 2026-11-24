@@ -976,17 +976,23 @@ def _same_copy(path: Path, target: Path) -> tuple[int, int, int] | None:
 
 def _released(connection, path: Path) -> bool:
     """Whether every run that owns `path` ended and was released: all of the assignment's for its
-    `sd-N.title` or `.body.md`, else the run its name starts with."""
+    `sd-N.title`, `.body.md` or `.blockers.json` and for a run's `.review.out` or `.prior.out`, which a later
+    run of the assignment reads back (`Supervisor.review_files`, pack sd:10236); else the run its name starts with."""
     owner = re.fullmatch(r"sd-(\d+)\.(?:title|body\.md|blockers\.json)", path.name)
+    ident = path.name.split(".", 1)[0]
+    lead = int(owner[1]) if owner else None
+    if path.name in (f"{ident}.review.out", f"{ident}.prior.out"):
+        row = connection.execute("SELECT assignment FROM runner_run WHERE id = ?", (ident,)).fetchone()
+        lead = row[0] if row else None  # no such run: the query below finds none, and the file stays
     ended = "SELECT outcome IS NOT NULL AND released_at IS NOT NULL FROM runner_run WHERE "
-    rows = connection.execute(ended + "assignment = ?", (int(owner[1]),)) if owner \
-        else connection.execute(ended + "id = ?", (path.name.split(".", 1)[0],))
+    rows = connection.execute(ended + "assignment = ?", (lead,)) if lead is not None \
+        else connection.execute(ended + "id = ?", (ident,))
     released = [row[0] for row in rows]
     # A usage limit releases its run and queues the bundle again: the resume reads these files locally
     # (`Supervisor.round_blockers`, the body), so they wait while the last run is that one (review of build/sd-1557).
-    if owner and released:
+    if lead is not None and released:
         last = connection.execute("SELECT outcome FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
-                                  (int(owner[1]),)).fetchone()
+                                  (lead,)).fetchone()
         if last is not None and last[0] == build.RATE_LIMITED:
             return False
     return bool(released) and all(released)
@@ -1015,7 +1021,8 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
     """Move each file of an ended run from `local` to the same place under `bulk`; the new paths.
 
     `sd-<assignment>.title`, `.body.md` and `.blockers.json` move once every run of that assignment ended and was
-    released and its last did not end at a usage limit, which resumes on them; the rest once the run their name starts with was: an outcome alone leaves a blocked or abandoned run's
+    released and its last did not end at a usage limit, which resumes on them, as do a run's `.review.out` and
+    `.prior.out`, which a resumed run of the assignment verifies (pack sd:10236); the rest once the run their name starts with was: an outcome alone leaves a blocked or abandoned run's
     groups alive until the reap releases it, and they may still write. A file no run owns, one written in the
     last `settle` seconds or one whose copy fails stays for a later tick.
 
@@ -1665,15 +1672,13 @@ class Supervisor:
         its assignment that does. A usage-limit or loss resume is a new run that keeps the round, so its own
         names hold no review, and the next round would review the branch afresh (pack sd:10236). Only the runs
         it resumed: the walk stops at a fresh claim (`claimed`), whose earlier attempt's review covers another
-        start (review of build/sd-1726). An earlier run's file the archive moved is read from its bulk copy,
-        named beside its `log_path`: the copy lands before the local file goes, so it is read first."""
-        rows = [(self.ident, self.row["start_step"], None), *((row[0], row[1], row[2]) for row in self.db.execute(
-            "SELECT id, start_step, log_path FROM runner_run WHERE assignment = ? AND run < ? ORDER BY run DESC",
+        start (review of build/sd-1726). The files are read here, under the local root: the archive leaves them
+        until every run of the assignment is released (`_released`)."""
+        rows = [(self.ident, self.row["start_step"]), *((row[0], row[1]) for row in self.db.execute(
+            "SELECT id, start_step FROM runner_run WHERE assignment = ? AND run < ? ORDER BY run DESC",
             (self.row["assignment"], self.row["run"])))]
-        for ident, start, log_path in rows:
-            review, prior = (archived if log_path and _has_text(archived := Path(log_path).parent / local.name)
-                             else local for local in (self.logs / f"{ident}.review.out", self.logs / f"{ident}.prior.out"))
-            pair = (review, prior)
+        for ident, start in rows:
+            pair = (self.logs / f"{ident}.review.out", self.logs / f"{ident}.prior.out")
             if any(_has_text(path) for path in pair):
                 return pair
             if start in ("claimed", None):  # a row with no start step reads as fresh: fail closed

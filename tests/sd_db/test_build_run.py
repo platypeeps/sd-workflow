@@ -3074,9 +3074,10 @@ class Supervise(Case):
         self.assertEqual(review[review.index("--base") + 1], blocking["subject"]["head"])
         self.assertEqual(json.loads(resumed.out("prior").read_text(encoding="utf-8")), blocking)
 
-    def test_a_resumed_fix_verifies_a_review_the_archive_moved(self):
+    def test_a_resumed_fix_verifies_the_review_an_archive_tick_passed(self):
         """Review of build/sd-1726 (pack sd:10236): the archive moves a released run's own files to the bulk
-        root, so a usage-limited run's review left before the resume and the resumed fix reviewed afresh."""
+        root, so a usage-limited run's review left before the resume and the resumed fix reviewed afresh. Its
+        log moves and its review stays, so no `log_path` says where a moved review would be (class pass)."""
         self.press()
         self.write_pr()
         self.plan(claude=["pass", "rate_limited"], sd_review=["blocking"])
@@ -3085,8 +3086,9 @@ class Supervise(Case):
         blocking = json.loads(first.out("review").read_text(encoding="utf-8"))
         bulk = self.root / "archive"  # the fixture's live root is named `bulk`
         moved = build_run.archive(self.db, self.logs, bulk, settle=-60)
-        self.assertIn(str(bulk / first.out("review").relative_to(self.logs)), moved)
-        self.assertFalse(first.out("review").exists())
+        self.assertIn(str(bulk / first.log.relative_to(self.logs)), moved, "the limited run's log did not move")
+        self.assertNotIn(str(bulk / first.out("review").relative_to(self.logs)), moved,
+                         "the archive moved a review the resume reads")
         reset = int((self.plans / "reset.txt").read_text())
         later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
         with mock.patch.object(build, "clock", return_value=later):
@@ -3097,7 +3099,7 @@ class Supervise(Case):
         resumed = self.supervisor(again["id"])
         self.assertEqual(resumed.run()["step"], "enqueued")
         review = [call["argv"] for call in self.calls("sd-review")][-1]
-        self.assertIn("--verify-report", review, "the resumed fix lost the review the archive moved")
+        self.assertIn("--verify-report", review, "the resumed fix lost the review an archive tick passed")
         self.assertEqual(review[review.index("--base") + 1], blocking["subject"]["head"])
 
     def test_a_resumed_fix_keeps_every_blocker_whole(self):
@@ -4987,6 +4989,34 @@ class Archive(Case):
                         "WHERE id = ?", (build_run.now(), str(path), f"refused; log {path}", self.bundle["id"]))
         self.db.commit()
         return path, build_run.log_dir(self.logs, str(self.repo)) / path.name
+
+    def test_a_runs_review_waits_for_every_run_of_its_assignment(self):
+        """Class pass on build/sd-1726 (pack sd:10236): a resumed run reads the review and prior of the run it
+        resumed, which the archive moved once that run alone was released. They wait as the assignment's files
+        do: through the limit, through the resume, until its last run is released; the run's other files do not."""
+        path, target = self.ended("{run}.review.out")
+        prior, errors = path.with_name(path.name.replace("review", "prior")), path.with_name(path.name[:-3] + "err.out")
+        for each in (prior, errors):
+            each.write_text("x")
+            os.utime(each, (0, 0))
+        local = self.root / "local"
+        self.db.execute("UPDATE runner_run SET outcome = ? WHERE id = ?", (build.RATE_LIMITED, self.bundle["id"]))
+        self.db.commit()
+        self.assertEqual(build_run.archive(self.db, local, self.logs), [str(target.with_name(errors.name))])
+        resumed = "e" * 32
+        self.db.execute("INSERT INTO runner_run (id, assignment, run, repo, branch, owner, work_path, retained_path, "
+                        "start_step, step, model, created_at, updated_at) SELECT ?, assignment, run + 1, repo, branch, "
+                        "owner, work_path, retained_path, 'fixing', 'fixing', model, created_at, updated_at "
+                        "FROM runner_run WHERE id = ?", (resumed, self.bundle["id"]))
+        self.db.commit()
+        self.assertEqual(build_run.archive(self.db, local, self.logs), [], "moved while the resumed run lives")
+        self.assertTrue(path.exists() and prior.exists())
+        self.db.execute("UPDATE runner_run SET outcome = 'done', released_at = ? WHERE id = ?",
+                        (build_run.now(), resumed))
+        self.db.commit()
+        self.assertEqual(build_run.archive(self.db, local, self.logs),
+                         [str(target.with_name(prior.name)), str(target)])
+        self.assertFalse(path.exists() or prior.exists())
 
     def test_a_rate_limited_bundles_files_wait_for_its_resume(self):
         """Review of build/sd-1557: a usage limit releases the run and queues the bundle again; the archive
