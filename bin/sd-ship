@@ -1674,14 +1674,6 @@ class Ship(SharedReview):
         Only an explicit claim: a receipt that stored one before this check
         keeps it, since an open pull request cannot change its claim.
         """
-        if not self.args.no_item:
-            # A design item's design is its whole deliverable: a skipped code lead leaves it the
-            # bundle's only commit, and it delivers that (review of sd:10096).
-            sd_lib.import_sd_db()  # the gateway first, as for every sd_db import here
-            from sd_db import build
-            if all(build.work_kind(self.connection, number) == build.DESIGN_KIND
-                   for number in (self.args.item, *self.args.closes)):
-                return
         paths = git(self.root, "diff", "--name-only", "--no-renames", "-z", f"origin/{base}...{head}").split("\0")
         if design_only([path for path in paths if path]):
             raise Refusal(f"this branch changes only design records (docs/work/) and instruction files, so it cannot "

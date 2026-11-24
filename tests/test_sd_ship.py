@@ -3232,19 +3232,6 @@ roles:
             self.unanswered("--associate-only", "--title", "design").prepare()
         self.assertFalse(self.operation().state["deliver"])
 
-    def test_a_design_item_delivers_its_design_only_branch(self):
-        """Review of sd:10096: a code lead skipped with a question leaves its bundle's design the only commit.
-        The design is that item's whole deliverable, so `--deliver` of a design item (`work_kind = design`) is
-        no build left unbuilt: the guard refused the documented skipped-lead handoff."""
-        self.tiered_branch({"docs/work/2026-10-12-example/design.md": "---\nitem: sd:1\n---\n\ndesign\n"})
-        self.task_item("task")
-        self.connection.execute("UPDATE item SET branch = 'tiered', fields = json_object('work_kind', 'design') "
-                                "WHERE id = ?", (self.item,))
-        self.connection.commit()
-        with contextlib.redirect_stderr(io.StringIO()):
-            self.unanswered("--deliver", "--title", "design").prepare()
-        self.assertTrue(self.operation().state["deliver"])
-
     def test_design_only_needs_a_design_record_and_nothing_built(self):
         self.assertTrue(ship.design_only(["docs/work/x/design.md", "AGENTS.md", ".claude/rules/a.md"]))
         for paths in (["CLAUDE.md"], ["docs/work/x/design.md", "bin/sd"], ["docs/work/x/design.md", "README.md"], []):
