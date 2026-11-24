@@ -879,10 +879,11 @@ class PipelineTests(ReviewFixture):
 
     def test_plain_output_prints_a_blockers_evidence_under_its_summary(self) -> None:
         """pack sd:10235. Plain output dropped the repro, so a lead could not act on a blocker without a rerun.
-        Each evidence line prints under the summary, escaped; an advisory finding's evidence does not."""
+        Each evidence line prints under the summary, escaped; an advisory finding's evidence does not.
+        Round 3 (note #77417): only non-printables are escaped, so a repro's quoted spaces survive."""
         root = self.make_repo()
         self.prepare(root)
-        evidence = "printf 'a\\n' | python3 src.py\n<b>Traceback</b>\x1b[31m: exit 1"
+        evidence = "printf 'a  b\\n' | python3 src.py\n<b>Traceback</b>\x1b[31m: exit 1"
         payload = json.dumps({"findings": [
             {"path": "src.py", "line": 1, "severity": "high", "instances": ["src.py:1"], "summary": "bad",
              "family": "correctness", "evidence": evidence},
@@ -895,7 +896,7 @@ class PipelineTests(ReviewFixture):
         sd_review.render(result, stream)
         lines = stream.getvalue().splitlines()
         at = lines.index("      bad")
-        self.assertEqual(lines[at + 1:at + 3], ["      evidence: printf 'a\\n' | python3 src.py",
+        self.assertEqual(lines[at + 1:at + 3], ["      evidence: printf 'a  b\\n' | python3 src.py",
                                                 "                <b>Traceback</b>\\x1b[31m: exit 1"])
         self.assertNotIn("hidden advice", stream.getvalue())
 

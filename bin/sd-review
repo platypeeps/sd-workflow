@@ -2774,9 +2774,9 @@ def head_holds(root: pathlib.Path, ref: str) -> Callable[[str], bool]:
     return file_at_head
 
 
-def for_note(text: Any, limit: int = 120) -> str:
-    """Model text bound for a note: one line, escaped where not printable, `limit` characters."""
-    line = " ".join(str(text or "").split())
+def for_note(text: Any, limit: int = 120, spaced: bool = False) -> str:
+    """Model text bound for a note: one line (`spaced` keeps its spaces), escaped where not printable, `limit` long."""
+    line = str(text or "") if spaced else " ".join(str(text or "").split())
     return "".join(ch if ch.isprintable() else ch.encode("unicode_escape").decode() for ch in line)[:limit]
 
 
@@ -2981,9 +2981,9 @@ def render(result: Mapping[str, Any], stream: TextIO) -> None:
                 f"  ({finding['backend']}/{finding['family']})\n"
                 f"      {finding['summary']}\n"
             )
-            # pack sd:10235: a blocker's repro, so the lead acts without a rerun; escaped, since a reader wrote it.
+            # pack sd:10235: a blocker's repro for the lead; escaped (a reader wrote it), spaces kept (note #77417).
             for index, line in enumerate(str(finding.get("evidence") or "").splitlines() if finding["disposition"] == "blocking" else ()):
-                write(f"      {'evidence:' if index == 0 else ' ' * 9} {for_note(line, EVIDENCE_CHARS)}\n")
+                write(f"      {'evidence:' if index == 0 else ' ' * 9} {for_note(line, EVIDENCE_CHARS, spaced=True)}\n")
     remaining = result.get("remaining") or []
     if remaining:
         write(f"\nreview incomplete; unavailable entries: {', '.join(remaining)}\n")
