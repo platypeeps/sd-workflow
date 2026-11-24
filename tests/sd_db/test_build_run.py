@@ -931,9 +931,10 @@ class Supervise(Case):
     def test_a_builders_child_runs_its_tests_on_capped_threads(self):
         """sd:10393: a builder's cargo, pytest and Unity runs took every core; its child now starts with the cap,
         and a lower count the dispatcher's own environment set wins, as it does for a gate holder."""
-        self.env.update(SD_GATE_SLOTS="1", TEST_WORKERS="1")
-        self.env.pop("CARGO_BUILD_JOBS", None)
-        self.env.pop("PYTEST_XDIST_AUTO_NUM_WORKERS", None)
+        gate = build_run._gate_slots()
+        for name in (*gate.CPU_VARIABLES, *build_run.THREAD_VARIABLES, "CI", "GITHUB_ACTIONS"):
+            self.env.pop(name, None)  # a gate holder runs this test with its own caps set: none may reach it
+        self.env.update(SD_GATE_SLOTS="1", TEST_WORKERS="1", XDG_CONFIG_HOME=str(self.root / "no-config"))
         self.press()
         self.plan(claude=["pass"])
         supervisor = self.supervisor()
@@ -955,7 +956,20 @@ class Supervise(Case):
                                  ("4", math.nan, 4), ("4", math.inf, 4), ("0", 2.0, 14), ("bad", 0.0, 16),
                                  ("20", 0.0, 1)):
             with self.subTest(slots=slots, load=load):
-                self.assertEqual(build_run.thread_cap({"SD_GATE_SLOTS": slots}, load=load, cores=16), cap)
+                env = {"SD_GATE_SLOTS": slots, "XDG_CONFIG_HOME": str(self.root / "no-config")}
+                self.assertEqual(build_run.thread_cap(env, load=load, cores=16), cap)
+
+    def test_the_thread_cap_reads_the_machine_setting_from_the_environment_it_is_given(self):
+        """Review of build/sd-1808: the cap's inputs come from the environment handed in, never the host's: the
+        variable first, then CI, then `sd.gate_slots` in that environment's config."""
+        home = self.root / "config"
+        (home / "sd-ai-command-pack").mkdir(parents=True)
+        (home / "sd-ai-command-pack" / "config.json").write_text(
+            json.dumps({"config": {"sd": {"gate_slots": "8"}}}), encoding="utf-8")
+        env = {"XDG_CONFIG_HOME": str(home)}
+        self.assertEqual(build_run.thread_cap(env, load=0.0, cores=16), 2)
+        self.assertEqual(build_run.thread_cap({**env, "SD_GATE_SLOTS": "4"}, load=0.0, cores=16), 4)
+        self.assertEqual(build_run.thread_cap({**env, "CI": "1"}, load=0.0, cores=16), 16, "CI caps no gate")
 
     def test_a_success_line_passes_whatever_the_exit_code(self):
         self.press()
