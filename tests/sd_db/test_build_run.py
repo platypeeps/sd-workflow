@@ -3156,6 +3156,43 @@ class Supervise(Case):
         self.assertEqual(review[review.index("--base") + 1], blocking["subject"]["head"])
         self.assertEqual(json.loads(resumed.out("prior").read_text(encoding="utf-8")), blocking)
 
+    def resumed_with_broken_report(self, broken: str):
+        """A usage-limited blocking round resumed as a new run whose own review report cannot be read."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "rate_limited"], sd_review=["blocking"])
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        resumed = self.supervisor(again["id"])
+        own = resumed.out("review")
+        own.write_bytes(b'{"subject": "\xff\xfe"}' if broken == "bytes" else b"{}")
+        if broken == "mode":
+            own.chmod(0)
+            self.addCleanup(own.chmod, 0o644)
+        # A fix commit after the blocking round: the older report is then a verifiable prior.
+        (resumed.work / "work.txt").write_text("fixed\n", encoding="utf-8")
+        for argv in (["add", "work.txt"], ["-c", "user.name=t", "-c", "user.email=t@example.test", "commit", "-qm", "fix"]):
+            subprocess.run(["git", "-C", str(resumed.work), *argv], check=True)
+        head = subprocess.run(["git", "-C", str(resumed.work), "rev-parse", "HEAD"], capture_output=True,
+                              text=True, check=True).stdout.strip()
+        return resumed, head
+
+    def test_an_own_report_not_utf8_reviews_in_full_not_an_older_runs(self):
+        """Lane review of build/sd-1726 (pack sd:10235): a resumed run whose own report is not UTF-8 walked on
+        to the earlier run's report and verified those stale findings. Its own report exists: review in full."""
+        resumed, head = self.resumed_with_broken_report("bytes")
+        self.assertIsNone(resumed.prior_review(head), "an older run's report stood in for an unreadable one")
+
+    def test_an_own_report_with_no_read_permission_reviews_in_full(self):
+        """Lane review of build/sd-1726 (pack sd:10235): the same walk for a report the run cannot open."""
+        resumed, head = self.resumed_with_broken_report("mode")
+        self.assertIsNone(resumed.prior_review(head), "an older run's report stood in for an unreadable one")
+
     def test_a_resumed_fix_verifies_the_review_an_archive_tick_passed(self):
         """Review of build/sd-1726 (pack sd:10236): the archive moves a released run's own files to the bulk
         root, so a usage-limited run's review left before the resume and the resumed fix reviewed afresh. Its

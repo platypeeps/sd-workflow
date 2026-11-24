@@ -699,11 +699,14 @@ def defined_names(line: str) -> set[str]:
 
 
 def _has_text(path: Path) -> bool:
-    """Whether `path` reads with more than whitespace; an unreadable file has none."""
+    """Whether `path` holds a report: more than whitespace, or a file that exists but does not read (no
+    permission, not UTF-8), which the caller must not skip for an older one (lane review of build/sd-1726)."""
     try:
         return bool(path.read_text(encoding="utf-8").strip())
-    except (OSError, ValueError):
+    except FileNotFoundError:
         return False
+    except (OSError, ValueError):
+        return True
 
 
 def instance_files(instances: Any) -> list[str]:
@@ -1678,8 +1681,10 @@ class Supervisor:
         for path in (last, mine):
             try:
                 text = path.read_text(encoding="utf-8")
-            except OSError:
+            except FileNotFoundError:
                 continue
+            except (OSError, ValueError):
+                return None  # a report that does not read proves nothing: review the branch in full
             if not text.strip():
                 continue  # no last report: the kept one is the last round's
             # A last report that fails a check below falls through to None, never to the older kept report,
