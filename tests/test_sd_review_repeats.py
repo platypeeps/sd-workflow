@@ -68,12 +68,13 @@ class RepeatFixture(ReviewFixture):
 
     def adjudication(self, *rows: tuple[str, str, str], branch: str = BRANCH, repository: str = REPOSITORY,
                      head: Any = "", days: float = 0.5, prefix: str = "ship-adjudication:", key: str = "k",
-                     line: Any = 3, instances: Any = None) -> None:
+                     line: Any = 3, instances: Any = None, evidence: Any = None) -> None:
         """One `sd-ship adjudicate` record: each (summary, disposition, reason) a blocking finding's answer,
-        at the reviewed head unless `head` names another."""
+        at the reviewed head unless `head` names another; `evidence` is what the answered finding cited."""
         findings = [{"index": index, "finding_digest": "0" * 64, "response_disposition": answer, "reason": reason,
                      "raw_finding": {"path": "bin/tool.py", "line": line, "severity": "high", "instances": instances or [f"bin/tool.py:{line}"], "summary": summary,
-                                     "family": "correctness", "disposition": "blocking"}}
+                                     "family": "correctness", "disposition": "blocking",
+                                     **({} if evidence is None else {"evidence": evidence})}}
                     for index, (summary, answer, reason) in enumerate(rows, 1)]
         bindings = {"repository": repository, "branch": branch, "head": head if head != "" else self.head}
         self.write_row(f"{prefix}{key}", {"decision": "accepted", "proposal": {
@@ -287,7 +288,7 @@ class PriorLineTests(RepeatFixture):
         (self.root / "other.py").write_text("x = 1\n", encoding="utf-8")
         new = self.commit("add", "other.py") and self.commit("new")
         rebutted = [sd_review.Rebuttal(ruled, "src.py", sd_review.summary_key("Division by zero"), 20, True,
-                                       "src.py", "Division by zero", "line 2 sets the divisor to 1", ("src.py:20",))]
+                                       "src.py", "Division by zero", "line 2 sets the divisor to 1", ("src.py:20",), REPRO)]
         repeat = finding(line=20, summary="Division by zero")
         for head, expected in ((found, "blocking"), (ruled, "advisory")):
             with self.subTest(found_at=head):
@@ -298,6 +299,46 @@ class PriorLineTests(RepeatFixture):
                                              later=sd_review.found_after(self.root))
                 self.assertEqual(record["disposition"], expected)
                 self.assertEqual(record.get("evidence"), REPRO if expected == "blocking" else None)
+
+    def test_only_the_evidence_a_ruling_answered_is_old_to_it(self) -> None:
+        """Class pass of sd:10191 (bin/sd-review:2011): what a ruling answered is the evidence in its own
+        adjudication, not a commit. At the ruling's head, evidence it did not answer is new, whole or one
+        line of a joined repro; the evidence it answered is not. A head before the ruling is old; a head on
+        another line of history, or one git cannot place, counts as after: hold on doubt."""
+        (self.root / "src.py").write_text("".join(f"line{n}\n" for n in range(1, 41)), encoding="utf-8")
+        before = self.commit("add", "src.py") and self.commit("before")
+        ruled = self.commit("ruled")
+        self.commit("checkout", "--quiet", "-b", "side", before)
+        aside = self.commit("aside")
+        self.commit("checkout", "--quiet", "-")
+        new = self.commit("new")
+        rebutted = [sd_review.Rebuttal(ruled, "src.py", sd_review.summary_key("Division by zero"), 20, True,
+                                       "src.py", "Division by zero", "a reason", ("src.py:20",), f" {REPRO}\n\nsecond line")]
+        fresh = "python3 src.py: ZeroDivisionError"
+        for head, evidence, expected in ((ruled, fresh, "blocking"), (ruled, REPRO, "advisory"),
+                                         (ruled, f"second line\n{REPRO}", "advisory"),
+                                         (ruled, f"{REPRO}\n{fresh}", "blocking"), (before, fresh, "advisory"),
+                                         (aside, REPRO, "blocking"), ("f" * 40, REPRO, "blocking")):
+            with self.subTest(found_at=head, evidence=evidence):
+                prior = [dict(finding(evidence, line=20, summary="Division by zero"), disposition="blocking",
+                              prior_review={"pass": 1, "head": head})]
+                moved = sd_review.prior_at(self.root, ruled, new, prior)
+                [record] = sd_review.dispose([finding(line=20, summary="Division by zero")], "high", rebutted,
+                                             repro=True, prior=moved, later=sd_review.found_after(self.root))
+                self.assertEqual(record["disposition"], expected)
+                self.assertEqual(record.get("evidence"), evidence if expected == "blocking" else None)
+
+    def test_a_ruling_keeps_the_evidence_its_adjudication_answered(self) -> None:
+        """The evidence in the adjudicated finding is what the ruling answered; any other shape is none."""
+        def answered(evidence: Any) -> str:
+            body = json.dumps({"decision": "accepted", "proposal": {"bindings": {"head": ON_BRANCH}, "findings": [
+                {"response_disposition": "rebutted", "reason": "a reason",
+                 "raw_finding": {"path": "src.py", "line": 1, "severity": "high", "summary": "defect",
+                                 "instances": ["src.py:1"], "evidence": evidence}}]}})
+            return listed(body)[0].answered
+        self.assertEqual(answered(REPRO), REPRO)
+        for shape in UNCITED:
+            self.assertEqual(answered(shape).strip(), "", repr(shape))
 
     def test_each_blocker_maps_from_the_head_it_was_found_at(self) -> None:
         """Lead ruling 2026-11-22 (bin/sd-review:2496): a full-branch retry mapped every prior finding from the
@@ -1196,7 +1237,8 @@ class RepeatReviewTests(RepeatFixture):
         (self.root / "bin").mkdir(exist_ok=True)
         (self.root / "bin" / "tool.py").write_text("a\nb\nc\n", encoding="utf-8")
         head = self.commit("add", "src.py", "bin/tool.py") and self.commit("tracked")
-        self.adjudication(("lane claim", "rebutted", "x"), head=head, instances=["bin/tool.py:3", "./src.py:1"])
+        self.adjudication(("lane claim", "rebutted", "x"), head=head, instances=["bin/tool.py:3", "./src.py:1"],
+                          evidence=REPRO)  # the ruling answered this blocker's repro; another repro is new to it
         blocker = dict(finding(REPRO, path="bin/tool.py", line=3, summary="lane claim",
                                instances=["bin/tool.py:3", "./src.py:1"]), disposition="blocking",
                        prior_review={"pass": 1, "head": head})
