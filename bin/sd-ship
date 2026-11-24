@@ -936,6 +936,20 @@ class Ship(SharedReview):
                           state="operator_decision",
                           next_action="Run sd-ship prepare again with the same identity, then merge.")
 
+    def opened_at(self, head: str | None, opening: bool = False) -> dict:
+        """The fields that keep an opened, unpublished pull request's heads: every head a prepare pushed to it.
+
+        Each one passed `check_review` before its push, and `reviewed_head`
+        moves with every later review, so reconcile reads these (sd:9268
+        round 13). Recorded before the push: a head whose push failed is one
+        GitHub never shows. No head clears the record, at publication.
+        """
+        if not (opening or self.state.get("opened_pull_request")):
+            return {}
+        if head is None:
+            return {"opened_pull_request": None, "opened_heads": None}
+        return {"opened_heads": list(dict.fromkeys([*(self.state.get("opened_heads") or []), head]))}
+
     def promoted(self) -> dict:
         """The fields `ready_to_send` saves: the pending claim, now published, and no pending one."""
         pending, publishing, self.publishing = self.state.get("pending"), self.publishing, False
@@ -2056,7 +2070,7 @@ class Ship(SharedReview):
         if current_head(self.root) != head:
             raise Refusal("HEAD moved before push")
         lease = self.lease(head, pushed_from) if rebase else []
-        self.save(phase="push_dispatch", head=head)
+        self.save(phase="push_dispatch", head=head, **self.opened_at(head))
         git(self.root, "push", *lease, "origin", f"{head}:refs/heads/{self.branch}")
         if current_head(self.root) != head:
             raise Refusal("HEAD moved during push; remote still contains only the reviewed commit")
@@ -2108,11 +2122,11 @@ class Ship(SharedReview):
         if not self.state.get("pull_request"):
             # Recorded apart: merge reads only `pull_request`, so it still refuses this one, while reconcile
             # finds it once it merges after a failed Copilot step (sd:9268 round 12).
-            self.save(opened_pull_request=reference)
+            self.save(opened_pull_request=reference, **self.opened_at(head, opening=True))
         copilot = self.prepare_copilot_review(number, pull, head, mode)
         warned = {"warnings": list(self.state.get("warnings") or []) + [copilot["warning"]]} if copilot.get(
             "warning") else {}
-        self.save(pull_request=reference, phase="ready_to_send", **warned, **self.promoted())
+        self.save(pull_request=reference, phase="ready_to_send", **warned, **self.promoted(), **self.opened_at(None))
         return self.result("ready_to_send", copilot_review=copilot, invoker=self.state["invoker"],
                            body_source=self.body_source, normalized=list(self.body_normalized),
                            closes=self.closes_now(self.state.get("closing") or {}, bool(self.state.get("deliver"))))
@@ -3258,9 +3272,11 @@ class Ship(SharedReview):
         it opened apart, so merge refuses it; once merged, it is this
         receipt's (sd:9268 round 12).
         """
-        reference = self.state.get("pull_request") or self.state.get("opened_pull_request")
+        published = self.state.get("pull_request")
+        reference = published or self.state.get("opened_pull_request")
         if not reference:
             raise Refusal("there is no durable pull-request receipt to reconcile")
+        heads = [self.state.get("reviewed_head"), *([] if published else self.state.get("opened_heads") or [])]
         pull = self.api.pull(reference["number"])
         if pull.get("merged") is not True:
             raise Refusal("GitHub has not confirmed this pull request merged; database completion stays open")
@@ -3268,10 +3284,10 @@ class Ship(SharedReview):
         if (not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit)
                 or str(pull.get("html_url", "")).lower() != reference["url"]
                 or pull.get("base", {}).get("ref") != reference["base"]
-                or pull.get("head", {}).get("sha") != self.state.get("reviewed_head")):
+                or pull.get("head", {}).get("sha") not in [head for head in heads if head]):
             raise Refusal("merged PR evidence does not match the prepared receipt")
-        if not self.state.get("pull_request"):
-            self.save(pull_request=reference)
+        if not published:
+            self.save(pull_request=reference, reviewed_head=pull["head"]["sha"], **self.opened_at(None))
         return reference, pull, commit
 
     def reconcile(self) -> dict:

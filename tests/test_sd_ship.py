@@ -5068,6 +5068,76 @@ roles:
         self.assertEqual(result["phase"], "merged")
         self.assertEqual(self.operation().state["merge_commit"], self.remote.pull(1).merge_commit_sha)
 
+    def opened_then_copilot_failed(self) -> str:
+        """A first prepare whose Copilot request failed after GitHub opened pull request 1: its head."""
+        self.double.lose_copilot_request = True
+        with self.assertRaisesRegex(ship.Refusal, "review request transport failed"):
+            self.prepare("--copilot-review", "request")
+        return self.operation().state["reviewed_head"]
+
+    def reconciled(self) -> dict:
+        with patch.object(ship.time, "sleep"):
+            return self.operation("reconcile").reconcile()
+
+    def test_a_reprepare_whose_review_blocks_leaves_the_opened_pull_request_reconcilable(self):
+        """Round 13 of sd:9268, the class: the merged check read `reviewed_head`, which each later prepare's
+        review moves, so a reprepare that failed left the opened pull request, merged at the head an earlier
+        prepare reviewed and pushed, unreconcilable. The check reads the heads prepare pushed to it."""
+        opened = self.opened_then_copilot_failed()
+        (self.root / "src.py").write_text("value = 3\n")
+        _git(self.root, "commit", "-qam", "a later change\n\nAuthored-with: human")
+        self.blocking_review()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "local review blocking"):
+            self.prepare()
+        self.assertIsNone(self.operation().state["reviewed_head"])
+        self.remote.merge(1)
+        self.assertEqual(self.reconciled()["phase"], "merged")
+        self.assertEqual(self.operation().state["reviewed_head"], opened)
+
+    def test_a_reprepare_that_stops_before_its_push_leaves_the_opened_pull_request_reconcilable(self):
+        """The same class: the review passed at a newer head that never reached GitHub."""
+        opened = self.opened_then_copilot_failed()
+        _git(self.root, "commit", "--allow-empty", "-qm", "a newer tip\n\nAuthored-with: human")
+        with patch.object(ship.Ship, "check_review", side_effect=ship.Refusal("stopped before the push")), \
+                contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "stopped before"):
+            self.prepare()
+        self.assertNotEqual(self.operation().state["reviewed_head"], opened)
+        self.remote.merge(1)
+        self.assertEqual(self.reconciled()["phase"], "merged")
+
+    def test_a_second_pushed_head_of_an_opened_pull_request_stays_reconcilable(self):
+        """The same class: the second prepare pushed a newer head and Copilot failed again; a third blocked."""
+        self.opened_then_copilot_failed()
+        _git(self.root, "commit", "--allow-empty", "-qm", "a newer tip\n\nAuthored-with: human")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "transport failed"):
+            self.prepare()
+        pushed = self.operation().state["reviewed_head"]
+        (self.root / "src.py").write_text("value = 3\n")
+        _git(self.root, "commit", "-qam", "a later change\n\nAuthored-with: human")
+        self.blocking_review()
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaisesRegex(ship.Refusal, "local review blocking"):
+            self.prepare()
+        self.remote.merge(1)
+        self.assertEqual(self.reconciled()["phase"], "merged")
+        self.assertEqual(self.operation().state["reviewed_head"], pushed)
+
+    def test_a_head_no_prepare_pushed_to_an_opened_pull_request_never_reconciles(self):
+        """The guard the class fix keeps: a head pushed by hand was reviewed by no prepare."""
+        self.opened_then_copilot_failed()
+        _git(self.root, "commit", "--allow-empty", "-qm", "pushed by hand\n\nAuthored-with: human")
+        _git(self.root, "push", "-q", "origin", "HEAD:refs/heads/topic")
+        self.remote.merge(1)
+        with self.assertRaisesRegex(ship.Refusal, "merged PR evidence does not match the prepared receipt"):
+            self.reconciled()
+        self.assertNotIn("pull_request", self.operation().state)
+
+    def test_a_published_prepare_keeps_no_record_of_the_opened_pull_request(self):
+        self.opened_then_copilot_failed()
+        self.double.lose_copilot_request = False
+        self.assertEqual(self.prepare()["phase"], "ready_to_send")
+        state = self.operation().state
+        self.assertEqual((state.get("opened_pull_request"), state["pull_request"]["number"]), (None, 1))
+
     def test_an_explicit_skip_withdraws_an_owed_copilot_request(self):
         """The way out when Copilot stays down: the operator's `skip` withdraws the request, and merge goes."""
         self.prepare()
