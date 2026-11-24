@@ -1015,6 +1015,47 @@ class ReproRuleTests(unittest.TestCase):
         self.assertEqual((record["disposition"], record["summary"], record.get("evidence")),
                          ("advisory", f"defect {sd_review.REPEAT_NOTE}", None))
 
+    def test_a_repro_on_input_no_caller_or_data_carries_is_advisory(self) -> None:
+        """sd:10288, note #77932: a repro only on synthetic input no caller or recorded data produces
+        posts as advisory, filed, and says why."""
+        [record] = sd_review.dispose([finding(REPRO, trigger="synthetic")], "high", repro=True)
+        self.assertEqual((record["disposition"], record["summary"]),
+                         ("advisory", f"defect {sd_review.SYNTHETIC_NOTE}"))
+
+    def test_the_same_repro_on_a_reachable_or_untrusted_input_still_blocks(self) -> None:
+        """sd:10288: a real caller, recorded data, input from outside the operator's control (a network
+        reply), a data-loss or secret-leak path, or a reader that does not say, still blocks."""
+        for trigger in (*sorted(set(sd_review.TRIGGERS) - {"synthetic"}), None, "Synthetic", " synthetic", 3):
+            with self.subTest(trigger=trigger):
+                raw = finding(REPRO) if trigger is None else finding(REPRO, trigger=trigger)
+                parsed = sd_review._finding(raw)
+                assert parsed is not None
+                [record] = sd_review.dispose([parsed], "high", repro=True)
+                self.assertEqual((record["disposition"], record["summary"]), ("blocking", "defect"))
+
+    def test_a_synthetic_repro_releases_no_prior_hold(self) -> None:
+        """sd:10288: only a finding that blocks answers a prior blocker's hold; a synthetic repeat does not."""
+        prior = [dict(finding(REPRO), disposition="blocking")]
+        records = sd_review.dispose([finding(REPRO, trigger="synthetic"), finding()], "high", repro=True, prior=prior)
+        self.assertEqual([record["disposition"] for record in records], ["advisory", "blocking"])
+
+    def test_a_planning_review_keeps_the_floor_alone(self) -> None:
+        [record] = sd_review.dispose([finding(REPRO, trigger="synthetic")], "high")
+        self.assertEqual(record["disposition"], "blocking")
+
+    def test_a_synthetic_finding_below_the_floor_gets_no_note(self) -> None:
+        [record] = sd_review.dispose([finding(REPRO, severity="medium", trigger="synthetic")], "high", repro=True)
+        self.assertEqual((record["disposition"], record["summary"]), ("advisory", "defect"))
+
+    def test_an_unknown_trigger_is_a_schema_error(self) -> None:
+        self.assertEqual(sd_review._finding_error(finding(REPRO, trigger="maybe", instances=["src.py:1"])),
+                         "trigger: invalid enum value")
+        for value in ([], {}, None, 3, "Synthetic"):
+            with self.subTest(value=value):
+                self.assertEqual(sd_review._finding_error(finding(REPRO, trigger=value, instances=["src.py:1"])),
+                                 "trigger: invalid enum value")
+        self.assertEqual(sd_review._finding_error(finding(REPRO, trigger="untrusted", instances=["src.py:1"])), "")
+
     def test_the_lanes_own_blockers_need_no_repro(self) -> None:
         parsed = sd_review.oversized_findings()
         assert parsed is not None
