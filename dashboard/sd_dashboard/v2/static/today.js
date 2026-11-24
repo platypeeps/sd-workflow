@@ -442,7 +442,7 @@ window.PAGE_VIEWS = [{ id: 'needs', label: 'Needs you', key: 'n' }, { id: 'queue
   // dispatcher's next reap settles).
   const RUNSTATE = { working: 'ok', merging: 'queued', waiting: 'warning', stalled: 'caution', lost: 'unknown' };
   // Operator 2026-11-24 (pack sd:10306): each member's blocking review rounds, builder and lane, after its title.
-  const rounds = m => m.reviews ? html` <span class="via" title="${`${m.reviews} rounds ended on blockers: builder reviews, gates and lane reviews`}">· ${m.reviews} ${m.reviews === 1 ? 'review' : 'reviews'}</span>` : '';
+  const rounds = m => m.reviews ? html` <span class="via" title="${`${m.reviews} rounds ended on blockers: builder reviews, gates and lane reviews${m.bundle ? '; the bundle\'s builder rounds are noted on this lead item' : ''}`}">· ${m.reviews} ${m.reviews === 1 ? 'review' : 'reviews'}</span>` : '';
   const names = r => r.items.length ? html`${r.items.map((m, i) => html`${i ? '; ' : ''}<a href="${shell.itemHref(m.item)}">#${m.item} ${m.title}</a>${rounds(m)}`)}` : 'no items recorded';
   const bb = (act, r, label, aria, off) => html`<button class="btn quiet sm" type="button" data-build="${act}" data-run="${r.run}" aria-label="${aria}"${off ? html` disabled title="${off}"` : QV.busy ? html` disabled` : ''}>${label}</button>`;
   // Open PR (pack sd:6020 ruling #31553): the pull request `sd-ship` opened for the row's branch; none shows nothing.

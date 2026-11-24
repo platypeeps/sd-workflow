@@ -291,27 +291,23 @@ def _log_quiet(path: str | None, now: str) -> int | None:
     return max(0, int(clock.timestamp() - changed)) if clock else None
 
 
-def review_rounds(connection, items: list[int], lead: int | None = None, since: str | None = None) -> dict[int, int]:
-    """Each item's review rounds that left blockers, builder and lane (pack sd:10306): its `Review round blockers:`
-    notes (a review, gate or enqueue check that blocked), plus its lane prepares a local review blocked. Clean rounds
-    leave no note, so they are not counted. A bundle notes its builder rounds on its `lead` item alone, so every
-    other member adds the lead's builder rounds from `since` (the run's start) on: the lead's earlier builds are not
-    the member's. The lane notes each member itself, so no lane round counts twice."""
-    if not items:
-        return {}
-    rows = reads.review_round_counts(connection, items)
-    own = {item: sum(n for i, _, n in rows if i == item) for item in items}
-    shared = reads.review_round_counts(connection, [lead], since=since) if lead is not None else []
-    built = sum(n for _, builder, n in shared if builder)
-    return {item: own[item] + (built if lead is not None and item != lead else 0) for item in items if own[item] or built}
+def review_rounds(connection, items: list[int]) -> dict[int, int]:
+    """Each item's own review rounds that left blockers (pack sd:10306): its `Review round blockers:` notes (a
+    review, gate or enqueue check that blocked), plus its lane prepares a local review blocked. Clean rounds leave no
+    note, so they are not counted. A bundle notes its builder rounds on its lead item alone; notes carry no run, so
+    no member inherits them: the lead's row says its count is the bundle's (`bundle`)."""
+    rounds: dict[int, int] = {}
+    for item, _, n in reads.review_round_counts(connection, items):
+        rounds[item] = rounds.get(item, 0) + n
+    return rounds
 
 
 def _members(connection, run: dict) -> list[dict]:
     rows = build.run(connection, run["id"])["members"]
     titles = reads.items_by_ids(connection, [row["item"] for row in rows])
-    lead = next((row["item"] for row in rows if row["id"] == run["assignment"]), None)
-    rounds = review_rounds(connection, [row["item"] for row in rows], lead, run["created_at"])
+    rounds = review_rounds(connection, [row["item"] for row in rows])
     return [{"item": row["item"], "assignment": row["id"], "status": row["status"], "reviews": rounds.get(row["item"], 0),
+             "bundle": len(rows) > 1 and row["id"] == run["assignment"],
              "title": titles[row["item"]]["title"] if row["item"] in titles else ""} for row in rows]
 
 

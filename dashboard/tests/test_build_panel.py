@@ -229,8 +229,8 @@ class BuildsPanel(Fixture):
         self.assertEqual(again["cancel_requested"], "cancelled by dashboard")
         self.assertIn("cancelled by dashboard; build run", again["cancel"]["reason"])
 
-    def test_a_bundle_member_counts_the_rounds_noted_on_its_lead(self):
-        """pack sd:10306 lead review: a bundle notes its review rounds on its lead's item alone; each member ran them."""
+    def test_a_bundle_lead_carries_its_builder_rounds_and_members_their_own(self):
+        """pack sd:10306: a bundle notes its builder rounds on its lead alone; the lead row carries them as the bundle's."""
         from sd_db.writes import add_note
         items = [self.ready(), self.ready()]
         run = self.claimed(items)
@@ -242,22 +242,9 @@ class BuildsPanel(Fixture):
         add_note(self.connection, other, "comment", "Lane failed in prepare at abc: local review blocking: 1/1 completed")
         add_note(self.connection, other, "comment", "Lane failed in prepare at abc: gate output quoted local review blocking")
         row = builds.panel(self.connection, now=run["created_at"])["runs"][0]
-        # The lane notes each member itself: the lead's lane round is the lead's alone, so none counts twice.
-        self.assertEqual({m["item"]: m["reviews"] for m in row["items"]}, {lead: 3, other: 3})
-
-    def test_a_member_skips_the_rounds_its_lead_ran_before_this_run(self):
-        """pack sd:10306 review 4: a lead's earlier solo build is not a round the new member ran."""
-        from sd_db.writes import add_note
-        items = [self.ready(), self.ready()]
-        run = self.claimed(items)
-        lead = build.run(self.connection, run["id"])["members"][0]["item"]
-        other = next(item for item in items if item != lead)
-        add_note(self.connection, lead, "comment", "Review round blockers: - old.py:1 x")
-        self.connection.execute("UPDATE note SET timestamp = '2000-01-01T00:00:00Z' WHERE item = ? AND body LIKE "
-                                "'Review round blockers: - old.py%'", (lead,))
-        add_note(self.connection, lead, "comment", "Review round blockers: - a.py:1 x")
-        row = builds.panel(self.connection, now=run["created_at"])["runs"][0]
-        self.assertEqual({m["item"]: m["reviews"] for m in row["items"]}, {lead: 2, other: 1})
+        # Review 5: notes carry no run, so a member inherits none; the lead's row says its count is the bundle's.
+        self.assertEqual({m["item"]: (m["reviews"], m["bundle"]) for m in row["items"]},
+                         {lead: (3, True), other: (1, False)})
 
     def test_only_a_run_at_a_builder_step_holds_a_builder(self):
         """pack sd:10306 review 4: a run at a lane step (checking, cleaning) released its builder slot."""

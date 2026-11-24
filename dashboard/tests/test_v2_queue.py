@@ -2314,7 +2314,7 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
         # pack sd:10306 (operator 2026-11-24): working counts queued assignments and waiting runs too, so it read more
         # builds than ran. Building counts the working and stalled runs alone; each member shows its blocking rounds.
         builds, runner = json.loads(json.dumps(self.BUILDS)), json.loads(json.dumps(self.RUNNER))
-        builds["runs"][0]["items"][0]["reviews"] = 4
+        builds["runs"][0]["items"][0].update(reviews=4, bundle=True)
         builds["runs"].append({**builds["runs"][0], "run": "r2", "state": "waiting", "builder": False, "why": "an open question asks",
                                "items": [{"item": 8, "assignment": 8, "status": "running", "title": "Eight", "reviews": 1}],
                                "cancel": {**builds["runs"][0]["cancel"], "assignment": 8}})
@@ -2323,7 +2323,8 @@ OUT.urls = []; window.shell.url = q => OUT.urls.push(q);
                             answers={"/api/queue/builds?show=all": [200, builds], "/api/queue/runner": [200, runner]})
         self.assertEqual(self.repo_detail(out["R"]["html"], "alpha")[1],
                          ' aria-label="0 merging, 0 review, 3 working, 1 building, 0 next, 0 blocked, 0 suggested, 0 parked"')
-        self.assertIn('#7 Seven</a> <span class="via" title="4 rounds ended on blockers: builder reviews, gates and lane reviews">'
+        self.assertIn('#7 Seven</a> <span class="via" title="4 rounds ended on blockers: builder reviews, gates and lane reviews; '
+                      'the bundle&#39;s builder rounds are noted on this lead item">'
                       '· 4 reviews</span>', out["R"]["html"])
         self.assertIn("#8 Eight</a> <span", out["R"]["html"])
         self.assertIn("· 1 review</span>", out["R"]["html"])
