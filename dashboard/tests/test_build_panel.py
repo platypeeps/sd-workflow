@@ -236,12 +236,14 @@ class BuildsPanel(Fixture):
         run = self.claimed(items)
         lead = build.run(self.connection, run["id"])["members"][0]["item"]
         other = next(item for item in items if item != lead)
-        for body in ("Review round blockers: - a.py:1 x", "Review round blockers: - b.py:2 y"):
+        for body in ("Review round blockers: - a.py:1 x", "Review round blockers: - b.py:2 y",
+                     "Lane failed in prepare at abc: local review blocking: 1/1 completed"):
             add_note(self.connection, lead, "comment", body)
         add_note(self.connection, other, "comment", "Lane failed in prepare at abc: local review blocking: 1/1 completed")
         add_note(self.connection, other, "comment", "Lane failed in prepare at abc: gate output quoted local review blocking")
         row = builds.panel(self.connection, now=run["created_at"])["runs"][0]
-        self.assertEqual({m["item"]: m["reviews"] for m in row["items"]}, {lead: 2, other: 3})
+        # The lane notes each member itself: the lead's lane round is the lead's alone, so none counts twice.
+        self.assertEqual({m["item"]: m["reviews"] for m in row["items"]}, {lead: 3, other: 3})
 
     def test_an_enqueued_run_reads_merging_and_its_untrailed_member_is_no_blocked_row(self):
         """sd:8960: a run in the lane waits on review; the member no `Closes:` trailer named is no blocked build."""
