@@ -399,6 +399,20 @@ class PriorLineTests(RepeatFixture):
                                              repro=True, prior=prior, later=lambda *_: True)
                 self.assertEqual(record["disposition"], expected)
 
+    def test_fresh_evidence_at_one_place_of_a_ruling_blocks_its_repeat_at_another(self) -> None:
+        """Review of sd:10191 (bin/sd-review:1868, :1877): one rebuttal names src.py:20 and src.py:40. The pass
+        it answered is rebutted at 20; a later pass found the crash at 40 with fresh evidence. The uncited
+        repeat at 20 is that ruling's too: the old rebutted record there held it back, and the fresh evidence
+        at 40 was lent to nothing. It blocks, carrying the fresh evidence."""
+        key = sd_review.summary_key("Division by zero")
+        rebutted = [sd_review.Rebuttal(ON_BRANCH, "src.py", key, 20, True, "src.py", "Division by zero",
+                                       "a reason", ("src.py:20", "src.py:40"), "old evidence")]
+        prior = [dict(finding("old evidence", line=20, summary="Division by zero"), disposition="blocking"),
+                 dict(finding(REPRO, line=40, summary="Division by zero"), disposition="blocking")]
+        [record] = sd_review.dispose([finding(line=20, summary="Division by zero")], "high", rebutted,
+                                     repro=True, prior=prior, later=lambda _, old: old.get("evidence") == REPRO)
+        self.assertEqual((record["disposition"], record.get("evidence")), ("blocking", REPRO))
+
     def test_each_blocker_maps_from_the_head_it_was_found_at(self) -> None:
         """Lead ruling 2026-11-22 (bin/sd-review:2496): a full-branch retry mapped every prior finding from the
         aggregate's latest head, so a blocker found at line 10 on an older head, with 30 lines inserted above it

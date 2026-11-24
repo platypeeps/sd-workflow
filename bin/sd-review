@@ -1863,10 +1863,10 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
     def _lends(old: Mapping[str, Any]) -> bool:  # a rebutted place still blocking: its evidence came after the ruling
         return old.get("disposition") == "blocking" and _rebutted(old)
     revived = [*filter(_lends, prior)]
+    def _lent(row: Mapping[str, Any]) -> str:  # revived evidence at any place of its own ruling, no other (sd-review:1865, :1877)
+        return "\n".join(dict.fromkeys(text for old in revived if (mine := _ruling(row)) is not None and _ruling(old) is mine for text in [old.get("evidence")] if isinstance(text, str) and text.strip()))
     def _repeat(row: Mapping[str, Any]) -> bool:  # an uncited repeat of a rebutted finding: the rebuttal is read first (build/sd-1423 review)
-        # Only a revived blocker of its own ruling lends: another rebuttal nearby still holds (sd:10191, sd-review:1865).
-        return _floor(row) and not (isinstance(row.get("evidence"), str) and row["evidence"].strip()) and _rebutted(row) and not prior_evidence(
-            [old for old in revived if _ruling(old) is _ruling(row)], row)
+        return _floor(row) and not (isinstance(row.get("evidence"), str) and row["evidence"].strip()) and _rebutted(row) and not _lent(row)
     # Only a finding that blocks releases a hold: not a medium copy (build/sd-1423 review), not a rebutted repeat (sd-review:1783).
     at_floor = instance_rows(*(row for row in findings if _floor(row) and not _repeat(row)))
     disposed = []
@@ -1874,7 +1874,7 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
         record, blocking = dict(finding), _floor(finding)
         evidence, note = record.get("evidence"), REPEAT_NOTE if _repeat(finding) else None
         if blocking and not note and not (isinstance(evidence, str) and evidence.strip()):
-            stored = prior_evidence(prior, record, at_floor)
+            stored = _lent(record) or prior_evidence(prior, record, at_floor)
             if stored:
                 record["evidence"] = stored
             note = NO_REPRO_NOTE if stored is None and repro and str(record.get("path") or "").strip() not in LANE_PATHS else None
