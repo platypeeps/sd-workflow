@@ -4201,6 +4201,79 @@ def sd_quote(argv):
     return shlex.join(argv)
 
 
+class CargoClean(Case):
+    """sd:10384: a build that ends blocked or done runs `cargo clean` in the Rust worktree it keeps."""
+
+    def setUp(self):
+        super().setUp()
+        self.press()
+        self.work = Path(self.bundle["work_path"])
+        self.cargo_log = self.root / "cargo.log"
+        script = self.root / "tools" / "cargo.py"
+        script.write_text("import json, shutil, sys\n"
+                          f"open({str(self.cargo_log)!r}, 'a').write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                          "shutil.rmtree(sys.argv[sys.argv.index('--target-dir') + 1])\n"
+                          "sys.exit(int(__import__('os').environ.get('FAKE_CARGO_EXIT', '0')))\n")
+        self.tools.cargo = [sys.executable, str(script)]
+
+    def rust(self, work=None):
+        work = work or self.work
+        work.mkdir(parents=True, exist_ok=True)
+        (work / "Cargo.toml").write_text('[package]\nname = "fixture"\n')
+        (work / "target" / "debug").mkdir(parents=True)
+        (work / "target" / "debug" / "big.rlib").write_bytes(b"x" * 64)
+
+    def cargo_calls(self):
+        return [json.loads(line) for line in self.cargo_log.read_text().splitlines()] if self.cargo_log.exists() else []
+
+    def test_blocked_cleans_the_target(self):
+        self.rust()
+        self.assertEqual(self.supervisor().finish("blocked", "fixture block")["outcome"], "blocked")
+        self.assertEqual(self.cargo_calls(), [["clean", "--offline", "--manifest-path", str(self.work / "Cargo.toml"),
+                                               "--target-dir", str(self.work / "target")]])
+        self.assertFalse((self.work / "target").exists())
+        self.assertTrue((self.work / "Cargo.toml").is_file())
+
+    def test_done_cleans_the_target(self):
+        self.rust()
+        self.assertEqual(self.supervisor().finish("done", "worktree kept: not clean")["outcome"], "done")
+        self.assertEqual(len(self.cargo_calls()), 1)
+
+    def test_cancelled_cleans_nothing(self):
+        self.rust()
+        self.supervisor().finish("cancelled", "operator")
+        self.assertEqual(self.cargo_calls(), [])
+
+    def test_no_rust_no_target_or_a_linked_target_runs_nothing(self):
+        self.work.mkdir(parents=True)
+        (self.work / "Cargo.toml").write_text("")  # no target/ yet
+        elsewhere = self.root / "elsewhere"
+        elsewhere.mkdir()
+        (elsewhere / "keep.txt").write_text("keep")
+        (self.work / "target").symlink_to(elsewhere)
+        self.supervisor().finish("blocked", "fixture block")
+        self.assertEqual(self.cargo_calls(), [])
+        self.assertTrue((elsewhere / "keep.txt").is_file())
+
+    def test_a_removed_worktree_runs_nothing(self):
+        self.supervisor().finish("done", "worktree removed")
+        self.assertEqual(self.cargo_calls(), [])
+
+    def test_a_failed_clean_notes_and_still_ends(self):
+        self.rust()
+        self.env["FAKE_CARGO_EXIT"] = "3"
+        self.assertEqual(self.supervisor().finish("blocked", "fixture block")["outcome"], "blocked")
+        notes = [row["body"] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
+        self.assertTrue(any("cargo clean" in body and "exit 3" in body for body in notes), notes)
+
+    def test_a_missing_cargo_notes_and_still_ends(self):
+        self.rust()
+        self.tools.cargo = [str(self.root / "no-such-cargo")]
+        self.assertEqual(self.supervisor().finish("blocked", "fixture block")["outcome"], "blocked")
+        notes = [row["body"] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
+        self.assertTrue(any("cargo clean" in body for body in notes), notes)
+
+
 class Tick(Case):
     def setUp(self):
         super().setUp()

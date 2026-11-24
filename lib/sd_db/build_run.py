@@ -72,6 +72,8 @@ from .writes import add_note, create_item, now, record_cost, record_state
 TIMEOUT_SECONDS = build.BUDGET_MINUTES * 60
 GRACE_SECONDS = 20
 BEAT_SECONDS = 30
+#: `cargo clean`'s bound: under `build.STALE_SECONDS`, as the supervisor beats no heartbeat while it runs.
+CLEAN_SECONDS = 300
 #: Reviews with blockers before the class pass and park: 2, so a park comes after 3
 #: reviews (operator 2026-11-23, sd:10128; sd:10111 had set 4).
 REVIEW_ROUNDS = 2
@@ -427,6 +429,8 @@ class Tools:
     #: pre-push hook the repository has, since an unmanaged one normally has none (review of pack sd:7868).
     guard: list[str] = field(default_factory=lambda: ["sh", str(system_checkout() / "local-leak-guard" / "leak-guard.sh"),
                                                       "scan"])
+    #: `cargo clean` in a Rust worktree a blocked or done run keeps (sd:10384).
+    cargo: list[str] = field(default_factory=lambda: ["cargo"])
 
 
 def judge(lines: list[str], *, session: str | None = None) -> dict:
@@ -1471,11 +1475,36 @@ class Supervisor:
 
     def finish(self, outcome: str, detail: str, *, question: str | None = None) -> dict:
         self.ending = (outcome, detail, question)  # kept: a hub fault here must not lose how the run ended
+        if outcome in ("blocked", "done"):
+            self.clean_target()
         ended = build.end(self.db, self.ident, outcome, detail, question=question)
         return ended or {"run": self.ident, "outcome": None, "why": "the run ended or moved before its last write"}
 
     def fresh(self) -> dict:
         return build.run(self.db, self.ident)
+
+    def clean_target(self) -> None:
+        """`cargo clean` of the worktree's own `target/` (sd:10384): a kept Rust worktree held up to 106 GiB.
+
+        Only a top-level `Cargo.toml` beside a real `target/` folder, never a link, and `--target-dir` names it, so
+        a `CARGO_TARGET_DIR` or cargo config elsewhere is untouched. Idempotent: a replay of the end runs it again
+        on an empty or gone folder. A failure is noted on the lead and the run still ends: the commits are kept.
+        """
+        manifest, target = self.work / "Cargo.toml", self.work / "target"
+        if not manifest.is_file() or target.is_symlink() or not target.is_dir():
+            return
+        argv = [*self.tools.cargo, "clean", "--offline", "--manifest-path", str(manifest), "--target-dir", str(target)]
+        try:
+            self.logs.mkdir(parents=True, exist_ok=True)
+            with open(self.out("cargo-clean"), "ab") as sink:
+                code = subprocess.run(argv, cwd=self.work, stdin=subprocess.DEVNULL, stdout=sink,
+                                      stderr=subprocess.STDOUT, env=self.env, timeout=CLEAN_SECONDS).returncode
+            why = None if code == 0 else f"exit {code}"
+        except (OSError, subprocess.TimeoutExpired) as fault:
+            why = f"{type(fault).__name__}: {fault}"
+        if why:
+            self.note(self.lead, f"Build run {self.ident}: cargo clean in {self.work} failed ({why}); "
+                                 f"see {self.out('cargo-clean')}")
 
     def enter(self, step: str, **fields) -> None:
         if self.fresh()["cancel_requested"] and step in build.CANCELLABLE:
