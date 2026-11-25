@@ -2921,6 +2921,26 @@ def lane_failed_start(connection, lead: int) -> dict | None:
     return {"run": failed["id"], "branch": failed["branch"], "detail": failed["detail"] or "", "items": items}
 
 
+def outside_rebuild(connection, lead: int, cited: Collection[int]) -> list[int]:
+    """Of `cited`, the items outside the bundle under `lead` when it builds again an item whose last bundle failed
+    in the lane; [] for any other bundle. Its branch may start at that bundle's head (`lane_failed_start`) and so
+    hold its trailers, and the lane's merge closes every open item one cites. Read from history alone, each row of
+    the bundle counted, so a member that leaves mid-run turns no check off (class pass of build/sd-1808)."""
+    bundle = connection.execute("SELECT id, item FROM assignment WHERE (id = ? OR parent = ?) AND scope = ?",
+                                (lead, lead, SCOPE)).fetchall()
+    ids, items = [row["id"] for row in bundle], {row["item"] for row in bundle}
+    for item in items:
+        prior = connection.execute(
+            f"SELECT id, parent FROM assignment WHERE item = ? AND scope = ? AND id NOT IN "
+            f"({', '.join('?' for _ in ids)}) ORDER BY id DESC LIMIT 1", (item, SCOPE, *ids)).fetchone()
+        last = prior and connection.execute(
+            "SELECT outcome FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
+            (prior["parent"] or prior["id"],)).fetchone()
+        if last and last["outcome"] == "lane_failed":
+            return sorted(set(cited) - items)
+    return []
+
+
 def lane_fix_check(connection, run: str) -> tuple[list[dict], str, dict]:
     """Whether Fix on a failed lane entry (pack sd:8584) takes build run `run`: its bundle's members to send back, and
     the lane entry's key and body to hand back. Fix's state on the page and its press both read this one check.

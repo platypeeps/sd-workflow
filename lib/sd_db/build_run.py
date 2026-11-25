@@ -2410,9 +2410,18 @@ class Supervisor:
                                           f"{', '.join(f'sd:{item}' for item in delivered)}, and a design ships "
                                           f"with code; settle what held the code items, then Retry")
         # A member the operator cancelled on its own needs no line: the lane reads it from data (`build.left`).
-        if asked:
+        # A rebuild of a lane-failed bundle can hold that bundle's trailers (`start_point`), and the start read
+        # them once: one a revert hid there, revived since, would close an item no one selected. Read again
+        # here, each outside the bundle stays open (class pass of build/sd-1808).
+        outside = build.outside_rebuild(self.db, self.row["assignment"], cited)
+        if outside:
+            self.once("outside", lambda: add_note(
+                self.db, self.lead, "comment", f"Build run {self.ident}: {self.row['branch']} has commits that "
+                f"close {', '.join(f'sd:{item}' for item in outside)}, outside this bundle; a `Refs:` line in the "
+                f"body keeps each open"))
+        if asked or outside:
             # The lane closes every open item a branch trailer cites; a `Refs:` line keeps these open.
-            refs = f"Refs: {' '.join(f'sd:{item}' for item in asked)}"
+            refs = f"Refs: {' '.join(f'sd:{item}' for item in [*asked, *outside])}"
             if refs not in body.splitlines():
                 body = body.rstrip("\n") + f"\n\n{refs}\n"
                 self.body.write_text(body, encoding="utf-8")

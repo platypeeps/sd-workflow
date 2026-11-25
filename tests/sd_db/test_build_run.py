@@ -4584,7 +4584,7 @@ class Tick(Case):
         self.assertIn(build.FINDING + "pin the fixture clock", notes)
 
     def rebuilt_after_lane_failure(self, count, *, lost=False, trimmed=False, closes=False, extra=False,
-                                   outsider=None, left_out=False):
+                                   outsider=None, left_out=False, reverted=None):
         """sd:10379: a bundle of two fails in the lane; the operator moves its first `count` items back to ready and
         builds them again, a fresh press. Answers the failed branch's head and the new run's started worktree."""
         run = self.enqueued(2)
@@ -4595,6 +4595,11 @@ class Tick(Case):
         if outsider is not None:  # a trailer for an item outside the bundle, kept open by the failed entry
             trailers += f"\nCloses: sd:{outsider}"
         support.git(self.repo, "commit", "-qm", f"feat: the bundle's work\n{trailers}")
+        if reverted is not None:  # a commit that closes an item outside the bundle, reverted on the failed branch
+            (self.repo / "other.txt").write_text("another item's work\n", encoding="utf-8")
+            support.git(self.repo, "add", "other.txt")
+            support.git(self.repo, "commit", "-qm", f"feat: another item's work\n\nCloses: sd:{reverted}")
+            support.git(self.repo, "revert", "--no-edit", "HEAD")
         head = support.git(self.repo, "rev-parse", "HEAD")
         support.git(self.repo, "checkout", "-q", "main")
         self.failed_branch = run["branch"]
@@ -4674,6 +4679,33 @@ class Tick(Case):
         self.assertEqual(supervisor.brief()["findings"].count("whose lane entry failed"), 0)
         notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
         self.assertTrue(any(f"sd:{kept}" in body for body in notes), notes)
+
+    def test_a_member_that_leaves_mid_run_turns_no_delivery_check_off(self):
+        """Class pass of build/sd-1808: the delivery's read of the rebuild is history alone, so a member cancelled
+        out since the start (`lane_failed_start` then answers None) still leaves the outside citation open."""
+        self.test_a_citation_revived_after_the_start_stays_open_at_delivery(leaves=True)
+
+    def test_a_citation_revived_after_the_start_stays_open_at_delivery(self, leaves=False):
+        """Class pass of build/sd-1808: the start read the failed branch's citations once. One a revert hid there
+        came back when the rebuild reverted the revert, and the merge would close an item no one selected. The
+        delivery reads them again and keeps each outside the bundle open with a `Refs:` line."""
+        kept = create_item(self.db, kind="task", title="Kept open", repo=str(self.repo), status="ready")
+        head, _ = self.rebuilt_after_lane_failure(2, closes=True, reverted=kept)
+        work = Path(self.bundle["work_path"])
+        self.assertEqual(support.git(work, "rev-parse", "HEAD"), head, "the hidden citation passes the start")
+        support.git(work, "revert", "--no-edit", "HEAD")
+        if leaves:
+            self.db.execute("UPDATE assignment SET status = 'cancelled', result = ? WHERE parent = ? AND item = ?",
+                            (f"{build.ALONE}operator: left out", self.bundle["assignment"], self.items[1]))
+            self.assertIsNone(build.lane_failed_start(self.db, self.bundle["assignment"]))
+        self.write_pr()
+        build.write(self.db, self.bundle["id"], step="enqueuing")
+        self.assertEqual(self.supervisor().run()["step"], "enqueued")
+        logs = build_run.log_dir(self.logs, self.bundle["repo"])
+        body = (logs / f"sd-{self.bundle['assignment']}.body.md").read_text(encoding="utf-8")
+        self.assertIn(f"Refs: sd:{kept}", body.splitlines())
+        notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
+        self.assertTrue(any(f"sd:{kept}" in note and "outside" in note for note in notes), notes)
 
     def test_a_member_cancelled_out_of_the_new_bundle_sends_it_to_main(self):
         """Review of build/sd-1808: the bundle read counted a member cancelled out of it (`ALONE`) as selected."""
