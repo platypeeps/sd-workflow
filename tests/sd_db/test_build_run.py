@@ -1328,6 +1328,25 @@ class Supervise(Case):
         answer = {"status": "blocking", "blockers": [row]}
         self.assertEqual(supervisor.settled(answer, head)["status"], "advisory")
 
+    def test_a_ruling_lapses_when_its_round_changes_a_function_its_evidence_names(self):
+        """Review of sd:10286: the repro names the changed caller by function, not file (`forward()`
+        passes ''). A fix to that function in the round re-verifies the ruling; one to another does not."""
+        self.press()
+        supervisor = self.supervisor()
+        row = {"path": "src/parse.py", "line": 4, "summary": "int('') raises on an empty count",
+               "evidence": "forward() passes '' to parse_count, and int('') raises ValueError"}
+        head = "a" * 40
+        supervisor.rule(1, row, "reject", "no caller passes ''", head, "example/repo", ["src/dispatch.py"],
+                        ["src/dispatch.py"], {"forward"})
+        supervisor.rule(2, row, "reject", "no caller passes ''", head, "example/repo", ["src/dispatch.py"],
+                        ["src/dispatch.py"], {"route"})
+        supervisor.rule(3, row, "reject", "no caller passes ''", head, "example/repo", ["src/dispatch.py"],
+                        ["src/dispatch.py"], None)
+        first, second, third = self.decisions()
+        self.assertIn("not applied: the round changed forward", first)
+        self.assertNotIn("not applied", second)
+        self.assertIn("not applied: the round's own changes did not read", third)
+
     def test_a_ruling_clears_no_gate_blocker(self):
         """Review of sd:10286: the review gate's own blocker (a response past its byte limit, a finding it could
         not place) names no code a ruling judged. A reject of it records nothing, and its repeat still blocks:

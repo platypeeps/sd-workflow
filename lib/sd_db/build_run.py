@@ -2071,10 +2071,15 @@ class Supervisor:
         # What the round's own commits changed since the head its rulings judged; None when it does not read.
         reviewed = self.round_head() if found else None
         moved = changed_lines(self.tools.git, str(self.work), reviewed, head, env=self.env) if reviewed else None
+        # The names the round's changed functions define, for a finding that names a caller by function.
+        # ponytail: a change outside any function names none here; its file still lapses a ruling naming it.
+        words = (function_words(self.tools.git, str(self.work), reviewed, head, env=self.env)
+                 if reviewed and moved is not None else None)
+        functions = None if moved is None else words[1] if words else set()
         for number, (ruling, reason) in sorted(found.items()):
             self.once(f"ruling:{head}:{number}", functools.partial(
                 self.rule, number, blockers[number - 1], ruling, reason, head, repository, changed,
-                None if moved is None else moved.keys()))
+                None if moved is None else moved.keys(), functions))
         asked = [(blockers[number - 1], reason) for number, (ruling, reason) in sorted(found.items()) if ruling == "ask"]
         if asked:
             # Kept beside the body until the run ends: a replay of this end reads the same rulings.
@@ -2135,7 +2140,8 @@ class Supervisor:
         return dict(answer, blockers=left) if left else dict(answer, status="advisory", blockers=[])
 
     def rule(self, number: int, row: dict, ruling: str, reason: str, head: str, repository: str,
-             changed: Collection[str] | None = (), moved: Collection[str] | None = ()) -> None:
+             changed: Collection[str] | None = (), moved: Collection[str] | None = (),
+             functions: Collection[str] | None = ()) -> None:
         """One ruling's writes in one transaction: the decision note, a filed item, the rebuttal (sd:10286).
 
         A reject or file judged the code at the reviewed head. `moved` is what the round's own commits changed
@@ -2148,8 +2154,10 @@ class Supervisor:
         said = " ".join(self.summary([row]).split())
         finding = row.get("line") != "-"
         # A file the finding or its evidence names: a fixed caller its repro runs through (lead ruling).
-        touched = (sorted({path for path, _ in self.locations(row)} & set(moved) | set(names_in(finding_words(row), moved)))
-                   if moved is not None else None)
+        # Or a function the round changed that its words name as code (`forward()`): a fixed caller by name.
+        touched = (sorted({path for path, _ in self.locations(row)} & set(moved) | set(names_in(finding_words(row), moved))
+                          | callable_words(finding_words(row)) & set(functions))
+                   if moved is not None and functions is not None else None)
         lapsed = ("" if ruling not in ("reject", "file") or not finding else
                   "; not applied: the review gate's own blocker, no code it judged" if not ruleable(row) else
                   "" if touched == [] else
