@@ -302,10 +302,23 @@ def _log_quiet(path: str | None, now: str) -> int | None:
     return max(0, int(clock.timestamp() - changed)) if clock else None
 
 
+def review_rounds(connection, items: list[int]) -> dict[int, int]:
+    """Each item's own review rounds that left blockers (pack sd:10306): its `Review round blockers:` notes (a
+    review, gate or enqueue check that blocked), plus its lane prepares a local review blocked. Clean rounds leave no
+    note, so they are not counted. A bundle notes its builder rounds on its lead item alone; notes carry no run, so
+    no member inherits them: the lead's row says its count is the bundle's (`bundle`)."""
+    rounds: dict[int, int] = {}
+    for item, _, n in reads.review_round_counts(connection, items):
+        rounds[item] = rounds.get(item, 0) + n
+    return rounds
+
+
 def _members(connection, run: dict) -> list[dict]:
     rows = build.run(connection, run["id"])["members"]
     titles = reads.items_by_ids(connection, [row["item"] for row in rows])
-    return [{"item": row["item"], "assignment": row["id"], "status": row["status"],
+    rounds = review_rounds(connection, [row["item"] for row in rows])
+    return [{"item": row["item"], "assignment": row["id"], "status": row["status"], "reviews": rounds.get(row["item"], 0),
+             "bundle": len(rows) > 1 and row["id"] == run["assignment"],
              "title": titles[row["item"]]["title"] if row["item"] in titles else ""} for row in rows]
 
 
@@ -338,6 +351,8 @@ def _open_row(connection, run: dict, now: str) -> dict:
             connection, run["id"], members[0]["item"] if members else "<item>"))
     return {"run": run["id"], "attempt": run["run"], "repo": run["repo"], "name": Path(run["repo"]).name, "host": host,
             "items": members, "model": run["model"] or "", "step": step, "state": state, "why": waiting,
+            # pack sd:10306: a run at a lane step released its builder slot (`build.LANE_STEPS`).
+            "builder": state in ("working", "stalled") and step not in build.LANE_STEPS,
             "outcome": run["outcome"], "started": run["created_at"], "elapsed": _seconds(run["created_at"], now),
             "beat": beat, "quiet": quiet, "usd": round(build.run_spent(connection, run["id"]), 2),
             "log": run["log_path"] or "", "branch": run["branch"] or "", "worktree": run["work_path"] or "",

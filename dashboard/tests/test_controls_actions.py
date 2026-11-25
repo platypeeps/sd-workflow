@@ -546,6 +546,17 @@ class ItemStatusOnly(BrowserSession):
                         if "selected" in entry["attributes"]]
             self.assertEqual(selected, [target])
 
+    def test_done_refuses_an_open_followup_and_names_its_resolve_action(self):
+        """sd:10407: Done resolved a person's followup unasked; it refuses now, naming the action."""
+        item = self.item("Close me", kind="task")
+        note = add_note(self.connection, item, "followup", "Ask example.test")
+        self.connection.commit()
+        revision = Fields(self.status_form(item)).fields["revision"]["value"]
+        status, _, answer = self.post(f"/api/items/{item}/status", {"revision": revision, "status": "done"})
+        self.assertNotEqual(status, 200)
+        self.assertIn(f"resolve followup {note}", json.dumps(answer))
+        self.assertEqual(workflow.item_state(self.connection, item)["item"]["status"], "planning")
+
     def test_a_followup_with_a_queued_assignment_shows_the_hint_and_no_select(self):
         """The queued run owns the status, not the details. A task with a
         queued assignment keeps its `Save details` form for the same reason:

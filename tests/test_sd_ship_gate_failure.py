@@ -897,9 +897,18 @@ class TheRerunRunsAtTheReviewedHead(unittest.TestCase):
     """sd:9768 review: the rerun runs in a clean worktree of the gate's head, never the caller's checkout."""
 
     def test_the_rerun_runs_in_a_clean_worktree_of_head(self):
+        self.check_the_rerun(linked=False)
+
+    def test_a_linked_temp_dir_names_the_interpreter_make_names(self):
+        """sd:10530: with the RAM disk short the folder lies under the unresolved system temp dir
+        (`/var` on macOS links to `/private/var`); make's `abspath` names the resolved path."""
+        self.check_the_rerun(linked=True)
+
+    def check_the_rerun(self, *, linked):
         import subprocess
         import tempfile
 
+        import sd_gate_cache
         import sd_gate_run
 
         from tests.clean_env import clean_environment
@@ -908,6 +917,13 @@ class TheRerunRunsAtTheReviewedHead(unittest.TestCase):
         self.addCleanup(scratch.cleanup)
         root = pathlib.Path(scratch.name) / "repo"
         root.mkdir()
+        if linked:
+            (pathlib.Path(scratch.name) / "place").mkdir()
+            (pathlib.Path(scratch.name) / "link").symlink_to("place")
+            place = unittest.mock.patch.object(sd_gate_cache, "worktree_place", return_value={
+                "dir": str(pathlib.Path(scratch.name) / "link"), "prefix": "sd-gate-example-"})
+            place.start()
+            self.addCleanup(place.stop)
 
         def git(*args):
             return subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True,

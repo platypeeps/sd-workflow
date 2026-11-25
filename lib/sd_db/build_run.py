@@ -197,6 +197,8 @@ Rules:
   the background, and no exit wakes you (sd:9183). The lane runs the full gate.
 - End the commit that delivers a whole item with a `Closes: sd:N` trailer: an item no trailer names
   stays open and is not delivered. Add no attribution lines.
+- Give each later fix-up of a delivered item that item's `Closes: sd:N` trailer again: a bundle drop
+  reads whose a commit is from that trailer alone, and refuses a commit that cites no item (sd:10319).
 - Keep every commit line, and every body line, at 72 characters or less outside a code fence:
   `sd-ship lane enqueue` refuses a longer one.
 - Write the pull-request title, a Conventional Commit of {title_max} characters or less, alone to {title}.
@@ -229,7 +231,8 @@ then record it with the same command plus `--dispositions-file /dev/stdin`, the 
 """
 
 FIX = """The review of branch {branch} found these blockers. Fix each one fail-first as a new commit in
-{worktree}, then update the body at {body}. Never push. Your final message is your report.
+{worktree}, its item's `Closes: sd:N` trailer on it, then update the body at {body}. Never push. Your final
+message is your report.
 
 {blockers}
 """
@@ -244,8 +247,9 @@ enumerate every instance of it in this change, from the code, not from the findi
 CLASS_PASS = """The review of branch {branch} still found blockers after {rounds} rounds. This is the last round
 before the build parks, so do one class pass, not another single-finding fix: name the class these blockers
 share, enumerate every instance of it from the code, not from the findings, and fix each one fail-first as a
-new commit in {worktree}. Fix the class within this change's own scope: a new reader, audit or entry kind
-becomes its own item, not a commit here (sd:9584). Add each instance to the failure table in the body at
+new commit in {worktree}, its item's `Closes: sd:N` trailer on it. Fix the class
+within this change's own scope: a new reader, audit or entry kind becomes its own item, not a commit here
+(sd:9584). Add each instance to the failure table in the body at
 {body}. Never push. Your final message is your report: the class, each instance and its test.
 
 {blockers}
@@ -279,6 +283,43 @@ Risks: <what could make this wrong>
 <At most {questions}, only those whose answer changes the work. Each is its text, then two or more lines
 that start "Option:", the recommended one first, ending " (Recommended)". Leave the section out when there
 is none.>
+"""
+
+DESIGN = """You are the headless lead, run by the build dispatcher (sd:10096). Write the design page for one
+design-only item. You hold the read tools only: read the repository in the current directory, its CLAUDE.md
+and AGENTS.md, its `templates/design.md` when it has one, and the code the item touches. You write nothing;
+the dispatcher writes your reply on the item, and the repository's next code bundle commits it as
+`docs/work/<date>-<slug>/design.md`.
+
+The item is sd:{item}, in {repo}:
+Title: {title}
+{body}
+
+Ask only what would change the design and the repository cannot answer. Keep requirements apart from
+assumptions; each acceptance criterion names a check and its result. A design that moves state in steps
+carries a failure table: step, state moved, failure, recovery, test.
+
+Your final message is the reply, in exactly this form and nothing else:
+
+## Spec
+
+<the design page's text, its sections as `###` headings>
+
+## Questions
+
+<At most {questions}, only those whose answer changes the design. Each is its text, then two or more lines
+that start "Option:", the recommended one first, ending " (Recommended)". Leave the section out when there
+is none.>
+"""
+
+#: Added to a bundle's brief for each design item it carries (sd:10096).
+DESIGNS = """
+Each design below is a design item's whole work, written by its design run. Commit it, with the rulings
+under it applied, as `docs/work/<date>-<slug>/design.md` in your first commit, `<date>` today's and
+`<slug>` from the item's title, with a `Closes: sd:N` trailer for its item. Each design gets a directory
+of its own, even when two titles match, and its front matter names its item alone: `item: sd:N`. Change
+no word of it but its headings and what a ruling changes.
+{designs}
 """
 
 RESUME = """Your run was interrupted. Continue the brief in {worktree}: finish the items, commit, write the
@@ -622,7 +663,64 @@ def function_words(git: Collection[str], work: str, base: str, head: str, *,
     # Every name on a changed line, and each name a context line defines (`defined_names`).
     defined = {name for line in lines for name in (re.findall(r"[A-Za-z_]\w*", line[1:]) if line[0] in "+-"
                                                    else defined_names(line[1:]))}
-    return set(re.findall(r"[A-Za-z_]\w*", diff)), defined
+    # A quoted literal reads as `"text"`, which no identifier spells: a key an exporter writes ties it to the
+    # unchanged importer that reads the same key, a format and no name (sd:10027).
+    return set(re.findall(r"[A-Za-z_]\w*", diff)) | literals("\n".join(line[1:] for line in lines)), defined
+
+
+def literals(text: str) -> set[str]:
+    """Each quoted literal of two or more characters in `text`, as `"text"` whatever its quotes (sd:10027).
+    ponytail: an apostrophe in prose pairs with the next, so it reads more literals, never fewer."""
+    return {f'"{body}"' for _quote, body in re.findall(r"""(["'])((?:(?!\1)[^\\\n]){2,})\1""", text)}
+
+
+# Decorators that wrap a function and leave it reached by its own name; any other may file it in a table
+# (`@register("a")`, `@app.route`) its readers reach by no name, an edge the name walk misses (sd:10027).
+WRAPPERS = frozenset({"property", "setter", "getter", "deleter", "staticmethod", "classmethod", "abstractmethod",
+                      "cached_property", "cache", "lru_cache", "wraps", "override", "final", "dataclass",
+                      "contextmanager", "asynccontextmanager", "total_ordering"})
+# What a test decorator files, only a test runner reads, and the gate runs those.
+TEST_DECORATORS = frozenset({"mock", "unittest", "pytest"})
+# Dunders reached by name through their class (`Table()` reads the class body); any other is called by syntax:
+# `table[key]`, `a == b`, `obj.missing` (sd:10027).
+NAMED_DUNDERS = frozenset({"__init__", "__new__", "__post_init__"})
+
+
+def definition(lines: list[str], line: int) -> tuple[int, int] | None:
+    """The `(start, end)` indexes of the nearest definition whose lines hold the 1-based `line`: a line below
+    a function's end is not its own; None outside every function."""
+    for start in range(min(line, len(lines)) - 1, -1, -1):
+        if defined_names(lines[start]):
+            depth = len(lines[start]) - len(lines[start].lstrip())
+            # A line that opens with `)` or `]` closes a bracket (a signature split over lines), not the
+            # function. ponytail: a multiline string's column-0 text still ends it; a parser if that costs.
+            end = next((index for index in range(start + 1, len(lines)) if lines[index].strip()
+                        and not lines[index].lstrip().startswith((")", "]"))
+                        and len(lines[index]) - len(lines[index].lstrip()) <= depth), len(lines))
+            if line <= end:
+                return start, end
+    return None
+
+
+def implicit(lines: list[str], start: int, *, named: Collection[str] = ()) -> bool:
+    """Whether the definition at `lines[start]` is reached by no name: a dunder outside `named`, or one under
+    a decorator not in `WRAPPERS` (sd:10027). Decorator lines sit above it at its indent; a decorator's
+    arguments split over lines sit deeper or close with `)`."""
+    if any(name.startswith("__") and name.endswith("__") and name not in named for name in defined_names(lines[start])):
+        return True
+    depth = len(lines[start]) - len(lines[start].lstrip())
+    for text in reversed(lines[:start]):
+        indent = len(text) - len(text.lstrip())
+        if not text.strip() or indent < depth:
+            return False
+        if indent > depth or text.lstrip().startswith((")", "]")):
+            continue
+        if not text.lstrip().startswith("@"):
+            return False
+        parts = re.findall(r"[A-Za-z_]\w*", re.split(r"[^\w.]", text.lstrip()[1:].lstrip(), maxsplit=1)[0])
+        if parts and parts[-1] not in WRAPPERS and parts[0] not in TEST_DECORATORS:
+            return True
+    return False
 
 
 def defined_names(line: str) -> set[str]:
@@ -890,8 +988,9 @@ def dispatch(connection, *, owner: str, load: float | None, load_cap: float | No
             why, taken = str(refusal), None
         claimed += [taken["id"]] if taken else []
     drafted: list[str] = []
-    if not why and hub and not claimed:
-        # A tick that claimed no build: a draft takes what machine room the builds leave, and no repository slot.
+    if not why and hub:
+        # A draft or design run takes what machine room the builds leave, and no repository slot, so it claims
+        # beside a bundle in the same tick (sd:10096); one runs at a time, so a tick starts at most two.
         available = build.room(connection, load=load, load_cap=load_cap, interactive=interactive, hosts=hosts)
         taken = draft.claim(connection, owner=owner, available=available)
         drafted += [taken["id"]] if taken else []
@@ -1491,6 +1590,11 @@ class Supervisor:
     def building(self) -> str | dict:
         self.enter("building", log_path=str(self.log))
         session = self.fresh()["session_id"]
+        if not session:
+            # Before the brief reads them: a ruling between the two is one the brief may not carry (sd:10096).
+            for item in [self.lead, *self.others]:
+                if draft.is_design(self.db, item) and draft.design(self.db, item) is not None:
+                    build.note_brief(self.db, item, self.ident)
         prompt = (RESUME if session else BRIEF).format(**self.brief())
         return self.claude(prompt, session=session, then="reviewing", role="building")
 
@@ -1716,6 +1820,10 @@ class Supervisor:
         functions = self.branch_words(head) if changed is not None else None
 
         sources: dict[str, list[str] | None] = {}
+        # A change to a function reached by no name (a registered handler, a `__getitem__`) reaches readers no
+        # walk finds: every blocker holds (sd:10027).
+        if functions is not None and changed and self.implicit_change(changed, head, sources):
+            functions = None
 
         def held(row: dict) -> bool:
             # `<...>` names no file; an absolute or `..` path is outside the checkout no delta of it can clear.
@@ -1739,7 +1847,10 @@ class Supervisor:
             # name, so its path defers nothing.
             # Or a place whose function calls a changed one, directly or through unchanged ones: a fix that makes
             # `lookup()` return None breaks the unchanged consumer at `lookup().name`.
-            if any(self.called_from(path, line, head, sources, functions[0])
+            # Or a place reached by no name: under a registering decorator, a dunder, or a reader of a quoted key
+            # the changed code also spells (sd:10027).
+            if any(self.implicit_place(path, line, head, sources, functions[0])
+                   or self.called_from(path, line, head, sources, functions[0])
                    or self.calls_into(path, line, head, sources, functions[1]) for path, line in self.locations(row)):
                 return True
             # A name with a space or other character no word holds (`bin/my tool`), found literally and whole.
@@ -1747,6 +1858,31 @@ class Supervisor:
                        for name in names if re.search(r"[^\w./-]", name))
         new = [row for row in answer["blockers"] if not held(row)]
         return new, [row for row in answer["blockers"] if row not in new]
+
+    def implicit_place(self, path: str, line: int | None, head: str, sources: dict[str, list[str] | None],
+                       words: set[str]) -> bool:
+        """Whether the code at `path:line` is reached by no name (`implicit`, any dunder), or its scope quotes a
+        literal the changed code quotes too; an answer git cannot give counts as reached (sd:10027)."""
+        if (found := self.scope(path, line, head, sources)) is None:
+            return True
+        lines = sources.get(path) or []
+        at = definition(lines, line) if line is not None else None
+        return bool(at and implicit(lines, at[0])) or bool(literals("\n".join(found[1])) & words)
+
+    def implicit_change(self, changed: dict[str, set[int]], head: str,
+                        sources: dict[str, list[str] | None]) -> bool:
+        """Whether a line the branch changes sits in a definition reached by no name, a dunder outside
+        `NAMED_DUNDERS` or a registered function; a path with no lines reads whole, one git cannot read
+        counts (sd:10027)."""
+        for path, numbers in changed.items():
+            if (found := self.scope(path, None, head, sources)) is None:
+                return True
+            lines = found[1]
+            starts = ({at[0] for number in numbers if (at := definition(lines, number))} if numbers
+                      else {index for index, text in enumerate(lines) if defined_names(text)})
+            if any(implicit(lines, start, named=NAMED_DUNDERS) for start in starts):
+                return True
+        return False
 
     def called_from(self, path: str, line: int | None, head: str, sources: dict[str, list[str] | None],
                     words: set[str]) -> bool:
@@ -1871,17 +2007,8 @@ class Supervisor:
             return None
         if line is None:
             return {name for text in lines for name in defined_names(text)}, lines
-        # The nearest definition whose lines hold the cited one: a line below a function's end is not its own.
-        for start in range(min(line, len(lines)) - 1, -1, -1):
-            if names := defined_names(lines[start]):
-                depth = len(lines[start]) - len(lines[start].lstrip())
-                # A line that opens with `)` or `]` closes a bracket (a signature split over lines), not the
-                # function. ponytail: a multiline string's column-0 text still ends it; a parser if that costs.
-                end = next((index for index in range(start + 1, len(lines)) if lines[index].strip()
-                            and not lines[index].lstrip().startswith((")", "]"))
-                            and len(lines[index]) - len(lines[index].lstrip()) <= depth), len(lines))
-                if line <= end:
-                    return names, lines[start:end]
+        if (found := definition(lines, line)) is not None:
+            return defined_names(lines[found[0]]), lines[found[0]:found[1]]
         return set(), statement(lines, max(line - 1, 0))
 
     def branch_words(self, head: str) -> tuple[set[str], set[str]] | None:
@@ -1988,7 +2115,35 @@ class Supervisor:
         except ValueError:  # not UTF-8: the builder rewrites it, as for any other refusal
             return [f"the title at {self.title} or the body at {self.body} is not UTF-8 text"]
         refused = self.checked(self.work, self.base(), head, title.strip(), body) if self.checked else []
-        return refused + self.untabled(head, body)
+        return refused + self.untabled(head, body) + self.undesigned(head, body)
+
+    def undesigned(self, head: str, body: str) -> list[str]:
+        """The refusal for a design item the branch closes with no design.md of its own, or none (review of
+        sd:10096): two designs with one title closed from one file that kept only one. A design.md the branch
+        adds or changes under `docs/work` is the file of the item its front matter's `item: sd:N` line names."""
+        designs = [item for item in [self.lead, *self.others] if draft.is_design(self.db, item)]
+        cited = self.cited(self.work, self.base(), head, body) if designs else None
+        designs = [item for item in designs if item in (cited or ())]
+        if not designs:
+            return []
+        git = [*self.tools.git, "-C", str(self.work)]
+        owned = set()
+        for path in _read([*git, "diff", "--name-only", "-z", "--diff-filter=d", f"{self.base()}...{head}", "--",
+                           "docs/work"], env=self.env).split("\0"):
+            if re.fullmatch(r"docs/work/[^/]+/design\.md", path):
+                text = _read_bytes([*git, "cat-file", "blob", f"{head}:{path}"], env=self.env).decode("utf-8", "replace")
+                # The front matter's `item:` line alone: one in a Markdown example names no owner (review).
+                # It ends at the first closing `---` line, an empty one too (class pass).
+                lines = text.split("\n")
+                front = lines[1:lines.index("---", 1)] if lines[0] == "---" and "---" in lines[1:] else []
+                named = next((found for line in front if (found := re.fullmatch(r"item:\s*sd:([0-9]+)\s*", line))),
+                             None)
+                owned |= {int(named.group(1))} if named else set()
+        missing = [item for item in designs if item not in owned]
+        if not missing:
+            return []
+        return [f"each design item the branch closes needs a docs/work/<date>-<slug>/design.md of its own: "
+                f"{', '.join(f'sd:{item}' for item in missing)} has none whose first `item:` line names it"]
 
     def untabled(self, head: str, body: str) -> list[str]:
         """The failure-table refusal for a change that moves state in steps, or none (sd:9770).
@@ -2038,7 +2193,7 @@ class Supervisor:
         # One class-pass round past the bound (sd:9263). None when every member waits on a question no fix answers;
         # a question on one member leaves the others to fix, as enqueue delivers them without it.
         unasked = [item for item in [self.lead, *self.others]
-                   if not build.open_question(self.db, [item], self.row["asked_since"])]
+                   if not build.waits_on_operator(self.db, item, self.row["asked_since"])]
         if rounds == REVIEW_ROUNDS and unasked:
             return self.fix(CLASS_PASS, rounds=rounds)
         return self.finish("blocked", f"{rounds} review rounds left blockers: {self.summary(self.blockers)}")
@@ -2112,11 +2267,31 @@ class Supervisor:
         delivered = [item for item in [self.lead, *self.others] if item in cited]
         # A retry's branch keeps the lost run's trailers: a member this run's builder skipped with a question
         # waits on it (pack sd:6571).
-        asked = [item for item in delivered if build.open_question(self.db, [item], self.row["asked_since"])]
+        # Nor does a design whose ruling was taken back since the claim deliver (class pass of sd:10096).
+        asked = [item for item in delivered if build.waits_on_operator(self.db, item, self.row["asked_since"])]
         delivered = [item for item in delivered if item not in asked]
         if not delivered and asked:
             return self.finish("blocked", f"every cited item has an open question since the run started: "
                                           f"{', '.join(f'sd:{item}' for item in asked)}")
+        # A member ships with the design it waits on or not at all: one left out above, or with no commit,
+        # holds the delivery (class pass of sd:10096).
+        left = build.design_left(self.db, delivered, [self.lead, *self.others])
+        if left:
+            return self.finish("blocked", f"{left}; rule on the design or commit its design.md, then Retry")
+        # A design left out so still has its design.md on the branch, written under the old ruling: it would
+        # land with the code while its item stays open (review of sd:10096).
+        # Done or not: done says nothing of this branch's design.md, which would still land (review of sd:10096).
+        stale = sorted(build.aboard(self.db, asked))
+        if stale:
+            return self.finish("blocked", f"design {', '.join(f'sd:{item}' for item in stale)} waits on the "
+                                          f"operator again, and the branch holds its design.md written under the "
+                                          f"old ruling; rule on it, then Retry")
+        # Nor does a design ship without code: the lane refuses a branch of design records
+        # (`design_only_delivery`), and no reader of a delivery expects one with no code item (class pass).
+        if delivered and build.aboard(self.db, delivered) == set(delivered):
+            return self.finish("blocked", f"the branch delivers only design "
+                                          f"{', '.join(f'sd:{item}' for item in delivered)}, and a design ships "
+                                          f"with code; settle what held the code items, then Retry")
         # A member the operator cancelled on its own needs no line: the lane reads it from data (`build.left`).
         if asked:
             # The lane closes every open item a branch trailer cites; a `Refs:` line keeps these open.
@@ -2381,7 +2556,18 @@ class Supervisor:
             f"SELECT id, title FROM item WHERE id IN ({', '.join('?' for _ in items)})", items)}
         return {"worktree": self.work, "branch": self.row["branch"], "title": self.title, "body": self.body,
                 "title_max": TITLE_MAX, "items": "\n".join(f"- sd:{item} {titles.get(item, '')}" for item in items),
-                "findings": self.findings(items), "checklist": self.checklist(), "denied": self.denied()}
+                "findings": self.findings(items) + self.designs(items), "checklist": self.checklist(), "denied": self.denied()}
+
+    def designs(self, items: list[int]) -> str:
+        """The design and rulings of each design item in `items` (sd:10096); "" for none."""
+        found = []
+        for item in items:
+            text = draft.design(self.db, item) if draft.is_design(self.db, item) else None
+            if text is None:
+                continue
+            rulings = build.design_rulings(self.db, item)
+            found.append("\n".join([f"\n- sd:{item}:\n\n{text}", *(f"\n  {ruling}" for ruling in rulings)]))
+        return DESIGNS.format(designs="\n".join(found)) if found else ""
 
     def checklist(self) -> str:
         """The blocker classes recorded review rounds of the last `CHECKLIST_DAYS` found most, top first; "" for
@@ -2864,7 +3050,7 @@ class DraftSupervisor(Supervisor):
 
     def argv(self) -> list[str]:
         title, body = draft.item_text(self.db, self.item)
-        prompt = DRAFT.format(item=self.item, repo=self.row["repo"], title=title, body=body.strip() or "(no body)",
+        prompt = (DESIGN if draft.is_design(self.db, self.item) else DRAFT).format(item=self.item, repo=self.row["repo"], title=title, body=body.strip() or "(no body)",
                               questions=draft.QUESTIONS_MAX)
         return [*self.tools.claude, "-p", prompt, "--output-format", "stream-json", "--verbose",
                 "--tools", *draft.TOOLS, "--permission-mode", "dontAsk", "--strict-mcp-config",
@@ -2898,8 +3084,11 @@ class DraftSupervisor(Supervisor):
         if parsed is None:
             return self.finish("blocked", f"the reply has no `## Spec`, or a question short of two Option: "
                                           f"lines or of a recommended one; nothing was written; log {self.log}")
-        if not draft.write(self.db, self.ident, *parsed):
-            raise Lost
+        try:
+            if not draft.write(self.db, self.ident, *parsed):
+                raise Lost
+        except draft.Moved as moved:
+            return self.finish("blocked", f"{moved}; log {self.log}")
         return {"run": self.ident, "outcome": "done", "questions": len(parsed[1])}
 
 

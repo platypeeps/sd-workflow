@@ -1940,7 +1940,8 @@ def rerun_tests(root: pathlib.Path, head: str, tests: list[str]) -> tuple[int | 
     import sd_gate_run  # noqa: PLC0415
 
     with tempfile.TemporaryDirectory(**sd_gate_cache.worktree_place(root, head)) as parent:
-        tree = pathlib.Path(parent) / "tree"
+        # Resolved, as make's `abspath` names the interpreter: `/var` links to `/private/var` (sd:10530).
+        tree = pathlib.Path(parent).resolve() / "tree"
         try:
             sd_gate_run.gate_git(root, "worktree", "add", "--detach", str(tree), head)
         except sd_gate_run.GateError as error:

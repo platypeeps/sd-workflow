@@ -297,6 +297,18 @@ decline(cmd('today.lane.approve'), o); await flush(); R.said = (cmd('today.lane.
         self.assertEqual(out["confirms"], [])
         self.assertEqual([(path, body["action"]) for path, body, _ in out["posts"]], [("/api/queue/move", "retry")])
 
+    def test_retry_on_a_review_blocked_entry_asks_first_until_its_review_holds_dispositions(self):
+        """sd:9966 lane review: the page cannot tell whether the default branch moved, so Retry and Approve stay
+        on; Retry asks first while the review holds no dispositions, which `lane retry` would reuse."""
+        failure = {"code": "review_blocking", "retryable": False}
+        for held, ask in ((False, True), (True, False), (None, False)):
+            with self.subTest(held=held):
+                self.doc["needs"] = self.needs({**blocked(5780), "failure": failure, "held": held})
+                out = self.run_page(self.DECLINE + f"""const o = C.get('{self.ENTRY}');
+R.retry = cmd('today.lane.retry').when(o); R.approve = cmd('today.lane.approve').when(o);
+R.ask = cmd('today.lane.retry').askFirst(o);""")
+                self.assertEqual((out["R"]["retry"], out["R"]["approve"], out["R"]["ask"]), (True, True, ask))
+
     def test_retry_at_a_head_no_commit_moved_asks_first_and_names_the_lanes_next_action(self):
         """pack sd:8584: Retry on Needs you repeated a code failure silently, as Queue's did; it asks there too."""
         failure = {"code": "merge_conflict", "retryable": False,

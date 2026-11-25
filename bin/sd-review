@@ -95,18 +95,13 @@ SKILLS_UNKNOWN, SKILLS_NOT_PROBED = "unknown", "not_probed"
 SKILLS_BLOCK_MARKER = "<skills_instructions>"
 SKILL_PROBE_TIMEOUT_SECONDS = 120
 
-RATE_LIMIT_MARKERS = (
-    "rate limit",
-    "rate-limit",
-    "rate_limit",
-    "usage limit",
-    "quota exceeded",
-    "too many requests",
-    "http 429",
-    "status 429",
-    " 429 ",
-)
+RATE_LIMIT_MARKERS = ("rate limit", "rate-limit", "rate_limit", "usage limit", "quota exceeded", "too many requests",
+                      "http 429", "status 429", " 429 ")
 
+#: Where a finding's failing input comes from (sd:10288, note #77932): only `synthetic` posts as advisory; none blocks.
+TRIGGERS = {"caller": "a real caller path in the repository", "recorded": "repository history, logs or saved data",
+            "untrusted": "outside the operator's control: a network reply, another person's file or text, user-typed text",
+            "loss_or_leak": "a data-loss or secret-leak path", "synthetic": "only input no caller or recorded data produces"}
 FINDING_PROPERTIES: dict[str, Any] = {
     "path": {"type": "string", "minLength": 1},
     "line": {"type": ["integer", "null"]},
@@ -116,9 +111,10 @@ FINDING_PROPERTIES: dict[str, Any] = {
     # pack sd:9270: what shows a defect raised again after a rebuttal; empty otherwise.
     "evidence": {"type": "string"},
     "instances": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},  # each `path:line` of its class (sd:9769)
+    "trigger": {"enum": list(TRIGGERS)},  # where the failing input comes from (sd:10288, note #77932)
 }
 #: A finding may omit these and stay schema-valid: an answer from before evidence existed is read, not refused.
-OPTIONAL_FINDING_KEYS = frozenset({"evidence", "instances"})
+OPTIONAL_FINDING_KEYS = frozenset({"evidence", "instances", "trigger"})
 #: The most of one finding's evidence a report keeps, and the note an uncited repeat of a rebuttal gets (pack sd:9270).
 EVIDENCE_CHARS = 1000
 REPEAT_NOTE = "[downgraded: repeats a rebutted finding, no evidence cited]"
@@ -126,6 +122,8 @@ REPEAT_NOTE = "[downgraded: repeats a rebutted finding, no evidence cited]"
 EVIDENCE_ASK = ("a failing input and its path:line route, showing a failure this change causes in code "
                 "it touched or a caller it breaks; a code finding without one blocks nothing.")
 NO_REPRO_NOTE = "[advisory: no failing input or command cited]"
+TRIGGER_ASK = "trigger says where that input comes from: " + "; ".join(f"{name}: {why}" for name, why in TRIGGERS.items()) + "."
+SYNTHETIC_NOTE = "[advisory: no caller or recorded data carries the failing input]"
 #: How far a patch may move an unmatched prior blocker and its uncited repeat still block (fail closed).
 #: How far from a prior blocker's mapped line its own summary still repeats it, at a caller (bin/sd-review:1809).
 ECHO_LINES = 10  # ponytail: a neighbouring caller; a same-summary finding farther off is its own finding
@@ -984,7 +982,7 @@ def build_prompt(subject: Subject, challenge: bool, conventions: str) -> str:
         "speculative ones. path is the repository-relative file, "
         "line is the line in the new version or null, family is the defect's class, one short word such as security, correctness, testing, or maintainability. instances lists, as "
         "path:line, every place in the change where the same defect occurs, the reported one first; a high finding lists at least one. evidence is "
-        f"{EVIDENCE_ASK} Respond only with JSON matching the output schema; an empty findings array means clean."
+        f"{EVIDENCE_ASK} {TRIGGER_ASK} Respond only with JSON matching the output schema; an empty findings array means clean."
     )
 
 
@@ -1233,9 +1231,10 @@ def _instances(value: Any) -> list[str]:
 
 
 def _cited(raw: dict[str, Any]) -> dict[str, Any]:
-    """A finding's nonempty `evidence` and `instances`, the keys a reader may leave out."""
+    """A finding's nonempty `evidence`, `instances` and exact `trigger`, the keys a reader may leave out."""
     return {key: value for key, value in (("evidence", _evidence(raw.get("evidence"))),
-                                          ("instances", _instances(raw.get("instances")))) if value}
+                                          ("instances", _instances(raw.get("instances"))),
+                                          ("trigger", next((name for name in TRIGGERS if name == raw.get("trigger")), None))) if value}
 
 
 def _finding(raw: Any) -> dict[str, Any] | None:
@@ -1311,6 +1310,8 @@ def _finding_error(raw: Any) -> str:
         return "line: expected integer or null"
     if not isinstance(raw.get("instances", []), list) or not all(isinstance(e, str) for e in raw.get("instances", [])):
         return "instances: expected array of strings"
+    if "trigger" in raw and raw["trigger"] not in tuple(TRIGGERS):  # a tuple: a list or dict value is unhashable
+        return "trigger: invalid enum value"
     if raw["severity"] == "high" and not _instances(raw.get("instances")):
         return "instances: a high finding lists no instance"
     return ""
@@ -1393,8 +1394,11 @@ def _token_count(value: Any) -> int | None:
     return value if type(value) is int and 0 <= value <= 10**12 else None
 
 
-def reader_cost(reader: str | None, stdout: str) -> dict[str, Any] | None:
-    """pack sd:8503: Claude's `total_cost_usd` (API rates) and tokens, cache included; other readers read None, not zero."""
+def reader_cost(reader: str | None, stdout: str, stderr: str = "") -> dict[str, Any] | None:
+    """pack sd:8503: Claude's `total_cost_usd` (API rates) and tokens, cache split out; codex's closing `tokens used` total (sd:10205)."""
+    found = reader == "codex-json" and re.search(r"^tokens used\n(\d{1,3}(?:,\d{3})*|\d+)\n?\Z", stderr[-200:], re.M | re.A)
+    if found and (total := _token_count(int(found[1].replace(",", "")))) is not None:
+        return {"usd": None, "input_tokens": None, "output_tokens": None, "total_tokens": total}
     if reader != "claude-json":
         return None
     try:
@@ -1407,7 +1411,7 @@ def reader_cost(reader: str | None, stdout: str) -> dict[str, Any] | None:
     usage = value.get("usage") if isinstance(value.get("usage"), dict) else {}
     parts = [_token_count(usage.get(key)) for key in ("input_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")]
     return {"usd": usd, "input_tokens": sum(part or 0 for part in parts) if any(part is not None for part in parts) else None,
-            "output_tokens": _token_count(usage.get("output_tokens"))}
+            "output_tokens": _token_count(usage.get("output_tokens")), "uncached_input_tokens": parts[0], "cache_write_input_tokens": parts[1], "cache_read_input_tokens": parts[2]}
 
 
 def _answer(
@@ -1757,7 +1761,7 @@ def run_provider(
             result, parsed = sd_opencode.opencode_answer(result, parse=parse_findings, oversized=oversized_findings, limit=MAX_OUTPUT_BYTES)
         else:
             result, parsed = claude_answer(result)
-    return _answer(provider.name, result, parsed, argv, removed)._replace(cost=reader_cost(provider.reader, result.stdout), diagnostic=(
+    return _answer(provider.name, result, parsed, argv, removed)._replace(cost=reader_cost(provider.reader, result.stdout, result.stderr), diagnostic=(
         {"prompt_transport": "stdin", "prompt_bytes": len(prompt.encode()),
          "prompt_sha256": hashlib.sha256(prompt.encode()).hexdigest(),
          "skill_suppression": dict(skills) if skills is not None else None} if codex else
@@ -1774,7 +1778,7 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
 
     A finding at the floor posts as advisory, its summary saying why, when it cites no `evidence` and repeats
     one rebutted on this branch (pack sd:9270), or, with `repro`, outside the lane's own `LANE_PATHS` (pack
-    sd:9867, note #70162). Only that evidence exists is read: the lead rebuts one that does not reproduce.
+    sd:9867, note #70162), or a `synthetic` trigger (sd:10288). Only that evidence exists is read.
     An uncited repeat of a `prior` report's blocker, not rebutted, still blocks and keeps any evidence it stored.
     """
 
@@ -1785,19 +1789,24 @@ def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
         return getattr(recorded_at(rebutted, row.get("path"), row.get("summary"), row.get("line"), row.get("instances")), "listed", False)
     def _repeat(row: Mapping[str, Any]) -> bool:  # an uncited repeat of a rebutted finding: the rebuttal is read first (build/sd-1423 review)
         return _floor(row) and not (isinstance(row.get("evidence"), str) and row["evidence"].strip()) and _rebutted(row)
+    def _synthetic(row: Mapping[str, Any]) -> bool:  # a repro nothing real carries, not the lane's own (sd:10288, note #77932)
+        return repro and _floor(row) and row.get("trigger") == "synthetic" and str(row.get("path") or "").strip() not in LANE_PATHS
     def _prior(old: dict[str, Any]) -> dict[str, Any]:  # a rebutted place holds and lends nothing (sd-review:1814); it stays: a repeat on it is its own
         return dict(old, disposition="rebutted") if old.get("disposition") == "blocking" and _rebutted(old) else old
+    def _downgrade(record: dict[str, Any]) -> str | None:  # why a blocker posts as advisory; a held prior blocker's repeat never does
+        cited = isinstance(record.get("evidence"), str) and record["evidence"].strip()
+        if cited and not _synthetic(record):
+            return None
+        stored = prior_evidence(prior, record, at_floor)  # before the synthetic downgrade: no repeat clears a hold (sd:10288 review)
+        record.update({"evidence": stored} if stored and not cited else {})
+        return None if stored is not None else SYNTHETIC_NOTE if _synthetic(record) else NO_REPRO_NOTE if repro and str(
+            record.get("path") or "").strip() not in LANE_PATHS else None
     # Only a finding that blocks releases a hold: not a medium copy (build/sd-1423 review), not a rebutted repeat (sd-review:1783).
-    at_floor = instance_rows(*(row for row in findings if _floor(row) and not _repeat(row)))
+    at_floor = instance_rows(*(row for row in findings if _floor(row) and not _repeat(row) and not _synthetic(row)))
     prior, disposed = [*map(_prior, instance_rows(*prior))], []
     for finding in findings:
         record, blocking = dict(finding), _floor(finding)
-        evidence, note = record.get("evidence"), REPEAT_NOTE if _repeat(finding) else None
-        if blocking and not note and not (isinstance(evidence, str) and evidence.strip()):
-            stored = prior_evidence(prior, record, at_floor)
-            if stored:
-                record["evidence"] = stored
-            note = NO_REPRO_NOTE if stored is None and repro and str(record.get("path") or "").strip() not in LANE_PATHS else None
+        note = REPEAT_NOTE if _repeat(finding) else _downgrade(record) if blocking else None
         if note:
             blocking = False
             record["summary"] = f"{str(record.get('summary') or '').strip()} {note}".strip()
@@ -2318,11 +2327,10 @@ def prepared_prompt(root: pathlib.Path, subject: Subject, args: argparse.Namespa
                    "every unresolved blocker; an unrelated clean diff does not resolve it. A blocker that lists instances is "
                    "resolved only when every listed instance is fixed; repeat it with each one still unfixed. Prior findings:\n" + evidence)
         required = len(prompt.encode())
-        for name in sd_lib.blocking_places(previous["findings"]):  # each instance's file too (sd:9769)
+        for name in dict.fromkeys(map(repo_spelling(root), sd_lib.blocking_places(previous["findings"]))):  # sd:9769; sd:9962 an old absolute path
             path = pathlib.Path(name)
             if path.is_absolute() or ".." in path.parts or not (root / path).resolve().is_relative_to(root.resolve()):
                 raise UsageError("prior blocking finding path is outside this repository")
-            target = root / path
             entry = sd_lib.git_output(["ls-tree", "-z", "-l", subject.head, "--", f":(literal){name}"], root)
             if entry is None:
                 raise UsageError("cannot inspect prior finding source at current HEAD")
@@ -2340,7 +2348,7 @@ def prepared_prompt(root: pathlib.Path, subject: Subject, args: argparse.Namespa
                         raise UsageError("cannot read prior finding source at current HEAD")
                     current = blob.stdout
                     size = len(current.encode())
-            elif target.exists() or target.is_symlink():
+            elif (root / path).exists() or (root / path).is_symlink():
                 raise UsageError("prior finding source must be a tracked regular file")
             size += len(prefix.encode()) + 1
             required += size
@@ -2501,7 +2509,8 @@ def review(
     chosen, selection_refusal = ([], selection_refusal) if not asked else sd_review_readiness.select_ready_candidates(
         registry, args.provider, explain=args.explain, consent=consent, capped_bills=capped, readers=READERS,
     )
-    depth = sd_route.reader_depth(asked, len(chosen))  # min(2, eligible) (#43332)
+    chosen = sorted(chosen, key=lambda provider: bool(sd_review_readiness.provider_issues(provider, auth, env, str(root))))  # an unready reader falls back (sd:10231)
+    depth = sd_route.reader_depth(asked, len(chosen))  # the tier's depth cut to the eligible readers (#43332)
     providers = [provider.name for provider in chosen[:depth]]
     phase, check_seconds = phase_seconds(args), gate_seconds(args)
     timing: dict[str, Any] = {"setup_seconds": SETUP_TIMEOUT_SECONDS, "phase_seconds": phase,
@@ -2844,14 +2853,8 @@ def finish_review(result: dict[str, Any], outcomes: Sequence[Outcome], reviewed:
     return result
 
 
-STATUS_EXIT = {
-    "blocking": EXIT_FINDINGS,
-    "rate_limited": EXIT_RATE_LIMITED,
-    "refused": EXIT_REFUSED,
-    "unavailable": EXIT_GATE,
-    "gate_failed": EXIT_GATE,
-    "preflight_failed": EXIT_GATE,
-}
+STATUS_EXIT = {"blocking": EXIT_FINDINGS, "rate_limited": EXIT_RATE_LIMITED, "refused": EXIT_REFUSED,
+               "unavailable": EXIT_GATE, "gate_failed": EXIT_GATE, "preflight_failed": EXIT_GATE}
 
 
 # Rendering

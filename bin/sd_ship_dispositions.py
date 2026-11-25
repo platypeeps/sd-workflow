@@ -132,7 +132,11 @@ def blocking_refusal(operation: Any, head: str, report: dict, lead: str) -> Refu
     return Refusal(f"{lead}: {named}{more}", code="review_blocking", boundary="review", state="operator_decision",
                    next_action=f"Run `{command}` to print each blocking finding in full; fix them and prepare "
                                "again, or rebut or park each one through that adjudication.",
-                   details={"findings": findings, "check": report.get("check")})
+                   # The head the review saw, which a catch-up may have moved past the queued one, and the digest
+                   # `context` binds of each blocking finding: Reject rebuts only the review a page showed (sd:9966).
+                   details={"findings": findings, "check": report.get("check"), "reviewed_head": head,
+                            "finding_digests": [digest(row) for row in report.get("findings") or []
+                                                if isinstance(row, dict) and row.get("disposition") == "blocking"]})
 
 
 def place(row: dict) -> str:
@@ -183,7 +187,11 @@ def adjudicate(operation: Any) -> dict:
     if args.dispositions_file is None:
         proposal = {"schema_version": 1, "bindings": bindings,
                     "findings": [dict(row, response_disposition="|".join(DISPOSITIONS), reason="") for row in rows]}
-        return operation.result("disposition_template", proposal=proposal)
+        # sd:9966: the dispositions this review already holds, which a filled template replaces whole.
+        revision, value = operation.store.read(operation.connection, key(operation))
+        held = (revision and value.get("decision") == "accepted"
+                and digest((value.get("proposal") or {}).get("bindings")) == digest(bindings))
+        return operation.result("disposition_template", proposal=proposal, recorded_revision=revision if held else None)
     try:
         proposal = json.loads(read_file(args.dispositions_file, MAX_PROPOSAL_BYTES), object_pairs_hook=unique_object)
     except (ValueError, RecursionError):

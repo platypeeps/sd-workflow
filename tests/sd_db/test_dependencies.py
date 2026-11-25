@@ -700,4 +700,4 @@ class TheBuild(DependencyCase):
                     writers.append(node.name)
                     with self.subTest(node.name):
                         self.assertTrue("_item(connection" in text or "waiting_on(connection" in text)
-        self.assertEqual(sorted(writers), ["claim", "queue"])
+        self.assertEqual(sorted(writers), ["claim", "queue_row"])

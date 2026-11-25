@@ -197,7 +197,7 @@ def _close_report(connection: sqlite3.Connection, item: int, why: str, who: str)
 
 def _question_check(connection: sqlite3.Connection, note: int) -> tuple[str | None, str]:
     row = connection.execute("SELECT * FROM note WHERE id = ? AND resolved_at IS NULL", (note,)).fetchone()
-    ruling = _standing_ruling(connection, row) if row else None
+    ruling = standing_ruling(connection, row) if row else None
     return (f"answered by decision #{ruling}", "") if ruling else (None, "no standing ruling")
 
 
@@ -242,7 +242,7 @@ def sweep(connection: sqlite3.Connection, *, who: str, apply: bool = True) -> di
 
     for note in connection.execute("SELECT * FROM note WHERE kind = 'question' AND resolved_at IS NULL"
                                    " ORDER BY id").fetchall():
-        if _standing_ruling(connection, note) is None:
+        if standing_ruling(connection, note) is None:
             continue  # an unanswered question is the Decisions list's, not this sweep's to doubt
         settle({"item": note["item"], "kind": "question", "note": note["id"], "title": _first(note["body"])},
                lambda note=note: _question_check(connection, note["id"]),
@@ -256,7 +256,7 @@ RULING = re.compile(r"\ARuling on note #([0-9]+): ")
 UNDONE = re.compile(r"\A(?:Reversed ruling #([0-9]+)\b|Withdrawn: ruling #([0-9]+) on note #)")
 
 
-def _standing_ruling(connection: sqlite3.Connection, question) -> int | None:
+def standing_ruling(connection: sqlite3.Connection, question) -> int | None:
     """The newest ruling on `question` that no later reversal or withdrawal took back, or None."""
     standing = None
     for decision in connection.execute("SELECT id, body FROM note WHERE item = ? AND kind = 'decision' AND id > ?"
