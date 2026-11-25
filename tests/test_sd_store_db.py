@@ -290,10 +290,6 @@ class NoDatabase(DbStoreFixture):
         self.assertNotIn("Traceback", done.stderr)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TheEditorsRevision(DbStoreFixture):
     """A section update guarded by the revision the editor read (sd:10621)."""
 
@@ -333,3 +329,7 @@ class TheEditorsRevision(DbStoreFixture):
                            "--section", "Notes=Mine.")
         self.assertEqual(done.returncode, 2, done.stderr)
         self.assertIn("--revision", done.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
