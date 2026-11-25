@@ -254,6 +254,16 @@ class SharedTransitions(WritingCase):
         update_piece_metadata(self.db, self.item, {"title": "A renamed piece"}, who="operator")
         self.assertEqual(set(self.index_hashes().values()), {hashlib.sha256(self.index.read_bytes()).hexdigest()})
 
+    def test_a_gate_after_the_packs_rewrite_asks_for_a_fresh_review(self):
+        """sd:10719. A stamp names the bytes before a title rewrite: the gate refuses, never certifies, the new ones."""
+        self.attest()
+        update_piece_metadata(self.db, self.item, {"title": "A renamed piece"}, who="operator")
+        with self.assertRaisesRegex(WorkflowError, "index.md bytes changed after the review"):
+            self.gates()
+        self.attest()
+        self.gates()
+        self.assertEqual(set(self.index_hashes().values()), {hashlib.sha256(self.index.read_bytes()).hexdigest()})
+
     def test_a_rewrite_leaves_a_hash_for_other_bytes_alone(self):
         """sd:10719. A gate hash for bytes edited by hand after the gate stays stale through a rewrite."""
         self.attest()
@@ -716,18 +726,68 @@ class ReviewCompanions(WritingCase):
         self.assertEqual(result["path"], f"content/{self.piece}/adversarial.md")
         self.assertEqual(self.companions()["adversarial"], "current")
 
-    def test_a_run_stamps_the_index_bytes_its_brief_named(self):
-        """sd:10719. The brief names the index.md bytes; the run's stamp attests them for the gate."""
+    def stamp_line(self):
+        return (self.folder / "adversarial.md").read_text().split("\n", 1)[0]
+
+    def attested_run(self, between=lambda: None):
+        brief = adversarial_brief(self.db, self.item)
+        between()
+        return brief, record_adversarial(self.db, self.item, REPORT, digest=brief["digest"], record=brief["record"],
+                                         generation=brief["generation"], index_sha256=brief["index_sha256"],
+                                         index_mtime_ns=brief["index_mtime_ns"])
+
+    def test_a_layout_edit_during_the_run_leaves_no_index_attestation(self):
+        """sd:10719. The reviewer reads the file while it runs: bytes that moved meanwhile are not attested."""
+        self.write_draft(SENTENCES)
+
+        def relaid():
+            self.index.write_text(self.index.read_text().replace(SENTENCES[0] + " ", SENTENCES[0] + "\n\n"))
+        brief, result = self.attested_run(relaid)
+        self.assertTrue(result["current"])
+        self.assertIsNone(result["index_sha256"])
+        self.assertNotIn("index=", self.stamp_line())
+
+    def test_an_edit_reverted_during_the_run_leaves_no_index_attestation(self):
+        """sd:10719. The same bytes at both ends prove nothing when the file was written in between."""
+        self.write_draft(SENTENCES)
+
+        def touched():
+            stat = self.index.stat()
+            os.utime(self.index, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+        brief, result = self.attested_run(touched)
+        self.assertIsNone(result["index_sha256"])
+        self.assertNotIn("index=", self.stamp_line())
+
+    def test_an_untouched_run_attests_its_index_bytes(self):
+        self.write_draft(SENTENCES)
+        brief, result = self.attested_run()
+        self.assertEqual(result["index_sha256"], hashlib.sha256(self.index.read_bytes()).hexdigest())
+        self.assertRegex(self.stamp_line(), rf" gen=0 index={brief['index_sha256']} -->$")
+
+    def test_a_run_refuses_half_an_attestation(self):
         self.write_draft(SENTENCES)
         brief = adversarial_brief(self.db, self.item)
-        self.assertEqual(brief["index_sha256"], hashlib.sha256(self.index.read_bytes()).hexdigest())
-        record_adversarial(self.db, self.item, REPORT, digest=brief["digest"], record=brief["record"],
-                           generation=brief["generation"], index_sha256=brief["index_sha256"])
-        first = (self.folder / "adversarial.md").read_text().split("\n", 1)[0]
-        self.assertRegex(first, rf" gen=0 index={brief['index_sha256']} -->$")
-        with self.assertRaisesRegex(WorkflowError, "brief"):
-            record_adversarial(self.db, self.item, REPORT, digest=brief["digest"], record=brief["record"],
-                               generation=brief["generation"], index_sha256="abc")
+        for extra in ({"index_sha256": brief["index_sha256"]}, {"index_mtime_ns": brief["index_mtime_ns"]},
+                      {"index_sha256": brief["index_sha256"], "index_mtime_ns": True}):
+            with self.assertRaisesRegex(WorkflowError, "brief"):
+                record_adversarial(self.db, self.item, REPORT, digest=brief["digest"], record=brief["record"],
+                                   generation=brief["generation"], **extra)
+
+    def test_a_reconcile_keeps_an_attestation_for_the_bytes_still_on_disk(self):
+        """sd:10719. Reconciling an unchanged file rewrites the stamp; the layout attestation survives."""
+        self.write_draft(SENTENCES)
+        brief, _ = self.attested_run()
+        self.reconcile()
+        self.assertRegex(self.stamp_line(), rf" gen=0 index={brief['index_sha256']} -->$")
+        self.assertEqual(self.companions()["adversarial"], "current")
+
+    def test_a_reconcile_drops_an_attestation_for_other_bytes(self):
+        """sd:10719. A reconcile after a layout edit stamps the prose, never layout no reviewer read."""
+        self.write_draft(SENTENCES)
+        self.attested_run()
+        self.index.write_text(self.index.read_text().replace(SENTENCES[0] + " ", SENTENCES[0] + "\n\n"))
+        self.reconcile()
+        self.assertNotIn("index=", self.stamp_line())
 
     def test_a_draft_changed_during_the_run_leaves_a_stale_report(self):
         self.write_draft(SENTENCES)

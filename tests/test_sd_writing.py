@@ -267,7 +267,7 @@ class WritingContentCheckout(unittest.TestCase):
 
 
 BRIEF = {"piece": "2026/a", "draft": "content/2026/a/index.md", "research": "content/2026/a/research.md",
-         "research_exists": True, "digest": "0123456789ab", "generation": 2, "index_sha256": "e" * 64,
+         "research_exists": True, "digest": "0123456789ab", "generation": 2, "index_sha256": "e" * 64, "index_mtime_ns": 5,
          "record": "<!-- adversarial-reviewed: words=150 sentences=0123abcd -->", "words": 150}
 
 
@@ -343,9 +343,17 @@ class WritingReview(unittest.TestCase):
         self.assertTrue(argv[6].endswith("report.md"))
         self.assertTrue((self.stubs / "codex.stdin").read_text().startswith("word word"))
         self.recorded.assert_called_once_with(self.connection, 7, "# Review\n", digest="0123456789ab",
-                                              record=BRIEF["record"], generation=2, index_sha256="e" * 64)
+                                              record=BRIEF["record"], generation=2, index_sha256="e" * 64,
+                                              index_mtime_ns=5)
         self.connect.assert_called_once_with(sd_db, write=False)
         self.connection.close.assert_called_once()
+
+    def test_adversarial_says_when_its_report_attests_no_layout(self):
+        """sd:10719. The mocked run returns no index_sha256: index.md was written while the reviewer read it."""
+        arguments = self.parser.parse_args(["writing", "adversarial", "--piece", "2026/a", "--json"])
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()) as errors:
+            self.assertEqual(arguments.handler(arguments), 0)
+        self.assertIn("attests no layout", errors.getvalue())
 
     def test_adversarial_passes_a_model(self):
         self.call("adversarial", "--piece", "2026/a", "--model", "m1")
