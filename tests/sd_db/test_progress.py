@@ -179,7 +179,7 @@ class WorkCompletion(ProgressCase):
         waiting = add_note(self.db, self.item, "followup", "Waits on an outside reply")
         blocked = add_note(self.db, self.item, "followup", "Build blocked: gate red. Look at the log")
         pasted = add_note(self.db, self.item, "followup", "Build blocked: the vendor must answer", session="operator")
-        # B2: only a covering post-merge pass answers the lane's `Post-merge: ` (`resolve_post_merge`).
+        # B2: no close answers the lane's `Post-merge: `; a passing refresh does (sd:10529).
         refresh = add_note(self.db, self.item, "followup", "Post-merge: make post-merge failed (exit 2)",
                            session="sd-lane")
         self.remote()
