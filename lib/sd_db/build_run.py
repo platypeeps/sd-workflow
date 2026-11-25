@@ -577,11 +577,13 @@ def _read_bytes(argv: list[str], *, env: dict | None = None) -> bytes:
     return done.stdout
 
 
-def kept_files(git: Collection[str], work: str, *, env: dict | None = None) -> str:
+def kept_files(git: Collection[str], work: str, *, env: dict | None = None, ignored: bool = True) -> str:
     """The status lines of `work` that `git worktree remove` would lose: changes, untracked and ignored
-    files, those config hides too, less the ignored ones under a `DISPOSABLE` folder; "" when it may go."""
-    lines = _read([*git, "-C", work, "-c", "core.quotePath=false", "status", "--porcelain", "--ignored",
-                   "--untracked-files=all"], env=env)
+    files, those config hides too, less the ignored ones under a `DISPOSABLE` folder; "" when it may go.
+    `ignored=False` leaves ignored files out: a merged build's cleanup removes them with the worktree, as a
+    Rust `target/` is never clean after a build (pack sd:10506)."""
+    lines = _read([*git, "-C", work, "-c", "core.quotePath=false", "status", "--porcelain",
+                   *(["--ignored"] if ignored else []), "--untracked-files=all"], env=env)
     return "\n".join(line for line in lines.splitlines() if line.strip() and not (
         # Folder parts only: git ends an ignored folder with "/", so a file of that name is no cache.
         line.startswith("!! ") and DISPOSABLE.intersection(line[3:].strip('"').split("/")[:-1])))
@@ -880,8 +882,8 @@ def sweep(connection, *, git: Collection[str] = ("git",), hosts: Collection[str 
     may land the same items; the lane squash-merges, so the branch reads
     unpushed forever (pack sd:6909). Kept: an unreleased run on the path, an
     item of any run on it not done, a dirty or unread worktree, one holding an
-    ignored or untracked file outside a `DISPOSABLE` cache, a locked one, a
-    live session other than a builder's. The paths removed.
+    untracked file, a locked one, a live session other than a builder's. An
+    ignored file goes with the tree (pack sd:10506). The paths removed.
 
     An item marked done is no proof its commits landed: a squash merge leaves
     no ancestry to check, and an item can be closed by hand. So the branch
@@ -915,7 +917,7 @@ def sweep(connection, *, git: Collection[str] = ("git",), hosts: Collection[str 
         if entry["keep"] or not Path(work).is_dir():
             continue
         try:
-            if kept_files(git, work):
+            if kept_files(git, work, ignored=False):
                 continue
         except Unread:
             continue
@@ -2528,7 +2530,7 @@ class Supervisor:
         if not self.work.is_dir():
             return self.finish("done", f"worktree {self.work} was already removed")
         try:
-            dirty = kept_files(self.tools.git, str(self.work), env=self.env)
+            dirty = kept_files(self.tools.git, str(self.work), env=self.env, ignored=False)
         except Unread as unread:
             dirty = f"unread: {unread}"
         if dirty:

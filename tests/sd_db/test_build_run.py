@@ -3445,22 +3445,38 @@ class Supervise(Case):
         note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
         self.assertIn("kept worktree", note["body"])
 
-    def test_cleaning_keeps_an_ignored_file(self):
-        """pack sd:6979: `git worktree remove` deletes ignored files, which plain `status --porcelain` omits."""
+    def test_cleaning_removes_a_merged_worktree_whose_only_extras_are_ignored(self):
+        """Pack sd:10506 (reversing sd:6979): a Rust build leaves an ignored `target/`, so every merged
+        worktree read as not clean and kept 20-60 GB. Cleaning counts changes and untracked files only."""
         self.press()
         self.write_pr()
         self.plan(claude=["pass"], sd_review=["clean"])
         self.supervisor().run()
         work = Path(self.bundle["work_path"])
-        exclude(work, "__pycache__/\n.env\n")
-        (work / "__pycache__").mkdir()
-        (work / "__pycache__" / "x.pyc").write_bytes(b"x")
+        exclude(work, "target/\n.env\n")
+        (work / "target").mkdir()
+        (work / "target" / ".rustc_info.json").write_text("{}\n")
         (work / ".env").write_text("TOKEN=change-me\n")
         self.merge_to_cleaning()
         self.assertEqual(self.supervisor().run()["outcome"], "done")
-        self.assertEqual((work / ".env").read_text(), "TOKEN=change-me\n")
+        self.assertFalse(work.exists())
+
+    def test_cleaning_keeps_an_untracked_file(self):
+        """An untracked file is work no merge carried: cleaning still keeps its tree."""
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        work = Path(self.bundle["work_path"])
+        exclude(work, "target/\n")
+        (work / "target").mkdir()
+        (work / "target" / "out.bin").write_bytes(b"x")
+        (work / "notes.txt").write_text("x\n")
+        self.merge_to_cleaning()
+        self.assertEqual(self.supervisor().run()["outcome"], "done")
+        self.assertTrue((work / "notes.txt").exists())
         note = self.db.execute("SELECT body FROM note WHERE item = ? ORDER BY id DESC", (self.items[0],)).fetchone()
-        self.assertIn("!! .env", note["body"])
+        self.assertIn("?? notes.txt", note["body"])
 
     def test_cleaning_removes_a_clean_worktree(self):
         self.press()
@@ -4883,31 +4899,29 @@ class Sweep(Case):
         self.assertEqual(build_run.sweep(self.db), [], "an unreleased run still owns it")
         self.assertTrue(work.is_dir())
 
-    def test_an_ignored_file_keeps_the_worktree(self):
-        """Lane review: `git worktree remove` deletes ignored files, and plain `status --porcelain` omits them."""
+    def test_an_ignored_file_goes_with_the_swept_worktree(self):
+        """Pack sd:10506 (reversing the lane review of sd:6979): an ignored file is build output, such as a
+        Rust `target/`, and kept every tree; the sweep removes it with the tree."""
         work = self.blocked()
         self.done()
-        common = Path(support.git(work, "rev-parse", "--path-format=absolute", "--git-common-dir"))
-        (common / "info").mkdir(exist_ok=True)
-        (common / "info" / "exclude").write_text(".env\n")
-        (work / ".env").write_text("TOKEN=change-me\n")
-        self.assertEqual(support.git(work, "status", "--porcelain"), "", "the plain read sees a clean tree")
-        self.assertEqual(build_run.sweep(self.db), [])
-        self.assertEqual((work / ".env").read_text(), "TOKEN=change-me\n")
-        self.assertNotEqual(self.branches(), "")
+        exclude(work, "target/\n")
+        (work / "target").mkdir()
+        (work / "target" / ".rustc_info.json").write_text("{}\n")
+        self.assertEqual(build_run.sweep(self.db), [str(work)])
+        self.assertFalse(work.exists())
 
     def test_a_tree_with_only_caches_is_swept(self):
-        """pack sd:6979: a disposable cache is no reason to keep a tree; another ignored file still is."""
+        """pack sd:6979: a disposable cache is no reason to keep a tree; an untracked file still is."""
         work = self.blocked()
         self.done()
-        exclude(work, "__pycache__/\n.ruff_cache/\n.env\n")
+        exclude(work, "__pycache__/\n.ruff_cache/\n")
         (work / "lib" / "__pycache__").mkdir(parents=True)
         (work / "lib" / "__pycache__" / "x.pyc").write_bytes(b"x")
         (work / ".ruff_cache").mkdir()
         (work / ".ruff_cache" / "CACHEDIR.TAG").write_text("x")
-        (work / ".env").write_text("TOKEN=change-me\n")
-        self.assertEqual(build_run.sweep(self.db), [], "the .env keeps it")
-        (work / ".env").unlink()
+        (work / "notes.txt").write_text("x\n")
+        self.assertEqual(build_run.sweep(self.db), [], "the untracked file keeps it")
+        (work / "notes.txt").unlink()
         self.assertEqual(build_run.sweep(self.db), [str(work)])
         self.assertFalse(work.exists())
 
