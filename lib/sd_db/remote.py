@@ -646,7 +646,8 @@ def socks_proxy(host: str) -> tuple[str, int, bool] | None:
     except ValueError:
         port = None
     if not parsed.hostname or port is None or parsed.username is not None:
-        raise ProxyRefused(f"ALL_PROXY {value!r} is not {scheme}://<host>:<port> with no user")
+        # The value is not echoed: a user's password may be in it.
+        raise ProxyRefused(f"ALL_PROXY is not {scheme}://<host>:<port> with no user name or password")
     return parsed.hostname, port, scheme == "socks5h"
 
 
@@ -660,38 +661,31 @@ def _bypassed(host: str, no_proxy: str) -> bool:
     return False
 
 
-def _socks_address(host: str, port: int, by_name: bool) -> bytes:
-    """The CONNECT request's address: an IP as itself, a name sent or resolved here."""
+def _socks_addresses(host: str, port: int, by_name: bool) -> list[bytes]:
+    """Each CONNECT address to try: an IP as itself, a name sent, or each one it resolves to here."""
     for family, kind in ((socket.AF_INET, 1), (socket.AF_INET6, 4)):
         try:
-            return bytes([kind]) + socket.inet_pton(family, host) + struct.pack(">H", port)
+            return [bytes([kind]) + socket.inet_pton(family, host) + struct.pack(">H", port)]
         except OSError:
             pass
     if not by_name:
-        address = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)[0][4]
-        return _socks_address(str(address[0]), port, False)
+        found = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+        # A scoped IPv6 address (`fe80::1%en0`) has no SOCKS form; it is skipped.
+        resolved = dict.fromkeys(str(info[4][0]) for info in found if "%" not in str(info[4][0]))
+        return [_socks_addresses(address, port, False)[0] for address in resolved]
     try:
         name = host.encode("idna")
     except UnicodeError as error:
         raise ProxyRefused(f"the hub name {host!r} cannot be sent: {error}") from None
     if not name or len(name) > 255 or any(c < 0x21 or c > 0x7e for c in name):
         raise ProxyRefused(f"the hub name {host!r} cannot be sent")
-    return b"\x03" + bytes([len(name)]) + name + struct.pack(">H", port)
+    return [b"\x03" + bytes([len(name)]) + name + struct.pack(">H", port)]
 
 
-def dial(host: str, port: int, timeout: float | None) -> socket.socket:
-    """A socket to `host:port`, through the SOCKS5 proxy `ALL_PROXY` names, if any.
-
-    `timeout` bounds the proxy's connect and its handshake as it bounds a
-    direct connect. Every failure is an `OSError` whose text names the proxy.
-    """
-    proxy = socks_proxy(host)
-    if proxy is None:
-        return socket.create_connection((host, port), timeout=timeout)
-    proxy_host, proxy_port, by_name = proxy
-    where = f"through the SOCKS5 proxy {proxy_host}:{proxy_port}"
+def _socks_connect(proxy_host: str, proxy_port: int, address: bytes, where: str,
+                   timeout: float | None) -> socket.socket:
+    """One proxy session that CONNECTs to `address`; any failure is a `ProxyRefused`."""
     try:
-        request = b"\x05\x01\x00" + _socks_address(host, port, by_name)
         sock = socket.create_connection((proxy_host, proxy_port), timeout=timeout)
     except OSError as error:
         raise ProxyRefused(f"{where}: {error.strerror or error}") from error
@@ -699,7 +693,7 @@ def dial(host: str, port: int, timeout: float | None) -> socket.socket:
         sock.sendall(b"\x05\x01\x00")
         if _read_exactly(sock, 2) != b"\x05\x00":
             raise ProxyRefused(f"{where}: it accepts no unauthenticated session")
-        sock.sendall(request)
+        sock.sendall(b"\x05\x01\x00" + address)
         version, reply, _, kind = _read_exactly(sock, 4)
         if version != 5 or reply != 0:
             raise ProxyRefused(f"{where}: {_SOCKS_REPLIES.get(reply, f'reply {reply}')}")
@@ -717,6 +711,34 @@ def dial(host: str, port: int, timeout: float | None) -> socket.socket:
         sock.close()
         raise
     return sock
+
+
+def dial(host: str, port: int, timeout: float | None) -> tuple[socket.socket, str | None]:
+    """A socket to `host:port`, and the SOCKS5 proxy it went through (`ALL_PROXY`), or None.
+
+    `timeout` bounds each proxy connect and its handshake as it bounds a
+    direct connect. A `socks5://` name is tried at each address it
+    resolves to, as `create_connection` tries them, and the last refusal
+    is raised. Every failure is an `OSError` whose text names the proxy.
+    """
+    proxy = socks_proxy(host)
+    if proxy is None:
+        return socket.create_connection((host, port), timeout=timeout), None
+    proxy_host, proxy_port, by_name = proxy
+    where = f"through the SOCKS5 proxy {proxy_host}:{proxy_port}"
+    try:
+        addresses = _socks_addresses(host, port, by_name)
+    except ProxyRefused:
+        raise
+    except OSError as error:
+        raise ProxyRefused(f"{where}: {error.strerror or error}") from error
+    refused: ProxyRefused | None = None
+    for address in addresses:
+        try:
+            return _socks_connect(proxy_host, proxy_port, address, where, timeout), where
+        except ProxyRefused as error:
+            refused = error
+    raise refused or ProxyRefused(f"{where}: {host} resolves to no address")
 
 
 class Connection:
@@ -762,7 +784,7 @@ class Connection:
         """Dial the hub and send `open`, for a new connection or a reopened session."""
         token = self._token
         try:
-            self._socket = dial(self.host, self.port, self._timeout)
+            self._socket, proxy = dial(self.host, self.port, self._timeout)
         except OSError as error:
             raise HubUnreachable(self.host, self.port, error.strerror or str(error)) from error
         self._socket.settimeout(self._answer_timeout)
@@ -777,6 +799,13 @@ class Connection:
             except BaseException:
                 self._abandon()
                 raise
+        if token and proxy is not None:
+            # The token is the owner's credential for a loopback hub: a proxy
+            # this process inherited must not read it.
+            self._abandon()
+            raise HubUnreachable(self.host, self.port, (
+                f"the session would carry this hub's owner-only token {proxy}; "
+                f"name {self.host} in NO_PROXY to dial it directly"))
         self._call("open", path=self._path, write=self._write,
                    create=self._create, busy_timeout=self._busy_timeout, token=token, **handshake())
         global _opened
