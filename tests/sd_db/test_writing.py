@@ -878,6 +878,25 @@ class ReviewCompanions(WritingCase):
             self.adversarial_gate(brief["digest"])
         self.assertEqual(piece_state(self.db, self.item), before)
 
+    def test_a_companion_reads_the_attestation_as_the_gate_does(self):
+        """sd:10719. Each report the gate refuses for its layout attestation reads as stale, never current."""
+        self.write_draft(SENTENCES)
+        brief, _ = self.attested_run()
+        self.assertEqual(self.companions()["adversarial"], "current")
+        original = (self.folder / "adversarial.md").read_text()
+        cases = {"lost": lambda line: line.replace(f" index={brief['index_sha256']}", ""),
+                 "other bytes": lambda line: line.replace(brief["index_sha256"], "0" * 64),
+                 "two": lambda line: line.replace(" -->", f" index={brief['index_sha256']} -->"),
+                 "malformed": lambda line: line.replace(brief["index_sha256"], "abc"),
+                 "empty": lambda line: line.replace(brief["index_sha256"], "")}
+        for name, edit in cases.items():
+            with self.subTest(name):
+                (self.folder / "adversarial.md").write_text(original)
+                self.restamp(edit)
+                with self.assertRaises(WorkflowError):
+                    self.adversarial_gate(brief["digest"])
+                self.assertEqual(self.companions()["adversarial"], "stale")
+
     def test_a_gate_refuses_a_stamp_with_two_index_hashes(self):
         self.write_draft(SENTENCES)
         brief, _ = self.attested_run()

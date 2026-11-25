@@ -496,8 +496,11 @@ class TheApplyReview(FixCase):
         if report == "layout":
             # sd:10719: the stamp names this draft, but index.md bytes other than the ones on disk.
             stamp = stamp.replace(" -->", f" index={'0' * 64} -->")
+        if report == "lost":
+            # sd:10719: a run's report, by its run record, whose stamp names no index.md bytes.
+            stamp += writing.reviewed_record("An argument.") + "\n\n"
         if report:
-            (folder / "adversarial.md").write_text((stamp if report in ("current", "layout") else "")
+            (folder / "adversarial.md").write_text((stamp if report in ("current", "layout", "lost") else "")
                                                    + "Adversarial fixture report\n")
         return state["item"]["id"]
 
@@ -526,6 +529,15 @@ class TheApplyReview(FixCase):
         """sd:10719: a report whose draft stamp is current but whose index.md bytes changed since is stale."""
         self.running()
         item = self.piece(report="layout")
+        status, _, said = self.fix(item, apply="adversarial")
+        self.assertEqual(status, 400, said)
+        self.assertIn("adversarial.md is stale", said["error"])
+        self.assertEqual(self.calls(), [])
+
+    def test_apply_review_refuses_a_run_report_that_lost_its_index_bytes(self):
+        """sd:10719: a report the pack's run wrote always names index.md bytes; one without them is stale."""
+        self.running()
+        item = self.piece(report="lost")
         status, _, said = self.fix(item, apply="adversarial")
         self.assertEqual(status, 400, said)
         self.assertIn("adversarial.md is stale", said["error"])

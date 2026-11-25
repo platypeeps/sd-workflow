@@ -254,6 +254,23 @@ def _attested(report: str) -> str | None:
     return found[0]
 
 
+def _layout(report: str, artifact: str, index: str) -> str | None:
+    """The index.md hash `report` attests, once it holds for the bytes on disk, whose hash is `index` (sd:10719).
+
+    The one rule for every reader that asks whether a report answers this layout, the gate and the companion
+    state alike: a reader with a rule of its own passed what the gate refuses. None is a report that never
+    attested, which certifies no bytes.
+    """
+    attested = _attested(report)
+    if attested and attested != index:
+        raise WorkflowError("index.md bytes changed after the review; review the current layout before recording it")
+    # The pack's own run always attests, and marks its report with the run record: one without `index=` lost
+    # it, or predates it, and would pass as nothing to check.
+    if attested is None and artifact == "adversarial" and _REVIEWED.search(report):
+        raise WorkflowError("adversarial report names no index.md bytes; run the review again")
+    return attested
+
+
 def _draft(text: str) -> str | None:
     """The prose after `## Draft`, the part every gate reviews; None without that heading."""
     return text.split("## Draft", 1)[1] if "## Draft" in text else None
@@ -824,14 +841,7 @@ def record_gate(connection: sqlite3.Connection, item: int, artifact: str, *, ver
             raise WorkflowError("gate needs the explicitly reviewed draft digest; it must match the current draft")
         # The draft digest ignores whitespace, so it says nothing of layout. Only a stamp's `index=` names the
         # index.md bytes the reviewer read; a gate without one certifies no bytes, and a render refuses it (sd:10719).
-        report = snapshot["files"][artifact].decode("utf-8")
-        attested = _attested(report)
-        if attested and attested != snapshot["hashes"]["index"]:
-            raise WorkflowError("index.md bytes changed after the review; review the current layout before recording it")
-        # The pack's own run always attests, and marks its report with the run record: one without `index=` lost
-        # it, or predates it, and would pass as nothing to check.
-        if attested is None and artifact == "adversarial" and _REVIEWED.search(report):
-            raise WorkflowError("adversarial report names no index.md bytes; run the review again")
+        attested = _layout(snapshot["files"][artifact].decode("utf-8"), artifact, snapshot["hashes"]["index"])
         fields = _fields(row["fields"])
         gates = fields.setdefault("writing_gates", {})
         if not isinstance(gates, dict):
@@ -892,13 +902,11 @@ def _companion(snapshot: dict, artifact: str) -> dict:
     if not stamped:
         return {"state": "unstamped", "detail": "predates reconcile tracking; treat as stale"}
     if stamped.group(1) == snapshot["digest"]:
-        # The digest ignores whitespace; a report that attests index.md bytes answers only those bytes (sd:10719).
+        # The digest ignores whitespace; a report the gate would refuse for its layout is not current (sd:10719).
         try:
-            attested = _attested(data.decode("utf-8"))
+            _layout(data.decode("utf-8"), artifact, snapshot["hashes"]["index"])
         except WorkflowError as error:
             return {"state": "stale", "detail": str(error)}
-        if attested and attested != snapshot["hashes"]["index"]:
-            return {"state": "stale", "detail": "index.md layout changed after the review; run the review again"}
         return {"state": "current", "detail": f"draft {snapshot['digest']}"}
     return {"state": "stale", "detail": f"reconciled with {stamped.group(1)}, draft is now {snapshot['digest']}"}
 
