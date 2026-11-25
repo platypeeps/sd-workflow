@@ -604,12 +604,17 @@ class DoneResolvesOpenNotes(WorkflowCase):
     def test_a_close_leaves_a_post_merge_followup_open_and_kept(self):
         """sd:10407 B2: done resolved `Post-merge: ` before any target passed; only a covering
         pass answers it (`resolve_post_merge`). It blocks no close, and Today keeps it."""
-        for followups in (None, ()):
-            with self.subTest(followups=followups):
+        cases: tuple[tuple[str | None, bool], ...] = ((None, False), ("none", False), (None, True), ("named", False))
+        for followups, asked in cases:
+            with self.subTest(followups=followups, resolve_followups=asked):
                 item = self.capture()["item"]["id"]
                 note = add_note(self.db, item, "followup", "Post-merge: make post-merge failed (exit 2)",
                                 session=LANE_SESSION)
-                change_status(self.db, item, "done", who="operator", reason="delivered", followups=followups)
+                # Round 2: `--resolve-followups`, and every caller that passes it, or a delivery naming
+                # the note, erased the failure too.
+                change_status(self.db, item, "done", who="operator", reason="delivered",
+                              followups=None if followups is None else [note] if followups == "named" else [],
+                              resolve_followups=asked)
                 self.assertEqual(self.notes(item), {note: ("followup", True)})
                 self.assertEqual(json.loads(item_state(self.db, item)["item"]["fields"])["kept_followups"], [note])
 

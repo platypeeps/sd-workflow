@@ -899,12 +899,17 @@ def machine_followup(note: Mapping[str, Any]) -> bool:
         or (session is None and body.startswith(BUILD_FOLLOWUP)))
 
 
-def done_resolves(note: Mapping[str, Any]) -> bool:
-    """Whether a move to done resolves `note` unasked: the machine's, but `Post-merge: ` (sd:10407).
+def lane_post_merge(note: Mapping[str, Any]) -> bool:
+    """Whether `note` is the lane's `Post-merge: ` followup: a failed target only a covering pass answers.
 
-    A close comes before the target that checks it, so only a covering pass
-    answers that one (`resolve_post_merge`); it blocks no close and stays owed."""
-    return machine_followup(note) and not str(note["body"]).startswith(POST_MERGE_FOLLOWUP)
+    No close resolves it, asked (`resolve_followups`, a named followup) or not: a close comes
+    before the target that checks it (sd:10407). It blocks no close and stays owed."""
+    return machine_followup(note) and str(note["body"]).startswith(POST_MERGE_FOLLOWUP)
+
+
+def done_resolves(note: Mapping[str, Any]) -> bool:
+    """Whether a move to done resolves `note` unasked: the machine's, but `Post-merge: ` (sd:10407)."""
+    return machine_followup(note) and not lane_post_merge(note)
 
 
 def resolve_post_merge(connection: sqlite3.Connection, items: Collection[int],
@@ -955,8 +960,8 @@ def change_status(
     """Move a task, followup, hand idea or active work item without bypassing delivery authority.
 
     `session` is the status note's session, `who` when not given (pack sd:6046).
-    A move to done always resolves the machine's followups but a post-merge
-    one (`done_resolves`, sd:10407). `followups` names the others a delivery settles; the rest stay
+    A move to done always resolves the machine's followups, and never the
+    lane's post-merge one (`lane_post_merge`, sd:10407). `followups` names the others a delivery settles; the rest stay
     open and owed (sd:9869). A hand close (`followups` None) refuses while any
     other followup is open, naming each as `resolve followup N`, unless
     `resolve_followups` is True, as `reporting.acknowledge` does.
@@ -1051,9 +1056,9 @@ def change_status(
                 if blocking:
                     raise TransitionRefused(
                         f"item {item} has open followups; resolve each first: " + "; ".join(f"resolve followup {note}" for note in blocking))
-            owed = [note["id"] for note in open_followups
-                    if done_resolves(note) or (followups is None and resolve_followups)
-                    or note["id"] in (followups or ())]
+            owed = [note["id"] for note in open_followups if not lane_post_merge(note) and (
+                done_resolves(note) or (followups is None and resolve_followups)
+                or note["id"] in (followups or ()))]
             for note in owed:
                 resolve_note(connection, note)
             if owed:
