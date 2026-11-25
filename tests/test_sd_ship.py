@@ -2472,6 +2472,68 @@ roles:
         self.assertEqual(self.prepare()["copilot_review"]["decision"], "not_repeated")
         self.assertEqual(len(self.double.copilot_requests), 1)
 
+    def interrupt_copilot_request(self, *extra, lands):
+        """sd:10207. One prepare killed at the Copilot POST, after it `lands` on GitHub or before."""
+        original = ship.GitHub.request_copilot_review
+
+        def dies(api, number):
+            if lands:
+                original(api, number)
+            raise KeyboardInterrupt
+
+        with patch.object(ship.GitHub, "request_copilot_review", dies):
+            with self.assertRaises(KeyboardInterrupt):
+                self.prepare(*extra)
+
+    def advance(self):
+        (self.root / "src.py").write_text("value = 7\n")
+        _git(self.root, "commit", "-qam", "more\n\nAuthored-with: human")
+
+    def test_a_landed_request_is_not_bought_again_after_the_branch_moves(self):
+        """sd:10207. The POST landed, prepare died, Copilot reviewed that head,
+        the branch moved: the rerun buys no second automatic review."""
+        self.enable_automatic_copilot()
+        self.interrupt_copilot_request(lands=True)
+        self.reviewed_at(_git(self.root, "rev-parse", "HEAD"))
+        self.double.copilot_pending.clear()
+        self.advance()
+        rerun = self.prepare()
+        self.assertEqual(rerun["copilot_review"]["decision"], "not_repeated")
+        self.assertEqual(len(self.double.copilot_requests), 1)
+        self.assertEqual([entry["status"] for entry in self.operation().state["copilot_reviews"]], ["completed"])
+
+    def test_an_unsent_request_is_charged_once_after_the_branch_moves(self):
+        """sd:10207. Killed before the POST, then the branch moved: the rerun
+        sends one request and keeps one receipt, at the new head."""
+        self.interrupt_copilot_request("--copilot-review", "request", lands=False)
+        self.advance()
+        self.prepare("--copilot-review", "request")
+        self.assertEqual(len(self.double.copilot_requests), 1)
+        [entry] = self.operation().state["copilot_reviews"]
+        self.assertEqual((entry["status"], entry["head"]), ("requested", _git(self.root, "rev-parse", "HEAD")))
+
+    def test_an_unsent_request_owes_nothing_once_the_rerun_skips_copilot(self):
+        """sd:10207. Killed before the POST, rerun with `skip`: no review was
+        asked for, so the merge waits for none."""
+        self.interrupt_copilot_request("--copilot-review", "request", lands=False)
+        self.prepare("--copilot-review", "skip")
+        self.assertEqual(self.operation().state["copilot_reviews"], [])
+        self.assertEqual(self.double.copilot_requests, [])
+        self.assertEqual(self.merge()["phase"], "merged")
+
+    def test_a_recovery_request_interrupted_after_it_landed_keeps_its_receipt(self):
+        """sd:10207. The recovery of a disappeared request records before it
+        sends too: killed after the POST, its request still counts."""
+        self.prepare("--copilot-review", "request")
+        self.double.copilot_pending.clear()
+        self.interrupt_copilot_request("--copilot-review", "request", lands=True)
+        self.assertEqual(len(self.operation().state["copilot_reviews"]), 2)
+        rerun = self.prepare("--copilot-review", "request")
+        self.assertEqual(rerun["copilot_review"]["decision"], "already_recorded")
+        self.assertEqual(len(self.double.copilot_requests), 2)
+        self.assertEqual([entry["status"] for entry in self.operation().state["copilot_reviews"]],
+                         ["requested", "pending"])
+
     def test_a_failed_explicit_request_leaves_no_receipt(self):
         """sd:10207. A refused request owes nothing: the receipt is undone."""
         def refuses(api, number):

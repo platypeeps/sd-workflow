@@ -1124,15 +1124,9 @@ class Ship(SharedReview):
     def reconcile_copilot_request(self, entries: list[dict], pull_entries: list[dict],
                                   existing: dict, number: int, head: str,
                                   selection: str, status: str) -> dict:
-        if existing["status"] == "requesting" and status == "absent":
-            # sd:10207. A receipt whose POST never returned: send it once now.
-            self.api.request_copilot_review(number)
-            status = "requested"
-        elif selection == "request" and status == "absent":
+        if selection == "request" and status == "absent":
             self.require_copilot_capacity(pull_entries)
-            self.api.request_copilot_review(number)
-            return self.record_copilot_request(
-                entries, number, head, selection, "requested", "recovered")
+            return self.send_copilot_request(entries, number, head, selection, "recovered")
         if existing["status"] != status and status != "absent":
             index = entries.index(existing)
             entries[index] = {**existing, "status": status}
@@ -1140,14 +1134,66 @@ class Ship(SharedReview):
             existing = entries[index]
         return {**existing, "decision": "already_recorded"}
 
+    def send_copilot_request(self, entries: list[dict], number: int, head: str,
+                             selection: str, decision: str) -> dict:
+        """Record, send, confirm (sd:10207).
+
+        The receipt goes first, as `requesting`: a prepare killed after GitHub
+        took the request still owes the review at a merge, and
+        `settle_copilot_requests` reads what became of it on the next prepare.
+        A refused request restores the receipts as they were.
+        """
+        result = self.record_copilot_request(entries, number, head, selection, "requesting", decision)
+        try:
+            self.api.request_copilot_review(number)
+        except Refusal:
+            self.save(copilot_reviews=entries)
+            raise
+        result = {**result, "status": "requested"}
+        self.save(copilot_reviews=[*entries, {name: value for name, value in result.items() if name != "decision"}])
+        return result
+
+    def settle_copilot_requests(self, number: int, pull: dict) -> None:
+        """Settle each `requesting` receipt of this pull from GitHub, before anything reads one (sd:10207).
+
+        Run first on every prepare, whatever the head or the selection now, so
+        no later branch meets an unconfirmed receipt. A request GitHub holds,
+        or a completed Copilot review no other receipt accounts for, means the
+        POST landed: the receipt is confirmed and counts as the one bought. No
+        sign of it means it was never sent: the receipt is dropped, nothing is
+        owed, and this prepare decides afresh. The count leans to "landed": a
+        review someone asked for by hand reads as this one, which costs a wait
+        an explicit request ends, never a second paid review.
+        """
+        entries = self.copilot_entries()
+        if not any(entry["pull"] == number and entry["status"] == "requesting" for entry in entries):
+            return
+        reviews = self.api.pages(f"{self.api.prefix}/pulls/{number}/reviews")
+        completed = sum(1 for review in self.api.copilot_reviews(reviews)
+                        if bool(review.get("submitted_at"))
+                        and str(review.get("state") or "").upper() not in ("", "PENDING"))
+        confirmed = sum(1 for entry in entries if entry["pull"] == number and entry["status"] != "requesting")
+        settled = []
+        for entry in entries:
+            if entry["pull"] == number and entry["status"] == "requesting":
+                status = self.api.copilot_review_status(pull, reviews, entry["head"])
+                if status == "absent":
+                    if completed <= confirmed:
+                        continue
+                    status = "requested"
+                entry, confirmed = {**entry, "status": status}, confirmed + 1
+            settled.append(entry)
+        self.save(copilot_reviews=settled)
+
     def prepare_copilot_review(self, number: int, pull: dict, head: str, mode: str) -> dict:
+        self.settle_copilot_requests(number, pull)
         selection, automatic, decision = self.copilot_selection(pull, mode)
         if decision is not None:
             return decision
 
         entries = self.copilot_entries()
         pull_entries = [entry for entry in entries if entry["pull"] == number]
-        if automatic and pull_entries and pull_entries[-1]["status"] != "requesting":
+        if automatic and pull_entries:
             return {**pull_entries[-1], "decision": "not_repeated"}
         existing = next((entry for entry in reversed(pull_entries) if entry["head"] == head), None)
         if existing is None:
@@ -1164,20 +1210,13 @@ class Ship(SharedReview):
             result = self.record_copilot_request(entries, number, head, selection, status, "recorded")
             self.clear_copilot_suppression()
             return result
-        # sd:10207. The receipt goes first, as `requesting`: a prepare killed
-        # after GitHub took the request still owes the review at this head,
-        # and one killed before the POST sends it on the rerun.
-        result = self.record_copilot_request(entries, number, head, selection, "requesting", "recorded")
         try:
-            self.api.request_copilot_review(number)
+            result = self.send_copilot_request(entries, number, head, selection, "recorded")
         except Refusal as error:
-            self.save(copilot_reviews=entries)
             if automatic:
                 return {"decision": "request_failed", "selection": "automatic",
                         "warning": f"automatic Copilot review request failed: {error}"}
             raise
-        result = {**result, "status": "requested"}
-        self.save(copilot_reviews=[*entries, {key: value for key, value in result.items() if key != "decision"}])
         self.clear_copilot_suppression()
         return result
 
