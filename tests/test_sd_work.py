@@ -552,6 +552,24 @@ class TaskCLI(unittest.TestCase):
         filed = int(state["note"]["body"].rsplit("sd:", 1)[1])
         self.assertEqual(json.loads(self.call("task", "show", filed, "--json").stdout)["item"]["kind"], "task")
 
+    def test_option_on_a_batch_takes_the_exact_spelling_before_a_case_folded_one(self):
+        """Review of build/sd-1624: a batch question may offer `Use Foo` and `Use foo`; `--option 'Use foo'`
+        ruled `Use Foo`, the first case-folded match."""
+        import sd_db.review as review
+
+        with database(home=self.home) as connection:
+            item = review.file(connection, {
+                "schema": 1, "queue": "nightly", "batch": "2026-10-19", "title": "Nightly review 2026-10-19",
+                "source": "system@6c4317b", "mode": "open", "context": {"purpose": "Fixture batch.",
+                "rubric": ["Pick the option that fits."], "feeds": "This test."},
+                "questions": [{"subject": "case", "text": "Which spelling?", "options": ["Use Foo", "Use foo"]}]},
+                who="fixture")["item"]
+            connection.commit()
+            asked = review.read(connection, item)["questions"][0]["note"]
+        state = json.loads(self.call("task", "note", item, "Use foo", "--kind", "decision", "--answers", asked,
+                                     "--option", "Use foo", "--json").stdout)
+        self.assertEqual(state["note"]["body"], f"Ruling on note #{asked}: Use foo")
+
     def test_an_approval_task_records_the_session_and_the_ruling_the_user(self):
         """pack sd:6046: the task an approval files is the session's, so its trail lists it; the ruling
         and its comment keep the user, because the Review page shows their session as "ruled by"."""
@@ -599,7 +617,8 @@ class TaskCLI(unittest.TestCase):
         for name, row, flags, said in (
                 ("unknown label", item, ("--answers", asked, "--option", "Maybe"), "its options are Approve, Reject"),
                 ("no --answers", item, ("--option", "Approve"), "--option needs --answers"),
-                ("not a batch", plain, ("--answers", question, "--option", "Approve"), "not a review batch")):
+                ("not its option", plain, ("--answers", question, "--option", "Approve"),
+                 "its options are Pack store, Database rows")):
             with self.subTest(name):
                 before = json.loads(self.call("task", "show", row, "--json").stdout)
                 refused = self.call("task", "note", row, "Answer", "--kind", "decision", *flags, code=1)
@@ -626,15 +645,51 @@ class TaskCLI(unittest.TestCase):
         self.assertIn("--option LABEL, one of Approve, Reject", refused.stderr)
 
     def test_answers_refuses_a_review_batch_question(self):
-        """A batch question is Review's: its ruling may file a task, which `review.rule` writes and a note does not."""
-        with database(home=self.home) as connection:
-            item = sd_db.create_item(connection, kind="task", title="Batch", source="task-ref",
-                                     external_id="review:example:1")
-        asked = self.question(item)
+        """A batch question is Review's: its ruling may file a task, which `review.rule` writes and a note does not.
+        sd:10097: a `review:` ref alone is no batch; the batch is what `review.read` reads."""
+        item, asked = self.batch_question()
         before = json.loads(self.call("task", "show", item, "--json").stdout)
         refused = self.call("task", "note", item, "Pack store", "--kind", "decision", "--answers", asked, code=1)
         self.assertIn("review batch", refused.stderr)
         self.assertEqual(json.loads(self.call("task", "show", item, "--json").stdout), before)
+
+    def test_option_rules_a_question_on_a_review_ref_item_that_is_no_batch(self):
+        """sd:10097: an item a lane review filed has a `review:` ref but no batch header, so
+        `review.read` refused it, the question had no parsed options and every --option was
+        refused. The labels now come from the question's own `Option:` lines."""
+        body = ("Skipped on build/example: the fix needs helpers that exist only on another branch.\n"
+                "Option: Build it after build/example merges, on top of that branch (Recommended)\n"
+                "Option: Build a main-side guard now: Retry and Build by item refuse or go fresh")
+        with database(home=self.home) as connection:
+            item = sd_db.create_item(connection, kind="task", title="Finding", source="task-ref",
+                                     external_id="review:build-example-lane-move")
+            connection.commit()
+        asked = self.question(item, body)
+        before = json.loads(self.call("task", "show", item, "--json").stdout)
+        refused = self.call("task", "note", item, "Maybe", "--kind", "decision", "--answers", asked,
+                            "--option", "Maybe", code=1)
+        self.assertIn("its options are Build it after build/example merges, on top of that branch, "
+                      "Build a main-side guard now", refused.stderr)
+        self.assertEqual(json.loads(self.call("task", "show", item, "--json").stdout), before)
+        label = "build it after build/example merges, on top of that branch"
+        state = json.loads(self.call("task", "note", item, "Once it lands", "--kind", "decision",
+                                     "--answers", asked, "--option", label, "--json").stdout)
+        self.assertEqual(state["note"]["body"], f"Ruling on note #{asked}: Build it after build/example merges, "
+                                                "on top of that branch: Once it lands")
+        self.assertTrue(next(note for note in state["notes"] if note["id"] == asked)["resolved_at"])
+        plain = self.question(item, body)
+        state = json.loads(self.call("task", "note", item, "Build a main-side guard now", "--kind", "decision",
+                                     "--answers", plain, "--json").stdout)
+        self.assertEqual(state["note"]["body"], f"Ruling on note #{plain}: Build a main-side guard now")
+
+    def test_option_takes_the_exact_spelling_before_a_case_folded_one(self):
+        """Review of build/sd-1624: with `Use Foo (Recommended)` and `Use foo`, `--option 'Use foo'`
+        recorded `Use Foo`, the first case-folded match."""
+        item = json.loads(self.call("task", "add", "--priority", "3", "Asks", "--json").stdout)["item"]["id"]
+        asked = self.question(item, "Which?\nOption: Use Foo (Recommended)\nOption: Use foo")
+        state = json.loads(self.call("task", "note", item, "Use foo", "--kind", "decision", "--answers", asked,
+                                     "--option", "Use foo", "--json").stdout)
+        self.assertEqual(state["note"]["body"], f"Ruling on note #{asked}: Use foo")
 
     def test_answers_rules_a_question_with_no_options_on_a_review_ref_item(self):
         """sd:8975: a plain question on a review-ref item has no label to name, so --option
