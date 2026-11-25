@@ -1463,17 +1463,25 @@ def _usage_reads(
         "AND window_minutes IS latest.window_minutes AND substr(timestamp, 1, 7) = ? "
         "ORDER BY timestamp DESC, id DESC LIMIT 1) ORDER BY provider, window_minutes",
         (month, month)).fetchall()
-    areas = connection.execute(
+    # Summed in SQL per bill, provider and role, as `roles` is, then folded
+    # here: one SQLite SUM across providers can pass 64-bit range and raise
+    # `integer overflow`, which took the whole report down (sd:10307 review).
+    areas: dict[str, dict] = {}
+    for row in connection.execute(
         f"SELECT {_AREA} AS area, COUNT(*) AS calls, "
         "COALESCE(SUM(CASE WHEN source IN ('run', 'bound') THEN usd END), 0.0) AS spent, "
         "COALESCE(SUM(CASE WHEN source IN ('reserved', 'sending') THEN usd END), 0.0) AS held, "
         "COALESCE(SUM(tokens_in), 0) AS tokens_in, COALESCE(SUM(tokens_out), 0) AS tokens_out "
         "FROM cost LEFT JOIN assignment ON assignment.id = cost.assignment "
         "WHERE source != 'meter' AND (source IN ('reserved', 'sending') "
-        "OR substr(cost.timestamp, 1, 7) = ?) GROUP BY area ORDER BY area", (month,)).fetchall()
+        "OR substr(cost.timestamp, 1, 7) = ?) GROUP BY area, cost.bill, cost.provider, cost.role",
+            (month,)):
+        total = areas.setdefault(row["area"], dict.fromkeys(("calls", "spent", "held", "tokens_in", "tokens_out"), 0))
+        for key in total:
+            total[key] += row[key]
     return Usage(
         month=month, days=days, today=today, bills=tuple(bills),
-        roles=tuple(dict(row) for row in roles), areas=tuple(dict(row) for row in areas), bound=tuple(dict(row) for row in bound),
+        roles=tuple(dict(row) for row in roles), areas=tuple({"area": name, **areas[name]} for name in sorted(areas)), bound=tuple(dict(row) for row in bound),
         meter=tuple(dict(row) for row in meter),
         spent=round(sum(bill.spent for bill in bills) + (unbilled or 0.0), 6),
         held=round(sum(bill.held for bill in bills), 6), unbilled=unbilled,

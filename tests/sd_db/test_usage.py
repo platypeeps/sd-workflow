@@ -102,6 +102,19 @@ class TheVerb(UsageCase):
                           for area in found.areas],
                          [("coding", 1, 1.0, 3, 50), ("design", 1, 4.0, 7, 900)])
 
+    def test_area_totals_past_sqlite_integers_keep_the_report(self):
+        """Two providers' author rows whose token sum passes SQLite's
+        64-bit range: each provider group holds, so the area total
+        must too (sd:10307 lane review)."""
+        big = 2**63 - 1
+        for provider, tokens in (("kimi", big), ("mini", 1)):
+            writes.record_cost(self.db, source="run", provider=provider, role="author",
+                               assignment=self.assignment(), tokens_in=tokens, tokens_out=tokens, usd=1.0)
+        found = reads.usage_month(self.db)
+        self.assertEqual([(area["area"], area["calls"], area["spent"], area["tokens_in"], area["tokens_out"])
+                          for area in found.areas],
+                         [("coding", 2, 2.0, big + 1, big + 1)])
+
     @hub_only
     def test_json_is_the_read_byte_for_byte(self):
         self.month()
