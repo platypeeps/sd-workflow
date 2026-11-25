@@ -667,12 +667,31 @@ class PullRequestPrivacyTests(LintFixture):
         self.assertEqual(report.failures,
                          [f"pull request body: line 4 matches a privacy pattern in {self.patterns}"])
 
-    def test_a_pattern_splits_only_at_a_top_level_bar(self) -> None:
-        cases = {"a|b": ["a", "b"], "(a|b)|c": ["(a|b)", "c"], "[|]|x": ["[|]", "x"],
-                 "[^]|]|x": ["[^]|]", "x"], "a\\|b|c": ["a\\|b", "c"], "[abc": ["[abc"]}
-        self.assertEqual({p: lint.alternatives(p) for p in cases}, cases)
-        # An empty match, or one Python cannot read, names no repo: it stays.
-        self.assertEqual([lint.names_repo(alt, "shop") for alt in ("sho", "x*", "(")], [True, False, False])
+    def test_a_pattern_that_matches_inside_the_repo_name_still_guards_other_text(self) -> None:
+        """Review of sd:10720: `operator` matched inside `operators-site`, so it was dropped there and the
+        operator's name passed in any body of that repo. Only the repo's own name is exempt."""
+        self.patterns.write_text("operator|shop\n", encoding="utf-8")
+        self.git("remote", "add", "origin", "git@github.com:example/operators-site.git")
+        report = self.run_lint("## Summary\n\n- ask the operator\n", body_only=True)
+        self.assertEqual(report.failures,
+                         [f"pull request body: line 3 matches a privacy pattern in {self.patterns}"])
+
+    def test_a_valid_pattern_reaches_grep_unchanged(self) -> None:
+        """Review of sd:10720: splitting at `|` broke `[[:alpha:]|]x`, a valid ERE, into two invalid ones."""
+        self.patterns.write_text("[[:alpha:]|]operator\n", encoding="utf-8")
+        self.git("remote", "add", "origin", "git@github.com:example/shop-website.git")
+        report = self.run_lint("## Summary\n\n- x|operator\n", body_only=True)
+        self.assertEqual(report.failures,
+                         [f"pull request body: line 3 matches a privacy pattern in {self.patterns}"])
+
+    def test_only_the_whole_leading_segment_is_left_out(self) -> None:
+        """`shops`, `my-shop` and `shop_key` are other text, and the pattern still guards them."""
+        self.patterns.write_text("shop\n", encoding="utf-8")
+        self.git("remote", "add", "origin", "git@github.com:example/shop-website.git")
+        body = "## Summary\n\n- shop shop-web:scan shop-website\n- shops\n- my-shop\n- shop_key\n"
+        self.assertEqual(self.run_lint(body, body_only=True).failures,
+                         [f"pull request body: line {n} matches a privacy pattern in {self.patterns}"
+                          for n in (4, 5, 6)])
 
     def test_an_alternative_naming_another_repo_still_applies(self) -> None:
         self.patterns.write_text("operator|shop\n", encoding="utf-8")

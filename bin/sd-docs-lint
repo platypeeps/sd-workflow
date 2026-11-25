@@ -19,8 +19,8 @@ Five tree rules and one body rule. Numbers are stable: rules 5, 6 and 8 retired.
 7. Work refs     -- every `docs/work/` path tracked markdown names resolves.
 PR privacy        -- a pull request body is public, so no line of it matches
                     the operator's privacy-pattern file (sd:2999). The body
-                    carries no required or refused line. An alternative
-                    that names this repo does not apply in it (sd:10720).
+                    carries no required or refused line. This repo's own
+                    short name is left out of the scan (sd:10720).
 Rules 1 to 4 and 7 read the tree; the privacy rule needs `--pr-body`.
 A `mode: minimal` repository keeps `docs/work` local, so rules 1, 2 and 7 skip.
 A checkout with no `docs/work` skips rules 1, 2 and 7 too.
@@ -359,53 +359,28 @@ def own_name(repo: pathlib.Path) -> str:
     return match[2] if match else sd_lib.main_worktree_root(repo).name
 
 
-def alternatives(pattern: str) -> list[str]:
-    """`pattern` split at each `|` outside a group, a bracket or an escape."""
-    parts, start, depth, at = [], 0, 0, 0
-    while at < len(pattern):
-        char = pattern[at]
-        if char == "\\":
-            at += 1
-        elif char == "[":
-            # A `]` first in the bracket, after any `^`, is a member, not its end.
-            at += 2 if pattern[at + 1:at + 2] == "^" else 1
-            at = pattern.find("]", at + 1 if pattern[at:at + 1] == "]" else at)
-            if at < 0:
-                return [pattern]
-        elif char == "(":
-            depth += 1
-        elif char == ")":
-            depth = max(depth - 1, 0)
-        elif char == "|" and depth == 0:
-            parts.append(pattern[start:at])
-            start = at + 1
-        at += 1
-    return [*parts, pattern[start:]]
+def own_segment(repo: pathlib.Path) -> re.Pattern[str] | None:
+    """This repo's own short name, as a whole leading segment of a token:
+    `shop` in `shop`, `shop-web:scan` and `shop-website`, never in `shops`
+    or `my-shop`. None when the name has no segment to take."""
+    segment = re.split(r"[-_.]", own_name(repo))[0]
+    return re.compile(rf"(?<![\w.-]){re.escape(segment)}(?![\w.])") if segment else None
 
 
-def names_repo(alternative: str, name: str) -> bool:
-    """Whether `alternative` matches a non-empty run of `name`: that repo's own
-    name is no secret in its own pull request (sd:10720). One Python cannot
-    compile stays, so an unreadable pattern still applies."""
-    try:
-        found = re.search(alternative, name)
-    except re.error:
-        return False
-    return bool(found and found.group())
+def masked(body: str, repo: pathlib.Path, report: Report) -> str:
+    """`body` less this repo's own short name, for the privacy scan alone.
 
-
-def others(patterns: list[str], repo: pathlib.Path, report: Report) -> list[str]:
-    """`patterns` less each alternative that names `repo`: a project's short
-    name does not apply in its own repo, whose image names carry it
-    (sd:10720)."""
-    name = own_name(repo)
-    kept = [alt for pattern in patterns for alt in alternatives(pattern) if not names_repo(alt, name)]
-    dropped = sum(len(alternatives(pattern)) for pattern in patterns) - len(kept)
-    if dropped:
-        report.note(f"PR privacy: {dropped} alternative(s) name this repo, {name}; not applied here")
-    if not kept:
-        report.note(f"PR privacy: every pattern names this repo, {name}; nothing else to match")
-    return kept
+    A site repo's image names carry its short name, and a pattern for that
+    name refused them (sd:10720). The patterns reach grep as written; only
+    the name's own occurrences leave the scanned text, so every pattern
+    still guards everything else, the operator's name included."""
+    segment = own_segment(repo)
+    if segment is None:
+        return body
+    scanned, count = segment.subn("", body)
+    if count:
+        report.note(f"PR privacy: {count} use(s) of this repo's own name, {segment.pattern}, not scanned")
+    return scanned
 
 
 def check_pr_privacy(body: str | None, report: Report, repo: pathlib.Path | None = None) -> None:
@@ -437,12 +412,9 @@ def check_pr_privacy(body: str | None, report: Report, repo: pathlib.Path | None
     if not patterns:
         report.fail(str(path), f"holds no privacy pattern, so the body is unchecked; {remedy}")
         return
-    if repo is not None:
-        patterns = others(patterns, repo, report)
-        if not patterns:
-            return
+    scanned = body if repo is None else masked(body, repo, report)
     argv = ["grep", "-n", "-E", *(arg for pattern in patterns for arg in ("-e", pattern))]
-    done = subprocess.run(argv, input=body.encode("utf-8"), capture_output=True, timeout=60, check=False)
+    done = subprocess.run(argv, input=scanned.encode("utf-8"), capture_output=True, timeout=60, check=False)
     if done.returncode not in (0, 1):
         report.fail(str(path), "grep -E refused the privacy patterns: " + done.stderr.decode("utf-8", "replace").strip())
         return
