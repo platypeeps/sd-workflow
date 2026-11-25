@@ -2504,19 +2504,26 @@ class Supervisor:
         # its finding before a later item that leads. Its own alone, not the bundle's earliest nor the earlier of
         # its own and the lead's: each took in the finding of a member's cancelled build (review of
         # build/sd-1782, rounds 2 and 3). The lead keeps `first`; a member with no queue note falls back to it.
+        # A member's window opens after its queue note's id, not at its timestamp: timestamps have whole seconds,
+        # and a finding cancelled in the second of the next queue note read as inside (round 4).
         opens = dict.fromkeys(items, first)
+        after: dict[int, int] = {}
         for row in self.db.execute("SELECT id, item FROM assignment WHERE parent = ?", (lead,)):
-            own = self.db.execute("SELECT MIN(timestamp) FROM note WHERE item = ? AND body LIKE ?",
+            own = self.db.execute("SELECT MIN(id) FROM note WHERE item = ? AND body LIKE ?",
                                   (row["item"], f"Build assignment {row['id']} queued %")).fetchone()[0]
             if row["item"] in opens and row["item"] != self.lead and own is not None:
-                opens[row["item"]] = own
+                after[row["item"]] = own
+
+        def inside(note: sqlite3.Row) -> bool:
+            if note["item"] in after:
+                return note["id"] > after[note["item"]]
+            return opens[note["item"]] is not None and note["timestamp"] >= opens[note["item"]]
 
         def listed(prefix: str, *, latest: bool = False) -> str:
             notes = [note for note in self.db.execute(
-                f"SELECT item, body, timestamp FROM note WHERE item IN ({', '.join('?' for _ in items)}) "
+                f"SELECT id, item, body, timestamp FROM note WHERE item IN ({', '.join('?' for _ in items)}) "
                 f"AND body LIKE ? AND timestamp <= ? ORDER BY timestamp, id",
-                (*items, prefix + "%", self.row["created_at"])).fetchall()
-                if opens[note["item"]] is not None and note["timestamp"] >= opens[note["item"]]]
+                (*items, prefix + "%", self.row["created_at"])).fetchall() if inside(note)]
             # Only the latest park's blockers (pack sd:9593): one Retry notes the same text on each member, so the
             # newest note's text names them, whatever runs a recovery started since.
             if latest and notes:
