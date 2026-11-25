@@ -699,10 +699,21 @@ class Supervise(Case):
         self.assertEqual(json.loads(row["final"])["result"], "built (pass)")
         cost = self.db.execute("SELECT * FROM cost WHERE assignment = ?", (row["assignment"],)).fetchone()
         self.assertEqual((cost["source"], cost["usd"], cost["tokens_in"], cost["tokens_out"]), ("run", 0.42, 10, 20))
+        self.assertEqual((cost["provider"], cost["bill"]), (None, None), "no registry: attribution stays unknown")
         note = self.db.execute("SELECT body FROM note WHERE item = ? AND body LIKE '%report%'", (self.items[0],))
         self.assertIn("built (pass)", note.fetchone()["body"])
         self.assertEqual(self.remote_branches(), "main", "the fake lane pushed nothing; the supervisor neither")
         self.assertIsNone(self.latest()["cancel_requested"])
+
+    def test_a_builder_cost_row_names_its_provider_and_bill(self):
+        """sd:10400: the builder is `claude -p`, so its row names the claude entry and the bill the registry gives it."""
+        shutil.copy(Path(__file__).resolve().parents[2] / "providers.yaml", self.database.parent / "providers.yaml")
+        self.press(1)
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.supervisor().run()
+        cost = self.db.execute("SELECT provider, bill FROM cost WHERE pass = ?", (self.bundle["id"],)).fetchone()
+        self.assertEqual((cost["provider"], cost["bill"]), ("claude", "anthropic"))
 
     def test_a_skipped_member_is_not_delivered(self):
         """Review round 2: only the members a branch commit's `Closes:` trailer cites are enqueued and done; the

@@ -62,7 +62,8 @@ from . import build, contributions, draft, paths, remote, runner_journal, sessio
 from .build import Probe
 from .config import system_checkout
 from .database import Patient, transaction
-from .errors import SchemaTooNew
+from .errors import SchemaTooNew, SdDbError
+from .registry import read as read_registry
 from .ship import this_host
 from .workflow import WorkflowError
 from .writes import add_note, create_item, now, record_cost, record_state
@@ -84,6 +85,8 @@ STRONGEST, ESCALATED_EFFORT = "fable", "medium"
 RATE_LIMIT_WAIT_SECONDS = 900
 RATE_LIMIT_WAITS = 4
 MAX_TURNS = 300
+#: The registry entry `Tools.claude` runs (`claude -p`): the provider a builder or draft cost row names.
+PROVIDER = "claude"
 TITLE_MAX = 63
 #: A read (`git status`, `lane list`) that takes longer is unread.
 READ_SECONDS = 120
@@ -2720,11 +2723,28 @@ class Supervisor:
         usage = final.get("usage")
         usage = usage if isinstance(usage, dict) else {}
         usd = final.get("total_cost_usd")
-        record_cost(self.db, source="run", role="author", repo=self.row["repo"], assignment=self.row["assignment"],
-                    pass_=self.ident, owner_pid=os.getpid(),
+        provider, bill = self.attribution()
+        record_cost(self.db, source="run", provider=provider, bill=bill, role="author", repo=self.row["repo"],
+                    assignment=self.row["assignment"], pass_=self.ident, owner_pid=os.getpid(),
                     tokens_in=usage.get("input_tokens") if isinstance(usage.get("input_tokens"), int) else None,
                     tokens_out=usage.get("output_tokens") if isinstance(usage.get("output_tokens"), int) else None,
                     usd=float(usd) if isinstance(usd, (int, float)) else None)
+
+    def attribution(self) -> tuple[str | None, str | None]:
+        """The provider and bill a builder row names: `claude -p` is the registry's `claude` entry (sd:10400).
+
+        No registry, no `claude` entry or no row to name stays unknown, (None, None): a missing bill is not
+        guessed, and the cost row is still written.
+        """
+        try:
+            entry = read_registry(connection=self.db).providers.get(PROVIDER)
+            if entry is None:
+                return None, None
+            named = {table: self.db.execute(f"SELECT 1 FROM {table} WHERE name = ?", (name,)).fetchone() is not None
+                     for table, name in (("provider", PROVIDER), ("bill", entry.bill))}
+        except (SdDbError, sqlite3.Error, OSError):
+            return None, None
+        return (PROVIDER if named["provider"] else None), (entry.bill if named["bill"] else None)
 
     def unfinished(self) -> str:
         """Why a passing builder's worktree is not done: dirty, or no commit ahead of the base; empty when done."""
