@@ -303,7 +303,7 @@ def _unity_project(path: str) -> bool:
         return False  # a DOCTYPE or an entity is never Unity's, and is not parsed
     try:
         root = ElementTree.fromstring(data)
-    except ElementTree.ParseError:
+    except (ElementTree.ParseError, ValueError):  # ValueError: an encoding expat refuses, such as shift_jis
         return False
     return all(node.tag in UNITY_PROJECT_TAGS and UNITY_PROJECT_ATTRIBUTES.issuperset(node.attrib)
                for node in root.iter())

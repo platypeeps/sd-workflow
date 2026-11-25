@@ -340,3 +340,5 @@ class Disposable(unittest.TestCase):
         self.assertFalse(self.goes("Game/Cond.csproj"), "an attribute or property Unity never writes")
         (self.game / "Broken.csproj").write_text(self.STAMP + "<")
         self.assertFalse(self.goes("Game/Broken.csproj"), "not well-formed")
+        (self.game / "Wide.csproj").write_text('<?xml version="1.0" encoding="shift_jis"?>' + self.STAMP)
+        self.assertFalse(self.goes("Game/Wide.csproj"), "an encoding the parser refuses keeps the tree")
