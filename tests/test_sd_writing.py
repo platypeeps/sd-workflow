@@ -267,7 +267,7 @@ class WritingContentCheckout(unittest.TestCase):
 
 
 BRIEF = {"piece": "2026/a", "draft": "content/2026/a/index.md", "research": "content/2026/a/research.md",
-         "research_exists": True, "digest": "0123456789ab", "generation": 2,
+         "research_exists": True, "digest": "0123456789ab", "generation": 2, "index_sha256": "e" * 64,
          "record": "<!-- adversarial-reviewed: words=150 sentences=0123abcd -->", "words": 150}
 
 
@@ -343,7 +343,7 @@ class WritingReview(unittest.TestCase):
         self.assertTrue(argv[6].endswith("report.md"))
         self.assertTrue((self.stubs / "codex.stdin").read_text().startswith("word word"))
         self.recorded.assert_called_once_with(self.connection, 7, "# Review\n", digest="0123456789ab",
-                                              record=BRIEF["record"], generation=2)
+                                              record=BRIEF["record"], generation=2, index_sha256="e" * 64)
         self.connect.assert_called_once_with(sd_db, write=False)
         self.connection.close.assert_called_once()
 

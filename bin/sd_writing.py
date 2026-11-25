@@ -137,7 +137,7 @@ def adversarial(writing: Any, connection: Any, item: int, args: argparse.Namespa
     print(f"# codex adversarial review: {brief['piece']} (sandbox=read-only, {brief['root']})", file=sys.stderr)
     report = _codex(brief["root"], prompt, model=args.model, timeout=args.timeout, effort=getattr(args, "effort", None))
     result = writing.record_adversarial(connection, item, report, digest=brief["digest"], record=brief["record"],
-                                        generation=brief["generation"])
+                                        generation=brief["generation"], index_sha256=brief["index_sha256"])
     print(f"# reviewed draft {result['digest']}", file=sys.stderr)
     if not result["current"]:
         print("# draft changed during review; this report is stale and cannot clear readiness", file=sys.stderr)

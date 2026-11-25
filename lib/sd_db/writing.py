@@ -805,15 +805,22 @@ def record_gate(connection: sqlite3.Connection, item: int, artifact: str, *, ver
         reviewed = reviewed_digest or stamped_digest
         if reviewed != snapshot["digest"]:
             raise WorkflowError("gate needs the explicitly reviewed draft digest; it must match the current draft")
+        # The draft digest ignores whitespace, so it says nothing of layout. Only a stamp's `index=` names the
+        # index.md bytes the reviewer read; a gate without one certifies no bytes, and a render refuses it (sd:10719).
+        attested = re.search(r"\bindex=(\S*)", evidence_stamps[0].group(2)) if evidence_stamps else None
+        if attested and re.fullmatch(r"[0-9a-f]{64}", attested.group(1)) is None:
+            raise WorkflowError("gate report's index stamp is not a SHA-256")
+        if attested and attested.group(1) != snapshot["hashes"]["index"]:
+            raise WorkflowError("index.md bytes changed after the review; review the current layout before recording it")
         fields = _fields(row["fields"])
         gates = fields.setdefault("writing_gates", {})
         if not isinstance(gates, dict):
             raise WorkflowError("stored writing gate metadata is malformed")
         record = {"verdict": verdict, "findings": held, "reason": reason, "who": who,
                   "draft_digest": snapshot["digest"], "generation": row["gate_generation"],
-                  "evidence_sha256": snapshot["hashes"][artifact], "research_sha256": snapshot["hashes"]["research"],
-                  # The draft digest ignores whitespace; a render binds the exact bytes it lays out (sd:10719).
-                  "index_sha256": snapshot["hashes"]["index"]}
+                  "evidence_sha256": snapshot["hashes"][artifact], "research_sha256": snapshot["hashes"]["research"]}
+        if attested:
+            record["index_sha256"] = attested.group(1)
         existing = gates.get(artifact)
         if isinstance(existing, dict) and {key: value for key, value in existing.items() if key != "at"} == record:
             return piece_state(connection, item)
@@ -956,7 +963,8 @@ def adversarial_brief(connection: sqlite3.Connection, item: int) -> dict:
     return {"piece": row["piece"], "root": str(disk), "draft": draft.relative_to(disk).as_posix(),
             "research": draft.with_name(REPORTS["research"]).relative_to(disk).as_posix(),
             "research_exists": "research" in snapshot["files"], "digest": snapshot["digest"],
-            "generation": row["gate_generation"], "record": reviewed_record(prose), "words": words}
+            "generation": row["gate_generation"], "record": reviewed_record(prose), "words": words,
+            "index_sha256": snapshot["hashes"]["index"]}
 
 
 def _write_report(path: Path, text: str) -> None:
@@ -967,10 +975,10 @@ def _write_report(path: Path, text: str) -> None:
 
 
 def record_adversarial(connection: sqlite3.Connection, item: int, report: str, *, digest: str, record: str,
-                       generation: int) -> dict:
+                       generation: int, index_sha256: str | None = None) -> dict:
     """Write `adversarial.md` for one run: draft stamp, run record, provenance, then the report.
 
-    `digest`, `record` and `generation` come from the `adversarial_brief`
+    `digest`, `record`, `generation` and `index_sha256` come from the `adversarial_brief`
     the run reviewed. The result says whether the draft is still that one,
     counts the confidence tags, and quotes the reviewer's verdict line.
     The report is a set of hypotheses; this records which prose it answers
@@ -980,13 +988,16 @@ def record_adversarial(connection: sqlite3.Connection, item: int, report: str, *
         raise WorkflowError("the adversarial run produced no report; nothing written")
     if (not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{12}", digest) is None
             or not isinstance(record, str) or _REVIEWED.fullmatch(record) is None
-            or type(generation) is not int):
+            or type(generation) is not int
+            or (index_sha256 is not None and (not isinstance(index_sha256, str)
+                                              or re.fullmatch(r"[0-9a-f]{64}", index_sha256) is None))):
         raise WorkflowError("adversarial run needs the digest, run record and generation from its brief")
     row = _piece(connection, item)["item"]
     snapshot = _snapshot(row)
     day = now()[:10]
     target = snapshot["path"].with_name(REPORTS["adversarial"])
-    _write_report(target, f"<!-- reconciled-with-draft: {digest} on {day} gen={generation} -->\n\n{record}\n\n"
+    layout = f" index={index_sha256}" if index_sha256 else ""
+    _write_report(target, f"<!-- reconciled-with-draft: {digest} on {day} gen={generation}{layout} -->\n\n{record}\n\n"
                           f"<!-- codex adversarial review of {row['piece']}, {day}. Findings are HYPOTHESES: "
                           "verify each against the source before acting. Nothing here edited the draft. -->\n\n"
                           + (report if report.endswith("\n") else report + "\n"))

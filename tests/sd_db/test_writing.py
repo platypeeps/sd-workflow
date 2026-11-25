@@ -210,28 +210,53 @@ class SharedTransitions(WritingCase):
         gates = json.loads(piece_state(self.db, self.item)["item"]["fields"])["writing_gates"]
         return {name: gates[name].get("index_sha256") for name in ("fact-check", "adversarial")}
 
-    def test_gate_binds_index_bytes_a_layout_edit_moves_the_hash(self):
-        """sd:10719. The digest ignores whitespace; the gate also binds index.md bytes for a render check."""
+    def attest(self, data=None):
+        """Stamp both reports with the draft digest and the index.md bytes their reviewer read."""
+        seen = hashlib.sha256(self.index.read_bytes() if data is None else data).hexdigest()
+        for name in ("fact-check", "adversarial"):
+            (self.folder / f"{name}.md").write_text(
+                f"<!-- reconciled-with-draft: {self.digest} on 2026-09-08 gen=0 index={seen} -->\nReport.\n")
+        return seen
+
+    def test_an_unattested_gate_certifies_no_index_bytes(self):
+        """sd:10719. A report that names no index bytes leaves the gate without index_sha256."""
+        self.index.write_text(self.index.read_text().replace("A claim.", "A\n\nclaim."))
         self.gates()
-        held = hashlib.sha256(self.index.read_bytes()).hexdigest()
-        self.assertEqual(self.index_hashes(), {"fact-check": held, "adversarial": held})
+        self.assertEqual(self.index_hashes(), {"fact-check": None, "adversarial": None})
+
+    def test_a_gate_refuses_a_layout_edit_after_the_attested_review(self):
+        """sd:10719. The digest ignores whitespace; a stamp for other index.md bytes is refused."""
+        self.attest()
         self.index.write_text(self.index.read_text().replace("A claim.", "A\n\nclaim."))
         self.assertEqual(piece_state(self.db, self.item)["writing"]["gates"]["digest"], self.digest)
-        self.assertNotEqual(hashlib.sha256(self.index.read_bytes()).hexdigest(), held)
+        before = piece_state(self.db, self.item)
+        with self.assertRaisesRegex(WorkflowError, "index.md bytes"):
+            self.gates()
+        self.assertEqual(piece_state(self.db, self.item), before)
+
+    def test_a_malformed_index_attestation_is_refused(self):
+        (self.folder / "fact-check.md").write_text(
+            f"<!-- reconciled-with-draft: {self.digest} on 2026-09-08 gen=0 index=abc -->\nReport.\n")
+        with self.assertRaisesRegex(WorkflowError, "index"):
+            record_gate(self.db, self.item, "fact-check", verdict="pass", findings=[], reason="Reviewed", who="operator")
+
+    def test_an_attested_gate_binds_the_bytes_its_reviewer_read(self):
+        seen = self.attest()
         self.gates()
-        self.assertEqual(set(self.index_hashes().values()), {hashlib.sha256(self.index.read_bytes()).hexdigest()})
+        self.assertEqual(self.index_hashes(), {"fact-check": seen, "adversarial": seen})
 
     def test_the_packs_own_frontmatter_rewrites_carry_the_index_hash(self):
         """sd:10719. A file-owned ready or metadata rewrite moves index.md bytes; the gate hash follows."""
+        self.attest()
         self.gates()
         change_stage(self.db, self.item, "ready", who="operator")
-        current = hashlib.sha256(self.index.read_bytes()).hexdigest()
-        self.assertEqual(set(self.index_hashes().values()), {current})
+        self.assertEqual(set(self.index_hashes().values()), {hashlib.sha256(self.index.read_bytes()).hexdigest()})
         update_piece_metadata(self.db, self.item, {"title": "A renamed piece"}, who="operator")
         self.assertEqual(set(self.index_hashes().values()), {hashlib.sha256(self.index.read_bytes()).hexdigest()})
 
     def test_a_rewrite_leaves_a_hash_for_other_bytes_alone(self):
         """sd:10719. A gate hash for bytes edited by hand after the gate stays stale through a rewrite."""
+        self.attest()
         self.gates()
         self.index.write_text(self.index.read_text().replace("A claim.", "A\nclaim."))
         stale = self.index_hashes()
@@ -690,6 +715,19 @@ class ReviewCompanions(WritingCase):
         self.assertTrue(result["current"])
         self.assertEqual(result["path"], f"content/{self.piece}/adversarial.md")
         self.assertEqual(self.companions()["adversarial"], "current")
+
+    def test_a_run_stamps_the_index_bytes_its_brief_named(self):
+        """sd:10719. The brief names the index.md bytes; the run's stamp attests them for the gate."""
+        self.write_draft(SENTENCES)
+        brief = adversarial_brief(self.db, self.item)
+        self.assertEqual(brief["index_sha256"], hashlib.sha256(self.index.read_bytes()).hexdigest())
+        record_adversarial(self.db, self.item, REPORT, digest=brief["digest"], record=brief["record"],
+                           generation=brief["generation"], index_sha256=brief["index_sha256"])
+        first = (self.folder / "adversarial.md").read_text().split("\n", 1)[0]
+        self.assertRegex(first, rf" gen=0 index={brief['index_sha256']} -->$")
+        with self.assertRaisesRegex(WorkflowError, "brief"):
+            record_adversarial(self.db, self.item, REPORT, digest=brief["digest"], record=brief["record"],
+                               generation=brief["generation"], index_sha256="abc")
 
     def test_a_draft_changed_during_the_run_leaves_a_stale_report(self):
         self.write_draft(SENTENCES)
