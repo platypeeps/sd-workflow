@@ -2587,6 +2587,10 @@ class Landing(Lane):
                           (2, f"Post-merge: make post-merge passed in {self.repo}")])
         self.assertEqual(self.note_kinds[-2:], ["comment", "comment"])
 
+    def test_the_library_knows_the_lanes_session_by_the_lanes_own_name(self) -> None:
+        from sd_db import workflow
+        self.assertEqual(workflow.LANE_SESSION, sd_lane.LANE_SESSION)
+
     def test_a_makefile_without_the_target_runs_nothing_and_notes_nothing(self) -> None:
         tree, head = self.topic()
         (self.repo / "Makefile").write_text("post-merge-later:\n\ttouch ran\npost-merge := 1\n", encoding="utf-8")

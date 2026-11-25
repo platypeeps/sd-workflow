@@ -12,7 +12,7 @@ import hashlib
 import json
 import re
 import sqlite3
-from collections.abc import Collection
+from collections.abc import Collection, Mapping
 from datetime import date
 from typing import Any
 
@@ -879,19 +879,56 @@ def _refuse_unlanded_branch(state: dict, item: int) -> None:
         f"commit that landed it as its delivery")
 
 
+#: How each followup the machine writes starts, by who wrote it (sd:10407). The lane's session writes
+#: an entry's end (`sd_lane.note_ended`) and a post-merge target's answer (`sd_lane.note_post_merge`);
+#: a build's block (`build._block`) records no session, which no person's note does: the CLI and the
+#: dashboard always record one. The text alone names no author: an operator can type or paste it.
+#: A done item owes none of the machine's: none blocks its close, which resolves each but a
+#: `Post-merge: ` one unasked (`done_resolves`).
+LANE_SESSION = "sd-lane"  # `sd_lane.LANE_SESSION` is the same name
+POST_MERGE_FOLLOWUP = "Post-merge: "
+LANE_FOLLOWUPS = ("Lane failed in ", "Lane skipped in ", POST_MERGE_FOLLOWUP)
+BUILD_FOLLOWUP = "Build blocked: "
+
+
+def machine_followup(note: Mapping[str, Any]) -> bool:
+    """Whether `note` is a followup the machine wrote: its writer's session and its exact opening (sd:10407)."""
+    body, session = str(note["body"] or ""), note["session"]
+    return note["kind"] == "followup" and (
+        (session == LANE_SESSION and body.startswith(LANE_FOLLOWUPS))
+        or (session is None and body.startswith(BUILD_FOLLOWUP)))
+
+
+def lane_post_merge(note: Mapping[str, Any]) -> bool:
+    """Whether `note` is the lane's `Post-merge: ` followup: a failed target a later refresh answers (sd:10529).
+
+    No close resolves it, asked (`resolve_followups`, a named followup) or not: a close comes
+    before the target that checks it (sd:10407). It blocks no close and stays owed."""
+    return machine_followup(note) and str(note["body"]).startswith(POST_MERGE_FOLLOWUP)
+
+
+def done_resolves(note: Mapping[str, Any]) -> bool:
+    """Whether a move to done resolves `note` unasked: the machine's, but `Post-merge: ` (sd:10407)."""
+    return machine_followup(note) and not lane_post_merge(note)
+
+
 def change_status(
     connection: sqlite3.Connection, item: int, target: str, *, who: str,
     reason: str | None = None, expected_revision: str | None = None, session: str | None = None,
-    followups: Collection[int] | None = None,
+    followups: Collection[int] | None = None, resolve_followups: bool = False,
 ) -> dict:
     """Move a task, followup, hand idea or active work item without bypassing delivery authority.
 
     `session` is the status note's session, `who` when not given (pack sd:6046).
-    `followups` limits which open followups a move to done resolves: a
-    delivery passes the ones it settles; None, a hand close, resolves all
-    (sd:9869).
+    A move to done always resolves the machine's followups, and never the
+    lane's post-merge one (`lane_post_merge`, sd:10407). `followups` names the others a delivery settles; the rest stay
+    open and owed (sd:9869). A hand close (`followups` None) refuses while any
+    other followup is open, naming each as `resolve followup N`, unless
+    `resolve_followups` is True, as `reporting.acknowledge` does.
     """
     who = _text(who, "who")
+    if type(resolve_followups) is not bool:
+        raise WorkflowError("resolve_followups must be exactly True or False")
     if reason is not None:
         reason = _text(reason, "reason")
     if not isinstance(target, str) or target not in STATUSES:
@@ -968,12 +1005,20 @@ def change_status(
                 set_item_fields(connection, item, fields=held)
         if target == "done":
             # sd:3505: what a done item still owed is no longer owed; the brief
-            # and Today read only open notes, so close them with the move. A
+            # and Today read only open notes, so close them with the move, the
+            # machine's always and a person's only when asked (sd:10407). A
             # question is not owed work: it waits on the operator's answer,
             # which a close does not give (pack sd:6329).
-            owed = [note["id"] for note in state["notes"]
-                    if note["kind"] == "followup" and not note["resolved_at"]
-                    and (followups is None or note["id"] in followups)]
+            open_followups = [note for note in state["notes"]
+                              if note["kind"] == "followup" and not note["resolved_at"]]
+            if followups is None and not resolve_followups:
+                blocking = [note["id"] for note in open_followups if not machine_followup(note)]
+                if blocking:
+                    raise TransitionRefused(
+                        f"item {item} has open followups; resolve each first: " + "; ".join(f"resolve followup {note}" for note in blocking))
+            owed = [note["id"] for note in open_followups if not lane_post_merge(note) and (
+                done_resolves(note) or (followups is None and resolve_followups)
+                or note["id"] in (followups or ()))]
             for note in owed:
                 resolve_note(connection, note)
             if owed:

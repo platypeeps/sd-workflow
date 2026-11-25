@@ -8,8 +8,8 @@ They were Operations > Resources until then.
 Since sd:2121 it also builds the documents behind the default UI's Reports
 page (`v2/reports.html`, at `/reports`); the page holds no rows:
 
-- `/api/reports` is `document`: the newest 200 reports `reporting.reports`
-  gives v1, each with its provenance, its body's last `BODY_CHARS`
+- `/api/reports` is `document`: the open reports, at most 200, and the newest 200
+  reports `reporting.reports` gives v1 (sd:10432), each with its provenance, its body's last `BODY_CHARS`
   characters, the revision the acknowledge route checks and its open
   followups; the scheduled jobs `operations.inventory` gives Management; each
   job's run cadence over the last seven local days, read from its
@@ -401,7 +401,10 @@ def _reports(connection) -> list[dict]:
 
     # One revision read and one note read for the page, not an `item_state` per report (sd:3531).
     with _one_snapshot(connection):
-        rows = reporting.reports(connection)
+        # sd:10432: the open reports first, then the newest history; an open one behind 200 newer rows still shows.
+        rows = {row["id"]: row for row in reporting.reports(connection, open_only=True)}
+        rows.update((row["id"], row) for row in reporting.reports(connection) if row["id"] not in rows)
+        rows = sorted(rows.values(), key=lambda row: (row["created_at"], row["id"]), reverse=True)
         ids = [row["id"] for row in rows]
         revisions = reads.revisions(connection, ids)
         followups = {item: [] for item in ids}
