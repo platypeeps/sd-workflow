@@ -3923,6 +3923,64 @@ class CitedCloses(SharedQueue):
         head = git(tree, "rev-parse", "HEAD")
         self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {b})
 
+    def test_a_move_back_that_keeps_the_cited_edits_keeps_the_close(self) -> None:
+        """sd:10214 class pass 5: a cited commit renames a file and edits it; a revert moves it back but keeps
+        the edits. The file is one file under two names: at the old name it still holds the work. Undoing the
+        edits too closes nothing."""
+        import sd_operations
+        a, *_ = self.open
+        tree, _ = self.committed("topic-rename-keeps-edits")
+        lines = "".join(f"reader line {n}\n" for n in range(20))
+        (tree / "old.txt").write_text(lines, encoding="utf-8")
+        git(tree, "add", "old.txt")
+        git(tree, "commit", "-q", "-m", "docs: the reader")
+        git(tree, "mv", "old.txt", "new.txt")
+        (tree / "new.txt").write_text(lines + "the cited edit\n", encoding="utf-8")
+        git(tree, "commit", "-q", "-am", f"feat: the reader\n\nCloses: sd:{a}")
+        git(tree, "mv", "new.txt", "old.txt")
+        git(tree, "commit", "-q", "-m", "revert: keep the old name")
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a})
+        (tree / "old.txt").write_text(lines, encoding="utf-8")
+        git(tree, "commit", "-q", "-am", "revert: drop the edit too")
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), set())
+
+    def test_a_move_back_of_a_rewritten_file_keeps_the_close(self) -> None:
+        """sd:10214 class pass 5: the cited commit moves a file and rewrites it, so git sees a delete and an
+        add, no rename. A revert that only moves it back keeps the rewrite: the work is read where it went."""
+        import sd_operations
+        a, *_ = self.open
+        tree, _ = self.committed("topic-rewrite-moved-back")
+        (tree / "old.txt").write_text("".join(f"draft {n}\n" for n in range(20)), encoding="utf-8")
+        git(tree, "add", "old.txt")
+        git(tree, "commit", "-q", "-m", "docs: the draft")
+        git(tree, "rm", "-q", "old.txt")
+        (tree / "new.txt").write_text("".join(f"reader {n}\n" for n in range(20)), encoding="utf-8")
+        git(tree, "add", "new.txt")
+        git(tree, "commit", "-q", "-m", f"feat: the reader\n\nCloses: sd:{a}")
+        git(tree, "mv", "new.txt", "old.txt")
+        git(tree, "commit", "-q", "-m", "revert: keep the old name")
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a})
+
+    def test_a_revert_that_swaps_two_cited_files_keeps_the_close(self) -> None:
+        """sd:10214 class pass 5: a revert-titled commit swaps the names of two files the cited commit added.
+        Each name holds the other's work: nothing was taken out."""
+        import sd_operations
+        a, *_ = self.open
+        tree, _ = self.committed("topic-swapped-names")
+        (tree / "one.txt").write_text("".join(f"reader {n}\n" for n in range(20)), encoding="utf-8")
+        (tree / "two.txt").write_text("".join(f"writer {n}\n" for n in range(20)), encoding="utf-8")
+        git(tree, "add", "one.txt", "two.txt")
+        git(tree, "commit", "-q", "-m", f"feat: reader and writer\n\nCloses: sd:{a}")
+        git(tree, "mv", "one.txt", "hold.txt")
+        git(tree, "mv", "two.txt", "one.txt")
+        git(tree, "mv", "hold.txt", "two.txt")
+        git(tree, "commit", "-q", "-m", "revert: swap the names back")
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a})
+
     def test_a_partial_revert_after_a_refactor_keeps_the_close(self) -> None:
         """sd:10214 review: a refactor moves one file's work out and a revert removes the other file. The set
         reads as the base only after the revert, but the refactor, no revert, took the first file out."""

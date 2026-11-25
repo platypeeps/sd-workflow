@@ -1042,8 +1042,11 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     put back, or a revert one reapplied, decides nothing (class pass 3).
     Each file is judged alone, by who took its own work out: reverts on
     two sides of a merge undo all of it, and a revert of the last file
-    gets no credit for one a refactor took out. A later move back to
-    the name a cited rename left undoes that rename (sd:10214 review).
+    gets no credit for one a refactor took out (sd:10214 review). A
+    file the cited commit renamed is one file: its work is read where a
+    later commit holds it, and it reads as before only back at its old
+    name with its old content, so a move back that keeps the edits
+    keeps the close (class pass 5).
 
     `kept_commits` reads this list after it, so this check hides none of
     its evidence (sd:10214 review). An undone commit stays in place with
@@ -1075,28 +1078,36 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         return {status[at + 1]: status[at + 2] for at, field in enumerate(status[:-2])
                 if field[:1] == "R" and field[1:].isdigit()}
 
-    def reads_before(sha: str, rev: str, names: list[str], want: dict[str, str]) -> bool | None:
-        """Whether `sha`'s files, where `rev` holds them, read as `want`; None when git gave no answer."""
+    def reads_before(sha: str, rev: str, names: list[str], want: dict[str, str],
+                     home: dict[str, str] | None = None) -> bool | None:
+        """Whether `sha`'s files, where `rev` holds them, read as `want`; None when git gave no answer.
+
+        `home` names the path a file the cited commit renamed came from: such
+        a file reads as before only back at that path, with that content.
+        """
         where = renames_since(sha, rev)
         if where is None:
             return None
-        # A later move back to where the cited commit took a file from undoes its rename, so the file is read
-        # under its own name there: followed, it reads as the old name's content (sd:10214 review).
-        held = [name if where.get(name) == moved.get(name) else where.get(name, name) for name in names]
+        held = [where.get(name, name) for name in names]
         now = blobs(rev, held)
-        return None if now is None else all(now.get(at) == want.get(name) for at, name in zip(held, names, strict=True))
+        return None if now is None else all(
+            now.get(at) == want.get(name) and (at not in now or at == (home or {}).get(name, at))
+            for at, name in zip(held, names, strict=True))
 
     def undone(index: int, names: list[str], before: str) -> bool | None:
         """Whether reverts alone took the work in `names` out; None when the cited commit itself left them as
         `before` (a fix that restores the base), so no later commit undid anything there."""
         sha = commits[index][0]
-        want = blobs(before, names)
-        if want is None:
+        # A file the cited commit renamed is one file under two names: what it held before is read at the
+        # name it came from, in `moved`, and its work wherever a later commit holds it (class pass 5).
+        came = blobs(before, [moved.get(name, name) for name in names])
+        if came is None:
             return False
-        own_read = reads_before(sha, sha, names, want)
+        want = {name: came[moved.get(name, name)] for name in names if moved.get(name, name) in came}
+        own_read = reads_before(sha, sha, names, want, moved)
         if own_read is not False:
             return None if own_read else False
-        if not reads_before(sha, head, names, want):
+        if not reads_before(sha, head, names, want, moved):
             return False
         # Its descendants alone: a sibling a merge brought in never held the work, so it took none out.
         after = lane_git(worktree, "rev-list", "--parents", "--ancestry-path", f"{sha}..{head}")
@@ -1128,7 +1139,7 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
             def back(later: str = later, own: dict[str, str] = own) -> bool:
                 return git_answered(reads_before(sha, later, names, own))
 
-            was[later] = git_answered(reads_before(sha, later, names, want))
+            was[later] = git_answered(reads_before(sha, later, names, want, moved))
             left[later] = work_left(was[later], bool(sd_ship_body.REVERT_SUBJECT.match(text)),
                                     [(was[parent], left[parent]) for parent in held], back, forked_in)
             if unread:
@@ -1154,6 +1165,7 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
                 kept.append((sha, message))
                 continue
             moved = {new: old for old, new in own_moves.items()}
+            names = [name for name in names if name not in own_moves]  # the old name is the same file
             at_base = None if sd_ship_body.reverts_another(message) else fork
             if names and any(all_undone(index, names, before) for before in (f"{sha}^", at_base) if before):
                 message = ""
