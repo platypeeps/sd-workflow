@@ -6126,6 +6126,49 @@ class Importing(SharedQueue):
                          [(1, "pending", True), (2, "cancelled", False)])
         self.assertFalse(self.file.exists())
 
+    def writers(self) -> list[list[str]]:
+        """Every lane verb that writes the queue, on item 1; `lane_main` imports before each."""
+        return [["enqueue", "--item", "1", "--title", "fix: t", "--body-file", str(self.body), "--deliver"],
+                ["retry", "1"], ["cancel", "1"], ["move", "1", "top"], ["hold", "1"], ["release", "1"]]
+
+    def refused_writers(self, why: str) -> None:
+        """Each writing verb refuses, names the file and `why`, and leaves the file and the rows as they were."""
+        import argparse  # noqa: PLC0415
+        parser = argparse.ArgumentParser()
+        sd_lane.add_lane_verbs(parser.add_subparsers(dest="command"))
+        original = self.file.read_bytes()
+        for argv in self.writers():
+            with self.subTest(verb=argv[0]), contextlib.chdir(self.feature), \
+                    mock.patch.dict(os.environ, self.environ), contextlib.redirect_stdout(io.StringIO()) as said:
+                code = sd_lane.lane_main(parser.parse_args(["lane", *argv]))
+                answer = json.loads(said.getvalue())
+                self.assertEqual((code, answer["ok"], answer.get("code")), (3, False, None), answer)
+                self.assertIn(str(self.file), answer["error"])
+                self.assertIn(why, answer["error"])
+                self.assertEqual((self.file.read_bytes(), self.rows()), (original, []))
+
+    def test_a_writer_refuses_while_a_runner_lock_holds_the_import_back(self) -> None:
+        """sd:10420 review, failure table: import skipped; a writer would miss the file's entry."""
+        self.write_file(self.old(1, self.feature))
+        self.store().lock_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.store().lock_file, "a", encoding="utf-8") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            self.refused_writers("a runner holds the lock")
+
+    def test_a_writer_refuses_a_file_the_import_could_not_read(self) -> None:
+        """sd:10420 review, failure table: import stopped on the file's bytes or shape."""
+        for text, why in (("{", "cannot read"), ('{"entries": 7}', "holds no entry list"), ("[]", "cannot read")):
+            with self.subTest(text=text):
+                self.file.parent.mkdir(parents=True, exist_ok=True)
+                self.file.write_text(text, encoding="utf-8")
+                self.refused_writers(why)
+
+    def test_a_writer_refuses_when_a_pending_head_was_not_published(self) -> None:
+        """sd:10420 review, failure table: import stopped on an unknown publish answer; nothing was written."""
+        self.write_file(self.old(1, self.feature))
+        with mock.patch.object(sd_lane, "publish_head", side_effect=sd_lane.LaneError("origin gave no answer")):
+            self.refused_writers("origin gave no answer")
+
     def test_a_busy_runner_lock_skips_the_import(self) -> None:
         """An older runner mid-entry holds the lock and keeps its file until the next pass."""
         self.write_file(self.old(1, self.feature))

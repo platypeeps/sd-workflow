@@ -5094,7 +5094,10 @@ def lane_main(args: Any) -> int:
         if args.lane_command == "prune":
             return lane_prune(root, environ, dry_run=args.dry_run, as_json=args.json)
         if args.lane_command not in ("run", "list"):  # a view stays read-only; a writer reaches file entries (sd:10420)
-            import_file_queue(root, queue_for(root, environ))
+            imported = import_file_queue(root, queue_for(root, environ))
+            if not_done := imported.get("stopped") or imported.get("skipped"):  # its entries are not in the queue yet
+                raise LaneError(f"{queue_path(root, environ)}, an earlier version's queue, is not imported: {not_done}; "
+                                f"`lane {args.lane_command}` would miss its entries, so run it again once it is")
         if args.lane_command == "enqueue":
             result: Any = enqueue_entry(root, args.items[0], args.title, args.body_file, environ,
                                         expected_head=args.expected_head, manual=args.manual, claim=args.claim,
