@@ -519,8 +519,20 @@ class TheBuild(DependencyCase):
         with self.assertRaisesRegex(build.BuildRefused, "waits on sd:424242, which no longer exists"):
             build.queue(self.db, [item], who="operator")
         # pack sd:9862: the flag that clears it is --clear-blocked-by; --blocked-by sets a new set.
-        with self.assertRaisesRegex(build.BuildRefused, rf"sd task edit {item} --clear-blocked-by"):
+        with self.assertRaisesRegex(build.BuildRefused, rf"sd task edit {item} --clear-blocked-by$"):
             build.queue(self.db, [item], who="operator")
+
+    def test_the_fix_for_a_missing_dependency_keeps_the_live_ones(self):
+        """Pack sd:10691: `--clear-blocked-by` drops every dependency, live ones too, so the item could build
+        before them. With live ones left the fix names exactly them, as `--blocked-by` replaces the set."""
+        live, done, item = self.item(status="planning"), self.item(status="done"), self.item()
+        set_item_fields(self.db, item, fields=json.dumps({"blocked_by": [live, 424242, done]}))
+        with self.assertRaises(build.BuildRefused) as refused:
+            build.queue(self.db, [item], who="operator")
+        self.assertIn("waits on sd:424242, which no longer exists", str(refused.exception))
+        self.assertTrue(str(refused.exception).endswith(
+            f"sd task edit {item} --blocked-by {live} --blocked-by {done}"), str(refused.exception))
+        self.assertNotIn("--clear-blocked-by", str(refused.exception))
 
     def test_a_done_dependency_lets_the_next_tick_pick_the_item(self):
         first, item = self.item(status="planning"), self.item()

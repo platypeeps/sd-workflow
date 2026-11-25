@@ -575,8 +575,11 @@ def waiting_on(connection, row, *, riding: Collection[int] = ()) -> str:
         f"SELECT id, status FROM item WHERE id IN ({marks})", named)}
     gone = [other for other in named if other not in found]
     if gone:
-        return (f"waits on sd:{gone[0]}, which no longer exists; clear it with sd task edit {row['id']} "
-                "--clear-blocked-by, or name the rest with --blocked-by")
+        # `--blocked-by` replaces the set, so the fix names exactly the items that still exist: a bare
+        # `--clear-blocked-by` would drop live ones too and let the item build before them (pack sd:10691).
+        kept = [other for other in named if other in found]
+        fix = " ".join(f"--blocked-by {other}" for other in kept) if kept else "--clear-blocked-by"
+        return f"waits on sd:{gone[0]}, which no longer exists; drop it with sd task edit {row['id']} {fix}"
     held = [other for other in named if found[other] != "done" and other not in riding]
     return f"waits on {', '.join(f'sd:{other}' for other in held)}" if held else ""
 
