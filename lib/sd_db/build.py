@@ -2895,9 +2895,10 @@ def lane_failed_start(connection, lead: int) -> dict | None:
     """Where a new bundle under assignment `lead` starts when its items were last built in a bundle whose lane entry
     failed: that run's `branch` and its `detail` (sd:10379). An item
     moved back to ready and built again is a fresh press with a new branch, which from origin/main dropped the
-    failed bundle's commits. None, so main, unless each item's newest earlier build is one such run, the same
-    for all, and every item it built is in this bundle: its commits cite them, and a missing one would not
-    deliver."""
+    failed bundle's commits. None, so main, unless the items whose newest earlier build failed in the lane name one
+    such run, the same for all, and every item it built is in this bundle: its commits cite them, and a missing one
+    would not deliver. An item never built, or last built elsewhere, rides along: it cites nothing on that branch
+    (lane review of build/sd-1808)."""
     bundle = connection.execute("SELECT id, item FROM assignment WHERE (id = ? OR parent = ?) AND scope = ?",
                                 (lead, lead, SCOPE)).fetchall()
     ids, items = {row["id"] for row in bundle}, {row["item"] for row in bundle}
@@ -2909,9 +2910,8 @@ def lane_failed_start(connection, lead: int) -> dict | None:
         last = prior and connection.execute(
             "SELECT id, outcome FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
             (prior["parent"] or prior["id"],)).fetchone()
-        if not last or last["outcome"] != "lane_failed":
-            return None
-        runs.add(last["id"])
+        if last and last["outcome"] == "lane_failed":
+            runs.add(last["id"])
     if len(runs) != 1:
         return None
     failed = run(connection, runs.pop())

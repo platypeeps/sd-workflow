@@ -4583,7 +4583,7 @@ class Tick(Case):
         notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", self.items)]
         self.assertIn(build.FINDING + "pin the fixture clock", notes)
 
-    def rebuilt_after_lane_failure(self, count, *, lost=False, trimmed=False, closes=False):
+    def rebuilt_after_lane_failure(self, count, *, lost=False, trimmed=False, closes=False, extra=False):
         """sd:10379: a bundle of two fails in the lane; the operator moves its first `count` items back to ready and
         builds them again, a fresh press. Answers the failed branch's head and the new run's started worktree."""
         run = self.enqueued(2)
@@ -4609,6 +4609,9 @@ class Tick(Case):
                         rebuild)
         queued = build.queue_again(self.db, rebuild, who="operator")
         self.assertNotIn(run["assignment"], [entry["id"] for entry in queued], "a fresh press, not Fix")
+        if extra:  # an unrelated item, never built, queued beside them: the claim bundles it in
+            fresh = create_item(self.db, kind="task", title="Unrelated", repo=str(self.repo), status="ready")
+            build.queue(self.db, [fresh], who="operator")
         again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
                             root=self.root / "worktrees")
         assert again is not None
@@ -4647,6 +4650,14 @@ class Tick(Case):
         entries = json.loads((self.plans / "lane.json").read_text())
         self.assertEqual([(row["status"], row["expected_head"]) for row in entries],
                          [("failed", head), ("pending", head)])
+
+    def test_a_rebuilt_failed_bundle_with_an_unrelated_item_beside_it_starts_from_the_failed_head(self):
+        """Lane review of build/sd-1808: an item never built, bundled in with the whole failed bundle, sent the
+        branch to main and dropped the bundle's commits. Its commits cite only items this bundle holds."""
+        head, supervisor = self.rebuilt_after_lane_failure(2, extra=True)
+        self.assertEqual(len(build.run(self.db, self.bundle["id"])["members"]), 3, "the unrelated item rides along")
+        self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+        self.assertIn("whose lane entry failed", supervisor.brief()["findings"])
 
     def test_a_fresh_build_of_part_of_a_lane_failed_bundle_starts_from_main(self):
         """sd:10379: the failed branch's commits cite an item this bundle leaves out, so it starts from main."""
