@@ -4042,6 +4042,64 @@ class CitedCloses(SharedQueue):
         head = git(tree, "rev-parse", "HEAD")
         self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), set())
 
+    def on_main(self, tree: pathlib.Path, files: dict[str, str]) -> None:
+        """`files` committed on the branch and pushed as `origin/main`, the merge base."""
+        for name, text in files.items():
+            (tree / name).write_text(text, encoding="utf-8")
+        git(tree, "add", *files)
+        git(tree, "commit", "-q", "-m", "docs: the base")
+        git(tree, "push", "-q", "origin", "HEAD:main")
+        git(tree, "fetch", "-q", "origin")
+
+    def test_a_revert_that_moves_the_fix_into_an_existing_file_keeps_the_close(self) -> None:
+        """sd:10214 review: as the new-file case, but the fixed text goes into a file main already holds, so git
+        reports a modification, no copy. The lines the cited commit added are read wherever the head gained
+        them. Taking them out of that file too closes nothing."""
+        import sd_operations
+        a, *_ = self.open
+        tree, _ = self.committed("topic-fix-moved-to-an-existing-file")
+        lines = "".join(f"reader line {n}\n" for n in range(20))
+        self.on_main(tree, {"reader.txt": lines, "caller.txt": "the caller\n"})
+        draft = lines.replace("line 3\n", "line 3 draft\n")
+        (tree / "reader.txt").write_text(draft, encoding="utf-8")
+        git(tree, "commit", "-q", "-am", "feat: a draft reader")
+        fixed = draft.replace("line 3 draft\n", "line 3 fixed\n") + "the fix\n"
+        (tree / "reader.txt").write_text(fixed, encoding="utf-8")
+        git(tree, "commit", "-q", "-am", f"fix: the reader\n\nCloses: sd:{a}")
+        (tree / "caller.txt").write_text("the caller\n" + fixed, encoding="utf-8")
+        (tree / "reader.txt").write_text(lines, encoding="utf-8")
+        git(tree, "commit", "-q", "-am", "revert: move the reader into the caller")
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a})
+        (tree / "caller.txt").write_text("the caller\n", encoding="utf-8")
+        git(tree, "commit", "-q", "-am", "revert: drop it from the caller")
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), set())
+
+    def test_a_revert_that_restores_a_deleted_base_file_closes_nothing(self) -> None:
+        """sd:10214 review: a draft deletes a base file, the cited commit adds its text under a new name, and a
+        revert puts the tree back as main has it. Git pairs the new name with the restored file as a rename;
+        a file that reads as before holds no moved work, so the close drops."""
+        import sd_operations
+        a, *_ = self.open
+        tree, _ = self.committed("topic-restored-base-file")
+        text = "".join(f"template line {n}\n" for n in range(20))
+        self.on_main(tree, {"template.txt": text})
+        git(tree, "rm", "-q", "template.txt")
+        git(tree, "commit", "-q", "-m", "feat: drop the template")
+        (tree / "reader.txt").write_text(text, encoding="utf-8")
+        git(tree, "add", "reader.txt")
+        git(tree, "commit", "-q", "-m", f"feat: the reader\n\nCloses: sd:{a}")
+        cited = git(tree, "rev-parse", "HEAD")
+        git(tree, "rm", "-q", "reader.txt")
+        (tree / "template.txt").write_text(text, encoding="utf-8")
+        git(tree, "add", "template.txt")
+        git(tree, "commit", "-q", "-m", "revert: back to the template")
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(git(tree, "diff", "--name-only", "origin/main", head), "")
+        self.assertIn("R100", git(tree, "diff", "-M", "--name-status", cited, head))
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), set())
+
     def test_a_move_back_of_a_rewritten_file_keeps_the_close(self) -> None:
         """sd:10214 class pass 5: the cited commit moves a file and rewrites it, so git sees a delete and an
         add, no rename. A revert that only moves it back keeps the rewrite: the work is read where it went."""

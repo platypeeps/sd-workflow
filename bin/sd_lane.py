@@ -1050,8 +1050,8 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     so a move back git pairs as no rename keeps it too (class pass 6).
     A file holds no work only when both reads find it left as before,
     so a revert of one file keeps a fix the other still ships.
-    A file added since that git pairs as a copy of the fixed text holds
-    the work too, so a revert that moves the fix out keeps the close.
+    Another file that gained every line the cited commit added holds the
+    work too, so a revert that moves the fix out keeps the close.
 
     `kept_commits` reads this list after it, so this check hides none of
     its evidence (sd:10214 review). An undone commit stays in place with
@@ -1083,59 +1083,63 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         return {status[at + 1]: status[at + 2] for at, field in enumerate(status[:-2])
                 if field[:1] == "R" and field[1:].isdigit()}
 
-    def reads_before(sha: str, rev: str, names: list[str], want: dict[str, str],
+    def reads_before(sha: str, rev: str, names: list[str], before: str,
                      home: dict[str, str] | None = None) -> bool | None:
-        """Whether `sha`'s files, where `rev` holds them, read as `want`, keyed by path; None when git gave no answer.
+        """Whether `sha`'s files, where `rev` holds them, read as `before` held them; None when git gave no answer.
 
         `home` names the path a file the cited commit renamed came from: such
-        a file reads as before only when both its names read as `want`, so
+        a file reads as before only when both its names read as `before` held them, so
         git's rename pairing at `rev` decides nothing and a move back it does
         not pair still holds the work (class pass 6). A move git follows to a
-        third name holds the work there.
+        third name holds the work there, unless it reads there as `before`
+        held it: git paired a restored file, not the work (sd:10214 review).
         """
         home = home or {}
         where = renames_since(sha, rev)
         if where is None:
             return None
         held = [where.get(name, name) for name in names]
-        now = blobs(rev, held + [path for name in names if name in home for path in (name, home[name])])
-        if now is None:
+        paths = held + names + [home[name] for name in names if name in home]
+        want, now = blobs(before, paths), blobs(rev, paths)
+        if want is None or now is None:
             return None
+        held = [name if at != name and now.get(at) == want.get(at) else at for at, name in zip(held, names, strict=True)]
         return all(now.get(at) == want.get(name) if name not in home else
                    at in (name, home[name]) and all(now.get(path) == want.get(path) for path in (name, home[name]))
                    for at, name in zip(held, names, strict=True))
 
+    def plus_lines(old: str, new: str, paths: list[str], renames: str = "--no-renames") -> list[str] | None:
+        """The non-blank lines `new` adds to `paths` over `old`, stripped; None when git gave no answer."""
+        done = publish_git(worktree, "--literal-pathspecs", "diff", "-U0", "--no-color", "--no-ext-diff", renames,
+                           old, new, "--", *paths)
+        if done is None or done.returncode != 0:
+            return None
+        lines, body = [], False
+        for line in done.stdout.splitlines():  # a hunk's lines start with +, - or a space; headers never do
+            body = line.startswith("@@") or (body and not line.startswith("diff --git "))
+            if body and line.startswith("+") and line[1:].strip():
+                lines.append(line[1:].strip())
+        return lines
+
     def copied(sha: str, names: list[str], before: str) -> bool | None:
-        """Whether a file `head` adds since `sha` holds the work in `names`: git pairs it as a copy of the text
-        `sha` left, more alike than to the text `before` held; None when git gave no answer. A revert that puts
-        the fix in a new file and the old one back as before took nothing out (sd:10214 lane review)."""
-        added = fields("diff", "--no-renames", "--diff-filter=A", "--name-only", "-z", sha, head)
-        if added is None:
+        """Whether another file `head` changed since `sha` holds the work in `names`: it gained, since `before`,
+        every line the cited commit added there; None when git gave no answer. A revert that moves the fix into
+        a new or an existing file and puts the old one back took nothing out (sd:10214 lane review)."""
+        homes = [moved[name] for name in names if name in moved]
+        fix = plus_lines(before, sha, names + homes, "-M")
+        changed = fields("diff", "--no-renames", "--name-only", "-z", sha, head)
+        if fix is None or changed is None:
             return None
-        added = [name for name in added if name]
-        then, now = blobs(before, added), blobs(head, added)
-        if then is None or now is None:
-            return None
-        added = [name for name in added if now.get(name) != then.get(name)]  # one that reads as before is no work
-        if not added:
+        if not fix:
             return False
-
-        def best(rev: str, sources: list[str]) -> dict[str, int] | None:
-            # ponytail: pathspec holds every added file; git skips copy detection past diff.renameLimit.
-            status = fields("diff", "-C", "--find-copies-harder", "--name-status", "-z", rev, head, "--",
-                            *sources, *added)
-            if status is None:
+        # ponytail: one diff per file the head changed since `sha`; a coincidental one-line fix reads as kept.
+        for path in (path for path in changed if path and path not in names and path not in homes):
+            got = plus_lines(before, head, [path])
+            if got is None:
                 return None
-            score: dict[str, int] = {}
-            for at, field in enumerate(status[:-2]):
-                if field[:1] in "CR" and field[1:].isdigit() and status[at + 1] in sources:
-                    score[status[at + 2]] = max(score.get(status[at + 2], 0), int(field[1:]))
-            return score
-
-        fixed, prior = best(sha, names), best(before, [moved.get(name, name) for name in names])
-        if fixed is None or prior is None:
-            return None
-        return any(score > prior.get(name, 0) for name, score in fixed.items() if name in added)
+            if set(fix) <= set(got):
+                return True
+        return False
 
     def undone(index: int, names: list[str], before: str) -> bool | None:
         """Whether reverts alone took the work in `names` out; None when the cited commit itself left them as
@@ -1143,13 +1147,10 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         sha = commits[index][0]
         # A file the cited commit renamed is one file under two names, in `moved`: what both names held before
         # is read, and its work wherever a later commit holds it (class passes 5 and 6).
-        want = blobs(before, names + [moved[name] for name in names if name in moved])
-        if want is None:
-            return False
-        own_read = reads_before(sha, sha, names, want, moved)
+        own_read = reads_before(sha, sha, names, before, moved)
         if own_read is not False:
             return None if own_read else False
-        if not reads_before(sha, head, names, want, moved) or copied(sha, names, before) is not False:
+        if not reads_before(sha, head, names, before, moved) or copied(sha, names, before) is not False:
             return False
         # Its descendants alone: a sibling a merge brought in never held the work, so it took none out.
         after = lane_git(worktree, "rev-list", "--parents", "--ancestry-path", f"{sha}..{head}")
@@ -1158,9 +1159,6 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         parents = {line.split()[0]: line.split()[1:] for line in after.splitlines() if line.strip()}
         # Who took the work out, read per commit and carried to the head (`work_left`, class pass 3). The
         # head's own entry decides: a removal a later commit put back, or a revert one reapplied, decides nothing.
-        own = blobs(sha, names)
-        if own is None:
-            return False
         unread: list[None] = []
 
         def git_answered(answer: bool | None) -> bool:
@@ -1178,10 +1176,10 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
                 forked = (lane_git(worktree, "merge-base", *held) or "").strip()
                 return forked in left and left[forked] is None
 
-            def back(later: str = later, own: dict[str, str] = own) -> bool:
-                return git_answered(reads_before(sha, later, names, own))
+            def back(later: str = later) -> bool:
+                return git_answered(reads_before(sha, later, names, sha))
 
-            was[later] = git_answered(reads_before(sha, later, names, want, moved))
+            was[later] = git_answered(reads_before(sha, later, names, before, moved))
             left[later] = work_left(was[later], bool(sd_ship_body.REVERT_SUBJECT.match(text)),
                                     [(was[parent], left[parent]) for parent in held], back, forked_in)
             if unread:
