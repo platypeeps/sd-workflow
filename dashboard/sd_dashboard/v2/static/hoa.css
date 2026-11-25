@@ -135,6 +135,8 @@ main { container-type: inline-size; }
 .asset.st-unknown { color: var(--color-unknown); }
 .asset.st-unknown .body { fill: var(--color-paper); stroke-dasharray: 2 2; }
 .asset:focus-visible { outline: 2px solid var(--color-focus); outline-offset: 2px; }
+/* sd:10612: a focused lot or tract draws the focus colour on its outline, at once. */
+.lot[tabindex]:focus-visible { outline: none; stroke: var(--color-focus); stroke-width: 3; }
 /* sd:7516: an irrigation line is a dashed run under the glyphs, in the status colour as a glyph is; the wide clear stroke takes the tap. */
 .asset .run { fill: none; stroke: currentColor; stroke-width: 2.5; stroke-dasharray: 8 4; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
 .asset .hit { fill: none; stroke: transparent; stroke-width: 14; vector-effect: non-scaling-stroke; }

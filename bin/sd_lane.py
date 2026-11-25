@@ -1747,6 +1747,8 @@ def ask_wait(checkout: pathlib.Path, path: str, environ: dict[str, str]) -> dict
 
 #: The suite a gate failure names: `sd-check`'s `failed shard <suite>:` summary (pack sd:6739).
 FAILED_SUITE = re.compile(r"\bfailed shard (\S+?):")
+#: The suffix `run-tests.sh` gives one part of a module it splits by test id: `tests.test_x.part2of3`.
+SHARD_PART = re.compile(r"\.part\d+of\d+$")
 #: The statuses a gate passed in: the head the gate ran at is proved good.
 GATE_PASSED = ("merged", "prepared")
 
@@ -1773,7 +1775,9 @@ def flake_items(connection: Any, repository: str, path: str, *, now: float, days
             continue
         reason = str(entry.get("reason") or "")
         if entry.get("status") == "failed":
-            failed.setdefault(head, []).extend((suite, entry) for suite in FAILED_SUITE.findall(reason))
+            # A split module's shard, `<suite>.partNofM`, is its suite's: sd-ship names the module (sd:9866).
+            failed.setdefault(head, []).extend((SHARD_PART.sub("", suite), entry)
+                                               for suite in dict.fromkeys(FAILED_SUITE.findall(reason)))
             continue
         if entry.get("status") not in GATE_PASSED or entry["finished_at"] < since:
             continue
