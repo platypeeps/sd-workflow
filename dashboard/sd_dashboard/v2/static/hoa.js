@@ -62,6 +62,10 @@ let polling = 0;
   // ---------- Annunciator ----------
   // build: every cell is a reading of the document or unknown with its reason; the design's mail-only facts (the 05:50 fault,
   // "9 overdue") have no reader, so Water is unknown and Tasks counts the checkout's open items (sd:4959: every kind).
+  // sd:10589: each daily feed is current, stale or unknown on its own (hoa_screen.FEEDS); the alarm log has no state.
+  const FEED_STATE = { current: 'ok', stale: 'caution', unknown: 'unknown' };
+  const feedText = f => f.state === 'unknown' ? (f.error ? `unknown: ${f.error}` : 'unknown: no rows') : `${f.state} · latest ${f.latest.slice(0, 10)} · ${f.age_days} d old`;
+  const feedLine = m => m.files.filter(f => f.state).map(f => `${f.name.replace(/-daily\.csv$/, '')} ${f.state}`).join(' · ');
   function readCells() {
     const m = DOC.mission, la = m.analog[m.analog.length - 1], lp = m.pump[m.pump.length - 1], f = DOC.items;
     const why = m.error || 'no rows in the export';
@@ -81,8 +85,9 @@ let polling = 0;
     out.push(f.error ? { id: 'tasks', label: 'Tasks', state: 'unknown', val: html`<b>—</b> not read`, small: f.error }
       : late ? { id: 'tasks', label: 'Tasks', state: 'warning', open: OB[0].key, val: html`<b>${late}</b> overdue`, small: `${OB.length} open · ${soon} due within a week` }
       : { id: 'tasks', label: 'Tasks', state: soon ? 'caution' : 'ok', open: OB[0]?.key, val: html`<b>${soon || OB.length}</b> ${soon ? 'due soon' : 'open'}`, small: soon ? `${OB.length} open · none overdue` : 'none overdue or due within a week' });
-    out.push(m.latest ? { id: 'mission', label: 'Mission data', state: m.stale ? 'caution' : 'ok', open: 'source:mission', val: html`<b>${m.age_days} d</b> old`, small: `newest row ${m.latest}${m.error ? ' · a file did not read' : ''}` }
-      : { id: 'mission', label: 'Mission data', state: 'unknown', open: src, val: html`<b>—</b> not read`, small: why });
+    // sd:10589: the cell is the worst feed's state; each feed's own state is in its line.
+    out.push(m.state !== 'unknown' ? { id: 'mission', label: 'Mission data', state: FEED_STATE[m.state], open: 'source:mission', val: html`<b>${m.age_days} d</b> old`, small: `${feedLine(m)}${m.error ? ' · a file did not read' : ''}` }
+      : { id: 'mission', label: 'Mission data', state: 'unknown', open: src, val: html`<b>—</b> not read`, small: m.files.length ? feedLine(m) : why });
     return out;
   }
   // Each lamp's hover and focus text (sd:5287): what it measures, its source, and the line that reads it where one exists.
@@ -93,7 +98,7 @@ let polling = 0;
     aquifer: 'Mean aquifer level on the newest daily row, with that day\'s low and high, from Mission\'s daily export.',
     alarms: 'Alarm events today; returns to normal and generator tests do not count. From Mission\'s alarm export.',
     tasks: 'Open HOA tasks: overdue first, then due within a week.',
-    mission: 'How old the newest Mission data is.',
+    mission: 'How old each daily Mission feed is: the oldest one dates the export.',
   };
   function lamps() {
     // sd:6697: no Observed clock; the shell's Read again (or r) is the page's one re-read.
@@ -306,10 +311,11 @@ let polling = 0;
   function selectSource(open) {
     const m = DOC.mission;
     selected = 'source:mission'; mark();
-    show(html`<div class="kind"><span class="g-${m.stale ? 'caution' : m.latest ? 'ok' : 'unknown'}" aria-hidden="true">${GLYPH[m.stale ? 'caution' : m.latest ? 'ok' : 'unknown']}</span><span class="label">Source · Mission export</span></div>
+    const st = FEED_STATE[m.state] || 'unknown';
+    show(html`<div class="kind"><span class="g-${st}" aria-hidden="true">${GLYPH[st]}</span><span class="label">Source · Mission export</span></div>
       <h2>Mission telemetry export</h2>
-      ${dl([['Path', m.dir], ['Cadence', 'daily export, one row per day'], ['State', m.latest ? `${m.stale ? 'stale' : 'current'} · newest row ${m.latest} · ${m.age_days} d old` : 'not read']])}
-      <h3 class="label">Files in this page</h3>${dl(m.files.map(f => [f.name, f.error ? `not read: ${f.error}` : `${f.rows} rows · latest ${f.latest.slice(0, 10)}`]))}
+      ${dl([['Path', m.dir], ['Cadence', 'daily export, one row per day'], ['State', m.state === 'unknown' ? 'unknown: a daily feed is not read' : `${m.state} · every daily feed through ${m.latest} · ${m.age_days} d old`]])}
+      <h3 class="label">Files in this page</h3>${dl(m.files.map(f => [f.name, f.state ? `${feedText(f)}${f.error ? '' : ` · ${f.rows} rows`}` : f.error ? `not read: ${f.error}` : `${f.rows} rows · latest ${f.latest.slice(0, 10)}`]))}
       <p class="note">Tank level and Aquifer read analog-daily.csv; Pumps reads pump-daily.csv; Alarms reads alarm-events.csv. The pump export lags the analog export by one day.</p>
       ${ageBlock(srcOf('mission'))}<h3 class="label">Act</h3>${window.shell.commands.bar('source:mission')}${logBlock('mission')}`, 'source:mission', open);
   }
@@ -536,7 +542,7 @@ let polling = 0;
       CELLS = readCells(); attention();
       document.body.dataset.observed = doc.read;
       const c = doc.config, failed = [M.error && `Mission export: ${M.error}`, doc.assets.error && `Assets: ${doc.assets.error}`, doc.base.error && `Base map: ${doc.base.error}`, !doc.base.error && doc.lots.error && `Lots: ${doc.lots.error}`, doc.items.error && `Tasks: ${doc.items.error}`].filter(Boolean);
-      put($('subhead'), html`Water system: ${plural(ASSETS.length, 'mapped asset')}, ${plural(LOTS.length, 'lot and tract outline', 'lot and tract outlines')}; Mission export ${M.latest ? `through ${M.latest}` : 'not read'} · read <time class="rel" datetime="${doc.read}"></time>`);
+      put($('subhead'), html`Water system: ${plural(ASSETS.length, 'mapped asset')}, ${plural(LOTS.length, 'lot and tract outline', 'lot and tract outlines')}; Mission export ${M.latest ? `through ${M.latest}` : M.files?.length ? 'with a daily feed unknown' : 'not read'} · read <time class="rel" datetime="${doc.read}"></time>`);
       const objects = [...ASSETS.map(a => ({ id: `asset:${a.id}`, type: 'asset', label: `${a.id} · ${a.name}`, asset: a.id, name: a.name })),
         ...TASKS().map(TD.objectOf),
         // sd:5621: the Alarms toolbar, which Acknowledge all acts on; its label is the count the confirm names.

@@ -201,7 +201,8 @@ class TheDocument(Fixture):
         self.assertEqual([f["rows"] for f in m["files"]], [48, 32, 5])
         self.assertEqual((len(m["analog"]), m["analog"][0]["date"], m["analog"][-1]["date"], m["pump"][-1]["date"]),
                          (48, "2026-07-20", "2026-09-05", "2026-09-04"))
-        self.assertEqual((m["latest"], m["age_days"], m["stale"]), ("2026-09-05", 1, False))
+        # sd:10589: the oldest daily feed dates the export, so the pump file's day-old lag shows.
+        self.assertEqual((m["latest"], m["age_days"], m["state"], m["stale"]), ("2026-09-04", 2, "current", False))
         # 30 days back from the newest alarm: the July row is gone, oldest first.
         self.assertEqual([a["event"] for a in m["alarms"]], ["Generator Running", "A2 VSD Alarm", "A2 VSD Normal", "Tank Low Alarm"])
         self.assertEqual(m["alarms_today"], {"count": None, "reason": "the export ends 2026-09-05", "acked": 0})
@@ -209,9 +210,25 @@ class TheDocument(Fixture):
     def test_an_export_more_than_two_days_old_is_stale(self):
         self.assertEqual(hoa_screen.STALE_DAYS, 2)
         m = hoa_screen.document(self.connection, now="2026-09-08T12:00:00Z")["mission"]
-        self.assertEqual((m["age_days"], m["stale"]), (3, True))
-        m = hoa_screen.document(self.connection, now="2026-09-07T12:00:00Z")["mission"]
+        self.assertEqual((m["age_days"], m["stale"]), (4, True))
+        m = hoa_screen.document(self.connection, now="2026-09-06T12:00:00Z")["mission"]
         self.assertEqual((m["age_days"], m["stale"]), (2, False))
+
+    def test_each_daily_feed_is_current_stale_or_unknown_on_its_own(self):
+        """sd:10589: a fresh analog file does not make a late pump file current."""
+        m = hoa_screen.document(self.connection, now="2026-09-07T12:00:00Z")["mission"]
+        self.assertEqual([(f["name"], f["state"], f["age_days"]) for f in m["files"]],
+                         [("analog-daily.csv", "current", 2), ("pump-daily.csv", "stale", 3), ("alarm-events.csv", None, 2)])
+        self.assertEqual((m["state"], m["stale"], m["latest"], m["age_days"]), ("stale", True, "2026-09-04", 3))
+
+    def test_a_missing_daily_feed_makes_the_export_unknown_not_current(self):
+        """sd:10589: an unread required feed is unknown; the fresh analog file cannot stand in for it."""
+        for pump in (None, "date,a2_starts\n2026-09-01,1\n", PUMP.splitlines(True)[0]):
+            checkout(self.hoa, pump=pump)
+            m = self.doc()["mission"]
+            files = {f["name"]: f["state"] for f in m["files"]}
+            self.assertEqual((files["analog-daily.csv"], files["pump-daily.csv"]), ("current", "unknown"), pump)
+            self.assertEqual((m["state"], m["stale"], m["latest"], m["age_days"]), ("unknown", False, "", None), pump)
 
     def test_alarms_today_count_only_real_alarms_on_a_day_the_export_reaches(self):
         alarms = ALARMS + ("2026-09-06 01:00:00,other,A2 VSD Alarm,N,2\n2026-09-06 01:10:00,other,A2 VSD Normal,,0\n"
@@ -440,7 +457,7 @@ window.shell.view.current = () => 'tasks'; read(); await flush(); R.tasks = ELS.
         tips = dict(re.findall(r'data-cell="(\w+)"[^>]*data-tip="([^"]+)"', out["R"]["lamps"]))
         self.assertEqual(sorted(tips), ["alarms", "aquifer", "mission", "pumps", "tank", "tasks", "water"])
         self.assertIn("From Mission&#39;s alarm export.", tips["alarms"])
-        self.assertEqual(tips["mission"], "How old the newest Mission data is.")
+        self.assertEqual(tips["mission"], "How old each daily Mission feed is: the oldest one dates the export.")
         self.assertEqual([k for k, tip in tips.items() if re.search(r"\.csv|\.py|CLI:", tip)], [])
         self.assertNotIn('id="refresh"', out["R"]["lamps"], "sd:6697: Read again is the one re-read")
 
@@ -453,18 +470,21 @@ window.shell.view.current = () => 'tasks'; read(); await flush(); R.tasks = ELS.
         self.assertRegex(lamps, r'data-cell="pumps" data-open="day:2026-09-04" data-state="ok".*?<b>16.9</b> h A2.*?0 starts · 91,119 gal · 09-04')
         self.assertRegex(lamps, r'data-cell="alarms"[^>]*data-state="unknown".*?the export ends 2026-09-05.*?2 alarms in 30 d · 1 generator test')
         self.assertRegex(lamps, rf'data-cell="tasks" data-open="{self.late}" data-state="warning".*?Tasks.*?<b>1</b> overdue.*?5 open · 1 due within a week')
-        self.assertRegex(lamps, r'data-cell="mission" data-open="source:mission" data-state="ok".*?<b>1 d</b> old')
-        self.assertIn("3 mapped assets, 4 lot and tract outlines; Mission export through 2026-09-05", out["R"]["sub"])
+        self.assertRegex(lamps, r'data-cell="mission" data-open="source:mission" data-state="ok".*?<b>2 d</b> old.*?analog current · pump current')
+        self.assertIn("3 mapped assets, 4 lot and tract outlines; Mission export through 2026-09-04", out["R"]["sub"])
         self.assertEqual(out["attention"][-1], {"state": "warning", "n": 1, "what": "HOA annunciator cells"})
         self.assertIsNone(out["states"][-1])
 
     def test_an_unread_mission_lamp_opens_the_export_row_that_says_why(self):
         # sd:5298: a lamp unknown for want of the Mission export opens its evidence, the export's source row and its job.
         doc = self.doc()
-        doc["mission"].update(analog=[], pump=[], latest=None, error="cannot read analog-daily.csv")
+        checkout(self.hoa, analog=None)
+        doc = self.doc()
         lamps = self.run_page("R.lamps = ELS.annunciator.html;", doc)["R"]["lamps"]
-        for cell in ("tank", "pumps", "aquifer", "mission"):
+        for cell in ("tank", "aquifer", "mission"):
             self.assertRegex(lamps, rf'data-cell="{cell}" data-open="source:mission" data-state="unknown"', cell)
+        # sd:10589: the pump file still reads on its own.
+        self.assertRegex(lamps, r'data-cell="pumps" data-open="day:2026-09-04" data-state="ok"')
         # No reader at all is no evidence: Water stays a lamp that says so.
         self.assertRegex(lamps, r'data-cell="water" data-state="unknown"')
 
@@ -479,7 +499,8 @@ window.shell.view.current = () => 'tasks'; read(); await flush(); R.tasks = ELS.
         cases = []
         for alarms, stale, rows in ((None, False, None), (2, True, None), (0, True, []), (1, False, [])):
             doc = self.doc()
-            doc["mission"]["alarms_today"]["count"], doc["mission"]["stale"] = alarms, stale
+            doc["mission"]["alarms_today"]["count"] = alarms
+            doc["mission"]["state"] = "stale" if stale else "current"
             if rows is not None:
                 doc["items"]["rows"] = [dict(row, state="caution") for row in doc["items"]["rows"]]
             doc["attention"] = hoa_screen._attention(doc["mission"], doc["items"])
@@ -732,6 +753,22 @@ shellRun(cmd('item.email'), OBJ.get('{self.late}')); await flush();""", doc)
         self.assertRegex(out["R"]["lamps"], r'data-cell="pumps" data-open="source:mission" data-state="unknown".*?pump-daily.csv has no')
         self.assertRegex(out["R"]["lamps"], r'data-cell="tank"[^>]*data-state="ok"')
         self.assertIn("<b>▨ Not read.</b> pump-daily.csv has no", out["R"]["trends"])
+
+    def test_the_mission_lamp_and_source_show_each_feeds_state(self):
+        """sd:10589: a late pump file lights the Mission lamp while the analog file is current; a missing one is unknown."""
+        late = hoa_screen.document(self.connection, now="2026-09-07T12:00:00Z", jobs=self.jobs)
+        out = self.run_page("R.lamps = ELS.annunciator.html; document.dispatchEvent(new CustomEvent('shell:open', "
+                            "{ detail: 'source:mission' })); R.det = ELS.details.html;", late)
+        self.assertRegex(out["R"]["lamps"], r'data-cell="mission"[^>]*data-state="caution".*?<b>3 d</b> old.*?analog current · pump stale')
+        self.assertIn("analog-daily.csv</dt><dd>current · latest 2026-09-05 · 2 d old · 48 rows", out["R"]["det"])
+        self.assertIn("pump-daily.csv</dt><dd>stale · latest 2026-09-04 · 3 d old · 32 rows", out["R"]["det"])
+        self.assertIn("stale · every daily feed through 2026-09-04 · 3 d old", out["R"]["det"])
+        checkout(self.hoa, pump=None)
+        out = self.run_page("R.lamps = ELS.annunciator.html; R.sub = ELS.subhead.html; document.dispatchEvent(new CustomEvent("
+                            "'shell:open', { detail: 'source:mission' })); R.det = ELS.details.html;")
+        self.assertRegex(out["R"]["lamps"], r'data-cell="mission"[^>]*data-state="unknown".*?analog current · pump unknown')
+        self.assertIn("pump-daily.csv</dt><dd>unknown: pump-daily.csv is not in the export folder", out["R"]["det"])
+        self.assertIn("Mission export with a daily feed unknown", out["R"]["sub"])
 
     def test_a_document_that_does_not_arrive_leaves_no_row_and_says_so(self):
         out = self.run_page("""R.before = ELS['ob-body'].html;

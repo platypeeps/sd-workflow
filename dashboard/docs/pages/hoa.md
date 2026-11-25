@@ -10,8 +10,11 @@ unknown.
 
 Each source is guarded on its own: a file that is missing or does not parse is
 named, its cells and charts are unknown with that reason, and the other parts
-still answer. The trends carry every row of the export: 7d, 30d, 6m, 1y or All. Mission data is
-caution when the newest row is more than two days old (`STALE_DAYS`). Alarms
+still answer. The trends carry every row of the export: 7d, 30d, 6m, 1y or All. Each daily
+feed (`analog-daily.csv`, `pump-daily.csv`) is current, stale past two days
+(`STALE_DAYS`) or unknown when it does not read, on its own (sd:10589): a
+fresh sibling never covers a late or missing feed. Mission data is the worst
+feed: caution when one is stale, unknown when one is unknown. Alarms
 today is unknown until the export holds a row for today. The Tasks cell and the
 Tasks view hold the checkout's open items of every kind but report (sd:4959),
 and any item tagged hoa with `sd task edit N --area hoa` (pack sd:8010), less one tagged home:
