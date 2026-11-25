@@ -267,6 +267,19 @@ class TheFlakes(TheQuestion):
         self.assertEqual(len(found), 2)
         self.assertEqual(len({row["id"] for row in found}), 1)
 
+    def test_a_split_shard_flakes_on_its_suites_one_item(self):
+        """Review of pack sd:9770 (sd:9866): a split module's shard is `<suite>.partNofM`; its flake goes on the
+        suite's item, the one sd-ship's flake retry names by module, not one item per part."""
+        self.failed("e1", 90, "tests.test_sd_install.part2of3")
+        self.failed("e5", 85, "tests.test_sd_install.part3of3")
+        self.ended("e2", 7, 80, "prepared", self.HEAD)
+        self.failed("e3", 60, "tests.test_sd_install", self.OTHER)
+        self.ended("e4", 8, 30, "merged", self.OTHER)
+        found = self.flakes()
+        self.assertEqual({row["external_id"] for row in found}, {"flake:tests.test_sd_install"})
+        self.assertEqual(found[0]["title"], "Flaky suite tests.test_sd_install: make it hermetic")
+        self.assertEqual(len(found), 2, "one note per head, whichever parts failed there")
+
     def test_a_done_item_reopens_when_its_suite_flakes_again(self):
         self.failed("e1", 90, "tests.test_sd_install")
         self.ended("e2", 7, 80, "merged", self.HEAD)

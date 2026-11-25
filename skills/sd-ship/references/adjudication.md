@@ -24,6 +24,8 @@ For itemless records, replace `--item ID` below with `--no-item --review-id ID`.
    Identical findings keep separate indices and decisions.
 3. Record it with `sd-ship adjudicate --item ID --expected-head SHA --dispositions-file FILE --json`.
    This validates the file and records it at once; it calls no provider.
+   The record replaces any record made since step 1 without a check: dispositions recorded between the two calls are lost.
+   That window is accepted (sd:9999): one operator, about a second between the calls; no flag binds the prior record.
 4. Resume `sd-ship prepare --item ID --json`.
    A recorded disposition reuses completed coverage without another review reservation.
    When the report's gate did not run, this prepare runs it at the head before clearance and records `adjudicated_gate`.
