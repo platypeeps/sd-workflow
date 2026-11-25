@@ -1317,7 +1317,7 @@ def _build_blocked(connection, item: int) -> str | None:
     is that build's, which a Build lifts; else None. The block is the build's while that assignment ended
     blocked and the item's latest status change is the build's move to blocked with that assignment's
     reason. A block someone wrote after it, an operator's hold, is not the build's (review of build/sd-1867)."""
-    row = connection.execute("SELECT id, parent, status, result FROM assignment WHERE item = ? AND scope = ? "
+    row = connection.execute("SELECT id, parent, status, result, ended FROM assignment WHERE item = ? AND scope = ? "
                              "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
     if row is None or row["status"] != "blocked" or not row["result"]:
         return None
@@ -1327,8 +1327,11 @@ def _build_blocked(connection, item: int) -> str | None:
                                      moved["body"] or "", re.DOTALL) is None:
         return None
     lead = row["parent"] or row["id"]
-    number = connection.execute("SELECT MAX(run) FROM runner_run WHERE assignment = ?", (lead,)).fetchone()[0]
-    # A block with no run recorded reads every question, as before.
+    # The run that blocked it, the newest begun by its block: a later run of the bundle, a lane Fix's,
+    # did not build this item, so its start would hide the question it waits on (review of build/sd-1867).
+    number = connection.execute("SELECT MAX(run) FROM runner_run WHERE assignment = ? AND created_at <= ?",
+                                (lead, row["ended"] or "")).fetchone()[0]
+    # A block with no run recorded before it reads every question, as before.
     return asked_since(connection, lead, number) if number is not None else ""
 
 

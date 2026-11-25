@@ -6033,6 +6033,30 @@ class Drafts(Case):
             build.queue_again(self.db, [second], who="operator")
         self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the operator's block stays")
 
+    def test_a_later_run_of_the_bundle_does_not_hide_the_blocking_question(self):
+        """Review of build/sd-1867: Build read questions from the bundle's newest run. A lane Fix claims
+        the bundle again after the run that blocked a skipped task, so its question went unread and the
+        task built unanswered. Questions are read from the run that blocked the item."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked")
+        lead = build.run(self.db, bundle["id"])["assignment"]
+        fix = build._open_run(self.db, lead, repo=str(self.repo), owner="fixture", step="claimed",
+                              model="fixture", work=self.root / "worktrees" / "fix",
+                              stamp="2999-01-01T00:00:00Z")  # the Fix's claim, since ended
+        self.db.execute("UPDATE runner_run SET outcome = 'done', released_at = ? WHERE id = ?", (build.clock(), fix))
+        self.db.execute("UPDATE runner_lease SET released_at = ? WHERE run = ?", (build.clock(), fix))
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        with self.assertRaisesRegex(build.BuildRefused, f"waits on question note #{asked}"):
+            build.queue_again(self.db, [second], who="operator")
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the refusal writes nothing")
+
     def test_build_reads_only_the_questions_its_blocking_run_raised(self):
         """Lane review of build/sd-1867: Build refused a run-blocked item on any pending question, so an
         unrelated one asked before that build was queued held a Build that worked before."""
