@@ -414,6 +414,9 @@ def _problems(row, snapshot: dict) -> list[str]:
             problems.append(f"{name} gate is stale against this draft or generation")
         if gate.get("evidence_sha256") != snapshot["hashes"].get(name) or gate.get("research_sha256") != snapshot["hashes"].get("research"):
             problems.append(f"{name} evidence or research changed after its gate record")
+        # The digest ignores whitespace; a gate bound to index.md bytes is stale once they move (sd:10719).
+        if "index_sha256" in gate and gate["index_sha256"] != snapshot["hashes"].get("index"):
+            problems.append(f"{name} index.md changed after its gate record; review the current layout")
         if gate.get("verdict") != "pass":
             problems.append(f"{name} verdict is not pass")
         for finding in gate.get("findings", []):
@@ -1047,11 +1050,11 @@ def reconcile_companion(connection: sqlite3.Connection, item: int, artifact: str
     day = now()[:10]
     heading = "## Resolution ledger" if artifact == "adversarial" else "## Reconciled with the draft"
     body = _STAMP_LINE.sub("", text).strip()
-    # A reconcile answers for the prose. The layout attestation is the last run's: kept while it still names the
-    # bytes on disk, dropped once they moved, since no reviewer read the new layout (sd:10719).
+    # A reconcile answers for the prose, never the layout: it keeps the last run's attestation as it was, so a
+    # gate on this report still refuses bytes no reviewer read; only a fresh run moves it (sd:10719).
     stamped = _STAMP_LINE.search(text)
-    layout = f" index={snapshot['hashes']['index']}" if stamped and re.search(
-        rf"\bindex={snapshot['hashes']['index']}(?!\S)", stamped.group(0)) else ""
+    kept = re.search(r"\bindex=([0-9a-f]{64})(?!\S)", stamped.group(0)) if stamped else None
+    layout = f" index={kept.group(1)}" if kept else ""
     _write_report(snapshot["path"].with_name(name),
                   f"<!-- reconciled-with-draft: {digest} on {day} gen={row['gate_generation']}{layout} -->\n\n"
                   f"{body}\n\n{heading} — {day}\n\n{note}\n")

@@ -238,6 +238,16 @@ class SharedTransitions(WritingCase):
             self.gates()
         self.assertEqual(piece_state(self.db, self.item), before)
 
+    def test_a_layout_edit_after_the_gates_refuses_publication(self):
+        """sd:10719. A gate bound to index bytes goes stale once they move, though the digest ignores whitespace."""
+        self.attest()
+        self.gates()
+        change_stage(self.db, self.item, "ready", who="operator")
+        self.assertTrue(readiness(self.db, self.item)["ok"])
+        self.index.write_text(self.index.read_text().replace("A claim.", "A\n\nclaim."))
+        with self.assertRaisesRegex(WorkflowError, "adversarial index.md changed after its gate record"):
+            writing.preflight(self.db, self.item)
+
     def test_a_malformed_index_attestation_is_refused(self):
         (self.folder / "fact-check.md").write_text(
             f"<!-- reconciled-with-draft: {self.digest} on 2026-09-08 gen=0 index=abc -->\nReport.\n")
@@ -814,13 +824,16 @@ class ReviewCompanions(WritingCase):
         self.assertRegex(self.stamp_line(), rf" gen=0 index={brief['index_sha256']} -->$")
         self.assertEqual(self.companions()["adversarial"], "current")
 
-    def test_a_reconcile_drops_an_attestation_for_other_bytes(self):
-        """sd:10719. A reconcile after a layout edit stamps the prose, never layout no reviewer read."""
+    def test_a_reconcile_after_a_layout_edit_cannot_clear_the_gate(self):
+        """sd:10719. A reconcile answers for prose: it keeps the run's attestation, so the gate still refuses."""
         self.write_draft(SENTENCES)
-        self.attested_run()
+        brief, _ = self.attested_run()
         self.index.write_text(self.index.read_text().replace(SENTENCES[0] + " ", SENTENCES[0] + "\n\n"))
         self.reconcile()
-        self.assertNotIn("index=", self.stamp_line())
+        self.assertRegex(self.stamp_line(), rf" index={brief['index_sha256']} -->$")
+        with self.assertRaisesRegex(WorkflowError, "index.md bytes changed after the review"):
+            record_gate(self.db, self.item, "adversarial", verdict="pass", findings=[], who="operator",
+                        reason="Reviewed full report", reviewed_digest=brief["digest"])
 
     def test_a_draft_changed_during_the_run_leaves_a_stale_report(self):
         self.write_draft(SENTENCES)
