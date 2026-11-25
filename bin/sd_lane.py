@@ -1334,7 +1334,8 @@ def merged_by_hand(root: pathlib.Path, entry: dict[str, Any], receipts: list[dic
     queued is often absent here, and a done item's merged receipt is then
     the proof (pack sd:6805). An entry imported from the file queue has
     no receipt to show: that queue kept none, and a satellite's merge
-    writes none on the hub; its item being `done` is the proof (sd:10381).
+    writes none on the hub; its item being `done`, with no merged
+    receipt of the item at all, is the proof (sd:10381).
     """
     item, head = entry.get("item"), str(entry.get("expected_head") or "")
     for receipt in receipts:
@@ -1348,7 +1349,7 @@ def merged_by_hand(root: pathlib.Path, entry: dict[str, Any], receipts: list[dic
             if not done or error.code != PUBLISH_UNKNOWN:
                 raise
             return f"sd:{item} is done; its receipt merged at {commit}, and this clone cannot read {head} or {merged}"
-    if done and entry.get("imported_from"):
+    if done and entry.get("imported_from") and not receipts:  # a receipt read here that excludes the head is other work
         return f"sd:{item} is done; the old file queue kept no ship receipt for {head or 'its head'}"
     raise LaneError(f"sd:{item}'s prepared entry {entry.get('id')} at {head or 'no head'} has no merged ship receipt "
                     "that holds its head; merge it with `sd-ship merge --item`, or queue it again with "

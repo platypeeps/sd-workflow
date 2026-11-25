@@ -5800,6 +5800,25 @@ class CancelMerged(SharedQueue):
         self.assertEqual((cancelled["status"], [row["status"] for row in self.entries()]), ("cancelled", ["cancelled"]))
         self.assertIn("sd:1 is done; the old file queue kept no ship receipt", cancelled["reason"])
 
+    def test_a_done_items_imported_entry_whose_receipt_excludes_its_head_is_refused(self) -> None:
+        """sd:10381 review: a receipt this clone reads, at a head that does not hold the queued one, says
+        other work merged; the done item's file-queue fallback is only for an item with no receipt."""
+        import sd_db
+        self.prepared()
+        sd_lane.update(self.store(), lambda rows: rows[0].update(imported_from="queue.json"))
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            connection.execute("INSERT OR REPLACE INTO item(id, kind, title, status, created_at, updated_at) VALUES "
+                               "(1, 'task', 'one', 'done', '2026-10-09T00:00:00Z', '2026-10-09T00:00:00Z')")
+            connection.commit()
+        finally:
+            connection.close()
+        self.merged_receipt("main", 1, git(self.repo, "rev-parse", "main"))
+        before = self.rows()
+        with self.assertRaisesRegex(sd_lane.LaneError, "no merged ship receipt"):
+            sd_lane.cancel(self.repo, 1, self.environ)
+        self.assertEqual(self.rows(), before)
+
     def test_an_unreadable_receipt_proves_no_merge_and_blocks_no_other_cancel(self) -> None:
         """Failures: a receipt that cannot be read is no proof, so it refuses, and a pending cancel is as before."""
         import sd_db
