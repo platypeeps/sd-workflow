@@ -1302,7 +1302,10 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                     change_status(connection, item, "ready", who=who, expected_revision=state["revision"])
                 elif state["item"]["status"] == "blocked" and _build_blocked(connection, item):
                     # A member its run blocked, whose bundle cannot retry (its lead done: the code shipped
-                    # without it), builds fresh; the press still holds an open question (pack sd:10294).
+                    # without it), builds fresh once its builder's question is answered (pack sd:10294).
+                    if asked := open_question(connection, [item], "", pending=True):
+                        raise BuildRefused(f"item {item} waits on question note #{asked['id']}; "
+                                           f"answer it, then Build it")
                     transition(connection, item, "ready", who=who, reason="Build after its bundle ended")
         fresh = list(dict.fromkeys(fresh))
         return queued + (queue(connection, fresh, who=who) if fresh else [])

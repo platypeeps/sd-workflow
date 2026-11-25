@@ -5666,7 +5666,7 @@ class Drafts(Case):
         self.assertTrue(build.enqueued(self.db, bundle["id"], [code]))
         self.assertEqual(item_state(self.db, design)["item"]["status"], "blocked")
         self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (code,))  # the lane merged it
-        with self.assertRaisesRegex(build.BuildRefused, f"waits on design question note #{asked}"):
+        with self.assertRaisesRegex(build.BuildRefused, f"question note #{asked}"):
             build.queue_again(self.db, [design], who="operator")
         self.assertEqual(item_state(self.db, design)["item"]["status"], "blocked", "the refusal writes nothing")
         add_note(self.db, design, "decision", f"Ruling on note #{asked}: A")
@@ -5674,6 +5674,26 @@ class Drafts(Case):
         [ride] = build.queue_again(self.db, [design], who="operator")
         self.assertEqual((ride["item"], ride["status"], ride["scope"]), (design, "queued", build.SCOPE))
         self.assertEqual(item_state(self.db, design)["item"]["status"], "ready")
+
+    def test_a_blocked_task_builds_again_only_once_its_question_is_answered(self):
+        """Review of build/sd-1867: Build lifted a task its run blocked on a builder question to ready once
+        its bundle shipped, and the press checks no question on a task, so it built before the answer."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked")
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        with self.assertRaisesRegex(build.BuildRefused, f"waits on question note #{asked}"):
+            build.queue_again(self.db, [second], who="operator")
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the refusal writes nothing")
+        add_note(self.db, second, "decision", f"Ruling on note #{asked}: A")
+        [again] = build.queue_again(self.db, [second], who="operator")
+        self.assertEqual((again["item"], again["status"]), (second, "queued"))
 
     def test_a_code_item_still_waits_on_a_design_with_no_ride(self):
         """The ride exemption reads a queued ride only: a design not yet written still holds its code item."""
