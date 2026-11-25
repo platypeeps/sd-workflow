@@ -4470,6 +4470,14 @@ class Unmanaged(Case):
         (work / "Makefile").write_text("check:\n\ttrue\ntest:\n\ttrue\n")
         self.assertEqual(ADAPTER.own_checks(work), [["make", "check"]])
 
+    def test_own_checks_run_the_precheck_the_gate_runs(self):
+        """A Makefile `precheck` runs first, as `sd-check` runs it: a pass built from a blocking review
+        runs these, and a failing precheck must not reach enqueue (sd:10286)."""
+        work = self.root / "prechecks"
+        work.mkdir()
+        (work / "Makefile").write_text("precheck:\n\ttrue\ncheck:\n\ttrue\n")
+        self.assertEqual(ADAPTER.own_checks(work), [["make", "precheck"], ["make", "check"]])
+
 
 def sd_quote(argv):
     import shlex
