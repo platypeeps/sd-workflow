@@ -2452,6 +2452,26 @@ roles:
         with self.assertRaisesRegex(ship.Refusal, "has not completed"):
             self.merge()
 
+    def test_a_request_interrupted_before_it_was_sent_is_sent_on_the_rerun(self):
+        """sd:10207. Prepare dies after the receipt, before the POST: the
+        rerun sends the request once, even for an automatic review."""
+        self.enable_automatic_copilot()
+
+        def dies(api, number):
+            raise KeyboardInterrupt
+
+        with patch.object(ship.GitHub, "request_copilot_review", dies):
+            with self.assertRaises(KeyboardInterrupt):
+                self.prepare()
+        self.assertEqual(self.double.copilot_requests, [])
+        self.assertEqual(self.operation().state["copilot_reviews"][0]["status"], "requesting")
+        rerun = self.prepare()
+        self.assertEqual(rerun["copilot_review"]["status"], "requested")
+        self.assertEqual(len(self.double.copilot_requests), 1)
+        self.assertEqual(len(self.operation().state["copilot_reviews"]), 1)
+        self.assertEqual(self.prepare()["copilot_review"]["decision"], "not_repeated")
+        self.assertEqual(len(self.double.copilot_requests), 1)
+
     def test_a_failed_explicit_request_leaves_no_receipt(self):
         """sd:10207. A refused request owes nothing: the receipt is undone."""
         def refuses(api, number):
