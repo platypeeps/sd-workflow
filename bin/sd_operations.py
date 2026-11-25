@@ -414,7 +414,9 @@ def own_checks(worktree: Path) -> list[list[str]]:
 
     The Makefile `precheck` first, as the gate runs it (sd:10286), then the
     aggregate `check` when the repository has one, else each of `test` and
-    `lint` it has; none is an empty list. A declaration that does not read is
+    `lint` it has; none is an empty list. A policy `test` recipe runs
+    `sd-check` itself, which wraps the checks in its setup and teardown.
+    A declaration that does not read is
     ValueError, a configuration fault that ends the run blocked; a `git` that
     gave no answer is `Unread`, which the reap retries. Neither is a fix
     round: the builder cannot fix either (review of b34af431e).
@@ -426,6 +428,12 @@ def own_checks(worktree: Path) -> list[list[str]]:
         raise build_modules()[2].Unread(f"git gave no answer reading the check entrypoints: {error}") from error
     except sd_lib.ConfigError as error:
         raise ValueError(str(error)) from error
+    try:
+        recipe = (sd_lib.repo_declaration(worktree, "policy") or {}).get("test")
+    except sd_lib.DatabaseUnreadable as error:
+        raise ValueError(f"the repository's test recipe is unknown: {error}") from error
+    if recipe:  # setup, teardown and env wrap the checks: `sd-check` runs them as the gate does (sd:10286)
+        return [[sys.executable, str(BIN / "sd-check")]]
     first = [list(found.precheck)] if found.precheck else []
     return first + [list(found.commands[name]) for name in sd_lib._runs(found.commands)]
 

@@ -4612,6 +4612,20 @@ class Unmanaged(Case):
         (work / "Makefile").write_text("precheck:\n\ttrue\ncheck:\n\ttrue\n")
         self.assertEqual(ADAPTER.own_checks(work), [["make", "precheck"], ["make", "check"]])
 
+    def test_own_checks_run_sd_check_for_a_test_recipe(self):
+        """A policy `test` recipe (`setup: exit 7`) wraps the gate's checks: bare entrypoints skip it, so
+        a pass made from a blocking review would enqueue what the gate fails. `sd-check` runs the recipe."""
+        work = self.root / "recipe"
+        work.mkdir()
+        (work / "Makefile").write_text("check:\n\ttrue\n")
+        with mock.patch.object(SD_LIB, "repo_declaration", return_value={"test": {"setup": "exit 7"}}):
+            commands = ADAPTER.own_checks(work)
+        self.assertEqual([Path(part).name for part in commands[0][1:]], ["sd-check"], commands)
+        self.assertEqual(len(commands), 1, commands)
+        unread = SD_LIB.DatabaseUnreadable("locked")
+        with mock.patch.object(SD_LIB, "repo_declaration", side_effect=unread), self.assertRaises(ValueError):
+            ADAPTER.own_checks(work)
+
 
 def sd_quote(argv):
     import shlex
