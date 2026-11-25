@@ -4913,6 +4913,37 @@ class PostMergeOwed(RefusingHub):
         self.assertIn(f"resolved earlier post-merge followups #{failed}", answer["post_merge"])
         self.assertEqual((self.open_followups(), self.entries()[0]["post_merge"].get("settle")), ([], newer))
 
+    def test_a_followup_filed_while_git_ran_keeps_the_settle_for_the_next_run(self) -> None:
+        """Failure table, settle write (sd:10529 class pass: a value read, then used after it changed): a
+        followup filed between the read and the write had no ancestry answer, yet the write cleared the
+        pass's mark, so no later run settled it. A mark with an unchecked followup stays."""
+        import sd_db
+        parent = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "commit", "-q", "--allow-empty", "-m", "a later merge")  # the pin holds two merges
+        failed = self.an_earlier_failure()
+        real, late = sd_lane.read_git, []
+
+        def a_followup_lands_meanwhile(tree: Any, *args: str, **kwargs: Any) -> Any:
+            if args[0] == "merge-base" and not late:
+                connection = sd_db.connect(home=self.tmp)
+                try:
+                    late.append(sd_db.add_note(connection, 1, "followup",
+                                               f"Post-merge: make post-merge failed (exit 2)\nMerged at {parent}",
+                                               session=sd_lane.LANE_SESSION))
+                    connection.commit()
+                finally:
+                    connection.close()
+            return real(tree, *args, **kwargs)
+
+        with mock.patch.object(sd_lane, "read_git", a_followup_lands_meanwhile):
+            answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertIn(f"resolved earlier post-merge followups #{failed}", answer["post_merge"])
+        self.assertEqual((self.open_followups(), "settle" in self.entries()[0]["post_merge"]), (late, True))
+        answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual((self.runs(), self.open_followups()), (1, []))
+        self.assertIn(f"resolved earlier post-merge followups #{late[0]}", answer["post_merge"])
+        self.assertNotIn("settle", self.entries()[0]["post_merge"])
+
     def test_a_settle_the_hub_refused_is_done_by_the_next_run_without_running_the_target(self) -> None:
         """Failure table, settle (sd:10407 round 2): the pass was recorded, then the write that resolves the
         followups it answered failed; no entry owed the target again, so no later run resolved them."""

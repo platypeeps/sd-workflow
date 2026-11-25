@@ -3142,7 +3142,8 @@ def settle_post_merge(queue: Queue, main: pathlib.Path, ran: str | None) -> str 
     git under `BEGIN IMMEDIATE` held every hub writer), then one hub transaction that resolves
     the followups whose merge that commit holds and clears each mark still as it was read. A
     mark set meanwhile is a newer pass, left for its own settle; a followup filed meanwhile is
-    not one git answered, so it stays open. A failed write leaves the marks for the next run,
+    not one git answered, so it stays open and its pass keeps its mark: the next run asks git
+    and settles it. A failed write leaves the marks for the next run,
     which settles without running the target again. A pass at an older pin answers no newer
     failure. A git that cannot answer is unknown, not a no: nothing resolves and no mark is
     cleared on a guess. None when there was nothing to say; the merge stands either way.
@@ -3174,11 +3175,14 @@ def settle_post_merge(queue: Queue, main: pathlib.Path, ran: str | None) -> str 
         sd_lib.import_sd_db()
         from sd_db import workflow  # noqa: PLC0415
         resolved: list[int] = []
+        unchecked = set()  # a followup filed while git ran has no answer: its pass keeps its mark for the next run
         for head, items in sorted(heads.items()):  # the passes as read: a mark set meanwhile awaits its own
+            if any((commit, head) not in held for _, commit in workflow.post_merge_owed(connection, items)):
+                unchecked.add(head)
             resolved += workflow.resolve_post_merge(connection, items,
                                                     lambda commit, head=head: held.get((commit, head), False))
         for row in stored(connection, queue.repository):
-            if row["id"] in marks and unsettled(row) == marks[row["id"]]:
+            if row["id"] in marks and unsettled(row) == marks[row["id"]] and marks[row["id"]] not in unchecked:
                 row["post_merge"] = {key: value for key, value in row["post_merge"].items() if key != "settle"}
                 store(connection, queue.repository, row)
         return resolved
