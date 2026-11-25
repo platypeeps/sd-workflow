@@ -857,7 +857,20 @@ def enqueue_entry(worktree: pathlib.Path, item: int, title: str, body_file: path
         on_hub(queue, lambda connection: refuse_teammate(connection, entry))  # the whole set
     require_published(worktree, branch, head, f"{head} names no commit in {worktree}", refuse_before_push,
                       lambda tip: tip_past(worktree, branch, tip, head))
-    return add_entry(queue, entry)
+    return add_entry(queue, entry, (lambda entries: refuse_ran(entries, item, head)) if expected_head else None)
+
+
+def refuse_ran(entries: list[dict[str, Any]], item: int, head: str) -> None:
+    """Refuse an `--expected-head` enqueue of a head an imported entry ended (sd:10420): the lane ran that
+    delivery under an earlier version. Read in the enqueue's own transaction, so an import by the runner at any
+    point before the write counts; a caller's earlier `lane list` cannot (a build's recovery). An entry the
+    import itself failed, `no_body` or `no_branch`, never ran: its reason says to enqueue it again."""
+    for row in entries:
+        if (row.get("item") == item and row.get("expected_head") == head and row.get("imported_from")
+                and row.get("status") not in ("pending", "cancelled")
+                and row.get("code") not in ("no_body", "no_branch")):
+            raise LaneError(f"sd:{item} at {head} already ran in this lane: an earlier version's queue ended it "
+                            f"{row.get('status')}; `sd-ship lane retry {item}` runs it again")
 
 
 def refuse_teammate(connection: Any, entry: dict[str, Any]) -> None:

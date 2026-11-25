@@ -6246,6 +6246,33 @@ class Importing(SharedQueue):
         self.assertEqual((code, self.statuses()), (3, [(1, "failed")]), answer)
         self.assertEqual(self.lane(*enqueue[:-2])[0], 0)  # the worktree's head, once imported: an operator retry
 
+    def test_an_enqueue_refuses_a_head_a_runner_imported_ended_at_any_point(self) -> None:
+        """sd:10420 class pass: a build's lookup read no entry, then the lane runner imported the file's failed
+        entry at this head. The enqueue refuses on the queue it writes to, in its own transaction: an import
+        before the call, or between its first read and its write, never lets the ended head run again."""
+        head = git(self.feature, "rev-parse", "HEAD")
+        asks = {"claim": "deliver", "expected_head": head}
+        self.write_file(self.old(1, self.feature, status="failed"))
+        self.import_now()  # the scheduled runner, after the build's `lane list`
+        with self.assertRaisesRegex(sd_lane.LaneError, "already ran in this lane"):
+            sd_lane.enqueue_entry(self.feature, 1, "fix: t", self.body, self.environ, **asks)
+        self.write_file(self.old(2, self.feature, status="failed"))
+        published = sd_lane.require_published
+
+        def runner_imports_then(*args: Any, **kwargs: Any) -> None:
+            self.import_now()  # after the enqueue's first read of the queue
+            published(*args, **kwargs)
+        with mock.patch.object(sd_lane, "require_published", runner_imports_then), \
+                self.assertRaisesRegex(sd_lane.LaneError, "already ran in this lane"):
+            sd_lane.enqueue_entry(self.feature, 2, "fix: t", self.body, self.environ, **asks)
+        self.assertEqual(self.statuses(), [(1, "failed"), (2, "failed")])
+        code, answer = self.lane("retry", "1")  # the operator's way to run it again stays open
+        self.assertEqual((code, self.statuses()[-1]), (0, (1, "pending")), answer)
+        self.write_file(self.old(3, self.feature, body=False))  # the import fails it unrun: `no_body`
+        self.import_now()
+        sd_lane.enqueue_entry(self.feature, 3, "fix: t", self.body, self.environ, **asks)
+        self.assertEqual(self.statuses()[-2:], [(3, "failed"), (3, "pending")])
+
     def test_lane_list_names_the_files_waiting_entries(self) -> None:
         """sd:10420 review: the view shows what the next runner pass imports, never an empty lane alone."""
         self.write_file(self.old(1, self.feature), self.old(2, self.feature, status="merged"))
