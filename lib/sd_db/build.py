@@ -1300,10 +1300,11 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
                 state = item_state(connection, item)
                 if state["item"]["status"] == "planning":
                     change_status(connection, item, "ready", who=who, expected_revision=state["revision"])
-                elif state["item"]["status"] == "blocked" and _build_blocked(connection, item):
+                elif state["item"]["status"] == "blocked" and (since := _build_blocked(connection, item)) is not None:
                     # A member its run blocked, whose bundle cannot retry (its lead done: the code shipped
-                    # without it), builds fresh once its builder's question is answered (pack sd:10294).
-                    if asked := open_question(connection, [item], "", pending=True):
+                    # without it), builds fresh once its builder's question is answered (pack sd:10294): one
+                    # that run raised, as delivery read it (`asked_since`), not an older unrelated one.
+                    if asked := open_question(connection, [item], since, pending=True):
                         raise BuildRefused(f"item {item} waits on question note #{asked['id']}; "
                                            f"answer it, then Build it")
                     transition(connection, item, "ready", who=who, reason="Build after its bundle ended")
@@ -1311,18 +1312,24 @@ def queue_again(connection, items: list[int], *, who: str, finding: str = "") ->
         return queued + (queue(connection, fresh, who=who) if fresh else [])
 
 
-def _build_blocked(connection, item: int) -> bool:
-    """Whether `item`'s block is its newest build's, which a Build lifts: that assignment ended blocked, and
-    the item's latest status change is the build's move to blocked with that assignment's reason. A block
-    someone wrote after it, an operator's hold, is not the build's (review of build/sd-1867)."""
-    row = connection.execute("SELECT status, result FROM assignment WHERE item = ? AND scope = ? "
+def _build_blocked(connection, item: int) -> str | None:
+    """When the newest build run of `item`'s bundle reads questions from (`asked_since`), if `item`'s block
+    is that build's, which a Build lifts; else None. The block is the build's while that assignment ended
+    blocked and the item's latest status change is the build's move to blocked with that assignment's
+    reason. A block someone wrote after it, an operator's hold, is not the build's (review of build/sd-1867)."""
+    row = connection.execute("SELECT id, parent, status, result FROM assignment WHERE item = ? AND scope = ? "
                              "ORDER BY id DESC LIMIT 1", (item, SCOPE)).fetchone()
     if row is None or row["status"] != "blocked" or not row["result"]:
-        return False
+        return None
     moved = connection.execute("SELECT body FROM note WHERE item = ? AND kind = 'status_change' "
                                "ORDER BY id DESC LIMIT 1", (item,)).fetchone()
-    return moved is not None and re.fullmatch(r"\w+ -> blocked by build: " + re.escape(row["result"]),
-                                              moved["body"] or "", re.DOTALL) is not None
+    if moved is None or re.fullmatch(r"\w+ -> blocked by build: " + re.escape(row["result"]),
+                                     moved["body"] or "", re.DOTALL) is None:
+        return None
+    lead = row["parent"] or row["id"]
+    number = connection.execute("SELECT MAX(run) FROM runner_run WHERE assignment = ?", (lead,)).fetchone()[0]
+    # A block with no run recorded reads every question, as before.
+    return asked_since(connection, lead, number) if number is not None else ""
 
 
 def _retry_row(connection, item: int):

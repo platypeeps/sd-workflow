@@ -6033,6 +6033,25 @@ class Drafts(Case):
             build.queue_again(self.db, [second], who="operator")
         self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked", "the operator's block stays")
 
+    def test_build_reads_only_the_questions_its_blocking_run_raised(self):
+        """Lane review of build/sd-1867: Build refused a run-blocked item on any pending question, so an
+        unrelated one asked before that build was queued held a Build that worked before."""
+        first, second = (create_item(self.db, kind="task", title=f"Build me {n}", repo=str(self.repo),
+                                     status="ready") for n in (1, 2))
+        older = add_note(self.db, second, "question", "Unrelated?\nOption: A (Recommended)\nOption: B")
+        self.db.execute("UPDATE note SET timestamp = ? WHERE id = ?", ("2000-01-01T00:00:00Z", older))
+        build.queue(self.db, [first, second], who="operator")
+        bundle = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                             root=self.root / "worktrees")
+        assert bundle is not None
+        asked = add_note(self.db, second, "question", "Which shape?\nOption: A (Recommended)\nOption: B")
+        self.assertTrue(build.enqueued(self.db, bundle["id"], [first]))
+        self.assertEqual(item_state(self.db, second)["item"]["status"], "blocked")
+        self.db.execute("UPDATE item SET status = 'done' WHERE id = ?", (first,))  # the lane merged it
+        add_note(self.db, second, "decision", f"Ruling on note #{asked}: A")
+        [again] = build.queue_again(self.db, [second], who="operator")
+        self.assertEqual((again["item"], again["status"]), (second, "queued"))
+
     def test_a_code_item_still_waits_on_a_design_with_no_ride(self):
         """The ride exemption reads a queued ride only: a design not yet written still holds its code item."""
         design, _ = self.design()
