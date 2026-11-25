@@ -804,6 +804,36 @@ class Supervise(Case):
         cost = self.db.execute("SELECT provider, bill FROM cost WHERE pass = ?", (self.bundle["id"],)).fetchone()
         self.assertEqual((cost["provider"], cost["bill"]), ("claude", "anthropic"))
 
+    #: Registry files `registry.parse` does not refuse by name: bytes that are not UTF-8 (`UnicodeDecodeError`)
+    #: and a shape it reads as a key (`TypeError`).
+    UNREADABLE = {"not UTF-8": b"\xff\xfe", "a list for a bill name": (
+        b'bills:\n  a: { cost: subscription }\nproviders:\n  claude: { start: "claude -p", vendor: a, bill: [x],'
+        b' roles: [author] }\nroles:\n  author: [claude]\n')}
+
+    def test_an_unreadable_registry_leaves_the_cost_row_unattributed(self):
+        """Class pass: attribution is optional, so no registry file may end a passing run before its result."""
+        self.press(1)
+        for name, body in self.UNREADABLE.items():
+            with self.subTest(name):
+                (self.database.parent / "providers.yaml").write_bytes(body)
+                self.assertEqual(self.supervisor().attribution(), (None, None))
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        self.assertEqual(self.supervisor().run(), {"run": self.bundle["id"], "outcome": None, "step": "enqueued"})
+        cost = self.db.execute("SELECT provider, bill, usd FROM cost WHERE pass = ?", (self.bundle["id"],)).fetchone()
+        self.assertEqual(tuple(cost), (None, None, 0.42))
+
+    def test_a_row_gone_before_the_write_leaves_the_cost_row_unattributed(self):
+        """Class pass: a `provider` or `bill` row removed after the lookup read it is no refused cost row."""
+        self.press(1)
+        self.write_pr()
+        self.plan(claude=["pass"], sd_review=["clean"])
+        with mock.patch.object(build_run.Supervisor, "attribution", return_value=("claude", "anthropic")):
+            ended = self.supervisor().run()
+        self.assertEqual(ended, {"run": self.bundle["id"], "outcome": None, "step": "enqueued"})
+        cost = self.db.execute("SELECT provider, bill, usd FROM cost WHERE pass = ?", (self.bundle["id"],)).fetchall()
+        self.assertEqual([tuple(row) for row in cost], [(None, None, 0.42)])
+
     def test_a_skipped_member_is_not_delivered(self):
         """Review round 2: only the members a branch commit's `Closes:` trailer cites are enqueued and done; the
         other, skipped with no question, ends and returns to planning, not blocked (sd:8960)."""
@@ -7296,6 +7326,15 @@ class Drafts(Case):
         prompt = self.calls("claude")[0]["argv"][1]
         self.assertIn(f"sd:{self.items[0]}", prompt)
         self.assertIn("The capture's one line.", prompt)
+
+    def test_a_draft_run_survives_an_unreadable_registry(self):
+        """Class pass: the draft walk shares `cost`, so it ends done with an unattributed row too."""
+        (self.database.parent / "providers.yaml").write_bytes(b"\xff\xfe")
+        run = self.claimed()
+        self.plan(claude=["draft"])
+        self.assertEqual(self.drafter(run["id"]).run(), {"run": run["id"], "outcome": "done", "questions": 1})
+        cost = self.db.execute("SELECT provider, bill, usd FROM cost WHERE pass = ?", (run["id"],)).fetchone()
+        self.assertEqual(tuple(cost), (None, None, 0.31))
 
     def test_a_draft_run_denies_write_tools(self):
         """Failure table, Drafting: the run holds the read tools only, and a denial writes nothing."""

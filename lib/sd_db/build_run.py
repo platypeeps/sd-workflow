@@ -73,7 +73,7 @@ from . import (
 from .build import Probe
 from .config import system_checkout
 from .database import Patient, transaction
-from .errors import SchemaTooNew, SdDbError
+from .errors import SchemaTooNew
 from .registry import read as read_registry
 from .ship import this_host
 from .workflow import WorkflowError
@@ -3500,18 +3500,25 @@ class Supervisor:
         usage = final.get("usage")
         usage = usage if isinstance(usage, dict) else {}
         usd = final.get("total_cost_usd")
+        row = dict(source="run", role="author", repo=self.row["repo"], assignment=self.row["assignment"],
+                   pass_=self.ident, owner_pid=os.getpid(),
+                   tokens_in=usage.get("input_tokens") if isinstance(usage.get("input_tokens"), int) else None,
+                   tokens_out=usage.get("output_tokens") if isinstance(usage.get("output_tokens"), int) else None,
+                   usd=float(usd) if isinstance(usd, (int, float)) else None)
         provider, bill = self.attribution()
-        record_cost(self.db, source="run", provider=provider, bill=bill, role="author", repo=self.row["repo"],
-                    assignment=self.row["assignment"], pass_=self.ident, owner_pid=os.getpid(),
-                    tokens_in=usage.get("input_tokens") if isinstance(usage.get("input_tokens"), int) else None,
-                    tokens_out=usage.get("output_tokens") if isinstance(usage.get("output_tokens"), int) else None,
-                    usd=float(usd) if isinstance(usd, (int, float)) else None)
+        if provider is None and bill is None:
+            record_cost(self.db, **row)
+            return
+        try:
+            record_cost(self.db, provider=provider, bill=bill, **row)
+        except sqlite3.IntegrityError:  # a row `attribution` read is gone: the cost outranks its attribution
+            record_cost(self.db, **row)
 
     def attribution(self) -> tuple[str | None, str | None]:
         """The provider and bill a builder row names: `claude -p` is the registry's `claude` entry (sd:10400).
 
-        No registry, no `claude` entry or no row to name stays unknown, (None, None): a missing bill is not
-        guessed, and the cost row is still written.
+        No registry, one that does not read, no `claude` entry or no row to name stays unknown, (None, None): a
+        missing bill is not guessed, and the cost row is still written.
         """
         try:
             entry = read_registry(connection=self.db).providers.get(PROVIDER)
@@ -3519,8 +3526,8 @@ class Supervisor:
                 return None, None
             named = {table: self.db.execute(f"SELECT 1 FROM {table} WHERE name = ?", (name,)).fetchone() is not None
                      for table, name in (("provider", PROVIDER), ("bill", entry.bill))}
-        except (SdDbError, sqlite3.Error, OSError):
-            return None, None
+        except Exception:  # noqa: BLE001 - the lookup is optional: a file `registry.parse` meets with a
+            return None, None  # `UnicodeDecodeError` or a `TypeError` must not end a run before its result
         return (PROVIDER if named["provider"] else None), (entry.bill if named["bill"] else None)
 
     def unfinished(self) -> str:
