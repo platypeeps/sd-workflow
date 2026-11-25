@@ -685,6 +685,27 @@ class OpenQuestion(Case):
         found = build.open_question(self.db, [item], since)
         self.assertEqual(found and found["id"], asked, "a withdrawn ruling counted as an answer at delivery")
 
+    def test_a_reversed_ruling_answers_the_skip_evidence_no_more(self):
+        """Lane review of build/sd-1726: the skip evidence read only withdrawals, so ruling R1 that Decide
+        reversed answered the question again once the operator withdrew its replacement R2. Both reads take
+        a ruling back by reversal or by a withdrawal that names its own note, `; sd:N stays filed` too."""
+        item = self.item()
+        since = "2000-01-01T00:00:00+00:00"
+        asked = add_note(self.db, item, "question", "Which?\nOption: A (Recommended)\nOption: B")
+        first = add_note(self.db, item, "decision", f"Ruling on note #{asked}: A")
+        add_note(self.db, item, "decision", f"Reversed ruling #{first}: question #{asked} asks again.")
+        second = add_note(self.db, item, "decision", f"Ruling on note #{asked}: B")
+        for pending in (False, True):
+            self.assertIsNone(build.open_question(self.db, [item], since, pending=pending), "R2 answers it")
+        add_note(self.db, item, "decision", f"Withdrawn: ruling #{second} on note #{asked}9")
+        for pending in (False, True):
+            self.assertIsNone(build.open_question(self.db, [item], since, pending=pending),
+                              "a withdrawal naming another note took R2 back")
+        add_note(self.db, item, "decision", f"Withdrawn: ruling #{second} on note #{asked}; sd:1 stays filed")
+        for pending in (False, True):
+            found = build.open_question(self.db, [item], since, pending=pending)
+            self.assertEqual(found and found["id"], asked, "the reversed R1 answered the question again")
+
 
 class DesignChain(Case):
     """Review of sd:10096: a design aboard the bundle is no dependency, but what it waits on still is."""
