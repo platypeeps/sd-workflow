@@ -6131,9 +6131,9 @@ class Importing(SharedQueue):
         self.assertFalse(self.file.exists())
 
     def writers(self) -> list[list[str]]:
-        """Every lane verb that writes the queue, on item 1; `lane_main` imports before each."""
-        return [["enqueue", "--item", "1", "--title", "fix: t", "--body-file", str(self.body), "--deliver"],
-                ["retry", "1"], ["cancel", "1"], ["move", "1", "top"], ["hold", "1"], ["release", "1"]]
+        """Every lane verb that looks for item 1's entry; `lane_main` imports before each. `enqueue` adds one,
+        so it misses nothing (`test_an_enqueue_proceeds_and_the_import_cancels_the_files_duplicate`)."""
+        return [["retry", "1"], ["cancel", "1"], ["move", "1", "top"], ["hold", "1"], ["release", "1"]]
 
     def refused_writers(self, why: str) -> None:
         """Each writing verb refuses, names the file and `why`, and leaves the file and the rows as they were."""
@@ -6193,6 +6193,42 @@ class Importing(SharedQueue):
             code, answer = self.lane("cancel", "3")
         self.assertEqual((code, self.statuses()), (0, [(3, "cancelled")]), answer)
 
+    def leftover(self) -> None:
+        """Item 1 imported and then cancelled, with the file back as a kill before the rename left it."""
+        original = self.write_file(self.old(1, self.feature))
+        self.import_now()
+        sd_lane.cancel(self.repo, 1, self.environ)
+        self.file.write_bytes(original)
+
+    def test_a_leftover_file_names_no_entry_its_import_already_wrote(self) -> None:
+        """sd:10420 class pass: a reader skips a file entry by its import id, as the import does, so a row the
+        operator cancelled is not shown as waiting and holds no writer back."""
+        self.leftover()
+        code, answer = self.lane("list")
+        self.assertEqual(code, 0)
+        self.assertNotIn("sd:1", answer["legacy"])
+        self.store().lock_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.store().lock_file, "a", encoding="utf-8") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            code, answer = self.lane("hold", "1")
+        self.assertEqual(code, 3)
+        self.assertNotIn(str(self.file), answer["error"])  # the queue's own answer, not the file's
+        self.assertEqual(self.statuses(), [(1, "cancelled")])
+
+    def test_an_enqueue_proceeds_and_the_import_cancels_the_files_duplicate(self) -> None:
+        """sd:10420 class pass: an enqueue held off the import adds the live entry; the file's is then a
+        duplicate, so a build's recovery is never refused for a head the file queued."""
+        self.write_file(self.old(1, self.feature))
+        self.store().lock_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.store().lock_file, "a", encoding="utf-8") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            code, answer = self.lane("enqueue", "--item", "1", "--title", "fix: t", "--body-file", str(self.body),
+                                     "--deliver")
+        self.assertEqual((code, self.statuses()), (0, [(1, "pending")]), answer)
+        self.import_now()
+        self.assertEqual([(row["item"], row["status"], row.get("code")) for row in self.entries()],
+                         [(1, "pending", None), (1, "cancelled", "duplicate_on_import")])
+
     def test_lane_list_names_the_files_waiting_entries(self) -> None:
         """sd:10420 review: the view shows what the next runner pass imports, never an empty lane alone."""
         self.write_file(self.old(1, self.feature), self.old(2, self.feature, status="merged"))
@@ -6200,11 +6236,7 @@ class Importing(SharedQueue):
         self.assertEqual((code, answer["entries"]), (0, []))
         self.assertIn("sd:1", answer["legacy"])
         self.assertNotIn("sd:2", answer["legacy"])
-        [waiting] = answer["legacy_entries"]  # a build's recovery finds its head here (sd:10420 review)
-        self.assertEqual((waiting["item"], waiting["status"], waiting["expected_head"]),
-                         (1, "pending", git(self.feature, "rev-parse", "HEAD")))
-        self.import_now()
-        self.assertEqual([row["id"] for row in self.entries()][0], waiting["id"])  # the id the import writes
+        self.assertNotIn("legacy_entries", answer)  # the line stands in for no entry (sd:10420 class pass)
         self.file.write_text("{", encoding="utf-8")
         self.assertIn("is not imported: cannot read", self.lane("list")[1]["legacy"])
         self.file.unlink()
