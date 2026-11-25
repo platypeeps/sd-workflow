@@ -927,42 +927,32 @@ def resolve_post_merge(connection: sqlite3.Connection, items: Collection[int],
     """Resolve each open `Post-merge: ` followup the lane wrote in the repositories of `items`
     whose merge a passing target covered; the ids resolved (sd:10406, sd:10407).
 
-    The merge is the one the followup names (`stamped_merge`); one written before the stamp
-    stands for its item's latest recorded delivery. `covered(commit)` says whether the commit
-    the pass ran at holds it: a pass at an older pin answers no failure of a newer merge, and
-    a followup with neither keeps open. A note another writer resolved meanwhile is not counted."""
+    The merge is the one the followup names (`stamped_merge`). One that names none is unknown:
+    it is never guessed from the item's recorded deliveries, whose note can lag the failure, so
+    no pass resolves it and a person does. `covered(commit)` says whether the commit the pass
+    ran at holds it, and raises when it cannot tell, which resolves nothing: a pass at an older
+    pin answers no failure of a newer merge. A note another writer resolved meanwhile is not
+    counted."""
     numbers = sorted({int(item) for item in items})
     if not numbers:
         return []
     marks = ", ".join("?" for _ in numbers)
     found = connection.execute(
-        "SELECT note.id, note.item, note.body FROM note JOIN item ON item.id = note.item "
+        "SELECT note.id, note.body FROM note JOIN item ON item.id = note.item "
         "WHERE note.kind = 'followup' AND note.resolved_at IS NULL "
         "AND note.session = ? AND substr(note.body, 1, ?) = ? AND item.repo IN "
         f"(SELECT repo FROM item WHERE id IN ({marks}) AND repo IS NOT NULL) ORDER BY note.id",
         [LANE_SESSION, len(POST_MERGE_FOLLOWUP), POST_MERGE_FOLLOWUP, *numbers]).fetchall()
     held: dict[str, bool] = {}
     answered = []
-    for note, item, body in found:
-        commit = stamped_merge(body) or _delivered_commit(connection, item)
+    for note, body in found:
+        commit = stamped_merge(body)
         if commit is not None and commit not in held:
             held[commit] = bool(covered(commit))
         if commit is not None and held[commit]:
             answered.append(note)
     with transaction(connection):
         return [note for note in answered if resolve_note(connection, note)]
-
-
-def _delivered_commit(connection: sqlite3.Connection, item: int) -> str | None:
-    """The commit `item`'s latest delivery names: a `Code delivery` comment or a delivering transition."""
-    for kind, body in connection.execute(
-            "SELECT kind, body FROM note WHERE item = ? AND kind IN ('comment', 'status_change') "
-            "ORDER BY id DESC", (item,)):
-        text = str(body or "")
-        found = CODE_DELIVERY.match(text) if kind == "comment" else DELIVERED_AT.search(text)
-        if found:
-            return found.group(found.lastindex or 0)
-    return None
 
 
 def change_status(

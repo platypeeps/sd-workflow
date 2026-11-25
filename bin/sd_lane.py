@@ -3286,9 +3286,13 @@ POST_MERGE_PASSED = "make post-merge passed"
 def post_merge_stamp(row: dict[str, Any]) -> str:
     """The followup's last line naming the merge it reports, which `sd_db.workflow.stamped_merge` reads.
 
-    Only a pass that holds that commit answers it (sd:10407); a row without a full commit gets none."""
+    Only a pass that holds that commit answers it (sd:10407). A row without a full commit says so:
+    its merge is unknown, so no pass resolves it, and the last line stays the lane's own, never the
+    tail of the target's output."""
     merged = row.get("merge_commit")
-    return f"\nMerged at {merged}" if isinstance(merged, str) and re.fullmatch(r"[0-9a-f]{40,64}", merged) else ""
+    if isinstance(merged, str) and re.fullmatch(r"[0-9a-f]{40,64}", merged):
+        return f"\nMerged at {merged}"
+    return "\nMerge commit not recorded: no pass resolves this, resolve it by hand"
 
 
 def note_post_merge(rows: list[dict[str, Any]], ran: str, main: pathlib.Path) -> str:

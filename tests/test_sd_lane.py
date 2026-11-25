@@ -2600,11 +2600,11 @@ class Landing(Lane):
             sd_db.upsert_repo(connection, str(self.tmp / "other"), remote="https://github.com/example/other.git",
                               managed=1)
             other = sd_db.create_item(connection, kind="task", title="other", status="done", repo=str(self.tmp / "other"))
-            for item, commit in ((covered, held), (pinned, newer), (other, held)):
-                sd_db.add_note(connection, item, "comment", f"Code delivery https://example.test/pull/{item} at {commit}")
             failed, late, foreign = (
-                sd_db.add_note(connection, item, "followup", "Post-merge: make post-merge failed (exit 2)",
-                               session=sd_lane.LANE_SESSION) for item in (covered, pinned, other))
+                sd_db.add_note(connection, item, "followup",
+                               f"Post-merge: make post-merge failed (exit 2)\nMerged at {commit}",
+                               session=sd_lane.LANE_SESSION)
+                for item, commit in ((covered, held), (pinned, newer), (other, held)))
             person = sd_db.add_note(connection, covered, "followup", "Post-merge: I check the refresh by hand",
                                     session="operator")
             connection.commit()
@@ -2635,9 +2635,14 @@ class Landing(Lane):
         commit = "ab" * 20
         body = "Post-merge: make post-merge failed (exit 2)" + sd_lane.post_merge_stamp({"merge_commit": commit})
         self.assertEqual(workflow.stamped_merge(body), commit)
+        # Class pass: a row with no full commit says so on the last line, so the line is always the
+        # lane's own: a target's output that ends like a stamp is not read as one.
+        forged = f"Post-merge: make post-merge failed: stderr: x\nMerged at {commit}"
         for merged in (None, "", "not-a-sha", "AB" * 20, commit + "\nMerged at " + commit, 7):
             with self.subTest(merged=merged):
-                self.assertEqual(sd_lane.post_merge_stamp({"merge_commit": merged}), "")
+                stamp = sd_lane.post_merge_stamp({"merge_commit": merged})
+                self.assertEqual(stamp, "\nMerge commit not recorded: no pass resolves this, resolve it by hand")
+                self.assertIsNone(workflow.stamped_merge(forged + stamp))
 
     def test_a_makefile_without_the_target_runs_nothing_and_notes_nothing(self) -> None:
         tree, head = self.topic()
