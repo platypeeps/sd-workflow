@@ -200,7 +200,7 @@ def in_process(connection, path: str, remote: str | None) -> dict | None:
     `remote`'s GitHub name, which the pack reads from the checkout's origin, and the lane folder is named after the
     registered checkout, the main one. None where either could differ: a remote that names no GitHub repository, a
     `.git` that is not a folder, or no pack `bin/` beside the library. The caller runs `lane list` for those. An
-    earlier version's queue file stays for the runner to import (sd:10420). A failed read is
+    earlier version's queue file stays for a writer to import (sd:10420). A failed read is
     `{"ok": False, "error": ...}`, never an empty lane.
     """
     from sd_db.protection import github_slug

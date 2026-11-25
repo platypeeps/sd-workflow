@@ -1469,7 +1469,7 @@ class RealLane(BrowserSession):
     """The pinned pack's `sd-ship lane` on a temporary lane root, seeded with `seeds()`.
 
     The pack keeps the queue in the hub database (pack sd:3282), so the entries go there through its own writer:
-    a `<lane>/queue/queue.json` is only an earlier version's file, which the runner alone imports by publishing each
+    a `<lane>/queue/queue.json` is only an earlier version's file, which the runner or a writing verb imports by publishing each
     pending head to `origin` (sd:10420). The checkout's origin names a GitHub repository, as every lane's must.
     """
 
@@ -1743,7 +1743,7 @@ class TheInProcessRead(RealLane):
         self.assertEqual(satellite, {**hub, "host": "build-2"})
 
     def test_a_queue_file_an_earlier_version_left_stays_for_the_runner(self):
-        # sd:10420: only the runner imports that file; the page reads the database and leaves it in place.
+        # sd:10420: the runner or a writing verb imports that file; the page reads and leaves it.
         queue = Path(os.environ["SD_LANE_ROOT"]) / "system" / "lane" / "queue" / "queue.json"
         queue.write_text(json.dumps({"entries": [{"item": 9, "status": "pending", "branch": "topic"}]}))
         original = queue.read_bytes()

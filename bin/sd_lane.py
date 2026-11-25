@@ -74,9 +74,9 @@ repository has no lane. The lane folder, `<lane root>/<repository>/lane/`,
 keeps this machine's logs and runner lock, and under `review/` each review
 `sd-ship prepare` finished but the hub has not yet recorded (sd:3340). The lane root is `SD_LANE_ROOT`,
 else `sd.lane_root`, else `$XDG_STATE_HOME/sd/lanes`. A `queue/queue.json` an
-earlier version left there is imported once, by the runner alone
-(`import_file_queue`): every other verb, and above all `lane list`, leaves it
-in place, so a view changes no ref, file or row (sd:10420).
+earlier version left there is imported once (`import_file_queue`), by the
+runner or a verb that writes the queue; `lane list` leaves it in place, so a
+view changes no ref, file or row (sd:10420).
 
 Another host runs an entry only from a commit on `origin`, so enqueue,
 retry and the import of a pending entry publish its head first, by
@@ -454,7 +454,7 @@ def lane_dir(root: pathlib.Path, environ: dict[str, str]) -> pathlib.Path:
 
 
 def queue_path(root: pathlib.Path, environ: dict[str, str]) -> pathlib.Path:
-    """Where an earlier version kept the queue file; the runner's `import_file_queue` reads it once, and `lane list` names it."""
+    """Where an earlier version kept the queue file; `import_file_queue` reads it once, and `lane list` names it."""
     return lane_dir(root, environ) / "queue" / "queue.json"
 
 
@@ -5093,6 +5093,8 @@ def lane_main(args: Any) -> int:
             return watch_items(queue_for(root, environ), args.items)
         if args.lane_command == "prune":
             return lane_prune(root, environ, dry_run=args.dry_run, as_json=args.json)
+        if args.lane_command not in ("run", "list"):  # a view stays read-only; a writer reaches file entries (sd:10420)
+            import_file_queue(root, queue_for(root, environ))
         if args.lane_command == "enqueue":
             result: Any = enqueue_entry(root, args.items[0], args.title, args.body_file, environ,
                                         expected_head=args.expected_head, manual=args.manual, claim=args.claim,

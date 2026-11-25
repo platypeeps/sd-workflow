@@ -6112,6 +6112,20 @@ class Importing(SharedQueue):
         self.assertEqual((sorted(path.name for path in self.bodies.iterdir()), self.git_verbs), (bodies, []))
         self.assertEqual(git(self.origin, "for-each-ref"), refs)
 
+    def test_a_writing_verb_still_imports_so_a_legacy_entry_can_be_held_or_cancelled(self) -> None:
+        """sd:10420 review: only views skip the import; hold and cancel reach a file entry before the runner."""
+        import argparse  # noqa: PLC0415
+        self.write_file(self.old(1, self.worktree("one")), self.old(2, self.worktree("two")))
+        parser = argparse.ArgumentParser()
+        sd_lane.add_lane_verbs(parser.add_subparsers(dest="command"))
+        for argv in (["hold", "1"], ["cancel", "2"]):
+            with self.subTest(argv=argv), contextlib.chdir(self.repo), mock.patch.dict(os.environ, self.environ), \
+                    contextlib.redirect_stdout(io.StringIO()) as said:
+                self.assertEqual(sd_lane.lane_main(parser.parse_args(["lane", *argv])), 0, said.getvalue())
+        self.assertEqual([(row["item"], row["status"], bool(row.get("held"))) for row in self.entries()],
+                         [(1, "pending", True), (2, "cancelled", False)])
+        self.assertFalse(self.file.exists())
+
     def test_a_busy_runner_lock_skips_the_import(self) -> None:
         """An older runner mid-entry holds the lock and keeps its file until the next pass."""
         self.write_file(self.old(1, self.feature))
