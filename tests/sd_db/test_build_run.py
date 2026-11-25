@@ -1297,7 +1297,10 @@ class Supervise(Case):
         for text, expected in (("Each step needs state, failure, recovery and test.", False), (header, False),
                                (header + "| --- | --- | --- | --- | --- |\n", False),
                                (header + "| --- | --- | --- | --- | --- |\n" + row, True), (header + row, True),
-                               (plain, True), (header + "\n" + row, False)):
+                               (plain, True), (header + "\n" + row, False),
+                               # pack sd:9866: a data row fills the five columns, not one cell or a lone pipe.
+                               (header + "| --- | --- | --- | --- | --- |\n| write |\n", False),
+                               (header + "|\n", False), (header + "write | note\n", False)):
             with self.subTest(text=text):
                 self.assertIs(build_run.failure_table(text), expected)
 
