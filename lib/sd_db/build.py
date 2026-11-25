@@ -2527,19 +2527,13 @@ def open_question(connection, items: list[int], since: str, *, pending: bool = F
     if not items:
         return None
     marks = ", ".join("?" for _ in items)
-    if pending:
-        # A reopened question keeps its ruling note: Decide's reversal and a review withdrawal each take one back
-        # (`needs_sweep.standing_ruling` reads both; advisory of PR #1940, sd:9973; class pass of sd:10096).
-        return next((dict(row) for row in connection.execute(
-            f"SELECT id, item FROM note WHERE kind = 'question' AND item IN ({marks}) AND timestamp >= ? "
-            f"AND resolved_at IS NULL ORDER BY id", (*items, since)).fetchall()
-            if standing_ruling(connection, row) is None), None)
-    row = connection.execute(
-        f"SELECT asked.id, asked.item FROM note asked WHERE asked.kind = 'question' AND asked.item IN ({marks}) "
-        f"AND asked.timestamp >= ? AND NOT EXISTS (SELECT 1 FROM note ruling WHERE ruling.item = asked.item "
-        f"AND ruling.kind = 'decision' AND ruling.body LIKE 'Ruling on note #' || asked.id || ':%') "
-        f"ORDER BY asked.id LIMIT 1", (*items, since)).fetchone()
-    return dict(row) if row else None
+    # A reopened question keeps its ruling note: Decide's reversal and a review withdrawal each take one back
+    # (`needs_sweep.standing_ruling` reads both; advisory of PR #1940, sd:9973; class pass of sd:10096). The
+    # skip's evidence reads it too: a resolved question still counts there, a taken-back ruling not (sd:10236).
+    return next((dict(row) for row in connection.execute(
+        f"SELECT id, item FROM note WHERE kind = 'question' AND item IN ({marks}) AND timestamp >= ? "
+        f"{'AND resolved_at IS NULL ' if pending else ''}ORDER BY id", (*items, since)).fetchall()
+        if standing_ruling(connection, row) is None), None)
 
 
 def finished_seconds(connection, *, limit: int = 20) -> list[float]:
