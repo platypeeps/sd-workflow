@@ -273,6 +273,8 @@ your report: each blocker, its ruling and reason, and the test of each fix.
 """
 #: The checkpoint key prefix of a blocker a REJECT or FILE ruling cleared, by run, head and number.
 RULED = "build-run-ruled:"
+#: The checkpoint key prefix of the head a blocking round found its blockers at, by assignment.
+ROUND_HEAD = "build-round-head:"
 #: The rulings `RULING` asks for, and the longest reason kept.
 RULINGS = ("fix", "reject", "file", "ask")
 REASON_MAX = 500
@@ -1558,7 +1560,7 @@ class Supervisor:
         # What enqueue would refuse goes back to the builder before a review is spent (pack sd:6926).
         refused = self.prechecked(head)
         if refused:
-            return self.blocked_round([{"path": "enqueue check", "line": "-", "summary": text} for text in refused])
+            return self.blocked_round([{"path": "enqueue check", "line": "-", "summary": text} for text in refused], head)
         answer: dict | None = None
         argv, prior = self.review_plan(head)
         unknown = waits = 0
@@ -1611,10 +1613,10 @@ class Supervisor:
             if isinstance(failed, dict):
                 return failed
             if failed:
-                return self.blocked_round(failed)
+                return self.blocked_round(failed, head)
             self.reviewed = head
             return "enqueuing"
-        return self.blocked_round(answer["blockers"])
+        return self.blocked_round(answer["blockers"], head)
 
     def review_plan(self, head: str) -> tuple[list[str], dict | None]:
         """This round's `sd-review` argv and the prior report it verifies, if any.
@@ -2087,12 +2089,14 @@ class Supervisor:
         return None
 
     def round_head(self) -> str | None:
-        """The head the last review, whose blockers the ruling round ruled, read; None when it does not read."""
+        """The head the last blocking round, whose blockers the ruling round ruled, read, as `blocked_round`
+        kept it for the assignment, whichever run of it found them; None when it does not read."""
+        found = self.db.execute("SELECT body FROM state WHERE kind = 'checkpoint' AND key = ? ORDER BY id DESC "
+                                "LIMIT 1", (f"{ROUND_HEAD}{self.row['assignment']}",)).fetchone()
         try:
-            answer = json.loads(self.out("review").read_text(encoding="utf-8"))
-        except (OSError, ValueError):
+            head = json.loads(found[0]) if found else None
+        except (TypeError, ValueError):
             return None
-        head = (answer.get("subject") or {}).get("head") if isinstance(answer, dict) else None
         return head if isinstance(head, str) and re.fullmatch(r"[0-9a-f]{40,64}", head) else None
 
     def place(self, row: dict) -> str:
@@ -2265,8 +2269,11 @@ class Supervisor:
         return [f"this change moves state in steps ({', '.join(bare)}), and neither that design.md nor "
                 f"the body holds its failure table: {FAILURE_TABLE_RULE}. Add the table, one row per step"]
 
-    def blocked_round(self, blockers: list[dict]) -> str | dict:
+    def blocked_round(self, blockers: list[dict], head: str) -> str | dict:
         self.blockers = blockers
+        # The head these blockers were found at, for the ruling round's rulings: a run a usage limit
+        # resumes has another id, so its own review file is no record of it (sd:10286).
+        record_state(self.db, "checkpoint", key=f"{ROUND_HEAD}{self.row['assignment']}", body=head)
         # Whole, as the fix reads them: the lead's note is cut at FINDING_MAX (review of build/sd-1557).
         part = self.round_file.with_name(f".{self.round_file.name}.{os.getpid()}.part")
         part.write_text(json.dumps(blockers))

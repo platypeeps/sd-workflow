@@ -3469,6 +3469,29 @@ class Supervise(Case):
         self.assertIn("rule each numbered blocker", fix[fix.index("-p") + 1])
         self.assertEqual(build.run(self.db, again["id"])["review_round"], R + 1)
 
+    def test_a_usage_limit_resume_keeps_the_ruling_rounds_rulings(self):
+        """Review of sd:10286: the resumed run has a new id, so its own review file is not the review the
+        rulings judged. A reject the resumed ruling round writes still applies, as in one run."""
+        R = build_run.REVIEW_ROUNDS
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", *(f"fix{n}" for n in range(1, R + 1)), "rate_limited"],
+                  sd_review=[*["blocking"] * R, "blocking2"])
+        self.assertEqual(self.supervisor().run()["outcome"], "rate_limited")
+        reset = int((self.plans / "reset.txt").read_text())
+        later = datetime.fromtimestamp(reset + 1, UTC).isoformat(timespec="seconds")
+        with mock.patch.object(build, "clock", return_value=later):
+            again = build.claim(self.db, owner="fixture", load=1.0, load_cap=40.0, interactive=[],
+                                root=self.root / "worktrees")
+        assert again is not None
+        (self.plans / "rulings.txt").write_text(json.dumps([
+            {"blocker": 1, "ruling": "fix", "reason": "a failing input"},
+            {"blocker": 2, "ruling": "reject", "reason": "no failing input"}]))
+        self.plan(claude=["rule_apart"], sd_review=["repeat2"])
+        ended = self.supervisor(again["id"]).run()
+        self.assertNotIn("not applied", self.decisions()[1])
+        self.assertEqual(ended.get("step"), "enqueued", ended)
+
     def test_a_usage_limit_reclaim_refuses_a_worktree_on_another_branch(self):
         """Review of build/sd-1557: the reclaim resumed at building or fixing, past the worktree step's branch
         guard, so a checkout switched during the hold took the builder's commits. The guard runs first."""
