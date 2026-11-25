@@ -426,6 +426,10 @@ def fake_grep(files: dict[str, str], head: str, argv: list[str]) -> str:
                    for number, text in enumerate(body.splitlines(), 1) if any(test.search(text) for test in tests))
 
 
+#: A `CACHEDIR.TAG` as cargo writes it into `target/`.
+CACHE_TAG = "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag.\n"
+
+
 def exclude(work: Path, patterns: str) -> None:
     """Ignore `patterns` in every worktree of `work`'s repository, through its common `info/exclude`."""
     common = Path(support.git(work, "rev-parse", "--path-format=absolute", "--git-common-dir"))
@@ -3447,18 +3451,17 @@ class Supervise(Case):
 
     def test_cleaning_removes_a_merged_worktree_whose_only_extras_are_build_output(self):
         """Pack sd:10506: a Rust build leaves an ignored `target/`, so every merged worktree read as not
-        clean and kept 20-60 GB. Build output is disposable, as a cache is."""
+        clean and kept 20-60 GB. Cargo tags it as a cache (`CACHEDIR.TAG`), and a tagged folder is disposable."""
         self.press()
         self.write_pr()
         self.plan(claude=["pass"], sd_review=["clean"])
         self.supervisor().run()
         work = Path(self.bundle["work_path"])
-        exclude(work, "target/\nnode_modules/\n")
+        exclude(work, "target/\n")
         (work / "target" / "debug").mkdir(parents=True)
+        (work / "target" / "CACHEDIR.TAG").write_text(CACHE_TAG)
         (work / "target" / ".rustc_info.json").write_text("{}\n")
         (work / "target" / "debug" / "app").write_bytes(b"x")
-        (work / "node_modules").mkdir()
-        (work / "node_modules" / "x.js").write_text("x\n")
         self.merge_to_cleaning()
         self.assertEqual(self.supervisor().run()["outcome"], "done")
         self.assertFalse(work.exists())
@@ -3473,6 +3476,7 @@ class Supervise(Case):
         work = Path(self.bundle["work_path"])
         exclude(work, "target/\n.env\n")
         (work / "target").mkdir()
+        (work / "target" / "CACHEDIR.TAG").write_text(CACHE_TAG)
         (work / "target" / ".rustc_info.json").write_text("{}\n")
         (work / ".env").write_text("TOKEN=change-me\n")
         self.merge_to_cleaning()
@@ -3490,6 +3494,7 @@ class Supervise(Case):
         work = Path(self.bundle["work_path"])
         exclude(work, "target/\n")
         (work / "target").mkdir()
+        (work / "target" / "CACHEDIR.TAG").write_text(CACHE_TAG)
         (work / "target" / "out.bin").write_bytes(b"x")
         (work / "notes.txt").write_text("x\n")
         self.merge_to_cleaning()
@@ -4931,16 +4936,71 @@ class Sweep(Case):
         self.assertNotEqual(self.branches(), "")
 
     def test_build_output_goes_with_the_swept_worktree(self):
-        """Pack sd:10506: an ignored Rust `target/` kept every tree; it is build output, and goes with it."""
+        """Pack sd:10506: an ignored Rust `target/` kept every tree; cargo tags it as a cache, at any depth,
+        and a tagged folder goes with the tree."""
         work = self.blocked()
         self.done()
-        exclude(work, "target/\n.venv/\n")
-        (work / "target").mkdir()
-        (work / "target" / ".rustc_info.json").write_text("{}\n")
-        (work / ".venv" / "bin").mkdir(parents=True)
-        (work / ".venv" / "bin" / "python").write_text("x\n")
+        exclude(work, "target/\n")
+        for target in (work / "target", work / "crates" / "café" / "target"):
+            (target / "debug").mkdir(parents=True)
+            (target / "CACHEDIR.TAG").write_text(CACHE_TAG)
+            (target / ".rustc_info.json").write_text("{}\n")
+            (target / "debug" / "app").write_bytes(b"x")
         self.assertEqual(build_run.sweep(self.db), [str(work)])
         self.assertFalse(work.exists())
+
+    def test_a_folder_only_named_like_build_output_keeps_the_tree(self):
+        """Review of build/sd-1867, the class: a folder's name alone made its ignored files disposable, so local
+        files under any `target/`, `node_modules/` or `.venv/` went with the tree. The tool's own tag decides."""
+        work = self.blocked()
+        self.done()
+        exclude(work, "target/\nnode_modules/\n.venv/\n*.local\n")
+        (work / "docs" / "target").mkdir(parents=True)
+        (work / "docs" / "target" / "notes.local").write_text("mine\n")
+        (work / "node_modules").mkdir()
+        (work / "node_modules" / "patch.js").write_text("mine\n")
+        (work / ".venv").mkdir()
+        (work / ".venv" / "secrets.cfg").write_text("mine\n")
+        self.assertEqual(build_run.kept_files(("git",), str(work)),
+                         "!! .venv/secrets.cfg\n!! docs/target/notes.local\n!! node_modules/patch.js")
+        self.assertEqual(build_run.sweep(self.db), [])
+        self.assertEqual((work / "docs" / "target" / "notes.local").read_text(), "mine\n")
+
+    def test_only_a_plain_signed_ignored_tag_in_a_folder_marks_a_cache(self):
+        """The class pass, each way a tag is no tag: wrong or empty content, a symlink, a folder of that name,
+        a tracked tag, a tag at the top, and a sibling whose name only starts like the tagged folder's."""
+        work = self.blocked()
+        exclude(work, "target*/\nout/\nCACHEDIR.TAG\n*.bin\n")
+        cases = {"unsigned": "Signature: 0000\n", "empty": ""}
+        for name, text in cases.items():
+            (work / name / "target").mkdir(parents=True)
+            (work / name / "target" / "CACHEDIR.TAG").write_text(text)
+            (work / name / "target" / "o.bin").write_bytes(b"x")
+        (work / "real").mkdir()
+        (work / "real" / "CACHEDIR.TAG").write_text(CACHE_TAG)
+        (work / "linked" / "target").mkdir(parents=True)
+        (work / "linked" / "target" / "CACHEDIR.TAG").symlink_to(work / "real" / "CACHEDIR.TAG")
+        (work / "linked" / "target" / "o.bin").write_bytes(b"x")
+        (work / "folder" / "target" / "CACHEDIR.TAG").mkdir(parents=True)
+        (work / "folder" / "target" / "o.bin").write_bytes(b"x")
+        (work / "target").mkdir()
+        (work / "target" / "CACHEDIR.TAG").write_text(CACHE_TAG)
+        (work / "target" / "o.bin").write_bytes(b"x")
+        (work / "target-notes").mkdir()
+        (work / "target-notes" / "o.bin").write_bytes(b"x")
+        (work / "CACHEDIR.TAG").write_text(CACHE_TAG)
+        (work / "top.bin").write_bytes(b"x")
+        (work / "tracked").mkdir()
+        (work / "tracked" / "CACHEDIR.TAG").write_text(CACHE_TAG)
+        support.git(work, "add", "-f", "tracked/CACHEDIR.TAG")
+        support.git(work, "commit", "-m", "track a tag")
+        (work / "tracked" / "o.bin").write_bytes(b"x")
+        kept = build_run.kept_files(("git",), str(work)).splitlines()
+        self.assertEqual(kept, [
+            "!! CACHEDIR.TAG", "!! empty/target/CACHEDIR.TAG", "!! empty/target/o.bin",
+            "!! folder/target/o.bin", "!! linked/target/CACHEDIR.TAG", "!! linked/target/o.bin",
+            "!! target-notes/o.bin", "!! top.bin", "!! tracked/o.bin",
+            "!! unsigned/target/CACHEDIR.TAG", "!! unsigned/target/o.bin"])
 
     def test_a_tree_with_only_caches_is_swept(self):
         """pack sd:6979: a disposable cache is no reason to keep a tree; another ignored file still is."""

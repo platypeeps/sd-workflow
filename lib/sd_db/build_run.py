@@ -88,9 +88,10 @@ TITLE_MAX = 63
 #: A read (`git status`, `lane list`) that takes longer is unread.
 READ_SECONDS = 120
 # Ignored folders that `git worktree remove` may delete: tools rebuild them (pack sd:6979).
-DISPOSABLE = frozenset({"__pycache__", ".ruff_cache", ".mypy_cache", ".pytest_cache",
-                        # Build output: a Rust `target/` kept every merged worktree, 20-60 GB each (pack sd:10506).
-                        "target", "node_modules", ".venv"})
+DISPOSABLE = frozenset({"__pycache__", ".ruff_cache", ".mypy_cache", ".pytest_cache"})
+#: The Cache Directory Tagging signature: a folder whose `CACHEDIR.TAG` starts with it is its tool's to rebuild.
+#: Cargo tags a Rust `target/`, which kept every merged worktree, 20-60 GB each (pack sd:10506).
+CACHE_TAG, CACHE_SIGNATURE = "CACHEDIR.TAG", b"Signature: 8a477f597d28d172789f06886806bc55"
 #: The pack checkout this module runs from: its `dashboard/dashboard.sh` is the health check.
 PACK = Path(__file__).resolve().parents[2]
 #: The `heartbeat` state row the tick writes first; a satellite's tick writes `<key>@<host>` (pack sd:7933).
@@ -581,12 +582,36 @@ def _read_bytes(argv: list[str], *, env: dict | None = None) -> bytes:
 
 def kept_files(git: Collection[str], work: str, *, env: dict | None = None) -> str:
     """The status lines of `work` that `git worktree remove` would lose: changes, untracked and ignored
-    files, those config hides too, less the ignored ones under a `DISPOSABLE` folder; "" when it may go."""
+    files, those config hides too, less the ignored ones under a `DISPOSABLE` folder or a tagged cache
+    folder (`_tagged`); "" when it may go."""
     lines = _read([*git, "-C", work, "-c", "core.quotePath=false", "status", "--porcelain", "--ignored",
                    "--untracked-files=all"], env=env)
+    caches = _tagged(work, [line[3:] for line in lines.splitlines() if line.startswith("!! ")])
     return "\n".join(line for line in lines.splitlines() if line.strip() and not (
         # Folder parts only: git ends an ignored folder with "/", so a file of that name is no cache.
-        line.startswith("!! ") and DISPOSABLE.intersection(line[3:].strip('"').split("/")[:-1])))
+        line.startswith("!! ") and (DISPOSABLE.intersection(line[3:].strip('"').split("/")[:-1])
+                                    or line[3:].startswith(caches))))
+
+
+def _tagged(work: str, ignored: list[str]) -> tuple[str, ...]:
+    """The folders of `work`, each ending in "/", that their tool tagged as a cache: an ignored `CACHEDIR.TAG`
+    in the folder, a plain file that starts with `CACHE_SIGNATURE`. The tag decides, never the folder's name:
+    an ignored folder that is only named `target` may hold local files (review of build/sd-1867). A tag at
+    the top tags no folder, a tracked tag is not ignored, and a path git quotes matches no file."""
+    found = []
+    for path in ignored:
+        folder, _, name = path.rpartition("/")
+        tag = Path(work, path)
+        if not folder or name != CACHE_TAG or tag.is_symlink() or not tag.is_file():
+            continue
+        try:
+            with tag.open("rb") as handle:
+                signed = handle.read(len(CACHE_SIGNATURE)) == CACHE_SIGNATURE
+        except OSError:
+            signed = False
+        if signed:
+            found.append(folder + "/")
+    return tuple(found)
 
 
 def changed_lines(git: Collection[str], work: str, base: str, head: str, *,
@@ -882,7 +907,7 @@ def sweep(connection, *, git: Collection[str] = ("git",), hosts: Collection[str 
     may land the same items; the lane squash-merges, so the branch reads
     unpushed forever (pack sd:6909). Kept: an unreleased run on the path, an
     item of any run on it not done, a dirty or unread worktree, one holding an
-    ignored or untracked file outside a `DISPOSABLE` cache or build output, a
+    ignored or untracked file outside a `DISPOSABLE` or tagged cache folder, a
     locked one, a live session other than a builder's. The paths removed.
 
     An item marked done is no proof its commits landed: a squash merge leaves
