@@ -448,6 +448,8 @@ class Tools:
     #: An unmanaged repository's run (pack sd:7868): its own checks wait for a gate slot through `<gate>`,
     #: and its draft pull request opens through `<gh>`.
     gate: list[str] = field(default_factory=lambda: [sys.executable, str(PACK / "bin" / "sd_gate_slots.py"), "run"])
+    #: A managed repository's gate, `sd gate check`: the lane's own check, for a pass `sd-review` ran none on.
+    check: list[str] = field(default_factory=lambda: [sys.executable, str(PACK / "bin" / "sd"), "gate", "check"])
     gh: list[str] = field(default_factory=lambda: ["gh"])
     #: Before that push, `<guard>` reads the title, body and commits on stdin: `leak-guard.sh scan`, run whatever
     #: pre-push hook the repository has, since an unmanaged one normally has none (review of pack sd:7868).
@@ -2232,7 +2234,8 @@ class Supervisor:
                                                "reason": f"filed as follow-up sd:{filed}: {reason}" if filed else reason}]}})
 
     def own_checks(self, head: str) -> list[dict] | dict:
-        """Run an unmanaged repository's own checks at `head`, each in a gate slot; a blocker per failure.
+        """Run the checks `sd-review` did not at `head`, each in a gate slot; a blocker per failure: a managed
+        repository's gate (`sd gate check`), an unmanaged one's own entrypoints.
 
         No check found is noted on the lead item and passes: a repository with none did not fail one.
         Entrypoints that do not read are a configuration fault, no code blocker: the run's blocked end (a
@@ -2240,8 +2243,12 @@ class Supervisor:
         """
         if self.checks is None:
             return []
+        # A managed repository has a gate: the pass runs that gate itself, in its clean tree at `head`, its
+        # environment and its test recipe, never a copy of its commands that can differ (class pass, sd:10286).
+        managed = not build.unmanaged(self.db, self.row["repo"])
         try:
-            commands = self.checks(self.work)
+            commands = ([[*self.tools.check, "--base", self.base().removeprefix("origin/")]] if managed
+                        else self.checks(self.work))
         except ValueError as error:
             return self.finish("blocked", f"the repository's check entrypoints did not read, a configuration "
                                           f"fault no fix round can mend: {error}")
@@ -2255,12 +2262,16 @@ class Supervisor:
             for name in ("checks", "checks.err"):
                 self.empty(self.out(name), "checks")
             code = self.child([*self.tools.gate, "--label", f"build {self.row['branch']} checks", "--", *argv],
-                              cwd=self.work, name="checks", descendants=True, env=_checks_environ(self.env))
+                              cwd=self.work, name="checks", descendants=True,
+                              env=self.env if managed else _checks_environ(self.env))  # the gate takes no PAT
             if code == 125 and self.refused():  # the gate started nothing: unknown, never a failure of the code
                 raise Unread(f"sd gate run did not start `{said}`; see {self.out('checks.err')}")
             if code != 0:
                 tail = "".join(path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
                                for path in (self.out("checks"), self.out("checks.err")))
+                if managed and code == 1 and not tail.lstrip().startswith("{"):
+                    # `sd gate check` refused (no worktree, no commit): it printed no result, so no check ran.
+                    raise Unread(f"sd gate check gave no result at {head[:12]}: {tail.strip()[-500:]}")
                 return [{"path": said, "line": "-", "summary": f"exit {code}: {tail.strip()[-1500:]}"}]
             # A check that rewrote a tracked file tested a tree `head` does not hold; an unread status raises Unread.
             changed = _read([*self.tools.git, "-C", str(self.work), "-c", "core.quotePath=false", "status",

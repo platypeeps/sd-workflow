@@ -1245,10 +1245,13 @@ class Supervise(Case):
         nothing."""
         tools = self.root / "tools"
         (tools / "gate.py").write_text(FAKE, encoding="utf-8")
-        self.tools = dataclasses.replace(self.tools, gate=[sys.executable, str(tools / "gate.py")])
+        # Class pass: the gate itself (`sd gate check`: its tree, environment and recipe), which fails here,
+        # not the bare entrypoints, which pass in the builder's worktree and environment.
+        self.tools = dataclasses.replace(self.tools, gate=[sys.executable, str(tools / "gate.py")],
+                                         check=[sys.executable, "-c", "exit(3)"])
         ended = self.ruling_round([{"blocker": 1, "ruling": "fix", "reason": "a failing input"},
                                    {"blocker": 2, "ruling": "reject", "reason": "no failing input"}],
-                                  after=("repeat2",), checks=lambda work: [[sys.executable, "-c", "exit(3)"]])
+                                  after=("repeat2",), checks=lambda work: [[sys.executable, "-c", "exit(0)"]])
         self.assertEqual(len(self.calls("gate")), 1, "the settled pass ran no gate")
         self.assertEqual(ended.get("outcome"), "blocked", ended)
         self.assertEqual([call for call in self.calls("sd-ship") if "enqueue" in call["argv"]], [])
@@ -1926,14 +1929,28 @@ class Supervise(Case):
         a pass; a managed run runs the repository's checks before it enqueues, and a failure goes back."""
         tools = self.root / "tools"
         (tools / "gate.py").write_text(FAKE, encoding="utf-8")
-        self.tools = dataclasses.replace(self.tools, gate=[sys.executable, str(tools / "gate.py")])
+        self.tools = dataclasses.replace(self.tools, gate=[sys.executable, str(tools / "gate.py")],
+                                         check=[sys.executable, "-c", "exit(3)"])  # the gate itself fails
         self.press()
         self.write_pr()
         self.plan(claude=["pass", "fix1", "fix"], sd_review=["blocking", "offdelta", "clean"])
-        fail = [sys.executable, "-c", "exit(3)"]
-        self.supervisor(checks=lambda work: [fail]).run()
+        self.supervisor(checks=lambda work: [[sys.executable, "-c", "exit(0)"]]).run()  # bare entrypoints pass
         self.assertGreaterEqual(len(self.calls("gate")), 1, "the deferral's pass ran no gate")
         self.assertEqual(len(self.calls("claude")), 3, "the failing check did not go back to the builder")
+
+    def test_a_gate_that_refused_to_run_is_no_fix_round(self):
+        """Class pass on sd:10286: `sd gate check` that refuses (exit 1, no result) ran no check: unknown,
+        for the reap's retry, never a blocker a paid fix round is sent to mend."""
+        tools = self.root / "tools"
+        (tools / "gate.py").write_text(FAKE, encoding="utf-8")
+        refuse = [sys.executable, "-c", "import sys; sys.exit('sd: HEAD names no commit')"]
+        self.tools = dataclasses.replace(self.tools, gate=[sys.executable, str(tools / "gate.py")], check=refuse)
+        self.press()
+        self.write_pr()
+        self.plan(claude=["pass", "fix1", "fix"], sd_review=["blocking", "offdelta", "clean"])
+        ended = self.supervisor(checks=lambda work: []).run()
+        self.assertEqual((ended["outcome"], len(self.calls("claude"))), (None, 2), ended)
+        self.assertIn("sd gate check gave no result", ended["why"])
 
     def test_a_filed_follow_up_is_a_rebuttal_the_lane_review_honours(self):
         """Review of sd:9769: the lane reviews the branch again; the same finding must not block it there."""
@@ -4620,20 +4637,6 @@ class Unmanaged(Case):
         work.mkdir()
         (work / "Makefile").write_text("precheck:\n\ttrue\ncheck:\n\ttrue\n")
         self.assertEqual(ADAPTER.own_checks(work), [["make", "precheck"], ["make", "check"]])
-
-    def test_own_checks_run_sd_check_for_a_test_recipe(self):
-        """A policy `test` recipe (`setup: exit 7`) wraps the gate's checks: bare entrypoints skip it, so
-        a pass made from a blocking review would enqueue what the gate fails. `sd-check` runs the recipe."""
-        work = self.root / "recipe"
-        work.mkdir()
-        (work / "Makefile").write_text("check:\n\ttrue\n")
-        with mock.patch.object(SD_LIB, "repo_declaration", return_value={"test": {"setup": "exit 7"}}):
-            commands = ADAPTER.own_checks(work)
-        self.assertEqual([Path(part).name for part in commands[0][1:]], ["sd-check"], commands)
-        self.assertEqual(len(commands), 1, commands)
-        unread = SD_LIB.DatabaseUnreadable("locked")
-        with mock.patch.object(SD_LIB, "repo_declaration", side_effect=unread), self.assertRaises(ValueError):
-            ADAPTER.own_checks(work)
 
 
 def sd_quote(argv):
