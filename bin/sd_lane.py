@@ -3075,9 +3075,9 @@ def post_merge(root: pathlib.Path, queue: Queue, environ: dict[str, str], answer
     retry = (ran or "").startswith(NOT_STARTED)
     # The commit the pass ran at, recorded with its result: the followups it answers are settled
     # against it, by this run or, if that write is lost, by the next (sd:10407).
-    passed_at, ran = passed_commit(main, ran)
+    passed_at, ran, owed = passed_commit(main, ran, retry)
     try:
-        update(queue, lambda entries: record_post_merge(entries, token, ran, retry, passed_at))
+        update(queue, lambda entries: record_post_merge(entries, token, ran, owed, passed_at))
     except LaneError as error:
         if ran is not None:
             ran = (f"{ran}; its result could not be recorded ({error}), so a later run may run the target "
@@ -3090,22 +3090,32 @@ def post_merge(root: pathlib.Path, queue: Queue, environ: dict[str, str], answer
     return {**answer, "post_merge": settle_post_merge(queue, main, ran) or ran}
 
 
-def passed_commit(main: pathlib.Path, ran: str | None) -> tuple[str | None, str | None]:
-    """`(commit, ran)`: the commit a passing target ran at in `main`, None for any other answer or
-    one git cannot read, which `ran` then says."""
+def passed_commit(main: pathlib.Path, ran: str | None, retry: bool) -> tuple[str | None, str | None, bool]:
+    """`(commit, ran, owed)`: the commit a passing target ran at in `main`, and whether the target is owed again.
+
+    A pass whose commit git cannot read is unknown, not settled: with no commit to settle its followups
+    against, the target stays owed and runs again, which `ran` says (sd:10407). `retry` is owed as it was."""
     if ran is None or not ran.startswith(POST_MERGE_PASSED):
-        return None, ran
+        return None, ran, retry
     done = publish_git(main, "rev-parse", "--verify", "HEAD")
     head = done.stdout.strip() if done is not None and done.returncode == 0 else ""
-    if re.fullmatch(r"[0-9a-f]{40,64}", head):
-        return head, ran
-    return None, f"{ran}; its commit could not be read, so no earlier post-merge followup is resolved"[:1200]
+    if FULL_COMMIT.fullmatch(head):
+        return head, ran, retry
+    return None, f"{ran}; its commit could not be read, so the target stays owed and runs again"[:1200], True
+
+
+#: A whole commit id, as a settle mark and a followup's stamp hold it.
+FULL_COMMIT = re.compile(r"[0-9a-f]{40,64}")
 
 
 def unsettled(row: dict[str, Any]) -> str | None:
-    """The commit a recorded pass on `row` ran at whose followups are not settled yet, or None."""
+    """The commit a recorded pass on `row` ran at whose followups are not settled yet, or None.
+
+    Stored data: a mark that is no whole commit id settles nothing and is left alone."""
     mark = row.get("post_merge")
-    return mark["settle"] if isinstance(mark, dict) and isinstance(mark.get("settle"), str) else None
+    if not isinstance(mark, dict) or not isinstance(mark.get("settle"), str):
+        return None
+    return mark["settle"] if FULL_COMMIT.fullmatch(mark["settle"]) else None
 
 
 def owes_settle(entries: list[dict[str, Any]]) -> bool:
@@ -3118,14 +3128,16 @@ def settle_post_merge(queue: Queue, main: pathlib.Path, ran: str | None) -> str 
     Each entry a pass settled carries the commit it ran at (`unsettled`); one hub transaction
     resolves the followups whose merge that commit holds and clears the marks, so a failed write
     leaves both for the next run, which settles without running the target again. A pass at an
-    older pin answers no newer failure, and a git that cannot answer covers nothing. None when
-    there was nothing to say; the merge stands either way.
+    older pin answers no newer failure. A git that cannot answer is unknown, not a no: it fails
+    the whole transaction the same way, so no mark is cleared on a guess. None when there was
+    nothing to say; the merge stands either way.
     """
     def pass_holds(commit: str, head: str) -> bool:
-        if not re.fullmatch(r"[0-9a-f]{40,64}", head):
+        # No such object here is a known no: it is in no commit's history. Any other git failure is
+        # unknown, and `read_git` raises it, so nothing resolves and the marks stay (sd:10407).
+        if read_git(main, "cat-file", "-e", commit, ok=(0, 1)).returncode:
             return False
-        done = publish_git(main, "merge-base", "--is-ancestor", commit, head)
-        return done is not None and done.returncode == 0
+        return read_git(main, "merge-base", "--is-ancestor", commit, head, ok=(0, 1)).returncode == 0
 
     def resolve_covered(connection: Any) -> list[int]:
         sd_lib.import_sd_db()  # every caller holds an sd_db connection, so this finds it
@@ -3290,7 +3302,7 @@ def post_merge_stamp(row: dict[str, Any]) -> str:
     its merge is unknown, so no pass resolves it, and the last line stays the lane's own, never the
     tail of the target's output."""
     merged = row.get("merge_commit")
-    if isinstance(merged, str) and re.fullmatch(r"[0-9a-f]{40,64}", merged):
+    if isinstance(merged, str) and FULL_COMMIT.fullmatch(merged):
         return f"\nMerged at {merged}"
     return "\nMerge commit not recorded: no pass resolves this, resolve it by hand"
 

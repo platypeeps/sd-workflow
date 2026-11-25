@@ -4813,11 +4813,9 @@ class PostMergeOwed(RefusingHub):
         finally:
             connection.close()
 
-    def test_a_settle_the_hub_refused_is_done_by_the_next_run_without_running_the_target(self) -> None:
-        """Failure table, settle (sd:10407 round 2): the pass was recorded, then the write that resolves the
-        followups it answered failed; no entry owed the target again, so no later run resolved them."""
+    def an_earlier_failure(self) -> int:
+        """An open lane followup on another item of this repository, for a merge the pinned checkout holds."""
         import sd_db
-        from sd_db import workflow
         self.assertEqual(self.register_items(1), [1])  # the queued entry's item, in this repository
         held = git(self.repo, "rev-parse", "HEAD")
         connection = sd_db.connect(home=self.tmp)
@@ -4829,6 +4827,54 @@ class PostMergeOwed(RefusingHub):
             connection.commit()
         finally:
             connection.close()
+        return failed
+
+    def git_cannot(self, *verb: str) -> Any:
+        """`publish_git` with no answer for `git <verb> ...`, as a timeout gives; every other read is real."""
+        real = sd_lane.publish_git
+        return mock.patch.object(sd_lane, "publish_git", lambda root, *args: (
+            None if args[:len(verb)] == verb else real(root, *args)))
+
+    def test_a_git_that_cannot_say_what_a_pass_holds_keeps_the_settle_for_the_next_run(self) -> None:
+        """Failure table, coverage (sd:10407 class pass: an unknown read as an answer): a git that could not
+        answer was read as "not held", and the settle mark was cleared with the followup still open."""
+        failed = self.an_earlier_failure()
+        for verb in (("cat-file",), ("merge-base",)):
+            with self.subTest(verb=verb), self.git_cannot(*verb):
+                answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+                self.assertIn("earlier post-merge followups stay open", answer["post_merge"])
+                self.assertEqual((self.runs(), self.open_followups()), (1, [failed]))
+        answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual((self.runs(), self.open_followups()), (1, []))
+        self.assertIn(f"resolved earlier post-merge followups #{failed}", answer["post_merge"])
+        self.assertNotIn("settle", self.entries()[0]["post_merge"])
+
+    def test_a_pass_whose_commit_git_cannot_read_stays_owed_and_runs_again(self) -> None:
+        """Failure table, pass commit (class pass): with HEAD unread the pass recorded no commit to settle
+        against, so its followups were never resolved. Unknown is owed: the target runs again."""
+        failed = self.an_earlier_failure()
+        with self.git_cannot("rev-parse", "--verify", "HEAD"):
+            answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertIn("its commit could not be read, so the target stays owed", answer["post_merge"])
+        self.assertEqual((self.runs(), self.open_followups(), self.entries()[0]["post_merge"]),
+                         (1, [failed], sd_lane.POST_MERGE_OWED))
+        answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual((self.runs(), self.open_followups()), (2, []))
+        self.assertIn(f"resolved earlier post-merge followups #{failed}", answer["post_merge"])
+
+    def test_a_settle_mark_that_is_no_commit_is_left_alone(self) -> None:
+        """Stored data, not trusted: a mark that names no full commit settles nothing and is not cleared."""
+        for mark in ("HEAD", "", "--all", 7, None, "ab" * 19):
+            with self.subTest(mark=mark):
+                self.assertIsNone(sd_lane.unsettled({"post_merge": {"ran": "x", "settle": mark}}))
+        self.assertIsNone(sd_lane.unsettled({"post_merge": "owed"}))
+        self.assertEqual(sd_lane.unsettled({"post_merge": {"settle": "ab" * 20}}), "ab" * 20)
+
+    def test_a_settle_the_hub_refused_is_done_by_the_next_run_without_running_the_target(self) -> None:
+        """Failure table, settle (sd:10407 round 2): the pass was recorded, then the write that resolves the
+        followups it answered failed; no entry owed the target again, so no later run resolved them."""
+        from sd_db import workflow
+        failed = self.an_earlier_failure()
         locked = sqlite3.OperationalError("database is locked")
         with mock.patch.object(workflow, "resolve_post_merge", side_effect=locked):
             answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
