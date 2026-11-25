@@ -646,12 +646,14 @@ def socks_proxy(host: str) -> tuple[str, int, bool] | None:
     scheme = value.partition("://")[0].lower()
     if scheme not in ("socks5", "socks5h") or _bypassed(host, proxies.get("no", "")):
         return None
-    parsed = urllib.parse.urlsplit(value)
+    # `urlsplit` raises on a bad bracketed host (`[::1:1080`), and `.port`
+    # on a port that is not a number: both are a value that does not parse.
     try:
+        parsed = urllib.parse.urlsplit(value)
         port = parsed.port
     except ValueError:
-        port = None
-    if not parsed.hostname or port is None or parsed.username is not None:
+        parsed, port = None, None
+    if parsed is None or not parsed.hostname or port is None or parsed.username is not None:
         # The value is not echoed: a user's password may be in it.
         raise ProxyRefused(f"ALL_PROXY is not {scheme}://<host>:<port> with no user name or password")
     return parsed.hostname, port, scheme == "socks5h"

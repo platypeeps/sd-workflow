@@ -281,7 +281,8 @@ class ThroughAProxy(unittest.TestCase):
 
     def test_a_socks_proxy_with_no_port_is_refused_by_name(self):
         for value in ("socks5h://127.0.0.1", "socks5h://:1080", "socks5h://127.0.0.1:x",
-                      "socks5h://user:pw@127.0.0.1:1080"):
+                      "socks5h://user:pw@127.0.0.1:1080", "socks5h://[::1:1080",
+                      "socks5h://[zz]:1080"):
             with self.subTest(value=value):
                 os.environ["ALL_PROXY"] = value
                 with self.assertRaises(remote.HubUnreachable) as raised:
