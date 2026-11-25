@@ -3950,6 +3950,39 @@ class CitedCloses(SharedQueue):
         head = git(tree, "rev-parse", "HEAD")
         self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), set())
 
+    def test_a_move_back_git_does_not_pair_keeps_the_close(self) -> None:
+        """sd:10214 class pass 6: a cited commit renames a branch file and edits it; a revert moves it back,
+        keeps the edit and rewrites the rest, so git pairs no rename. Neither name reads as the base: the old
+        name holds the work. Git's pairing decides nothing; both names are read. A true revert still closes
+        nothing."""
+        import sd_operations
+        a, *_ = self.open
+        tree, _ = self.committed("topic-move-back-unpaired")
+        lines = "".join(f"reader line {n}\n" for n in range(20))
+        (tree / "old.txt").write_text(lines, encoding="utf-8")
+        git(tree, "add", "old.txt")
+        git(tree, "commit", "-q", "-m", "docs: the reader")
+        start = git(tree, "rev-parse", "HEAD")
+        git(tree, "mv", "old.txt", "new.txt")
+        (tree / "new.txt").write_text(lines + "the cited edit\n", encoding="utf-8")
+        git(tree, "commit", "-q", "-am", f"feat: the reader\n\nCloses: sd:{a}")
+        cited = git(tree, "rev-parse", "HEAD")
+        git(tree, "mv", "new.txt", "old.txt")
+        (tree / "old.txt").write_text("".join(f"writer {n}\n" for n in range(40)) + "the cited edit\n",
+                                      encoding="utf-8")
+        git(tree, "commit", "-q", "-am", "revert: keep the old name")
+        head = git(tree, "rev-parse", "HEAD")
+        status = git(tree, "diff", "-M", "--name-status", cited, head)
+        self.assertNotIn("R", status[:1], "the fixture must be a move back git does not pair")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a})
+        git(tree, "checkout", "-q", "--detach", cited)
+        git(tree, "mv", "new.txt", "old.txt")
+        (tree / "old.txt").write_text(lines, encoding="utf-8")
+        git(tree, "commit", "-q", "-am", "revert: the reader")
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(git(tree, "diff", "--name-only", start, head), "")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), set())
+
     def test_a_move_back_of_a_rewritten_file_keeps_the_close(self) -> None:
         """sd:10214 class pass 5: the cited commit moves a file and rewrites it, so git sees a delete and an
         add, no rename. A revert that only moves it back keeps the rewrite: the work is read where it went."""

@@ -1046,7 +1046,8 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     file the cited commit renamed is one file: its work is read where a
     later commit holds it, and it reads as before only back at its old
     name with its old content, so a move back that keeps the edits
-    keeps the close (class pass 5).
+    keeps the close (class pass 5). Both names are read at each commit,
+    so a move back git pairs as no rename keeps it too (class pass 6).
 
     `kept_commits` reads this list after it, so this check hides none of
     its evidence (sd:10214 review). An undone commit stays in place with
@@ -1080,30 +1081,35 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
 
     def reads_before(sha: str, rev: str, names: list[str], want: dict[str, str],
                      home: dict[str, str] | None = None) -> bool | None:
-        """Whether `sha`'s files, where `rev` holds them, read as `want`; None when git gave no answer.
+        """Whether `sha`'s files, where `rev` holds them, read as `want`, keyed by path; None when git gave no answer.
 
         `home` names the path a file the cited commit renamed came from: such
-        a file reads as before only back at that path, with that content.
+        a file reads as before only when both its names read as `want`, so
+        git's rename pairing at `rev` decides nothing and a move back it does
+        not pair still holds the work (class pass 6). A move git follows to a
+        third name holds the work there.
         """
+        home = home or {}
         where = renames_since(sha, rev)
         if where is None:
             return None
         held = [where.get(name, name) for name in names]
-        now = blobs(rev, held)
-        return None if now is None else all(
-            now.get(at) == want.get(name) and (at not in now or at == (home or {}).get(name, at))
-            for at, name in zip(held, names, strict=True))
+        now = blobs(rev, held + [path for name in names if name in home for path in (name, home[name])])
+        if now is None:
+            return None
+        return all(now.get(at) == want.get(name) if name not in home else
+                   at in (name, home[name]) and all(now.get(path) == want.get(path) for path in (name, home[name]))
+                   for at, name in zip(held, names, strict=True))
 
     def undone(index: int, names: list[str], before: str) -> bool | None:
         """Whether reverts alone took the work in `names` out; None when the cited commit itself left them as
         `before` (a fix that restores the base), so no later commit undid anything there."""
         sha = commits[index][0]
-        # A file the cited commit renamed is one file under two names: what it held before is read at the
-        # name it came from, in `moved`, and its work wherever a later commit holds it (class pass 5).
-        came = blobs(before, [moved.get(name, name) for name in names])
-        if came is None:
+        # A file the cited commit renamed is one file under two names, in `moved`: what both names held before
+        # is read, and its work wherever a later commit holds it (class passes 5 and 6).
+        want = blobs(before, names + [moved[name] for name in names if name in moved])
+        if want is None:
             return False
-        want = {name: came[moved.get(name, name)] for name in names if moved.get(name, name) in came}
         own_read = reads_before(sha, sha, names, want, moved)
         if own_read is not False:
             return None if own_read else False
