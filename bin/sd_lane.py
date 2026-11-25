@@ -1048,6 +1048,8 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     name with its old content, so a move back that keeps the edits
     keeps the close (class pass 5). Both names are read at each commit,
     so a move back git pairs as no rename keeps it too (class pass 6).
+    A file holds no work only when both reads find it left as before,
+    so a revert of one file keeps a fix the other still ships.
 
     `kept_commits` reads this list after it, so this check hides none of
     its evidence (sd:10214 review). An undone commit stays in place with
@@ -1152,12 +1154,18 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
                 return False
         return left.get(next(iter(parents), "")) is True  # rev-list names the head first
 
-    def all_undone(index: int, names: list[str], before: str) -> bool:
+    def all_undone(index: int, names: list[str], befores: list[str]) -> bool:
         """Each file judged alone, by who took its own work out: a revert of the set's last file gets no credit
         for one a refactor removed before it, and two partial reverts a merge joins undo all of it (sd:10214
-        review). A file the cited commit left as `before` holds none of its work there and is not judged."""
-        # ponytail: one walk per file; cache reads per commit if a wide commit makes this slow.
-        judged = [verdict for verdict in (undone(index, [name], before) for name in names) if verdict is not None]
+        review). A file is undone when a read of `befores` finds reverts took it out, and holds no work only
+        when every read finds the cited commit left it as before: a deletion the base never saw still ships
+        against its parent (sd:10214 review, the one-file revert)."""
+        # ponytail: one walk per file and read; cache reads per commit if a wide commit makes this slow.
+        judged = []
+        for name in names:
+            verdicts = [undone(index, [name], before) for before in befores]
+            if True in verdicts or False in verdicts:
+                judged.append(True in verdicts)
         return bool(judged) and all(judged)
 
     kept = []
@@ -1173,7 +1181,7 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
             moved = {new: old for old, new in own_moves.items()}
             names = [name for name in names if name not in own_moves]  # the old name is the same file
             at_base = None if sd_ship_body.reverts_another(message) else fork
-            if names and any(all_undone(index, names, before) for before in (f"{sha}^", at_base) if before):
+            if names and all_undone(index, names, [before for before in (f"{sha}^", at_base) if before]):
                 message = ""
         kept.append((sha, message))
     return kept

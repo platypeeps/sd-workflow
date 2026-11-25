@@ -3983,6 +3983,30 @@ class CitedCloses(SharedQueue):
         self.assertEqual(git(tree, "diff", "--name-only", start, head), "")
         self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), set())
 
+    def test_a_revert_of_one_file_keeps_the_close_of_a_fix_the_other_file_ships(self) -> None:
+        """sd:10214 review: a cited commit deletes a file the branch added and adds another; a revert takes the
+        new file out. Against the base the deletion reads as no work, but against its parent it still ships:
+        a file holds no work only when every read says so. Reverting the deletion too closes nothing."""
+        import sd_operations
+        a, *_ = self.open
+        tree, _ = self.committed("topic-one-file-reverted")
+        (tree / "broken.txt").write_text("a broken draft\n", encoding="utf-8")
+        git(tree, "add", "broken.txt")
+        git(tree, "commit", "-q", "-m", "docs: a draft")
+        git(tree, "rm", "-q", "broken.txt")
+        (tree / "fix.txt").write_text("the fix\n", encoding="utf-8")
+        git(tree, "add", "fix.txt")
+        git(tree, "commit", "-q", "-m", f"fix: drop the draft\n\nCloses: sd:{a}")
+        git(tree, "rm", "-q", "fix.txt")
+        git(tree, "commit", "-q", "-m", "revert: hold the new file")
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a})
+        (tree / "broken.txt").write_text("a broken draft\n", encoding="utf-8")
+        git(tree, "add", "broken.txt")
+        git(tree, "commit", "-q", "-m", "revert: bring the draft back")
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), set())
+
     def test_a_move_back_of_a_rewritten_file_keeps_the_close(self) -> None:
         """sd:10214 class pass 5: the cited commit moves a file and rewrites it, so git sees a delete and an
         add, no rename. A revert that only moves it back keeps the rewrite: the work is read where it went."""
