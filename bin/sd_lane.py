@@ -3137,12 +3137,15 @@ def owes_settle(entries: list[dict[str, Any]]) -> bool:
 def settle_post_merge(queue: Queue, main: pathlib.Path, ran: str | None) -> str | None:
     """`ran`, after each recorded pass resolved the open `Post-merge:` followups it covers (sd:10407).
 
-    Each entry a pass settled carries the commit it ran at (`unsettled`); one hub transaction
-    resolves the followups whose merge that commit holds and clears the marks, so a failed write
-    leaves both for the next run, which settles without running the target again. A pass at an
-    older pin answers no newer failure. A git that cannot answer is unknown, not a no: it fails
-    the whole transaction the same way, so no mark is cleared on a guess. None when there was
-    nothing to say; the merge stands either way.
+    Each entry a pass settled carries the commit it ran at (`unsettled`). Three steps: a read
+    of the marks and the followups they owe, git with no hub lock held (sd:10529 review: a slow
+    git under `BEGIN IMMEDIATE` held every hub writer), then one hub transaction that resolves
+    the followups whose merge that commit holds and clears each mark still as it was read. A
+    mark set meanwhile is a newer pass, left for its own settle; a followup filed meanwhile is
+    not one git answered, so it stays open. A failed write leaves the marks for the next run,
+    which settles without running the target again. A pass at an older pin answers no newer
+    failure. A git that cannot answer is unknown, not a no: nothing resolves and no mark is
+    cleared on a guess. None when there was nothing to say; the merge stands either way.
     """
     def pass_holds(commit: str, head: str) -> bool:
         # No such object here is a known no: it is in no commit's history. Any other git failure is
@@ -3151,23 +3154,41 @@ def settle_post_merge(queue: Queue, main: pathlib.Path, ran: str | None) -> str 
             return False
         return read_git(main, "merge-base", "--is-ancestor", commit, head, ok=(0, 1)).returncode == 0
 
-    def resolve_covered(connection: Any) -> list[int]:
+    def heads_of(connection: Any) -> dict[str, list[int]]:
+        heads: dict[str, list[int]] = {}
+        for row in stored(connection, queue.repository):
+            if head := unsettled(row):
+                heads.setdefault(head, []).append(row["item"])
+        return heads
+
+    def read_owed(connection: Any) -> tuple[dict[Any, str], dict[str, list[int]], dict[str, set[str]]]:
         sd_lib.import_sd_db()  # every caller holds an sd_db connection, so this finds it
         from sd_db import workflow  # noqa: PLC0415
-        marked = [(row, unsettled(row)) for row in stored(connection, queue.repository)]
+        marks = {row["id"]: head for row in stored(connection, queue.repository) if (head := unsettled(row))}
+        heads = heads_of(connection)
+        return marks, heads, {head: {commit for _, commit in workflow.post_merge_owed(connection, items)}
+                              for head, items in heads.items()}
+
+    def resolve_covered(connection: Any, marks: dict[Any, str], heads: dict[str, list[int]],
+                        held: dict[tuple[str, str], bool]) -> list[int]:
+        sd_lib.import_sd_db()
+        from sd_db import workflow  # noqa: PLC0415
         resolved: list[int] = []
-        for head in sorted({head for _, head in marked if head}):
-            items = [row["item"] for row, at in marked if at == head]
+        for head, items in sorted(heads.items()):  # the passes as read: a mark set meanwhile awaits its own
             resolved += workflow.resolve_post_merge(connection, items,
-                                                    lambda commit, head=head: pass_holds(commit, head))
-        for row, head in marked:
-            if head:
+                                                    lambda commit, head=head: held.get((commit, head), False))
+        for row in stored(connection, queue.repository):
+            if row["id"] in marks and unsettled(row) == marks[row["id"]]:
                 row["post_merge"] = {key: value for key, value in row["post_merge"].items() if key != "settle"}
                 store(connection, queue.repository, row)
         return resolved
 
     try:
-        resolved = on_hub(queue, resolve_covered)
+        marks, heads, owed = on_hub(queue, read_owed, write=False)
+        if not marks:
+            return ran
+        held = {(commit, head): pass_holds(commit, head) for head, commits in owed.items() for commit in sorted(commits)}
+        resolved = on_hub(queue, lambda connection: resolve_covered(connection, marks, heads, held))
     except LaneError as error:
         said = f"earlier post-merge followups stay open: {error}"
     else:

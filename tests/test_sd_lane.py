@@ -4884,6 +4884,35 @@ class PostMergeOwed(RefusingHub):
         self.assertIsNone(sd_lane.unsettled({"post_merge": "owed"}))
         self.assertEqual(sd_lane.unsettled({"post_merge": {"settle": "ab" * 20}}), "ab" * 20)
 
+    def test_the_settle_runs_git_with_no_hub_write_lock_and_keeps_a_mark_set_meanwhile(self) -> None:
+        """Failure table, settle git (sd:10529 review): the settle ran `cat-file` and `merge-base` for each
+        followup inside the hub's `BEGIN IMMEDIATE`, so a slow git held every hub writer. Git now runs
+        between a read and a write; a mark another run set meanwhile is a new pass, left for its own settle."""
+        failed = self.an_earlier_failure()
+        real, locked, newer = sd_lane.read_git, [], "cd" * 20
+
+        def git_free_of_the_lock(tree: Any, *args: str, **kwargs: Any) -> Any:
+            if args[0] in ("cat-file", "merge-base"):
+                probe = sqlite3.connect(sd_lane.hub_database(self.environ), timeout=0)
+                try:
+                    probe.execute("BEGIN IMMEDIATE")
+                    probe.execute("ROLLBACK")
+                    locked.append(False)
+                except sqlite3.OperationalError:
+                    locked.append(True)
+                finally:
+                    probe.close()
+                if args[0] == "merge-base" and len(locked) == 2:  # another run's pass lands meanwhile
+                    sd_lane.update(self.store(), lambda rows: [row["post_merge"].update(settle=newer) for row in rows
+                                                               if isinstance(row.get("post_merge"), dict)])
+            return real(tree, *args, **kwargs)
+
+        with mock.patch.object(sd_lane, "read_git", git_free_of_the_lock):
+            answer = sd_lane.run_lane(self.repo, self.environ, self.ship)
+        self.assertEqual(locked, [False, False])
+        self.assertIn(f"resolved earlier post-merge followups #{failed}", answer["post_merge"])
+        self.assertEqual((self.open_followups(), self.entries()[0]["post_merge"].get("settle")), ([], newer))
+
     def test_a_settle_the_hub_refused_is_done_by_the_next_run_without_running_the_target(self) -> None:
         """Failure table, settle (sd:10407 round 2): the pass was recorded, then the write that resolves the
         followups it answered failed; no entry owed the target again, so no later run resolved them."""

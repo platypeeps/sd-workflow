@@ -922,17 +922,11 @@ def done_resolves(note: Mapping[str, Any]) -> bool:
     return machine_followup(note) and not lane_post_merge(note)
 
 
-def resolve_post_merge(connection: sqlite3.Connection, items: Collection[int],
-                       covered: Callable[[str], bool]) -> list[int]:
-    """Resolve each open `Post-merge: ` followup the lane wrote in the repositories of `items`
-    whose merge a passing target covered; the ids resolved (sd:10406, sd:10407).
-
-    The merge is the one the followup names (`stamped_merge`). One that names none is unknown:
-    it is never guessed from the item's recorded deliveries, whose note can lag the failure, so
-    no pass resolves it and a person does. `covered(commit)` says whether the commit the pass
-    ran at holds it, and raises when it cannot tell, which resolves nothing: a pass at an older
-    pin answers no failure of a newer merge. A note another writer resolved meanwhile is not
-    counted."""
+def post_merge_owed(connection: sqlite3.Connection, items: Collection[int]) -> list[tuple[int, str]]:
+    """`(note, merge)` for each open `Post-merge: ` followup the lane wrote in the repositories of
+    `items` that names its merge (`stamped_merge`), oldest first; a read, so no git runs under a
+    write lock (sd:10529). One that names none is unknown: it is never guessed from the item's
+    recorded deliveries, whose note can lag the failure, so no pass resolves it and a person does."""
     numbers = sorted({int(item) for item in items})
     if not numbers:
         return []
@@ -943,13 +937,23 @@ def resolve_post_merge(connection: sqlite3.Connection, items: Collection[int],
         "AND note.session = ? AND substr(note.body, 1, ?) = ? AND item.repo IN "
         f"(SELECT repo FROM item WHERE id IN ({marks}) AND repo IS NOT NULL) ORDER BY note.id",
         [LANE_SESSION, len(POST_MERGE_FOLLOWUP), POST_MERGE_FOLLOWUP, *numbers]).fetchall()
+    return [(note, commit) for note, body in found if (commit := stamped_merge(body)) is not None]
+
+
+def resolve_post_merge(connection: sqlite3.Connection, items: Collection[int],
+                       covered: Callable[[str], bool]) -> list[int]:
+    """Resolve each followup `post_merge_owed` lists whose merge a passing target covered; the ids
+    resolved (sd:10406, sd:10407).
+
+    `covered(commit)` says whether the commit the pass ran at holds it, and raises when it cannot
+    tell, which resolves nothing: a pass at an older pin answers no failure of a newer merge. A
+    note another writer resolved meanwhile is not counted."""
     held: dict[str, bool] = {}
     answered = []
-    for note, body in found:
-        commit = stamped_merge(body)
-        if commit is not None and commit not in held:
+    for note, commit in post_merge_owed(connection, items):
+        if commit not in held:
             held[commit] = bool(covered(commit))
-        if commit is not None and held[commit]:
+        if held[commit]:
             answered.append(note)
     with transaction(connection):
         return [note for note in answered if resolve_note(connection, note)]
