@@ -156,7 +156,9 @@ let polling = 0;
     const [vx, vy, vw, vh] = view(), u = vw / (box.clientWidth || W);
     const ring = r => `M${r.map(([x, y]) => `${P.x(x).toFixed(1)},${P.y(y).toFixed(1)}`).join('L')}Z`;
     // sd:4964: a lot is a tap target (data-lot) titled by its address; zoomed in to LABEL_ZOOM, the address is drawn on it.
-    const key = l => l.kind === 'tract' ? html` data-tract="${l.ain || l.label}"` : l.kind === 'lot' ? html` data-lot="${l.index}"` : '';
+    // sd:10612: a lot or tract is a named keyboard stop, as an asset is; Enter or Space selects it as a tap does.
+    const key = l => l.kind === 'tract' ? html` data-tract="${l.ain || l.label}" tabindex="0" role="button" aria-label="${parcelName(l)}"`
+      : l.kind === 'lot' ? html` data-lot="${l.index}" tabindex="0" role="button" aria-label="${parcelName(l)}"` : '';
     const mid = r => [r.reduce((a, p) => a + p[0], 0) / r.length, r.reduce((a, p) => a + p[1], 0) / r.length];
     const labels = zoom >= LABEL_ZOOM ? LOTS.filter(l => l.kind === 'lot' && l.address).map(l => { const [x, y] = mid(l.rings[0].slice(0, -1));
       return html`<text class="lot-label" x="${P.x(x).toFixed(1)}" y="${P.y(y).toFixed(1)}" font-size="${(11 * u).toFixed(2)}">${l.address}</text>`; }) : '';
@@ -260,6 +262,9 @@ let polling = 0;
       button.disabled = false; button.removeAttribute('aria-busy');
     }
   }
+  // A parcel's accessible name: its address or label, then what it is.
+  const parcelName = l => l.kind === 'lot' ? `${l.address || `Lot ${l.index + 1}`}, lot`
+    : `${l.label || `Tract ${l.ain}`}, ${owned(l) ? 'HOA-owned tract' : 'tract'}`;
   function selectTract(key, open) {
     const l = LOTS.find(x => (x.ain || x.label) === key); if (!l) return;
     show(html`<div class="kind"><span class="label">Tract</span></div><h2>${l.label || `Tract ${l.ain}`}</h2>${dl([['AIN', l.ain], ['Land use', l.luc], ['Acres', l.acres], ['Source', 'base.geojson']])}`, null, open);
@@ -619,15 +624,16 @@ let polling = 0;
       if (k.startsWith('day:')) $('trends').scrollIntoView({ behavior: reduce() ? 'auto' : 'smooth' });
       select(k, true);
     });
-    $('map').addEventListener('click', e => {
-      if (dragged) return;
-      const a = e.target.closest('[data-asset]'); if (a) { select(`asset:${a.dataset.asset}`, true); return; }
-      const t = e.target.closest('[data-tract]'); if (t) { selectTract(t.dataset.tract, true); return; }
-      const l = e.target.closest('[data-lot]'); if (l) selectLot(l.dataset.lot, true);
-    });
+    // One selection path for a tap and a key (sd:10612): the asset, tract or lot under the target; false for none.
+    const pick = target => {
+      const a = target.closest('[data-asset]'); if (a) { select(`asset:${a.dataset.asset}`, true); return true; }
+      const t = target.closest('[data-tract]'); if (t) { selectTract(t.dataset.tract, true); return true; }
+      const l = target.closest('[data-lot]'); if (l) { selectLot(l.dataset.lot, true); return true; }
+      return false;
+    };
+    $('map').addEventListener('click', e => { if (!dragged) pick(e.target); });
     $('map').addEventListener('keydown', e => {
-      const a = e.target.closest('[data-asset]');
-      if (a && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); e.stopPropagation(); select(`asset:${a.dataset.asset}`, true); }
+      if ((e.key === 'Enter' || e.key === ' ') && pick(e.target)) { e.preventDefault(); e.stopPropagation(); }
     });
     // Drag pans: a pointer move turns into viewBox units at the map's drawn width.
     let drag = null, dragged = false;

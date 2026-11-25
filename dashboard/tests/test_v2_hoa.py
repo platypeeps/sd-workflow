@@ -597,7 +597,7 @@ for (let i = 0; i < 3; i++) ELS['zoom-in'].listeners.click[0]();
 R.near = ELS.map.html;""", self.tract_doc())
         self.assertEqual(len(re.findall(r'class="hoa-mark"', out["R"]["far"])), 1)
         self.assertEqual(len(re.findall(r'class="hoa-mark"', out["R"]["near"])), 0)
-        self.assertEqual(len(re.findall(r'<path class="lot k-tract" data-tract="[^"]+" data-owned', out["R"]["near"])), 2)
+        self.assertEqual(len(re.findall(r'<path class="lot k-tract" data-tract="[^"]+"[^>]* data-owned', out["R"]["near"])), 2)
 
     def test_the_ring_key_shows_only_while_a_ring_is_drawn(self):
         out = self.run_page("""R.far = ELS.legend.html;
@@ -748,6 +748,25 @@ shellRun(cmd('item.email'), OBJ.get('{self.late}')); await flush();""", doc)
         self.assertIn("<dt>Owner of record</dt><dd>Test Owner B</dd>", det)
         self.assertIn("<dt>AIN</dt><dd>TEST-0002</dd>", det)
         self.assertIn("2026-09-05", det)
+
+    def test_a_lot_and_a_tract_are_named_keyboard_stops_that_enter_and_space_select(self):
+        """sd:10612: a parcel is a keyboard stop with a name, as an asset is; its key selects it as a tap does."""
+        key = ("const press = (k, attr, v) => { const e = { key: k, prevented: 0, preventDefault() { this.prevented++; }, "
+               "stopPropagation() {}, target: { closest: s => s === `[${attr}]` ? { dataset: attr === 'data-lot' ? { lot: v } "
+               ": { tract: v } } : null } }; ELS.map.listeners.keydown[0](e); return e.prevented; };\n")
+        out = self.run_page(key + """R.map = ELS.map.html;
+R.other = press('a', 'data-lot', '1'); R.none = ELS.details.html;
+R.enter = press('Enter', 'data-lot', '1'); R.lot = ELS.details.html;
+R.space = press(' ', 'data-tract', '0001'); R.tract = ELS.details.html;
+R.empty = press('Enter', 'data-nothing', '');""")
+        self.assertRegex(out["R"]["map"], r'<path class="lot k-lot" data-lot="0" tabindex="0" role="button" '
+                                          r'aria-label="100 Example St, lot"')
+        self.assertRegex(out["R"]["map"], r'<path class="lot k-tract" data-tract="0001" tabindex="0" role="button" '
+                                          r'aria-label="[^"]+, (HOA-owned )?tract"')
+        self.assertEqual((out["R"]["other"], out["R"]["enter"], out["R"]["space"], out["R"]["empty"]), (0, 1, 1, 0))
+        self.assertNotIn("<h2>102 Example St</h2>", out["R"]["none"])
+        self.assertIn("<h2>102 Example St</h2>", out["R"]["lot"])
+        self.assertIn('<span class="label">Tract</span>', out["R"]["tract"])
 
     def test_lot_data_not_fetched_is_a_partial_read_and_the_lot_says_why(self):
         self.lot_data.unlink()
