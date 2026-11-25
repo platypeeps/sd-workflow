@@ -5985,23 +5985,20 @@ class Hosts(Case):
         with self.on("hub"):
             self.assertEqual(self.tick()["spawned"], hub["claimed"], "nor the satellite's on the hub")
 
-    def test_the_hub_builds_a_satellite_lane_while_its_host_is_over_the_load_cap(self):
-        """sd:8991: a satellite over its load cap claimed nothing, and the hub left its rows queued; the hub now
-        builds them itself, and the repository's one slot holds the satellite's claim off meanwhile."""
-        (self.satellite / ".git").mkdir(parents=True)  # the hub builds only a repository checked out here
+    def test_the_hub_leaves_a_satellite_lane_queued_while_its_host_is_over_the_load_cap(self):
+        """Pack sd:10397 (reversing sd:8991): the hub built a busy satellite's rows, and their work sat in a hub
+        worktree that lane's lead could not read. The rows wait for the satellite's own tick."""
+        (self.satellite / ".git").mkdir(parents=True)  # checked out here too: still not the hub's to build
         _, sat = self.both()
         with self.on("work"):
             self.assertEqual(self.tick(load=30.0, load_cap=24.0)["claimed"], [])
         with self.on("hub"):
-            hub = self.tick()
-            taken = [build.run(self.db, ident) for ident in hub["claimed"]]
-            self.assertEqual([(row["repo"], row["owner"]) for row in taken], [(str(self.repo), "fixture")])
             taken = [build.run(self.db, ident) for ident in self.tick()["claimed"]]
-            self.assertEqual([(row["repo"], row["owner"]) for row in taken], [(str(self.satellite), "fixture")])
-        later = create_item(self.db, kind="task", title="Later", repo=str(self.satellite), status="ready")
-        build.queue(self.db, [later], who="operator")
+            self.assertEqual([(row["repo"], row["owner"]) for row in taken], [(str(self.repo), "fixture")])
+            self.assertEqual(self.tick()["claimed"], [], "the satellite's row is not the hub's")
         with self.on("work"):
-            self.assertEqual(self.tick()["claimed"], [], "the hub's bundle holds the repository's slot")
+            taken = [build.run(self.db, ident) for ident in self.tick()["claimed"]]
+            self.assertEqual([(row["repo"], row["owner"]) for row in taken], [(str(self.satellite), "fixture@work")])
 
     def test_a_tick_that_cannot_claim_says_why_in_its_beat(self):
         """Review round 4: a satellite whose tick claims nothing beats with the reason, and the hub refuses its

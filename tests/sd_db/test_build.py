@@ -2841,13 +2841,22 @@ class Hosts(Case):
 
     OVER = {"load": "the five-minute load is 30, above the cap of 24"}
 
-    def test_the_hub_takes_no_overloaded_satellite_row_whose_repository_it_has_not_checked_out(self):
-        """sd:8991 review: the hub claimed a satellite's row for a repository with no checkout on its disk, and the
-        run blocked at the worktree step, once per queued row while the satellite stayed busy."""
-        build.queue(self.db, [self.item(repo=SAT)], who="operator")
+    def test_the_hub_takes_no_overloaded_satellite_row_even_one_checked_out_here(self):
+        """Pack sd:10397: the hub built a busy satellite's fresh rows (sd:8991), and their work sat in a hub
+        worktree the satellite's lead could not read. A runner skips a row whose lane runs on another host."""
+        build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
         record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
         self.assertIsNone(self.claim(hosts=HUB))
         self.assertEqual(self.count("SELECT status FROM assignment"), "queued", "skipped, not blocked")
+
+    def hub_built(self):
+        """A bundle the hub built for the satellite's lane, as the overload fallback did before pack sd:10397;
+        its run. Its work is in a hub worktree."""
+        build.queue(self.db, [self.item(repo=SAT)], who="operator")
+        self.db.execute("UPDATE repo SET lane_host = NULL WHERE path = ?", (SAT,))
+        run = self.claim(hosts=HUB)
+        self.db.execute("UPDATE repo SET lane_host = 'work' WHERE path = ?", (SAT,))
+        return run
 
     def retried(self, run):
         """`run`'s bundle ended blocked and released, and queued again as Retry does."""
@@ -2882,9 +2891,7 @@ class Hosts(Case):
     def test_a_hub_retry_behind_another_row_is_not_blocked_on_the_satellites_quiet_beat(self):
         """sd:8991 review round 2: the quiet-dispatcher refusal ran before `_ran_on` routed the later rows, so the
         retry of the hub's fallback build, queued behind another row, blocked once its satellite went quiet."""
-        build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
-        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
-        fallback = self.claim(hosts=HUB)
+        fallback = self.hub_built()
         self.retried(fallback)
         build.queue(self.db, [self.item(priority=1)], who="operator")
         self.stale()
@@ -2911,10 +2918,8 @@ class Hosts(Case):
     def test_the_hubs_fallback_retry_stays_on_the_hub(self):
         """sd:8991 review: the retry of a bundle the hub built for a busy satellite moved back to the satellite,
         whose disk holds none of its work."""
-        build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
-        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
-        fallback = self.claim(hosts=HUB)
-        self.assertEqual(fallback["owner"], "fixture", "a fresh row of a checked-out repository moves")
+        fallback = self.hub_built()
+        self.assertEqual(fallback["owner"], "fixture")
         self.retried(fallback)
         record_state(self.db, "heartbeat", key="build-dispatch@work", body={})
         self.assertIsNone(self.claim(hosts=WORK), "the hub's fallback retry waits for the hub")
@@ -2950,9 +2955,7 @@ class Hosts(Case):
 
     def fallback_retried(self):
         """A bundle the hub built for the busy satellite's lane, ended blocked and released; its run."""
-        build.queue(self.db, [self.item(repo=self.checkout())], who="operator")
-        record_state(self.db, "heartbeat", key="build-dispatch@work", body=self.OVER)
-        fallback = self.claim(hosts=HUB)
+        fallback = self.hub_built()
         self.retried(fallback)
         self.db.execute("UPDATE assignment SET status = 'blocked' WHERE id = ?", (fallback["assignment"],))
         return fallback
