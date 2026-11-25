@@ -1151,11 +1151,15 @@ class LineBudgetTests(unittest.TestCase):
         #
         # 5219 -> 5222 merges sd:10205 from main: `bin/sd-review` +3 for
         # `reader_cost`. Measured: `sd-review` is 3252.
+        #
+        # 5222 -> 5225 merges pack sd:10235 from main: `bin/sd-review` +3,
+        # so plain output prints a blocking finding's evidence under its
+        # summary. Measured: `sd-review` is 3255 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5222,
+            5225,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

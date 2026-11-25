@@ -285,6 +285,43 @@ that start "Option:", the recommended one first, ending " (Recommended)". Leave 
 is none.>
 """
 
+DESIGN = """You are the headless lead, run by the build dispatcher (sd:10096). Write the design page for one
+design-only item. You hold the read tools only: read the repository in the current directory, its CLAUDE.md
+and AGENTS.md, its `templates/design.md` when it has one, and the code the item touches. You write nothing;
+the dispatcher writes your reply on the item, and the repository's next code bundle commits it as
+`docs/work/<date>-<slug>/design.md`.
+
+The item is sd:{item}, in {repo}:
+Title: {title}
+{body}
+
+Ask only what would change the design and the repository cannot answer. Keep requirements apart from
+assumptions; each acceptance criterion names a check and its result. A design that moves state in steps
+carries a failure table: step, state moved, failure, recovery, test.
+
+Your final message is the reply, in exactly this form and nothing else:
+
+## Spec
+
+<the design page's text, its sections as `###` headings>
+
+## Questions
+
+<At most {questions}, only those whose answer changes the design. Each is its text, then two or more lines
+that start "Option:", the recommended one first, ending " (Recommended)". Leave the section out when there
+is none.>
+"""
+
+#: Added to a bundle's brief for each design item it carries (sd:10096).
+DESIGNS = """
+Each design below is a design item's whole work, written by its design run. Commit it, with the rulings
+under it applied, as `docs/work/<date>-<slug>/design.md` in your first commit, `<date>` today's and
+`<slug>` from the item's title, with a `Closes: sd:N` trailer for its item. Each design gets a directory
+of its own, even when two titles match, and its front matter names its item alone: `item: sd:N`. Change
+no word of it but its headings and what a ruling changes.
+{designs}
+"""
+
 RESUME = """Your run was interrupted. Continue the brief in {worktree}: finish the items, commit, write the
 title to {title} and the body to {body}, and leave the worktree clean. Your final message is your report.
 {denied}"""
@@ -698,6 +735,17 @@ def defined_names(line: str) -> set[str]:
     return {name for pattern in (keyword, assigned, method) for name in re.findall(pattern, line)}
 
 
+def _has_text(path: Path) -> bool:
+    """Whether `path` holds a report: more than whitespace, or a file that exists but does not read (no
+    permission, not UTF-8), which the caller must not skip for an older one (lane review of build/sd-1726)."""
+    try:
+        return bool(path.read_text(encoding="utf-8").strip())
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True
+
+
 def instance_files(instances: Any) -> list[str]:
     """The file of each `path:line` in a finding's `instances`, as `sd-review` reads it; a value not a list
     names none (pack sd:9769)."""
@@ -951,8 +999,9 @@ def dispatch(connection, *, owner: str, load: float | None, load_cap: float | No
             why, taken = str(refusal), None
         claimed += [taken["id"]] if taken else []
     drafted: list[str] = []
-    if not why and hub and not claimed:
-        # A tick that claimed no build: a draft takes what machine room the builds leave, and no repository slot.
+    if not why and hub:
+        # A draft or design run takes what machine room the builds leave, and no repository slot, so it claims
+        # beside a bundle in the same tick (sd:10096); one runs at a time, so a tick starts at most two.
         available = build.room(connection, load=load, load_cap=load_cap, interactive=interactive, hosts=hosts)
         taken = draft.claim(connection, owner=owner, available=available)
         drafted += [taken["id"]] if taken else []
@@ -1029,17 +1078,23 @@ def _same_copy(path: Path, target: Path) -> tuple[int, int, int] | None:
 
 def _released(connection, path: Path) -> bool:
     """Whether every run that owns `path` ended and was released: all of the assignment's for its
-    `sd-N.title` or `.body.md`, else the run its name starts with."""
+    `sd-N.title`, `.body.md` or `.blockers.json` and for a run's `.review.out` or `.prior.out`, which a later
+    run of the assignment reads back (`Supervisor.review_files`, pack sd:10236); else the run its name starts with."""
     owner = re.fullmatch(r"sd-(\d+)\.(?:title|body\.md|blockers\.json)", path.name)
+    ident = path.name.split(".", 1)[0]
+    lead = int(owner[1]) if owner else None
+    if path.name in (f"{ident}.review.out", f"{ident}.prior.out"):
+        row = connection.execute("SELECT assignment FROM runner_run WHERE id = ?", (ident,)).fetchone()
+        lead = row[0] if row else None  # no such run: the query below finds none, and the file stays
     ended = "SELECT outcome IS NOT NULL AND released_at IS NOT NULL FROM runner_run WHERE "
-    rows = connection.execute(ended + "assignment = ?", (int(owner[1]),)) if owner \
-        else connection.execute(ended + "id = ?", (path.name.split(".", 1)[0],))
+    rows = connection.execute(ended + "assignment = ?", (lead,)) if lead is not None \
+        else connection.execute(ended + "id = ?", (ident,))
     released = [row[0] for row in rows]
     # A usage limit releases its run and queues the bundle again: the resume reads these files locally
     # (`Supervisor.round_blockers`, the body), so they wait while the last run is that one (review of build/sd-1557).
-    if owner and released:
+    if lead is not None and released:
         last = connection.execute("SELECT outcome FROM runner_run WHERE assignment = ? ORDER BY run DESC LIMIT 1",
-                                  (int(owner[1]),)).fetchone()
+                                  (lead,)).fetchone()
         if last is not None and last[0] == build.RATE_LIMITED:
             return False
     return bool(released) and all(released)
@@ -1068,7 +1123,8 @@ def archive(connection, local: Path, bulk: Path, *, settle: float = ARCHIVE_SETT
     """Move each file of an ended run from `local` to the same place under `bulk`; the new paths.
 
     `sd-<assignment>.title`, `.body.md` and `.blockers.json` move once every run of that assignment ended and was
-    released and its last did not end at a usage limit, which resumes on them; the rest once the run their name starts with was: an outcome alone leaves a blocked or abandoned run's
+    released and its last did not end at a usage limit, which resumes on them, as do a run's `.review.out` and
+    `.prior.out`, which a resumed run of the assignment verifies (pack sd:10236); the rest once the run their name starts with was: an outcome alone leaves a blocked or abandoned run's
     groups alive until the reap releases it, and they may still write. A file no run owns, one written in the
     last `settle` seconds or one whose copy fails stays for a later tick.
 
@@ -1552,6 +1608,11 @@ class Supervisor:
     def building(self) -> str | dict:
         self.enter("building", log_path=str(self.log))
         session = self.fresh()["session_id"]
+        if not session:
+            # Before the brief reads them: a ruling between the two is one the brief may not carry (sd:10096).
+            for item in [self.lead, *self.others]:
+                if draft.is_design(self.db, item) and draft.design(self.db, item) is not None:
+                    build.note_brief(self.db, item, self.ident)
         prompt = (RESUME if session else BRIEF).format(**self.brief())
         return self.claude(prompt, session=session, then="reviewing", role="building")
 
@@ -1658,12 +1719,15 @@ class Supervisor:
         """
         if not (self.fresh()["review_round"] or 0):
             return None
-        last, kept = self.out("review"), self.out("prior")
-        for path in (last, kept):
+        last, mine = self.review_files()
+        kept = self.out("prior")
+        for path in (last, mine):
             try:
                 text = path.read_text(encoding="utf-8")
-            except OSError:
+            except FileNotFoundError:
                 continue
+            except (OSError, ValueError):
+                return None  # a report that does not read proves nothing: review the branch in full
             if not text.strip():
                 continue  # no last report: the kept one is the last round's
             # A last report that fails a check below falls through to None, never to the older kept report,
@@ -1711,6 +1775,32 @@ class Supervisor:
             kept.write_text(encoded, encoding="utf-8")
             return answer
         return None
+
+    def review_files(self) -> tuple[Path, Path]:
+        """The last and kept review reports: this run's, or, when it holds neither, the latest earlier run's of
+        its assignment that does. A usage-limit or loss resume is a new run that keeps the round, so its own
+        names hold no review, and the next round would review the branch afresh (pack sd:10236). Only the runs
+        it resumed: the walk stops at a fresh claim (`claimed`), whose earlier attempt's review covers another
+        start (review of build/sd-1726). The files are read here, under the local root: the archive leaves them
+        until every run of the assignment is released (`_released`), and while a rate_limited run is the last.
+        So an earlier run that ended otherwise may have lost a report to the archive before this run claimed:
+        its prior with no last report beside it, or no report at all, ends the walk with none (lane review of
+        build/sd-1726): an older report omits the moved round's blockers."""
+        rows = [(self.ident, self.row["start_step"], None), *((row[0], row[1], row[2]) for row in self.db.execute(
+            "SELECT id, start_step, outcome FROM runner_run WHERE assignment = ? AND run < ? ORDER BY run DESC",
+            (self.row["assignment"], self.row["run"])))]
+        for ident, start, outcome in rows:
+            pair = (self.logs / f"{ident}.review.out", self.logs / f"{ident}.prior.out")
+            earlier = ident != self.ident
+            if any(_has_text(path) for path in pair):
+                if earlier and not os.path.lexists(pair[0]):
+                    break  # its last report moved: the prior left beside it is an older round's
+                return pair
+            if start in ("claimed", None):  # a row with no start step reads as fresh: fail closed
+                break
+            if earlier and outcome != build.RATE_LIMITED:
+                break  # its reports may be in the archive: a run before it reviewed an older round
+        return self.out("review"), self.out("prior")
 
     def verifiable(self, path: Any, head: str) -> bool:
         """Whether `sd-review --verify-report` takes a prior blocker at `path`: inside the checkout and a
@@ -2074,7 +2164,35 @@ class Supervisor:
         except ValueError:  # not UTF-8: the builder rewrites it, as for any other refusal
             return [f"the title at {self.title} or the body at {self.body} is not UTF-8 text"]
         refused = self.checked(self.work, self.base(), head, title.strip(), body) if self.checked else []
-        return refused + self.untabled(head, body)
+        return refused + self.untabled(head, body) + self.undesigned(head, body)
+
+    def undesigned(self, head: str, body: str) -> list[str]:
+        """The refusal for a design item the branch closes with no design.md of its own, or none (review of
+        sd:10096): two designs with one title closed from one file that kept only one. A design.md the branch
+        adds or changes under `docs/work` is the file of the item its front matter's `item: sd:N` line names."""
+        designs = [item for item in [self.lead, *self.others] if draft.is_design(self.db, item)]
+        cited = self.cited(self.work, self.base(), head, body) if designs else None
+        designs = [item for item in designs if item in (cited or ())]
+        if not designs:
+            return []
+        git = [*self.tools.git, "-C", str(self.work)]
+        owned = set()
+        for path in _read([*git, "diff", "--name-only", "-z", "--diff-filter=d", f"{self.base()}...{head}", "--",
+                           "docs/work"], env=self.env).split("\0"):
+            if re.fullmatch(r"docs/work/[^/]+/design\.md", path):
+                text = _read_bytes([*git, "cat-file", "blob", f"{head}:{path}"], env=self.env).decode("utf-8", "replace")
+                # The front matter's `item:` line alone: one in a Markdown example names no owner (review).
+                # It ends at the first closing `---` line, an empty one too (class pass).
+                lines = text.split("\n")
+                front = lines[1:lines.index("---", 1)] if lines[0] == "---" and "---" in lines[1:] else []
+                named = next((found for line in front if (found := re.fullmatch(r"item:\s*sd:([0-9]+)\s*", line))),
+                             None)
+                owned |= {int(named.group(1))} if named else set()
+        missing = [item for item in designs if item not in owned]
+        if not missing:
+            return []
+        return [f"each design item the branch closes needs a docs/work/<date>-<slug>/design.md of its own: "
+                f"{', '.join(f'sd:{item}' for item in missing)} has none whose first `item:` line names it"]
 
     def untabled(self, head: str, body: str) -> list[str]:
         """The failure-table refusal for a change that moves state in steps, or none (sd:9770).
@@ -2124,7 +2242,7 @@ class Supervisor:
         # One class-pass round past the bound (sd:9263). None when every member waits on a question no fix answers;
         # a question on one member leaves the others to fix, as enqueue delivers them without it.
         unasked = [item for item in [self.lead, *self.others]
-                   if not build.open_question(self.db, [item], self.row["asked_since"])]
+                   if not build.waits_on_operator(self.db, item, self.row["asked_since"])]
         if rounds == REVIEW_ROUNDS and unasked:
             return self.fix(CLASS_PASS, rounds=rounds)
         return self.finish("blocked", f"{rounds} review rounds left blockers: {self.summary(self.blockers)}")
@@ -2198,11 +2316,31 @@ class Supervisor:
         delivered = [item for item in [self.lead, *self.others] if item in cited]
         # A retry's branch keeps the lost run's trailers: a member this run's builder skipped with a question
         # waits on it (pack sd:6571).
-        asked = [item for item in delivered if build.open_question(self.db, [item], self.row["asked_since"])]
+        # Nor does a design whose ruling was taken back since the claim deliver (class pass of sd:10096).
+        asked = [item for item in delivered if build.waits_on_operator(self.db, item, self.row["asked_since"])]
         delivered = [item for item in delivered if item not in asked]
         if not delivered and asked:
             return self.finish("blocked", f"every cited item has an open question since the run started: "
                                           f"{', '.join(f'sd:{item}' for item in asked)}")
+        # A member ships with the design it waits on or not at all: one left out above, or with no commit,
+        # holds the delivery (class pass of sd:10096).
+        left = build.design_left(self.db, delivered, [self.lead, *self.others])
+        if left:
+            return self.finish("blocked", f"{left}; rule on the design or commit its design.md, then Retry")
+        # A design left out so still has its design.md on the branch, written under the old ruling: it would
+        # land with the code while its item stays open (review of sd:10096).
+        # Done or not: done says nothing of this branch's design.md, which would still land (review of sd:10096).
+        stale = sorted(build.aboard(self.db, asked))
+        if stale:
+            return self.finish("blocked", f"design {', '.join(f'sd:{item}' for item in stale)} waits on the "
+                                          f"operator again, and the branch holds its design.md written under the "
+                                          f"old ruling; rule on it, then Retry")
+        # Nor does a design ship without code: the lane refuses a branch of design records
+        # (`design_only_delivery`), and no reader of a delivery expects one with no code item (class pass).
+        if delivered and build.aboard(self.db, delivered) == set(delivered):
+            return self.finish("blocked", f"the branch delivers only design "
+                                          f"{', '.join(f'sd:{item}' for item in delivered)}, and a design ships "
+                                          f"with code; settle what held the code items, then Retry")
         # A member the operator cancelled on its own needs no line: the lane reads it from data (`build.left`).
         if asked:
             # The lane closes every open item a branch trailer cites; a `Refs:` line keeps these open.
@@ -2467,7 +2605,18 @@ class Supervisor:
             f"SELECT id, title FROM item WHERE id IN ({', '.join('?' for _ in items)})", items)}
         return {"worktree": self.work, "branch": self.row["branch"], "title": self.title, "body": self.body,
                 "title_max": TITLE_MAX, "items": "\n".join(f"- sd:{item} {titles.get(item, '')}" for item in items),
-                "findings": self.findings(items), "checklist": self.checklist(), "denied": self.denied()}
+                "findings": self.findings(items) + self.designs(items), "checklist": self.checklist(), "denied": self.denied()}
+
+    def designs(self, items: list[int]) -> str:
+        """The design and rulings of each design item in `items` (sd:10096); "" for none."""
+        found = []
+        for item in items:
+            text = draft.design(self.db, item) if draft.is_design(self.db, item) else None
+            if text is None:
+                continue
+            rulings = build.design_rulings(self.db, item)
+            found.append("\n".join([f"\n- sd:{item}:\n\n{text}", *(f"\n  {ruling}" for ruling in rulings)]))
+        return DESIGNS.format(designs="\n".join(found)) if found else ""
 
     def checklist(self) -> str:
         """The blocker classes recorded review rounds of the last `CHECKLIST_DAYS` found most, top first; "" for
@@ -2950,7 +3099,7 @@ class DraftSupervisor(Supervisor):
 
     def argv(self) -> list[str]:
         title, body = draft.item_text(self.db, self.item)
-        prompt = DRAFT.format(item=self.item, repo=self.row["repo"], title=title, body=body.strip() or "(no body)",
+        prompt = (DESIGN if draft.is_design(self.db, self.item) else DRAFT).format(item=self.item, repo=self.row["repo"], title=title, body=body.strip() or "(no body)",
                               questions=draft.QUESTIONS_MAX)
         return [*self.tools.claude, "-p", prompt, "--output-format", "stream-json", "--verbose",
                 "--tools", *draft.TOOLS, "--permission-mode", "dontAsk", "--strict-mcp-config",
@@ -2984,15 +3133,18 @@ class DraftSupervisor(Supervisor):
         if parsed is None:
             return self.finish("blocked", f"the reply has no `## Spec`, or a question short of two Option: "
                                           f"lines or of a recommended one; nothing was written; log {self.log}")
-        if not draft.write(self.db, self.ident, *parsed):
-            raise Lost
+        try:
+            if not draft.write(self.db, self.ident, *parsed):
+                raise Lost
+        except draft.Moved as moved:
+            return self.finish("blocked", f"{moved}; log {self.log}")
         return {"run": self.ident, "outcome": "done", "questions": len(parsed[1])}
 
 
 def failure_table(text: str) -> bool:
     """Whether `text` holds a failure table (sd:9770): a header line whose `|`-separated cells begin with the five
-    `FAILURE_COLUMNS` in order, then at least one data row in the lines of `|` right below it. Prose naming the
-    words, or a header with only its separator, is no table."""
+    `FAILURE_COLUMNS` in order, then at least one data row in the lines of `|` right below it, with a cell for
+    each column (pack sd:9866). Prose naming the words, or a header with only its separator, is no table."""
     lines = text.splitlines()
     for at, line in enumerate(lines):
         cells = [cell.strip().lower() for cell in line.strip().strip("|").split("|")]
@@ -3001,6 +3153,7 @@ def failure_table(text: str) -> bool:
         for row in lines[at + 1:]:
             if "|" not in row:
                 break
-            if not TABLE_SEPARATOR.fullmatch(row.strip()):
+            if (not TABLE_SEPARATOR.fullmatch(row.strip())
+                    and len(row.strip().strip("|").split("|")) >= len(FAILURE_COLUMNS)):
                 return True
     return False

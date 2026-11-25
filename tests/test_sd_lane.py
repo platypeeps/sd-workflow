@@ -2587,6 +2587,10 @@ class Landing(Lane):
                           (2, f"Post-merge: make post-merge passed in {self.repo}")])
         self.assertEqual(self.note_kinds[-2:], ["comment", "comment"])
 
+    def test_the_library_knows_the_lanes_session_by_the_lanes_own_name(self) -> None:
+        from sd_db import workflow
+        self.assertEqual(workflow.LANE_SESSION, sd_lane.LANE_SESSION)
+
     def test_a_makefile_without_the_target_runs_nothing_and_notes_nothing(self) -> None:
         tree, head = self.topic()
         (self.repo / "Makefile").write_text("post-merge-later:\n\ttouch ran\npost-merge := 1\n", encoding="utf-8")
@@ -5771,6 +5775,53 @@ class CancelMerged(SharedQueue):
         cancelled = sd_lane.cancel(self.repo, 1, self.environ)
         self.assertEqual((cancelled["status"], [row["status"] for row in self.entries()]), ("cancelled", ["cancelled"]))
         self.assertIn(f"sd:1 is done; its receipt merged at {'1' * 40}", cancelled["reason"])
+
+    def test_a_done_items_imported_entry_without_a_receipt_is_cancelled(self) -> None:
+        """sd:10381: the old file queue kept no ship receipt, and a satellite merge writes none on the hub.
+        A done item's imported entry is cancelled; an open item's, or a done item's own entry, refuses."""
+        import sd_db
+        self.prepared()
+
+        def refused() -> None:
+            before = self.rows()
+            with self.assertRaisesRegex(sd_lane.LaneError, "no merged ship receipt"):
+                sd_lane.cancel(self.repo, 1, self.environ)
+            self.assertEqual(self.rows(), before)
+
+        sd_lane.update(self.store(), lambda rows: rows[0].update(imported_from="queue.json"))
+        refused()  # the item is open
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            connection.execute("INSERT OR REPLACE INTO item(id, kind, title, status, created_at, updated_at) VALUES "
+                               "(1, 'task', 'one', 'done', '2026-10-09T00:00:00Z', '2026-10-09T00:00:00Z')")
+            connection.commit()
+        finally:
+            connection.close()
+        sd_lane.update(self.store(), lambda rows: rows[0].update(imported_from=None))
+        refused()  # done, but an entry this lane queued has a receipt to show
+        sd_lane.update(self.store(), lambda rows: rows[0].update(imported_from="queue.json"))
+        cancelled = sd_lane.cancel(self.repo, 1, self.environ)
+        self.assertEqual((cancelled["status"], [row["status"] for row in self.entries()]), ("cancelled", ["cancelled"]))
+        self.assertIn("sd:1 is done; the old file queue kept no ship receipt", cancelled["reason"])
+
+    def test_a_done_items_imported_entry_whose_receipt_excludes_its_head_is_refused(self) -> None:
+        """sd:10381 review: a receipt this clone reads, at a head that does not hold the queued one, says
+        other work merged; the done item's file-queue fallback is only for an item with no receipt."""
+        import sd_db
+        self.prepared()
+        sd_lane.update(self.store(), lambda rows: rows[0].update(imported_from="queue.json"))
+        connection = sd_db.connect(home=self.tmp)
+        try:
+            connection.execute("INSERT OR REPLACE INTO item(id, kind, title, status, created_at, updated_at) VALUES "
+                               "(1, 'task', 'one', 'done', '2026-10-09T00:00:00Z', '2026-10-09T00:00:00Z')")
+            connection.commit()
+        finally:
+            connection.close()
+        self.merged_receipt("main", 1, git(self.repo, "rev-parse", "main"))
+        before = self.rows()
+        with self.assertRaisesRegex(sd_lane.LaneError, "no merged ship receipt"):
+            sd_lane.cancel(self.repo, 1, self.environ)
+        self.assertEqual(self.rows(), before)
 
     def test_an_unreadable_receipt_proves_no_merge_and_blocks_no_other_cancel(self) -> None:
         """Failures: a receipt that cannot be read is no proof, so it refuses, and a pending cancel is as before."""

@@ -101,7 +101,8 @@ class OpenFollowups(unittest.TestCase):
             workflow.change_status(connection, item, "done", who="sd-ship", reason="delivered", followups={settled})
             closed = create_item(connection, kind="task", title="Closed by hand", status="in_progress")
             add_note(connection, closed, "followup", "Not owed after a hand close")
-            workflow.change_status(connection, closed, "done", who="operator", reason="test")
+            workflow.change_status(connection, closed, "done", who="operator", reason="test",
+                                   resolve_followups=True)
             self.assertEqual([row["id"] for row in reads.open_followups(connection)], [waiting])
 
     def test_a_close_reason_that_names_a_followup_does_not_keep_it_owed(self):

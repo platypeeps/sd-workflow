@@ -515,8 +515,9 @@ class TwoHomes(HomeCase):
 #: key, so equality is right for them. A lookup whose argument comes from a
 #: caller must probe `paths.keys` with `IN (...)` instead.
 EQUALITY_LOOKUPS = {
-    "build.py": (2, "`queued_fresh` binds the item row's `repo` the Build plan grouped by (pack sd:9484); a "
-                 "bundle drop's lane host lookup binds the ended run row's `repo` (pack sd:9709)"),
+    "build.py": (3, "`queued_fresh` binds the item row's `repo` the Build plan grouped by (pack sd:9484); a "
+                 "bundle drop's lane host lookup binds the ended run row's `repo` (pack sd:9709); `_riding` "
+                 "binds the queued row's item `repo` its one caller, `_press_refusal`, read (sd:10096)"),
     "progress.py": (5, "stored row values; `item.path` is repo-relative; `shadow.repo` is a slug"),
     "recovery.py": (1, "`_pieces` takes the row path `reimport` found with `row_for`"),
     "repos.py": (9, "`set_channels`, `set_clones`, `set_dependabot`, `set_github_issues`, `set_jira_project` and "

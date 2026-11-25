@@ -314,7 +314,9 @@ Queued assignments can be cancelled without completing their item, with
 `sd assignments cancel`. A queued build lead's cancel ends each queued
 member too, and the answer lists every row it ended (pack sd:9266).
 A cancelled queued or running build parks its items, so auto-pickup
-skips them until Unpark (sd:9222). A blocked assignment can be cancelled, whatever its
+skips them until Unpark (sd:9222). `sd assignments pickup` prints auto-pickup's
+state; `pickup on` or `off` sets it as the Queue panel does, refusing a value that
+moved since its read, and On kickstarts the dispatcher (sd:10001). A blocked assignment can be cancelled, whatever its
 item's status, once no runner attempt holds its lease, its own or its bundle
 lead's. A restore
 blocks starting jobs and starting or restarting services, while supported stop

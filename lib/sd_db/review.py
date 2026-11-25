@@ -728,7 +728,7 @@ def export(connection: sqlite3.Connection, item: int, *, who: str, key: bytes | 
                 raise ReviewError(f"sd:{item} has {count} question{'s' if count != 1 else ''} open; "
                                   f"a sealed export waits until every question is ruled")
             if found["closed"] is None:
-                workflow.change_status(connection, item, "done", who=who,
+                workflow.change_status(connection, item, "done", who=who, resolve_followups=True,
                                        reason="sealed export: closed before the key is read")
         rows = _key_rows(key)
     return _lines(read(connection, item), key, rows, now)
@@ -921,7 +921,7 @@ def _close(connection: sqlite3.Connection, item: int, who: str, reason: str) -> 
                       for question in found["questions"])
         if found["open"] or waiting or found["closed"] is not None:
             return False
-        workflow.change_status(connection, item, "done", who=who, reason=reason)
+        workflow.change_status(connection, item, "done", who=who, reason=reason, resolve_followups=True)
         return True
 
 

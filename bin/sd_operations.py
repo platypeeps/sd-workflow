@@ -191,6 +191,48 @@ def queue_builds(args: argparse.Namespace) -> int:
     return 0
 
 
+def kickstart_dispatch() -> dict:
+    """Start the dispatcher's tick now, as the panel's On does: `{ok, why}`."""
+    sys.path.insert(0, str(BIN.parent / "dashboard"))
+    try:
+        # By name, as `sd_work` loads its modules: the dashboard is not on bin/'s lint path.
+        return importlib.import_module("sd_dashboard.builds").kickstart()
+    finally:
+        sys.path.remove(str(BIN.parent / "dashboard"))
+
+
+def pickup_control(args: argparse.Namespace) -> int:
+    """`sd assignments pickup [on|off]`: auto-pickup's state; with on or off, write it bound to the value read,
+    as the Queue panel does (pack sd:10001). A value that moved since the read writes nothing and exits 1."""
+    sd_db = sd_handoff_rows.library()
+    try:
+        import sd_db.build as build
+        from sd_db.writes import SettingStale
+    except ImportError:
+        raise WorkRefusal("update this pack checkout, whose lib/ is the sd_db bin/ runs for builds") from None
+    connection = sd_handoff_rows.connect(sd_db, write=args.state is not None)
+    try:
+        state = build.pickup_state(connection)
+        if args.state is not None:
+            state = build.set_pickup(connection, args.state == "on", before=state["value"])
+    except SettingStale as stale:
+        print(f"sd assignments pickup: {stale}; nothing was written", file=sys.stderr)
+        return 1
+    except (sd_db.SdDbError, sqlite3.Error) as error:
+        raise WorkRefusal(str(error)) from error
+    finally:
+        connection.close()
+    result = {"on": state["on"], "value": state["value"], "since": state["since"],
+              "kickstart": kickstart_dispatch() if args.state == "on" and state["on"] else None}
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False))
+        return 0
+    print(f"auto-pickup {'on' if state['on'] else 'off'}" + (f" since {state['since']}" if state["since"] else ""))
+    if result["kickstart"] and not result["kickstart"]["ok"]:
+        print(f"the dispatcher starts at its next slot: {result['kickstart']['why']}", file=sys.stderr)
+    return 0
+
+
 def _beat_flags(args: argparse.Namespace) -> None:
     """Refuse a `beat` flag set that does not go together, before anything is read."""
     if not args.start and (args.worktree or args.branch or args.budget is not None or args.into):
@@ -761,6 +803,11 @@ def register(groups: Any) -> None:
             parser.add_argument("--drop", action="store_true",
                                 help="take the one item out of its ended bundle: the kept items' commits go on a "
                                      "fresh branch under a kept lead, and the item builds alone (pack sd:9709)")
+            parser.add_argument("--json", action="store_true")
+            parser = verbs.add_parser("pickup", help="print auto-pickup's state; on or off sets it, as the "
+                                                     "Queue panel does")
+            parser.set_defaults(handler=pickup_control)
+            parser.add_argument("state", nargs="?", choices=("on", "off"))
             parser.add_argument("--json", action="store_true")
             # One verb for the dispatcher (ruling #31545, pack sd:6356): the tick, and with a flag its supervisor or
             # the sessions it counts.
