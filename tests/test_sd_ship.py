@@ -2436,6 +2436,32 @@ roles:
         self.operation().save(copilot_reviews=[])
         self.assertEqual(self.merge()["phase"], "merged")
 
+    def test_a_request_interrupted_before_its_receipt_still_owes_the_review(self):
+        """sd:10207. The request lands, then prepare dies before it records it:
+        a merge at that head still waits for the Copilot review."""
+        original = ship.GitHub.request_copilot_review
+
+        def lands_then_dies(api, number):
+            original(api, number)
+            raise KeyboardInterrupt
+
+        with patch.object(ship.GitHub, "request_copilot_review", lands_then_dies):
+            with self.assertRaises(KeyboardInterrupt):
+                self.prepare("--copilot-review", "request")
+        self.assertEqual(len(self.double.copilot_requests), 1)
+        with self.assertRaisesRegex(ship.Refusal, "has not completed"):
+            self.merge()
+
+    def test_a_failed_explicit_request_leaves_no_receipt(self):
+        """sd:10207. A refused request owes nothing: the receipt is undone."""
+        def refuses(api, number):
+            raise ship.Refusal("reviewer endpoint refused")
+
+        with patch.object(ship.GitHub, "request_copilot_review", refuses):
+            with self.assertRaisesRegex(ship.Refusal, "reviewer endpoint refused"):
+                self.prepare("--copilot-review", "request")
+        self.assertEqual(self.operation().state.get("copilot_reviews") or [], [])
+
     def test_selected_automatic_review_adopts_an_existing_remote_request(self):
         self.enable_automatic_copilot()
         self.double.copilot_pending.add(1)

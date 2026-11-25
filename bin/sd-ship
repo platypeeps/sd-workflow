@@ -1156,16 +1156,21 @@ class Ship(SharedReview):
             self.clear_copilot_suppression()
             return result
 
-        if status == "absent":
-            try:
-                self.api.request_copilot_review(number)
-            except Refusal as error:
-                if automatic:
-                    return {"decision": "request_failed", "selection": "automatic",
-                            "warning": f"automatic Copilot review request failed: {error}"}
-                raise
-            status = "requested"
-        result = self.record_copilot_request(entries, number, head, selection, status, "recorded")
+        if status != "absent":
+            result = self.record_copilot_request(entries, number, head, selection, status, "recorded")
+            self.clear_copilot_suppression()
+            return result
+        # sd:10207. The receipt goes first: a prepare killed after GitHub took
+        # the request still leaves the review owed for a merge at this head.
+        result = self.record_copilot_request(entries, number, head, selection, "requested", "recorded")
+        try:
+            self.api.request_copilot_review(number)
+        except Refusal as error:
+            self.save(copilot_reviews=entries)
+            if automatic:
+                return {"decision": "request_failed", "selection": "automatic",
+                        "warning": f"automatic Copilot review request failed: {error}"}
+            raise
         self.clear_copilot_suppression()
         return result
 
