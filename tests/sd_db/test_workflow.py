@@ -15,6 +15,7 @@ from sd_db.migrate import initialise
 from sd_db.reads import item_by_id
 from sd_db.workflow import (
     HAND_KINDS,
+    LANE_SESSION,
     REPO_LESS_KINDS,
     TASK_STATUSES,
     MissingItem,
@@ -527,7 +528,7 @@ class DoneResolvesOpenNotes(WorkflowCase):
         comment = add_note(self.db, item, "comment", "Context only")
         settled = add_note(self.db, item, "followup", "Already done")
         resolve_item_note(self.db, settled, who="operator")
-        finished = change_status(self.db, item, "done", who="operator")
+        finished = change_status(self.db, item, "done", who="operator", resolve_followups=True)
         self.assertEqual(self.notes(item), {followup: ("followup", False), second: ("followup", False),
                                             comment: ("comment", True), settled: ("followup", False)})
         self.assertEqual(finished["notes"][-1]["body"],
@@ -537,7 +538,8 @@ class DoneResolvesOpenNotes(WorkflowCase):
         item = self.capture()["item"]["id"]
         followup = add_note(self.db, item, "followup", "Check the backup")
         question = add_note(self.db, item, "question", "Move all 45?\nOption: Approve all (Recommended)\nOption: Videos only")
-        finished = change_status(self.db, item, "done", who="sd-ship", reason="delivered at " + "a" * 40)
+        finished = change_status(self.db, item, "done", who="sd-ship", reason="delivered at " + "a" * 40,
+                                 resolve_followups=True)
         self.assertEqual(self.notes(item), {followup: ("followup", False), question: ("question", True)})
         self.assertEqual(finished["notes"][-1]["body"],
                          f"planning -> done by sd-ship: delivered at {'a' * 40}; resolved open note {followup}")
@@ -545,7 +547,8 @@ class DoneResolvesOpenNotes(WorkflowCase):
     def test_a_reason_keeps_its_place_before_the_resolved_notes(self):
         item = self.capture()["item"]["id"]
         followup = add_note(self.db, item, "followup", "Check the backup")
-        finished = change_status(self.db, item, "done", who="operator", reason="shipped by hand")
+        finished = change_status(self.db, item, "done", who="operator", reason="shipped by hand",
+                                 resolve_followups=True)
         self.assertEqual(finished["notes"][-1]["body"],
                          f"planning -> done by operator: shipped by hand; resolved open note {followup}")
 
@@ -569,9 +572,98 @@ class DoneResolvesOpenNotes(WorkflowCase):
         followup = add_note(self.db, item, "followup", "Check the backup")
         with patch("sd_db.workflow.transition", side_effect=sqlite3.OperationalError("disk I/O error")):
             with self.assertRaises(sqlite3.OperationalError):
-                change_status(self.db, item, "done", who="operator")
+                change_status(self.db, item, "done", who="operator", resolve_followups=True)
         self.assertEqual(self.notes(item), {followup: ("followup", True)})
         self.assertEqual(item_state(self.db, item)["item"]["status"], "planning")
+
+    def test_done_refuses_a_persons_open_followup_and_names_each(self):
+        """sd:10407: a hand close resolved a followup somebody still owed; now it refuses, as
+        `reporting.acknowledge` does, naming each as `resolve followup N`, and writes nothing."""
+        item = self.capture()["item"]["id"]
+        first = add_note(self.db, item, "followup", "Check the backup")
+        second = add_note(self.db, item, "followup", "Ask the vendor\nabout <b>the</b> renewal")
+        machine = add_note(self.db, item, "followup", "Build blocked: the gate failed")
+        before = item_state(self.db, item)
+        with self.assertRaisesRegex(TransitionRefused, rf"resolve followup {first}; resolve followup {second}$"):
+            change_status(self.db, item, "done", who="operator")
+        self.assertEqual(item_state(self.db, item), before)
+        self.assertNotIn(f"resolve followup {machine}", str(self.notes(item)))
+
+    def test_done_resolves_the_machines_followups_without_being_asked(self):
+        """sd:10407: Build blocked, Lane failed and Post-merge followups are no work a person
+        owes; 642 sat open on done items."""
+        item = self.capture()["item"]["id"]
+        bodies = ("Build blocked: the gate failed. Look at the log",
+                  "Lane failed in prepare at aaaaaaaaaaaa: gate red",
+                  "Lane skipped in merge at aaaaaaaaaaaa: stale head")
+        machine = [add_note(self.db, item, "followup", body,
+                            session=None if body.startswith("Build") else LANE_SESSION) for body in bodies]
+        change_status(self.db, item, "done", who="operator")
+        self.assertEqual(self.notes(item), {note: ("followup", False) for note in machine})
+
+    def test_a_close_leaves_a_post_merge_followup_open_and_kept(self):
+        """sd:10407 B2: done resolved `Post-merge: ` before any target passed; only a passing
+        refresh answers it (sd:10529). It blocks no close, and Today keeps it."""
+        cases: tuple[tuple[str | None, bool], ...] = ((None, False), ("none", False), (None, True), ("named", False))
+        for followups, asked in cases:
+            with self.subTest(followups=followups, resolve_followups=asked):
+                item = self.capture()["item"]["id"]
+                note = add_note(self.db, item, "followup", "Post-merge: make post-merge failed (exit 2)",
+                                session=LANE_SESSION)
+                # Round 2: `--resolve-followups`, and every caller that passes it, or a delivery naming
+                # the note, erased the failure too.
+                change_status(self.db, item, "done", who="operator", reason="delivered",
+                              followups=None if followups is None else [note] if followups == "named" else [],
+                              resolve_followups=asked)
+                self.assertEqual(self.notes(item), {note: ("followup", True)})
+                self.assertEqual(json.loads(item_state(self.db, item)["item"]["fields"])["kept_followups"], [note])
+
+    def test_a_persons_followup_that_opens_like_the_machines_is_still_owed(self):
+        """sd:10407 class pass: the author was read from the text alone, so an operator's
+        followup that opens `Post-merge: ` or `Build blocked: ` was resolved unasked and left
+        Today. The machine's are told by who wrote them: the lane's session, a build's none."""
+        cases = (("Post-merge: check the refresh by hand", "operator"),
+                 ("Lane failed in prepare at aaaaaaaaaaaa: pasted by a person", "dashboard"),
+                 ("Lane skipped in merge at aaaaaaaaaaaa: pasted", "a-harness-session"),
+                 ("Build blocked: I looked, the vendor must answer", "operator"),
+                 ("Build blocked: written under the lane's name", LANE_SESSION),
+                 ("Post-merge: a library write with no session", None),
+                 ("Post-merge: the lane's name with a suffix", LANE_SESSION + "-2"),
+                 ("Post-merge: an empty session", ""))
+        for body, session in cases:
+            with self.subTest(body=body):
+                item = self.capture()["item"]["id"]
+                note = add_note(self.db, item, "followup", body, session=session)
+                with self.assertRaisesRegex(TransitionRefused, f"resolve followup {note}$"):
+                    change_status(self.db, item, "done", who="operator")
+                change_status(self.db, item, "done", who="sd-ship", reason="delivered", followups=())
+                self.assertEqual(self.notes(item), {note: ("followup", True)})
+                self.assertEqual(json.loads(item_state(self.db, item)["item"]["fields"])["kept_followups"], [note])
+
+    def test_a_prefix_inside_the_body_is_not_the_machines(self):
+        for body in (" Build blocked: indented", "post-merge: lower case", "Post-merge:no space", ""):
+            item = self.capture()["item"]["id"]
+            add_note(self.db, item, "followup", body or "x")
+            if not body:
+                self.db.execute("UPDATE note SET body = '' WHERE item = ? AND kind = 'followup'", (item,))
+                self.db.commit()
+            with self.subTest(body=body), self.assertRaises(TransitionRefused):
+                change_status(self.db, item, "done", who="operator")
+
+    def test_resolve_followups_is_exactly_a_bool(self):
+        item = self.capture()["item"]["id"]
+        add_note(self.db, item, "followup", "Check the backup")
+        for value in ("yes", 1, None):
+            with self.subTest(value=value), self.assertRaises(WorkflowError):
+                change_status(self.db, item, "done", who="operator", resolve_followups=value)  # type: ignore[arg-type]
+
+    def test_a_delivery_resolves_machine_followups_and_keeps_the_others(self):
+        item = self.capture()["item"]["id"]
+        kept = add_note(self.db, item, "followup", "Waits on a reply")
+        machine = add_note(self.db, item, "followup", "Build blocked: gate red")
+        self.assertIsNone(self.db.execute("SELECT session FROM note WHERE id = ?", (machine,)).fetchone()[0])
+        change_status(self.db, item, "done", who="sd-ship", reason="delivered", followups=())
+        self.assertEqual(self.notes(item), {kept: ("followup", True), machine: ("followup", False)})
 
 
 class BranchClearing(WorkflowCase):
