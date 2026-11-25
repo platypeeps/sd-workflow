@@ -298,7 +298,7 @@ class ReviewTable(unittest.TestCase):
 
     def test_the_table_has_a_cap_on_every_row(self):
         body = review_table(RULE)[2:]
-        self.assertEqual(len(body), 4)
+        self.assertEqual(len(body), 5)
         for row in body:
             self.assertTrue(row.rsplit("|", 2)[1].strip(), f"no cap on row: {row}")
 
