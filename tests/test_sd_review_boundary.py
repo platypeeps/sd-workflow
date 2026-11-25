@@ -1125,11 +1125,18 @@ class LineBudgetTests(unittest.TestCase):
         # one spelling, the newest overlapping record decides, and a repeat
         # at any place of a blocker answers it. Measured: `sd-review` is
         # 3150 here.
+        #
+        # 5120 -> 5129 is the build/sd-1675 class pass (sd:10087):
+        # `bin/sd-review` +9 for `unanswered`, which narrows a prior blocker
+        # to the places no rebuttal answers before the verify prompt and
+        # the carry read it. Without it a blocker fixed at one instance and
+        # rebutted at another stayed open on the reader's reading of the
+        # rebuttal prose. Measured: `sd-review` is 3159 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5120,
+            5129,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

@@ -498,6 +498,28 @@ class PriorVerdictTests(unittest.TestCase):
             with self.subTest(label):
                 self.assertEqual(len(sd_review.carried(prior, [self.answer()], listed(*bodies))), count)
 
+    def test_a_blocker_stands_at_the_places_no_rebuttal_answers(self) -> None:
+        """build/sd-1675 class pass: `unanswered` narrows a blocker to its unanswered places; one answered at
+        every place, at none, or by a rebuttal a newer record overrides keeps every place."""
+        both = dict(finding(REPRO, line=10, summary="Empty input crashes", instances=["src.py:10", "b.py:40", "c.py"]),
+                    disposition="blocking", id="B1")
+        own = adjudicated(("src.py", "Empty input crashes", "rebutted"), line=10)
+        other = adjudicated(("b.py", "Empty input crashes", "rebutted"), line=40)
+        third = adjudicated(("c.py", "Empty input crashes", "rebutted"), line=None)
+        newer = adjudicated(("b.py", "Empty input crashes", "accepted"), line=40)
+        for label, bodies, place, left in (
+                ("its own place", (own,), ("b.py", 40), ["b.py:40", "c.py"]),
+                ("an instance", (other,), ("src.py", 10), ["src.py:10", "c.py"]),
+                ("all but an unplaced one", (other, own), ("c.py", None), ["c.py"]),
+                ("every place", (third, other, own), ("src.py", 10), both["instances"]),
+                ("none", (), ("src.py", 10), both["instances"]),
+                ("a newer record", (newer, other), ("src.py", 10), both["instances"])):
+            with self.subTest(label):
+                row = sd_review.unanswered(listed(*bodies), both)
+                self.assertEqual(((row["path"], row["line"]), row["instances"], row["id"]), (place, left, "B1"))
+        advisory = dict(both, disposition="advisory")
+        self.assertEqual(sd_review.unanswered(listed(own), advisory), advisory)
+
     def test_a_failed_readers_open_verdict_outlives_a_fallbacks_fixed(self) -> None:
         """build/sd-1675 review: a reviewer that failed after a valid `open` verdict, and a fallback that
         said `fixed`, cleared the blocker, since only the readers that completed were read."""
@@ -876,8 +898,33 @@ class RepeatReviewTests(RepeatFixture):
         prompts, _result, _stderr = self.prompts(scope="branch", base=base, verify_report=str(report))
         self.assertIn('"id": "B1"', prompts[0])
         self.assertIn("verdicts", prompts[0])
-        # build/sd-1675 review (bin/sd-review:2318): an instance fixed and another rebutted is a fixed blocker
-        self.assertIn("every listed instance is fixed or rebutted", prompts[0])
+
+    def test_a_verify_pass_asks_only_for_the_places_no_rebuttal_answers(self) -> None:
+        """build/sd-1675 class pass: a blocker is resolved place by place, yet the verify pass asked and carried
+        it whole, so the reader had to match the rebuttal's prose to an instance. With one instance rebutted
+        and the other fixed, the prompt, the verdict and the carried row name the standing place alone."""
+        (self.root / "src.py").write_text("".join(f"line{n}\n" for n in range(1, 41)), encoding="utf-8")
+        base = self.commit("add", "src.py") and self.commit("src")
+        self.commit("fix")
+        self.adjudication(("lane claim", "rebutted", "git 2.54 matches it literally"), head=base)
+        blocker = dict(finding(REPRO, path="bin/tool.py", line=3, summary="lane claim",
+                               instances=["./bin/tool.py:3", "src.py:10"]), disposition="blocking")
+        report = self.tmp / "prior.json"
+        report.write_text(json.dumps({"scope": "branch", "subject": {"head": base}, "status": "blocking",
+                                      "findings": [blocker]}))
+        prompts, _result, _stderr = self.prompts(scope="branch", base=base, verify_report=str(report))
+        [shown] = json.loads(prompts[0].split("Prior findings:\n", 1)[1].split("\n", 1)[0])
+        self.assertEqual((shown["id"], shown["path"], shown["line"], shown["instances"]), ("B1", "src.py", 10, ["src.py:10"]))
+        self.assertNotIn("Current source for prior finding bin/tool.py", prompts[0])
+        still = {"findings": [], "verdicts": [{"id": "B1", "verdict": "open", "evidence": "src.py:10 still raises"}]}
+        fixed = {"findings": [], "verdicts": [{"id": "B1", "verdict": "fixed", "evidence": "src.py:10 checks []"}]}
+        for label, answer, carried in (("open", still, [("src.py", 10, ["src.py:10"])]), ("fixed", fixed, [])):
+            with self.subTest(label):
+                runner = FakeRunner({"sd-check": sd_review.Completed(0, "{}", "")},
+                                    default=sd_review.Completed(0, json.dumps(answer), ""))
+                result = sd_review.review(self.root, namespace(scope="branch", base=base, verify_report=str(report)),
+                                          runner, self.environment(), self.chatgpt_home())
+                self.assertEqual([(r["path"], r["line"], r["instances"]) for r in result["findings"] if "carried" in r], carried)
 
     def test_a_prior_report_with_a_nul_in_a_path_is_refused_before_any_provider(self) -> None:
         """build/sd-1423 class pass (bin/sd-review:1865): the prompt's source read resolves each prior blocker's

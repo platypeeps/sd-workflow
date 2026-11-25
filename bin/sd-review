@@ -1804,6 +1804,17 @@ def is_rebutted(rebutted: Sequence[Rebuttal], row: Mapping[str, Any]) -> bool:
     return all(getattr(recorded_at(rebutted, path, row.get("summary"), line), "listed", False) for path, line in [(row.get("path"), row.get("line")), *((entry.strip(), None) for entry in (row.get("instances") if isinstance(row.get("instances"), list) else None) or [] if isinstance(entry, str) and entry.strip())])
 
 
+def unanswered(rebutted: Sequence[Rebuttal], row: Mapping[str, Any]) -> dict[str, Any]:
+    """`row` at the places whose newest record is no listed rebuttal (build/sd-1675 class pass): a blocker is settled
+    place by place, so the verify prompt, its verdict and a carried row name only those. One answered at every
+    place (`is_rebutted`) or at none, and any row that is no blocker, is as it was."""
+    own, found = f"{row.get('path')}:{row['line']}" if type(row.get("line")) is int else row.get("path"), row.get("instances")
+    places = list(dict.fromkeys([own, *(entry.strip() for entry in (found if isinstance(found, list) else []) if isinstance(entry, str) and entry.strip())]))
+    left = [place for place in places if not getattr(recorded_at(rebutted, place, row.get("summary"), None), "listed", False)]
+    first = instance_place(left[0]) if row.get("disposition") == "blocking" and 0 < len(left) < len(places) else None
+    return dict(row, path=first[0], line=first[1], instances=left) if first else dict(row)
+
+
 def dispose(findings: Sequence[Mapping[str, Any]], floor: str,
             rebutted: Sequence[Rebuttal] = (), *, repro: bool = False) -> list[dict[str, Any]]:
     """Label each finding `blocking` or `advisory` against the policy floor.
@@ -2314,7 +2325,7 @@ def prepared_prompt(root: pathlib.Path, subject: Subject, args: argparse.Namespa
                    "against the fix and current code, including code outside changed hunks. Return one verdicts "
                    "entry per id: fixed, with evidence naming the code that fixes it, or open, with evidence of the "
                    "input that still fails; an unrelated clean diff fixes nothing. A blocker that lists instances is "
-                   "fixed only when every listed instance is fixed or rebutted above. A blocker without a fixed verdict stays blocking, "
+                   "fixed only when every listed instance is fixed; one a rebuttal answered is not listed. A blocker without a fixed verdict stays blocking, "
                    "so do not repeat it in findings (sd:10087). Prior findings:\n" + evidence)
         required = len(prompt.encode())
         for name in sd_lib.blocking_places(previous["findings"]):  # each instance's file too (sd:9769)
@@ -2449,9 +2460,11 @@ def review(
             raise UsageError("cannot establish the refreshed target boundary for item authorship")
         authored_subject = subject if target_base == subject.head else subject._replace(base=target_base)
     database = getattr(args, "database", None)
-    rebutted = [] if preflight else rebutted_findings(root, subject, database, env)
+    rebutted, spelled = [] if preflight else rebutted_findings(root, subject, database, env), repo_spelling(root)  # build/sd-1423: one spelling before any match
+    rebutted = [row._replace(path=spelled(row.path), instances=tuple(respelled(spelled, {"instances": list(row.instances)})["instances"])) for row in rebutted]
+    shown = previous and dict(previous, findings=[unanswered(rebutted, respelled(spelled, row)) for row in previous["findings"]])
     checklist = "" if preflight else blocker_checklist(root, subject, database, env) + rebuttal_section(rebutted)
-    prompt, prepended, context = ("", False, []) if preflight else prepared_prompt(root, subject, args, previous, env, checklist)
+    prompt, prepended, context = ("", False, []) if preflight else prepared_prompt(root, subject, args, shown, env, checklist)
     try:
         _material, inventory = ("", []) if preflight else collect_material(root, subject, prompt)
         input_manifest = sd_review_material.input_manifest(inventory, prompt, {}, MAX_OUTPUT_BYTES, context)
@@ -2634,13 +2647,10 @@ def review(
         result["codex_skill_suppression"] = next((row for row in measures if row["state"] != SKILLS_SUPPRESSED), measures[-1]) if measures else skills
         outcomes = [outcome for _measured, attempts in answers for outcome in attempts]
         outcomes = [row._replace(status=FINDINGS if row.findings else CLEAN) if (row.diagnostic or {}).get("coverage") == "partial" and set(row.diagnostic["omitted_paths"]) <= {path["path"] for path in input_manifest.get("paths", ()) if path.get("media")} and any(other.status in (CLEAN, FINDINGS) for other in outcomes) else row for row in outcomes]
-        spelled = repo_spelling(root)  # build/sd-1423: one spelling per finding before any is matched
         outcomes = [row._replace(findings=tuple(respelled(spelled, found) for found in row.findings)) for row in outcomes]
         finish_review(result, outcomes, [outcome.backend for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)],
-                      [row._replace(path=spelled(row.path), instances=tuple(respelled(spelled, {"instances": list(row.instances)})["instances"]))
-                       for row in rebutted], subject.scope != "planning",
-                      prior_at(root, previous["subject"].get("head"), subject.head,
-                               [respelled(spelled, found) for found in prior_blockers(previous) if "id" in found]) if previous else ())
+                      rebutted, subject.scope != "planning", prior_at(root, shown["subject"].get("head"), subject.head,
+                                                                      [found for found in prior_blockers(shown) if "id" in found]) if shown else ())
         if any(not reads_checkout(provider) for provider in chosen if provider.name in result["reviewed_by"]):
             result["covers_from"] = None  # a reader handed patches saw no whole file: no chain (sd:9769)
     finally:
@@ -2655,7 +2665,7 @@ def review(
     gate_branch = getattr(args, "gate_check", None)
     result["check"] = (run_gate_check(root, runner, env, check_seconds, gate_branch, args, subject.head)
                        if gate_branch or args.scope in ("branch", "pr") else run_check(root, runner, env, check_seconds, sd_lib.gate_slot_bound(args)))
-    return after_gate(result, root, args, previous, env, (subject, prompt, _material, checklist), transport_overheads, chosen)
+    return after_gate(result, root, args, shown, env, (subject, prompt, _material, checklist), transport_overheads, chosen)
 
 
 #: The review statuses the repository gate runs after (sd:2605). A blocking or
