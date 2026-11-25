@@ -4583,7 +4583,8 @@ class Tick(Case):
         notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", self.items)]
         self.assertIn(build.FINDING + "pin the fixture clock", notes)
 
-    def rebuilt_after_lane_failure(self, count, *, lost=False, trimmed=False, closes=False, extra=False):
+    def rebuilt_after_lane_failure(self, count, *, lost=False, trimmed=False, closes=False, extra=False,
+                                   outsider=None, left_out=False):
         """sd:10379: a bundle of two fails in the lane; the operator moves its first `count` items back to ready and
         builds them again, a fresh press. Answers the failed branch's head and the new run's started worktree."""
         run = self.enqueued(2)
@@ -4591,6 +4592,8 @@ class Tick(Case):
         (self.repo / "work.txt").write_text("the bundle's work\n", encoding="utf-8")
         support.git(self.repo, "add", "work.txt")
         trailers = "".join(f"\nCloses: sd:{item}" for item in self.items) if closes else ""
+        if outsider is not None:  # a trailer for an item outside the bundle, kept open by the failed entry
+            trailers += f"\nCloses: sd:{outsider}"
         support.git(self.repo, "commit", "-qm", f"feat: the bundle's work\n{trailers}")
         head = support.git(self.repo, "rev-parse", "HEAD")
         support.git(self.repo, "checkout", "-q", "main")
@@ -4617,6 +4620,9 @@ class Tick(Case):
         assert again is not None
         self.bundle = again
         self.assertNotEqual(self.bundle["branch"], run["branch"])
+        if left_out:  # a member cancelled out of the new bundle before its worktree: not selected
+            self.db.execute("UPDATE assignment SET status = 'cancelled', result = ? WHERE parent = ? AND item = ?",
+                            (f"{build.ALONE}operator: left out", self.bundle["assignment"], self.items[1]))
         supervisor = self.supervisor()
         supervisor.logs.mkdir(parents=True, exist_ok=True)
         self.assertEqual(supervisor.worktree(), "building")
@@ -4658,6 +4664,21 @@ class Tick(Case):
         self.assertEqual(len(build.run(self.db, self.bundle["id"])["members"]), 3, "the unrelated item rides along")
         self.assertEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
         self.assertIn("whose lane entry failed", supervisor.brief()["findings"])
+
+    def test_a_failed_branch_that_closes_an_item_outside_the_bundle_starts_from_main(self):
+        """Review of build/sd-1808: the failed branch's commit closes an open item this bundle does not hold, one the
+        failed entry kept open; its merge would close it unselected. It starts from main and says why."""
+        kept = create_item(self.db, kind="task", title="Kept open", repo=str(self.repo), status="ready")
+        head, supervisor = self.rebuilt_after_lane_failure(2, closes=True, outsider=kept)
+        self.assertNotEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
+        self.assertEqual(supervisor.brief()["findings"].count("whose lane entry failed"), 0)
+        notes = [row[0] for row in self.db.execute("SELECT body FROM note WHERE item = ?", (self.items[0],))]
+        self.assertTrue(any(f"sd:{kept}" in body for body in notes), notes)
+
+    def test_a_member_cancelled_out_of_the_new_bundle_sends_it_to_main(self):
+        """Review of build/sd-1808: the bundle read counted a member cancelled out of it (`ALONE`) as selected."""
+        head, _ = self.rebuilt_after_lane_failure(2, left_out=True)
+        self.assertNotEqual(support.git(Path(self.bundle["work_path"]), "rev-parse", "HEAD"), head)
 
     def test_a_fresh_build_of_part_of_a_lane_failed_bundle_starts_from_main(self):
         """sd:10379: the failed branch's commits cite an item this bundle leaves out, so it starts from main."""

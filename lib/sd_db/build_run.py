@@ -1592,9 +1592,10 @@ class Supervisor:
         except Unread:
             start = self.start_point()
             if start is None and (failed := build.lane_failed_start(self.db, self.row["assignment"])):
+                why = self.start_refused or "did not read here"
                 self.once("start", lambda: add_note(
                     self.db, self.lead, "comment", f"Build run {self.ident}: {failed['branch']}, whose lane entry "
-                    f"failed, did not read here, so {branch} starts from {self.base()} without its commits"))
+                    f"failed, {why}, so {branch} starts from {self.base()} without its commits"))
             argv = ["worktree", "add", "-b", branch, str(self.work), start or self.base()]
         if self.child([*self.tools.git, "-C", str(self.repo), *argv], cwd=self.repo, name="worktree") != 0:
             return self.finish("blocked", f"git worktree add {self.work} failed; see {self.out('worktree')}")
@@ -1603,16 +1604,30 @@ class Supervisor:
     def start_point(self) -> str | None:
         """The commit a new branch starts from when its items' last bundle failed in the lane: the failed branch's
         local tip as the operator left it, not the entry's head or a pushed copy, which can hold commits the
-        operator removed (sd:10379); None, so the base, when there is none or it does not read."""
+        operator removed (sd:10379); None, so the base, when there is none or it does not read. None too when its
+        commits close an item this bundle does not hold, one the failed entry kept open: the lane's merge closes
+        every open item a trailer cites, so it would close one no one selected (review of build/sd-1808);
+        `start_refused` says which."""
+        self.start_refused = ""
         failed = build.lane_failed_start(self.db, self.row["assignment"])
         if failed is None:
             return None
         try:
             tip = _read([*self.tools.git, "-C", str(self.repo), "rev-parse", "--verify", "--quiet",
-                         "--end-of-options", f"refs/heads/{failed['branch']}^{{commit}}"], env=self.env)
-            return tip.strip() or None
+                         "--end-of-options", f"refs/heads/{failed['branch']}^{{commit}}"], env=self.env).strip()
         except Unread:
             return None
+        if not tip:
+            return None
+        cited = self.cited(self.repo, self.base(), tip, "")
+        if cited is None:
+            self.start_refused = "has commits whose trailers did not read"
+            return None
+        if outside := sorted(set(cited) - set(failed["items"])):
+            self.start_refused = ("has commits that close " + ", ".join(f"sd:{item}" for item in outside)
+                                  + ", outside this bundle")
+            return None
+        return tip
 
     def guarded(self) -> dict | None:
         """The kept worktree's guard: the blocked end when a subset Retry's split holds it, or it is gone or on

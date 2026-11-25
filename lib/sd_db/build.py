@@ -2899,8 +2899,9 @@ def lane_failed_start(connection, lead: int) -> dict | None:
     such run, the same for all, and every item it built is in this bundle: its commits cite them, and a missing one
     would not deliver. An item never built, or last built elsewhere, rides along: it cites nothing on that branch
     (lane review of build/sd-1808)."""
-    bundle = connection.execute("SELECT id, item FROM assignment WHERE (id = ? OR parent = ?) AND scope = ?",
-                                (lead, lead, SCOPE)).fetchall()
+    # A member cancelled out of this bundle (`ALONE`) is not selected: it neither builds nor delivers here.
+    bundle = connection.execute(f"SELECT id, item FROM assignment WHERE (id = ? OR parent = ?) AND scope = ? "
+                                f"AND {_in_group()}", (lead, lead, SCOPE)).fetchall()
     ids, items = {row["id"] for row in bundle}, {row["item"] for row in bundle}
     runs = set()
     for item in items:
@@ -2917,7 +2918,7 @@ def lane_failed_start(connection, lead: int) -> dict | None:
     failed = run(connection, runs.pop())
     if not {member["item"] for member in failed["members"]} <= items:
         return None
-    return {"run": failed["id"], "branch": failed["branch"], "detail": failed["detail"] or ""}
+    return {"run": failed["id"], "branch": failed["branch"], "detail": failed["detail"] or "", "items": items}
 
 
 def lane_fix_check(connection, run: str) -> tuple[list[dict], str, dict]:
