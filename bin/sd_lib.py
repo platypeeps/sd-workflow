@@ -481,6 +481,17 @@ def git_output(args: list[str], root: pathlib.Path) -> str | None:
     return _git(args, root)
 
 
+def git_show(root: pathlib.Path, spec: str) -> str | None:
+    """`git show <spec>` unstripped, or None: file bytes keep their last newline."""
+    try:
+        done = subprocess.run(["git", "-C", str(root), "show", spec], capture_output=True,  # nosec B603 B607
+                              text=True, timeout=GIT_TIMEOUT_SECONDS, check=False,
+                              env={**without_fsmonitor(os.environ), "GIT_TERMINAL_PROMPT": "0"})
+    except (OSError, subprocess.SubprocessError):  # a non-UTF-8 blob raises UnicodeDecodeError to the caller
+        return None
+    return done.stdout if done.returncode == 0 else None
+
+
 def instance_files(instances: Any) -> list[str]:
     """The file of each `path:line` in a finding's `instances`; a value not a list names none (sd:9769)."""
     return [re.sub(r":[0-9]+$", "", entry.strip()) for entry in (instances if isinstance(instances, list) else [])
