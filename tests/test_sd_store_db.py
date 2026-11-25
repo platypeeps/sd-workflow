@@ -292,3 +292,44 @@ class NoDatabase(DbStoreFixture):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TheEditorsRevision(DbStoreFixture):
+    """A section update guarded by the revision the editor read (sd:10621)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.plugin()
+        self.add("First tip", "--section", "Tip=Use the flag.")
+
+    def read(self, *extra: str) -> dict:
+        return json.loads(self.ok("store", "get", "pp.tip", "First tip", "--json", *extra).stdout)
+
+    def test_get_reports_the_revision_it_read(self) -> None:
+        whole = self.read()
+        part = self.read("--section", "Tip")
+        self.assertEqual(part, {"section": "Tip", "text": "Use the flag.", "revision": whole["revision"]})
+        self.assertRegex(whole["revision"], r"^[0-9a-f]{64}$")
+
+    def test_a_write_after_the_editors_read_refuses_the_stale_update(self) -> None:
+        read = self.read("--section", "Notes")["revision"]
+        self.ok("store", "set-section", "pp.tip", "First tip", "--section", "Notes=Someone else.")
+        for verb in ("set-section", "set"):
+            with self.subTest(verb=verb):
+                self.refused("store", verb, "pp.tip", "First tip", "--revision", read,
+                             "--section", "Notes=Mine.", says="changed; reload it")
+        self.assertIn("Someone else.", self.read()["body"])
+
+    def test_the_revision_the_editor_read_lets_the_update_through(self) -> None:
+        for verb in ("set-section", "set"):
+            with self.subTest(verb=verb):
+                read = self.read()["revision"]
+                self.ok("store", verb, "pp.tip", "First tip", "--revision", read,
+                        "--section", f"Notes=By {verb}.")
+                self.assertIn(f"By {verb}.", self.read()["body"])
+
+    def test_an_empty_revision_refuses(self) -> None:
+        done = self.run_sd("store", "set-section", "pp.tip", "First tip", "--revision", " ",
+                           "--section", "Notes=Mine.")
+        self.assertEqual(done.returncode, 2, done.stderr)
+        self.assertIn("--revision", done.stderr)
