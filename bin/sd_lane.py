@@ -3242,12 +3242,22 @@ def release_ruling(queue: Queue, item: int, main: pathlib.Path) -> Callable[[str
 POST_MERGE_PASSED = "make post-merge passed"
 
 
+def post_merge_stamp(row: dict[str, Any]) -> str:
+    """The followup's last line naming the merge it reports, which `sd_db.workflow.stamped_merge` reads.
+
+    Only a pass that holds that commit answers it (sd:10407); a row without a full commit gets none."""
+    merged = row.get("merge_commit")
+    return f"\nMerged at {merged}" if isinstance(merged, str) and re.fullmatch(r"[0-9a-f]{40,64}", merged) else ""
+
+
 def note_post_merge(rows: list[dict[str, Any]], ran: str, main: pathlib.Path) -> str:
-    """Note each row's item with `ran`, a comment when the target passed, else a followup; `ran` with any failure."""
+    """Note each row's item with `ran`, a comment when the target passed, else a followup naming its merge;
+    `ran` with any failure."""
     kind = "comment" if ran.startswith(POST_MERGE_PASSED) else "followup"
     for row in rows:
         try:
-            written = default_note(row["item"], f"Post-merge: {ran}", main, kind)
+            stamp = post_merge_stamp(row) if kind == "followup" else ""
+            written = default_note(row["item"], f"Post-merge: {ran}{stamp}", main, kind)
         except Exception as error:  # noqa: BLE001 -- the merge stands; the answer keeps what the note could not
             written = f"failed: {type(error).__name__}: {error}"
         if written != "written":

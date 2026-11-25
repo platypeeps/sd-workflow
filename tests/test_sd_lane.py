@@ -2630,6 +2630,15 @@ class Landing(Lane):
         from sd_db import workflow
         self.assertEqual(workflow.LANE_SESSION, sd_lane.LANE_SESSION)
 
+    def test_the_library_reads_the_merge_the_lanes_followup_names(self) -> None:
+        from sd_db import workflow
+        commit = "ab" * 20
+        body = "Post-merge: make post-merge failed (exit 2)" + sd_lane.post_merge_stamp({"merge_commit": commit})
+        self.assertEqual(workflow.stamped_merge(body), commit)
+        for merged in (None, "", "not-a-sha", "AB" * 20, commit + "\nMerged at " + commit, 7):
+            with self.subTest(merged=merged):
+                self.assertEqual(sd_lane.post_merge_stamp({"merge_commit": merged}), "")
+
     def test_a_makefile_without_the_target_runs_nothing_and_notes_nothing(self) -> None:
         tree, head = self.topic()
         (self.repo / "Makefile").write_text("post-merge-later:\n\ttouch ran\npost-merge := 1\n", encoding="utf-8")
@@ -2656,7 +2665,9 @@ class Landing(Lane):
         self.assertEqual(self.entries()[0]["status"], "merged")
         self.assertTrue(answer["post_merge"].startswith(f"make post-merge failed (exit 2) in {self.repo}:"), answer)
         self.assertIn("the install broke", answer["post_merge"])
-        self.assertEqual((self.notes[-1][1], self.note_kinds[-1]), (f"Post-merge: {answer['post_merge']}", "followup"))
+        # Round 2: the followup names the merge it reports, so only a pass that holds it answers it.
+        self.assertEqual((self.notes[-1][1], self.note_kinds[-1]),
+                         (f"Post-merge: {answer['post_merge']}\nMerged at {'c0ffee' * 6 + 'c0ff'}", "followup"))
         tree, head = self.topic("slow")
         self.post_merge("sleep 60")
         self.merge_lands(tree, 2, head)
@@ -2695,7 +2706,8 @@ class Landing(Lane):
         self.assertTrue(answer["post_merge"].startswith("make post-merge skipped: the main checkout did not "
                                                         "fast-forward (fast-forward skipped: the main checkout is on "
                                                         "elsewhere"), answer["post_merge"])
-        self.assertEqual((self.notes[-1][1], self.note_kinds[-1]), (f"Post-merge: {answer['post_merge']}", "followup"))
+        self.assertEqual((self.notes[-1][1], self.note_kinds[-1]),
+                         (f"Post-merge: {answer['post_merge']}\nMerged at {'c0ffee' * 6 + 'c0ff'}", "followup"))
 
     def test_a_variable_the_lanes_environment_omits_never_reaches_the_post_merge(self) -> None:
         """sd:7051: `{**os.environ, **environ}` put back what the caller dropped, such as a GIT_DIR naming

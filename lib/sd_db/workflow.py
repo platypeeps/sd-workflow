@@ -899,6 +899,16 @@ def machine_followup(note: Mapping[str, Any]) -> bool:
         or (session is None and body.startswith(BUILD_FOLLOWUP)))
 
 
+#: The last line of the lane's post-merge followup (`sd_lane.post_merge_stamp`): the merge it reports.
+MERGED_AT = re.compile(r"\nMerged at ([0-9a-f]{40,64})\Z")
+
+
+def stamped_merge(body: object) -> str | None:
+    """The merge commit a lane post-merge followup names on its last line, or None (sd:10407)."""
+    found = MERGED_AT.search(body) if isinstance(body, str) else None
+    return found.group(1) if found else None
+
+
 def lane_post_merge(note: Mapping[str, Any]) -> bool:
     """Whether `note` is the lane's `Post-merge: ` followup: a failed target only a covering pass answers.
 
@@ -915,29 +925,32 @@ def done_resolves(note: Mapping[str, Any]) -> bool:
 def resolve_post_merge(connection: sqlite3.Connection, items: Collection[int],
                        covered: Callable[[str], bool]) -> list[int]:
     """Resolve each open `Post-merge: ` followup the lane wrote in the repositories of `items`
-    whose item's delivered commit a passing target covered; the ids resolved (sd:10406, sd:10407).
+    whose merge a passing target covered; the ids resolved (sd:10406, sd:10407).
 
-    `covered(commit)` says whether the checkout the pass ran in holds `commit`: a pass at an
-    older pin answers no failure of a newer commit. An item with no recorded delivery keeps its
-    followup. `covered` runs outside the write, and a note another writer resolved meanwhile
-    is not counted."""
+    The merge is the one the followup names (`stamped_merge`); one written before the stamp
+    stands for its item's latest recorded delivery. `covered(commit)` says whether the commit
+    the pass ran at holds it: a pass at an older pin answers no failure of a newer merge, and
+    a followup with neither keeps open. A note another writer resolved meanwhile is not counted."""
     numbers = sorted({int(item) for item in items})
     if not numbers:
         return []
     marks = ", ".join("?" for _ in numbers)
     found = connection.execute(
-        "SELECT note.id, note.item FROM note JOIN item ON item.id = note.item "
+        "SELECT note.id, note.item, note.body FROM note JOIN item ON item.id = note.item "
         "WHERE note.kind = 'followup' AND note.resolved_at IS NULL "
         "AND note.session = ? AND substr(note.body, 1, ?) = ? AND item.repo IN "
         f"(SELECT repo FROM item WHERE id IN ({marks}) AND repo IS NOT NULL) ORDER BY note.id",
         [LANE_SESSION, len(POST_MERGE_FOLLOWUP), POST_MERGE_FOLLOWUP, *numbers]).fetchall()
-    held: dict[int, bool] = {}
-    for _, item in found:
-        if item not in held:
-            commit = _delivered_commit(connection, item)
-            held[item] = commit is not None and bool(covered(commit))
+    held: dict[str, bool] = {}
+    answered = []
+    for note, item, body in found:
+        commit = stamped_merge(body) or _delivered_commit(connection, item)
+        if commit is not None and commit not in held:
+            held[commit] = bool(covered(commit))
+        if commit is not None and held[commit]:
+            answered.append(note)
     with transaction(connection):
-        return [note for note, item in found if held[item] and resolve_note(connection, note)]
+        return [note for note in answered if resolve_note(connection, note)]
 
 
 def _delivered_commit(connection: sqlite3.Connection, item: int) -> str | None:
