@@ -1160,11 +1160,16 @@ class LineBudgetTests(unittest.TestCase):
         # `_unruled`, so a rebuttal at an adjacent line does not clear an
         # unruled prior blocker no other finding holds. Measured: `sd-review`
         # is 3262 here.
+        #
+        # 5232 -> 5234 is the sd:10191 class pass at bin/sd-review:1878: +2
+        # for `_shadowed` in `prior_evidence`; a rebutted place no longer
+        # takes an open blocker's hold from a finding beside it. Measured:
+        # `sd-review` is 3264 here.
         lane = sorted(REVIEW_LANE)
         total = sum(_lines(path) for path in lane)
         self.assertLessEqual(
             total,
-            5232,
+            5234,
             f"the review lane is {total} lines across {[p.name for p in lane]}",
         )
 

@@ -330,6 +330,54 @@ class PriorLineTests(RepeatFixture):
         [record] = sd_review.dispose([repeat], "high", rebutted, repro=True, prior=[])
         self.assertEqual(record["disposition"], "advisory")
 
+    def test_a_rebutted_repeat_reads_the_same_hold_as_any_uncited_finding(self) -> None:
+        """Class pass of sd:10191 (bin/sd-review:1878). Class: a listed rebuttal made its uncited repeat
+        advisory before the hold of an open prior blocker was read, while every other uncited finding
+        fails closed beside one (`prior_evidence`). A rebuttal sits at line 20; an unruled prior blocker
+        sits nearby under another summary, as a second reviewer words it. The repeat at 20 blocks while
+        that blocker is within `SHIFT_LINES` and no other blocking finding holds it; farther off, or
+        held by its own repeat, the rebuttal still answers line 20."""
+        rebutted = [sd_review.Rebuttal("a" * 40, "src.py", sd_review.summary_key("Division by zero"), 20, True,
+                                       "src.py", "Division by zero", "a reason", ("src.py:20",), "")]
+        repeat = finding(line=20, summary="Division by zero")
+        for line, expected in ((21, "blocking"), (20, "blocking"), (17, "blocking"), (23, "blocking"),
+                               (24, "advisory"), (None, "advisory")):
+            with self.subTest(open_blocker_at=line):
+                prior = [dict(finding(REPRO, line=line, summary="A zero divisor crashes the report"),
+                              disposition="blocking")]
+                [record] = sd_review.dispose([repeat], "high", rebutted, repro=True, prior=prior)
+                self.assertEqual(record["disposition"], expected)
+        prior = [dict(finding(REPRO, line=21, summary="A zero divisor crashes the report"), disposition="blocking")]
+        own = finding(line=21, summary="A zero divisor crashes the report")
+        disposed = sd_review.dispose([repeat, own], "high", rebutted, repro=True, prior=prior)
+        self.assertEqual([(row["disposition"], row.get("evidence")) for row in disposed],
+                         [("advisory", None), ("blocking", REPRO)])
+        other = [dict(finding(REPRO, path="other.py", line=20, summary="A zero divisor crashes the report"),
+                      disposition="blocking")]
+        [record] = sd_review.dispose([repeat], "high", rebutted, repro=True, prior=other)
+        self.assertEqual(record["disposition"], "advisory")
+
+    def test_a_rebutted_place_does_not_shadow_an_open_blocker_from_a_finding_beside_it(self) -> None:
+        """Class pass of sd:10191 (bin/sd-review:1878), in `prior_evidence`: the ruled blocker sits rebutted
+        at line 20 and an open blocker of the same summary sits a few lines on. An uncited finding beside
+        line 20, not on it, echoed the rebutted place as the nearer one, so it took no hold and posted as
+        advisory: the rebuttal cleared the open blocker. Without the rebuttal the same finding blocks, so
+        with it the finding blocks too. A finding that repeats the open blocker at its own line still
+        releases it."""
+        rebutted = [sd_review.Rebuttal("a" * 40, "src.py", sd_review.summary_key("Division by zero"), 20, True,
+                                       "src.py", "Division by zero", "a reason", ("src.py:20",), "")]
+        for at, blocker in ((19, 24), (19, 27), (21, 25), (21, 27), (22, 27), (18, 28)):
+            with self.subTest(finding_at=at, open_blocker_at=blocker):
+                prior = [dict(finding("old evidence", line=20, summary="Division by zero"), disposition="blocking"),
+                         dict(finding(REPRO, line=blocker, summary="Division by zero"), disposition="blocking")]
+                beside = finding(line=at, summary="Division by zero")
+                [record] = sd_review.dispose([beside], "high", rebutted, repro=True, prior=prior)
+                self.assertEqual(record["disposition"], "blocking")
+                own = finding(line=blocker, summary="Division by zero")
+                disposed = sd_review.dispose([beside, own], "high", rebutted, repro=True, prior=prior)
+                self.assertEqual([(row["disposition"], row.get("evidence")) for row in disposed],
+                                 [("advisory", None), ("blocking", REPRO)])
+
     def test_only_the_evidence_a_ruling_answered_is_old_to_it(self) -> None:
         """Class pass of sd:10191 (bin/sd-review:2011, :2024): what a ruling answered is the evidence in its
         own adjudication, not a commit and not a normal form of it. At the ruling's head only that text,
