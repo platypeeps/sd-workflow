@@ -28,6 +28,8 @@ from sd_db.writes import (
     create_item,
     read_settings,
     record_state,
+    reopen_note,
+    resolve_note,
     set_setting,
     transition,
     upsert_repo,
@@ -682,6 +684,132 @@ class OpenQuestion(Case):
         add_note(self.db, item, "decision", f"Withdrawn: ruling #{ruling} on note #{asked}")
         found = build.open_question(self.db, [item], since)
         self.assertEqual(found and found["id"], asked, "a withdrawn ruling counted as an answer at delivery")
+
+
+class DesignChain(Case):
+    """Review of sd:10096: a design aboard the bundle is no dependency, but what it waits on still is."""
+
+    def test_a_prerequisite_behind_a_riding_design_is_ahead_of_the_lead(self):
+        later = self.item()
+        design = self.item(fields={"work_kind": "design", "blocked_by": [later]})
+        lead = self.item(fields={"blocked_by": [design]})
+        members = [{"item": design}, {"item": later}]
+        ahead, behind = build._inside(self.db, lead, members)
+        self.assertEqual([member["item"] for member in ahead], [later])
+        self.assertEqual([member["item"] for member in behind], [design])
+
+
+class DesignRulings(Case):
+    """Class pass of sd:10096: every reader of a design's rulings reads the standing one, so a ruling Decide
+    reversed (`Reversed ruling #N`) holds the design as a review withdrawal does."""
+
+    def designed(self):
+        """A design item whose design run wrote its design and one question: (item, question)."""
+        item = self.item(fields={"work_kind": "design"})
+        [run] = build.queue(self.db, [item], who="operator")
+        self.assertEqual(run["scope"], build.DRAFT)
+        self.db.execute("UPDATE assignment SET status = 'done' WHERE id = ?", (run["id"],))
+        add_note(self.db, item, "comment", "Design:\n\nProblem: x", session="draft:fixture")
+        asked = add_note(self.db, item, "question", "Which?\nOption: A (Recommended)\nOption: B",
+                         session="draft:fixture")
+        return item, asked
+
+    def rule(self, item, asked, answer):
+        ruling = add_note(self.db, item, "decision", f"Ruling on note #{asked}: {answer}")
+        resolve_note(self.db, asked)
+        return ruling
+
+    def reverse(self, item, asked, ruling):
+        """As Decide's reverse writes it (`sd_dashboard.decisions.reverse`)."""
+        add_note(self.db, item, "decision", f"Reversed ruling #{ruling}: question #{asked} asks again.")
+        reopen_note(self.db, asked)
+
+    def test_a_reversed_ruling_leaves_its_question_pending(self):
+        item, asked = self.designed()
+        ruling = self.rule(item, asked, "A")
+        self.assertIsNone(build.open_question(self.db, [item], "", pending=True))
+        self.reverse(item, asked, ruling)
+        found = build.open_question(self.db, [item], "", pending=True)
+        self.assertEqual(found and found["id"], asked)
+
+    def test_the_press_refuses_a_design_whose_ruling_decide_reversed(self):
+        item, asked = self.designed()
+        self.reverse(item, asked, self.rule(item, asked, "A"))
+        with self.assertRaisesRegex(build.BuildRefused, f"waits on design question note #{asked}"):
+            build.queue(self.db, [item], who="operator")
+        self.assertNotIn(item, [row["id"] for row in build.eligible(self.db)])
+
+    def test_the_claim_leaves_out_a_ride_whose_ruling_decide_reversed(self):
+        item, asked = self.designed()
+        ruling = self.rule(item, asked, "A")
+        [ride] = build.queue(self.db, [item], who="operator")
+        code = self.item()
+        build.queue(self.db, [code], who="operator")
+        self.reverse(item, asked, ruling)
+        bundle = self.claim()
+        self.assertEqual([member["item"] for member in build.run(self.db, bundle["id"])["members"]], [code])
+        self.assertEqual(self.count("SELECT status FROM assignment WHERE id = ?", ride["id"]), "queued")
+
+    def test_a_retried_bundle_holds_while_its_design_ruling_is_reversed(self):
+        """A bundle that ran before claims whole, past the fresh rows' check: a ruling reversed between its
+        Retry and the claim holds it, as a reopened dependency does."""
+        item, asked = self.designed()
+        ruling = self.rule(item, asked, "A")
+        code = self.item()
+        build.queue(self.db, [code, item], who="operator")
+        bundle = self.claim()
+        self.assertEqual([member["item"] for member in build.run(self.db, bundle["id"])["members"]], [code, item])
+        build.write(self.db, bundle["id"], supervisor_pid=4242, supervisor_pgid=4242, supervisor_start=START)
+        build.end(self.db, bundle["id"], "blocked", "3 review rounds left blockers: a.py:2 one item")
+        build.reap(self.db, probe=Probe(alive=False, group=False), kill=Kill(self.db))
+        build.retry(self.db, bundle["assignment"], who="operator")
+        self.reverse(item, asked, ruling)
+        self.assertIsNone(self.claim())
+        results = [row["result"] for row in self.db.execute(
+            "SELECT result FROM assignment WHERE scope = ? AND item IN (?, ?) ORDER BY id", (build.SCOPE, code, item))]
+        self.assertTrue(all(f"waits on design question note #{asked}" in (result or "") for result in results),
+                        results)
+        with self.assertRaisesRegex(build.BuildRefused, "waits on design question"):
+            build.retry(self.db, bundle["assignment"], who="operator")
+
+    def test_a_p1_design_rides_an_ordinary_code_bundle(self):
+        """Review of sd:10096: a P1 row joined only a P1 lead of its area, and a ride never leads, so a P1
+        design waited while ordinary code bundles shipped. A ride takes no slot: it joins any fresh bundle."""
+        item = self.item(priority=1, fields={"work_kind": "design"})
+        [run] = build.queue(self.db, [item], who="operator")
+        self.db.execute("UPDATE assignment SET status = 'done' WHERE id = ?", (run["id"],))
+        add_note(self.db, item, "comment", "Design:\n\nProblem: x", session="draft:fixture")
+        build.queue(self.db, [item], who="operator")
+        code = self.item(priority=2)
+        build.queue(self.db, [code], who="operator")
+        bundle = self.claim()
+        self.assertEqual([member["item"] for member in build.run(self.db, bundle["id"])["members"]], [code, item])
+
+    def test_delivery_holds_unless_the_standing_rulings_are_the_briefs(self):
+        """Class pass of sd:10096: delivery held only a ruling the brief lacked. One the brief carried and
+        that stands no more holds too, also when its question was not reopened."""
+        item, asked = self.designed()
+        ruling = self.rule(item, asked, "A")
+        self.assertIsNone(build.design_waits(self.db, item, delivered=True))  # no brief sent: nothing to compare
+        build.note_brief(self.db, item, "run-1")
+        self.assertIsNone(build.design_waits(self.db, item, delivered=True))
+        self.assertEqual(build.briefed(self.db, item), {ruling})
+        add_note(self.db, item, "decision", f"Withdrawn: ruling #{ruling} on note #{asked}")
+        self.assertIsNone(build.open_question(self.db, [item], "", pending=True))
+        self.assertIn(f"ruling #{ruling}", build.design_waits(self.db, item, delivered=True) or "")
+        replaced = self.rule(item, asked, "B")
+        self.assertIn(f"ruling #{replaced}", build.design_waits(self.db, item, delivered=True) or "")
+        build.note_brief(self.db, item, "run-2")
+        self.assertIsNone(build.design_waits(self.db, item, delivered=True))
+
+    def test_the_brief_rulings_are_the_standing_ones(self):
+        """A reversed ruling, and one a later ruling replaced, are no instruction."""
+        item, asked = self.designed()
+        self.reverse(item, asked, self.rule(item, asked, "A"))
+        self.assertEqual(build.design_rulings(self.db, item), [])
+        self.rule(item, asked, "B")
+        self.rule(item, asked, "C")
+        self.assertEqual(build.design_rulings(self.db, item), [f"Ruling on note #{asked}: C"])
 
 
 class Writes(Case):
@@ -2615,6 +2743,31 @@ class Pickup(Case):
         self.db.execute("UPDATE state SET timestamp = ? WHERE id = (SELECT MAX(id) FROM state)",
                         (later(build.clock(), 3600),))
         self.assertIsNone(build.stop_on_blocks(self.db, now=self.NOW), "On again counts only what ends after it")
+
+    def blocked_design(self):
+        """A design item auto-pickup queued, whose design run then ended blocked (draft `_block`)."""
+        item = self.item(fields={"work_kind": "design"})
+        self.assertIn(item, build.pickup(self.db, self.room(), now=self.NOW))
+        lead = self.count("SELECT id FROM assignment WHERE item = ? AND scope = ?", item, build.DRAFT)
+        stamp = later(build.clock(), self.count("SELECT COUNT(*) FROM assignment"))
+        self.db.execute("UPDATE assignment SET status = 'blocked', started = ?, ended = ? WHERE id = ?",
+                        (stamp, stamp, lead))
+        return item
+
+    def test_a_blocked_design_run_is_not_picked_again(self):
+        """Review of sd:10096: a failed design run left its item ready with no design, so every tick picked
+        it again and ran it again. Like a blocked build, it waits on the operator's Build."""
+        self.on()
+        item = self.blocked_design()
+        self.assertNotIn(item, build.pickup(self.db, self.room(), now=self.NOW))
+        self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE item = ?", item), 1)
+
+    def test_two_blocked_design_runs_turn_off(self):
+        """Review of sd:10096: the stop counted build rows only, so blocked design runs never turned it off."""
+        self.on()
+        self.blocked_design()
+        self.blocked_design()
+        self.assertIn("ended blocked in a row", build.stop_on_blocks(self.db, now=self.NOW) or "")
 
     def picked_run(self):
         item = self.item()

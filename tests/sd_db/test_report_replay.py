@@ -152,14 +152,15 @@ class AReplayWritesNothing(unittest.TestCase):
         self.assertIn("same second", tied["why"])
         self.assertEqual(self.beats(), ["a", "b"])
 
-    def test_the_runs_one_second_remembers_are_bounded(self):
+    @mock.patch("sd_db.ship.this_host", return_value="hosta")
+    def test_the_runs_one_second_remembers_are_bounded(self, _host):
         for number in range(reporting.REMEMBERED_RUNS + 5):
             self.tick(f"r{number:02d}", 1, second=5)
         retention.compact_heartbeats(self.db)
         body = json.loads(self.db.execute("SELECT body FROM state WHERE kind='heartbeat' AND key=?",
                                           (reporting.HEARTBEAT_KEY + "probe",)).fetchone()["body"])
         self.assertEqual(body["run_id"], "r24")
-        self.assertEqual(body["same_second"], [f"r{number:02d}" for number in range(4, 24)])
+        self.assertEqual(body["same_second"], [f"r{number:02d}@hosta" for number in range(4, 24)])
         self.assertEqual(self.tick("r04", 1, second=5)["recorded"], "nothing")
 
     def test_an_older_clean_run_is_not_a_recovery_from_a_newer_failure(self):
@@ -1142,3 +1143,70 @@ class ACleanRunClosesItsHostsOpenReport(_HostReports):
         failed = self.tick("b", 16, "boom\n", exit_code=1)["item"]["id"]
         self.tick("a", 1, "all good\n")
         self.assertEqual(self.row(failed)["status"], "planning")
+
+
+class ARunIdIsOnlyAReplayOnItsOwnHost(_HostReports):
+    """sd:10440: a run id is a UTC second and a pid, so two hosts can mint one.
+
+    The replay checks read the run id alone: a clean run on host B made host
+    A's failure with the same id read as a replay of a clean run, and it filed
+    nothing. A retry on the same host still deduplicates.
+    """
+
+    def on(self, host, *args, **kwargs):
+        with mock.patch("sd_db.ship.this_host", return_value=host):
+            return self.tick(*args, **kwargs)
+
+    def reports(self):
+        return self.db.execute("SELECT COUNT(*) FROM item WHERE kind='report'").fetchone()[0]
+
+    def test_another_hosts_clean_run_does_not_hide_this_hosts_failure(self):
+        self.on("hostb", "x", 1, "all good\n")
+        failed = self.on("hosta", "x", 2, "boom\n", exit_code=1)
+        self.assertEqual(failed["recorded"], "report", failed)
+        self.assertEqual(json.loads(failed["item"]["fields"])["report"]["host"], "hosta")
+        again = self.on("hosta", "x", 2, "boom\n", exit_code=1)
+        self.assertEqual(again["item"]["id"], failed["item"]["id"])
+        self.assertEqual(self.reports(), 1)
+
+    def test_another_hosts_tied_clean_run_does_not_hide_this_hosts_failure(self):
+        self.on("hostb", "x", 1, "all good\n")
+        self.on("hosta", "y", 1, "all good\n")
+        failed = self.on("hosta", "x", 1, "boom\n", exit_code=1)
+        self.assertEqual(failed["recorded"], "report", failed)
+
+    def test_another_hosts_failure_with_the_same_run_id_is_its_own_report(self):
+        theirs = self.on("hostb", "x", 1, "boom\n", exit_code=1)["item"]["id"]
+        ours = self.on("hosta", "x", 1, "boom\n", exit_code=1)
+        self.assertEqual(ours["recorded"], "report", ours)
+        self.assertNotEqual(ours["item"]["id"], theirs)
+        self.assertEqual(self.on("hosta", "x", 1, "boom\n", exit_code=1)["item"]["id"], ours["item"]["id"])
+        self.assertEqual(self.on("hostb", "x", 1, "boom\n", exit_code=1)["item"]["id"], theirs)
+        self.assertEqual(self.reports(), 2)
+
+    def test_another_hosts_folded_run_does_not_answer_this_hosts_run(self):
+        self.on("hostb", "a", 1, "boom\n", exit_code=1)
+        self.on("hostb", "x", 2, "boom\n", exit_code=1)
+        ours = self.on("hosta", "x", 2, "boom\n", exit_code=1)
+        self.assertEqual(ours["recorded"], "report", ours)
+        self.assertEqual(self.reports(), 2)
+
+    def test_another_hosts_clean_run_is_not_this_jobs_recovery(self):
+        self.on("hosta", "a", 1, "boom\n", exit_code=1)
+        other = self.on("hostb", "b", 2, "all good\n")
+        self.assertNotEqual(other["why"], "the job recovered", other)
+        self.assertEqual(self.on("hosta", "c", 3, "all good\n")["why"], "the job recovered")
+
+    def test_a_retry_on_the_same_host_still_writes_nothing(self):
+        self.on("hostb", "x", 1, "all good\n")
+        self.on("hosta", "x", 1, "all good\n")
+        self.assertEqual(self.on("hosta", "x", 1, "all good\n")["recorded"], "nothing")
+        replay = self.on("hosta", "x", 1, "SD_REPORT_ATTENTION: late line\n")
+        self.assertEqual((replay["recorded"], self.reports()), ("nothing", 0))
+
+    def test_a_run_recorded_before_hosts_were_stored_still_replays(self):
+        """A heartbeat or `same_second` entry with no host is anyone's."""
+        self.on("", "x", 1, "all good\n")
+        self.on("", "y", 1, "all good\n")
+        for run in ("x", "y"):
+            self.assertEqual(self.on("hosta", run, 1, "all good\n")["recorded"], "nothing")
