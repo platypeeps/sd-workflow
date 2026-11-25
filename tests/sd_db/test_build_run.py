@@ -1292,6 +1292,30 @@ class Supervise(Case):
         self.assertEqual([key.rsplit(":", 1)[1] for (key,) in self.db.execute(
             "SELECT key FROM state WHERE kind = 'checkpoint' AND key LIKE 'build-run-ruled:%'")], ["3"])
 
+    def test_a_ruling_lapses_when_its_round_changes_a_file_its_evidence_names(self):
+        """Lead ruling on sd:10286: a reject of the crash at parse.py, whose repro routes '' through
+        dispatch.py, judged the old caller. A fix that changes dispatch.py in the same round can make it
+        reachable, so the ruling is re-verified, not carried to the new head; one that changes neither
+        file carries."""
+        self.press()
+        supervisor = self.supervisor()
+        row = {"path": "src/parse.py", "line": 4, "summary": "int('') raises on an empty count",
+               "evidence": "src/dispatch.py forwards '' to parse_count, and int('') raises ValueError"}
+        head = "a" * 40
+        supervisor.rule(1, row, "reject", "no caller passes ''", head, "example/repo", ["src/dispatch.py"],
+                        ["src/dispatch.py"])
+        supervisor.rule(2, dict(row, evidence="dispatch.py forwards ''"), "reject", "no caller passes ''",
+                        head, "example/repo", ["src/dispatch.py"], ["src/dispatch.py"])
+        supervisor.rule(3, row, "reject", "no caller passes ''", head, "example/repo", ["src/far.py"],
+                        ["src/far.py"])
+        first, second, third = self.decisions()
+        self.assertIn("not applied: the round changed src/dispatch.py", first)
+        self.assertIn("not applied: the round changed src/dispatch.py", second)
+        self.assertNotIn("not applied", third)
+        self.assertEqual(len(self.rebuttals()), 1)
+        answer = {"status": "blocking", "blockers": [row]}
+        self.assertEqual(supervisor.settled(answer, head)["status"], "advisory")
+
     def test_a_ruling_clears_no_gate_blocker(self):
         """Review of sd:10286: the review gate's own blocker (a response past its byte limit, a finding it could
         not place) names no code a ruling judged. A reject of it records nothing, and its repeat still blocks:

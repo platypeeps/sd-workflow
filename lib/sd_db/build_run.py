@@ -581,6 +581,23 @@ def ruleable(row: dict) -> bool:
     return row.get("line") != "-" and isinstance(path, str) and bool(path) and not path.startswith("<")
 
 
+def finding_words(row: dict) -> str:
+    """A finding's own words, its evidence among them: each field but its place."""
+    return " ".join(str(value) for key, value in row.items() if key not in ("path", "line", "instances"))
+
+
+def names_in(words: str, paths: Collection[str]) -> list[str]:
+    """Each of `paths` the words name, whole, as a path-like word (`./x`, `a/../x`, absolute) or its file
+    name; a file name shared with another path names both, more, never less. A name with a space or other
+    character no word holds (`bin/my tool`) is found literally and whole."""
+    spelled = {os.path.normpath(word.rstrip(".")) for word in re.findall(r"[\w./-]+", words) if word.rstrip(".")}
+    spelled |= {os.path.basename(word) for word in spelled}
+    return sorted(path for path in paths if any(
+        name in spelled or re.search(r"[^\w./-]", name)
+        and re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w/-]|\.\w)", words)
+        for name in {path, os.path.basename(path)} if name))
+
+
 def changed_lines(git: Collection[str], work: str, base: str, head: str, *,
                   env: dict | None = None) -> dict[str, set[int]] | None:
     """Each path `base..head` changes, with the new-side lines its hunks touch, or no lines for a change git
@@ -1758,8 +1775,6 @@ class Supervisor:
         # ponytail: location, not causation: a defect a new caller causes in unchanged code is filed, not held,
         # unless the finding's own words name a changed file. Its `evidence` is among them: a blocker's repro
         # routes the failing input through the change (pack sd:9867), so a dropped check holds (sd:9900).
-        # A changed path or its file name; a name shared with an unchanged file holds more, never less.
-        names = {name for path in changed or () for name in (path, os.path.basename(path)) if name}
         # The identifiers of the functions the branch changes, read whole: a caller named by function (sd:9769).
         functions = self.branch_words(head) if changed is not None else None
 
@@ -1774,9 +1789,8 @@ class Supervisor:
                 return True
             # A finding cited at unchanged code that names a changed file (a new caller) is the branch's own.
             # Each path-like word, as `./x`, `a/../x` or an absolute path spells it: whole names, not substrings.
-            words = " ".join(str(value) for key, value in row.items() if key not in ("path", "line", "instances"))
-            spelled = {os.path.normpath(word.rstrip(".")) for word in re.findall(r"[\w./-]+", words) if word.rstrip(".")}
-            if any(word in names or os.path.basename(word) in names for word in spelled):
+            words = finding_words(row)
+            if names_in(words, changed):
                 return True
             # A function or method the change touches, as `name(`, `a_b`, `camelCase` or `` `x.name` ``.
             # Or a plain word that is the name of a function the change defines (`export`).
@@ -1790,9 +1804,7 @@ class Supervisor:
             if any(self.called_from(path, line, head, sources, functions[0])
                    or self.calls_into(path, line, head, sources, functions[1]) for path, line in self.locations(row)):
                 return True
-            # A name with a space or other character no word holds (`bin/my tool`), found literally and whole.
-            return any(re.search(rf"(?<![\w.-]){re.escape(name)}(?![\w/-]|\.\w)", words)
-                       for name in names if re.search(r"[^\w./-]", name))
+            return False
         new = [row for row in answer["blockers"] if not held(row)]
         return new, [row for row in answer["blockers"] if row not in new]
 
@@ -2130,7 +2142,9 @@ class Supervisor:
         again without its marks (a crash before the rulings file went) finds it and writes nothing twice."""
         said = " ".join(self.summary([row]).split())
         finding = row.get("line") != "-"
-        touched = sorted({path for path, _ in self.locations(row)} & set(moved)) if moved is not None else None
+        # A file the finding or its evidence names: a fixed caller its repro runs through (lead ruling).
+        touched = (sorted({path for path, _ in self.locations(row)} & set(moved) | set(names_in(finding_words(row), moved)))
+                   if moved is not None else None)
         lapsed = ("" if ruling not in ("reject", "file") or not finding else
                   "; not applied: the review gate's own blocker, no code it judged" if not ruleable(row) else
                   "" if touched == [] else
