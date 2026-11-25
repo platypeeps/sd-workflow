@@ -693,6 +693,37 @@ class PullRequestPrivacyTests(LintFixture):
                          [f"pull request body: line {n} matches a privacy pattern in {self.patterns}"
                           for n in (4, 5, 6)])
 
+    def own_repo(self, patterns: str, body: str) -> list[str]:
+        """The failures for `body` in a repo whose origin names it `shop-website`."""
+        self.patterns.write_text(patterns, encoding="utf-8")
+        self.git("remote", "add", "origin", "git@github.com:example/shop-website.git")
+        return self.run_lint("## Summary\n\n" + body, body_only=True).failures
+
+    def line(self, *numbers: int) -> list[str]:
+        return [f"pull request body: line {n} matches a privacy pattern in {self.patterns}" for n in numbers]
+
+    def test_a_match_that_runs_past_the_own_name_fails(self) -> None:
+        """Round 3 class pass, sd:10720: with the name cut from the scanned text, `shop/keys` was never seen."""
+        self.assertEqual(self.own_repo("shop/keys\nshop\n", "- see shop/keys\n- the shop-web image\n"), self.line(3))
+
+    def test_a_match_that_runs_into_the_own_name_fails(self) -> None:
+        self.assertEqual(self.own_repo("keys/shop\nshop\n", "- see keys/shop-web\n"), self.line(3))
+
+    def test_a_match_another_match_overlaps_fails(self) -> None:
+        """`grep -o` reports `shop` and steps over `op-private`, which starts inside it."""
+        self.assertEqual(self.own_repo("shop\nop-private\n", "- the shop-private host\n"), self.line(3))
+
+    def test_a_pattern_that_matches_nothing_at_all_still_fails_every_line(self) -> None:
+        """An empty match selects each line and reports no text: nothing shows it lies inside the name."""
+        self.assertEqual(self.own_repo("shop|x*\n", "- the shop-web image\n"), self.line(1, 2, 3))
+
+    def test_a_name_only_the_folder_carries_exempts_nothing(self) -> None:
+        """A PR publishes origin's name; a checkout's folder name is local, so it frees no text."""
+        self.patterns.write_text("shop\n", encoding="utf-8")
+        with mock.patch.object(lint.sd_lib, "main_worktree_root", return_value=pathlib.Path("/x/shop-website")):
+            report = self.run_lint("## Summary\n\n- the shop-web image\n", body_only=True)
+        self.assertEqual(report.failures, self.line(3))
+
     def test_an_alternative_naming_another_repo_still_applies(self) -> None:
         self.patterns.write_text("operator|shop\n", encoding="utf-8")
         self.git("remote", "add", "origin", "https://github.com/example/other-site")
