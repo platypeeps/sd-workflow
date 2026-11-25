@@ -1843,9 +1843,9 @@ def carried(prior: Sequence[Mapping[str, Any]], outcomes: Sequence[Outcome],
     its own. An answer that did not complete (a failed or retried attempt, a voided or partial one) clears
     nothing and answers for no other, yet its `open` carries (build/sd-1675 review). A rebutted blocker is
     answered unless a reader's `open` gives evidence, as a cited repeat of a rebutted finding blocks.
-    With no reader answered nothing is carried: the review is incomplete and blocks on that."""
+    With no reader answered only a cited `open` carries, for the retry (lane review); the review is incomplete."""
     answered = [outcome for outcome in outcomes if outcome.status in (CLEAN, FINDINGS)]
-    return [row for old in prior if answered and old.get("disposition") == "blocking"
+    return [row for old in prior if old.get("disposition") == "blocking" and (answered or _opened(old.get("id"), outcomes))
             and (not is_rebutted(rebutted, old) or _opened(old.get("id"), outcomes))
             and (row := _carry(old, answered, outcomes)) is not None]
 
@@ -1926,12 +1926,15 @@ def moved_line(diff: str, line: int) -> int:
 
 def prior_blockers(previous: Mapping[str, Any]) -> list[dict[str, Any]]:
     """The prior report's findings, each open blocker (`unresolved`) with the `id` its verdict names, `B1` up, in
-    report order (sd:10087); every other row has no `id`."""
-    open_rows = {id(row) for row in unresolved(previous) if row.get("disposition") == "blocking"}
-    rows: list[dict[str, Any]] = []
+    report order (sd:10087); every other row has no `id`. A row a retry carried adds its evidence to the earlier
+    pass's open blocker its `carried.id` names, unrenumbered as no pass completed since: one record per blocker."""
+    open_rows, rows, named = {id(row) for row in unresolved(previous) if row.get("disposition") == "blocking"}, list[dict[str, Any]](), dict[str, dict[str, Any]]()
     for row in previous["findings"]:
-        record = {key: value for key, value in row.items() if key != "id"}
-        rows.append(dict(record, id=f"B{sum('id' in seen for seen in rows) + 1}") if id(row) in open_rows else record)
+        record, again = {key: value for key, value in row.items() if key != "id"}, row["carried"].get("id") if isinstance(row.get("carried"), dict) else None
+        if id(row) in open_rows and isinstance(again, str) and (target := named.get(again)) and target.get("prior_review") != row.get("prior_review"):
+            target["evidence"] = "\n".join(dict.fromkeys(line for told in (target.get("evidence"), record.get("evidence")) if isinstance(told, str) for line in told.splitlines() if line.strip()))
+        else:
+            rows.append(named.setdefault(f"B{len(named) + 1}", dict(record, id=f"B{len(named) + 1}")) if id(row) in open_rows else record)
     return rows
 
 

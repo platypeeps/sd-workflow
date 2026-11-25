@@ -380,6 +380,29 @@ class PriorLineTests(RepeatFixture):
                 previous = {"findings": rows, **({"history": history} if history else {})}
                 self.assertEqual([row.get("id") for row in sd_review.prior_blockers(previous)], ids)
 
+    def test_an_incomplete_pass_adds_evidence_to_its_blocker_not_a_new_id(self) -> None:
+        """build/sd-1675 lane review (bin/sd-review:1935): each incomplete retry's carried copy of a blocker
+        took a new id, so every retry added one. A carried row merges into the open blocker of an earlier
+        pass its id names, its evidence added; a new blocker still gets the next id."""
+        passes = [{"pass": 1, "head": "a" * 40, "completed": True},
+                  {"pass": 2, "head": "b" * 40, "completed": False},
+                  {"pass": 3, "head": "c" * 40, "completed": False}]
+        original = dict(self.blocker(), prior_review=passes[0])
+        again = dict(self.blocker(line=12), evidence="one: python3 t.py []: IndexError",
+                     carried={"id": "B1", "verdict": "open"}, prior_review=passes[1])
+        fresh = dict(self.blocker(summary="Another crash", line=30), prior_review=passes[1])
+        third = dict(self.blocker(), evidence="two: still fails", carried={"id": "B1", "verdict": "open"},
+                     prior_review=passes[2])
+        rows = sd_review.prior_blockers({"findings": [original, again, fresh, third], "history": passes})
+        named = [row for row in rows if "id" in row]
+        self.assertEqual([(row["id"], row["line"]) for row in named], [("B1", 10), ("B2", 30)])
+        self.assertEqual(named[0]["evidence"].splitlines(),
+                         [REPRO, "one: python3 t.py []: IndexError", "two: still fails"])
+        # once a later pass completes, its own carried copy is the blocker and earlier passes hold none
+        done = [passes[0], dict(passes[1], completed=True)]
+        rows = sd_review.prior_blockers({"findings": [original, again], "history": done})
+        self.assertEqual([(row.get("id"), row["line"]) for row in rows], [(None, 10), ("B1", 12)])
+
 
 def verdict(answer: str, evidence: str = "src.py:10 now returns early on []", ident: str = "B1") -> dict[str, str]:
     return {"id": ident, "verdict": answer, "evidence": evidence}
@@ -515,6 +538,20 @@ class PriorVerdictTests(unittest.TestCase):
         failed = sd_review.Outcome("one", sd_review.UNAVAILABLE, (), "", (), ())
         result = self.settle(failed, reviewed=[])
         self.assertEqual((result["status"], result["findings"]), ("unavailable", []))
+
+    def test_a_cited_open_verdict_carries_when_no_reader_completes(self) -> None:
+        """build/sd-1675 lane review (bin/sd-review:1849): with every reader failed, a failed reader's cited
+        `open` verdict was dropped, so the retry lost it. It carries; an uncited one does not."""
+        for label, evidence, carried in (
+                ("cited", "python3 t.py []: IndexError",
+                 [("blocking", "one: python3 t.py []: IndexError", {"id": "B1", "verdict": "open"})]),
+                ("uncited", " ", [])):
+            with self.subTest(label):
+                raw = json.dumps({"findings": [], "verdicts": [verdict("open", evidence)]})
+                failed = sd_review._answer("one", sd_review.Completed(1, raw, "crash"), sd_review.parse_findings(raw))
+                result = self.settle(failed, reviewed=[])
+                self.assertEqual(self.carried(result), carried)
+                self.assertEqual(result["completed_reviews"], 0)
 
     def test_the_parser_reads_verdicts_and_refuses_a_bad_one(self) -> None:
         parsed = sd_review.parse_findings(json.dumps({"findings": [], "verdicts": [verdict("fixed")]}))
