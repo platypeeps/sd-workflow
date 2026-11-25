@@ -1040,8 +1040,10 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     (sd:10214 review, round 5). The verdict is the head's own: who took
     the work out is carried commit by commit, so a removal a later commit
     put back, or a revert one reapplied, decides nothing (class pass 3).
-    When the files as a set never read so, each file is judged alone:
-    reverts on two sides of a merge that took out all of it undid it.
+    Each file is judged alone, by who took its own work out: reverts on
+    two sides of a merge undo all of it, and a revert of the last file
+    gets no credit for one a refactor took out. A later move back to
+    the name a cited rename left undoes that rename (sd:10214 review).
 
     `kept_commits` reads this list after it, so this check hides none of
     its evidence (sd:10214 review). An undone commit stays in place with
@@ -1078,15 +1080,23 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
         where = renames_since(sha, rev)
         if where is None:
             return None
-        held = [where.get(name, name) for name in names]
+        # A later move back to where the cited commit took a file from undoes its rename, so the file is read
+        # under its own name there: followed, it reads as the old name's content (sd:10214 review).
+        held = [name if where.get(name) == moved.get(name) else where.get(name, name) for name in names]
         now = blobs(rev, held)
         return None if now is None else all(now.get(at) == want.get(name) for at, name in zip(held, names, strict=True))
 
-    def undone(index: int, names: list[str], before: str) -> bool:
+    def undone(index: int, names: list[str], before: str) -> bool | None:
+        """Whether reverts alone took the work in `names` out; None when the cited commit itself left them as
+        `before` (a fix that restores the base), so no later commit undid anything there."""
         sha = commits[index][0]
         want = blobs(before, names)
-        # The cited commit itself left them so (a fix that restores the base): no later commit undid it.
-        if want is None or not reads_before(sha, head, names, want) or reads_before(sha, sha, names, want) is not False:
+        if want is None:
+            return False
+        own_read = reads_before(sha, sha, names, want)
+        if own_read is not False:
+            return None if own_read else False
+        if not reads_before(sha, head, names, want):
             return False
         # Its descendants alone: a sibling a merge brought in never held the work, so it took none out.
         after = lane_git(worktree, "rev-list", "--parents", "--ancestry-path", f"{sha}..{head}")
@@ -1125,16 +1135,27 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
                 return False
         return left.get(next(iter(parents), "")) is True  # rev-list names the head first
 
+    def all_undone(index: int, names: list[str], before: str) -> bool:
+        """Each file judged alone, by who took its own work out: a revert of the set's last file gets no credit
+        for one a refactor removed before it, and two partial reverts a merge joins undo all of it (sd:10214
+        review). A file the cited commit left as `before` holds none of its work there and is not judged."""
+        # ponytail: one walk per file; cache reads per commit if a wide commit makes this slow.
+        judged = [verdict for verdict in (undone(index, [name], before) for name in names) if verdict is not None]
+        return bool(judged) and all(judged)
+
     kept = []
+    moved: dict[str, str] = {}
     for index, (sha, message) in enumerate(commits):
         if "Closes:" in message and any(sd_ship_body.REVERT_SUBJECT.match(later) for _, later in commits[:index]):
             names = [name for name in fields("diff-tree", "--no-commit-id", "--name-only", "-z", "-r", sha) or [] if name]
+            # The cited commit's own renames, new name to old: a failed read keeps the commit.
+            own_moves = renames_since(f"{sha}^", sha)
+            if own_moves is None:
+                kept.append((sha, message))
+                continue
+            moved = {new: old for old, new in own_moves.items()}
             at_base = None if sd_ship_body.reverts_another(message) else fork
-            # Each file on its own too: two partial reverts a merge joins took all the work out, though no
-            # commit read as before for the whole set (sd:10214 review).
-            # ponytail: one walk per file; cache reads per commit if a wide commit makes this slow.
-            if names and any(undone(index, names, before) or (len(names) > 1 and all(
-                    undone(index, [name], before) for name in names)) for before in (f"{sha}^", at_base) if before):
+            if names and any(all_undone(index, names, before) for before in (f"{sha}^", at_base) if before):
                 message = ""
         kept.append((sha, message))
     return kept

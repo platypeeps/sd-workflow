@@ -3906,6 +3906,45 @@ class CitedCloses(SharedQueue):
         head = git(tree, "rev-parse", "HEAD")
         self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {b})
 
+    def test_a_hand_written_revert_of_a_rename_closes_nothing_it_undid(self) -> None:
+        """sd:10214 review: a cited commit renames a file and a revert moves it back. The new name is not
+        followed into the old one, which reads as before under its own name: the revert undid the rename."""
+        import sd_operations
+        a, b, *_ = self.open
+        tree, _ = self.committed("topic-rename-reverted")
+        (tree / "old.txt").write_text("one reader\ntwo readers\nthree readers\n", encoding="utf-8")
+        git(tree, "add", "old.txt")
+        git(tree, "commit", "-q", "-m", "docs: the reader")
+        git(tree, "mv", "old.txt", "new.txt")
+        git(tree, "commit", "-q", "-m", f"refactor: name the reader\n\nCloses: sd:{a}")
+        git(tree, "mv", "new.txt", "old.txt")
+        git(tree, "commit", "-q", "-m", "revert: keep the old name")
+        git(tree, "commit", "-q", "--allow-empty", "-m", f"fix: the gate\n\nCloses: sd:{b}")
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {b})
+
+    def test_a_partial_revert_after_a_refactor_keeps_the_close(self) -> None:
+        """sd:10214 review: a refactor moves one file's work out and a revert removes the other file. The set
+        reads as the base only after the revert, but the refactor, no revert, took the first file out."""
+        import sd_operations
+        a, b, *_ = self.open
+        tree, _ = self.committed("topic-refactor-partial-revert")
+        (tree / "a.txt").write_text("draft a\n", encoding="utf-8")
+        (tree / "b.txt").write_text("draft b\n", encoding="utf-8")
+        git(tree, "add", "a.txt", "b.txt")
+        git(tree, "commit", "-q", "-m", "docs: drafts")
+        (tree / "a.txt").write_text("the reader\n", encoding="utf-8")
+        (tree / "b.txt").write_text("provisional docs\n", encoding="utf-8")
+        git(tree, "commit", "-q", "-am", f"feat: the reader\n\nCloses: sd:{a}")
+        git(tree, "rm", "-q", "a.txt")
+        (tree / "caller.txt").write_text("a caller\nthat holds the reader\nnow\n", encoding="utf-8")
+        git(tree, "add", "caller.txt")
+        git(tree, "commit", "-q", "-m", "refactor: fold the reader into its caller")
+        git(tree, "rm", "-q", "b.txt")
+        git(tree, "commit", "-q", "-m", "revert: drop the provisional docs")
+        head = git(tree, "rev-parse", "HEAD")
+        self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), {a})
+
     def test_a_revert_of_a_file_named_like_pathspec_magic_closes_nothing(self) -> None:
         """sd:10214 review: git reads `:(unknown)x` as pathspec magic and fails; the lookup reads names
         literally, so a revert that removes such a file undid the work."""
