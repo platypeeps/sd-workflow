@@ -518,6 +518,21 @@ class TheBuild(DependencyCase):
         set_item_fields(self.db, item, fields=json.dumps({"blocked_by": [424242]}))
         with self.assertRaisesRegex(build.BuildRefused, "waits on sd:424242, which no longer exists"):
             build.queue(self.db, [item], who="operator")
+        # pack sd:9862: the flag that clears it is --clear-blocked-by; --blocked-by sets a new set.
+        with self.assertRaisesRegex(build.BuildRefused, rf"sd task edit {item} --clear-blocked-by$"):
+            build.queue(self.db, [item], who="operator")
+
+    def test_the_fix_for_a_missing_dependency_keeps_the_live_ones(self):
+        """Pack sd:10691: `--clear-blocked-by` drops every dependency, live ones too, so the item could build
+        before them. With live ones left the fix names exactly them, as `--blocked-by` replaces the set."""
+        live, done, item = self.item(status="planning"), self.item(status="done"), self.item()
+        set_item_fields(self.db, item, fields=json.dumps({"blocked_by": [live, 424242, done]}))
+        with self.assertRaises(build.BuildRefused) as refused:
+            build.queue(self.db, [item], who="operator")
+        self.assertIn("waits on sd:424242, which no longer exists", str(refused.exception))
+        self.assertTrue(str(refused.exception).endswith(
+            f"sd task edit {item} --blocked-by {live} --blocked-by {done}"), str(refused.exception))
+        self.assertNotIn("--clear-blocked-by", str(refused.exception))
 
     def test_a_done_dependency_lets_the_next_tick_pick_the_item(self):
         first, item = self.item(status="planning"), self.item()
@@ -573,9 +588,14 @@ class TheBuild(DependencyCase):
         self.wait(lead, first)
         build.retry(self.db, run["assignment"], who="operator")
         change_status(self.db, first, "ready", who="operator")
+        before = self.count("SELECT COALESCE(MAX(id), 0) FROM note")
         self.assertIsNone(self.claim())
         self.assertIsNone(self.claim(), "no member leads a new branch")
         self.assertEqual(self.count("SELECT COUNT(*) FROM assignment WHERE status = 'blocked'"), 2)
+        # pack sd:9862: one blocked note per row; the waiting lead was refused twice and noted twice.
+        notes = self.db.execute("SELECT item, COUNT(*) AS n FROM note WHERE id > ? AND body LIKE "
+                                "'Build assignment % blocked:%' GROUP BY item", (before,)).fetchall()
+        self.assertEqual(sorted(row["n"] for row in notes), [1, 1])
         change_status(self.db, first, "done", who="operator")
         build.retry(self.db, run["assignment"], who="operator")
         self.assertEqual(self.claim()["branch"], run["branch"])
