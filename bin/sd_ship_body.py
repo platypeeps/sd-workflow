@@ -421,6 +421,23 @@ def refuse_left(connection, branch: str, items, then: str = "nothing was publish
                                   "build it again to deliver it on its own branch.")
 
 
+def refuse_design_waiting(connection, items, then: str = "nothing was published") -> None:
+    """Refuse delivering a design item of `items` whose question waits again, or whose standing rulings are not the
+    ones its build's brief carried (`build.design_waits`, the rule delivery reads): Decide reversed, a review
+    withdrew or the operator replaced a ruling after the enqueue left it in (review and class pass of sd:10096).
+    `sd-ship merge` checks right before it publishes, beside `refuse_left`."""
+    sd_lib.import_sd_db()  # every caller holds an sd_db connection, so this finds it
+    from sd_db import build  # noqa: PLC0415
+    for number in dict.fromkeys(items):
+        why = build.design_waits(connection, number, delivered=True)
+        if why:
+            raise Refusal(f"sd:{number} {why}, so this delivery may not close it; {then}", code="design_waits",
+                          boundary="input", state="operator_decision",
+                          next_action="Rule on the question, or Build the design again so its brief carries the "
+                                      "standing ruling, then deliver; or drop the design from the delivery (its "
+                                      "--item and its commit).")
+
+
 def refuse_unclosable(connection, item: int, repo: str, named, deliver: bool) -> None:
     """Refuse a co-delivered item the merge could not close; `repo` is `item`'s registered path.
 
