@@ -4076,6 +4076,52 @@ class CitedCloses(SharedQueue):
         head = git(tree, "rev-parse", "HEAD")
         self.assertEqual(sd_operations.cited(tree, "origin/main", head, "Words.\n"), set())
 
+    def reverted_reader(self, name: str, before: bytes, fixed: bytes, caller: bytes) -> set[int]:
+        """What stays cited when a cited fix turns a base reader from `before` into `fixed`, and a revert puts
+        the reader back and leaves the base caller as `caller`: `{0}` for the cited item, else nothing."""
+        import sd_operations
+        a, *_ = self.open
+        tree, _ = self.committed(name)
+        git(tree, "fetch", "-q", "origin")
+        git(tree, "reset", "-q", "--hard", "origin/main")  # a second case in one test builds on the first's main
+        (tree / "reader.txt").write_bytes(before)
+        (tree / "caller.txt").write_bytes(b"the caller\n")
+        git(tree, "add", "reader.txt", "caller.txt")
+        git(tree, "commit", "-q", "--allow-empty", "-m", "docs: the base")
+        git(tree, "push", "-q", "origin", "HEAD:main")
+        git(tree, "fetch", "-q", "origin")
+        (tree / "reader.txt").write_bytes(fixed)
+        git(tree, "commit", "-q", "-am", f"fix: the reader\n\nCloses: sd:{a}")
+        (tree / "reader.txt").write_bytes(before)
+        (tree / "caller.txt").write_bytes(caller)
+        git(tree, "commit", "-q", "-am", "revert: the reader")
+        head = git(tree, "rev-parse", "HEAD")
+        return {0 for item in sd_operations.cited(tree, "origin/main", head, "Words.\n") if item == a}
+
+    def test_a_line_of_the_fix_in_another_file_does_not_keep_the_close(self) -> None:
+        """sd:10214 class pass 7: part of the cited text found elsewhere is not the work. A revert restores the
+        reader and adds, on its own, a line the fix also added to a caller: the close drops. So does one that
+        leaves every fixed line in the caller, scattered or re-indented. Only the reader's whole fixed text,
+        as one exact run of lines, is the work moved."""
+        lines = [f"reader line {n}\n" for n in range(6)]
+        before = "".join(lines) + "    return True\n"
+        fixed = "".join(lines) + "    return False\n"
+        for label, caller, kept in (
+                ("one-line", "the caller\n    return False\n", set()),
+                ("scattered", "the caller\n" + "between\n".join(lines) + "    return False\n", set()),
+                ("re-indented", "the caller\n" + fixed.replace("    return", "return"), set()),
+                ("whole", "the caller\n" + fixed + "more\n", {0})):
+            with self.subTest(label):
+                self.assertEqual(self.reverted_reader(f"topic-partial-{label}", before.encode(), fixed.encode(),
+                                                      caller.encode()), kept)
+
+    def test_a_revert_of_a_file_git_cannot_decode_closes_nothing(self) -> None:
+        """sd:10214 class pass 7: the cited text is compared as bytes, so a file that is not UTF-8 is read
+        like any other: its revert drops the close, and its whole text in another file keeps it."""
+        before, fixed = b"caf\xe9 one\n", b"caf\xe9 one\ncaf\xe9 two\n"
+        self.assertEqual(self.reverted_reader("topic-latin-reverted", before, fixed, b"the caller\nmore\n"), set())
+        self.assertEqual(self.reverted_reader("topic-latin-moved", before, fixed, b"the caller\n" + fixed), {0})
+
     def test_a_revert_that_restores_a_deleted_base_file_closes_nothing(self) -> None:
         """sd:10214 review: a draft deletes a base file, the cited commit adds its text under a new name, and a
         revert puts the tree back as main has it. Git pairs the new name with the restored file as a rename;

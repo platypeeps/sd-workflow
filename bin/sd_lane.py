@@ -1050,8 +1050,10 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
     so a move back git pairs as no rename keeps it too (class pass 6).
     A file holds no work only when both reads find it left as before,
     so a revert of one file keeps a fix the other still ships.
-    Another file that gained every line the cited commit added holds the
-    work too, so a revert that moves the fix out keeps the close.
+    Another file that holds the cited file's whole text, as one exact
+    run of lines, holds the work too, so a revert that moves the fixed
+    file out keeps the close; part of that text proves no move (class
+    pass 7).
 
     `kept_commits` reads this list after it, so this check hides none of
     its evidence (sd:10214 review). An undone commit stays in place with
@@ -1108,36 +1110,51 @@ def unreverted(worktree: pathlib.Path, head: str, commits: list[tuple[str, str]]
                    at in (name, home[name]) and all(now.get(path) == want.get(path) for path in (name, home[name]))
                    for at, name in zip(held, names, strict=True))
 
-    def plus_lines(old: str, new: str, paths: list[str], renames: str = "--no-renames") -> list[str] | None:
-        """The non-blank lines `new` adds to `paths` over `old`, stripped; None when git gave no answer."""
-        done = publish_git(worktree, "--literal-pathspecs", "diff", "-U0", "--no-color", "--no-ext-diff", renames,
-                           old, new, "--", *paths)
-        if done is None or done.returncode != 0:
+    def run_of_lines(rev: str, path: str) -> bytes | None:
+        """`path`'s lines at `rev`, each between two newlines; None when git gave no answer. Bytes: a file
+        need not be UTF-8, and no line is trimmed (class pass 7)."""
+        try:
+            done = subprocess.run(["git", "cat-file", "blob", f"{rev}:{path}"], cwd=worktree, capture_output=True,
+                                  timeout=PUBLISH_SECONDS, check=False, env=sd_lib.without_fsmonitor(os.environ))
+        except (OSError, subprocess.SubprocessError):
             return None
-        lines, body = [], False
-        for line in done.stdout.splitlines():  # a hunk's lines start with +, - or a space; headers never do
-            body = line.startswith("@@") or (body and not line.startswith("diff --git "))
-            if body and line.startswith("+") and line[1:].strip():
-                lines.append(line[1:].strip())
-        return lines
+        return b"\n" + b"\n".join(done.stdout.splitlines()) + b"\n" if done.returncode == 0 else None
+
+    def changed_since(sha: str, skip: list[str], before: str) -> list[tuple[bytes, bytes]] | None:
+        """Each other file `head` changed since `sha` and holds otherwise than `before` did, as its text now
+        and at `before` (empty where `before` lacks it); None when git gave no answer."""
+        changed = fields("diff", "--no-renames", "--name-only", "-z", sha, head)
+        others = [path for path in changed or [] if path and path not in skip]
+        now, then = blobs(head, others), blobs(before, others)
+        if changed is None or now is None or then is None:
+            return None
+        pairs = []
+        # ponytail: one blob read per file the head changed since `sha`; batch them if a wide branch is slow.
+        for path in others:
+            if path in now and now[path] != then.get(path):
+                held, had = run_of_lines(head, path), run_of_lines(before, path) if path in then else b""
+                if held is None or had is None:
+                    return None
+                pairs.append((held, had))
+        return pairs
 
     def copied(sha: str, names: list[str], before: str) -> bool | None:
-        """Whether another file `head` changed since `sha` holds the work in `names`: it gained, since `before`,
-        every line the cited commit added there; None when git gave no answer. A revert that moves the fix into
-        a new or an existing file and puts the old one back took nothing out (sd:10214 lane review)."""
-        homes = [moved[name] for name in names if name in moved]
-        fix = plus_lines(before, sha, names + homes, "-M")
-        changed = fields("diff", "--no-renames", "--name-only", "-z", sha, head)
-        if fix is None or changed is None:
+        """Whether another file `head` changed since `sha` holds the work in `names`: it holds the whole text
+        the cited commit left there, as one exact run of lines, and did not at `before`; None when git gave
+        no answer. A revert that moves the fixed file into a new or an existing file and puts the old one
+        back took nothing out (sd:10214 lane review). Part of that text is not the work: a line the fix
+        added, found in another file, proves no move (class pass 7)."""
+        own = blobs(sha, names)
+        pairs = changed_since(sha, names + [moved[name] for name in names if name in moved], before)
+        if own is None or pairs is None:
             return None
-        if not fix:
-            return False
-        # ponytail: one diff per file the head changed since `sha`; a coincidental one-line fix reads as kept.
-        for path in (path for path in changed if path and path not in names and path not in homes):
-            got = plus_lines(before, head, [path])
-            if got is None:
+        # ponytail: a one-line cited file can still match by chance; name the reverted sha in the revert
+        # (`kept_commits`) where that matters.
+        for name in own:  # a file the cited commit deleted left no text
+            work = run_of_lines(sha, name)
+            if work is None:
                 return None
-            if set(fix) <= set(got):
+            if work.strip() and any(work in held and work not in had for held, had in pairs):
                 return True
         return False
 
